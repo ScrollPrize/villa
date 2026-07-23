@@ -72,13 +72,10 @@ private:
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
     // ~/.fit_services convention) ---
-    // On a successful listen(), a small JSON file named "<pid>.json" is written
-    // under ~/.vc3d/agent_bridge/ containing {pid, name, path, startedAt} so an
-    // out-of-process MCP server can auto-discover a running bridge without the
-    // human relaying the stdout handshake line. Removed on clean shutdown (the
-    // destructor); an orphaned file from a hard kill is reaped by the reader's
-    // stale-PID check (dead pid -> file removed), exactly as discoverServices()
-    // does. Pure QFile/QDir I/O -- never touches the UI.
+    // On a successful listen(), writes ~/.vc3d/agent_bridge/<pid>.json
+    // ({pid, name, path, startedAt}) so an out-of-process MCP can auto-discover a
+    // running bridge. Removed on clean shutdown; an orphan from a hard kill is
+    // reaped by the reader's stale-PID check. Pure QFile/QDir I/O, never the UI.
     void writeRegistryFile();
     void removeRegistryFile();
 
@@ -131,11 +128,8 @@ private:
     QJsonObject handleViewerZoom(const QJsonValue& params);
     QJsonObject handleViewerRotate(const QJsonValue& params);
     QJsonObject handleViewerSetAxisAlignedSlices(const QJsonValue& params);
-    // Global render-settings get/set (ADDITIONS_SPEC item 6). Reads current
-    // values from ViewerManager getters and the first chunked viewer; the set
-    // handler applies each present field via ViewerManager setters / broadcast
-    // and echoes the resulting full settings. viewerRenderSettingsJson() builds
-    // the shared reply body.
+    // Global render-settings get/set (ADDITIONS_SPEC item 6).
+    // viewerRenderSettingsJson() builds the shared reply body.
     QJsonObject handleViewerGetRenderSettings(const QJsonValue& params);
     QJsonObject handleViewerSetRenderSettings(const QJsonValue& params);
     QJsonObject viewerRenderSettingsJson() const;

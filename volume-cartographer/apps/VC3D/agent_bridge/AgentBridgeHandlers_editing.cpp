@@ -351,11 +351,9 @@ QJsonObject AgentBridgeServer::handleViewerSetAxisAlignedSlices(const QJsonValue
     }
     const bool enabled = p.value(QStringLiteral("enabled")).toBool();
 
-    // Drive the checkbox so the toggle takes the exact human/shortcut path
-    // (CWindow::onAxisAlignedSlicesToggled): setEnabled + persist the QSetting +
-    // sync the overlay checkbox. setChecked emits toggled synchronously (same
-    // thread, direct connection), so slices->isEnabled() is up to date on return.
-    // Setting an already-matching value is a no-op (idempotent).
+    // Drive the checkbox so the toggle takes the human/shortcut path
+    // (CWindow::onAxisAlignedSlicesToggled); setChecked emits toggled
+    // synchronously, so slices->isEnabled() is up to date on return.
     QCheckBox* chk = _window ? _window->chkAxisAlignedSlices : nullptr;
     if (chk) {
         if (chk->isChecked() != enabled)
@@ -407,20 +405,10 @@ QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue&
 
     widget->setEditingEnabled(enabled);
 
-    // SegmentationWidget::setEditingEnabled() is the *silent* sync setter (it
-    // calls updateEditingState(enabled, /*notifyListeners=*/false)): it flips the
-    // widget's own checkbox flag and returns without ever emitting
-    // editingModeChanged. On its own that means this handler previously
-    // reported {"enabled": true} without ever reaching
-    // SegmentationModule::setEditingEnabled -> editingEnabledChanged ->
-    // CWindow::onSegmentationEditingModeChanged -> beginEditingSession(): the
-    // widget flag flipped but no real edit session was ever established, so
-    // every editing-gated RPC downstream (manual_add.*, corrections.*) kept
-    // failing with -32007 kind:"session" even after segments.activate. Drive
-    // the module directly -- the same call CWindow itself makes to reconcile
-    // widget/module drift (see CWindow.cpp's onSurfaceActivated, ~line 9795) --
-    // so the real signal cascade (and beginEditingSession/endEditingSession)
-    // actually runs.
+    // widget->setEditingEnabled() is silent (never emits editingModeChanged), so
+    // on its own it never reaches SegmentationModule's signal cascade into
+    // beginEditingSession(); drive the module directly too (as CWindow's
+    // onSurfaceActivated does) so a real edit session is established.
     if (SegmentationModule* mod = _window->_segmentationModule.get()) {
         if (mod->editingEnabled() != enabled) {
             mod->setEditingEnabled(enabled);
@@ -591,12 +579,11 @@ QJsonObject AgentBridgeServer::handleSegmentationSave(const QJsonValue&)
                                    QStringLiteral("Save segment"),
                                    /*broadcastStart=*/false);
 
-    // flushAutosave() -> markAutosaveNeeded(true) -> performAutosave(): startSave()
-    // flips saveInProgress synchronously when a save actually launches (or when a
-    // save was already in flight it stays true and its completion signal will
-    // close this job). If saveInProgress is still false afterwards, performAutosave
-    // early-returned (no resolvable surface / missing file metadata) and no
-    // autosaveCompleted signal will fire — so resolve the job here.
+    // flushAutosave() -> markAutosaveNeeded(true) -> performAutosave():
+    // saveInProgress flips synchronously when a save launches (or stays true if
+    // one was already running). If it's still false afterward, performAutosave
+    // early-returned (no resolvable surface / missing metadata) and no
+    // autosaveCompleted signal will ever fire, so resolve the job here.
     mod->flushAutosave();
     const SegmentationModule::AutosaveStatus after = mod->autosaveStatus();
 
@@ -683,12 +670,10 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
                                    QStringLiteral("GrowPatch from seed"),
                                    /*broadcastStart=*/false);
 
-    // This job is bridge-tracked and typically runs headless/offscreen. Tell
-    // the runner to suppress the interactive "Operation Complete" QMessageBox
-    // for this run so the modal dialog cannot starve the toolFinished slots
-    // that transition the job out of "running" (see CommandLineToolRunner
-    // ::setSuppressCompletionDialogs). The flag is auto-cleared once
-    // toolFinished fires; we also clear it on the synchronous-failure path.
+    // Suppress the interactive "Operation Complete" QMessageBox for this run so
+    // the modal dialog cannot starve the toolFinished slots that transition the
+    // job out of "running"; auto-cleared on toolFinished, also cleared below on
+    // the synchronous-failure path.
     if (_window->_cmdRunner)
         _window->_cmdRunner->setSuppressCompletionDialogs(true);
 
@@ -920,13 +905,10 @@ QJsonObject AgentBridgeServer::handleCorrectionsSetPointMode(const QJsonValue& p
 }
 
 
-// NOTE: The deferred-response mechanism below (beginDeferred /
-// completeDeferredResult / completeDeferredError, plus the AgentBridgeDeferred
-// dispatch path) is bridge-core infrastructure per SPEC §8.4. It is proven out
-// but not yet wired to a shipping method; the first real users (lasagna.* /
-// atlas.* / fiber.create_atlas) arrive in later stages. It was validated
-// during this stage against a temporary debug.defer self-test RPC (since
-// removed) covering both the signal-completion and timeout (-32005) paths.
+// NOTE: the deferred-response mechanism (beginDeferred / completeDeferredResult
+// / completeDeferredError, plus the AgentBridgeDeferred dispatch path) is
+// bridge-core infrastructure per SPEC §8.4, not yet wired to a shipping method
+// (lasagna.* / atlas.* / fiber.create_atlas arrive later); timeout -> -32005.
 
 // ---------------------------------------------------------------------------
 // canvas.drag (SPEC §9.1)

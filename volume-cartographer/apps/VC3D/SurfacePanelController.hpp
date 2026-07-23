@@ -118,12 +118,11 @@ public:
 
     void syncSelectionUi(const std::string& surfaceId, QuadSurface* surface);
     bool selectSurfaceById(const std::string& surfaceId);
-    /// Programmatically activate a segment: select it in the tree (signals blocked,
-    /// via selectSurfaceById) and then emit surfaceActivated exactly as a live click
-    /// would, reaching CWindow::onSurfaceActivated. Never shows UI. Returns false with
-    /// a reason in *errorMessage when the id is unknown, the surface cannot be loaded,
-    /// the segment is an unmaterialized open-data placeholder, or the selection is
-    /// locked while growth runs.
+    /// Programmatically activate a segment: selects it in the tree (signals blocked,
+    /// via selectSurfaceById) then emits surfaceActivated exactly as a live click would
+    /// (reaching CWindow::onSurfaceActivated). Never shows UI. Returns false with a
+    /// reason in *errorMessage when the id is unknown, unloadable, an unmaterialized
+    /// open-data placeholder, or selection is locked while growth runs.
     bool activateSurfaceById(const std::string& surfaceId,
                              QString* errorMessage = nullptr);
     void resetTagUi();
@@ -138,22 +137,18 @@ public:
     void setVisibleSegmentFolders(std::vector<SegmentFolderSelection> folders);
     void addSingleSegmentation(const std::string& segId);
     void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
-    // Dialog-free core of handleDeleteSegments: irreversibly deletes each id from
-    // the package on disk (removeSingleSegmentation + VolumePkg::removeSegmentation)
-    // and refreshes the panel. Never shows a dialog. Returns true when every id
-    // was deleted; on partial/total failure returns false and, when `err` is
-    // non-null, sets it to a human-readable summary of the failed ids. When
-    // `deletedCount` is non-null it receives the number of ids actually deleted
-    // (so callers can distinguish partial success from total failure). The
-    // interactive handleDeleteSegments calls this after its confirmation dialog;
-    // the agent bridge calls it directly (SPEC.md §23).
+    // Dialog-free core of handleDeleteSegments: irreversibly deletes each id from the
+    // package on disk and refreshes the panel. Returns true only when every id was
+    // deleted; on partial/total failure, `err` gets a summary and `deletedCount` the
+    // number actually deleted. The interactive handleDeleteSegments calls this after its
+    // confirmation dialog; the agent bridge calls it directly (SPEC.md §23).
     bool deleteSegmentsHeadless(const QStringList& segmentIds, QString* err = nullptr,
                                 int* deletedCount = nullptr);
     // Replace the whole highlighted-surface set at once and push it to the viewers,
-    // keeping _highlightedSurfaceIds (the source of truth behind the context-menu
-    // "Highlight in slice views" checkmarks) in sync. The agent bridge routes
-    // viewer.set_render_settings through this instead of ViewerManager directly, so
-    // a bridge-driven highlight change and the GUI toggle stay consistent.
+    // keeping _highlightedSurfaceIds (source of truth behind the "Highlight in slice
+    // views" checkmarks) in sync. The agent bridge routes viewer.set_render_settings
+    // through this rather than ViewerManager directly, so bridge and GUI highlight
+    // changes stay consistent.
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     std::vector<std::string> highlightedSurfaceIds() const;
     bool cycleToNextVisibleSegment();

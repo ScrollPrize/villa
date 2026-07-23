@@ -2857,9 +2857,7 @@ void SegmentationModule::stopPushPullAll()
 // Agent-bridge public save/flush accessors (SPEC §3.11c / segmentation.save).
 void SegmentationModule::flushAutosave()
 {
-    // markAutosaveNeeded(true) runs performAutosave() synchronously if a save is
-    // pending; when a save is already in flight it is marked dirty so a follow-up
-    // save runs on completion. A no-op when nothing is pending.
+    // No-op when nothing is pending; marks dirty (follow-up save) when one is in flight.
     markAutosaveNeeded(true);
 }
 
@@ -3052,12 +3050,9 @@ void SegmentationModule::performAutosave()
             ? _autosaveState.completeSuccess(autosaveTicket)
             : _autosaveState.completeFailure(autosaveTicket, canRetry);
         if (completion == segmentation::AutosaveState::Completion::Stale) {
-            // The write itself finished (its success/failure is already known);
-            // the completion is only "stale" because the editing session ended or
-            // restarted while this async save was in flight. Still emit so any
-            // in-flight bridge autosave job (SPEC §3.11c) closes instead of
-            // hanging -- the GUI ignores this signal, and the bridge handler is a
-            // no-op unless an explicit save job is open.
+            // Stale just means the session changed while this save was in flight; still
+            // emit so an in-flight bridge autosave job (SPEC §3.11c) closes rather than
+            // hangs (the GUI ignores this signal).
             updateAutosaveState();
             emit autosaveCompleted(failureMessage.isEmpty());
             return;

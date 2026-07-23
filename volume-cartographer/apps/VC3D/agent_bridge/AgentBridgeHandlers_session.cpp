@@ -991,12 +991,9 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
 
     const QJsonObject p = paramsObject(params);
 
-    // --- Phase 1: parse, validate, and clamp every supplied field into locals.
-    // Present-but-wrong-typed values are rejected by the strict helpers; opacities
-    // are clamped to 0..1 (the setters clamp again defensively). Doing all of this
-    // before any setter or QSettings write means a malformed field rejects the
-    // whole request rather than persisting the earlier fields and then throwing,
-    // which would leave render settings half-applied. ---
+    // --- Phase 1: parse/validate/clamp into locals (opacities to 0..1). Doing
+    // this before any setter or QSettings write means a malformed field rejects
+    // the whole request rather than leaving render settings half-applied. ---
     const bool hasIntersectionOpacity = p.contains("intersectionOpacity");
     float intersectionOpacity = 0.0f;
     if (hasIntersectionOpacity) {
@@ -1097,10 +1094,9 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         normalMaxArrows = std::clamp(v, 4, 100);
     }
 
-    // --- Phase 2: apply. The request is fully validated, so every setter,
-    // QSettings write, and broadcast below runs as a group -- a rejected request
-    // above mutated nothing. Global controls go via ViewerManager (broadcast +
-    // QSettings-persisted). ---
+    // --- Phase 2: apply. Fully validated above, so the setters, QSettings
+    // writes, and broadcasts run as a group. Global controls go via ViewerManager
+    // (broadcast + QSettings-persisted). ---
     if (hasIntersectionOpacity)
         mgr->setIntersectionOpacity(intersectionOpacity);
     if (hasIntersectionThickness)

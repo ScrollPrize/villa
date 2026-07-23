@@ -344,8 +344,7 @@ QJsonObject AgentBridgeServer::handleAtlasOpenResult(const QJsonValue& params)
 
     const QJsonObject p = paramsObject(params);
     // jsonRequireInt rejects wrong-typed / fractional / int-overflowing values
-    // (the last guarding the cast against a finite double like 1e300, §11a). The
-    // in-range check against the result count follows below.
+    // (the last guarding the cast against a finite double like 1e300, §11a).
     const int index = jsonRequireInt(p.value("index"), "index");
     const auto& results = _window->_atlasSearchResults;
     if (index < 0 || index >= static_cast<int>(results.size())) {

@@ -61,15 +61,10 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
 
-// ---------------------------------------------------------------------------
-// Same-winding wrap annotation (SPEC §3.9d) — the tutorial's shift+E workflow.
-//
-// Human flow: enable "Same-wrap annotation mode" -> shift-click on a chunked
-// viewer to seed preview points -> shift+E to commit them into the point
-// collection (Ctrl+Z clears the preview / undoes the last commit). These RPCs
-// expose set_mode / commit / undo; the preview itself is seeded via
-// canvas.shift_click, exactly as for a human.
-// ---------------------------------------------------------------------------
+// Same-winding wrap annotation (SPEC §3.9d): human flow is enable "Same-wrap
+// annotation mode" -> shift-click a chunked viewer to seed preview points ->
+// shift+E to commit (Ctrl+Z undoes). These RPCs expose set_mode/commit/undo;
+// preview is seeded via canvas.shift_click, exactly as for a human.
 
 QJsonObject AgentBridgeServer::handleWrapAnnotationSetMode(const QJsonValue& params)
 {
@@ -89,9 +84,8 @@ QJsonObject AgentBridgeServer::handleWrapAnnotationSetMode(const QJsonValue& par
         throw AgentBridgeError{-32000, "Wrap annotation widget unavailable", data};
     }
 
-    // Drives the checkbox's toggled() signal (CWindow ->
-    // CChunkedVolumeViewer::setSameWrapAnnotationMode) exactly as a click would;
-    // setting the current state is an inert no-op.
+    // Drives the checkbox's toggled() signal exactly as a click would; setting
+    // the current state is an inert no-op.
     widget->setSameWrapAnnotationEnabled(enabled);
 
     QJsonObject result;

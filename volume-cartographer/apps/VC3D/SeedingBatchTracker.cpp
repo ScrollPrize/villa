@@ -30,7 +30,6 @@ bool SeedingBatchTracker::recordTerminal(int key, bool failedToStart,
     }
     _terminalKeys.insert(key);
 
-    // A child fails if it never started, crashed, or returned nonzero.
     const bool failed = failedToStart || crashed || exitCode != 0;
     if (failed) {
         _failures++;

@@ -1,8 +1,5 @@
 // Unit tests for the Agent Bridge strict wire-parameter helpers (SPEC §5).
-//
-// These are pure functions over QJsonValue/QJsonObject — no server, no event
-// loop — so a tiny dependency-free assert harness suffices (matches the
-// "plain main() returns nonzero on failure" style noted for this test).
+// Pure functions over QJsonValue/QJsonObject, so a tiny assert harness suffices.
 //
 // QJsonValue::toDouble()/toInt()/toBool() silently coerce a wrong-typed value to
 // 0/false; the jsonRequire*/jsonTo* helpers must instead reject a PRESENT-but-
@@ -66,7 +63,6 @@ void expectParamError(const char* label, const char* expectedParam, Fn&& fn)
     }
 }
 
-// Runs `fn`, asserts it does NOT throw.
 template <typename Fn>
 void expectNoThrow(const char* label, Fn&& fn)
 {

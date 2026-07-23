@@ -173,9 +173,8 @@ struct OpenDataResourceSelection {
     // True when a raw source volume with this id is allowed by the volumeIds
     // axis (the only axis that gates whole volumes).
     [[nodiscard]] bool allowsVolume(const std::string& volumeId) const;
-    // True when a derived representation identified by its (volumeIndex,
-    // artifactIndex) ref, `kind`, and owning `volumeId` passes every provided
-    // axis.
+    // True when the (volumeIndex, artifactIndex, kind, volumeId) representation passes
+    // every provided axis.
     [[nodiscard]] bool allowsRepresentation(std::size_t volumeIndex,
                                             std::size_t artifactIndex,
                                             OpenDataRepresentationKind kind,

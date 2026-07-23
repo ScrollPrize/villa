@@ -37,12 +37,9 @@ public:
         CustomCommand
     };
 
-    // Output format for Tool::RenderTifXYZ. vc_render_tifxyz supports two
-    // mutually-exclusive-in-practice output sinks: a per-slice TIFF stack
-    // (--tif-output, the long-standing GUI default) and an OME-Zarr store
-    // (--zarr-output). Selected via setRenderOutputFormat; the interactive
-    // render path always resets this to TifStack, while the agent bridge can
-    // thread through either choice (SPEC §19).
+    // Output format for Tool::RenderTifXYZ: a per-slice TIFF stack (--tif-output,
+    // the GUI default) or an OME-Zarr store (--zarr-output). The interactive path
+    // always resets to TifStack; the agent bridge can pick either (SPEC §19).
     enum class RenderOutputFormat {
         TifStack,   // --tif-output <pattern>
         Zarr        // --zarr-output <path.zarr>
@@ -64,9 +61,8 @@ public:
     // tool specific params 
     void setRenderParams(float scale, int resolution, int layers);
     void setRenderVoxelSize(double voxelSizeUm, bool enabled);
-    // Selects --tif-output vs --zarr-output for the next RenderTifXYZ run.
-    // Defaults to TifStack; the interactive render slot re-asserts TifStack so a
-    // prior headless Zarr render never leaks into a subsequent GUI render.
+    // Selects --tif-output vs --zarr-output for the next RenderTifXYZ run (default
+    // TifStack; interactive re-asserts TifStack to avoid leaking a prior Zarr choice).
     void setRenderOutputFormat(RenderOutputFormat format);
     void setRenderAdvanced(int cropX, int cropY, int cropWidth, int cropHeight,
                            const QString& affinePath, bool invertAffine,
@@ -135,15 +131,11 @@ public:
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
     void setPreserveConsoleOutput(bool preserve);
 
-    // When set, the interactive toolFinished handler (see
-    // CWindow::initializeCommandLineRunner) must NOT pop a blocking
-    // "Operation Complete"/"Error" QMessageBox for the current run. The agent
-    // bridge sets this before launching a job it tracks so that a headless /
-    // offscreen (or otherwise unattended) process is not starved by a modal
-    // dialog that no one can dismiss (mirrors the NeighborCopy first-pass
-    // suppression). It also gates the error-path console-dock pop in
-    // onProcessError for the same reason. The flag is scoped to a single run: it
-    // is cleared automatically once toolFinished has been emitted.
+    // When set, the interactive toolFinished handler must NOT pop a blocking
+    // completion/error QMessageBox for the current run, and onProcessError skips
+    // its error-path console-dock pop -- so an unattended (headless/offscreen)
+    // run isn't starved by a modal no one can dismiss. Scoped to a single run:
+    // cleared automatically once toolFinished has been emitted.
     void setSuppressCompletionDialogs(bool suppress) { _suppressCompletionDialogs = suppress; }
     bool suppressCompletionDialogs() const { return _suppressCompletionDialogs; }
 
@@ -225,9 +217,8 @@ private:
 
     int _ompThreads{-1};
     bool _explicitVolumePath{false};
-    // Set by the agent bridge for jobs it tracks; suppresses the interactive
-    // completion QMessageBox for the current run only. Cleared after the
-    // toolFinished signal is emitted. See setSuppressCompletionDialogs.
+    // Suppresses the interactive completion QMessageBox for the current run only;
+    // cleared after toolFinished. See setSuppressCompletionDialogs.
     bool _suppressCompletionDialogs{false};
 
     QString _objOutputDir;

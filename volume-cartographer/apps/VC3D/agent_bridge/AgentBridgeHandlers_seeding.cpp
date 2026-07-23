@@ -744,11 +744,8 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
                                    QStringLiteral("Render segment"),
                                    /*broadcastStart=*/false);
 
-    // Suppress the runner's interactive "Operation Complete" QMessageBox for this
-    // headless run so the modal dialog cannot starve the toolFinished slots that
-    // transition the job out of "running" (auto-cleared on toolFinished; also
-    // cleared on the synchronous-failure path below). Same proven pattern as
-    // segmentation.grow_patch_from_seed / tracer.run_trace.
+    // Same dialog-suppression pattern as tracer.run_trace /
+    // segmentation.grow_patch_from_seed (see tracer.run_trace above for why).
     if (_window->_cmdRunner)
         _window->_cmdRunner->setSuppressCompletionDialogs(true);
 

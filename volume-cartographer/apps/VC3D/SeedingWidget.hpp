@@ -51,45 +51,36 @@ public:
     void setViewerManager(ViewerManager* viewerManager);
 
     // --- Agent bridge headless entry points (SPEC §15.2) ---
-    // The seeding action entry points are private slots; these one-line public
-    // wrappers let the agent bridge invoke the non-blocking ones without a Qt
-    // signal connection. preview-rays (synchronous point math), cast-rays
-    // (QtConcurrent background), and reset-points (pure UI reset) are simple
-    // wrappers. setDialogsSuppressed() gates the precondition QMessageBox::warning
-    // calls the wrapped slots would otherwise raise (a static QMessageBox spins a
-    // nested event loop), for the bridge's lifetime only.
+    // Public wrappers around private slots so the bridge can invoke them without a Qt
+    // connection. setDialogsSuppressed() gates the precondition QMessageBox::warning
+    // calls (a static QMessageBox spins a nested event loop) for the bridge's lifetime only.
     void runPreviewRays() { onPreviewRaysClicked(); }
     void runCastRays() { onCastRaysClicked(); }
     void runResetPoints() { onResetPointsClicked(); }
     void setDialogsSuppressed(bool suppressed) { _dialogsSuppressed = suppressed; }
     [[nodiscard]] bool dialogsSuppressed() const { return _dialogsSuppressed; }
 
-    // --- Agent bridge headless entry points for the batch seeding actions ---
-    // (SPEC §15.2, as amended). onRunSegmentationClicked / onExpandSeedsClicked
-    // used to end in a blocking `while (jobsRunning) QApplication::processEvents`
-    // loop (a §1.3 violation). They now launch the QProcess batch and return; the
-    // batch drains through the process finished callbacks and reports progress /
-    // completion via seedingBatchProgressChanged / seedingBatchFinished. These
-    // headless twins run the exact same validation + launch but report precondition
-    // failures through *errorMessage (never a QMessageBox) and never block. Distinct
-    // names (not overloads of the connect()-target slots), per the headless-split
-    // doctrine. Return true when the batch was accepted (≥1 child launched).
+    // --- Agent bridge headless entry points for the batch seeding actions (SPEC §15.2,
+    // as amended) --- onRun/onExpand used to block in a
+    // `while (jobsRunning) QApplication::processEvents` loop (a §1.3 violation); they now
+    // launch the QProcess batch and return, reporting progress/completion via
+    // seedingBatchProgressChanged/seedingBatchFinished. These headless twins run the same
+    // validation + launch but report failures via *errorMessage instead of a QMessageBox,
+    // and never block. Returns true when the batch was accepted (≥1 child launched).
     bool runSegmentationHeadless(QString* errorMessage);
     bool runExpandSeedsHeadless(QString* errorMessage);
-    // Synchronous path-intensity analysis (Draw mode). Pure in-process compute; the
-    // only reason the slot wasn't bridge-safe was a per-path QApplication::
-    // processEvents repaint pump, now removed. Reports counts via the optional
-    // out-params.
+    // Synchronous path-intensity analysis (Draw mode); the only reason this wasn't
+    // bridge-safe was a per-path QApplication::processEvents repaint pump, now removed.
     bool runAnalyzePathsHeadless(QString* errorMessage, int* pathsAnalyzed = nullptr,
                                  int* peaksFound = nullptr);
-    // Dialog-free cancel of the active run/expand (or neural-trace) batch. Bounded:
-    // terminate() + waitForFinished(1000) then kill() per running child, so it is
-    // safe to call synchronously from a bridge RPC handler. Fires
-    // seedingBatchFinished(kind,false,...) when a run/expand batch was active.
+    // Dialog-free cancel of the active run/expand (or neural-trace) batch: terminate() +
+    // waitForFinished(1000) then kill() per child, safe to call synchronously from a
+    // bridge RPC handler. Fires seedingBatchFinished(kind,false,...) when a run/expand
+    // batch was active.
     void cancelSeedingBatchHeadless();
-    // Live batch introspection for the bridge job model (SPEC §8.3). "active" means
-    // a run/expand batch specifically (not a neural trace, which shares the
-    // jobsRunning flag). kind is "run" | "expand" | "" (idle).
+    // Live batch introspection for the bridge job model (SPEC §8.3); "active" means a
+    // run/expand batch, not a neural trace (which shares the jobsRunning flag). kind is
+    // "run" | "expand" | "" (idle).
     [[nodiscard]] bool seedingBatchActive() const { return jobsRunning && !_batch.kind().isEmpty(); }
     [[nodiscard]] QString seedingBatchKind() const { return _batch.kind(); }
     [[nodiscard]] int seedingBatchTotal() const { return _batch.total(); }
@@ -98,13 +89,11 @@ signals:
     void sendPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void sendStatusMessageAvailable(QString text, int timeout);
     void relWindingAnnotationModeChanged(bool active);
-    // Batch seeding lifecycle (SPEC §15.2). kind is "run" | "expand". Emitted from
-    // the QProcess finished callbacks so the agent bridge can mirror the batch as a
-    // source:"seeding" job: progress on each child completion, finished on
-    // completion, failure, or cancel. success is true only when the whole batch
-    // ran clean (no child failed and no cancel); canceled distinguishes a user
-    // cancel from an execution failure (both map to a failed bridge job). message
-    // carries meaningful terminal text (see finalizeSeedingBatch).
+    // Batch seeding lifecycle (SPEC §15.2); kind is "run" | "expand", emitted from the
+    // QProcess finished callbacks so the bridge can mirror the batch as a
+    // source:"seeding" job. success is true only when the whole batch ran clean;
+    // canceled distinguishes a user cancel from an execution failure. message carries
+    // the terminal text (see finalizeSeedingBatch).
     void seedingBatchProgressChanged(const QString& kind, int completed, int total);
     void seedingBatchFinished(const QString& kind, bool success, bool canceled,
                               int completed, int total, const QString& message);
@@ -160,23 +149,20 @@ private:
     void startDrawing(cv::Vec3f startPoint);
     void addPointToPath(cv::Vec3f point);
     void finalizePath();
-    // Batch seeding internals (non-blocking replacements for the former
-    // self-referencing local lambdas in onRun/onExpand — those lambdas captured
-    // stack locals by reference, which would dangle now that the launching call
-    // returns before the batch finishes). One batch (run OR expand) at a time.
+    // Batch seeding internals; replace the former self-referencing local lambdas in
+    // onRun/onExpand, whose captured stack locals would dangle now that the launching
+    // call returns before the batch finishes. One batch (run OR expand) at a time.
     void startSegmentationProcessForPoint(int pointIndex);
     void startExpansionProcessForIteration(int iterationIndex);
-    // Shared child launch: drains merged output (bounded tail), wires the
-    // finished + errorOccurred(FailedToStart) completion paths, resolves the
-    // nice/ionice priority wrappers (which may be absent) and falls back to
-    // launching vc_grow_seg_from_seed directly. Appends to runningProcesses
-    // before start() so a synchronous FailedToStart is still tracked.
+    // Shared child launch: drains merged output (bounded tail), wires finished +
+    // errorOccurred(FailedToStart), and falls back to vc_grow_seg_from_seed directly if
+    // the nice/ionice wrappers are absent. Appends to runningProcesses before start() so a
+    // synchronous FailedToStart is still tracked.
     void launchBatchProcess(QProcess* process, int index, const QStringList& toolArgs);
-    // A single QProcess reaches its terminal state exactly once here (deduped by
-    // the tracker keyed on process identity): finished() and errorOccurred() may
-    // both fire.
-    // failedToStart routes FailedToStart through the same completion path so a
-    // missing wrapper/tool fails the batch instead of stranding it.
+    // A single QProcess reaches its terminal state exactly once here (deduped by the
+    // tracker keyed on process identity) since finished() and errorOccurred() may both
+    // fire. failedToStart routes FailedToStart through the same path so a missing
+    // wrapper/tool fails the batch rather than stranding it.
     void handleBatchProcessFinished(QProcess* process, int index, int exitCode,
                                     QProcess::ExitStatus exitStatus, bool failedToStart);
     void finalizeSeedingBatch();
@@ -246,21 +232,18 @@ private:
     QList<QPointer<QProcess>> runningProcesses;
     bool jobsRunning;
 
-    // Async seeding batch state (run/expand). Promoted from onRun/onExpand locals
-    // so the QProcess finished callbacks read stable members, not dangling
-    // captures. Only one batch is active at a time (gated by jobsRunning).
-    // Outcome aggregation (failure/cancel/success + terminal message) lives in
-    // SeedingBatchTracker _batch; only genuine process-lifecycle bookkeeping
-    // (scheduling cursor, config, per-child output tail) stays here.
+    // Async seeding batch state (run/expand), promoted from onRun/onExpand locals so the
+    // QProcess finished callbacks read stable members, not dangling captures. Only one
+    // batch is active at a time (gated by jobsRunning). Outcome aggregation lives in
+    // SeedingBatchTracker _batch; only process-lifecycle bookkeeping stays here.
     int _batchNextIndex{0};
     int _batchOmpThreads{0};
     SeedingBatchTracker _batch;                  // honest batch outcome (SPEC §1)
     QHash<QProcess*, QString> _batchProcessTail; // bounded per-child output tail for diagnostics
     std::vector<ColPoint> _batchPoints;      // run: source points; empty for expand
-    // Resolved vc_grow_seg_from_seed volume argument: local zarr path for a
-    // mirrored volume, or the remote locator for a streaming-only volume
-    // (issue #1188). A QString (not filesystem::path) because a remote locator
-    // is a URL, not a path.
+    // Resolved vc_grow_seg_from_seed volume argument: local zarr path for a mirrored
+    // volume, or the remote locator for a streaming-only volume (issue #1188). QString,
+    // not filesystem::path, since a remote locator is a URL.
     QString _batchVolumePath;
     std::filesystem::path _batchPathsDir;
     std::filesystem::path _batchConfigJson;  // seed.json (run) or expand.json (expand)

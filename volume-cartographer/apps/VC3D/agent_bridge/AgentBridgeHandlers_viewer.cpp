@@ -23,21 +23,14 @@
 #include "vc/core/util/Compositing.hpp"
 
 // ---------------------------------------------------------------------------
-// Viewer round-2: overlay-volume controls and per-viewer intersection sets.
-//
-// `viewer.get_overlay` / `viewer.set_overlay` expose the ViewerManager-backed
-// overlay volume (colormap, opacity, window, composite) that the GUI's
-// overlay-volume combo box + sliders drive; `viewer.list_overlay_volumes`
-// lists candidate volumes; `viewer.set_intersects` mirrors
-// SurfacePanelController's per-viewer `setIntersects()` calls (the surfaces
-// whose intersection lines a viewer draws).
+// Viewer round-2: ViewerManager-backed overlay-volume controls (colormap,
+// opacity, window, composite) and per-viewer intersection sets (the surfaces
+// whose intersection lines a viewer draws, mirroring SurfacePanelController).
 // ---------------------------------------------------------------------------
 
 namespace {
 
-// The caller passes _window->_viewerManager.get() (a private member reachable
-// only from AgentBridgeServer members, which are friends of CWindow); this
-// helper just centralizes the null-check -> -32010 throw.
+// Centralizes the null-check -> -32010 throw for the viewer manager.
 ViewerManager* requireViewerManager(ViewerManager* mgr)
 {
     if (!mgr) {
@@ -48,13 +41,10 @@ ViewerManager* requireViewerManager(ViewerManager* mgr)
     return mgr;
 }
 
-// vc::resolve() (Colormaps.cpp) has no notion of "unknown" -- an unrecognized
-// id silently falls back to the first spec ("fire") at render time, so a typo
-// would be accepted and echoed back while quietly not doing what was asked.
-// Validate against the same vc::specs() table the overlay panel populates its
-// combo box from, rather than a hand-maintained guess. Empty string is the
-// sentinel VolumeOverlayController uses for "no explicit choice yet" (see its
-// resetToDefaults()), so it stays valid here too.
+// vc::resolve() silently falls back to the first spec ("fire") for an unknown
+// id, so validate against vc::specs() (the same table the overlay combo uses).
+// Empty string is VolumeOverlayController's "no explicit choice" sentinel, so
+// it stays valid.
 bool isKnownOverlayColormap(const QString& id)
 {
     if (id.isEmpty())
@@ -101,11 +91,9 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
     ViewerManager* mgr = requireViewerManager(_window ? _window->_viewerManager.get() : nullptr);
     const QJsonObject p = paramsObject(params);
 
-    // --- Phase 1: parse, validate, and resolve every supplied field into
-    // locals. Nothing here mutates viewer state, so a malformed field rejects
-    // the whole request (-32602 / -32007 / -32000) rather than switching the
-    // overlay volume and then throwing on a later bad field, which would leave
-    // the overlay half-updated. ---
+    // --- Phase 1: parse/validate/resolve into locals. No mutation here, so a
+    // malformed field rejects the whole request (-32602 / -32007 / -32000)
+    // instead of leaving the overlay half-updated. ---
 
     // Overlay volume selection: "clear" or an explicit empty "volumeId" both
     // mean "no overlay volume"; a non-empty "volumeId" resolves and sets it.
@@ -175,9 +163,8 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
             throwParamError("composite", QStringLiteral("must be an object"));
         const QJsonObject co = cv.toObject();
 
-        // Merge over the current settings so an agent can tweak a single
-        // sub-key (e.g. just "enabled") without restating the rest. Reading the
-        // current settings is not a mutation, so it stays in the validation phase.
+        // Merge over current settings so a caller can tweak one sub-key without
+        // restating the rest (a read, so it stays in the validation phase).
         composite = mgr->overlayComposite();
         if (co.contains("enabled"))
             composite.enabled = jsonRequireBool(co.value("enabled"), "composite.enabled");

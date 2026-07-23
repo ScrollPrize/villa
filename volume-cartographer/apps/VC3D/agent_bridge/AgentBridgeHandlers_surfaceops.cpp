@@ -23,14 +23,11 @@
 #include "vc/core/types/VolumePkg.hpp"
 
 // ===========================================================================
-// Per-segment mesh operations (Workstream 4). Two families:
-//   * synchronous, dialog-free ops that call an existing SegmentationCommand-
-//     Handler / SurfaceAreaCalculator entry directly (crop, recalc_area);
-//   * asynchronous ops that drive a headless start* launcher and are tracked as
-//     jobs -- the external-tool ones share the single source:"tool" slot (§8.3,
-//     exactly like render.tifxyz), while the in-process mask render resolves via
-//     the §8.4 deferred-response mechanism.
-// Registered handlers come first; the shared mask helper follows in call order.
+// Per-segment mesh operations. Sync dialog-free ops (crop, recalc_area) call a
+// SegmentationCommandHandler / SurfaceAreaCalculator entry directly; async ops
+// drive a headless start* launcher tracked as a job -- external-tool ones share
+// the source:"tool" slot (§8.3, like render.tifxyz), the in-process mask render
+// resolves via the §8.4 deferred mechanism.
 // ===========================================================================
 
 
@@ -74,12 +71,9 @@ QJsonObject AgentBridgeServer::handleSegmentCropBounds(const QJsonValue& params)
         throw AgentBridgeError{-32004, "A mask render is in progress", data};
     }
 
-    // Synchronous, dialog-free core: crops the surface to its tightest valid
-    // bounds, writes it, and refreshes metrics. An internal failure (missing
-    // coordinate grid, channel-size mismatch, save error) reports through `err`
-    // rather than a QMessageBox, so it becomes a real -32005 instead of a false
-    // cropped:true. A successful no-op (already tightest) still reports success;
-    // the op does not distinguish "cropped" from "already tightest".
+    // Synchronous dialog-free core. Failures report through `err` (not a
+    // QMessageBox) so they become a real -32005 instead of a false cropped:true;
+    // a no-op (already tightest) still reports success.
     QString err;
     if (!handler->cropSurfaceToValidRegion(segmentId.toStdString(), &err)) {
         QJsonObject data;

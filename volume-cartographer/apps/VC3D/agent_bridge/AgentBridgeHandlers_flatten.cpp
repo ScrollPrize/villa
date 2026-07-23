@@ -65,14 +65,12 @@
 // Flattening RPCs (SPEC §20): flatten.slim / flatten.abf / flatten.straighten
 // ---------------------------------------------------------------------------
 
-// Shared launch body for all three flatten RPCs. The specific handler validates
-// its params and builds `launch` (a closure over the concrete start* launcher);
-// this registers the source:"flatten" job, invokes the launcher, and maps its
-// distinct failure sentences to JSON-RPC codes. Reuses the exact
-// beginJob->launch->broadcast pattern proven for render.tifxyz / tracer.run_trace,
-// except completion is driven by SegmentationCommandHandler::flattenJobFinished
-// rather than a CommandLineToolRunner signal (the flatten jobs own their own
-// QProcess / QtConcurrent lifecycle).
+// Shared launch body for all three flatten RPCs: the handler builds `launch`
+// (a closure over the concrete start* launcher); this registers the job and
+// maps failure sentences to codes. Completion is driven by
+// SegmentationCommandHandler::flattenJobFinished rather than a
+// CommandLineToolRunner signal, since flatten jobs own their own
+// QProcess/QtConcurrent lifecycle.
 QJsonObject AgentBridgeServer::launchFlattenJob(
     const QString& kind, const QString& label, const QString& segmentId,
     const std::function<bool(QString* err, QString* outDir)>& launch)

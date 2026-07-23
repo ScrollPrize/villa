@@ -489,14 +489,10 @@ QJsonObject AgentBridgeServer::handleFiberCreateAtlas(const QJsonValue& params)
     const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
     requireKnownFiber(ctrl, fiberId);
 
-    // As-built deviation from §13.8's deferred design: createAtlasFromFiber is
-    // fully SYNCHRONOUS (the atlasCreated signal fires before it returns), so
-    // the deferred machinery adds nothing — and both its failure path
-    // (showError QMessageBox) and its success path (atlasCreated ->
-    // CWindow::displayAtlasFromDirectory -> possible rebuild
-    // QMessageBox::question) violate §1.3. The headless split runs the same
-    // core dialog-free, and the bridge then displays the created atlas via
-    // the already-proven displayAtlasFromDirectoryHeadless (SPEC §12.1).
+    // Deviates from §13.8's deferred design: createAtlasFromFiber is fully
+    // synchronous (atlasCreated fires before return) and its dialogs (showError
+    // / rebuild QMessageBox::question) violate §1.3, so we run the headless
+    // split and display via the proven displayAtlasFromDirectoryHeadless (§12.1).
     QString err;
     std::filesystem::path atlasDir;
     if (!ctrl->createAtlasFromFiberHeadless(fiberId, &err, &atlasDir)) {

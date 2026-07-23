@@ -554,9 +554,9 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         return false;
     }
 
-    // Interactive path only: confirm replacing an already-open project. A
-    // non-interactive (agent-bridge) call is treated as explicit consent to
-    // replace, and must never spin a nested event loop (SPEC §1.3, §8.2).
+    // Interactive path only: confirm replacing an already-open project. A non-interactive
+    // (agent-bridge) call is treated as consent to replace and must never spin a nested
+    // event loop (SPEC §1.3, §8.2).
     if (interactive && _window->_state->vpkg()) {
         QMessageBox prompt(_window);
         prompt.setWindowTitle(QObject::tr("Open Data Sample"));
@@ -573,10 +573,10 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         }
     }
 
-    // In-flight guard (SPEC §18.3): a second overlapping open must never
-    // interleave CloseVolume/setVpkg with a still-running open. This is the only
-    // remaining path that spins a nested event loop, and it is interactive-only
-    // (never reachable from the bridge, SPEC §18.5).
+    // In-flight guard (SPEC §18.3): a second overlapping open must never interleave
+    // CloseVolume/setVpkg with a still-running open. This is the only remaining path
+    // that spins a nested event loop, and it's interactive-only (never reachable from
+    // the bridge, SPEC §18.5).
     if (_openDataSampleOpenInFlight) {
         if (errorMessage)
             *errorMessage = QObject::tr("An Open Data sample open is already in progress.");
@@ -632,10 +632,10 @@ bool MenuActionController::startOpenDataSampleOpen(
         return false;
     }
 
-    // Always non-interactive from the bridge (SPEC §8.2/§18.3): no nested event
-    // loop, no blocking UI. Completion is delivered solely via onFinished on the
-    // GUI thread. `options.selection` is passed by pointer; a default-constructed
-    // selection means attach everything (SPEC §10.3).
+    // Always non-interactive from the bridge (SPEC §8.2/§18.3): no nested event loop, no
+    // blocking UI; completion is delivered solely via onFinished on the GUI thread.
+    // `options.selection` is passed by pointer; a default-constructed selection means
+    // attach everything (SPEC §10.3).
     beginOpenDataSampleOpenTask(*sample, /*interactive=*/false, &options.selection,
                                 std::move(onFinished), std::move(onProgress));
     return true;

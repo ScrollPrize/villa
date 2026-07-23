@@ -2363,11 +2363,11 @@ void CChunkedVolumeViewer::adjustZoomByFactor(float factor)
 {
     if (!std::isfinite(factor) || factor <= 0.0f || factor == 1.0f)
         return;
-    // `factor` is a true scale multiplier (the GUI zoom buttons pass 1.15,
-    // the bridge's viewer.zoom passes an arbitrary value). Apply it directly,
-    // centered on the viewport, rather than collapsing it to a single wheel
-    // notch. Mark interactive motion proportional to the zoom magnitude so the
-    // cache/LOD heuristics treat a big programmatic zoom like a big wheel zoom.
+    // `factor` is a true scale multiplier (GUI zoom buttons pass 1.15; the bridge's
+    // viewer.zoom passes an arbitrary value). Apply it directly, centered on the
+    // viewport, rather than collapsing it to a single wheel notch, and mark interactive
+    // motion proportional to the zoom magnitude so cache/LOD heuristics treat a big
+    // programmatic zoom like a big wheel zoom.
     const QPointF center(_view->viewport()->width() * 0.5,
                          _view->viewport()->height() * 0.5);
     const double mag = std::abs(std::log(double(factor)) / std::log(1.05));

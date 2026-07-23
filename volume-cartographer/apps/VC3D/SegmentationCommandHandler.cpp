@@ -945,11 +945,10 @@ public:
         progress_->setWindowModality(Qt::WindowModal);
         progress_->setAutoClose(false);
         progress_->setAutoReset(true);
-        // Headless (bridge) runs must never pop UI: a huge minimum-duration
-        // means the QProgressDialog's auto-show timer never fires, so the dialog
-        // stays invisible while every setValue/setLabelText call below remains a
-        // safe no-op on a live-but-hidden object (SPEC §1.3, §20). Nothing in
-        // this class ever calls progress_->show()/exec(), so this fully gates it.
+        // Headless (bridge): a huge minimum-duration keeps the QProgressDialog's
+        // auto-show timer from ever firing, so it stays hidden while every
+        // setValue/setLabelText below is a safe no-op (SPEC §1.3, §20). Nothing
+        // here calls show()/exec().
         progress_->setMinimumDuration(suppressDialogs_ ? std::numeric_limits<int>::max() : 0);
         progress_->setMaximum(1 + iters_ + 1);
         progress_->setValue(0);
@@ -1480,9 +1479,9 @@ private:
 
     bool errorShown_ = false;
 
-    // Emit flattenJobFinished exactly once so the bridge can transition the
-    // source:"flatten" job out of "running" (SPEC §8.3, §20). Called at every
-    // terminal state, whether or not dialogs are suppressed.
+    // Emit flattenJobFinished exactly once (SPEC §8.3, §20) so the bridge can
+    // transition the source:"flatten" job out of "running". Called at every
+    // terminal state.
     void emitFinishedOnce_(bool success, const QString& message,
                            const QString& outputPath) {
         if (finishedEmitted_) return;
@@ -2047,9 +2046,8 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 
     _cmdRunner->setSegmentPath(dlg.segmentPath());
     _cmdRunner->setOutputPattern(dlg.outputPattern());
-    // The interactive dialog always produces a per-slice TIFF stack. Re-assert
-    // TifStack explicitly so a prior headless (agent-bridge) Zarr render cannot
-    // leak its --zarr-output selection into this GUI render (SPEC §19).
+    // Re-assert TifStack so a prior headless Zarr render can't leak its
+    // --zarr-output selection into this GUI render (SPEC §19).
     _cmdRunner->setRenderOutputFormat(CommandLineToolRunner::RenderOutputFormat::TifStack);
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
     _cmdRunner->setRenderVoxelSize(
@@ -2214,9 +2212,8 @@ void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
 
 void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& segmentId)
 {
-    // Interactive path: the dialog collects params, then the shared headless
-    // launcher (startRunTrace) does all preconditions/merge/launch. Dialogs and
-    // QMessageBoxes live only here (SPEC §14.4).
+    // Interactive path: dialog collects params, then startRunTrace does
+    // preconditions/merge/launch; dialogs live only here (SPEC §14.4).
     auto* surface = requireSurfaceAndRunner(segmentId, true);
     if (!surface) return;
     if (_state && _state->currentVolume() && _state->currentVolume()->isRemote()) {
@@ -2412,10 +2409,9 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
         return false;
     }
 
-    // Verify the tool executable exists up front. execute() would otherwise pop a
-    // blocking QMessageBox + console dialog on a missing binary (a §1.3 hang for a
-    // headless run), so we pre-check with the same path construction toolName()
-    // uses and report through errorMessage instead.
+    // Verify the tool exists up front: execute() would otherwise pop a blocking
+    // QMessageBox on a missing binary (a §1.3 hang for a headless run). Same path
+    // construction toolName() uses.
     const QString toolPath =
         QCoreApplication::applicationDirPath() + QStringLiteral("/vc_render_tifxyz");
     QFileInfo toolInfo(toolPath);
@@ -2572,10 +2568,9 @@ bool SegmentationCommandHandler::startSlimFlatten(const std::string& segmentId,
 
     const int iters = params.iterations > 0 ? params.iterations : 50;
 
-    // Construct the job with dialogs suppressed. Its multi-stage QProcess
-    // pipeline runs asynchronously; completion is observable via
-    // flattenJobFinished (emitted from the job, SPEC §20). The job parents to
-    // `this` and self-deletes on completion.
+    // Construct the job with dialogs suppressed; its multi-stage QProcess pipeline
+    // runs async, completion observable via flattenJobFinished (SPEC §20). Job
+    // parents to `this` and self-deletes.
     new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this, iters,
                 params.tolerance, params.energyType, params.keepPercent,
                 params.inpaintHoles, outputDir, voxelSize,
@@ -3061,11 +3056,10 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& se
                                                           QString* resolvedOutputDir)
 {
     // Dialog-free mirror of onResumeLocalGrowPatchRequested: same preconditions,
-    // fixed base tracer params, and Tool::NeighborCopy launch, but failures report
-    // through errorMessage (never a QMessageBox) so the bridge can classify them
-    // (see startRenderSegment for the sentence->code convention). The interactive
-    // "Missing Normal3D" confirmation prompt is intentionally dropped -- an
-    // unattended run cannot answer it, and the constraint merely has no effect.
+    // fixed base tracer params, and Tool::NeighborCopy launch, failures via
+    // errorMessage (bridge classifies; see startRenderSegment). The interactive
+    // "Missing Normal3D" prompt is intentionally dropped -- an unattended run
+    // cannot answer it and it has no effect.
     auto fail = [&](const QString& message) -> bool {
         if (errorMessage) {
             *errorMessage = message;
@@ -3157,13 +3151,11 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& se
                                       QStringLiteral("local"));
     configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
     _cmdRunner->setOmpThreads(params.ompThreads);
-    // Headless launcher (bridge-only): execute() synchronously pops the
-    // interactive console dock when _autoShowConsole is set (its default), so
-    // turn auto-show off just for this launch and restore the prior value -- a
-    // later GUI-driven run must still auto-show. (The async error-path console
-    // pop is gated separately on the run's suppress-dialogs flag; see
-    // CommandLineToolRunner::onProcessError.) The interactive
-    // onResumeLocalGrowPatchRequested slot shows the console for GUI runs.
+    // Headless launcher (bridge-only): execute() synchronously pops the console
+    // dock when _autoShowConsole is set (default), so turn auto-show off for this
+    // launch and restore the prior value -- a later GUI run must still auto-show.
+    // (The async error-path pop is gated separately on suppress-dialogs; see
+    // CommandLineToolRunner::onProcessError.)
     const bool prevAutoShow = _cmdRunner->autoShowConsoleOutput();
     _cmdRunner->setAutoShowConsoleOutput(false);
     const bool started = _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
@@ -3432,10 +3424,8 @@ bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoi
 
 void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint)
 {
-    // Interactive path: gather the same defaults the dialog needs, show the
-    // dialog, then hand the collected params to the shared headless launcher.
-    // All dialogs/QMessageBoxes live here; execution lives in
-    // startGrowPatchFromSeed (see apps/VC3D/agent_bridge/SPEC.md §4).
+    // Interactive path: gather defaults, show the dialog, then hand params to
+    // startGrowPatchFromSeed; all dialogs live here (SPEC §4).
     if (!_state || !_state->vpkg()) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume package loaded."));
         return;
@@ -3584,9 +3574,8 @@ void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)
 
 void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& segmentId)
 {
-    // Interactive wrapper: run the dialog-free core and surface any failure the
-    // way the slot always did -- through a QMessageBox. Success (including the
-    // already-tightest no-op) is reported by the core's own statusMessage.
+    // Interactive wrapper: run the dialog-free core and surface failures via
+    // QMessageBox as before; success is reported by the core's own statusMessage.
     QString err;
     if (!cropSurfaceToValidRegion(segmentId, &err) && !err.isEmpty()) {
         QMessageBox::warning(_parentWidget, tr("Crop failed"), err);
@@ -3597,11 +3586,9 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
                                                           QString* errorMessage)
 {
     // Dialog-free core shared by the interactive slot above and the agent bridge:
-    // crops the surface grid to its tightest valid bounds and persists it,
-    // reporting every failure through errorMessage (never a QMessageBox) so the
-    // bridge can surface a real error instead of a false success. Returns true on
-    // success, including the already-tightest no-op (see startRenderSegment for
-    // the sentence-based error convention).
+    // crops the surface grid to its tightest valid bounds and persists it, failures
+    // via errorMessage (never a QMessageBox). Returns true on success, including the
+    // already-tightest no-op.
     auto fail = [&](const QString& message) -> bool {
         if (errorMessage) {
             *errorMessage = message;
@@ -3879,10 +3866,9 @@ bool SegmentationCommandHandler::startAlphaCompRefine(const std::string& segment
                                                      QString* resolvedOutputDir)
 {
     // Dialog-free mirror of onAlphaCompRefine: same preconditions, output-path
-    // derivation, params-JSON, and Tool::AlphaCompRefine launch, but failures
-    // report through errorMessage (never a QMessageBox) so the bridge can
-    // classify them. The remote-volume guard is preserved -- vc_objrefine cannot
-    // consume a remote locator -- and surfaces as a distinct sentence.
+    // derivation, params-JSON, and Tool::AlphaCompRefine launch, failures via
+    // errorMessage (bridge classifies). The remote-volume guard is preserved --
+    // vc_objrefine cannot consume a remote locator.
     auto fail = [&](const QString& message) -> bool {
         if (errorMessage) {
             *errorMessage = message;

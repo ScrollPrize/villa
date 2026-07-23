@@ -126,9 +126,7 @@ def is_nontrivial_image(data: bytes, min_stddev: float = 1.0) -> tuple[bool, str
     try:
         decoded = decode_png(data)
     except PngUnsupported as e:
-        # Fallback: a truly blank/constant image compresses to a tiny file;
-        # anything above a few KB for a real window grab is very unlikely to
-        # be blank. Not as strong a check, but avoids a hard dependency.
+        # Fallback: a blank/constant image compresses to a tiny file, so size alone is a weak signal.
         ok = len(data) > 4096
         return ok, f"png decode unsupported ({e}); size-heuristic only: {len(data)} bytes"
 

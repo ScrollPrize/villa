@@ -72,9 +72,8 @@ public:
         std::unique_ptr<QTemporaryFile> paramsFile;
     };
 
-    // Parameters the interactive GrowPatch dialog collects, packaged so the
-    // non-interactive (agent bridge) path can supply them directly. See
-    // startGrowPatchFromSeed and apps/VC3D/agent_bridge/SPEC.md §4.
+    // Params for the headless startGrowPatchFromSeed (mirror of the interactive
+    // GrowPatch dialog; SPEC §4).
     struct GrowPatchSeedParams {
         QString volumeId;          // vpkg volume id; empty => current volume
         int     iterations{200};   // clamped/validated to [1, 100000]
@@ -83,20 +82,17 @@ public:
                                    // default head of the dialog's choice list
     };
 
-    // Parameters the interactive Run-Trace (TraceParamsDialog) collects, packaged
-    // so the non-interactive (agent bridge) path can supply them directly. See
-    // startRunTrace and apps/VC3D/agent_bridge/SPEC.md §14.4 / §15.4.
+    // Params for the headless startRunTrace (mirror of TraceParamsDialog;
+    // SPEC §14.4 / §15.4).
     struct RunTraceParams {
         QJsonObject paramOverrides;   // merged over <volpkg>/trace_params.json
         int         ompThreads{-1};   // -1 => runner default
         QString     tgtDir;           // empty => <volpkg>/traces (created if missing)
     };
 
-    // Parameters the interactive Render (RenderParamsDialog) collects, reduced to
-    // the core surface the non-interactive (agent bridge) path threads through.
-    // See startRenderSegment and apps/VC3D/agent_bridge/SPEC.md §19. Advanced
-    // dialog-only options (crop/affine/rotate/flip/flatten/include-tifs/composite
-    // /alpha) are deliberately omitted from the headless surface.
+    // Params for the headless startRenderSegment (reduced from RenderParamsDialog;
+    // SPEC §19). Advanced dialog-only options (crop/affine/rotate/flip/flatten/
+    // include-tifs/composite/alpha) are deliberately omitted.
     struct RenderSegmentParams {
         QString volumeId;             // vpkg volume id; empty => current volume
         CommandLineToolRunner::RenderOutputFormat outputFormat{
@@ -111,12 +107,9 @@ public:
         double  voxelSizeUm{0.0};     // physical voxel size (micrometers), > 0
     };
 
-    // Parameters the interactive SlimFlattenDialog collects, packaged so the
-    // non-interactive (agent bridge) path can supply them directly. See
-    // startSlimFlatten and apps/VC3D/agent_bridge/SPEC.md §20. The headless
-    // default keepPercent is 100 (full-resolution SLIM, no decimation) -- the
-    // production-recommended path -- rather than the dialog's 1.5% session
-    // default.
+    // Params for the headless startSlimFlatten (mirror of SlimFlattenDialog;
+    // SPEC §20). Headless keepPercent defaults to 100 (full-res, no decimation),
+    // not the dialog's 1.5% session default.
     struct SlimFlattenParams {
         int     iterations{50};      // flatboi iterations; > 0 (SlimJob clamps <=0 to 20)
         double  tolerance{0.0};      // 0.0 => no --tol (run all iterations)
@@ -127,10 +120,8 @@ public:
                                      // <segment>_flatboi (matching the dialog default)
     };
 
-    // Parameters the interactive StraightenDialog collects, packaged so the
-    // non-interactive (agent bridge) path can supply them directly. See
-    // startStraighten and apps/VC3D/agent_bridge/SPEC.md §20. Defaults mirror
-    // the dialog's initial state.
+    // Params for the headless startStraighten (mirror of StraightenDialog;
+    // SPEC §20). Defaults mirror the dialog's initial state.
     struct StraightenParams {
         bool    unbend{true};
         double  unbendSmoothCols{300.0};  // only emitted when unbend is true
@@ -142,10 +133,8 @@ public:
                                           // => <segment>_straightened (dialog default)
     };
 
-    // Parameters the interactive Resume-opt Local dialog (selectResumeLocalTracerParams)
-    // collects, packaged so the non-interactive (agent bridge) path can supply
-    // them directly. See startResumeLocalGrowPatch. Base tracer params are fixed
-    // (matching the interactive path); paramOverrides merge over them last, exactly
+    // Params for the headless startResumeLocalGrowPatch. Base tracer params are
+    // fixed (matching the interactive path); paramOverrides merge over them last,
     // like the dialog's JsonProfileEditor "extra params".
     struct ResumeLocalGrowParams {
         QString     volumeId;         // vpkg volume id; empty => current volume
@@ -154,10 +143,8 @@ public:
         QJsonObject paramOverrides;   // merged over the fixed resume-local tracer params
     };
 
-    // Parameters the interactive AlphaCompRefineDialog collects, packaged so the
-    // non-interactive (agent bridge) path can supply them directly. See
-    // startAlphaCompRefine. Defaults mirror the dialog's session defaults
-    // (ToolDialogs.cpp AlphaCompRefineDialog::s_*).
+    // Params for the headless startAlphaCompRefine (mirror of AlphaCompRefineDialog;
+    // defaults = its session defaults, ToolDialogs.cpp AlphaCompRefineDialog::s_*).
     struct AlphaCompRefineParams {
         bool    refine{true};
         double  start{-6.0};
@@ -234,24 +221,19 @@ signals:
     void showWarning(QString title, QString text);
 
     /**
-     * Emitted by the flattening job classes (SlimJob / ABFJob / StraightenJob)
-     * when a job begins. Lets the agent bridge track flattening as a
-     * source:"flatten" job (SPEC §8.3, §20). Emitted from BOTH the interactive
-     * slots and the headless start* methods, so the bridge registers
-     * human-initiated flattens as external jobs too. `kind` is one of
+     * Emitted when a flattening job (SlimJob / ABFJob / StraightenJob) begins so
+     * the agent bridge can track it as a source:"flatten" job (SPEC §8.3, §20).
+     * Emitted from BOTH interactive slots and headless start* methods. `kind` is
      * "flatten.slim" / "flatten.abf" / "flatten.straighten"; `label` is a short
-     * human string. No-op when nothing is connected (bridge disabled).
+     * human string.
      */
     void flattenJobStarted(QString kind, QString label);
 
     /**
-     * Emitted by the flattening job classes at every terminal state
-     * (success/failure/cancel). Carries the outcome for the bridge to surface
-     * as the source:"flatten" job's completion (SPEC §8.3, §20). On failure
-     * `message` holds the captured error text that WOULD have been shown in a
-     * QMessageBox (suppressed on headless runs). `outputPath` is the flattened
-     * artifact directory on success, empty otherwise. Emitted exactly once per
-     * job. `success=false` with an empty message denotes a user cancel.
+     * Emitted once per flattening job at its terminal state (SPEC §8.3, §20).
+     * `message` holds the captured error text on failure (suppressed dialog);
+     * `outputPath` is the artifact dir on success, else empty. `success=false`
+     * with an empty message denotes a user cancel.
      */
     void flattenJobFinished(bool success, QString message, QString outputPath);
 
@@ -290,33 +272,26 @@ public slots:
     void launchNeighborCopySecondPass();
 
 public:
-    /// Headless GrowPatch-from-seed launch. Performs ALL validation and
-    /// execution that onCreateSegmentGrowPatchFromSeed performs today, but
-    /// reports failures through `errorMessage` (never via QMessageBox) and never
-    /// opens a dialog. Returns true when the vc_grow_seg_from_seed process was
-    /// started (job accepted), false otherwise. On success, completion is
-    /// observable via CommandLineToolRunner::toolFinished exactly as in the
-    /// interactive path (same one-shot handler: meta.json coordinate identity
-    /// fixup, VolumePkg::refreshSegmentations, surface panel reload).
+    /// Headless GrowPatch-from-seed launch (mirror of
+    /// onCreateSegmentGrowPatchFromSeed): failures via `errorMessage`, never a
+    /// dialog; returns true when vc_grow_seg_from_seed started. Completion
+    /// observable via CommandLineToolRunner::toolFinished as in the interactive
+    /// path.
     bool startGrowPatchFromSeed(const QVector3D& seedPoint,
                                 const GrowPatchSeedParams& params,
                                 QString* errorMessage = nullptr);
 
-    /// Output directory resolved by the most recent successful
-    /// startGrowPatchFromSeed call while its job is still active. Empty when no
-    /// GrowPatch seed job is pending.
+    /// Output dir from the most recent successful startGrowPatchFromSeed while its
+    /// job is active; empty when none pending.
     QString activeGrowPatchOutputDir() const
     {
         return _growPatchSeedJob ? _growPatchSeedJob->outputDir : QString();
     }
 
-    /// Headless Run-Trace launch (vc_grow_seg_from_segments). Performs ALL the
-    /// preconditions, params-JSON merge/write, and launch that
-    /// onGrowSegmentFromSegment performs today, but reports failures through
-    /// `errorMessage` (never via QMessageBox) and never opens a dialog. Returns
-    /// true when the tool process was launched (job accepted), false otherwise.
-    /// Completion is observable via CommandLineToolRunner::toolFinished exactly
-    /// as in the interactive path. Distinct failure sentences let the bridge map
+    /// Headless Run-Trace launch (vc_grow_seg_from_segments; mirror of
+    /// onGrowSegmentFromSegment): preconditions, params-JSON merge/write, launch;
+    /// failures via `errorMessage` (never a dialog). Completion observable via
+    /// CommandLineToolRunner::toolFinished. Distinct failure sentences map
     /// to JSON-RPC codes: "No volume package or volume loaded", "Invalid segment"
     /// (-32007 segment), "remote" (-32009), "trace_params.json not found"
     /// (-32007 file), "already running" (-32004), "Command line tools not
@@ -327,13 +302,11 @@ public:
                        QString* errorMessage = nullptr,
                        QString* resolvedOutputDir = nullptr);
 
-    /// Headless Render launch (vc_render_tifxyz). Performs ALL preconditions,
-    /// volume/output resolution, and launch that onRenderSegment performs today,
-    /// but reports failures through `errorMessage` (never via QMessageBox) and
-    /// never opens the RenderParamsDialog. Returns true when the tool process was
-    /// launched (job accepted), false otherwise. Completion is observable via
-    /// CommandLineToolRunner::toolFinished exactly as in the interactive path.
-    /// Distinct failure sentences let the bridge map to JSON-RPC codes:
+    /// Headless Render launch (vc_render_tifxyz; mirror of onRenderSegment):
+    /// preconditions, volume/output resolution, launch; failures via
+    /// `errorMessage` (never a dialog). Completion observable via
+    /// CommandLineToolRunner::toolFinished.
+    /// Distinct failure sentences map to JSON-RPC codes:
     /// "No volume package or volume loaded" / "No volume loaded", "Invalid
     /// segment" (-32007 segment), "Unknown volume id" (-32007 volume),
     /// "vc_render_tifxyz not found" (-32006), "already running" (-32004), and
@@ -345,57 +318,49 @@ public:
                             QString* errorMessage = nullptr,
                             QString* resolvedOutputDir = nullptr);
 
-    /// Headless SLIM/flatboi flatten launch. Performs ALL preconditions and
-    /// tool resolution up front (so the constructed SlimJob never hits a
-    /// synchronous dialog), constructs a SlimJob with dialogs suppressed, and
-    /// returns true when the job was accepted (its multi-stage QProcess
-    /// pipeline runs asynchronously). Never opens the SlimFlattenDialog and
-    /// never pops a QMessageBox -- all failures report through `errorMessage`
-    /// and completion is observable via flattenJobFinished (SPEC §20). Distinct
-    /// failure sentences let the bridge map to JSON-RPC codes: "No volume
-    /// package or volume loaded", "Invalid segment" (-32007 segment), "flatboi
-    /// not found" / "vc_tifxyz2obj not found" / ... (-32006), and generic
-    /// output-dir failures (-32005). On success `resolvedOutputDir` (when
-    /// non-null) receives the flattened tifxyz directory.
+    /// Headless SLIM/flatboi flatten launch. Resolves all preconditions and tools
+    /// up front (so the SlimJob never hits a synchronous dialog), then constructs a
+    /// SlimJob with dialogs suppressed; runs async, completion via
+    /// flattenJobFinished (SPEC §20). Failures via `errorMessage`, never a dialog.
+    /// Distinct failure sentences map to JSON-RPC codes: "No volume package or
+    /// volume loaded", "Invalid segment" (-32007 segment), "flatboi not found" /
+    /// "vc_tifxyz2obj not found" / ... (-32006), and generic output-dir failures
+    /// (-32005). On success `resolvedOutputDir` (when non-null) receives the
+    /// flattened tifxyz directory.
     bool startSlimFlatten(const std::string& segmentId,
                           const SlimFlattenParams& params,
                           QString* errorMessage = nullptr,
                           QString* resolvedOutputDir = nullptr);
 
     /// Headless ABF++ flatten launch (in-process, QtConcurrent). Constructs an
-    /// ABFJob with dialogs suppressed; the flatten runs on a worker thread and
-    /// completion is observable via flattenJobFinished (SPEC §20). Never opens
-    /// the ABFFlattenDialog or a QMessageBox. Failure sentences: "No volume
-    /// package loaded", "Invalid segment" (-32007 segment). On success
-    /// `resolvedOutputDir` receives the <segment>_abf directory.
+    /// ABFJob with dialogs suppressed; runs on a worker thread, completion via
+    /// flattenJobFinished (SPEC §20). Failure sentences: "No volume package
+    /// loaded", "Invalid segment" (-32007 segment). On success `resolvedOutputDir`
+    /// receives the <segment>_abf directory.
     bool startAbfFlatten(const std::string& segmentId,
                          int iterations,
                          int downsampleFactor,
                          QString* errorMessage = nullptr,
                          QString* resolvedOutputDir = nullptr);
 
-    /// Headless vc_straighten launch. Resolves the tool and validates the
-    /// output dir up front, constructs a StraightenJob with dialogs suppressed,
-    /// and returns true when the subprocess was launched. Never opens the
-    /// StraightenDialog or a QMessageBox; completion observable via
-    /// flattenJobFinished (SPEC §20). Failure sentences: "No volume package or
-    /// volume loaded", "Invalid segment" (-32007 segment), "vc_straighten not
-    /// found" (-32006), "Output directory already exists" (-32005). On success
-    /// `resolvedOutputDir` receives the straightened tifxyz directory.
+    /// Headless vc_straighten launch. Resolves the tool and validates the output
+    /// dir up front, constructs a StraightenJob with dialogs suppressed; async,
+    /// completion via flattenJobFinished (SPEC §20). Failure sentences: "No volume
+    /// package or volume loaded", "Invalid segment" (-32007 segment),
+    /// "vc_straighten not found" (-32006), "Output directory already exists"
+    /// (-32005). On success `resolvedOutputDir` receives the straightened dir.
     bool startStraighten(const std::string& segmentId,
                          const StraightenParams& params,
                          QString* errorMessage = nullptr,
                          QString* resolvedOutputDir = nullptr);
 
-    /// Headless Resume-opt Local (GrowPatch) launch. Performs the same
-    /// preconditions, params-JSON assembly, and vc_grow_seg_from_segments launch
-    /// (Tool::NeighborCopy, resumeOpt "local") that onResumeLocalGrowPatchRequested
-    /// performs today, but reports failures through `errorMessage` (never via
-    /// QMessageBox) and never opens selectResumeLocalTracerParams. Returns true
-    /// when the tool process was launched (job accepted). Completion is observable
-    /// via CommandLineToolRunner::toolFinished exactly as in the interactive path
-    /// (the CWindow toolFinished slot reloads surfaces and clears resumeLocalJob()).
-    /// Distinct failure sentences let the bridge map to JSON-RPC codes: "No volume
+    /// Headless Resume-opt Local (GrowPatch) launch (mirror of
+    /// onResumeLocalGrowPatchRequested): preconditions, params-JSON, and
+    /// vc_grow_seg_from_segments launch (Tool::NeighborCopy, resumeOpt "local");
+    /// failures via `errorMessage` (never a dialog). Completion observable via
+    /// CommandLineToolRunner::toolFinished (the CWindow slot reloads surfaces and
+    /// clears resumeLocalJob()).
+    /// Distinct failure sentences map to JSON-RPC codes: "No volume
     /// package loaded" / "No volume loaded", "Command line tools are not available"
     /// (-32006), "already running" / "already active" (-32004), "Invalid segment"
     /// (-32007 segment), "Unknown volume id" (-32007 volume), and generic
@@ -406,14 +371,11 @@ public:
                                    QString* errorMessage = nullptr,
                                    QString* resolvedOutputDir = nullptr);
 
-    /// Headless alpha-comp refinement launch (vc_objrefine via
-    /// Tool::AlphaCompRefine). Performs the same preconditions, output-path
-    /// derivation, params-JSON write, and launch that onAlphaCompRefine performs
-    /// today, but reports failures through `errorMessage` (never via QMessageBox)
-    /// and never opens the AlphaCompRefineDialog. Returns true when the tool
-    /// process was launched (job accepted). Completion is observable via
-    /// CommandLineToolRunner::toolFinished exactly as in the interactive path.
-    /// Distinct failure sentences let the bridge map to JSON-RPC codes: "No volume
+    /// Headless alpha-comp refinement launch (vc_objrefine, Tool::AlphaCompRefine;
+    /// mirror of onAlphaCompRefine): preconditions, output-path derivation,
+    /// params-JSON write, launch; failures via `errorMessage` (never a dialog).
+    /// Completion observable via CommandLineToolRunner::toolFinished.
+    /// Distinct failure sentences map to JSON-RPC codes: "No volume
     /// package or volume loaded", "Invalid segment" (-32007 segment), "Command
     /// line tools are not available" (-32006), "already running" (-32004), "only
     /// local volumes" (remote guard -> -32009), and generic failures (-32005). On
@@ -424,28 +386,24 @@ public:
                               QString* errorMessage = nullptr,
                               QString* resolvedOutputDir = nullptr);
 
-    /// Dialog-free core of onCropSurfaceToValidRegion (the interactive slot is a
-    /// thin wrapper over this). Crops the surface grid to its tightest valid
-    /// bounds, writes it in place, and refreshes metrics, reporting every failure
-    /// through `errorMessage` (never via QMessageBox) so the agent bridge can
-    /// return a real error rather than a false success. Returns true on success,
-    /// including the already-tightest no-op. Failure sentences: "No volume package
-    /// or volume loaded", "Invalid segment or segment not loaded", "Missing
+    /// Dialog-free core of onCropSurfaceToValidRegion (the interactive slot wraps
+    /// this). Crops the surface grid to its tightest valid bounds, writes it in
+    /// place, and refreshes metrics; failures via `errorMessage` (never a dialog)
+    /// so the bridge returns a real error, not a false success. Returns true on
+    /// success, including the already-tightest no-op. Failure sentences: "No volume
+    /// package or volume loaded", "Invalid segment or segment not loaded", "Missing
     /// coordinate grid", "does not contain any valid vertices", channel-size
     /// mismatch, and save failures.
     bool cropSurfaceToValidRegion(const std::string& segmentId,
                                   QString* errorMessage = nullptr);
 
     /// Dialog-free core of onRenameSurface: renames the segment folder + meta.json
-    /// UUID from `oldId` to `newName`, keeping the editing guard, the
-    /// ^[a-zA-Z0-9_-]+$ name validation, the collision check, the CState/vpkg
-    /// cleanup, and the rollback paths. Never opens QInputDialog / QMessageBox.
-    /// Returns true on success. On failure returns false and, when `err` is
-    /// non-null, sets it to a classifiable sentence: "editing in progress",
-    /// "invalid name", "name unchanged", "segment not found", "name exists",
-    /// "no volume package", or a metadata/rename error string. The interactive
-    /// onRenameSurface calls this after its dialog; the agent bridge calls it
-    /// directly (ADDITIONS_SPEC item 5).
+    /// UUID from `oldId` to `newName`, keeping the editing guard, name validation
+    /// (^[a-zA-Z0-9_-]+$), collision check, CState/vpkg cleanup, and rollback.
+    /// Never opens QInputDialog / QMessageBox. Returns true on success; on failure
+    /// sets `err` (when non-null) to a classifiable sentence: "editing in
+    /// progress", "invalid name", "name unchanged", "segment not found", "name
+    /// exists", "no volume package", or a metadata/rename error string.
     bool renameSurfaceHeadless(const QString& oldId, const QString& newName,
                                QString* err = nullptr);
 
@@ -483,11 +441,9 @@ private:
     void configureCommandRunnerRemoteAuthForVolumePath(const QString& volumePath);
 
     /**
-     * The fixed resume-local tracer params (resolved normal-grid / normal3d
-     * paths plus the constant opt-step / radius / iteration settings), before
-     * any caller overrides. Single source of truth shared by the interactive
-     * onResumeLocalGrowPatchRequested slot and the headless
-     * startResumeLocalGrowPatch launcher so the two cannot drift.
+     * Fixed resume-local tracer params (normal-grid/normal3d paths + constant
+     * opt-step/radius/iteration settings) before overrides; shared by the
+     * interactive slot and startResumeLocalGrowPatch so the two can't drift.
      */
     QJsonObject buildResumeLocalBaseParamsJson() const;
 

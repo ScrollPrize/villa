@@ -134,7 +134,6 @@ def check_c4(client: BridgeClient, results: Results) -> None:
         results.record("c4_int_fractional_rejected", False,
                        f"unexpected {type(e).__name__}: {e}")
 
-    # No state corruption: bridge still answers after the malformed requests.
     try:
         state2, _ = client.call("state.get", {}, timeout=10.0)
         results.record("c4_no_corruption_state_get", isinstance(state2, dict),
@@ -153,10 +152,7 @@ def check_c2_oversized(sock_path: str, results: Results) -> None:
     detail = ""
     try:
         raw.connect(sock_path)
-        # Send the oversized unterminated payload in chunks. The server trips the
-        # bound mid-stream, sends a best-effort -32600, and disconnects — so the
-        # send itself may raise EPIPE/ECONNRESET (that IS the server dropping us),
-        # or we observe EOF on the read side. Either proves the drop.
+        # The server may drop us with EPIPE/ECONNRESET mid-send, or via EOF on read — either proves it.
         chunk = b" " * 65536
         sent = 0
         try:

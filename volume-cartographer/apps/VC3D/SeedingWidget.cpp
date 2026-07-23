@@ -48,15 +48,11 @@ using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
 
 namespace {
 
-// Resolve the command-line volume argument for vc_grow_seg_from_seed the same
-// way SegmentationCommandHandler::commandPathForVolume does: a fully
-// remote/streaming-only volume (no local zarr mirror, e.g. an Open Data catalog
-// sample) has an empty Volume::path(), so we must pass its remote locator
-// instead. Passing the empty local path used to spawn the child with an empty
-// volume argument, which failed instantly (issue #1188). Kept as a small
-// file-local helper (mirroring the file-local static in
-// SegmentationCommandHandler.cpp) rather than a shared header, matching how this
-// codebase already duplicates such tiny cross-file helpers.
+// Resolve the command-line volume argument for vc_grow_seg_from_seed, mirroring
+// SegmentationCommandHandler::commandPathForVolume: a fully remote/streaming-only volume
+// has an empty Volume::path(), so pass its remote locator instead (an empty path made the
+// child fail instantly — issue #1188). Kept as a file-local helper rather than a shared
+// header, matching how this codebase already duplicates such tiny cross-file helpers.
 QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
 {
     if (!volume) {
@@ -1143,10 +1139,9 @@ void SeedingWidget::findPeaksAlongRay(
 
 void SeedingWidget::onRunSegmentationClicked()
 {
-    // Interactive slot: delegate to the non-blocking headless core; surface a
-    // precondition failure as a warning dialog (unless the bridge suppressed
-    // dialogs). The batch itself now drains through the event loop instead of a
-    // nested processEvents wait, so the UI stays responsive.
+    // Interactive slot: delegate to the headless core; surface a precondition failure as
+    // a warning dialog (unless the bridge suppressed dialogs). The batch drains through
+    // the event loop now, not a nested processEvents wait, so the UI stays responsive.
     QString err;
     if (!runSegmentationHeadless(&err) && !err.isEmpty() && !_dialogsSuppressed) {
         QMessageBox::warning(this, tr("Seeding"), err);
@@ -1236,10 +1231,9 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
         return false;
     }
 
-    // Latch per-batch config into member state so the QProcess finished callbacks
-    // (which outlive this call now that the blocking loop is gone) read stable
-    // fields rather than dangling stack captures.
-    // Reset outcome aggregation before launching the first child (SPEC §1).
+    // Latch per-batch config into member state so the QProcess finished callbacks (which
+    // outlive this call now that the blocking loop is gone) read stable fields, not
+    // dangling stack captures; begin() below resets outcome aggregation (SPEC §1).
     _batch.begin(QStringLiteral("run"), totalPoints);
     _batchPoints = std::move(allPoints);
     _batchNextIndex = 0;
@@ -1315,12 +1309,9 @@ void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int
     const bool isExpand = (_batch.kind() == QLatin1String("expand"));
     const bool crashed = (exitStatus != QProcess::NormalExit);
 
-    // Aggregate the outcome (dedup by the stable child index: finished() and
-    // errorOccurred() can both fire for the same child). We must NOT key on the
-    // QProcess* here — process->deleteLater() below frees each finished child
-    // mid-batch, and a later new QProcess can be allocated at that same address,
-    // which would then be misread as already-terminal and strand the batch. The
-    // index is unique per child and identical across both signals.
+    // Aggregate the outcome, deduping on the stable child index — not the QProcess*
+    // itself, since process->deleteLater() below frees each finished child mid-batch and
+    // a later QProcess can be allocated at the same address, misreading as already-terminal.
     const QString label = isExpand ? tr("Expansion iteration %1").arg(index)
                                    : tr("Segmentation for point %1").arg(index);
     if (!_batch.recordTerminal(index, failedToStart, crashed, exitCode,
@@ -1337,7 +1328,6 @@ void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int
                   << index << std::endl;
     }
 
-    // Update progress
     progressUtil->updateProgress(_batch.completed());
     emit seedingBatchProgressChanged(_batch.kind(), _batch.completed(), _batch.total());
 
@@ -1355,7 +1345,6 @@ void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int
         }
     }
 
-    // Check if all done
     if (_batch.isComplete()) {
         finalizeSeedingBatch();
     }
@@ -1363,19 +1352,16 @@ void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int
 
 void SeedingWidget::finalizeSeedingBatch()
 {
-    // Common terminal teardown for a run/expand batch OR a cancel of any seeding
-    // widget process batch. A neural trace shares jobsRunning/runningProcesses/
-    // cancelButton but leaves the tracker kind empty, so we emit the batch-
-    // finished signal (and use seeding-specific wording) only for a real run/
-    // expand batch. Idempotent: cancel + the last child completion both reach here.
+    // Common terminal teardown for a run/expand batch OR a cancel of any seeding-widget
+    // process batch. A neural trace shares jobsRunning/runningProcesses/cancelButton but
+    // leaves the tracker kind empty, so the batch-finished signal (and seeding-specific
+    // wording) are only emitted for a real run/expand batch. Idempotent: cancel + the
+    // last child completion can both reach here.
     if (_batch.finalized()) {
         return;
     }
 
-    // The tracker owns the honest outcome + terminal message (SPEC §1); capture
-    // kind before finalize() clears it. A neural trace shares jobsRunning/
-    // runningProcesses/cancelButton but never called _batch.begin(), so kind is
-    // empty and we skip the seeding-specific wording / seedingBatchFinished emit.
+    // Capture kind before finalize() clears it (SPEC §1).
     const QString kind = _batch.kind();
     const SeedingBatchTracker::Result r = _batch.finalize();
     const int completed = r.completed;
@@ -1567,11 +1553,9 @@ void SeedingWidget::analyzePaths()
         // Update progress
         pathIndex++;
         progressUtil->updateProgress(pathIndex);
-        // NOTE: no QApplication::processEvents() here — this loop is pure
-        // in-process synchronous compute (no QProcess), so pumping the event
-        // loop only served UI repaints but made the method reentrant/unsafe for
-        // the agent bridge (SPEC §1.3). Removing it makes analyzePaths a
-        // straight-line synchronous call.
+        // NOTE: no QApplication::processEvents() here — this loop is pure in-process
+        // synchronous compute; pumping the event loop only served UI repaints but made
+        // the method reentrant/unsafe for the agent bridge (SPEC §1.3).
     }
 
     progressUtil->stopProgress();
@@ -2669,9 +2653,8 @@ void SeedingWidget::onNeuralTraceClicked()
     infoLabel->setText("Running neural trace...");
     _btnNeuralTrace->setEnabled(false);
     // Clear any finalized state left by a PRIOR seeding batch so this neural
-    // activation's shared finalizeSeedingBatch() teardown (via cancel) is not
-    // short-circuited by a stale _batch.finalized() (codex #2b). A neural trace
-    // has no real batch (kind stays empty), so seedingBatchActive() is false.
+    // activation's shared finalizeSeedingBatch() teardown isn't short-circuited by a
+    // stale _batch.finalized() (codex #2b); a neural trace has no real batch of its own.
     _batch.reset();
     jobsRunning = true;
     cancelButton->setVisible(true);

@@ -594,15 +594,11 @@ void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
 
     emit toolFinished(_currentTool, false, errorMessage, QString(), false);
 
-    // A bridge-driven headless run sets _suppressCompletionDialogs so that no GUI
-    // window pops for a process no one is watching -- that includes this console
-    // dock, not just the completion QMessageBox. Capture the flag before the
-    // per-run reset below so the error-path console pop is suppressed too;
-    // interactive runs (flag unset) still surface the console on failure.
+    // A bridge-driven headless run suppresses GUI pops for an unwatched process --
+    // including this console dock, not just the completion QMessageBox. Capture
+    // the flag before the per-run reset below so the error-path console pop is
+    // suppressed too; interactive runs still surface the console on failure.
     const bool suppressed = _suppressCompletionDialogs;
-
-    // Scoped to a single run (see onProcessFinished): clear now that every
-    // toolFinished slot has observed the suppression flag for this process.
     _suppressCompletionDialogs = false;
 
     if (_consoleOutput) {

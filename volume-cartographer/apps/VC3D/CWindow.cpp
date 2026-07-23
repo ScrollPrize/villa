@@ -5769,11 +5769,9 @@ void CWindow::updateAtlasSearchDocks()
     }
 }
 
-// Headless core of remapCurrentAtlas (SPEC §12.7): preconditions are reported
-// through `errorMessage` instead of QMessageBox, and the asynchronous
-// completion path never opens a dialog — success redisplays via the headless
-// atlas open; the interactive slot supplies its completion QMessageBox through
-// `onFinished`. Returns true when the remap worker was launched.
+// Headless core of remapCurrentAtlas (SPEC §12.7): preconditions via
+// `errorMessage`, async completion never opens a dialog (onFinished carries the
+// interactive completion QMessageBox).
 bool CWindow::startAtlasRemapHeadless(QString* errorMessage,
                                       std::function<void(bool success, const QString& detail)> onFinished)
 {
@@ -5830,9 +5828,8 @@ bool CWindow::startAtlasRemapHeadless(QString* errorMessage,
         watcher->deleteLater();
         try {
             const QString summary = watcher->result();
-            // Headless redisplay: a remap just rebuilt the mappings, so the
-            // interactive rebuild prompt can never legitimately trigger here;
-            // any load failure is routed to onFinished instead of a dialog.
+            // Headless redisplay: the rebuild prompt can't legitimately fire after
+            // a remap; load failures route to onFinished, not a dialog.
             QString displayError;
             if (!displayAtlasFromDirectoryHeadless(atlasDir, &displayError)) {
                 throw std::runtime_error(displayError.toStdString());
@@ -5908,11 +5905,9 @@ void CWindow::remapCurrentAtlas()
     }
 }
 
-// Headless core of optimizeAtlasSnapCandidates (SPEC §12.8): preconditions are
-// reported through `errorMessage` instead of QMessageBox; asynchronous
-// failures go to the status bar / stderr and the optional `onAsyncError`
-// callback (the interactive slot uses it for its QMessageBox). Returns true
-// when the prepare/rank pipeline was launched.
+// Headless core of optimizeAtlasSnapCandidates (SPEC §12.8): preconditions via
+// `errorMessage`; async failures go to status bar/stderr plus optional
+// `onAsyncError` (interactive QMessageBox).
 bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
                                                   std::function<void(const QString& detail)> onAsyncError)
 {
@@ -5952,9 +5947,9 @@ bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
         return fail(tr("Failed to start Lasagna service: %1").arg(manager.lastError()));
     }
 
-    // Asynchronous failure reporting shared by the three completion paths
-    // below: never a dialog here (SPEC §1.3) — the interactive slot layers its
-    // QMessageBox on top via `onAsyncError`.
+    // Async failure reporting shared by the three completion paths below: never a
+    // dialog here (SPEC §1.3); the interactive slot layers its QMessageBox via
+    // `onAsyncError`.
     auto reportAsyncError = [this, onAsyncError = std::move(onAsyncError)](const QString& message) {
         if (statusBar()) {
             showStatusBarMessage(tr("Could not rank snap candidates: %1").arg(message), 7000);
@@ -6301,9 +6296,8 @@ void CWindow::startAtlasFiberIntersectionSearch()
         return;
     }
 
-    // Scrape the search widgets into an AtlasFiberSearchParams and forward to
-    // the headless launcher (SPEC §12.3): all validation/launch logic lives
-    // there; only the widget scraping and the failure dialog stay here.
+    // Scrape the search widgets into AtlasFiberSearchParams and forward to the
+    // headless launcher (SPEC §12.3); validation/launch live there.
     AtlasFiberSearchParams params;
     params.searchMode = ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS;
     auto readSearchControls = [&](QDockWidget* dock) {
@@ -6347,8 +6341,8 @@ void CWindow::startAtlasFiberIntersectionSearch()
         }
     }
 
-    // No saved fibers is a silent no-op in the interactive flow (unchanged
-    // behavior: no dialog, just refresh the docks).
+    // No saved fibers: silent no-op in the interactive flow (unchanged: no dialog,
+    // just refresh the docks).
     if (_lineAnnotationController->fiberSnapshotsFromStorageWithPaths().empty()) {
         updateAtlasSearchDocks();
         return;
@@ -6360,9 +6354,8 @@ void CWindow::startAtlasFiberIntersectionSearch()
     }
 }
 
-// Headless atlas fiber-intersection search (SPEC §12.3): performs the same
-// validation and launch as the interactive slot, but reports every failure
-// through `errorMessage` (never a dialog). Progress/terminal state is
+// Headless atlas fiber-intersection search (SPEC §12.3): same validation/launch as
+// the interactive slot, failures via `errorMessage` (never a dialog); progress
 // observable via atlasSearchProgressChanged / atlasSearchFinished.
 bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
                                                         QString* errorMessage)
@@ -6377,9 +6370,9 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
         updateAtlasSearchDocks();
         return fail(tr("Line annotation is not available."));
     }
-    // A live cancel flag means a search is currently in flight (it is created
-    // at launch and reset in the finished handler). The interactive run
-    // button is disabled during a search; headless callers need this guard.
+    // A live cancel flag means a search is in flight (created at launch, reset in
+    // the finished handler); the interactive run button is disabled then, so
+    // headless callers need this explicit guard.
     if (_atlasSearchCancelFlag) {
         return fail(tr("An atlas object search is already running."));
     }
@@ -6389,9 +6382,8 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
         broad.maxDistance = *params.maxDistance;
     } else {
         // "Omit to keep the current spin-box value" (SPEC §12.3): the spin box
-        // persists to QSettings on every change and is initialized from this
-        // same key, so reading it matches the visible value without touching
-        // any widget.
+        // persists to QSettings on every change, so reading the key matches the
+        // visible value without touching any widget.
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         broad.maxDistance = settings.value(vc3d::settings::atlas::SEARCH_MAX_DISTANCE,
                                            broad.maxDistance).toDouble();
@@ -6602,9 +6594,9 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
              searchStart]() {
                 watcher->deleteLater();
                 // The worker can throw (e.g. LasagnaDataset::open); result()
-                // rethrows here. Treat that as a failed search instead of
-                // letting the exception escape into the event loop, so the
-                // terminal atlasSearchFinished signal always fires (SPEC §12.9).
+                // rethrows here. Treat as a failed search so the exception can't
+                // escape into the event loop and atlasSearchFinished always fires
+                // (SPEC §12.9).
                 AtlasSearchWorkerResult workerResult;
                 bool workerFailed = false;
                 QString workerError;
@@ -7343,14 +7335,13 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
     }));
 }
 
-// Dialog-free core shared by the interactive displayAtlasFromDirectory (which
-// wraps it in the rebuild prompt / warning dialogs) and the headless
-// displayAtlasFromDirectoryHeadless (SPEC §12.1). Failures propagate as
-// std::exception; this never shows a dialog or spins a nested event loop.
+// Dialog-free core shared by displayAtlasFromDirectory and
+// displayAtlasFromDirectoryHeadless (SPEC §12.1): failures propagate as
+// std::exception; never shows a dialog or spins a nested event loop.
 void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
 {
-    // Body kept at its original indentation (it previously lived inside the
-    // interactive method's try-block) to preserve history/blame readability.
+    // Bare block preserves the original indentation from the interactive method's
+    // try-block.
     {
         if (!_atlasWorkspaceWindow || !_atlasViewer) {
             createAtlasWorkspace();
@@ -10006,12 +9997,9 @@ void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> 
 }
 
 // Renders <segment>/mask.tif on the calling (worker) thread with no GUI side
-// effects, so the interactive slots and the headless bridge launcher share a
-// single algorithm rather than drifting copies. append=false writes a
-// single-layer binary mask (volume unused). append=true appends a rendered
-// surface-image layer to an existing mask, or creates a two-layer (mask +
-// image) file when none exists. Throws std::runtime_error on any read/write
-// failure; returns a human-readable status string on success.
+// effects. append=false writes a single-layer binary mask; append=true appends a
+// surface-image layer to an existing mask (or creates a two-layer mask+image file).
+// Throws std::runtime_error on failure; returns a status string on success.
 static QString renderSegmentMaskToFile(const std::shared_ptr<QuadSurface>& surf,
                                        const std::shared_ptr<Volume>& volume,
                                        const std::filesystem::path& path,
@@ -10104,8 +10092,8 @@ void CWindow::onEditMaskPressed(const QString& segmentId)
                 _maskRenderInProgress = false;
 
                 try {
-                    const QString msg = watcher->result();
-                    showStatusBarMessage(msg, 3000);
+                    watcher->result();  // rethrows on worker failure
+                    showStatusBarMessage(tr("Mask saved"), 3000);
                     QDesktopServices::openUrl(QUrl::fromLocalFile(
                         QString::fromStdString(path.string())));
                 } catch (const std::exception& e) {
@@ -10171,12 +10159,10 @@ bool CWindow::startMaskRenderHeadless(const QString& segmentId, bool append,
                                       std::function<void(bool, QString)> onFinished,
                                       QString* errorMessage)
 {
-    // Dialog-free twin of onEditMaskPressed / onAppendMaskPressed: it runs the
-    // same renderSegmentMaskToFile worker but omits the QMessageBox /
-    // QDesktopServices GUI side effects, so an unattended bridge run cannot block
-    // on a modal or spawn an external viewer. Completion is reported through
-    // `onFinished` (invoked on the GUI thread via the watcher's finished signal),
-    // which the bridge wires to a deferred JSON-RPC response.
+    // Dialog-free twin of onEditMaskPressed / onAppendMaskPressed: same
+    // renderSegmentMaskToFile worker without the QMessageBox / QDesktopServices
+    // side effects. Completion reported via `onFinished` (GUI thread, watcher
+    // finished signal), which the bridge wires to a deferred JSON-RPC response.
     auto fail = [&](const QString& message) -> bool {
         if (errorMessage) {
             *errorMessage = message;
@@ -10738,15 +10724,11 @@ void CWindow::onPlaneIntersectionLinesToggled(bool enabled)
 
 void CWindow::onSegmentationEditingModeChanged(bool enabled)
 {
-    qWarning() << "DIAGVERIFY onSegmentationEditingModeChanged enabled=" << enabled
-               << "_segmentationModule=" << (_segmentationModule ? "present" : "null");
     if (!_segmentationModule) {
         return;
     }
 
     const bool already = _segmentationModule->editingEnabled();
-    qWarning() << "DIAGVERIFY already=" << already << "enabled=" << enabled
-               << "state.surface(segmentation)=" << (_state && _state->surface("segmentation") ? "present" : "null");
     if (already != enabled) {
         // Update widget to reflect actual module state to avoid drift.
         if (_segmentationWidget && _segmentationWidget->isEditingEnabled() != already) {

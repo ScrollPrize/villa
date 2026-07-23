@@ -4,16 +4,13 @@
 #include <QString>
 #include <QStringList>
 
-// Outcome aggregation for a run/expand seeding batch, extracted from
-// SeedingWidget so it can be unit-tested without spawning real QProcess
-// children (SPEC §1). QObject-free and process-agnostic: it takes a stable
-// per-child index key (never a raw QProcess*, whose address a later child can
-// reuse after deleteLater — see recordTerminal) and pre-extracted outcome
-// fields, never a Qt process type.
+// Outcome aggregation for a run/expand seeding batch, extracted from SeedingWidget so it
+// can be unit-tested without spawning real QProcess children (SPEC §1). QObject-free:
+// takes a stable per-child index key (never a raw QProcess*, whose address a later child
+// can reuse after deleteLater — see recordTerminal) and pre-extracted outcome fields.
 //
-// SeedingWidget keeps the genuine process lifecycle (draining output, killing,
-// deleteLater, the running list, the per-child output tail); this class owns
-// only the honest failure/cancel/success bookkeeping and the terminal message.
+// SeedingWidget keeps the process lifecycle (draining output, killing, deleteLater); this
+// class owns only the failure/cancel/success bookkeeping and the terminal message.
 class SeedingBatchTracker {
 public:
     struct Result {
@@ -24,28 +21,21 @@ public:
         QString message;
     };
 
-    // Clear all state to the fresh, not-finalized, no-active-batch shape. Call
-    // this when a NON-seeding activation (e.g. a neural trace) that shares
-    // SeedingWidget's finalizeSeedingBatch() teardown begins, so finalized()
-    // reflects only the current activation and does not leak true across from a
-    // prior batch (codex #2b).
+    // Resets to the fresh, not-finalized shape; call when a non-seeding activation (e.g. a
+    // neural trace) shares SeedingWidget's finalizeSeedingBatch() teardown, so finalized()
+    // doesn't leak true from a prior batch (codex #2b).
     void reset();
 
-    // Reset all state for a new batch (mirrors the reset SeedingWidget did
-    // before launching the first child). kind is "run" | "expand".
+    // Resets state for a new batch (mirrors SeedingWidget's pre-launch reset). kind is
+    // "run" | "expand".
     void begin(const QString& kind, int total);
 
-    // Record one child reaching its terminal state. key is the child's stable
-    // batch index, used only for dedup: finished() and errorOccurred() can both
-    // fire for the same child, but it must count exactly once. A raw QProcess*
-    // must NOT be used here — SeedingWidget deleteLater()s each finished child
-    // mid-batch, so a later child can be allocated at a freed address and be
-    // mistaken for an already-terminal one, stranding the batch. The index is
-    // unique per child and identical across both signals. Returns false (and
-    // no-ops) when key is already terminal. Otherwise advances completion and,
-    // when failedToStart || crashed || exitCode != 0, counts a failure and
-    // appends a bounded diagnostic. label (optional) is the "Segmentation for
-    // point N" / "Expansion iteration N" prefix SeedingWidget builds.
+    // Records one child's terminal state; key is a stable per-child index (never a raw
+    // QProcess*, since SeedingWidget deleteLater()s finished children and a later child
+    // can reuse the freed address). finished()/errorOccurred() may both fire for the same
+    // child, so key dedups to count each exactly once; returns false when key is already
+    // terminal. label is the optional "Segmentation for point N" / "Expansion iteration N"
+    // prefix.
     bool recordTerminal(int key, bool failedToStart, bool crashed,
                         int exitCode, const QString& tail,
                         const QString& label = QString());
@@ -56,8 +46,7 @@ public:
     [[nodiscard]] bool isComplete() const { return _completed >= _total; }
     [[nodiscard]] bool finalized() const { return _finalized; }
 
-    // Compute the terminal outcome + message. Idempotent: repeated calls return
-    // the same cached Result and mutate nothing further.
+    // Idempotent: repeated calls return the cached Result without further mutation.
     Result finalize();
 
     // Introspection (mirrors the former SeedingWidget batch members).

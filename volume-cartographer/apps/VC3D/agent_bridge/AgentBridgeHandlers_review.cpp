@@ -20,11 +20,9 @@
 
 namespace {
 
-// Build the {"approved","defective","reviewed","inspect","partial_review"} tag
-// snapshot for one segment. has_tag()/tags_or_empty() (LoadJson.hpp) read
-// meta["tags"], an object whose KEYS are the set tags -- exactly what the
-// surface panel's checkboxes toggle (SurfacePanelController::onTagCheckboxToggled)
-// and its filter checkboxes test (SurfacePanelController.cpp ~2727-2782).
+// Tag snapshot for one segment. has_tag() reads meta["tags"], whose keys are
+// the set tags -- what the surface panel's checkboxes toggle
+// (SurfacePanelController::onTagCheckboxToggled) and filter against.
 QJsonObject tagsJson(const utils::Json& meta)
 {
     QJsonObject o;
@@ -36,12 +34,9 @@ QJsonObject tagsJson(const utils::Json& meta)
     return o;
 }
 
-// One-line precedence summary. "defective" wins even over "approved" because a
-// segment flagged defective needs attention regardless of a stale approval;
-// "partial_review" ranks below "reviewed" since the latter is the more
-// complete state (mirrors the filter's `hasPartialReview = partial_review ||
-// reviewed` grouping, but this summary still distinguishes the two so a caller
-// doesn't have to reason about the OR itself).
+// Precedence summary. "defective" wins even over "approved" (a defective flag
+// needs attention regardless of a stale approval); "partial_review" ranks below
+// "reviewed" as the less complete state.
 QString reviewStateOf(const QJsonObject& tags)
 {
     if (tags.value("defective").toBool()) return QStringLiteral("defective");
@@ -52,28 +47,16 @@ QString reviewStateOf(const QJsonObject& tags)
     return QStringLiteral("unreviewed");
 }
 
-// Resolve a segment's meta.json content without ever forcing a full (TIFF)
-// surface load. Preference order:
-//
-//  1. A live QuadSurface: state->surface(id) (attached to a viewer) or,
-//     failing that, vpkg.getSurface(id) (loaded earlier this session, e.g. by
-//     the surface panel) -- because tag-checkbox edits mutate that object's
-//     `meta` in place and are flushed to disk immediately
-//     (SurfacePanelController::onTagCheckboxToggled), so it is the freshest
-//     possible source for a segment touched this session.
-//  2. A fresh read of meta.json straight off disk. We deliberately do NOT
-//     use vpkg.segmentation(id)->metadata(): that is a copy parsed once at
-//     project-open time (Segmentation ctor -> loadMetadata()) and never
-//     updated afterwards, so it goes stale the moment a segment is loaded,
-//     tag-edited (which writes only to the QuadSurface's meta + disk, per
-//     path 1 above), and then unloaded again this session -- exactly the
-//     nulled-`surface_` case path 1 can no longer see. Re-parsing meta.json
-//     is a plain small-file read (same loader Segmentation::loadMetadata()
-//     uses), not a TIFF/point-data load, so this stays cheap enough that
-//     onlyLoaded=false remains safe as the default: there is still no hidden
-//     O(N) heavy load here. If the file is transiently unreadable (e.g. a
-//     concurrent writer mid-save), fall back to the stale cached copy rather
-//     than dropping the segment from the listing.
+// Resolve a segment's meta.json without forcing a full (TIFF) surface load.
+// Preference order:
+//  1. A live QuadSurface (state->surface(id), else vpkg.getSurface(id)) -- its
+//     `meta` is mutated in place on tag edits and flushed to disk immediately,
+//     so it is the freshest source for a segment touched this session.
+//  2. A fresh meta.json read. NOT vpkg.segmentation(id)->metadata(): that copy
+//     is parsed once at project-open and never refreshed, so it goes stale once
+//     a tag-edited segment is unloaded. Re-parsing is a cheap small-file read
+//     (no TIFF), so onlyLoaded=false stays a safe default. On a transient read
+//     failure, fall back to the stale cached copy rather than drop the segment.
 utils::Json resolveSegmentMeta(CState* state, VolumePkg& vpkg, const std::string& id)
 {
     if (state) {
@@ -105,10 +88,8 @@ QJsonObject AgentBridgeServer::handleSegmentsReview(const QJsonValue& params)
     const QJsonObject p = paramsObject(params);
     const bool onlyLoaded = jsonOptionalBool(p, "onlyLoaded", false);
 
-    // "filter" mirrors the surface panel's filter checkboxes (SurfacePanelController.cpp
-    // ~2727-2782): each present-and-true key ANDs in one more constraint. A key
-    // that is absent, or present-but-false, contributes nothing -- same as an
-    // unchecked checkbox -- rather than inverting the predicate.
+    // "filter" mirrors the surface panel's filter checkboxes: each true key ANDs
+    // one more constraint; absent or false contributes nothing (no inversion).
     QJsonObject filterObj;
     if (p.contains("filter")) {
         const QJsonValue fv = p.value("filter");
@@ -124,14 +105,8 @@ QJsonObject AgentBridgeServer::handleSegmentsReview(const QJsonValue& params)
     const bool fInspect = jsonOptionalBool(filterObj, "inspect", false);
     const bool fPartialReview = jsonOptionalBool(filterObj, "partialReview", false);
 
-    // Loaded surface names live in CState; the on-disk segment ids come from the
-    // package (same resolution as handleSegmentsList). "loaded" is deliberately
-    // computed the same way segments.list computes it -- set membership against
-    // CState::surfaceNames() -- so the two endpoints agree on what "loaded"
-    // means for a given id. (A surface whose CState entry maps to a null
-    // QuadSurface would still count as "loaded" here, same as in
-    // handleSegmentsList; that's a shared, pre-existing nuance of CState's
-    // surface map, not something specific to this listing.)
+    // "loaded" = id present in CState::surfaceNames(), computed exactly as
+    // segments.list does so the two endpoints agree.
     const std::vector<std::string> loadedNames = state->surfaceNames();
     const std::unordered_set<std::string> loadedSet(loadedNames.begin(), loadedNames.end());
     const std::string activeId = state->activeSurfaceId();

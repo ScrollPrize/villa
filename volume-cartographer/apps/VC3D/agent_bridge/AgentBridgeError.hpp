@@ -1,11 +1,8 @@
 #pragma once
 
-// Standalone JSON-RPC error payload for the Agent Bridge.
-//
-// Split out of AgentBridgeServer.hpp so the strict wire-parsing helpers in
-// AgentBridgeInternal.hpp (and their unit tests) can throw/catch this type
-// without pulling in the full Q_OBJECT server class and its heavy app/Qt-Widgets
-// dependencies (CWindow, MenuActionController, ...).
+// Standalone JSON-RPC error payload. Split out of AgentBridgeServer.hpp so the
+// strict wire-parsing helpers (AgentBridgeInternal.hpp) and their tests can
+// throw/catch it without pulling in the full Q_OBJECT server class.
 
 #include <QJsonObject>
 #include <QString>

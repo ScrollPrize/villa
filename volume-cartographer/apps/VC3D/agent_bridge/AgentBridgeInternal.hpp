@@ -1,10 +1,7 @@
 #pragma once
 
-// Shared free helpers for the Agent Bridge server. The server's member
-// functions are defined across several per-domain translation units; these
-// helpers are used by more than one of them, so they live here as plain
-// `inline` free functions (ODR-safe across TUs). Bodies are moved verbatim
-// from AgentBridgeServer.cpp.
+// Shared inline free helpers for the Agent Bridge server, used across several
+// per-domain translation units (ODR-safe as inline free functions).
 
 #include <cmath>
 #include <cstdint>

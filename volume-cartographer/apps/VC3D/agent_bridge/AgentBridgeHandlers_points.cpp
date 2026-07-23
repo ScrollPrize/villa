@@ -19,11 +19,9 @@
 #include "vc/core/PointCollections.hpp"
 #include "vc/ui/VCCollection.hpp"
 
-// Home of the whole points.* family: the live VCCollection editing surface
-// (add/update/remove points and collections, winding fills, tags, and IO).
-// Every handler first resolves the store via requirePointStore() and, where a
-// collection is named, resolveCollectionId(); the small local helpers below
-// keep that boilerplate out of the handler bodies.
+// The points.* family: the live VCCollection editing surface (points,
+// collections, winding fills, tags, IO). Handlers resolve the store via
+// requirePointStore() and, where named, resolveCollectionId().
 
 namespace {
 
@@ -60,16 +58,11 @@ VCCollection* requirePointStore(CState* state)
         QStringLiteral("Unknown point: %1").arg(id), data};
 }
 
-// Require an integral, positive JSON number carrying a uint64 id. Kept local
-// (rather than in AgentBridgeInternal) because ids are a points.*-only wire
-// shape; the shared helpers stop at int for the rest of the bridge.
-//
-// The bound is 2^53-1 (JSON's safe-integer limit), not uint64_t's true range:
-// JSON numbers travel as IEEE-754 doubles, which only round-trip integers
-// exactly up to 2^53-1. static_cast<double>(uint64_t::max()) itself rounds up
-// to 2^64, so bounding against it let a rounded 2^64 through unrejected, and
-// casting that back to uint64_t is undefined behavior (2^64 is outside
-// uint64_t's representable range). Ids this large are not real ids anyway.
+// Require an integral, positive JSON number carrying a uint64 id (points.*-only
+// wire shape; the shared helpers stop at int). The bound is 2^53-1 (JSON's
+// safe-integer limit), not uint64_t's range: static_cast<double>(uint64_t::max())
+// rounds up to 2^64, and casting that back to uint64_t is UB. Ids this large are
+// not real ids anyway.
 uint64_t jsonRequireId(const QJsonValue& v, const char* paramName)
 {
     constexpr double kMaxSafeInteger = 9007199254740991.0;  // 2^53 - 1
@@ -185,9 +178,8 @@ QJsonObject AgentBridgeServer::handlePointsCommit(const QJsonValue& params)
 
     std::optional<double> winding;
     if (p.contains("winding")) {
-        // winding_annotation is a float; jsonRequireFiniteFloat (not
-        // jsonRequireFinite) keeps an out-of-float-range value like 1e300
-        // from silently narrowing to +/-inf below.
+        // jsonRequireFiniteFloat (not jsonRequireFinite): winding is a float, so
+        // an out-of-float-range value is rejected, not narrowed to +/-inf below.
         const double w = jsonRequireFiniteFloat(p.value("winding"), "winding");
         winding = w;
     }
@@ -304,8 +296,7 @@ QJsonObject AgentBridgeServer::handlePointsRenameCollection(const QJsonValue& pa
 
     const uint64_t id = resolveCollectionId(pc, p);
     const QString newName = jsonRequireString(p, "newName");
-    // Rejected here rather than left to the model: an empty name is not a
-    // meaningful rename and would make the collection unreachable by name
+    // Reject empty: it would make the collection unreachable by name
     // (resolveCollectionId's name lookup treats "" the same as absent).
     if (newName.isEmpty())
         throwParamError("newName", QStringLiteral("must not be empty"));
@@ -365,9 +356,8 @@ QJsonObject AgentBridgeServer::handlePointsUpdatePoint(const QJsonValue& params)
         cp->p = jsonToVec3(p.value("position"), "position");
     if (p.contains("winding")) {
         // Explicit null clears the annotation (null <-> NaN convention).
-        // jsonRequireFiniteFloat (not jsonRequireFinite) rejects a value like
-        // 1e300 that would otherwise narrow to +/-inf and corrupt that
-        // convention (isnan() no longer identifies "unset").
+        // jsonRequireFiniteFloat rejects an out-of-float-range value that would
+        // narrow to +/-inf and corrupt that convention (isnan() no longer "unset").
         const QJsonValue wv = p.value("winding");
         cp->winding_annotation = wv.isNull()
             ? std::numeric_limits<float>::quiet_NaN()
@@ -506,10 +496,9 @@ QJsonObject AgentBridgeServer::handlePointsAutoFillWindings(const QJsonValue& pa
     const uint64_t id = resolveCollectionId(pc, p);
     const PointCollections::WindingFillMode mode =
         windingFillModeFromString(jsonRequireString(p, "mode"));
-    // constant only matters for the Constant mode; keep the model default (0)
-    // when omitted, but reject a present-but-malformed value. jsonRequireFiniteFloat
-    // (not jsonRequireFinite) rejects an out-of-float-range double before the
-    // narrowing cast below silently turns it into +/-inf.
+    // constant only matters for Constant mode; default 0 when omitted.
+    // jsonRequireFiniteFloat rejects an out-of-float-range value before the cast
+    // narrows it to +/-inf.
     const float constant = p.contains("constant")
         ? static_cast<float>(jsonRequireFiniteFloat(p.value("constant"), "constant"))
         : 0.0f;
@@ -562,9 +551,8 @@ QJsonObject AgentBridgeServer::handlePointsApplyAnchorOffset(const QJsonValue& p
     CState* state = _window ? _window->_state : nullptr;
     VCCollection* pc = requirePointStore(state);
 
-    // jsonRequireFiniteFloat (not jsonRequireFinite): both offsets end up in
-    // float fields, so an out-of-float-range double must be rejected here
-    // rather than narrowed to +/-inf.
+    // jsonRequireFiniteFloat (not jsonRequireFinite): the offsets are float
+    // fields, so reject an out-of-float-range value rather than narrow to +/-inf.
     const float offsetX = static_cast<float>(jsonRequireFiniteFloat(p.value("offsetX"), "offsetX"));
     const float offsetY = static_cast<float>(jsonRequireFiniteFloat(p.value("offsetY"), "offsetY"));
     pc->applyAnchorOffset(offsetX, offsetY);

@@ -944,10 +944,9 @@ SurfacePanelController::fetchOpenDataSegmentAsync(
                 _segmentMaterializationWatcher = nullptr;
                 watcher->deleteLater();
                 if (result.success) {
-                    // Reload so the freshly-materialized surface stops being a
-                    // placeholder and becomes activatable. Unlike the GUI path
-                    // (activateMaterializedSurface) we do NOT force activation --
-                    // the bridge composes fetch + activate itself.
+                    // Reload so the freshly-materialized surface stops being a placeholder
+                    // and becomes activatable. Unlike the GUI path (activateMaterializedSurface)
+                    // we do NOT force activation -- the bridge composes fetch + activate itself.
                     loadSurfaces(true);
                 }
                 if (onDone) {
@@ -1526,7 +1525,6 @@ void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
     if (deleteSegmentsHeadless(segmentIds, &err, &deleted)) {
         emit statusMessageRequested(tr("Successfully deleted %1 segment(s)").arg(total), 5000);
     } else if (deleted > 0) {
-        // Partial success: some segments were deleted, others failed.
         QMessageBox::warning(parentWidget,
                              tr("Partial Deletion"),
                              tr("Deleted %1 of %2 segment(s). The following could not be deleted: %3\n\n"
@@ -1536,7 +1534,6 @@ void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
                                  .arg(total)
                                  .arg(err));
     } else {
-        // Total failure: nothing was deleted.
         QMessageBox::critical(parentWidget,
                               tr("Deletion Failed"),
                               tr("None of the %1 selected segment(s) could be deleted: %2\n\n"

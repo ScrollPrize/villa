@@ -87,37 +87,23 @@ AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
 
     subscribeJobSignals();
 
-    // Line-annotation headless error reporting (SPEC §13 as-built, §1.3): the
-    // fiber subsystem funnels virtually every failure — including failures of
-    // ASYNCHRONOUS completions (line-optimization results, fiber-save jobs)
-    // that land minutes after an RPC already returned — through
-    // LineAnnotationController::showError (a blocking QMessageBox) or a
-    // dataset-picker QFileDialog. A per-call guard cannot cover the async
-    // completions, so suppression is set once for the bridge's lifetime:
-    // messages are logged and recorded (takeLastSuppressedError) instead of
-    // shown. The bridge is opt-in (--agent-bridge), but when it is attached to a
-    // live/windowed session these line-annotation dialogs are suppressed for the
-    // human sharing that window too — by design, since an async completion cannot
-    // be guarded per-call. Suppressed errors stay visible: they are logged and
-    // returned as structured JSON-RPC errors, so nothing is silently swallowed.
+    // Line-annotation headless error reporting (SPEC §13, §1.3): the fiber
+    // subsystem funnels nearly every failure -- including ASYNCHRONOUS completions
+    // that land after an RPC returned -- through a blocking QMessageBox. A per-call
+    // guard cannot cover the async ones, so suppression is set once for the
+    // bridge's lifetime (this also suppresses these dialogs for a human sharing the
+    // window). Suppressed errors are still logged and returned as JSON-RPC errors.
     if (_window && _window->_lineAnnotationController) {
         _window->_lineAnnotationController->setErrorDialogsSuppressed(true);
     }
 
-    // Seeding widget headless dialog suppression (SPEC §15.2, §1.3): every
-    // seeding action the bridge invokes (preview_rays, cast_rays, and the batch
-    // run/expand entry points) opens a precondition QMessageBox::warning on a
-    // failed precondition; a static QMessageBox spins a nested event loop,
+    // Seeding widget headless dialog suppression (SPEC §15.2, §1.3): every seeding
+    // action opens a precondition QMessageBox, which spins a nested event loop --
     // forbidden in a bridge handler. As with the line-annotation valve above, set
-    // once for the bridge's lifetime: when the bridge is attached to a
-    // live/windowed session these seeding precondition dialogs are suppressed for
-    // the human too (the no-nested-modal invariant wins), and the failures surface
-    // as structured JSON-RPC errors + logs rather than modal popups. The batch
-    // actions (seeding.run /
-    // seeding.expand) are now exposed: their former nested-processEvents wait was
-    // refactored away (SeedingWidget::runSegmentationHeadless / runExpandSeedsHeadless
-    // launch the QProcess batch and return; it drains through the process finished
-    // callbacks and resolves via the seedingBatch* signals — see subscribeJobSignals).
+    // once for the bridge's lifetime (suppressed for a human sharing the window
+    // too); failures surface as JSON-RPC errors instead. The batch actions
+    // (seeding.run/expand) now launch a QProcess and resolve via the seedingBatch*
+    // signals rather than a nested-processEvents wait (see subscribeJobSignals).
     if (_window && _window->_seedingWidget) {
         _window->_seedingWidget->setDialogsSuppressed(true);
     }
@@ -286,12 +272,10 @@ void AgentBridgeServer::onSocketReadyRead()
         processLine(socket, line);
     }
 
-    // Bound the unterminated remainder left after consuming complete lines: an
-    // oversized request that never sends a newline (whether alone or trailing a
-    // valid line, e.g. "{}\n" + 2 MiB of junk) must not grow memory without
-    // limit. The loop only exits with no newline in `buffer`, so any residual
-    // over the bound is a partial oversized line: report (best-effort) and drop
-    // ONLY this client, others untouched (SPEC §6).
+    // Bound the unterminated remainder: an oversized request that never sends a
+    // newline must not grow memory without limit. Any residual over the bound is
+    // a partial oversized line -- report (best-effort) and drop ONLY this client
+    // (SPEC §6).
     if (buffer.size() > kMaxLineBytes) {
         sendError(socket, QJsonValue(QJsonValue::Null), -32600,
                   QStringLiteral("Invalid Request: request exceeds %1-byte limit")
