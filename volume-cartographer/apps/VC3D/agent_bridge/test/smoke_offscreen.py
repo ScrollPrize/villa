@@ -131,6 +131,10 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
         client, "state.get", ["not", "an", "object"], "params")
     results.record("c4_array_params", ok, detail)
 
+    ok, detail = expect_param_error(
+        client, "job.status", {"jobId": 123}, "jobId")
+    results.record("c4_job_id_number", ok, detail)
+
     # C4: fractional value for an integer param. Offscreen this is gated by the
     # -32000 "no volume package" check before the int parse (see module docstring);
     # assert it is cleanly rejected (any BridgeError) rather than crashing. The

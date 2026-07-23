@@ -708,8 +708,8 @@ void AgentBridgeServer::handleSeedingBatchFinished(const QString& kind, bool suc
 QJsonObject AgentBridgeServer::handleJobStatus(const QJsonValue& params)
 {
     const QJsonObject p = paramsObject(params);
-    const QString jobId = p.value("jobId").toString();
-    const QString source = p.value("source").toString();
+    const QString jobId = jsonOptionalString(p, "jobId");
+    const QString source = jsonOptionalString(p, "source");
 
     const JobRecord* rec = jobId.isEmpty() ? mostRecentJob(source) : jobById(jobId);
 

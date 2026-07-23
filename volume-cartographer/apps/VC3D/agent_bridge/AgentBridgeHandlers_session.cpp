@@ -1217,7 +1217,8 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
             }
             std::vector<std::string> vids;
             for (const QJsonValue& vv : vidsv.toArray()) {
-                const std::string vid = vv.toString().toStdString();
+                const std::string vid =
+                    jsonRequireString(vv, "resources.volumeIds").toStdString();
                 if (std::find(sampleVolumeIds.begin(), sampleVolumeIds.end(), vid) ==
                     sampleVolumeIds.end()) {
                     QJsonObject data;
@@ -1252,7 +1253,8 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
             const auto derived = vc3d::opendata::derivedRepresentations(*sample);
             std::vector<vc3d::opendata::OpenDataRepresentationRef> refs;
             for (const QJsonValue& rv : refsv.toArray()) {
-                const QString refStr = rv.toString();
+                const QString refStr =
+                    jsonRequireString(rv, "resources.representationRefs");
                 const auto reject = [&]() {
                     QJsonObject data;
                     data["kind"] = "resource";
@@ -1289,7 +1291,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
             }
             std::vector<vc3d::opendata::OpenDataRepresentationKind> kinds;
             for (const QJsonValue& kv : kindsv.toArray()) {
-                const QString ks = kv.toString();
+                const QString ks = jsonRequireString(kv, "resources.kinds");
                 const auto kind = representationKindFromJson(ks);
                 if (!kind) {
                     QJsonObject data;

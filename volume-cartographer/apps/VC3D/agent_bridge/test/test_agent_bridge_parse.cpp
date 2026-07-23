@@ -102,6 +102,9 @@ int main()
     expectParamError("params<-number", "params", [&] {
         paramsObject(QJsonValue(1));
     });
+    expectParamError("string<-number", "name", [&] {
+        jsonRequireString(QJsonValue(1), "name");
+    });
 
     // --- jsonRequireNumber: reject non-numbers, accept numbers ---
     expectParamError("number<-string", "amount",

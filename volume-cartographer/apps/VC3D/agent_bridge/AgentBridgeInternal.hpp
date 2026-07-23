@@ -107,13 +107,17 @@ inline bool jsonRequireBool(const QJsonValue& v, const char* paramName)
     return v.toBool();
 }
 
+inline QString jsonRequireString(const QJsonValue& value, const char* paramName)
+{
+    if (!value.isString())
+        throwParamError(paramName, QStringLiteral("must be a string"));
+    return value.toString();
+}
+
 // Require a JSON string on an object key (rejects absent + wrong type).
 inline QString jsonRequireString(const QJsonObject& o, const char* key)
 {
-    const QJsonValue v = o.value(QLatin1String(key));
-    if (!v.isString())
-        throwParamError(key, QStringLiteral("must be a string"));
-    return v.toString();
+    return jsonRequireString(o.value(QLatin1String(key)), key);
 }
 
 // Optional string: absent -> default; present-but-wrong-type -> reject.
