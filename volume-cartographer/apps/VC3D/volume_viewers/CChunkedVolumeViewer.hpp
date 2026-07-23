@@ -137,6 +137,7 @@ public:
     void setOverlayVolume(std::shared_ptr<Volume> volume) override;
     void setOverlayOpacity(float opacity) override;
     void setOverlayColormap(const std::string& colormapId) override;
+    void setOverlaySamplingMethod(vc::Sampling method) override;
     void setOverlayThreshold(float threshold) override;
     void setOverlayWindow(float low, float high) override;
     void setOverlayMaxDisplayedResolution(int level) override;
@@ -315,6 +316,7 @@ private:
         int startLevel = 0;
         int overlayStartLevel = 0;
         vc::Sampling samplingMethod = vc::Sampling::Trilinear;
+        vc::Sampling overlaySamplingMethod = vc::Sampling::Nearest;
         CompositeRenderSettings compositeSettings;
         float windowLow = 0.0f;
         float windowHigh = 255.0f;
@@ -359,6 +361,7 @@ private:
     struct RenderResult;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
+    void maybeDegradeForCachePressure(const RenderResult& result);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
@@ -435,6 +438,10 @@ private:
     float _scale = 1.0f;
     float _dsScale = 1.0f;
     int _dsScaleIdx = 0;
+    // Extra pyramid levels applied on top of _dsScaleIdx when the shared
+    // chunk cache reports view-protection stalls (live working set larger
+    // than capacity). Reset when the zoom crosses a level boundary.
+    int _cachePressureLevelBias = 0;
     float _zOff = 0.0f;
     float _camSurfX = 0.0f;
     float _camSurfY = 0.0f;
@@ -449,6 +456,7 @@ private:
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
+    vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
     int _overlayMaxDisplayedResolution = 0;

@@ -154,6 +154,9 @@ public:
     bool cycleToNextVisibleSegment();
     bool cycleToPreviousVisibleSegment();
     void materializeCurrentOpenDataFolder();
+    // Enables the "Add to current spiral fit" context action while a Spiral
+    // session is active on the connected service.
+    void setSpiralFitAvailable(bool available) { _spiralFitAvailable = available; }
 
     /// Outcome of a bridge-driven single-segment fetch request. Only `Started`
     /// implies the completion callback will fire later (on the main thread);
@@ -188,6 +191,7 @@ signals:
     void filtersApplied(int hiddenCount);
     void surfaceActivated(const QString& id, QuadSurface* surface);
     void copySegmentPathRequested(const QString& segmentId);
+    void addSurfaceToSpiralFitRequested(const QString& segmentId);
     void renderSegmentRequested(const QString& segmentId);
     void growSegmentRequested(const QString& segmentId);
     void convertToObjRequested(const QString& segmentId);
@@ -276,6 +280,7 @@ private:
     std::string _currentSurfaceId;
     QMetaObject::Connection _pointSetModelConnection;
     bool _configuringFilters{false};
+    bool _spiralFitAvailable{false};
     bool _selectionLocked{false};
     QStringList _lockedSelectionIds;
     bool _selectionLockNotified{false};

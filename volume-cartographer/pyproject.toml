@@ -13,7 +13,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "numpy",
-    "numcodecs>=0.16.5,<0.17",
+    "numcodecs>=0.15.1,<0.17",
 ]
 license = { file = "LICENSE" }
 

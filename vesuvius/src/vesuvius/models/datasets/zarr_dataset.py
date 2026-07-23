@@ -354,7 +354,7 @@ class ZarrDataset(Dataset):
         store = zarr.open(path, mode="r")
 
         # Handle zarr Group (OME-Zarr format)
-        if isinstance(store, zarr.hierarchy.Group):
+        if isinstance(store, zarr.Group):
             # Try to get the requested resolution level
             level_key = str(self.ome_zarr_resolution)
             if level_key in store:

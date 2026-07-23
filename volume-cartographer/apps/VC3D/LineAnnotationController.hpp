@@ -238,6 +238,11 @@ public:
     void setSurfacePanel(SurfacePanelController* panel);
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
+    // On-disk JSON path of a stored fiber (empty when the fiber is unknown or
+    // not yet saved). Used by cross-panel actions such as adding a fiber to a
+    // running Spiral fit.
+    [[nodiscard]] std::filesystem::path fiberFilePath(uint64_t fiberId) const;
+
 signals:
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);

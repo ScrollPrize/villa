@@ -1,0 +1,47 @@
+name: Progress Prize public safety
+
+on:
+  pull_request:
+    paths:
+      - .github/actions/progress-prizes-google/**
+      - .github/progress-prizes*
+      - .github/workflows/progress-prizes-*.yml
+      - .github/workflows/progress-prizes-*.yaml
+      - scrollprize.org/docs/34_prizes.md
+      - scrollprize.org/scripts/progress-prizes/**
+      - scrollprize.org/package.json
+
+permissions: {}
+
+jobs:
+  test:
+    name: Public no-secret tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the pull request without credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Reject whitespace errors
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git diff --check "$BASE_SHA"...HEAD
+
+      - name: Run dependency-free Progress Prize and Atlas tests
+        working-directory: scrollprize.org
+        shell: bash
+        run: >-
+          node --test
+          "scripts/progress-prizes/**/*.test.mjs"
+          "src/components/atlas/**/*.test.js"

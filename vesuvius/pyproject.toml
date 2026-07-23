@@ -25,11 +25,12 @@ dependencies = [
     "requests>=2.32.5",
     "pyyaml>=6.0.2",
     "fsspec>=2025.9.0",
-    "numcodecs>=0.16.5,<0.17",
-    "zarr>=3.2,<4",
+    "numcodecs>=0.15.1,<0.17",
+    "zarr>=2.18.7,<4",
     "s3fs>=2025.9.0",
     "cachetools>=6.2.4",
     "volume-cartographer",
+    "edt>=3.1.2",
 ]
 
 [project.optional-dependencies]
@@ -41,8 +42,8 @@ volume-only = [
     "requests>=2.32.5",
     "pyyaml>=6.0.2",
     "fsspec>=2025.9.0",
-    "numcodecs>=0.16.5,<0.17",
-    "zarr>=3.2,<4",
+    "numcodecs>=0.15.1,<0.17",
+    "zarr>=2.18.7,<4",
     "s3fs>=2025.9.0",
 ]
 # Machine-learning & training stack

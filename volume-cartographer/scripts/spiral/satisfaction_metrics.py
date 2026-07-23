@@ -28,15 +28,23 @@ metrics_config = {
 }
 
 
-def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches, z_begin, z_end, verbose=False, metrics_overrides=None):
+def get_patch_satisfied_areas(
+    slice_to_spiral_transform,
+    dr_per_winding,
+    patches,
+    z_begin,
+    z_end,
+    verbose=False,
+    metrics_overrides=None,
+):
     """Per-patch satisfaction metrics.
 
     Returns ``(satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks,
     boundary_satisfied_count, target_winding_idx_per_patch)``: a bool flag per patch
-    indicating whether at least ``satisfied_patch_quad_fraction`` of
+    indicating whether at least ``metrics_config['satisfied_patch_quad_fraction']`` of
     its valid quads are satisfied, the satisfied/total area tensors, the per-patch
     (H-1, W-1) bool quad masks, a bool flag per patch indicating whether at least
-    ``boundary_satisfied_patch_quad_fraction`` of its boundary quads
+    ``metrics_config['boundary_satisfied_patch_quad_fraction']`` of its boundary quads
     (in-ROI valid quads with at least one 4-neighbor that is out-of-bounds or not
     in-ROI-valid) are satisfied, and the per-patch (H-1, W-1) int64 winding-index
     tensors (the integer output-mesh winding each quad's snap-target sits on; -1 where
@@ -59,7 +67,7 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
     winding.
 
     ``metrics_overrides`` optionally overrides individual ``metrics_config`` entries
-    for this call only (e.g. looser thresholds for splicing decisions).
+    for this call only, such as the looser thresholds used for mesh splicing.
     """
     thresholds = dict(metrics_config)
     if metrics_overrides:
@@ -215,19 +223,19 @@ def get_patch_satisfied_areas(slice_to_spiral_transform, dr_per_winding, patches
                     if propagate_branch_offset(source, source_pos, target, target_pos):
                         queue.append(target)
 
-            # Snap-target winding is chosen from the center column across the connected
-            # component. Gather the BRANCH-CONSISTENT (unwrapped, branch-offset-removed)
-            # shifted radius at that column - the same `adjusted_shifted` frame the
-            # satisfaction check below compares against - NOT the raw shifted_radius_all.
-            # Raw values jump by ~dr across a theta=0 crossing even on the same physical
-            # winding, so a raw median lands between windings and mismatches every quad
-            # (spuriously reporting a well-fit seam-crossing patch as 0% satisfied).
+            # Choose the snap target in the same branch-consistent frame used by
+            # the satisfaction comparisons below. Raw shifted radii differ by a
+            # full winding where this column crosses theta=0.
             component_col_shifted = []
             for subrow in all_subrows:
-                if subrow['branch_offset'] is None or not (subrow['j_min'] <= center_col < subrow['j_max']):
+                if subrow['branch_offset'] is None or not (
+                    subrow['j_min'] <= center_col < subrow['j_max']
+                ):
                     continue
                 pos = center_col - subrow['j_min']
-                component_col_shifted.append(subrow['unwrapped_shifted'][pos] - subrow['branch_offset'])
+                component_col_shifted.append(
+                    subrow['unwrapped_shifted'][pos] - subrow['branch_offset']
+                )
             if len(component_col_shifted) == 0:
                 continue
             component_col_shifted = torch.stack(component_col_shifted)
@@ -356,7 +364,7 @@ def _build_strip_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         spiral_zyxs = transform_in_chunks(zyxs, slice_to_spiral_transform)
         theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
 
-        # Segmented version of unwrap_shifted_radii: build
+        # Segmented version of _unwrap_track_shifted_radii: build
         # adjustments via a global cumsum where step_adj is zeroed across strip
         # boundaries, then subtract each strip's start value so each strip
         # starts at 0 in its own frame.
@@ -511,6 +519,7 @@ def save_overlay_and_print_satisfaction(
     voxel_size_um,
     get_or_build_unattached_pcl_flat,
     run_tag=None,
+    save_png_visualizations=False,
 ):
     satisfied_patches, satisfied_areas, total_areas, satisfied_quad_masks, boundary_satisfied_patches, target_winding_idx_per_patch = get_patch_satisfied_areas(
         slice_to_spiral_transform, dr_per_winding, patches_list, z_begin, z_end, verbose=True,
@@ -643,10 +652,11 @@ def save_overlay_and_print_satisfaction(
         torch.full_like(satisfied_quads_flat, 2, dtype=torch.int64),
         satisfied_quads_flat.to(torch.int64),
     )
-    if os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1':
+    if save_png_visualizations and os.environ.get('FIT_SPIRAL_SKIP_SAVE_OVERLAY') != '1':
         winding_range, patch_extents, pcl_extents = compute_winding_range_and_input_extents(
             slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
             cfg, z_begin, z_end, get_or_build_unattached_pcl_flat,
+            authoritative_zyx_lines=tracks,
         )
         _warn_if_inputs_exceed_flow_bounds(
             list(patches_dict.keys()), patch_extents,
@@ -668,7 +678,13 @@ def save_overlay_and_print_satisfaction(
             render_volume_scale=render_volume_scale,
         )
     if os.environ.get('FIT_SPIRAL_SKIP_SAVE_MESH') != '1':
-        def get_patch_satisfied_areas_for_mesh(transform, winding_delta, patches, verbose=False, metrics_overrides=None):
+        def get_patch_satisfied_areas_for_mesh(
+            transform,
+            winding_delta,
+            patches,
+            verbose=False,
+            metrics_overrides=None,
+        ):
             return get_patch_satisfied_areas(
                 transform, winding_delta, patches, z_begin, z_end, verbose=verbose,
                 metrics_overrides=metrics_overrides,
@@ -678,5 +694,6 @@ def save_overlay_and_print_satisfaction(
             slice_to_spiral_transform, dr_per_winding, patches_list, unattached_pcl_strips,
             out_path, cfg, z_begin, z_end, voxel_size_um,
             get_or_build_unattached_pcl_flat, get_patch_satisfied_areas_for_mesh,
+            tracks=tracks,
             run_tag=run_tag, name=suffix,
         )

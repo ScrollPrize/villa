@@ -27,6 +27,13 @@ constexpr int kViewEpochPriorityStride = 1024;
 // strict LRU so a working set larger than memory degrades to refetching
 // instead of unbounded growth.
 constexpr std::size_t kEvictionHardCeilingFactor = 2;
+// Entries touched by a still-active view request survive even past the hard
+// ceiling: evicting them guarantees the in-flight render refetches them and
+// re-renders, which loops forever when concurrent views' combined working
+// set exceeds capacity. Instead the cache reports a viewProtectionStall so
+// consumers degrade to a coarser level. This higher ceiling is only the
+// last-resort OOM guard for a single pathological render.
+constexpr std::size_t kEvictionViewRequestCeilingFactor = 4;
 
 std::string uniqueTmpSuffix()
 {
@@ -360,6 +367,7 @@ ChunkCache::Stats ChunkCache::stats() const
             static_cast<double>(recentBytes) /
             std::chrono::duration<double>(kDownloadStatsWindow).count();
         result.persistentCacheEnabled = state->options_.persistentCachePath.has_value();
+        result.viewProtectionStalls = state->viewProtectionStalls_;
     }
     if (state->persistentBudget_) {
         const auto budget = state->persistentBudget_->stats();
@@ -397,7 +405,7 @@ void ChunkCache::invalidate()
     state->cv_.notify_all();
 }
 
-void ChunkCache::beginViewRequest()
+std::int64_t ChunkCache::beginViewRequest()
 {
     auto state = state_;
     std::lock_guard lock(state->mutex_);
@@ -405,6 +413,19 @@ void ChunkCache::beginViewRequest()
         state->viewEpoch_ = 1;
     else
         ++state->viewEpoch_;
+    ++state->activeViewRequests_[state->viewEpoch_];
+    return state->viewEpoch_;
+}
+
+void ChunkCache::endViewRequest(std::int64_t token)
+{
+    auto state = state_;
+    std::lock_guard lock(state->mutex_);
+    auto it = state->activeViewRequests_.find(token);
+    if (it == state->activeViewRequests_.end())
+        return;
+    if (--it->second <= 0)
+        state->activeViewRequests_.erase(it);
 }
 
 void ChunkCache::waitForPersistentWrites() const
@@ -1142,6 +1163,7 @@ void ChunkCache::touchLocked(State& state, const ChunkKey& key, Entry& entry)
     if (entry.status == EntryStatus::InFlight)
         return;
     entry.lastTouch = std::chrono::steady_clock::now();
+    entry.lastEpoch = state.viewEpoch_;
     if (entry.inLru)
         state.lru_.erase(entry.lruIt);
     state.lru_.push_front(key);
@@ -1161,11 +1183,21 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
                state->entries_.size() >
                    kEvictionHardCeilingFactor * state->options_.metadataEntryCapacity;
     };
+    auto overViewRequestCeiling = [&] {
+        return state->decodedBytes_ >
+                   kEvictionViewRequestCeilingFactor * state->options_.decodedByteCapacity ||
+               state->entries_.size() >
+                   kEvictionViewRequestCeilingFactor * state->options_.metadataEntryCapacity;
+    };
     if (!overBudget())
         return;
 
     const auto protectedAfter = std::chrono::steady_clock::now() -
                                 state->options_.evictionProtectionWindow;
+    const std::int64_t minActiveEpoch = state->activeViewRequests_.empty()
+        ? std::numeric_limits<std::int64_t>::max()
+        : state->activeViewRequests_.begin()->first;
+    bool skippedViewProtected = false;
     auto it = state->lru_.end();
     while (overBudget() && it != state->lru_.begin()) {
         auto victimIt = std::prev(it);
@@ -1175,6 +1207,11 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
             continue;
         }
         Entry& entry = entryIt->second;
+        if (entry.lastEpoch >= minActiveEpoch && !overViewRequestCeiling()) {
+            skippedViewProtected = true;
+            it = victimIt;
+            continue;
+        }
         if (entry.lastTouch > protectedAfter && !overHardCeiling()) {
             it = victimIt;
             continue;
@@ -1189,6 +1226,8 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
         }
         state->entries_.erase(entryIt);
     }
+    if (skippedViewProtected && overHardCeiling())
+        ++state->viewProtectionStalls_;
 }
 
 bool ChunkCache::isValidKey(const State& state, const ChunkKey& key)
