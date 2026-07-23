@@ -1215,6 +1215,23 @@ class AutoLaunchTest(unittest.TestCase):
             ["/tmp/VC3D", "--agent-bridge", "--volpkg", "/tmp/demo.volpkg.json"],
         )
 
+    def test_path_binary_is_used_before_repo_builds(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(server_module.shutil, "which", return_value="/usr/bin/VC3D"),
+            mock.patch.object(server_module, "default_vc3d_binary") as fallback,
+        ):
+            self.assertEqual(server_module.resolve_launch_binary(None), "/usr/bin/VC3D")
+            fallback.assert_not_called()
+
+    def test_invalid_explicit_binary_does_not_silently_fall_back(self) -> None:
+        with (
+            mock.patch.object(server_module, "_is_executable", return_value=False),
+            mock.patch.object(server_module.shutil, "which") as path_lookup,
+        ):
+            self.assertIsNone(server_module.resolve_launch_binary("/missing/VC3D"))
+            path_lookup.assert_not_called()
+
 
 class NewTailLinesTest(unittest.TestCase):
     """_new_tail_lines: which consoleTail lines are new versus already seen."""

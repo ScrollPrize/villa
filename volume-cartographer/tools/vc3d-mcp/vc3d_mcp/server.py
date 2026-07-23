@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -36,27 +37,49 @@ LAUNCH_HANDSHAKE_TIMEOUT_S = 30.0
 _launched_process: subprocess.Popen | None = None
 
 
-def default_vc3d_binary() -> str:
-    """The fallback VC3D binary path, resolved relative to the repo root.
+def _is_executable(path: str | None) -> bool:
+    return bool(path and os.path.isfile(path) and os.access(path, os.X_OK))
+
+
+def default_vc3d_binary() -> str | None:
+    """Find a VC3D binary in a standard repo build directory.
 
     ``server.py`` lives at ``<repo>/tools/vc3d-mcp/vc3d_mcp/server.py``, so the
     repo root is three directories up.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.abspath(os.path.join(here, os.pardir, os.pardir, os.pardir))
-    return os.path.join(repo_root, "build-macos", "bin", "VC3D")
+    presets = (
+        "dev-gcc",
+        "dev-clang",
+        "ci-release-gcc",
+        "ci-release-clang",
+        "macos-homebrew-llvm",
+    )
+    candidates = [
+        os.path.join(repo_root, "build", preset, "bin", "VC3D")
+        for preset in presets
+    ]
+    candidates.append(os.path.join(repo_root, "build-macos", "bin", "VC3D"))
+    return next((path for path in candidates if _is_executable(path)), None)
 
 
 def resolve_launch_binary(explicit: str | None) -> str | None:
     """Pick the VC3D binary to auto-launch, or None if none is usable.
 
-    Priority: explicit ``--launch`` > ``VC3D_BINARY`` env var > the repo-root
-    default. Returns the path only if it names a real, executable file.
+    Priority: explicit ``--launch`` > ``VC3D_BINARY`` env var > ``VC3D`` on
+    PATH > a standard repo build. Explicit and environment paths fail closed
+    when invalid instead of silently selecting a different binary.
     """
-    candidate = explicit or os.environ.get("VC3D_BINARY") or default_vc3d_binary()
-    if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-        return candidate
-    return None
+    if explicit is not None:
+        return explicit if _is_executable(explicit) else None
+
+    configured = os.environ.get("VC3D_BINARY")
+    if configured is not None:
+        return configured if _is_executable(configured) else None
+
+    installed = shutil.which("VC3D")
+    return installed or default_vc3d_binary()
 
 
 def _launch_command(binary: str, volpkg: str | None) -> list[str]:
@@ -241,8 +264,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Path to a VC3D binary to auto-launch (with --agent-bridge) when no "
             "socket is given and no running bridge is discovered. Falls back to "
-            "the VC3D_BINARY env var, then to the repo-root build "
-            "(build-macos/bin/VC3D). Ignored when --socket or a running bridge "
+            "the VC3D_BINARY env var, VC3D on PATH, then a standard repo build. "
+            "Ignored when --socket or a running bridge "
             "is available."
         ),
     )
@@ -283,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
             "  2. Start VC3D with --agent-bridge and it will be auto-discovered "
             "via ~/.vc3d/agent_bridge.\n"
             "  3. Pass --launch <path-to-VC3D> (or set VC3D_BINARY, or build "
-            "build-macos/bin/VC3D) to have this server launch VC3D itself.",
+            "a standard CMake preset) to have this server launch VC3D itself.",
             file=sys.stderr,
         )
         return 2
