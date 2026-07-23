@@ -85,6 +85,8 @@ jobs:
           cmake --preset "$preset" -DVC_USE_SCCACHE=ON
           ninja -C "build/$preset"
           ctest --preset "$preset"
+          QT_QPA_PLATFORM=offscreen python3 apps/VC3D/agent_bridge/test/smoke_offscreen.py \
+            --vc3d "build/$preset/bin/VC3D"
           sccache --show-stats
 
   mcp-test:
