@@ -538,5 +538,46 @@ class TritonGapExpanderTests(unittest.TestCase):
         self._run_case('inverse', 0.37)
 
 
+class BilinearAtlasLookupClampTest(unittest.TestCase):
+    """Edge samples must stay inside their patch (float32-rounded jitter can
+    reach exactly 1.0 and floor one cell past the last valid quad row/col)."""
+
+    def _make_atlas(self):
+        # two patches with distinct, recognisable values
+        a = torch.arange(4 * 5 * 3, dtype=torch.float32).reshape(4, 5, 3)
+        b = 1000. + torch.arange(3 * 4 * 3, dtype=torch.float32).reshape(3, 4, 3)
+        zyxs_flat = torch.cat([a.reshape(-1, 3), b.reshape(-1, 3)], dim=0)
+        offsets = torch.tensor([0, 20, 32], dtype=torch.int64)
+        widths = torch.tensor([5, 4], dtype=torch.int64)
+        heights = torch.tensor([4, 3], dtype=torch.int64)
+        return a, b, zyxs_flat, offsets, widths, heights
+
+    def test_edge_sample_stays_in_patch(self):
+        from geom_utils import bilinear_atlas_lookup
+        a, b, zyxs_flat, offsets, widths, heights = self._make_atlas()
+        # i lands exactly on the last row of patch 0 (jitter rounded to 1.0)
+        ij = torch.tensor([[3.0, 2.5]], dtype=torch.float32)
+        idx = torch.tensor([0], dtype=torch.int64)
+        out = bilinear_atlas_lookup(zyxs_flat, offsets, widths, idx, ij,
+                                    heights=heights)
+        # clamped to the (2, 2)-(3, 3) quad at di=1: row 3 interpolated at j=2.5
+        expected = (a[3, 2] + a[3, 3]) / 2
+        torch.testing.assert_close(out[0], expected)
+        # without the clamp the same sample reads into patch 1's first row
+        leaked = bilinear_atlas_lookup(zyxs_flat, offsets, widths, idx, ij)
+        self.assertGreater(float(leaked.max()), 999.)
+
+    def test_last_patch_edge_does_not_index_oob(self):
+        from geom_utils import bilinear_atlas_lookup
+        _a, _b, zyxs_flat, offsets, widths, heights = self._make_atlas()
+        ij = torch.tensor([[2.0, 3.0]], dtype=torch.float32)  # last row+col
+        idx = torch.tensor([1], dtype=torch.int64)
+        out = bilinear_atlas_lookup(zyxs_flat, offsets, widths, idx, ij,
+                                    heights=heights)
+        self.assertTrue(bool(torch.isfinite(out).all()))
+        with self.assertRaises(IndexError):
+            bilinear_atlas_lookup(zyxs_flat, offsets, widths, idx, ij)
+
+
 if __name__ == '__main__':
     unittest.main()
