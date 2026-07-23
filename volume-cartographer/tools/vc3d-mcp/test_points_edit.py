@@ -150,6 +150,14 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
         await vc3d_update_point(pointId=7)
         self._assert_wire("points.update_point", {"pointId": 7})
 
+    async def test_update_point_can_clear_winding(self) -> None:
+        await vc3d_update_point(pointId=7, clear_winding=True)
+        self._assert_wire("points.update_point", {"pointId": 7, "winding": None})
+
+    async def test_update_point_rejects_winding_and_clear(self) -> None:
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            await vc3d_update_point(pointId=7, winding=1.5, clear_winding=True)
+
     async def test_remove_point(self) -> None:
         await vc3d_remove_point(pointId=9)
         self._assert_wire("points.remove_point", {"pointId": 9})

@@ -37,12 +37,21 @@ async def vc3d_update_point(
     pointId: int,
     position: Optional[dict[str, float]] = None,
     winding: Optional[float] = None,
+    clear_winding: bool = False,
 ) -> dict[str, Any]:
     """Update an existing point's volume-space position and/or winding
-    annotation. Returns the updated {id, position, winding}."""
+    annotation. Set clear_winding to remove an existing winding. A winding
+    value and clear_winding cannot be supplied together. Returns the updated
+    {id, position, winding}."""
+    if winding is not None and clear_winding:
+        raise ValueError("winding and clear_winding are mutually exclusive")
+
+    params = _strip_none({"pointId": pointId, "position": position, "winding": winding})
+    if clear_winding:
+        params["winding"] = None
     return await _call(
         "points.update_point",
-        _strip_none({"pointId": pointId, "position": position, "winding": winding}),
+        params,
     )
 
 
