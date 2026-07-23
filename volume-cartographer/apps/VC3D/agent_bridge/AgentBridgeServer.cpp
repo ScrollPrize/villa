@@ -690,26 +690,7 @@ void AgentBridgeServer::registerHandlers()
     registerSessionHandlers();
     registerCanvasHandlers();
     registerViewerHandlers();
-    _handlers.insert("segmentation.enable_editing",
-        [this](const QJsonValue& p) { return handleSegmentationEnableEditing(p); });
-    _handlers.insert("segmentation.grow",
-        [this](const QJsonValue& p) { return handleSegmentationGrow(p); });
-    _handlers.insert("segmentation.grow_patch_from_seed",
-        [this](const QJsonValue& p) { return handleSegmentationGrowPatchFromSeed(p); });
-    _handlers.insert("segmentation.save",
-        [this](const QJsonValue& p) { return handleSegmentationSave(p); });
-    _handlers.insert("segmentation.manual_add.begin",
-        [this](const QJsonValue& p) { return handleManualAddBegin(p); });
-    _handlers.insert("segmentation.manual_add.finish",
-        [this](const QJsonValue& p) { return handleManualAddFinish(p); });
-    _handlers.insert("segmentation.manual_add.set_line_mode",
-        [this](const QJsonValue& p) { return handleManualAddSetLineMode(p); });
-    _handlers.insert("segmentation.manual_add.set_interpolation",
-        [this](const QJsonValue& p) { return handleManualAddSetInterpolation(p); });
-    _handlers.insert("segmentation.manual_add.undo_constraint",
-        [this](const QJsonValue& p) { return handleManualAddUndoConstraint(p); });
-    _handlers.insert("segmentation.corrections.set_point_mode",
-        [this](const QJsonValue& p) { return handleCorrectionsSetPointMode(p); });
+    registerEditingHandlers();
     registerWrapHandlers();
     registerPointsHandlers();
     registerJobHandlers();

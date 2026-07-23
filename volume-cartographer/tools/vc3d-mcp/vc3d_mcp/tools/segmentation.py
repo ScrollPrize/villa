@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, TypedDict
 
 from mcp.server.fastmcp import Context
 
 from ..core import mcp, _call, _wait_for_job, _strip_none, _is_placeholder_error
 from ..bridge_client import BridgeError
+
+
+class Point3D(TypedDict):
+    x: float
+    y: float
+    z: float
 
 
 @mcp.tool()
@@ -190,7 +196,7 @@ async def vc3d_grow_segment(
 
 @mcp.tool()
 async def vc3d_grow_patch_from_seed(
-    seed: dict[str, float],
+    seed: Point3D,
     volume_id: Optional[str] = None,
     iterations: int = 200,
     min_area_cm: float = 0.002,

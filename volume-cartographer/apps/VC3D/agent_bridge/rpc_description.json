@@ -1768,6 +1768,291 @@
         "type": "object"
       }
     },
+    "segmentation.corrections.set_point_mode": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32007,
+        -32008
+      ],
+      "mcp": {
+        "tool": "vc3d_corrections_set_point_mode"
+      },
+      "params": {
+        "properties": {
+          "active": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "active"
+        ],
+        "type": "object"
+      }
+    },
+    "segmentation.enable_editing": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_enable_editing"
+      },
+      "params": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      }
+    },
+    "segmentation.grow": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32007,
+        -32008,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "inpaintOnly": "inpaint_only"
+        },
+        "tool": "vc3d_grow_segment"
+      },
+      "params": {
+        "properties": {
+          "direction": {
+            "default": "all",
+            "enum": [
+              "all",
+              "up",
+              "down",
+              "left",
+              "right",
+              "fill"
+            ],
+            "type": "string"
+          },
+          "inpaintOnly": {
+            "default": false,
+            "type": "boolean"
+          },
+          "method": {
+            "default": "tracer",
+            "enum": [
+              "tracer",
+              "corrections",
+              "patch_tracer"
+            ],
+            "type": "string"
+          },
+          "steps": {
+            "maximum": 2147483647,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "steps"
+        ],
+        "type": "object"
+      }
+    },
+    "segmentation.grow_patch_from_seed": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "minAreaCm": "min_area_cm",
+          "outputDir": "output_dir",
+          "volumeId": "volume_id"
+        },
+        "tool": "vc3d_grow_patch_from_seed"
+      },
+      "params": {
+        "properties": {
+          "iterations": {
+            "default": 200,
+            "maximum": 100000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "minAreaCm": {
+            "default": 0.002,
+            "minimum": 0,
+            "type": "number"
+          },
+          "outputDir": {
+            "type": "string"
+          },
+          "seed": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "z"
+            ],
+            "type": "object"
+          },
+          "volumeId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "seed"
+        ],
+        "type": "object"
+      }
+    },
+    "segmentation.manual_add.begin": {
+      "errors": [
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32008
+      ],
+      "mcp": {
+        "tool": "vc3d_manual_add_begin"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "segmentation.manual_add.finish": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_manual_add_finish"
+      },
+      "params": {
+        "properties": {
+          "apply": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "segmentation.manual_add.set_interpolation": {
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_manual_add_set_interpolation"
+      },
+      "params": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "thin_plate_spline",
+              "tracer_restricted_to_fill"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      }
+    },
+    "segmentation.manual_add.set_line_mode": {
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_manual_add_set_line_mode"
+      },
+      "params": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "vertical",
+              "horizontal",
+              "cross",
+              "cross_fill"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      }
+    },
+    "segmentation.manual_add.undo_constraint": {
+      "errors": [
+        -32000,
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_manual_add_undo_constraint"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "segmentation.save": {
+      "errors": [
+        -32000,
+        -32004
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "tool": "vc3d_save_segment"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
     "segments.activate": {
       "errors": [
         -32602,

@@ -75,6 +75,7 @@ private:
     void registerHandlers();
     void registerSessionHandlers();
     void registerCanvasHandlers();
+    void registerEditingHandlers();
     void registerViewerHandlers();
     void registerWrapHandlers();
     void registerJobHandlers();
