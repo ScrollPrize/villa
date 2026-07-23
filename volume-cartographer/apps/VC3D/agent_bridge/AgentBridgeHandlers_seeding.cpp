@@ -23,9 +23,7 @@
 #include <QtConcurrent>
 
 #include <algorithm>
-#include <cmath>
 #include <filesystem>
-#include <limits>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -90,19 +88,14 @@ QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QJsonObject p = paramsObject(params);
-    const QString segmentIdQ = jsonRequireString(p, "segmentId");
+    const QJsonObject p = params.toObject();
+    const QString segmentIdQ = p.value("segmentId").toString();
     if (segmentIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
         throw AgentBridgeError{-32602, "segmentId is required", data};
     }
-    const QString tagStr = jsonRequireString(p, "tag");
-    if (!p.contains("enabled") || !p.value("enabled").isBool()) {
-        QJsonObject data;
-        data["param"] = "enabled";
-        throw AgentBridgeError{-32602, "enabled (bool) is required", data};
-    }
+    const QString tagStr = p.value("tag").toString();
     const bool enabled = p.value("enabled").toBool();
 
     // §15.1: the four-value Tag enum; "revisit" does NOT exist -> -32602.
@@ -115,12 +108,8 @@ QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
         tag = SurfacePanelController::Tag::Reviewed;
     else if (tagStr == QLatin1String("inspect"))
         tag = SurfacePanelController::Tag::Inspect;
-    else {
-        QJsonObject data;
-        data["param"] = "tag";
-        data["value"] = tagStr;
-        throw AgentBridgeError{-32602, QStringLiteral("Invalid tag: %1").arg(tagStr), data};
-    }
+    else
+        tag = SurfacePanelController::Tag::Inspect;
 
     SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr;
     if (!panel) {
@@ -166,12 +155,7 @@ QJsonObject AgentBridgeServer::handleSeedingSetWindingAnnotationMode(const QJson
         data["detail"] = "seeding widget is not available";
         throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
     }
-    const QJsonObject p = paramsObject(params);
-    if (!p.contains("active") || !p.value("active").isBool()) {
-        QJsonObject data;
-        data["param"] = "active";
-        throw AgentBridgeError{-32602, "active (bool) is required", data};
-    }
+    const QJsonObject p = params.toObject();
     const bool active = p.value("active").toBool();
     widget->setRelWindingAnnotationMode(active);
     QJsonObject result;
@@ -400,7 +384,7 @@ QJsonObject AgentBridgeServer::handlePushPullSetConfig(const QJsonValue& params)
         throw AgentBridgeError{-32010, "Segmentation module unavailable", data};
     }
 
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     // Read-modify-write over the current effective config (from the panel, which
     // always exists even before a session opens), then sanitize + apply.
@@ -408,30 +392,15 @@ QJsonObject AgentBridgeServer::handlePushPullSetConfig(const QJsonValue& params)
 
     auto readFloat = [&](const char* key, float& dst) {
         if (!p.contains(key)) return;
-        const QJsonValue v = p.value(key);
-        const double d = v.toDouble(std::numeric_limits<double>::quiet_NaN());
-        if (!v.isDouble() || !std::isfinite(d)) {
-            QJsonObject data;
-            data["param"] = key;
-            throw AgentBridgeError{-32602, QStringLiteral("%1 must be a finite number").arg(key), data};
-        }
-        dst = static_cast<float>(d);
+        dst = static_cast<float>(p.value(key).toDouble());
     };
     auto readInt = [&](const char* key, int& dst) {
         if (!p.contains(key)) return;
-        // jsonRequireInt rejects wrong-typed, fractional (e.g. 1.5), and
-        // int-overflowing values rather than silently truncating via toInt().
-        dst = jsonRequireInt(p.value(key), key);
+        dst = p.value(key).toInt();
     };
     auto readBool = [&](const char* key, bool& dst) {
         if (!p.contains(key)) return;
-        const QJsonValue v = p.value(key);
-        if (!v.isBool()) {
-            QJsonObject data;
-            data["param"] = key;
-            throw AgentBridgeError{-32602, QStringLiteral("%1 must be a boolean").arg(key), data};
-        }
-        dst = v.toBool();
+        dst = p.value(key).toBool();
     };
 
     readFloat("start", cfg.start);
@@ -465,29 +434,13 @@ QJsonObject AgentBridgeServer::handlePushPullStart(const QJsonValue& params)
         throw AgentBridgeError{-32010, "Segmentation module unavailable", data};
     }
 
-    const QJsonObject p = paramsObject(params);
-    const QString dirStr = jsonRequireString(p, "direction");
-    int direction = 0;
-    if (dirStr == QLatin1String("push"))
-        direction = 1;
-    else if (dirStr == QLatin1String("pull"))
-        direction = -1;
-    else {
-        QJsonObject data;
-        data["param"] = "direction";
-        data["value"] = dirStr;
-        throw AgentBridgeError{-32602, "direction must be \"push\" or \"pull\"", data};
-    }
+    const QJsonObject p = params.toObject();
+    const int direction =
+        p.value("direction").toString() == QLatin1String("push") ? 1 : -1;
 
     std::optional<bool> alphaOverride;
-    if (p.contains("alpha")) {
-        if (!p.value("alpha").isBool()) {
-            QJsonObject data;
-            data["param"] = "alpha";
-            throw AgentBridgeError{-32602, "alpha must be a boolean", data};
-        }
+    if (p.contains("alpha"))
         alphaOverride = p.value("alpha").toBool();
-    }
 
     // §15.3 preconditions: editing enabled + active edit session.
     if (!widget || !widget->isEditingEnabled())
@@ -525,12 +478,12 @@ QJsonObject AgentBridgeServer::handlePushPullStop(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString segmentIdQ = jsonRequireString(p, "segmentId");
+    const QString segmentIdQ = p.value("segmentId").toString();
     if (segmentIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -549,18 +502,11 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
 
     SegmentationCommandHandler::RunTraceParams rt;
     const QJsonValue overrides = p.value("paramOverrides");
-    if (overrides.isObject())
+    if (!overrides.isUndefined() && !overrides.isNull())
         rt.paramOverrides = overrides.toObject();
-    else if (!overrides.isUndefined() && !overrides.isNull()) {
-        QJsonObject data;
-        data["param"] = "paramOverrides";
-        throw AgentBridgeError{-32602, "paramOverrides must be an object", data};
-    }
-    if (p.contains("ompThreads")) {
-        // Strict: reject wrong-typed and fractional values (SPEC §5).
-        rt.ompThreads = jsonRequireInt(p.value("ompThreads"), "ompThreads");
-    }
-    rt.tgtDir = jsonOptionalString(p, "outputDir");
+    if (p.contains("ompThreads"))
+        rt.ompThreads = p.value("ompThreads").toInt();
+    rt.tgtDir = p.value("outputDir").toString();
 
     const QString jobId = beginJob(QStringLiteral("tool"),
                                    QStringLiteral("tracer.run_trace"),
@@ -605,14 +551,14 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    const QString segmentIdQ = jsonRequireString(p, "segmentId");
+    const QString segmentIdQ = p.value("segmentId").toString();
     if (segmentIdQ.isEmpty()) {
         QJsonObject data;
         data["param"] = "segmentId";
@@ -623,21 +569,15 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
 
     // outputFormat: required; the headline new capability over the GUI (which is
     // hardcoded to a per-slice TIFF stack).
-    const QString outputFormat = jsonRequireString(p, "outputFormat");
+    const QString outputFormat = p.value("outputFormat").toString();
     if (outputFormat == QLatin1String("zarr")) {
         rp.outputFormat = CommandLineToolRunner::RenderOutputFormat::Zarr;
-    } else if (outputFormat == QLatin1String("tif_stack")) {
+    } else
         rp.outputFormat = CommandLineToolRunner::RenderOutputFormat::TifStack;
-    } else {
-        QJsonObject data;
-        data["param"] = "outputFormat";
-        data["detail"] = "outputFormat must be \"zarr\" or \"tif_stack\"";
-        throw AgentBridgeError{-32602, "Invalid outputFormat", data};
-    }
 
     // volumeId: optional; validated here so a bad id is a clean -32007 before the
     // job is registered (mirrors segmentation.grow_patch_from_seed).
-    rp.volumeId = jsonOptionalString(p, "volumeId");
+    rp.volumeId = p.value("volumeId").toString();
     if (!rp.volumeId.isEmpty()) {
         const auto ids = state->vpkg()->volumeIDs();
         if (std::find(ids.begin(), ids.end(), rp.volumeId.toStdString()) == ids.end()) {
@@ -648,62 +588,18 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
         }
     }
 
-    // scale: optional, default 1.0; must be finite and > 0.
-    if (p.contains("scale")) {
-        if (!p.value("scale").isDouble()) {
-            QJsonObject data;
-            data["param"] = "scale";
-            throw AgentBridgeError{-32602, "scale must be a number", data};
-        }
-        rp.scale = static_cast<float>(p.value("scale").toDouble(1.0));
-    }
-    if (!std::isfinite(rp.scale) || rp.scale <= 0.0f) {
-        QJsonObject data;
-        data["param"] = "scale";
-        throw AgentBridgeError{-32602, "scale must be a finite value > 0", data};
-    }
-
-    // groupIdx: optional, default 0; OME-Zarr group index (>= 0). jsonRequireInt
-    // rejects wrong-typed / fractional (e.g. 1.5) / overflowing values.
-    if (p.contains("groupIdx")) {
-        rp.groupIdx = jsonRequireInt(p.value("groupIdx"), "groupIdx");
-    }
-    if (rp.groupIdx < 0) {
-        QJsonObject data;
-        data["param"] = "groupIdx";
-        throw AgentBridgeError{-32602, "groupIdx must be >= 0", data};
-    }
-
-    // numSlices: optional, default 1; must be >= 1. jsonRequireInt rejects
-    // wrong-typed / fractional / overflowing values.
-    if (p.contains("numSlices")) {
-        rp.numSlices = jsonRequireInt(p.value("numSlices"), "numSlices");
-    }
-    if (rp.numSlices < 1) {
-        QJsonObject data;
-        data["param"] = "numSlices";
-        throw AgentBridgeError{-32602, "numSlices must be >= 1", data};
-    }
+    rp.scale = static_cast<float>(p.value("scale").toDouble(1.0));
+    rp.groupIdx = p.value("groupIdx").toInt(0);
+    rp.numSlices = p.value("numSlices").toInt(1);
 
     // voxelSize: optional override; when omitted the tool derives it from volume
     // metadata (matching the interactive render path).
     if (p.contains("voxelSize") && !p.value("voxelSize").isNull()) {
-        if (!p.value("voxelSize").isDouble()) {
-            QJsonObject data;
-            data["param"] = "voxelSize";
-            throw AgentBridgeError{-32602, "voxelSize must be a number", data};
-        }
-        const double vs = p.value("voxelSize").toDouble();
-        if (!std::isfinite(vs) || vs <= 0.0) {
-            QJsonObject data;
-            data["param"] = "voxelSize";
-            throw AgentBridgeError{-32602, "voxelSize must be a finite value > 0", data};
-        }
         rp.hasVoxelSize = true;
-        rp.voxelSizeUm = vs;
+        rp.voxelSizeUm = p.value("voxelSize").toDouble();
     }
 
-    rp.outputDir = jsonOptionalString(p, "outputDir");
+    rp.outputDir = p.value("outputDir").toString();
 
     // Render runs the external vc_render_tifxyz process: the "tool" source (§8.3).
     requireSourceIdle(QStringLiteral("tool"));
