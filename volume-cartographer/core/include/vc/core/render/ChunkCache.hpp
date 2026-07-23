@@ -10,7 +10,6 @@
 #include <deque>
 #include <filesystem>
 #include <list>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -56,13 +55,6 @@ public:
         // CacheCompression.hpp). Combined (max) with the process-wide
         // default below at construction.
         int cacheQuantBinWidth = 1;
-        // Entries read within this window are skipped by capacity eviction
-        // (until the hard ceiling of twice the capacity): they belong to a
-        // view that is still being rendered, so dropping them frees little
-        // memory (render workers pin the bytes for the frame anyway) and
-        // guarantees a refetch plus a visible blank on the next re-render.
-        // Zero restores strict-capacity LRU.
-        std::chrono::milliseconds evictionProtectionWindow{3000};
     };
 
     struct Stats {
@@ -78,12 +70,6 @@ public:
         std::optional<std::size_t> persistentCacheMaximumBytes;
         std::size_t remoteFetchesInFlight = 0;
         double remoteDownloadBytesPerSecond = 0.0;
-        // Monotonic count of capacity enforcements that stayed above the
-        // hard ceiling because the excess belonged to still-active view
-        // requests. A consumer that sees this advance across one of its own
-        // renders is sharing a cache whose combined live working set does
-        // not fit, and should render coarser instead of refetching.
-        std::size_t viewProtectionStalls = 0;
     };
 
     ChunkCache(std::vector<LevelInfo> levels,
@@ -113,14 +99,8 @@ public:
 
     Stats stats() const;
     void invalidate();
-    // Marks the start of a view render. Entries touched while any view
-    // request is active are protected from capacity eviction (up to a
-    // last-resort OOM ceiling), so concurrent renders sharing this cache
-    // cannot evict each other's working set and force an endless
-    // refetch/re-render loop. The returned token must be passed to
-    // endViewRequest when the render's sampling is done.
-    std::int64_t beginViewRequest();
-    void endViewRequest(std::int64_t token);
+    // Advances fetch priority so newer view renders supersede stale requests.
+    void beginViewRequest();
     void waitForPersistentWrites() const;
 
     // Process-wide default for Options::compressPersistentCache, OR-ed into
@@ -154,8 +134,6 @@ private:
         int basePriority = 0;
         std::int64_t priority = 0;
         std::uint64_t fetchSerial = 0;
-        std::chrono::steady_clock::time_point lastTouch{};
-        std::int64_t lastEpoch = 0;
         std::list<ChunkKey>::iterator lruIt;
     };
 
@@ -185,11 +163,6 @@ private:
         std::size_t decodedBytes_ = 0;
         std::uint64_t generation_ = 0;
         std::int64_t viewEpoch_ = 1;
-        // Epochs of view requests whose renders are still sampling (epoch →
-        // active request count). Entries last touched at or after the oldest
-        // active epoch are protected from eviction.
-        std::map<std::int64_t, int> activeViewRequests_;
-        std::size_t viewProtectionStalls_ = 0;
         std::uint64_t nextFetchSerial_ = 1;
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;

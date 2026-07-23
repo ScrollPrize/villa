@@ -866,7 +866,6 @@ void CChunkedVolumeViewer::rebuildChunkArray()
     }
     _chunkArray.reset();
     _lastRenderResult.reset();
-    _cachePressureLevelBias = 0;
     if (!_volume)
         return;
 
@@ -1219,15 +1218,9 @@ void CChunkedVolumeViewer::recalcPyramidLevel()
         ? kSegmentationResolutionLodZoomBias
         : kResolutionLodZoomBias;
     const float lodScale = std::max(_scale * lodZoomBias, 1e-6f);
-    const int newIdx = std::clamp(
+    _dsScaleIdx = std::clamp(
         static_cast<int>(std::floor(std::max(0.0f, std::log2(1.0f / lodScale)))),
         0, std::max(0, n - 1));
-    if (newIdx != _dsScaleIdx) {
-        // Zoom crossed a pyramid-level boundary: the working set changes, so
-        // retry full resolution before any cache-pressure degrade re-applies.
-        _cachePressureLevelBias = 0;
-    }
-    _dsScaleIdx = newIdx;
     _dsScale = static_cast<float>(std::uint64_t{1} << _dsScaleIdx);
     updateScalebarScale();
 }
@@ -1349,7 +1342,7 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
     // `_dsScaleIdx` intentionally waits for about 2x more zoom before moving
     // to a finer level. Surface-resolution views keep their target level to
     // avoid panning blur.
-    int level = _dsScaleIdx + _cachePressureLevelBias;
+    int level = _dsScaleIdx;
     if (preferSurfaceResolution && _chunkArray && level < _chunkArray->numLevels() - 1)
         level -= kSurfaceResolutionLevelBias;
     level = std::max(level, _maxDisplayedResolution);
@@ -1362,7 +1355,7 @@ int CChunkedVolumeViewer::overlayRenderStartLevel(bool preferSurfaceResolution) 
         return 0;
     }
 
-    int level = _dsScaleIdx + _cachePressureLevelBias;
+    int level = _dsScaleIdx;
     if (preferSurfaceResolution && level < _overlayChunkArray->numLevels() - 1) {
         level -= kSurfaceResolutionLevelBias;
     }
@@ -1384,39 +1377,9 @@ bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
            _compositeSettings.useVolumeGradients;
 }
 
-namespace {
-
-// Holds a ChunkCache view request open while a render job samples, so
-// capacity eviction cannot drop chunks an in-flight render still needs
-// (which would force a refetch + re-render loop).
-struct ViewRequestGuard {
-    explicit ViewRequestGuard(std::shared_ptr<vc::render::ChunkCache> c)
-        : cache(std::move(c))
-    {
-        if (cache)
-            token = cache->beginViewRequest();
-    }
-    ~ViewRequestGuard()
-    {
-        if (cache)
-            cache->endViewRequest(token);
-    }
-    ViewRequestGuard(const ViewRequestGuard&) = delete;
-    ViewRequestGuard& operator=(const ViewRequestGuard&) = delete;
-
-    std::shared_ptr<vc::render::ChunkCache> cache;
-    std::int64_t token = 0;
-};
-
-} // namespace
-
 struct CChunkedVolumeViewer::RenderContext {
     PendingRenderJob renderJob;
     std::uint64_t serial = 0;
-    std::unique_ptr<ViewRequestGuard> viewRequest;
-    std::unique_ptr<ViewRequestGuard> overlayViewRequest;
-    std::size_t viewStallsAtStart = 0;
-    std::size_t overlayViewStallsAtStart = 0;
     int fbW = 0;
     int fbH = 0;
     float surfacePtrX = 0.0f;
@@ -1465,11 +1428,6 @@ struct CChunkedVolumeViewer::RenderResult {
     std::chrono::steady_clock::time_point submittedAt;
     std::chrono::steady_clock::time_point workerStartedAt;
     std::chrono::steady_clock::time_point workerFinishedAt;
-    // Cache viewProtectionStalls counters when the job started; if they
-    // advanced while rendering, the shared cache could not hold the live
-    // working set and the viewer should degrade a level.
-    std::size_t viewStallsAtStart = 0;
-    std::size_t overlayViewStallsAtStart = 0;
 };
 
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
@@ -1496,8 +1454,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.surfacePtrX = ctx.surfacePtrX;
     result.surfacePtrY = ctx.surfacePtrY;
     result.scale = ctx.scale;
-    result.viewStallsAtStart = ctx.viewStallsAtStart;
-    result.overlayViewStallsAtStart = ctx.overlayViewStallsAtStart;
     result.submittedAt = ctx.renderJob.submittedAt;
     result.workerStartedAt = std::chrono::steady_clock::now();
     result.framebuffer = QImage(std::max(1, ctx.fbW), std::max(1, ctx.fbH), QImage::Format_RGB32);
@@ -2000,12 +1956,9 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     _pendingRenderDirty = false;
 
     RenderContext ctx;
-    ctx.viewRequest = std::make_unique<ViewRequestGuard>(job.chunkArray);
-    ctx.viewStallsAtStart = job.chunkArray->stats().viewProtectionStalls;
-    if (job.overlayChunkArray) {
-        ctx.overlayViewRequest = std::make_unique<ViewRequestGuard>(job.overlayChunkArray);
-        ctx.overlayViewStallsAtStart = job.overlayChunkArray->stats().viewProtectionStalls;
-    }
+    job.chunkArray->beginViewRequest();
+    if (job.overlayChunkArray)
+        job.overlayChunkArray->beginViewRequest();
     ctx.renderJob = job;
     ctx.serial = ++_renderSerial;
     emit renderFrameSubmitted(ctx.serial);
@@ -2215,7 +2168,6 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
         }
     }
     submitPendingRenderJobIfNeeded();
-    maybeDegradeForCachePressure(*result);
 
     if (profile.enabled()) {
         profile.setDetails(std::format(
@@ -2223,29 +2175,6 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
             result->serial, result->renderJob.requestId, result->renderFrameElapsedMs,
             _framebuffer.width(), _framebuffer.height(), _pendingRenderJob.has_value()));
     }
-}
-
-void CChunkedVolumeViewer::maybeDegradeForCachePressure(const RenderResult& result)
-{
-    const auto& job = result.renderJob;
-    const bool stalled =
-        (job.chunkArray &&
-         job.chunkArray->stats().viewProtectionStalls > result.viewStallsAtStart) ||
-        (job.overlayChunkArray &&
-         job.overlayChunkArray->stats().viewProtectionStalls > result.overlayViewStallsAtStart);
-    if (!stalled || !_chunkArray)
-        return;
-
-    // The shared cache could not hold every live view's working set while
-    // this frame rendered; re-requesting evicted chunks at the same level
-    // sustains the coarse/fine refetch loop indefinitely. Render coarser
-    // instead; recalcPyramidLevel resets the bias when the zoom moves to a
-    // different level.
-    const int coarsest = _chunkArray->numLevels() - 1;
-    if (_dsScaleIdx + _cachePressureLevelBias >= coarsest)
-        return;
-    ++_cachePressureLevelBias;
-    submitRender("cache pressure degrade");
 }
 
 void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::source_location caller)
@@ -4297,8 +4226,19 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         _flattenedIntersectionCache.surface = activeSeg.get();
         _flattenedIntersectionCache.planesHash = planesHash;
         _flattenedIntersectionCache.indexSamplingStride = stride;
+        const std::size_t sampledRows =
+            std::size_t(points->rows / stride + 1);
+        const std::size_t sampledColumns =
+            std::size_t(points->cols / stride + 1);
+        const std::size_t sampledCells = sampledRows * sampledColumns;
+        // A plane normally crosses a surface along a curve, so populated cells
+        // scale with the sampled perimeter rather than with the entire grid.
+        // Let pathological surfaces grow the map naturally instead of eagerly
+        // reserving buckets for a fixed fraction of every cell.
+        const std::size_t expectedIntersectedCells =
+            planes.size() * 2 * (sampledRows + sampledColumns) + 1024;
         _flattenedIntersectionCache.cellLines.reserve(
-            std::size_t(points->rows / stride + 1) * std::size_t(points->cols / stride + 1) / 8 + 1024);
+            std::min(sampledCells, expectedIntersectedCells));
         rebuildFlattenedCells(cellBounds());
         _flattenedIntersectionCache.valid = true;
     } else if (_flattenedIntersectionDirtyCells) {

@@ -16,11 +16,18 @@ namespace vc::render {
 namespace {
 
 struct LocalChunkCache {
+    // ChunkResult owns a shared_ptr to decoded chunk bytes. Keeping every
+    // result touched by a frame pins the whole working set even after the
+    // shared ChunkCache evicts it. A small window preserves the hot consecutive
+    // lookup fast path without allowing each render worker to become another
+    // unbounded decoded-byte cache.
+    static constexpr std::size_t kMaxPinnedChunks = 8;
+
     explicit LocalChunkCache(IChunkedArray& a, std::size_t expectedChunks = 0)
         : array(a)
     {
         if (expectedChunks > 0) {
-            chunks.reserve(expectedChunks);
+            chunks.reserve(std::min(expectedChunks, kMaxPinnedChunks));
             requestedKeys.reserve(expectedChunks);
             errorKeys.reserve(expectedChunks);
         }
@@ -36,6 +43,10 @@ struct LocalChunkCache {
 
         auto it = chunks.find(key);
         if (it == chunks.end()) {
+            if (chunks.size() >= kMaxPinnedChunks) {
+                lastResult = nullptr;
+                chunks.clear();
+            }
             ChunkResult result = array.tryGetChunk(key.level, key.iz, key.iy, key.ix);
             if (result.status == ChunkStatus::MissQueued && requestedKeys.insert(key).second)
                 ++requested;

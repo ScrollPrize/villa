@@ -795,6 +795,11 @@ cv::Size QuadSurface::size()
     return {static_cast<int>(_points->cols / _scale[0]), static_cast<int>(_points->rows / _scale[1])};
 }
 
+cv::Size QuadSurface::gridSize() const
+{
+    return {_bounds.width + 1, _bounds.height + 1};
+}
+
 cv::Vec2f QuadSurface::scale() const
 {
     return _scale;
@@ -2010,11 +2015,18 @@ Rect3D QuadSurface::bbox()
     return _bbox;
 }
 
-std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags)
+namespace {
+
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
+    const std::filesystem::path &path,
+    const std::optional<cv::Rect> &requestedRegion,
+    int flags)
 {
     recoverIncompleteSave(path);
 
-    auto read_band_into = [](const std::filesystem::path& fpath,
+    cv::Rect loadedRegion;
+    auto read_band_into = [&requestedRegion, &loadedRegion](
+                             const std::filesystem::path& fpath,
                              cv::Mat_<cv::Vec3f>& points,
                              int channel,
                              int& outW, int& outH) -> void
@@ -2045,17 +2057,28 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
             throw std::runtime_error("Unsupported BitsPerSample in " + fpath.string());
         }
 
-        // Allocate destination if first band
+        const cv::Rect fullRegion(0, 0, static_cast<int>(W), static_cast<int>(H));
+        const cv::Rect bandRegion = requestedRegion.value_or(fullRegion);
+        if (bandRegion.width <= 0 || bandRegion.height <= 0
+            || (bandRegion & fullRegion) != bandRegion) {
+            TIFFClose(tif);
+            throw std::runtime_error("Requested TIFF region is out of bounds in "
+                                     + fpath.string());
+        }
+
+        // Allocate destination if first band.
         if (points.empty()) {
-            points.create(static_cast<int>(H), static_cast<int>(W));
+            points.create(bandRegion.height, bandRegion.width);
             // Initialize as invalid
             for (int y=0;y<points.rows;++y)
                 for (int x=0;x<points.cols;++x)
                     points(y,x) = cv::Vec3f(-1.f,-1.f,-1.f);
             outW = static_cast<int>(W);
             outH = static_cast<int>(H);
+            loadedRegion = bandRegion;
         } else {
-            if (outW != static_cast<int>(W) || outH != static_cast<int>(H)) {
+            if (outW != static_cast<int>(W) || outH != static_cast<int>(H)
+                || loadedRegion != bandRegion) {
                 TIFFClose(tif);
                 throw std::runtime_error("Band size mismatch in " + fpath.string());
             }
@@ -2098,21 +2121,39 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
             const tmsize_t tileBytes = TIFFTileSize(tif);
             std::vector<uint8_t> tileBuf(static_cast<size_t>(tileBytes));
 
-            for (uint32_t y0=0; y0<H; y0+=tileH) {
-                const uint32_t dy = std::min(tileH, H - y0);
-                for (uint32_t x0=0; x0<W; x0+=tileW) {
-                    const uint32_t dx = std::min(tileW, W - x0);
+            const uint32_t firstTileY =
+                static_cast<uint32_t>(loadedRegion.y) / tileH * tileH;
+            const uint32_t firstTileX =
+                static_cast<uint32_t>(loadedRegion.x) / tileW * tileW;
+            const uint32_t regionEndY =
+                static_cast<uint32_t>(loadedRegion.y + loadedRegion.height);
+            const uint32_t regionEndX =
+                static_cast<uint32_t>(loadedRegion.x + loadedRegion.width);
+            for (uint32_t y0=firstTileY; y0<regionEndY; y0+=tileH) {
+                const uint32_t copyY0 =
+                    std::max(y0, static_cast<uint32_t>(loadedRegion.y));
+                const uint32_t copyY1 = std::min(
+                    std::min(y0 + tileH, H), regionEndY);
+                for (uint32_t x0=firstTileX; x0<regionEndX; x0+=tileW) {
+                    const uint32_t copyX0 =
+                        std::max(x0, static_cast<uint32_t>(loadedRegion.x));
+                    const uint32_t copyX1 = std::min(
+                        std::min(x0 + tileW, W), regionEndX);
                     const ttile_t tidx = TIFFComputeTile(tif, x0, y0, 0, 0);
                     tmsize_t n = TIFFReadEncodedTile(tif, tidx, tileBuf.data(), tileBytes);
                     if (n < 0) {
                         // fill with zeros on read error
                         std::fill(tileBuf.begin(), tileBuf.end(), 0);
                     }
-                    for (uint32_t ty=0; ty<dy; ++ty) {
+                    for (uint32_t sourceY=copyY0; sourceY<copyY1; ++sourceY) {
+                        const uint32_t ty = sourceY - y0;
                         const uint8_t* row = tileBuf.data() + (static_cast<size_t>(ty)*tileW*bytesPer);
-                        for (uint32_t tx=0; tx<dx; ++tx) {
+                        for (uint32_t sourceX=copyX0; sourceX<copyX1; ++sourceX) {
+                            const uint32_t tx = sourceX - x0;
                             float fv = to_float(row + static_cast<size_t>(tx)*bytesPer);
-                            cv::Vec3f& dst = points(static_cast<int>(y0+ty), static_cast<int>(x0+tx));
+                            cv::Vec3f& dst = points(
+                                static_cast<int>(sourceY) - loadedRegion.y,
+                                static_cast<int>(sourceX) - loadedRegion.x);
                             dst[channel] = fv;
                         }
                     }
@@ -2121,14 +2162,20 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
         } else {
             const tmsize_t scanBytes = TIFFScanlineSize(tif);
             std::vector<uint8_t> scanBuf(static_cast<size_t>(scanBytes));
-            for (uint32_t y=0; y<H; ++y) {
+            const uint32_t endY =
+                static_cast<uint32_t>(loadedRegion.y + loadedRegion.height);
+            const uint32_t endX =
+                static_cast<uint32_t>(loadedRegion.x + loadedRegion.width);
+            for (uint32_t y=static_cast<uint32_t>(loadedRegion.y); y<endY; ++y) {
                 if (TIFFReadScanline(tif, scanBuf.data(), y, 0) != 1) {
                     std::fill(scanBuf.begin(), scanBuf.end(), 0);
                 }
                 const uint8_t* row = scanBuf.data();
-                for (uint32_t x=0; x<W; ++x) {
+                for (uint32_t x=static_cast<uint32_t>(loadedRegion.x); x<endX; ++x) {
                     float fv = to_float(row + static_cast<size_t>(x)*bytesPer);
-                    cv::Vec3f& dst = points(static_cast<int>(y), static_cast<int>(x));
+                    cv::Vec3f& dst = points(
+                        static_cast<int>(y) - loadedRegion.y,
+                        static_cast<int>(x) - loadedRegion.x);
                     dst[channel] = fv;
                 }
             }
@@ -2219,8 +2266,14 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
                     auto invalidate = [&](uint32_t srcX, uint32_t srcY){
                         const uint32_t dstX = (scaleX == 1) ? srcX : (srcX / scaleX);
                         const uint32_t dstY = (scaleY == 1) ? srcY : (srcY / scaleY);
-                        if (dstX < static_cast<uint32_t>(W) && dstY < static_cast<uint32_t>(H)) {
-                            (*points)(static_cast<int>(dstY), static_cast<int>(dstX)) = invalidPoint;
+                        if (dstX >= static_cast<uint32_t>(loadedRegion.x)
+                            && dstX < static_cast<uint32_t>(
+                                loadedRegion.x + loadedRegion.width)
+                            && dstY >= static_cast<uint32_t>(loadedRegion.y)
+                            && dstY < static_cast<uint32_t>(
+                                loadedRegion.y + loadedRegion.height)) {
+                            (*points)(static_cast<int>(dstY) - loadedRegion.y,
+                                      static_cast<int>(dstX) - loadedRegion.x) = invalidPoint;
                         }
                     };
                     if (TIFFIsTiled(mtif)) {
@@ -2229,20 +2282,38 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
                         TIFFGetField(mtif, TIFFTAG_TILELENGTH, &tileH);
                         const tmsize_t tileBytes = TIFFTileSize(mtif);
                         std::vector<uint8_t> tileBuf(static_cast<size_t>(tileBytes));
-                        for (uint32_t y0=0; y0<mH; y0+=tileH) {
-                            const uint32_t dy = std::min(tileH, mH - y0);
-                            for (uint32_t x0=0; x0<mW; x0+=tileW) {
-                                const uint32_t dx = std::min(tileW, mW - x0);
+                        const uint32_t maskX0 =
+                            static_cast<uint32_t>(loadedRegion.x) * scaleX;
+                        const uint32_t maskY0 =
+                            static_cast<uint32_t>(loadedRegion.y) * scaleY;
+                        const uint32_t maskX1 = std::min(
+                            mW, static_cast<uint32_t>(
+                                loadedRegion.x + loadedRegion.width) * scaleX);
+                        const uint32_t maskY1 = std::min(
+                            mH, static_cast<uint32_t>(
+                                loadedRegion.y + loadedRegion.height) * scaleY);
+                        const uint32_t firstTileX = maskX0 / tileW * tileW;
+                        const uint32_t firstTileY = maskY0 / tileH * tileH;
+                        for (uint32_t y0=firstTileY; y0<maskY1; y0+=tileH) {
+                            const uint32_t copyY0 = std::max(y0, maskY0);
+                            const uint32_t copyY1 =
+                                std::min(std::min(y0 + tileH, mH), maskY1);
+                            for (uint32_t x0=firstTileX; x0<maskX1; x0+=tileW) {
+                                const uint32_t copyX0 = std::max(x0, maskX0);
+                                const uint32_t copyX1 =
+                                    std::min(std::min(x0 + tileW, mW), maskX1);
                                 const ttile_t tidx = TIFFComputeTile(mtif, x0, y0, 0, 0);
                                 tmsize_t n = TIFFReadEncodedTile(mtif, tidx, tileBuf.data(), tileBytes);
                                 if (n < 0) std::fill(tileBuf.begin(), tileBuf.end(), 0);
                                 const size_t tileRowStride = static_cast<size_t>(tileW) * pixelStride;
-                                for (uint32_t ty=0; ty<dy; ++ty) {
+                                for (uint32_t sourceY=copyY0; sourceY<copyY1; ++sourceY) {
+                                    const uint32_t ty = sourceY - y0;
                                     const uint8_t* row = tileBuf.data() + static_cast<size_t>(ty) * tileRowStride;
-                                    for (uint32_t tx=0; tx<dx; ++tx) {
+                                    for (uint32_t sourceX=copyX0; sourceX<copyX1; ++sourceX) {
+                                        const uint32_t tx = sourceX - x0;
                                         const uint8_t* px = row + static_cast<size_t>(tx) * pixelStride;
                                         if (!to_valid(px)) {
-                                            invalidate(x0 + tx, y0 + ty);
+                                            invalidate(sourceX, sourceY);
                                         }
                                     }
                                 }
@@ -2251,12 +2322,22 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
                     } else {
                         const tmsize_t scanBytes = TIFFScanlineSize(mtif);
                         std::vector<uint8_t> scanBuf(static_cast<size_t>(scanBytes));
-                        for (uint32_t y=0; y<mH; ++y) {
+                        const uint32_t maskX0 =
+                            static_cast<uint32_t>(loadedRegion.x) * scaleX;
+                        const uint32_t maskY0 =
+                            static_cast<uint32_t>(loadedRegion.y) * scaleY;
+                        const uint32_t maskX1 = std::min(
+                            mW, static_cast<uint32_t>(
+                                loadedRegion.x + loadedRegion.width) * scaleX);
+                        const uint32_t maskY1 = std::min(
+                            mH, static_cast<uint32_t>(
+                                loadedRegion.y + loadedRegion.height) * scaleY);
+                        for (uint32_t y=maskY0; y<maskY1; ++y) {
                             if (TIFFReadScanline(mtif, scanBuf.data(), y, 0) != 1) {
                                 std::fill(scanBuf.begin(), scanBuf.end(), 0);
                             }
                             const uint8_t* row = scanBuf.data();
-                            for (uint32_t x=0; x<mW; ++x) {
+                            for (uint32_t x=maskX0; x<maskX1; ++x) {
                                 const uint8_t* px = row + static_cast<size_t>(x) * pixelStride;
                                 if (!to_valid(px)) {
                                     invalidate(x, y);
@@ -2271,20 +2352,36 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
     }
 
     auto surf = std::make_unique<QuadSurface>(points.release(), scale);
-    surf->path = path;
+    if (!requestedRegion) surf->path = path;
     surf->id   = metadata["uuid"].get_string();
     surf->meta = metadata;
 
     // Register extra channels lazily (left as OpenCV-based on-demand load).
-    for (const auto& entry : std::filesystem::directory_iterator(path)) {
-        if (entry.path().extension() == ".tif") {
-            std::string filename = entry.path().stem().string();
-            if (filename != "x" && filename != "y" && filename != "z") {
-                surf->setChannel(filename, cv::Mat());
+    if (!requestedRegion) {
+        for (const auto& entry : std::filesystem::directory_iterator(path)) {
+            if (entry.path().extension() == ".tif") {
+                std::string filename = entry.path().stem().string();
+                if (filename != "x" && filename != "y" && filename != "z") {
+                    surf->setChannel(filename, cv::Mat());
+                }
             }
         }
     }
     return surf;
+}
+
+} // namespace
+
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz(
+    const std::filesystem::path &path, int flags)
+{
+    return load_quad_from_tifxyz_impl(path, std::nullopt, flags);
+}
+
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz_region(
+    const std::filesystem::path &path, const cv::Rect &region, int flags)
+{
+    return load_quad_from_tifxyz_impl(path, region, flags);
 }
 
 Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p)

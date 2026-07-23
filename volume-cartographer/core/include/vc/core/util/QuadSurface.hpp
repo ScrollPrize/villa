@@ -8,6 +8,7 @@
 #include <set>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <string>
 
@@ -287,6 +288,8 @@ public:
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000,
                   class SurfacePatchIndex* surfaceIndex = nullptr, class PointIndex* pointIndex = nullptr) override;
     cv::Size size();
+    // Raw grid dimensions without forcing a lazy surface to load its XYZ data.
+    [[nodiscard]] cv::Size gridSize() const;
     [[nodiscard]] cv::Vec2f scale() const;
     [[nodiscard]] cv::Vec3f center() const;
 
@@ -308,6 +311,12 @@ public:
 
     // True iff this surface was loaded from disk and can be safely unloaded.
     bool canUnload() const { return !path.empty(); }
+
+    // Override disconnected component column ranges for an in-memory view.
+    void setComponents(std::vector<std::pair<int, int>> components)
+    {
+        _components = std::move(components);
+    }
 
     // Drop _points and all derived caches; ensureLoaded() will re-read from
     // disk on next access. No-op for in-memory-only surfaces.
@@ -472,6 +481,8 @@ private:
 };
 
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags = 0);
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz_region(
+    const std::filesystem::path &path, const cv::Rect &region, int flags = 0);
 
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3d> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);

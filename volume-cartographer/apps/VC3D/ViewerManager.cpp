@@ -913,6 +913,30 @@ void ViewerManager::setSegmentationOverlay(SegmentationOverlayController* overla
     registerOverlay(overlay);
 }
 
+void ViewerManager::scheduleSurfacePatchIndexOverlayRefresh()
+{
+    if (!_segmentationOverlay || _surfacePatchIndexOverlayRefreshPending) {
+        return;
+    }
+
+    // Surface-overlap queries can legitimately run before an asynchronous
+    // index rebuild has installed their target surfaces. In that case the
+    // controller caches an empty result. Retry after every completed index
+    // mutation so that result does not remain empty indefinitely.
+    //
+    // Queue this instead of refreshing synchronously: an index swap can occur
+    // inside SegmentationOverlayController::endIndexRead(), while its previous
+    // overlap result is still being finalized. A direct callback there would
+    // re-enter and overwrite the controller's in-flight request state.
+    _surfacePatchIndexOverlayRefreshPending = true;
+    QTimer::singleShot(0, this, [this]() {
+        _surfacePatchIndexOverlayRefreshPending = false;
+        if (_segmentationOverlay) {
+            _segmentationOverlay->forceRefreshAllOverlays();
+        }
+    });
+}
+
 void ViewerManager::setSegmentationEditActive(bool active)
 {
     _segmentationEditActive = active;
@@ -1274,6 +1298,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     if (_surfacePatchIndex.updateSurface(surface)) {
         _indexedSurfaceIds.insert(surfId);
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Rebuilt SurfacePatchIndex entries for surface" << surfId.c_str();
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -1316,6 +1341,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Updated SurfacePatchIndex region for" << surfId.c_str()
                                 << "rows" << rowStart << "-" << rowEnd
                                 << "cols" << colStart << "-" << colEnd;
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -1367,6 +1393,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -1418,6 +1445,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
                 v->invalidateIntersect();
                 v->renderIntersections("surface index cache hit");
             });
+            scheduleSurfacePatchIndexOverlayRefresh();
             return;
         }
         // Entry went stale (surfaces reloaded, deleted, or stride changed);
@@ -1475,6 +1503,7 @@ void ViewerManager::endIndexRead()
         _indexedSurfaceIds.insert(_deferredIndexSwapIds.begin(), _deferredIndexSwapIds.end());
         _deferredIndexSwapIds.clear();
         forEachBaseViewer([](VolumeViewerBase* v) { v->renderIntersections("deferred index swap"); });
+        scheduleSurfacePatchIndexOverlayRefresh();
     }
     // Run any single-surface mutation task that was held while reads were in flight.
     startNextSurfacePatchIndexTask();
@@ -1522,6 +1551,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     // require another full rebuild. Apply just those deltas on the worker.
     if (queuedDuringRebuild.empty()) {
         forEachBaseViewer([](VolumeViewerBase* v) { v->renderIntersections(); });
+        scheduleSurfacePatchIndexOverlayRefresh();
     } else {
         forEachBaseViewer([](VolumeViewerBase* v) { v->invalidateIntersect(); });
         for (auto& task : queuedDuringRebuild) {
@@ -1633,6 +1663,7 @@ void ViewerManager::handleSurfacePatchIndexTaskFinished()
                 v->renderIntersections();
             });
         }
+        scheduleSurfacePatchIndexOverlayRefresh();
     } else if (result.type == SurfacePatchIndexTaskType::Update) {
         _indexedSurfaceIds.erase(result.id);
         _surfacePatchIndexNeedsRebuild = true;
@@ -1675,6 +1706,7 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
         const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
         if (flushed) {
             _indexedSurfaceIds.insert(surfId);
+            scheduleSurfacePatchIndexOverlayRefresh();
         }
         _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !flushed;
         return flushed;

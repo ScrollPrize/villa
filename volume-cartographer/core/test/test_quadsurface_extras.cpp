@@ -21,6 +21,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -285,6 +286,17 @@ TEST_CASE("mapped SurfacePatchIndex rebuild keeps disk-backed surfaces lazy")
     CHECK_FALSE(index.empty());
     CHECK(index.containsSurface(lazy));
     CHECK_FALSE(lazy->isLoaded());
+
+    std::unordered_set<QuadSurface*> targets{lazy.get()};
+    SurfacePatchIndex::PointQuery query;
+    query.worldPoint = cv::Vec3f(4.f, 4.f, 5.f);
+    query.tolerance = 1.f;
+    query.surfaces.includeRaw = &targets;
+    const auto hit = index.locateAny(query);
+    REQUIRE(hit);
+    CHECK(hit->surface == lazy);
+    CHECK_FALSE(lazy->isLoaded());
+
     fs::remove_all(root);
 }
 
