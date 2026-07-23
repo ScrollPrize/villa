@@ -330,6 +330,8 @@ private:
         QString outputPath;
         QString externalId;  // service job id when known, else empty (-> null)
         QStringList consoleTail;
+        qint64 nextProgressSeq = 1;
+        std::deque<QJsonObject> progressHistory;
         qint64 startedAtMs = 0;
         qint64 finishedAtMs = 0;  // 0 => null
         // Additive terminal result body (SPEC §18.4). Empty => "result": null on
@@ -350,7 +352,7 @@ private:
     const JobRecord* mostRecentJob(const QString& sourceFilter = QString()) const;
     // Looks up any job (active or recent) by id across all sources.
     const JobRecord* jobById(const QString& jobId) const;
-    void broadcastJobProgress(const JobRecord& job, const QString& phase,
+    void broadcastJobProgress(JobRecord& job, const QString& phase,
                               const QString& messageOverride = QString(),
                               std::optional<bool> success = std::nullopt);
     QJsonObject jobStatusJson(const JobRecord& job) const;

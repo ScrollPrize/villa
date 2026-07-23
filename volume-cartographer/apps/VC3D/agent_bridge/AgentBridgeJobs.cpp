@@ -289,8 +289,10 @@ QString AgentBridgeServer::beginJob(const QString& source, const QString& kind,
     job.message = label;
     job.startedAtMs = QDateTime::currentMSecsSinceEpoch();
     _activeJobs.insert(source, job);
-    if (broadcastStart)
-        broadcastJobProgress(_activeJobs.value(source), QStringLiteral("started"));
+    if (broadcastStart) {
+        auto it = _activeJobs.find(source);
+        broadcastJobProgress(it.value(), QStringLiteral("started"));
+    }
     return job.id;
 }
 
@@ -354,12 +356,13 @@ AgentBridgeServer::jobById(const QString& jobId) const
 }
 
 
-void AgentBridgeServer::broadcastJobProgress(const JobRecord& job, const QString& phase,
+void AgentBridgeServer::broadcastJobProgress(JobRecord& job, const QString& phase,
                                              const QString& messageOverride,
                                              std::optional<bool> success)
 {
     QJsonObject params;
     params["jobId"] = job.id;
+    params["seq"] = static_cast<double>(job.nextProgressSeq++);
     params["source"] = job.source;   // required in v2 (§8.3)
     params["kind"] = job.kind;
     params["phase"] = phase;
@@ -374,6 +377,9 @@ void AgentBridgeServer::broadcastJobProgress(const JobRecord& job, const QString
         params["result"] = job.resultJson.isEmpty() ? QJsonValue(QJsonValue::Null)
                                                      : QJsonValue(job.resultJson);
     }
+    job.progressHistory.push_back(params);
+    while (job.progressHistory.size() > 64)
+        job.progressHistory.pop_front();
     broadcastNotification(QStringLiteral("job.progress"), params);
 }
 
@@ -395,6 +401,10 @@ QJsonObject AgentBridgeServer::jobStatusJson(const JobRecord& job) const
     for (const QString& line : job.consoleTail)
         tail.append(line);
     o["consoleTail"] = tail;
+    QJsonArray progressHistory;
+    for (const QJsonObject& update : job.progressHistory)
+        progressHistory.append(update);
+    o["progressHistory"] = progressHistory;
     o["startedAtMs"] = static_cast<double>(job.startedAtMs);
     o["finishedAtMs"] = job.finishedAtMs == 0
                             ? QJsonValue(QJsonValue::Null)

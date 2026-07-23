@@ -143,7 +143,9 @@ async def vc3d_enable_editing(enabled: bool) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_save_segment(wait: bool = True) -> dict[str, Any]:
+async def vc3d_save_segment(
+    wait: bool = True, ctx: Optional[Context] = None
+) -> dict[str, Any]:
     """Force the active segment's pending autosave to disk now.
 
     Segment edits are normally flushed by a periodic autosave; this forces that
@@ -159,7 +161,7 @@ async def vc3d_save_segment(wait: bool = True) -> dict[str, Any]:
     job_id = result.get("jobId") if isinstance(result, dict) else None
     if not job_id:
         return result  # idle: nothing to flush, nothing to wait on
-    return await _wait_for_job(job_id, wait, result)
+    return await _wait_for_job(job_id, wait, result, ctx)
 
 
 @mcp.tool()

@@ -9,6 +9,7 @@ module registers its ``@mcp.tool()`` functions on, the bridge-client plumbing
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, Optional
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -95,7 +96,7 @@ def _is_placeholder_error(exc: Exception) -> bool:
 
 
 POLL_INTERVAL_S = 1.0
-PROGRESS_REPORT_TIMEOUT_S = 10.0
+PROGRESS_REPORT_TIMEOUT_S = 1.0
 
 
 def _new_tail_lines(prev: list[str], cur: list[str]) -> list[str]:
@@ -112,19 +113,29 @@ def _new_tail_lines(prev: list[str], cur: list[str]) -> list[str]:
     return cur
 
 
-async def _report_progress(ctx: Optional[Context], seq: int, message: str) -> None:
-    """Best-effort MCP progress report: bounded, and never fails the tool."""
+async def _report_progress(ctx: Optional[Context], seq: int, message: str) -> bool:
+    """Report progress once, returning false when the sink is unavailable."""
     if ctx is None:
-        return
+        return False
     try:
         await asyncio.wait_for(
             ctx.report_progress(progress=seq, total=None, message=message),
             timeout=PROGRESS_REPORT_TIMEOUT_S,
         )
+        return True
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - progress is observational only
-        pass
+        return False
+
+
+def _progress_message(update: dict[str, Any]) -> str:
+    """Render output as text and terminal updates as compact structured data."""
+    if update.get("phase") != "finished":
+        return str(update.get("message") or update.get("phase") or "progress")
+    fields = ("phase", "success", "message", "outputPath", "result")
+    completion = {name: update[name] for name in fields if name in update}
+    return json.dumps(completion, separators=(",", ":"), sort_keys=True)
 
 
 async def _wait_for_job(
@@ -135,11 +146,11 @@ async def _wait_for_job(
 ) -> dict[str, Any]:
     """Shared `wait: true` handling for the long-running tools.
 
-    Polls `job.status` (SPEC 3.17) once a second until the job is terminal,
-    forwarding new consoleTail lines as best-effort MCP progress along the
-    way, then returns the terminal status merged into `initial_result`. On
-    the 30-minute cap, returns `initial_result` plus `waitTimedOut: true`. A
-    bridge disconnect makes the next poll raise, failing the call promptly.
+    Subscribes before reading status so buffered and live updates can be merged
+    by sequence without a lost-wakeup window. A periodic status read remains as
+    a best-effort delivery fallback and supplies the authoritative terminal
+    result. Progress reporting is observational: one failing or stalled MCP
+    sink disables it for this wait, while task cancellation still propagates.
     """
     if not wait:
         return initial_result
@@ -147,16 +158,61 @@ async def _wait_for_job(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + DEFAULT_WAIT_TIMEOUT_S
     seen_tail: list[str] = []
-    seq = 0
-    while True:
-        status = await _call("job.status", {"jobId": job_id})
-        tail = status.get("consoleTail") or []
-        for line in _new_tail_lines(seen_tail, tail):
-            seq += 1
-            await _report_progress(ctx, seq, line)
-        seen_tail = list(tail)
-        if status.get("state") in ("succeeded", "failed"):
-            return {**initial_result, **status}
-        if loop.time() >= deadline:
-            return {**initial_result, "waitTimedOut": True}
-        await asyncio.sleep(POLL_INTERVAL_S)
+    last_seq = 0
+    local_seq = 0
+    reporting = ctx is not None
+
+    async def forward(update: dict[str, Any]) -> None:
+        nonlocal last_seq, local_seq, reporting
+        raw_seq = update.get("seq")
+        update_seq = int(raw_seq) if isinstance(raw_seq, (int, float)) else 0
+        if update_seq and update_seq <= last_seq:
+            return
+        if update_seq:
+            last_seq = update_seq
+            local_seq = max(local_seq, update_seq)
+        else:
+            local_seq += 1
+        if reporting:
+            reporting = await _report_progress(
+                ctx, local_seq, _progress_message(update)
+            )
+
+    client = _get_client()
+    async with client.subscribe_job_progress(job_id) as updates:
+        while True:
+            status = await _call("job.status", {"jobId": job_id})
+            history = status.get("progressHistory")
+            if isinstance(history, list):
+                for update in history:
+                    if isinstance(update, dict):
+                        await forward(update)
+            else:
+                # Compatibility with bridge versions that predate sequenced
+                # progress history.
+                tail = status.get("consoleTail") or []
+                for line in _new_tail_lines(seen_tail, tail):
+                    await forward({"phase": "output", "message": line})
+                seen_tail = list(tail)
+
+            if status.get("state") in ("succeeded", "failed"):
+                return {**initial_result, **status}
+            if loop.time() >= deadline:
+                return {**initial_result, "waitTimedOut": True}
+
+            next_status = min(loop.time() + POLL_INTERVAL_S, deadline)
+            while True:
+                remaining = next_status - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    update = await asyncio.wait_for(
+                        updates.get(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    break
+                await forward(update)
+                if update.get("phase") == "finished":
+                    break
+            # Re-read authoritative status after the fallback interval or a
+            # terminal notification.

@@ -23,8 +23,9 @@ import asyncio
 import json
 import os
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, AsyncIterator
 
 HANDSHAKE_RE = re.compile(
     r"^VC3D-AGENT-BRIDGE:\s*listening\s+name=(?P<name>\S+)\s+path=(?P<path>.+)$"
@@ -35,6 +36,7 @@ HANDSHAKE_RE = re.compile(
 # one JSON file per process ("<pid>.json") holding {pid, name, path, startedAt},
 # with dead-PID entries reaped on scan. See AgentBridgeServer::writeRegistryFile.
 REGISTRY_DIR = os.path.join(os.path.expanduser("~"), ".vc3d", "agent_bridge")
+PROGRESS_QUEUE_SIZE = 64
 
 
 def _pid_alive(pid: int) -> bool:
@@ -185,6 +187,7 @@ class BridgeClient:
         self._write_lock = asyncio.Lock()
         self._next_id = 1
         self._closed = False
+        self._job_progress: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
 
     @staticmethod
     def resolve_socket_path(configured: str) -> str:
@@ -255,6 +258,23 @@ class BridgeClient:
 
     async def connect(self) -> None:
         await self._ensure_conn()
+
+    @asynccontextmanager
+    async def subscribe_job_progress(
+        self, job_id: str
+    ) -> AsyncIterator[asyncio.Queue[dict[str, Any]]]:
+        """Yield a bounded queue of best-effort progress for one job."""
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=PROGRESS_QUEUE_SIZE
+        )
+        subscribers = self._job_progress.setdefault(job_id, set())
+        subscribers.add(queue)
+        try:
+            yield queue
+        finally:
+            subscribers.discard(queue)
+            if not subscribers:
+                self._job_progress.pop(job_id, None)
 
     async def close(self) -> None:
         self._closed = True
@@ -349,8 +369,18 @@ class BridgeClient:
             msg = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return  # malformed line from the peer; nothing sane to do with it
-        if not isinstance(msg, dict) or msg.get("id") is None:
-            return  # notification (e.g. job.progress): unused, ignore
+        if not isinstance(msg, dict):
+            return
+        if msg.get("id") is None:
+            if msg.get("method") == "job.progress":
+                params = msg.get("params")
+                job_id = params.get("jobId") if isinstance(params, dict) else None
+                if isinstance(job_id, str):
+                    for queue in tuple(self._job_progress.get(job_id, ())):
+                        if queue.full():
+                            queue.get_nowait()
+                        queue.put_nowait(params)
+            return
         fut = conn.pending.pop(msg["id"], None)
         if fut is None or fut.done():
             return
