@@ -68,13 +68,7 @@
 
 QJsonObject AgentBridgeServer::handleWrapAnnotationSetMode(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-
-    if (!p.contains("enabled") || !p.value("enabled").isBool()) {
-        QJsonObject data;
-        data["param"] = "enabled";
-        throw AgentBridgeError{-32602, "enabled is required and must be a boolean", data};
-    }
+    const QJsonObject p = params.toObject();
     const bool enabled = p.value("enabled").toBool();
 
     WrapAnnotationWidget* widget = _window ? _window->_wrapAnnotationWidget : nullptr;
@@ -96,11 +90,7 @@ QJsonObject AgentBridgeServer::handleWrapAnnotationSetMode(const QJsonValue& par
 
 QJsonObject AgentBridgeServer::handleWrapAnnotationCommit(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    if (p.contains("viewer") && !p.value("viewer").isNull() &&
-        !p.value("viewer").isString()) {
-        throwParamError("viewer", QStringLiteral("must be a string or null"));
-    }
+    const QJsonObject p = params.toObject();
 
     // Precondition: same-wrap mode must be enabled, mirroring the shift+E key
     // handler's guard (CWindow::keyPressEvent). commit is otherwise a no-op.
@@ -158,7 +148,7 @@ QJsonObject AgentBridgeServer::handleWrapAnnotationCommit(const QJsonValue& para
 
 QJsonObject AgentBridgeServer::handleWrapAnnotationUndo(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
 
     bool undone = false;
 
