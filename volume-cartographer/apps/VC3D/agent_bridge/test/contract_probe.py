@@ -173,11 +173,17 @@ def probe_successful_calls(client: Any, contract: dict[str, Any]) -> ProbeReport
         return report
 
     for method, method_contract in contract["methods"].items():
+        success_probe = method_contract.get("successProbe", {})
+        if success_probe is False:
+            continue
         report.attempted += 1
         try:
             client.call(
                 method,
-                _required_params(method_contract["params"]),
+                success_probe.get(
+                    "params",
+                    _required_params(method_contract["params"]),
+                ),
                 timeout=10.0,
             )
         except Exception as error:  # noqa: BLE001
@@ -191,6 +197,11 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
     report = ProbeReport()
     for method, method_contract in contract["methods"].items():
         params_schema = method_contract["params"]
+        for name in params_schema.get("required", []):
+            params = _required_params(params_schema)
+            params.pop(name)
+            _record_expected_param_error(report, client, method, params, name)
+
         for name, schema in params_schema["properties"].items():
             params = _required_params(params_schema)
             params[name] = _invalid_value(schema)
@@ -231,6 +242,22 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
                     params,
                     ".".join(path),
                 )
+
+        for path, schema in _walk(params_schema, "x-invalid"):
+            if not path:
+                continue
+            params = _params_with_value(
+                params_schema,
+                path,
+                schema["x-invalid"],
+            )
+            _record_expected_param_error(
+                report,
+                client,
+                method,
+                params,
+                ".".join(path),
+            )
     return report
 
 

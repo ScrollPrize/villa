@@ -1,0 +1,323 @@
+{
+  "contractVersion": 1,
+  "domain": "segments",
+  "methods": {
+    "segments.list": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "onlyLoaded": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "errorProbes": [
+        {
+          "name": "no volume package",
+          "state": "no-project",
+          "params": {},
+          "code": -32000
+        }
+      ],
+      "mcp": {
+        "tool": "vc3d_list_segments",
+        "paramRenames": {
+          "onlyLoaded": "only_loaded"
+        }
+      }
+    },
+    "segments.activate": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32004,
+        -32007,
+        -32005
+      ],
+      "successProbe": false,
+      "errorProbes": [
+        {
+          "name": "unknown segment",
+          "state": "loaded",
+          "params": {
+            "segmentId": "__missing__"
+          },
+          "code": -32007
+        },
+        {
+          "name": "no volume package",
+          "state": "no-project",
+          "params": {
+            "segmentId": "__missing__"
+          },
+          "code": -32000
+        }
+      ],
+      "unprobedErrors": [
+        -32010,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_activate_segment",
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "extraParams": {
+          "auto_fetch": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      }
+    },
+    "segments.fetch": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32004,
+        -32007
+      ],
+      "successProbe": false,
+      "errorProbes": [
+        {
+          "name": "unknown segment",
+          "state": "loaded",
+          "params": {
+            "segmentId": "__missing__"
+          },
+          "code": -32007
+        },
+        {
+          "name": "no volume package",
+          "state": "no-project",
+          "params": {
+            "segmentId": "__missing__"
+          },
+          "code": -32000
+        }
+      ],
+      "unprobedErrors": [
+        -32010,
+        -32004
+      ],
+      "mcp": {
+        "tool": "vc3d_fetch_segment",
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "extraParams": {
+          "wait": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      }
+    },
+    "segments.delete": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          },
+          "confirm": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "segmentId"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32007,
+        -32010
+      ],
+      "successProbe": false,
+      "errorProbes": [
+        {
+          "name": "confirmation required",
+          "state": "loaded",
+          "params": {
+            "segmentId": "__missing__"
+          },
+          "code": -32602
+        },
+        {
+          "name": "unknown segment",
+          "state": "loaded",
+          "params": {
+            "segmentId": "__missing__",
+            "confirm": true
+          },
+          "code": -32007
+        },
+        {
+          "name": "no volume package",
+          "state": "no-project",
+          "params": {
+            "segmentId": "__missing__",
+            "confirm": true
+          },
+          "code": -32000
+        }
+      ],
+      "unprobedErrors": [
+        -32004,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_delete_segment",
+        "paramRenames": {
+          "segmentId": "segment_id"
+        }
+      }
+    },
+    "segments.rename": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          },
+          "newName": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]+$",
+            "x-invalid": "bad/name"
+          }
+        },
+        "required": [
+          "segmentId",
+          "newName"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32007,
+        -32010
+      ],
+      "successProbe": false,
+      "errorProbes": [
+        {
+          "name": "unknown segment",
+          "state": "loaded",
+          "params": {
+            "segmentId": "__missing__",
+            "newName": "renamed"
+          },
+          "code": -32007
+        },
+        {
+          "name": "no volume package",
+          "state": "no-project",
+          "params": {
+            "segmentId": "__missing__",
+            "newName": "renamed"
+          },
+          "code": -32000
+        }
+      ],
+      "unprobedErrors": [
+        -32004,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_rename_segment",
+        "paramRenames": {
+          "segmentId": "segment_id",
+          "newName": "new_name"
+        }
+      }
+    },
+    "segments.review": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "onlyLoaded": {
+            "type": "boolean",
+            "default": false
+          },
+          "filter": {
+            "type": "object",
+            "properties": {
+              "unreviewed": {
+                "type": "boolean"
+              },
+              "approved": {
+                "type": "boolean"
+              },
+              "defective": {
+                "type": "boolean"
+              },
+              "hideDefective": {
+                "type": "boolean"
+              },
+              "reviewed": {
+                "type": "boolean"
+              },
+              "inspect": {
+                "type": "boolean"
+              },
+              "partialReview": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "errorProbes": [
+        {
+          "name": "no volume package",
+          "state": "no-project",
+          "params": {},
+          "code": -32000
+        }
+      ],
+      "mcp": {
+        "tool": "vc3d_review_segments",
+        "paramRenames": {
+          "onlyLoaded": "only_loaded"
+        }
+      }
+    }
+  }
+}

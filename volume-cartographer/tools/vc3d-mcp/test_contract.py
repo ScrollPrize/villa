@@ -97,6 +97,11 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
                     if contract["params"]["properties"]:
                         self.assertIn(-32602, contract["errors"])
                     self._assert_extensions(contract["params"])
+                    success_probe = contract.get("successProbe", {})
+                    self.assertTrue(
+                        success_probe is False
+                        or isinstance(success_probe.get("params", {}), dict)
+                    )
 
                     probes = contract.get("errorProbes", [])
                     probed_errors = {probe["code"] for probe in probes}
@@ -125,12 +130,21 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
                     tools.add(tool)
 
                     properties = contract["params"]["properties"]
-                    renames = contract["mcp"].get("paramRenames", {})
+                    mcp_contract = contract["mcp"]
+                    renames = mcp_contract.get("paramRenames", {})
                     self.assertLessEqual(renames.keys(), properties.keys())
                     self.assertEqual(
                         len(renames.values()),
                         len(set(renames.values())),
                     )
+                    extra_params = mcp_contract.get("extraParams", {})
+                    self.assertIsInstance(extra_params, dict)
+                    self.assertFalse(
+                        set(extra_params)
+                        & {renames.get(name, name) for name in properties}
+                    )
+                    for schema in extra_params.values():
+                        self._assert_extensions(schema)
 
     def _assert_extensions(self, schema: dict[str, Any]) -> None:
         if "x-clamp" in schema:
@@ -180,6 +194,13 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
             actual = registered[tool_name]
             expected = contract["params"]
             renames = contract["mcp"].get("paramRenames", {})
+            expected = {
+                **expected,
+                "properties": {
+                    **expected["properties"],
+                    **contract["mcp"].get("extraParams", {}),
+                },
+            }
             with self.subTest(method=method, tool=tool_name):
                 self._assert_schema_matches(expected, actual, actual, renames)
 

@@ -4,12 +4,25 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from typing_extensions import TypedDict
+
 from ..core import mcp, _call, _strip_none
+
+
+class _ReviewFilter(TypedDict, total=False):
+    unreviewed: bool
+    approved: bool
+    defective: bool
+    hideDefective: bool
+    reviewed: bool
+    inspect: bool
+    partialReview: bool
 
 
 @mcp.tool()
 async def vc3d_review_segments(
-    only_loaded: Optional[bool] = None, filter: Optional[dict] = None
+    only_loaded: bool = False,
+    filter: Optional[_ReviewFilter] = None,
 ) -> dict[str, Any]:
     """List segments together with their review-tag state, with optional
     server-side filtering (the programmatic equivalent of the surface panel's
