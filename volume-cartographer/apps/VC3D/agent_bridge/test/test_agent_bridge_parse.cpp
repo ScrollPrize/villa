@@ -246,6 +246,14 @@ int main()
         .name = QStringLiteral("test.method"),
         .params = {factor, mode},
         .errors = {-32602, -32000},
+        .mcp = {
+            .tool = QStringLiteral("test_tool"),
+            .paramRenames = {{
+                QStringLiteral("factor"),
+                QStringLiteral("scale"),
+            }},
+            .extraParams = {QStringLiteral("wait")},
+        },
     };
     expectNoThrow("method<-valid", [&] {
         method.validate(QJsonObject{{"factor", 2.5}, {"mode", "max"}});
@@ -297,9 +305,34 @@ int main()
         CHECK(properties.value("mode").toObject().value("enum").toArray() ==
               QJsonArray({"max", "mean"}));
         CHECK(description.value("errors").toArray() == QJsonArray({-32602, -32000}));
+        const QJsonObject mcp = description.value("mcp").toObject();
+        CHECK(mcp.value("tool") == "test_tool");
+        CHECK(mcp.value("paramRenames").toObject().value("factor") == "scale");
+        CHECK(mcp.value("extraParams").toArray() == QJsonArray{"wait"});
         CHECK(nestedArray.describe().value("items").toObject()
                   .value("items").toObject().value("type") == "number");
     }
+    const AgentBridgeMethod unknownMcpRename{
+        .name = QStringLiteral("bad.mcp.rename"),
+        .params = {factor},
+        .mcp = {
+            .tool = QStringLiteral("bad_tool"),
+            .paramRenames = {{
+                QStringLiteral("missing"),
+                QStringLiteral("renamed"),
+            }},
+        },
+    };
+    CHECK(unknownMcpRename.definitionError().contains("unknown parameter"));
+    const AgentBridgeMethod collidingMcpExtra{
+        .name = QStringLiteral("bad.mcp.extra"),
+        .params = {factor},
+        .mcp = {
+            .tool = QStringLiteral("bad_tool"),
+            .extraParams = {QStringLiteral("factor")},
+        },
+    };
+    CHECK(collidingMcpExtra.definitionError().contains("duplicate MCP parameter"));
 
     CHECK(volumePointInBounds(cv::Vec3f{0.0f, 1.0f, 2.0f}, {3, 4, 5}));
     CHECK(volumePointInBounds(cv::Vec3f{2.9f, 3.9f, 4.9f}, {3, 4, 5}));

@@ -59,6 +59,10 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::optionalBoolean(QStringLiteral("forceRender"), true),
             },
             .errors = {-32602, -32003, -32002, -32001},
+            .mcp = {
+                .tool = QStringLiteral("vc3d_center_viewer"),
+                .snakeCaseParams = true,
+            },
         },
         [this](const QJsonValue& p) { return handleViewerCenterOnPoint(p); });
 
@@ -70,6 +74,7 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::requiredPositiveNumber(QStringLiteral("factor")),
             },
             .errors = {-32602, -32002},
+            .mcp = {.tool = QStringLiteral("vc3d_zoom_viewer")},
         },
         [this](const QJsonValue& p) { return handleViewerZoom(p); });
 
@@ -84,6 +89,7 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::optionalBoolean(QStringLiteral("relative"), true),
             },
             .errors = {-32602, -32002, -32000},
+            .mcp = {.tool = QStringLiteral("vc3d_rotate_viewer")},
         },
         [this](const QJsonValue& p) { return handleViewerRotate(p); });
 
@@ -92,6 +98,7 @@ void AgentBridgeServer::registerViewerHandlers()
             .name = QStringLiteral("viewer.set_axis_aligned_slices"),
             .params = {Params::requiredBoolean(QStringLiteral("enabled"))},
             .errors = {-32602, -32000},
+            .mcp = {.tool = QStringLiteral("vc3d_set_axis_aligned_slices")},
         },
         [this](const QJsonValue& p) { return handleViewerSetAxisAlignedSlices(p); });
 
@@ -99,6 +106,7 @@ void AgentBridgeServer::registerViewerHandlers()
         {
             .name = QStringLiteral("viewer.get_render_settings"),
             .errors = {-32010},
+            .mcp = {.tool = QStringLiteral("vc3d_get_render_settings")},
         },
         [this](const QJsonValue& p) { return handleViewerGetRenderSettings(p); });
 
@@ -125,6 +133,10 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::optionalNumber(QStringLiteral("zScrollSensitivity")),
             },
             .errors = {-32602, -32010},
+            .mcp = {
+                .tool = QStringLiteral("vc3d_set_render_settings"),
+                .snakeCaseParams = true,
+            },
         },
         [this](const QJsonValue& p) { return handleViewerSetRenderSettings(p); });
 
@@ -132,6 +144,7 @@ void AgentBridgeServer::registerViewerHandlers()
         {
             .name = QStringLiteral("viewer.get_overlay"),
             .errors = {-32010},
+            .mcp = {.tool = QStringLiteral("vc3d_get_overlay")},
         },
         [this](const QJsonValue& p) { return handleViewerGetOverlay(p); });
 
@@ -164,6 +177,10 @@ void AgentBridgeServer::registerViewerHandlers()
                     }),
             },
             .errors = {-32602, -32010, -32007, -32000},
+            .mcp = {
+                .tool = QStringLiteral("vc3d_set_overlay"),
+                .snakeCaseParams = true,
+            },
         },
         [this](const QJsonValue& p) { return handleViewerSetOverlay(p); });
 
@@ -171,6 +188,7 @@ void AgentBridgeServer::registerViewerHandlers()
         {
             .name = QStringLiteral("viewer.list_overlay_volumes"),
             .errors = {-32010, -32000},
+            .mcp = {.tool = QStringLiteral("vc3d_list_overlay_volumes")},
         },
         [this](const QJsonValue& p) { return handleViewerListOverlayVolumes(p); });
 
@@ -184,6 +202,10 @@ void AgentBridgeServer::registerViewerHandlers()
                 optionalViewer(),
             },
             .errors = {-32602, -32010, -32009, -32002},
+            .mcp = {
+                .tool = QStringLiteral("vc3d_set_intersects"),
+                .snakeCaseParams = true,
+            },
         },
         [this](const QJsonValue& p) { return handleViewerSetIntersects(p); });
 }

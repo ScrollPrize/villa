@@ -45,6 +45,7 @@ from contract_probe import (  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_VC3D_BIN = REPO_ROOT / "build" / "ci-release-gcc" / "bin" / "VC3D"
 CONTRACT_DIR = Path(__file__).resolve().parents[1] / "schema"
+DESCRIPTION_SNAPSHOT = Path(__file__).resolve().parents[1] / "rpc_description.json"
 
 OFFSCREEN_ENV = {"QT_QPA_PLATFORM": "offscreen"}
 
@@ -146,7 +147,11 @@ def expect_param_error(client: BridgeClient, method: str, params: object,
         return False, f"unexpected {type(e).__name__}: {e}"
 
 
-def check_rpc_describe(client: BridgeClient, results: Results) -> None:
+def check_rpc_describe(
+    client: BridgeClient,
+    results: Results,
+    update_snapshot: bool = False,
+) -> None:
     expected = {
         "viewer.center_on_point",
         "viewer.zoom",
@@ -203,6 +208,26 @@ def check_rpc_describe(client: BridgeClient, results: Results) -> None:
     except Exception as error:  # noqa: BLE001
         results.record(
             "rpc_describe_viewer",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+    try:
+        description, _ = client.call("rpc.describe", {}, timeout=10.0)
+        snapshot = {"methods": description.get("methods", {})}
+        rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
+        if update_snapshot:
+            DESCRIPTION_SNAPSHOT.write_text(rendered, encoding="utf-8")
+        expected = DESCRIPTION_SNAPSHOT.read_text(encoding="utf-8")
+        results.record(
+            "rpc_description_snapshot",
+            rendered == expected,
+            f"methods={len(snapshot['methods'])}"
+            + (" snapshot updated" if update_snapshot else ""),
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "rpc_description_snapshot",
             False,
             f"{type(error).__name__}: {error}",
         )
@@ -620,6 +645,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--vc3d", default=str(DEFAULT_VC3D_BIN),
                     help="path to the VC3D binary")
+    ap.add_argument(
+        "--update-description-snapshot",
+        action="store_true",
+        help="rewrite the checked-in rpc.describe snapshot from the live binary",
+    )
     args = ap.parse_args()
 
     binary = args.vc3d
@@ -656,7 +686,11 @@ def main() -> int:
             log(f"handshake: name={name} path={sock_path}")
             client = BridgeClient(sock_path, connect_timeout=10.0)
 
-            check_rpc_describe(client, results)
+            check_rpc_describe(
+                client,
+                results,
+                update_snapshot=args.update_description_snapshot,
+            )
             check_viewer_normalization(client, results)
             contracts = [
                 load_contract(path)

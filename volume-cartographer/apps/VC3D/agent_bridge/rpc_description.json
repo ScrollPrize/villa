@@ -1,0 +1,393 @@
+{
+  "methods": {
+    "rpc.describe": {
+      "errors": [
+        -32602
+      ],
+      "params": {
+        "properties": {
+          "prefix": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "viewer.center_on_point": {
+      "errors": [
+        -32602,
+        -32003,
+        -32002,
+        -32001
+      ],
+      "mcp": {
+        "paramRenames": {
+          "forceRender": "force_render"
+        },
+        "tool": "vc3d_center_viewer"
+      },
+      "params": {
+        "properties": {
+          "forceRender": {
+            "default": true,
+            "type": "boolean"
+          },
+          "point": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "z"
+            ],
+            "type": "object"
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "point"
+        ],
+        "type": "object"
+      }
+    },
+    "viewer.get_overlay": {
+      "errors": [
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_get_overlay"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "viewer.get_render_settings": {
+      "errors": [
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_get_render_settings"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "viewer.list_overlay_volumes": {
+      "errors": [
+        -32010,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_list_overlay_volumes"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "viewer.rotate": {
+      "errors": [
+        -32602,
+        -32002,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_rotate_viewer"
+      },
+      "params": {
+        "properties": {
+          "degrees": {
+            "type": "number"
+          },
+          "plane": {
+            "type": "string"
+          },
+          "relative": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "plane",
+          "degrees"
+        ],
+        "type": "object"
+      }
+    },
+    "viewer.set_axis_aligned_slices": {
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_set_axis_aligned_slices"
+      },
+      "params": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      }
+    },
+    "viewer.set_intersects": {
+      "errors": [
+        -32602,
+        -32010,
+        -32009,
+        -32002
+      ],
+      "mcp": {
+        "paramRenames": {
+          "surfaceIds": "surface_ids"
+        },
+        "tool": "vc3d_set_intersects"
+      },
+      "params": {
+        "properties": {
+          "surfaceIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "surfaceIds"
+        ],
+        "type": "object"
+      }
+    },
+    "viewer.set_overlay": {
+      "errors": [
+        -32602,
+        -32010,
+        -32007,
+        -32000
+      ],
+      "mcp": {
+        "paramRenames": {
+          "maxDisplayedResolution": "max_displayed_resolution",
+          "volumeId": "volume_id"
+        },
+        "tool": "vc3d_set_overlay"
+      },
+      "params": {
+        "properties": {
+          "clear": {
+            "type": "boolean"
+          },
+          "colormap": {
+            "enum": [
+              "",
+              "fire",
+              "viridis",
+              "magma",
+              "red",
+              "green",
+              "blue",
+              "cyan",
+              "magenta",
+              "glasbey_black0"
+            ],
+            "type": "string"
+          },
+          "composite": {
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "layersBehind": {
+                "type": "integer"
+              },
+              "layersFront": {
+                "type": "integer"
+              },
+              "method": {
+                "enum": [
+                  "max",
+                  "mean",
+                  "min"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "maxDisplayedResolution": {
+            "type": "integer"
+          },
+          "opacity": {
+            "type": "number"
+          },
+          "threshold": {
+            "type": "number"
+          },
+          "volumeId": {
+            "type": "string"
+          },
+          "window": {
+            "properties": {
+              "high": {
+                "type": "number"
+              },
+              "low": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "low",
+              "high"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "viewer.set_render_settings": {
+      "errors": [
+        -32602,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "highlightedSurfaceIds": "highlighted_surface_ids",
+          "intersectionMaxSurfaces": "intersection_max_surfaces",
+          "intersectionOpacity": "intersection_opacity",
+          "intersectionThickness": "intersection_thickness",
+          "normalArrowLengthScale": "normal_arrow_length_scale",
+          "normalMaxArrows": "normal_max_arrows",
+          "overlayOpacity": "overlay_opacity",
+          "planeIntersectionLinesVisible": "plane_intersection_lines_visible",
+          "samplingStride": "sampling_stride",
+          "segmentationCursorMirroring": "segmentation_cursor_mirroring",
+          "showDirectionHints": "show_direction_hints",
+          "showSurfaceNormals": "show_surface_normals",
+          "surfaceOverlayEnabled": "surface_overlay_enabled",
+          "volumeWindow": "volume_window",
+          "zScrollSensitivity": "z_scroll_sensitivity"
+        },
+        "tool": "vc3d_set_render_settings"
+      },
+      "params": {
+        "properties": {
+          "highlightedSurfaceIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "intersectionMaxSurfaces": {
+            "type": "integer"
+          },
+          "intersectionOpacity": {
+            "type": "number"
+          },
+          "intersectionThickness": {
+            "type": "number"
+          },
+          "normalArrowLengthScale": {
+            "type": "number"
+          },
+          "normalMaxArrows": {
+            "type": "integer"
+          },
+          "overlayOpacity": {
+            "type": "number"
+          },
+          "planeIntersectionLinesVisible": {
+            "type": "boolean"
+          },
+          "samplingStride": {
+            "type": "integer"
+          },
+          "segmentationCursorMirroring": {
+            "type": "boolean"
+          },
+          "showDirectionHints": {
+            "type": "boolean"
+          },
+          "showSurfaceNormals": {
+            "type": "boolean"
+          },
+          "surfaceOverlayEnabled": {
+            "type": "boolean"
+          },
+          "volumeWindow": {
+            "properties": {
+              "high": {
+                "type": "number"
+              },
+              "low": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "low",
+              "high"
+            ],
+            "type": "object"
+          },
+          "zScrollSensitivity": {
+            "type": "number"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "viewer.zoom": {
+      "errors": [
+        -32602,
+        -32002
+      ],
+      "mcp": {
+        "tool": "vc3d_zoom_viewer"
+      },
+      "params": {
+        "properties": {
+          "factor": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "factor"
+        ],
+        "type": "object"
+      }
+    }
+  }
+}

@@ -9,6 +9,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QMap>
 #include <QSet>
 #include <QString>
 #include <QStringList>
@@ -357,11 +358,58 @@ inline AgentBridgeParam requiredArray(
 
 }  // namespace AgentBridgeParams
 
+struct AgentBridgeMcp
+{
+    QString tool;
+    bool snakeCaseParams{false};
+    QMap<QString, QString> paramRenames;
+    QStringList extraParams;
+
+    QString mappedParamName(const QString& wireName) const
+    {
+        const auto rename = paramRenames.constFind(wireName);
+        if (rename != paramRenames.cend())
+            return *rename;
+        if (!snakeCaseParams)
+            return wireName;
+
+        QString result;
+        for (const QChar character : wireName) {
+            if (character.isUpper()) {
+                if (!result.isEmpty())
+                    result.append(QLatin1Char('_'));
+                result.append(character.toLower());
+            } else {
+                result.append(character);
+            }
+        }
+        return result;
+    }
+
+    QJsonObject describe(const std::vector<AgentBridgeParam>& params) const
+    {
+        QJsonObject result;
+        result["tool"] = tool;
+        QJsonObject renames;
+        for (const AgentBridgeParam& param : params) {
+            const QString mappedName = mappedParamName(param.name);
+            if (mappedName != param.name)
+                renames[param.name] = mappedName;
+        }
+        if (!renames.isEmpty())
+            result["paramRenames"] = renames;
+        if (!extraParams.isEmpty())
+            result["extraParams"] = QJsonArray::fromStringList(extraParams);
+        return result;
+    }
+};
+
 struct AgentBridgeMethod
 {
     QString name;
     std::vector<AgentBridgeParam> params;
     std::vector<int> errors;
+    AgentBridgeMcp mcp;
 
     void validate(const QJsonValue& value) const
     {
@@ -407,6 +455,36 @@ struct AgentBridgeMethod
                 return QStringLiteral("%1 has duplicate error code %2").arg(name).arg(error);
             errorCodes.insert(error);
         }
+
+        if (mcp.tool.isEmpty()) {
+            if (mcp.snakeCaseParams ||
+                !mcp.paramRenames.isEmpty() ||
+                !mcp.extraParams.isEmpty()) {
+                return QStringLiteral("%1 has MCP parameters without an MCP tool").arg(name);
+            }
+            return {};
+        }
+
+        QSet<QString> toolParams;
+        for (const AgentBridgeParam& param : params) {
+            const QString toolParam = mcp.mappedParamName(param.name);
+            if (toolParam.isEmpty())
+                return QStringLiteral("%1 maps %2 to an empty MCP parameter").arg(name, param.name);
+            if (toolParams.contains(toolParam))
+                return QStringLiteral("%1 has duplicate MCP parameter %2").arg(name, toolParam);
+            toolParams.insert(toolParam);
+        }
+        for (auto it = mcp.paramRenames.cbegin(); it != mcp.paramRenames.cend(); ++it) {
+            if (!names.contains(it.key()))
+                return QStringLiteral("%1 renames unknown parameter %2").arg(name, it.key());
+        }
+        for (const QString& extra : mcp.extraParams) {
+            if (extra.isEmpty())
+                return QStringLiteral("%1 has an empty extra MCP parameter").arg(name);
+            if (toolParams.contains(extra))
+                return QStringLiteral("%1 has duplicate MCP parameter %2").arg(name, extra);
+            toolParams.insert(extra);
+        }
         return {};
     }
 
@@ -433,6 +511,8 @@ struct AgentBridgeMethod
         QJsonObject result;
         result["params"] = paramsSchema;
         result["errors"] = errorCodes;
+        if (!mcp.tool.isEmpty())
+            result["mcp"] = mcp.describe(params);
         return result;
     }
 };

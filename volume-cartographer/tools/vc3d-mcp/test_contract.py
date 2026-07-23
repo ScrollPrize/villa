@@ -14,6 +14,7 @@ VC_ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_DIR = VC_ROOT / "apps/VC3D/agent_bridge/schema"
 SPEC_PATH = VC_ROOT / "apps/VC3D/agent_bridge/SPEC.md"
 SERVER_PATH = VC_ROOT / "apps/VC3D/agent_bridge/AgentBridgeServer.cpp"
+DESCRIPTION_PATH = VC_ROOT / "apps/VC3D/agent_bridge/rpc_description.json"
 
 
 def _load_contracts() -> list[dict[str, Any]]:
@@ -58,6 +59,8 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
             for contract in cls.contracts
             for method, method_contract in contract["methods"].items()
         }
+        with DESCRIPTION_PATH.open(encoding="utf-8") as stream:
+            cls.described_methods = json.load(stream)["methods"]
 
     def test_contract_shape(self) -> None:
         self.assertTrue(self.contracts)
@@ -124,6 +127,36 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertLessEqual(set(self.methods), registered)
 
+    def test_live_description_shape(self) -> None:
+        self.assertTrue(self.described_methods)
+        tools: set[str] = set()
+        for method, contract in self.described_methods.items():
+            with self.subTest(method=method):
+                self.assertEqual(contract["params"]["type"], "object")
+                self.assertIsInstance(contract["params"]["properties"], dict)
+                self.assertEqual(
+                    len(contract["errors"]),
+                    len(set(contract["errors"])),
+                )
+                mcp_contract = contract.get("mcp")
+                if mcp_contract is None:
+                    continue
+                tool = mcp_contract["tool"]
+                self.assertNotIn(tool, tools)
+                tools.add(tool)
+                renames = mcp_contract.get("paramRenames", {})
+                self.assertLessEqual(
+                    renames.keys(),
+                    contract["params"]["properties"].keys(),
+                )
+                mapped = {
+                    renames.get(name, name)
+                    for name in contract["params"]["properties"]
+                }
+                extras = mcp_contract.get("extraParams", [])
+                self.assertEqual(len(extras), len(set(extras)))
+                self.assertFalse(mapped & set(extras))
+
     def _assert_extensions(self, schema: dict[str, Any]) -> None:
         if "x-clamp" in schema:
             bounds = schema["x-clamp"]
@@ -157,7 +190,15 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
 
     def test_spec_lists_every_mcp_mapping(self) -> None:
         spec = SPEC_PATH.read_text(encoding="utf-8")
-        for method, contract in self.methods.items():
+        contracts = {
+            **self.methods,
+            **{
+                method: contract
+                for method, contract in self.described_methods.items()
+                if "mcp" in contract
+            },
+        }
+        for method, contract in contracts.items():
             tool = contract["mcp"]["tool"]
             row_start = f"| `{tool}` | `{method}` |"
             self.assertIn(row_start, spec)
@@ -169,18 +210,46 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
 
         for method, contract in self.methods.items():
             tool_name = contract["mcp"]["tool"]
-            actual = registered[tool_name]
-            expected = contract["params"]
-            renames = contract["mcp"].get("paramRenames", {})
+            with self.subTest(method=method, tool=tool_name):
+                self._assert_mcp_contract(contract, registered)
+
+        for method, contract in self.described_methods.items():
+            if "mcp" not in contract:
+                continue
+            tool_name = contract["mcp"]["tool"]
+            with self.subTest(method=method, tool=tool_name):
+                self._assert_mcp_contract(contract, registered)
+
+    def _assert_mcp_contract(
+        self,
+        contract: dict[str, Any],
+        registered: dict[str, dict[str, Any]],
+    ) -> None:
+        mcp_contract = contract["mcp"]
+        tool_name = mcp_contract["tool"]
+        self.assertIn(tool_name, registered)
+        actual = registered[tool_name]
+        expected = contract["params"]
+        renames = mcp_contract.get("paramRenames", {})
+        extra_params = mcp_contract.get("extraParams", {})
+        if isinstance(extra_params, dict):
             expected = {
                 **expected,
                 "properties": {
                     **expected["properties"],
-                    **contract["mcp"].get("extraParams", {}),
+                    **extra_params,
                 },
             }
-            with self.subTest(method=method, tool=tool_name):
-                self._assert_schema_matches(expected, actual, actual, renames)
+            allowed_extra_properties: set[str] = set()
+        else:
+            allowed_extra_properties = set(extra_params)
+        self._assert_schema_matches(
+            expected,
+            actual,
+            actual,
+            renames,
+            allowed_extra_properties,
+        )
 
     def _assert_schema_matches(
         self,
@@ -188,6 +257,7 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
         actual: dict[str, Any],
         root: dict[str, Any],
         renames: dict[str, str] | None = None,
+        allowed_extra_properties: set[str] | None = None,
     ) -> None:
         actual = _without_null(actual, root)
         expected_types = expected["type"]
@@ -221,7 +291,10 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
             for name, schema in expected.get("properties", {}).items()
         }
         actual_properties = actual.get("properties", {})
-        self.assertEqual(set(actual_properties), set(expected_properties))
+        self.assertEqual(
+            set(actual_properties),
+            set(expected_properties) | (allowed_extra_properties or set()),
+        )
         for name, property_schema in expected_properties.items():
             self._assert_schema_matches(
                 property_schema,

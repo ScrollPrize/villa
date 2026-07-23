@@ -96,10 +96,11 @@ are **jobs**: the RPC returns immediately with a `jobId` and progress is deliver
 The viewer RPCs pilot server-owned method descriptions in
 `AgentBridgeServer::registerViewerHandlers`. Each description declares mechanical input
 types, required fields, enums, simple rejecting bounds, and documented error codes beside
-the handler registration. Dispatch validates those declarations before invoking the
-handler. `rpc.describe {"prefix":"viewer."}` returns the live descriptions plus migration
-coverage. Cross-field rules, normalization, result shapes, and behavioral notes remain in
-their readable handlers and the reference below.
+the handler registration. MCP tool names, snake-case parameter mapping, and MCP-only
+parameters are small annotations on the same description. Dispatch validates those
+declarations before invoking the handler. `rpc.describe {"prefix":"viewer."}` returns the
+live descriptions plus migration coverage. Cross-field rules, normalization, result shapes,
+and behavioral notes remain in their readable handlers and the reference below.
 
 `rpc.describe` accepts an optional string `prefix`. Its `methods` object contains matching
 method descriptions, `undocumented` lists matching handlers not yet migrated, and `coverage`
@@ -108,6 +109,16 @@ reports matching `described` and `registered` counts plus whether that slice is 
 The remaining files under `schema/` are temporary migration oracles for methods that have
 not moved to C++ registration yet. Their generic conformance and offscreen probes stay in
 place until each domain is migrated, then that domain file is deleted.
+
+`rpc_description.json` is a generated snapshot of the live descriptions, not a
+hand-authored contract. The offscreen smoke test checks it against the compiled binary and
+the host-side MCP suite consumes it for input-schema parity. Regenerate it after changing a
+description with:
+
+```
+QT_QPA_PLATFORM=offscreen python3 apps/VC3D/agent_bridge/test/smoke_offscreen.py \
+  --vc3d build/ci-release-gcc/bin/VC3D --update-description-snapshot
+```
 
 ### 2.1 Coordinate spaces
 
