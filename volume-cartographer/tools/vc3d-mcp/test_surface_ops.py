@@ -199,8 +199,10 @@ class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["jobId"], "job-ro")
         self.assertEqual(result["source"], "tool")
         self.assertNotIn("state", result)
-        # None optionals stripped: only segmentId on the wire.
-        self.assertEqual(self.bridge.params_for("segment.reoptimize"), {"segmentId": "seg-1"})
+        self.assertEqual(
+            self.bridge.params_for("segment.reoptimize"),
+            {"segmentId": "seg-1", "ompThreads": 1},
+        )
 
     async def test_reoptimize_wait_returns_terminal_status(self) -> None:
         result = await vc3d_reoptimize_segment("seg-1", wait=True)
@@ -225,8 +227,24 @@ class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["jobId"], "job-ac")
         self.assertEqual(result["source"], "tool")
         self.assertNotIn("state", result)
-        self.assertEqual(self.bridge.params_for("segment.refine_alpha_comp"),
-                         {"segmentId": "seg-1"})
+        self.assertEqual(
+            self.bridge.params_for("segment.refine_alpha_comp"),
+            {
+                "segmentId": "seg-1",
+                "refine": True,
+                "start": -6.0,
+                "stop": 30.0,
+                "step": 2.0,
+                "low": 26,
+                "high": 255,
+                "borderOff": 1.0,
+                "radius": 3,
+                "genVertexColor": False,
+                "overwrite": True,
+                "readerScale": 0.5,
+                "scaleGroup": "1",
+            },
+        )
 
     async def test_refine_alpha_comp_wait_returns_terminal_status(self) -> None:
         result = await vc3d_refine_segment_alpha_comp("seg-1", wait=True)
