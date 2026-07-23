@@ -2252,10 +2252,56 @@ def optimize(
 			flush=True,
 		)
 
+		_flatten_diagnostics = _truthy(os.environ.get(
+			"LASAGNA_FLATTEN_DIAGNOSTICS",
+			stage_args.get("flatten_diagnostics", True),
+		))
 		opt_loss_flatten.configure(
 			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
 			orient_min_det=float(stage_args.get("flatten_orient_min_det", 0.0)),
+			diagnostics=_flatten_diagnostics,
 		)
+		_compile_flatten = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN",
+			stage_args.get("compile_flatten", False),
+		))
+		_compile_flatten_backend = os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_BACKEND",
+			stage_args.get("compile_flatten_backend", None),
+		)
+		_compile_flatten_mode = os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_MODE",
+			stage_args.get("compile_flatten_mode", None),
+		)
+		_compile_flatten_dynamic = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_DYNAMIC",
+			stage_args.get("compile_flatten_dynamic", False),
+		))
+		_compile_flatten_fullgraph = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_FULLGRAPH",
+			stage_args.get("compile_flatten_fullgraph", False),
+		))
+		opt_loss_flatten.configure_compile(
+			enabled=_compile_flatten,
+			backend=_compile_flatten_backend,
+			mode=_compile_flatten_mode,
+			dynamic=_compile_flatten_dynamic,
+			fullgraph=_compile_flatten_fullgraph,
+		)
+		if not _flatten_diagnostics and "map_flatten_ms" in opt_cfg.params:
+			print(f"[optimizer] {label}: flatten_diagnostics=0", flush=True)
+		if _compile_flatten and "map_flatten_ms" in opt_cfg.params:
+			_details = []
+			if _compile_flatten_backend:
+				_details.append(f"backend={_compile_flatten_backend}")
+			if _compile_flatten_mode:
+				_details.append(f"mode={_compile_flatten_mode}")
+			if _compile_flatten_dynamic:
+				_details.append("dynamic=1")
+			if _compile_flatten_fullgraph:
+				_details.append("fullgraph=1")
+			_detail_str = " " + " ".join(_details) if _details else ""
+			print(f"[optimizer] {label}: compile_flatten=1{_detail_str}", flush=True)
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",
 			stage_args.get("compile_cyl_normal", False),
@@ -3218,7 +3264,10 @@ def optimize(
 				else:
 					lv, lms, masks = result
 					w = _need_term(name, eff_)
-					tv[name] = float(lv.detach().cpu())
+					is_flatten_term = name in (
+						"flatten_sdir", "flatten_map_step", "flatten_avg_offset", "flatten_orient")
+					if _flatten_diagnostics or not is_flatten_term:
+						tv[name] = float(lv.detach().cpu())
 					if name == "pred_dt":
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					if name == "cyl_outside":
@@ -3227,7 +3276,7 @@ def optimize(
 						tv.update(opt_loss_snap_surf.last_stats())
 					if name == "atlas_line":
 						tv.update(opt_loss_atlas_line.last_stats())
-					if name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
+					if _flatten_diagnostics and name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
 						tv.update(opt_loss_flatten.last_stats())
 					total = total + w * lv
 			display_loss: float | None = None

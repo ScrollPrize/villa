@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 import tifffile
@@ -252,6 +253,31 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 11.0, places=6)
 		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 22.0, places=6)
 
+	def test_initial_forward_inversion_can_be_skipped(self) -> None:
+		mdl = _make_flatten_model(_flat_grid(5, 7), mesh_step=1, flatten_direction="forward")
+		with mock.patch.object(
+			fit_model.Model3D,
+			"_flatten_invert_forward_uv_map",
+			side_effect=AssertionError("initial inversion should be skipped"),
+		):
+			map_yx, xyz, point_mask, quad_mask = fit._initial_flatten_state(
+				mdl,
+				invert_forward=False,
+			)
+
+		self.assertEqual(tuple(map_yx.shape), (5, 7, 2))
+		self.assertEqual(tuple(xyz.shape), (1, 5, 7, 3))
+		self.assertEqual(tuple(point_mask.shape), (5, 7))
+		self.assertEqual(tuple(quad_mask.shape), (1, 4, 6))
+
+	def test_fast_flatten_config_enables_opt_in_speed_flags(self) -> None:
+		cfg = json.loads((Path(ROOT) / "configs" / "flatten_fast_nofilter.json").read_text(encoding="utf-8"))
+
+		self.assertFalse(cfg["args"]["flatten_initial_inversion"])
+		for stage in cfg["stages"]:
+			self.assertFalse(stage["args"]["flatten_diagnostics"])
+			self.assertTrue(stage["args"]["compile_flatten"])
+
 	def test_bilinear_validity_rejects_cells_with_any_invalid_corner(self) -> None:
 		xyz = _flat_grid(4, 4)
 		valid = torch.ones(4, 4, dtype=torch.bool)
@@ -309,6 +335,54 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertAlmostEqual(float(res.flatten_target_step.detach()), 3.0, places=5)
 		self.assertLess(float(loss.detach()), 1.0e-6)
 		self.assertGreater(int(res.flatten_quad_mask.sum()), 0)
+
+	def test_flatten_diagnostics_can_be_disabled(self) -> None:
+		opt_loss_flatten.configure(diagnostics=False, reset_history=True)
+		try:
+			mdl = _make_flatten_model(_flat_grid(6, 6), mesh_step=1, flatten_direction="forward")
+			res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+			for loss_fn in (
+				opt_loss_flatten.flatten_sdir_loss,
+				opt_loss_flatten.flatten_map_step_loss,
+				opt_loss_flatten.flatten_avg_offset_loss,
+				opt_loss_flatten.flatten_orient_loss,
+			):
+				loss, maps, masks = loss_fn(res=res)
+				self.assertTrue(bool(torch.isfinite(loss)))
+				self.assertEqual(maps, ())
+				self.assertEqual(masks, ())
+			self.assertEqual(opt_loss_flatten.last_stats(), {})
+		finally:
+			opt_loss_flatten.configure(diagnostics=True, reset_history=True)
+
+	def test_compiled_forward_flatten_kernels_match_eager_loss_and_gradients(self) -> None:
+		def _evaluate(*, compiled: bool) -> tuple[torch.Tensor, list[torch.Tensor]]:
+			opt_loss_flatten.configure(orient_min_det=1.1, diagnostics=False, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=compiled, backend="eager")
+			mdl = _make_flatten_model(_flat_grid(7, 7), mesh_step=1, flatten_direction="forward")
+			map_yx = mdl.flatten_map().detach().clone()
+			map_yx[..., 1] = map_yx[..., 1] * 1.1
+			_set_flatten_map(mdl, map_yx)
+			res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+			sdir, _maps, _masks = opt_loss_flatten.flatten_sdir_loss(res=res)
+			orient, _maps, _masks = opt_loss_flatten.flatten_orient_loss(res=res)
+			total = sdir + orient
+			total.backward()
+			grads = [p.grad.detach().clone() for p in mdl.flatten_map_ms if p.grad is not None]
+			return total.detach(), grads
+
+		try:
+			eager_loss, eager_grads = _evaluate(compiled=False)
+			compiled_loss, compiled_grads = _evaluate(compiled=True)
+			self.assertIsNotNone(opt_loss_flatten._compiled_forward_sdir_core)
+			self.assertIsNotNone(opt_loss_flatten._compiled_orient_core)
+			self.assertTrue(torch.allclose(compiled_loss, eager_loss, rtol=1.0e-6, atol=1.0e-6))
+			self.assertEqual(len(compiled_grads), len(eager_grads))
+			for compiled_grad, eager_grad in zip(compiled_grads, eager_grads, strict=True):
+				self.assertTrue(torch.allclose(compiled_grad, eager_grad, rtol=1.0e-5, atol=1.0e-6))
+		finally:
+			opt_loss_flatten.configure(diagnostics=True, orient_min_det=0.0, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=False)
 
 	def test_flatten_target_step_is_measured_not_mesh_step(self) -> None:
 		mdl = _make_flatten_model(_flat_grid(5, 5, sx=3.0, sy=3.0), mesh_step=20)

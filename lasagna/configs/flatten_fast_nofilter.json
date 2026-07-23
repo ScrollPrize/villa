@@ -1,7 +1,8 @@
 {
 	"args": {
 		"model-init": "flatten",
-	    "flatten_solver": "forward"
+		"flatten_solver": "forward",
+		"flatten_initial_inversion": false
 	},
 	"base": {
 		"flatten_sdir": 1.0,
@@ -17,6 +18,8 @@
 			"params": ["map_flatten_ms"],
 			"min_scaledown": 0,
 			"args": {
+				"compile_flatten": true,
+				"flatten_diagnostics": false,
 				"flatten_support": true,
 				"flatten_support_radius": 1,
 				"flatten_orient_min_det": 0.0,
@@ -36,6 +39,8 @@
 			"params": ["map_flatten_ms"],
 			"min_scaledown": 0,
 			"args": {
+				"compile_flatten": true,
+				"flatten_diagnostics": false,
 				"flatten_support": true,
 				"flatten_support_radius": 1,
 				"flatten_orient_min_det": 0.0,
@@ -55,6 +60,8 @@
 			"params": ["map_flatten_ms"],
 			"min_scaledown": 0,
 			"args": {
+				"compile_flatten": true,
+				"flatten_diagnostics": false,
 				"flatten_support": true,
 				"flatten_support_radius": 1,
 				"flatten_orient_min_det": 0.0,
