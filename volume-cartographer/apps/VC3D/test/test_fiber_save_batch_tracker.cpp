@@ -70,7 +70,7 @@ private slots:
         QCOMPARE(error, QStringLiteral("validation failed\nwrite failed"));
     }
 
-    void coalescedWaitersCompleteAfterDiskWrite()
+    void waitersCompleteAfterAsynchronousDiskWrite()
     {
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
