@@ -16,8 +16,10 @@ from . import (  # noqa: F401  (imported for their registration side effects)
     manual_add,
     misc,
     points,
+    review,
     seeding,
     segmentation,
+    surface_ops,
     viewer,
     wrap,
 )

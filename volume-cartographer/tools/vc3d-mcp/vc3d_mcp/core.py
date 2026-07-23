@@ -53,7 +53,11 @@ def _get_client() -> BridgeClient:
     return _client
 
 
-async def _call(method: str, params: dict[str, Any] | None = None) -> Any:
+async def _call(
+    method: str,
+    params: dict[str, Any] | None = None,
+    timeout: float | None = None,
+) -> Any:
     """Call a bridge RPC, translating transport failures into a clear message.
 
     JSON-RPC error replies (BridgeError) are left to propagate as-is -- its
@@ -61,10 +65,15 @@ async def _call(method: str, params: dict[str, Any] | None = None) -> Any:
     section 2.5, which is what ends up in the MCP tool's error text, per the
     "RPC errors surface as MCP tool errors with code/message/data preserved"
     requirement in SPEC.md section 5.
+
+    `timeout` overrides the client's default request timeout for this one call
+    (None => the configured default). Deferred RPCs whose server-side cap
+    exceeds that default (e.g. the mask renders) pass a value comfortably above
+    the cap so the client does not give up while the bridge is still working.
     """
     client = _get_client()
     try:
-        return await client.call(method, params)
+        return await client.call(method, params, timeout=timeout)
     except BridgeConnectionError as exc:
         raise RuntimeError(str(exc)) from exc
 

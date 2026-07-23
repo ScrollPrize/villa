@@ -151,9 +151,13 @@ async def vc3d_get_render_settings() -> dict[str, Any]:
 
     Returns the full settings object: {"intersectionOpacity" (0..1),
     "intersectionThickness" (>=0), "overlayOpacity" (0..1),
-    "intersectionMaxSurfaces" (int >=0), "planeIntersectionLinesVisible" (bool),
-    "showSurfaceNormals" (bool), "showDirectionHints" (bool),
-    "surfaceOverlayEnabled" (bool), "highlightedSurfaceIds" ([str...])}."""
+    "intersectionMaxSurfaces" (int >=0), "volumeWindow" ({"low","high"}),
+    "samplingStride" (int >=1), "zScrollSensitivity" (0.1..100),
+    "segmentationCursorMirroring" (bool),
+    "planeIntersectionLinesVisible" (bool), "showSurfaceNormals" (bool),
+    "showDirectionHints" (bool), "surfaceOverlayEnabled" (bool),
+    "normalArrowLengthScale" (float), "normalMaxArrows" (int),
+    "highlightedSurfaceIds" ([str...])}."""
     return await _call("viewer.get_render_settings")
 
 
@@ -168,6 +172,12 @@ async def vc3d_set_render_settings(
     show_direction_hints: Optional[bool] = None,
     surface_overlay_enabled: Optional[bool] = None,
     highlighted_surface_ids: Optional[list[str]] = None,
+    volume_window: Optional[dict[str, float]] = None,
+    normal_arrow_length_scale: Optional[float] = None,
+    normal_max_arrows: Optional[int] = None,
+    segmentation_cursor_mirroring: Optional[bool] = None,
+    sampling_stride: Optional[int] = None,
+    z_scroll_sensitivity: Optional[float] = None,
 ) -> dict[str, Any]:
     """Update the global viewer render settings; changes apply across all
     viewers. Every argument is optional -- omitted (None) fields are left
@@ -182,13 +192,26 @@ async def vc3d_set_render_settings(
     show_direction_hints: draw growth direction hints.
     surface_overlay_enabled: master toggle for the surface overlay.
     highlighted_surface_ids: replace the set of highlighted surface ids.
+    volume_window: {"low", "high"} base-volume display window, clamped 0..255.
+    normal_arrow_length_scale: surface-normal arrow length multiplier,
+    clamped 0.1..2.0 (the GUI slider's range) and persisted like the slider.
+    normal_max_arrows: cap on surface-normal arrows drawn per axis,
+    clamped 4..100 (the GUI slider's range) and persisted like the slider.
+    segmentation_cursor_mirroring: mirror the cursor position onto the
+    segmentation viewer from other panes.
+    sampling_stride: surface-patch intersection sampling stride, floored to 1.
+    z_scroll_sensitivity: scroll-to-move-through-z sensitivity, clamped
+    0.1..100.
 
-    The four numeric fields (opacities, thickness, max-surfaces) are backed by
-    ViewerManager and persist even with no viewer pane open. The five toggle/
-    highlight fields apply only to currently-open viewers: with zero viewers
-    instantiated they are no-ops, and the returned echo will report defaults
-    for them rather than the values you passed -- open a viewer first if you
-    need those to stick.
+    The numeric/global fields (opacities, thickness, max-surfaces, volume
+    window, sampling stride, z-scroll sensitivity, cursor mirroring,
+    normal-arrow length/count) are persisted (QSettings/ViewerManager) even
+    with no viewer pane open. The toggle/highlight fields (plane-intersection
+    lines, show-normals, show-direction-hints, surface-overlay,
+    highlighted-surface-ids) apply only to currently-open viewers: with zero
+    viewers instantiated they are no-ops, and the returned echo will report
+    defaults for them rather than the values you passed -- open a viewer
+    first if you need those to stick.
 
     Returns the full resulting settings object (same shape as
     vc3d_get_render_settings) so you can confirm what was applied."""
@@ -205,8 +228,113 @@ async def vc3d_set_render_settings(
                 "showDirectionHints": show_direction_hints,
                 "surfaceOverlayEnabled": surface_overlay_enabled,
                 "highlightedSurfaceIds": highlighted_surface_ids,
+                "volumeWindow": volume_window,
+                "normalArrowLengthScale": normal_arrow_length_scale,
+                "normalMaxArrows": normal_max_arrows,
+                "segmentationCursorMirroring": segmentation_cursor_mirroring,
+                "samplingStride": sampling_stride,
+                "zScrollSensitivity": z_scroll_sensitivity,
             }
         ),
+    )
+
+
+@mcp.tool()
+async def vc3d_get_overlay() -> dict[str, Any]:
+    """Read the current overlay-volume settings (the semi-transparent second
+    volume rendered on top of the base volume).
+
+    Returns {"volumeId" (str, "" when no overlay is set), "colormap" (str, ""
+    when unset), "opacity" (0..1), "threshold" (0..255), "windowLow"/
+    "windowHigh" (0..255), "maxDisplayedResolution" (int 0..5),
+    "composite": {"enabled" (bool), "method" ("max"|"mean"|"min"),
+    "layersFront"/"layersBehind" (int 0..64)}}."""
+    return await _call("viewer.get_overlay")
+
+
+@mcp.tool()
+async def vc3d_set_overlay(
+    volume_id: Optional[str] = None,
+    clear: Optional[bool] = None,
+    colormap: Optional[str] = None,
+    opacity: Optional[float] = None,
+    threshold: Optional[float] = None,
+    window: Optional[dict[str, float]] = None,
+    max_displayed_resolution: Optional[int] = None,
+    composite: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Update the overlay-volume settings. Every argument is optional --
+    omitted (None) fields are left unchanged; pass only what you want to
+    change.
+
+    volume_id: id of the volume to overlay (see vc3d_list_overlay_volumes /
+    vc3d_list_volumes). An empty string clears the overlay, same as
+    clear=True. Unknown id raises -32007.
+    clear: True clears the overlay volume (equivalent to volume_id="").
+    colormap: colormap id, one of "fire", "viridis", "magma", "red", "green",
+    "blue", "cyan", "magenta", "glasbey_black0"; empty string clears it.
+    An unrecognized id raises -32602 rather than being silently ignored.
+    opacity: overlay opacity, clamped 0..1.
+    threshold: overlay display threshold, clamped >=0.
+    window: {"low", "high"} overlay display window, clamped 0..255.
+    max_displayed_resolution: overlay resolution cap, clamped 0..5.
+    composite: {"enabled", "method" ("max"|"mean"|"min"), "layersFront",
+    "layersBehind"} -- any subset; merged over the current composite settings.
+    An unrecognized method raises -32602.
+
+    Returns the full resulting overlay settings object (same shape as
+    vc3d_get_overlay). Note: ViewerManager re-validates the overlay volume's
+    coordinate space against the base volume and may silently reject a
+    mismatched volume_id -- check the echoed "volumeId" to confirm it stuck.
+    """
+    return await _call(
+        "viewer.set_overlay",
+        _strip_none(
+            {
+                "volumeId": volume_id,
+                "clear": clear,
+                "colormap": colormap,
+                "opacity": opacity,
+                "threshold": threshold,
+                "window": window,
+                "maxDisplayedResolution": max_displayed_resolution,
+                "composite": composite,
+            }
+        ),
+    )
+
+
+@mcp.tool()
+async def vc3d_list_overlay_volumes() -> dict[str, Any]:
+    """List every volume id in the open package, for picking an overlay
+    volume via vc3d_set_overlay. Not filtered by coordinate-space
+    compatibility with the base volume -- vc3d_set_overlay re-validates and
+    may silently reject a mismatched pick.
+
+    Returns {"volumes": [{"id", "current" (bool, true for the base volume)}],
+    "overlayVolumeId" (str, "" when no overlay is set)}."""
+    return await _call("viewer.list_overlay_volumes")
+
+
+@mcp.tool()
+async def vc3d_set_intersects(
+    surface_ids: list[str], viewer: Optional[str] = None
+) -> dict[str, Any]:
+    """Set which surfaces' intersection lines a viewer draws -- the same
+    per-viewer state SurfacePanelController's filters apply.
+
+    surface_ids: surface/slot ids to draw intersections for (e.g. "seg xz",
+    "seg yz", or a segment id). "segmentation" is always included even if
+    omitted here.
+    viewer: viewer id or surface-slot name to target; if omitted, applies to
+    every base viewer except the one whose surface slot is "segmentation"
+    (mirrors the GUI's default, no-filter behavior). Targeting the
+    "segmentation" viewer itself raises -32009.
+
+    Returns {"surfaceIds": [str...] (the resulting set, with "segmentation"
+    unioned in), "appliedToViewers": [viewer ids the set was applied to]}."""
+    return await _call(
+        "viewer.set_intersects", _strip_none({"viewer": viewer, "surfaceIds": surface_ids})
     )
 
 
