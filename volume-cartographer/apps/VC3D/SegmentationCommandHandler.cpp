@@ -957,10 +957,8 @@ public:
         progress_->setWindowModality(Qt::WindowModal);
         progress_->setAutoClose(false);
         progress_->setAutoReset(true);
-        // Headless (bridge): a huge minimum-duration keeps the QProgressDialog's
-        // auto-show timer from ever firing, so it stays hidden while every
-        // setValue/setLabelText below is a safe no-op (SPEC §1.3, §20). Nothing
-        // here calls show()/exec().
+        // Suppressed dialogs use a huge minimum duration so the auto-show timer
+        // never fires. Updates below remain harmless.
         progress_->setMinimumDuration(suppressDialogs_ ? std::numeric_limits<int>::max() : 0);
         progress_->setMaximum(1 + iters_ + 1);
         progress_->setValue(0);
@@ -977,7 +975,7 @@ public:
 
         if (handler_) {
             emit handler_->statusMessage(QObject::tr("Converting TIFXYZ to OBJ..."), 0);
-            // Register the job with any bridge listener (SPEC §8.3 source:"flatten").
+            // Publish the shared flattening lifecycle.
             emit handler_->flattenJobStarted(QStringLiteral("flatten.slim"), stem_);
         }
         startToObj_();
@@ -1222,7 +1220,7 @@ private:
                           outFinal_);
 
         if (suppressDialogs_) {
-            // Headless: no completion dialog; just clean up (SPEC §20).
+            // Direct callers suppress the completion dialog.
             if (progress_) progress_->deleteLater();
             this->deleteLater();
             return;
@@ -1491,9 +1489,7 @@ private:
 
     bool errorShown_ = false;
 
-    // Emit flattenJobFinished exactly once (SPEC §8.3, §20) so the bridge can
-    // transition the source:"flatten" job out of "running". Called at every
-    // terminal state.
+    // Emit exactly one terminal event from every completion path.
     void emitFinishedOnce_(bool success, const QString& message,
                            const QString& outputPath) {
         if (finishedEmitted_) return;
@@ -1610,8 +1606,7 @@ public:
         , progress_(new QProgressDialog(QObject::tr("ABF++ Flattening..."), QObject::tr("Cancel"), 0, 0, parentWidget))
     {
         progress_->setWindowModality(Qt::NonModal);
-        // Headless (bridge): a huge minimum-duration keeps the (non-modal)
-        // progress dialog from ever auto-showing (SPEC §1.3, §20).
+        // Suppressed dialogs must not be auto-shown.
         progress_->setMinimumDuration(suppressDialogs_ ? std::numeric_limits<int>::max() : 0);
         progress_->setRange(0, 0); // indeterminate
         progress_->setAttribute(Qt::WA_DeleteOnClose);
@@ -1619,7 +1614,7 @@ public:
         connect(progress_, &QProgressDialog::canceled, this, &ABFJob::onCanceledRequested_);
         connect(&watcher_, &QFutureWatcher<ABFFlattenResult>::finished, this, &ABFJob::onFinished_);
 
-        // Register the job with any bridge listener (SPEC §8.3 source:"flatten").
+        // Publish the shared flattening lifecycle.
         if (handler_)
             emit handler_->flattenJobStarted(QStringLiteral("flatten.abf"),
                                              stem_.isEmpty() ? outDir_ : stem_);
@@ -1768,8 +1763,7 @@ public:
         , progress_(new QProgressDialog(QObject::tr("Straightening..."), QObject::tr("Cancel"), 0, 0, parentWidget))
     {
         progress_->setWindowModality(Qt::NonModal);
-        // Headless (bridge): a huge minimum-duration keeps the (non-modal)
-        // progress dialog from ever auto-showing (SPEC §1.3, §20).
+        // Suppressed dialogs must not be auto-shown.
         progress_->setMinimumDuration(suppressDialogs_ ? std::numeric_limits<int>::max() : 0);
         progress_->setRange(0, 0); // indeterminate; vc_straighten emits no PROGRESS
         progress_->setAttribute(Qt::WA_DeleteOnClose);
@@ -1787,7 +1781,7 @@ public:
                   << " " << args.join(' ').toStdString() << std::endl;
         if (handler_) {
             emit handler_->statusMessage(QObject::tr("Running vc_straighten..."), 0);
-            // Register the job with any bridge listener (SPEC §8.3 source:"flatten").
+            // Publish the shared flattening lifecycle.
             emit handler_->flattenJobStarted(QStringLiteral("flatten.straighten"),
                                              stem_.isEmpty() ? outDir_ : stem_);
         }
@@ -2058,8 +2052,7 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 
     _cmdRunner->setSegmentPath(dlg.segmentPath());
     _cmdRunner->setOutputPattern(dlg.outputPattern());
-    // Re-assert TifStack so a prior headless Zarr render can't leak its
-    // --zarr-output selection into this GUI render (SPEC §19).
+    // Interactive renders always start from the TIFF-stack default.
     _cmdRunner->setRenderOutputFormat(CommandLineToolRunner::RenderOutputFormat::TifStack);
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
     _cmdRunner->setRenderVoxelSize(
@@ -3430,8 +3423,7 @@ bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoi
 
 void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint)
 {
-    // Interactive path: gather defaults, show the dialog, then hand params to
-    // startGrowPatchFromSeed; all dialogs live here (SPEC §4).
+    // Gather interactive defaults before using the shared launcher.
     if (!_state || !_state->vpkg()) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume package loaded."));
         return;
@@ -3591,10 +3583,8 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
 bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& segmentId,
                                                           QString* errorMessage)
 {
-    // Dialog-free core shared by the interactive slot above and the agent bridge:
-    // crops the surface grid to its tightest valid bounds and persists it, failures
-    // via errorMessage (never a QMessageBox). Returns true on success, including the
-    // already-tightest no-op.
+    // Crop to the tightest valid bounds and persist the surface. An already
+    // tight surface is a successful no-op.
     auto fail = [&](const QString& message) -> bool {
         if (errorMessage) {
             *errorMessage = message;
@@ -5582,11 +5572,8 @@ bool SegmentationCommandHandler::renameSurfaceHeadless(const QString& segmentIdQ
                                                        const QString& newName,
                                                        QString* err)
 {
-    // The short sentinels below are stable machine-read tokens: both
-    // onRenameSurface and the agent-bridge handleSegmentsRename compare *err
-    // against these exact literals to pick their user-facing message / JSON
-    // error code, so they must stay untranslated. Only the descriptive
-    // failures further down (which are shown verbatim) are wrapped in tr().
+    // The short sentinels below are stable machine-readable tokens used to
+    // classify failures, so they must stay untranslated.
     auto fail = [&](const QString& msg) {
         if (err) *err = msg;
         return false;

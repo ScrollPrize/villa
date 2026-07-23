@@ -65,9 +65,8 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
                                      const std::filesystem::path& remoteCacheRoot);
 
 // Set up streaming normal grids for every volume of this sample that has a
-// normal-grids artifact. Returns the number of entries attached. `selection`
-// (SPEC §10.3) optionally restricts which volumes/normal-grid representations
-// attach; nullptr preserves the historical attach-everything behavior.
+// normal-grids artifact. Returns the number of entries attached. selection
+// optionally restricts volumes and representations; nullptr attaches all.
 int attachOpenDataNormalGrids(VolumePkg& pkg,
                               const OpenDataSample& sample,
                               const std::filesystem::path& remoteCacheRoot,

@@ -79,10 +79,8 @@ public:
                                  int seedX,
                                  int seedY,
                                  int seedZ);
-    /// Headless (non-interactive) optimization launch for the agent bridge
-    /// (SPEC §11.4). Wraps startOptimizationWithOverrides / startAtlasOptimization
-    /// with statusBar==nullptr and reports every failure through `errorMessage`
-    /// (never a dialog). Returns true when the optimization was submitted.
+    /// Starts optimization without dialogs and reports failures through
+    /// errorMessage. Returns true when the optimization was submitted.
     ///   configPath: empty => selectedLasagnaConfigPathForMode(mode)
     ///   seed:       nullopt => panel seed / focus (no seed override)
     ///   atlasPath:  empty => panel selection; applied via setSelectedAtlasPath
@@ -92,12 +90,7 @@ public:
                                    std::optional<cv::Vec3i> seed,
                                    const QString& atlasPath,
                                    QString* errorMessage = nullptr);
-    /// Headless twin of repeatLastLasagnaAction() for the agent bridge (SPEC
-    /// §11.8). repeatLastLasagnaAction() re-emits lasagnaOptimizeRequested,
-    /// which CWindow connects to the *interactive* startOptimization(state,
-    /// statusBar()) overload -- unsafe for the bridge to trigger (can show a
-    /// blocking dialog, SPEC §1.3). This calls startOptimizationHeadless with
-    /// the last-used mode directly instead, never touching that signal chain.
+    /// Repeats the last action without entering the interactive signal chain.
     bool repeatLastLasagnaActionHeadless(CState* state, QString* errorMessage = nullptr);
     [[nodiscard]] QString selectedLasagnaConfigPathForMode(LasagnaMode mode) const;
     [[nodiscard]] QStringList lasagnaConfigPathsForMode(LasagnaMode mode) const;
@@ -233,21 +226,13 @@ private:
     int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand, 3=offset
     LasagnaMode _lastLasagnaMode{LasagnaMode::ReOptimize};
 
-    // Set around a startOptimizationHeadless()-driven call (SPEC §11.4/§11.8):
-    // suppresses showLasagnaConfigError's QMessageBox, the single choke point
-    // for every blocking dialog reachable from startOptimizationWithOverrides/
-    // startAtlasOptimization (unreadable/invalid-JSON config, missing atlas
-    // data input, etc.) -- these are real, easy-to-hit failure modes (not just
-    // the config-file-missing case startOptimizationHeadless pre-checks), and
-    // the bridge must never reach a blocking dialog (SPEC §1.3).
+    // Suppresses the single QMessageBox path reachable during a direct launch.
+    // Unreadable configs and missing atlas inputs can fail after preflight.
     bool _suppressInteractiveDialogs{false};
     // Set immediately before the real LasagnaServiceManager submission call in
     // startOptimizationWithOverrides/startAtlasOptimization. Both functions
-    // return void and silently `return` on several failure paths (empty data
-    // input, unreadable model, missing seed/focus, ...) even when called
-    // headlessly, so startOptimizationHeadless reads this flag afterward
-    // instead of assuming success -- otherwise the bridge registers a job that
-    // will never start or finish.
+    // return void on several failure paths, so startOptimizationHeadless reads
+    // this flag instead of assuming submission succeeded.
     bool _headlessSubmissionMade{false};
     int _connectionMode{0};  // 0=internal, 1=external
     QString _externalHost{"127.0.0.1"};

@@ -97,8 +97,8 @@ public:
     void setEraseBrushActive(bool active);
     void setManualAddActive(bool active);
     ManualAddTool::LinePreviewMode cycleManualAddLinePreviewMode();
-    // Agent-bridge direct setters (SPEC §9.4/§9.5); route through the panel so the config
-    // change reaches the module via manualAddConfigChanged, same as a human combo edit.
+    // Route direct changes through the panel so manualAddConfigChanged reaches
+    // the module just as it does for a combo-box edit.
     ManualAddTool::LinePreviewMode setManualAddLinePreviewMode(ManualAddTool::LinePreviewMode mode);
     ManualAddTool::InterpolationMode setManualAddInterpolationMode(ManualAddTool::InterpolationMode mode);
 

@@ -29,10 +29,8 @@ struct OpenDataSampleProjectResult;
 class OpenDataCatalogWindow;
 }
 
-// Options for a non-interactive (agent-bridge) Open Data sample open (SPEC §14.1).
-// `selection` restricts which resources attach (SPEC §10.3; default = attach everything).
-// `interactive` gates every blocking UI element (prompts, progress dialog, message
-// boxes); the bridge always passes false.
+// Options for opening an Open Data sample. `selection` restricts attached
+// resources; `interactive` permits prompts, progress dialogs, and message boxes.
 struct OpenDataSampleOpenOptions {
     vc3d::opendata::OpenDataResourceSelection selection;
     bool interactive{true};
@@ -57,40 +55,34 @@ public:
                       QString* errorMessage = nullptr);
     void showOpenDataCatalog();
     bool isOpenDataCatalogVisible() const;
-    // Headless twin of double-clicking a catalog sample; resolves `sampleId` against the
-    // cached manifest and forwards to openOpenDataSample() (agent_bridge/SPEC.md §3.16).
-    // When `interactive` is false (SPEC §8.2), the replace-project prompt is skipped (an
-    // explicit call is treated as consent), the progress dialog isn't created, and message
-    // boxes are suppressed — bridge handlers must never spin a nested event loop
-    // (SPEC §1.3), so they always pass false.
+    // Resolves sampleId against the cached manifest and opens it. When
+    // interactive is false, prompts, progress dialogs, and message boxes are
+    // suppressed.
     bool openOpenDataSampleById(const QString& sampleId, bool interactive = true);
 
-    // Non-interactive-aware overload with resource selection (SPEC §10.3, §14.1);
-    // forwards to openOpenDataSample() with `options`. `resultOut`, when provided,
-    // receives the attach counters/messages used to report catalog.open_sample's
-    // `attached` block.
+    // Opens a sample with explicit resource selection. resultOut receives the
+    // attachment counters and messages when provided.
     bool openOpenDataSampleById(const QString& sampleId,
                                 const OpenDataSampleOpenOptions& options,
                                 QString* errorMessage = nullptr,
                                 vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr);
 
-    // Terminal outcome of an asynchronous Open Data sample open (SPEC §18.3).
+    // Terminal outcome of an asynchronous Open Data sample open.
     struct OpenDataSampleOpenOutcome {
         bool success{false};
         QString error;                                       // set iff !success
         vc3d::opendata::OpenDataSampleProjectResult result;  // attach counters/messages
     };
 
-    // Asynchronous, always non-interactive open of a catalog sample (the §1.3-safe twin
-    // of openOpenDataSampleById(sampleId, options, ...)); starts the open without
-    // spinning a nested event loop and returns immediately.
+    // Starts a catalog sample open without spinning a nested event loop and
+    // returns immediately.
     //
     // Returns false (with *errorMessage) on synchronous precondition failure (no
     // window/state, empty/unknown id, manifest unavailable, or an open already in
     // flight). Returns true once the background task started; exactly one GUI-thread
     // call to `onFinished` follows. `onProgress`, if set, is invoked on the GUI thread
     // with the same stream the interactive QProgressDialog consumes.
-    // `options.interactive` is ignored (SPEC §8.2).
+    // options.interactive is ignored; this entry point is always non-interactive.
     bool startOpenDataSampleOpen(
         const QString& sampleId,
         const OpenDataSampleOpenOptions& options,
@@ -152,12 +144,10 @@ private:
                             const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
                             QString* errorMessage = nullptr,
                             vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr);
-    // .cpp-local task payload for an async open; kept out of the header so it doesn't
-    // leak the QtConcurrent result type (SPEC §18.3).
+    // .cpp-local payload keeps the QtConcurrent result type out of this header.
     struct OpenDataOpenTaskResult;
-    // Launches the QtConcurrent open task with a heap QFutureWatcher parented to this (no
-    // QEventLoop); its finished slot clears the in-flight flag, runs
-    // finishOpenDataSampleOpen(), then calls onFinished on the GUI thread (SPEC §18.3).
+    // Launches the QtConcurrent task without a nested event loop. Its watcher is
+    // parented to this; completion and onFinished run on the GUI thread.
     void beginOpenDataSampleOpenTask(
         const vc3d::opendata::OpenDataSample& sample,
         bool interactive,
@@ -234,6 +224,6 @@ private:
     std::vector<QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>*> _openDataPrefillWatchers;
     std::vector<std::shared_ptr<std::atomic<bool>>> _openDataPrefillCancelFlags;
     std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
-    // True from launch until the finished slot runs; guards against overlapping opens (SPEC §18.3).
+    // True from launch until the finished slot runs; prevents overlapping opens.
     bool _openDataSampleOpenInFlight{false};
 };

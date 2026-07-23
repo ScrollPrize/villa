@@ -467,8 +467,8 @@ int attachOpenDataLasagna(VolumePkg& pkg,
         }
         if (infos.empty()) continue;
         if (selection) {
-            // Gate the lasagna representation on the representationRefs/kinds
-            // axes (SPEC §10.3), mapping the info back to its artifact index.
+            // Map the representation back to its artifact index before applying
+            // the representation and kind filters.
             std::optional<std::size_t> artifactIndex;
             for (std::size_t ai = 0; ai < volume.artifacts.size(); ++ai) {
                 const auto& art = volume.artifacts[ai];

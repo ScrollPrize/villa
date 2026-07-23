@@ -159,12 +159,11 @@ struct OpenDataRepresentationRef {
 [[nodiscard]] std::optional<OpenDataRepresentationKind>
 classifyDerivedRepresentation(const OpenDataArtifact& artifact);
 
-// Optional subset of a sample's resources to attach (agent-bridge catalog
-// resource selection, SPEC §10.3). Each axis is independent: an absent
-// (nullopt) sub-field means "no filter on that axis". A raw source volume is
+// Optional subset of a sample's resources to attach. Each axis is independent:
+// an absent sub-field means "no filter on that axis". A raw source volume is
 // governed only by `volumeIds`; a derived representation (normal grids /
 // lasagna / prediction) must pass all three axes. A nullptr selection anywhere
-// downstream preserves the historical attach-everything behavior byte-for-byte.
+// downstream preserves the attach-everything behavior.
 struct OpenDataResourceSelection {
     std::optional<std::vector<std::string>> volumeIds;
     std::optional<std::vector<OpenDataRepresentationRef>> representations;

@@ -2842,8 +2842,8 @@ void SegmentationModule::stopAllPushPull()
     }
 }
 
-// Agent-bridge public wrappers (SPEC §15.3) — distinct names, no overload of the
-// private startPushPull(int,...) / stopPushPull(int) / stopAllPushPull().
+// Programmatic push/pull entry points use distinct names to avoid overload
+// ambiguity in connect().
 bool SegmentationModule::startPushPullMode(int direction, std::optional<bool> alphaOverride)
 {
     return startPushPull(direction, alphaOverride);
@@ -2854,7 +2854,6 @@ void SegmentationModule::stopPushPullAll()
     stopAllPushPull();
 }
 
-// Agent-bridge public save/flush accessors (SPEC §3.11c / segmentation.save).
 void SegmentationModule::flushAutosave()
 {
     // No-op when nothing is pending; marks dirty (follow-up save) when one is in flight.
@@ -3050,9 +3049,7 @@ void SegmentationModule::performAutosave()
             ? _autosaveState.completeSuccess(autosaveTicket)
             : _autosaveState.completeFailure(autosaveTicket, canRetry);
         if (completion == segmentation::AutosaveState::Completion::Stale) {
-            // Stale just means the session changed while this save was in flight; still
-            // emit so an in-flight bridge autosave job (SPEC §3.11c) closes rather than
-            // hangs (the GUI ignores this signal).
+            // A stale ticket still emits terminal completion for observers.
             updateAutosaveState();
             emit autosaveCompleted(failureMessage.isEmpty());
             return;

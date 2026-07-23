@@ -73,8 +73,7 @@ public:
         std::unique_ptr<QTemporaryFile> paramsFile;
     };
 
-    // Params for the headless startGrowPatchFromSeed (mirror of the interactive
-    // GrowPatch dialog; SPEC §4).
+    // Arguments accepted by startGrowPatchFromSeed.
     struct GrowPatchSeedParams {
         QString volumeId;          // vpkg volume id; empty => current volume
         int     iterations{200};   // clamped/validated to [1, 100000]
@@ -83,17 +82,15 @@ public:
                                    // default head of the dialog's choice list
     };
 
-    // Params for the headless startRunTrace (mirror of TraceParamsDialog;
-    // SPEC §14.4 / §15.4).
+    // Arguments accepted by startRunTrace.
     struct RunTraceParams {
         QJsonObject paramOverrides;   // merged over <volpkg>/trace_params.json
         int         ompThreads{-1};   // -1 => runner default
         QString     tgtDir;           // empty => <volpkg>/traces (created if missing)
     };
 
-    // Params for the headless startRenderSegment (reduced from RenderParamsDialog;
-    // SPEC §19). Advanced dialog-only options (crop/affine/rotate/flip/flatten/
-    // include-tifs/composite/alpha) are deliberately omitted.
+    // Arguments accepted by startRenderSegment. Options that belong to the
+    // interactive dialog are deliberately omitted.
     struct RenderSegmentParams {
         QString volumeId;             // vpkg volume id; empty => current volume
         CommandLineToolRunner::RenderOutputFormat outputFormat{
@@ -108,9 +105,8 @@ public:
         double  voxelSizeUm{0.0};     // physical voxel size (micrometers), > 0
     };
 
-    // Params for the headless startSlimFlatten (mirror of SlimFlattenDialog;
-    // SPEC §20). Headless keepPercent defaults to 100 (full-res, no decimation),
-    // not the dialog's 1.5% session default.
+    // Arguments accepted by startSlimFlatten. keepPercent defaults to full
+    // resolution rather than the dialog's session default.
     struct SlimFlattenParams {
         int     iterations{50};      // flatboi iterations; > 0 (SlimJob clamps <=0 to 20)
         double  tolerance{0.0};      // 0.0 => no --tol (run all iterations)
@@ -121,8 +117,7 @@ public:
                                      // <segment>_flatboi (matching the dialog default)
     };
 
-    // Params for the headless startStraighten (mirror of StraightenDialog;
-    // SPEC §20). Defaults mirror the dialog's initial state.
+    // Arguments accepted by startStraighten.
     struct StraightenParams {
         bool    unbend{true};
         double  unbendSmoothCols{300.0};  // only emitted when unbend is true
@@ -222,17 +217,16 @@ signals:
     void showWarning(QString title, QString text);
 
     /**
-     * Emitted when a flattening job (SlimJob / ABFJob / StraightenJob) begins so
-     * the agent bridge can track it as a source:"flatten" job (SPEC §8.3, §20).
-     * Emitted from BOTH interactive slots and headless start* methods. `kind` is
+     * Emitted when a flattening job (SlimJob / ABFJob / StraightenJob) begins.
+     * Emitted from both interactive slots and direct start* methods. `kind` is
      * "flatten.slim" / "flatten.abf" / "flatten.straighten"; `label` is a short
      * human string.
      */
     void flattenJobStarted(QString kind, QString label);
 
     /**
-     * Emitted once per flattening job at its terminal state (SPEC §8.3, §20).
-     * `message` holds the captured error text on failure (suppressed dialog);
+     * Emitted once per flattening job at its terminal state. `message` holds the
+     * captured error text on failure when dialogs are suppressed;
      * `outputPath` is the artifact dir on success, else empty. `success=false`
      * with an empty message denotes a user cancel.
      */
@@ -273,11 +267,8 @@ public slots:
     void launchNeighborCopySecondPass();
 
 public:
-    /// Headless GrowPatch-from-seed launch (mirror of
-    /// onCreateSegmentGrowPatchFromSeed): failures return through `error`, never a
-    /// dialog; returns true when vc_grow_seg_from_seed started. Completion
-    /// observable via CommandLineToolRunner::toolFinished as in the interactive
-    /// path.
+    /// Starts GrowPatch from a seed without opening a dialog. Returns true once
+    /// vc_grow_seg_from_seed starts; completion uses toolFinished.
     bool startGrowPatchFromSeed(const QVector3D& seedPoint,
                                 const GrowPatchSeedParams& params,
                                 CommandLaunchError* error = nullptr);
@@ -289,57 +280,38 @@ public:
         return _growPatchSeedJob ? _growPatchSeedJob->outputDir : QString();
     }
 
-    /// Headless Run-Trace launch (vc_grow_seg_from_segments; mirror of
-    /// onGrowSegmentFromSegment): preconditions, params-JSON merge/write, launch;
-    /// failures via `error` (never a dialog). Completion
-    /// is observable via CommandLineToolRunner::toolFinished.
-    /// On success, `resolvedOutputDir` (when non-null) receives the target dir.
+    /// Starts vc_grow_seg_from_segments without opening a dialog. On success,
+    /// `resolvedOutputDir` receives the target directory when provided.
     bool startRunTrace(const std::string& segmentId,
                        const RunTraceParams& params,
                        CommandLaunchError* error = nullptr,
                        QString* resolvedOutputDir = nullptr);
 
-    /// Headless Render launch (vc_render_tifxyz; mirror of onRenderSegment):
-    /// preconditions, volume/output resolution, launch; failures via
-    /// `error` (never a dialog). Completion observable via
-    /// CommandLineToolRunner::toolFinished.
-    /// `error.kind` provides a stable machine-readable failure category. On success,
-    /// `resolvedOutputDir` (when non-null) receives the output artifact path
-    /// (the layers dir for a TIFF stack, or the .zarr store).
+    /// Starts vc_render_tifxyz without opening a dialog. On success,
+    /// `resolvedOutputDir` receives the layers directory or Zarr store.
     bool startRenderSegment(const std::string& segmentId,
                             const RenderSegmentParams& params,
                             CommandLaunchError* error = nullptr,
                             QString* resolvedOutputDir = nullptr);
 
-    /// Headless SLIM/flatboi flatten launch. Resolves all preconditions and tools
-    /// up front (so the SlimJob never hits a synchronous dialog), then constructs a
-    /// SlimJob with dialogs suppressed; runs async, completion via
-    /// flattenJobFinished (SPEC §20). Failures return through `error`, never a dialog.
-    /// `error.kind` provides a stable machine-readable failure category. On
-    /// success `resolvedOutputDir` (when non-null) receives the
-    /// flattened tifxyz directory.
+    /// Starts SLIM/flatboi asynchronously with dialogs suppressed. Preconditions
+    /// and tools are resolved before launch; completion uses flattenJobFinished.
     bool startSlimFlatten(const std::string& segmentId,
                           const SlimFlattenParams& params,
                           CommandLaunchError* error = nullptr,
                           QString* resolvedOutputDir = nullptr);
 
-    /// Headless ABF++ flatten launch (in-process, QtConcurrent). Constructs an
-    /// ABFJob with dialogs suppressed; runs on a worker thread, completion via
-    /// flattenJobFinished (SPEC §20). Failure sentences: "No volume package
-    /// loaded", "Invalid segment" (-32007 segment). On success `resolvedOutputDir`
-    /// receives the <segment>_abf directory.
+    /// Starts ABF++ asynchronously on a worker thread with dialogs suppressed.
+    /// Completion uses flattenJobFinished.
     bool startAbfFlatten(const std::string& segmentId,
                          int iterations,
                          int downsampleFactor,
                          CommandLaunchError* error = nullptr,
                          QString* resolvedOutputDir = nullptr);
 
-    /// Headless vc_straighten launch. Resolves the tool and validates the output
-    /// dir up front, constructs a StraightenJob with dialogs suppressed; async,
-    /// completion via flattenJobFinished (SPEC §20). Failure sentences: "No volume
-    /// package or volume loaded", "Invalid segment" (-32007 segment),
-    /// "vc_straighten not found" (-32006), "Output directory already exists"
-    /// (-32005). On success `resolvedOutputDir` receives the straightened dir.
+    /// Starts vc_straighten asynchronously with dialogs suppressed. The tool and
+    /// output directory are validated before launch; completion uses
+    /// flattenJobFinished.
     bool startStraighten(const std::string& segmentId,
                          const StraightenParams& params,
                          CommandLaunchError* error = nullptr,

@@ -1257,9 +1257,7 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
         return false;
     }
 
-    // Latch per-batch config into member state so the QProcess finished callbacks (which
-    // outlive this call now that the blocking loop is gone) read stable fields, not
-    // dangling stack captures; begin() below resets outcome aggregation (SPEC §1).
+    // Keep per-batch configuration in member state for asynchronous callbacks.
     _batch.begin(QStringLiteral("run"), totalPoints);
     _batchPoints = std::move(allPoints);
     _batchNextIndex = 0;
@@ -1285,8 +1283,7 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     progressUtil->startProgress(totalPoints, &barOptions);
 
     // Start initial batch of processes; the rest chain in via the finished
-    // callback (bounded concurrency), and the whole batch resolves through
-    // finalizeSeedingBatch — no nested event loop (SPEC §1.3).
+    // callback with bounded concurrency.
     for (int i = 0; i < std::min(numProcesses, totalPoints); i++) {
         startSegmentationProcessForPoint(_batchNextIndex++);
     }
@@ -1387,7 +1384,7 @@ void SeedingWidget::finalizeSeedingBatch()
         return;
     }
 
-    // Capture kind before finalize() clears it (SPEC §1).
+    // Capture kind before finalize() clears it.
     const QString kind = _batch.kind();
     const SeedingBatchTracker::Result r = _batch.finalize();
     const int completed = r.completed;
@@ -1579,9 +1576,7 @@ void SeedingWidget::analyzePaths()
         // Update progress
         pathIndex++;
         progressUtil->updateProgress(pathIndex);
-        // NOTE: no QApplication::processEvents() here — this loop is pure in-process
-        // synchronous compute; pumping the event loop only served UI repaints but made
-        // the method reentrant/unsafe for the agent bridge (SPEC §1.3).
+        // This synchronous computation must not pump a re-entrant event loop.
     }
 
     progressUtil->stopProgress();
@@ -1612,9 +1607,7 @@ bool SeedingWidget::runAnalyzePathsHeadless(QString* errorMessage, int* pathsAna
         return false;
     }
 
-    // analyzePaths is now straight-line synchronous compute (no processEvents,
-    // no QProcess), so it completes before this returns — safe to drive directly
-    // from a bridge RPC handler (SPEC §15.2).
+    // analyzePaths is synchronous and completes before this returns.
     analyzePaths();
 
     if (pathsAnalyzed) *pathsAnalyzed = static_cast<int>(paths.size());
@@ -2345,8 +2338,7 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
         return false;
     }
 
-    // Latch per-batch config into member state (see runSegmentationHeadless).
-    // Reset outcome aggregation before launching the first child (SPEC §1).
+    // Keep per-batch configuration in member state for asynchronous callbacks.
     _batch.begin(QStringLiteral("expand"), expansionIterations);
     _batchPoints.clear();
     _batchNextIndex = 0;
@@ -2373,7 +2365,7 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     progressUtil->startProgress(expansionIterations, &barOptions);
 
     // Start initial batch of processes; the rest chain in via the finished
-    // callback and the batch resolves through finalizeSeedingBatch (SPEC §1.3).
+    // callback with bounded concurrency.
     for (int i = 0; i < std::min(numProcesses, expansionIterations); i++) {
         startExpansionProcessForIteration(_batchNextIndex++);
     }
@@ -2436,8 +2428,8 @@ void SeedingWidget::launchBatchProcess(QProcess* process, int index, const QStri
                                            QProcess::CrashExit, /*failedToStart=*/true);
         });
 
-    // Track the child before start() so a synchronous FailedToStart is still in
-    // runningProcesses when the completion path runs (SPEC §1).
+    // Track before start() so synchronous FailedToStart is handled as part of
+    // this batch.
     runningProcesses.append(QPointer<QProcess>(process));
 
     // Resolve the priority wrappers: nice/ionice may be absent (macOS has no
@@ -2471,8 +2463,7 @@ void SeedingWidget::cancelSeedingBatchHeadless()
         return;
     }
 
-    // Set flags to stop any new processes from starting and to mark the terminal
-    // outcome as a user cancel (distinct from an execution failure) (SPEC §1).
+    // Stop launching children and distinguish cancellation from failure.
     jobsRunning = false;
     _batch.requestCancel();
 

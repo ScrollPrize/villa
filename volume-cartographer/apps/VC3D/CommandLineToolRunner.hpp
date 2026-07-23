@@ -37,9 +37,8 @@ public:
         CustomCommand
     };
 
-    // Output format for Tool::RenderTifXYZ: a per-slice TIFF stack (--tif-output,
-    // the GUI default) or an OME-Zarr store (--zarr-output). The interactive path
-    // always resets to TifStack; the agent bridge can pick either (SPEC §19).
+    // Output format for Tool::RenderTifXYZ: a per-slice TIFF stack or an
+    // OME-Zarr store. Interactive launches reset this to TifStack.
     enum class RenderOutputFormat {
         TifStack,   // --tif-output <pattern>
         Zarr        // --zarr-output <path.zarr>

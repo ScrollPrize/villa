@@ -368,7 +368,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
     if (!state->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    // Method enum (SPEC §3.11 as amended by §8.1).
+    // Growth method accepted by the wire contract.
     const QString methodStr =
         p.value("method").toString(QStringLiteral("tracer"));
     // Footgun fix (§8.1): manual-add is an interactive editing mode, not a grow

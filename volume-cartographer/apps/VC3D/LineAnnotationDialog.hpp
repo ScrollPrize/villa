@@ -141,9 +141,7 @@ public:
     void setCloseAfterFinalizationAllowed(bool allowed);
     void setWorkspaceEmbedded(bool embedded);
     bool workspaceEmbedded() const { return _workspaceEmbedded; }
-    // Agent-bridge wrapper (SPEC §13.4): public twin of the private
-    // setCurrentCutFollowsStripMouse toggle ("current cut follows strip
-    // mouse"). Dialog-free.
+    // Programmatic twin of the "current cut follows strip mouse" toggle.
     void setCutFollowEnabled(bool enabled);
     bool cutFollowEnabled() const { return _currentCutFollowsStripMouse; }
 

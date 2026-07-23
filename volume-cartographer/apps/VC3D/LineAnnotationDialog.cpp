@@ -1749,7 +1749,7 @@ void LineAnnotationDialog::handleShiftScrollModeChanged()
 
 void LineAnnotationDialog::setCutFollowEnabled(bool enabled)
 {
-    // Agent-bridge wrapper (SPEC §13.4); delegates to the private toggle.
+    // Programmatic twin of the private toggle.
     setCurrentCutFollowsStripMouse(enabled);
 }
 

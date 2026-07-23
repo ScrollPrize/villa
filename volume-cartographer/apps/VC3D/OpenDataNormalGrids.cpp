@@ -490,8 +490,8 @@ int attachOpenDataNormalGrids(VolumePkg& pkg,
         }
         for (const auto& info : normalGridsArtifacts(sample.id, volume)) {
             if (selection) {
-                // Map this info back to its artifact index so the
-                // representationRefs axis can gate it (SPEC §10.3).
+                // Map this representation back to its artifact index before
+                // applying the representation filter.
                 std::optional<std::size_t> artifactIndex;
                 for (std::size_t ai = 0; ai < volume.artifacts.size(); ++ai) {
                     const auto& art = volume.artifacts[ai];

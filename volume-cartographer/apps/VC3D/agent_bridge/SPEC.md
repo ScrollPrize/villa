@@ -2769,7 +2769,7 @@ consistent state because the handler closes the old project before the loop star
 
 ### 18.6 Test-harness bindings (`apps/VC3D/agent_bridge/test/`)
 
-1. **Timeout ⇒ liveness check (fixes the finding that masked this crash).** The
+1. **Timeout ⇒ liveness check.** The
    existing catalog steps classify a client-side `TimeoutError` as a non-fatal
    "deferred" note (e.g. the unfiltered-regression step,
    manual_bridge_test.py ~"DEFERRED (full remote open exceeded the offscreen

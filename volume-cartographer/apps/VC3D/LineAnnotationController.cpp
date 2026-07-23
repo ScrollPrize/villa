@@ -2945,12 +2945,8 @@ bool LineAnnotationController::createAtlasFromFiberHeadless(uint64_t fiberId,
                                                             QString* errorMessage,
                                                             fs::path* atlasDirOut)
 {
-    // Headless twin (agent bridge, SPEC §13.8): identical core, but failures
-    // come back through `errorMessage` (never showError's QMessageBox) and
-    // atlasCreated is deliberately NOT emitted — that signal is connected to
-    // the interactive CWindow::displayAtlasFromDirectory, whose failure path
-    // raises the atlas rebuild QMessageBox::question. The bridge displays the
-    // created atlas itself via CWindow::displayAtlasFromDirectoryHeadless.
+    // Do not emit atlasCreated: it is connected to the interactive display
+    // path. Direct callers display the returned directory themselves.
     try {
         const fs::path atlasDir = createAtlasFromFiberCore(fiberId);
         if (atlasDirOut) {
@@ -3249,9 +3245,7 @@ void LineAnnotationController::showIntersectionInspection(
     }
 }
 
-// Headless twin of showIntersectionInspection (agent bridge, SPEC §12.6):
-// identical logic, but failures are reported through `errorMessage` instead of
-// a QMessageBox — bridge handlers must never reach a blocking dialog.
+// Dialog-free intersection inspection.
 bool LineAnnotationController::showIntersectionInspectionHeadless(
     const vc::atlas::FiberIntersectionResult& result,
     QMdiArea* targetArea,
@@ -4906,8 +4900,7 @@ LineAnnotationController::resolveAlignmentMetricsManifestPath()
     const fs::path startDir = vpkg->path().empty()
         ? fs::path{}
         : vpkg->path().parent_path();
-    // Suppressed (agent bridge, SPEC §1.3): never open the dataset-picker
-    // QFileDialog; fail as if the user cancelled, recording the reason.
+    // Suppressed callers cannot open the dataset picker.
     auto picked = (_datasetPicker && !_errorDialogsSuppressed)
         ? _datasetPicker(_parentWidget, startDir)
         : std::optional<std::string>{};
@@ -5931,8 +5924,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         const fs::path startDir = vpkg->path().empty()
             ? fs::path{}
             : vpkg->path().parent_path();
-        // Suppressed (agent bridge, SPEC §1.3): never open the dataset-picker
-        // QFileDialog; fail as if the user cancelled, recording the reason.
+        // Suppressed callers cannot open the dataset picker.
         auto picked = (_datasetPicker && !headless)
             ? _datasetPicker(_parentWidget, startDir)
             : std::optional<std::string>{};
@@ -7021,9 +7013,8 @@ void LineAnnotationController::loadFibersForCurrentPackage()
 
         bool repairRequested = false;
         if (_errorDialogsSuppressed) {
-            // Agent-bridge headless mode (SPEC §1.3): never spin the repair
-            // prompt's nested event loop; take the non-destructive
-            // "keep files unchanged" path and log the details.
+            // Without dialogs, take the conservative "keep files unchanged"
+            // path and log the details.
             Logger()->warn("Line Annotation (suppressed dialog): broken fiber "
                            "branch links, keeping files unchanged:\n{}",
                            details.toStdString());
@@ -8316,8 +8307,7 @@ bool LineAnnotationController::confirmLinkedControlPointEdit(
         return true;
     }
     if (session.suppressErrorDialogs || _errorDialogsSuppressed) {
-        // Agent-bridge headless mode (SPEC §1.3): no confirmation prompt is
-        // possible; refuse the linked edit (the dialog's conservative default).
+        // Without confirmation UI, conservatively refuse the linked edit.
         showError(
             tr("%1 was rejected: the control point is linked to another "
                "fiber and confirmation prompts are disabled in headless mode.")

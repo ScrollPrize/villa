@@ -1957,14 +1957,13 @@ bool SegmentationLasagnaPanel::startOptimizationHeadless(CState* state,
 
     _lastLasagnaMode = mode;
 
-    // Apply an explicit atlas selection before resolving/validating (SPEC §11.4).
+    // Apply an explicit atlas selection before validation.
     if (!atlasPath.isEmpty()) {
         setSelectedAtlasPath(atlasPath);
     }
 
-    // Resolve the config path (empty => panel selection for the mode). Validate
-    // with plain QFileInfo -- NOT validateLasagnaConfigPath, which pops a
-    // QMessageBox (the headless path must never open a dialog, SPEC §1.3).
+    // Resolve the config path without validateLasagnaConfigPath, which can open
+    // a message box.
     const QString resolvedConfig = configPath.isEmpty()
         ? selectedLasagnaConfigPathForMode(mode)
         : configPath;
@@ -1995,9 +1994,8 @@ bool SegmentationLasagnaPanel::startOptimizationHeadless(CState* state,
         }
     }
 
-    // The bridge drives ensure_service separately; require a live service here so
-    // a submission failure is reported via errorMessage rather than the deeper
-    // dialog paths inside startOptimizationWithOverrides (SPEC §11.4 -> -32005).
+    // Require a live service so failure is returned before dialog-capable
+    // submission paths.
     auto& mgr = LasagnaServiceManager::instance();
     if (!mgr.isRunning()) {
         return fail(QStringLiteral("lasagna service is not running"));

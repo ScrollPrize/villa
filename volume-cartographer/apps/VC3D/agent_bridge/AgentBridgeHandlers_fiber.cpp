@@ -103,8 +103,7 @@ uint64_t jsonToFiberId(const QJsonValue& value, const char* paramName)
     if (value.isDouble()) {
         const double d = value.toDouble();
         // Reject a finite double that would overflow uint64 on cast (e.g. 1e300):
-        // 2^64 is exactly representable as double, so require strictly below it
-        // (FINDING 11a).
+        // 2^64 is exactly representable as double, so require strictly below it.
         if (std::isfinite(d) && d > 0 && std::floor(d) == d && d < std::ldexp(1.0, 64))
             return static_cast<uint64_t>(d);
         data["value"] = value;

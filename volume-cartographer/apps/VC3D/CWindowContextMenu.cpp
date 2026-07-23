@@ -1054,14 +1054,8 @@ bool CWindow::initializeCommandLineRunner()
                                            _segmentationCommandHandler->neighborCopyJob()->stage ==
                                                SegmentationCommandHandler::NeighborCopyJob::Stage::FirstPass;
 
-                    // Jobs launched by the agent bridge run unattended (often
-                    // headless/offscreen). A blocking modal here would starve
-                    // every later-connected toolFinished slot -- including the
-                    // bridge's own job-tracking handler -- leaving job.status
-                    // stuck at "running" forever. The runner carries a
-                    // per-run flag the bridge sets for jobs it tracks; honor it
-                    // the same way NeighborCopy's first pass suppresses this
-                    // dialog.
+                    // Unattended runs suppress the modal so later
+                    // toolFinished observers always receive completion.
                     const bool bridgeDriven = _cmdRunner && _cmdRunner->suppressCompletionDialogs();
 
                     const bool suppressDialogs = bridgeDriven || neighborFirstPassSuppress;

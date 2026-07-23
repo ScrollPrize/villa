@@ -303,15 +303,12 @@ private:
         int token,
         const std::function<QJsonObject(const vc3d::opendata::OpenDataManifest&)>& build);
 
-    // --- Job tracking (SPEC §2.4 as amended by §8.3) ---
-    // The generalized model tracks at most one active job **per source**
-    // ("tool" | "growth" | "lasagna" | "atlas"): a lasagna optimization and an
-    // external tool can run concurrently, but two jobs of the same source
-    // cannot. Job ids share one monotonic counter across all sources.
+    // Job tracking permits one active job per lifecycle source. Independent
+    // sources may run concurrently; job ids share one monotonic counter.
     struct JobRecord {
         QString id;          // "job-<n>"
         int     num = 0;     // monotonic order key (parsed-free "most recent" sort)
-        QString source;      // "tool" | "growth" | "lasagna" | "atlas" | "catalog" | "seeding"
+        QString source;      // fixed lifecycle source reported over the wire
         QString kind;        // "segmentation.grow", "segmentation.grow_patch_from_seed", ...
         QString label;
         QString state;       // "running" | "succeeded" | "failed"
@@ -422,8 +419,8 @@ private:
     std::vector<ViewerEntry> _viewers;
     int _nextViewerNum = 1;
 
-    // Active jobs keyed by source (0-4 entries) and per-source completed history
-    // (last <=8 each, SPEC §8.3). One job-number counter across all sources.
+    // At most one active job per source, with the last eight completed records
+    // retained per source. Job numbers are shared across sources.
     QHash<QString, JobRecord> _activeJobs;
     QHash<QString, std::deque<JobRecord>> _recentJobs;
     int _nextJobNum = 1;

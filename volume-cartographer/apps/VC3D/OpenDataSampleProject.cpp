@@ -495,9 +495,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     for (std::size_t volumeIndex = 0; volumeIndex < sample.volumes.size();
          ++volumeIndex) {
         const auto& volume = sample.volumes[volumeIndex];
-        // Volume-level filter (SPEC §10.3): a volume not listed in the
-        // selection's volumeIds is skipped entirely (no artifacts, no
-        // predictions, no counters). nullptr selection => attach everything.
+        // Skip an excluded volume and all of its artifacts and counters.
         if (selection && !selection->allowsVolume(volume.id)) {
             continue;
         }
@@ -526,10 +524,8 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
                 continue;
             }
 
-            // Derived-representation filter (SPEC §10.3): raw source volumes
-            // pass on the volume filter alone, but a supported *prediction*
-            // (the only derived representation attached as a volume entry here)
-            // must additionally pass the representationRefs/kinds axes.
+            // Source volumes use only the volume filter; predictions must also
+            // pass the representation and kind filters.
             if (selection) {
                 if (const auto reprKind =
                         classifyDerivedRepresentation(artifact)) {

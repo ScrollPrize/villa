@@ -31,9 +31,8 @@ struct OpenDataSampleProjectResult {
     std::vector<std::string> messages;
 };
 
-// `selection` (SPEC §10.3) optionally restricts which volumes/derived
-// representations get attached; nullptr preserves the historical
-// attach-everything behavior byte-for-byte.
+// selection optionally restricts attached volumes and derived
+// representations; nullptr attaches everything.
 [[nodiscard]] std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,

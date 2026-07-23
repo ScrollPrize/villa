@@ -33,10 +33,8 @@ from vc3d_mcp.tools.viewer import (  # noqa: E402
 )
 
 
-# Mirrors AgentBridgeHandlers_viewer.cpp's isKnownOverlayColormap() -- the
-# same ids vc::specs() (core/src/render/Colormaps.cpp) exposes, plus "" for
-# "no explicit choice" -- so the fake can reject an unknown id like the real
-# bridge does instead of always echoing back whatever it was sent.
+# The ids exposed by vc::specs(), plus "" for no explicit choice. The fake
+# rejects unknown values like the descriptor-backed bridge.
 _KNOWN_COLORMAPS = {
     "", "fire", "viridis", "magma", "red", "green", "blue", "cyan", "magenta", "glasbey_black0",
 }

@@ -1,5 +1,5 @@
 // Unit tests for SeedingBatchTracker — the honest run/expand batch outcome
-// aggregation extracted from SeedingWidget (SPEC §1).
+// aggregation used by SeedingWidget.
 //
 // Deterministic and process-free: the tracker takes a stable per-child index
 // key (the child's batch index in production, NOT a raw QProcess* — see

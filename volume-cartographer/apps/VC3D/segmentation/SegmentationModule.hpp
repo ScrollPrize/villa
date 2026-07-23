@@ -187,25 +187,23 @@ public:
     [[nodiscard]] cv::Mat takePendingManualAddTracerMask();
     bool applyManualAddTracerPreview(QuadSurface* surface);
 
-    // --- Agent-bridge public wrappers (SPEC §9.2–9.7) ---
-    // Enter/leave manual-add (hole-fill) mode without a keypress; beginManualAdd() is idempotent.
+    // Programmatic editing operations shared with the keyboard-driven tools.
+    // Enter or leave manual-add mode without a keypress.
     bool setManualAddModeActive(bool active, bool apply = true);
-    // Public wrapper for undoManualAddPlaneConstraint() (SPEC §9.6); returns false when there was none to remove.
+    // Returns false when there is no manual-add constraint to remove.
     bool undoManualAddConstraint();
-    // Toggle correction-point authoring mode (the G-key flag) without a keypress (SPEC §9.7).
+    // Toggle correction-point authoring mode without a keypress.
     // Activating enforces the same preconditions as the key handler; on failure sets
     // errorMessage to "editing_disabled" | "no_session" | "growth_in_progress". Unlike the
     // key, this mode is not auto-cleared on mouse release.
     bool setCorrectionPointMode(bool active, QString* errorMessage = nullptr);
     [[nodiscard]] bool correctionPointMode() const { return _correctionDragKeyActive; }
-    // Public wrappers for Gaussian push/pull (SPEC §15.3); distinct names avoid overloading
-    // the private startPushPull/stopAllPushPull (connect() ambiguity). startPushPullMode
-    // returns false when there's no valid hover target / no session.
+    // Gaussian push/pull entry points. Distinct names avoid connect()
+    // ambiguity with the private methods.
     bool startPushPullMode(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stopPushPullAll();
 
-    // Public save/flush accessors for the agent bridge (SPEC §3.11c / segmentation.save).
-    // Snapshot of the autosave bookkeeping, mirrored from segmentation::AutosaveState.
+    // Snapshot of the autosave bookkeeping.
     struct AutosaveStatus
     {
         bool pending{false};        // a deferred save is queued (edits not yet on disk)
@@ -215,7 +213,7 @@ public:
     // Force the pending autosave to run immediately; no-op when nothing is pending, marks
     // dirty (follow-up save) when one is already in flight.
     void flushAutosave();
-    // Current autosave bookkeeping snapshot (SPEC §3.11c, §9.8).
+    // Current autosave bookkeeping snapshot.
     [[nodiscard]] AutosaveStatus autosaveStatus() const;
 
 public slots:
@@ -234,8 +232,7 @@ signals:
                               int steps,
                               bool inpaintOnly);
     void growthInProgressChanged(bool running);
-    // Emitted when an in-flight autosave reaches terminal (non-stale) completion; used by
-    // the agent bridge to close the "autosave" job.
+    // Emitted when an in-flight autosave reaches non-stale completion.
     void autosaveCompleted(bool success);
     void approvalMaskSaved(const std::string& segmentId);
     void annotationPointSelected(uint64_t pointId);

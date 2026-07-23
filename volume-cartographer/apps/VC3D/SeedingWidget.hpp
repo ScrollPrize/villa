@@ -50,28 +50,21 @@ public:
     void setState(CState* state);
     void setViewerManager(ViewerManager* viewerManager);
 
-    // Dialog-free entry points shared with the agent bridge.
+    // Dialog-free operation entry points.
     bool previewRaysHeadless(QString* errorMessage = nullptr);
     bool castRaysHeadless(QString* errorMessage = nullptr);
     void runResetPoints() { onResetPointsClicked(); }
 
-    // --- Agent bridge headless entry points for the batch seeding actions (SPEC §15.2,
-    // as amended) --- onRun/onExpand used to block in a
-    // `while (jobsRunning) QApplication::processEvents` loop (a §1.3 violation); they now
-    // launch the QProcess batch and return, reporting progress/completion via
-    // seedingBatchProgressChanged/seedingBatchFinished. These headless twins run the same
-    // validation + launch but report failures via *errorMessage instead of a QMessageBox,
-    // and never block. Returns true when the batch was accepted (≥1 child launched).
+    // Non-blocking batch entry points shared by the UI and automation. They
+    // report validation failures through errorMessage and lifecycle through the
+    // signals below. A true return means at least one child was launched.
     bool runSegmentationHeadless(QString* errorMessage);
     bool runExpandSeedsHeadless(QString* errorMessage);
-    // Synchronous path-intensity analysis (Draw mode); the only reason this wasn't
-    // bridge-safe was a per-path QApplication::processEvents repaint pump, now removed.
+    // Synchronous path-intensity analysis in Draw mode.
     bool runAnalyzePathsHeadless(QString* errorMessage, int* pathsAnalyzed = nullptr,
                                  int* peaksFound = nullptr);
-    // Dialog-free cancel of the active run/expand (or neural-trace) batch: terminate() +
-    // waitForFinished(1000) then kill() per child, safe to call synchronously from a
-    // bridge RPC handler. Fires seedingBatchFinished(kind,false,...) when a run/expand
-    // batch was active.
+    // Cancels the active run/expand or neural-trace batch. Each child is asked
+    // to terminate, then killed if it does not exit within one second.
     void cancelSeedingBatchHeadless();
     // A neural trace shares jobsRunning but is not a seeding batch.
     [[nodiscard]] bool seedingBatchActive() const { return jobsRunning && !_batch.kind().isEmpty(); }
@@ -81,11 +74,8 @@ signals:
     void sendPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void sendStatusMessageAvailable(QString text, int timeout);
     void relWindingAnnotationModeChanged(bool active);
-    // Batch seeding lifecycle (SPEC §15.2); kind is "run" | "expand", emitted from the
-    // QProcess finished callbacks so the bridge can mirror the batch as a
-    // source:"seeding" job. success is true only when the whole batch ran clean;
-    // canceled distinguishes a user cancel from an execution failure. message carries
-    // the terminal text (see finalizeSeedingBatch).
+    // Batch lifecycle. kind is "run" or "expand"; success requires every child
+    // to finish cleanly, and canceled distinguishes cancellation from failure.
     void seedingBatchProgressChanged(const QString& kind, int completed, int total);
     void seedingBatchFinished(const QString& kind, bool success, bool canceled,
                               int completed, int total, const QString& message);
@@ -229,7 +219,7 @@ private:
     // SeedingBatchTracker _batch; only process-lifecycle bookkeeping stays here.
     int _batchNextIndex{0};
     int _batchOmpThreads{0};
-    SeedingBatchTracker _batch;                  // honest batch outcome (SPEC §1)
+    SeedingBatchTracker _batch;
     QHash<QProcess*, QString> _batchProcessTail; // bounded per-child output tail for diagnostics
     std::vector<ColPoint> _batchPoints;      // run: source points; empty for expand
     // Resolved vc_grow_seg_from_seed volume argument: local zarr path for a mirrored

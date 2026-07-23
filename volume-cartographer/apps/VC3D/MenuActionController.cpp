@@ -84,9 +84,7 @@ bool isAuthError(const QString& msg);
 
 } // namespace
 
-// .cpp-local definition of the forward-declared nested type (SPEC §18.3). It
-// carries the sample id/segment count so finishOpenDataSampleOpen() can build
-// its status messages without re-resolving the sample.
+// Kept local so the QtConcurrent result type does not leak into the header.
 struct MenuActionController::OpenDataOpenTaskResult {
     std::shared_ptr<VolumePkg> pkg;
     vc3d::opendata::OpenDataSampleProjectResult result;
@@ -555,9 +553,7 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         return false;
     }
 
-    // Interactive path only: confirm replacing an already-open project. A non-interactive
-    // (agent-bridge) call is treated as consent to replace and must never spin a nested
-    // event loop (SPEC §1.3, §8.2).
+    // Only interactive callers ask before replacing the current project.
     if (interactive && _window->_state->vpkg()) {
         QMessageBox prompt(_window);
         prompt.setWindowTitle(QObject::tr("Open Data Sample"));
@@ -574,10 +570,8 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         }
     }
 
-    // In-flight guard (SPEC §18.3): a second overlapping open must never interleave
-    // CloseVolume/setVpkg with a still-running open. This is the only remaining path
-    // that spins a nested event loop, and it's interactive-only (never reachable from
-    // the bridge, SPEC §18.5).
+    // Do not interleave CloseVolume/setVpkg from overlapping opens. Only this
+    // interactive wrapper waits through a nested event loop.
     if (_openDataSampleOpenInFlight) {
         if (errorMessage)
             *errorMessage = QObject::tr("An Open Data sample open is already in progress.");
@@ -633,10 +627,8 @@ bool MenuActionController::startOpenDataSampleOpen(
         return false;
     }
 
-    // Always non-interactive from the bridge (SPEC §8.2/§18.3): no nested event loop, no
-    // blocking UI; completion is delivered solely via onFinished on the GUI thread.
-    // `options.selection` is passed by pointer; a default-constructed selection means
-    // attach everything (SPEC §10.3).
+    // This entry point is always non-interactive. Completion is delivered
+    // through onFinished on the GUI thread.
     beginOpenDataSampleOpenTask(*sample, /*interactive=*/false, &options.selection,
                                 std::move(onFinished), std::move(onProgress));
     return true;
@@ -657,7 +649,7 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     const QString cacheDir = vc3d::remoteCachePath();
     const vc3d::opendata::OpenDataSample sampleCopy = sample;
     // Copy the selection by value so the worker thread never dereferences a
-    // caller-owned pointer; a null selection means attach everything (SPEC §10.3).
+    // caller-owned pointer; a null selection means attach everything.
     const bool hasSelection = selection != nullptr;
     const vc3d::opendata::OpenDataResourceSelection selectionCopy =
         selection ? *selection : vc3d::opendata::OpenDataResourceSelection{};
@@ -682,9 +674,8 @@ void MenuActionController::beginOpenDataSampleOpenTask(
         progressDialog = dialog;
     }
 
-    // Forward the same progress stream both to the interactive dialog (when
-    // present) and to the caller's onProgress callback, marshalled to the GUI
-    // thread and guarded by a QPointer liveness check on this (SPEC §18.3).
+    // Forward one progress stream to the optional dialog and callback. Both
+    // updates are marshalled to the GUI thread and guarded for object lifetime.
     QPointer<MenuActionController> self(this);
     auto progressCallback =
         [progressDialog, self, onProgress](
@@ -773,11 +764,9 @@ void MenuActionController::beginOpenDataSampleOpenTask(
                 Qt::QueuedConnection);
         };
 
-    // Heap watcher parented to this (SPEC §18.3): no QEventLoop on this path.
-    // Its finished slot runs on the GUI thread, clears the in-flight flag, runs
-    // the epilogue, and finally calls onFinished. A QtConcurrent open task cannot
-    // be interrupted; if the app exits mid-open the parented watcher's connection
-    // dies and the result is simply discarded.
+    // The parented watcher completes on the GUI thread without a nested event
+    // loop. QtConcurrent cannot interrupt this task; destruction simply
+    // disconnects and discards a late result.
     auto* watcher = new QFutureWatcher<OpenDataOpenTaskResult>(this);
     connect(watcher,
             &QFutureWatcher<OpenDataOpenTaskResult>::finished,
@@ -958,11 +947,8 @@ void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volu
             this,
             [this, watcher, cancelFlag, volumeId]() {
                 vc3d::opendata::OpenDataVolumePrefillResult result;
-                // Fix A (SPEC §18.2): calling result() on a canceled QFuture is
-                // undefined behavior (the result is never stored) -- the actual
-                // 0x28 SIGSEGV. cancelOpenDataVolumePrefills() cancels this
-                // watcher on every open; the stale finished signal then arrives
-                // on the main loop. Check cancellation BEFORE touching result().
+                // A canceled QFuture has no stored result. Check cancellation
+                // before result() when a stale finished signal arrives.
                 if (watcher->isCanceled()) {
                     result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Cancelled;
                     result.volumeId = volumeId.toStdString();

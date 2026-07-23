@@ -84,8 +84,8 @@ struct AtlasSearchFiberSnapshot {
     std::vector<std::string> tags;
 };
 
-// Parameters for a headless atlas fiber-intersection search (SPEC §12.3): the GUI
-// slot scrapes its widgets into one and forwards to the headless launcher.
+// Parameters for an atlas fiber-intersection search. The GUI slot builds the
+// same value from its widgets.
 struct AtlasFiberSearchParams {
     int searchMode{0};                 // ATLAS_SEARCH_MODE_* (CWindow.cpp)
     QStringList requiredTags;
@@ -137,31 +137,25 @@ class CWindow : public QMainWindow
     friend class AgentBridgeServer;
 
 public:
-    // Headless atlas fiber-intersection search (SPEC §12.3): same validation/launch
-    // as the zero-arg slot, failures via `errorMessage` (never a dialog); progress
-    // observable via atlasSearchProgressChanged / atlasSearchFinished.
+    // Starts an atlas fiber-intersection search without opening a dialog.
+    // Progress and completion use the atlasSearch signals below.
     // Distinct name (not an overload): the slot is used as a member-function
     // pointer in new-style connect(), which an overload would make ambiguous.
     bool startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
                                                    QString* errorMessage = nullptr);
 
-    // Headless mask render for the agent bridge: renders <segment>/mask.tif on a
-    // QtConcurrent worker like onEditMaskPressed (append=false) / onAppendMaskPressed
-    // (append=true), minus the QMessageBox / QDesktopServices side effects.
-    // `onFinished` runs on the GUI thread with (success, message). Returns true when
-    // launched; a precondition failure returns false with a classifiable
-    // `errorMessage`: "No volume package loaded", "Invalid segment", "No volume
-    // loaded", or "A mask render is already in progress".
+    // Renders <segment>/mask.tif on a QtConcurrent worker without opening a
+    // dialog or file browser. onFinished runs on the GUI thread.
     bool startMaskRenderHeadless(const QString& segmentId, bool append,
                                  std::function<void(bool, QString)> onFinished,
                                  QString* errorMessage = nullptr);
 
 signals:
-    // Atlas search progress (SPEC §12.9). `phase` in [1, ATLAS_SEARCH_PHASE_COUNT];
-    // `fraction` in [0,1] within that phase.
+    // Atlas search progress. phase is in [1, ATLAS_SEARCH_PHASE_COUNT] and
+    // fraction is in [0, 1] within that phase.
     void atlasSearchProgressChanged(int phase, double fraction);
-    // Terminal atlas-search notification (SPEC §12.9). `success` is false for both
-    // cancellation and error; `resultCount` = _atlasSearchResults.size().
+    // Terminal atlas-search notification. success is false for cancellation
+    // and error; resultCount equals _atlasSearchResults.size().
     void atlasSearchFinished(bool success, int resultCount);
 
 public slots:
@@ -214,26 +208,21 @@ private:
     // letting std::exception propagate (no QMessageBox). Shared by the interactive
     // method and the headless variant below.
     void loadAndDisplayAtlas(const std::filesystem::path& atlasDir);
-    // Headless atlas-open (SPEC §12.1): never shows a dialog or triggers the
-    // rebuild prompt; failures set *errorMessage and return false. Used by the
-    // agent bridge (§1.3). Distinct name rather than an overload:
-    // displayAtlasFromDirectory is used as a member-function pointer in a
-    // new-style connect() (LineAnnotationController::atlasCreated).
+    // Opens an atlas without dialogs or the rebuild prompt. The distinct name
+    // avoids ambiguity where displayAtlasFromDirectory is used in connect().
     bool displayAtlasFromDirectoryHeadless(const std::filesystem::path& atlasDir,
                                            QString* errorMessage = nullptr);
     void refreshAtlasOverviewDocks();
     void updateAtlasFiberDocks();
     void updateAtlasSearchDocks();
     void remapCurrentAtlas();
-    // Headless core of remapCurrentAtlas (SPEC §12.7): preconditions via
-    // `errorMessage`, async completion never opens a dialog; optional `onFinished`
-    // lets the interactive slot attach its completion QMessageBox.
+    // Starts atlas remapping without dialogs. The interactive caller can add
+    // its completion UI through onFinished.
     bool startAtlasRemapHeadless(QString* errorMessage = nullptr,
                                  std::function<void(bool success, const QString& detail)> onFinished = {});
     void optimizeAtlasSnapCandidates();
-    // Headless core of optimizeAtlasSnapCandidates (SPEC §12.8): preconditions via
-    // `errorMessage`; async failures go to status bar/stderr plus optional
-    // `onAsyncError` (interactive QMessageBox).
+    // Starts snap-candidate optimization without dialogs. Async failures go to
+    // the status bar and stderr, plus onAsyncError when provided.
     bool optimizeAtlasSnapCandidatesHeadless(QString* errorMessage = nullptr,
                                              std::function<void(const QString& detail)> onAsyncError = {});
     void startAtlasFiberIntersectionSearch();

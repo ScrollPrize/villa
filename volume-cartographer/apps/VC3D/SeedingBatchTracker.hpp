@@ -4,10 +4,8 @@
 #include <QString>
 #include <QStringList>
 
-// Outcome aggregation for a run/expand seeding batch, extracted from SeedingWidget so it
-// can be unit-tested without spawning real QProcess children (SPEC §1). QObject-free:
-// takes a stable per-child index key (never a raw QProcess*, whose address a later child
-// can reuse after deleteLater — see recordTerminal) and pre-extracted outcome fields.
+// Outcome aggregation for a run/expand seeding batch. QObject-free: takes a
+// stable per-child index key and pre-extracted outcome fields.
 //
 // SeedingWidget keeps the process lifecycle (draining output, killing, deleteLater); this
 // class owns only the failure/cancel/success bookkeeping and the terminal message.
@@ -24,16 +22,12 @@ public:
     // Clear finalized state before a non-seeding operation reuses the teardown path.
     void reset();
 
-    // Resets state for a new batch (mirrors SeedingWidget's pre-launch reset). kind is
-    // "run" | "expand".
+    // Resets state for a new "run" or "expand" batch.
     void begin(const QString& kind, int total);
 
-    // Records one child's terminal state; key is a stable per-child index (never a raw
-    // QProcess*, since SeedingWidget deleteLater()s finished children and a later child
-    // can reuse the freed address). finished()/errorOccurred() may both fire for the same
-    // child, so key dedups to count each exactly once; returns false when key is already
-    // terminal. label is the optional "Segmentation for point N" / "Expansion iteration N"
-    // prefix.
+    // Records one child's terminal state. A stable index avoids QProcess
+    // address reuse after deleteLater. The key also deduplicates overlapping
+    // finished() and errorOccurred() signals.
     bool recordTerminal(int key, bool failedToStart, bool crashed,
                         int exitCode, const QString& tail,
                         const QString& label = QString());
@@ -47,7 +41,7 @@ public:
     // Idempotent: repeated calls return the cached Result without further mutation.
     Result finalize();
 
-    // Introspection (mirrors the former SeedingWidget batch members).
+    // Current batch state.
     [[nodiscard]] const QString& kind() const { return _kind; }
     [[nodiscard]] int total() const { return _total; }
     [[nodiscard]] int completed() const { return _completed; }

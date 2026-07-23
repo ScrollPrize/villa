@@ -24,7 +24,7 @@ bool SeedingBatchTracker::recordTerminal(int key, bool failedToStart,
                                          bool crashed, int exitCode,
                                          const QString& tail, const QString& label)
 {
-    // Each child contributes to batch completion exactly once (SPEC §1).
+    // Each child contributes to completion exactly once.
     if (_terminalKeys.contains(key)) {
         return false;
     }
@@ -47,7 +47,7 @@ bool SeedingBatchTracker::recordTerminal(int key, bool failedToStart,
         if (!trimmed.isEmpty()) {
             diag += QStringLiteral(" [%1]").arg(trimmed.right(200));
         }
-        // Bound the retained failure tail (SPEC §1).
+        // Bound the retained failure tail.
         _failureMessages.append(diag);
         while (_failureMessages.size() > 10) {
             _failureMessages.removeFirst();
@@ -77,7 +77,6 @@ SeedingBatchTracker::Result SeedingBatchTracker::finalize()
     r.canceled = _cancelRequested;
     r.success = !_cancelRequested && _failures == 0;
 
-    // Meaningful terminal text (SPEC §1).
     if (r.success) {
         r.message = QStringLiteral("Seeding %1 finished: %2/%3")
                         .arg(_kind).arg(r.completed).arg(r.total);

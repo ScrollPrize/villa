@@ -137,18 +137,13 @@ public:
     void setVisibleSegmentFolders(std::vector<SegmentFolderSelection> folders);
     void addSingleSegmentation(const std::string& segId);
     void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
-    // Dialog-free core of handleDeleteSegments: irreversibly deletes each id from the
-    // package on disk and refreshes the panel. Returns true only when every id was
-    // deleted; on partial/total failure, `err` gets a summary and `deletedCount` the
-    // number actually deleted. The interactive handleDeleteSegments calls this after its
-    // confirmation dialog; the agent bridge calls it directly (SPEC.md §23).
+    // Irreversibly deletes each id from disk and refreshes the panel. The
+    // interactive caller is responsible for confirmation.
     bool deleteSegmentsHeadless(const QStringList& segmentIds, QString* err = nullptr,
                                 int* deletedCount = nullptr);
     // Replace the whole highlighted-surface set at once and push it to the viewers,
-    // keeping _highlightedSurfaceIds (source of truth behind the "Highlight in slice
-    // views" checkmarks) in sync. The agent bridge routes viewer.set_render_settings
-    // through this rather than ViewerManager directly, so bridge and GUI highlight
-    // changes stay consistent.
+    // keeping _highlightedSurfaceIds, the source of truth behind the
+    // "Highlight in slice views" checkmarks, in sync.
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     std::vector<std::string> highlightedSurfaceIds() const;
     bool cycleToNextVisibleSegment();
