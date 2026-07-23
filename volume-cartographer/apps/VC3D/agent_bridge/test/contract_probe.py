@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -242,9 +244,9 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
                 if keyword == "exclusiveMinimum":
                     value = bound
                 elif keyword == "minimum":
-                    value = bound - 1
+                    value = math.nextafter(bound, -math.inf)
                 elif keyword == "maximum":
-                    value = bound + 1
+                    value = math.nextafter(bound, math.inf)
                 else:
                     value = bound
                 params = _params_with_value(params_schema, path, value)

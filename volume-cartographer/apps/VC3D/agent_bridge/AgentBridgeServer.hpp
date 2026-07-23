@@ -83,6 +83,7 @@ private:
     void registerAtlasHandlers();
     void registerFiberHandlers();
     void registerPointsHandlers();
+    void registerSeedingHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's

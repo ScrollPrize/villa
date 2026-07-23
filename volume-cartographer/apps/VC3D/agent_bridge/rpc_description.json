@@ -1723,6 +1723,82 @@
         "type": "object"
       }
     },
+    "render.tifxyz": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "groupIdx": "group_idx",
+          "numSlices": "num_slices",
+          "outputDir": "output_dir",
+          "outputFormat": "output_format",
+          "segmentId": "segment_id",
+          "volumeId": "volume_id",
+          "voxelSize": "voxel_size"
+        },
+        "tool": "vc3d_render_tifxyz"
+      },
+      "params": {
+        "properties": {
+          "groupIdx": {
+            "default": 0,
+            "maximum": 2147483647,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "numSlices": {
+            "default": 1,
+            "maximum": 2147483647,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "outputDir": {
+            "type": "string"
+          },
+          "outputFormat": {
+            "enum": [
+              "zarr",
+              "tif_stack"
+            ],
+            "type": "string"
+          },
+          "scale": {
+            "default": 1,
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "segmentId": {
+            "type": "string"
+          },
+          "volumeId": {
+            "type": "string"
+          },
+          "voxelSize": {
+            "exclusiveMinimum": 0,
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "segmentId",
+          "outputFormat"
+        ],
+        "type": "object"
+      }
+    },
     "rpc.describe": {
       "errors": [
         -32602
@@ -1765,6 +1841,142 @@
             "type": "string"
           }
         },
+        "type": "object"
+      }
+    },
+    "seeding.analyze_paths": {
+      "errors": [
+        -32000,
+        -32001,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_seeding_analyze_paths"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "seeding.cancel": {
+      "errors": [
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_seeding_cancel"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "seeding.cast_rays": {
+      "errors": [
+        -32000,
+        -32001,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_seeding_cast_rays"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "seeding.expand": {
+      "errors": [
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "tool": "vc3d_seeding_expand"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "seeding.preview_rays": {
+      "errors": [
+        -32000,
+        -32001,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_seeding_preview_rays"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "seeding.reset_points": {
+      "errors": [
+        -32000,
+        -32001,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_seeding_reset_points"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "seeding.run": {
+      "errors": [
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "tool": "vc3d_seeding_run"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "seeding.set_winding_annotation_mode": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_seeding_set_winding_annotation_mode"
+      },
+      "params": {
+        "properties": {
+          "active": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "active"
+        ],
         "type": "object"
       }
     },
@@ -2037,6 +2249,112 @@
         "type": "object"
       }
     },
+    "segmentation.push_pull.set_config": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "blurRadius": "blur_radius",
+          "computeScale": "compute_scale",
+          "perVertex": "per_vertex",
+          "perVertexLimit": "per_vertex_limit"
+        },
+        "tool": "vc3d_push_pull_set_config"
+      },
+      "params": {
+        "properties": {
+          "blurRadius": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "computeScale": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "high": {
+            "maximum": 3.4028234663852886e+38,
+            "minimum": -3.4028234663852886e+38,
+            "type": "number"
+          },
+          "low": {
+            "maximum": 3.4028234663852886e+38,
+            "minimum": -3.4028234663852886e+38,
+            "type": "number"
+          },
+          "perVertex": {
+            "type": "boolean"
+          },
+          "perVertexLimit": {
+            "maximum": 3.4028234663852886e+38,
+            "minimum": -3.4028234663852886e+38,
+            "type": "number"
+          },
+          "start": {
+            "maximum": 3.4028234663852886e+38,
+            "minimum": -3.4028234663852886e+38,
+            "type": "number"
+          },
+          "step": {
+            "maximum": 3.4028234663852886e+38,
+            "minimum": -3.4028234663852886e+38,
+            "type": "number"
+          },
+          "stop": {
+            "maximum": 3.4028234663852886e+38,
+            "minimum": -3.4028234663852886e+38,
+            "type": "number"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "segmentation.push_pull.start": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32008,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_push_pull_start"
+      },
+      "params": {
+        "properties": {
+          "alpha": {
+            "type": "boolean"
+          },
+          "direction": {
+            "enum": [
+              "push",
+              "pull"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "direction"
+        ],
+        "type": "object"
+      }
+    },
+    "segmentation.push_pull.stop": {
+      "errors": [
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_push_pull_stop"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
     "segmentation.save": {
       "errors": [
         -32000,
@@ -2248,6 +2566,94 @@
       },
       "params": {
         "properties": {},
+        "type": "object"
+      }
+    },
+    "tags.set": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32010
+      ],
+      "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_set_segment_tag"
+      },
+      "params": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "segmentId": {
+            "type": "string"
+          },
+          "tag": {
+            "enum": [
+              "approved",
+              "defective",
+              "reviewed",
+              "inspect"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId",
+          "tag",
+          "enabled"
+        ],
+        "type": "object"
+      }
+    },
+    "tracer.run_trace": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "ompThreads": "omp_threads",
+          "outputDir": "output_dir",
+          "paramOverrides": "param_overrides",
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_run_trace"
+      },
+      "params": {
+        "properties": {
+          "ompThreads": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "outputDir": {
+            "type": "string"
+          },
+          "paramOverrides": {
+            "properties": {},
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
         "type": "object"
       }
     },

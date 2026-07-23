@@ -2405,8 +2405,17 @@ errors preserved). The v1 table stands; `vc3d_grow_segment`'s `method` enum drop
 | `vc3d_fiber_export` | `fiber.export` |
 | `vc3d_fiber_import` | `fiber.import` |
 | `vc3d_set_segment_tag` | `tags.set` |
-| `vc3d_seeding` (one tool per `seeding.*` RPC, same suffix) | `seeding.*` |
-| `vc3d_push_pull_set_config` / `_start` / `_stop` | `segmentation.push_pull.*` |
+| `vc3d_seeding_set_winding_annotation_mode` | `seeding.set_winding_annotation_mode` |
+| `vc3d_seeding_preview_rays` | `seeding.preview_rays` |
+| `vc3d_seeding_cast_rays` | `seeding.cast_rays` |
+| `vc3d_seeding_reset_points` | `seeding.reset_points` |
+| `vc3d_seeding_run` | `seeding.run` |
+| `vc3d_seeding_expand` | `seeding.expand` |
+| `vc3d_seeding_cancel` | `seeding.cancel` |
+| `vc3d_seeding_analyze_paths` | `seeding.analyze_paths` |
+| `vc3d_push_pull_set_config` | `segmentation.push_pull.set_config` |
+| `vc3d_push_pull_start` | `segmentation.push_pull.start` |
+| `vc3d_push_pull_stop` | `segmentation.push_pull.stop` |
 | `vc3d_run_trace` | `tracer.run_trace` |
 
 `vc3d_job_status` gains the optional `source` param (§8.3). The MCP server's `wait`

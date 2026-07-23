@@ -698,38 +698,7 @@ void AgentBridgeServer::registerHandlers()
     registerLasagnaHandlers();
     registerAtlasHandlers();
     registerFiberHandlers();
-
-    // --- Stage 6 backlog surface (SPEC §15) ---
-    _handlers.insert("tags.set",
-        [this](const QJsonValue& p) { return handleTagsSet(p); });
-    _handlers.insert("seeding.set_winding_annotation_mode",
-        [this](const QJsonValue& p) { return handleSeedingSetWindingAnnotationMode(p); });
-    _handlers.insert("seeding.preview_rays",
-        [this](const QJsonValue& p) { return handleSeedingPreviewRays(p); });
-    _handlers.insert("seeding.cast_rays",
-        [this](const QJsonValue& p) { return handleSeedingCastRays(p); });
-    _handlers.insert("seeding.reset_points",
-        [this](const QJsonValue& p) { return handleSeedingResetPoints(p); });
-    _handlers.insert("seeding.run",
-        [this](const QJsonValue& p) { return handleSeedingRun(p); });
-    _handlers.insert("seeding.expand",
-        [this](const QJsonValue& p) { return handleSeedingExpand(p); });
-    _handlers.insert("seeding.cancel",
-        [this](const QJsonValue& p) { return handleSeedingCancel(p); });
-    _handlers.insert("seeding.analyze_paths",
-        [this](const QJsonValue& p) { return handleSeedingAnalyzePaths(p); });
-    _handlers.insert("segmentation.push_pull.set_config",
-        [this](const QJsonValue& p) { return handlePushPullSetConfig(p); });
-    _handlers.insert("segmentation.push_pull.start",
-        [this](const QJsonValue& p) { return handlePushPullStart(p); });
-    _handlers.insert("segmentation.push_pull.stop",
-        [this](const QJsonValue& p) { return handlePushPullStop(p); });
-    _handlers.insert("tracer.run_trace",
-        [this](const QJsonValue& p) { return handleTracerRunTrace(p); });
-
-    // --- Rendering RPC (SPEC §19) ---
-    _handlers.insert("render.tifxyz",
-        [this](const QJsonValue& p) { return handleRenderTifxyz(p); });
+    registerSeedingHandlers();
 
     // --- Flattening RPCs (SPEC §20) ---
     _handlers.insert("flatten.slim",
