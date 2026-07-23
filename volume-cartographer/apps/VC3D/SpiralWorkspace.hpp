@@ -195,7 +195,7 @@ private:
     int _maximumDisplayedWinding = 130;
     bool _outputVisible = true;
     bool _showSurfaceIntersections = true;
-    bool _showSurfaceOverlap = false;
+    bool _showSurfaceOverlap = true;
     bool _pendingPatchesOnly = false;
     bool _haveRunDiffBaseline = false;
     bool _flattenedPreviewActive = false;

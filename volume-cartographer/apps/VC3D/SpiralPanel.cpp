@@ -457,7 +457,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* surfaceOverlap = new QCheckBox(tr("Show patch overlap on flattened output"),
                                          _displayDialog);
     surfaceOverlap->setObjectName(QStringLiteral("spiralShowSurfaceOverlap"));
-    surfaceOverlap->setChecked(false);
+    surfaceOverlap->setChecked(true);
     surfaceOverlap->setToolTip(
         tr("Color areas of the flattened output that overlap the selected patch categories"));
     connect(surfaceOverlap, &QCheckBox::toggled,
