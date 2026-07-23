@@ -1,0 +1,140 @@
+{
+  "contractVersion": 1,
+  "domain": "catalog",
+  "methods": {
+    "catalog.open_sample": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "sampleId": {
+            "type": "string"
+          },
+          "resources": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "volumeIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "representationRefs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "kinds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "normal_grids",
+                    "lasagna",
+                    "prediction"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "sampleId"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32007,
+        -32005,
+        -32010,
+        -32004
+      ],
+      "successProbe": false,
+      "invalidProbe": {
+        "skipParams": [
+          "resources"
+        ]
+      },
+      "unprobedErrors": [
+        -32007,
+        -32005,
+        -32010,
+        -32004
+      ],
+      "mcp": {
+        "tool": "vc3d_open_catalog_sample",
+        "paramRenames": {
+          "sampleId": "sample_id"
+        },
+        "extraParams": {
+          "wait": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      }
+    },
+    "catalog.list_samples": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "refresh": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "errors": [
+        -32602,
+        -32005,
+        -32010
+      ],
+      "successProbe": false,
+      "unprobedErrors": [
+        -32005,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_list_catalog_samples"
+      }
+    },
+    "catalog.describe_sample": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "sampleId": {
+            "type": "string"
+          },
+          "refresh": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "sampleId"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32007,
+        -32005,
+        -32010
+      ],
+      "successProbe": false,
+      "unprobedErrors": [
+        -32007,
+        -32005,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_describe_catalog_sample",
+        "paramRenames": {
+          "sampleId": "sample_id"
+        }
+      }
+    }
+  }
+}

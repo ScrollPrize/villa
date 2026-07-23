@@ -102,6 +102,16 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
                         success_probe is False
                         or isinstance(success_probe.get("params", {}), dict)
                     )
+                    invalid_probe = contract.get("invalidProbe", {})
+                    self.assertTrue(
+                        invalid_probe is False
+                        or isinstance(invalid_probe.get("skipParams", []), list)
+                    )
+                    if invalid_probe is not False:
+                        self.assertLessEqual(
+                            set(invalid_probe.get("skipParams", [])),
+                            set(contract["params"]["properties"]),
+                        )
 
                     probes = contract.get("errorProbes", [])
                     probed_errors = {probe["code"] for probe in probes}

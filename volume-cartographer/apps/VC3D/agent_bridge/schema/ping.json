@@ -1,0 +1,16 @@
+{
+  "contractVersion": 1,
+  "domain": "ping",
+  "methods": {
+    "ping": {
+      "params": {
+        "type": "object",
+        "properties": {}
+      },
+      "errors": [],
+      "mcp": {
+        "tool": "vc3d_ping"
+      }
+    }
+  }
+}

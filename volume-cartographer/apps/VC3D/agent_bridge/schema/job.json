@@ -1,0 +1,98 @@
+{
+  "contractVersion": 1,
+  "domain": "job",
+  "methods": {
+    "job.status": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "jobId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "errors": [
+        -32602,
+        -32007
+      ],
+      "successProbe": false,
+      "errorProbes": [
+        {
+          "name": "unknown job",
+          "state": "loaded",
+          "params": {
+            "jobId": "__missing__"
+          },
+          "code": -32007
+        }
+      ],
+      "mcp": {
+        "tool": "vc3d_job_status",
+        "paramRenames": {
+          "jobId": "job_id"
+        }
+      }
+    },
+    "job.cancel": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "jobId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "errors": [
+        -32602,
+        -32007,
+        -32010,
+        -32005
+      ],
+      "successProbe": false,
+      "errorProbes": [
+        {
+          "name": "identifier required",
+          "state": "loaded",
+          "params": {},
+          "code": -32602
+        },
+        {
+          "name": "unknown job",
+          "state": "loaded",
+          "params": {
+            "jobId": "__missing__"
+          },
+          "code": -32007
+        }
+      ],
+      "unprobedErrors": [
+        -32010,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_cancel_job",
+        "paramRenames": {
+          "jobId": "job_id"
+        }
+      }
+    }
+  }
+}

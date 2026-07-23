@@ -1,0 +1,46 @@
+{
+  "contractVersion": 1,
+  "domain": "workspace",
+  "methods": {
+    "workspace.switch": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "main",
+              "lasagna",
+              "fiber_slice"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "successProbe": {
+        "params": {
+          "name": "main"
+        }
+      },
+      "errorProbes": [
+        {
+          "name": "no volume package",
+          "state": "no-project",
+          "params": {
+            "name": "main"
+          },
+          "code": -32000
+        }
+      ],
+      "mcp": {
+        "tool": "vc3d_switch_workspace"
+      }
+    }
+  }
+}

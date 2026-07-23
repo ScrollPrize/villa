@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from mcp.server.fastmcp import Context
+from typing_extensions import TypedDict
 
 from ..core import mcp, _call, _wait_for_job, _strip_none
+
+
+class _CatalogResources(TypedDict, total=False):
+    volumeIds: list[str]
+    representationRefs: list[str]
+    kinds: list[Literal["normal_grids", "lasagna", "prediction"]]
 
 
 @mcp.tool()
@@ -19,7 +26,7 @@ async def vc3d_open_volume(path: str, volume_id: Optional[str] = None) -> dict[s
 @mcp.tool()
 async def vc3d_open_catalog_sample(
     sample_id: str,
-    resources: Optional[dict[str, Any]] = None,
+    resources: Optional[_CatalogResources] = None,
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:

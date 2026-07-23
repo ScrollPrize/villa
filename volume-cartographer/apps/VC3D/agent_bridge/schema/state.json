@@ -1,0 +1,16 @@
+{
+  "contractVersion": 1,
+  "domain": "state",
+  "methods": {
+    "state.get": {
+      "params": {
+        "type": "object",
+        "properties": {}
+      },
+      "errors": [],
+      "mcp": {
+        "tool": "vc3d_get_state"
+      }
+    }
+  }
+}

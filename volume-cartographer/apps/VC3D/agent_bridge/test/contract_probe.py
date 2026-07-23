@@ -197,18 +197,26 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
     report = ProbeReport()
     for method, method_contract in contract["methods"].items():
         params_schema = method_contract["params"]
+        invalid_probe = method_contract.get("invalidProbe", {})
+        if invalid_probe is False:
+            continue
+        skipped_params = set(invalid_probe.get("skipParams", []))
         for name in params_schema.get("required", []):
+            if name in skipped_params:
+                continue
             params = _required_params(params_schema)
             params.pop(name)
             _record_expected_param_error(report, client, method, params, name)
 
         for name, schema in params_schema["properties"].items():
+            if name in skipped_params:
+                continue
             params = _required_params(params_schema)
             params[name] = _invalid_value(schema)
             _record_expected_param_error(report, client, method, params, name)
 
         for path, schema in _walk(params_schema, "enum"):
-            if not path:
+            if not path or path[0] in skipped_params:
                 continue
             params = _params_with_value(
                 params_schema,
@@ -225,6 +233,8 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
 
         for keyword in ("exclusiveMinimum", "minimum", "maximum", "exclusiveMaximum"):
             for path, schema in _walk(params_schema, keyword):
+                if path and path[0] in skipped_params:
+                    continue
                 bound = schema[keyword]
                 if keyword == "exclusiveMinimum":
                     value = bound
@@ -244,7 +254,7 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
                 )
 
         for path, schema in _walk(params_schema, "x-invalid"):
-            if not path:
+            if not path or path[0] in skipped_params:
                 continue
             params = _params_with_value(
                 params_schema,
