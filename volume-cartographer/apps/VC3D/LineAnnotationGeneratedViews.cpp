@@ -741,7 +741,8 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         designateLinkCandidateAction =
             menu.addAction(QWidget::tr("Designate as link candidate"));
         designateLinkCandidateAction->setEnabled(
-            selectedControlIndex != std::numeric_limits<size_t>::max());
+            selectedControlIndex != std::numeric_limits<size_t>::max() &&
+            !selectedControl.hasBranches);
     }
     std::vector<std::pair<QAction*, GeneratedOverlay::ControlPointMarker::BranchLink>> openBranchActions;
     if (!selectedControl.branchLinks.empty()) {
@@ -829,14 +830,16 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             QWidget::tr("New linked line annotation from control point"));
         newLinkedLineAnnotationAction->setEnabled(
             selectedControlIndex != std::numeric_limits<size_t>::max() &&
-            canSampleClickedVolume);
+            canSampleClickedVolume &&
+            !selectedControl.hasBranches);
     }
     QAction* linkWithCandidateAction = nullptr;
     if (options.linkWithCandidate && !options.linkWithCandidateLabel.isEmpty()) {
         linkWithCandidateAction = menu.addAction(options.linkWithCandidateLabel);
         linkWithCandidateAction->setEnabled(
             options.linkWithCandidateEnabled &&
-            selectedControlIndex != std::numeric_limits<size_t>::max());
+            selectedControlIndex != std::numeric_limits<size_t>::max() &&
+            !selectedControl.hasBranches);
     }
     QAction* openNearbyAnnotationAction = nullptr;
     if (options.openNearbyAnnotation && nearbyIntersection) {

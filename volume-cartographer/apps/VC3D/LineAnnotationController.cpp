@@ -787,6 +787,18 @@ bool branchReferencesFiber(const LineAnnotationController::FiberBranchRef& branc
     return !fileName.empty() && branch.branchFileName == fileName;
 }
 
+bool controlPointHasBranchLink(
+    const std::vector<LineAnnotationController::FiberBranchRef>& branches,
+    size_t controlPointIndex)
+{
+    return std::any_of(
+        branches.begin(),
+        branches.end(),
+        [controlPointIndex](const LineAnnotationController::FiberBranchRef& branch) {
+            return branch.controlPointIndex == static_cast<int>(controlPointIndex);
+        });
+}
+
 bool branchLinkedEndpointMatches(
     const LineAnnotationController::FiberBranchRef& lhs,
     const LineAnnotationController::FiberBranchRef& rhs)
@@ -5536,6 +5548,10 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     if (controlPointIndex >= parentSession.controlPoints.size()) {
         return;
     }
+    if (controlPointHasBranchLink(parentSession.branches, controlPointIndex)) {
+        showError(tr("This control point is already linked; unlink it first."));
+        return;
+    }
     if (openAfterCreate && !ensureDatasetForSession(parentSession)) {
         return;
     }
@@ -5704,6 +5720,10 @@ void LineAnnotationController::handleGeneratedControlPointLinkCandidate(
     if (controlPointIndex >= session.controlPoints.size()) {
         return;
     }
+    if (controlPointHasBranchLink(session.branches, controlPointIndex)) {
+        showError(tr("This control point is already linked; unlink it first."));
+        return;
+    }
     const cv::Vec3d candidatePosition = session.controlPoints[controlPointIndex].volumePoint;
     if (!finitePoint(candidatePosition)) {
         showError(tr("Could not determine a finite position for the link candidate."));
@@ -5776,6 +5796,10 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
     if (controlPointIndex >= session.controlPoints.size()) {
         return;
     }
+    if (controlPointHasBranchLink(session.branches, controlPointIndex)) {
+        showError(tr("This control point is already linked; unlink it first."));
+        return;
+    }
     if (!_linkCandidate || _linkCandidate->fiberId == 0) {
         showError(tr("No link candidate is designated."));
         return;
@@ -5812,6 +5836,11 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
     if (!farControlIndex) {
         _linkCandidate.reset();
         showError(tr("The link candidate control point no longer exists."));
+        return;
+    }
+    if (controlPointHasBranchLink(farIt->branches,
+                                  static_cast<size_t>(*farControlIndex))) {
+        showError(tr("The link candidate is already linked; unlink it first."));
         return;
     }
     const cv::Vec3d farPoint = farIt->controlPoints[static_cast<size_t>(*farControlIndex)];
