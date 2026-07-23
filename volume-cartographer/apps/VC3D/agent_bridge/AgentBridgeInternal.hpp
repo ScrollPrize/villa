@@ -10,7 +10,6 @@
 #include <limits>
 #include <optional>
 
-#include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QPointF>
@@ -30,26 +29,10 @@ inline QJsonObject vec3ToJson(const cv::Vec3f& v)
     return o;
 }
 
-inline QJsonObject paramsObject(const QJsonValue& params)
-{
-    if (params.isObject()) {
-        return params.toObject();
-    }
-    if (params.isUndefined() || params.isNull()) {
-        return {};
-    }
-    QJsonObject data;
-    data["param"] = "params";
-    throw AgentBridgeError{-32602, "params must be an object", data};
-}
-
 // ---------------------------------------------------------------------------
-// Strict wire-parameter parsing (SPEC §5). QJsonValue::toDouble()/toInt()/
-// toBool() silently coerce a wrong-typed value to 0/false, which turns a
-// malformed request into a plausible-but-wrong operation. These helpers reject a
-// PRESENT-but-malformed value with -32602 + data.param instead. Callers still
-// decide required vs optional: an omitted optional may keep its documented
-// default, but a value that IS present must have the right type.
+// Numeric conversion helpers for values stored as floats. Method descriptors
+// validate their JSON types first; these helpers additionally reject values
+// that would become non-finite when narrowed from double to float.
 // ---------------------------------------------------------------------------
 
 [[noreturn]] inline void throwParamError(const char* paramName, const QString& detail)
@@ -86,28 +69,6 @@ inline double jsonRequireFiniteFloat(const QJsonValue& v, const char* paramName)
     if (std::abs(d) > static_cast<double>(std::numeric_limits<float>::max()))
         throwParamError(paramName, QStringLiteral("is out of range for a float coordinate"));
     return d;
-}
-
-inline QString jsonRequireString(const QJsonValue& value, const char* paramName)
-{
-    if (!value.isString())
-        throwParamError(paramName, QStringLiteral("must be a string"));
-    return value.toString();
-}
-
-// Require a JSON string on an object key (rejects absent + wrong type).
-inline QString jsonRequireString(const QJsonObject& o, const char* key)
-{
-    return jsonRequireString(o.value(QLatin1String(key)), key);
-}
-
-// Optional string: absent -> default; present-but-wrong-type -> reject.
-inline QString jsonOptionalString(const QJsonObject& o, const char* key,
-                                  const QString& def = QString())
-{
-    if (!o.contains(QLatin1String(key)))
-        return def;
-    return jsonRequireString(o, key);
 }
 
 inline cv::Vec3f jsonToVec3(const QJsonValue& value, const char* paramName)

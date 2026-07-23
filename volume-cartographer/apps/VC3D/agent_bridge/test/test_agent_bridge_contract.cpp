@@ -1,14 +1,10 @@
-// Unit tests for the Agent Bridge wire contract and remaining parsing helpers.
-//
-// QJsonValue::toDouble()/toInt()/toBool() silently coerce a wrong-typed value to
-// 0/false; the jsonRequire*/jsonTo* helpers must instead reject a PRESENT-but-
-// malformed value with AgentBridgeError{-32602} carrying data["param"], while
-// still ACCEPTING well-formed values.
+// Unit tests for the Agent Bridge wire contract and float conversion helpers.
 
 #include <cstdio>
 #include <limits>
 #include <string>
 
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QString>
@@ -87,25 +83,6 @@ int main()
     const double kInf = std::numeric_limits<double>::infinity();
     const double kNaN = std::numeric_limits<double>::quiet_NaN();
 
-    expectNoThrow("params<-absent", [&] {
-        CHECK(paramsObject(QJsonValue(QJsonValue::Undefined)).isEmpty());
-    });
-    expectNoThrow("params<-null", [&] {
-        CHECK(paramsObject(QJsonValue(QJsonValue::Null)).isEmpty());
-    });
-    expectNoThrow("params<-object", [&] {
-        CHECK(paramsObject(QJsonObject{{"value", 1}}).value("value").toInt() == 1);
-    });
-    expectParamError("params<-array", "params", [&] {
-        paramsObject(QJsonArray{});
-    });
-    expectParamError("params<-number", "params", [&] {
-        paramsObject(QJsonValue(1));
-    });
-    expectParamError("string<-number", "name", [&] {
-        jsonRequireString(QJsonValue(1), "name");
-    });
-
     // --- jsonRequireNumber: reject non-numbers, accept numbers ---
     expectParamError("number<-string", "amount",
         [&] { jsonRequireNumber(QJsonValue(QStringLiteral("abc")), "amount"); });
@@ -140,26 +117,6 @@ int main()
     expectNoThrow("finiteFloat<-inrange", [&] {
         CHECK(jsonRequireFiniteFloat(QJsonValue(123.5), "coord") == 123.5);
     });
-
-    // --- jsonRequireString / optional string ---
-    {
-        QJsonObject o;
-        o["name"] = QStringLiteral("hi");
-        o["num"] = 5;
-        expectNoThrow("reqString<-string", [&] {
-            CHECK(jsonRequireString(o, "name") == QLatin1String("hi"));
-        });
-        expectParamError("reqString<-number", "num",
-            [&] { jsonRequireString(o, "num"); });
-        // absent required string -> also -32602 (not a string).
-        expectParamError("reqString<-absent", "missing",
-            [&] { jsonRequireString(o, "missing"); });
-        // Optional: absent returns default, present-but-wrong-type rejects.
-        expectNoThrow("optString<-absent", [&] {
-            CHECK(jsonOptionalString(o, "missing", QStringLiteral("def")) ==
-                  QLatin1String("def"));
-        });
-    }
 
     // --- jsonToVec3 {x, y, z} ---
     expectParamError("vec3<-not-object", "point",

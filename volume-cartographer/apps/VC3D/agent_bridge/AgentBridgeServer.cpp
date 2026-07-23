@@ -617,8 +617,7 @@ VolumeViewerBase* AgentBridgeServer::resolveViewer(const QJsonValue& ref,
 
 QJsonObject AgentBridgeServer::handleRpcDescribe(const QJsonValue& params)
 {
-    const QJsonObject object = paramsObject(params);
-    const QString prefix = jsonOptionalString(object, "prefix");
+    const QString prefix = params.toObject().value("prefix").toString();
 
     QStringList describedNames = _methodDescriptions.keys();
     std::sort(describedNames.begin(), describedNames.end());

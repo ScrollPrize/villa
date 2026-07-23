@@ -717,9 +717,9 @@ void AgentBridgeServer::handleSeedingBatchFinished(const QString& kind, bool suc
 
 QJsonObject AgentBridgeServer::handleJobStatus(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    const QString jobId = jsonOptionalString(p, "jobId");
-    const QString source = jsonOptionalString(p, "source");
+    const QJsonObject p = params.toObject();
+    const QString jobId = p.value("jobId").toString();
+    const QString source = p.value("source").toString();
 
     const JobRecord* rec = jobId.isEmpty() ? mostRecentJob(source) : jobById(jobId);
 
@@ -737,9 +737,9 @@ QJsonObject AgentBridgeServer::handleJobStatus(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    const QString jobId = jsonOptionalString(p, "jobId");
-    const QString source = jsonOptionalString(p, "source");
+    const QJsonObject p = params.toObject();
+    const QString jobId = p.value("jobId").toString();
+    const QString source = p.value("source").toString();
     if (jobId.isEmpty() && source.isEmpty()) {
         QJsonObject data;
         data["param"] = "jobId";
