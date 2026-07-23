@@ -18,6 +18,7 @@ if ROOT not in sys.path:
 
 import fit
 import fit2tifxyz
+from flatten_clamped_adam import FlattenClampedAdam
 import model as fit_model
 import opt_loss_flatten
 import optimizer
@@ -277,6 +278,7 @@ class FlattenLossTest(unittest.TestCase):
 		for stage in cfg["stages"]:
 			self.assertFalse(stage["args"]["flatten_diagnostics"])
 			self.assertTrue(stage["args"]["compile_flatten"])
+			self.assertTrue(stage["args"]["fused_flatten_adam_clamp"])
 
 	def test_bilinear_validity_rejects_cells_with_any_invalid_corner(self) -> None:
 		xyz = _flat_grid(4, 4)
@@ -452,6 +454,60 @@ class FlattenLossTest(unittest.TestCase):
 
 		self.assertLessEqual(float(torch.linalg.vector_norm((params[0] - before[0]).detach(), dim=0).max()), 0.10001)
 		self.assertLessEqual(float(torch.linalg.vector_norm((params[1] - before[1]).detach(), dim=0).max()), 0.20001)
+
+	def _assert_fused_clamped_adam_matches_reference(self, device: torch.device) -> None:
+		torch.manual_seed(7)
+		base_step = 0.005
+		reference_params = [
+			torch.nn.Parameter(torch.randn(2, 1, 17, 19, device=device)),
+			torch.nn.Parameter(torch.randn(2, 1, 9, 10, device=device)),
+		]
+		fused_params = [torch.nn.Parameter(p.detach().clone()) for p in reference_params]
+		reference = torch.optim.Adam([
+			{"params": [p], "lr": 0.01, "_flatten_scale_i": scale_i}
+			for scale_i, p in enumerate(reference_params)
+		])
+		fused = FlattenClampedAdam([
+			{"params": [p], "lr": 0.01, "_flatten_scale_i": scale_i}
+			for scale_i, p in enumerate(fused_params)
+		], base_step=base_step)
+
+		for _step in range(8):
+			grads = [torch.randn_like(p) for p in reference_params]
+			for p, grad in zip(reference_params, grads, strict=True):
+				p.grad = grad
+			for p, grad in zip(fused_params, grads, strict=True):
+				p.grad = grad.clone()
+			reference_before = [p.detach().clone() for p in reference_params]
+			fused_before = [p.detach().clone() for p in fused_params]
+			reference.step()
+			optimizer._clamp_flatten_map_ms_update(
+				reference_params,
+				reference_before,
+				base_step=base_step,
+			)
+			fused.step()
+
+			for scale_i, (p, before) in enumerate(zip(fused_params, fused_before, strict=True)):
+				max_norm = torch.linalg.vector_norm((p - before).detach(), dim=0).max()
+				self.assertLessEqual(float(max_norm), base_step * (2.0 ** scale_i) + 1.0e-6)
+
+		for reference_param, fused_param in zip(reference_params, fused_params, strict=True):
+			self.assertTrue(torch.allclose(reference_param, fused_param, rtol=1.0e-6, atol=5.0e-7))
+			for state_name in ("exp_avg", "exp_avg_sq", "step"):
+				self.assertTrue(torch.allclose(
+					reference.state[reference_param][state_name],
+					fused.state[fused_param][state_name],
+					rtol=1.0e-6,
+					atol=1.0e-7,
+				))
+
+	def test_fused_clamped_adam_matches_reference_on_cpu(self) -> None:
+		self._assert_fused_clamped_adam_matches_reference(torch.device("cpu"))
+
+	@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the Triton fused optimizer test")
+	def test_fused_clamped_adam_matches_reference_on_cuda(self) -> None:
+		self._assert_fused_clamped_adam_matches_reference(torch.device("cuda"))
 
 	def test_orient_regularizer_allows_positive_area_stretch(self) -> None:
 		opt_loss_flatten.configure(orient_min_det=0.0, reset_history=True)

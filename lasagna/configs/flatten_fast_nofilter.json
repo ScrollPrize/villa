@@ -20,6 +20,7 @@
 			"args": {
 				"compile_flatten": true,
 				"flatten_diagnostics": false,
+				"fused_flatten_adam_clamp": true,
 				"flatten_support": true,
 				"flatten_support_radius": 1,
 				"flatten_orient_min_det": 0.0,
@@ -41,6 +42,7 @@
 			"args": {
 				"compile_flatten": true,
 				"flatten_diagnostics": false,
+				"fused_flatten_adam_clamp": true,
 				"flatten_support": true,
 				"flatten_support_radius": 1,
 				"flatten_orient_min_det": 0.0,
@@ -62,6 +64,7 @@
 			"args": {
 				"compile_flatten": true,
 				"flatten_diagnostics": false,
+				"fused_flatten_adam_clamp": true,
 				"flatten_support": true,
 				"flatten_support_radius": 1,
 				"flatten_orient_min_det": 0.0,

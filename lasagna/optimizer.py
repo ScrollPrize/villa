@@ -29,6 +29,7 @@ import opt_loss_atlas_line
 from snap_surf import map_global as snap_surf_map_global
 from progress_table import format_progress_value, print_progress_legend
 import opt_loss_flatten
+from flatten_clamped_adam import FlattenClampedAdam
 
 
 def _debug_cuda_sync(label: str) -> None:
@@ -2088,6 +2089,10 @@ def optimize(
 			if "map_flatten_ms" in opt_cfg.params and bool(getattr(model, "flatten_enabled", False))
 			else 0.0
 		)
+		fused_flatten_adam_clamp = _truthy(os.environ.get(
+			"LASAGNA_FUSED_FLATTEN_ADAM_CLAMP",
+			stage_args.get("fused_flatten_adam_clamp", False),
+		))
 		if opt_timing_enabled and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: opt timing enabled interval={opt_timing_interval} "
@@ -2387,7 +2392,10 @@ def optimize(
 					for pi, p in enumerate(group):
 						if pi < k0:
 							continue
-						param_groups_.append({"params": [p], "lr": _lr_scalespace(lr=settings.lr, scale_i=pi)})
+						param_group = {"params": [p], "lr": _lr_scalespace(lr=settings.lr, scale_i=pi)}
+						if name == "map_flatten_ms":
+							param_group["_flatten_scale_i"] = pi
+						param_groups_.append(param_group)
 				elif name == "cyl_params" and bool(getattr(model, "cyl_shell_mode", False)):
 					scale_count = 0
 					if hasattr(model, "cyl_param_scale_count"):
@@ -2406,16 +2414,35 @@ def optimize(
 						param_groups_.append({"params": [p], "lr": lr_last})
 			return all_params_, param_groups_
 
+		def _make_optimizer(
+			param_groups_: list[dict],
+			opt_settings: OptSettings | None = None,
+		) -> torch.optim.Optimizer:
+			settings = opt_settings if opt_settings is not None else opt_cfg
+			if (
+				fused_flatten_adam_clamp
+				and flatten_max_update > 0.0
+				and settings.params == ["map_flatten_ms"]
+			):
+				return FlattenClampedAdam(param_groups_, base_step=flatten_max_update)
+			return torch.optim.Adam(param_groups_)
+
 		_t = _stage_start(f"{label}.build_optimizer")
 		all_params, param_groups = _make_param_groups()
 		if not param_groups:
 			return data
-		opt = torch.optim.Adam(param_groups)
+		opt = _make_optimizer(param_groups)
 		_capture_optimizer_target_lrs(opt)
 		if flatten_max_update > 0.0 and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: flatten_max_update={flatten_max_update:g} "
 				f"(per-scale cap doubles at each coarser level)",
+				flush=True,
+			)
+		if isinstance(opt, FlattenClampedAdam) and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: fused_flatten_adam_clamp=1 "
+				f"(Triton CUDA with PyTorch fallback)",
 				flush=True,
 			)
 		_stage_done(f"{label}.build_optimizer", _t)
@@ -2440,7 +2467,7 @@ def optimize(
 				all_params, param_groups = _make_param_groups()
 				if not param_groups:
 					return data
-				opt = torch.optim.Adam(param_groups)
+				opt = _make_optimizer(param_groups)
 				_capture_optimizer_target_lrs(opt)
 		_stage_done(f"{label}.winding_offset_autocrop", _t)
 
@@ -3461,7 +3488,7 @@ def optimize(
 				all_params, param_groups = _make_param_groups(pass_settings)
 				if not param_groups:
 					raise RuntimeError(f"{shell_label}: no cylinder parameters available to optimize")
-				opt = torch.optim.Adam(param_groups)
+				opt = _make_optimizer(param_groups, pass_settings)
 				_capture_optimizer_target_lrs(opt)
 				resample_count = 0
 				resampled_this_pass = False
@@ -4165,7 +4192,11 @@ def optimize(
 			_t_part = time.perf_counter()
 			_flatten_update_before = None
 			_flatten_update_params = all_params.get("flatten_map_ms", [])
-			if flatten_max_update > 0.0 and _flatten_update_params:
+			if (
+				flatten_max_update > 0.0
+				and _flatten_update_params
+				and not isinstance(opt, FlattenClampedAdam)
+			):
 				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
 			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
 			_log_cuda_memory(f"{label}.{step + 1}.opt_step.before")
