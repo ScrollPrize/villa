@@ -423,6 +423,9 @@ QString findLasagnaServiceScript()
 {
     QString appDir = QCoreApplication::applicationDirPath();
     QStringList searchPaths = {
+        // Current monorepo layout: build/bin -> villa/lasagna.
+        QDir(appDir).filePath("../../../lasagna/fit_service.py"),
+        QDir::home().filePath("villa/lasagna/fit_service.py"),
         // Development: build dir is volume-cartographer/build/bin/
         QDir(appDir).filePath("../../vesuvius/src/vesuvius/exps_2d_model/fit_service.py"),
         QDir(appDir).filePath("../../../vesuvius/src/vesuvius/exps_2d_model/fit_service.py"),
@@ -497,15 +500,26 @@ QString LasagnaServiceManager::localSourceName() const
 // Service lifecycle
 // ---------------------------------------------------------------------------
 
-bool LasagnaServiceManager::ensureServiceRunning(const QString& pythonPath)
+bool LasagnaServiceManager::ensureServiceRunning(const QString& pythonPath,
+                                                 const QString& dataDirectory)
 {
     if (_isExternal && _serviceReady) {
         return true;
     }
+    const QString requestedDataDirectory =
+        dataDirectory.trimmed().isEmpty()
+            ? QString{}
+            : QFileInfo(dataDirectory).absoluteFilePath();
     if (_process && _process->state() == QProcess::Running && _serviceReady) {
-        return true;
+        if (requestedDataDirectory.isEmpty() ||
+            requestedDataDirectory == _dataDirectory) {
+            return true;
+        }
+        // The fit service discovers datasets only at startup. Switch its data
+        // directory when the active project/volume changes.
+        stopService();
     }
-    return startService(pythonPath);
+    return startService(pythonPath, requestedDataDirectory);
 }
 
 void LasagnaServiceManager::connectToExternal(const QString& host, int port)
@@ -569,7 +583,8 @@ void LasagnaServiceManager::connectToExternal(const QString& host, int port)
     });
 }
 
-bool LasagnaServiceManager::startService(const QString& pythonPath)
+bool LasagnaServiceManager::startService(const QString& pythonPath,
+                                         const QString& dataDirectory)
 {
     ++_requestGeneration;
     clearLocalUploadJobs();
@@ -588,6 +603,21 @@ bool LasagnaServiceManager::startService(const QString& pythonPath)
         emit serviceError(_lastError);
         return false;
     }
+
+    const QFileInfo dataDirectoryInfo(dataDirectory);
+    const QDir dataDir(dataDirectoryInfo.absoluteFilePath());
+    if (dataDirectory.trimmed().isEmpty() || !dataDirectoryInfo.isDir() ||
+        dataDir.entryList(QStringList{QStringLiteral("*.lasagna.json")},
+                          QDir::Files | QDir::Readable | QDir::NoDotAndDotDot)
+            .isEmpty()) {
+        _lastError = dataDirectory.trimmed().isEmpty()
+            ? tr("No Lasagna data directory was provided")
+            : tr("Lasagna data directory contains no .lasagna.json datasets: %1")
+                  .arg(dataDirectory);
+        emit serviceError(_lastError);
+        return false;
+    }
+    _dataDirectory = dataDirectoryInfo.absoluteFilePath();
 
     _process = std::make_unique<QProcess>();
     _process->setProcessChannelMode(QProcess::SeparateChannels);
@@ -617,7 +647,10 @@ bool LasagnaServiceManager::startService(const QString& pythonPath)
     QString python = pythonPath.isEmpty() ? findPythonExecutable() : pythonPath;
 
     // Port 0 = auto-select
-    QStringList args = {scriptPath, "--port", "0"};
+    QStringList args = {
+        scriptPath, QStringLiteral("--port"), QStringLiteral("0"),
+        QStringLiteral("--data-dir"), _dataDirectory
+    };
 
     emit statusMessage(tr("Starting lasagna service..."));
     std::cout << "Starting lasagna service: " << python.toStdString();
@@ -632,6 +665,7 @@ bool LasagnaServiceManager::startService(const QString& pythonPath)
         _lastError = tr("Failed to start lasagna service process");
         emit serviceError(_lastError);
         _process.reset();
+        _dataDirectory.clear();
         return false;
     }
 
@@ -677,6 +711,7 @@ void LasagnaServiceManager::stopService()
         _serviceReady = false;
         _optimizationRunning = false;
         _isExternal = false;
+        _dataDirectory.clear();
         _host = QStringLiteral("127.0.0.1");
         _port = 0;
         _activeJobId.clear();
@@ -711,6 +746,7 @@ void LasagnaServiceManager::stopService()
 
     _process.reset();
     _serviceReady = false;
+    _dataDirectory.clear();
     _port = 0;
     _optimizationRunning = false;
     _activeJobId.clear();
@@ -735,6 +771,68 @@ bool LasagnaServiceManager::isRunning() const
         return _serviceReady;
     }
     return _process && _process->state() == QProcess::Running && _serviceReady;
+}
+
+QString LasagnaServiceManager::findConfigFile(const QString& fileName)
+{
+    const QString serviceScript = findLasagnaServiceScript();
+    if (serviceScript.isEmpty() || fileName.trimmed().isEmpty()) {
+        return {};
+    }
+    const QString candidate = QDir(QFileInfo(serviceScript).absolutePath())
+                                  .filePath(QStringLiteral("configs/%1").arg(fileName));
+    return QFileInfo(candidate).isFile() ? QFileInfo(candidate).absoluteFilePath()
+                                         : QString{};
+}
+
+QJsonObject LasagnaServiceManager::makeTifxyzArtifactUpload(
+    const QString& tifxyzDirectory)
+{
+    namespace fs = std::filesystem;
+    const fs::path root(tifxyzDirectory.toStdString());
+    std::error_code ec;
+    if (!fs::is_directory(root, ec)) {
+        return {};
+    }
+
+    std::vector<fs::path> files;
+    for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
+        if (entry.is_regular_file()) {
+            files.push_back(entry.path());
+        }
+    }
+    if (ec || files.empty()) {
+        return {};
+    }
+    std::sort(files.begin(), files.end());
+
+    QByteArray manifest;
+    for (const auto& path : files) {
+        QFile file(QString::fromStdString(path.string()));
+        if (!file.open(QIODevice::ReadOnly)) {
+            return {};
+        }
+        const QByteArray bytes = file.readAll();
+        const fs::path relative = fs::relative(path, root, ec);
+        if (ec) {
+            return {};
+        }
+        manifest.append(QString::fromStdString(relative.generic_string()).toUtf8());
+        manifest.append('\t');
+        manifest.append(md5Ref(bytes).toUtf8());
+        manifest.append('\n');
+    }
+
+    QJsonObject ref;
+    ref[QStringLiteral("type")] = QStringLiteral("tifxyz_segment");
+    ref[QStringLiteral("name")] = QFileInfo(tifxyzDirectory).fileName();
+    ref[QStringLiteral("hash")] = md5Ref(manifest);
+
+    QJsonObject upload;
+    upload[QStringLiteral("object")] = ref;
+    upload[QStringLiteral("_local_payload")] = QStringLiteral("directory");
+    upload[QStringLiteral("_local_path")] = QFileInfo(tifxyzDirectory).absoluteFilePath();
+    return upload;
 }
 
 void LasagnaServiceManager::rankLaplaceSnapPairs(

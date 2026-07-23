@@ -146,9 +146,15 @@ public:
 
     bool surfaceOverlayEnabled() const override { return false; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override { return overlays_; }
+    std::uint64_t surfaceOverlaysRevision() const override { return overlaysRevision_; }
     float surfaceOverlapThreshold() const override { return 0.0f; }
     void setSurfaceOverlayEnabled(bool) override {}
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override { overlays_ = overlays; }
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override
+    {
+        if (overlays_ == overlays) return;
+        overlays_ = overlays;
+        ++overlaysRevision_;
+    }
     void setSurfaceOverlapThreshold(float) override {}
 
     const ActiveSegmentationHandle& activeSegmentationHandle() const override { return activeSegmentation_; }
@@ -172,6 +178,7 @@ private:
     CompositeRenderSettings compositeSettings_;
     std::vector<ViewerOverlayControllerBase::PathPrimitive> paths_;
     std::map<std::string, cv::Vec3b> overlays_;
+    std::uint64_t overlaysRevision_{0};
     ActiveSegmentationHandle activeSegmentation_;
 };
 

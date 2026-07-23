@@ -135,7 +135,7 @@ void SpiralBrushController::resetSession()
 {
     _gestures.clear();
     _polylines.clear();
-    _pendingPointCollectionIds.clear();
+    _visiblePointCollectionIds.clear();
     clearPointChainProjectionCache();
     _usedColors.clear();
     _sampledColor.reset();
@@ -164,10 +164,10 @@ bool SpiralBrushController::hasUnfinalizedPolylines() const
     });
 }
 
-void SpiralBrushController::setPendingPointCollectionIds(const QSet<QString>& ids)
+void SpiralBrushController::setVisiblePointCollectionIds(const QSet<QString>& ids)
 {
-    if (_pendingPointCollectionIds == ids) return;
-    _pendingPointCollectionIds = ids;
+    if (_visiblePointCollectionIds == ids) return;
+    _visiblePointCollectionIds = ids;
     refreshAll();
 }
 
@@ -602,7 +602,7 @@ bool SpiralBrushController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
     return hasPaint || std::any_of(
         _polylines.begin(), _polylines.end(), [this](const PolylineGesture& line) {
             const bool visible = line.state != GestureState::Finalized
-                || _pendingPointCollectionIds.contains(line.id);
+                || _visiblePointCollectionIds.contains(line.id);
             return visible && line.volumePoints.size() >= 2;
         });
 }
@@ -622,7 +622,7 @@ void SpiralBrushController::collectPrimitives(VolumeViewerBase* viewer, OverlayB
     }
     for (const auto& line : _polylines) {
         const bool visible = line.state != GestureState::Finalized
-            || _pendingPointCollectionIds.contains(line.id);
+            || _visiblePointCollectionIds.contains(line.id);
         if (!visible || line.volumePoints.size() < 2) continue;
         // Volume points remain the canonical line. renderPointChain projects
         // them through the current preview's indexed surface generation, so a
@@ -834,7 +834,7 @@ void SpiralBrushController::discardUnfinalized()
 {
     _gestures.clear();
     _polylines.clear();
-    _pendingPointCollectionIds.clear();
+    _visiblePointCollectionIds.clear();
     clearPointChainProjectionCache();
     _sampledColor.reset();
     refreshAll();

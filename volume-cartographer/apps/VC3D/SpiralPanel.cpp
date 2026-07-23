@@ -436,6 +436,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             this, &SpiralPanel::surfaceIntersectionsChanged);
     displayDialogLayout->addWidget(_showSurfaceIntersections);
 
+    auto* surfaceOverlap = new QCheckBox(tr("Show patch overlap on flattened output"),
+                                         _displayDialog);
+    surfaceOverlap->setObjectName(QStringLiteral("spiralShowSurfaceOverlap"));
+    surfaceOverlap->setChecked(false);
+    surfaceOverlap->setToolTip(
+        tr("Color areas of the flattened output that overlap the selected patch categories"));
+    connect(surfaceOverlap, &QCheckBox::toggled,
+            this, &SpiralPanel::surfaceOverlapChanged);
+    displayDialogLayout->addWidget(surfaceOverlap);
+
     auto* runDiff = new QCheckBox(tr("Run diff"), _displayDialog);
     runDiff->setObjectName(QStringLiteral("spiralRunDiff"));
     runDiff->setToolTip(
@@ -520,6 +530,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     checkpointControls->addWidget(_downloadCheckpoint);
     checkpointControls->addStretch(1);
     runLayout->addLayout(checkpointControls);
+    _flattenWithLasagna = new QPushButton(tr("Flatten with Lasagna"), runContents);
+    _flattenWithLasagna->setObjectName(QStringLiteral("spiralFlattenWithLasagna"));
+    _flattenWithLasagna->setEnabled(false);
+    _flattenWithLasagna->setToolTip(
+        tr("Flatten the complete latest Spiral output with Lasagna"));
+    runLayout->addWidget(_flattenWithLasagna);
 
     auto* ephemeralLabel = new QLabel(tr("Inputs added to the running fit:"), runContents);
     _ephemeralList = new QListWidget(runContents);
@@ -701,6 +717,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                 runAdvancedConfig());
     });
     connect(_stop, &QPushButton::clicked, _service, &SpiralServiceManager::stopAfterIteration);
+    connect(_flattenWithLasagna, &QPushButton::clicked,
+            this, &SpiralPanel::flattenWithLasagnaRequested);
     connect(_save, &QPushButton::clicked, this, [this]() {
         const QString initial = QDir(_paths["output_directory"]->text())
             .filePath(QStringLiteral("checkpoint_manual.ckpt"));
@@ -1062,6 +1080,25 @@ void SpiralPanel::setLossMapOptions(const QStringList& names)
 void SpiralPanel::setLossMapLegend(const QString& text)
 {
     if (_lossMapLegend) _lossMapLegend->setText(text);
+}
+
+void SpiralPanel::setLasagnaFlattenAvailable(bool available, const QString& reason)
+{
+    if (!_flattenWithLasagna) return;
+    _lasagnaFlattenAvailable = available;
+    _flattenWithLasagna->setEnabled(available);
+    _flattenWithLasagna->setToolTip(
+        reason.isEmpty()
+            ? tr("Flatten the complete latest Spiral output with Lasagna")
+            : reason);
+}
+
+void SpiralPanel::setLasagnaFlattenRunning(bool running)
+{
+    if (!_flattenWithLasagna) return;
+    _flattenWithLasagna->setEnabled(!running && _lasagnaFlattenAvailable);
+    _flattenWithLasagna->setText(
+        running ? tr("Flattening with Lasagna…") : tr("Flatten with Lasagna"));
 }
 
 void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)

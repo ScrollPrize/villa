@@ -71,10 +71,13 @@ class LossMapRecorder:
                                     else dr_per_winding)
         self.weights = {str(name): float(value) for name, value in weights.items()}
         self.error = None
+        ranges = preview_manifest.get(
+            "winding_column_ranges", preview_manifest.get("components", [])
+        )
         self.components = {
             int(winding): (int(bounds[0]), int(bounds[1]))
             for winding, bounds in zip(preview_manifest["winding_ids"],
-                                       preview_manifest["components"])
+                                       ranges)
         }
         surface = self.generation_path / preview_manifest["surface_id"] / "x.tif"
         with Image.open(surface) as image:

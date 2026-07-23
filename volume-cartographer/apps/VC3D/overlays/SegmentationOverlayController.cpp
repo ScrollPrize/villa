@@ -69,11 +69,6 @@ bool validSurfaceOverlapPoint(const cv::Vec3f& p)
            p[0] != -1.0f && p[1] != -1.0f && p[2] != -1.0f;
 }
 
-std::size_t mixHash(std::size_t seed, std::size_t value)
-{
-    return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
-}
-
 int overlapSampleCount(int fullCount)
 {
     if (fullCount <= 0) {
@@ -1698,110 +1693,109 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
         return;
     }
 
-    std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
-    std::unordered_map<QuadSurface*, cv::Vec3b> targetColors;
-    targets.reserve(overlays.size());
-    targetColors.reserve(overlays.size());
-
-    std::size_t generationHash = 0;
-    generationHash = mixHash(generationHash, std::hash<const void*>{}(currentQuad));
-    generationHash = mixHash(generationHash, std::hash<std::uint64_t>{}(patchIndex->generation(
-        SurfacePatchIndex::SurfacePtr(currentQuad, [](QuadSurface*) {}))));
-
-    for (const auto& [surfId, color] : overlays) {
-        auto surfBase = _state->surface(surfId);
-        auto overlaySurf = std::dynamic_pointer_cast<QuadSurface>(surfBase);
-        if (!overlaySurf || overlaySurf.get() == currentQuad ||
-            (!overlaySurf->id.empty() && overlaySurf->id == currentQuad->id)) {
-            continue;
-        }
-        if (!patchIndex->containsSurface(overlaySurf)) {
-            continue;
-        }
-        targets.insert(overlaySurf);
-        targetColors[overlaySurf.get()] = color;
-        generationHash = mixHash(generationHash, std::hash<const void*>{}(overlaySurf.get()));
-        generationHash = mixHash(generationHash, std::hash<std::uint64_t>{}(
-            patchIndex->generation(overlaySurf)));
-    }
-
     const int sampleRows = overlapSampleCount(rows);
     const int sampleCols = overlapSampleCount(cols);
     if (sampleRows <= 0 || sampleCols <= 0) {
         return;
     }
 
-    // Check cache validity (cheap - stays on main thread)
+    // The common interaction path reaches here every overlay refresh. Compare
+    // only O(1) revisions before resolving surface IDs or querying the index.
+    // SurfacePatchIndex's global generation deliberately over-invalidates when
+    // an unrelated surface changes, which is preferable to walking and hashing
+    // every selected surface on each pan/zoom tick.
+    const std::uint64_t overlaysRevision = viewer->surfaceOverlaysRevision();
+    const std::uint64_t indexGeneration = patchIndex->globalGeneration();
     auto cacheIt = _overlapCaches.find(viewer);
     bool needsRebuild = (cacheIt == _overlapCaches.end()) ||
                         (cacheIt->second.surface != currentQuad) ||
-                        (cacheIt->second.overlays != overlays) ||
+                        (cacheIt->second.overlaysRevision != overlaysRevision) ||
+                        (cacheIt->second.indexGeneration != indexGeneration) ||
                         (std::abs(cacheIt->second.threshold - threshold) > 0.01f) ||
-                        (cacheIt->second.generationHash != generationHash) ||
                         (cacheIt->second.sampleStride != kSurfaceOverlapSampleStride) ||
                         (cacheIt->second.image.width() != sampleCols) ||
                         (cacheIt->second.image.height() != sampleRows);
 
-    if (needsRebuild && targets.empty()) {
-        OverlapCache emptyCache;
-        emptyCache.surface = currentQuad;
-        emptyCache.overlays = overlays;
-        emptyCache.threshold = threshold;
-        emptyCache.generationHash = generationHash;
-        emptyCache.sampleStride = kSurfaceOverlapSampleStride;
-        _overlapCaches[viewer] = std::move(emptyCache);
-        return;
-    }
+    if (needsRebuild) {
+        std::unordered_set<SurfacePatchIndex::SurfacePtr> targets;
+        std::unordered_map<QuadSurface*, cv::Vec3b> targetColors;
+        targets.reserve(overlays.size());
+        targetColors.reserve(overlays.size());
 
-    // If a compute for *different* parameters is still in flight (e.g. the
-    // previously shown surface), cancel it so the fresh one can start as soon
-    // as the watcher fires instead of waiting out the stale pass.
-    if (needsRebuild && _overlapComputeRunning && _overlapCancel) {
-        const OverlapCache& pending = _pendingOverlap.cache;
-        const bool pendingMatches = _pendingOverlap.viewer == viewer &&
-                                    pending.surface == currentQuad &&
-                                    pending.overlays == overlays &&
-                                    std::abs(pending.threshold - threshold) <= 0.01f &&
-                                    pending.generationHash == generationHash &&
-                                    pending.sampleStride == kSurfaceOverlapSampleStride;
-        if (!pendingMatches) {
-            _overlapCancel->store(true, std::memory_order_relaxed);
+        for (const auto& [surfId, color] : overlays) {
+            auto surfBase = _state->surface(surfId);
+            auto overlaySurf = std::dynamic_pointer_cast<QuadSurface>(surfBase);
+            if (!overlaySurf || overlaySurf.get() == currentQuad ||
+                (!overlaySurf->id.empty() && overlaySurf->id == currentQuad->id)) {
+                continue;
+            }
+            if (!patchIndex->containsSurface(overlaySurf)) {
+                continue;
+            }
+            targets.insert(overlaySurf);
+            targetColors[overlaySurf.get()] = color;
         }
-    }
 
-    if (needsRebuild && !_overlapComputeRunning) {
-        cv::Mat_<cv::Vec3f> sampledPoints(sampleRows, sampleCols);
-        for (int sr = 0; sr < sampleRows; ++sr) {
-            const int r = overlapSampleIndex(sr, sampleRows, rows);
-            for (int sc = 0; sc < sampleCols; ++sc) {
-                const int c = overlapSampleIndex(sc, sampleCols, cols);
-                sampledPoints(sr, sc) = (*currentPts)(r, c);
+        if (targets.empty()) {
+            OverlapCache emptyCache;
+            emptyCache.surface = currentQuad;
+            emptyCache.overlaysRevision = overlaysRevision;
+            emptyCache.indexGeneration = indexGeneration;
+            emptyCache.threshold = threshold;
+            emptyCache.sampleStride = kSurfaceOverlapSampleStride;
+            _overlapCaches[viewer] = std::move(emptyCache);
+            return;
+        }
+
+        // If a compute for *different* parameters is still in flight (e.g. the
+        // previously shown surface), cancel it so the fresh one can start as soon
+        // as the watcher fires instead of waiting out the stale pass.
+        if (_overlapComputeRunning && _overlapCancel) {
+            const OverlapCache& pending = _pendingOverlap.cache;
+            const bool pendingMatches = _pendingOverlap.viewer == viewer &&
+                                        pending.surface == currentQuad &&
+                                        pending.overlaysRevision == overlaysRevision &&
+                                        pending.indexGeneration == indexGeneration &&
+                                        std::abs(pending.threshold - threshold) <= 0.01f &&
+                                        pending.sampleStride == kSurfaceOverlapSampleStride;
+            if (!pendingMatches) {
+                _overlapCancel->store(true, std::memory_order_relaxed);
             }
         }
 
-        // Store cache metadata for when the result arrives
-        _pendingOverlap.viewer = viewer;
-        _pendingOverlap.cache = OverlapCache{};
-        _pendingOverlap.cache.surface = currentQuad;
-        _pendingOverlap.cache.overlays = overlays;
-        _pendingOverlap.cache.threshold = threshold;
-        _pendingOverlap.cache.generationHash = generationHash;
-        _pendingOverlap.cache.sampleStride = kSurfaceOverlapSampleStride;
+        if (!_overlapComputeRunning) {
+            cv::Mat_<cv::Vec3f> sampledPoints(sampleRows, sampleCols);
+            for (int sr = 0; sr < sampleRows; ++sr) {
+                const int r = overlapSampleIndex(sr, sampleRows, rows);
+                for (int sc = 0; sc < sampleCols; ++sc) {
+                    const int c = overlapSampleIndex(sc, sampleCols, cols);
+                    sampledPoints(sr, sc) = (*currentPts)(r, c);
+                }
+            }
 
-        _overlapComputeRunning = true;
-        _overlapIndexReadInFlight = true;
-        _viewerManager->beginIndexRead();
+            // Store cache metadata for when the result arrives
+            _pendingOverlap.viewer = viewer;
+            _pendingOverlap.cache = OverlapCache{};
+            _pendingOverlap.cache.surface = currentQuad;
+            _pendingOverlap.cache.overlaysRevision = overlaysRevision;
+            _pendingOverlap.cache.indexGeneration = indexGeneration;
+            _pendingOverlap.cache.threshold = threshold;
+            _pendingOverlap.cache.sampleStride = kSurfaceOverlapSampleStride;
 
-        auto cancel = std::make_shared<std::atomic_bool>(false);
-        _overlapCancel = cancel;
+            _overlapComputeRunning = true;
+            _overlapIndexReadInFlight = true;
+            _viewerManager->beginIndexRead();
 
-        auto future = QtConcurrent::run(
-            [sampledPoints = std::move(sampledPoints),
-             targets = std::move(targets),
-             targetColors = std::move(targetColors),
-             threshold,
-             patchIndex,
-             cancel]() -> QImage {
+            auto cancel = std::make_shared<std::atomic_bool>(false);
+            _overlapCancel = cancel;
+
+            auto future = QtConcurrent::run(
+                [sampledPoints = std::move(sampledPoints),
+                 targets = std::move(targets),
+                 targetColors = std::move(targetColors),
+                 threshold,
+                 patchIndex,
+                 cancel]() -> QImage {
                 try {
                     QElapsedTimer timer;
                     timer.start();
@@ -1888,7 +1882,8 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                 return {};
             });
 
-        _overlapWatcher->setFuture(future);
+            _overlapWatcher->setFuture(future);
+        }
     }
 
     // Render from cache if available (stale data while recomputing is fine)

@@ -124,19 +124,25 @@ class HandoffTests(unittest.TestCase):
                  [12, 11, 10], [15, 14, 13]],
             )
 
-    def test_combined_preview_has_separators_and_ordered_components(self):
+    def test_combined_preview_is_connected_with_ordered_winding_ranges(self):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "generation-1"
             blocks = {winding: np.full((3, 2, 3), winding, dtype=np.float32)
                       for winding in range(10, 13)}
             save_combined_tifxyz(blocks, destination, "preview", 20, 9.6, "test")
             metadata = json.loads((destination / "preview" / "meta.json").read_text())
-            self.assertEqual(metadata["components"], [[0, 2], [3, 5], [6, 8]])
+            manifest = json.loads((destination / "manifest.json").read_text())
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(
+                metadata["winding_column_ranges"], [[0, 2], [2, 4], [4, 6]]
+            )
+            self.assertNotIn("components", metadata)
             self.assertEqual(metadata["component_winding_ids"], [10, 11, 12])
             from PIL import Image
             x = np.asarray(Image.open(destination / "preview" / "x.tif"))
-            self.assertTrue(np.all(x[:, 2] == -1))
-            self.assertTrue(np.all(x[:, 5] == -1))
+            self.assertEqual(x.shape, (3, 6))
+            self.assertTrue(np.all(x[:, 1] == 10))
+            self.assertTrue(np.all(x[:, 2] == 11))
 
 
 class PreviewRangeTests(unittest.TestCase):

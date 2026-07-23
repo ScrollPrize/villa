@@ -180,6 +180,7 @@ public:
     // --- Surface overlays ---
     virtual bool surfaceOverlayEnabled() const = 0;
     virtual const std::map<std::string, cv::Vec3b>& surfaceOverlays() const = 0;
+    virtual std::uint64_t surfaceOverlaysRevision() const = 0;
     virtual float surfaceOverlapThreshold() const = 0;
     virtual void setSurfaceOverlayEnabled(bool enabled) = 0;
     virtual void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) = 0;

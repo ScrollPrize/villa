@@ -6,6 +6,7 @@
 #include <QImage>
 #include <QJsonObject>
 #include <QColor>
+#include <QPointer>
 #include <QSet>
 #include <QStringList>
 #include <opencv2/core/types.hpp>
@@ -22,6 +23,7 @@ class CState;
 class ConsoleOutputWidget;
 class QDialog;
 class QKeyEvent;
+class QProgressDialog;
 class QuadSurface;
 class SpiralPanel;
 class SpiralServiceManager;
@@ -32,6 +34,7 @@ class PolylineIndex;
 class SpiralOverlayController;
 class SpiralBrushController;
 class SegmentationOverlayController;
+class VolumeViewerBase;
 
 class SpiralWorkspace : public QMainWindow
 {
@@ -84,6 +87,7 @@ private:
             qint64 supportedPixels = 0;
         };
         std::vector<LossMap> lossMaps;
+        bool connected = false;
     };
     struct GeometryLoadResult {
         std::shared_ptr<PolylineIndex> index;
@@ -139,6 +143,15 @@ private:
     void ensureInitialFocus();
     void initializePreviewFocus();
     void mirrorFocusToMainWorkspace(const cv::Vec3f& position);
+    void updateLasagnaFlattenAvailability();
+    QString lasagnaDataDirectorySettingsKey() const;
+    QString resolveLasagnaDataDirectory();
+    void startLasagnaFlatten();
+    void updateLasagnaFlattenProgress(const QJsonObject& job);
+    void failLasagnaFlatten(const QString& error, bool cancelled = false);
+    void closeLasagnaFlattenProgress();
+    void handleLasagnaResults(const QString& outputDir,
+                              const QStringList& segmentNames);
 
     CState* _mainState = nullptr;
     CState* _state = nullptr;
@@ -152,6 +165,7 @@ private:
     ConsoleOutputWidget* _pythonOutput = nullptr;
     QDialog* _pythonOutputDialog = nullptr;
     ViewerSplitGrid* _grid = nullptr;
+    VolumeViewerBase* _flattenedViewer = nullptr;
     qint64 _requestedPreviewGeneration = -1;
     QString _geometryManifestPath;
     QJsonObject _sessionPaths;
@@ -159,7 +173,7 @@ private:
     QHash<QString, QString> _surfaceSourceIds;
     QHash<QString, bool> _surfaceCategoryVisible;
     QSet<QString> _pendingPatchIds;
-    QSet<QString> _pendingDrawnPointCollectionIds;
+    QSet<QString> _visibleUncommittedPointCollectionIds;
     std::map<std::string, std::size_t> _surfaceOverlayColorAssignments;
     std::map<std::string, cv::Vec3b> _surfaceOverlayColors;
     std::size_t _nextSurfaceOverlayColorIndex = 0;
@@ -167,6 +181,7 @@ private:
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
     std::vector<PreviewComponent> _previewComponents;
+    bool _previewConnected = false;
     std::shared_ptr<QuadSurface> _currentPreview;
     QString _currentPreviewRegistrationId;
     QImage _previewRunDiffImage;
@@ -180,8 +195,17 @@ private:
     int _maximumDisplayedWinding = 130;
     bool _outputVisible = true;
     bool _showSurfaceIntersections = true;
+    bool _showSurfaceOverlap = false;
     bool _pendingPatchesOnly = false;
     bool _haveRunDiffBaseline = false;
+    bool _flattenedPreviewActive = false;
+    bool _lasagnaFlattenRunning = false;
+    bool _lasagnaFlattenCancelRequested = false;
+    QString _pendingLasagnaOutputDir;
+    QString _pendingLasagnaOutputName;
+    QString _pendingLasagnaJobId;
+    std::shared_ptr<QuadSurface> _pendingLasagnaSource;
+    QPointer<QProgressDialog> _lasagnaFlattenProgress;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;

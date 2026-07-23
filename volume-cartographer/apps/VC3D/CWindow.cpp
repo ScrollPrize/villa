@@ -5219,7 +5219,8 @@ void CWindow::optimizeAtlasSnapCandidates()
                                  tr("Connect the external Lasagna service before ranking snap candidates."));
             return;
         }
-    } else if (!manager.ensureServiceRunning()) {
+    } else if (!manager.ensureServiceRunning(
+                   {}, QString::fromStdString(manifestPath.parent_path().string()))) {
         QMessageBox::warning(this,
                              tr("Atlas"),
                              tr("Failed to start Lasagna service: %1").arg(manager.lastError()));

@@ -19,7 +19,7 @@ LasagnaServiceManager::LasagnaServiceManager(QObject* parent)
 
 LasagnaServiceManager::~LasagnaServiceManager() = default;
 
-bool LasagnaServiceManager::ensureServiceRunning(const QString&)
+bool LasagnaServiceManager::ensureServiceRunning(const QString&, const QString&)
 {
     _serviceReady = true;
     return true;
@@ -71,6 +71,16 @@ void LasagnaServiceManager::exportLasagnaVis(const QJsonObject&)
 }
 
 QJsonArray LasagnaServiceManager::discoverServices()
+{
+    return {};
+}
+
+QString LasagnaServiceManager::findConfigFile(const QString&)
+{
+    return {};
+}
+
+QJsonObject LasagnaServiceManager::makeTifxyzArtifactUpload(const QString&)
 {
     return {};
 }

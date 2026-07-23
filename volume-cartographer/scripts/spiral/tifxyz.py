@@ -382,13 +382,12 @@ def save_combined_tifxyz(
     *,
     first_winding=10,
 ):
-    """Atomically write disconnected winding grids as one QuadSurface.
+    """Atomically write consecutive winding grids as one QuadSurface.
 
     ``winding_zyxs`` is a mapping from integer winding id to equally tall
-    ``[z, theta, 3]`` ZYX float arrays.  Components use half-open column ranges,
-    matching QuadSurface's metadata contract.  An invalid separator column is
-    inserted between every pair even though components are also recorded; the
-    redundancy keeps old readers from constructing cross-winding quads.
+    ``[z, theta, 3]`` ZYX float arrays. Winding ranges use half-open column
+    bounds for display filtering, but they are not QuadSurface components:
+    adjacent windings remain joined by quads across their shared seam.
     """
     import os
     import shutil
@@ -425,10 +424,6 @@ def save_combined_tifxyz(
         blocks.append(block)
         cursor += block.shape[1]
         components.append([start, cursor])
-        if index + 1 < len(ids):
-            blocks.append(np.full((rows, 1, 3), -1.0, dtype=np.float32))
-            cursor += 1
-
     combined = np.concatenate(blocks, axis=1)
     destination = os.path.abspath(os.fspath(path))
     parent = os.path.dirname(destination)
@@ -464,7 +459,7 @@ def save_combined_tifxyz(
             "type": "seg",
             "uuid": uuid,
             "source": source,
-            "components": components,
+            "winding_column_ranges": components,
             "component_winding_ids": ids,
             "output_first_winding": ids[0],
             "output_last_winding": ids[-1],
@@ -476,13 +471,13 @@ def save_combined_tifxyz(
             os.fsync(stream.fileno())
 
         published = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "spiral_combined_preview",
             "surface_path": os.path.join(destination, uuid),
             "surface_id": uuid,
             "first_winding": ids[0],
             "last_winding": ids[-1],
-            "components": components,
+            "winding_column_ranges": components,
             "winding_ids": ids,
             "manifest_path": os.path.join(destination, "manifest.json"),
         }

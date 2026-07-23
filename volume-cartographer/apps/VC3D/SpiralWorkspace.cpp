@@ -4,6 +4,8 @@
 #include "CState.hpp"
 #include "ConsoleOutputWidget.hpp"
 #include "Keybinds.hpp"
+#include "LasagnaServiceManager.hpp"
+#include "OpenDataLasagna.hpp"
 #include "SpiralPanel.hpp"
 #include "SpiralBrushController.hpp"
 #include "SpiralServiceManager.hpp"
@@ -20,9 +22,12 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <QDialog>
+#include <QCryptographicHash>
+#include <QDateTime>
 #include <QDockWidget>
 #include <QDir>
 #include <QFile>
+#include <QFileDialog>
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -30,6 +35,8 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QMessageBox>
+#include <QProgressDialog>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QSaveFile>
 #include <QShortcut>
@@ -158,7 +165,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     // Ctrl+click-to-focus is wired by ViewerManager for every viewer.
     for (int pane = 0; pane < 4; ++pane) {
         auto* viewer = _viewerManager->createViewerInWidget(specs[pane].surface, _grid);
-        if (pane == 0) _brush->bindFlattenedViewer(viewer);
+        if (pane == 0) {
+            _flattenedViewer = viewer;
+            _brush->bindFlattenedViewer(viewer);
+        }
         viewer->setIntersects(specs[pane].intersects);
         _grid->setViewer(pane, qobject_cast<QWidget*>(viewer->asQObject()));
     }
@@ -247,8 +257,9 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 if (error.isEmpty()) {
                     _pointCollectionProvisionalPaths[inputId] = path;
                     _uncommittedPointCollectionIds.insert(inputId);
-                    _pendingDrawnPointCollectionIds.insert(inputId);
-                    _brush->setPendingPointCollectionIds(_pendingDrawnPointCollectionIds);
+                    _visibleUncommittedPointCollectionIds.insert(inputId);
+                    _brush->setVisiblePointCollectionIds(
+                        _visibleUncommittedPointCollectionIds);
                     _brush->finalizationSucceeded(inputId);
                 } else {
                     QFile::remove(path);
@@ -276,7 +287,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     const QString pclPath = _pointCollectionProvisionalPaths.take(id);
                     if (!pclPath.isEmpty()) QFile::remove(pclPath);
                     _uncommittedPointCollectionIds.remove(id);
+                    _visibleUncommittedPointCollectionIds.remove(id);
                 }
+                _brush->setVisiblePointCollectionIds(
+                    _visibleUncommittedPointCollectionIds);
                 if (_pendingExitAction && !hasPendingBrushWork()) {
                     auto continuation = std::move(_pendingExitAction);
                     _pendingExitAction = {};
@@ -333,6 +347,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         _showSurfaceIntersections = shown;
         updateSurfaceIntersections();
     });
+    connect(_panel, &SpiralPanel::surfaceOverlapChanged, this, [this](bool shown) {
+        _showSurfaceOverlap = shown;
+        updateSurfaceIntersections();
+    });
     connect(_panel, &SpiralPanel::runDiffChanged,
             _overlay.get(), &SpiralOverlayController::setRunDiffVisible);
     connect(_panel, &SpiralPanel::lossMapChanged, this,
@@ -340,6 +358,34 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _selectedLossMap = name;
                 _lossMapOpacity = opacity;
                 updateLossMapOverlay();
+            });
+    connect(_panel, &SpiralPanel::flattenWithLasagnaRequested,
+            this, &SpiralWorkspace::startLasagnaFlatten);
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::resultsPlaced,
+            this, &SpiralWorkspace::handleLasagnaResults);
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::jobsUpdated,
+            this, [this](const QJsonArray& jobs) {
+                if (!_lasagnaFlattenRunning) return;
+                for (const QJsonValue& value : jobs) {
+                    const QJsonObject job = value.toObject();
+                    if (job.value(QStringLiteral("output_name")).toString()
+                        != _pendingLasagnaOutputName) continue;
+                    _pendingLasagnaJobId =
+                        job.value(QStringLiteral("job_id")).toString();
+                    const QString state = job.value(QStringLiteral("state")).toString();
+                    if (state == QStringLiteral("error")
+                        || state == QStringLiteral("cancelled")) {
+                        failLasagnaFlatten(
+                            job.value(QStringLiteral("error")).toString(
+                                state == QStringLiteral("cancelled")
+                                    ? tr("Lasagna job was cancelled")
+                                    : tr("Lasagna job failed")),
+                            state == QStringLiteral("cancelled"));
+                        return;
+                    }
+                    updateLasagnaFlattenProgress(job);
+                    return;
+                }
             });
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
@@ -374,6 +420,16 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     connect(_service, &SpiralServiceManager::sessionAccepted, this,
             [this](const QJsonObject& paths, qint64 generation) {
                 _sessionPaths = paths;
+                _flattenedPreviewActive = false;
+                _previewSource.reset();
+                _previewComponents.clear();
+                _previewConnected = false;
+                _lasagnaFlattenRunning = false;
+                _lasagnaFlattenCancelRequested = false;
+                _pendingLasagnaSource.reset();
+                _pendingLasagnaJobId.clear();
+                closeLasagnaFlattenProgress();
+                _panel->setLasagnaFlattenRunning(false);
                 _brush->resetSession();
                 _pendingBrushPatches.clear();
                 _brushProvisionalPaths.clear();
@@ -385,8 +441,8 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _pendingPointCollectionPaths.clear();
                 _pointCollectionProvisionalPaths.clear();
                 _uncommittedPointCollectionIds.clear();
-                _pendingDrawnPointCollectionIds.clear();
-                _brush->setPendingPointCollectionIds({});
+                _visibleUncommittedPointCollectionIds.clear();
+                _brush->setVisiblePointCollectionIds({});
                 // A newly loaded fit starts a new comparison sequence even when
                 // it reuses the existing service connection.
                 _haveRunDiffBaseline = false;
@@ -400,6 +456,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _overlay->publishRunDiff({}, {});
                 _overlay->publishLossMap({}, {}, _lossMapOpacity);
                 loadInputSurfaces(paths, static_cast<quint64>(generation));
+                updateLasagnaFlattenAvailability();
             });
     // Geometry snapshots arrive as artifacts already transferred to the local
     // cache; the manager hands over a local manifest path.
@@ -599,7 +656,7 @@ void SpiralWorkspace::setSurfaceCategoryVisible(const QString& category, bool vi
 void SpiralWorkspace::updatePendingPatchIds(const QJsonObject& status)
 {
     QSet<QString> pendingPatches;
-    QSet<QString> pendingDrawnPointCollections;
+    QSet<QString> uncommittedDrawnPointCollections;
     for (const QJsonValue& value : status.value(QStringLiteral("ephemeral_inputs")).toArray()) {
         const QJsonObject input = value.toObject();
         if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("patch")
@@ -609,13 +666,16 @@ void SpiralWorkspace::updatePendingPatchIds(const QJsonObject& status)
         if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("pcl")
             && input.value(QStringLiteral("role")).toString()
                    == QStringLiteral("drawn_control_points")
-            && input.value(QStringLiteral("state")).toString() == QStringLiteral("pending")) {
-            pendingDrawnPointCollections.insert(input.value(QStringLiteral("id")).toString());
+            && !input.value(QStringLiteral("committed")).toBool()) {
+            uncommittedDrawnPointCollections.insert(
+                input.value(QStringLiteral("id")).toString());
         }
     }
-    if (pendingDrawnPointCollections != _pendingDrawnPointCollectionIds) {
-        _pendingDrawnPointCollectionIds = std::move(pendingDrawnPointCollections);
-        _brush->setPendingPointCollectionIds(_pendingDrawnPointCollectionIds);
+    if (uncommittedDrawnPointCollections != _visibleUncommittedPointCollectionIds) {
+        _visibleUncommittedPointCollectionIds =
+            std::move(uncommittedDrawnPointCollections);
+        _brush->setVisiblePointCollectionIds(
+            _visibleUncommittedPointCollectionIds);
     }
     if (pendingPatches != _pendingPatchIds) {
         _pendingPatchIds = std::move(pendingPatches);
@@ -638,9 +698,11 @@ void SpiralWorkspace::updateSurfaceIntersections()
                     || shownPendingPatchIds.contains(sourceId))) continue;
             if (pendingOnly) shownPendingPatchIds.insert(sourceId);
             intersections.insert(id.toStdString());
-            const auto color = _surfaceOverlayColors.find(id.toStdString());
-            if (color != _surfaceOverlayColors.end())
-                surfaceOverlays.emplace(color->first, color->second);
+            if (_showSurfaceOverlap) {
+                const auto color = _surfaceOverlayColors.find(id.toStdString());
+                if (color != _surfaceOverlayColors.end())
+                    surfaceOverlays.emplace(color->first, color->second);
+            }
         }
     };
     if (_pendingPatchesOnly) {
@@ -658,12 +720,17 @@ void SpiralWorkspace::updateSurfaceIntersections()
     addCategory(QStringLiteral("brush"), false);
     for (auto* viewer : _viewerManager->baseViewers()) {
         if (!viewer) continue;
-        if (viewer->surfName() == "segmentation") {
+        if (viewer == _flattenedViewer) {
             viewer->setSurfaceOverlays(surfaceOverlays);
-            viewer->setSurfaceOverlayEnabled(!surfaceOverlays.empty());
+            viewer->setSurfaceOverlayEnabled(_showSurfaceOverlap
+                                             && !surfaceOverlays.empty());
             viewer->requestRender("Spiral surface overlays changed");
             continue;
         }
+        // Patch-overlap rendering belongs exclusively to the one flattened
+        // output viewer, independent of the surface type currently installed.
+        viewer->setSurfaceOverlays({});
+        viewer->setSurfaceOverlayEnabled(false);
         viewer->setIntersects(_showSurfaceIntersections ? intersections
                                                         : std::set<std::string>{});
         viewer->requestRender("Spiral surface visibility changed");
@@ -805,8 +872,8 @@ void SpiralWorkspace::discardBrushWork()
     _pendingPointCollectionPaths.clear();
     _pointCollectionProvisionalPaths.clear();
     _uncommittedPointCollectionIds.clear();
-    _pendingDrawnPointCollectionIds.clear();
-    _brush->setPendingPointCollectionIds({});
+    _visibleUncommittedPointCollectionIds.clear();
+    _brush->setVisiblePointCollectionIds({});
     const QStringList brushSurfaceIds = _surfaceCategoryIds.take(QStringLiteral("brush"));
     for (const QString& id : brushSurfaceIds) {
         _surfaceSourceIds.remove(id);
@@ -986,6 +1053,456 @@ void SpiralWorkspace::selectVolume(const QString& id)
     for (auto* viewer : _viewerManager->baseViewers()) if (viewer) viewer->requestRender("Spiral display volume changed");
 }
 
+void SpiralWorkspace::updateLasagnaFlattenAvailability()
+{
+    if (!_panel) return;
+    QString reason;
+    bool available = !_lasagnaFlattenRunning && _previewSource && _previewConnected;
+    if (!_previewSource) {
+        reason = tr("Run Spiral once to create a preview before flattening");
+    } else if (!_previewConnected) {
+        reason = tr("Run Spiral again to create a connected schema-v2 preview");
+    } else {
+        const QString output = _sessionPaths.value(QStringLiteral("output_directory")).toString();
+        if (output.isEmpty() || mapServicePath(output).isEmpty()) {
+            available = false;
+            reason = tr("The Spiral output directory is not locally accessible; configure a path map");
+        } else if (LasagnaServiceManager::findConfigFile(
+                       QStringLiteral("flatten_fast_nofilter.json")).isEmpty()) {
+            available = false;
+            reason = tr("Cannot find Lasagna configs/flatten_fast_nofilter.json");
+        }
+    }
+    _panel->setLasagnaFlattenAvailable(available, reason);
+}
+
+QString SpiralWorkspace::lasagnaDataDirectorySettingsKey() const
+{
+    const CState* state = _state ? _state : _mainState;
+    QString projectPath = state ? state->vpkgPath() : QString{};
+    if (projectPath.isEmpty()) {
+        projectPath =
+            _sessionPaths.value(QStringLiteral("dataset_root")).toString();
+    }
+    if (!projectPath.isEmpty()) {
+        projectPath = QFileInfo(projectPath).absoluteFilePath();
+    }
+    const QString volumeId =
+        state ? QString::fromStdString(state->currentVolumeId()) : QString{};
+    const QByteArray identity =
+        (projectPath + QLatin1Char('\n') + volumeId).toUtf8();
+    const QString digest = QString::fromLatin1(
+        QCryptographicHash::hash(identity, QCryptographicHash::Sha256).toHex());
+    return QStringLiteral("spiral/lasagna_data_dirs/%1").arg(digest);
+}
+
+QString SpiralWorkspace::resolveLasagnaDataDirectory()
+{
+    auto isDataDirectory = [](const QString& path) {
+        if (path.trimmed().isEmpty()) return false;
+        const QDir dir(path);
+        return dir.exists() &&
+            !dir.entryList(QStringList{QStringLiteral("*.lasagna.json")},
+                           QDir::Files | QDir::Readable | QDir::NoDotAndDotDot)
+                 .isEmpty();
+    };
+
+    QSettings settings;
+    const QString settingsKey = lasagnaDataDirectorySettingsKey();
+    const QString persisted = settings.value(settingsKey).toString();
+
+    QStringList candidates;
+    auto addCandidate = [&candidates](const QString& path) {
+        if (path.trimmed().isEmpty()) return;
+        const QString absolute = QFileInfo(path).absoluteFilePath();
+        if (!candidates.contains(absolute)) candidates.push_back(absolute);
+    };
+    addCandidate(persisted);
+    addCandidate(_sessionPaths.value(QStringLiteral("dataset_root")).toString());
+
+    const QString scrollZarr =
+        _sessionPaths.value(QStringLiteral("scroll_zarr")).toString();
+    if (!scrollZarr.isEmpty()) addCandidate(QFileInfo(scrollZarr).absolutePath());
+
+    const CState* state = _state ? _state : _mainState;
+    if (state && state->currentVolume()) {
+        addCandidate(QFileInfo(QString::fromStdString(
+                         state->currentVolume()->path().string())).absolutePath());
+    }
+    if (state && state->vpkg()) {
+        try {
+            const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
+                *state->vpkg(), state->currentVolumeId());
+            if (resolved && !resolved->manifestPath.empty()) {
+                addCandidate(QString::fromStdString(
+                    resolved->manifestPath.parent_path().string()));
+            }
+        } catch (...) {
+            // A missing or malformed catalog entry should simply fall through
+            // to the local candidates and directory picker.
+        }
+    }
+    if (state) {
+        const QString projectPath = state->vpkgPath();
+        addCandidate(projectPath);
+        if (!projectPath.isEmpty())
+            addCandidate(QFileInfo(projectPath).absolutePath());
+    }
+
+    for (const QString& candidate : candidates) {
+        if (!isDataDirectory(candidate)) continue;
+        settings.setValue(settingsKey, candidate);
+        return candidate;
+    }
+
+    QString initialDirectory = persisted;
+    if (initialDirectory.isEmpty() || !QFileInfo(initialDirectory).isDir()) {
+        initialDirectory =
+            _sessionPaths.value(QStringLiteral("dataset_root")).toString();
+    }
+    if (initialDirectory.isEmpty() || !QFileInfo(initialDirectory).isDir()) {
+        initialDirectory = QDir::homePath();
+    }
+
+    while (true) {
+        const QString selected = QFileDialog::getExistingDirectory(
+            this, tr("Select Lasagna data directory"), initialDirectory,
+            QFileDialog::ShowDirsOnly);
+        if (selected.isEmpty()) return {};
+        if (isDataDirectory(selected)) {
+            const QString absolute = QFileInfo(selected).absoluteFilePath();
+            settings.setValue(settingsKey, absolute);
+            return absolute;
+        }
+        QMessageBox::warning(
+            this, tr("Lasagna data directory"),
+            tr("%1 does not contain any .lasagna.json dataset files.")
+                .arg(selected));
+        initialDirectory = selected;
+    }
+}
+
+void SpiralWorkspace::updateLasagnaFlattenProgress(const QJsonObject& job)
+{
+    if (!_lasagnaFlattenProgress) return;
+
+    const QString state = job.value(QStringLiteral("state")).toString();
+    if (state == QStringLiteral("upload")) {
+        const double progress = std::clamp(
+            job.value(QStringLiteral("upload_progress")).toDouble(), 0.0, 1.0);
+        const int current =
+            job.value(QStringLiteral("upload_current")).toInt();
+        const int total = job.value(QStringLiteral("upload_total")).toInt();
+        QString label =
+            job.value(QStringLiteral("upload_label")).toString();
+        if (label.isEmpty()) label = tr("Uploading Spiral surface");
+        if (total > 0) {
+            label += tr(" (%1/%2)").arg(current).arg(total);
+        }
+        _lasagnaFlattenProgress->setRange(0, 1000);
+        _lasagnaFlattenProgress->setValue(
+            static_cast<int>(progress * 1000.0));
+        _lasagnaFlattenProgress->setLabelText(label);
+        return;
+    }
+
+    if (state == QStringLiteral("waiting")) {
+        const int position =
+            job.value(QStringLiteral("queue_position")).toInt();
+        _lasagnaFlattenProgress->setRange(0, 0);
+        _lasagnaFlattenProgress->setLabelText(
+            position > 0
+                ? tr("Waiting for Lasagna (queue position %1)…").arg(position)
+                : tr("Waiting for Lasagna…"));
+        return;
+    }
+
+    if (state == QStringLiteral("running")) {
+        double progress =
+            job.value(QStringLiteral("overall_progress")).toDouble();
+        const int step = job.value(QStringLiteral("step")).toInt();
+        const int total = job.value(QStringLiteral("total_steps")).toInt();
+        if (progress <= 0.0 && step > 0 && total > 0) {
+            progress = static_cast<double>(step) / static_cast<double>(total);
+        }
+        progress = std::clamp(progress, 0.0, 1.0);
+        QString stage =
+            job.value(QStringLiteral("stage_name")).toString();
+        if (stage.isEmpty()) {
+            stage = job.value(QStringLiteral("stage")).toString();
+        }
+        if (stage.isEmpty()) stage = tr("Flattening");
+
+        QString label = total > 0
+            ? tr("%1 — step %2/%3").arg(stage).arg(step).arg(total)
+            : stage;
+        if (job.contains(QStringLiteral("loss"))) {
+            label += tr(" — loss %1")
+                         .arg(job.value(QStringLiteral("loss")).toDouble(),
+                              0, 'g', 5);
+        }
+        _lasagnaFlattenProgress->setRange(0, 1000);
+        _lasagnaFlattenProgress->setValue(
+            static_cast<int>(progress * 1000.0));
+        _lasagnaFlattenProgress->setLabelText(label);
+        return;
+    }
+
+    if (state == QStringLiteral("finished")) {
+        _lasagnaFlattenProgress->setRange(0, 0);
+        _lasagnaFlattenProgress->setLabelText(
+            tr("Downloading Lasagna result…"));
+    }
+}
+
+void SpiralWorkspace::closeLasagnaFlattenProgress()
+{
+    if (!_lasagnaFlattenProgress) return;
+    _lasagnaFlattenProgress->close();
+    _lasagnaFlattenProgress->deleteLater();
+    _lasagnaFlattenProgress = nullptr;
+}
+
+void SpiralWorkspace::failLasagnaFlatten(const QString& error, bool cancelled)
+{
+    if (!_lasagnaFlattenRunning) return;
+    _lasagnaFlattenRunning = false;
+    _lasagnaFlattenCancelRequested = false;
+    _pendingLasagnaSource.reset();
+    _pendingLasagnaJobId.clear();
+    _panel->setLasagnaFlattenRunning(false);
+    closeLasagnaFlattenProgress();
+    updateLasagnaFlattenAvailability();
+    statusBar()->showMessage(
+        tr("Lasagna flatten failed: %1").arg(error), 15000);
+    if (!_shuttingDown && !cancelled) {
+        QMessageBox::warning(
+            this, tr("Flatten with Lasagna"),
+            tr("Lasagna flatten failed: %1").arg(error));
+    }
+}
+
+void SpiralWorkspace::startLasagnaFlatten()
+{
+    updateLasagnaFlattenAvailability();
+    if (_lasagnaFlattenRunning || !_previewSource || !_previewConnected) return;
+
+    const QString configPath = LasagnaServiceManager::findConfigFile(
+        QStringLiteral("flatten_fast_nofilter.json"));
+    QFile configFile(configPath);
+    if (!configFile.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, tr("Lasagna configuration"),
+                             tr("Cannot read %1").arg(configPath));
+        return;
+    }
+    QJsonParseError parseError;
+    const QJsonDocument configDocument =
+        QJsonDocument::fromJson(configFile.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !configDocument.isObject()) {
+        QMessageBox::warning(
+            this, tr("Lasagna configuration"),
+            tr("Invalid flatten_fast_nofilter.json: %1").arg(parseError.errorString()));
+        return;
+    }
+
+    const QString sourcePath = QString::fromStdString(_previewSource->path.string());
+    const QJsonObject upload =
+        LasagnaServiceManager::makeTifxyzArtifactUpload(sourcePath);
+    const QJsonObject sourceRef = upload.value(QStringLiteral("object")).toObject();
+    if (sourcePath.isEmpty() || upload.isEmpty() || sourceRef.isEmpty()) {
+        QMessageBox::warning(this, tr("Lasagna input"),
+                             tr("Cannot package the current Spiral preview"));
+        return;
+    }
+
+    const QString serviceOutput =
+        _sessionPaths.value(QStringLiteral("output_directory")).toString();
+    const QString localOutput = mapServicePath(serviceOutput);
+    if (localOutput.isEmpty() || !QDir().mkpath(localOutput)) {
+        QMessageBox::warning(this, tr("Lasagna output"),
+                             tr("Cannot access the Spiral output directory: %1")
+                                 .arg(serviceOutput));
+        return;
+    }
+
+    auto& lasagna = LasagnaServiceManager::instance();
+    QString dataDirectory;
+    if (lasagna.isExternal()) {
+        if (!lasagna.isRunning()) {
+            QMessageBox::warning(
+                this, tr("Lasagna service"),
+                tr("The configured external Lasagna service is not connected."));
+            return;
+        }
+    } else {
+        dataDirectory = resolveLasagnaDataDirectory();
+        if (dataDirectory.isEmpty()) return;
+    }
+
+    QJsonObject config = configDocument.object();
+    config[QStringLiteral("external_surfaces")] = QJsonArray{sourceRef};
+    if (_state && _state->currentVolume()) {
+        try {
+            const double voxelSize = _state->currentVolume()->voxelSize();
+            if (std::isfinite(voxelSize) && voxelSize > 0.0)
+                config[QStringLiteral("voxel_size_um")] = voxelSize;
+        } catch (...) {
+        }
+    }
+
+    QString stem = _previewSourceId;
+    stem.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")),
+                 QStringLiteral("-"));
+    const QString outputName = QStringLiteral("%1-lasagna-flat-%2.tifxyz")
+        .arg(stem)
+        .arg(QDateTime::currentMSecsSinceEpoch());
+
+    QJsonObject jobSpec;
+    jobSpec[QStringLiteral("config")] = config;
+    jobSpec[QStringLiteral("linked_surfaces")] = QJsonArray{sourceRef};
+
+    QJsonObject request;
+    request[QStringLiteral("config")] = config;
+    request[QStringLiteral("job_spec")] = jobSpec;
+    request[QStringLiteral("single_segment")] = true;
+    request[QStringLiteral("config_name")] =
+        QStringLiteral("flatten_fast_nofilter.json");
+    request[QStringLiteral("output_name")] = outputName;
+    request[QStringLiteral("_objects")] = QJsonArray{upload};
+    request[QStringLiteral("source")] = QStringLiteral("VC3D Spiral workspace");
+
+    _lasagnaFlattenRunning = true;
+    _lasagnaFlattenCancelRequested = false;
+    _pendingLasagnaSource = _previewSource;
+    _pendingLasagnaOutputDir = QFileInfo(localOutput).absoluteFilePath();
+    _pendingLasagnaOutputName = outputName;
+    _pendingLasagnaJobId.clear();
+    _panel->setLasagnaFlattenRunning(true);
+
+    closeLasagnaFlattenProgress();
+    _lasagnaFlattenProgress = new QProgressDialog(
+        tr("Preparing Spiral surface for Lasagna…"), tr("Cancel"),
+        0, 0, this);
+    _lasagnaFlattenProgress->setWindowTitle(tr("Flatten with Lasagna"));
+    _lasagnaFlattenProgress->setWindowModality(Qt::WindowModal);
+    _lasagnaFlattenProgress->setMinimumDuration(0);
+    _lasagnaFlattenProgress->setAutoClose(false);
+    _lasagnaFlattenProgress->setAutoReset(false);
+    connect(_lasagnaFlattenProgress, &QProgressDialog::canceled,
+            this, [this]() {
+                if (!_lasagnaFlattenRunning) return;
+                _lasagnaFlattenCancelRequested = true;
+                auto& manager = LasagnaServiceManager::instance();
+                if (!_pendingLasagnaJobId.isEmpty()) {
+                    manager.cancelJob(_pendingLasagnaJobId);
+                } else if (!manager.isExternal()) {
+                    manager.stopService();
+                } else {
+                    manager.stopOptimization();
+                }
+                statusBar()->showMessage(
+                    tr("Cancelling Lasagna flatten…"), 5000);
+            });
+    _lasagnaFlattenProgress->show();
+
+    if (!lasagna.isExternal()) {
+        _lasagnaFlattenProgress->setLabelText(
+            tr("Starting Lasagna service…"));
+        if (!lasagna.ensureServiceRunning({}, dataDirectory)) {
+            const bool cancelled = _lasagnaFlattenCancelRequested;
+            failLasagnaFlatten(
+                cancelled ? tr("Lasagna job was cancelled")
+                          : tr("Cannot start Lasagna: %1")
+                                .arg(lasagna.lastError()),
+                cancelled);
+            return;
+        }
+    }
+    if (_lasagnaFlattenCancelRequested) {
+        failLasagnaFlatten(tr("Lasagna job was cancelled"), true);
+        return;
+    }
+    if (_lasagnaFlattenProgress) {
+        _lasagnaFlattenProgress->setLabelText(
+            tr("Preparing Spiral surface for Lasagna…"));
+    }
+    statusBar()->showMessage(tr("Queued Lasagna flatten: %1").arg(outputName));
+    lasagna.startOptimization(request, localOutput);
+}
+
+void SpiralWorkspace::handleLasagnaResults(
+    const QString& outputDir, const QStringList& segmentNames)
+{
+    if (!_lasagnaFlattenRunning
+        || QFileInfo(outputDir).absoluteFilePath() != _pendingLasagnaOutputDir
+        || !segmentNames.contains(_pendingLasagnaOutputName)) {
+        return;
+    }
+
+    const QString outputName = _pendingLasagnaOutputName;
+    const QString resultPath = QDir(outputDir).filePath(outputName);
+    const auto source = _pendingLasagnaSource;
+    _pendingLasagnaJobId.clear();
+    if (_lasagnaFlattenProgress) {
+        _lasagnaFlattenProgress->setRange(0, 0);
+        _lasagnaFlattenProgress->setLabelText(
+            tr("Loading flattened surface…"));
+        _lasagnaFlattenProgress->setCancelButton(nullptr);
+    }
+
+    auto* watcher = new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
+    connect(watcher, &QFutureWatcher<std::shared_ptr<QuadSurface>>::finished,
+            this, [this, watcher, source, outputName]() {
+                const auto flattened = watcher->result();
+                watcher->deleteLater();
+                _lasagnaFlattenRunning = false;
+                _lasagnaFlattenCancelRequested = false;
+                _pendingLasagnaSource.reset();
+                _pendingLasagnaJobId.clear();
+                _panel->setLasagnaFlattenRunning(false);
+                closeLasagnaFlattenProgress();
+                updateLasagnaFlattenAvailability();
+                if (!flattened) {
+                    statusBar()->showMessage(
+                        tr("Lasagna finished, but its output could not be loaded"), 15000);
+                    if (!_shuttingDown) {
+                        QMessageBox::warning(
+                            this, tr("Flatten with Lasagna"),
+                            tr("Lasagna finished, but its output could not be loaded."));
+                    }
+                    return;
+                }
+                if (_shuttingDown || source != _previewSource) {
+                    statusBar()->showMessage(
+                        tr("Lasagna output was saved but not displayed because a newer Spiral run exists"),
+                        10000);
+                    return;
+                }
+
+                const quint64 revision = ++_previewDisplayRevision;
+                const QString registrationId =
+                    QStringLiteral("%1-active").arg(outputName);
+                flattened->id = registrationId.toStdString();
+                _flattenedPreviewActive = true;
+                _overlay->publishRunDiff({}, {});
+                _overlay->publishLossMap({}, {}, _lossMapOpacity);
+                _state->setSurface(registrationId.toStdString(), flattened);
+                installPreviewAliasWhenIndexed(
+                    flattened, registrationId, _requestedPreviewGeneration,
+                    revision, true, 0);
+                statusBar()->showMessage(
+                    tr("Lasagna flatten ready: %1").arg(outputName), 10000);
+            });
+    watcher->setFuture(QtConcurrent::run([resultPath]() {
+        try {
+            auto loaded = load_quad_from_tifxyz(resultPath.toStdString());
+            return std::shared_ptr<QuadSurface>(std::move(loaded));
+        } catch (...) {
+            return std::shared_ptr<QuadSurface>{};
+        }
+    }));
+}
+
 void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation)
 {
     if (_shuttingDown || generation < _requestedPreviewGeneration) return;
@@ -1000,7 +1517,8 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
         QFile file(manifestPath);
         if (!file.open(QIODevice::ReadOnly)) return {{}, {}, {}, QObject::tr("Cannot read Spiral preview manifest")};
         const QJsonObject manifest = QJsonDocument::fromJson(file.readAll()).object();
-        if (manifest.value(QStringLiteral("schema_version")).toInt() != 1
+        const int schemaVersion = manifest.value(QStringLiteral("schema_version")).toInt();
+        if ((schemaVersion != 1 && schemaVersion != 2)
             || manifest.value(QStringLiteral("kind")).toString() != QStringLiteral("spiral_combined_preview"))
             return {{}, {}, {}, QObject::tr("Unsupported Spiral preview manifest")};
         QString surfacePath = manifest.value(QStringLiteral("surface_path")).toString();
@@ -1012,7 +1530,11 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
         const QString localSurfacePath = QDir(QFileInfo(manifestPath).absolutePath()).filePath(surfaceId);
         if (QFileInfo(QDir(localSurfacePath).filePath(QStringLiteral("meta.json"))).isFile())
             surfacePath = localSurfacePath;
-        const QJsonArray components = manifest.value(QStringLiteral("components")).toArray();
+        const bool connected = schemaVersion >= 2;
+        const QString rangesKey = connected
+            ? QStringLiteral("winding_column_ranges")
+            : QStringLiteral("components");
+        const QJsonArray components = manifest.value(rangesKey).toArray();
         const QJsonArray windingIds = manifest.value(QStringLiteral("winding_ids")).toArray();
         if (components.isEmpty() || components.size() != windingIds.size()
             || windingIds.at(0).toInt() != 10)
@@ -1022,10 +1544,14 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
         int previousEnd = -1;
         for (int index = 0; index < components.size(); ++index) {
             const QJsonArray range = components[index].toArray();
-            if (range.size() != 2 || range[0].toInt() <= previousEnd
+            const int rangeStart = range.size() == 2 ? range[0].toInt() : -1;
+            const bool invalidStart = connected
+                ? (index == 0 ? rangeStart != 0 : rangeStart != previousEnd)
+                : rangeStart <= previousEnd;
+            if (range.size() != 2 || invalidStart
                 || range[1].toInt() <= range[0].toInt()
                 || windingIds[index].toInt() != 10 + index)
-                return {{}, {}, {}, QObject::tr("Invalid disconnected Spiral component range")};
+                return {{}, {}, {}, QObject::tr("Invalid Spiral winding column range")};
             previewComponents.push_back(
                 {range[0].toInt(), range[1].toInt(), windingIds[index].toInt()});
             previousEnd = range[1].toInt();
@@ -1034,7 +1560,7 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
         if (!metadata.open(QIODevice::ReadOnly))
             return {{}, {}, {}, QObject::tr("Spiral preview surface metadata is missing")};
         const QJsonObject meta = QJsonDocument::fromJson(metadata.readAll()).object();
-        if (meta.value(QStringLiteral("components")) != manifest.value(QStringLiteral("components"))
+        if (meta.value(rangesKey) != manifest.value(rangesKey)
             || meta.value(QStringLiteral("component_winding_ids")) != manifest.value(QStringLiteral("winding_ids"))
             || meta.value(QStringLiteral("uuid")).toString() != surfaceId)
             return {{}, {}, {}, QObject::tr("Spiral preview metadata does not match its generation manifest")};
@@ -1083,7 +1609,7 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
                 lossMaps.push_back(std::move(map));
             }
             return {surface, surfaceId, std::move(previewComponents), {},
-                    std::move(lossMaps)};
+                    std::move(lossMaps), connected};
         } catch (const std::exception& error) {
             return {{}, {}, {}, QString::fromUtf8(error.what())};
         }
@@ -1093,11 +1619,13 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
 void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 generation)
 {
     if (!result.surface) { statusBar()->showMessage(result.error, 15000); return; }
+    _flattenedPreviewActive = false;
     const auto previous = _haveRunDiffBaseline ? _previewSource : nullptr;
     const auto previousComponents = _previewComponents;
     _previewSource = result.surface;
     _previewSourceId = result.surfaceId;
     _previewComponents = result.components;
+    _previewConnected = result.connected;
     _previewRunDiffImage = {};
     _previewLossMaps.clear();
     _loadedLossMap.clear();
@@ -1114,6 +1642,7 @@ void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 gen
     _haveRunDiffBaseline = true;
     if (previous)
         loadRunDiff(previous, previousComponents, result.surface, result.components, generation);
+    updateLasagnaFlattenAvailability();
 }
 
 void SpiralWorkspace::loadRunDiff(
@@ -1259,6 +1788,10 @@ QImage SpiralWorkspace::buildRunDiffImage(
 
 void SpiralWorkspace::updateRunDiffOverlay()
 {
+    if (_flattenedPreviewActive) {
+        _overlay->publishRunDiff({}, {});
+        return;
+    }
     if (!_currentPreview || _previewRunDiffImage.isNull()) {
         _overlay->publishRunDiff({}, {});
         return;
@@ -1294,6 +1827,10 @@ void SpiralWorkspace::updateRunDiffOverlay()
 
 void SpiralWorkspace::updateLossMapOverlay()
 {
+    if (_flattenedPreviewActive) {
+        _overlay->publishLossMap({}, {}, _lossMapOpacity);
+        return;
+    }
     const auto found = _previewLossMaps.constFind(_selectedLossMap);
     if (_selectedLossMap.isEmpty() || found == _previewLossMaps.constEnd()
         || !_currentPreview || found->imagePath.isEmpty()) {
@@ -1377,17 +1914,16 @@ std::shared_ptr<QuadSurface> SpiralWorkspace::makeDisplayedPreview(
     const int firstColumn = selected.front().firstColumn;
     const int endColumn = selected.back().endColumn;
     std::vector<std::pair<int, int>> relativeComponents;
-    relativeComponents.reserve(selected.size());
-    for (const PreviewComponent& component : selected) {
-        relativeComponents.emplace_back(component.firstColumn - firstColumn,
-                                        component.endColumn - firstColumn);
+    if (!_previewConnected) {
+        relativeComponents.reserve(selected.size());
+        for (const PreviewComponent& component : selected) {
+            relativeComponents.emplace_back(component.firstColumn - firstColumn,
+                                            component.endColumn - firstColumn);
+        }
     }
-    // Always use the display wrapper, including for the unbounded (-1) range.
-    // load_quad_from_tifxyz() returns an in-memory surface whose protected
-    // component ranges are not populated from meta.json.  Returning that source
-    // directly for the full range therefore loses the disconnected-winding
-    // layout, while every bounded range takes this wrapper path and renders
-    // correctly.  The wrapper installs the selected component ranges explicitly.
+    // The wrapper retains the source ROI. Schema-v1 previews also install their
+    // disconnected component ranges; schema-v2 previews intentionally leave
+    // them empty so the winding seams remain topologically connected.
     registrationId = QStringLiteral("%1-display-%2")
                          .arg(_previewSourceId)
                          .arg(_previewDisplayRevision);
@@ -1398,7 +1934,7 @@ std::shared_ptr<QuadSurface> SpiralWorkspace::makeDisplayedPreview(
 
 void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
 {
-    if (_shuttingDown || !_previewSource) return;
+    if (_shuttingDown || !_previewSource || _flattenedPreviewActive) return;
     const quint64 revision = ++_previewDisplayRevision;
     QString registrationId;
     auto preview = makeDisplayedPreview(registrationId);

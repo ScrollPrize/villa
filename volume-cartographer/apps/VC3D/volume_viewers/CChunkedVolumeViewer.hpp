@@ -183,10 +183,28 @@ public:
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override;
+    std::uint64_t surfaceOverlaysRevision() const override { return _surfaceOverlaysRevision; }
     float surfaceOverlapThreshold() const override { return _surfaceOverlapThreshold; }
-    void setSurfaceOverlayEnabled(bool enabled) override { if (_closing) return; _surfaceOverlayEnabled = enabled; emit overlaysUpdated(); }
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override { if (_closing) return; _surfaceOverlays = overlays; emit overlaysUpdated(); }
-    void setSurfaceOverlapThreshold(float threshold) override { if (_closing) return; _surfaceOverlapThreshold = std::max(0.0f, threshold); emit overlaysUpdated(); }
+    void setSurfaceOverlayEnabled(bool enabled) override
+    {
+        if (_closing || _surfaceOverlayEnabled == enabled) return;
+        _surfaceOverlayEnabled = enabled;
+        emit overlaysUpdated();
+    }
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override
+    {
+        if (_closing || _surfaceOverlays == overlays) return;
+        _surfaceOverlays = overlays;
+        ++_surfaceOverlaysRevision;
+        emit overlaysUpdated();
+    }
+    void setSurfaceOverlapThreshold(float threshold) override
+    {
+        const float clamped = std::max(0.0f, threshold);
+        if (_closing || _surfaceOverlapThreshold == clamped) return;
+        _surfaceOverlapThreshold = clamped;
+        emit overlaysUpdated();
+    }
 
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
@@ -470,6 +488,7 @@ private:
     bool _surfaceOverlayEnabled = false;
     bool _initializedFirstSegmentationSurface = false;
     std::map<std::string, cv::Vec3b> _surfaceOverlays;
+    std::uint64_t _surfaceOverlaysRevision = 0;
     float _surfaceOverlapThreshold = 5.0f;
     float _intersectionOpacity = 0.7f;
     float _intersectionThickness = 0.0f;

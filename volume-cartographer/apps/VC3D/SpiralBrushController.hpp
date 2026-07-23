@@ -41,7 +41,7 @@ public:
 
     void bindFlattenedViewer(VolumeViewerBase* viewer);
     void setPaintSurface(const std::shared_ptr<QuadSurface>& surface);
-    void setPendingPointCollectionIds(const QSet<QString>& ids);
+    void setVisiblePointCollectionIds(const QSet<QString>& ids);
     void resetSession();
     bool hasUnfinalizedPaint() const;
     bool hasUnfinalizedPolylines() const;
@@ -113,7 +113,7 @@ private:
     SpiralBrushCursorWidget* _cursorWidget = nullptr;
     std::vector<Gesture> _gestures;
     std::vector<PolylineGesture> _polylines;
-    QSet<QString> _pendingPointCollectionIds;
+    QSet<QString> _visiblePointCollectionIds;
     QSet<QRgb> _usedColors;
     std::optional<QColor> _sampledColor;
     QPointF _cursorDevicePos;
