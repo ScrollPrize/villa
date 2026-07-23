@@ -185,7 +185,16 @@ class FakeAgentBridgeServer:
         params = msg.get("params") or {}
 
         if method == "ping":
-            await self._reply(writer, req_id, result={"pong": True, "pid": 4242, "version": "test-0.0"})
+            await self._reply(
+                writer,
+                req_id,
+                result={
+                    "pong": True,
+                    "pid": 4242,
+                    "version": "test-0.0",
+                    "protocolVersion": 1,
+                },
+            )
         elif method == "state.get":
             await self._reply(writer, req_id, result={"vpkg": None, "volume": None})
         elif method == "segmentation.grow":
@@ -513,7 +522,7 @@ class BridgeClientTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_connect_send_request_and_parse_response(self) -> None:
         result = await self.client.call("ping")
-        self.assertEqual(result, {"pong": True, "pid": 4242, "version": "test-0.0"})
+        self.assertEqual(result["protocolVersion"], 1)
 
     async def test_jsonrpc_error_reply_becomes_bridge_error(self) -> None:
         with self.assertRaises(BridgeError) as ctx:
@@ -850,7 +859,7 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.fail("condition not met within timeout")
 
     async def test_reconnects_after_peer_eof(self) -> None:
-        self.assertEqual(await self.client.call("ping"), {"pong": True, "pid": 4242, "version": "test-0.0"})
+        self.assertEqual((await self.client.call("ping"))["protocolVersion"], 1)
         # Drop the peer: stopping the server EOFs the client's reader.
         await self.fake_server.stop()
         await self._wait_until(lambda: self.client.connected is False)
@@ -1231,6 +1240,10 @@ class AutoLaunchTest(unittest.TestCase):
         ):
             self.assertIsNone(server_module.resolve_launch_binary("/missing/VC3D"))
             path_lookup.assert_not_called()
+
+    def test_protocol_check_rejects_stale_bridge(self) -> None:
+        with self.assertRaisesRegex(BridgeConnectionError, "expected 1, got None"):
+            server_module._validate_protocol({"pong": True})
 
 
 class NewTailLinesTest(unittest.TestCase):

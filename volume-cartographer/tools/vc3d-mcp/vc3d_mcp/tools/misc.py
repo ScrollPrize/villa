@@ -14,7 +14,7 @@ INLINE_SCREENSHOT_MAX_DIM = 2048
 
 @mcp.tool()
 async def vc3d_ping() -> dict[str, Any]:
-    """Check the VC3D bridge is alive; returns pid and app version."""
+    """Check the VC3D bridge is alive; returns pid, app version, and protocol version."""
     return await _call("ping")
 
 

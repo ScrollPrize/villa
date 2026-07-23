@@ -48,6 +48,8 @@ class AgentBridgeServer : public QObject
     Q_OBJECT
 
 public:
+    static constexpr int kProtocolVersion = 1;
+
     explicit AgentBridgeServer(CWindow* window, QObject* parent = nullptr);
     ~AgentBridgeServer() override;
 

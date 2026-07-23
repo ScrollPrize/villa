@@ -96,6 +96,7 @@ QJsonObject AgentBridgeServer::handlePing(const QJsonValue&)
     result["pong"] = true;
     result["pid"] = static_cast<double>(QCoreApplication::applicationPid());
     result["version"] = QCoreApplication::applicationVersion();
+    result["protocolVersion"] = kProtocolVersion;
     return result;
 }
 

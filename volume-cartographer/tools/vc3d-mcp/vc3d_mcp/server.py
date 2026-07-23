@@ -10,6 +10,7 @@ runs the FastMCP stdio loop. The ``@mcp.tool()`` functions live in
 from __future__ import annotations
 
 import argparse
+import asyncio
 import atexit
 import os
 import shutil
@@ -21,6 +22,7 @@ from collections import deque
 
 from .bridge_client import (
     BridgeClient,
+    BridgeClientConfig,
     BridgeConnectionError,
     discover_registry_socket,
 )
@@ -31,6 +33,7 @@ from . import tools  # noqa: F401  - imports every module, registering its @mcp.
 # Handshake wait budget for the auto-launch path: VC3D can take a while to
 # construct CWindow before AgentBridgeServer::listen() prints the handshake.
 LAUNCH_HANDSHAKE_TIMEOUT_S = 30.0
+BRIDGE_PROTOCOL_VERSION = 1
 
 # Kept alive for the process lifetime so a bridge we launched isn't reaped as a
 # child zombie, and can be terminated on our own exit.
@@ -87,6 +90,25 @@ def _launch_command(binary: str, volpkg: str | None) -> list[str]:
     if volpkg:
         command += ["--volpkg", volpkg]
     return command
+
+
+def _validate_protocol(ping: object) -> None:
+    actual = ping.get("protocolVersion") if isinstance(ping, dict) else None
+    if actual != BRIDGE_PROTOCOL_VERSION:
+        raise BridgeConnectionError(
+            "incompatible VC3D agent bridge protocol: "
+            f"expected {BRIDGE_PROTOCOL_VERSION}, got {actual!r}"
+        )
+
+
+async def verify_bridge_protocol(socket: str, request_timeout: float) -> None:
+    client = BridgeClient(
+        BridgeClientConfig(socket=socket, request_timeout=request_timeout)
+    )
+    try:
+        _validate_protocol(await client.call("ping"))
+    finally:
+        await client.close()
 
 
 def launch_vc3d(
@@ -309,6 +331,12 @@ def main(argv: list[str] | None = None) -> int:
             "a standard CMake preset) to have this server launch VC3D itself.",
             file=sys.stderr,
         )
+        return 2
+
+    try:
+        asyncio.run(verify_bridge_protocol(socket, args.request_timeout))
+    except BridgeConnectionError as exc:
+        print(f"vc3d-mcp: bridge compatibility check failed: {exc}", file=sys.stderr)
         return 2
 
     print(f"vc3d-mcp: using bridge socket {socket!r} via {how}.", file=sys.stderr)
