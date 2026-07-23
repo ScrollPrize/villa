@@ -119,6 +119,18 @@ static QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
     return QString::fromStdString(volume->path().string());
 }
 
+struct CommandLaunchErrorSetter {
+    CommandLaunchError* error;
+
+    void operator()(
+        const QString& message,
+        CommandLaunchError::Kind kind = CommandLaunchError::Other) const
+    {
+        if (error)
+            *error = {kind, message};
+    }
+};
+
 static QString findExecutable(
     const QString& name,
     const QStringList& extraPaths = {},
@@ -2212,8 +2224,7 @@ void SegmentationCommandHandler::onABFFlatten(const std::string& segmentId)
 
 void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& segmentId)
 {
-    // Interactive path: dialog collects params, then startRunTrace does
-    // preconditions/merge/launch; dialogs live only here (SPEC §14.4).
+    // The dialog collects inputs; startRunTrace owns validation and launch.
     auto* surface = requireSurfaceAndRunner(segmentId, true);
     if (!surface) return;
     if (_state && _state->currentVolume() && _state->currentVolume()->isRemote()) {
@@ -2269,7 +2280,7 @@ void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& seg
         return;
     }
 
-    _cmdRunner->showConsoleOutput();  // interactive-only (SPEC §14.4)
+    _cmdRunner->showConsoleOutput();
     emit statusMessage(tr("Growing segment from: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
@@ -2278,13 +2289,9 @@ bool SegmentationCommandHandler::startRunTrace(const std::string& segmentId,
                                               CommandLaunchError* error,
                                               QString* resolvedOutputDir)
 {
-    auto setErr = [&](const QString& msg,
-                      CommandLaunchError::Kind kind = CommandLaunchError::Other) {
-        if (error) *error = {kind, msg};
-    };
+    const CommandLaunchErrorSetter setErr{error};
 
-    // --- Step 1: preconditions (headless mirror of requireSurfaceAndRunner +
-    // the remote/trace_params.json checks in onGrowSegmentFromSegment). ---
+    // Validate without opening dialogs.
     if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
         setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
         return false;
@@ -2340,7 +2347,7 @@ bool SegmentationCommandHandler::startRunTrace(const std::string& segmentId,
         return false;
     }
 
-    // --- Step 3: merge overrides over trace_params.json and write the UI copy. ---
+    // Merge overrides over trace_params.json and write the launch copy.
     QJsonObject base;
     {
         QFile f(QString::fromStdString(jsonParamsPath.string()));
@@ -2365,8 +2372,6 @@ bool SegmentationCommandHandler::startRunTrace(const std::string& segmentId,
         f.close();
     }
 
-    // --- Step 4: launch (shared by both paths; showConsoleOutput stays in the
-    // interactive slot only). ---
     _cmdRunner->setTraceParams(
         getCurrentVolumePath(),
         QString::fromStdString(pathsDir.string()),
@@ -2386,13 +2391,9 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
                                                     CommandLaunchError* error,
                                                     QString* resolvedOutputDir)
 {
-    auto setErr = [&](const QString& msg,
-                      CommandLaunchError::Kind kind = CommandLaunchError::Other) {
-        if (error) *error = {kind, msg};
-    };
+    const CommandLaunchErrorSetter setErr{error};
 
-    // --- Step 1: preconditions (headless mirror of requireSurfaceAndRunner +
-    // the execute() pre-launch checks in onRenderSegment). No dialogs. ---
+    // Validate without opening dialogs.
     if (!_state || !_state->vpkg()) {
         setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
         return false;
@@ -2417,9 +2418,7 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
         return false;
     }
 
-    // Verify the tool exists up front: execute() would otherwise pop a blocking
-    // QMessageBox on a missing binary (a §1.3 hang for a headless run). Same path
-    // construction toolName() uses.
+    // Return missing-tool errors before execute() reaches its dialog path.
     const QString toolPath =
         QCoreApplication::applicationDirPath() + QStringLiteral("/vc_render_tifxyz");
     QFileInfo toolInfo(toolPath);
@@ -2429,8 +2428,7 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
         return false;
     }
 
-    // --- Step 2: resolve the render volume + path (+ remote auth). Render
-    // (unlike Run Trace) accepts remote volumes, so we do not reject them. ---
+    // Rendering accepts local paths and remote locators.
     std::shared_ptr<Volume> renderVolume;
     if (params.volumeId.isEmpty()) {
         renderVolume = _state->currentVolume();
@@ -2449,10 +2447,7 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
         return false;
     }
 
-    // --- Step 3: resolve the output artifact path. Base dir is params.outputDir
-    // (absolute or relative to the volpkg root) or the segment folder by default
-    // (matching the dialog's <segment>/layers). Create it if missing so execute()
-    // never reaches its mkpath-failure QMessageBox. ---
+    // Resolve the output base relative to the package and create it if needed.
     const std::filesystem::path volpkgPath(_state->vpkgPath().toStdString());
     std::filesystem::path baseDir;
     if (params.outputDir.isEmpty()) {
@@ -2475,10 +2470,7 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
         baseDir / (wantZarr ? "surface.zarr" : "layers");
     const QString outputPattern = QString::fromStdString(outputArtifact.string());
 
-    // --- Step 4: configure the runner and launch. Advanced options (crop/affine/
-    // rotate/flip/flatten/include-tifs) are reset to defaults so a prior
-    // interactive render's dialog settings cannot leak into this reduced-surface
-    // headless render (SPEC §19). ---
+    // Reset options omitted from this API so prior UI settings cannot leak in.
     _cmdRunner->setSegmentPath(QString::fromStdString(surf->path.string()));
     _cmdRunner->setOutputPattern(outputPattern);
     _cmdRunner->setRenderOutputFormat(params.outputFormat);
@@ -2514,12 +2506,8 @@ bool SegmentationCommandHandler::startSlimFlatten(const std::string& segmentId,
                                                   CommandLaunchError* error,
                                                   QString* resolvedOutputDir)
 {
-    auto setErr = [&](const QString& msg,
-                      CommandLaunchError::Kind kind = CommandLaunchError::Other) {
-        if (error) *error = {kind, msg};
-    };
+    const CommandLaunchErrorSetter setErr{error};
 
-    // --- Preconditions (headless mirror of onSlimFlatten, SPEC §20). ---
     if (!_state || !_state->vpkg() || !_state->currentVolume()) {
         setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
         return false;
@@ -2532,10 +2520,8 @@ bool SegmentationCommandHandler::startSlimFlatten(const std::string& segmentId,
         return false;
     }
 
-    // Resolve every executable the SlimJob pipeline will need UP FRONT, so the
-    // constructed job never reaches its synchronous showImmediateToolNotFound_
-    // (a §1.3 blocking QMessageBox) path. flatboi + vc_tifxyz2obj + vc_obj2tifxyz
-    // are always needed; vc_obj_uv_lift only when decimating (keepPercent < 100).
+    // Resolve the full pipeline before constructing a job; vc_obj_uv_lift is
+    // needed only when decimating.
     const QString flatboiExe = findFlatboiExecutable();
     if (flatboiExe.isEmpty()) {
         setErr(tr("flatboi not found or not executable (checked known locations, "
@@ -2565,8 +2551,7 @@ bool SegmentationCommandHandler::startSlimFlatten(const std::string& segmentId,
     const QString segDir = QString::fromStdString(segDirFs.string());
     const QString segmentStem = QString::fromStdString(segmentId);
 
-    // Resolve the output dir: params.outputDir (absolute or relative to the
-    // volpkg root) or <segment>_flatboi by default (matching the dialog default).
+    // Relative output paths are rooted at the volume package.
     QString outputDir;
     if (params.outputDir.isEmpty()) {
         outputDir = segDir.endsWith("_flatboi") ? segDir : (segDir + "_flatboi");
@@ -2585,9 +2570,7 @@ bool SegmentationCommandHandler::startSlimFlatten(const std::string& segmentId,
 
     const int iters = params.iterations > 0 ? params.iterations : 50;
 
-    // Construct the job with dialogs suppressed; its multi-stage QProcess pipeline
-    // runs async, completion observable via flattenJobFinished (SPEC §20). Job
-    // parents to `this` and self-deletes.
+    // The job reports completion through flattenJobFinished and self-deletes.
     new SlimJob(_parentWidget, segDir, segmentStem, flatboiExe, this, iters,
                 params.tolerance, params.energyType, params.keepPercent,
                 params.inpaintHoles, outputDir, voxelSize,
@@ -2603,10 +2586,7 @@ bool SegmentationCommandHandler::startAbfFlatten(const std::string& segmentId,
                                                  CommandLaunchError* error,
                                                  QString* resolvedOutputDir)
 {
-    auto setErr = [&](const QString& msg,
-                      CommandLaunchError::Kind kind = CommandLaunchError::Other) {
-        if (error) *error = {kind, msg};
-    };
+    const CommandLaunchErrorSetter setErr{error};
 
     if (!_state || !_state->vpkg()) {
         setErr(tr("No volume package loaded."), CommandLaunchError::InvalidState);
@@ -2625,8 +2605,7 @@ bool SegmentationCommandHandler::startAbfFlatten(const std::string& segmentId,
     const QString segmentStem = QString::fromStdString(segmentId);
     const QString outDir = segDir.endsWith("_abf") ? segDir : (segDir + "_abf");
 
-    // ABF++ runs in-process on a QtConcurrent worker; no external tool to
-    // resolve. Completion is observable via flattenJobFinished (SPEC §20).
+    // ABF++ runs in-process and reports completion through flattenJobFinished.
     new ABFJob(_parentWidget, _surfacePanel, this, segDir, segmentStem,
                std::max(1, iterations), std::max(1, downsampleFactor),
                /*suppressDialogs=*/true);
@@ -2640,10 +2619,7 @@ bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
                                                  CommandLaunchError* error,
                                                  QString* resolvedOutputDir)
 {
-    auto setErr = [&](const QString& msg,
-                      CommandLaunchError::Kind kind = CommandLaunchError::Other) {
-        if (error) *error = {kind, msg};
-    };
+    const CommandLaunchErrorSetter setErr{error};
 
     if (!_state || !_state->vpkg() || !_state->currentVolume()) {
         setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
@@ -2679,16 +2655,14 @@ bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
             (requested.is_absolute() ? requested : (volpkgPath / requested)).string());
     }
 
-    // vc_straighten refuses to overwrite an existing output dir; reject up front
-    // (mirrors the interactive slot's existence check) instead of letting the
-    // subprocess fail deep in the job.
+    // vc_straighten refuses to overwrite an existing output directory.
     if (QFileInfo::exists(outputDir)) {
         setErr(tr("Output directory already exists: %1 (vc_straighten will not "
                   "overwrite it; choose a different name).").arg(outputDir));
         return false;
     }
 
-    // Build the CLI args exactly as StraightenDialog::toArgs() does, from params.
+    // Keep argument construction aligned with StraightenDialog::toArgs().
     QStringList args;
     if (params.unbend) {
         args << QStringLiteral("--unbend");
