@@ -101,11 +101,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
 {
     setObjectName(QStringLiteral("spiralWorkspaceWindow"));
     setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
-    // Mirror Main's cache budget so sharedChunkCacheForVolume() resolves to the
-    // same ChunkCache instance for the same volume (the budget is part of the
-    // cache key). Volume::setCacheBudget is a no-op for an unchanged budget, so
-    // re-applying it here never resets the warm cache.
-    _state = new CState(_mainState ? _mainState->cacheSizeBytes() : 0, this);
+    // Share Main's process-wide decoded-chunk budget. Both workspaces use the
+    // single cache owned by their shared Volume.
+    _state = new CState(
+        _mainState ? _mainState->cacheSizeBytes() : 0,
+        this,
+        _mainState ? _mainState->decodedCacheBudget() : nullptr);
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     // Spiral can trade some intersection detail for substantially cheaper
     // input-patch indexing without changing the main workspace preference.

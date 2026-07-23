@@ -488,12 +488,15 @@ QString formatMegabytesPerSecond(double bytesPerSecond)
     return QString("%1 MB/s").arg(std::max(0.0, bytesPerSecond) / kMiB, 0, 'f', 1);
 }
 
-std::size_t streamingCacheCapacityBytes(const CState* state)
+constexpr std::size_t kOverlayDecodedCacheCapacity =
+    1ULL * 1024ULL * 1024ULL * 1024ULL;
+
+std::shared_ptr<vc::render::DecodedChunkCacheBudget> overlayDecodedCacheBudget()
 {
-    constexpr std::size_t kFallbackCapacity = 2ULL * 1024ULL * 1024ULL * 1024ULL;
-    if (!state || state->cacheSizeBytes() == 0)
-        return kFallbackCapacity;
-    return state->cacheSizeBytes();
+    static auto budget =
+        std::make_shared<vc::render::DecodedChunkCacheBudget>(
+            kOverlayDecodedCacheCapacity);
+    return budget;
 }
 
 float scaleForSurfaceRenderStartLevel(int renderLevel, int numLevels)
@@ -534,17 +537,16 @@ float fitScaleForExtent(float extentU, float extentV, int viewportW, int viewpor
     return std::clamp(std::min(scaleU, scaleV) * kFitPadding, kMinScale, kMaxScale);
 }
 
-std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
-                                                                std::size_t decodedByteCapacity,
-                                                                const CState* state)
+std::shared_ptr<vc::render::ChunkCache> makeOverlayChunkCacheForVolume(
+    const std::shared_ptr<Volume>& volume,
+    const CState* state)
 {
     if (!volume)
         return nullptr;
 
     vc::render::ChunkCache::Options options;
-    options.decodedByteCapacity = decodedByteCapacity > 0
-        ? decodedByteCapacity
-        : streamingCacheCapacityBytes(nullptr);
+    options.decodedByteCapacity = kOverlayDecodedCacheCapacity;
+    options.decodedByteBudget = overlayDecodedCacheBudget();
     options.maxConcurrentReads = 16;
     options.detectAllFillChunks = volume->isRemote();
     if (volume->isRemote()) {
@@ -570,43 +572,55 @@ std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
     return volume->createChunkCache(std::move(options));
 }
 
-std::shared_ptr<vc::render::ChunkCache> sharedChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
-                                                                  std::size_t decodedByteCapacity,
-                                                                  const CState* state)
+struct OverlayChunkCacheLease {
+    ~OverlayChunkCacheLease()
+    {
+        if (cache)
+            cache->invalidate();
+    }
+
+    std::shared_ptr<vc::render::ChunkCache> cache;
+};
+
+std::shared_ptr<OverlayChunkCacheLease> sharedOverlayChunkCacheForVolume(
+    const std::shared_ptr<Volume>& volume,
+    const CState* state)
 {
     if (!volume)
         return nullptr;
 
-    const std::size_t capacity = decodedByteCapacity > 0
-        ? decodedByteCapacity
-        : streamingCacheCapacityBytes(nullptr);
-    const std::string key = vc3d::normalizedVolumeCacheIdentity(volume) +
-                            "|decoded=" + std::to_string(capacity) +
-                            "|cache=" + (volume->isRemote() ? vc3d::remoteCacheRootForState(state).string() : std::string{});
+    const std::string key =
+        vc3d::normalizedVolumeCacheIdentity(volume) +
+        "|overlay-cache=" +
+        (volume->isRemote()
+             ? vc3d::remoteCacheRootForState(state).string()
+             : std::string{});
 
     static std::mutex cacheMutex;
-    static std::unordered_map<std::string, std::weak_ptr<vc::render::ChunkCache>> caches;
+    static std::unordered_map<std::string, std::weak_ptr<OverlayChunkCacheLease>> caches;
 
     {
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = caches.find(key);
         if (it != caches.end()) {
-            if (auto cache = it->second.lock())
-                return cache;
+            if (auto lease = it->second.lock())
+                return lease;
             caches.erase(it);
         }
     }
 
-    auto cache = makeChunkCacheForVolume(volume, capacity, state);
+    auto cache = makeOverlayChunkCacheForVolume(volume, state);
     if (!cache)
         return nullptr;
+    auto lease = std::make_shared<OverlayChunkCacheLease>();
+    lease->cache = std::move(cache);
 
     std::lock_guard<std::mutex> lock(cacheMutex);
     auto& slot = caches[key];
     if (auto existing = slot.lock())
         return existing;
-    slot = cache;
-    return cache;
+    slot = lease;
+    return lease;
 }
 
 } // namespace
@@ -749,6 +763,8 @@ void CChunkedVolumeViewer::quiesceForClose()
         _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
         _overlayChunkCbId = 0;
     }
+    _overlayChunkArray.reset();
+    _overlayChunkCacheOwner.reset();
 }
 
 void CChunkedVolumeViewer::reloadPerfSettings()
@@ -870,7 +886,7 @@ void CChunkedVolumeViewer::rebuildChunkArray()
         return;
 
     try {
-        _chunkArray = sharedChunkCacheForVolume(_volume, streamingCacheCapacityBytes(_state), _state);
+        _chunkArray = _volume->sharedChunkCache();
     } catch (const std::exception& e) {
         if (_statsBar)
             _statsBar->setItems({QString("Streaming unavailable: %1").arg(e.what())});
@@ -2221,11 +2237,18 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
     }
     _overlayVolume = std::move(volume);
     _overlayChunkArray.reset();
+    _overlayChunkCacheOwner.reset();
     if (_overlayVolume) {
         try {
-            _overlayChunkArray = sharedChunkCacheForVolume(_overlayVolume, streamingCacheCapacityBytes(_state), _state);
+            auto lease =
+                sharedOverlayChunkCacheForVolume(_overlayVolume, _state);
+            if (lease) {
+                _overlayChunkArray = lease->cache;
+                _overlayChunkCacheOwner = std::move(lease);
+            }
         } catch (const std::exception&) {
             _overlayChunkArray.reset();
+            _overlayChunkCacheOwner.reset();
         }
         if (_overlayChunkArray) {
             QPointer<CChunkedVolumeViewer> guard(this);

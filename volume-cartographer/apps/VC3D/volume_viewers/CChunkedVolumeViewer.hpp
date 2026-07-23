@@ -458,6 +458,9 @@ private:
     std::string _baseColormapId;
     std::shared_ptr<Volume> _overlayVolume;
     std::shared_ptr<vc::render::ChunkCache> _overlayChunkArray;
+    // The final viewer lease invalidates the overlay cache even if an
+    // obsolete render job still holds the cache object.
+    std::shared_ptr<void> _overlayChunkCacheOwner;
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;

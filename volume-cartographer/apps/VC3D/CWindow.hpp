@@ -28,6 +28,8 @@
 #include "CPointCollectionWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
+
+namespace vc::render { class DecodedChunkCacheBudget; }
 #include "OpenDataManifest.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
@@ -381,6 +383,7 @@ private:
     bool can_change_volume_();
 
     size_t _cacheSizeBytes = 0;
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> _decodedChunkCacheBudget;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;

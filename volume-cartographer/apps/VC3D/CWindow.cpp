@@ -7,6 +7,7 @@
 #include "StatusDockPanelHost.hpp"
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/DecodedChunkCacheBudget.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -2518,7 +2519,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    _state = new CState(_cacheSizeBytes, this);
+    _decodedChunkCacheBudget =
+        std::make_shared<vc::render::DecodedChunkCacheBudget>(_cacheSizeBytes);
+    vc::render::ChunkCache::setDecodedByteBudgetDefault(
+        _decodedChunkCacheBudget);
+    _state = new CState(_cacheSizeBytes, this, _decodedChunkCacheBudget);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,

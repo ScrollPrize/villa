@@ -17,6 +17,7 @@ class Volume;
 class QuadSurface;
 class Surface;
 class VCCollection;
+namespace vc::render { class DecodedChunkCacheBudget; }
 
 struct POI
 {
@@ -33,7 +34,10 @@ class CState : public QObject
     Q_OBJECT
 
 public:
-    explicit CState(size_t cacheSizeBytes, QObject* parent = nullptr);
+    explicit CState(
+        size_t cacheSizeBytes,
+        QObject* parent = nullptr,
+        std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget = {});
     ~CState();
 
     // --- VolumePkg ---
@@ -62,6 +66,7 @@ public:
 
     // --- Cache budget ---
     size_t cacheSizeBytes() const;
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget() const;
 
     // --- Teardown ---
     void closeAll();
@@ -116,6 +121,7 @@ private:
     VCCollection* _pointCollection;
 
     size_t _cacheSizeBytes;
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> _decodedCacheBudget;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;
