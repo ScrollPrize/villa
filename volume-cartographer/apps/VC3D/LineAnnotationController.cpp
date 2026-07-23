@@ -156,6 +156,7 @@ struct LineAnnotationController::LineAnnotationSession {
 
 struct LineAnnotationController::FiberMetricsTaskResult {
     bool ok = false;
+    bool suppressErrorDialogs = false;
     uint64_t generation = 0;
     fs::path manifestPath;
     std::string error;
@@ -187,6 +188,7 @@ struct LineAnnotationController::IntersectionInspectionSession {
     };
 
     QPointer<QMdiArea> targetArea;
+    bool suppressErrorDialogs = false;
     vc::atlas::FiberIntersectionResult result;
     std::optional<fs::path> atlasDir;
     double sourceFocusLinePosition = 0.0;
@@ -1955,7 +1957,8 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     if (!_state || !session) {
         return false;
     }
-    session->suppressErrorDialogs = _errorDialogsSuppressed;
+    session->suppressErrorDialogs =
+        session->suppressErrorDialogs || _errorDialogsSuppressed;
     if (!prepareForUserFacingLineAnnotationOpen()) {
         return false;
     }
@@ -2051,7 +2054,8 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         }
         auto& session = *pane->session;
         if (session.taskState == LineAnnotationSession::TaskState::Running) {
-            showError(tr("Line optimization is already running."));
+            showError(tr("Line optimization is already running."),
+                      session.suppressErrorDialogs);
             return;
         }
         if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
@@ -2078,7 +2082,8 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                     return;
                 }
                 if (session.taskState == LineAnnotationSession::TaskState::Running) {
-                    showError(tr("Line optimization is already running."));
+                    showError(tr("Line optimization is already running."),
+                              session.suppressErrorDialogs);
                     return;
                 }
                 if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
@@ -2213,7 +2218,8 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     } catch (const std::exception& ex) {
         showError(tr("Could not reopen fiber %1: %2")
                       .arg(fiberId)
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  session->suppressErrorDialogs);
         return;
     }
 
@@ -3258,6 +3264,7 @@ bool LineAnnotationController::showIntersectionInspectionHeadless(
         cleanupIntersectionInspectionSurfaces();
         _intersectionInspection = std::make_unique<IntersectionInspectionSession>();
         _intersectionInspection->targetArea = targetArea;
+        _intersectionInspection->suppressErrorDialogs = _errorDialogsSuppressed;
         _intersectionInspection->result = result;
         _intersectionInspection->atlasDir = std::move(atlasDir);
         targetArea->installEventFilter(this);
@@ -4603,10 +4610,13 @@ void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t e
             oldSourceArclength,
             oldTargetArclength);
         if (!nearest) {
+            const bool suppressErrorDialogs =
+                _intersectionInspection->suppressErrorDialogs || _errorDialogsSuppressed;
             cleanupIntersectionInspectionSurfaces();
             _intersectionInspection.reset();
-            if (_errorDialogsSuppressed) {
-                showError(tr("The edited fiber pair no longer has an intersection result."));
+            if (suppressErrorDialogs) {
+                showError(tr("The edited fiber pair no longer has an intersection result."),
+                          true);
             } else {
                 QMessageBox::warning(_parentWidget,
                                      tr("Intersections"),
@@ -4618,7 +4628,8 @@ void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t e
         rebuildIntersectionInspection();
     } catch (const std::exception& ex) {
         showError(tr("Could not refresh intersection inspection: %1")
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  _intersectionInspection && _intersectionInspection->suppressErrorDialogs);
     }
 }
 
@@ -4932,6 +4943,16 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
         return;
     }
 
+    bool suppressErrorDialogs = _errorDialogsSuppressed;
+    if (!suppressErrorDialogs) {
+        suppressErrorDialogs = std::any_of(
+            _panes.begin(), _panes.end(), [&fiberIds](const PaneRecord& pane) {
+                return pane.session && pane.session->suppressErrorDialogs &&
+                       std::find(fiberIds.begin(), fiberIds.end(), pane.session->fiberId) !=
+                           fiberIds.end();
+            });
+    }
+
     std::vector<StoredFiber> fibers;
     std::vector<uint64_t> requestTokens;
     fibers.reserve(fiberIds.size());
@@ -4988,6 +5009,7 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
             });
     QPointer<LineAnnotationController> self(this);
     watcher->setFuture(QtConcurrent::run([generation,
+                                           suppressErrorDialogs,
                                            self,
                                            resolvedManifestPath = manifestPath->first,
                                            workingToBaseScale = manifestPath->second,
@@ -4995,6 +5017,7 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
                                            requestTokens = std::move(requestTokens)]() mutable {
         FiberMetricsTaskResult result;
         result.ok = true;
+        result.suppressErrorDialogs = suppressErrorDialogs;
         result.generation = generation;
         result.manifestPath = resolvedManifestPath;
         result.requestedFiberIds.reserve(fibers.size());
@@ -5323,7 +5346,8 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
 
     auto& session = *pane->session;
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."));
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
         return;
     }
 
@@ -5354,7 +5378,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
 
     auto& session = *pane->session;
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."));
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
         return;
     }
     if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
@@ -5474,7 +5499,9 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                                                              *session.normalSampler,
                                                              updateConfig);
     } catch (const std::exception& ex) {
-        showError(tr("Could not update line control point: %1").arg(QString::fromStdString(ex.what())));
+        showError(tr("Could not update line control point: %1")
+                      .arg(QString::fromStdString(ex.what())),
+                  session.suppressErrorDialogs);
         return;
     }
     session.optimizedLine = lineModelFromPoints(update.linePoints, session.normalSampler.get());
@@ -5516,7 +5543,8 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
 
     auto& parentSession = *pane->session;
     if (parentSession.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."));
+        showError(tr("Line optimization is already running."),
+                  parentSession.suppressErrorDialogs);
         return;
     }
     if (controlPointIndex >= parentSession.controlPoints.size()) {
@@ -5538,12 +5566,14 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     }
     const cv::Vec3d linkedPoint = toVec3d(linkedControlPoint);
     if (!finitePoint(linkedPoint)) {
-        showError(tr("Could not determine a finite linked-fiber point from the clicked location."));
+        showError(tr("Could not determine a finite linked-fiber point from the clicked location."),
+                  parentSession.suppressErrorDialogs);
         return;
     }
     cv::Vec3d linkDirection = toVec3d(requestedLinkDirection);
     if (!finiteDirection(linkDirection)) {
-        showError(tr("Could not determine a finite linked-fiber direction from the current view."));
+        showError(tr("Could not determine a finite linked-fiber direction from the current view."),
+                  parentSession.suppressErrorDialogs);
         return;
     }
     linkDirection = normalizedOrZero(linkDirection);
@@ -5554,6 +5584,7 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     const cv::Vec3d linkedInitialDirection = linkDirection;
 
     auto linkedSeedRecord = std::make_shared<LineAnnotationSession>();
+    linkedSeedRecord->suppressErrorDialogs = parentSession.suppressErrorDialogs;
     linkedSeedRecord->fiberId = std::max(nextFiberId(), parentFiberId + 1);
     linkedSeedRecord->sourceSliceNormal = linkedInitialDirection;
     linkedSeedRecord->initialDirectionMode = InitialDirectionMode::ZInOut;
@@ -5650,7 +5681,8 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
                 true);
         }
         showError(tr("Could not save linked fiber: %1")
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  parentSession.suppressErrorDialogs);
         return;
     }
 
@@ -5727,7 +5759,8 @@ void LineAnnotationController::handleGeneratedPredSnapPoint(const std::string& s
         }
     } catch (const std::exception& ex) {
         showError(tr("Could not save pred-snap point: %1")
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  session.suppressErrorDialogs);
     }
 }
 
@@ -5742,7 +5775,8 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
 
     auto& session = *pane->session;
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."));
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
         return;
     }
     if (session.optimizedLine.points.empty() || session.controlPoints.size() <= 1) {
@@ -6136,7 +6170,8 @@ void LineAnnotationController::requestFinalizedClose(const std::string& surfaceN
 
     auto& session = *pane->session;
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."));
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
         return;
     }
     if (!needsFinalOptimization(session)) {
@@ -6310,7 +6345,8 @@ void LineAnnotationController::finishFiberAlignmentMetrics(
 
     if (!result.ok) {
         showError(tr("Could not calculate fiber alignment metrics: %1")
-                      .arg(QString::fromStdString(result.error)));
+                      .arg(QString::fromStdString(result.error)),
+                  result.suppressErrorDialogs);
     }
 
     for (uint64_t fiberId : result.requestedFiberIds) {
@@ -6553,7 +6589,8 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
 
     auto& session = *pane->session;
     if (session.taskState != LineAnnotationSession::TaskState::Succeeded) {
-        showError(tr("Run line optimization before exporting generated meshes."));
+        showError(tr("Run line optimization before exporting generated meshes."),
+                  session.suppressErrorDialogs);
         return;
     }
     if (!finalizeSessionOptimizationSynchronously(session, false)) {
@@ -6566,7 +6603,8 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
     try {
         const auto savedPaths = saveGeneratedQuadMeshes(session);
         if (savedPaths.empty()) {
-            showError(tr("No generated line quad meshes are available to export."));
+            showError(tr("No generated line quad meshes are available to export."),
+                      session.suppressErrorDialogs);
             return;
         }
 
@@ -6575,13 +6613,16 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
         for (const auto& path : savedPaths) {
             labels.push_back(QString::fromStdString(path.filename().string()));
         }
-        QMessageBox::information(_parentWidget,
-                                 tr("Line Annotation"),
-                                 tr("Saved generated mesh surfaces in paths:\n%1")
-                                     .arg(labels.join(QStringLiteral("\n"))));
+        if (!session.suppressErrorDialogs && !_errorDialogsSuppressed) {
+            QMessageBox::information(_parentWidget,
+                                     tr("Line Annotation"),
+                                     tr("Saved generated mesh surfaces in paths:\n%1")
+                                         .arg(labels.join(QStringLiteral("\n"))));
+        }
     } catch (const std::exception& ex) {
         showError(tr("Could not save generated line meshes: %1")
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  session.suppressErrorDialogs);
     }
 }
 
@@ -7480,6 +7521,8 @@ void LineAnnotationController::handleGeneratedSideStripIntersectionQuery(
     }
 
     SideStripIntersectionRequest request;
+    request.suppressErrorDialogs =
+        pane->session->suppressErrorDialogs || _errorDialogsSuppressed;
     request.surfaceName = surfaceName;
     request.sourceFiberId = pane->session->fiberId;
     request.stripPoints = stripPointsPtr->clone();
@@ -7593,6 +7636,7 @@ LineAnnotationController::runSideStripIntersectionQuery(
     SideStripCancelCallback cancelCallback)
 {
     SideStripIntersectionTaskResult result;
+    result.suppressErrorDialogs = request.suppressErrorDialogs;
     result.token = request.token;
     result.cacheKey = request.cacheKey;
     result.surfaceName = request.surfaceName;
@@ -7958,7 +8002,8 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
                     pane->dialog->setGeneratedSideStripIntersectionError();
                 }
                 showError(tr("Could not query strip fiber intersections: %1")
-                              .arg(QString::fromStdString(result.error)));
+                              .arg(QString::fromStdString(result.error)),
+                          result.suppressErrorDialogs);
             }
         }
     } else if (!hasPendingRequest) {
@@ -8267,12 +8312,14 @@ bool LineAnnotationController::confirmLinkedControlPointEdit(
     if (!controlPointHasBranch(session, controlPointIndex)) {
         return true;
     }
-    if (_errorDialogsSuppressed) {
+    if (session.suppressErrorDialogs || _errorDialogsSuppressed) {
         // Agent-bridge headless mode (SPEC §1.3): no confirmation prompt is
         // possible; refuse the linked edit (the dialog's conservative default).
-        showError(tr("%1 was rejected: the control point is linked to another "
-                     "fiber and confirmation prompts are disabled in headless mode.")
-                      .arg(action));
+        showError(
+            tr("%1 was rejected: the control point is linked to another "
+               "fiber and confirmation prompts are disabled in headless mode.")
+                .arg(action),
+            true);
         return false;
     }
     const auto response = QMessageBox::question(
@@ -8985,7 +9032,8 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         emitFiberSummaries();
         refreshBranchLineViews(savedFiberId);
     } catch (const std::exception& ex) {
-        showError(tr("Could not save fiber: %1").arg(QString::fromStdString(ex.what())));
+        showError(tr("Could not save fiber: %1").arg(QString::fromStdString(ex.what())),
+                  session.suppressErrorDialogs);
     }
 }
 
@@ -10048,6 +10096,11 @@ void LineAnnotationController::setErrorDialogsSuppressed(bool suppressed)
     if (!suppressed) {
         _lastSuppressedError.clear();
     }
+}
+
+bool LineAnnotationController::errorDialogsSuppressed() const
+{
+    return _errorDialogsSuppressed;
 }
 
 QString LineAnnotationController::takeLastSuppressedError()

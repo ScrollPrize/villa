@@ -1938,11 +1938,12 @@ does: a single fiber JSON, a bundle, or a directory of fiber JSONs
 Implementation-time amendments; where these contradict §13.1–13.10, the
 as-built notes win.
 
-- **Per-operation headless errors.** Fiber handlers suppress dialogs only
-  while invoking their controller operation and convert synchronous failures
-  to `-32005`. A line-annotation session created in that scope retains the
-  headless policy for its own asynchronous optimization failures. Enabling the
-  bridge does not alter dialogs for human-initiated work in the same window.
+- **Per-request headless errors.** Each bridge dispatch suppresses line-annotation
+  dialogs for the duration of that request, including project reloads and
+  synthetic canvas events. Fiber handlers convert captured synchronous failures
+  to `-32005`, and sessions created in that scope retain the policy for their
+  asynchronous work. Enabling the bridge does not alter dialogs for
+  human-initiated work in the same window.
 - **`fiber.launch` / `fiber.open`** fail `-32005` (not a hang) with
   `data.detail: "No Lasagna dataset is selected for the active volume."` when
   the package has no resolvable Lasagna dataset — the interactive twin would

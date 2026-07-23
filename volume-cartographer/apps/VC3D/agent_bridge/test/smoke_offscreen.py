@@ -101,7 +101,8 @@ def expect_param_error(client: BridgeClient, method: str, params: object,
         return False, f"unexpected {type(e).__name__}: {e}"
 
 
-def check_c4(client: BridgeClient, results: Results, volpkg: str) -> None:
+def check_c4(client: BridgeClient, results: Results, volpkg: str,
+             broken_fiber_volpkg: str) -> None:
     # Liveness / dispatch sanity.
     try:
         state, _ = client.call("state.get", {}, timeout=10.0)
@@ -195,6 +196,18 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str) -> None:
                        f"code={e.code} vpkg unchanged={preserved}")
     except Exception as e:  # noqa: BLE001
         results.record("volume_open_unknown_id_preserves_project", False,
+                       f"unexpected {type(e).__name__}: {e}")
+
+    try:
+        opened, _ = client.call(
+            "volume.open", {"path": broken_fiber_volpkg}, timeout=10.0)
+        results.record(
+            "volume_open_broken_fibers_is_headless",
+            opened.get("opened") is True,
+            "broken branch metadata was kept without opening a repair dialog",
+        )
+    except Exception as e:  # noqa: BLE001
+        results.record("volume_open_broken_fibers_is_headless", False,
                        f"unexpected {type(e).__name__}: {e}")
 
     try:
@@ -392,6 +405,21 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="vc3d-smoke-") as tmp_dir:
         volpkg = Path(tmp_dir) / "smoke.volpkg.json"
         volpkg.write_text(json.dumps({"name": "smoke", "version": 1}))
+        broken_volpkg = Path(tmp_dir) / "broken.volpkg.json"
+        broken_volpkg.write_text(json.dumps({"name": "broken", "version": 1}))
+        fiber_dir = Path(tmp_dir) / "fibers" / broken_volpkg.name
+        fiber_dir.mkdir(parents=True)
+        (fiber_dir / "fiber_smoke.json").write_text(json.dumps({
+            "type": "vc3d_fiber",
+            "version": 1,
+            "username": "smoke",
+            "started_at": "2026-01-01T00:00:00Z",
+            "sequence": 1,
+            "generation": 1,
+            "control_points": [[0.0, 0.0, 0.0]],
+            "line_points": [],
+            "branches": [{}],
+        }))
         name = unique_name("main")
         proc = launch(binary, name, str(volpkg))
         client = None
@@ -400,7 +428,7 @@ def main() -> int:
             log(f"handshake: name={name} path={sock_path}")
             client = BridgeClient(sock_path, connect_timeout=10.0)
 
-            check_c4(client, results, str(volpkg))
+            check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_c2_oversized(sock_path, results)
             check_c2_suffix_bypass(sock_path, results)
             check_c3_live_probe(binary, name, sock_path, client, results)

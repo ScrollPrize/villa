@@ -228,6 +228,7 @@ public:
     // Synchronous bridge calls use this as a short-lived dialog guard. Sessions
     // created while it is set retain their own headless error policy.
     void setErrorDialogsSuppressed(bool suppressed);
+    [[nodiscard]] bool errorDialogsSuppressed() const;
     [[nodiscard]] QString takeLastSuppressedError();
 
     void setDatasetPickerForTesting(DatasetPicker picker);
@@ -356,6 +357,7 @@ private:
     using SideStripCancelCallback = std::function<bool()>;
 
     struct SideStripIntersectionRequest {
+        bool suppressErrorDialogs = false;
         uint64_t token = 0;
         uint64_t cacheKey = 0;
         std::string surfaceName;
@@ -368,6 +370,7 @@ private:
 
     struct SideStripIntersectionTaskResult {
         bool ok = false;
+        bool suppressErrorDialogs = false;
         uint64_t token = 0;
         uint64_t cacheKey = 0;
         std::string surfaceName;

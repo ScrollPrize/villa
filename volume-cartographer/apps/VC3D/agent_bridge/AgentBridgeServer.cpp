@@ -69,6 +69,29 @@ namespace {
 // precedes a newline). One oversized client is reported + dropped without
 // affecting the others (SPEC §6).
 constexpr int kMaxLineBytes = 1 * 1024 * 1024;  // 1 MiB
+
+class ScopedLineAnnotationDialogSuppression {
+public:
+    explicit ScopedLineAnnotationDialogSuppression(LineAnnotationController* controller)
+        : _controller(controller),
+          _wasSuppressed(controller && controller->errorDialogsSuppressed())
+    {
+        if (_controller) {
+            _controller->setErrorDialogsSuppressed(true);
+        }
+    }
+
+    ~ScopedLineAnnotationDialogSuppression()
+    {
+        if (_controller) {
+            _controller->setErrorDialogsSuppressed(_wasSuppressed);
+        }
+    }
+
+private:
+    LineAnnotationController* _controller;
+    bool _wasSuppressed;
+};
 }  // namespace
 
 
@@ -353,6 +376,11 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
             sendError(socket, id, -32601, QStringLiteral("Method not found: %1").arg(method));
         return;
     }
+
+    ScopedLineAnnotationDialogSuppression suppressLineAnnotationDialogs(
+        _window && _window->_lineAnnotationController
+            ? _window->_lineAnnotationController.get()
+            : nullptr);
 
     // Per-request context: handlers that defer their response (SPEC §8.4) read
     // this to stash the caller. Cleared after the handler returns/throws.

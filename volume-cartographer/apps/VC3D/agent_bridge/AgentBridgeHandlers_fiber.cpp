@@ -70,16 +70,17 @@ namespace {
 template <typename Operation>
 QString captureFiberError(LineAnnotationController* controller, Operation&& operation)
 {
+    const bool wasSuppressed = controller->errorDialogsSuppressed();
     controller->setErrorDialogsSuppressed(true);
     (void)controller->takeLastSuppressedError();
     try {
         operation();
     } catch (...) {
-        controller->setErrorDialogsSuppressed(false);
+        controller->setErrorDialogsSuppressed(wasSuppressed);
         throw;
     }
     const QString error = controller->takeLastSuppressedError();
-    controller->setErrorDialogsSuppressed(false);
+    controller->setErrorDialogsSuppressed(wasSuppressed);
     return error;
 }
 
