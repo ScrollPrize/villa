@@ -74,7 +74,8 @@ VC3D-AGENT-BRIDGE: listening name=<serverName> path=<fullServerName>
 - A framed request and an unterminated receive buffer are each limited to
   1 MiB. An oversized client receives a best-effort invalid-request response
   and is disconnected without affecting other clients.
-- Multiple clients may connect. Each connection preserves request order.
+- Multiple clients may connect. Requests are dispatched in frame order;
+  deferred responses may complete out of order and are correlated by `id`.
 - Handlers run serially on the Qt GUI thread.
 - Server notifications have no `id` and are broadcast to all connected
   clients.
@@ -198,20 +199,21 @@ registered as jobs. A source retains its eight most recent terminal records.
 most recently started job across all sources. Its record contains:
 
 ```text
-jobId, kind, source, state, message, outputPath, consoleTail,
-progressHistory, result
+jobId, kind, source, label, state, message, outputPath, externalId,
+consoleTail, progressHistory, startedAtMs, finishedAtMs, result
 ```
 
 `state` is `running`, `succeeded`, or `failed`. `consoleTail` and
-`progressHistory` are bounded. `result` is an operation-specific object when a
+`progressHistory` are bounded. `outputPath`, `externalId`, and `finishedAtMs`
+are null when unavailable. `result` is an operation-specific object when a
 terminal job has structured output, otherwise null.
 
 ### Progress
 
 `job.progress` is a notification. Every update contains `jobId`, `kind`,
-`source`, a monotonically increasing per-job `seq`, `phase`, and `message`.
-Structured updates may also include `completed`, `total`, `success`,
-`outputPath`, or `result`.
+`source`, a monotonically increasing per-job `seq`, and `phase`. `message` is
+present when the job has non-empty text. Terminal updates also contain
+`success` and `result`, plus `outputPath` when one is available.
 
 Each job retains the last 64 notifications. Output text is rate-limited to ten
 notifications per second and may be coalesced. Delivery is ordered and
@@ -496,7 +498,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_set_point_collection_metadata` | `points.set_collection_metadata` |
 | `vc3d_set_point_collection_tag` | `points.set_collection_tag` |
 | `vc3d_set_point_windings_linked` | `points.set_windings_linked` |
-| `vc3d_set_render_settings` | `viewer.set_render_settings` | Set any subset of the viewer render/overlay settings; returns the full settings after applying. Viewer-specific toggle and highlight fields are no-ops when no viewer is open. |
+| `vc3d_set_render_settings` | `viewer.set_render_settings` | Set any subset of the viewer render/overlay settings; returns the full settings after applying. Viewer-specific toggle fields are no-ops when no viewer is open; highlighted surface ids are retained by the surface panel. |
 | `vc3d_set_segment_tag` | `tags.set` |
 | `vc3d_set_wrap_annotation_mode` | `wrap_annotation.set_mode` | Enable/disable "Same-wrap annotation mode" (prerequisite for the shift+E commit workflow; seed the preview via `vc3d_shift_click`). |
 | `vc3d_shift_click` | `canvas.shift_click` | Shift+click convenience: the canonical place-point / set-focus gesture. |

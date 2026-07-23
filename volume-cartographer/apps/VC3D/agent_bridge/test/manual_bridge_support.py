@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import os
-import statistics
 import sys
-import time
 import urllib.request
 from pathlib import Path
 
@@ -47,9 +45,8 @@ S3_VOLPKG_JSON = Path(
 LOCAL_REAL_SEED = {"x": 4914.0, "y": 3539.0, "z": 9150.0}
 LOCAL_RAW_VOLUME_ID = "s1_2.4um_ds2_raw"
 
-# Re-verification uses distinct points so runs cover fresh neighborhoods.
+# Re-verification uses a distinct point so runs cover a fresh neighborhood.
 LOCAL_REAL_SEED_OFFSCREEN_REVERIFY = {"x": 4326.0, "y": 4921.0, "z": 16350.0}
-LOCAL_REAL_SEED_LIVE_REVERIFY = {"x": 4392.0, "y": 4435.0, "z": 13600.0}
 
 # Real point derived from an on-disk segment bbox center for the S3 fixture
 # (test-data/PHercParis4_neural_tracing.volpkg/segments/extensions/w00_flat_clean/meta.json).

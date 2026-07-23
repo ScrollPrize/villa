@@ -255,12 +255,11 @@ async def vc3d_set_render_settings(
     The numeric/global fields (opacities, thickness, max-surfaces, volume
     window, sampling stride, z-scroll sensitivity, cursor mirroring,
     normal-arrow length/count) are persisted (QSettings/ViewerManager) even
-    with no viewer pane open. The toggle/highlight fields (plane-intersection
-    lines, show-normals, show-direction-hints, surface-overlay,
-    highlighted-surface-ids) apply only to currently-open viewers: with zero
-    viewers instantiated they are no-ops, and the returned echo will report
-    defaults for them rather than the values you passed -- open a viewer
-    first if you need those to stick.
+    with no viewer pane open. highlighted_surface_ids is retained by the
+    surface panel and applies when viewers become available. The four
+    per-viewer toggles (plane-intersection lines, show-normals,
+    show-direction-hints, surface-overlay) are no-ops with zero viewers; their
+    returned echo reports defaults until a viewer is open.
 
     Returns the full resulting settings object (same shape as
     vc3d_get_render_settings) so you can confirm what was applied."""
