@@ -40,7 +40,7 @@ async def vc3d_add_point_collection(name: Optional[str] = None) -> dict[str, Any
 
 @mcp.tool()
 async def vc3d_update_point(
-    pointId: int,
+    point_id: int,
     position: Optional[Point3D] = None,
     winding: Optional[float] = None,
     clear_winding: bool = False,
@@ -52,7 +52,9 @@ async def vc3d_update_point(
     if winding is not None and clear_winding:
         raise ValueError("winding and clear_winding are mutually exclusive")
 
-    params = _strip_none({"pointId": pointId, "position": position, "winding": winding})
+    params = _strip_none(
+        {"pointId": point_id, "position": position, "winding": winding}
+    )
     if clear_winding:
         params["winding"] = None
     return await _call(
@@ -62,20 +64,20 @@ async def vc3d_update_point(
 
 
 @mcp.tool()
-async def vc3d_remove_point(pointId: int) -> dict[str, Any]:
+async def vc3d_remove_point(point_id: int) -> dict[str, Any]:
     """Remove a single point by id. Returns {removed: true}."""
-    return await _call("points.remove_point", {"pointId": pointId})
+    return await _call("points.remove_point", {"pointId": point_id})
 
 
 @mcp.tool()
 async def vc3d_clear_point_collection(
-    collection: Optional[str] = None, collectionId: Optional[int] = None
+    collection: Optional[str] = None, collection_id: Optional[int] = None
 ) -> dict[str, Any]:
     """Delete a collection and all of its points (identify by name or id).
     Returns {cleared: true}."""
     return await _call(
         "points.clear_collection",
-        _strip_none({"collection": collection, "collectionId": collectionId}),
+        _strip_none({"collection": collection, "collectionId": collection_id}),
     )
 
 
@@ -87,33 +89,45 @@ async def vc3d_clear_all_points() -> dict[str, Any]:
 
 @mcp.tool()
 async def vc3d_rename_point_collection(
-    newName: str, collection: Optional[str] = None, collectionId: Optional[int] = None
+    new_name: str,
+    collection: Optional[str] = None,
+    collection_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Rename a collection (identify by name or id). Returns {collectionId,
     name}."""
     return await _call(
         "points.rename_collection",
-        _strip_none({"collection": collection, "collectionId": collectionId, "newName": newName}),
+        _strip_none(
+            {
+                "collection": collection,
+                "collectionId": collection_id,
+                "newName": new_name,
+            }
+        ),
     )
 
 
 @mcp.tool()
 async def vc3d_set_point_collection_color(
-    color: list[float], collection: Optional[str] = None, collectionId: Optional[int] = None
+    color: list[float],
+    collection: Optional[str] = None,
+    collection_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Set a collection's [r, g, b] float color (identify by name or id).
     Echoes {collectionId, color}."""
     return await _call(
         "points.set_collection_color",
-        _strip_none({"collection": collection, "collectionId": collectionId, "color": color}),
+        _strip_none(
+            {"collection": collection, "collectionId": collection_id, "color": color}
+        ),
     )
 
 
 @mcp.tool()
 async def vc3d_set_point_collection_metadata(
-    absoluteWindingNumber: bool,
+    absolute_winding_number: bool,
     collection: Optional[str] = None,
-    collectionId: Optional[int] = None,
+    collection_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Set a collection's absolute-winding-number metadata flag (identify by
     name or id). Echoes {collectionId, absoluteWindingNumber}."""
@@ -122,8 +136,8 @@ async def vc3d_set_point_collection_metadata(
         _strip_none(
             {
                 "collection": collection,
-                "collectionId": collectionId,
-                "absoluteWindingNumber": absoluteWindingNumber,
+                "collectionId": collection_id,
+                "absoluteWindingNumber": absolute_winding_number,
             }
         ),
     )
@@ -131,35 +145,47 @@ async def vc3d_set_point_collection_metadata(
 
 @mcp.tool()
 async def vc3d_set_point_collection_tag(
-    key: str, value: str, collection: Optional[str] = None, collectionId: Optional[int] = None
+    key: str,
+    value: str,
+    collection: Optional[str] = None,
+    collection_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Set a key/value tag on a collection (identify by name or id). Returns
     {ok: true}."""
     return await _call(
         "points.set_collection_tag",
         _strip_none(
-            {"collection": collection, "collectionId": collectionId, "key": key, "value": value}
+            {
+                "collection": collection,
+                "collectionId": collection_id,
+                "key": key,
+                "value": value,
+            }
         ),
     )
 
 
 @mcp.tool()
 async def vc3d_remove_point_collection_tag(
-    key: str, collection: Optional[str] = None, collectionId: Optional[int] = None
+    key: str,
+    collection: Optional[str] = None,
+    collection_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Remove a tag by key from a collection (identify by name or id). Returns
     {ok: true}."""
     return await _call(
         "points.remove_collection_tag",
-        _strip_none({"collection": collection, "collectionId": collectionId, "key": key}),
+        _strip_none(
+            {"collection": collection, "collectionId": collection_id, "key": key}
+        ),
     )
 
 
 @mcp.tool()
 async def vc3d_set_point_windings_linked(
-    linkedCollectionIds: list[int],
+    linked_collection_ids: list[int],
     collection: Optional[str] = None,
-    collectionId: Optional[int] = None,
+    collection_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Set the collections whose windings are linked to this one (identify by
     name or id). Echoes {collectionId, linkedCollectionIds}."""
@@ -168,8 +194,8 @@ async def vc3d_set_point_windings_linked(
         _strip_none(
             {
                 "collection": collection,
-                "collectionId": collectionId,
-                "linkedCollectionIds": linkedCollectionIds,
+                "collectionId": collection_id,
+                "linkedCollectionIds": linked_collection_ids,
             }
         ),
     )
@@ -179,7 +205,7 @@ async def vc3d_set_point_windings_linked(
 async def vc3d_auto_fill_windings(
     mode: Literal["none", "incremental", "decremental", "constant"],
     collection: Optional[str] = None,
-    collectionId: Optional[int] = None,
+    collection_id: Optional[int] = None,
     constant: Optional[float] = None,
 ) -> dict[str, Any]:
     """Auto-fill winding annotations across a collection (identify by name or
@@ -190,7 +216,7 @@ async def vc3d_auto_fill_windings(
         _strip_none(
             {
                 "collection": collection,
-                "collectionId": collectionId,
+                "collectionId": collection_id,
                 "mode": mode,
                 "constant": constant,
             }
@@ -202,7 +228,7 @@ async def vc3d_auto_fill_windings(
 async def vc3d_set_auto_fill_mode(
     mode: Literal["none", "incremental", "decremental", "constant"],
     collection: Optional[str] = None,
-    collectionId: Optional[int] = None,
+    collection_id: Optional[int] = None,
     constant: Optional[float] = None,
 ) -> dict[str, Any]:
     """Set (without applying) a collection's auto-fill mode for future points
@@ -213,7 +239,7 @@ async def vc3d_set_auto_fill_mode(
         _strip_none(
             {
                 "collection": collection,
-                "collectionId": collectionId,
+                "collectionId": collection_id,
                 "mode": mode,
                 "constant": constant,
             }
@@ -228,11 +254,13 @@ async def vc3d_reset_windings() -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_apply_anchor_offset(offsetX: float, offsetY: float) -> dict[str, Any]:
+async def vc3d_apply_anchor_offset(
+    offset_x: float, offset_y: float
+) -> dict[str, Any]:
     """Apply a grid offset to every collection's 2D anchor (surface-growth
     remapping). Returns {ok: true}."""
     return await _call(
-        "points.apply_anchor_offset", {"offsetX": offsetX, "offsetY": offsetY}
+        "points.apply_anchor_offset", {"offsetX": offset_x, "offsetY": offset_y}
     )
 
 
@@ -249,14 +277,14 @@ async def vc3d_load_points_json(path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_save_points_segment_path(segmentPath: str) -> dict[str, Any]:
+async def vc3d_save_points_segment_path(segment_path: str) -> dict[str, Any]:
     """Save 2D-anchored correction points into a segment directory. Returns
     {saved: bool}."""
-    return await _call("points.save_segment_path", {"segmentPath": segmentPath})
+    return await _call("points.save_segment_path", {"segmentPath": segment_path})
 
 
 @mcp.tool()
-async def vc3d_load_points_segment_path(segmentPath: str) -> dict[str, Any]:
+async def vc3d_load_points_segment_path(segment_path: str) -> dict[str, Any]:
     """Load 2D-anchored correction points from a segment directory. Returns
     {loaded: bool}."""
-    return await _call("points.load_segment_path", {"segmentPath": segmentPath})
+    return await _call("points.load_segment_path", {"segmentPath": segment_path})

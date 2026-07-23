@@ -2,3 +2,4 @@
 # (pyproject.toml is the primary packaging metadata; this file is provided
 # for `pip install -r requirements.txt` convenience / non-editable installs.)
 mcp>=1.6.0,<2
+typing-extensions>=4.8

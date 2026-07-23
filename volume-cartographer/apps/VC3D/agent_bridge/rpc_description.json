@@ -1357,6 +1357,10 @@
         -32010
       ],
       "mcp": {
+        "paramRenames": {
+          "offsetX": "offset_x",
+          "offsetY": "offset_y"
+        },
         "tool": "vc3d_apply_anchor_offset"
       },
       "params": {
@@ -1383,6 +1387,9 @@
         -32602
       ],
       "mcp": {
+        "paramRenames": {
+          "collectionId": "collection_id"
+        },
         "tool": "vc3d_auto_fill_windings"
       },
       "params": {
@@ -1435,6 +1442,9 @@
         -32602
       ],
       "mcp": {
+        "paramRenames": {
+          "collectionId": "collection_id"
+        },
         "tool": "vc3d_clear_point_collection"
       },
       "params": {
@@ -1543,6 +1553,9 @@
         -32010
       ],
       "mcp": {
+        "paramRenames": {
+          "segmentPath": "segment_path"
+        },
         "tool": "vc3d_load_points_segment_path"
       },
       "params": {
@@ -1565,6 +1578,9 @@
         -32602
       ],
       "mcp": {
+        "paramRenames": {
+          "collectionId": "collection_id"
+        },
         "tool": "vc3d_remove_point_collection_tag"
       },
       "params": {
@@ -1595,6 +1611,9 @@
         -32007
       ],
       "mcp": {
+        "paramRenames": {
+          "pointId": "point_id"
+        },
         "tool": "vc3d_remove_point"
       },
       "params": {
@@ -1619,6 +1638,10 @@
         -32602
       ],
       "mcp": {
+        "paramRenames": {
+          "collectionId": "collection_id",
+          "newName": "new_name"
+        },
         "tool": "vc3d_rename_point_collection"
       },
       "params": {
@@ -1682,6 +1705,9 @@
         -32010
       ],
       "mcp": {
+        "paramRenames": {
+          "segmentPath": "segment_path"
+        },
         "tool": "vc3d_save_points_segment_path"
       },
       "params": {
@@ -1704,6 +1730,9 @@
         -32602
       ],
       "mcp": {
+        "paramRenames": {
+          "collectionId": "collection_id"
+        },
         "tool": "vc3d_set_auto_fill_mode"
       },
       "params": {
@@ -1743,6 +1772,9 @@
         -32602
       ],
       "mcp": {
+        "paramRenames": {
+          "collectionId": "collection_id"
+        },
         "tool": "vc3d_set_point_collection_color"
       },
       "params": {
@@ -1776,6 +1808,10 @@
         -32602
       ],
       "mcp": {
+        "paramRenames": {
+          "absoluteWindingNumber": "absolute_winding_number",
+          "collectionId": "collection_id"
+        },
         "tool": "vc3d_set_point_collection_metadata"
       },
       "params": {
@@ -1806,6 +1842,9 @@
         -32602
       ],
       "mcp": {
+        "paramRenames": {
+          "collectionId": "collection_id"
+        },
         "tool": "vc3d_set_point_collection_tag"
       },
       "params": {
@@ -1840,6 +1879,10 @@
         -32602
       ],
       "mcp": {
+        "paramRenames": {
+          "collectionId": "collection_id",
+          "linkedCollectionIds": "linked_collection_ids"
+        },
         "tool": "vc3d_set_point_windings_linked"
       },
       "params": {
@@ -1878,6 +1921,9 @@
         "extraParams": [
           "clear_winding"
         ],
+        "paramRenames": {
+          "pointId": "point_id"
+        },
         "tool": "vc3d_update_point"
       },
       "params": {

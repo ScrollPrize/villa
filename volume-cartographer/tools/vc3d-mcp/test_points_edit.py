@@ -141,25 +141,25 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_point_all_fields(self) -> None:
         pos = {"x": 1.0, "y": 2.0, "z": 3.0}
-        await vc3d_update_point(pointId=7, position=pos, winding=1.5)
+        await vc3d_update_point(point_id=7, position=pos, winding=1.5)
         self._assert_wire(
             "points.update_point", {"pointId": 7, "position": pos, "winding": 1.5}
         )
 
     async def test_update_point_optionals_stripped(self) -> None:
-        await vc3d_update_point(pointId=7)
+        await vc3d_update_point(point_id=7)
         self._assert_wire("points.update_point", {"pointId": 7})
 
     async def test_update_point_can_clear_winding(self) -> None:
-        await vc3d_update_point(pointId=7, clear_winding=True)
+        await vc3d_update_point(point_id=7, clear_winding=True)
         self._assert_wire("points.update_point", {"pointId": 7, "winding": None})
 
     async def test_update_point_rejects_winding_and_clear(self) -> None:
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            await vc3d_update_point(pointId=7, winding=1.5, clear_winding=True)
+            await vc3d_update_point(point_id=7, winding=1.5, clear_winding=True)
 
     async def test_remove_point(self) -> None:
-        await vc3d_remove_point(pointId=9)
+        await vc3d_remove_point(point_id=9)
         self._assert_wire("points.remove_point", {"pointId": 9})
 
     async def test_clear_collection_by_name(self) -> None:
@@ -167,7 +167,7 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
         self._assert_wire("points.clear_collection", {"collection": "corr"})
 
     async def test_clear_collection_by_id(self) -> None:
-        await vc3d_clear_point_collection(collectionId=3)
+        await vc3d_clear_point_collection(collection_id=3)
         self._assert_wire("points.clear_collection", {"collectionId": 3})
 
     async def test_clear_all(self) -> None:
@@ -175,7 +175,7 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
         self._assert_wire("points.clear_all", {})
 
     async def test_rename_collection(self) -> None:
-        await vc3d_rename_point_collection(newName="fresh", collectionId=2)
+        await vc3d_rename_point_collection(new_name="fresh", collection_id=2)
         self._assert_wire(
             "points.rename_collection", {"collectionId": 2, "newName": "fresh"}
         )
@@ -187,7 +187,9 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_set_collection_metadata(self) -> None:
-        await vc3d_set_point_collection_metadata(absoluteWindingNumber=False, collectionId=1)
+        await vc3d_set_point_collection_metadata(
+            absolute_winding_number=False, collection_id=1
+        )
         self._assert_wire(
             "points.set_collection_metadata",
             {"collectionId": 1, "absoluteWindingNumber": False},
@@ -200,13 +202,15 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_remove_collection_tag(self) -> None:
-        await vc3d_remove_point_collection_tag(key="k", collectionId=4)
+        await vc3d_remove_point_collection_tag(key="k", collection_id=4)
         self._assert_wire(
             "points.remove_collection_tag", {"collectionId": 4, "key": "k"}
         )
 
     async def test_set_windings_linked(self) -> None:
-        await vc3d_set_point_windings_linked(linkedCollectionIds=[2, 3], collectionId=1)
+        await vc3d_set_point_windings_linked(
+            linked_collection_ids=[2, 3], collection_id=1
+        )
         self._assert_wire(
             "points.set_windings_linked", {"collectionId": 1, "linkedCollectionIds": [2, 3]}
         )
@@ -219,13 +223,13 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_auto_fill_windings_constant_stripped(self) -> None:
-        await vc3d_auto_fill_windings(mode="incremental", collectionId=1)
+        await vc3d_auto_fill_windings(mode="incremental", collection_id=1)
         self._assert_wire(
             "points.auto_fill_windings", {"collectionId": 1, "mode": "incremental"}
         )
 
     async def test_set_auto_fill_mode(self) -> None:
-        await vc3d_set_auto_fill_mode(mode="decremental", collectionId=1)
+        await vc3d_set_auto_fill_mode(mode="decremental", collection_id=1)
         self._assert_wire(
             "points.set_auto_fill_mode", {"collectionId": 1, "mode": "decremental"}
         )
@@ -235,7 +239,7 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
         self._assert_wire("points.reset_windings", {})
 
     async def test_apply_anchor_offset(self) -> None:
-        result = await vc3d_apply_anchor_offset(offsetX=1.5, offsetY=-2.0)
+        result = await vc3d_apply_anchor_offset(offset_x=1.5, offset_y=-2.0)
         self._assert_wire("points.apply_anchor_offset", {"offsetX": 1.5, "offsetY": -2.0})
         self._assert_passthrough(
             result, "points.apply_anchor_offset", {"offsetX": 1.5, "offsetY": -2.0}
@@ -250,11 +254,11 @@ class PointsToolTest(unittest.IsolatedAsyncioTestCase):
         self._assert_wire("points.load_json", {"path": "/tmp/p.json"})
 
     async def test_save_segment_path(self) -> None:
-        await vc3d_save_points_segment_path(segmentPath="/tmp/seg")
+        await vc3d_save_points_segment_path(segment_path="/tmp/seg")
         self._assert_wire("points.save_segment_path", {"segmentPath": "/tmp/seg"})
 
     async def test_load_segment_path(self) -> None:
-        await vc3d_load_points_segment_path(segmentPath="/tmp/seg")
+        await vc3d_load_points_segment_path(segment_path="/tmp/seg")
         self._assert_wire("points.load_segment_path", {"segmentPath": "/tmp/seg"})
 
 

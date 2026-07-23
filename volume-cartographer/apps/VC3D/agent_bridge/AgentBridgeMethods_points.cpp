@@ -74,7 +74,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::optionalNumber(QStringLiteral("winding")),
             },
             .errors = {-32602, -32000, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_commit_points")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_commit_points")),
         },
         [this](const QJsonValue& p) { return handlePointsCommit(p); });
 
@@ -85,7 +85,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::optionalString(QStringLiteral("collection")),
             },
             .errors = {-32602, -32007},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_list_points")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_list_points")),
         },
         [this](const QJsonValue& p) { return handlePointsList(p); });
 
@@ -96,7 +96,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::optionalString(QStringLiteral("name")),
             },
             .errors = {-32602, -32000, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_add_point_collection")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_add_point_collection")),
         },
         [this](const QJsonValue& p) { return handlePointsAddCollection(p); });
 
@@ -110,7 +110,7 @@ void AgentBridgeServer::registerPointsHandlers()
                     Params::optionalNumber(QStringLiteral("winding"))),
             },
             .errors = {-32602, -32000, -32010, -32007},
-            .mcp = Mcp::exact(
+            .mcp = Mcp::snakeCase(
                 QStringLiteral("vc3d_update_point"),
                 {QStringLiteral("clear_winding")}),
         },
@@ -123,7 +123,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::requiredSafeId(QStringLiteral("pointId")),
             },
             .errors = {-32602, -32000, -32010, -32007},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_remove_point")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_remove_point")),
         },
         [this](const QJsonValue& p) { return handlePointsRemovePoint(p); });
 
@@ -132,7 +132,7 @@ void AgentBridgeServer::registerPointsHandlers()
             .name = QStringLiteral("points.clear_collection"),
             .params = collectionSelector(),
             .errors = collectionErrors(),
-            .mcp = Mcp::exact(QStringLiteral("vc3d_clear_point_collection")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_clear_point_collection")),
         },
         [this](const QJsonValue& p) { return handlePointsClearCollection(p); });
 
@@ -140,7 +140,7 @@ void AgentBridgeServer::registerPointsHandlers()
         {
             .name = QStringLiteral("points.clear_all"),
             .errors = {-32000, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_clear_all_points")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_clear_all_points")),
         },
         [this](const QJsonValue& p) { return handlePointsClearAll(p); });
 
@@ -151,7 +151,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::requiredString(QStringLiteral("newName")),
             }),
             .errors = collectionErrors(),
-            .mcp = Mcp::exact(QStringLiteral("vc3d_rename_point_collection")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_rename_point_collection")),
         },
         [this](const QJsonValue& p) { return handlePointsRenameCollection(p); });
 
@@ -164,7 +164,7 @@ void AgentBridgeServer::registerPointsHandlers()
                     AgentBridgeParam{.type = AgentBridgeParamType::Number, .finite = true}),
             }),
             .errors = collectionErrors(),
-            .mcp = Mcp::exact(QStringLiteral("vc3d_set_point_collection_color")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_set_point_collection_color")),
         },
         [this](const QJsonValue& p) { return handlePointsSetCollectionColor(p); });
 
@@ -175,7 +175,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::requiredBoolean(QStringLiteral("absoluteWindingNumber")),
             }),
             .errors = collectionErrors(),
-            .mcp = Mcp::exact(QStringLiteral("vc3d_set_point_collection_metadata")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_set_point_collection_metadata")),
         },
         [this](const QJsonValue& p) { return handlePointsSetCollectionMetadata(p); });
 
@@ -187,7 +187,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::requiredString(QStringLiteral("value")),
             }),
             .errors = collectionErrors(),
-            .mcp = Mcp::exact(QStringLiteral("vc3d_set_point_collection_tag")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_set_point_collection_tag")),
         },
         [this](const QJsonValue& p) { return handlePointsSetCollectionTag(p); });
 
@@ -198,7 +198,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::requiredString(QStringLiteral("key")),
             }),
             .errors = collectionErrors(),
-            .mcp = Mcp::exact(QStringLiteral("vc3d_remove_point_collection_tag")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_remove_point_collection_tag")),
         },
         [this](const QJsonValue& p) { return handlePointsRemoveCollectionTag(p); });
 
@@ -211,7 +211,7 @@ void AgentBridgeServer::registerPointsHandlers()
                     Params::requiredSafeId(QString())),
             }),
             .errors = collectionErrors(),
-            .mcp = Mcp::exact(QStringLiteral("vc3d_set_point_windings_linked")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_set_point_windings_linked")),
         },
         [this](const QJsonValue& p) { return handlePointsSetWindingsLinked(p); });
 
@@ -223,7 +223,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::optionalNumber(QStringLiteral("constant")),
             }),
             .errors = collectionErrors(),
-            .mcp = Mcp::exact(QStringLiteral("vc3d_auto_fill_windings")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_auto_fill_windings")),
         },
         [this](const QJsonValue& p) { return handlePointsAutoFillWindings(p); });
 
@@ -235,7 +235,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::optionalNumber(QStringLiteral("constant")),
             }),
             .errors = collectionErrors(),
-            .mcp = Mcp::exact(QStringLiteral("vc3d_set_auto_fill_mode")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_set_auto_fill_mode")),
         },
         [this](const QJsonValue& p) { return handlePointsSetAutoFillMode(p); });
 
@@ -243,7 +243,7 @@ void AgentBridgeServer::registerPointsHandlers()
         {
             .name = QStringLiteral("points.reset_windings"),
             .errors = {-32000, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_reset_windings")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_reset_windings")),
         },
         [this](const QJsonValue& p) { return handlePointsResetWindings(p); });
 
@@ -255,7 +255,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::requiredNumber(QStringLiteral("offsetY")),
             },
             .errors = {-32602, -32000, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_apply_anchor_offset")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_apply_anchor_offset")),
         },
         [this](const QJsonValue& p) { return handlePointsApplyAnchorOffset(p); });
 
@@ -266,7 +266,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::requiredString(QStringLiteral("path")),
             },
             .errors = {-32602, -32000, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_save_points_json")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_save_points_json")),
         },
         [this](const QJsonValue& p) { return handlePointsSaveJson(p); });
 
@@ -277,7 +277,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::requiredString(QStringLiteral("path")),
             },
             .errors = {-32602, -32000, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_load_points_json")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_load_points_json")),
         },
         [this](const QJsonValue& p) { return handlePointsLoadJson(p); });
 
@@ -288,7 +288,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::requiredString(QStringLiteral("segmentPath")),
             },
             .errors = {-32602, -32000, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_save_points_segment_path")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_save_points_segment_path")),
         },
         [this](const QJsonValue& p) { return handlePointsSaveSegmentPath(p); });
 
@@ -299,7 +299,7 @@ void AgentBridgeServer::registerPointsHandlers()
                 Params::requiredString(QStringLiteral("segmentPath")),
             },
             .errors = {-32602, -32000, -32010},
-            .mcp = Mcp::exact(QStringLiteral("vc3d_load_points_segment_path")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_load_points_segment_path")),
         },
         [this](const QJsonValue& p) { return handlePointsLoadSegmentPath(p); });
 }
