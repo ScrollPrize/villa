@@ -67,13 +67,14 @@
 
 // Shared launch body for all three flatten RPCs: the handler builds `launch`
 // (a closure over the concrete start* launcher); this registers the job and
-// maps failure sentences to codes. Completion is driven by
+// maps typed launch failures to JSON-RPC errors. Completion is driven by
 // SegmentationCommandHandler::flattenJobFinished rather than a
 // CommandLineToolRunner signal, since flatten jobs own their own
 // QProcess/QtConcurrent lifecycle.
 QJsonObject AgentBridgeServer::launchFlattenJob(
     const QString& kind, const QString& label, const QString& segmentId,
-    const std::function<bool(QString* err, QString* outDir)>& launch)
+    const std::function<bool(CommandLaunchError* error,
+                             QString* outDir)>& launch)
 {
     // Only one flatten at a time (its own source, so it may run concurrently
     // with a "tool"/"growth"/etc. job, §8.3).
@@ -90,26 +91,12 @@ QJsonObject AgentBridgeServer::launchFlattenJob(
     const QString jobId = beginJob(QStringLiteral("flatten"), kind, label,
                                    /*broadcastStart=*/false);
 
-    QString err;
+    CommandLaunchError error;
     QString outputDir;
-    if (!launch(&err, &outputDir)) {
+    if (!launch(&error, &outputDir)) {
         _activeJobs.remove(QStringLiteral("flatten"));
-        // Map the distinct failure sentences the start* launchers produce (§20).
-        if (err.contains(QLatin1String("Invalid segment"))) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = segmentId;
-            data["detail"] = err;
-            throw AgentBridgeError{-32007, "Segment not found", data};
-        }
-        if (err.contains(QLatin1String("not found or not executable"))) {
-            QJsonObject data;
-            data["detail"] = err;
-            throw AgentBridgeError{-32006, "Flatten tool unavailable", data};
-        }
-        QJsonObject data;
-        data["detail"] = err;
-        throw AgentBridgeError{-32005, "Failed to start flatten", data};
+        throwCommandLaunchError(error, "Failed to start flatten",
+                                segmentId, "flatten");
     }
 
     // The job ctor already emitted flattenJobStarted (adopted by
@@ -199,8 +186,9 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
         _window ? _window->_segmentationCommandHandler.get() : nullptr;
     return launchFlattenJob(
         QStringLiteral("flatten.slim"), QStringLiteral("SLIM flatten"), segmentId,
-        [handler, segmentId, sp](QString* err, QString* outDir) {
-            return handler && handler->startSlimFlatten(segmentId.toStdString(), sp, err, outDir);
+        [handler, segmentId, sp](CommandLaunchError* error, QString* outDir) {
+            return handler && handler->startSlimFlatten(
+                segmentId.toStdString(), sp, error, outDir);
         });
 }
 
@@ -240,9 +228,11 @@ QJsonObject AgentBridgeServer::handleFlattenAbf(const QJsonValue& params)
         _window ? _window->_segmentationCommandHandler.get() : nullptr;
     return launchFlattenJob(
         QStringLiteral("flatten.abf"), QStringLiteral("ABF++ flatten"), segmentId,
-        [handler, segmentId, iterations, downsampleFactor](QString* err, QString* outDir) {
+        [handler, segmentId, iterations, downsampleFactor](CommandLaunchError* error,
+                                                           QString* outDir) {
             return handler && handler->startAbfFlatten(segmentId.toStdString(),
-                                                       iterations, downsampleFactor, err, outDir);
+                                                       iterations, downsampleFactor,
+                                                       error, outDir);
         });
 }
 
@@ -323,7 +313,8 @@ QJsonObject AgentBridgeServer::handleFlattenStraighten(const QJsonValue& params)
         _window ? _window->_segmentationCommandHandler.get() : nullptr;
     return launchFlattenJob(
         QStringLiteral("flatten.straighten"), QStringLiteral("Straighten"), segmentId,
-        [handler, segmentId, stp](QString* err, QString* outDir) {
-            return handler && handler->startStraighten(segmentId.toStdString(), stp, err, outDir);
+        [handler, segmentId, stp](CommandLaunchError* error, QString* outDir) {
+            return handler && handler->startStraighten(
+                segmentId.toStdString(), stp, error, outDir);
         });
 }

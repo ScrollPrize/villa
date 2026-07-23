@@ -2263,9 +2263,9 @@ void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& seg
     params.ompThreads = dlg.ompThreads();
     params.tgtDir = dlg.tgtDir();
 
-    QString err;
-    if (!startRunTrace(segmentId, params, &err)) {
-        QMessageBox::warning(_parentWidget, tr("Error"), err);
+    CommandLaunchError error;
+    if (!startRunTrace(segmentId, params, &error)) {
+        QMessageBox::warning(_parentWidget, tr("Error"), error.message);
         return;
     }
 
@@ -2275,35 +2275,39 @@ void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& seg
 
 bool SegmentationCommandHandler::startRunTrace(const std::string& segmentId,
                                               const RunTraceParams& params,
-                                              QString* errorMessage,
+                                              CommandLaunchError* error,
                                               QString* resolvedOutputDir)
 {
-    auto setErr = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+    auto setErr = [&](const QString& msg,
+                      CommandLaunchError::Kind kind = CommandLaunchError::Other) {
+        if (error) *error = {kind, msg};
+    };
 
     // --- Step 1: preconditions (headless mirror of requireSurfaceAndRunner +
-    // the remote/trace_params.json checks in onGrowSegmentFromSegment). Distinct
-    // sentences so the bridge can classify (SPEC §15.4). ---
+    // the remote/trace_params.json checks in onGrowSegmentFromSegment). ---
     if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
-        setErr(tr("No volume package or volume loaded."));
+        setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
         return false;
     }
     auto surf = _state->vpkg()->getSurface(segmentId);
     if (!surf) {
         setErr(tr("Invalid segment or segment not loaded: %1")
-                   .arg(QString::fromStdString(segmentId)));
+                   .arg(QString::fromStdString(segmentId)),
+               CommandLaunchError::SegmentNotFound);
         return false;
     }
     if (!_cmdRunner) {
-        setErr(tr("Command line tools not available"));
+        setErr(tr("Command line tools not available"), CommandLaunchError::ToolUnavailable);
         return false;
     }
     if (_cmdRunner->isRunning()) {
-        setErr(tr("A command line tool is already running."));
+        setErr(tr("A command line tool is already running."), CommandLaunchError::Busy);
         return false;
     }
     if (_state->currentVolume()->isRemote()) {
         setErr(tr("Run Trace uses vc_grow_seg_from_segments, which accepts only "
-                  "local volumes (remote current volume rejected)."));
+                  "local volumes (remote current volume rejected)."),
+               CommandLaunchError::RemoteVolume);
         return false;
     }
 
@@ -2331,7 +2335,8 @@ bool SegmentationCommandHandler::startRunTrace(const std::string& segmentId,
     }
 
     if (!std::filesystem::exists(jsonParamsPath)) {
-        setErr(tr("trace_params.json not found in the volpkg"));
+        setErr(tr("trace_params.json not found in the volpkg"),
+               CommandLaunchError::InputNotFound);
         return false;
     }
 
@@ -2378,34 +2383,37 @@ bool SegmentationCommandHandler::startRunTrace(const std::string& segmentId,
 
 bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId,
                                                     const RenderSegmentParams& params,
-                                                    QString* errorMessage,
+                                                    CommandLaunchError* error,
                                                     QString* resolvedOutputDir)
 {
-    auto setErr = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+    auto setErr = [&](const QString& msg,
+                      CommandLaunchError::Kind kind = CommandLaunchError::Other) {
+        if (error) *error = {kind, msg};
+    };
 
     // --- Step 1: preconditions (headless mirror of requireSurfaceAndRunner +
-    // the execute() pre-launch checks in onRenderSegment). Distinct sentences so
-    // the bridge can classify (SPEC §19). No QMessageBox / dialog on any path. ---
+    // the execute() pre-launch checks in onRenderSegment). No dialogs. ---
     if (!_state || !_state->vpkg()) {
-        setErr(tr("No volume package or volume loaded."));
+        setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
         return false;
     }
     if (!_state->currentVolume()) {
-        setErr(tr("No volume loaded."));
+        setErr(tr("No volume loaded."), CommandLaunchError::InvalidState);
         return false;
     }
     auto surf = _state->vpkg()->getSurface(segmentId);
     if (!surf) {
         setErr(tr("Invalid segment or segment not loaded: %1")
-                   .arg(QString::fromStdString(segmentId)));
+                   .arg(QString::fromStdString(segmentId)),
+               CommandLaunchError::SegmentNotFound);
         return false;
     }
     if (!_cmdRunner) {
-        setErr(tr("Command line tools not available"));
+        setErr(tr("Command line tools not available"), CommandLaunchError::ToolUnavailable);
         return false;
     }
     if (_cmdRunner->isRunning()) {
-        setErr(tr("A command line tool is already running."));
+        setErr(tr("A command line tool is already running."), CommandLaunchError::Busy);
         return false;
     }
 
@@ -2416,7 +2424,8 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
         QCoreApplication::applicationDirPath() + QStringLiteral("/vc_render_tifxyz");
     QFileInfo toolInfo(toolPath);
     if (!toolInfo.exists() || !toolInfo.isExecutable()) {
-        setErr(tr("vc_render_tifxyz not found or not executable: %1").arg(toolPath));
+        setErr(tr("vc_render_tifxyz not found or not executable: %1").arg(toolPath),
+               CommandLaunchError::ToolUnavailable);
         return false;
     }
 
@@ -2428,7 +2437,8 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
     } else {
         const auto ids = _state->vpkg()->volumeIDs();
         if (std::find(ids.begin(), ids.end(), params.volumeId.toStdString()) == ids.end()) {
-            setErr(tr("Unknown volume id: %1").arg(params.volumeId));
+            setErr(tr("Unknown volume id: %1").arg(params.volumeId),
+                   CommandLaunchError::VolumeNotFound);
             return false;
         }
         renderVolume = _state->vpkg()->volume(params.volumeId.toStdString());
@@ -2501,21 +2511,24 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
 
 bool SegmentationCommandHandler::startSlimFlatten(const std::string& segmentId,
                                                   const SlimFlattenParams& params,
-                                                  QString* errorMessage,
+                                                  CommandLaunchError* error,
                                                   QString* resolvedOutputDir)
 {
-    auto setErr = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+    auto setErr = [&](const QString& msg,
+                      CommandLaunchError::Kind kind = CommandLaunchError::Other) {
+        if (error) *error = {kind, msg};
+    };
 
-    // --- Preconditions (headless mirror of onSlimFlatten; distinct sentences so
-    // the bridge can classify, SPEC §20). No QMessageBox / dialog on any path. ---
+    // --- Preconditions (headless mirror of onSlimFlatten, SPEC §20). ---
     if (!_state || !_state->vpkg() || !_state->currentVolume()) {
-        setErr(tr("No volume package or volume loaded."));
+        setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
         return false;
     }
     auto surf = _state->vpkg()->getSurface(segmentId);
     if (!surf) {
         setErr(tr("Invalid segment or segment not loaded: %1")
-                   .arg(QString::fromStdString(segmentId)));
+                   .arg(QString::fromStdString(segmentId)),
+               CommandLaunchError::SegmentNotFound);
         return false;
     }
 
@@ -2526,21 +2539,25 @@ bool SegmentationCommandHandler::startSlimFlatten(const std::string& segmentId,
     const QString flatboiExe = findFlatboiExecutable();
     if (flatboiExe.isEmpty()) {
         setErr(tr("flatboi not found or not executable (checked known locations, "
-                  "PATH, VC.ini [tools] flatboi_path, and $FLATBOI)."));
+                  "PATH, VC.ini [tools] flatboi_path, and $FLATBOI)."),
+               CommandLaunchError::ToolUnavailable);
         return false;
     }
     if (findVcTool("vc_tifxyz2obj").isEmpty()) {
-        setErr(tr("vc_tifxyz2obj not found or not executable."));
+        setErr(tr("vc_tifxyz2obj not found or not executable."),
+               CommandLaunchError::ToolUnavailable);
         return false;
     }
     if (findVcTool("vc_obj2tifxyz").isEmpty()) {
-        setErr(tr("vc_obj2tifxyz not found or not executable."));
+        setErr(tr("vc_obj2tifxyz not found or not executable."),
+               CommandLaunchError::ToolUnavailable);
         return false;
     }
     const bool decimating = params.keepPercent < 100.0;
     if (decimating && findVcTool("vc_obj_uv_lift").isEmpty()) {
         setErr(tr("vc_obj_uv_lift not found or not executable (required when "
-                  "keepPercent < 100)."));
+                  "keepPercent < 100)."),
+               CommandLaunchError::ToolUnavailable);
         return false;
     }
 
@@ -2583,19 +2600,23 @@ bool SegmentationCommandHandler::startSlimFlatten(const std::string& segmentId,
 bool SegmentationCommandHandler::startAbfFlatten(const std::string& segmentId,
                                                  int iterations,
                                                  int downsampleFactor,
-                                                 QString* errorMessage,
+                                                 CommandLaunchError* error,
                                                  QString* resolvedOutputDir)
 {
-    auto setErr = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+    auto setErr = [&](const QString& msg,
+                      CommandLaunchError::Kind kind = CommandLaunchError::Other) {
+        if (error) *error = {kind, msg};
+    };
 
     if (!_state || !_state->vpkg()) {
-        setErr(tr("No volume package loaded."));
+        setErr(tr("No volume package loaded."), CommandLaunchError::InvalidState);
         return false;
     }
     auto surf = _state->vpkg()->getSurface(segmentId);
     if (!surf) {
         setErr(tr("Invalid segment or segment not loaded: %1")
-                   .arg(QString::fromStdString(segmentId)));
+                   .arg(QString::fromStdString(segmentId)),
+               CommandLaunchError::SegmentNotFound);
         return false;
     }
 
@@ -2616,25 +2637,30 @@ bool SegmentationCommandHandler::startAbfFlatten(const std::string& segmentId,
 
 bool SegmentationCommandHandler::startStraighten(const std::string& segmentId,
                                                  const StraightenParams& params,
-                                                 QString* errorMessage,
+                                                 CommandLaunchError* error,
                                                  QString* resolvedOutputDir)
 {
-    auto setErr = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+    auto setErr = [&](const QString& msg,
+                      CommandLaunchError::Kind kind = CommandLaunchError::Other) {
+        if (error) *error = {kind, msg};
+    };
 
     if (!_state || !_state->vpkg() || !_state->currentVolume()) {
-        setErr(tr("No volume package or volume loaded."));
+        setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
         return false;
     }
     auto surf = _state->vpkg()->getSurface(segmentId);
     if (!surf) {
         setErr(tr("Invalid segment or segment not loaded: %1")
-                   .arg(QString::fromStdString(segmentId)));
+                   .arg(QString::fromStdString(segmentId)),
+               CommandLaunchError::SegmentNotFound);
         return false;
     }
 
     const QString exe = findVcTool("vc_straighten");
     if (exe.isEmpty()) {
-        setErr(tr("vc_straighten not found or not executable."));
+        setErr(tr("vc_straighten not found or not executable."),
+               CommandLaunchError::ToolUnavailable);
         return false;
     }
 
@@ -3052,32 +3078,31 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
 
 bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& segmentId,
                                                           const ResumeLocalGrowParams& params,
-                                                          QString* errorMessage,
+                                                          CommandLaunchError* error,
                                                           QString* resolvedOutputDir)
 {
     // Dialog-free mirror of onResumeLocalGrowPatchRequested: same preconditions,
-    // fixed base tracer params, and Tool::NeighborCopy launch, failures via
-    // errorMessage (bridge classifies; see startRenderSegment). The interactive
+    // fixed base tracer params, and Tool::NeighborCopy launch. The interactive
     // "Missing Normal3D" prompt is intentionally dropped -- an unattended run
     // cannot answer it and it has no effect.
-    auto fail = [&](const QString& message) -> bool {
-        if (errorMessage) {
-            *errorMessage = message;
-        }
+    auto fail = [&](const QString& message,
+                    CommandLaunchError::Kind kind = CommandLaunchError::Other) -> bool {
+        if (error) *error = {kind, message};
         return false;
     };
 
     if (!_state || !_state->vpkg()) {
-        return fail(tr("No volume package loaded."));
+        return fail(tr("No volume package loaded."), CommandLaunchError::InvalidState);
     }
     if (_state->currentVolume() == nullptr) {
-        return fail(tr("No volume loaded."));
+        return fail(tr("No volume loaded."), CommandLaunchError::InvalidState);
     }
     if (!_cmdRunner) {
-        return fail(tr("Command line tools are not available."));
+        return fail(tr("Command line tools are not available."),
+                    CommandLaunchError::ToolUnavailable);
     }
     if (_cmdRunner->isRunning()) {
-        return fail(tr("A command line tool is already running."));
+        return fail(tr("A command line tool is already running."), CommandLaunchError::Busy);
     }
     // Preflight the tool binary the same way startRenderSegment does: execute()
     // would otherwise pop a blocking QMessageBox on a missing binary, hanging an
@@ -3085,19 +3110,22 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& se
     const QString toolPath =
         QCoreApplication::applicationDirPath() + QStringLiteral("/vc_grow_seg_from_seed");
     if (const QFileInfo toolInfo(toolPath); !toolInfo.exists() || !toolInfo.isExecutable()) {
-        return fail(tr("vc_grow_seg_from_seed not found or not executable: %1").arg(toolPath));
+        return fail(tr("vc_grow_seg_from_seed not found or not executable: %1").arg(toolPath),
+                    CommandLaunchError::ToolUnavailable);
     }
     if (_neighborCopyJob && _neighborCopyJob->stage != NeighborCopyJob::Stage::None) {
-        return fail(tr("A neighbor copy request is already active."));
+        return fail(tr("A neighbor copy request is already active."), CommandLaunchError::Busy);
     }
     if (_resumeLocalJob) {
-        return fail(tr("A resume-opt local GrowPatch run is already active."));
+        return fail(tr("A resume-opt local GrowPatch run is already active."),
+                    CommandLaunchError::Busy);
     }
 
     auto surf = _state->vpkg()->getSurface(segmentId);
     if (!surf) {
         return fail(tr("Invalid segment or segment not loaded: %1")
-                        .arg(QString::fromStdString(segmentId)));
+                        .arg(QString::fromStdString(segmentId)),
+                    CommandLaunchError::SegmentNotFound);
     }
 
     QString defaultVolumeId;
@@ -3115,12 +3143,14 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& se
         }
     }
     if (selectedVolumePath.isEmpty()) {
-        return fail(tr("Unknown volume id: %1").arg(selectedVolumeId));
+        return fail(tr("Unknown volume id: %1").arg(selectedVolumeId),
+                    CommandLaunchError::VolumeNotFound);
     }
 
-    QString outputDirPath = resolveSegmentOutputDir(surf->path, errorMessage);
+    QString outputError;
+    QString outputDirPath = resolveSegmentOutputDir(surf->path, &outputError);
     if (outputDirPath.isEmpty()) {
-        return false;  // errorMessage already set by resolveSegmentOutputDir
+        return fail(outputError);
     }
 
     QJsonObject paramsJson = buildResumeLocalBaseParamsJson();
@@ -3176,36 +3206,36 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& se
 
 bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoint,
                                                        const GrowPatchSeedParams& params,
-                                                       QString* errorMessage)
+                                                       CommandLaunchError* error)
 {
-    // Distinct failure sentences let the agent bridge classify precondition
-    // failures (see apps/VC3D/agent_bridge/SPEC.md §4). Never opens a dialog.
-    auto fail = [&](const QString& message) -> bool {
-        if (errorMessage) {
-            *errorMessage = message;
-        }
+    // Never opens a dialog; typed failures let the bridge preserve error codes.
+    auto fail = [&](const QString& message,
+                    CommandLaunchError::Kind kind = CommandLaunchError::Other) -> bool {
+        if (error) *error = {kind, message};
         return false;
     };
 
     if (!_state || !_state->vpkg()) {
-        return fail(tr("No volume package loaded."));
+        return fail(tr("No volume package loaded."), CommandLaunchError::InvalidState);
     }
     if (_state->currentVolume() == nullptr) {
-        return fail(tr("No volume loaded."));
+        return fail(tr("No volume loaded."), CommandLaunchError::InvalidState);
     }
     if (!_cmdRunner) {
-        return fail(tr("Command line tools are not available."));
+        return fail(tr("Command line tools are not available."),
+                    CommandLaunchError::ToolUnavailable);
     }
     if (_cmdRunner->isRunning()) {
-        return fail(tr("A command line tool is already running."));
+        return fail(tr("A command line tool is already running."), CommandLaunchError::Busy);
     }
     if (_growPatchSeedJob) {
-        return fail(tr("A GrowPatch seed run is already active."));
+        return fail(tr("A GrowPatch seed run is already active."), CommandLaunchError::Busy);
     }
 
     const QString executable = findVcTool("vc_grow_seg_from_seed");
     if (executable.isEmpty()) {
-        return fail(tr("Could not find the 'vc_grow_seg_from_seed' executable."));
+        return fail(tr("Could not find the 'vc_grow_seg_from_seed' executable."),
+                    CommandLaunchError::ToolUnavailable);
     }
 
     QString defaultVolumeId;
@@ -3226,7 +3256,8 @@ bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoi
         }
     }
     if (selectedVolumePath.isEmpty()) {
-        return fail(tr("Unknown volume id: %1").arg(selectedVolumeId));
+        return fail(tr("Unknown volume id: %1").arg(selectedVolumeId),
+                    CommandLaunchError::VolumeNotFound);
     }
 
     QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
@@ -3237,7 +3268,8 @@ bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoi
         }
     }
     if (normalGridPath.isEmpty()) {
-        return fail(tr("No normal grid is available for GrowPatch."));
+        return fail(tr("No normal grid is available for GrowPatch."),
+                    CommandLaunchError::InputNotFound);
     }
 
     QString volpkgRoot = _state->vpkgPath();
@@ -3543,9 +3575,9 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
     patchParams.minAreaCm = minAreaCm;
     patchParams.outputDir = outputDirPath;
 
-    QString err;
-    if (!startGrowPatchFromSeed(seedPoint, patchParams, &err)) {
-        QMessageBox::warning(_parentWidget, tr("Error"), err);
+    CommandLaunchError error;
+    if (!startGrowPatchFromSeed(seedPoint, patchParams, &error)) {
+        QMessageBox::warning(_parentWidget, tr("Error"), error.message);
     }
 }
 
@@ -3862,36 +3894,39 @@ void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
 
 bool SegmentationCommandHandler::startAlphaCompRefine(const std::string& segmentId,
                                                      const AlphaCompRefineParams& params,
-                                                     QString* errorMessage,
+                                                     CommandLaunchError* error,
                                                      QString* resolvedOutputDir)
 {
     // Dialog-free mirror of onAlphaCompRefine: same preconditions, output-path
-    // derivation, params-JSON, and Tool::AlphaCompRefine launch, failures via
-    // errorMessage (bridge classifies). The remote-volume guard is preserved --
+    // derivation, params-JSON, and Tool::AlphaCompRefine launch. The remote-volume
+    // guard is preserved --
     // vc_objrefine cannot consume a remote locator.
-    auto fail = [&](const QString& message) -> bool {
-        if (errorMessage) {
-            *errorMessage = message;
-        }
+    auto fail = [&](const QString& message,
+                    CommandLaunchError::Kind kind = CommandLaunchError::Other) -> bool {
+        if (error) *error = {kind, message};
         return false;
     };
 
     if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
-        return fail(tr("No volume package or volume loaded."));
+        return fail(tr("No volume package or volume loaded."),
+                    CommandLaunchError::InvalidState);
     }
     auto surf = _state->vpkg()->getSurface(segmentId);
     if (!surf) {
         return fail(tr("Invalid segment or segment not loaded: %1")
-                        .arg(QString::fromStdString(segmentId)));
+                        .arg(QString::fromStdString(segmentId)),
+                    CommandLaunchError::SegmentNotFound);
     }
     if (!_cmdRunner) {
-        return fail(tr("Command line tools are not available."));
+        return fail(tr("Command line tools are not available."),
+                    CommandLaunchError::ToolUnavailable);
     }
     if (_cmdRunner->isRunning()) {
-        return fail(tr("A command line tool is already running."));
+        return fail(tr("A command line tool is already running."), CommandLaunchError::Busy);
     }
     if (_state->currentVolume()->isRemote()) {
-        return fail(tr("Alpha-comp refinement accepts only local volumes."));
+        return fail(tr("Alpha-comp refinement accepts only local volumes."),
+                    CommandLaunchError::RemoteVolume);
     }
     // Preflight the tool binary (as startRenderSegment does): a missing binary
     // would otherwise trip execute()'s blocking QMessageBox, hanging a headless
@@ -3899,7 +3934,8 @@ bool SegmentationCommandHandler::startAlphaCompRefine(const std::string& segment
     const QString toolPath =
         QCoreApplication::applicationDirPath() + QStringLiteral("/vc_objrefine");
     if (const QFileInfo toolInfo(toolPath); !toolInfo.exists() || !toolInfo.isExecutable()) {
-        return fail(tr("vc_objrefine not found or not executable: %1").arg(toolPath));
+        return fail(tr("vc_objrefine not found or not executable: %1").arg(toolPath),
+                    CommandLaunchError::ToolUnavailable);
     }
 
     const QString volumePath = getCurrentVolumePath();

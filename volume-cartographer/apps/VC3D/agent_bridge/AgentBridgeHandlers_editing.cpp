@@ -678,27 +678,13 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
         _window->_cmdRunner->setSuppressCompletionDialogs(true);
 
     const QVector3D seedQ(seed[0], seed[1], seed[2]);
-    QString err;
-    if (!handler->startGrowPatchFromSeed(seedQ, gp, &err)) {
+    CommandLaunchError error;
+    if (!handler->startGrowPatchFromSeed(seedQ, gp, &error)) {
         if (_window->_cmdRunner)
             _window->_cmdRunner->setSuppressCompletionDialogs(false);
         _activeJobs.remove(QStringLiteral("tool"));
-        // Map the distinct failure sentences to codes (SPEC §3.12, §4).
-        if (err.contains(QLatin1String("Unknown volume id"))) {
-            QJsonObject data;
-            data["kind"] = "volume";
-            data["detail"] = err;
-            throw AgentBridgeError{-32007, err, data};
-        }
-        if (err.contains(QLatin1String("Could not find")) ||
-            err.contains(QLatin1String("executable"))) {
-            QJsonObject data;
-            data["detail"] = err;
-            throw AgentBridgeError{-32006, "vc_grow_seg_from_seed not found", data};
-        }
-        QJsonObject data;
-        data["detail"] = err;
-        throw AgentBridgeError{-32005, "Failed to start GrowPatch from seed", data};
+        throwCommandLaunchError(error, "Failed to start GrowPatch from seed",
+                                {}, "tool");
     }
 
     const QString outputDir = handler->activeGrowPatchOutputDir();

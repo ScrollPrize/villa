@@ -33,6 +33,7 @@ class QLocalSocket;
 class QTimer;
 class CWindow;
 class VolumeViewerBase;
+struct CommandLaunchError;
 
 namespace vc3d::opendata {
 struct OpenDataManifest;
@@ -90,6 +91,10 @@ private:
     // Server -> client notification (no "id") broadcast to every connected
     // client (SPEC §1.2).
     void broadcastNotification(const QString& method, const QJsonObject& params);
+    [[noreturn]] void throwCommandLaunchError(const CommandLaunchError& error,
+                                              const QString& fallbackMessage,
+                                              const QString& segmentId,
+                                              const QString& source);
 
     // --- Viewer registry (SPEC §2.2) ---
     struct ViewerEntry {
@@ -247,7 +252,7 @@ private:
     QJsonObject handleSeedingCancel(const QJsonValue& params);
     QJsonObject handleSeedingAnalyzePaths(const QJsonValue& params);
     // Shared body for run/expand: validate vpkg/volume/widget, requireSourceIdle,
-    // invoke the headless launcher, map its distinct failure sentences to codes,
+    // invoke the headless launcher, map its typed failure to a bridge error,
     // and register the source:"seeding" job.
     QJsonObject launchSeedingBatch(
         const QString& kind, const QString& label,
@@ -263,12 +268,11 @@ private:
     QJsonObject handleFlattenSlim(const QJsonValue& params);
     QJsonObject handleFlattenAbf(const QJsonValue& params);
     QJsonObject handleFlattenStraighten(const QJsonValue& params);
-    // Shared body for the three flatten handlers: validated params + a callback
-    // that invokes the specific start* launcher. Registers the "flatten" job,
-    // maps the launcher's distinct failure sentences to JSON-RPC codes.
+    // Shared body for the three flatten handlers.
     QJsonObject launchFlattenJob(
         const QString& kind, const QString& label, const QString& segmentId,
-        const std::function<bool(QString* err, QString* outDir)>& launch);
+        const std::function<bool(CommandLaunchError* error,
+                                 QString* outDir)>& launch);
 
     // Per-segment mesh operations (SPEC §25, AgentBridgeHandlers_surfaceops.cpp).
     // Sync: crop_bounds / recalc_area. Async source:"tool": reoptimize /

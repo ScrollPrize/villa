@@ -224,41 +224,15 @@ QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
     if (_window->_cmdRunner)
         _window->_cmdRunner->setSuppressCompletionDialogs(true);
 
-    QString err;
+    CommandLaunchError error;
     QString outputDir;
-    if (!handler->startResumeLocalGrowPatch(segmentId.toStdString(), rp, &err, &outputDir)) {
+    if (!handler->startResumeLocalGrowPatch(
+            segmentId.toStdString(), rp, &error, &outputDir)) {
         if (_window->_cmdRunner)
             _window->_cmdRunner->setSuppressCompletionDialogs(false);
         _activeJobs.remove(QStringLiteral("tool"));
-        if (err.contains(QLatin1String("Invalid segment"))) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = segmentId;
-            data["detail"] = err;
-            throw AgentBridgeError{-32007, "Segment not found", data};
-        }
-        if (err.contains(QLatin1String("Unknown volume id"))) {
-            QJsonObject data;
-            data["kind"] = "volume";
-            data["detail"] = err;
-            throw AgentBridgeError{-32007, err, data};
-        }
-        if (err.contains(QLatin1String("already running")) ||
-            err.contains(QLatin1String("already active"))) {
-            QJsonObject data;
-            data["source"] = "tool";
-            data["detail"] = err;
-            throw AgentBridgeError{-32004, "A tool job is already running", data};
-        }
-        if (err.contains(QLatin1String("Command line tools are not available")) ||
-            err.contains(QLatin1String("not found or not executable"))) {
-            QJsonObject data;
-            data["detail"] = err;
-            throw AgentBridgeError{-32006, "Command line tools unavailable", data};
-        }
-        QJsonObject data;
-        data["detail"] = err;
-        throw AgentBridgeError{-32005, "Failed to start reoptimize", data};
+        throwCommandLaunchError(error, "Failed to start reoptimize",
+                                segmentId, "tool");
     }
 
     if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end()) {
@@ -336,39 +310,15 @@ QJsonObject AgentBridgeServer::handleSegmentRefineAlphaComp(const QJsonValue& pa
     if (_window->_cmdRunner)
         _window->_cmdRunner->setSuppressCompletionDialogs(true);
 
-    QString err;
+    CommandLaunchError error;
     QString outputDir;
-    if (!handler->startAlphaCompRefine(segmentId.toStdString(), rp, &err, &outputDir)) {
+    if (!handler->startAlphaCompRefine(
+            segmentId.toStdString(), rp, &error, &outputDir)) {
         if (_window->_cmdRunner)
             _window->_cmdRunner->setSuppressCompletionDialogs(false);
         _activeJobs.remove(QStringLiteral("tool"));
-        if (err.contains(QLatin1String("Invalid segment"))) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = segmentId;
-            data["detail"] = err;
-            throw AgentBridgeError{-32007, "Segment not found", data};
-        }
-        if (err.contains(QLatin1String("only local volumes"))) {
-            QJsonObject data;
-            data["detail"] = err;
-            throw AgentBridgeError{-32009, "Remote volume not supported", data};
-        }
-        if (err.contains(QLatin1String("already running"))) {
-            QJsonObject data;
-            data["source"] = "tool";
-            data["detail"] = err;
-            throw AgentBridgeError{-32004, "A tool job is already running", data};
-        }
-        if (err.contains(QLatin1String("Command line tools are not available")) ||
-            err.contains(QLatin1String("not found or not executable"))) {
-            QJsonObject data;
-            data["detail"] = err;
-            throw AgentBridgeError{-32006, "Command line tools unavailable", data};
-        }
-        QJsonObject data;
-        data["detail"] = err;
-        throw AgentBridgeError{-32005, "Failed to start refinement", data};
+        throwCommandLaunchError(error, "Failed to start refinement",
+                                segmentId, "tool");
     }
 
     if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end()) {

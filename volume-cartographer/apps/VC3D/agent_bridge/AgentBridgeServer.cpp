@@ -455,6 +455,41 @@ void AgentBridgeServer::broadcastNotification(const QString& method, const QJson
 }
 
 
+[[noreturn]] void AgentBridgeServer::throwCommandLaunchError(
+    const CommandLaunchError& error,
+    const QString& fallbackMessage,
+    const QString& segmentId,
+    const QString& source)
+{
+    QJsonObject data;
+    data["detail"] = error.message;
+
+    switch (error.kind) {
+    case CommandLaunchError::SegmentNotFound:
+        data["kind"] = "segment";
+        data["id"] = segmentId;
+        throw AgentBridgeError{-32007, "Segment not found", data};
+    case CommandLaunchError::VolumeNotFound:
+        data["kind"] = "volume";
+        throw AgentBridgeError{-32007, "Volume not found", data};
+    case CommandLaunchError::InputNotFound:
+        data["kind"] = "file";
+        throw AgentBridgeError{-32007, "Required input not found", data};
+    case CommandLaunchError::RemoteVolume:
+        throw AgentBridgeError{-32009, "Remote volume not supported", data};
+    case CommandLaunchError::ToolUnavailable:
+        throw AgentBridgeError{-32006, "Command line tool unavailable", data};
+    case CommandLaunchError::Busy:
+        data["source"] = source;
+        throw AgentBridgeError{-32004, "A job is already running", data};
+    case CommandLaunchError::InvalidState:
+    case CommandLaunchError::Other:
+        throw AgentBridgeError{-32005, fallbackMessage, data};
+    }
+    throw AgentBridgeError{-32005, fallbackMessage, data};
+}
+
+
 // ---------------------------------------------------------------------------
 // Viewer registry (SPEC §2.2)
 // ---------------------------------------------------------------------------

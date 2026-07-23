@@ -574,45 +574,15 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
     if (_window->_cmdRunner)
         _window->_cmdRunner->setSuppressCompletionDialogs(true);
 
-    QString err;
+    CommandLaunchError error;
     QString outputDir;
-    if (!handler->startRunTrace(segmentIdQ.toStdString(), rt, &err, &outputDir)) {
+    if (!handler->startRunTrace(
+            segmentIdQ.toStdString(), rt, &error, &outputDir)) {
         if (_window->_cmdRunner)
             _window->_cmdRunner->setSuppressCompletionDialogs(false);
         _activeJobs.remove(QStringLiteral("tool"));
-        // Map the distinct failure sentences from startRunTrace to codes (§15.4).
-        if (err.contains(QLatin1String("Invalid segment"))) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = segmentIdQ;
-            data["detail"] = err;
-            throw AgentBridgeError{-32007, "Segment not found", data};
-        }
-        if (err.contains(QLatin1String("trace_params.json not found"))) {
-            QJsonObject data;
-            data["kind"] = "file";
-            data["detail"] = err;
-            throw AgentBridgeError{-32007, "trace_params.json not found", data};
-        }
-        if (err.contains(QLatin1String("remote"))) {
-            QJsonObject data;
-            data["detail"] = err;
-            throw AgentBridgeError{-32009, "Remote volumes are unsupported by Run Trace", data};
-        }
-        if (err.contains(QLatin1String("Command line tools not available"))) {
-            QJsonObject data;
-            data["detail"] = err;
-            throw AgentBridgeError{-32006, "vc_grow_seg_from_segments unavailable", data};
-        }
-        if (err.contains(QLatin1String("already running"))) {
-            QJsonObject data;
-            data["source"] = "tool";
-            data["detail"] = err;
-            throw AgentBridgeError{-32004, "A tool job is already running", data};
-        }
-        QJsonObject data;
-        data["detail"] = err;
-        throw AgentBridgeError{-32005, "Failed to start Run Trace", data};
+        throwCommandLaunchError(error, "Failed to start Run Trace",
+                                segmentIdQ, "tool");
     }
 
     if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end()) {
@@ -759,40 +729,15 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
     if (_window->_cmdRunner)
         _window->_cmdRunner->setSuppressCompletionDialogs(true);
 
-    QString err;
+    CommandLaunchError error;
     QString outputDir;
-    if (!handler->startRenderSegment(segmentIdQ.toStdString(), rp, &err, &outputDir)) {
+    if (!handler->startRenderSegment(
+            segmentIdQ.toStdString(), rp, &error, &outputDir)) {
         if (_window->_cmdRunner)
             _window->_cmdRunner->setSuppressCompletionDialogs(false);
         _activeJobs.remove(QStringLiteral("tool"));
-        // Map the distinct failure sentences from startRenderSegment (§19).
-        if (err.contains(QLatin1String("Invalid segment"))) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = segmentIdQ;
-            data["detail"] = err;
-            throw AgentBridgeError{-32007, "Segment not found", data};
-        }
-        if (err.contains(QLatin1String("Unknown volume id"))) {
-            QJsonObject data;
-            data["kind"] = "volume";
-            data["detail"] = err;
-            throw AgentBridgeError{-32007, err, data};
-        }
-        if (err.contains(QLatin1String("not found or not executable"))) {
-            QJsonObject data;
-            data["detail"] = err;
-            throw AgentBridgeError{-32006, "vc_render_tifxyz unavailable", data};
-        }
-        if (err.contains(QLatin1String("already running"))) {
-            QJsonObject data;
-            data["source"] = "tool";
-            data["detail"] = err;
-            throw AgentBridgeError{-32004, "A tool job is already running", data};
-        }
-        QJsonObject data;
-        data["detail"] = err;
-        throw AgentBridgeError{-32005, "Failed to start render", data};
+        throwCommandLaunchError(error, "Failed to start render",
+                                segmentIdQ, "tool");
     }
 
     if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end()) {

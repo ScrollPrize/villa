@@ -27,6 +27,22 @@ class QuadSurface;
 class QWidget;
 class QFileInfo;
 
+struct CommandLaunchError {
+    enum Kind {
+        Other,
+        InvalidState,
+        SegmentNotFound,
+        VolumeNotFound,
+        InputNotFound,
+        RemoteVolume,
+        ToolUnavailable,
+        Busy,
+    };
+
+    Kind kind{Other};
+    QString message;
+};
+
 /**
  * SegmentationCommandHandler
  *
@@ -273,13 +289,13 @@ public slots:
 
 public:
     /// Headless GrowPatch-from-seed launch (mirror of
-    /// onCreateSegmentGrowPatchFromSeed): failures via `errorMessage`, never a
+    /// onCreateSegmentGrowPatchFromSeed): failures return through `error`, never a
     /// dialog; returns true when vc_grow_seg_from_seed started. Completion
     /// observable via CommandLineToolRunner::toolFinished as in the interactive
     /// path.
     bool startGrowPatchFromSeed(const QVector3D& seedPoint,
                                 const GrowPatchSeedParams& params,
-                                QString* errorMessage = nullptr);
+                                CommandLaunchError* error = nullptr);
 
     /// Output dir from the most recent successful startGrowPatchFromSeed while its
     /// job is active; empty when none pending.
@@ -290,46 +306,36 @@ public:
 
     /// Headless Run-Trace launch (vc_grow_seg_from_segments; mirror of
     /// onGrowSegmentFromSegment): preconditions, params-JSON merge/write, launch;
-    /// failures via `errorMessage` (never a dialog). Completion observable via
-    /// CommandLineToolRunner::toolFinished. Distinct failure sentences map
-    /// to JSON-RPC codes: "No volume package or volume loaded", "Invalid segment"
-    /// (-32007 segment), "remote" (-32009), "trace_params.json not found"
-    /// (-32007 file), "already running" (-32004), "Command line tools not
-    /// available" (-32006), and generic write/create failures (-32005).
+    /// failures via `error` (never a dialog). Completion
+    /// is observable via CommandLineToolRunner::toolFinished.
     /// On success, `resolvedOutputDir` (when non-null) receives the target dir.
     bool startRunTrace(const std::string& segmentId,
                        const RunTraceParams& params,
-                       QString* errorMessage = nullptr,
+                       CommandLaunchError* error = nullptr,
                        QString* resolvedOutputDir = nullptr);
 
     /// Headless Render launch (vc_render_tifxyz; mirror of onRenderSegment):
     /// preconditions, volume/output resolution, launch; failures via
-    /// `errorMessage` (never a dialog). Completion observable via
+    /// `error` (never a dialog). Completion observable via
     /// CommandLineToolRunner::toolFinished.
-    /// Distinct failure sentences map to JSON-RPC codes:
-    /// "No volume package or volume loaded" / "No volume loaded", "Invalid
-    /// segment" (-32007 segment), "Unknown volume id" (-32007 volume),
-    /// "vc_render_tifxyz not found" (-32006), "already running" (-32004), and
-    /// generic create/validation failures (-32005). On success,
+    /// `error.kind` provides a stable machine-readable failure category. On success,
     /// `resolvedOutputDir` (when non-null) receives the output artifact path
     /// (the layers dir for a TIFF stack, or the .zarr store).
     bool startRenderSegment(const std::string& segmentId,
                             const RenderSegmentParams& params,
-                            QString* errorMessage = nullptr,
+                            CommandLaunchError* error = nullptr,
                             QString* resolvedOutputDir = nullptr);
 
     /// Headless SLIM/flatboi flatten launch. Resolves all preconditions and tools
     /// up front (so the SlimJob never hits a synchronous dialog), then constructs a
     /// SlimJob with dialogs suppressed; runs async, completion via
-    /// flattenJobFinished (SPEC §20). Failures via `errorMessage`, never a dialog.
-    /// Distinct failure sentences map to JSON-RPC codes: "No volume package or
-    /// volume loaded", "Invalid segment" (-32007 segment), "flatboi not found" /
-    /// "vc_tifxyz2obj not found" / ... (-32006), and generic output-dir failures
-    /// (-32005). On success `resolvedOutputDir` (when non-null) receives the
+    /// flattenJobFinished (SPEC §20). Failures return through `error`, never a dialog.
+    /// `error.kind` provides a stable machine-readable failure category. On
+    /// success `resolvedOutputDir` (when non-null) receives the
     /// flattened tifxyz directory.
     bool startSlimFlatten(const std::string& segmentId,
                           const SlimFlattenParams& params,
-                          QString* errorMessage = nullptr,
+                          CommandLaunchError* error = nullptr,
                           QString* resolvedOutputDir = nullptr);
 
     /// Headless ABF++ flatten launch (in-process, QtConcurrent). Constructs an
@@ -340,7 +346,7 @@ public:
     bool startAbfFlatten(const std::string& segmentId,
                          int iterations,
                          int downsampleFactor,
-                         QString* errorMessage = nullptr,
+                         CommandLaunchError* error = nullptr,
                          QString* resolvedOutputDir = nullptr);
 
     /// Headless vc_straighten launch. Resolves the tool and validates the output
@@ -351,39 +357,30 @@ public:
     /// (-32005). On success `resolvedOutputDir` receives the straightened dir.
     bool startStraighten(const std::string& segmentId,
                          const StraightenParams& params,
-                         QString* errorMessage = nullptr,
+                         CommandLaunchError* error = nullptr,
                          QString* resolvedOutputDir = nullptr);
 
     /// Headless Resume-opt Local (GrowPatch) launch (mirror of
     /// onResumeLocalGrowPatchRequested): preconditions, params-JSON, and
     /// vc_grow_seg_from_segments launch (Tool::NeighborCopy, resumeOpt "local");
-    /// failures via `errorMessage` (never a dialog). Completion observable via
-    /// CommandLineToolRunner::toolFinished (the CWindow slot reloads surfaces and
-    /// clears resumeLocalJob()).
-    /// Distinct failure sentences map to JSON-RPC codes: "No volume
-    /// package loaded" / "No volume loaded", "Command line tools are not available"
-    /// (-32006), "already running" / "already active" (-32004), "Invalid segment"
-    /// (-32007 segment), "Unknown volume id" (-32007 volume), and generic
-    /// write/launch failures (-32005). On success `resolvedOutputDir` (when
+    /// failures return through `error` (never a dialog). Completion is observable
+    /// via CommandLineToolRunner::toolFinished (the CWindow slot reloads surfaces
+    /// and clears resumeLocalJob()). On success `resolvedOutputDir` (when
     /// non-null) receives the target segment directory.
     bool startResumeLocalGrowPatch(const std::string& segmentId,
                                    const ResumeLocalGrowParams& params,
-                                   QString* errorMessage = nullptr,
+                                   CommandLaunchError* error = nullptr,
                                    QString* resolvedOutputDir = nullptr);
 
     /// Headless alpha-comp refinement launch (vc_objrefine, Tool::AlphaCompRefine;
     /// mirror of onAlphaCompRefine): preconditions, output-path derivation,
-    /// params-JSON write, launch; failures via `errorMessage` (never a dialog).
-    /// Completion observable via CommandLineToolRunner::toolFinished.
-    /// Distinct failure sentences map to JSON-RPC codes: "No volume
-    /// package or volume loaded", "Invalid segment" (-32007 segment), "Command
-    /// line tools are not available" (-32006), "already running" (-32004), "only
-    /// local volumes" (remote guard -> -32009), and generic failures (-32005). On
+    /// params-JSON write, launch; failures return through `error` (never a dialog).
+    /// Completion is observable via CommandLineToolRunner::toolFinished. On
     /// success `resolvedOutputDir` (when non-null) receives the refined output
     /// directory.
     bool startAlphaCompRefine(const std::string& segmentId,
                               const AlphaCompRefineParams& params,
-                              QString* errorMessage = nullptr,
+                              CommandLaunchError* error = nullptr,
                               QString* resolvedOutputDir = nullptr);
 
     /// Dialog-free core of onCropSurfaceToValidRegion (the interactive slot wraps
