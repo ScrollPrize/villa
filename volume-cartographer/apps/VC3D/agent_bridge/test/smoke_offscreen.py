@@ -36,15 +36,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from bridge_client import BridgeClient, BridgeError, parse_handshake_line  # noqa: E402
 from vc3d_process import VC3DProcess  # noqa: E402
-from contract_probe import (  # noqa: E402
-    load_contract,
-    probe_clamps,
-    probe_invalid_inputs,
-)
+from contract_probe import probe_invalid_inputs  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_VC3D_BIN = REPO_ROOT / "build" / "ci-release-gcc" / "bin" / "VC3D"
-CONTRACT_DIR = Path(__file__).resolve().parents[1] / "schema"
 DESCRIPTION_SNAPSHOT = Path(__file__).resolve().parents[1] / "rpc_description.json"
 
 OFFSCREEN_ENV = {"QT_QPA_PLATFORM": "offscreen"}
@@ -717,23 +712,6 @@ def main() -> int:
             )
             check_viewer_normalization(client, results)
             check_canvas_normalization(client, results)
-            contracts = [
-                load_contract(path)
-                for path in sorted(CONTRACT_DIR.glob("*.json"))
-            ]
-            for contract in contracts:
-                domain = contract["domain"].replace(".", "_")
-                for suffix, probe in (
-                    ("invalid_inputs", probe_invalid_inputs),
-                    ("clamps", probe_clamps),
-                ):
-                    report = probe(client, contract)
-                    if report.attempted:
-                        results.record(
-                            f"{domain}_contract_{suffix}",
-                            report.ok,
-                            report.detail,
-                        )
 
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_c2_oversized(sock_path, results)

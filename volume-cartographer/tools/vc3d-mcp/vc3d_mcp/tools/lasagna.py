@@ -5,8 +5,15 @@ from __future__ import annotations
 from typing import Any, Literal, Optional
 
 from mcp.server.fastmcp import Context
+from typing_extensions import TypedDict
 
 from ..core import mcp, _call, _wait_for_job, _strip_none
+
+
+class _Vec3(TypedDict):
+    x: float
+    y: float
+    z: float
 
 
 @mcp.tool()
@@ -70,7 +77,7 @@ async def vc3d_lasagna_list_datasets() -> dict[str, Any]:
 async def vc3d_lasagna_start_optimization(
     mode: Literal["reoptimize", "new_model", "offset", "atlas"],
     config_path: Optional[str] = None,
-    seed: Optional[dict[str, float]] = None,
+    seed: Optional[_Vec3] = None,
     atlas_path: Optional[str] = None,
     wait: bool = False,
     ctx: Optional[Context] = None,

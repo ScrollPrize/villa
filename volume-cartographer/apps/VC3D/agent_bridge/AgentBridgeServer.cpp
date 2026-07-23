@@ -755,65 +755,9 @@ void AgentBridgeServer::registerHandlers()
         [this](const QJsonValue& p) { return handlePointsLoadSegmentPath(p); });
     registerJobHandlers();
 
-    // --- Lasagna RPCs (SPEC §11) ---
-    _handlers.insert("lasagna.service_status",
-        [this](const QJsonValue& p) { return handleLasagnaServiceStatus(p); });
-    _handlers.insert("lasagna.ensure_service",
-        [this](const QJsonValue& p) { return handleLasagnaEnsureService(p); });
-    _handlers.insert("lasagna.list_datasets",
-        [this](const QJsonValue& p) { return handleLasagnaListDatasets(p); });
-    _handlers.insert("lasagna.start_optimization",
-        [this](const QJsonValue& p) { return handleLasagnaStartOptimization(p); });
-    _handlers.insert("lasagna.jobs",
-        [this](const QJsonValue& p) { return handleLasagnaJobs(p); });
-    _handlers.insert("lasagna.cancel",
-        [this](const QJsonValue& p) { return handleLasagnaCancel(p); });
-    _handlers.insert("lasagna.select_output_segment",
-        [this](const QJsonValue& p) { return handleLasagnaSelectOutputSegment(p); });
-    _handlers.insert("lasagna.repeat_last",
-        [this](const QJsonValue& p) { return handleLasagnaRepeatLast(p); });
-    _handlers.insert("workspace.switch",
-        [this](const QJsonValue& p) { return handleWorkspaceSwitch(p); });
-
-    // --- Atlas RPCs (SPEC §12) ---
-    _handlers.insert("atlas.open",
-        [this](const QJsonValue& p) { return handleAtlasOpen(p); });
-    _handlers.insert("atlas.status",
-        [this](const QJsonValue& p) { return handleAtlasStatus(p); });
-    _handlers.insert("atlas.search_start",
-        [this](const QJsonValue& p) { return handleAtlasSearchStart(p); });
-    _handlers.insert("atlas.search_cancel",
-        [this](const QJsonValue& p) { return handleAtlasSearchCancel(p); });
-    _handlers.insert("atlas.search_results",
-        [this](const QJsonValue& p) { return handleAtlasSearchResults(p); });
-    _handlers.insert("atlas.open_result",
-        [this](const QJsonValue& p) { return handleAtlasOpenResult(p); });
-    _handlers.insert("atlas.remap",
-        [this](const QJsonValue& p) { return handleAtlasRemap(p); });
-    _handlers.insert("atlas.optimize_snap_candidates",
-        [this](const QJsonValue& p) { return handleAtlasOptimizeSnapCandidates(p); });
-
-    // --- Line-annotation / fiber RPCs (SPEC §13) ---
-    _handlers.insert("fiber.launch",
-        [this](const QJsonValue& p) { return handleFiberLaunch(p); });
-    _handlers.insert("fiber.list",
-        [this](const QJsonValue& p) { return handleFiberList(p); });
-    _handlers.insert("fiber.open",
-        [this](const QJsonValue& p) { return handleFiberOpen(p); });
-    _handlers.insert("fiber.set_follow",
-        [this](const QJsonValue& p) { return handleFiberSetFollow(p); });
-    _handlers.insert("fiber.save",
-        [this](const QJsonValue& p) { return handleFiberSave(p); });
-    _handlers.insert("fiber.delete",
-        [this](const QJsonValue& p) { return handleFiberDelete(p); });
-    _handlers.insert("fiber.set_tag",
-        [this](const QJsonValue& p) { return handleFiberSetTag(p); });
-    _handlers.insert("fiber.create_atlas",
-        [this](const QJsonValue& p) { return handleFiberCreateAtlas(p); });
-    _handlers.insert("fiber.export",
-        [this](const QJsonValue& p) { return handleFiberExport(p); });
-    _handlers.insert("fiber.import",
-        [this](const QJsonValue& p) { return handleFiberImport(p); });
+    registerLasagnaHandlers();
+    registerAtlasHandlers();
+    registerFiberHandlers();
 
     // --- Stage 6 backlog surface (SPEC §15) ---
     _handlers.insert("tags.set",

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
-import math
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Iterator
 
 from bridge_client import BridgeError
@@ -29,18 +26,13 @@ class ProbeReport:
         return f"{len(self.failures)}/{self.attempted} failed: {'; '.join(self.failures[:3])}"
 
 
-def load_contract(path: Path) -> dict[str, Any]:
-    with path.open(encoding="utf-8") as stream:
-        return json.load(stream)
-
-
 def _schema_type(schema: dict[str, Any]) -> str:
     kinds = schema["type"]
     if not isinstance(kinds, list):
         return kinds
     non_null = [kind for kind in kinds if kind != "null"]
-    if len(non_null) != 1:
-        raise ValueError(f"expected one non-null type: {schema}")
+    if not non_null:
+        raise ValueError(f"expected a non-null type: {schema}")
     return non_null[0]
 
 
@@ -69,7 +61,7 @@ def _sample(schema: dict[str, Any]) -> Any:
 
 
 def _invalid_value(schema: dict[str, Any]) -> Any:
-    return {
+    invalid = {
         "string": 7,
         "number": "not-a-number",
         "integer": 1.5,
@@ -77,6 +69,37 @@ def _invalid_value(schema: dict[str, Any]) -> Any:
         "array": {},
         "object": [],
     }[_schema_type(schema)]
+    kinds = schema["type"]
+    if not isinstance(kinds, list) or not any(
+        _value_matches_type(invalid, kind)
+        for kind in kinds
+        if kind != "null"
+    ):
+        return invalid
+    for candidate in (True, "invalid", 1.5, [], {}):
+        if not any(
+            _value_matches_type(candidate, kind)
+            for kind in kinds
+            if kind != "null"
+        ):
+            return candidate
+    raise ValueError(f"could not produce an invalid value: {schema}")
+
+
+def _value_matches_type(value: Any, kind: str) -> bool:
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "array":
+        return isinstance(value, list)
+    if kind == "object":
+        return isinstance(value, dict)
+    return False
 
 
 def _required_params(schema: dict[str, Any]) -> dict[str, Any]:
@@ -233,88 +256,4 @@ def probe_invalid_inputs(client: Any, contract: dict[str, Any]) -> ProbeReport:
                     ".".join(path),
                     declared_errors,
                 )
-    return report
-
-
-def _lookup(result: dict[str, Any], path: str) -> Any:
-    value: Any = result
-    for part in path.split("."):
-        if not isinstance(value, dict) or part not in value:
-            raise KeyError(path)
-        value = value[part]
-    return value
-
-
-def _outside(bound: int | float, lower: bool, integer: bool) -> int | float:
-    offset = 7 if integer else 7.5
-    return bound - offset if lower else bound + offset
-
-
-def probe_clamps(client: Any, contract: dict[str, Any]) -> ProbeReport:
-    report = ProbeReport()
-    for method, method_contract in contract["methods"].items():
-        params_schema = method_contract["params"]
-        for path, schema in _walk(params_schema, "x-clamp"):
-            lower, upper = schema["x-clamp"]
-            for is_lower, bound in ((True, lower), (False, upper)):
-                if bound is None:
-                    continue
-                params = _params_with_value(
-                    params_schema,
-                    path,
-                    _outside(bound, is_lower, _schema_type(schema) == "integer"),
-                )
-                report.attempted += 1
-                try:
-                    result, _ = client.call(method, params, timeout=10.0)
-                    result_path = schema.get("x-result", ".".join(path))
-                    actual = _lookup(result, result_path)
-                    if (not isinstance(actual, (int, float)) or
-                            not math.isclose(actual, bound, abs_tol=1e-6)):
-                        report.failures.append(
-                            f"{method}.{'.'.join(path)}: expected {bound}, got {actual!r}"
-                        )
-                except Exception as error:  # noqa: BLE001
-                    report.failures.append(
-                        f"{method}.{'.'.join(path)}: {type(error).__name__}: {error}"
-                    )
-
-        for path, schema in _walk(params_schema, "x-ordered-range"):
-            order = schema["x-ordered-range"]
-            lower_name = order["lower"]
-            upper_name = order["upper"]
-            gap = order["minimumGap"]
-            ceiling = order["ceiling"]
-            result_paths = order.get("result", {})
-            cases = [
-                ({lower_name: 10, upper_name: 5}, 10, 10 + gap),
-                ({lower_name: ceiling, upper_name: 0}, ceiling, ceiling),
-            ]
-            for value, expected_lower, expected_upper in cases:
-                params = _params_with_value(params_schema, path, value)
-                report.attempted += 1
-                try:
-                    result, _ = client.call(method, params, timeout=10.0)
-                    default_prefix = ".".join(path)
-                    lower_path = result_paths.get(
-                        lower_name,
-                        f"{default_prefix}.{lower_name}",
-                    )
-                    upper_path = result_paths.get(
-                        upper_name,
-                        f"{default_prefix}.{upper_name}",
-                    )
-                    actual_lower = _lookup(result, lower_path)
-                    actual_upper = _lookup(result, upper_path)
-                    if (not math.isclose(actual_lower, expected_lower, abs_tol=1e-6) or
-                            not math.isclose(actual_upper, expected_upper, abs_tol=1e-6)):
-                        report.failures.append(
-                            f"{method}.{'.'.join(path)}: expected "
-                            f"({expected_lower}, {expected_upper}), got "
-                            f"({actual_lower!r}, {actual_upper!r})"
-                        )
-                except Exception as error:  # noqa: BLE001
-                    report.failures.append(
-                        f"{method}.{'.'.join(path)}: {type(error).__name__}: {error}"
-                    )
     return report

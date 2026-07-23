@@ -78,6 +78,9 @@ private:
     void registerViewerHandlers();
     void registerWrapHandlers();
     void registerJobHandlers();
+    void registerLasagnaHandlers();
+    void registerAtlasHandlers();
+    void registerFiberHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's

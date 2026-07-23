@@ -284,6 +284,23 @@ int main()
     expectParamError("nested-array<-invalid-item", "points", [&] {
         nestedArray.validate(QJsonArray{QJsonArray{1.0, "two"}});
     });
+    AgentBridgeParam stringOrInteger{
+        .name = QStringLiteral("id"),
+        .type = AgentBridgeParamType::String,
+        .alternateTypes = {AgentBridgeParamType::Integer},
+    };
+    expectNoThrow("union<-string", [&] {
+        stringOrInteger.validate(QStringLiteral("42"));
+    });
+    expectNoThrow("union<-integer", [&] {
+        stringOrInteger.validate(42);
+    });
+    expectParamError("union<-bool", "id", [&] {
+        stringOrInteger.validate(true);
+    });
+    CHECK(
+        stringOrInteger.describe().value("type").toArray() ==
+        QJsonArray({"string", "integer"}));
     CHECK(method.definitionError().isEmpty());
     CHECK(nestedArray.definitionError(QStringLiteral("points")).isEmpty());
     const AgentBridgeMethod duplicateParams{

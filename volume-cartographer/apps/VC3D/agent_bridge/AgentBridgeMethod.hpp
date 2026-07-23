@@ -30,6 +30,7 @@ struct AgentBridgeParam
 {
     QString name;
     AgentBridgeParamType type;
+    std::vector<AgentBridgeParamType> alternateTypes;
     bool required{false};
     bool nullable{false};
     bool finite{false};
@@ -54,6 +55,18 @@ struct AgentBridgeParam
             if (!nullable)
                 fail(param, QStringLiteral("must not be null"));
             return;
+        }
+
+        if (!matchesType(value, type)) {
+            for (AgentBridgeParamType alternateType : alternateTypes) {
+                if (!matchesType(value, alternateType))
+                    continue;
+                AgentBridgeParam alternate = *this;
+                alternate.type = alternateType;
+                alternate.alternateTypes.clear();
+                alternate.validate(value, path);
+                return;
+            }
         }
 
         switch (type) {
@@ -104,8 +117,13 @@ struct AgentBridgeParam
     QJsonObject describe() const
     {
         QJsonObject schema;
-        if (nullable) {
-            schema["type"] = QJsonArray{typeName(type), QStringLiteral("null")};
+        if (nullable || !alternateTypes.empty()) {
+            QJsonArray types{typeName(type)};
+            for (AgentBridgeParamType alternateType : alternateTypes)
+                types.append(typeName(alternateType));
+            if (nullable)
+                types.append(QStringLiteral("null"));
+            schema["type"] = types;
         } else {
             schema["type"] = typeName(type);
         }
@@ -141,6 +159,12 @@ struct AgentBridgeParam
         const QString param = path.isEmpty() ? name : path;
         if (!values.isEmpty() && type != AgentBridgeParamType::String)
             return QStringLiteral("%1 has enum values but is not a string").arg(param);
+        QSet<AgentBridgeParamType> types{type};
+        for (AgentBridgeParamType alternateType : alternateTypes) {
+            if (types.contains(alternateType))
+                return QStringLiteral("%1 has duplicate parameter types").arg(param);
+            types.insert(alternateType);
+        }
         if (QSet<QString>(values.begin(), values.end()).size() != values.size())
             return QStringLiteral("%1 has duplicate enum values").arg(param);
         if (minimum && maximum && *minimum > *maximum)
@@ -232,6 +256,21 @@ private:
         case AgentBridgeParamType::Array:   return QStringLiteral("array");
         }
         return {};
+    }
+
+    static bool matchesType(
+        const QJsonValue& value,
+        AgentBridgeParamType type)
+    {
+        switch (type) {
+        case AgentBridgeParamType::String:  return value.isString();
+        case AgentBridgeParamType::Number:
+        case AgentBridgeParamType::Integer: return value.isDouble();
+        case AgentBridgeParamType::Boolean: return value.isBool();
+        case AgentBridgeParamType::Object:  return value.isObject();
+        case AgentBridgeParamType::Array:   return value.isArray();
+        }
+        return false;
     }
 };
 
@@ -455,6 +494,27 @@ struct AgentBridgeMcp
         return result;
     }
 };
+
+namespace AgentBridgeMcpTools {
+
+inline AgentBridgeMcp exact(QString tool, QStringList extraParams = {})
+{
+    return {
+        .tool = std::move(tool),
+        .extraParams = std::move(extraParams),
+    };
+}
+
+inline AgentBridgeMcp snakeCase(QString tool, QStringList extraParams = {})
+{
+    return {
+        .tool = std::move(tool),
+        .snakeCaseParams = true,
+        .extraParams = std::move(extraParams),
+    };
+}
+
+}  // namespace AgentBridgeMcpTools
 
 struct AgentBridgeMethod
 {

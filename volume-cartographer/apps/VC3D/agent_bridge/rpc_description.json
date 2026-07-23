@@ -1,5 +1,179 @@
 {
   "methods": {
+    "atlas.open": {
+      "errors": [
+        -32602,
+        -32007,
+        -32005,
+        -32000
+      ],
+      "mcp": {
+        "paramRenames": {
+          "atlasDir": "atlas_dir"
+        },
+        "tool": "vc3d_atlas_open"
+      },
+      "params": {
+        "properties": {
+          "atlasDir": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "atlasDir"
+        ],
+        "type": "object"
+      }
+    },
+    "atlas.open_result": {
+      "errors": [
+        -32602,
+        -32007,
+        -32005,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_atlas_open_result"
+      },
+      "params": {
+        "properties": {
+          "index": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "type": "object"
+      }
+    },
+    "atlas.optimize_snap_candidates": {
+      "errors": [
+        -32007,
+        -32005,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_atlas_optimize_snap_candidates"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "atlas.remap": {
+      "errors": [
+        -32007,
+        -32005,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_atlas_remap"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "atlas.search_cancel": {
+      "errors": [
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_atlas_search_cancel"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "atlas.search_results": {
+      "errors": [
+        -32602,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_atlas_search_results"
+      },
+      "params": {
+        "properties": {
+          "limit": {
+            "default": 100,
+            "maximum": 2147483647,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "maximum": 2147483647,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "atlas.search_start": {
+      "errors": [
+        -32602,
+        -32004,
+        -32007,
+        -32005,
+        -32000
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "excludedTags": "excluded_tags",
+          "maxDistance": "max_distance",
+          "requiredTags": "required_tags"
+        },
+        "tool": "vc3d_atlas_search_start"
+      },
+      "params": {
+        "properties": {
+          "excludedTags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "maxDistance": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "mode": {
+            "default": "atlas_to_non_atlas",
+            "enum": [
+              "atlas_to_non_atlas",
+              "non_atlas_only"
+            ],
+            "type": "string"
+          },
+          "requiredTags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "atlas.status": {
+      "errors": [],
+      "mcp": {
+        "tool": "vc3d_atlas_status"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
     "canvas.click": {
       "errors": [
         -32602,
@@ -407,6 +581,319 @@
         "type": "object"
       }
     },
+    "fiber.create_atlas": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32007,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "fiberId": "fiber_id"
+        },
+        "tool": "vc3d_fiber_create_atlas"
+      },
+      "params": {
+        "properties": {
+          "fiberId": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          }
+        },
+        "required": [
+          "fiberId"
+        ],
+        "type": "object"
+      }
+    },
+    "fiber.delete": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32007,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "fiberIds": "fiber_ids"
+        },
+        "tool": "vc3d_fiber_delete"
+      },
+      "params": {
+        "properties": {
+          "fiberIds": {
+            "items": {
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "fiberIds"
+        ],
+        "type": "object"
+      }
+    },
+    "fiber.export": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_fiber_export"
+      },
+      "params": {
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "scale": {
+            "default": 1,
+            "exclusiveMinimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "fiber.import": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32007,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_fiber_import"
+      },
+      "params": {
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "scale": {
+            "default": 1,
+            "exclusiveMinimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "fiber.launch": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32001,
+        -32002,
+        -32003,
+        -32005,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "replaceOwning": "replace_owning"
+        },
+        "tool": "vc3d_fiber_launch"
+      },
+      "params": {
+        "properties": {
+          "position": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "replaceOwning": {
+            "default": true,
+            "type": "boolean"
+          },
+          "space": {
+            "default": "volume",
+            "enum": [
+              "volume",
+              "scene"
+            ],
+            "type": "string"
+          },
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "position"
+        ],
+        "type": "object"
+      }
+    },
+    "fiber.list": {
+      "errors": [
+        -32000,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_fiber_list"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "fiber.open": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32007,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "controlPointIndex": "control_point_index",
+          "fiberId": "fiber_id",
+          "linePointIndex": "line_point_index"
+        },
+        "tool": "vc3d_fiber_open"
+      },
+      "params": {
+        "properties": {
+          "controlPointIndex": {
+            "maximum": 2147483647,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fiberId": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "linePointIndex": {
+            "maximum": 2147483647,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "span": {
+            "items": {
+              "maximum": 2147483647,
+              "minimum": -2147483648,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "fiberId"
+        ],
+        "type": "object"
+      }
+    },
+    "fiber.save": {
+      "errors": [
+        -32000,
+        -32010,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_fiber_save"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "fiber.set_follow": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_fiber_set_follow"
+      },
+      "params": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      }
+    },
+    "fiber.set_tag": {
+      "errors": [
+        -32602,
+        -32000,
+        -32010,
+        -32007,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "fiberId": "fiber_id"
+        },
+        "tool": "vc3d_fiber_set_tag"
+      },
+      "params": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "fiberId": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "tag": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "fiberId",
+          "tag",
+          "enabled"
+        ],
+        "type": "object"
+      }
+    },
     "job.cancel": {
       "errors": [
         -32602,
@@ -452,6 +939,190 @@
             "type": "string"
           }
         },
+        "type": "object"
+      }
+    },
+    "lasagna.cancel": {
+      "errors": [
+        -32602,
+        -32007,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "jobId": "job_id"
+        },
+        "tool": "vc3d_lasagna_cancel"
+      },
+      "params": {
+        "properties": {
+          "jobId": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "lasagna.ensure_service": {
+      "errors": [
+        -32602,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "pythonPath": "python_path"
+        },
+        "tool": "vc3d_lasagna_ensure_service"
+      },
+      "params": {
+        "properties": {
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "pythonPath": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "lasagna.jobs": {
+      "errors": [
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_lasagna_jobs"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "lasagna.list_datasets": {
+      "errors": [
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_lasagna_list_datasets"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "lasagna.repeat_last": {
+      "errors": [
+        -32004,
+        -32005,
+        -32009,
+        -32000
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "tool": "vc3d_lasagna_repeat_last"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "lasagna.select_output_segment": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_lasagna_select_output"
+      },
+      "params": {
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      }
+    },
+    "lasagna.service_status": {
+      "errors": [],
+      "mcp": {
+        "tool": "vc3d_lasagna_service_status"
+      },
+      "params": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    "lasagna.start_optimization": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "atlasPath": "atlas_path",
+          "configPath": "config_path"
+        },
+        "tool": "vc3d_lasagna_start_optimization"
+      },
+      "params": {
+        "properties": {
+          "atlasPath": {
+            "type": "string"
+          },
+          "configPath": {
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "reoptimize",
+              "new_model",
+              "offset",
+              "atlas"
+            ],
+            "type": "string"
+          },
+          "seed": {
+            "properties": {
+              "x": {
+                "type": "number"
+              },
+              "y": {
+                "type": "number"
+              },
+              "z": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "z"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "mode"
+        ],
         "type": "object"
       }
     },
@@ -1157,6 +1828,31 @@
         },
         "required": [
           "volumeId"
+        ],
+        "type": "object"
+      }
+    },
+    "workspace.switch": {
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_switch_workspace"
+      },
+      "params": {
+        "properties": {
+          "name": {
+            "enum": [
+              "main",
+              "lasagna",
+              "fiber_slice"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       }

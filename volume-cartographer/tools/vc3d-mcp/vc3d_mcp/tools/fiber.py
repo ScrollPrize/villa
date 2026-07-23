@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+
+from typing_extensions import NotRequired, TypedDict
 
 from ..core import mcp, _call, _strip_none
 
 FIBER_SAVE_TIMEOUT_S = 130.0
 
 
+class _Position(TypedDict):
+    x: float
+    y: float
+    z: NotRequired[float]
+
+
 @mcp.tool()
 async def vc3d_fiber_launch(
-    position: dict[str, float],
+    position: _Position,
     viewer: Optional[str] = None,
-    space: str = "volume",
+    space: Literal["volume", "scene"] = "volume",
     replace_owning: bool = True,
 ) -> dict[str, Any]:
     """Open the line-annotation (fiber tracing) workspace seeded at a position

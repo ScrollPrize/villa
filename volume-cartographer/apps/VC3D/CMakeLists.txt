@@ -228,8 +228,11 @@ set(srcs
     agent_bridge/AgentBridgeServer.cpp
     agent_bridge/AgentBridgeServer.hpp
     agent_bridge/AgentBridgeMethod.hpp
+    agent_bridge/AgentBridgeMethods_atlas.cpp
     agent_bridge/AgentBridgeMethods_canvas.cpp
+    agent_bridge/AgentBridgeMethods_fiber.cpp
     agent_bridge/AgentBridgeMethods_jobs.cpp
+    agent_bridge/AgentBridgeMethods_lasagna.cpp
     agent_bridge/AgentBridgeMethods_session.cpp
     agent_bridge/AgentBridgeMethods_viewer.cpp
     agent_bridge/AgentBridgeMethods_wrap.cpp
