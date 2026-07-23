@@ -2137,8 +2137,8 @@ binding):
 |---|---|---|---|
 | `seeding.set_winding_annotation_mode` | `{"active": bool}` | (already public slot) `setRelWindingAnnotationMode(bool)` (SeedingWidget.hpp:64) | `{"active": bool}` |
 | `seeding.analyze_paths` | `{}` | `runAnalyzePaths()` → `analyzePaths()` (:98) | superseded, see below † |
-| `seeding.preview_rays` | `{}` | `runPreviewRays()` → `onPreviewRaysClicked()` (:69) | `{"requested": true}` |
-| `seeding.cast_rays` | `{}` | `runCastRays()` → `onCastRaysClicked()` (:71) | `{"requested": true}` |
+| `seeding.preview_rays` | `{}` | `previewRaysHeadless()` | `{"requested": true}` |
+| `seeding.cast_rays` | `{}` | `castRaysHeadless()` | `{"requested": true}` |
 | `seeding.run` | `{}` | `runSeeding()` → `onRunSegmentationClicked()` (:74) | superseded, see below † |
 | `seeding.expand` | `{}` | `runExpandSeeds()` → `onExpandSeedsClicked()` (:75) | superseded, see below † |
 | `seeding.reset_points` | `{}` | `runResetPoints()` → `onResetPointsClicked()` (:76) | `{"reset": true}` |
@@ -2163,13 +2163,11 @@ finished (`run`/`expand`) or repainted per-path (`analyze_paths`) — a §1.3 vi
 The exposed subset was `set_winding_annotation_mode`, `preview_rays`, `cast_rays`
 (async `QtConcurrent`, safe), and `reset_points`.
 
-`preview_rays` / `cast_rays` each raise a precondition `QMessageBox::warning` when no
-focus POI is set (a static `QMessageBox` spins a nested event loop); the bridge sets a
-lifetime `SeedingWidget::setDialogsSuppressed(true)` in `AgentBridgeServer`'s
-constructor (gated on the bridge being enabled, mirroring
-`LineAnnotationController::setErrorDialogsSuppressed`), so those calls return cleanly
-instead of blocking. Result shapes: `preview_rays`/`cast_rays` return
-`{"requested": true}`; `reset_points` returns `{"reset": true}`;
+`preview_rays` / `cast_rays` use dialog-free entry points that return precondition
+errors to the bridge. Their interactive slots call the same entry points and show the
+returned error when needed, so enabling the bridge does not change human-facing
+dialogs. Result shapes: `preview_rays`/`cast_rays` return `{"requested": true}`;
+`reset_points` returns `{"reset": true}`;
 `set_winding_annotation_mode` returns `{"active": bool}`.
 
 **Amendment (as-built, batch-seeding follow-up):** the three deferred actions are now

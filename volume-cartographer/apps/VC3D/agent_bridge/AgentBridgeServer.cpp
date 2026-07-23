@@ -97,16 +97,6 @@ AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
         _window->_lineAnnotationController->setErrorDialogsSuppressed(true);
     }
 
-    // Seeding widget headless dialog suppression (SPEC §15.2, §1.3): every seeding
-    // action opens a precondition QMessageBox, which spins a nested event loop --
-    // forbidden in a bridge handler. As with the line-annotation valve above, set
-    // once for the bridge's lifetime (suppressed for a human sharing the window
-    // too); failures surface as JSON-RPC errors instead. The batch actions
-    // (seeding.run/expand) now launch a QProcess and resolve via the seedingBatch*
-    // signals rather than a nested-processEvents wait (see subscribeJobSignals).
-    if (_window && _window->_seedingWidget) {
-        _window->_seedingWidget->setDialogsSuppressed(true);
-    }
 }
 
 

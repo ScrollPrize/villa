@@ -193,7 +193,12 @@ QJsonObject AgentBridgeServer::handleSeedingPreviewRays(const QJsonValue&)
         data["detail"] = "seeding widget is not available";
         throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
     }
-    widget->runPreviewRays();
+    QString errorMessage;
+    if (!widget->previewRaysHeadless(&errorMessage)) {
+        QJsonObject data;
+        data["detail"] = errorMessage;
+        throw AgentBridgeError{-32007, "Cannot preview rays", data};
+    }
     QJsonObject result;
     result["requested"] = true;
     return result;
@@ -213,7 +218,12 @@ QJsonObject AgentBridgeServer::handleSeedingCastRays(const QJsonValue&)
         data["detail"] = "seeding widget is not available";
         throw AgentBridgeError{-32010, "Seeding widget unavailable", data};
     }
-    widget->runCastRays();
+    QString errorMessage;
+    if (!widget->castRaysHeadless(&errorMessage)) {
+        QJsonObject data;
+        data["detail"] = errorMessage;
+        throw AgentBridgeError{-32007, "Cannot cast rays", data};
+    }
     QJsonObject result;
     result["requested"] = true;
     return result;

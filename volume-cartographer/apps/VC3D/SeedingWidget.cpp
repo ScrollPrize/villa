@@ -646,16 +646,28 @@ void SeedingWidget::onClearPeaksClicked()
 
 void SeedingWidget::onPreviewRaysClicked()
 {
+    QString errorMessage;
+    if (!previewRaysHeadless(&errorMessage) && !errorMessage.isEmpty()) {
+        QMessageBox::warning(this, tr("Warning"), errorMessage);
+    }
+}
+
+bool SeedingWidget::previewRaysHeadless(QString* errorMessage)
+{
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (currentMode != Mode::PointMode || !currentVolume) {
-        return;
+        if (errorMessage) {
+            *errorMessage = tr("Ray preview requires Point mode and a loaded volume.");
+        }
+        return false;
     }
 
     POI* focus_poi = _state->poi("focus");
     if (!focus_poi) {
-        if (!_dialogsSuppressed)
-            QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before previewing rays.");
-        return;
+        if (errorMessage) {
+            *errorMessage = tr("No focus point set. Please set a focus point before previewing rays.");
+        }
+        return false;
     }
 
     _point_collection->clearCollection(_point_collection->getCollectionId("ray_preview"));
@@ -687,13 +699,25 @@ void SeedingWidget::onPreviewRaysClicked()
     }
 
     infoLabel->setText(QString("Previewing %1 rays.").arg(numSteps));
+    return true;
 }
 
 void SeedingWidget::onCastRaysClicked()
 {
+    QString errorMessage;
+    if (!castRaysHeadless(&errorMessage) && !errorMessage.isEmpty()) {
+        QMessageBox::warning(this, tr("Warning"), errorMessage);
+    }
+}
+
+bool SeedingWidget::castRaysHeadless(QString* errorMessage)
+{
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (!currentVolume) {
-        return;
+        if (errorMessage) {
+            *errorMessage = tr("No volume loaded.");
+        }
+        return false;
     }
 
     _castRaysWasPointMode = (currentMode == Mode::PointMode);
@@ -701,13 +725,17 @@ void SeedingWidget::onCastRaysClicked()
     if (_castRaysWasPointMode) {
         POI* focusPoi = _state ? _state->poi("focus") : nullptr;
         if (!focusPoi) {
-            if (!_dialogsSuppressed)
-                QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
-            return;
+            if (errorMessage) {
+                *errorMessage = tr("No focus point set. Please set a focus point before casting rays.");
+            }
+            return false;
         }
     } else {
         if (paths.empty()) {
-            return;
+            if (errorMessage) {
+                *errorMessage = tr("Draw at least one path before casting rays.");
+            }
+            return false;
         }
     }
 
@@ -903,6 +931,7 @@ void SeedingWidget::onCastRaysClicked()
     });
 
     _castRaysWatcher->setFuture(future);
+    return true;
 }
 
 void SeedingWidget::onCastRaysFinished()
@@ -1143,7 +1172,7 @@ void SeedingWidget::onRunSegmentationClicked()
     // a warning dialog (unless the bridge suppressed dialogs). The batch drains through
     // the event loop now, not a nested processEvents wait, so the UI stays responsive.
     QString err;
-    if (!runSegmentationHeadless(&err) && !err.isEmpty() && !_dialogsSuppressed) {
+    if (!runSegmentationHeadless(&err) && !err.isEmpty()) {
         QMessageBox::warning(this, tr("Seeding"), err);
     }
 }
@@ -2250,7 +2279,7 @@ void SeedingWidget::onExpandSeedsClicked()
     // Interactive slot: delegate to the non-blocking headless core (see
     // onRunSegmentationClicked).
     QString err;
-    if (!runExpandSeedsHeadless(&err) && !err.isEmpty() && !_dialogsSuppressed) {
+    if (!runExpandSeedsHeadless(&err) && !err.isEmpty()) {
         QMessageBox::warning(this, tr("Seeding"), err);
     }
 }

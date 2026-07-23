@@ -50,15 +50,10 @@ public:
     void setState(CState* state);
     void setViewerManager(ViewerManager* viewerManager);
 
-    // --- Agent bridge headless entry points (SPEC §15.2) ---
-    // Public wrappers around private slots so the bridge can invoke them without a Qt
-    // connection. setDialogsSuppressed() gates the precondition QMessageBox::warning
-    // calls (a static QMessageBox spins a nested event loop) for the bridge's lifetime only.
-    void runPreviewRays() { onPreviewRaysClicked(); }
-    void runCastRays() { onCastRaysClicked(); }
+    // Dialog-free entry points shared with the agent bridge.
+    bool previewRaysHeadless(QString* errorMessage = nullptr);
+    bool castRaysHeadless(QString* errorMessage = nullptr);
     void runResetPoints() { onResetPointsClicked(); }
-    void setDialogsSuppressed(bool suppressed) { _dialogsSuppressed = suppressed; }
-    [[nodiscard]] bool dialogsSuppressed() const { return _dialogsSuppressed; }
 
     // --- Agent bridge headless entry points for the batch seeding actions (SPEC §15.2,
     // as amended) --- onRun/onExpand used to block in a
@@ -210,7 +205,6 @@ private:
     ProgressUtil* progressUtil;
     
     // Data
-    bool _dialogsSuppressed{false};  // agent bridge suppresses precondition dialogs
     CState* _state{nullptr};
     ViewerManager* _viewerManager{nullptr};
     QPointer<CChunkedVolumeViewer> _relWindingDrawViewer;
