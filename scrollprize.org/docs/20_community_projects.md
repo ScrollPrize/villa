@@ -80,6 +80,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
+- [Correct chunked label expansion](https://github.com/ScrollPrize/villa/pull/1200) by Karolis Stanius. Fixes chunk-boundary seams and cascading over-expansion in `labels_to_zarr`, restores Zarr 3 compatibility, and validates chunked results against a global EDT.
+
 - [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/999) by pscamillo. GPU-native augmentations for the segmentation training pipeline, addressing #201: Squeeze (compression, [#997](https://github.com/ScrollPrize/villa/pull/997)), Decohesion (beam-scatter blur) and Warp (coherent warping), plus CT-reconstruction artifacts — Ring ([#1020](https://github.com/ScrollPrize/villa/pull/1020)) and Streak ([#1021](https://github.com/ScrollPrize/villa/pull/1021)). Each models a real scroll/CT distortion rather than generic noise, and is validated with a controlled ablation and a speed benchmark to improve segmentation robustness in degraded regions.
 
 - [Volume Cartographer](https://github.com/educelab/volume-cartographer): the OG virtual unwrapping toolkit. Includes a graphical interface to annotate scroll segments. First built by [EduceLab](https://educelab.engr.uky.edu/); an [active fork](https://github.com/spacegaier/volume-cartographer) by Philip Allgaier contains many community contributions and is currently used by the segmentation team.
