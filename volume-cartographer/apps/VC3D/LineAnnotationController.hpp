@@ -96,6 +96,9 @@ public:
         std::string automaticHvTag;
         std::string manualHvTag;
         std::vector<std::string> tags;
+        // Number of fibers in this fiber's branch-link connected component
+        // (including itself); 0 when the fiber has no links.
+        int linkedFiberCount = 0;
     };
 
     struct FiberSnapshotWithPath {
@@ -366,6 +369,24 @@ private:
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
+    void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
+                                                  size_t controlPointIndex,
+                                                  cv::Vec3f volumePoint);
+    void handleGeneratedControlPointLinkWithCandidate(const std::string& surfaceName,
+                                                      size_t controlPointIndex,
+                                                      cv::Vec3f volumePoint);
+    void handleGeneratedOpenNearbyAnnotation(uint64_t fiberId, cv::Vec3f volumePoint);
+    void handleGeneratedControlPointUnlink(const std::string& surfaceName,
+                                           size_t controlPointIndex,
+                                           uint64_t branchFiberId,
+                                           int branchControlPointIndex);
+    [[nodiscard]] std::vector<vc3d::line_annotation::GeneratedOverlay::ControlPointMarker>
+        controlMarkersForSession(const LineAnnotationSession& session) const;
+    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
+        linkCandidateMenuState(const LineAnnotationSession& session) const;
+    [[nodiscard]] std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker>
+        markLinkCandidateFiberIntersections(
+            std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers) const;
     bool ensureDatasetForSession(LineAnnotationSession& session);
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
@@ -598,4 +619,15 @@ private:
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
+
+    // Transient (in-memory only) staging state for linking two existing control
+    // points across fibers. Position is the primary key; the stored index is a
+    // hint re-resolved at link time because indices are remapped on save.
+    struct LinkCandidate {
+        uint64_t fiberId = 0;
+        std::string fiberFileName;
+        cv::Vec3d position{0.0, 0.0, 0.0};
+        int storedControlPointIndexHint = -1;
+    };
+    std::optional<LinkCandidate> _linkCandidate;
 };
