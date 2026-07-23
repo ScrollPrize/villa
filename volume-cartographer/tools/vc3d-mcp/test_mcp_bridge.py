@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-test for vc3d-mcp, run without a real VC3D instance.
+"""Core vc3d-mcp transport and tool tests, run without a real VC3D instance.
 
 Stands up a trivial fake JSON-RPC-over-AF_UNIX-socket server (standing in for
 apps/VC3D/agent_bridge/AgentBridgeServer, so the suite stays hermetic -- no Qt
@@ -12,10 +12,8 @@ app needed) and confirms:
   * the actual MCP tool functions wire all of the above together correctly
     (configure_client -> tool call -> bridge round trip).
 
-Run directly:
-    cd tools/vc3d-mcp && python3 test_mcp_bridge.py -v
-or via unittest discovery:
-    python3 -m unittest test_mcp_bridge -v
+Run the complete suite, including progress, runtime, contract, and domain tests:
+    cd tools/vc3d-mcp && python3 -m unittest discover -v
 """
 
 from __future__ import annotations

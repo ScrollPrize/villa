@@ -47,7 +47,11 @@ tools/vc3d-mcp/
     server.py          # entry/CLI: connection resolution + auto-launch, imports
                         # tools/ to register them on the shared mcp instance
     __main__.py        # `python -m vc3d_mcp` entry point
-  test_mcp_bridge.py   # self-test: fake AF_UNIX JSON-RPC server + assertions
+  mcp_test_support.py  # shared fake AF_UNIX bridge used by tool tests
+  test_mcp_bridge.py   # bridge transport and core tool round trips
+  test_mcp_progress.py # connection lifecycle, progress, waiting, schemas
+  test_mcp_runtime.py  # discovery, auto-launch, teardown helpers
+  test_*.py            # domain tool and contract tests
   pyproject.toml
   requirements.txt
   README.md
@@ -220,9 +224,9 @@ so prefer passing `file_path` for large captures.
 
 ## Self-test (no real VC3D required)
 
-`test_mcp_bridge.py` starts a trivial fake JSON-RPC server on a local
-AF_UNIX socket (standing in for `AgentBridgeServer`, which speaks the same
-newline-delimited JSON-RPC 2.0 framing) and checks that:
+The test suite uses a fake JSON-RPC server on a local AF_UNIX socket (standing
+in for `AgentBridgeServer`, which speaks the same newline-delimited JSON-RPC
+2.0 framing) and checks that:
 
 - `BridgeClient` connects, sends a request, and parses both success and
   JSON-RPC error responses (error `code`/`message`/`data` preserved);
@@ -236,7 +240,7 @@ Run it:
 
 ```sh
 cd tools/vc3d-mcp
-./.venv/bin/python test_mcp_bridge.py -v
+./.venv/bin/python -m unittest discover -v
 ```
 
 ## Tool list

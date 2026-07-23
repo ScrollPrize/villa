@@ -359,10 +359,10 @@ def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
     tracer.run_trace.
 
     Every timeout checks whether VC3D is still alive. The safe fire-and-forget
-    seeding actions are exercised for real; the batch actions are left to the
-    automated smoke suite. tracer.run_trace is exercised only through its
-    error paths so no external tool job is launched. tags.set applies and then
-    reverts a single tag so the fixture is left unchanged.
+    seeding actions are exercised for real; seeding batch and analyze-paths
+    success paths are not launched here. tracer.run_trace is exercised only
+    through its error paths so no external tool job is launched. tags.set
+    applies and then reverts a single tag so the fixture is left unchanged.
     """
 
     def call_checked(name: str, method: str, params: dict | None = None,
