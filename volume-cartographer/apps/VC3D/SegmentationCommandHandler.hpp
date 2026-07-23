@@ -3,6 +3,7 @@
 #include <optional>
 #include <memory>
 #include <functional>
+#include <filesystem>
 #include <string>
 
 #include <QObject>
@@ -24,6 +25,7 @@ class SurfacePanelController;
 class SegmentationGrower;
 class QuadSurface;
 class QWidget;
+class QFileInfo;
 
 /**
  * SegmentationCommandHandler
@@ -479,6 +481,31 @@ private:
     QVector<VolumeSelector::VolumeOption> buildVolumeOptionList(
         QString* defaultOut = nullptr);
     void configureCommandRunnerRemoteAuthForVolumePath(const QString& volumePath);
+
+    /**
+     * The fixed resume-local tracer params (resolved normal-grid / normal3d
+     * paths plus the constant opt-step / radius / iteration settings), before
+     * any caller overrides. Single source of truth shared by the interactive
+     * onResumeLocalGrowPatchRequested slot and the headless
+     * startResumeLocalGrowPatch launcher so the two cannot drift.
+     */
+    QJsonObject buildResumeLocalBaseParamsJson() const;
+
+    /**
+     * Resolve a segment launch's output directory: the surface's own parent
+     * directory, falling back to <volpkg>/paths, created if missing. Returns the
+     * absolute path, or an empty string with \p errorMessage set on a directory
+     * creation failure.
+     */
+    QString resolveSegmentOutputDir(const std::filesystem::path& surfacePath,
+                                    QString* errorMessage) const;
+
+    /**
+     * The default alpha-comp refinement output path (<src>_refined, preserving
+     * any file suffix), shared by the interactive dialog default and the
+     * headless empty-outputDir default.
+     */
+    static QString defaultRefinedOutputPath(const QFileInfo& srcInfo);
 
     QWidget* _parentWidget{nullptr};
     CState* _state{nullptr};

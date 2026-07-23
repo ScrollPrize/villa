@@ -2866,6 +2866,67 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
                              5000);
 }
 
+QJsonObject SegmentationCommandHandler::buildResumeLocalBaseParamsJson() const
+{
+    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
+    if (normalGridPath.isEmpty() && _state && _state->vpkg()) {
+        const auto paths = _state->vpkg()->normalGridPaths();
+        if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
+    }
+
+    QJsonObject params;
+    params["normal_grid_path"] = normalGridPath;
+    if (_normal3dZarrPathGetter) {
+        const QString n3dPath = _normal3dZarrPathGetter();
+        if (!n3dPath.isEmpty()) {
+            params["normal3d_zarr_path"] = n3dPath;
+        }
+    }
+    params["max_gen"] = 1;
+    params["generations"] = 1;
+    params["resume_local_opt_step"] = 20;
+    params["resume_local_opt_radius"] = 40;
+    params["resume_local_max_iters"] = 1000;
+    params["resume_local_dense_qr"] = false;
+    return params;
+}
+
+QString SegmentationCommandHandler::resolveSegmentOutputDir(
+    const std::filesystem::path& surfacePath, QString* errorMessage) const
+{
+    QString volpkgRoot = _state->vpkgPath();
+    if (volpkgRoot.isEmpty()) {
+        volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
+    }
+
+    QString outputDirPath = QString::fromStdString(surfacePath.parent_path().string());
+    if (outputDirPath.isEmpty()) {
+        outputDirPath = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+    }
+    QDir outDir(outputDirPath);
+    if (!outDir.exists() && !outDir.mkpath(QStringLiteral("."))) {
+        if (errorMessage) {
+            *errorMessage = tr("Failed to create output directory: %1").arg(outputDirPath);
+        }
+        return QString();
+    }
+    return outDir.absolutePath();
+}
+
+QString SegmentationCommandHandler::defaultRefinedOutputPath(const QFileInfo& srcInfo)
+{
+    if (srcInfo.isDir()) {
+        return srcInfo.absoluteFilePath() + "_refined";
+    }
+    const QString base = srcInfo.completeBaseName();
+    const QString suffix = srcInfo.completeSuffix();
+    QString candidate = srcInfo.absolutePath() + "/" + base + "_refined";
+    if (!suffix.isEmpty()) {
+        candidate += "." + suffix;
+    }
+    return candidate;
+}
+
 void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& segmentId)
 {
     if (!_state->vpkg()) {
@@ -2928,44 +2989,14 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
         return;
     }
 
-    QString volpkgRoot = _state->vpkgPath();
-    if (volpkgRoot.isEmpty()) {
-        volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
-    }
-
-    std::filesystem::path outputDirFs = surf->path.parent_path();
-    QString outputDirPath = QString::fromStdString(outputDirFs.string());
+    QString outErr;
+    QString outputDirPath = resolveSegmentOutputDir(surf->path, &outErr);
     if (outputDirPath.isEmpty()) {
-        outputDirPath = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
-    }
-    QDir outDir(outputDirPath);
-    if (!outDir.exists() && !outDir.mkpath(".")) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create output directory: %1").arg(outputDirPath));
+        QMessageBox::warning(_parentWidget, tr("Error"), outErr);
         return;
     }
-    outputDirPath = outDir.absolutePath();
 
-    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
-    if (normalGridPath.isEmpty() && _state && _state->vpkg()) {
-        const auto paths = _state->vpkg()->normalGridPaths();
-        if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
-    }
-
-    QJsonObject params;
-    params["normal_grid_path"] = normalGridPath;
-    if (_normal3dZarrPathGetter) {
-        const QString n3dPath = _normal3dZarrPathGetter();
-        if (!n3dPath.isEmpty()) {
-            params["normal3d_zarr_path"] = n3dPath;
-        }
-    }
-    params["max_gen"] = 1;
-    params["generations"] = 1;
-    params["resume_local_opt_step"] = 20;
-    params["resume_local_opt_radius"] = 40;
-    params["resume_local_max_iters"] = 1000;
-    params["resume_local_dense_qr"] = false;
-
+    QJsonObject params = buildResumeLocalBaseParamsJson();
     if (extraParams) {
         for (auto it = extraParams->begin(); it != extraParams->end(); ++it) {
             params.insert(it.key(), it.value());
@@ -3093,43 +3124,12 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& se
         return fail(tr("Unknown volume id: %1").arg(selectedVolumeId));
     }
 
-    QString volpkgRoot = _state->vpkgPath();
-    if (volpkgRoot.isEmpty()) {
-        volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
-    }
-
-    std::filesystem::path outputDirFs = surf->path.parent_path();
-    QString outputDirPath = QString::fromStdString(outputDirFs.string());
+    QString outputDirPath = resolveSegmentOutputDir(surf->path, errorMessage);
     if (outputDirPath.isEmpty()) {
-        outputDirPath = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
-    }
-    QDir outDir(outputDirPath);
-    if (!outDir.exists() && !outDir.mkpath(QStringLiteral("."))) {
-        return fail(tr("Failed to create output directory: %1").arg(outputDirPath));
-    }
-    outputDirPath = outDir.absolutePath();
-
-    QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
-    if (normalGridPath.isEmpty() && _state->vpkg()) {
-        const auto paths = _state->vpkg()->normalGridPaths();
-        if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
+        return false;  // errorMessage already set by resolveSegmentOutputDir
     }
 
-    QJsonObject paramsJson;
-    paramsJson["normal_grid_path"] = normalGridPath;
-    if (_normal3dZarrPathGetter) {
-        const QString n3dPath = _normal3dZarrPathGetter();
-        if (!n3dPath.isEmpty()) {
-            paramsJson["normal3d_zarr_path"] = n3dPath;
-        }
-    }
-    paramsJson["max_gen"] = 1;
-    paramsJson["generations"] = 1;
-    paramsJson["resume_local_opt_step"] = 20;
-    paramsJson["resume_local_opt_radius"] = 40;
-    paramsJson["resume_local_max_iters"] = 1000;
-    paramsJson["resume_local_dense_qr"] = false;
-
+    QJsonObject paramsJson = buildResumeLocalBaseParamsJson();
     // Caller overrides win, exactly like the dialog's extra-params editor.
     for (auto it = params.paramOverrides.begin(); it != params.paramOverrides.end(); ++it) {
         paramsJson.insert(it.key(), it.value());
@@ -3841,18 +3841,7 @@ void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
     QString srcPath = QString::fromStdString(surface->path.string());
     QFileInfo srcInfo(srcPath);
 
-    QString defaultOutput;
-    if (srcInfo.isDir()) {
-        defaultOutput = srcInfo.absoluteFilePath() + "_refined";
-    } else {
-        const QString base = srcInfo.completeBaseName();
-        const QString suffix = srcInfo.completeSuffix();
-        QString candidate = srcInfo.absolutePath() + "/" + base + "_refined";
-        if (!suffix.isEmpty()) {
-            candidate += "." + suffix;
-        }
-        defaultOutput = candidate;
-    }
+    const QString defaultOutput = defaultRefinedOutputPath(srcInfo);
 
     AlphaCompRefineDialog dlg(_parentWidget, volumePath, srcPath, defaultOutput);
     if (dlg.exec() != QDialog::Accepted) {
@@ -3939,17 +3928,7 @@ bool SegmentationCommandHandler::startAlphaCompRefine(const std::string& segment
     // path is resolved against the volpkg root so callers can pass short names.
     QString dstPath = params.outputDir.trimmed();
     if (dstPath.isEmpty()) {
-        if (srcInfo.isDir()) {
-            dstPath = srcInfo.absoluteFilePath() + "_refined";
-        } else {
-            const QString base = srcInfo.completeBaseName();
-            const QString suffix = srcInfo.completeSuffix();
-            QString candidate = srcInfo.absolutePath() + "/" + base + "_refined";
-            if (!suffix.isEmpty()) {
-                candidate += "." + suffix;
-            }
-            dstPath = candidate;
-        }
+        dstPath = defaultRefinedOutputPath(srcInfo);
     } else if (QDir::isRelativePath(dstPath)) {
         QString volpkgRoot = _state->vpkgPath();
         if (volpkgRoot.isEmpty()) {
