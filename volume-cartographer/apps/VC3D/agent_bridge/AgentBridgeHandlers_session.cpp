@@ -118,7 +118,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     if (SegmentationModule* mod = _window->_segmentationModule.get()) {
         result["manualAddMode"] = mod->manualAddMode();
         result["correctionsPointMode"] = mod->correctionPointMode();
-        // Explicit save/flush bookkeeping (SPEC §3.11c, §9.8).
+        // Explicit save/flush bookkeeping.
         const SegmentationModule::AutosaveStatus save = mod->autosaveStatus();
         QJsonObject autosave;
         autosave["pending"] = save.pending;
@@ -131,7 +131,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["autosave"] = QJsonValue::Null;
     }
 
-    // Axis-aligned slice mode (SPEC §3.9c): when enabled, "seg xz"/"seg yz" are the
+    // Axis-aligned slice mode: when enabled, "seg xz"/"seg yz" are the
     // rotatable canonical planes. viewer.rotate requires this on (else -32002), and
     // viewer.set_axis_aligned_slices toggles it.
     if (AxisAlignedSliceController* slices = _window->_axisAlignedSliceController.get()) {
@@ -152,7 +152,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["manualAddInterpolation"] = QJsonValue::Null;
     }
 
-    // Same-winding wrap annotation (SPEC §3.9d). `enabled` is the widget's
+    // Same-winding wrap annotation. `enabled` is the widget's
     // checkbox state; `hasPreview` is true when any chunked viewer currently
     // holds an uncommitted preview (seeded by shift-click, committed by shift+E).
     WrapAnnotationWidget* wrapWidget = _window->_wrapAnnotationWidget;
@@ -187,8 +187,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     }
     result["viewers"] = viewers;
 
-    // Active job(s). "job" keeps its v1 meaning (most recently started active
-    // job, else null); "jobs" lists every currently active job (§8.3).
+    // "job" is the most recently started active job; "jobs" lists all of them.
     QJsonObject mostRecentActive;
     int bestNum = -1;
     QJsonArray jobs;
@@ -292,7 +291,7 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
         throw AgentBridgeError{-32010, "Surface panel unavailable", data};
     }
 
-    // Resolve the path for the result's segment entry (SPEC §3.3 shape). Prefer the
+    // Resolve the path for the result's segment entry. Prefer the
     // loaded CState surface (covers multi-folder display ids), fall back to the vpkg.
     auto resolveSegPath = [&]() -> QString {
         if (auto surf = state->surface(segmentId))
@@ -310,15 +309,14 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
         ? QJsonValue(QJsonValue::Null)
         : QJsonValue(QString::fromStdString(prevActive));
 
-    // Activating the already-active id is a no-op success (SPEC §17.3): no re-emit,
+    // Activating the already-active id is a no-op success: no re-emit,
     // no side effects, mirroring the tree where re-clicking the current row is inert.
     const bool alreadyActive = !prevActive.empty() && prevActive == segmentId;
 
     if (!alreadyActive) {
         QString err;
         if (!panel->activateSurfaceById(segmentId, &err)) {
-            // Classify via the distinct sentences activateSurfaceById produces
-            // (SPEC §17.2 contract).
+            // Classify via the distinct sentences activateSurfaceById produces.
             if (err.contains(QLatin1String("locked"))) {
                 QJsonObject data;
                 data["source"] = "growth";
@@ -339,7 +337,7 @@ QJsonObject AgentBridgeServer::handleSegmentsActivate(const QJsonValue& params)
         }
 
         // Post-verify: onSurfaceActivated clears the active surface when the surface
-        // throws while loading (CWindow.cpp:9614-9625) -> map to -32005 (SPEC §17.3).
+        // A load exception is an operation failure, not an invalid identifier.
         if (state->activeSurfaceId() != segmentId) {
             QJsonObject data;
             data["detail"] = "active surface was cleared during activation "
@@ -409,7 +407,7 @@ QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
     };
 
     // A concurrent Open Data operation (catalog open or another segment fetch)
-    // shares the same download subsystem: reject up front (SPEC §1.3 / §18.4).
+    // shares the same download subsystem, so reject it up front.
     requireSourceIdle(QStringLiteral("catalog"));
 
     // Kick off (or short-circuit) the materialize. fetchOpenDataSegmentAsync
@@ -603,7 +601,7 @@ QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
 
 
 // ---------------------------------------------------------------------------
-// Project/catalog opening (SPEC §3.15-3.16)
+// Project/catalog opening
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
@@ -848,7 +846,7 @@ QJsonObject AgentBridgeServer::handleVolumeSelect(const QJsonValue& params)
 
     const QString previousVolumeId = QString::fromStdString(state->currentVolumeId());
 
-    // Selecting the already-current volume is a no-op success (SPEC §10.4).
+    // Selecting the already-current volume is a no-op success.
     if (previousVolumeId == volumeIdQ) {
         QJsonObject result;
         result["volumeId"] = volumeIdQ;

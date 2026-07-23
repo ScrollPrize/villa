@@ -18,50 +18,15 @@ from vc3d_process import VC3DProcess
 
 def run_manual_add_corrections_smoke(client: BridgeClient, rec: Recorder,
                                      target_viewer, canvas_point) -> None:
-    """Exercise manual-add (hole-fill) mode, its
-    line/interpolation config, plane-constraint placement via canvas.*, and
-    corrections point-authoring mode.
+    """Exercise manual-add and corrections through a real editing session.
 
-    As of this revision, run_offscreen() calls run_segment_activation_proof()
-    (which calls segments.activate then segmentation.enable_editing) BEFORE
-    this function, so `editing_enabled` below is normally True and the
-    "began"/"corr_on" branches (the real success paths, not just the guard
-    errors) execute for real on every run. This function still tolerates
-    editing_enabled being False (e.g. if called standalone, or if activation
-    failed upstream) by asserting the documented guard-error codes instead --
-    that path is exercised on its own by re-verify runs invoked before
-    activation, and is the regression check for "does editing-not-enabled
-    still fail correctly" now that the success path also works.
-
-    HISTORICAL NOTE / bug this revision fixes: before AgentBridgeServer's
-    handleSegmentationEnableEditing was fixed (see AgentBridgeServer.cpp,
-    handleSegmentationEnableEditing), it only called
-    SegmentationWidget::setEditingEnabled(bool), which -- despite the SPEC's
-    §3.10 claim that "the widget's existing signal wiring propagates to
-    CWindow::onSegmentationEditingModeChanged" -- calls
-    updateEditingState(enabled, /*notifyListeners=*/false) and so NEVER emits
-    editingModeChanged. That meant segmentation.enable_editing(true) always
-    reported {"enabled": true} (a real, observable bug: state.get's
-    segmentationEditingEnabled read the same cosmetic widget flag) without
-    ever reaching SegmentationModule::setEditingEnabled ->
-    editingEnabledChanged -> CWindow::onSegmentationEditingModeChanged ->
-    beginEditingSession(): no real edit session was ever established, so
-    manual_add.begin / corrections.set_point_mode kept failing -32007
-    kind:"session" even after segments.activate made a surface active --
-    silently, since the misleading {"enabled": true} gave no hint anything
-    was wrong. The fix drives SegmentationModule::setEditingEnabled directly
-    (mirroring the same call CWindow itself makes to reconcile widget/module
-    drift, e.g. in onSurfaceActivated) so the real signal cascade actually
-    runs. Confirmed fixed via a real edit session + a genuine on-disk
-    manual-add hole-fill (verified by re-reading the segment's x/y/z.tif
-    directly, not just trusting RPC results) and a real corrections-drag ->
-    source:"growth" job against test-data/s1_ds2.volpkg fixture segments
-    during independent re-verification of this stage.
+    The suite verifies both disabled-state guards and successful point
+    authoring, including an on-disk hole fill and a corrections growth job.
     """
-    # Documented precondition error codes for the editing-gated RPCs (§9.2/§9.7).
+    # Accepted precondition errors for editing-gated RPCs.
     PRECOND = {-32000, -32001, -32004, -32007, -32008}
 
-    # --- Config setters (§9.4/§9.5): valid with or without an active session ---
+    # Config setters are valid with or without an active session.
     r, _ = client.call("segmentation.manual_add.set_line_mode", {"mode": "cross_fill"}, timeout=10.0)
     rec.step("manual_add.set_line_mode(cross_fill)", r.get("mode") == "cross_fill", json.dumps(r))
     r, _ = client.call("segmentation.manual_add.set_line_mode", {"mode": "vertical"}, timeout=10.0)
@@ -79,11 +44,11 @@ def run_manual_add_corrections_smoke(client: BridgeClient, rec: Recorder,
         rec.step("manual_add.set_line_mode rejects bad enum with -32602", e.code == -32602,
                  f"code={e.code} data={e.data}")
 
-    # --- state.get Stage-2 additions (§9.8) ---
+    # state.get reports the editing modes.
     st, _ = client.call("state.get", timeout=10.0)
     stage2_keys = ("manualAddMode", "manualAddLineMode", "manualAddInterpolation", "correctionsPointMode")
     fields_present = all(k in st for k in stage2_keys)
-    rec.step("state.get reports Stage-2 manual-add/corrections fields", fields_present,
+    rec.step("state.get reports manual-add/corrections fields", fields_present,
              json.dumps({k: st.get(k) for k in stage2_keys}))
     rec.step("state.get manualAddLineMode reflects last setter",
              st.get("manualAddLineMode") == "vertical", f"manualAddLineMode={st.get('manualAddLineMode')}")
@@ -116,7 +81,7 @@ def run_manual_add_corrections_smoke(client: BridgeClient, rec: Recorder,
         rec.step("corrections.set_point_mode(true) fails -32008 while editing disabled (regression)",
                  e.code == -32008, f"code={e.code} message={e.message} data={e.data}")
 
-    # --- manual_add.begin (§9.2): only with editing + active session ---
+    # --- manual_add.begin: only with editing + active session ---
     editing_enabled = False
     try:
         r, _ = client.call("segmentation.enable_editing", {"enabled": True}, timeout=10.0)
@@ -248,7 +213,7 @@ def run_manual_add_corrections_smoke(client: BridgeClient, rec: Recorder,
                      e.code == -32007 and "manual_add_session" in json.dumps(e.data),
                      f"code={e.code} data={e.data}")
 
-    # --- corrections.set_point_mode (§9.7) ---
+    # --- corrections.set_point_mode ---
     corr_on = False
     try:
         r, _ = client.call("segmentation.corrections.set_point_mode", {"active": True}, timeout=10.0)
@@ -294,7 +259,7 @@ def run_manual_add_corrections_smoke(client: BridgeClient, rec: Recorder,
             log(f"corrections point commit screenshot diff (supplementary, non-fatal): "
                 f"changed={pre_png != post_png} pre_len={len(pre_png)} post_len={len(post_png)}")
 
-        # --- Drag > 1.0 voxel (§9.7): commits an anchored point AND
+        # --- Drag > 1.0 voxel: commits an anchored point AND
         # immediately triggers the corrections solver as a source:"growth"
         # job -- poll job.status to a terminal state. Use the "segmentation"
         # viewer (not target_viewer/canvas_point, which follow a raw-volume
@@ -393,11 +358,9 @@ def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
     """Exercise tags.set, seeding.*, push_pull.*,
     tracer.run_trace.
 
-    Every step is liveness-checked (a SIGSEGV presents as a client timeout,
-    SPEC §18.6). The safe fire-and-forget seeding actions (preview/cast/reset,
-    winding mode) are exercised for real; seeding.run / seeding.expand /
-    seeding.analyze_paths are deliberately absent (they spin a nested event
-    loop, §15.2). tracer.run_trace is exercised only through its
+    Every timeout checks whether VC3D is still alive. The safe fire-and-forget
+    seeding actions are exercised for real; the batch actions are left to the
+    automated smoke suite. tracer.run_trace is exercised only through its
     error paths so no external tool job is launched. tags.set applies and then
     reverts a single tag so the fixture is left unchanged.
     """
@@ -435,7 +398,7 @@ def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
             rec.step(name, False, f"TIMEOUT (VC3D still alive): {e}")
             return None
 
-    # --- tags.set (§15.1) ---
+    # --- tags.set ---
     call_expect_error("tags.set missing segmentId -> -32602",
                       "tags.set", {"tag": "approved", "enabled": True}, -32602)
     call_expect_error("tags.set missing enabled -> -32602",
@@ -467,7 +430,7 @@ def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
         call_checked("tags.set inspect=false (revert)", "tags.set",
                      {"segmentId": target, "tag": "inspect", "enabled": False})
 
-    # --- seeding.* (§15.2) ---
+    # --- seeding.* ---
     call_expect_error("seeding.set_winding_annotation_mode missing active -> -32602",
                       "seeding.set_winding_annotation_mode", {}, -32602)
     r = call_checked("seeding.set_winding_annotation_mode(true)",
@@ -479,7 +442,7 @@ def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
                  "seeding.set_winding_annotation_mode", {"active": False})
     # preview_rays / cast_rays are fire-and-forget; with no focus POI the
     # precondition dialog is suppressed and the call returns cleanly (proving
-    # the no-nested-dialog contract, §1.3).
+    # that no dialog is opened.
     r = call_checked("seeding.preview_rays (no focus POI -> clean, no dialog)",
                      "seeding.preview_rays", {})
     if r is not None:
@@ -491,7 +454,7 @@ def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
         rec.step("seeding.reset_points returns reset=true",
                  r.get("reset") is True, json.dumps(r))
 
-    # --- segmentation.push_pull.* (§15.3) ---
+    # --- segmentation.push_pull.* ---
     r = call_checked("push_pull.set_config (subset read-modify-write)",
                      "segmentation.push_pull.set_config",
                      {"blurRadius": 5, "perVertex": False, "step": 3.0})
@@ -517,7 +480,7 @@ def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
         rec.step("push_pull.stop returns stopped=true",
                  r.get("stopped") is True, json.dumps(r))
 
-    # --- tracer.run_trace (§15.4) error paths (no tool job launched) ---
+    # --- tracer.run_trace error paths (no tool job launched) ---
     call_expect_error("tracer.run_trace missing segmentId -> -32602",
                       "tracer.run_trace", {}, -32602)
     call_expect_error("tracer.run_trace bad paramOverrides type -> -32602",
@@ -533,7 +496,7 @@ def run_stage6_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
 
 
 def run_segment_activation_proof(client: BridgeClient, rec: Recorder, seg_ids: set) -> None:
-    """Stage: segments.activate (SPEC §17).
+    """Exercise segments.activate against a real segment.
 
     Activates a real, pre-existing segment via the new RPC and proves the fix:
     segmentation.enable_editing(true) SUCCEEDS afterwards (it previously failed
@@ -548,7 +511,7 @@ def run_segment_activation_proof(client: BridgeClient, rec: Recorder, seg_ids: s
                  "no segments listed to activate")
         return
 
-    # Unknown-id error path (§17.3): -32007 data.kind:"segment".
+    # Unknown-id error path: -32007 data.kind:"segment".
     try:
         client.call("segments.activate", {"segmentId": "agent-bridge-nonexistent-seg"}, timeout=10.0)
         rec.step("segments.activate unknown id rejected with -32007 kind=segment", False,
@@ -558,7 +521,7 @@ def run_segment_activation_proof(client: BridgeClient, rec: Recorder, seg_ids: s
                  e.code == -32007 and e.data.get("kind") == "segment",
                  f"code={e.code} data={e.data}")
 
-    # Missing param (§17.3): -32602 data.param:"segmentId".
+    # Missing param: -32602 data.param:"segmentId".
     try:
         client.call("segments.activate", {}, timeout=10.0)
         rec.step("segments.activate missing segmentId rejected with -32602", False,
@@ -610,7 +573,7 @@ def run_segment_activation_proof(client: BridgeClient, rec: Recorder, seg_ids: s
         rec.step("segmentation.enable_editing(true) SUCCEEDS after segments.activate (the fix)",
                  False, f"STILL FAILS: code={e.code} message={e.message} data={e.data}")
 
-    # Re-activating the already-active id is a documented no-op success (§17.3).
+    # Re-activating the already-active id is a documented no-op success.
     try:
         r, _ = client.call("segments.activate", {"segmentId": target}, timeout=10.0)
         rec.step("segments.activate on already-active id is a no-op success",

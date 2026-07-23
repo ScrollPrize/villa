@@ -177,7 +177,7 @@ other MCP clients.)
 
 ### Socket discovery / naming convention
 
-Per SPEC.md §1.1, VC3D is started with `--agent-bridge` (default socket name
+VC3D is started with `--agent-bridge` (default socket name
 `vc3d-agent-<pid>`) or `--agent-bridge-name <name>` (explicit, e.g. for
 tests), and on success prints the handshake line shown above.
 
@@ -222,7 +222,7 @@ so prefer passing `file_path` for large captures.
 
 `test_mcp_bridge.py` starts a trivial fake JSON-RPC server on a local
 AF_UNIX socket (standing in for `AgentBridgeServer`, which speaks the same
-newline-delimited JSON-RPC 2.0 framing per SPEC.md §1.2) and checks that:
+newline-delimited JSON-RPC 2.0 framing) and checks that:
 
 - `BridgeClient` connects, sends a request, and parses both success and
   JSON-RPC error responses (error `code`/`message`/`data` preserved);
@@ -242,7 +242,7 @@ cd tools/vc3d-mcp
 ## Tool list
 
 One MCP tool per JSON-RPC method documented in `apps/VC3D/agent_bridge/SPEC.md`,
-named per its §5/§16 conventions (`vc3d_` prefix, snake_case). Coordinates are
+named with a `vc3d_` prefix and snake_case. Coordinates are
 volume-space voxels unless a tool takes an explicit `space` field. RPC errors
 surface as MCP tool errors whose text is the JSON-encoded
 `{"code", "message", "data"}` error object.
@@ -263,8 +263,8 @@ surface as MCP tool errors whose text is the JSON-encoded
 
 ### The `wait` convenience
 
-The wait-capable tools accept an MCP-only `wait: bool` param (not part of the
-underlying RPC, per SPEC.md §5). The full set is:
+The wait-capable tools accept an MCP-only `wait: bool` param that is not part of
+the underlying RPC. The full set is:
 
 - `vc3d_fetch_segment` (defaults to `wait=true`) and `vc3d_open_catalog_sample`,
 - `vc3d_grow_segment`, `vc3d_grow_patch_from_seed`, `vc3d_run_trace`,
@@ -293,13 +293,13 @@ and a failing or stalled sink is abandoned after one bounded attempt without
 changing execution or the terminal result. Task cancellation still propagates.
 The injected `Context` is not part of any tool's input schema.
 
-`vc3d_wait_job` (SPEC.md §21.3) is the standalone counterpart to `wait`: it has
+`vc3d_wait_job` is the standalone counterpart to `wait`: it has
 no underlying RPC and blocks on an **already-running** job by id, using the same
 notification/replay/status-fallback loop and returning the terminal `job.status`
 inline — or the
 last status with `"waitTimedOut": true` on the cap. Use it to wait on a job that
 some earlier call started with `wait=false`, or on an externally-initiated job seen
-in `vc3d_get_state`. To stop a running job, `vc3d_cancel_job` (SPEC.md §21) maps to
+in `vc3d_get_state`. To stop a running job, `vc3d_cancel_job` maps to
 `job.cancel`: it is request-only (poll `vc3d_job_status` for the terminal state), and
 only `tool`/`atlas`/`seeding`/`lasagna` jobs are cancellable — `growth`/`flatten`/
 `catalog`/`autosave` jobs return an error.
@@ -309,6 +309,5 @@ only `tool`/`atlas`/`seeding`/`lasagna` jobs are cancellable — `growth`/`flatt
 - **`vc3d_click`/`vc3d_shift_click` `position` schema**: SPEC.md's RPC
   params allow `Vec3 | {"x","y"}` depending on `space`. Modeled as a plain
   `dict[str, float]` (rather than a strict union type) so the MCP-level
-  JSON Schema doesn't over-constrain either shape — matching SPEC.md §5's
-  "the MCP server performs no semantic validation beyond schema; the bridge
-  is the authority."
+  JSON Schema doesn't over-constrain either shape. The bridge remains the
+  authority for semantic validation.

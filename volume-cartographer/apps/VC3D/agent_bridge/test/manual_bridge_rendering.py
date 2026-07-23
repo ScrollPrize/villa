@@ -18,8 +18,8 @@ def run_render_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
     Exercises every error path (missing/bad params, unknown segment, unknown
     volume) plus a real, bounded render of a pre-existing segment to a temp
     directory, polled to a terminal job state with the output artifact verified
-    on disk. Every step is liveness-checked (a SIGSEGV presents as a client
-    timeout, SPEC §18.6). No RenderParamsDialog is ever reached (the headless
+    on disk. Every timeout checks process liveness. No RenderParamsDialog is
+    ever reached (the headless
     startRenderSegment launcher builds the runner args directly), so no step can
     hang on a modal dialog.
     """
@@ -185,8 +185,7 @@ def run_flatten_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
     segment, and the source:"flatten" concurrency guard) plus one REAL, bounded,
     in-process ABF++ flatten of a pre-existing segment, polled to a terminal job
     state with the output artifact verified on disk and then cleaned up. Every
-    step is liveness-checked (a SIGSEGV or a nested-event-loop hang presents as a
-    client timeout, SPEC §18.6). No SlimFlattenDialog / ABFFlattenDialog /
+    timeout checks process liveness. No SlimFlattenDialog / ABFFlattenDialog /
     StraightenDialog is ever reached (the headless start* launchers go straight
     from validated params to a suppressDialogs=true job), and every terminal /
     mid-pipeline QMessageBox in the three bespoke job classes is gated behind
@@ -336,7 +335,7 @@ def run_flatten_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess,
                      jst.get("source") == "flatten", f"source={jst.get('source')}")
 
         # Concurrency guard: a second flatten (any kind) while one is active ->
-        # -32004 with data.source:"flatten" (its own source, §8.3 / §20).
+        # -32004 with data.source:"flatten".
         e = call_expect_error("flatten.slim while flatten active -> -32004",
                               "flatten.slim", {"segmentId": target}, -32004)
         if e is not None:

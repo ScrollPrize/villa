@@ -97,7 +97,7 @@ def run_offscreen(args) -> dict:
         rec.step("volume.open", r.get("opened") is True and r.get("volumeId") == LOCAL_RAW_VOLUME_ID,
                   json.dumps(r))
 
-        # 2b. Nested-dialog footgun fix (SPEC §8.2): with a vpkg already open,
+        # 2b. Nested-dialog footgun fix: with a vpkg already open,
         # neither a re-open nor catalog.open_sample may hang on a blocking
         # replace-project prompt. A hang would surface as a client-side
         # TimeoutError; anything that returns (success OR a documented error)
@@ -207,7 +207,7 @@ def run_offscreen(args) -> dict:
             close = all(abs(vp.get(k, 1e9) - canvas_point[k]) < 5.0 for k in "xyz")
             rec.step("canvas.get_cursor_volume_point", close, json.dumps(r))
 
-            # 6b. canvas.drag (SPEC §9.1): press-move-release between two real
+            # 6b. canvas.drag: press-move-release between two real
             # on-surface points on the same plane (shared Z), through the real
             # onMousePress/onMouseMove/onMouseRelease slots.
             drag_to = dict(canvas_point)
@@ -262,7 +262,7 @@ def run_offscreen(args) -> dict:
             rec.step("segmentation.grow returns well-formed documented error (no active surface)",
                      e.code in expected_codes, f"code={e.code} message={e.message} data={e.data}")
 
-        # 7b. Footgun fix (SPEC §8.1): method:"manual_add" must be rejected with
+        # 7b. Footgun fix: method:"manual_add" must be rejected with
         # -32009 UNSUPPORTED (not a silent no-op, and not routed into growth).
         try:
             r, dt = client.call("segmentation.grow",
@@ -297,7 +297,7 @@ def run_offscreen(args) -> dict:
             rec.step("segmentation.grow_patch_from_seed (started)", False,
                       f"code={e.code} message={e.message} data={e.data}")
 
-        # 8b. Generalized job model (SPEC §8.3): job.status carries a "source"
+        # 8b. Generalized job model: job.status carries a "source"
         # for this real job, state.get exposes an active-jobs array, and
         # job.progress notifications include "source".
         if job_id:
@@ -385,7 +385,7 @@ def run_offscreen(args) -> dict:
                  shot.get("width", 0) > 0 and shot.get("height", 0) > 0 and nontrivial,
                  f"{shot.get('width')}x{shot.get('height')} {detail}")
 
-        # 10b. segments.activate (SPEC §17): the critical activation proof.
+        # 10b. segments.activate: the critical activation proof.
         # Before this RPC existed there was NO way for a headless session to make
         # a segment the active editing target, so segmentation.enable_editing
         # always failed -32007 (see run_manual_add_corrections_smoke docstring).
@@ -440,32 +440,16 @@ def run_offscreen(args) -> dict:
                                               canvas_point, n=args.bench_iterations)
         result["benchmark"] = benchmark
 
-        # 11b. Lasagna RPCs. Runs before the catalog suite
-        # (needs the original local segments still attached; catalog.open_sample
-        # replaces the whole project). All calls are liveness-checked on timeout
-        # (SPEC §18.6) since the historical failure mode here was a HANG, not a
-        # crash: lasagna.repeat_last used to route through the *interactive*
-        # startOptimization(state, statusBar()) dialog path via a live Qt signal
-        # connection and could block forever offscreen.
+        # Lasagna needs the original fixture, before catalog.open_sample replaces
+        # the project. Every timeout includes a process-liveness check.
         run_lasagna_smoke(client, rec, proc)
 
-        # 11c. Atlas RPCs. No real atlas data exists in
-        # this fixture, so this exercises every atlas.* method's error paths:
-        # the point is proving well-formed errors with NO hang and NO crash
-        # (the historical atlas failure modes were QMessageBox paths several
-        # calls deep -- e.g. the rebuild prompt inside displayAtlasFromDirectory
-        # and showError inside showIntersectionInspection -- that block forever
-        # offscreen). Every timeout is liveness-checked (SPEC §18.6).
+        # The fixture has no atlas data, so exercise every atlas error path and
+        # verify that none opens a dialog or terminates the process.
         run_atlas_smoke(client, rec, proc)
 
-        # 11d. Line annotation / fiber RPCs. Runs before
-        # the catalog suite (needs the local fixture project). Includes a REAL
-        # headless fiber.import / fiber.export round trip through a temp file
-        # (the newest headless-split code), with cleanup via fiber.delete so
-        # the fixture is left unchanged. Every step is liveness-checked: the
-        # historical fiber failure modes are dialogs several calls deep
-        # (showError QMessageBox, the Lasagna dataset-picker QFileDialog, the
-        # broken-branch-links prompt) plus saveOpenFibers' nested QEventLoop.
+        # Exercise a real fiber import/export round trip before the catalog
+        # suite replaces the fixture, then delete the imported fibers.
         run_fiber_smoke(client, rec, proc)
 
         # 11e. tags.set / seeding.* / push_pull.* /
@@ -486,23 +470,15 @@ def run_offscreen(args) -> dict:
         # verified. Threaded `proc` so every timeout is liveness-checked.
         run_render_smoke(client, rec, proc, seg_ids)
 
-        # 11f. flatten.slim / flatten.abf / flatten.straighten.
-        # Runs against the still-attached local fixture + its real segments, BEFORE
-        # the catalog stage replaces the project. Error paths for all three RPCs
-        # (missing/bad params, unknown segment, concurrency guard) plus one REAL
-        # in-process ABF++ flatten (fast, no subprocess) of a real segment, polled
-        # to terminal with the on-disk artifact verified. Threaded `proc` so every
-        # timeout is liveness-checked -- the historical footgun class here is the
-        # three bespoke job classes' terminal QMessageBoxes and mid-pipeline static
-        # QMessageBox::critical calls, all now gated behind suppressDialogs.
+        # Exercise flatten error paths and one bounded in-process ABF++ job
+        # before catalog replacement. Verify its artifact and process liveness.
         run_flatten_smoke(client, rec, proc, seg_ids)
 
         # 12. Remote catalog resource selection. Runs last
         # because a real catalog.open_sample replaces the local fixture project.
         # Network-gated: probes the manifest URL first and skips cleanly (not a
         # failure) when unreachable from this environment. `proc` is threaded in
-        # so every timeout is liveness-checked (a SIGSEGV also presents as a
-        # client timeout, SPEC §18.6).
+        # so every timeout distinguishes a slow request from a dead process.
         run_catalog_resource_selection_smoke(client, rec, proc)
 
         result["recorder"] = rec.as_dict()

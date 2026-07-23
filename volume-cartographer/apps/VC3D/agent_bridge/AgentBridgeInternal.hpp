@@ -62,7 +62,7 @@ inline double jsonRequireFinite(const QJsonValue& v, const char* paramName)
 
 // Require a finite JSON number that also stays finite when narrowed to float.
 // A finite double beyond float's range (e.g. 1e300) becomes +/-inf on cast, which
-// would silently violate the finite-coordinate promise of the {x,y,z} helpers (SPEC §5).
+// would silently violate the finite-coordinate promise of the {x,y,z} helpers.
 inline double jsonRequireFiniteFloat(const QJsonValue& v, const char* paramName)
 {
     const double d = jsonRequireFinite(v, paramName);
@@ -87,7 +87,7 @@ inline cv::Vec3f jsonToVec3(const QJsonValue& value, const char* paramName)
             QStringLiteral("%1 requires x, y and z").arg(QLatin1String(paramName)), data};
     }
     // Reject wrong-typed (string/bool) or non-finite coordinates rather than
-    // silently coercing them to 0 (SPEC §5). jsonRequireFiniteFloat additionally
+    // silently coercing them to 0. jsonRequireFiniteFloat additionally
     // rejects a finite double that would overflow to +/-inf on the float cast below.
     const double x = jsonRequireFiniteFloat(o.value("x"), "x");
     const double y = jsonRequireFiniteFloat(o.value("y"), "y");

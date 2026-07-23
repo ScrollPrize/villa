@@ -118,9 +118,9 @@ QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
         throw AgentBridgeError{-32010, "Surface panel unavailable", data};
     }
 
-    // §15.1: select first (documented side effect: leaves segmentId selected,
-    // which enables the tag checkboxes), then setTagChecked. selectSurfaceById
-    // returns false for an unknown/unloaded id -> -32007.
+    // Select first, leaving segmentId active so the tag checkboxes are enabled,
+    // then set the tag. selectSurfaceById returns false for an unknown or
+    // unloaded id.
     const std::string segmentId = segmentIdQ.toStdString();
     if (!panel->selectSurfaceById(segmentId)) {
         QJsonObject data;
@@ -252,7 +252,7 @@ QJsonObject AgentBridgeServer::launchSeedingBatch(
 
     // run and expand are mutually exclusive with each other (shared jobsRunning
     // flag); both map to source:"seeding", so the standard per-source guard
-    // rejects a second batch of either kind (SPEC §8.3).
+    // rejects a second batch of either kind.
     requireSourceIdle(QStringLiteral("seeding"));
 
     QString err;
@@ -352,7 +352,7 @@ QJsonObject AgentBridgeServer::handleSeedingAnalyzePaths(const QJsonValue&)
     }
     // Synchronous, in-process compute (no QProcess, no nested event loop): runs
     // to completion before returning, so this is a plain synchronous RPC rather
-    // than a job (SPEC §15.2). Requires paths drawn in the widget's Draw mode.
+    // than a job. Requires paths drawn in the widget's Draw mode.
     QString err;
     int pathsAnalyzed = 0;
     int peaksFound = 0;
@@ -442,7 +442,7 @@ QJsonObject AgentBridgeServer::handlePushPullStart(const QJsonValue& params)
     if (p.contains("alpha"))
         alphaOverride = p.value("alpha").toBool();
 
-    // §15.3 preconditions: editing enabled + active edit session.
+    // Push/pull requires editing to be enabled with an active session.
     if (!widget || !widget->isEditingEnabled())
         throw AgentBridgeError{-32008, "Segmentation editing is not enabled", {}};
     if (!mod->hasActiveSession()) {
@@ -453,7 +453,7 @@ QJsonObject AgentBridgeServer::handlePushPullStart(const QJsonValue& params)
     }
 
     // startPushPull returns false when there is no valid hover target (the agent
-    // must position the cursor first with a buttonless canvas.drag, §15.3) — that
+    // must position the cursor first with a buttonless canvas.drag — that
     // is reported as active:false, not an error.
     const bool active = mod->startPushPullMode(direction, alphaOverride);
     QJsonObject result;
@@ -490,7 +490,7 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
         throw AgentBridgeError{-32602, "segmentId is required", data};
     }
 
-    // Run Trace runs vc_grow_seg_from_segments: the "tool" source (§8.3).
+    // Run Trace runs vc_grow_seg_from_segments: the "tool" source.
     requireSourceIdle(QStringLiteral("tool"));
 
     SegmentationCommandHandler* handler = _window->_segmentationCommandHandler.get();
@@ -546,7 +546,7 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
 
 
 // ---------------------------------------------------------------------------
-// render.tifxyz (SPEC §19)
+// render.tifxyz
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
@@ -601,7 +601,7 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
 
     rp.outputDir = p.value("outputDir").toString();
 
-    // Render runs the external vc_render_tifxyz process: the "tool" source (§8.3).
+    // Render runs the external vc_render_tifxyz process: the "tool" source.
     requireSourceIdle(QStringLiteral("tool"));
 
     SegmentationCommandHandler* handler = _window->_segmentationCommandHandler.get();

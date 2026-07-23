@@ -55,7 +55,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
     }
 
     // Resolve the sample first so we can distinguish "unknown sample" (-32007)
-    // from "manifest unavailable" / "open failed" (-32005) (SPEC §3.16).
+    // from "manifest unavailable" / "open failed" (-32005).
     const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
     if (!manifest) {
         QJsonObject data;
@@ -78,10 +78,11 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
         throw AgentBridgeError{-32010, "Internal error", data};
     }
 
-    // --- Optional resource selection (SPEC §10.3). Validated in full against
+    // --- Optional resource selection. Validated in full against
     // the resolved sample *before* any download or project mutation begins. ---
     OpenDataSampleOpenOptions options;
-    options.interactive = false;  // SPEC §8.2: explicit call = consent to replace.
+    // An explicit remote call is consent to replace the current project.
+    options.interactive = false;
 
     if (p.contains("resources")) {
         const QJsonObject res = p.value("resources").toObject();
@@ -109,7 +110,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
                 }
                 vids.push_back(vid);
             }
-            // A selection that leaves zero volumes is rejected (SPEC §10.3).
+            // A selection that leaves zero volumes is rejected.
             if (vids.empty()) {
                 QJsonObject data;
                 data["param"] = "resources.volumeIds";
@@ -173,9 +174,9 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
         }
     }
 
-    // Async open (SPEC §18.4): the RPC no longer blocks on the network. Reject a
+    // Async open: the RPC no longer blocks on the network. Reject a
     // second catalog open (bridge-started or human-initiated) up front, then
-    // start the §1.3-safe asynchronous core and return a jobId immediately.
+    // start the dialog-free asynchronous core and return a jobId immediately.
     requireSourceIdle(QStringLiteral("catalog"));
     if (mc->openDataSampleOpenInFlight()) {
         QJsonObject data;
@@ -186,7 +187,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
     }
 
     // Progress: forward the download/transform stream as job.progress "output"
-    // notifications, rate-limited to <=10/s (SPEC §3.18).
+    // notifications, rate-limited to <=10/s.
     auto onProgress =
         [this](const vc3d::opendata::OpenDataSampleDownloadProgress& progress) {
             auto it = _activeJobs.find(QStringLiteral("catalog"));
@@ -248,7 +249,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
 
 
 // ---------------------------------------------------------------------------
-// Remote catalog resource selection (SPEC §10.1-10.4)
+// Remote catalog resource selection
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::withOpenDataManifest(
@@ -269,7 +270,7 @@ QJsonObject AgentBridgeServer::withOpenDataManifest(
     }
 
     // No cached manifest (or a forced refresh): fetch off-thread and reply via
-    // the deferred mechanism (SPEC §8.4, 30 s cap per §10.1).
+    // the deferred mechanism, with a 30-second deadline.
     const int token = beginDeferred(30000, "Open Data manifest fetch");
     startManifestFetch(token, build);
     throw AgentBridgeDeferred{};

@@ -19,16 +19,8 @@ from vc3d_process import VC3DProcess
 def run_lasagna_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> None:
     """Exercise lasagna.* RPCs and workspace.switch.
 
-    No real Lasagna Python service is assumed to be installed -- every call is
-    liveness-checked on timeout (SPEC §18.6), since the historical failure mode
-    here was a permanent HANG, not a crash: both `lasagna.repeat_last` and
-    `lasagna.start_optimization` used to be able to reach an interactive
-    QMessageBox/dialog path (via `repeatLastLasagnaAction()`'s
-    `lasagnaOptimizeRequested` signal, and via `showLasagnaConfigError`'s
-    unconditional `QMessageBox::warning` for an unreadable/invalid config) that
-    nothing can dismiss offscreen. Fixed by routing repeat_last through a new
-    `repeatLastLasagnaActionHeadless` and gating the dialog behind a
-    `_suppressInteractiveDialogs` flag set for the duration of any headless call.
+    No Lasagna Python service is assumed. Every timeout checks process liveness,
+    and the headless calls must never open an interactive dialog.
     """
 
     def call_checked(name: str, method: str, params: dict | None = None,
@@ -72,7 +64,7 @@ def run_lasagna_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) ->
         call_expect_error("lasagna.ensure_service (internal, script not installed)",
                            "lasagna.ensure_service", {}, -32005)
 
-        # 3. list_datasets / jobs -- deferred (SPEC §8.4); with no service
+        # 3. list_datasets / jobs -- deferred; with no service
         # running both must fail cleanly and quickly, never hang.
         call_expect_error("lasagna.list_datasets (no service)", "lasagna.list_datasets", {}, -32005)
         call_expect_error("lasagna.jobs (no service)", "lasagna.jobs", {}, -32005)
@@ -108,7 +100,7 @@ def run_lasagna_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) ->
                            {"name": "not_a_real_workspace"}, -32602)
 
         # 9. Liveness proof: the process must still be fully responsive after
-        # everything above, including the two historically hang-prone calls.
+        # everything above, including both service-start paths.
         call_checked("ping after lasagna smoke (proves no hang)", "ping")
     except VC3DDiedError:
         return
@@ -516,8 +508,7 @@ def run_fiber_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> N
                          final_ids == baseline_ids,
                          f"final={sorted(final_ids)} baseline={sorted(baseline_ids)}")
 
-        # 13. Liveness proof after everything above (multiple historically
-        # dialog-prone calls ran; none may have wedged the event loop).
+        # Prove none of the dialog-prone calls wedged the event loop.
         call_checked("ping after fiber smoke (proves no hang)", "ping", timeout=10.0)
     except VC3DDiedError:
         return

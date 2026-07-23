@@ -135,7 +135,7 @@ QJsonValue windingToJson(float winding)
 
 
 // ---------------------------------------------------------------------------
-// points.commit / points.list — authoring + read-back (SPEC §3.13-3.14)
+// points.commit / points.list — authoring + read-back
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handlePointsCommit(const QJsonValue& params)

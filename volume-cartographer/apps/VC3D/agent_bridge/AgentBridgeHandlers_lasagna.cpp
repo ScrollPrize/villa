@@ -61,7 +61,7 @@
 #include "vc/ui/VCCollection.hpp"
 
 
-// --- Lasagna RPCs (SPEC §11) + workspace switching (SPEC §11.9) ---
+// --- Lasagna RPCs + workspace switching ---
 
 QJsonObject AgentBridgeServer::handleLasagnaServiceStatus(const QJsonValue&)
 {
@@ -91,7 +91,7 @@ QJsonObject AgentBridgeServer::handleLasagnaEnsureService(const QJsonValue& para
 
     if (hasHost && hasPort) {
         // External mode: connectToExternal pings GET /health asynchronously;
-        // completion is deferred (SPEC §8.4) on serviceStarted/serviceError.
+        // completion is deferred on serviceStarted/serviceError.
         const QString host = p.value("host").toString();
         const int port = p.value("port").toInt();
         const int token = beginDeferred(15000, "Lasagna external service connect");
@@ -209,7 +209,7 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
     // The optimizationStarted/jobStarted signals may already have fired
     // synchronously (direct connection, same thread) and registered this as
     // an external job via handleLasagnaStarted/handleLasagnaJobStarted --
-    // reuse that record rather than double-registering (SPEC §8.3).
+    // reuse that record rather than double-registering.
     QString jobId;
     auto it = _activeJobs.find(QStringLiteral("lasagna"));
     if (it != _activeJobs.end()) {
@@ -280,7 +280,7 @@ QJsonObject AgentBridgeServer::handleLasagnaCancel(const QJsonValue& params)
             }
             serviceJobId = job->externalId;
         } else {
-            serviceJobId = jobId;  // raw service job id passthrough (SPEC §11.6).
+            serviceJobId = jobId;  // raw service job id passthrough.
         }
         if (!mgr.isRunning()) {
             QJsonObject data;
@@ -345,7 +345,7 @@ QJsonObject AgentBridgeServer::handleLasagnaRepeatLast(const QJsonValue&)
 
     // repeatLastLasagnaAction() re-emits lasagnaOptimizeRequested, which
     // CWindow routes to the *interactive* startOptimization(state,
-    // statusBar()) overload -- unsafe here (SPEC §1.3). Use the headless
+    // statusBar()) overload -- unsafe here. Use the headless
     // twin, which calls startOptimizationHeadless directly instead.
     QString errorMessage;
     const bool started = panel->repeatLastLasagnaActionHeadless(state, &errorMessage);

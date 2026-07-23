@@ -64,7 +64,7 @@ OPEN_DATA_MANIFEST_URL = (
 
 
 def probe_manifest_reachable(timeout: float = 8.0) -> tuple[bool, str]:
-    """Quick network probe of the Open Data manifest URL (SPEC §10.1). Returns
+    """Quick network probe of the Open Data manifest URL. Returns
     (reachable, detail). A HEAD-like GET with a tiny read is enough to confirm
     the endpoint answers; we do not parse the (large) body here."""
     try:

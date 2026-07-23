@@ -62,7 +62,7 @@
 
 
 // ---------------------------------------------------------------------------
-// Line-annotation / fiber RPCs (SPEC §13)
+// Line-annotation / fiber RPCs
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -84,8 +84,8 @@ QString captureFiberError(LineAnnotationController* controller, Operation&& oper
     return error;
 }
 
-// Parses a fiber id param: a decimal string (the canonical wire form — uint64
-// ids serialize as strings, SPEC §13.2) or a non-negative integer number.
+// Parses a fiber id param: a decimal string (the canonical wire form because
+// uint64 ids serialize as strings) or a non-negative integer number.
 uint64_t jsonToFiberId(const QJsonValue& value, const char* paramName)
 {
     QJsonObject data;
@@ -161,8 +161,7 @@ QJsonObject AgentBridgeServer::handleFiberLaunch(const QJsonValue& params)
     if (!chunked->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    // Position conversion per §3.6 conventions (same round-trip rule as
-    // canvas.click).
+    // Use the same position round-trip rule as canvas.click.
     const QString space =
         p.value("space").toString(QStringLiteral("volume"));
     QPointF scenePos;
@@ -266,7 +265,7 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
     const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
     requireKnownFiber(ctrl, fiberId);
 
-    // At most one selector (SPEC §13.3).
+    // At most one selector.
     int selectors = 0;
     if (p.contains("controlPointIndex")) ++selectors;
     if (p.contains("linePointIndex")) ++selectors;
@@ -375,7 +374,7 @@ QJsonObject AgentBridgeServer::handleFiberDelete(const QJsonValue& params)
     for (const QJsonValue& v : idsv.toArray())
         ids.push_back(jsonToFiberId(v, "fiberIds"));
 
-    // All-or-nothing validation (SPEC §13.6): any unknown id fails the call.
+    // All-or-nothing validation: any unknown id fails the call.
     for (uint64_t id : ids)
         requireKnownFiber(ctrl, id);
 
@@ -449,10 +448,9 @@ QJsonObject AgentBridgeServer::handleFiberCreateAtlas(const QJsonValue& params)
     const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
     requireKnownFiber(ctrl, fiberId);
 
-    // Deviates from §13.8's deferred design: createAtlasFromFiber is fully
-    // synchronous (atlasCreated fires before return) and its dialogs (showError
-    // / rebuild QMessageBox::question) violate §1.3, so we run the headless
-    // split and display via the proven displayAtlasFromDirectoryHeadless (§12.1).
+    // createAtlasFromFiber is synchronous, but its error and rebuild dialogs are
+    // unsafe for remote calls. Run the dialog-free split and display the result
+    // through displayAtlasFromDirectoryHeadless.
     QString err;
     std::filesystem::path atlasDir;
     if (!ctrl->createAtlasFromFiberHeadless(fiberId, &err, &atlasDir)) {

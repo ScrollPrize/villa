@@ -32,10 +32,10 @@ async def vc3d_open_catalog_sample(
 ) -> dict[str, Any]:
     """Open an Open Data catalog sample by its manifest sample id. Async: a
     remote open is a multi-second-to-multi-minute network operation, so this
-    returns a jobId immediately (SPEC §18.4).
+    returns a jobId immediately.
 
-    resources: optional resource-selection filter to attach only a subset
-    (SPEC §10.3). Omit to attach everything (original behavior). Shape:
+    resources: optional resource-selection filter to attach only a subset.
+    Omit it to attach everything. Shape:
     {"volumeIds": [str],            # subset of the sample's volume ids
      "representationRefs": [str],   # "vi:ai" refs from vc3d_describe_catalog_sample
      "kinds": [str]}                # subset of "normal_grids"|"lasagna"|"prediction"

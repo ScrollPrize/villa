@@ -40,7 +40,7 @@ class FakeAgentBridgeServer:
         self._rotation: dict[str, float] = {}
         # Axis-aligned slice mode (viewer.set_axis_aligned_slices / state.get).
         self._axis_enabled: bool = False
-        # Same-wrap annotation state (SPEC §3.9d): the mode checkbox and whether a
+        # Same-wrap annotation state: the mode checkbox and whether a
         # chunked viewer holds an uncommitted preview (seeded by shift-click).
         self._wrap_enabled: bool = False
         self._wrap_has_preview: bool = False

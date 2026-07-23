@@ -496,7 +496,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_set_point_collection_metadata` | `points.set_collection_metadata` |
 | `vc3d_set_point_collection_tag` | `points.set_collection_tag` |
 | `vc3d_set_point_windings_linked` | `points.set_windings_linked` |
-| `vc3d_set_render_settings` | `viewer.set_render_settings` | Set any subset of the viewer render/overlay settings; returns the full settings after applying. The five toggle/highlight fields are no-ops when no viewer is open (§24.2). |
+| `vc3d_set_render_settings` | `viewer.set_render_settings` | Set any subset of the viewer render/overlay settings; returns the full settings after applying. Viewer-specific toggle and highlight fields are no-ops when no viewer is open. |
 | `vc3d_set_segment_tag` | `tags.set` |
 | `vc3d_set_wrap_annotation_mode` | `wrap_annotation.set_mode` | Enable/disable "Same-wrap annotation mode" (prerequisite for the shift+E commit workflow; seed the preview via `vc3d_shift_click`). |
 | `vc3d_shift_click` | `canvas.shift_click` | Shift+click convenience: the canonical place-point / set-focus gesture. |

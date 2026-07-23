@@ -7,7 +7,7 @@
 #include <QJsonObject>
 #include <QString>
 
-// Thrown by handlers to produce a JSON-RPC error response. Codes follow SPEC §2.5.
+// Thrown by handlers to produce a bridge-specific JSON-RPC error response.
 struct AgentBridgeError {
     int code;
     QString message;

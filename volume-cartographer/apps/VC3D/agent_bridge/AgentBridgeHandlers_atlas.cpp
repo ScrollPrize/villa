@@ -62,7 +62,7 @@
 
 
 // ---------------------------------------------------------------------------
-// Atlas RPCs (SPEC §12)
+// Atlas RPCs
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleAtlasOpen(const QJsonValue& params)
@@ -82,8 +82,8 @@ QJsonObject AgentBridgeServer::handleAtlasOpen(const QJsonValue& params)
 
     std::filesystem::path dir(atlasDirStr.toStdString());
     if (dir.is_relative()) {
-        // Relative paths resolve against the volpkg root (SPEC §12.1), same
-        // derivation as CWindow::loadAndDisplayAtlas.
+        // Match CWindow::loadAndDisplayAtlas by resolving relative paths
+        // against the volpkg root.
         const std::filesystem::path volpkgRoot = vpkg->path().empty()
             ? std::filesystem::path(vpkg->getVolpkgDirectory())
             : vpkg->path().parent_path();
@@ -97,7 +97,7 @@ QJsonObject AgentBridgeServer::handleAtlasOpen(const QJsonValue& params)
         throw AgentBridgeError{-32007, "Atlas directory not found", data};
     }
 
-    // Headless open (SPEC §12.1 safety split): never the rebuild prompt or a
+    // The headless path never opens the rebuild prompt or a
     // warning dialog — failures come back as the exception text.
     QString err;
     if (!_window->displayAtlasFromDirectoryHeadless(dir, &err)) {
@@ -179,7 +179,7 @@ QJsonObject AgentBridgeServer::handleAtlasSearchStart(const QJsonValue& params)
     if (p.contains("maxDistance")) {
         sp.maxDistance = p.value("maxDistance").toDouble();
     }
-    // else: keep the current spin-box value (SPEC §12.3) — the headless
+    // else: keep the current spin-box value — the headless
     // launcher reads the persisted QSettings key.
 
     requireSourceIdle(QStringLiteral("atlas"));
@@ -196,7 +196,7 @@ QJsonObject AgentBridgeServer::handleAtlasSearchStart(const QJsonValue& params)
     if (!_window->startAtlasFiberIntersectionSearchHeadless(sp, &err)) {
         QJsonObject data;
         data["detail"] = err;
-        // -32007 for the atlas-shaped preconditions (SPEC §12.3); everything
+        // -32007 for the atlas-shaped preconditions; everything
         // else (no fibers / no lasagna dataset / already running) is -32005.
         if (err.contains(QLatin1String("no saved fiber mappings"), Qt::CaseInsensitive) ||
             err.contains(QLatin1String("Select an atlas"), Qt::CaseInsensitive)) {
@@ -307,7 +307,7 @@ QJsonObject AgentBridgeServer::handleAtlasOpenResult(const QJsonValue& params)
     }
 
     // Mirror the interactive slot's preconditions (CWindow::openAtlasSearchResult)
-    // without its QMessageBoxes (SPEC §1.3).
+    // without its QMessageBoxes.
     if (!_window->_lineAnnotationController || !_window->_intersectionsMdiArea) {
         QJsonObject data;
         data["detail"] = "intersections workspace is not available";

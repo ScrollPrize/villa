@@ -60,7 +60,7 @@
 
 
 // ---------------------------------------------------------------------------
-// Flattening RPCs (SPEC §20): flatten.slim / flatten.abf / flatten.straighten
+// Flattening RPCs: flatten.slim / flatten.abf / flatten.straighten
 // ---------------------------------------------------------------------------
 
 // Shared launch body for all three flatten RPCs: the handler builds `launch`
@@ -75,7 +75,7 @@ QJsonObject AgentBridgeServer::launchFlattenJob(
                              QString* outDir)>& launch)
 {
     // Only one flatten at a time (its own source, so it may run concurrently
-    // with a "tool"/"growth"/etc. job, §8.3).
+    // with a "tool", "growth", or other source-specific job).
     requireSourceIdle(QStringLiteral("flatten"));
 
     SegmentationCommandHandler* handler =
@@ -129,7 +129,7 @@ QJsonObject AgentBridgeServer::handleFlattenSlim(const QJsonValue& params)
         throw AgentBridgeError{-32602, "segmentId is required", data};
     }
 
-    SegmentationCommandHandler::SlimFlattenParams sp;  // headless defaults (§20)
+    SegmentationCommandHandler::SlimFlattenParams sp;  // headless defaults
 
     sp.iterations = p.value("iterations").toInt(sp.iterations);
     sp.tolerance = p.value("tolerance").toDouble(sp.tolerance);

@@ -19,7 +19,7 @@ from vc3d_process import VC3DProcess
 def _poll_catalog_job(client: BridgeClient, proc: VC3DProcess, rec: Recorder,
                       job_id: str, step_name: str,
                       deadline_s: float = 300.0) -> tuple[dict | None, bool]:
-    """Poll job.status until terminal (SPEC §18.4/§18.6).
+    """Poll job.status until terminal.
 
     Returns (terminal_record, timed_out). On a client-side TimeoutError or on
     deadline expiry, checks proc.exit_code() FIRST: alive => (None, True) so the
@@ -51,8 +51,9 @@ def _poll_catalog_job(client: BridgeClient, proc: VC3DProcess, rec: Recorder,
 def _open_sample_via_job(client: BridgeClient, proc: VC3DProcess, rec: Recorder,
                          params: dict, step_name: str,
                          deadline_s: float = 300.0) -> tuple[dict | None, bool]:
-    """Start catalog.open_sample (§18.4 job flow) and wait for its terminal
-    state. Returns (result_body, timed_out).
+    """Start catalog.open_sample and wait for its terminal state.
+
+    Returns (result_body, timed_out).
 
     - The RPC itself must return {jobId, source:"catalog"} promptly (<=10 s); it
       no longer blocks on the network.
@@ -87,8 +88,7 @@ def run_catalog_resource_selection_smoke(client: BridgeClient, rec: Recorder,
     proves the read-only surface end-to-end and that a resources filter attaches
     a strict subset while an unfiltered open still attaches everything.
 
-    `proc` is used for the SPEC §18.6 liveness rule: a client timeout on a dead
-    VC3D is a crash failure, never a silent deferral.
+    A client timeout on a dead VC3D is a crash failure, never a silent deferral.
     """
     try:
         _run_catalog_resource_selection_smoke_impl(client, rec, proc)
@@ -238,8 +238,8 @@ def _run_catalog_resource_selection_smoke_impl(client: BridgeClient, rec: Record
             client, proc, rec, {"sampleId": sample_id},
             "unfiltered open_sample regression", deadline_s=300.0)
         if timed_out:
-            # SPEC §18.6 rule 1: a deferral is only allowed because the poll
-            # helper already confirmed VC3D is still alive on deadline expiry.
+            # The poll helper confirmed VC3D was still alive at the deadline,
+            # so this slow network operation may be deferred.
             rec.step("catalog.open_sample unfiltered regression DEFERRED "
                      "(full remote open exceeded the offscreen deadline; VC3D "
                      "still alive, not a failure)",
@@ -259,17 +259,14 @@ def _run_catalog_resource_selection_smoke_impl(client: BridgeClient, rec: Record
         rec.step("catalog.open_sample unfiltered regression", False,
                  f"code={e.code} message={e.message} data={e.data}")
 
-    # 4b. Crash regression (SPEC §18.6 rule 3): TWO consecutive opens in one
-    # process (the §18.1 reproducer). The first left a background prefill watcher
-    # running; the second cancels it -- the exact sequence that used to SIGSEGV
-    # at 0x28. After both terminal states, VC3D must still be alive. Also fires a
-    # third open while the second is still running and asserts a clean -32004
-    # (in-flight guard) rather than a crash.
+    # Opening twice in one process exercises prefill-watcher replacement. After
+    # both terminal states VC3D must remain alive; an overlapping request must
+    # be rejected cleanly with -32004.
     run_catalog_double_open_crash_regression(client, rec, proc, sample_id)
 
     # 5. Strict clean-cache subset proof (independent verification addendum).
-    # The checks above tolerate the documented cache caveat (SPEC §10.5: a
-    # reopen over an already-fuller local cache does not prune stale
+    # The checks above tolerate the documented cache caveat: reopening over an
+    # already-fuller local cache does not prune stale
     # volume/normal-grid entries), so "no_new_derived" alone does not prove a
     # STRICT subset was attached if the chosen sample happened to already be
     # cached from a prior run. This step removes that ambiguity by picking a
@@ -284,12 +281,10 @@ def _run_catalog_resource_selection_smoke_impl(client: BridgeClient, rec: Record
 
 def run_catalog_double_open_crash_regression(client: BridgeClient, rec: Recorder,
                                              proc: VC3DProcess, sample_id: str) -> None:
-    """SPEC §18.6 rule 3: the direct regression proof for the §18.1 SIGSEGV.
+    """Prove repeated and overlapping catalog opens remain safe.
 
-    Two consecutive catalog.open_sample calls (filtered then unfiltered) in one
-    process, each awaited to a terminal state, then assert proc.exit_code() is
-    None. Then issue a third open while a fourth is still running and assert a
-    clean -32004 in-flight rejection (never a crash).
+    Await two consecutive opens, then issue another pair to verify that the
+    in-flight request is rejected with -32004.
     """
     # Two consecutive opens (the reproducer). Each awaited to terminal.
     _open_sample_via_job(client, proc, rec, {"sampleId": sample_id},
@@ -301,8 +296,7 @@ def run_catalog_double_open_crash_regression(client: BridgeClient, rec: Recorder
                          {"sampleId": sample_id, "resources": {}},
                          "crash regression open #2", deadline_s=300.0)
     survived = proc.exit_code() is None
-    rec.step("CRASH REGRESSION (SPEC §18.1): two consecutive catalog.open_sample "
-             "calls in one process do not crash VC3D",
+    rec.step("two consecutive catalog.open_sample calls keep VC3D alive",
              survived,
              f"proc.exit_code()={proc.exit_code()} (None=alive)")
     if not survived:
@@ -410,7 +404,7 @@ def run_catalog_strict_subset_and_volume_select(client: BridgeClient, rec: Recor
     # 5b. Reopen with BOTH volume ids (still kinds=[]) so vol_b becomes
     # available for a real volume.select switch, without paying the ~10min+
     # cost of a fully unfiltered open (which also streams-attaches normal
-    # grids/lasagna per SPEC §10.5's observed timing).
+    # grids/lasagna left by an earlier open).
     try:
         fr2, timed_out2 = _open_sample_via_job(
             client, proc, rec,

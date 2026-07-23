@@ -26,8 +26,8 @@
 // Per-segment mesh operations. Sync dialog-free ops (crop, recalc_area) call a
 // SegmentationCommandHandler / SurfaceAreaCalculator entry directly; async ops
 // drive a headless start* launcher tracked as a job -- external-tool ones share
-// the source:"tool" slot (§8.3, like render.tifxyz), the in-process mask render
-// resolves via the §8.4 deferred mechanism.
+// the source:"tool" slot like render.tifxyz; the in-process mask render resolves
+// via the deferred-response mechanism.
 // ===========================================================================
 
 
@@ -309,8 +309,7 @@ QJsonObject AgentBridgeServer::handleSegmentRefineAlphaComp(const QJsonValue& pa
 
 
 // ---------------------------------------------------------------------------
-// segment.generate_mask / segment.append_mask (async in-process,
-// deferred response — SPEC §8.4)
+// segment.generate_mask / segment.append_mask (deferred in-process work)
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleSegmentGenerateMask(const QJsonValue& params)
@@ -366,7 +365,7 @@ QJsonObject AgentBridgeServer::handleSegmentMask(const QJsonValue& params, bool 
     }
 
     // The render runs on a QtConcurrent worker with no bridge-visible completion
-    // signal today, so resolve the RPC via the deferred mechanism (§8.4): the
+    // signal today, so resolve the RPC via the deferred mechanism: the
     // reply is written from the worker's finished callback.
     const int token = beginDeferred(
         120000, append ? QStringLiteral("append mask render")

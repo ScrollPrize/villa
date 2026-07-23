@@ -61,7 +61,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
 
-// Same-winding wrap annotation (SPEC §3.9d): human flow is enable "Same-wrap
+// Same-winding wrap annotation: human flow is enable "Same-wrap
 // annotation mode" -> shift-click a chunked viewer to seed preview points ->
 // shift+E to commit (Ctrl+Z undoes). These RPCs expose set_mode/commit/undo;
 // preview is seeded via canvas.shift_click, exactly as for a human.
@@ -107,8 +107,8 @@ QJsonObject AgentBridgeServer::handleWrapAnnotationCommit(const QJsonValue& para
     bool hadPreview = false;
 
     if (p.contains("viewer") && !p.value("viewer").isNull()) {
-        // Explicit target: resolve it and commit on that one (§3.6-style
-        // resolution, like canvas.click).
+        // Resolve an explicit target and commit on that viewer, using the same
+        // round-trip resolution as canvas.click.
         VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
         auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
         if (!chunked) {

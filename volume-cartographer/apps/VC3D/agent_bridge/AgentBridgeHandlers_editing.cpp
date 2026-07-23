@@ -118,7 +118,7 @@ QJsonArray modifiersToJson(Qt::KeyboardModifiers mods)
 
 
 // ---------------------------------------------------------------------------
-// Canvas + viewer control (SPEC §3.6-3.9)
+// Canvas + viewer control
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool addShift)
@@ -152,7 +152,7 @@ QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool 
         const cv::Vec3f vol = jsonToVec3(p.value("position"), "position");
         scenePos = chunked->volumeToScene(vol);
         // Verify the round-trip lands within 2.0 voxels: otherwise the point is
-        // not on this viewer's current slice/surface view (SPEC §3.6).
+        // not on this viewer's current slice/surface view.
         const cv::Vec3f back = chunked->sceneToVolume(scenePos);
         const double dist = cv::norm(back - vol);
         if (!std::isfinite(dist) || dist > 2.0) {
@@ -166,7 +166,7 @@ QJsonObject AgentBridgeServer::handleCanvasClick(const QJsonValue& params, bool 
 
     // Synthesize the full click through the real mouse slots so all signal
     // wiring (sendVolumeClicked -> CWindow::onVolumeClicked, point placement,
-    // tools) fires exactly as for a human click (SPEC §3.6).
+    // tools) fires exactly as for a human click.
     chunked->onMousePress(scenePos, button, modifiers);
     chunked->onMouseRelease(scenePos, button, modifiers);
     chunked->onVolumeClicked(scenePos, button, modifiers);
@@ -314,7 +314,7 @@ QJsonObject AgentBridgeServer::handleViewerSetAxisAlignedSlices(const QJsonValue
 
 
 // ---------------------------------------------------------------------------
-// Segmentation editing + growth (SPEC §3.10-3.12)
+// Segmentation editing + growth
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue& params)
@@ -333,7 +333,7 @@ QJsonObject AgentBridgeServer::handleSegmentationEnableEditing(const QJsonValue&
         throw AgentBridgeError{-32009, "Segmentation editing unavailable", data};
     }
 
-    // Enabling requires an active surface to edit (SPEC §3.10).
+    // Enabling requires an active surface to edit.
     if (enabled && state->activeSurfaceId().empty()) {
         QJsonObject data;
         data["kind"] = "segment";
@@ -371,8 +371,8 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
     // Growth method accepted by the wire contract.
     const QString methodStr =
         p.value("method").toString(QStringLiteral("tracer"));
-    // Footgun fix (§8.1): manual-add is an interactive editing mode, not a grow
-    // invocation. Feeding SegmentationGrowthMethod::ManualAdd through
+    // Manual-add is an interactive editing mode, not a grow invocation.
+    // Feeding SegmentationGrowthMethod::ManualAdd through
     // onGrowSegmentationSurface from the bridge would bypass the mode's session
     // state, so the RPC rejects it and points at the future manual_add RPCs.
     // The C++ enum value itself is untouched (the in-app apply path still uses it).
@@ -419,12 +419,12 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
     const int steps = p.value("steps").toInt();
     const bool inpaintOnly = p.value("inpaintOnly").toBool(false);
 
-    // Growth is the "growth" source; a concurrent tool/lasagna/atlas job is fine
-    // (§8.3), but a second growth job is not.
+    // Growth has its own source, so other job types may run concurrently but a
+    // second growth job may not.
     requireSourceIdle(QStringLiteral("growth"));
 
     // The grower operates on the surface registered under the "segmentation"
-    // slot; without it there is nothing to grow (SPEC §3.11 -> -32007).
+    // slot; without it there is nothing to grow.
     if (!state->surface("segmentation")) {
         QJsonObject data;
         data["kind"] = "segment";
@@ -469,7 +469,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrow(const QJsonValue& params)
 QJsonObject AgentBridgeServer::handleSegmentationSave(const QJsonValue&)
 {
     // Force the pending autosave to disk and report the flush as an async
-    // "autosave"-source job (SPEC §3.11c). Params are ignored ({} accepted).
+    // "autosave"-source job. Params are ignored ({} accepted).
     SegmentationModule* mod = _window ? _window->_segmentationModule.get() : nullptr;
     if (!mod) {
         QJsonObject data;
@@ -541,7 +541,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
     // GrowPatch runs the external vc_grow_seg_from_seed process: the "tool"
-    // source (§8.3).
+    // source.
     requireSourceIdle(QStringLiteral("tool"));
 
     const cv::Vec3f seed = jsonToVec3(p.value("seed"), "seed");
@@ -611,7 +611,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
 
 
 // ---------------------------------------------------------------------------
-// Manual-add (hole-fill) + corrections point authoring (SPEC §9.2-9.7)
+// Manual-add (hole-fill) + corrections point authoring
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleManualAddBegin(const QJsonValue&)
@@ -623,7 +623,7 @@ QJsonObject AgentBridgeServer::handleManualAddBegin(const QJsonValue&)
         data["detail"] = "segmentation module is not available";
         throw AgentBridgeError{-32000, "Segmentation module unavailable", data};
     }
-    // §9.2 preconditions: editing enabled, active edit session, no growth.
+    // Point authoring requires an active edit session with no growth in flight.
     if (!widget->isEditingEnabled())
         throw AgentBridgeError{-32008, "Segmentation editing is not enabled", {}};
     if (!mod->hasActiveSession()) {
@@ -764,7 +764,7 @@ QJsonObject AgentBridgeServer::handleCorrectionsSetPointMode(const QJsonValue& p
         throw AgentBridgeError{-32000, "Segmentation module unavailable", data};
     }
 
-    // Enabling enforces the same preconditions as the G-key handler (§9.7);
+    // Enabling enforces the same preconditions as the G-key handler;
     // disabling always succeeds. Pre-check here so failures map to the
     // documented JSON-RPC error codes rather than a generic false.
     if (active) {
@@ -786,13 +786,8 @@ QJsonObject AgentBridgeServer::handleCorrectionsSetPointMode(const QJsonValue& p
 }
 
 
-// NOTE: the deferred-response mechanism (beginDeferred / completeDeferredResult
-// / completeDeferredError, plus the AgentBridgeDeferred dispatch path) is
-// bridge-core infrastructure per SPEC §8.4, not yet wired to a shipping method
-// (lasagna.* / atlas.* / fiber.create_atlas arrive later); timeout -> -32005.
-
 // ---------------------------------------------------------------------------
-// canvas.drag (SPEC §9.1)
+// canvas.drag
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleCanvasDrag(const QJsonValue& params)
@@ -809,7 +804,7 @@ QJsonObject AgentBridgeServer::handleCanvasDrag(const QJsonValue& params)
     if (!chunked->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
-    // button, incl. the "none" hover-only variant (§9.1).
+    // button, incl. the "none" hover-only variant.
     const QJsonValue btnv = p.value("button");
     const QString btnStr = btnv.toString(QStringLiteral("left"));
     const bool buttonNone = (btnStr == QLatin1String("none"));
@@ -824,7 +819,7 @@ QJsonObject AgentBridgeServer::handleCanvasDrag(const QJsonValue& params)
         p.value("space").toString(QStringLiteral("volume"));
 
     // Convert one endpoint (Vec3 volume, or {x,y} scene) to a scene point,
-    // reusing the §3.6 round-trip validation. `name` is "from" / "to".
+    // reusing the click path's round-trip validation. `name` is "from" / "to".
     auto convertEndpoint = [&](const QJsonValue& v, const char* name) -> QPointF {
         if (space == QLatin1String("scene")) {
             const QJsonObject o = v.toObject();
@@ -850,7 +845,7 @@ QJsonObject AgentBridgeServer::handleCanvasDrag(const QJsonValue& params)
     const QPointF sceneTo = convertEndpoint(p.value("to"), "to");
 
     // Dispatch press -> steps x move -> release through the real mouse slots so
-    // all signal wiring fires exactly as for a human drag (§9.1). For
+    // all signal wiring fires exactly as for a human drag. For
     // button:"none" the press/release are skipped (hover-only positioning).
     if (!buttonNone)
         chunked->onMousePress(sceneFrom, button, modifiers);

@@ -104,7 +104,7 @@ void AgentBridgeServer::completeCatalogOpenJob(
         message = outcome.error.isEmpty()
             ? QStringLiteral("Open Data sample open failed")
             : outcome.error;
-        // resultJson stays empty -> "result": null on the wire (SPEC §18.4).
+        // resultJson stays empty -> "result": null on the wire.
     }
 
     _catalogOpenSampleId.clear();
@@ -112,7 +112,7 @@ void AgentBridgeServer::completeCatalogOpenJob(
 }
 
 // ---------------------------------------------------------------------------
-// Job tracking (SPEC §2.4, §3.17-3.18)
+// Job tracking
 // ---------------------------------------------------------------------------
 
 void AgentBridgeServer::subscribeJobSignals()
@@ -139,12 +139,12 @@ void AgentBridgeServer::subscribeJobSignals()
         connect(_window->_segmentationModule.get(), &SegmentationModule::growthInProgressChanged,
                 this, [this](bool running) { handleGrowthStatusChanged(running); });
         // Explicit segment save/flush lifecycle -> source:"autosave" jobs
-        // (SPEC §3.11c). Closes the job opened by handleSegmentationSave.
+        // Closes the job opened by handleSegmentationSave.
         connect(_window->_segmentationModule.get(), &SegmentationModule::autosaveCompleted,
                 this, [this](bool success) { handleAutosaveCompleted(success); });
     }
 
-    // Flattening lifecycle -> source:"flatten" jobs (SPEC §8.3, §20). Emitted by
+    // Flattening lifecycle -> source:"flatten" jobs. Emitted by
     // the SlimJob / ABFJob / StraightenJob classes from BOTH the interactive
     // slots and the headless start* launchers, so human-initiated flattens are
     // registered as external jobs too.
@@ -160,7 +160,7 @@ void AgentBridgeServer::subscribeJobSignals()
                 });
     }
 
-    // Lasagna optimization lifecycle -> source:"lasagna" jobs (SPEC §8.3, §11.4).
+    // Lasagna optimization lifecycle -> source:"lasagna" jobs.
     // The singleton outlives the bridge, so the connections are lifetime-safe.
     LasagnaServiceManager* lasagna = &LasagnaServiceManager::instance();
     connect(lasagna, &LasagnaServiceManager::optimizationStarted, this,
@@ -195,7 +195,7 @@ void AgentBridgeServer::subscribeJobSignals()
                 handleLasagnaResultsPlaced(outputDir, segmentNames);
             });
 
-    // Atlas fiber-search lifecycle -> source:"atlas" jobs (SPEC §12.9).
+    // Atlas fiber-search lifecycle -> source:"atlas" jobs.
     if (_window) {
         connect(_window, &CWindow::atlasSearchProgressChanged, this,
                 [this](int phase, double fraction) {
@@ -207,7 +207,7 @@ void AgentBridgeServer::subscribeJobSignals()
                 });
     }
 
-    // Batch seeding lifecycle -> source:"seeding" jobs (SPEC §15.2). Emitted from
+    // Batch seeding lifecycle -> source:"seeding" jobs. Emitted from
     // the SeedingWidget QProcess finished callbacks (run/expand). Only
     // bridge-initiated batches become tracked jobs (see handleSeedingBatch*).
     if (_window && _window->_seedingWidget) {
@@ -244,7 +244,7 @@ bool AgentBridgeServer::jobIsRunning(const QString& source) const
         // Lifecycle authority for seeding batches: seedingBatchActive() is true
         // only while a run/expand batch is draining (not a neural trace, which
         // shares the widget's jobsRunning flag) — so a human-initiated Run/Expand
-        // click is also seen as busy here (SPEC §15.2).
+        // click is also seen as busy here.
         if (source == QLatin1String("seeding") && _window->_seedingWidget &&
             _window->_seedingWidget->seedingBatchActive())
             return true;
@@ -315,7 +315,7 @@ void AgentBridgeServer::finishJob(const QString& source, bool success,
 
     broadcastJobProgress(job, QStringLiteral("finished"), QString(), success);
 
-    // Retain the last <=8 completed jobs per source (§8.3).
+    // Retain the last <=8 completed jobs per source.
     std::deque<JobRecord>& hist = _recentJobs[source];
     hist.push_back(job);
     while (hist.size() > 8)
@@ -363,7 +363,7 @@ void AgentBridgeServer::broadcastJobProgress(JobRecord& job, const QString& phas
     QJsonObject params;
     params["jobId"] = job.id;
     params["seq"] = static_cast<double>(job.nextProgressSeq++);
-    params["source"] = job.source;   // required in v2 (§8.3)
+    params["source"] = job.source;
     params["kind"] = job.kind;
     params["phase"] = phase;
     const QString msg = messageOverride.isEmpty() ? job.message : messageOverride;
@@ -373,7 +373,7 @@ void AgentBridgeServer::broadcastJobProgress(JobRecord& job, const QString& phas
         params["success"] = *success;
         if (!job.outputPath.isEmpty())
             params["outputPath"] = job.outputPath;
-        // Terminal job.progress carries the result body too (SPEC §18.4).
+        // Terminal job.progress carries the result body too.
         params["result"] = job.resultJson.isEmpty() ? QJsonValue(QJsonValue::Null)
                                                      : QJsonValue(job.resultJson);
     }
@@ -409,7 +409,7 @@ QJsonObject AgentBridgeServer::jobStatusJson(const JobRecord& job) const
     o["finishedAtMs"] = job.finishedAtMs == 0
                             ? QJsonValue(QJsonValue::Null)
                             : QJsonValue(static_cast<double>(job.finishedAtMs));
-    // Additive result body (SPEC §18.4): obj for "catalog" jobs, null otherwise.
+    // Additive result body: obj for "catalog" jobs, null otherwise.
     o["result"] = job.resultJson.isEmpty() ? QJsonValue(QJsonValue::Null)
                                            : QJsonValue(job.resultJson);
     return o;
@@ -421,7 +421,7 @@ void AgentBridgeServer::handleToolStarted(const QString& message)
     auto it = _activeJobs.find(QStringLiteral("tool"));
     if (it == _activeJobs.end()) {
         // Tool run initiated outside the bridge (e.g. a menu action): track it
-        // as an externally-initiated job (§8.3).
+        // as an externally-initiated job.
         beginJob(QStringLiteral("tool"), QStringLiteral("tool.external"), message,
                  /*broadcastStart=*/true);
     } else {
@@ -451,7 +451,7 @@ void AgentBridgeServer::handleConsoleOutput(const QString& output)
     while (job.consoleTail.size() > 50)
         job.consoleTail.removeFirst();
 
-    // Rate-limit job.progress "output" to <=10/sec, coalescing (SPEC §3.18).
+    // Rate-limit job.progress "output" to <=10/sec, coalescing.
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now - _lastConsoleBroadcastMs < 100)
         return;
@@ -475,7 +475,7 @@ void AgentBridgeServer::handleGrowthStatusChanged(bool running)
 
 void AgentBridgeServer::handleAutosaveCompleted(bool success)
 {
-    // Only close a bridge-initiated explicit save (SPEC §3.11c). Autosaves that
+    // Only close a bridge-initiated explicit save. Autosaves that
     // fire from the periodic timer / edit hooks are not tracked as jobs, so
     // finishJob is a no-op unless handleSegmentationSave opened one.
     if (!_activeJobs.contains(QStringLiteral("autosave")))
@@ -487,7 +487,7 @@ void AgentBridgeServer::handleAutosaveCompleted(bool success)
 }
 
 
-// --- Flattening lifecycle (SPEC §8.3, §20) ---
+// --- Flattening lifecycle ---
 
 void AgentBridgeServer::handleFlattenStarted(const QString& kind, const QString& label)
 {
@@ -495,7 +495,7 @@ void AgentBridgeServer::handleFlattenStarted(const QString& kind, const QString&
     if (it == _activeJobs.end()) {
         // A flatten launched outside the bridge (a human ran SLIM/ABF/Straighten
         // from the context menu): register it as an externally-initiated job so
-        // -32004 / state.get reflect true app state (§8.3). The kind carries the
+        // -32004 / state.get reflect true app state. The kind carries the
         // real flatten type (flatten.slim / flatten.abf / flatten.straighten).
         beginJob(QStringLiteral("flatten"), kind,
                  label.isEmpty() ? QStringLiteral("Flatten") : label,
@@ -513,7 +513,7 @@ void AgentBridgeServer::handleFlattenStarted(const QString& kind, const QString&
 void AgentBridgeServer::handleFlattenFinished(bool success, const QString& message,
                                               const QString& outputPath)
 {
-    // An empty message on failure denotes a user cancel (SPEC §20); surface a
+    // An empty message on failure denotes a user cancel; surface a
     // stable message so job.status is not blank.
     const QString msg = (!success && message.isEmpty())
                             ? QStringLiteral("Flatten cancelled")
@@ -522,13 +522,13 @@ void AgentBridgeServer::handleFlattenFinished(bool success, const QString& messa
 }
 
 
-// --- Lasagna optimization lifecycle (SPEC §8.3, §11.4) ---
+// --- Lasagna optimization lifecycle ---
 
 void AgentBridgeServer::handleLasagnaStarted()
 {
     // An optimization launched outside the bridge (a human clicked the panel):
     // register it as an externally-initiated job so -32004 / state.get reflect
-    // true app state (§8.3). A bridge-submitted job already exists here.
+    // true app state. A bridge-submitted job already exists here.
     if (!_activeJobs.contains(QStringLiteral("lasagna"))) {
         beginJob(QStringLiteral("lasagna"), QStringLiteral("lasagna.external"),
                  QStringLiteral("Lasagna optimization started"), /*broadcastStart=*/true);
@@ -584,7 +584,7 @@ void AgentBridgeServer::handleLasagnaProgress(const QString& stageName, int step
     while (job.consoleTail.size() > 50)
         job.consoleTail.removeFirst();
 
-    // Rate-limit job.progress "output" to <=10/sec (SPEC §3.18).
+    // Rate-limit job.progress "output" to <=10/sec.
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now - _lastConsoleBroadcastMs < 100)
         return;
@@ -621,11 +621,11 @@ void AgentBridgeServer::handleLasagnaResultsPlaced(const QString& outputDir,
 }
 
 
-// --- Atlas fiber-search lifecycle (SPEC §12.9) ---
+// --- Atlas fiber-search lifecycle ---
 
 void AgentBridgeServer::handleAtlasSearchProgress(int phase, double fraction)
 {
-    // Only bridge-initiated searches are tracked (SPEC §12.2): do NOT
+    // Only bridge-initiated searches are tracked: do NOT
     // auto-register an external job here — FinishResults progress also fires
     // on pure UI re-population (group-by-fiber checkbox), which would leak a
     // job that never finishes.
@@ -640,7 +640,7 @@ void AgentBridgeServer::handleAtlasSearchProgress(int phase, double fraction)
                               .arg(qRound(clamped * 100.0));
     job.message = label;
 
-    // Rate-limit job.progress "output" to <=10/sec (SPEC §3.18).
+    // Rate-limit job.progress "output" to <=10/sec.
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now - _lastConsoleBroadcastMs < 100)
         return;
@@ -663,7 +663,7 @@ void AgentBridgeServer::handleAtlasSearchFinished(bool success, int resultCount)
 }
 
 
-// --- Batch seeding lifecycle (SPEC §15.2) ---
+// --- Batch seeding lifecycle ---
 
 void AgentBridgeServer::handleSeedingBatchProgress(const QString& kind, int completed,
                                                    int total)
@@ -682,7 +682,7 @@ void AgentBridgeServer::handleSeedingBatchProgress(const QString& kind, int comp
     while (job.consoleTail.size() > 50)
         job.consoleTail.removeFirst();
 
-    // Rate-limit job.progress "output" to <=10/sec (SPEC §3.18).
+    // Rate-limit job.progress "output" to <=10/sec.
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now - _lastConsoleBroadcastMs < 100)
         return;
@@ -700,7 +700,7 @@ void AgentBridgeServer::handleSeedingBatchFinished(const QString& kind, bool suc
     if (!_activeJobs.contains(QStringLiteral("seeding")))
         return;
     // Both an execution failure and a user cancel map to a failed job; the widget
-    // supplies meaningful terminal text distinguishing them (SPEC §1). Fall back
+    // supplies meaningful terminal text distinguishing them. Fall back
     // to a synthesized label only if the widget passed none.
     QString label = message;
     if (label.isEmpty()) {

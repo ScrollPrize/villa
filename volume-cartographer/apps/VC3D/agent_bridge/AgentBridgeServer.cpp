@@ -68,7 +68,7 @@
 namespace {
 // Upper bound on a single framed request (and on the un-framed read buffer that
 // precedes a newline). One oversized client is reported + dropped without
-// affecting the others (SPEC §6).
+// affecting the others.
 constexpr int kMaxLineBytes = 1 * 1024 * 1024;  // 1 MiB
 
 class ScopedLineAnnotationDialogSuppression {
@@ -131,7 +131,7 @@ bool AgentBridgeServer::listen(const QString& serverName)
                 this, &AgentBridgeServer::onNewConnection);
     }
 
-    // Restrict the endpoint to the current user (SPEC §6): the bridge grants full
+    // Restrict the endpoint to the current user: the bridge grants full
     // control of the running app, so no other account should be able to connect.
     _server->setSocketOptions(QLocalServer::UserAccessOption);
 
@@ -140,7 +140,7 @@ bool AgentBridgeServer::listen(const QString& serverName)
     // rely on a listen() failure to detect this -- on Linux/Qt, QLocalServer::listen()
     // will reclaim (unlink + rebind) a name whose socket is still served by another
     // process, returning success and stranding that server. Probing first is the
-    // only reliable guard (SPEC §6: a live socket name is never unlinked as stale).
+    // only reliable guard: a live socket name is never unlinked as stale.
     {
         QLocalSocket probe;
         probe.connectToServer(serverName);
@@ -152,7 +152,7 @@ bool AgentBridgeServer::listen(const QString& serverName)
 
     if (!_server->listen(serverName)) {
         // No live server answered, but the endpoint still refused: a stale socket
-        // file from a crashed run. Remove once and retry (SPEC §6).
+        // file from a crashed run. Remove once and retry.
         QLocalServer::removeServer(serverName);
         if (!_server->listen(serverName))
             return false;
@@ -194,7 +194,7 @@ void AgentBridgeServer::writeRegistryFile()
     obj[QStringLiteral("startedAt")] =
         static_cast<double>(QDateTime::currentMSecsSinceEpoch());
 
-    // Publish atomically (SPEC §6): a QSaveFile writes to a temp sibling and
+    // Publish atomically: a QSaveFile writes to a temp sibling and
     // rename()s into place on commit, so a concurrent reader can never observe
     // (and reap) a half-written JSON file.
     QSaveFile f(filePath);
@@ -263,7 +263,7 @@ void AgentBridgeServer::onSocketReadyRead()
         buffer.remove(0, newlineIdx + 1);
         if (line.endsWith('\r'))
             line.chop(1);
-        // Reject a complete line whose own length exceeds the limit (SPEC §6).
+        // Reject a complete line whose own length exceeds the limit.
         if (line.size() > kMaxLineBytes) {
             sendError(socket, QJsonValue(QJsonValue::Null), -32600,
                       QStringLiteral("Invalid Request: request exceeds %1-byte limit")
@@ -279,8 +279,7 @@ void AgentBridgeServer::onSocketReadyRead()
 
     // Bound the unterminated remainder: an oversized request that never sends a
     // newline must not grow memory without limit. Any residual over the bound is
-    // a partial oversized line -- report (best-effort) and drop ONLY this client
-    // (SPEC §6).
+    // a partial oversized line -- report it best-effort and drop only this client.
     if (buffer.size() > kMaxLineBytes) {
         sendError(socket, QJsonValue(QJsonValue::Null), -32600,
                   QStringLiteral("Invalid Request: request exceeds %1-byte limit")
@@ -301,7 +300,7 @@ void AgentBridgeServer::onSocketDisconnected()
 
     // Drop any deferred responses still pending for this connection so their
     // timers do not fire against a dead socket and the (connection, method)
-    // guard does not leak (SPEC §8.4).
+    // guard does not leak.
     for (auto it = _pendingDeferred.begin(); it != _pendingDeferred.end();) {
         if (it->socket.data() == socket) {
             if (it->timer) {
@@ -328,7 +327,7 @@ void AgentBridgeServer::processLine(QLocalSocket* socket, const QByteArray& line
     }
 
     if (doc.isArray()) {
-        // Batch requests are not supported (SPEC §1.2).
+        // Batch requests are not supported.
         sendError(socket, QJsonValue(QJsonValue::Null), -32600,
                   "Invalid Request: batch requests are not supported");
         return;
@@ -384,7 +383,7 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
             ? _window->_lineAnnotationController.get()
             : nullptr);
 
-    // Per-request context: handlers that defer their response (SPEC §8.4) read
+    // Per-request context: handlers that defer their response read
     // this to stash the caller. Cleared after the handler returns/throws.
     _currentSocket = socket;
     _currentRequestId = id;
@@ -398,7 +397,7 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
         result = it.value()(params);
     } catch (const AgentBridgeDeferred&) {
         // The handler took ownership of the reply; it will be written later by
-        // a signal completion or the timeout (SPEC §8.4). Send nothing now.
+        // a signal completion or the timeout. Send nothing now.
         _currentSocket = nullptr;
         _currentRequestId = QJsonValue();
         _currentMethod.clear();
@@ -499,7 +498,7 @@ void AgentBridgeServer::broadcastNotification(const QString& method, const QJson
 
 
 // ---------------------------------------------------------------------------
-// Viewer registry (SPEC §2.2)
+// Viewer registry
 // ---------------------------------------------------------------------------
 
 void AgentBridgeServer::seedViewerRegistry()
@@ -706,7 +705,7 @@ void AgentBridgeServer::registerHandlers()
 
 
 // ---------------------------------------------------------------------------
-// Deferred responses (SPEC §8.4)
+// Deferred responses
 // ---------------------------------------------------------------------------
 
 int AgentBridgeServer::beginDeferred(int timeoutMs, const QString& signalDesc)
