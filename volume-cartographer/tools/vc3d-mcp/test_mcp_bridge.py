@@ -145,10 +145,18 @@ class FakeAgentBridgeServer:
         self._server = await asyncio.start_unix_server(self._handle_client, path=self.socket_path)
 
     async def stop(self) -> None:
-        for w in list(self._writers):
-            w.close()
         if self._server is not None:
             self._server.close()
+
+        writers = list(self._writers)
+        for w in writers:
+            w.close()
+        if writers:
+            await asyncio.gather(
+                *(w.wait_closed() for w in writers), return_exceptions=True
+            )
+
+        if self._server is not None:
             # Bound wait_closed(): on some CPython versions Server.wait_closed()
             # can block indefinitely if a client opened and immediately dropped a
             # connection (e.g. connect()'s abort-when-closed path) so it was
@@ -176,6 +184,11 @@ class FakeAgentBridgeServer:
         finally:
             if writer in self._writers:
                 self._writers.remove(writer)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
 
     async def _handle_line(self, raw: bytes, writer: asyncio.StreamWriter) -> None:
         msg = json.loads(raw.decode("utf-8"))
@@ -887,6 +900,7 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_write_failure_resets_connection(self) -> None:
         await self.client.call("ping")  # establish a live connection
+        real_writer = self.client._conn.writer
 
         class BadWriter:
             def is_closing(self):
@@ -899,11 +913,12 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
                 return None
 
             def close(self):
-                return None
+                real_writer.close()
 
         self.client._conn.writer = BadWriter()
         with self.assertRaises(BridgeConnectionError):
             await self.client.call("ping")
+        await real_writer.wait_closed()
         self.assertFalse(self.client.connected)
         self.assertIsNone(self.client._conn)
 
