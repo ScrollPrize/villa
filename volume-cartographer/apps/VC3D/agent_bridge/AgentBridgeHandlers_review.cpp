@@ -85,25 +85,21 @@ QJsonObject AgentBridgeServer::handleSegmentsReview(const QJsonValue& params)
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QJsonObject p = paramsObject(params);
-    const bool onlyLoaded = jsonOptionalBool(p, "onlyLoaded", false);
+    const QJsonObject p = params.toObject();
+    const bool onlyLoaded = p.value("onlyLoaded").toBool(false);
 
     // "filter" mirrors the surface panel's filter checkboxes: each true key ANDs
     // one more constraint; absent or false contributes nothing (no inversion).
-    QJsonObject filterObj;
-    if (p.contains("filter")) {
-        const QJsonValue fv = p.value("filter");
-        if (!fv.isObject())
-            throwParamError("filter", QStringLiteral("must be an object"));
-        filterObj = fv.toObject();
-    }
-    const bool fUnreviewed = jsonOptionalBool(filterObj, "unreviewed", false);
-    const bool fApproved = jsonOptionalBool(filterObj, "approved", false);
-    const bool fDefective = jsonOptionalBool(filterObj, "defective", false);
-    const bool fHideDefective = jsonOptionalBool(filterObj, "hideDefective", false);
-    const bool fReviewed = jsonOptionalBool(filterObj, "reviewed", false);
-    const bool fInspect = jsonOptionalBool(filterObj, "inspect", false);
-    const bool fPartialReview = jsonOptionalBool(filterObj, "partialReview", false);
+    const QJsonObject filterObj = p.value("filter").toObject();
+    const bool fUnreviewed = filterObj.value("unreviewed").toBool(false);
+    const bool fApproved = filterObj.value("approved").toBool(false);
+    const bool fDefective = filterObj.value("defective").toBool(false);
+    const bool fHideDefective =
+        filterObj.value("hideDefective").toBool(false);
+    const bool fReviewed = filterObj.value("reviewed").toBool(false);
+    const bool fInspect = filterObj.value("inspect").toBool(false);
+    const bool fPartialReview =
+        filterObj.value("partialReview").toBool(false);
 
     // "loaded" = id present in CState::surfaceNames(), computed exactly as
     // segments.list does so the two endpoints agree.
