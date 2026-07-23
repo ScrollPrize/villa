@@ -78,7 +78,7 @@ QJsonObject AgentBridgeServer::handleLasagnaServiceStatus(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleLasagnaEnsureService(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     const bool hasHost = p.contains("host");
     const bool hasPort = p.contains("port");
     if (hasHost != hasPort) {
@@ -92,8 +92,8 @@ QJsonObject AgentBridgeServer::handleLasagnaEnsureService(const QJsonValue& para
     if (hasHost && hasPort) {
         // External mode: connectToExternal pings GET /health asynchronously;
         // completion is deferred (SPEC §8.4) on serviceStarted/serviceError.
-        const QString host = jsonRequireString(p, "host");
-        const int port = jsonRequireInt(p.value("port"), "port");
+        const QString host = p.value("host").toString();
+        const int port = p.value("port").toInt();
         const int token = beginDeferred(15000, "Lasagna external service connect");
         connect(&mgr, &LasagnaServiceManager::serviceStarted, this,
                 [this, token]() {
@@ -118,7 +118,7 @@ QJsonObject AgentBridgeServer::handleLasagnaEnsureService(const QJsonValue& para
 
     // Internal mode: ensureServiceRunning() blocks until the process is up (or
     // fails) and returns synchronously -- no deferral needed.
-    const QString pythonPath = jsonOptionalString(p, "pythonPath");
+    const QString pythonPath = p.value("pythonPath").toString();
     if (!mgr.ensureServiceRunning(pythonPath)) {
         QJsonObject data;
         data["detail"] = mgr.lastError();
@@ -155,12 +155,12 @@ QJsonObject AgentBridgeServer::handleLasagnaListDatasets(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    const QString modeStr = jsonRequireString(p, "mode");
+    const QString modeStr = p.value("mode").toString();
     SegmentationLasagnaPanel::LasagnaMode mode;
     if (modeStr == QLatin1String("reoptimize"))
         mode = SegmentationLasagnaPanel::ReOptimize;
@@ -168,14 +168,8 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
         mode = SegmentationLasagnaPanel::NewModel;
     else if (modeStr == QLatin1String("offset"))
         mode = SegmentationLasagnaPanel::Offset;
-    else if (modeStr == QLatin1String("atlas"))
+    else
         mode = SegmentationLasagnaPanel::Atlas;
-    else {
-        QJsonObject data;
-        data["param"] = "mode";
-        data["value"] = modeStr;
-        throw AgentBridgeError{-32602, QStringLiteral("Invalid mode: %1").arg(modeStr), data};
-    }
 
     requireSourceIdle(QStringLiteral("lasagna"));
 
@@ -187,8 +181,8 @@ QJsonObject AgentBridgeServer::handleLasagnaStartOptimization(const QJsonValue& 
         throw AgentBridgeError{-32009, "Lasagna panel unavailable", data};
     }
 
-    const QString configPath = jsonOptionalString(p, "configPath");
-    const QString atlasPath = jsonOptionalString(p, "atlasPath");
+    const QString configPath = p.value("configPath").toString();
+    const QString atlasPath = p.value("atlasPath").toString();
     std::optional<cv::Vec3i> seed;
     if (p.contains("seed")) {
         const cv::Vec3f v = jsonToVec3(p.value("seed"), "seed");
@@ -257,7 +251,7 @@ QJsonObject AgentBridgeServer::handleLasagnaJobs(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleLasagnaCancel(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
+    const QJsonObject p = params.toObject();
     LasagnaServiceManager& mgr = LasagnaServiceManager::instance();
 
     QString serviceJobId;
@@ -274,7 +268,7 @@ QJsonObject AgentBridgeServer::handleLasagnaCancel(const QJsonValue& params)
         }
         mgr.stopOptimization();
     } else {
-        const QString jobId = jsonRequireString(p, "jobId");
+        const QString jobId = p.value("jobId").toString();
         if (jobId.startsWith(QLatin1String("job-"))) {
             const JobRecord* job = jobById(jobId);
             if (!job) {
@@ -305,8 +299,8 @@ QJsonObject AgentBridgeServer::handleLasagnaCancel(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleLasagnaSelectOutputSegment(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    const QString name = jsonRequireString(p, "name");
+    const QJsonObject p = params.toObject();
+    const QString name = p.value("name").toString();
     if (name.isEmpty()) {
         QJsonObject data;
         data["param"] = "name";
@@ -383,8 +377,8 @@ QJsonObject AgentBridgeServer::handleLasagnaRepeatLast(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
 {
-    const QJsonObject p = paramsObject(params);
-    const QString name = jsonRequireString(p, "name");
+    const QJsonObject p = params.toObject();
+    const QString name = p.value("name").toString();
 
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
@@ -394,14 +388,8 @@ QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
         _window->switchToMainWorkspace();
     } else if (name == QLatin1String("lasagna")) {
         _window->switchToLasagnaWorkspace();
-    } else if (name == QLatin1String("fiber_slice")) {
-        _window->switchToFiberSliceWorkspace();
     } else {
-        QJsonObject data;
-        data["param"] = "name";
-        data["value"] = name;
-        throw AgentBridgeError{-32602, QStringLiteral("Invalid workspace name: %1").arg(name),
-                               data};
+        _window->switchToFiberSliceWorkspace();
     }
 
     QJsonObject result;
