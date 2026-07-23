@@ -1,4 +1,4 @@
-"""Standalone tests for the surface_ops MCP tool module (Workstream 4).
+"""Standalone tests for the surface_ops MCP tool module.
 
 Exercises the actual @mcp.tool() wrappers in vc3d_mcp.tools.surface_ops against a
 small in-process fake Agent Bridge (AF_UNIX, newline-delimited JSON-RPC 2.0),
@@ -176,7 +176,7 @@ class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
         await self.bridge.stop()
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
-    # --- Stage 1: synchronous ops -------------------------------------------
+    # Synchronous operations
 
     async def test_crop_bounds_passthrough(self) -> None:
         result = await vc3d_crop_segment_bounds("seg-1")
@@ -192,7 +192,7 @@ class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge.params_for("segment.recalc_area"),
                          {"segmentIds": ["seg-1", "seg-2"]})
 
-    # --- Stage 2: async "tool" ops ------------------------------------------
+    # Async external-tool operations
 
     async def test_reoptimize_no_wait_returns_job(self) -> None:
         result = await vc3d_reoptimize_segment("seg-1", wait=False)
@@ -266,7 +266,7 @@ class SurfaceOpsTest(unittest.IsolatedAsyncioTestCase):
              "scaleGroup": "2", "ompThreads": 8, "outputDir": "refined"},
         )
 
-    # --- Stage 3: deferred mask ops -----------------------------------------
+    # Deferred mask operations
 
     async def test_generate_mask_passthrough(self) -> None:
         result = await vc3d_generate_segment_mask("seg-1")

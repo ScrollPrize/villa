@@ -1,10 +1,7 @@
 #pragma once
 
-// VC3D Agent Bridge — Phase 1 server.
-//
 // An in-process JSON-RPC 2.0 server that listens on a QLocalServer socket and
-// lets an out-of-process agent (via the Phase 3 MCP server) drive/inspect VC3D.
-// See apps/VC3D/agent_bridge/SPEC.md for the binding wire contract.
+// lets an out-of-process agent drive and inspect VC3D.
 //
 // Everything here runs on the Qt GUI thread: QLocalSocket delivers readyRead on
 // the main thread, so no extra thread is required and handlers may touch the UI
@@ -133,9 +130,7 @@ private:
     QJsonObject handleSegmentsList(const QJsonValue& params);
     QJsonObject handleSegmentsActivate(const QJsonValue& params);
     QJsonObject handleSegmentsFetch(const QJsonValue& params);
-    // Destructive on-disk segment ops (ADDITIONS_SPEC item 5). Both resolve the
-    // id like handleSegmentsActivate and drive dialog-free cores extracted from
-    // the interactive SurfacePanelController / SegmentationCommandHandler slots.
+    // Destructive on-disk operations use the same dialog-free cores as the UI.
     QJsonObject handleSegmentsDelete(const QJsonValue& params);
     QJsonObject handleSegmentsRename(const QJsonValue& params);
     // Review-state-aware segment listing with optional server-side tag filters
@@ -144,21 +139,17 @@ private:
     QJsonObject handleSegmentsReview(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
-    // Phase 2: canvas + mutating action handlers.
     QJsonObject handleCanvasClick(const QJsonValue& params, bool addShift);
     QJsonObject handleCanvasDrag(const QJsonValue& params);
     QJsonObject handleViewerCenterOnPoint(const QJsonValue& params);
     QJsonObject handleViewerZoom(const QJsonValue& params);
     QJsonObject handleViewerRotate(const QJsonValue& params);
     QJsonObject handleViewerSetAxisAlignedSlices(const QJsonValue& params);
-    // Global render-settings get/set (ADDITIONS_SPEC item 6).
-    // viewerRenderSettingsJson() builds the shared reply body.
+    // viewerRenderSettingsJson() builds the shared get/set reply body.
     QJsonObject handleViewerGetRenderSettings(const QJsonValue& params);
     QJsonObject handleViewerSetRenderSettings(const QJsonValue& params);
     QJsonObject viewerRenderSettingsJson() const;
-    // Viewer round-2: overlay-volume controls + per-viewer intersection sets
-    // (AgentBridgeHandlers_viewer.cpp). overlaySettingsJson() builds the shared
-    // reply body for get/set_overlay.
+    // Overlay-volume controls and per-viewer intersection sets.
     QJsonObject handleViewerGetOverlay(const QJsonValue& params);
     QJsonObject handleViewerSetOverlay(const QJsonValue& params);
     QJsonObject handleViewerListOverlayVolumes(const QJsonValue& params);
@@ -208,15 +199,13 @@ private:
     QJsonObject handlePointsLoadSegmentPath(const QJsonValue& params);
     QJsonObject handleVolumeOpen(const QJsonValue& params);
     QJsonObject handleVolumeSelect(const QJsonValue& params);
-    // Lists every volume id in the open package (ADDITIONS_SPEC item 4).
     QJsonObject handleVolumeList(const QJsonValue& params);
     QJsonObject handleCatalogOpenSample(const QJsonValue& params);
     // Remote catalog resource selection (SPEC §10.1-10.2).
     QJsonObject handleCatalogListSamples(const QJsonValue& params);
     QJsonObject handleCatalogDescribeSample(const QJsonValue& params);
     QJsonObject handleJobStatus(const QJsonValue& params);
-    // Generic cancel that resolves a running job (by id or source) and dispatches
-    // to its per-source cancel authority (ADDITIONS_SPEC item 3).
+    // Resolves a running job by id or source, then invokes its cancel authority.
     QJsonObject handleJobCancel(const QJsonValue& params);
     // Lasagna RPCs (SPEC §11) + workspace switching (SPEC §11.9).
     QJsonObject handleLasagnaServiceStatus(const QJsonValue& params);
@@ -253,7 +242,7 @@ private:
     QJsonObject handleFiberCreateAtlas(const QJsonValue& params);
     QJsonObject handleFiberExport(const QJsonValue& params);
     QJsonObject handleFiberImport(const QJsonValue& params);
-    // Stage 6 backlog surface (SPEC §15): tags, seeding, push/pull, run-trace.
+    // Tags, seeding, push/pull, and tracing.
     QJsonObject handleTagsSet(const QJsonValue& params);
     QJsonObject handleSeedingSetWindingAnnotationMode(const QJsonValue& params);
     QJsonObject handleSeedingPreviewRays(const QJsonValue& params);

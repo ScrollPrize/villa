@@ -141,7 +141,6 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         volume["id"] = QString::fromStdString(state->currentVolumeId());
         volume["path"] = QString::fromStdString(vol->path().string());
         volume["voxelSize"] = vol->voxelSize();
-        // Additive: every volume id in the open package (ADDITIONS_SPEC item 4).
         QJsonArray volIds;
         if (state->hasVpkg() && state->vpkg()) {
             for (const auto& id : state->vpkg()->volumeIDs())
@@ -171,9 +170,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
             ? _window->_segmentationWidget->isEditingEnabled()
             : false;
 
-    // Manual-add (hole-fill) + corrections point-authoring state (SPEC §9.2-9.7;
-    // reported here per Stage 2). Line/interpolation modes come from the panel
-    // config (they persist whether or not manual-add is currently active).
+    // Line and interpolation modes persist when manual-add is inactive.
     if (SegmentationModule* mod = _window->_segmentationModule.get()) {
         result["manualAddMode"] = mod->manualAddMode();
         result["correctionsPointMode"] = mod->correctionPointMode();
@@ -729,10 +726,7 @@ QJsonObject AgentBridgeServer::handleVolumeList(const QJsonValue&)
     result["volumeIds"] = volumeIds;
     result["currentVolumeId"] = current.empty() ? QJsonValue(QJsonValue::Null)
                                                 : QJsonValue(QString::fromStdString(current));
-    // Per-volume {id, path, voxelSize} objects are intentionally omitted: reading
-    // voxelSize would force-load every (possibly remote) volume, which is not
-    // "cheap" per ADDITIONS_SPEC item 4. The id list plus state.get's per-volume
-    // block cover the affordable data.
+    // Reading voxel sizes here would force-load every possibly remote volume.
     return result;
 }
 

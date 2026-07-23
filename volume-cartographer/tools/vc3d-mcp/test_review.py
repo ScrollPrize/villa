@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-test for the segments.review MCP tool (Workstream 3).
+"""Self-test for the segments.review MCP tool.
 
 Stands up a tiny purpose-built fake bridge (AF_UNIX, newline-delimited
 JSON-RPC 2.0) that records every request and echoes a canned result, so each

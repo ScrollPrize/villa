@@ -20,9 +20,7 @@
 #include "vc/core/util/Compositing.hpp"
 
 // ---------------------------------------------------------------------------
-// Viewer round-2: ViewerManager-backed overlay-volume controls (colormap,
-// opacity, window, composite) and per-viewer intersection sets (the surfaces
-// whose intersection lines a viewer draws, mirroring SurfacePanelController).
+// ViewerManager-backed overlay controls and per-viewer intersection sets.
 // ---------------------------------------------------------------------------
 
 namespace {

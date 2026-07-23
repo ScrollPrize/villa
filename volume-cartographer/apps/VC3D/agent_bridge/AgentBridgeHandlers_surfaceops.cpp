@@ -32,7 +32,7 @@
 
 
 // ---------------------------------------------------------------------------
-// segment.crop_bounds (Stage 1, synchronous)
+// segment.crop_bounds
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleSegmentCropBounds(const QJsonValue& params)
@@ -89,7 +89,7 @@ QJsonObject AgentBridgeServer::handleSegmentCropBounds(const QJsonValue& params)
 
 
 // ---------------------------------------------------------------------------
-// segment.recalc_area (Stage 1, synchronous)
+// segment.recalc_area
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleSegmentRecalcArea(const QJsonValue& params)
@@ -139,7 +139,7 @@ QJsonObject AgentBridgeServer::handleSegmentRecalcArea(const QJsonValue& params)
 
 
 // ---------------------------------------------------------------------------
-// segment.reoptimize (Stage 2, async, source:"tool")
+// segment.reoptimize
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
@@ -226,7 +226,7 @@ QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
 
 
 // ---------------------------------------------------------------------------
-// segment.refine_alpha_comp (Stage 2, async, source:"tool")
+// segment.refine_alpha_comp
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleSegmentRefineAlphaComp(const QJsonValue& params)
@@ -309,7 +309,7 @@ QJsonObject AgentBridgeServer::handleSegmentRefineAlphaComp(const QJsonValue& pa
 
 
 // ---------------------------------------------------------------------------
-// segment.generate_mask / segment.append_mask (Stage 3, async in-process,
+// segment.generate_mask / segment.append_mask (async in-process,
 // deferred response — SPEC §8.4)
 // ---------------------------------------------------------------------------
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-test for the points.* editing MCP tools (Workstream 1).
+"""Self-test for the points.* editing MCP tools.
 
 Stands up a tiny purpose-built fake bridge (AF_UNIX, newline-delimited
 JSON-RPC 2.0) that records every request and echoes a canned result for any

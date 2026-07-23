@@ -21,9 +21,7 @@ public:
         QString message;
     };
 
-    // Resets to the fresh, not-finalized shape; call when a non-seeding activation (e.g. a
-    // neural trace) shares SeedingWidget's finalizeSeedingBatch() teardown, so finalized()
-    // doesn't leak true from a prior batch (codex #2b).
+    // Clear finalized state before a non-seeding operation reuses the teardown path.
     void reset();
 
     // Resets state for a new batch (mirrors SeedingWidget's pre-launch reset). kind is

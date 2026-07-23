@@ -156,7 +156,7 @@ private slots:
         QCOMPARE(r.completed, 2);
     }
 
-    // Regression (codex #1): keying dedup on the stable index rather than a raw
+    // Key dedup on the stable index rather than a raw
     // QProcess* means a later child reusing an earlier (freed) process address
     // can never be misread as already-terminal. Simulate the production hazard:
     // child 0 finishes, then a distinct later child would collide on address but
@@ -200,7 +200,7 @@ private slots:
         QVERIFY(r.message.startsWith(QStringLiteral("Seeding run failed: 3 of 5 child processes failed")));
     }
 
-    // Regression (codex #2b): reset() clears a finalized batch back to the
+    // reset() clears a finalized batch back to the
     // fresh, not-finalized shape so a shared teardown (neural trace) is not
     // short-circuited by a prior batch's lingering finalized() == true.
     void resetClearsFinalizedState()

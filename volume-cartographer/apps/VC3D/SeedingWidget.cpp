@@ -1248,11 +1248,8 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
         return false;
     }
 
-    // Resolve + validate the volume path BEFORE latching a batch (codex #2a):
-    // _batch.begin() sets _batch.kind() non-empty, so bailing out after it would
-    // leave a phantom "run" batch. A later neural trace sets jobsRunning=true,
-    // making seedingBatchActive() (jobsRunning && !kind.isEmpty()) wrongly true —
-    // then jobIsRunning("seeding") accepts a seeding.cancel that kills the trace.
+    // Validate before begin(); otherwise an early return leaves a phantom batch
+    // that can make a later neural trace look like a cancellable seeding job.
     _batchVolumePath = commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for segmentation "
@@ -2340,10 +2337,7 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
         return false;
     }
 
-    // Resolve + validate the volume path BEFORE latching a batch (codex #2a):
-    // begin() after this would leave a phantom "expand" batch that a later
-    // neural trace could expose via seedingBatchActive() (see
-    // runSegmentationHeadless).
+    // Validate before begin() so an early return cannot leave a phantom batch.
     _batchVolumePath = commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for expansion "
@@ -2681,9 +2675,7 @@ void SeedingWidget::onNeuralTraceClicked()
     // Update UI
     infoLabel->setText("Running neural trace...");
     _btnNeuralTrace->setEnabled(false);
-    // Clear any finalized state left by a PRIOR seeding batch so this neural
-    // activation's shared finalizeSeedingBatch() teardown isn't short-circuited by a
-    // stale _batch.finalized() (codex #2b); a neural trace has no real batch of its own.
+    // A neural trace shares the batch teardown but has no seeding batch of its own.
     _batch.reset();
     jobsRunning = true;
     cancelButton->setVisible(true);

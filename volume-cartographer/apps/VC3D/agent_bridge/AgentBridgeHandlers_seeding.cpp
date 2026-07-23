@@ -78,7 +78,7 @@ QJsonObject pushPullConfigToJson(const AlphaPushPullConfig& c)
 
 
 // ---------------------------------------------------------------------------
-// Stage 6 backlog surface (SPEC §15): tags, seeding, push/pull, run-trace
+// Tags, seeding, push/pull, and tracing
 // ---------------------------------------------------------------------------
 
 QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
@@ -98,7 +98,7 @@ QJsonObject AgentBridgeServer::handleTagsSet(const QJsonValue& params)
     const QString tagStr = p.value("tag").toString();
     const bool enabled = p.value("enabled").toBool();
 
-    // §15.1: the four-value Tag enum; "revisit" does NOT exist -> -32602.
+    // Keep this mapping aligned with SurfacePanelController::Tag.
     SurfacePanelController::Tag tag;
     if (tagStr == QLatin1String("approved"))
         tag = SurfacePanelController::Tag::Approved;

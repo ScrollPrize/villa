@@ -598,7 +598,7 @@ def check_c2_suffix_bypass(sock_path: str, results: Results) -> None:
     """A VALID line followed by a >1 MiB UNTERMINATED suffix must still get the
     client dropped: the pre-loop bound check is skipped when any newline is
     present, so the residual has to be bounded after the framed lines are
-    consumed (codex #9). Send '{}\\n' + >1 MiB with no further newline."""
+    consumed. Send '{}\\n' + >1 MiB with no further newline."""
     raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     raw.settimeout(10.0)
     closed_by_server = False
