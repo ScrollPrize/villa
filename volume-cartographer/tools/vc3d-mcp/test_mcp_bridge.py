@@ -1084,15 +1084,7 @@ class WaitAndProgressTest(unittest.IsolatedAsyncioTestCase):
 class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
     """Official-SDK schema assertions over the whole registered tool surface."""
 
-    # The historical surface was 75 tools; this branch adds fetch, rotate, the
-    # axis-aligned-slice toggle, the same-wrap annotation trio, and vc3d_wait_job
-    # (80), then items 3-6 add vc3d_cancel_job, vc3d_list_volumes,
-    # vc3d_delete_segment, vc3d_rename_segment, vc3d_get_render_settings, and
-    # vc3d_set_render_settings, so the count was 86. The round-2 expansion then
-    # adds the full point-collection editing family (+19), review-state listing
-    # (+1), overlay-volume + intersects controls (+4), and per-segment mesh ops
-    # (+6), so the real current count is 116. Assert the real number so schema
-    # drift is caught.
+    # Assert the exact registered count so schema drift (added/removed tools) is caught.
     EXPECTED_TOOL_COUNT = 116
 
     async def test_tool_surface_and_schemas(self) -> None:

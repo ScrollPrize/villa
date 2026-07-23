@@ -165,7 +165,6 @@ class BridgeClientConfig:
 
 @dataclass
 class _Conn:
-    """One live connection: its transport, its pending calls, its reader task."""
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     pending: dict[int, "asyncio.Future[Any]"] = field(default_factory=dict)
@@ -206,10 +205,8 @@ class BridgeClient:
             if os.path.exists(candidate):
                 return candidate
 
-        # Nothing found on disk. Return the configured value unmodified so the
-        # eventual connect() failure carries the name the caller actually
-        # asked for, rather than a synthesized candidate that's confusing to
-        # read in an error message.
+        # Nothing found on disk; return unmodified so a failed connect() names
+        # what the caller actually asked for, not a synthesized candidate.
         return configured
 
     @staticmethod

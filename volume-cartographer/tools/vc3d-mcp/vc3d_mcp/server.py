@@ -27,11 +27,6 @@ from .core import configure_client, mcp
 from . import tools  # noqa: F401  - imports every module, registering its @mcp.tool()s
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
 # Handshake wait budget for the auto-launch path: VC3D can take a while to
 # construct CWindow before AgentBridgeServer::listen() prints the handshake.
 LAUNCH_HANDSHAKE_TIMEOUT_S = 30.0
@@ -109,9 +104,6 @@ def launch_vc3d(
     tail: deque[str] = deque(maxlen=200)
 
     def _drain() -> None:
-        # Read the child's stdout for its whole lifetime: find the handshake,
-        # then keep draining so the pipe never fills and blocks VC3D. Child
-        # output is forwarded to OUR stderr only (stdout is MCP stdio).
         assert proc.stdout is not None
         for line in proc.stdout:
             stripped = line.rstrip("\n")
