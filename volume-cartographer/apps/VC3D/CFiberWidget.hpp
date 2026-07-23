@@ -60,6 +60,7 @@ public:
         std::string manualHvTag;
         std::vector<std::string> tags;
         int linkedFiberCount = 0;
+        int pendingLinkCount = 0;
     };
 
     explicit CFiberWidget(QWidget* parent = nullptr);

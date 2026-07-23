@@ -1423,6 +1423,16 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                   branchFiberId,
                                                   branchControlPointIndex);
     };
+    options.setBranchLinkPending = [this, surfaceName](size_t controlPointIndex,
+                                                       uint64_t branchFiberId,
+                                                       int branchControlPointIndex,
+                                                       bool pending) {
+        emit generatedControlPointLinkPendingChangeRequested(surfaceName,
+                                                             controlPointIndex,
+                                                             branchFiberId,
+                                                             branchControlPointIndex,
+                                                             pending);
+    };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }
 
@@ -2317,9 +2327,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.seedPoints ||
         !_fastCurrentCutOverlayItems.linkCandidatePoints ||
         !_fastCurrentCutOverlayItems.branchControlPoints ||
+        !_fastCurrentCutOverlayItems.pendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.fiberIntersections ||
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
         !_fastCurrentCutOverlayItems.branchLinkFiberIntersections ||
+        !_fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections ||
         !_fastCurrentCutOverlayItems.fiberIntersectionConnectors) {
         viewer->clearOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey);
         _fastCurrentCutOverlayItems = {};
@@ -2363,6 +2375,15 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.branchControlPoints->setBrush(branchControlBrush);
         _fastCurrentCutOverlayItems.branchControlPoints->setZValue(162.0);
 
+        QPen pendingBranchControlPen(QColor(80, 150, 255, 245));
+        pendingBranchControlPen.setWidthF(2.0);
+        QBrush pendingBranchControlBrush(QColor(80, 150, 255, 175));
+        _fastCurrentCutOverlayItems.pendingBranchControlPoints = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.pendingBranchControlPoints->setPen(pendingBranchControlPen);
+        _fastCurrentCutOverlayItems.pendingBranchControlPoints->setBrush(
+            pendingBranchControlBrush);
+        _fastCurrentCutOverlayItems.pendingBranchControlPoints->setZValue(162.5);
+
         QPen fiberIntersectionPen(QColor(255, 245, 75, 245));
         fiberIntersectionPen.setWidthF(1.25);
         fiberIntersectionPen.setCapStyle(Qt::FlatCap);
@@ -2389,6 +2410,16 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setBrush(Qt::NoBrush);
         _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setZValue(168.25);
 
+        QPen pendingBranchLinkFiberIntersectionPen(QColor(80, 150, 255, 245));
+        pendingBranchLinkFiberIntersectionPen.setWidthF(1.75);
+        pendingBranchLinkFiberIntersectionPen.setCapStyle(Qt::FlatCap);
+        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections =
+            new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setPen(
+            pendingBranchLinkFiberIntersectionPen);
+        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setZValue(168.3);
+
         QPen fiberIntersectionConnectorPen(QColor(255, 60, 180, 225));
         fiberIntersectionConnectorPen.setWidthF(1.4);
         _fastCurrentCutOverlayItems.fiberIntersectionConnectors = new QGraphicsPathItem();
@@ -2403,9 +2434,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                  _fastCurrentCutOverlayItems.seedPoints,
                                  _fastCurrentCutOverlayItems.linkCandidatePoints,
                                  _fastCurrentCutOverlayItems.branchControlPoints,
+                                 _fastCurrentCutOverlayItems.pendingBranchControlPoints,
                                  _fastCurrentCutOverlayItems.fiberIntersections,
                                  _fastCurrentCutOverlayItems.linkCandidateFiberIntersections,
                                  _fastCurrentCutOverlayItems.branchLinkFiberIntersections,
+                                 _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections,
                                  _fastCurrentCutOverlayItems.fiberIntersectionConnectors});
     }
 
@@ -2425,6 +2458,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath seedPath;
     QPainterPath linkCandidatePath;
     QPainterPath branchControlPath;
+    QPainterPath pendingBranchControlPath;
     const double lineRadius =
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
     const double lower = _currentLinePosition - lineRadius;
@@ -2462,6 +2496,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         if (control.isLinkCandidate) {
             linkCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
                                          control.isSeed ? 11.0 : 10.0);
+        } else if (control.hasPendingLinks) {
+            pendingBranchControlPath.addEllipse(scenePoint, 12.0, 12.0);
         } else if (control.hasBranches) {
             branchControlPath.addEllipse(scenePoint, 12.0, 12.0);
         } else if (control.isSeed) {
@@ -2474,10 +2510,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.seedPoints->setPath(seedPath);
     _fastCurrentCutOverlayItems.linkCandidatePoints->setPath(linkCandidatePath);
     _fastCurrentCutOverlayItems.branchControlPoints->setPath(branchControlPath);
+    _fastCurrentCutOverlayItems.pendingBranchControlPoints->setPath(pendingBranchControlPath);
 
     QPainterPath fiberIntersectionPath;
     QPainterPath linkCandidateFiberIntersectionPath;
     QPainterPath branchLinkFiberIntersectionPath;
+    QPainterPath pendingBranchLinkFiberIntersectionPath;
     QPainterPath fiberIntersectionConnectorPath;
     auto* currentCutPlane = _generatedViews.currentCutSurface.get();
     const std::optional<float> intersectionThreshold =
@@ -2508,8 +2546,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             }
             QPainterPath& path = intersection.isLinkCandidateFiber
                 ? linkCandidateFiberIntersectionPath
-                : (intersection.projectedBranchLink ? branchLinkFiberIntersectionPath
-                                                    : fiberIntersectionPath);
+                : (intersection.projectedBranchLink
+                       ? (intersection.pendingBranchLink
+                              ? pendingBranchLinkFiberIntersectionPath
+                              : branchLinkFiberIntersectionPath)
+                       : fiberIntersectionPath);
             path.moveTo(scenePoint + QPointF(-kIntersectionArm, -kIntersectionArm));
             path.lineTo(scenePoint + QPointF(kIntersectionArm, kIntersectionArm));
             path.moveTo(scenePoint + QPointF(-kIntersectionArm, kIntersectionArm));
@@ -2521,6 +2562,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         linkCandidateFiberIntersectionPath);
     _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setPath(
         branchLinkFiberIntersectionPath);
+    _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setPath(
+        pendingBranchLinkFiberIntersectionPath);
     _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setPath(
         fiberIntersectionConnectorPath);
 }
