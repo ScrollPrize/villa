@@ -8724,6 +8724,9 @@ LineAnnotationController::makeIntersectionLineSession(
     std::function<void()> onOptimizationSucceeded)
 {
     auto session = std::make_shared<LineAnnotationSession>();
+    session->suppressErrorDialogs =
+        (_intersectionInspection && _intersectionInspection->suppressErrorDialogs) ||
+        _errorDialogsSuppressed;
     session->surfaceName = surfaceName;
     session->sourceAnnotationSurfaceName = surfaceName;
     session->fiberId = fiber.id;
