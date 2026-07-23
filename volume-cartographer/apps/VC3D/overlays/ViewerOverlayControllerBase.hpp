@@ -325,6 +325,10 @@ protected:
 
     virtual bool isOverlayEnabledFor(VolumeViewerBase* viewer) const;
     virtual void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) = 0;
+    FilteredPoints projectPointChainForHitTest(
+        VolumeViewerBase* viewer,
+        const std::vector<cv::Vec3f>& points,
+        float tolerance);
 
     QPointF volumeToScene(VolumeViewerBase* viewer, const cv::Vec3f& volumePoint) const;
     cv::Vec3f sceneToVolume(VolumeViewerBase* viewer, const QPointF& scenePoint) const;

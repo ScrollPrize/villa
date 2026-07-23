@@ -793,6 +793,21 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
     return filtered;
 }
 
+ViewerOverlayControllerBase::FilteredPoints
+ViewerOverlayControllerBase::projectPointChainForHitTest(
+    VolumeViewerBase* viewer,
+    const std::vector<cv::Vec3f>& points,
+    float tolerance)
+{
+    // Hit-test callers commonly assemble a temporary point vector. Do not let
+    // its transient data pointer alias a resident render-cache key.
+    clearPointChainProjectionCache(viewer);
+    std::vector<float> opacities;
+    FilteredPoints result = projectedPointChain(viewer, points, tolerance, &opacities);
+    clearPointChainProjectionCache(viewer);
+    return result;
+}
+
 void ViewerOverlayControllerBase::clearPointChainProjectionCache()
 {
     _pointChainProjectionCache.clear();

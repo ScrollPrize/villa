@@ -194,6 +194,8 @@ set(srcs
     SpiralArtifactCache.hpp
     SpiralBrushController.cpp
     SpiralBrushController.hpp
+    SpiralPointChain.cpp
+    SpiralPointChain.hpp
     SpiralServiceManager.cpp
     SpiralServiceManager.hpp
     SpiralServiceProfile.hpp

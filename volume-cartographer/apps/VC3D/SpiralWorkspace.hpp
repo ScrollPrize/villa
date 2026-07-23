@@ -89,6 +89,13 @@ private:
         std::vector<LossMap> lossMaps;
         bool connected = false;
     };
+    struct PreviewDisplaySelection {
+        int firstColumn = 0;
+        int endColumn = 0;
+        std::vector<PreviewComponent> diffComponents;
+        std::vector<std::pair<int, int>> surfaceComponents;
+        QString registrationId;
+    };
     struct GeometryLoadResult {
         std::shared_ptr<PolylineIndex> index;
         QString error;
@@ -110,11 +117,7 @@ private:
     void loadPreview(const QString& manifestPath, qint64 generation);
     void installPreview(const PreviewLoadResult& result, qint64 generation);
     void applyPreviewWindingRange(bool preserveFocus);
-    void loadRunDiff(const std::shared_ptr<QuadSurface>& previous,
-                     const std::vector<PreviewComponent>& previousComponents,
-                     const std::shared_ptr<QuadSurface>& current,
-                     const std::vector<PreviewComponent>& currentComponents,
-                     qint64 generation);
+    void loadRunDiff();
     static QImage buildRunDiffImage(
         const std::shared_ptr<QuadSurface>& previous,
         const std::vector<PreviewComponent>& previousComponents,
@@ -122,11 +125,12 @@ private:
         const std::vector<PreviewComponent>& currentComponents);
     void updateRunDiffOverlay();
     void updateLossMapOverlay();
-    std::shared_ptr<QuadSurface> makeDisplayedPreview(QString& registrationId) const;
+    std::optional<PreviewDisplaySelection> displayedPreviewSelection() const;
     void installPreviewAliasWhenIndexed(const std::shared_ptr<QuadSurface>& preview,
                                         const QString& registrationId,
                                         qint64 generation, quint64 revision,
-                                        bool preserveFocus, int attempt);
+                                        bool preserveFocus, int attempt,
+                                        std::vector<PreviewComponent> diffComponents = {});
     void loadGeometrySnapshot(const QString& manifestPath, quint64 generation);
     void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
@@ -182,7 +186,10 @@ private:
     QString _previewSourceId;
     std::vector<PreviewComponent> _previewComponents;
     bool _previewConnected = false;
+    std::shared_ptr<QuadSurface> _runDiffPreviousSource;
+    std::vector<PreviewComponent> _runDiffPreviousComponents;
     std::shared_ptr<QuadSurface> _currentPreview;
+    std::vector<PreviewComponent> _currentPreviewComponents;
     QString _currentPreviewRegistrationId;
     QImage _previewRunDiffImage;
     QHash<QString, PreviewLoadResult::LossMap> _previewLossMaps;
@@ -191,6 +198,7 @@ private:
     QImage _loadedLossMapImage;
     qreal _lossMapOpacity = 0.8;
     quint64 _previewDisplayRevision = 0;
+    quint64 _runDiffRequestRevision = 0;
     int _minimumDisplayedWinding = 10;
     int _maximumDisplayedWinding = 130;
     bool _outputVisible = true;
@@ -198,6 +206,7 @@ private:
     bool _showSurfaceOverlap = true;
     bool _pendingPatchesOnly = false;
     bool _haveRunDiffBaseline = false;
+    bool _runDiffVisible = false;
     bool _flattenedPreviewActive = false;
     bool _lasagnaFlattenRunning = false;
     bool _lasagnaFlattenCancelRequested = false;

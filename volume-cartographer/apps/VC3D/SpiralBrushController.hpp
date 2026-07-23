@@ -1,5 +1,6 @@
 #pragma once
 
+#include "SpiralPointChain.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 
 #include <QColor>
@@ -56,6 +57,7 @@ public:
 signals:
     void paintStateChanged();
     void brushDiameterChanged(int diameterPx);
+    void pointPlacementRejected(const QString& message);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -75,13 +77,16 @@ private:
         GestureState state = GestureState::Painted;
     };
     struct PolylineGesture {
+        enum class Kind { Freehand, Anchored };
         QString id;
         QColor color;
         std::shared_ptr<QuadSurface> source;
+        std::vector<vc3d::spiral::PointChainAnchor> anchors;
         std::vector<QPointF> surfacePoints;
         std::vector<cv::Vec3f> volumePoints;
         qint64 creationTime = 0;
         int sequence = 0;
+        Kind kind = Kind::Freehand;
         GestureState state = GestureState::Painted;
     };
     enum class DragMode { None, Paint, Polyline, Erase };
@@ -93,16 +98,21 @@ private:
     QPainterPath surfaceToScene(const QPainterPath& path) const;
     void beginPaint(const QPointF& devicePos);
     void beginPolyline(const QPointF& devicePos);
+    void appendAnchoredPoint(const QPointF& devicePos);
+    void finishAnchoredPolyline();
     void beginErase(const QPointF& devicePos);
     void extendDrag(const QPointF& devicePos);
     void finishDrag(const QPointF& devicePos);
-    void eraseWith(const QPainterPath& surfaceShape);
+    void eraseWith(const QPainterPath& deviceShape);
     void updateCursor(const QPointF& devicePos);
     void updateCursorWidget();
     void sampleColor(const QPointF& scenePos);
     bool appendPolylinePoint(const QPointF& devicePos);
+    bool rebuildAnchoredPolyline(PolylineGesture& gesture);
     std::optional<std::pair<QPointF, cv::Vec3f>> pointOnSurface(
         const QPointF& devicePos, const std::shared_ptr<QuadSurface>& source) const;
+    std::optional<cv::Vec3f> volumePointOnSurface(
+        const QPointF& surfacePos, const std::shared_ptr<QuadSurface>& source) const;
     void resamplePolyline(PolylineGesture& gesture);
     PreparedPatch makePatch(Gesture& gesture) const;
 
@@ -127,4 +137,7 @@ private:
     int _diameterPx = 32;
     bool _gHeld = false;
     bool _shiftHeld = false;
+    bool _controlHeld = false;
+    bool _vHeld = false;
+    bool _vClickConsumed = false;
 };

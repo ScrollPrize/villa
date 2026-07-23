@@ -149,6 +149,12 @@ vc_add_test(NAME test_spiral_config_profile_editor
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_spiral_point_chain
+    SOURCES test_spiral_point_chain.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralPointChain.cpp
+    LIBS doctest::doctest Qt6::Core vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 qt6_wrap_cpp(cfiber_widget_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.hpp)
 vc_add_test(NAME test_fiber_widget
     SOURCES test_fiber_widget.cpp
