@@ -204,14 +204,22 @@ def check_rpc_describe(
     try:
         description, _ = client.call("rpc.describe", {}, timeout=10.0)
         snapshot = {"methods": description.get("methods", {})}
+        coverage = description.get("coverage", {})
+        complete = (
+            description.get("undocumented") == []
+            and coverage.get("described") == 116
+            and coverage.get("registered") == 116
+            and coverage.get("complete") is True
+            and len(snapshot["methods"]) == 116
+        )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
             DESCRIPTION_SNAPSHOT.write_text(rendered, encoding="utf-8")
         expected = DESCRIPTION_SNAPSHOT.read_text(encoding="utf-8")
         results.record(
             "rpc_description_snapshot",
-            rendered == expected,
-            f"methods={len(snapshot['methods'])}"
+            complete and rendered == expected,
+            f"methods={len(snapshot['methods'])} coverage={coverage}"
             + (" snapshot updated" if update_snapshot else ""),
         )
         report = probe_invalid_inputs(client, snapshot)

@@ -12,6 +12,8 @@ from vc3d_mcp import tools as _tools  # noqa: F401 - registers the MCP tools
 VC_ROOT = Path(__file__).resolve().parents[2]
 SPEC_PATH = VC_ROOT / "apps/VC3D/agent_bridge/SPEC.md"
 DESCRIPTION_PATH = VC_ROOT / "apps/VC3D/agent_bridge/rpc_description.json"
+EXPECTED_RPC_METHODS = 116
+MCP_ONLY_TOOLS = {"vc3d_wait_job"}
 
 
 def _resolve_ref(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
@@ -44,7 +46,7 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
             cls.described_methods = json.load(stream)["methods"]
 
     def test_live_description_shape(self) -> None:
-        self.assertTrue(self.described_methods)
+        self.assertEqual(len(self.described_methods), EXPECTED_RPC_METHODS)
         tools: set[str] = set()
         for method, contract in self.described_methods.items():
             with self.subTest(method=method):
@@ -84,6 +86,12 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_fastmcp_input_shapes_match_contract(self) -> None:
         registered = {tool.name: tool.inputSchema for tool in await core.mcp.list_tools()}
+        described_tools = {
+            contract["mcp"]["tool"]
+            for contract in self.described_methods.values()
+            if "mcp" in contract
+        }
+        self.assertEqual(set(registered), described_tools | MCP_ONLY_TOOLS)
 
         for method, contract in self.described_methods.items():
             if "mcp" not in contract:

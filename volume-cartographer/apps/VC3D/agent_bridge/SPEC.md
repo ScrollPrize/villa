@@ -93,22 +93,17 @@ are **jobs**: the RPC returns immediately with a `jobId` and progress is deliver
 
 ## 2. Common conventions
 
-The viewer RPCs pilot server-owned method descriptions in
-`AgentBridgeServer::registerViewerHandlers`. Each description declares mechanical input
-types, required fields, enums, simple rejecting bounds, and documented error codes beside
-the handler registration. MCP tool names, snake-case parameter mapping, and MCP-only
-parameters are small annotations on the same description. Dispatch validates those
-declarations before invoking the handler. `rpc.describe {"prefix":"viewer."}` returns the
-live descriptions plus migration coverage. Cross-field rules, normalization, result shapes,
-and behavioral notes remain in their readable handlers and the reference below.
+Every RPC has a server-owned method description beside its handler registration. Each
+description declares mechanical input types, required fields, enums, simple rejecting
+bounds, and documented error codes. MCP tool names, snake-case parameter mapping, and
+MCP-only parameters are small annotations on the same description. Dispatch validates
+those declarations before invoking the handler. Cross-field rules, normalization, result
+shapes, and behavioral notes remain in their readable handlers and the reference below.
 
 `rpc.describe` accepts an optional string `prefix`. Its `methods` object contains matching
-method descriptions, `undocumented` lists matching handlers not yet migrated, and `coverage`
-reports matching `described` and `registered` counts plus whether that slice is complete.
-
-The remaining files under `schema/` are temporary migration oracles for methods that have
-not moved to C++ registration yet. Their generic conformance and offscreen probes stay in
-place until each domain is migrated, then that domain file is deleted.
+method descriptions, `undocumented` lists matching handlers without descriptions, and
+`coverage` reports matching `described` and `registered` counts plus whether that slice is
+complete. The full unfiltered response is required to report complete coverage.
 
 `rpc_description.json` is a generated snapshot of the live descriptions, not a
 hand-authored contract. The offscreen smoke test checks it against the compiled binary and
