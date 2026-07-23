@@ -7,8 +7,7 @@ assertion can check:
 
   * the correct bridge method name + params land on the wire
     (``received_requests[-1]``);
-  * optional/None args (onlyLoaded, filter) are stripped before send when
-    omitted;
+  * the false onlyLoaded default and optional filter reach the wire correctly;
   * a "filter" dict is forwarded to the wire verbatim;
   * the bridge's result is passed through unchanged.
 
@@ -108,10 +107,9 @@ class ReviewToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req["method"], method)
         self.assertEqual(req["params"], params)
 
-    async def test_no_args_sends_empty_params(self) -> None:
-        # Both onlyLoaded and filter are None by default -> stripped entirely.
+    async def test_no_args_sends_default_scope(self) -> None:
         await vc3d_review_segments()
-        self._assert_wire("segments.review", {})
+        self._assert_wire("segments.review", {"onlyLoaded": False})
 
     async def test_only_loaded_forwarded(self) -> None:
         await vc3d_review_segments(only_loaded=True)
@@ -126,7 +124,10 @@ class ReviewToolTest(unittest.IsolatedAsyncioTestCase):
     async def test_filter_dict_forwarded_verbatim(self) -> None:
         filt = {"unreviewed": True, "hideDefective": True}
         await vc3d_review_segments(filter=filt)
-        self._assert_wire("segments.review", {"filter": filt})
+        self._assert_wire(
+            "segments.review",
+            {"onlyLoaded": False, "filter": filt},
+        )
 
     async def test_only_loaded_and_filter_both_forwarded(self) -> None:
         filt = {"approved": True}
