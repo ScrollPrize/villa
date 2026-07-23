@@ -1,0 +1,131 @@
+{
+  "contractVersion": 1,
+  "domain": "wrap_annotation",
+  "probeSetup": [
+    {
+      "method": "wrap_annotation.set_mode",
+      "params": {
+        "enabled": true
+      }
+    }
+  ],
+  "methods": {
+    "wrap_annotation.set_mode": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ]
+      },
+      "errors": [
+        -32602,
+        -32000
+      ],
+      "unprobedErrors": [
+        -32000
+      ],
+      "mcp": {
+        "tool": "vc3d_set_wrap_annotation_mode"
+      }
+    },
+    "wrap_annotation.commit": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "errors": [
+        -32602,
+        -32000,
+        -32002,
+        -32009
+      ],
+      "errorProbes": [
+        {
+          "name": "annotation mode disabled",
+          "state": "loaded",
+          "before": [
+            {
+              "method": "wrap_annotation.set_mode",
+              "params": {
+                "enabled": false
+              }
+            }
+          ],
+          "params": {},
+          "code": -32002,
+          "after": [
+            {
+              "method": "wrap_annotation.set_mode",
+              "params": {
+                "enabled": true
+              }
+            }
+          ]
+        },
+        {
+          "name": "unknown viewer",
+          "state": "loaded",
+          "params": {
+            "viewer": "__missing__"
+          },
+          "code": -32002
+        }
+      ],
+      "unprobedErrors": [
+        -32000,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_commit_wrap_annotation"
+      }
+    },
+    "wrap_annotation.undo": {
+      "params": {
+        "type": "object",
+        "properties": {
+          "viewer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "errors": [
+        -32602,
+        -32000,
+        -32002,
+        -32009
+      ],
+      "errorProbes": [
+        {
+          "name": "unknown viewer",
+          "state": "loaded",
+          "params": {
+            "viewer": "__missing__"
+          },
+          "code": -32002
+        }
+      ],
+      "unprobedErrors": [
+        -32000,
+        -32009
+      ],
+      "mcp": {
+        "tool": "vc3d_undo_wrap_annotation"
+      }
+    }
+  }
+}
