@@ -702,19 +702,7 @@ void AgentBridgeServer::registerHandlers()
 
     registerFlattenHandlers();
 
-    // --- Per-segment mesh operations (SPEC §25) ---
-    _handlers.insert("segment.crop_bounds",
-        [this](const QJsonValue& p) { return handleSegmentCropBounds(p); });
-    _handlers.insert("segment.recalc_area",
-        [this](const QJsonValue& p) { return handleSegmentRecalcArea(p); });
-    _handlers.insert("segment.reoptimize",
-        [this](const QJsonValue& p) { return handleSegmentReoptimize(p); });
-    _handlers.insert("segment.refine_alpha_comp",
-        [this](const QJsonValue& p) { return handleSegmentRefineAlphaComp(p); });
-    _handlers.insert("segment.generate_mask",
-        [this](const QJsonValue& p) { return handleSegmentGenerateMask(p); });
-    _handlers.insert("segment.append_mask",
-        [this](const QJsonValue& p) { return handleSegmentAppendMask(p); });
+    registerSurfaceOpsHandlers();
 }
 
 

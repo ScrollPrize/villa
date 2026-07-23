@@ -238,6 +238,7 @@ set(srcs
     agent_bridge/AgentBridgeMethods_points.cpp
     agent_bridge/AgentBridgeMethods_seeding.cpp
     agent_bridge/AgentBridgeMethods_session.cpp
+    agent_bridge/AgentBridgeMethods_surfaceops.cpp
     agent_bridge/AgentBridgeMethods_viewer.cpp
     agent_bridge/AgentBridgeMethods_wrap.cpp
     agent_bridge/AgentBridgeCommandError.hpp

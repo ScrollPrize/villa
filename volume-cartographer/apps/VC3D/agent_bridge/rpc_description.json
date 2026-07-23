@@ -2158,6 +2158,262 @@
         "type": "object"
       }
     },
+    "segment.append_mask": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32007
+      ],
+      "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_append_segment_mask"
+      },
+      "params": {
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
+    "segment.crop_bounds": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_crop_segment_bounds"
+      },
+      "params": {
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
+    "segment.generate_mask": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005,
+        -32007
+      ],
+      "mcp": {
+        "paramRenames": {
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_generate_segment_mask"
+      },
+      "params": {
+        "properties": {
+          "segmentId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
+    "segment.recalc_area": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001
+      ],
+      "mcp": {
+        "paramRenames": {
+          "segmentIds": "segment_ids"
+        },
+        "tool": "vc3d_recalc_segment_area"
+      },
+      "params": {
+        "properties": {
+          "segmentIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "segmentIds"
+        ],
+        "type": "object"
+      }
+    },
+    "segment.refine_alpha_comp": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "borderOff": "border_off",
+          "genVertexColor": "gen_vertex_color",
+          "ompThreads": "omp_threads",
+          "outputDir": "output_dir",
+          "readerScale": "reader_scale",
+          "scaleGroup": "scale_group",
+          "segmentId": "segment_id"
+        },
+        "tool": "vc3d_refine_segment_alpha_comp"
+      },
+      "params": {
+        "properties": {
+          "borderOff": {
+            "default": 1,
+            "type": "number"
+          },
+          "genVertexColor": {
+            "default": false,
+            "type": "boolean"
+          },
+          "high": {
+            "default": 255,
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "low": {
+            "default": 26,
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "ompThreads": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "outputDir": {
+            "type": "string"
+          },
+          "overwrite": {
+            "default": true,
+            "type": "boolean"
+          },
+          "radius": {
+            "default": 3,
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "readerScale": {
+            "default": 0.5,
+            "type": "number"
+          },
+          "refine": {
+            "default": true,
+            "type": "boolean"
+          },
+          "scaleGroup": {
+            "default": "1",
+            "type": "string"
+          },
+          "segmentId": {
+            "type": "string"
+          },
+          "start": {
+            "default": -6,
+            "type": "number"
+          },
+          "step": {
+            "default": 2,
+            "type": "number"
+          },
+          "stop": {
+            "default": 30,
+            "type": "number"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
+    "segment.reoptimize": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32004,
+        -32005,
+        -32006,
+        -32007,
+        -32009
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "ompThreads": "omp_threads",
+          "paramOverrides": "param_overrides",
+          "segmentId": "segment_id",
+          "volumeId": "volume_id"
+        },
+        "tool": "vc3d_reoptimize_segment"
+      },
+      "params": {
+        "properties": {
+          "ompThreads": {
+            "default": 1,
+            "maximum": 2147483647,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "paramOverrides": {
+            "properties": {},
+            "type": "object"
+          },
+          "segmentId": {
+            "type": "string"
+          },
+          "volumeId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId"
+        ],
+        "type": "object"
+      }
+    },
     "segmentation.corrections.set_point_mode": {
       "errors": [
         -32602,
