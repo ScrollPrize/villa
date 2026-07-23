@@ -1198,6 +1198,7 @@ generatedControlMarkers(
     struct BranchLinkTarget {
         uint64_t fiberId = 0;
         int controlPointIndex = -1;
+        bool pending = false;
     };
     std::unordered_map<size_t, std::vector<BranchLinkTarget>> branchesByControl;
     branchesByControl.reserve(branches.size());
@@ -1218,7 +1219,11 @@ generatedControlMarkers(
                        target.controlPointIndex == branch.branchControlPointIndex;
             });
         if (duplicate == targets.end()) {
-            targets.push_back({branch.branchFiberId, branch.branchControlPointIndex});
+            targets.push_back({branch.branchFiberId,
+                               branch.branchControlPointIndex,
+                               branch.pending});
+        } else {
+            duplicate->pending = duplicate->pending || branch.pending;
         }
     }
 
@@ -1242,7 +1247,9 @@ generatedControlMarkers(
                       });
             for (const auto& target : it->second) {
                 marker.branchIds.push_back(target.fiberId);
-                marker.branchLinks.push_back({target.fiberId, target.controlPointIndex});
+                marker.branchLinks.push_back(
+                    {target.fiberId, target.controlPointIndex, target.pending});
+                marker.hasPendingLinks = marker.hasPendingLinks || target.pending;
             }
             marker.branchIds.erase(std::unique(marker.branchIds.begin(), marker.branchIds.end()),
                                    marker.branchIds.end());
@@ -2056,6 +2063,20 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                                                   controlPointIndex,
                                                   branchFiberId,
                                                   branchControlPointIndex);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::generatedControlPointLinkPendingChangeRequested,
+            this,
+            [this](const std::string& name,
+                   size_t controlPointIndex,
+                   uint64_t branchFiberId,
+                   int branchControlPointIndex,
+                   bool pending) {
+                handleGeneratedControlPointSetLinkPending(name,
+                                                          controlPointIndex,
+                                                          branchFiberId,
+                                                          branchControlPointIndex,
+                                                          pending);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedPredSnapPointRequested,
@@ -4561,13 +4582,28 @@ LineAnnotationController::controlMarkersForSession(const LineAnnotationSession& 
 
 std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker>
 LineAnnotationController::markLinkCandidateFiberIntersections(
-    std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers) const
+    std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers,
+    const std::vector<FiberBranchRef>& branches) const
 {
     const uint64_t candidateFiberId =
         _linkCandidate ? _linkCandidate->fiberId : uint64_t{0};
     for (auto& marker : markers) {
         marker.isLinkCandidateFiber =
             candidateFiberId != 0 && marker.fiberId == candidateFiberId;
+        marker.pendingBranchLink = false;
+        if (!marker.projectedBranchLink || !marker.connectorStart) {
+            continue;
+        }
+        for (const auto& branch : branches) {
+            // connectorStart carries the local endpoint position through a
+            // double->float round trip; match with a coarse tolerance.
+            if (branch.pending && branch.branchFiberId == marker.fiberId &&
+                cv::norm(toVec3f(branch.controlPointPosition) -
+                         *marker.connectorStart) <= 1.0e-3) {
+                marker.pendingBranchLink = true;
+                break;
+            }
+        }
     }
     return markers;
 }
@@ -4694,6 +4730,17 @@ bool LineAnnotationController::showGeneratedControlPointContextMenu(CChunkedVolu
                                               controlPointIndex,
                                               branchFiberId,
                                               branchControlPointIndex);
+        };
+        options.setBranchLinkPending = [this, surfaceName = viewer->surfName()](
+                                           size_t controlPointIndex,
+                                           uint64_t branchFiberId,
+                                           int branchControlPointIndex,
+                                           bool pending) {
+            handleGeneratedControlPointSetLinkPending(surfaceName,
+                                                      controlPointIndex,
+                                                      branchFiberId,
+                                                      branchControlPointIndex,
+                                                      pending);
         };
         result = vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
     }
@@ -5111,6 +5158,10 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             spanSummaries.push_back(std::move(summary));
         }
         const int componentSize = componentSizes[findRoot(indexById.at(fiber.id))];
+        const int pendingLinkCount = static_cast<int>(
+            std::count_if(fiber.branches.begin(),
+                          fiber.branches.end(),
+                          [](const FiberBranchRef& branch) { return branch.pending; }));
         summaries.push_back(FiberSummary{
             fiber.id,
             fiber.fileName,
@@ -5128,6 +5179,7 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             fiber.manualHvTag,
             fiber.tags,
             componentSize >= 2 ? componentSize : 0,
+            pendingLinkCount,
         });
     }
     std::sort(summaries.begin(), summaries.end(), [](const FiberSummary& a, const FiberSummary& b) {
@@ -5535,6 +5587,7 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     parentToLinked.branchControlPointDirection = linkedInitialDirection;
     parentToLinked.controlPointPosition = branchPoint;
     parentToLinked.branchControlPointPosition = linkedPoint;
+    parentToLinked.pending = true;
 
     const auto duplicateParentLink = std::find_if(
         parentSession.branches.begin(),
@@ -5557,6 +5610,7 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     linkedToParent.branchControlPointDirection = parentEndpointDirection;
     linkedToParent.controlPointPosition = linkedPoint;
     linkedToParent.branchControlPointPosition = branchPoint;
+    linkedToParent.pending = true;
     linkedSeedRecord->branches.push_back(linkedToParent);
     linkedSeedRecord->showLinkedLineOverlays = false;
     linkedSeedRecord->surfaceName = "linked_fiber_create_only";
@@ -5789,6 +5843,7 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
     localRef.branchControlPointDirection = farDirection;
     localRef.controlPointPosition = localPoint;
     localRef.branchControlPointPosition = farPoint;
+    localRef.pending = true;
 
     const auto duplicateLocal = std::find_if(
         session.branches.begin(),
@@ -5829,6 +5884,7 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
         reciprocal.branchControlPointDirection = storedLocalBranch->controlPointDirection;
         reciprocal.controlPointPosition = storedLocalBranch->branchControlPointPosition;
         reciprocal.branchControlPointPosition = storedLocalBranch->controlPointPosition;
+        reciprocal.pending = storedLocalBranch->pending;
 
         // storedFiberFromSession runs the branch metadata sync hook, which may
         // touch _fibers; re-find the far fiber before mutating it.
@@ -5961,6 +6017,123 @@ void LineAnnotationController::handleGeneratedControlPointUnlink(
         session.fiberMetricsMatchStoredFiber = true;
     } catch (const std::exception& ex) {
         showError(tr("Could not save fiber after unlinking: %1")
+                      .arg(QString::fromStdString(ex.what())));
+    }
+
+    emitFiberSummaries();
+    if (pane->dialog) {
+        pane->dialog->setGeneratedBranchOverlayData(
+            controlMarkersForSession(session),
+            generatedBranchLinePointsForSession(session),
+            generatedBranchLinkMarkers(session.branches),
+            true);
+    }
+    refreshBranchLineViews(session.fiberId);
+    refreshBranchLineViews(branchFiberId);
+}
+
+void LineAnnotationController::handleGeneratedControlPointSetLinkPending(
+    const std::string& surfaceName,
+    size_t controlPointIndex,
+    uint64_t branchFiberId,
+    int branchControlPointIndex,
+    bool pending)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+    auto& session = *pane->session;
+    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+        showError(tr("Line optimization is already running."));
+        return;
+    }
+    if (controlPointIndex >= session.controlPoints.size() || branchFiberId == 0) {
+        return;
+    }
+
+    std::vector<FiberBranchRef> updatedBranches;
+    for (auto& branch : session.branches) {
+        if (branch.controlPointIndex == static_cast<int>(controlPointIndex) &&
+            branch.branchFiberId == branchFiberId &&
+            (branchControlPointIndex < 0 ||
+             branch.branchControlPointIndex == branchControlPointIndex)) {
+            branch.pending = pending;
+            updatedBranches.push_back(branch);
+        }
+    }
+    if (updatedBranches.empty()) {
+        showError(tr("Could not find the link to update."));
+        return;
+    }
+
+    // Flip the reciprocal refs in the linked fiber, whether it is open in a
+    // pane or only loaded from storage. If it is neither, only the local side
+    // is updated/saved (same semantics as unlinking).
+    std::vector<uint64_t> affectedFiberIds;
+    auto updateReciprocals = [&session, pending](std::vector<FiberBranchRef>& targetBranches,
+                                                 const FiberBranchRef& updatedBranch) {
+        bool changed = false;
+        for (auto& candidate : targetBranches) {
+            const bool pointsToSession =
+                candidate.branchFiberId == session.fiberId ||
+                (!session.fiberFileName.empty() &&
+                 candidate.branchFileName == session.fiberFileName);
+            const bool sameLocalEndpoint =
+                candidate.branchControlPointIndex == updatedBranch.controlPointIndex ||
+                pointsApproximatelyEqual(candidate.branchControlPointPosition,
+                                         updatedBranch.controlPointPosition);
+            if (pointsToSession &&
+                candidate.controlPointIndex == updatedBranch.branchControlPointIndex &&
+                sameLocalEndpoint) {
+                candidate.pending = pending;
+                changed = true;
+            }
+        }
+        return changed;
+    };
+    for (const auto& updatedBranch : updatedBranches) {
+        for (const auto& otherPane : _panes) {
+            if (!otherPane.session ||
+                !branchReferencesFiber(updatedBranch,
+                                       otherPane.session->fiberId,
+                                       otherPane.session->fiberFileName)) {
+                continue;
+            }
+            if (updateReciprocals(otherPane.session->branches, updatedBranch)) {
+                addUniqueFiberId(affectedFiberIds, otherPane.session->fiberId);
+            }
+        }
+        for (auto& fiber : _fibers) {
+            if (!branchReferencesFiber(updatedBranch, fiber.id, fiber.fileName)) {
+                continue;
+            }
+            if (updateReciprocals(fiber.branches, updatedBranch)) {
+                addUniqueFiberId(affectedFiberIds, fiber.id);
+            }
+        }
+    }
+    scheduleBranchMetadataSaves(affectedFiberIds, session.fiberId);
+
+    try {
+        StoredFiber localFiber = storedFiberFromSession(session);
+        scheduleFiberSave(localFiber);
+        auto localIt = std::find_if(
+            _fibers.begin(),
+            _fibers.end(),
+            [&localFiber](const StoredFiber& existing) {
+                return (!localFiber.fileName.empty() &&
+                        existing.fileName == localFiber.fileName) ||
+                       existing.id == localFiber.id;
+            });
+        if (localIt == _fibers.end()) {
+            _fibers.push_back(std::move(localFiber));
+        } else {
+            *localIt = std::move(localFiber);
+        }
+        session.fiberMetricsMatchStoredFiber = true;
+    } catch (const std::exception& ex) {
+        showError(tr("Could not save fiber after updating the link: %1")
                       .arg(QString::fromStdString(ex.what())));
     }
 
@@ -7824,7 +7997,8 @@ void LineAnnotationController::handleGeneratedSideStripIntersectionQuery(
         request.cacheKey == _lastSideStripIntersectionKey &&
         request.surfaceName == _lastSideStripIntersectionSurfaceName) {
         pane->dialog->setGeneratedFiberIntersectionMarkers(
-            markLinkCandidateFiberIntersections(_lastSideStripIntersectionMarkers));
+            markLinkCandidateFiberIntersections(_lastSideStripIntersectionMarkers,
+                                                pane->session->branches));
         pane->dialog->setGeneratedSideStripIntersectionResult(
             _lastSideStripIntersectionMarkers.size());
         return;
@@ -7861,7 +8035,8 @@ void LineAnnotationController::handleGeneratedSideStripIntersectionQuery(
         auto previewMarkers = sideStripMarkersFromIntersections(
             previewIndex.sideStripIntersections(previewOptions));
         pane->dialog->setGeneratedFiberIntersectionMarkers(
-            markLinkCandidateFiberIntersections(std::move(previewMarkers)));
+            markLinkCandidateFiberIntersections(std::move(previewMarkers),
+                                                pane->session->branches));
     }
 
     if (_sideStripIntersectionRunning) {
@@ -8215,7 +8390,10 @@ void LineAnnotationController::applyPartialSideStripIntersectionMarkers(
     }
     if (auto* pane = paneForSurface(surfaceName); pane && pane->dialog) {
         pane->dialog->setGeneratedFiberIntersectionMarkers(
-            markLinkCandidateFiberIntersections(std::move(markers)));
+            markLinkCandidateFiberIntersections(
+                std::move(markers),
+                pane->session ? pane->session->branches
+                              : std::vector<FiberBranchRef>{}));
     }
 }
 
@@ -8236,7 +8414,10 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
                 _lastSideStripIntersectionSurfaceName = result.surfaceName;
                 _lastSideStripIntersectionMarkers = result.markers;
                 pane->dialog->setGeneratedFiberIntersectionMarkers(
-                    markLinkCandidateFiberIntersections(std::move(result.markers)));
+                    markLinkCandidateFiberIntersections(
+                        std::move(result.markers),
+                        pane->session ? pane->session->branches
+                                      : std::vector<FiberBranchRef>{}));
                 if (!hasPendingRequest) {
                     pane->dialog->setGeneratedSideStripIntersectionResult(markerCount);
                 }
@@ -9354,6 +9535,9 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
             throw std::runtime_error("Branch link is missing branch_file");
         }
         branchJson["branch_file"] = branchFileName;
+        if (branch.pending) {
+            branchJson["pending"] = true;
+        }
         root["branches"].push_back(std::move(branchJson));
     }
     root["control_points"] = nlohmann::json::array();
@@ -9517,6 +9701,7 @@ void LineAnnotationController::canonicalizeFiberSaveSnapshots(
             reciprocal->branchControlPointPosition = branch.controlPointPosition;
             reciprocal->controlPointDirection = branch.branchControlPointDirection;
             reciprocal->branchControlPointDirection = branch.controlPointDirection;
+            reciprocal->pending = branch.pending;
         }
     }
 }
@@ -9889,6 +10074,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
                         pointFromJson(branchJson.at("control_point_position"));
                     branch.branchControlPointPosition =
                         pointFromJson(branchJson.at("branch_control_point_position"));
+                    branch.pending = branchJson.value("pending", false);
                     if (branch.controlPointIndex < 0 ||
                         static_cast<size_t>(branch.controlPointIndex) >=
                             fiber.controlPoints.size()) {

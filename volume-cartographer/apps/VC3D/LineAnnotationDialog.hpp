@@ -86,9 +86,11 @@ public:
         QGraphicsPathItem* seedPoints = nullptr;
         QGraphicsPathItem* linkCandidatePoints = nullptr;
         QGraphicsPathItem* branchControlPoints = nullptr;
+        QGraphicsPathItem* pendingBranchControlPoints = nullptr;
         QGraphicsPathItem* fiberIntersections = nullptr;
         QGraphicsPathItem* linkCandidateFiberIntersections = nullptr;
         QGraphicsPathItem* branchLinkFiberIntersections = nullptr;
+        QGraphicsPathItem* pendingBranchLinkFiberIntersections = nullptr;
         QGraphicsPathItem* fiberIntersectionConnectors = nullptr;
     };
 
@@ -176,6 +178,11 @@ signals:
                                               size_t controlPointIndex,
                                               uint64_t branchFiberId,
                                               int branchControlPointIndex);
+    void generatedControlPointLinkPendingChangeRequested(const std::string& surfaceName,
+                                                         size_t controlPointIndex,
+                                                         uint64_t branchFiberId,
+                                                         int branchControlPointIndex,
+                                                         bool pending);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
