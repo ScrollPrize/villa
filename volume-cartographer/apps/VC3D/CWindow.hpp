@@ -84,6 +84,12 @@ struct AtlasSearchFiberSnapshot {
     std::vector<std::string> tags;
 };
 
+enum class VolumeAttachResult {
+    Attached,
+    AlreadyAttached,
+    VolumeIdConflict,
+};
+
 // Parameters for an atlas fiber-intersection search. The GUI slot builds the
 // same value from its widgets.
 struct AtlasFiberSearchParams {
@@ -272,8 +278,12 @@ private:
 
 
     void setVolume(std::shared_ptr<Volume> newvol);
-    bool attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
-                                      const QString& preferredVolumeId = QString());
+    VolumeAttachResult attachVolumeToCurrentPackage(
+        const std::shared_ptr<Volume>& volume,
+        const QString& location,
+        std::vector<std::string> tags = {},
+        const QString& remoteCacheRoot = {},
+        const QString& preferredVolumeId = {});
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
     void syncVolumeSelectionControls(const QString& activeVolumeId = QString());

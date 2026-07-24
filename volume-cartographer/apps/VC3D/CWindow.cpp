@@ -4085,24 +4085,31 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     updateOpenDataSegmentTransformState(true);
 }
 
-bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
-                                           const QString& preferredVolumeId)
+VolumeAttachResult CWindow::attachVolumeToCurrentPackage(
+    const std::shared_ptr<Volume>& volume,
+    const QString& location,
+    std::vector<std::string> tags,
+    const QString& remoteCacheRoot,
+    const QString& preferredVolumeId)
 {
     if (!_state || !_state->vpkg() || !volume) {
-        return false;
+        throw std::logic_error("cannot attach a volume without an open project");
     }
 
-    if (!_state->vpkg()->addVolume(volume)) {
-        return false;
-    }
+    const auto result = _state->vpkg()->attachPreparedVolume(
+        location.toStdString(),
+        std::move(tags),
+        volume,
+        remoteCacheRoot.toStdString());
+    if (result == VolumePkg::AttachVolumeResult::VolumeIdConflict)
+        return VolumeAttachResult::VolumeIdConflict;
 
     const bool needSurfaceLoad = _surfacePanel && !_surfacePanel->hasSurfaces();
-    refreshCurrentVolumePackageUi(preferredVolumeId.isEmpty()
-                                      ? QString::fromStdString(volume->id())
-                                      : preferredVolumeId,
-                                  needSurfaceLoad);
+    refreshCurrentVolumePackageUi(preferredVolumeId, needSurfaceLoad);
     UpdateView();
-    return true;
+    return result == VolumePkg::AttachVolumeResult::Attached
+        ? VolumeAttachResult::Attached
+        : VolumeAttachResult::AlreadyAttached;
 }
 
 void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,

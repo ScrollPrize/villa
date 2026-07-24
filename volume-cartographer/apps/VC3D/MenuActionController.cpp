@@ -32,7 +32,6 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QFutureWatcher>
-#include <QUnhandledException>
 #include <QInputDialog>
 #include <QtConcurrent>
 #include <QDateTime>
@@ -79,7 +78,6 @@
 namespace
 {
 constexpr int kMaxStoredRemoteUrls = 10;
-QString extractExceptionMessage(const std::exception& e);
 bool isAuthError(const QString& msg);
 
 } // namespace
@@ -91,6 +89,11 @@ struct MenuActionController::OpenDataOpenTaskResult {
     QString error;
     QString sampleId;
     qint64 tifxyzSegmentCount{0};
+};
+
+struct MenuActionController::VolumeAttachmentTaskResult {
+    std::shared_ptr<Volume> volume;
+    QString error;
 };
 
 MenuActionController::MenuActionController(CWindow* window)
@@ -639,6 +642,183 @@ bool MenuActionController::openDataSampleOpenInFlight() const
     return _openDataSampleOpenInFlight;
 }
 
+bool MenuActionController::prepareVolumeAttachment(
+    const QString& location,
+    std::vector<std::string> tags,
+    VolumeAttachmentPresentation presentation,
+    VolumeAttachmentRequest* request,
+    QString* errorMessage)
+{
+    if (!request) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("No attachment request output was provided.");
+        return false;
+    }
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("Open a volume package before attaching a volume.");
+        return false;
+    }
+
+    const QString trimmed = location.trimmed();
+    if (trimmed.isEmpty()) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("Volume location must not be blank.");
+        return false;
+    }
+
+    const std::string input = trimmed.toStdString();
+    const std::string validationError =
+        vc::project::validateSingleVolumeLocation(input);
+    if (!validationError.empty()) {
+        if (errorMessage)
+            *errorMessage = QString::fromStdString(validationError);
+        return false;
+    }
+
+    VolumeAttachmentRequest prepared;
+    prepared.tags = std::move(tags);
+    if (vc::project::isLocationRemote(input)) {
+        const auto spec = vc::parseRemoteVolumeSpec(input);
+        prepared.location = QString::fromStdString(spec.portableLocator);
+        if (!tryResolveRemoteAuth(
+                prepared.location,
+                &prepared.auth,
+                presentation == VolumeAttachmentPresentation::Interactive,
+                errorMessage)) {
+            return false;
+        }
+        prepared.remoteCacheRoot = remoteCacheDirectory(
+            presentation == VolumeAttachmentPresentation::Interactive);
+        if (prepared.remoteCacheRoot.isEmpty()) {
+            if (errorMessage && errorMessage->isEmpty() &&
+                presentation == VolumeAttachmentPresentation::Silent) {
+                *errorMessage = QObject::tr("Could not resolve the remote volume cache.");
+            }
+            return false;
+        }
+    } else {
+        prepared.location = QString::fromStdString(
+            vc::project::resolveLocalPath(input).lexically_normal().string());
+    }
+
+    *request = std::move(prepared);
+    if (errorMessage)
+        errorMessage->clear();
+    return true;
+}
+
+bool MenuActionController::startVolumeAttachment(
+    VolumeAttachmentRequest request,
+    std::function<void(const VolumeAttachmentOutcome&)> onFinished,
+    QString* errorMessage)
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("Open a volume package before attaching a volume.");
+        return false;
+    }
+    if (_volumeAttachmentInFlight) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("A volume attachment is already in progress.");
+        return false;
+    }
+
+    const auto targetPackage = _window->_state->vpkg();
+    const VolumeAttachmentRequest loadRequest = request;
+    auto* watcher = new QFutureWatcher<VolumeAttachmentTaskResult>(this);
+    connect(
+        watcher,
+        &QFutureWatcher<VolumeAttachmentTaskResult>::finished,
+        this,
+        [this,
+         watcher,
+         targetPackage,
+         request = std::move(request),
+         onFinished = std::move(onFinished)]() mutable {
+            VolumeAttachmentTaskResult task = watcher->result();
+            _volumeAttachmentInFlight = false;
+            watcher->deleteLater();
+
+            VolumeAttachmentOutcome outcome;
+            outcome.location = request.location;
+            outcome.error = task.error;
+            if (!task.volume) {
+                outcome.failure = VolumeAttachmentFailure::Load;
+            } else if (!_window || !_window->_state ||
+                       _window->_state->vpkg() != targetPackage) {
+                outcome.failure = VolumeAttachmentFailure::ProjectChanged;
+                outcome.error = QObject::tr(
+                    "The open project changed while the volume was loading.");
+            } else {
+                outcome.volumeId = QString::fromStdString(task.volume->id());
+                outcome.projectPath = _window->_state->vpkgPath();
+                try {
+                    const QString preferredVolumeId =
+                        request.selection == VolumeAttachmentSelection::SelectAttached
+                            ? outcome.volumeId
+                            : QString{};
+                    const auto result = _window->attachVolumeToCurrentPackage(
+                        task.volume,
+                        request.location,
+                        std::move(request.tags),
+                        request.remoteCacheRoot,
+                        preferredVolumeId);
+                    if (result == VolumeAttachResult::VolumeIdConflict) {
+                        outcome.failure = VolumeAttachmentFailure::VolumeIdConflict;
+                        outcome.error = QObject::tr(
+                            "A different volume with id '%1' is already attached.")
+                                            .arg(outcome.volumeId);
+                    } else {
+                        outcome.success = true;
+                        outcome.alreadyAttached =
+                            result == VolumeAttachResult::AlreadyAttached;
+                    }
+                } catch (const std::exception& error) {
+                    outcome.failure = VolumeAttachmentFailure::Apply;
+                    outcome.error = QString::fromUtf8(error.what());
+                } catch (...) {
+                    outcome.failure = VolumeAttachmentFailure::Apply;
+                    outcome.error = QObject::tr(
+                        "Unknown error while updating the volume package.");
+                }
+            }
+
+            if (onFinished)
+                onFinished(outcome);
+        });
+
+    _volumeAttachmentInFlight = true;
+    watcher->setFuture(QtConcurrent::run(
+        [request = loadRequest]() {
+            VolumeAttachmentTaskResult result;
+            try {
+                const std::string location = request.location.toStdString();
+                if (vc::project::isLocationRemote(location)) {
+                    result.volume = Volume::NewFromUrl(
+                        location,
+                        request.remoteCacheRoot.toStdString(),
+                        request.auth);
+                } else {
+                    result.volume = Volume::New(std::filesystem::path(location));
+                }
+            } catch (const std::exception& error) {
+                result.error = QString::fromUtf8(error.what());
+            } catch (...) {
+                result.error = QObject::tr("Unknown error while loading the volume.");
+            }
+            return result;
+        }));
+    if (errorMessage)
+        errorMessage->clear();
+    return true;
+}
+
+bool MenuActionController::volumeAttachmentInFlight() const
+{
+    return _volumeAttachmentInFlight;
+}
+
 void MenuActionController::beginOpenDataSampleOpenTask(
     const vc3d::opendata::OpenDataSample& sample,
     bool interactive,
@@ -1134,7 +1314,6 @@ QString MenuActionController::configuredRemoteCacheDirectory() const
 QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
 {
     QString cacheDir = configuredRemoteCacheDirectory();
-    bool shouldPersistCacheRoot = !cacheDir.isEmpty();
 
     if (cacheDir.isEmpty() && allowPrompt) {
         bool ok = false;
@@ -1151,7 +1330,6 @@ QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
         // Send the prompted value through the resolver too — keeps the host
         // mount authoritative even if the user typed something else.
         cacheDir = vc3d::remoteCachePath(cacheDir);
-        shouldPersistCacheRoot = !cacheDir.isEmpty();
     }
 
     if (cacheDir.isEmpty()) {
@@ -1168,63 +1346,27 @@ QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
         cacheDir = QDir::cleanPath(QDir::current().absoluteFilePath(cacheDir));
     }
 
-    if (shouldPersistCacheRoot && _window && _window->_state && _window->_state->vpkg()) {
-        // VolumePkg::setRemoteCacheRoot persists to the volpkg JSON
-        // automatically via persistProjectState().
-        auto pkg = _window->_state->vpkg();
-        if (!pkg->hasRemoteCacheRoot()) {
-            pkg->setRemoteCacheRoot(cacheDir.toStdString());
-        }
-    }
-
-    QDir().mkpath(cacheDir);
-    return cacheDir;
+    return QDir().mkpath(cacheDir) ? cacheDir : QString{};
 }
 
 void MenuActionController::attachRemoteZarrUrl(const QString& url)
 {
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::warning(_window,
-                             QObject::tr("No Volume Package Loaded"),
-                             QObject::tr("Open a volpkg before attaching a remote zarr."));
-        return;
-    }
-
-    vc::RemoteVolumeSpec spec;
-    try {
-        spec = vc::parseRemoteVolumeSpec(url.trimmed().toStdString());
-    } catch (const std::exception& e) {
-        QMessageBox::warning(_window, QObject::tr("Invalid Remote Zarr"),
-                             QString::fromUtf8(e.what()));
-        return;
-    }
-    const auto query = spec.sourceUrl.find('?');
-    const auto sourcePath = spec.sourceUrl.substr(0, query);
-    const bool looksLikeZarr = sourcePath.size() >= 5 &&
-                               sourcePath.substr(sourcePath.size() - 5) == ".zarr";
-    if (!looksLikeZarr) {
-        QMessageBox::warning(_window,
-                             QObject::tr("Expected Remote Zarr"),
-                             QObject::tr("Attach Remote Zarr expects a direct .zarr URL, not a scroll root."));
-        return;
-    }
-
-    vc::HttpAuth auth;
-    QString authError;
-    if (!tryResolveRemoteAuth(url, &auth, true, &authError)) {
-        if (!authError.isEmpty() && authError != QObject::tr("AWS credential entry canceled.")) {
-            QMessageBox::warning(_window, QObject::tr("Authentication Error"), authError);
+    VolumeAttachmentRequest request;
+    QString error;
+    if (!prepareVolumeAttachment(
+            url,
+            {},
+            VolumeAttachmentPresentation::Interactive,
+            &request,
+            &error)) {
+        if (!error.isEmpty()) {
+            QMessageBox::warning(
+                _window, QObject::tr("Attach Remote Zarr"), error);
         }
         return;
     }
-
-    const QString cacheDir = remoteCacheDirectory(true);
-    if (cacheDir.isEmpty()) {
-        return;
-    }
-    const QString persistedLocator = QString::fromStdString(
-        spec.hasBaseScaleSelector ? spec.portableLocator : url.trimmed().toStdString());
-    updateRecentRemoteList(persistedLocator);
+    request.selection = VolumeAttachmentSelection::SelectAttached;
+    const QString persistedLocator = request.location;
     if (_attachRemoteZarrAct) {
         _attachRemoteZarrAct->setEnabled(false);
     }
@@ -1232,68 +1374,28 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
         _window->showStatusBarMessage(QObject::tr("Attaching remote zarr..."));
     }
 
-    auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
-    connect(watcher, &QFutureWatcher<std::shared_ptr<Volume>>::finished, this,
-            [this, watcher, persistedLocator]() {
-                watcher->deleteLater();
+    const bool started = startVolumeAttachment(
+        std::move(request),
+        [this, persistedLocator](const VolumeAttachmentOutcome& outcome) {
                 if (_attachRemoteZarrAct) {
                     _attachRemoteZarrAct->setEnabled(true);
                 }
 
-                auto future = watcher->future();
-                QString errorMsg;
-                bool success = false;
-
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-                if (future.isValid() && !future.isCanceled() && future.isResultReadyAt(0)) {
-#else
-                if (future.isFinished() && !future.isCanceled()) {
-#endif
-                    try {
-                        auto volume = future.result();
-                        if (!_window || !_window->_state || !_window->_state->vpkg()) {
-                            return;
-                        }
-
-                        if (!_window->attachVolumeToCurrentPackage(volume)) {
-                            QMessageBox::warning(
-                                _window,
-                                QObject::tr("Attach Remote Zarr"),
-                                QObject::tr("A volume with id '%1' is already present in this volume package.")
-                                    .arg(QString::fromStdString(volume->id())));
-                            return;
-                        }
-
-                        // VolumePkg::addVolumeEntry persists to the volpkg
-                        // JSON automatically via persistProjectState().
-                        _window->_state->vpkg()->addVolumeEntry(persistedLocator.toStdString());
-
-                        if (_window->statusBar()) {
-                            _window->showStatusBarMessage(
-                                QObject::tr("Attached remote zarr: %1")
-                                    .arg(QString::fromStdString(volume->id())),
-                                5000);
-                        }
-                        success = true;
-                    } catch (const std::exception& e) {
-                        errorMsg = extractExceptionMessage(e);
-                    } catch (...) {
-                        errorMsg = QObject::tr("Unknown error attaching remote zarr");
+                if (outcome.success) {
+                    updateRecentRemoteList(persistedLocator);
+                    if (_window && _window->statusBar()) {
+                        _window->showStatusBarMessage(
+                            outcome.alreadyAttached
+                                ? QObject::tr("Remote zarr is already attached: %1")
+                                      .arg(outcome.volumeId)
+                                : QObject::tr("Attached remote zarr: %1")
+                                      .arg(outcome.volumeId),
+                            5000);
                     }
-                } else {
-                    try {
-                        future.waitForFinished();
-                        future.result();
-                    } catch (const std::exception& e) {
-                        errorMsg = extractExceptionMessage(e);
-                    } catch (...) {
-                        errorMsg = QObject::tr("Unknown error attaching remote zarr");
-                    }
+                    return;
                 }
 
-                if (success) return;
-
-                if (isAuthError(errorMsg)) {
+                if (isAuthError(outcome.error)) {
                     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
                     settings.remove(vc3d::settings::aws::ACCESS_KEY);
                     settings.remove(vc3d::settings::aws::SECRET_KEY);
@@ -1304,7 +1406,7 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
                         QObject::tr("Authentication Error"),
                         QObject::tr("Failed to attach remote zarr:\n%1\n\n"
                                     "Would you like to enter new AWS credentials and retry?")
-                            .arg(errorMsg),
+                            .arg(outcome.error),
                         QMessageBox::Yes | QMessageBox::No);
                     if (reply == QMessageBox::Yes) {
                         QTimer::singleShot(0, this, [this, persistedLocator]() {
@@ -1317,37 +1419,21 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
                 QMessageBox::critical(
                     _window,
                     QObject::tr("Attach Remote Zarr Error"),
-                    QObject::tr("Failed to attach remote zarr:\n%1").arg(errorMsg));
-            });
-
-    auto future = QtConcurrent::run([persistedLocator, auth, cacheDir]() -> std::shared_ptr<Volume> {
-        return Volume::NewFromUrl(persistedLocator.toStdString(), cacheDir.toStdString(), auth);
-    });
-    watcher->setFuture(future);
+                    QObject::tr("Failed to attach remote zarr:\n%1")
+                        .arg(outcome.error));
+        },
+        &error);
+    if (!started) {
+        if (_attachRemoteZarrAct) {
+            _attachRemoteZarrAct->setEnabled(true);
+        }
+        QMessageBox::warning(
+            _window, QObject::tr("Attach Remote Zarr"), error);
+    }
 }
 
 namespace
 {
-
-// Helper: extract the real error message from a QFuture exception.
-// Qt wraps task exceptions in QUnhandledException whose what() returns
-// "std::exception" — useless. Unwrap to get the original message.
-QString extractExceptionMessage(const std::exception& e)
-{
-    if (auto* unhandled = dynamic_cast<const QUnhandledException*>(&e)) {
-        auto ptr = unhandled->exception();
-        if (ptr) {
-            try {
-                std::rethrow_exception(ptr);
-            } catch (const std::exception& inner) {
-                return QString::fromStdString(inner.what());
-            } catch (...) {
-                return QObject::tr("Unknown error (non-std::exception)");
-            }
-        }
-    }
-    return QString::fromStdString(e.what());
-}
 
 bool isAuthError(const QString& msg)
 {
