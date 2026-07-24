@@ -109,6 +109,16 @@ signals:
     void lasagnaOutputActivated(const QString& outputName);
 
 private:
+    enum class Presentation {
+        Interactive,
+        Silent
+    };
+
+    struct SubmissionResult {
+        bool submitted{false};
+        QString error;
+    };
+
     void writeSetting(const QString& key, const QVariant& value);
     void populateConfigCombo(QComboBox* combo, const QString& dir,
                              const QString& selectName, QString& outPath,
@@ -120,7 +130,10 @@ private:
     void triggerOptimization();
     void launchLasagnaMode(LasagnaMode mode);
     void launchAtlasOptimization();
-    void startAtlasOptimization(CState* state, QStatusBar* statusBar);
+    [[nodiscard]] SubmissionResult startAtlasOptimization(
+        CState* state,
+        QStatusBar* statusBar,
+        Presentation presentation = Presentation::Interactive);
     void syncCompactConfigCombos();
     void syncCompactStatusFromFull();
     void updateCompactLinkedSurfaceTable(const QStringList& names);
@@ -128,21 +141,28 @@ private:
     [[nodiscard]] QStringList currentLinkedSurfaceNames() const;
     void showLasagnaConfigError(const QString& message,
                                 QStatusBar* statusBar,
-                                int timeoutMs);
+                                int timeoutMs,
+                                Presentation presentation = Presentation::Interactive);
     [[nodiscard]] bool validateLasagnaConfigPath(const QString& configPath,
-                                                 QStatusBar* statusBar);
+                                                 QStatusBar* statusBar,
+                                                 Presentation presentation =
+                                                     Presentation::Interactive);
     [[nodiscard]] bool validateAtlasDirPath(const QString& atlasDir,
-                                            QStatusBar* statusBar);
+                                            QStatusBar* statusBar,
+                                            Presentation presentation =
+                                                Presentation::Interactive);
     void populateAtlasCombo(const QString& volpkgRoot, const QString& selectPath);
     void refreshAtlasComboFromState();
-    void startOptimizationWithOverrides(CState* state,
-                                        QStatusBar* statusBar,
-                                        int modeOverride,
-                                        const QString& configPathOverride,
-                                        bool hasSeedOverride,
-                                        int seedX,
-                                        int seedY,
-                                        int seedZ);
+    [[nodiscard]] SubmissionResult startOptimizationWithOverrides(
+        CState* state,
+        QStatusBar* statusBar,
+        int modeOverride,
+        const QString& configPathOverride,
+        bool hasSeedOverride,
+        int seedX,
+        int seedY,
+        int seedZ,
+        Presentation presentation = Presentation::Interactive);
 
     // -- Sections --
     CollapsibleSettingsGroup* _connectionGroup{nullptr};
@@ -226,14 +246,6 @@ private:
     int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand, 3=offset
     LasagnaMode _lastLasagnaMode{LasagnaMode::ReOptimize};
 
-    // Suppresses the single QMessageBox path reachable during a direct launch.
-    // Unreadable configs and missing atlas inputs can fail after preflight.
-    bool _suppressInteractiveDialogs{false};
-    // Set immediately before the real LasagnaServiceManager submission call in
-    // startOptimizationWithOverrides/startAtlasOptimization. Both functions
-    // return void on several failure paths, so startOptimizationHeadless reads
-    // this flag instead of assuming submission succeeded.
-    bool _headlessSubmissionMade{false};
     int _connectionMode{0};  // 0=internal, 1=external
     QString _externalHost{"127.0.0.1"};
     int _externalPort{9999};
