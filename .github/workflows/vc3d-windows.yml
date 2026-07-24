@@ -91,6 +91,70 @@ jobs:
       - name: Build
         run: ninja -C build/ci-windows-mingw
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test MCP Windows support
+        shell: pwsh
+        working-directory: volume-cartographer/tools/vc3d-mcp
+        env:
+          VC3D_MCP_TEST_BINARY: ${{ github.workspace }}\volume-cartographer\build\ci-windows-mingw\bin\VC3D.exe
+        run: |
+          $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
+          $env:QT_PLUGIN_PATH = "C:\msys64\ucrt64\share\qt6\plugins"
+          python -m pip install -e .
+          python -m unittest -v `
+            tests.test_contract `
+            tests.test_real_bridge `
+            tests.test_windows_pipe `
+            tests.test_runtime.RegistryDiscoveryTest `
+            tests.test_runtime.RegistryResolutionTest `
+            tests.test_runtime.AutoLaunchTest
+
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD "run.ps1"),
+            [ref] $tokens,
+            [ref] $errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            throw "run.ps1 has PowerShell syntax errors"
+          }
+
+          $venv = Join-Path $PWD ".venv"
+          $stdout = Join-Path $env:RUNNER_TEMP "vc3d-mcp-launcher.stdout"
+          $stderr = Join-Path $env:RUNNER_TEMP "vc3d-mcp-launcher.stderr"
+          Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue
+          python -m venv $venv
+          $powershell = (Get-Command powershell.exe).Source
+          $launcher = Start-Process `
+            -FilePath $powershell `
+            -ArgumentList @(
+              "-NoProfile",
+              "-ExecutionPolicy", "Bypass",
+              "-File", (Join-Path $PWD "run.ps1"),
+              "--socket", "\\.\pipe\vc3d-mcp-ci-missing",
+              "--request-timeout", "0.1"
+            ) `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -NoNewWindow `
+            -Wait `
+            -PassThru
+          $launcherExitCode = $launcher.ExitCode
+          if ((Get-Item $stdout).Length -ne 0) {
+            Get-Content $stdout | Write-Host
+            throw "run.ps1 wrote setup output to MCP stdout"
+          }
+          if ($launcherExitCode -ne 2) {
+            Get-Content $stderr | Write-Host
+            throw "run.ps1 returned $launcherExitCode; expected connection failure 2"
+          }
+          Remove-Item -LiteralPath $venv -Recurse -Force
+
       - name: Report compiler cache statistics
         if: always()
         run: '"${SCCACHE_PATH}" --show-stats'

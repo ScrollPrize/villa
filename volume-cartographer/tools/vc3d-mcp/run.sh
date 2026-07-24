@@ -36,8 +36,8 @@ if [ "$needs_setup" -eq 1 ]; then
         echo "[vc3d-mcp] No '$PYTHON_BIN' found on PATH. Install Python 3.10+ or set PYTHON=/path/to/python3." >&2
         exit 1
     fi
-    "$PYTHON_BIN" -m venv "$VENV"
-    "$VENV/bin/pip" install -q -e "$DIR"
+    "$PYTHON_BIN" -m venv "$VENV" >&2
+    "$VENV/bin/pip" install -q -e "$DIR" >&2
     echo "[vc3d-mcp] Setup complete." >&2
 fi
 

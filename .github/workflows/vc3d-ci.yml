@@ -157,6 +157,16 @@ jobs:
       - name: Configure + build
         run: volume-cartographer/scripts/build_macos.sh --sccache
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test MCP bridge
+        working-directory: volume-cartographer/tools/vc3d-mcp
+        run: |
+          python -m pip install -e .
+          python -m unittest discover -p 'test*.py'
+
   ci:
     name: CI
     needs: [changes, skip, build-test, mcp-test, macos-build]
