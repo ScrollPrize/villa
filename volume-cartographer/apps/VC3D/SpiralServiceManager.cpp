@@ -31,7 +31,10 @@ namespace {
 constexpr int kPollMs = 500;
 constexpr int kPollBackoffMs = 2000;
 constexpr int kPollReconnectMs = 5000;
-constexpr int kRemoteLogPollMs = 10000;
+// Keep remote stdout/stderr close to the locally launched service experience.
+// In particular, tqdm redraws its loading and fit bars several times a second;
+// a long polling interval turns those redraws into delayed bursts.
+constexpr int kRemoteLogPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;

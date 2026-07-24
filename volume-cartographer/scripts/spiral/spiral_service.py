@@ -58,7 +58,10 @@ UPLOADED_CHECKPOINTS_KEPT = 3
 MAX_CHECKPOINT_UPLOAD_BYTES = int(os.environ.get(
     "SPIRAL_CHECKPOINT_UPLOAD_MAX_BYTES", 64 * 1024 * 1024 * 1024))
 UPLOADED_CHECKPOINTS_DIRNAME = "uploaded-checkpoints"
-MAX_LOG_ENTRIES = 2000
+# This buffer is also the reconnect/late-attach history for a remote VC3D
+# client.  tqdm produces one entry for each carriage-return redraw, so leave
+# enough room for the loading bars and a substantial portion of a long fit.
+MAX_LOG_ENTRIES = 20000
 MAX_LOG_READ_ENTRIES = 1000
 MAX_LOG_ENTRY_CHARS = 8192
 

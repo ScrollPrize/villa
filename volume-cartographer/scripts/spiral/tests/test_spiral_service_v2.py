@@ -300,6 +300,22 @@ class LogStreamingTests(HttpServiceFixture):
         self.assertEqual([entry["text"] for entry in logs.read_after(0)["entries"]],
                          ["useful fitter warning"])
 
+    def test_carriage_return_progress_redraws_are_relayed_as_complete_lines(self):
+        logs = ServiceLogBuffer()
+        logs.write("stderr", "\rloading patches:  25%|██▌       | 1/4")
+        logs.write("stderr", "\rloading patches: 100%|██████████| 4/4\n")
+        logs.write("stderr", "\r 40%|████      | 400/1000")
+        logs.write("stderr", "\r100%|██████████| 1000/1000\n")
+
+        self.assertEqual(
+            [entry["text"] for entry in logs.read_after(0)["entries"]],
+            [
+                "loading patches:  25%|██▌       | 1/4",
+                "loading patches: 100%|██████████| 4/4",
+                " 40%|████      | 400/1000",
+                "100%|██████████| 1000/1000",
+            ])
+
 
 class ArtifactHttpTests(HttpServiceFixture):
     def _register_artifact(self, contents=b"0123456789abcdef"):

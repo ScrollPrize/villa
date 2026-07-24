@@ -183,7 +183,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     auto* pythonOutputLayout = new QVBoxLayout(_pythonOutputDialog);
     _pythonOutput = new ConsoleOutputWidget(_pythonOutputDialog);
     _pythonOutput->setTitle(tr("Spiral Python stdout / stderr"));
-    _pythonOutput->setMaximumBlockCount(10000);
+    // A fit can run long enough to produce many tqdm redraws.  Retain enough
+    // blocks that the loading-stage bars and early fitter diagnostics remain
+    // available alongside the live fit-stage bar.
+    _pythonOutput->setMaximumBlockCount(100000);
     pythonOutputLayout->addWidget(_pythonOutput);
     connect(_service, &SpiralServiceManager::logMessage, _pythonOutput,
             [this](const QString& message) {
