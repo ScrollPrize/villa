@@ -165,6 +165,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
     - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput.
+- [vesuvius-sheet-tools](https://github.com/IyanDopico/vesuvius-sheet-tools) by Iyan Dopico: a CPU-friendly pipeline from the official surface predictions to spiral-fit inputs on scrolls with no human segments: prediction cleaning, per-sheet instance separation (calibrated watershed + CLAHE/structure-tensor splitting of fused stacks), whole-scroll stitching (the public 686k-instance PHerc1218 dataset), label-free winding-pitch QA with negative-control calibration, and machine-generated spiral-fit constraint packs (umbilicus, same/relative windings, synthesized seed patches) used for the first fitted surfaces of PHerc1218 with `fit_spiral`. Streams directly from the open S3 bucket; validated on PHerc0332 and PHerc1218.
       
 ### 📦 Materials
 
