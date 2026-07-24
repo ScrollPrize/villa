@@ -280,17 +280,66 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
         };
     }
 
+    const bool select = p.value("select").toBool(true);
+    auto sourceIsSelected = [&](const std::string& persistedLocation) {
+        const fs::path selected =
+            vpkg->outputSegmentsPath().lexically_normal();
+        const fs::path source = vc::project::resolveLocalPath(
+            persistedLocation, vpkg->path().parent_path()).lexically_normal();
+        if (selected.empty())
+            return false;
+        std::error_code ec;
+        if (fs::equivalent(selected, source, ec))
+            return true;
+        return selected == source;
+    };
     auto resultFor = [&](bool attached, const std::string& persistedLocation) {
         return QJsonObject{
             {"attached", attached},
             {"alreadyAttached", !attached},
             {"location", QString::fromStdString(persistedLocation)},
             {"projectPath", QString::fromStdString(vpkg->path().string())},
+            {"selected", sourceIsSelected(persistedLocation)},
         };
     };
 
-    if (const auto existing = vpkg->matchingSegmentsEntry(normalizedLocation))
-        return resultFor(false, existing->location);
+    const auto existing =
+        vpkg->matchingSegmentsEntry(normalizedLocation);
+    const std::string persistedLocation =
+        existing ? existing->location : normalizedLocation;
+    if (!existing) {
+        const std::string sourceName = localPath.filename().string();
+        for (const auto& entry : vpkg->segmentEntries()) {
+            const fs::path entryPath = vc::project::resolveLocalPath(
+                entry.location, vpkg->path().parent_path()).lexically_normal();
+            if (entryPath.filename() == localPath.filename()) {
+                throw AgentBridgeError{
+                    -32010,
+                    "A segment source with the same directory name is already attached",
+                    QJsonObject{
+                        {"sourceName", QString::fromStdString(sourceName)},
+                        {"existingLocation",
+                         QString::fromStdString(entry.location)},
+                    },
+                };
+            }
+        }
+    }
+
+    const bool selectionChanged =
+        select && !sourceIsSelected(persistedLocation);
+    const bool reloadSurfaces = !existing || selectionChanged;
+    if (reloadSurfaces && _window->_segmentationWidget &&
+        _window->_segmentationWidget->isEditingEnabled()) {
+        throw AgentBridgeError{
+            -32004,
+            "Cannot attach segments while editing",
+            QJsonObject{
+                {"detail",
+                 "disable segmentation editing before changing segment sources"},
+            },
+        };
+    }
 
     std::vector<std::string> tags;
     const QJsonArray tagValues = p.value("tags").toArray();
@@ -298,21 +347,13 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
     for (const QJsonValue& tag : tagValues)
         tags.push_back(tag.toString().toStdString());
 
+    bool attached = false;
     try {
-        if (!vpkg->addSegmentsEntry(normalizedLocation, std::move(tags))) {
-            if (const auto existing =
-                    vpkg->matchingSegmentsEntry(normalizedLocation)) {
-                return resultFor(false, existing->location);
-            }
-            throw AgentBridgeError{
-                -32010,
-                "Could not attach segments",
-                QJsonObject{},
-            };
-        }
-        _window->refreshCurrentVolumePackageUi(QString(), true);
-    } catch (const AgentBridgeError&) {
-        throw;
+        attached = vpkg->attachSegmentsEntry(
+                       normalizedLocation, std::move(tags), select) ==
+                   VolumePkg::AttachSegmentsResult::Attached;
+        if (reloadSurfaces)
+            _window->refreshCurrentVolumePackageUi(QString(), true);
     } catch (const std::exception& error) {
         throw AgentBridgeError{
             -32005,
@@ -321,7 +362,7 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
         };
     }
 
-    return resultFor(true, normalizedLocation);
+    return resultFor(attached, persistedLocation);
 }
 
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -780,10 +781,21 @@ def check_segments_attach(
     root: Path,
     volpkg: Path,
 ) -> None:
+    initial = root / "initial-segments"
+    create_test_segment(initial / "initial-segment", "initial-segment")
     source = root / "user-segments"
-    create_test_segment(source / "smoke-segment", "smoke-segment")
+    segment_id = "20241113080880"
+    shutil.copytree(
+        REPO_ROOT / "core" / "test" / "data" / "segments" / segment_id,
+        source / segment_id,
+    )
 
     try:
+        client.call(
+            "segments.attach",
+            {"location": str(initial)},
+            timeout=10.0,
+        )
         result, _ = client.call(
             "segments.attach",
             {
@@ -806,8 +818,9 @@ def check_segments_attach(
                 "alreadyAttached": False,
                 "location": str(source),
                 "projectPath": str(volpkg),
+                "selected": True,
             }
-            and "smoke-segment" in ids
+            and segment_id in ids
             and matching == [{
                 "location": str(source),
                 "tags": ["source:smoke", "status:working"],
@@ -842,6 +855,7 @@ def check_segments_attach(
             "segments_attach_idempotent",
             retry.get("attached") is False
             and retry.get("alreadyAttached") is True
+            and retry.get("selected") is True
             and matching == [{
                 "location": str(source),
                 "tags": ["source:smoke", "status:working"],
@@ -853,6 +867,90 @@ def check_segments_attach(
             "segments_attach_idempotent",
             False,
             f"{type(error).__name__}: {error}",
+        )
+
+    editing_enabled = False
+    try:
+        client.call(
+            "segments.activate",
+            {"segmentId": segment_id},
+            timeout=10.0,
+        )
+        client.call(
+            "segmentation.enable_editing",
+            {"enabled": True},
+            timeout=10.0,
+        )
+        editing_enabled = True
+        blocked = root / "blocked-segments"
+        create_test_segment(blocked / "blocked-segment", "blocked-segment")
+        before = json.loads(volpkg.read_text())
+        try:
+            client.call(
+                "segments.attach",
+                {"location": str(blocked), "select": False},
+                timeout=10.0,
+            )
+            results.record(
+                "segments_attach_editing_guard",
+                False,
+                "expected an error, got a result",
+            )
+        except BridgeError as error:
+            after = json.loads(volpkg.read_text())
+            results.record(
+                "segments_attach_editing_guard",
+                error.code == -32004 and after == before,
+                f"returned code={error.code} project_unchanged={after == before}",
+            )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_editing_guard",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+    finally:
+        if editing_enabled:
+            try:
+                client.call(
+                    "segmentation.enable_editing",
+                    {"enabled": False},
+                    timeout=10.0,
+                )
+            except Exception as error:  # noqa: BLE001
+                results.record(
+                    "segments_attach_editing_cleanup",
+                    False,
+                    f"{type(error).__name__}: {error}",
+                )
+
+    conflicting = root / "other" / source.name
+    create_test_segment(
+        conflicting / "conflicting-segment", "conflicting-segment")
+    before = json.loads(volpkg.read_text())
+    try:
+        client.call(
+            "segments.attach",
+            {"location": str(conflicting)},
+            timeout=10.0,
+        )
+        results.record(
+            "segments_attach_source_name_conflict",
+            False,
+            "expected an error, got a result",
+        )
+    except BridgeError as error:
+        after = json.loads(volpkg.read_text())
+        results.record(
+            "segments_attach_source_name_conflict",
+            error.code == -32010 and after == before,
+            f"returned code={error.code} project_unchanged={after == before}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_source_name_conflict",
+            False,
+            f"unexpected {type(error).__name__}: {error}",
         )
 
     ok, detail = expect_param_error(

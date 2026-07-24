@@ -81,8 +81,9 @@ void AgentBridgeServer::registerSessionHandlers()
                 Params::optionalArray(
                     QStringLiteral("tags"),
                     AgentBridgeParamType::String),
+                Params::optionalBoolean(QStringLiteral("select"), true),
             },
-            .errors = {-32602, -32000, -32007, -32005, -32010},
+            .errors = {-32602, -32000, -32004, -32007, -32005, -32010},
             .mcp = mcp(QStringLiteral("vc3d_attach_segments")),
         },
         [this](const QJsonValue& p) { return handleSegmentsAttach(p); });

@@ -273,6 +273,50 @@ TEST_CASE("VolumePkg: segment entries match normalized local paths")
     CHECK_FALSE(p->addSegmentsEntry((d / "segments").string()));
     CHECK(p->segmentEntries().size() == 1);
 
+    std::error_code symlinkError;
+    fs::create_directory_symlink(
+        d / "segments", d / "segments-alias", symlinkError);
+    if (!symlinkError) {
+        CHECK(p->matchingSegmentsEntry((d / "segments-alias").string()));
+        CHECK_FALSE(p->addSegmentsEntry((d / "segments-alias").string()));
+    }
+
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: segment attachment rolls back after a write failure")
+{
+    auto d = tmpDir("segment_attach_rollback");
+    auto makeSegment = [](const fs::path& path, const std::string& id) {
+        fs::create_directories(path);
+        std::ofstream meta(path / "meta.json");
+        meta << R"({"type":"seg","uuid":")" << id
+             << R"(","format":"tifxyz"})";
+    };
+    makeSegment(d / "initial", "initial");
+    makeSegment(d / "new", "new");
+
+    const auto project = d / "project.volpkg.json";
+    auto p = VolumePkg::newEmpty();
+    p->save(project);
+    REQUIRE(p->addSegmentsEntry((d / "initial").string()));
+    fs::remove(project);
+    fs::create_directory(project);
+
+    CHECK_THROWS(p->attachSegmentsEntry(
+        (d / "new").string(), {"source:test"}, true));
+    REQUIRE(p->segmentEntries().size() == 1);
+    CHECK(p->segmentEntries().front().location == (d / "initial").string());
+    CHECK(p->outputSegmentsPath() == d / "initial");
+    CHECK(p->segmentationIDs() == std::vector<std::string>{"initial"});
+
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto autosave = VolumePkg::load(VolumePkg::autosaveFile(), deferred);
+    REQUIRE(autosave->segmentEntries().size() == 1);
+    CHECK(autosave->segmentEntries().front().location ==
+          (d / "initial").string());
+
     fs::remove_all(d);
 }
 

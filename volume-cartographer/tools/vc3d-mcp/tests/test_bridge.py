@@ -262,7 +262,7 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["attached"])
         self.assertEqual(
             self.fake_server.received_requests[-1]["params"],
-            {"location": "/tmp/my-segments"},
+            {"location": "/tmp/my-segments", "select": True},
         )
 
     async def test_vc3d_attach_segments_forwards_tags(self) -> None:
@@ -275,7 +275,19 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
             {
                 "location": "/tmp/my-segments",
                 "tags": ["source:manual", "status:working"],
+                "select": True,
             },
+        )
+
+    async def test_vc3d_attach_segments_can_preserve_current_source(self) -> None:
+        result = await vc3d_attach_segments(
+            "/tmp/my-segments",
+            select=False,
+        )
+        self.assertFalse(result["selected"])
+        self.assertEqual(
+            self.fake_server.received_requests[-1]["params"],
+            {"location": "/tmp/my-segments", "select": False},
         )
 
     async def test_vc3d_activate_segment_plain_success(self) -> None:

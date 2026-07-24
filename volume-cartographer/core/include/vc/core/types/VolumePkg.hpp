@@ -50,6 +50,10 @@ public:
         AlreadyAttached,
         VolumeIdConflict,
     };
+    enum class AttachSegmentsResult {
+        Attached,
+        AlreadyAttached,
+    };
 
     static std::shared_ptr<VolumePkg> newEmpty();
     static std::shared_ptr<VolumePkg> newEmpty(
@@ -115,6 +119,10 @@ public:
                                const std::string& newLocation);
     bool relocateNormalGridEntry(const std::string& oldLocation,
                                  const std::string& newLocation);
+    AttachSegmentsResult attachSegmentsEntry(
+        const std::string& location,
+        std::vector<std::string> tags,
+        bool select);
     bool addSegmentsEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addNormalGridEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addLasagnaDatasetEntry(const std::string& location,

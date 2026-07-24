@@ -286,7 +286,10 @@ dialog.
 - `segments.attach` adds one absolute local tifxyz path to the open package.
   The path may identify a segment or a directory of segments. Attachment uses
   the same validation, persistence, and UI refresh as the GUI and is
-  idempotent by normalized location.
+  idempotent by normalized location. It selects the attached segment source by
+  default; `select: false` preserves the current source. A source whose
+  directory name is already used by another attachment is rejected because
+  the VC3D source picker identifies entries by that name.
 - `segments.list` reports package segments, whether they are loaded, and the
   active segment.
 - `segments.fetch` materializes an Open Data placeholder. Already-materialized

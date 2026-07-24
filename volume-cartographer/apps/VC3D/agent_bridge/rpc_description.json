@@ -2938,6 +2938,7 @@
       "errors": [
         -32602,
         -32000,
+        -32004,
         -32007,
         -32005,
         -32010
@@ -2949,6 +2950,10 @@
         "properties": {
           "location": {
             "type": "string"
+          },
+          "select": {
+            "default": true,
+            "type": "boolean"
           },
           "tags": {
             "items": {

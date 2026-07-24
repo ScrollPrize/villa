@@ -326,7 +326,12 @@ bool sameLocalSegmentsLocation(const vc::project::Entry& entry,
     if (vc::project::isLocationRemote(entry.location) || vc::project::isLocationRemote(location)) {
         return false;
     }
-    return normalizedLocalPath(entry.location, base) == normalizedLocalPath(location, base);
+    const auto entryPath = normalizedLocalPath(entry.location, base);
+    const auto requestedPath = normalizedLocalPath(location, base);
+    std::error_code ec;
+    if (fs::equivalent(entryPath, requestedPath, ec))
+        return true;
+    return entryPath == requestedPath;
 }
 
 bool matchesSegmentsDirectoryName(const vc::project::Entry& entry,
@@ -896,18 +901,68 @@ bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vec
     return false;
 }
 
-bool VolumePkg::addSegmentsEntry(const std::string& location, std::vector<std::string> tags)
+VolumePkg::AttachSegmentsResult VolumePkg::attachSegmentsEntry(
+    const std::string& location,
+    std::vector<std::string> tags,
+    bool select)
 {
-    if (location.empty()) return false;
-    if (matchingSegmentsEntry(location)) return false;
-    segments_.push_back({location, std::move(tags)});
-    if (!outputSegments_) {
-        outputSegments_ = location;
+    if (location.empty())
+        return AttachSegmentsResult::AlreadyAttached;
+
+    const auto existing = matchingSegmentsEntry(location);
+    const bool insertEntry = !existing;
+    const std::string persistedLocation =
+        existing ? existing->location : location;
+    const vc::project::Entry target{persistedLocation, {}};
+    const bool changeSelection =
+        (select || !outputSegments_) &&
+        (!outputSegments_ ||
+         !sameLocalSegmentsLocation(
+             target, *outputSegments_, path_.parent_path()));
+    if (!insertEntry && !changeSelection)
+        return AttachSegmentsResult::AlreadyAttached;
+
+    const auto previousOutputSegments = outputSegments_;
+    if (insertEntry)
+        segments_.push_back({persistedLocation, std::move(tags)});
+    if (changeSelection)
+        outputSegments_ = persistedLocation;
+
+    try {
+        persistProjectState();
+    } catch (...) {
+        if (insertEntry)
+            segments_.pop_back();
+        outputSegments_ = previousOutputSegments;
+        if (automaticPersistence_) {
+            try {
+                saveAutosave();
+            } catch (const std::exception& error) {
+                Logger()->warn(
+                    "Could not restore the volume-package autosave after a "
+                    "segment attachment failure: {}",
+                    error.what());
+            } catch (...) {
+                Logger()->warn(
+                    "Could not restore the volume-package autosave after a "
+                    "segment attachment failure");
+            }
+        }
+        throw;
     }
     if (!opts_.deferResolution)
         refreshSegmentations();
-    persistProjectState();
-    return true;
+
+    return insertEntry ? AttachSegmentsResult::Attached
+                       : AttachSegmentsResult::AlreadyAttached;
+}
+
+bool VolumePkg::addSegmentsEntry(
+    const std::string& location,
+    std::vector<std::string> tags)
+{
+    return attachSegmentsEntry(location, std::move(tags), false) ==
+           AttachSegmentsResult::Attached;
 }
 
 bool VolumePkg::reconcileSegmentsEntryTags(

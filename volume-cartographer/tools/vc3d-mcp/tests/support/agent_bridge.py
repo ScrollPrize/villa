@@ -256,6 +256,7 @@ class FakeAgentBridgeServer:
                     "alreadyAttached": False,
                     "location": params.get("location"),
                     "projectPath": "/tmp/project.volpkg.json",
+                    "selected": params.get("select", True),
                 },
             )
         elif method == "viewer.rotate":
