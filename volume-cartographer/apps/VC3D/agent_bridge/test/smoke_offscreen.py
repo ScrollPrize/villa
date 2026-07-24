@@ -791,9 +791,9 @@ def check_segments_attach(
     )
 
     try:
-        client.call(
+        initial_result, _ = client.call(
             "segments.attach",
-            {"location": str(initial)},
+            {"location": str(initial) + os.sep},
             timeout=10.0,
         )
         result, _ = client.call(
@@ -806,6 +806,10 @@ def check_segments_attach(
         )
         listed, _ = client.call("segments.list", {}, timeout=10.0)
         document = json.loads(volpkg.read_text())
+        initial_locations = {
+            entry.get("location") if isinstance(entry, dict) else entry
+            for entry in document.get("segments", [])
+        }
         matching = [
             entry
             for entry in document.get("segments", [])
@@ -813,7 +817,9 @@ def check_segments_attach(
         ]
         ids = {segment.get("id") for segment in listed.get("segments", [])}
         valid = (
-            result == {
+            initial_result.get("location") == str(initial)
+            and str(initial) in initial_locations
+            and result == {
                 "attached": True,
                 "alreadyAttached": False,
                 "location": str(source),
@@ -829,6 +835,7 @@ def check_segments_attach(
         results.record(
             "segments_attach_local_source",
             valid,
+            f"initial={initial_result} initial_locations={initial_locations} "
             f"result={result} ids={sorted(value for value in ids if value)}",
         )
     except Exception as error:  # noqa: BLE001

@@ -281,6 +281,12 @@ TEST_CASE("VolumePkg: segment entries match normalized local paths")
         CHECK_FALSE(p->addSegmentsEntry((d / "segments-alias").string()));
     }
 
+#ifndef _WIN32
+    fs::create_directories(d / "segments\\");
+    CHECK_FALSE(p->matchingSegmentsEntry((d / "segments\\").string()));
+    CHECK(p->addSegmentsEntry((d / "segments\\").string()));
+#endif
+
     fs::remove_all(d);
 }
 

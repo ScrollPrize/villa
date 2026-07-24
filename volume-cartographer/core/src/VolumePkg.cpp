@@ -294,28 +294,24 @@ bool anyImmediateSubdir(const fs::path& dir, bool (*test)(const fs::path&))
     return false;
 }
 
-std::string trimTrailingSeparators(std::string value)
+fs::path withoutTrailingSeparators(fs::path path)
 {
-    while (value.size() > 1 && (value.back() == '/' || value.back() == '\\')) {
-        value.pop_back();
-    }
-    return value;
+    while (path.has_relative_path() && path.filename().empty())
+        path = path.parent_path();
+    return path;
 }
 
 fs::path normalizedLocalPath(const std::string& location, const fs::path& base)
 {
-    return vc::project::resolveLocalPath(trimTrailingSeparators(location), base).lexically_normal();
+    const fs::path path = withoutTrailingSeparators(fs::path(location));
+    return vc::project::resolveLocalPath(path.string(), base).lexically_normal();
 }
 
 std::string normalizedPathName(std::string value)
 {
-    value = trimTrailingSeparators(std::move(value));
-    fs::path path(value);
-    std::string name = path.filename().string();
-    if (name.empty() && path.has_parent_path()) {
-        name = path.parent_path().filename().string();
-    }
-    return name;
+    return withoutTrailingSeparators(fs::path(std::move(value)))
+        .filename()
+        .string();
 }
 
 bool sameLocalSegmentsLocation(const vc::project::Entry& entry,
@@ -339,13 +335,15 @@ bool matchesSegmentsDirectoryName(const vc::project::Entry& entry,
                                   const fs::path& base)
 {
     if (vc::project::isLocationRemote(entry.location)) return false;
-    const auto requested = asciiLower(trimTrailingSeparators(dirName));
+    const auto requested = asciiLower(
+        withoutTrailingSeparators(fs::path(dirName)).string());
     const auto requestedName = asciiLower(normalizedPathName(dirName));
     const auto entryPath = normalizedLocalPath(entry.location, base);
     return asciiLower(entryPath.filename().string()) == requested
         || (!requestedName.empty() && asciiLower(entryPath.filename().string()) == requestedName)
         || asciiLower(entryPath.string()) == requested
-        || asciiLower(trimTrailingSeparators(entry.location)) == requested;
+        || asciiLower(withoutTrailingSeparators(
+                          fs::path(entry.location)).string()) == requested;
 }
 
 const vc::project::Entry* findSegmentsEntryByLocation(const std::vector<vc::project::Entry>& entries,

@@ -256,8 +256,10 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
         };
     }
 
-    const fs::path localPath =
+    fs::path localPath =
         vc::project::resolveLocalPath(input).lexically_normal();
+    while (localPath.has_relative_path() && localPath.filename().empty())
+        localPath = localPath.parent_path();
     if (!localPath.is_absolute()) {
         throw AgentBridgeError{
             -32602,
