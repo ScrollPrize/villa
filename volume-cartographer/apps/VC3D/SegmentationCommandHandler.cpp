@@ -809,11 +809,11 @@ bool selectIgnoreLabelParams(QWidget* parent,
 bool selectResumeLocalTracerParams(QWidget* parent,
                                    const QVector<VolumeSelector::VolumeOption>& volumes,
                                    const QString& defaultVolumeId,
-                                   QString* selectedVolumePath,
+                                   QString* selectedVolumeId,
                                    std::optional<QJsonObject>* paramsOut,
                                    int* ompThreadsOut)
 {
-    if (!paramsOut || !selectedVolumePath || !ompThreadsOut) {
+    if (!paramsOut || !selectedVolumeId || !ompThreadsOut) {
         return false;
     }
 
@@ -886,7 +886,7 @@ bool selectResumeLocalTracerParams(QWidget* parent,
         return false;
     }
 
-    *selectedVolumePath = volumeSelector->selectedVolumePath();
+    *selectedVolumeId = volumeSelector->selectedVolumeId();
     *ompThreadsOut = ompSpin->value();
 
     QString error;
@@ -2879,6 +2879,16 @@ QJsonObject SegmentationCommandHandler::buildResumeLocalBaseParamsJson() const
     return params;
 }
 
+QJsonObject SegmentationCommandHandler::buildResumeLocalParamsJson(
+    const QJsonObject& overrides) const
+{
+    QJsonObject params = buildResumeLocalBaseParamsJson();
+    for (auto it = overrides.begin(); it != overrides.end(); ++it) {
+        params.insert(it.key(), it.value());
+    }
+    return params;
+}
+
 QString SegmentationCommandHandler::resolveSegmentOutputDir(
     const std::filesystem::path& surfacePath, QString* errorMessage) const
 {
@@ -2917,7 +2927,7 @@ QString SegmentationCommandHandler::defaultRefinedOutputPath(const QFileInfo& sr
 
 void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& segmentId)
 {
-    if (!_state->vpkg()) {
+    if (!_state || !_state->vpkg()) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume package loaded."));
         return;
     }
@@ -2959,46 +2969,38 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
         return;
     }
 
-    QString selectedVolumePath;
+    ResumeLocalGrowParams params;
     std::optional<QJsonObject> extraParams;
-    int ompThreads = vc3d::settings::neighbor_copy::RESUME_LOCAL_OMP_THREADS_DEFAULT;
+    params.ompThreads =
+        vc3d::settings::neighbor_copy::RESUME_LOCAL_OMP_THREADS_DEFAULT;
     if (!selectResumeLocalTracerParams(_parentWidget,
                                        volumeOptions,
                                        defaultVolumeId,
-                                       &selectedVolumePath,
+                                       &params.volumeId,
                                        &extraParams,
-                                       &ompThreads)) {
+                                       &params.ompThreads)) {
         emit statusMessage(tr("Resume-opt local GrowPatch cancelled"), 3000);
         return;
     }
 
-    if (selectedVolumePath.isEmpty()) {
+    if (params.volumeId.isEmpty()) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("No target volume selected."));
         return;
     }
-
-    QString outErr;
-    QString outputDirPath = resolveSegmentOutputDir(surf->path, &outErr);
-    if (outputDirPath.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), outErr);
-        return;
-    }
-
-    QJsonObject params = buildResumeLocalBaseParamsJson();
     if (extraParams) {
-        for (auto it = extraParams->begin(); it != extraParams->end(); ++it) {
-            params.insert(it.key(), it.value());
-        }
+        params.paramOverrides = *extraParams;
     }
 
     // Check if merged params require normal3d but we don't have it
+    const QJsonObject paramsJson =
+        buildResumeLocalParamsJson(params.paramOverrides);
     bool needsNormal3d = false;
-    if (params.contains("normal3dline_weight")) {
-        const double w = params["normal3dline_weight"].toDouble(0.0);
+    if (paramsJson.contains("normal3dline_weight")) {
+        const double w = paramsJson["normal3dline_weight"].toDouble(0.0);
         needsNormal3d = (w > 0.0);
     }
 
-    if (needsNormal3d && !params.contains("normal3d_zarr_path")) {
+    if (needsNormal3d && !paramsJson.contains("normal3d_zarr_path")) {
         auto reply = QMessageBox::warning(
             _parentWidget, tr("Missing Normal3D"),
             tr("The selected tracer profile uses normal3dline_weight > 0, "
@@ -3015,31 +3017,12 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
         }
     }
 
-    auto paramsFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("growpatch_resume_local_XXXXXX.json"));
-    if (!paramsFile->open()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create temporary params file."));
+    CommandLaunchError error;
+    if (!startResumeLocalGrowPatchImpl(segmentId.toStdString(), params,
+                                       /*interactive=*/true, &error, nullptr)) {
+        QMessageBox::warning(_parentWidget, tr("Error"), error.message);
         return;
     }
-    paramsFile->write(QJsonDocument(params).toJson(QJsonDocument::Indented));
-    paramsFile->flush();
-
-    _resumeLocalJob = ResumeLocalJob{};
-    auto& job = *_resumeLocalJob;
-    job.segmentId = segmentId;
-    job.outputDir = outputDirPath;
-    job.paramsPath = paramsFile->fileName();
-    job.paramsFile = std::move(paramsFile);
-
-    _cmdRunner->setNeighborCopyParams(selectedVolumePath,
-                                      job.paramsPath,
-                                      QString::fromStdString(surf->path.string()),
-                                      outputDirPath,
-                                      QStringLiteral("local"));
-    configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
-
-    _cmdRunner->setOmpThreads(ompThreads);
-    _cmdRunner->showConsoleOutput();
-    _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
     emit statusMessage(tr("Resume-opt local GrowPatch started for %1").arg(segmentId), 5000);
 }
 
@@ -3048,10 +3031,17 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& se
                                                           CommandLaunchError* error,
                                                           QString* resolvedOutputDir)
 {
-    // Dialog-free mirror of onResumeLocalGrowPatchRequested: same preconditions,
-    // fixed base tracer params, and Tool::NeighborCopy launch. The interactive
-    // "Missing Normal3D" prompt is intentionally dropped -- an unattended run
-    // cannot answer it and it has no effect.
+    return startResumeLocalGrowPatchImpl(segmentId, params, /*interactive=*/false,
+                                         error, resolvedOutputDir);
+}
+
+bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
+    const std::string& segmentId,
+    const ResumeLocalGrowParams& params,
+    bool interactive,
+    CommandLaunchError* error,
+    QString* resolvedOutputDir)
+{
     auto fail = [&](const QString& message,
                     CommandLaunchError::Kind kind = CommandLaunchError::Other) -> bool {
         if (error) *error = {kind, message};
@@ -3120,11 +3110,8 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& se
         return fail(outputError);
     }
 
-    QJsonObject paramsJson = buildResumeLocalBaseParamsJson();
-    // Caller overrides win, exactly like the dialog's extra-params editor.
-    for (auto it = params.paramOverrides.begin(); it != params.paramOverrides.end(); ++it) {
-        paramsJson.insert(it.key(), it.value());
-    }
+    const QJsonObject paramsJson =
+        buildResumeLocalParamsJson(params.paramOverrides);
 
     auto paramsFile = std::make_unique<QTemporaryFile>(
         QDir::temp().filePath("growpatch_resume_local_XXXXXX.json"));
@@ -3148,13 +3135,13 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatch(const std::string& se
                                       QStringLiteral("local"));
     configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
     _cmdRunner->setOmpThreads(params.ompThreads);
-    // Headless launcher (bridge-only): execute() synchronously pops the console
-    // dock when _autoShowConsole is set (default), so turn auto-show off for this
-    // launch and restore the prior value -- a later GUI run must still auto-show.
-    // (The async error-path pop is gated separately on suppress-dialogs; see
-    // CommandLineToolRunner::onProcessError.)
+    if (interactive) {
+        _cmdRunner->showConsoleOutput();
+    }
     const bool prevAutoShow = _cmdRunner->autoShowConsoleOutput();
-    _cmdRunner->setAutoShowConsoleOutput(false);
+    if (!interactive) {
+        _cmdRunner->setAutoShowConsoleOutput(false);
+    }
     const bool started = _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
     _cmdRunner->setAutoShowConsoleOutput(prevAutoShow);
     if (!started) {

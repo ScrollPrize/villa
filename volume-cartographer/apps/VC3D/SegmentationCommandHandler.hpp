@@ -129,9 +129,8 @@ public:
                                           // => <segment>_straightened (dialog default)
     };
 
-    // Params for the headless startResumeLocalGrowPatch. Base tracer params are
-    // fixed (matching the interactive path); paramOverrides merge over them last,
-    // like the dialog's JsonProfileEditor "extra params".
+    // Inputs shared by the interactive dialog and dialog-free caller. Base
+    // tracer params are fixed; paramOverrides merge over them last.
     struct ResumeLocalGrowParams {
         QString     volumeId;         // vpkg volume id; empty => current volume
         int         ompThreads{1};    // OMP_NUM_THREADS for the run; matches the dialog
@@ -317,13 +316,10 @@ public:
                          CommandLaunchError* error = nullptr,
                          QString* resolvedOutputDir = nullptr);
 
-    /// Headless Resume-opt Local (GrowPatch) launch (mirror of
-    /// onResumeLocalGrowPatchRequested): preconditions, params-JSON, and
-    /// vc_grow_seg_from_segments launch (Tool::NeighborCopy, resumeOpt "local");
-    /// failures return through `error` (never a dialog). Completion is observable
-    /// via CommandLineToolRunner::toolFinished (the CWindow slot reloads surfaces
-    /// and clears resumeLocalJob()). On success `resolvedOutputDir` (when
-    /// non-null) receives the target segment directory.
+    /// Dialog-free Resume-opt Local (GrowPatch) launch. The interactive slot
+    /// gathers the same ResumeLocalGrowParams and uses the same launch core.
+    /// Completion is observable via CommandLineToolRunner::toolFinished. On
+    /// success `resolvedOutputDir` receives the target directory when provided.
     bool startResumeLocalGrowPatch(const std::string& segmentId,
                                    const ResumeLocalGrowParams& params,
                                    CommandLaunchError* error = nullptr,
@@ -395,11 +391,16 @@ private:
     void configureCommandRunnerRemoteAuthForVolumePath(const QString& volumePath);
 
     /**
-     * Fixed resume-local tracer params (normal-grid/normal3d paths + constant
-     * opt-step/radius/iteration settings) before overrides; shared by the
-     * interactive slot and startResumeLocalGrowPatch so the two can't drift.
+     * Fixed resume-local tracer params before caller overrides.
      */
     QJsonObject buildResumeLocalBaseParamsJson() const;
+    QJsonObject buildResumeLocalParamsJson(const QJsonObject& overrides) const;
+
+    bool startResumeLocalGrowPatchImpl(const std::string& segmentId,
+                                       const ResumeLocalGrowParams& params,
+                                       bool interactive,
+                                       CommandLaunchError* error,
+                                       QString* resolvedOutputDir);
 
     /**
      * Resolve a segment launch's output directory: the surface's own parent
