@@ -665,6 +665,7 @@ class PatchGpuAtlas:
             self.widths,
             patch_idx_per_sample,
             ijs,
+            heights=self.heights,
         )
 
     def append_patches(self, patches_by_id):

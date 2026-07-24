@@ -37,6 +37,8 @@ namespace {
 enum FiberColumn {
     kNameColumn = 0,
     kDirectionColumn,
+    kLinkColumn,
+    kPendingColumn,
     kLengthColumn,
     kControlPointsColumn,
     kLinePointsColumn,
@@ -302,6 +304,16 @@ void CFiberWidget::setupUi()
     connect(_showFibersCheckBox, &QCheckBox::toggled,
             this, &CFiberWidget::showFibersToggled);
 
+    _showLinkedCheckBox = new QCheckBox(tr("Show linked"), mainWidget);
+    _showLinkedCheckBox->setObjectName(QStringLiteral("fiberShowLinkedCheckBox"));
+    _showLinkedCheckBox->setEnabled(false);
+    _showLinkedCheckBox->setToolTip(
+        tr("Color linked fibers as one group and mark linked control points "
+           "(blue = pending, purple = approved)."));
+    fiberDisplayLayout->addWidget(_showLinkedCheckBox);
+    connect(_showLinkedCheckBox, &QCheckBox::toggled,
+            this, &CFiberWidget::showLinkedToggled);
+
     auto* viewDistanceLabel = new QLabel(tr("View distance:"), mainWidget);
     fiberDisplayLayout->addWidget(viewDistanceLabel);
     _fiberViewDistanceSpinBox = new QDoubleSpinBox(mainWidget);
@@ -328,6 +340,8 @@ void CFiberWidget::setupUi()
     _model->setHorizontalHeaderLabels({
         tr("name"),
         tr("dir"),
+        tr("link"),
+        tr("pending"),
         tr("len"),
         tr("cps"),
         tr("pts"),
@@ -353,6 +367,8 @@ void CFiberWidget::setupUi()
     _treeView->header()->setSortIndicator(_sortColumn, _sortOrder);
     _treeView->setColumnWidth(kNameColumn, 220);
     _treeView->setColumnWidth(kDirectionColumn, 42);
+    _treeView->setColumnWidth(kLinkColumn, 42);
+    _treeView->setColumnWidth(kPendingColumn, 56);
     _treeView->setColumnWidth(kLengthColumn, 72);
     _treeView->setColumnWidth(kControlPointsColumn, 48);
     _treeView->setColumnWidth(kLinePointsColumn, 48);
@@ -450,6 +466,7 @@ void CFiberWidget::setupUi()
 void CFiberWidget::setShowFibersAvailable(bool available)
 {
     _showFibersCheckBox->setEnabled(available);
+    _showLinkedCheckBox->setEnabled(available);
     if (!available) {
         setShowFibersChecked(false);
     }
@@ -464,6 +481,17 @@ void CFiberWidget::setShowFibersChecked(bool checked)
 bool CFiberWidget::showFibersChecked() const
 {
     return _showFibersCheckBox->isChecked();
+}
+
+void CFiberWidget::setShowLinkedChecked(bool checked)
+{
+    const QSignalBlocker blocker(_showLinkedCheckBox);
+    _showLinkedCheckBox->setChecked(checked);
+}
+
+bool CFiberWidget::showLinkedChecked() const
+{
+    return _showLinkedCheckBox->isChecked();
 }
 
 void CFiberWidget::setFiberViewDistance(double distance)
@@ -654,6 +682,8 @@ void CFiberWidget::rebuildModel()
     _model->setHorizontalHeaderLabels({
         tr("name"),
         tr("dir"),
+        tr("link"),
+        tr("pending"),
         tr("len"),
         tr("cps"),
         tr("pts"),
@@ -669,6 +699,12 @@ void CFiberWidget::rebuildModel()
         QList<QStandardItem*> row{
             readOnlyItem(displayNameForFiber(fiber)),
             readOnlyItem(directionForFiber(fiber)),
+            readOnlyItem(fiber.linkedFiberCount > 0
+                             ? QString::number(fiber.linkedFiberCount)
+                             : QString()),
+            readOnlyItem(fiber.pendingLinkCount > 0
+                             ? QString::number(fiber.pendingLinkCount)
+                             : QString()),
             readOnlyItem(formatDouble(fiber.lengthVx, 1)),
             readOnlyItem(QString::number(fiber.controlPointCount)),
             readOnlyItem(QString::number(fiber.linePointCount)),
@@ -687,6 +723,8 @@ void CFiberWidget::rebuildModel()
             QList<QStandardItem*> childRow{
                 readOnlyItem(spanName),
                 readOnlyItem(directionForFiber(fiber)),
+                readOnlyItem(QString()),
+                readOnlyItem(QString()),
                 readOnlyItem(formatDouble(span.lengthVx, 1)),
                 readOnlyItem(QString::number(span.controlPointCount)),
                 readOnlyItem(QString::number(span.linePointCount)),
@@ -815,6 +853,14 @@ void CFiberWidget::sortFibers()
             less = compareText(a, b);
             break;
         }
+        case kLinkColumn:
+            different = lhs.linkedFiberCount != rhs.linkedFiberCount;
+            less = compareNumber(lhs.linkedFiberCount, rhs.linkedFiberCount);
+            break;
+        case kPendingColumn:
+            different = lhs.pendingLinkCount != rhs.pendingLinkCount;
+            less = compareNumber(lhs.pendingLinkCount, rhs.pendingLinkCount);
+            break;
         case kLengthColumn:
             different = lhs.lengthVx != rhs.lengthVx;
             less = compareNumber(lhs.lengthVx, rhs.lengthVx);

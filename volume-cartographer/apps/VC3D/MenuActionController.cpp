@@ -1542,10 +1542,55 @@ void MenuActionController::materializeCurrentOpenDataSegmentFolder()
 void MenuActionController::newProject()
 {
     if (!_window) return;
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    // Default new projects into the per-user .VC3D folder (same root the
+    // autosave uses, so home resolution matches across platforms).
+    QString defaultDir;
+    const auto autosaveFile = VolumePkg::autosaveFile();
+    if (!autosaveFile.empty()) {
+        defaultDir = QString::fromStdString(autosaveFile.parent_path().string());
+        QDir().mkpath(defaultDir);
+    }
+    if (defaultDir.isEmpty()) {
+        defaultDir = settings.value(vc3d::settings::project::DEFAULT_PATH).toString();
+    }
+    const QString defaultBase = QStringLiteral("untitled");
+    const QString defaultName = defaultBase + QStringLiteral(".volpkg.json");
+
+    QFileDialog dlg(_window, QObject::tr("New Project"), defaultDir,
+                    QObject::tr("Project (*.volpkg.json)"));
+    dlg.setAcceptMode(QFileDialog::AcceptSave);
+    dlg.setFileMode(QFileDialog::AnyFile);
+    // The non-native dialog is required to reach the filename line edit below.
+    dlg.setOption(QFileDialog::DontUseNativeDialog, true);
+    dlg.selectFile(defaultName);
+    // Qt pre-selects everything before the last dot ("untitled.volpkg"), so
+    // typing would eat the ".volpkg" part; narrow the selection to the base name.
+    QTimer::singleShot(0, &dlg, [&dlg, &defaultBase] {
+        if (auto* edit = dlg.findChild<QLineEdit*>(QStringLiteral("fileNameEdit"))) {
+            edit->setSelection(0, static_cast<int>(defaultBase.size()));
+        }
+    });
+    if (dlg.exec() != QDialog::Accepted || dlg.selectedFiles().isEmpty()) return;
+    QString file = dlg.selectedFiles().first();
+    if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) file += ".volpkg.json";
+
     auto pkg = VolumePkg::newEmpty();
-    pkg->saveAutosave();
-    _window->_state->setVpkg(pkg);
-    _window->refreshCurrentVolumePackageUi(QString(), true);
+    QString base = QFileInfo(file).fileName();
+    base.chop(QStringLiteral(".volpkg.json").size());
+    // setName before save(): while the package has no path it only touches the
+    // autosave, and save() then writes the full JSON including the name.
+    pkg->setName(base.toStdString());
+    try {
+        pkg->save(std::filesystem::path(file.toStdString()));
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, QObject::tr("New Project failed"), QString::fromUtf8(e.what()));
+        return;
+    }
+    settings.setValue(vc3d::settings::project::DEFAULT_PATH, QFileInfo(file).absolutePath());
+
+    openVolpkgAt(file);
 }
 
 void MenuActionController::saveProjectAs()
