@@ -35,7 +35,7 @@ constexpr int kRemoteLogPollMs = 10000;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 6;
+constexpr int kSupportedApiVersion = 7;
 constexpr int kPreviewCacheKept = 3;
 
 QString stateName(SpiralServiceManager::ConnectionState state)
@@ -557,12 +557,16 @@ void SpiralServiceManager::loadSession(QJsonObject request)
     }
     emit logMessage(tr("Uploading resume checkpoint %1 to the service…").arg(checkpoint));
     uploadCheckpointForResume(checkpoint,
-                              [this, finish](const QString& hostPath, const QString& error) mutable {
+                              [this, finish](const QString& hostPath, const QString& error,
+                                             bool reused) mutable {
                                   if (hostPath.isEmpty()) {
                                       emit errorOccurred(tr("Resume checkpoint upload failed: %1").arg(error));
                                       return;
                                   }
-                                  emit logMessage(tr("Checkpoint uploaded to service path %1").arg(hostPath));
+                                  emit logMessage(
+                                      reused
+                                          ? tr("Reusing checkpoint already on the service at %1").arg(hostPath)
+                                          : tr("Checkpoint uploaded to service path %1").arg(hostPath));
                                   finish(hostPath);
                               });
 }
@@ -578,7 +582,7 @@ void SpiralServiceManager::sendLoadRequest(QJsonObject request, const QJsonObjec
 
 void SpiralServiceManager::uploadCheckpointForResume(
     const QString& localPath,
-    std::function<void(const QString&, const QString&)> done)
+    std::function<void(const QString&, const QString&, bool)> done)
 {
     const quint64 generation = _connectionGeneration;
     auto* watcher = new QFutureWatcher<QJsonObject>(this);
@@ -588,7 +592,7 @@ void SpiralServiceManager::uploadCheckpointForResume(
                 watcher->deleteLater();
                 if (generation != _connectionGeneration) return;
                 if (digest.contains(QStringLiteral("error"))) {
-                    done({}, digest.value(QStringLiteral("error")).toString());
+                    done({}, digest.value(QStringLiteral("error")).toString(), false);
                     return;
                 }
                 QString inputId = QFileInfo(localPath).fileName();
@@ -610,15 +614,26 @@ void SpiralServiceManager::uploadCheckpointForResume(
                 };
                 post(QStringLiteral("/session/inputs"), begin, Timeout::Command,
                      [this, localPath, inputId, done](const QJsonObject& response) {
+                         if (response.value(QStringLiteral("deduplicated")).toBool()) {
+                             const QString hostPath =
+                                 response.value(QStringLiteral("input")).toObject()
+                                     .value(QStringLiteral("path")).toString();
+                             done(hostPath,
+                                  hostPath.isEmpty()
+                                      ? tr("The service did not return the cached checkpoint path")
+                                      : QString(),
+                                  true);
+                             return;
+                         }
                          const QString uploadId =
                              response.value(QStringLiteral("upload_id")).toString();
                          if (uploadId.isEmpty()) {
-                             done({}, tr("The service did not return an upload id"));
+                             done({}, tr("The service did not return an upload id"), false);
                              return;
                          }
                          auto file = std::make_unique<QFile>(localPath);
                          if (!file->open(QIODevice::ReadOnly)) {
-                             done({}, tr("Cannot read %1").arg(localPath));
+                             done({}, tr("Cannot read %1").arg(localPath), false);
                              return;
                          }
                          // Checkpoints can be multiple gigabytes: no total
@@ -649,14 +664,19 @@ void SpiralServiceManager::uploadCheckpointForResume(
                                                               done(hostPath,
                                                                    hostPath.isEmpty()
                                                                        ? QObject::tr("The service did not return the checkpoint path")
-                                                                       : QString());
+                                                                       : QString(),
+                                                                   false);
                                                           },
-                                                          [done](const QString& error) { done({}, error); });
+                                                          [done](const QString& error) {
+                                                              done({}, error, false);
+                                                          });
                                                  },
-                                                 [done](const QString& error) { done({}, error); });
+                                                 [done](const QString& error) {
+                                                     done({}, error, false);
+                                                 });
                                  });
                      },
-                     [done](const QString& error) { done({}, error); });
+                     [done](const QString& error) { done({}, error, false); });
             });
     watcher->setFuture(QtConcurrent::run([localPath]() -> QJsonObject {
         QFile file(localPath);

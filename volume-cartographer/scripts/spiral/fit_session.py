@@ -18,9 +18,9 @@ import zipfile
 
 
 
-# Version 6 exposes the session's effective Python/checkpoint Advanced-config
-# baseline independently from client overrides.
-API_VERSION = 6
+# Version 7 lets checkpoint upload negotiation return an already-published
+# checkpoint instead of an upload id when the content digest is retained.
+API_VERSION = 7
 
 
 # Counts which describe how many training objects/points are sampled per

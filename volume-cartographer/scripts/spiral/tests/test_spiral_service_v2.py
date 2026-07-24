@@ -721,12 +721,12 @@ class UploadTests(unittest.TestCase):
         self.assertFalse(ephemeral_dir.exists())
 
 
-def _zip_checkpoint_bytes():
+def _zip_checkpoint_bytes(payload=b"payload"):
     import io as _io
     import zipfile
     buffer = _io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("data.pkl", b"payload")
+        archive.writestr("data.pkl", payload)
     return buffer.getvalue()
 
 
@@ -747,7 +747,21 @@ class CheckpointUploadTests(unittest.TestCase):
 
     def _upload_checkpoint(self, name, data=None):
         data = data if data is not None else _zip_checkpoint_bytes()
-        upload_id = _upload_input(self.state, "checkpoint", name, {name: data})
+        request = {
+            "kind": "checkpoint",
+            "id": name,
+            "files": [{
+                "name": name,
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        }
+        begin = self.state.begin_upload(request)
+        if begin.get("deduplicated"):
+            return begin["input"]
+        upload_id = begin["upload_id"]
+        self.state.receive_upload_file(
+            upload_id, name, io.BytesIO(data), len(data))
         return self.state.finalize_upload(upload_id)["input"]
 
     def test_checkpoint_upload_works_without_a_session_in_dataset_mode(self):
@@ -781,15 +795,121 @@ class CheckpointUploadTests(unittest.TestCase):
                          if (self.root / "spiral_output" / "uploaded-checkpoints").exists()
                          else False)
 
-    def test_name_collision_is_uniquified_not_overwritten(self):
+    def test_identical_checkpoint_is_reused_without_an_upload(self):
         first = self._upload_checkpoint("resume.ckpt")
-        second = self._upload_checkpoint("resume.ckpt")
+        data = _zip_checkpoint_bytes()
+        begin = self.state.begin_upload({
+            "kind": "checkpoint",
+            "id": "renamed.ckpt",
+            "files": [{
+                "name": "renamed.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        self.assertNotIn("upload_id", begin)
+        second = begin["input"]
+        self.assertEqual(first["path"], second["path"])
+        self.assertEqual(second["id"], "renamed.ckpt")
+        self.assertTrue(Path(first["path"]).is_file())
+
+    def test_same_name_with_different_content_is_not_reused(self):
+        first = self._upload_checkpoint("resume.ckpt", _zip_checkpoint_bytes(b"first"))
+        second = self._upload_checkpoint("resume.ckpt", _zip_checkpoint_bytes(b"second"))
         self.assertNotEqual(first["path"], second["path"])
         self.assertTrue(Path(first["path"]).is_file())
         self.assertTrue(Path(second["path"]).is_file())
 
+    def test_checkpoint_deduplication_survives_service_restart(self):
+        first = self._upload_checkpoint("resume.ckpt")
+        restarted = ServiceState(dataset_root=str(self.root),
+                                 dataset_resolution=self.resolution)
+        data = _zip_checkpoint_bytes()
+        begin = restarted.begin_upload({
+            "kind": "checkpoint",
+            "id": "after-restart.ckpt",
+            "files": [{
+                "name": "after-restart.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        self.assertEqual(begin["input"]["path"], first["path"])
+
+    def test_legacy_named_checkpoint_is_found_by_digest(self):
+        root = self.root / "spiral_output" / "uploaded-checkpoints"
+        root.mkdir()
+        data = _zip_checkpoint_bytes()
+        legacy = root / "resume-before-v7.ckpt"
+        legacy.write_bytes(data)
+        begin = self.state.begin_upload({
+            "kind": "checkpoint",
+            "id": "resume.ckpt",
+            "files": [{
+                "name": "resume.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        self.assertEqual(Path(begin["input"]["path"]), legacy)
+
+    def test_concurrent_identical_uploads_converge_on_one_file(self):
+        data = _zip_checkpoint_bytes()
+        request = {
+            "kind": "checkpoint",
+            "id": "resume.ckpt",
+            "files": [{
+                "name": "resume.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        }
+        first_id = self.state.begin_upload(request)["upload_id"]
+        second_id = self.state.begin_upload(request)["upload_id"]
+        for upload_id in (first_id, second_id):
+            self.state.receive_upload_file(
+                upload_id, "resume.ckpt", io.BytesIO(data), len(data))
+        first = self.state.finalize_upload(first_id)["input"]
+        second = self.state.finalize_upload(second_id)["input"]
+        self.assertEqual(first["path"], second["path"])
+        root = self.root / "spiral_output" / "uploaded-checkpoints"
+        self.assertEqual([Path(first["path"])], list(root.iterdir()))
+
+    def test_reusing_a_checkpoint_refreshes_retention_recency(self):
+        payloads = [str(i).encode() for i in range(
+            spiral_service.UPLOADED_CHECKPOINTS_KEPT)]
+        published = [
+            Path(self._upload_checkpoint(
+                f"resume-{i}.ckpt", _zip_checkpoint_bytes(payload))["path"])
+            for i, payload in enumerate(payloads)
+        ]
+        base_time = time.time() - 100
+        for age, path in enumerate(published):
+            os.utime(path, (base_time + age, base_time + age))
+
+        reused_data = _zip_checkpoint_bytes(payloads[0])
+        begin = self.state.begin_upload({
+            "kind": "checkpoint",
+            "id": "reuse.ckpt",
+            "files": [{
+                "name": "reuse.ckpt",
+                "size": len(reused_data),
+                "sha256": _digest(reused_data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        newest = Path(self._upload_checkpoint(
+            "new.ckpt", _zip_checkpoint_bytes(b"new"))["path"])
+        self.assertTrue(published[0].exists())
+        self.assertFalse(published[1].exists())
+        self.assertTrue(newest.exists())
+
     def test_retention_prunes_old_uploads(self):
-        published = [Path(self._upload_checkpoint(f"resume-{i}.ckpt")["path"])
+        published = [Path(self._upload_checkpoint(
+            f"resume-{i}.ckpt", _zip_checkpoint_bytes(str(i).encode()))["path"])
                      for i in range(spiral_service.UPLOADED_CHECKPOINTS_KEPT + 2)]
         for old_age, path in enumerate(published):
             if path.exists():

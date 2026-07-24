@@ -41,7 +41,7 @@ from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_BOOLEAN_KEYS,
                          validate_session_request)
 
 
-SERVICE_VERSION = "5.1.0"
+SERVICE_VERSION = "5.2.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -1096,6 +1096,57 @@ class ServiceState:
     def _checkpoint_upload_root(self):
         return self._output_root() / UPLOADED_CHECKPOINTS_DIRNAME
 
+    @staticmethod
+    def _checkpoint_digest_path(root, digest):
+        return root / f"{digest}.ckpt"
+
+    @staticmethod
+    def _file_sha256(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while True:
+                block = stream.read(TRANSFER_CHUNK_BYTES)
+                if not block:
+                    break
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _find_uploaded_checkpoint(self, root, digest, size):
+        """Find retained checkpoint content, including pre-v7 named uploads."""
+        canonical = self._checkpoint_digest_path(root, digest)
+        try:
+            if canonical.is_file() and canonical.stat().st_size == size:
+                return canonical
+        except OSError:
+            pass
+        if not root.is_dir():
+            return None
+        for candidate in root.iterdir():
+            if candidate == canonical:
+                continue
+            try:
+                if not candidate.is_file() or candidate.stat().st_size != size:
+                    continue
+                if self._file_sha256(candidate) == digest:
+                    return candidate
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def _checkpoint_record(input_id, path, size, upload_id=None):
+        record = {
+            "id": input_id,
+            "kind": "checkpoint",
+            "role": None,
+            "path": str(path),
+            "bytes": size,
+            "state": "uploaded",
+        }
+        if upload_id is not None:
+            record["upload_id"] = upload_id
+        return record
+
     def _ephemeral_bytes_in_use(self):
         total = sum(record["bytes"] for record in self.ephemeral_records)
         total += sum(upload.declared_bytes() for upload in self.uploads.values()
@@ -1120,12 +1171,13 @@ class ServiceState:
                            "The input id must be a single safe path component")
         manifest = _validate_upload_manifest(request)
         declared = sum(entry["size"] for entry in manifest.values())
-        with self.lock:
-            if kind == "checkpoint":
+        if kind == "checkpoint":
+            with self.lock:
                 # Resume checkpoints are needed before a session exists, so
                 # they are service-scoped: allowed whenever an output
                 # directory is known (a --dataset launch or a live session).
-                if self._output_root() is None:
+                output_root = self._output_root()
+                if output_root is None:
                     raise ApiError(HTTPStatus.CONFLICT,
                                    "Checkpoint uploads need a --dataset service "
                                    "or an active session")
@@ -1135,6 +1187,42 @@ class ServiceState:
                 if declared > MAX_CHECKPOINT_UPLOAD_BYTES:
                     raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                                    "The checkpoint exceeds the upload size limit")
+            entry = next(iter(manifest.values()))
+            checkpoint_root = output_root / UPLOADED_CHECKPOINTS_DIRNAME
+            existing = self._find_uploaded_checkpoint(
+                checkpoint_root, entry["sha256"], entry["size"])
+            if existing is not None:
+                try:
+                    os.utime(existing, None)
+                except OSError:
+                    pass
+                record = self._checkpoint_record(
+                    input_id, existing, entry["size"])
+                return {
+                    **self._base(),
+                    "accepted": True,
+                    "deduplicated": True,
+                    "input": record,
+                }
+        with self.lock:
+            if kind == "checkpoint":
+                current_output_root = self._output_root()
+                if current_output_root is None or current_output_root != output_root:
+                    raise ApiError(HTTPStatus.CONFLICT,
+                                   "The checkpoint upload destination changed")
+                # Close the race with another request that finalized this
+                # digest while the legacy-file scan ran without the state lock.
+                canonical = self._checkpoint_digest_path(
+                    checkpoint_root, entry["sha256"])
+                if canonical.is_file() and canonical.stat().st_size == entry["size"]:
+                    os.utime(canonical, None)
+                    return {
+                        **self._base(),
+                        "accepted": True,
+                        "deduplicated": True,
+                        "input": self._checkpoint_record(
+                            input_id, canonical, entry["size"]),
+                    }
             else:
                 self._require_session()
                 if any(record["id"] == input_id and record["kind"] == kind
@@ -1266,23 +1354,21 @@ class ServiceState:
                            "uploaded checkpoints")
         root.mkdir(parents=True, exist_ok=True)
         source = next(p for p in upload.staging_dir.rglob("*") if p.is_file())
-        destination = root / upload.input_id
-        if destination.exists():
-            # Never overwrite: an earlier upload with the same name may be the
-            # one a resident session is resuming from.
-            destination = root / f"{destination.stem}-{secrets.token_hex(4)}{destination.suffix}"
-        os.replace(source, destination)
+        entry = next(iter(upload.manifest.values()))
+        destination = self._checkpoint_digest_path(root, entry["sha256"])
+        with self.lock:
+            # A concurrent upload of the same content may have finalized after
+            # begin_upload checked the content-addressed destination.
+            if destination.is_file() and destination.stat().st_size == entry["size"]:
+                source.unlink(missing_ok=True)
+                os.utime(destination, None)
+            else:
+                os.replace(source, destination)
         shutil.rmtree(upload.staging_dir, ignore_errors=True)
         self._prune_uploaded_checkpoints(destination)
-        return {
-            "id": upload.input_id,
-            "kind": "checkpoint",
-            "role": None,
-            "path": str(destination),
-            "bytes": upload.declared_bytes(),
-            "state": "uploaded",
-            "upload_id": upload.upload_id,
-        }
+        return self._checkpoint_record(
+            upload.input_id, destination, upload.declared_bytes(),
+            upload.upload_id)
 
     def _prune_uploaded_checkpoints(self, just_published):
         root = self._checkpoint_upload_root()

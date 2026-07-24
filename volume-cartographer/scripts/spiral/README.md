@@ -151,10 +151,11 @@ service-advertised checkpoint (a `*.ckpt` at the dataset root), a service path
 under the output directory (for example the autosave), or a **client-local
 `.ckpt` file** — use the browse button. A local file is uploaded to the
 service's `<output>/uploaded-checkpoints/` directory before the session loads
-(the panel shows progress; the transfer restarts if interrupted). The service
-validates the archive, never overwrites an existing upload, and keeps the
-newest few uploaded checkpoints. To bring a fit result back to the client, use
-*Download Checkpoint…*.
+(the panel shows progress; the transfer restarts if interrupted). Checkpoints
+are identified by SHA-256, so selecting content the service already retains
+reuses it without transferring the file again. The service validates new
+archives and keeps the newest few unique uploaded checkpoints. To bring a fit
+result back to the client, use *Download Checkpoint…*.
 
 ### Shutdown and logs
 

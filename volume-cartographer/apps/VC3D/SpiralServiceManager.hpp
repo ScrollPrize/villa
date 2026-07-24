@@ -137,7 +137,8 @@ private:
     // uploaded-checkpoints directory and reports the resulting host path.
     void uploadCheckpointForResume(const QString& localPath,
                                    std::function<void(const QString& hostPath,
-                                                      const QString& error)> done);
+                                                      const QString& error,
+                                                      bool reused)> done);
 
     SpiralServiceProfile _profile;
     QProcess* _process = nullptr;       // owned local service process, if any
