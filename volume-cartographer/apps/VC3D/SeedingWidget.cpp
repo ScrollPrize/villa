@@ -1168,9 +1168,8 @@ void SeedingWidget::findPeaksAlongRay(
 
 void SeedingWidget::onRunSegmentationClicked()
 {
-    // Interactive slot: delegate to the headless core; surface a precondition failure as
-    // a warning dialog (unless the bridge suppressed dialogs). The batch drains through
-    // the event loop now, not a nested processEvents wait, so the UI stays responsive.
+    // The shared batch launcher reports precondition failures synchronously and
+    // drains child processes through the event loop.
     QString err;
     if (!runSegmentationHeadless(&err) && !err.isEmpty()) {
         QMessageBox::warning(this, tr("Seeding"), err);
@@ -2499,8 +2498,7 @@ void SeedingWidget::cancelSeedingBatchHeadless()
 
 void SeedingWidget::onCancelClicked()
 {
-    // Cancel button (shared with neural trace): the headless twin does the whole
-    // bounded teardown and, for a run/expand batch, resolves the bridge job.
+    // The shared cancel path performs the bounded child-process teardown.
     cancelSeedingBatchHeadless();
 }
 

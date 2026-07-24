@@ -944,9 +944,8 @@ SurfacePanelController::fetchOpenDataSegmentAsync(
                 _segmentMaterializationWatcher = nullptr;
                 watcher->deleteLater();
                 if (result.success) {
-                    // Reload so the freshly-materialized surface stops being a placeholder
-                    // and becomes activatable. Unlike the GUI path (activateMaterializedSurface)
-                    // we do NOT force activation -- the bridge composes fetch + activate itself.
+                    // Reload so the materialized surface becomes activatable;
+                    // activation remains an explicit caller decision.
                     loadSurfaces(true);
                 }
                 if (onDone) {

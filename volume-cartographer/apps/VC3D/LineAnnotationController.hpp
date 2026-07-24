@@ -209,8 +209,8 @@ public:
                                       std::filesystem::path* atlasDirOut = nullptr);
     // Most recently opened live line-annotation workspace, or nullptr.
     [[nodiscard]] LineAnnotationDialog* mostRecentLineAnnotationDialog() const;
-    // Synchronous bridge calls use this as a short-lived dialog guard. Sessions
-    // created while it is set retain their own headless error policy.
+    // Short-lived presentation guard for direct operations. Sessions created
+    // while it is set retain the same error policy.
     void setErrorDialogsSuppressed(bool suppressed);
     [[nodiscard]] bool errorDialogsSuppressed() const;
     [[nodiscard]] QString takeLastSuppressedError();

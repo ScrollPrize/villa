@@ -90,7 +90,7 @@ public:
         std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress = {},
         QString* errorMessage = nullptr);
 
-    // True while any sample open (interactive or bridge-started) is in flight.
+    // True while any sample open is in flight.
     bool openDataSampleOpenInFlight() const;
 
 private slots:
