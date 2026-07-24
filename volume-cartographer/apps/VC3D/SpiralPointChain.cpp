@@ -248,6 +248,20 @@ PointChainBuildResult buildPointChain(
     return result;
 }
 
+bool meetsMinimumVolumeSpacing(
+    const cv::Vec3f& candidate,
+    const std::vector<cv::Vec3f>& existing,
+    float minimumSpacing)
+{
+    if (!std::isfinite(minimumSpacing) || minimumSpacing < 0.0f)
+        return false;
+    const float minimumDistanceSquared = minimumSpacing * minimumSpacing;
+    return std::all_of(existing.begin(), existing.end(), [&](const cv::Vec3f& point) {
+        const cv::Vec3f delta = candidate - point;
+        return delta.dot(delta) >= minimumDistanceSquared;
+    });
+}
+
 AnchorEraseDecision classifyAnchorErase(const std::vector<bool>& touchedAnchors)
 {
     AnchorEraseDecision decision;

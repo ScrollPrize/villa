@@ -46,6 +46,13 @@ PointChainBuildResult buildPointChain(
     const SurfacePointSampler& sampleSurface,
     float spacing = 30.0f);
 
+// Return true when candidate is at least minimumSpacing voxels from every
+// existing volume point. A point exactly on the boundary is accepted.
+bool meetsMinimumVolumeSpacing(
+    const cv::Vec3f& candidate,
+    const std::vector<cv::Vec3f>& existing,
+    float minimumSpacing);
+
 enum class AnchorEraseAction {
     None,
     Trim,

@@ -31,8 +31,10 @@ namespace {
 constexpr int kMinimumDiameter = 4;
 constexpr int kMaximumDiameter = 256;
 constexpr qreal kPaintOpacity = 0.45;
-constexpr float kPolylineSpacingVoxels = 30.0f;
-constexpr qreal kPolylineWidth = 10.0;
+constexpr float kFreehandPolylineSpacingVoxels = 10.0f;
+constexpr float kAnchoredPolylineSpacingVoxels = 30.0f;
+constexpr float kPointCollectionSpacingVoxels = 10.0f;
+constexpr qreal kPolylineWidth = 3.0;
 constexpr qreal kControlPointRadius = 3.5;
 constexpr float kPolylineProjectionToleranceVoxels = 100.0f;
 
@@ -378,7 +380,8 @@ void SpiralBrushController::resamplePolyline(PolylineGesture& line)
     }
 
     std::vector<float> targets{0.0f};
-    for (float distance = kPolylineSpacingVoxels; distance < total; distance += kPolylineSpacingVoxels)
+    for (float distance = kFreehandPolylineSpacingVoxels; distance < total;
+         distance += kFreehandPolylineSpacingVoxels)
         targets.push_back(distance);
     if (total - targets.back() > 1e-3f) targets.push_back(total);
 
@@ -415,7 +418,7 @@ bool SpiralBrushController::rebuildAnchoredPolyline(PolylineGesture& line)
         [this, source = line.source](const QPointF& surface) {
             return volumePointOnSurface(surface, source);
         },
-        kPolylineSpacingVoxels);
+        kAnchoredPolylineSpacingVoxels);
     if (result.error != vc3d::spiral::PointChainBuildError::None) return false;
     line.surfacePoints.clear();
     line.volumePoints.clear();
@@ -464,7 +467,7 @@ void SpiralBrushController::appendAnchoredPoint(const QPointF& devicePos)
         [this, source = line.source](const QPointF& surface) {
             return volumePointOnSurface(surface, source);
         },
-        kPolylineSpacingVoxels);
+        kAnchoredPolylineSpacingVoxels);
     if (result.error != vc3d::spiral::PointChainBuildError::None) {
         line.anchors.pop_back();
         const QString reason =
@@ -534,6 +537,12 @@ void SpiralBrushController::appendPointCollectionPoint(const QPointF& devicePos)
         return;
 
     auto& collection = _polylines[static_cast<std::size_t>(_activePolyline)];
+    if (!vc3d::spiral::meetsMinimumVolumeSpacing(
+            sample->second, collection.volumePoints, kPointCollectionSpacingVoxels)) {
+        emit pointPlacementRejected(
+            tr("Point rejected: it must be at least 10 voxels from every other point"));
+        return;
+    }
     collection.anchors.push_back({sample->first, sample->second});
     collection.surfacePoints.push_back(sample->first);
     collection.volumePoints.push_back(sample->second);

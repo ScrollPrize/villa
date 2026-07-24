@@ -64,6 +64,21 @@ TEST_CASE("Spiral point chain preserves click order across curved spans")
     CHECK(result.samples.back().surface == QPointF(55.0, 25.0));
 }
 
+TEST_CASE("Spiral point collection spacing checks every existing point")
+{
+    const std::vector<cv::Vec3f> existing{
+        cv::Vec3f(0.0f, 0.0f, 0.0f),
+        cv::Vec3f(100.0f, 0.0f, 0.0f),
+    };
+
+    CHECK_FALSE(vc3d::spiral::meetsMinimumVolumeSpacing(
+        cv::Vec3f(9.9f, 0.0f, 0.0f), existing, 10.0f));
+    CHECK(vc3d::spiral::meetsMinimumVolumeSpacing(
+        cv::Vec3f(10.0f, 0.0f, 0.0f), existing, 10.0f));
+    CHECK(vc3d::spiral::meetsMinimumVolumeSpacing(
+        cv::Vec3f(50.0f, 0.0f, 0.0f), existing, 10.0f));
+}
+
 TEST_CASE("Spiral point chain rejects a self-intersecting candidate")
 {
     const auto result = vc3d::spiral::buildPointChain(
