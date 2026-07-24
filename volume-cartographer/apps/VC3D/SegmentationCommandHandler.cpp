@@ -3819,27 +3819,12 @@ void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
         return;
     }
 
-    if (dlg.volumePath().isEmpty() || dlg.srcPath().isEmpty() || dlg.dstPath().isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Volume, source, and output paths must be specified"));
+    CommandLaunchError error;
+    if (!startAlphaCompRefineImpl(segmentId, dlg.request(), /*interactive=*/true,
+                                  &error, nullptr)) {
+        QMessageBox::warning(_parentWidget, tr("Error"), error.message);
         return;
     }
-
-    QJsonObject paramsJson = dlg.paramsJson();
-
-    auto paramsFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("vc_objrefine_XXXXXX.json"));
-    if (!paramsFile->open()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create temporary params JSON file"));
-        return;
-    }
-    paramsFile->write(QJsonDocument(paramsJson).toJson(QJsonDocument::Indented));
-    paramsFile->flush();
-    QString paramsPath = paramsFile->fileName();
-    paramsFile->setAutoRemove(false); // CommandLineToolRunner will use the file after this scope
-    paramsFile->close();
-
-    _cmdRunner->setObjRefineParams(dlg.volumePath(), dlg.srcPath(), dlg.dstPath(), paramsPath);
-    _cmdRunner->setOmpThreads(dlg.ompThreads());
-    _cmdRunner->execute(CommandLineToolRunner::Tool::AlphaCompRefine);
     emit statusMessage(tr("Refining segment: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
@@ -3848,10 +3833,37 @@ bool SegmentationCommandHandler::startAlphaCompRefine(const std::string& segment
                                                      CommandLaunchError* error,
                                                      QString* resolvedOutputDir)
 {
-    // Dialog-free mirror of onAlphaCompRefine: same preconditions, output-path
-    // derivation, params-JSON, and Tool::AlphaCompRefine launch. The remote-volume
-    // guard is preserved --
-    // vc_objrefine cannot consume a remote locator.
+    return startAlphaCompRefineImpl(segmentId, params, /*interactive=*/false,
+                                    error, resolvedOutputDir);
+}
+
+QJsonObject SegmentationCommandHandler::alphaCompRefineParamsJson(
+    const AlphaCompRefineParams& params)
+{
+    return {
+        {QStringLiteral("refine"), params.refine},
+        {QStringLiteral("start"), params.start},
+        {QStringLiteral("stop"), params.stop},
+        {QStringLiteral("step"), params.step},
+        {QStringLiteral("low"), params.low},
+        {QStringLiteral("high"), params.high},
+        {QStringLiteral("border_off"), params.borderOff},
+        {QStringLiteral("r"), params.radius},
+        {QStringLiteral("gen_vertexcolor"), params.genVertexColor},
+        {QStringLiteral("overwrite"), params.overwrite},
+        {QStringLiteral("reader_scale"), params.readerScale},
+        {QStringLiteral("scale_group"),
+         params.scaleGroup.isEmpty() ? QStringLiteral("1") : params.scaleGroup},
+    };
+}
+
+bool SegmentationCommandHandler::startAlphaCompRefineImpl(
+    const std::string& segmentId,
+    const AlphaCompRefineParams& params,
+    bool interactive,
+    CommandLaunchError* error,
+    QString* resolvedOutputDir)
+{
     auto fail = [&](const QString& message,
                     CommandLaunchError::Kind kind = CommandLaunchError::Other) -> bool {
         if (error) *error = {kind, message};
@@ -3889,20 +3901,22 @@ bool SegmentationCommandHandler::startAlphaCompRefine(const std::string& segment
                     CommandLaunchError::ToolUnavailable);
     }
 
-    const QString volumePath = getCurrentVolumePath();
+    const QString volumePath = params.volumePath.isEmpty()
+        ? getCurrentVolumePath()
+        : params.volumePath;
     if (volumePath.isEmpty()) {
         return fail(tr("Unable to determine volume path."));
     }
 
-    const QString srcPath = QString::fromStdString(surf->path.string());
+    const QString srcPath = params.sourcePath.isEmpty()
+        ? QString::fromStdString(surf->path.string())
+        : params.sourcePath;
     const QFileInfo srcInfo(srcPath);
 
-    // Empty request -> the dialog's default output (<src>_refined); a relative
-    // path is resolved against the volpkg root so callers can pass short names.
     QString dstPath = params.outputDir.trimmed();
     if (dstPath.isEmpty()) {
         dstPath = defaultRefinedOutputPath(srcInfo);
-    } else if (QDir::isRelativePath(dstPath)) {
+    } else if (!interactive && QDir::isRelativePath(dstPath)) {
         QString volpkgRoot = _state->vpkgPath();
         if (volpkgRoot.isEmpty()) {
             volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
@@ -3910,45 +3924,33 @@ bool SegmentationCommandHandler::startAlphaCompRefine(const std::string& segment
         dstPath = QDir(volpkgRoot).filePath(dstPath);
     }
 
-    QJsonObject paramsJson;
-    paramsJson["refine"] = params.refine;
-    paramsJson["start"] = params.start;
-    paramsJson["stop"] = params.stop;
-    paramsJson["step"] = params.step;
-    paramsJson["low"] = params.low;
-    paramsJson["high"] = params.high;
-    paramsJson["border_off"] = params.borderOff;
-    paramsJson["r"] = params.radius;
-    paramsJson["gen_vertexcolor"] = params.genVertexColor;
-    paramsJson["overwrite"] = params.overwrite;
-    paramsJson["reader_scale"] = params.readerScale;
-    paramsJson["scale_group"] = params.scaleGroup.isEmpty() ? QStringLiteral("1")
-                                                            : params.scaleGroup;
+    if (volumePath.isEmpty() || srcPath.isEmpty() || dstPath.isEmpty()) {
+        return fail(tr("Volume, source, and output paths must be specified."));
+    }
 
     auto paramsFile = std::make_unique<QTemporaryFile>(
         QDir::temp().filePath("vc_objrefine_XXXXXX.json"));
     if (!paramsFile->open()) {
         return fail(tr("Failed to create temporary params JSON file."));
     }
-    paramsFile->write(QJsonDocument(paramsJson).toJson(QJsonDocument::Indented));
+    paramsFile->write(
+        QJsonDocument(alphaCompRefineParamsJson(params)).toJson(QJsonDocument::Indented));
     paramsFile->flush();
     const QString paramsPath = paramsFile->fileName();
-    // The runner reads the file after this scope, so keep it on disk (identical
-    // to onAlphaCompRefine's local QTemporaryFile with auto-remove disabled).
+    // The runner reads the file after this scope.
     paramsFile->setAutoRemove(false);
     paramsFile->close();
 
     _cmdRunner->setObjRefineParams(volumePath, srcPath, dstPath, paramsPath);
     _cmdRunner->setOmpThreads(params.ompThreads);
-    // Headless launcher (bridge-only): suppress execute()'s synchronous console-
-    // dock pop (it fires when _autoShowConsole is set, the default) for this
-    // launch only, then restore so a later GUI run still auto-shows. The async
-    // error-path pop is gated on the run's suppress-dialogs flag; see
-    // CommandLineToolRunner::onProcessError.
     const bool prevAutoShow = _cmdRunner->autoShowConsoleOutput();
-    _cmdRunner->setAutoShowConsoleOutput(false);
+    if (!interactive) {
+        _cmdRunner->setAutoShowConsoleOutput(false);
+    }
     const bool started = _cmdRunner->execute(CommandLineToolRunner::Tool::AlphaCompRefine);
-    _cmdRunner->setAutoShowConsoleOutput(prevAutoShow);
+    if (!interactive) {
+        _cmdRunner->setAutoShowConsoleOutput(prevAutoShow);
+    }
     if (!started) {
         _cmdRunner->setOmpThreads(-1);
         return fail(tr("Failed to start alpha-comp refinement."));

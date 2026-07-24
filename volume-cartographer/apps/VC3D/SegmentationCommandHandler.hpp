@@ -15,6 +15,7 @@
 #include <QVector3D>
 
 #include "elements/VolumeSelector.hpp"
+#include "AlphaCompRefineRequest.hpp"
 #include "CommandLaunchError.hpp"
 // Full definition needed: RenderSegmentParams stores a
 // CommandLineToolRunner::RenderOutputFormat (nested enum) by value.
@@ -138,25 +139,7 @@ public:
         QJsonObject paramOverrides;   // merged over the fixed resume-local tracer params
     };
 
-    // Params for the headless startAlphaCompRefine (mirror of AlphaCompRefineDialog;
-    // defaults = its session defaults, ToolDialogs.cpp AlphaCompRefineDialog::s_*).
-    struct AlphaCompRefineParams {
-        bool    refine{true};
-        double  start{-6.0};
-        double  stop{30.0};
-        double  step{2.0};
-        int     low{26};
-        int     high{255};
-        double  borderOff{1.0};
-        int     radius{3};
-        bool    genVertexColor{false};
-        bool    overwrite{true};
-        double  readerScale{0.5};
-        QString scaleGroup{QStringLiteral("1")};
-        int     ompThreads{-1};       // -1 => runner default (no OMP override)
-        QString outputDir;            // absolute or relative to volpkg root; empty =>
-                                      // <segment>_refined (matching the dialog default)
-    };
+    using AlphaCompRefineParams = AlphaCompRefineRequest;
 
     // --- Construction ---
 
@@ -325,9 +308,8 @@ public:
                                    CommandLaunchError* error = nullptr,
                                    QString* resolvedOutputDir = nullptr);
 
-    /// Headless alpha-comp refinement launch (vc_objrefine, Tool::AlphaCompRefine;
-    /// mirror of onAlphaCompRefine): preconditions, output-path derivation,
-    /// params-JSON write, launch; failures return through `error` (never a dialog).
+    /// Dialog-free alpha-comp refinement launch. The interactive slot gathers
+    /// the same request and uses the same preparation and launch core.
     /// Completion is observable via CommandLineToolRunner::toolFinished. On
     /// success `resolvedOutputDir` (when non-null) receives the refined output
     /// directory.
@@ -401,6 +383,13 @@ private:
                                        bool interactive,
                                        CommandLaunchError* error,
                                        QString* resolvedOutputDir);
+    bool startAlphaCompRefineImpl(const std::string& segmentId,
+                                  const AlphaCompRefineParams& params,
+                                  bool interactive,
+                                  CommandLaunchError* error,
+                                  QString* resolvedOutputDir);
+    static QJsonObject alphaCompRefineParamsJson(
+        const AlphaCompRefineParams& params);
 
     /**
      * Resolve a segment launch's output directory: the surface's own parent

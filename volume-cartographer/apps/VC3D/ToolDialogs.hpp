@@ -16,6 +16,8 @@
 
 #include <optional>
 
+#include "AlphaCompRefineRequest.hpp"
+
 class JsonProfileEditor;
 class VolumeSelector;
 
@@ -421,16 +423,13 @@ public:
                           const QString& srcSurfacePath,
                           const QString& dstSurfacePath);
 
-    QString volumePath() const;
-    QString srcPath() const;
-    QString dstPath() const;
-    QJsonObject paramsJson() const;
-    int ompThreads() const; // -1 if unset
+    AlphaCompRefineRequest request() const;
 
 protected:
     void accept() override;
 
 private:
+    int ompThreads() const; // -1 if unset
     void applySavedDefaults();
     void applySessionDefaults();
     void saveDefaults() const;

@@ -911,37 +911,37 @@ AlphaCompRefineDialog::AlphaCompRefineDialog(QWidget* parent,
     applySessionDefaults();
 }
 
-QString AlphaCompRefineDialog::volumePath() const { return edtVolume_->text().trimmed(); }
-QString AlphaCompRefineDialog::srcPath() const { return edtSrc_->text().trimmed(); }
-QString AlphaCompRefineDialog::dstPath() const { return edtDst_->text().trimmed(); }
-
-QJsonObject AlphaCompRefineDialog::paramsJson() const
+AlphaCompRefineRequest AlphaCompRefineDialog::request() const
 {
-    QJsonObject obj;
-    obj["refine"] = chkRefine_->isChecked();
-    obj["start"] = spStart_->value();
-    obj["stop"] = spStop_->value();
-    obj["step"] = spStep_->value();
-    obj["low"] = static_cast<int>(std::lround(spLow_->value()));
-    obj["high"] = static_cast<int>(std::lround(spHigh_->value()));
-    obj["border_off"] = spBorder_->value();
-    obj["r"] = spRadius_->value();
-    obj["gen_vertexcolor"] = chkVertexColor_->isChecked();
-    obj["overwrite"] = chkOverwrite_->isChecked();
-    obj["reader_scale"] = spReaderScale_->value();
-
-    const QString sg = edtScaleGroup_->text().trimmed();
-    obj["scale_group"] = sg.isEmpty() ? QStringLiteral("1") : sg;
-
-    return obj;
+    AlphaCompRefineRequest result;
+    result.volumePath = edtVolume_->text().trimmed();
+    result.sourcePath = edtSrc_->text().trimmed();
+    result.outputDir = edtDst_->text().trimmed();
+    result.refine = chkRefine_->isChecked();
+    result.start = spStart_->value();
+    result.stop = spStop_->value();
+    result.step = spStep_->value();
+    result.low = static_cast<int>(std::lround(spLow_->value()));
+    result.high = static_cast<int>(std::lround(spHigh_->value()));
+    result.borderOff = spBorder_->value();
+    result.radius = spRadius_->value();
+    result.genVertexColor = chkVertexColor_->isChecked();
+    result.overwrite = chkOverwrite_->isChecked();
+    result.readerScale = spReaderScale_->value();
+    result.scaleGroup = edtScaleGroup_->text().trimmed();
+    if (result.scaleGroup.isEmpty()) {
+        result.scaleGroup = QStringLiteral("1");
+    }
+    result.ompThreads = ompThreads();
+    return result;
 }
 
 int AlphaCompRefineDialog::ompThreads() const
 {
     const QString text = edtThreads_->text().trimmed();
     bool ok = false;
-    int v = text.toInt(&ok);
-    return ok ? v : -1;
+    const int threads = text.toInt(&ok);
+    return ok ? threads : -1;
 }
 
 void AlphaCompRefineDialog::accept()
