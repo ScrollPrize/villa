@@ -786,6 +786,8 @@ include(${CMAKE_SOURCE_DIR}/cmake/MacPackaging.cmake)
 if(VC_TESTING)
     enable_testing()
     add_subdirectory(core/test)
+    add_subdirectory(apps/VC3D/agent_bridge/test)
+    add_subdirectory(apps/VC3D/test)
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
         USES_TERMINAL)

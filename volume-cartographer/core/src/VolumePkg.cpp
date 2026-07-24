@@ -144,6 +144,27 @@ constexpr const char* kDirectRemoteZarrRequired =
     "remote Zarr volume locations must point directly to a .zarr root; "
     "collection listing is not supported";
 
+std::string validateRemoteVolumeLocation(
+    const std::string& location,
+    bool requireDirectZarr)
+{
+    const auto schemeEnd = location.find("://");
+    if (schemeEnd == std::string::npos) {
+        return "Remote URL is missing scheme separator (expected '://').";
+    }
+    if (location.size() <= schemeEnd + 3) {
+        return "Remote URL is missing host/bucket after scheme.";
+    }
+    try {
+        (void)vc::parseRemoteVolumeSpec(location);
+    } catch (const std::invalid_argument& error) {
+        return error.what();
+    }
+    if (requireDirectZarr && !isDirectRemoteZarrLocation(location))
+        return kDirectRemoteZarrRequired;
+    return {};
+}
+
 std::string tagValueWithPrefix(const std::vector<std::string>& tags, std::string_view prefix)
 {
     for (const auto& tag : tags) {
@@ -152,25 +173,6 @@ std::string tagValueWithPrefix(const std::vector<std::string>& tags, std::string
         }
     }
     return {};
-}
-
-utils::Json metadataFromVolumeEntryTags(const std::vector<std::string>& tags)
-{
-    auto metadata = utils::Json::object();
-    const auto voxelSizeTag = tagValueWithPrefix(tags, "vc-open-data-voxel-size-um:");
-    if (!voxelSizeTag.empty()) {
-        try {
-            const double voxelSize = std::stod(voxelSizeTag);
-            if (voxelSize > 0.0) {
-                metadata["voxelsize"] = voxelSize;
-            }
-        } catch (...) {
-        }
-    }
-    const auto nameTag = tagValueWithPrefix(tags, "vc-open-data-name:");
-    if (!nameTag.empty())
-        metadata["name"] = nameTag;
-    return metadata;
 }
 
 bool samePersistedVolumeIdentity(const std::string& a, const std::string& b)
@@ -189,6 +191,84 @@ bool samePersistedVolumeIdentity(const std::string& a, const std::string& b)
     } catch (...) {
         return false;
     }
+}
+
+fs::path absoluteLocalPath(
+    const std::string& location,
+    const fs::path& projectDirectory)
+{
+    auto path = vc::project::resolveLocalPath(location, projectDirectory);
+    if (path.is_relative())
+        path = fs::absolute(path);
+    return path.lexically_normal();
+}
+
+bool sameAttachmentLocation(
+    const std::string& a,
+    const std::string& b,
+    const fs::path& projectDirectory)
+{
+    const bool aRemote = vc::project::isLocationRemote(a);
+    const bool bRemote = vc::project::isLocationRemote(b);
+    if (aRemote != bRemote)
+        return false;
+    if (!aRemote) {
+        return absoluteLocalPath(a, projectDirectory) ==
+               absoluteLocalPath(b, projectDirectory);
+    }
+    try {
+        const auto aSpec = vc::parseRemoteVolumeSpec(a);
+        const auto bSpec = vc::parseRemoteVolumeSpec(b);
+        return aSpec.sourceUrl == bSpec.sourceUrl &&
+               aSpec.baseScaleLevel == bSpec.baseScaleLevel;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool entryBacksAttachmentLocation(
+    const std::string& entryLocation,
+    const std::string& attachmentLocation,
+    const fs::path& projectDirectory)
+{
+    if (sameAttachmentLocation(
+            entryLocation, attachmentLocation, projectDirectory)) {
+        return true;
+    }
+    if (vc::project::isLocationRemote(entryLocation) ||
+        vc::project::isLocationRemote(attachmentLocation)) {
+        return false;
+    }
+    const auto entryPath = absoluteLocalPath(entryLocation, projectDirectory);
+    const auto attachmentPath =
+        absoluteLocalPath(attachmentLocation, projectDirectory);
+    try {
+        return fs::is_directory(entryPath) &&
+               !isSingleZarrVolumeDir(entryPath) &&
+               attachmentPath.parent_path() == entryPath &&
+               isSingleZarrVolumeDir(attachmentPath);
+    } catch (const fs::filesystem_error&) {
+        return false;
+    }
+}
+
+bool loadedVolumeMatchesLocation(
+    const std::shared_ptr<Volume>& volume,
+    const std::string& location,
+    const fs::path& projectDirectory)
+{
+    if (!volume)
+        return false;
+    if (volume->isRemote())
+        return sameAttachmentLocation(
+            volume->remoteLocator(), location, projectDirectory);
+    if (vc::project::isLocationRemote(location))
+        return false;
+    auto loadedPath = volume->path();
+    if (loadedPath.is_relative())
+        loadedPath = fs::absolute(loadedPath);
+    return loadedPath.lexically_normal() ==
+           absoluteLocalPath(location, projectDirectory);
 }
 
 std::vector<fs::path> immediateSubdirs(const fs::path& dir)
@@ -364,6 +444,25 @@ std::vector<vc::project::Entry> entriesFromJson(const utils::Json& arr)
 
 namespace vc::project {
 
+utils::Json volumeMetadataFromEntryTags(const std::vector<std::string>& tags)
+{
+    auto metadata = utils::Json::object();
+    const auto voxelSizeTag =
+        tagValueWithPrefix(tags, "vc-open-data-voxel-size-um:");
+    if (!voxelSizeTag.empty()) {
+        try {
+            const double voxelSize = std::stod(voxelSizeTag);
+            if (voxelSize > 0.0)
+                metadata["voxelsize"] = voxelSize;
+        } catch (...) {
+        }
+    }
+    const auto nameTag = tagValueWithPrefix(tags, "vc-open-data-name:");
+    if (!nameTag.empty())
+        metadata["name"] = nameTag;
+    return metadata;
+}
+
 std::string validateLocation(Category category, const std::string& location)
 {
     if (location.empty()) return "Location is empty.";
@@ -372,14 +471,7 @@ std::string validateLocation(Category category, const std::string& location)
         if (category != Category::Volumes) {
             return "Remote locations are only supported for volumes.";
         }
-        const auto schemeEnd = location.find("://");
-        if (schemeEnd == std::string::npos) {
-            return "Remote URL is missing scheme separator (expected '://').";
-        }
-        if (location.size() <= schemeEnd + 3) {
-            return "Remote URL is missing host/bucket after scheme.";
-        }
-        return {};
+        return validateRemoteVolumeLocation(location, false);
     }
 
     const auto path = resolveLocalPath(location);
@@ -402,6 +494,31 @@ std::string validateLocation(Category category, const std::string& location)
             return "Not a normal-grid directory (expected xy/, xz/, yz/ subdirs and metadata.json).";
     }
     return "Unknown category.";
+}
+
+std::string validateSingleVolumeLocation(const std::string& location)
+{
+    if (location.empty()) return "Location is empty.";
+    if (isLocationRemote(location))
+        return validateRemoteVolumeLocation(location, true);
+
+    const auto path = resolveLocalPath(location);
+    std::error_code ec;
+    const bool exists = fs::exists(path, ec);
+    if (ec) return "Could not inspect path: " + ec.message();
+    if (!exists) return "Path does not exist: " + path.string();
+    const bool directory = fs::is_directory(path, ec);
+    if (ec) return "Could not inspect path: " + ec.message();
+    if (!directory) return "Path is not a directory: " + path.string();
+    try {
+        if (!isSingleZarrVolumeDir(path)) {
+            return "Not a zarr volume (expected volume metadata plus chunk-level "
+                   ".zarray or zarr.json).";
+        }
+    } catch (const fs::filesystem_error& error) {
+        return "Could not inspect path: " + std::string(error.what());
+    }
+    return {};
 }
 
 }
@@ -447,6 +564,14 @@ std::shared_ptr<VolumePkg> VolumePkg::newEmpty(
     return pkg;
 }
 
+std::shared_ptr<VolumePkg> VolumePkg::newDetached(
+    const vc::project::LoadOptions& opts)
+{
+    auto pkg = newEmpty(opts);
+    pkg->automaticPersistence_ = false;
+    return pkg;
+}
+
 std::shared_ptr<VolumePkg> VolumePkg::load(const fs::path& jsonFile,
                                            const vc::project::LoadOptions& opts)
 {
@@ -487,6 +612,19 @@ const std::vector<vc::project::Entry>& VolumePkg::segmentEntries() const { retur
 const std::vector<vc::project::Entry>& VolumePkg::normalGridEntries() const { return normalGrids_; }
 const std::vector<vc::project::Entry>& VolumePkg::lasagnaDatasetEntries() const { return lasagnaDatasets_; }
 
+std::optional<vc::project::Entry>
+VolumePkg::matchingVolumeEntry(const std::string& location) const
+{
+    auto entry = std::find_if(
+        volumes_.begin(), volumes_.end(), [&](const auto& candidate) {
+            return entryBacksAttachmentLocation(
+                candidate.location, location, path_.parent_path());
+        });
+    return entry == volumes_.end()
+        ? std::nullopt
+        : std::optional<vc::project::Entry>(*entry);
+}
+
 bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::string> tags)
 {
     if (location.empty()) return false;
@@ -516,6 +654,108 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
         resolveVolumeEntry(volumes_.back());
     persistProjectState();
     return true;
+}
+
+VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
+    const std::string& location,
+    std::vector<std::string> tags,
+    const std::shared_ptr<Volume>& volume,
+    const fs::path& remoteCacheRoot)
+{
+    if (location.empty() || !volume)
+        throw std::invalid_argument("volume location and prepared volume are required");
+
+    std::string persistedLocation = location;
+    if (vc::project::isLocationRemote(location)) {
+        const auto spec = vc::parseRemoteVolumeSpec(location);
+        if (spec.hasBaseScaleSelector)
+            persistedLocation = spec.portableLocator;
+    }
+    if (!loadedVolumeMatchesLocation(
+            volume, persistedLocation, path_.parent_path())) {
+        throw std::invalid_argument(
+            "prepared volume does not match its attachment location");
+    }
+
+    auto entry = std::find_if(
+        volumes_.begin(), volumes_.end(), [&](const auto& candidate) {
+            return entryBacksAttachmentLocation(
+                candidate.location,
+                persistedLocation,
+                path_.parent_path());
+        });
+    const bool backingEntryExists = entry != volumes_.end();
+    const std::string volumeId = volume->id();
+    auto loaded = loadedVolumes_.find(volumeId);
+    if (loaded != loadedVolumes_.end() &&
+        !loadedVolumeMatchesLocation(
+            loaded->second, persistedLocation, path_.parent_path())) {
+        return AttachVolumeResult::VolumeIdConflict;
+    }
+
+    const bool insertVolume = loaded == loadedVolumes_.end();
+    const bool insertEntry = !backingEntryExists;
+    const bool updateCacheRoot =
+        remoteCacheRoot_.empty() && !remoteCacheRoot.empty();
+    if (!insertVolume && !insertEntry && !updateCacheRoot)
+        return AttachVolumeResult::AlreadyAttached;
+
+    const fs::path previousCacheRoot = remoteCacheRoot_;
+    const fs::path previousOptionCacheRoot = opts_.remoteCacheRoot;
+    const auto previousTags = volumeTagsByID_.find(volumeId);
+    const std::optional<std::vector<std::string>> savedTags =
+        previousTags == volumeTagsByID_.end()
+            ? std::nullopt
+            : std::optional(previousTags->second);
+
+    if (insertEntry)
+        volumes_.push_back({persistedLocation, std::move(tags)});
+    if (insertVolume)
+        loadedVolumes_.emplace(volumeId, volume);
+
+    if (backingEntryExists && !entry->tags.empty())
+        volumeTagsByID_[volumeId] = entry->tags;
+    else if (insertEntry && !volumes_.back().tags.empty())
+        volumeTagsByID_[volumeId] = volumes_.back().tags;
+    if (updateCacheRoot) {
+        remoteCacheRoot_ = remoteCacheRoot;
+        opts_.remoteCacheRoot = remoteCacheRoot;
+    }
+
+    try {
+        persistProjectState();
+    } catch (...) {
+        if (insertEntry)
+            volumes_.pop_back();
+        if (insertVolume)
+            loadedVolumes_.erase(volumeId);
+        if (savedTags)
+            volumeTagsByID_[volumeId] = *savedTags;
+        else
+            volumeTagsByID_.erase(volumeId);
+        remoteCacheRoot_ = previousCacheRoot;
+        opts_.remoteCacheRoot = previousOptionCacheRoot;
+        // persistProjectState writes the autosave first. Restore it after the
+        // in-memory rollback when the canonical project write fails.
+        if (automaticPersistence_) {
+            try {
+                saveAutosave();
+            } catch (const std::exception& error) {
+                Logger()->warn(
+                    "Could not restore the volume-package autosave after an "
+                    "attachment failure: {}",
+                    error.what());
+            } catch (...) {
+                Logger()->warn(
+                    "Could not restore the volume-package autosave after an "
+                    "attachment failure");
+            }
+        }
+        throw;
+    }
+
+    return backingEntryExists ? AttachVolumeResult::AlreadyAttached
+                              : AttachVolumeResult::Attached;
 }
 
 bool VolumePkg::reconcileVolumeEntryTags(
@@ -557,7 +797,7 @@ bool VolumePkg::reconcileVolumeEntryTags(
                         ? volume->remoteCacheRoot()
                         : opts_.remoteCacheRoot,
                     volume->remoteAuth(),
-                    metadataFromVolumeEntryTags(entry.tags));
+                    vc::project::volumeMetadataFromEntryTags(entry.tags));
                 const auto oldId = it->first;
                 const auto newId = refreshed->id();
                 if (newId != oldId && loadedVolumes_.count(newId) != 0) {
@@ -605,7 +845,7 @@ bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vec
             if (!volume) continue;
             if (volume->isRemote() &&
                 samePersistedVolumeIdentity(volume->remoteLocator(), location)) {
-                auto metadata = metadataFromVolumeEntryTags(e.tags);
+                auto metadata = vc::project::volumeMetadataFromEntryTags(e.tags);
                 if (!metadata.empty()) {
                     try {
                         auto refreshed = Volume::NewFromUrl(
@@ -1244,6 +1484,7 @@ void VolumePkg::saveAutosave()
 
 void VolumePkg::persistProjectState()
 {
+    if (!automaticPersistence_) return;
     saveAutosave();
     if (!path_.empty()) {
         writeJsonTo(path_);
@@ -1288,7 +1529,7 @@ void VolumePkg::resolveAll()
                 remoteResults[i] = {
                     Volume::NewFromUrl(
                         entry.location, remoteCacheRoot, {},
-                        metadataFromVolumeEntryTags(entry.tags)),
+                        vc::project::volumeMetadataFromEntryTags(entry.tags)),
                     {}};
             } catch (const std::exception& ex) {
                 remoteResults[i] = {nullptr, ex.what()};
@@ -1399,7 +1640,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
                 e.location,
                 opts_.remoteCacheRoot,
                 {},
-                metadataFromVolumeEntryTags(e.tags));
+                vc::project::volumeMetadataFromEntryTags(e.tags));
             const auto id = v->id();
             if (loadedVolumes_.count(id) > 0) {
                 Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);

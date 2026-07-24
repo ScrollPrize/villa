@@ -153,6 +153,33 @@ struct OpenDataRepresentationRef {
 [[nodiscard]] std::string_view representationKindName(
     OpenDataRepresentationKind kind) noexcept;
 
+// Per-artifact classification shared by derivedRepresentations() (its single
+// authority) and by the resource-selection filters below. Returns nullopt for a
+// raw source-volume artifact (i.e. not a derived representation).
+[[nodiscard]] std::optional<OpenDataRepresentationKind>
+classifyDerivedRepresentation(const OpenDataArtifact& artifact);
+
+// Optional subset of a sample's resources to attach. Each axis is independent:
+// an absent sub-field means "no filter on that axis". A raw source volume is
+// governed only by `volumeIds`; a derived representation (normal grids /
+// lasagna / prediction) must pass all three axes. A nullptr selection anywhere
+// downstream preserves the attach-everything behavior.
+struct OpenDataResourceSelection {
+    std::optional<std::vector<std::string>> volumeIds;
+    std::optional<std::vector<OpenDataRepresentationRef>> representations;
+    std::optional<std::vector<OpenDataRepresentationKind>> kinds;
+
+    // True when a raw source volume with this id is allowed by the volumeIds
+    // axis (the only axis that gates whole volumes).
+    [[nodiscard]] bool allowsVolume(const std::string& volumeId) const;
+    // True when the (volumeIndex, artifactIndex, kind, volumeId) representation passes
+    // every provided axis.
+    [[nodiscard]] bool allowsRepresentation(std::size_t volumeIndex,
+                                            std::size_t artifactIndex,
+                                            OpenDataRepresentationKind kind,
+                                            const std::string& volumeId) const;
+};
+
 struct OpenDataModel {
     std::string id;
     nlohmann::json raw = nlohmann::json::object();

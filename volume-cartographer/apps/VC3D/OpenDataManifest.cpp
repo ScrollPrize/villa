@@ -616,6 +616,29 @@ std::size_t OpenDataSample::inkDetectionSegmentCount() const
         }));
 }
 
+std::optional<OpenDataRepresentationKind> classifyDerivedRepresentation(
+    const OpenDataArtifact& artifact)
+{
+    std::string type = lowerCopy(artifact.type);
+    std::replace(type.begin(), type.end(), '_', '-');
+
+    if (type.find("normal-grid") != std::string::npos) {
+        return OpenDataRepresentationKind::NormalGrids;
+    }
+    if (type == "lasagna") {
+        return OpenDataRepresentationKind::Lasagna;
+    }
+    const bool prediction =
+        type.find("prediction") != std::string::npos ||
+        type.starts_with("pred-") || type.ends_with("-pred") ||
+        type.find("-pred-") != std::string::npos;
+    const bool ink3d = type.find("ink-detection") != std::string::npos &&
+                       type.find("3d") != std::string::npos;
+    if (prediction || ink3d)
+        return OpenDataRepresentationKind::Prediction;
+    return std::nullopt;
+}
+
 std::vector<OpenDataRepresentationRef> derivedRepresentations(
     const OpenDataSample& sample)
 {
@@ -625,29 +648,44 @@ std::vector<OpenDataRepresentationRef> derivedRepresentations(
         const auto& volume = sample.volumes[volumeIndex];
         for (std::size_t artifactIndex = 0;
              artifactIndex < volume.artifacts.size(); ++artifactIndex) {
-            const auto& artifact = volume.artifacts[artifactIndex];
-            std::string type = lowerCopy(artifact.type);
-            std::replace(type.begin(), type.end(), '_', '-');
-
-            std::optional<OpenDataRepresentationKind> kind;
-            if (type.find("normal-grid") != std::string::npos) {
-                kind = OpenDataRepresentationKind::NormalGrids;
-            } else if (type == "lasagna") {
-                kind = OpenDataRepresentationKind::Lasagna;
-            } else {
-                const bool prediction =
-                    type.find("prediction") != std::string::npos ||
-                    type.starts_with("pred-") || type.ends_with("-pred") ||
-                    type.find("-pred-") != std::string::npos;
-                const bool ink3d = type.find("ink-detection") != std::string::npos &&
-                                   type.find("3d") != std::string::npos;
-                if (prediction || ink3d)
-                    kind = OpenDataRepresentationKind::Prediction;
+            if (const auto kind =
+                    classifyDerivedRepresentation(volume.artifacts[artifactIndex])) {
+                result.push_back({volumeIndex, artifactIndex, *kind});
             }
-            if (kind) result.push_back({volumeIndex, artifactIndex, *kind});
         }
     }
     return result;
+}
+
+bool OpenDataResourceSelection::allowsVolume(const std::string& volumeId) const
+{
+    if (!volumeIds)
+        return true;
+    return std::find(volumeIds->begin(), volumeIds->end(), volumeId) !=
+           volumeIds->end();
+}
+
+bool OpenDataResourceSelection::allowsRepresentation(
+    std::size_t volumeIndex, std::size_t artifactIndex,
+    OpenDataRepresentationKind kind, const std::string& volumeId) const
+{
+    if (!allowsVolume(volumeId))
+        return false;
+    if (representations) {
+        const bool listed = std::any_of(
+            representations->begin(), representations->end(),
+            [&](const OpenDataRepresentationRef& ref) {
+                return ref.volumeIndex == volumeIndex &&
+                       ref.artifactIndex == artifactIndex;
+            });
+        if (!listed)
+            return false;
+    }
+    if (kinds) {
+        if (std::find(kinds->begin(), kinds->end(), kind) == kinds->end())
+            return false;
+    }
+    return true;
 }
 
 std::string_view representationKindName(OpenDataRepresentationKind kind) noexcept

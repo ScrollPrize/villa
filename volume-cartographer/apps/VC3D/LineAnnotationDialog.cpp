@@ -1809,6 +1809,12 @@ void LineAnnotationDialog::handleShiftScrollModeChanged()
     rebuildGeneratedDynamicOverlays();
 }
 
+void LineAnnotationDialog::setCutFollowEnabled(bool enabled)
+{
+    // Programmatic twin of the private toggle.
+    setCurrentCutFollowsStripMouse(enabled);
+}
+
 void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
 {
     const bool wasFollowing = _currentCutFollowsStripMouse;

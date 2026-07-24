@@ -62,6 +62,8 @@ set(srcs
     AtlasControlPointsDock.cpp
     AtlasControlPointsDock.hpp
     AtlasControlPointsTypes.hpp
+    CommandLaunchError.hpp
+    FiberSaveBatchTracker.hpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
@@ -97,6 +99,8 @@ set(srcs
     SurfaceTreeWidget.cpp
     SurfaceDisplayName.hpp
     SurfaceTimestamp.hpp
+    SeedingBatchTracker.cpp
+    SeedingBatchTracker.hpp
     SeedingWidget.cpp
     SeedingWidget.hpp
     segmentation/SegmentationCommon.hpp
@@ -179,6 +183,8 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
+    VolumeAttachmentController.cpp
+    VolumeAttachmentController.hpp
     UnifiedBrowserDialog.cpp
     UnifiedBrowserDialog.hpp
     segmentation/SegmentationModule.cpp
@@ -240,6 +246,39 @@ set(srcs
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp
     volume_viewers/CChunkedVolumeViewer.hpp
+    agent_bridge/AgentBridgeServer.cpp
+    agent_bridge/AgentBridgeServer.hpp
+    agent_bridge/AgentBridgeMethod.cpp
+    agent_bridge/AgentBridgeMethod.hpp
+    agent_bridge/AgentBridgeMethods_atlas.cpp
+    agent_bridge/AgentBridgeMethods_canvas.cpp
+    agent_bridge/AgentBridgeMethods_editing.cpp
+    agent_bridge/AgentBridgeMethods_fiber.cpp
+    agent_bridge/AgentBridgeMethods_flatten.cpp
+    agent_bridge/AgentBridgeMethods_jobs.cpp
+    agent_bridge/AgentBridgeMethods_lasagna.cpp
+    agent_bridge/AgentBridgeMethods_points.cpp
+    agent_bridge/AgentBridgeMethods_seeding.cpp
+    agent_bridge/AgentBridgeMethods_session.cpp
+    agent_bridge/AgentBridgeMethods_surfaceops.cpp
+    agent_bridge/AgentBridgeMethods_viewer.cpp
+    agent_bridge/AgentBridgeMethods_wrap.cpp
+    agent_bridge/AgentBridgeCommandError.hpp
+    agent_bridge/AgentBridgeInternal.hpp
+    agent_bridge/AgentBridgeJobs.cpp
+    agent_bridge/AgentBridgeHandlers_catalog.cpp
+    agent_bridge/AgentBridgeHandlers_session.cpp
+    agent_bridge/AgentBridgeHandlers_editing.cpp
+    agent_bridge/AgentBridgeHandlers_wrap.cpp
+    agent_bridge/AgentBridgeHandlers_atlas.cpp
+    agent_bridge/AgentBridgeHandlers_fiber.cpp
+    agent_bridge/AgentBridgeHandlers_seeding.cpp
+    agent_bridge/AgentBridgeHandlers_lasagna.cpp
+    agent_bridge/AgentBridgeHandlers_flatten.cpp
+    agent_bridge/AgentBridgeHandlers_points.cpp
+    agent_bridge/AgentBridgeHandlers_review.cpp
+    agent_bridge/AgentBridgeHandlers_viewer.cpp
+    agent_bridge/AgentBridgeHandlers_surfaceops.cpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
