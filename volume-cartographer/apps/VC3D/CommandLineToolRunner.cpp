@@ -558,7 +558,9 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
 
     closeLog();
 
-    if (exitCode == 0 && exitStatus == QProcess::NormalExit) {
+    if (_pendingProcessError.isEmpty() &&
+        exitCode == 0 &&
+        exitStatus == QProcess::NormalExit) {
         QString message = tr("%1 completed successfully").arg(toolName(_currentTool));
         QString outputPath = getOutputPath();
 
