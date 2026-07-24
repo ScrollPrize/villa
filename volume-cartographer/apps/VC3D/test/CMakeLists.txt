@@ -7,7 +7,7 @@
 # so we compile its source straight into the test and link just Qt6::Core (for
 # QString et al.) + Qt6::Test (the QTest harness). No other VC3D code is pulled
 # in, keeping the test fast and self-contained.
-find_package(Qt6 REQUIRED COMPONENTS Core Test)
+find_package(Qt6 REQUIRED COMPONENTS Core Test Widgets)
 
 add_executable(test_seeding_batch_tracker
     test_seeding_batch_tracker.cpp
@@ -45,3 +45,28 @@ target_link_libraries(test_fiber_save_batch_tracker PRIVATE
 
 add_test(NAME fiber_save_batch_tracker COMMAND test_fiber_save_batch_tracker)
 set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_fiber_save_batch_tracker)
+
+add_executable(test_command_line_tool_runner
+    test_command_line_tool_runner.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandLineToolRunner.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandLineToolRunner.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ConsoleOutputWidget.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/ConsoleOutputWidget.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/ProgressUtil.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/ProgressUtil.hpp)
+
+set_target_properties(test_command_line_tool_runner PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_command_line_tool_runner PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_command_line_tool_runner PRIVATE
+    Qt6::Core
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME command_line_tool_runner COMMAND test_command_line_tool_runner)
+set_tests_properties(command_line_tool_runner PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_command_line_tool_runner)

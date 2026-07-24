@@ -1028,7 +1028,8 @@ void CWindow::onVisLasagnaObj(const std::string& segmentId)
 bool CWindow::initializeCommandLineRunner()
 {
     if (!_cmdRunner) {
-        _cmdRunner = new CommandLineToolRunner(statusBar(), this, this);
+        _cmdRunner = new CommandLineToolRunner(
+            statusBar(), [this] { return getCurrentVolumePath(); }, this);
 
         if (_segmentationCommandHandler) {
             _segmentationCommandHandler->setCmdRunner(_cmdRunner);

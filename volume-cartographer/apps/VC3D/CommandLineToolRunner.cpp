@@ -1,5 +1,4 @@
 #include "CommandLineToolRunner.hpp"
-#include "CWindow.hpp"
 #include <QDir>
 #include <QFileInfo>
 #include <QStatusBar>
@@ -57,9 +56,12 @@ QString formatCommand(const QString& program, const QStringList& args, int ompTh
 
 } // namespace
 
-CommandLineToolRunner::CommandLineToolRunner(QStatusBar* statusBar, CWindow* mainWindow, QObject* parent)
+CommandLineToolRunner::CommandLineToolRunner(
+    QStatusBar* statusBar,
+    std::function<QString()> currentVolumePath,
+    QObject* parent)
     : QObject(parent)
-    , _mainWindow(mainWindow)
+    , _currentVolumePath(std::move(currentVolumePath))
     , _progressUtil(new ProgressUtil(nullptr, this))
     , _process(nullptr)
     , _consoleOutput(new ConsoleOutputWidget())
@@ -263,8 +265,8 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
             }
         } else {
             QString resolvedVolumePath = _volumePath;
-            if (_mainWindow) {
-                resolvedVolumePath = _mainWindow->getCurrentVolumePath();
+            if (_currentVolumePath) {
+                resolvedVolumePath = _currentVolumePath();
                 if (resolvedVolumePath.isEmpty()) {
                     warn(tr("Error"), tr("No volume selected."));
                     return false;

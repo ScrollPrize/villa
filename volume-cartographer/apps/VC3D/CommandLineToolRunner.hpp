@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -10,8 +12,6 @@
 #include "elements/ProgressUtil.hpp"
 #include "ConsoleOutputWidget.hpp"
 
-class CWindow;
-
 /**
  * @brief Class to manage execution of command-line tools
  */
@@ -21,7 +21,10 @@ class CommandLineToolRunner : public QObject
 
 public:
 
-    explicit CommandLineToolRunner(QStatusBar* statusBar, CWindow* mainWindow, QObject* parent = nullptr);
+    explicit CommandLineToolRunner(
+        QStatusBar* statusBar,
+        std::function<QString()> currentVolumePath,
+        QObject* parent = nullptr);
     
     ~CommandLineToolRunner();
 
@@ -179,7 +182,7 @@ private:
                          const QString& outputPath = {},
                          bool copyToClipboard = false);
 
-    CWindow* _mainWindow;
+    std::function<QString()> _currentVolumePath;
     ProgressUtil* _progressUtil;
     
     QProcess* _process;
