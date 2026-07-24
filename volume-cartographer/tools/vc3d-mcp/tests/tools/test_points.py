@@ -10,10 +10,8 @@ points.* method. For each new tool we assert:
   * optional/None args are stripped before send;
   * the bridge's result is passed through unchanged.
 
-Run directly:
-    cd tools/vc3d-mcp && python3 test_points_edit.py -v
-or via unittest discovery:
-    python3 -m unittest test_points_edit -v
+Run with:
+    python3 -m unittest tests.tools.test_points -v
 """
 
 from __future__ import annotations
@@ -23,13 +21,9 @@ import shutil
 import tempfile
 import unittest
 
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from vc3d_mcp import core  # noqa: E402
-from test_support import EchoBridgeServer  # noqa: E402
-from vc3d_mcp.tools.points import (  # noqa: E402
+from tests.support import EchoBridgeServer
+from vc3d_mcp import core
+from vc3d_mcp.tools.points import (
     vc3d_add_point_collection,
     vc3d_apply_anchor_offset,
     vc3d_auto_fill_windings,

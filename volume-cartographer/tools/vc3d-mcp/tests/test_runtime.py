@@ -1,4 +1,4 @@
-"""Socket discovery, launch, console-tail, and process-reaping tests."""
+"""Socket discovery, launch, console-tail, and process lifecycle tests."""
 
 from __future__ import annotations
 

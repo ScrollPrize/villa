@@ -1,4 +1,4 @@
-"""Stateful fake VC3D bridge used by the MCP integration tests."""
+"""Stateful VC3D bridge fake used by transport and progress tests."""
 
 from __future__ import annotations
 

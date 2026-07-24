@@ -22,36 +22,33 @@ import base64
 import json
 import os
 import shutil
-import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mcp.server.fastmcp import Image
 
-from mcp.server.fastmcp import Image  # noqa: E402
-
-from mcp_test_support import (  # noqa: E402
+from tests.support import (
     FakeAgentBridgeServer,
     TINY_PNG_BYTES,
 )
-from vc3d_mcp.bridge_client import (  # noqa: E402
+from vc3d_mcp.bridge_client import (
     BridgeClient,
     BridgeClientConfig,
     BridgeError,
 )
-from vc3d_mcp import core  # noqa: E402
-from vc3d_mcp.tools.lasagna import vc3d_lasagna_start_optimization  # noqa: E402
-from vc3d_mcp.tools.catalog_volume import (  # noqa: E402
+from vc3d_mcp import core
+from vc3d_mcp.tools.lasagna import vc3d_lasagna_start_optimization
+from vc3d_mcp.tools.catalog_volume import (
     vc3d_attach_volume,
     vc3d_create_project,
     vc3d_list_volumes,
 )
-from vc3d_mcp.tools.misc import (  # noqa: E402
-    vc3d_cancel_job,
+from vc3d_mcp.tools.jobs import vc3d_cancel_job
+from vc3d_mcp.tools.session import (
     vc3d_ping,
     vc3d_screenshot,
 )
-from vc3d_mcp.tools.segmentation import (  # noqa: E402
+from vc3d_mcp.tools.segmentation import (
     vc3d_activate_segment,
     vc3d_delete_segment,
     vc3d_fetch_segment,
@@ -59,13 +56,13 @@ from vc3d_mcp.tools.segmentation import (  # noqa: E402
     vc3d_rename_segment,
     vc3d_save_segment,
 )
-from vc3d_mcp.tools.viewer import (  # noqa: E402
+from vc3d_mcp.tools.viewer import (
     vc3d_get_render_settings,
     vc3d_rotate_viewer,
     vc3d_set_axis_aligned_slices,
     vc3d_set_render_settings,
 )
-from vc3d_mcp.tools.wrap import (  # noqa: E402
+from vc3d_mcp.tools.wrap import (
     vc3d_commit_wrap_annotation,
     vc3d_set_wrap_annotation_mode,
     vc3d_undo_wrap_annotation,

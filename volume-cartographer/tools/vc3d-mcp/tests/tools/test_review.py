@@ -11,10 +11,8 @@ assertion can check:
   * a "filter" dict is forwarded to the wire verbatim;
   * the bridge's result is passed through unchanged.
 
-Run directly:
-    cd tools/vc3d-mcp && python3 test_review.py -v
-or via unittest discovery:
-    python3 -m unittest test_review -v
+Run with:
+    python3 -m unittest tests.tools.test_review -v
 """
 
 from __future__ import annotations
@@ -24,13 +22,9 @@ import shutil
 import tempfile
 import unittest
 
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from vc3d_mcp import core  # noqa: E402
-from vc3d_mcp.tools.review import vc3d_review_segments  # noqa: E402
-from test_support import EchoBridgeServer  # noqa: E402
+from tests.support import EchoBridgeServer
+from vc3d_mcp import core
+from vc3d_mcp.tools.review import vc3d_review_segments
 
 
 class ReviewToolTest(unittest.IsolatedAsyncioTestCase):

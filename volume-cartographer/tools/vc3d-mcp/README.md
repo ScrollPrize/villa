@@ -41,17 +41,18 @@ tools/vc3d-mcp/
                         # request/response correlation over one _Conn
     core.py            # shared FastMCP instance + _call / _wait_for_job /
                         # _strip_none used by every tool module
-    tools/             # per-domain @mcp.tool() modules (segmentation, viewer,
-                        # atlas, lasagna, seeding, flatten, ...) registered on
-                        # the shared mcp instance
+    tools/             # explicit per-domain @mcp.tool() modules; jobs and
+                        # session/app-state tools are kept separate
     server.py          # entry/CLI: connection resolution + auto-launch, imports
                         # tools/ to register them on the shared mcp instance
     __main__.py        # `python -m vc3d_mcp` entry point
-  mcp_test_support.py  # shared fake AF_UNIX bridge used by tool tests
-  test_mcp_bridge.py   # bridge transport and core tool round trips
-  test_mcp_progress.py # connection lifecycle, progress, waiting, schemas
-  test_mcp_runtime.py  # discovery, auto-launch, teardown helpers
-  test_*.py            # domain tool and contract tests
+  tests/
+    support/            # shared stateful and extensible AF_UNIX bridge fakes
+    tools/              # focused tests for individual MCP tool domains
+    test_bridge.py      # bridge transport and core tool round trips
+    test_progress.py    # connection lifecycle, progress, waiting, schemas
+    test_runtime.py     # discovery, auto-launch, teardown helpers
+    test_contract.py    # descriptor snapshot, MCP schema, and SPEC alignment
   pyproject.toml
   requirements.txt
   README.md
@@ -240,8 +241,13 @@ Run it:
 
 ```sh
 cd tools/vc3d-mcp
-./.venv/bin/python -m unittest discover -v
+python3 -m unittest discover -v
 ```
+
+The repository-local `.venv` is runtime convenience state created by
+`run.sh`, not part of the source layout. For development and CI, use a clean
+external environment such as `/tmp/vcmcp` so stale local environments cannot
+affect test results.
 
 ## Tool list
 

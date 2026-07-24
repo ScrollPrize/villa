@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from mcp_test_support import FakeAgentBridgeServer
+from tests.support import FakeAgentBridgeServer
 from vc3d_mcp import core
 from vc3d_mcp.bridge_client import (
     BridgeClient,
@@ -18,7 +18,7 @@ from vc3d_mcp.bridge_client import (
     BridgeConnectionError,
 )
 from vc3d_mcp.tools.atlas import vc3d_atlas_search_start
-from vc3d_mcp.tools.misc import vc3d_wait_job
+from vc3d_mcp.tools.jobs import vc3d_wait_job
 from vc3d_mcp.tools.segmentation import (
     vc3d_grow_segment,
     vc3d_run_trace,

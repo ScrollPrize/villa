@@ -9,7 +9,7 @@ from vc3d_mcp import core
 from vc3d_mcp import tools as _tools  # noqa: F401 - registers the MCP tools
 
 
-VC_ROOT = Path(__file__).resolve().parents[2]
+VC_ROOT = Path(__file__).resolve().parents[3]
 SPEC_PATH = VC_ROOT / "apps/VC3D/agent_bridge/SPEC.md"
 DESCRIPTION_PATH = VC_ROOT / "apps/VC3D/agent_bridge/rpc_description.json"
 EXPECTED_RPC_METHODS = 118

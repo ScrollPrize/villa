@@ -1,4 +1,4 @@
-"""Shared AF_UNIX JSON-RPC test server for the MCP wrapper suites."""
+"""Small extensible AF_UNIX JSON-RPC server for domain-tool tests."""
 
 from __future__ import annotations
 

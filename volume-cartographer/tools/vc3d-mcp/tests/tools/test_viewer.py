@@ -4,26 +4,21 @@
 A purpose-built fake bridge confirms that each wrapper sends the right method
 and camelCase params, strips None values, and returns the bridge response.
 
-Run directly:
-    cd tools/vc3d-mcp && python3 test_viewer.py -v
-or via unittest discovery:
-    python3 -m unittest test_viewer -v
+Run with:
+    python3 -m unittest tests.tools.test_viewer -v
 """
 
 from __future__ import annotations
 
 import os
 import shutil
-import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from vc3d_mcp import core  # noqa: E402
-from vc3d_mcp.bridge_client import BridgeError  # noqa: E402
-from test_support import FakeBridgeServer  # noqa: E402
-from vc3d_mcp.tools.viewer import (  # noqa: E402
+from tests.support import FakeBridgeServer
+from vc3d_mcp import core
+from vc3d_mcp.bridge_client import BridgeError
+from vc3d_mcp.tools.viewer import (
     vc3d_get_overlay,
     vc3d_get_render_settings,
     vc3d_list_overlay_volumes,

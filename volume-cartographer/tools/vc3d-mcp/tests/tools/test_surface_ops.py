@@ -11,22 +11,19 @@ asserting:
     run_trace / grow idiom (wait=True polls job.status to a terminal state).
 
 Run:
-    python3 -m unittest test_surface_ops -v
+    python3 -m unittest tests.tools.test_surface_ops -v
 """
 
 from __future__ import annotations
 
 import os
 import shutil
-import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from vc3d_mcp import core  # noqa: E402
-from test_support import FakeBridgeServer  # noqa: E402
-from vc3d_mcp.tools.surface_ops import (  # noqa: E402
+from tests.support import FakeBridgeServer
+from vc3d_mcp import core
+from vc3d_mcp.tools.surface_ops import (
     vc3d_append_segment_mask,
     vc3d_crop_segment_bounds,
     vc3d_generate_segment_mask,
