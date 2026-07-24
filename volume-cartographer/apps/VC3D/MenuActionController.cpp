@@ -778,7 +778,7 @@ bool MenuActionController::startVolumeAttachment(
                         std::move(request.tags),
                         request.remoteCacheRoot,
                         preferredVolumeId);
-                    if (result == VolumeAttachResult::VolumeIdConflict) {
+                    if (result == CWindow::VolumeAttachResult::VolumeIdConflict) {
                         outcome.failure = VolumeAttachmentFailure::VolumeIdConflict;
                         outcome.error = QObject::tr(
                             "A different volume with id '%1' is already attached.")
@@ -786,7 +786,7 @@ bool MenuActionController::startVolumeAttachment(
                     } else {
                         outcome.success = true;
                         outcome.alreadyAttached =
-                            result == VolumeAttachResult::AlreadyAttached;
+                            result == CWindow::VolumeAttachResult::AlreadyAttached;
                     }
                 } catch (const std::exception& error) {
                     outcome.failure = VolumeAttachmentFailure::Apply;

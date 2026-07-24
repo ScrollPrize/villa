@@ -4085,7 +4085,7 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     updateOpenDataSegmentTransformState(true);
 }
 
-VolumeAttachResult CWindow::attachVolumeToCurrentPackage(
+CWindow::VolumeAttachResult CWindow::attachVolumeToCurrentPackage(
     const std::shared_ptr<Volume>& volume,
     const QString& location,
     std::vector<std::string> tags,
