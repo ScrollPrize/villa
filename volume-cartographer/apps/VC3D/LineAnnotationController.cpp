@@ -5200,6 +5200,90 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
     return summaries;
 }
 
+std::vector<LineAnnotationController::FiberLinkOverlayInfo>
+LineAnnotationController::fiberLinkOverlayInfos() const
+{
+    // Union-find mirrors fiberSummaries(): all branches, pending included,
+    // unknown targets skipped.
+    std::unordered_map<uint64_t, size_t> indexById;
+    indexById.reserve(_fibers.size());
+    for (size_t i = 0; i < _fibers.size(); ++i) {
+        indexById.emplace(_fibers[i].id, i);
+    }
+    std::vector<size_t> parent(_fibers.size());
+    for (size_t i = 0; i < parent.size(); ++i) {
+        parent[i] = i;
+    }
+    const auto findRoot = [&parent](size_t index) {
+        while (parent[index] != index) {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        return index;
+    };
+    for (size_t i = 0; i < _fibers.size(); ++i) {
+        for (const auto& branch : _fibers[i].branches) {
+            const auto targetIt = indexById.find(branch.branchFiberId);
+            if (targetIt == indexById.end()) {
+                continue;
+            }
+            parent[findRoot(i)] = findRoot(targetIt->second);
+        }
+    }
+    std::unordered_map<size_t, uint64_t> minIdByRoot;
+    for (size_t i = 0; i < _fibers.size(); ++i) {
+        auto [it, inserted] = minIdByRoot.emplace(findRoot(i), _fibers[i].id);
+        if (!inserted) {
+            it->second = std::min(it->second, _fibers[i].id);
+        }
+    }
+
+    std::vector<FiberLinkOverlayInfo> infos;
+    for (size_t i = 0; i < _fibers.size(); ++i) {
+        const StoredFiber& fiber = _fibers[i];
+        // Pending wins per control point, matching the annotation GUI's
+        // marker precedence.
+        std::map<int, bool> pendingByControlPoint;
+        for (const auto& branch : fiber.branches) {
+            if (indexById.find(branch.branchFiberId) == indexById.end()) {
+                continue;
+            }
+            if (branch.controlPointIndex < 0 ||
+                branch.controlPointIndex >=
+                    static_cast<int>(fiber.controlPoints.size())) {
+                continue;
+            }
+            auto [it, inserted] =
+                pendingByControlPoint.emplace(branch.controlPointIndex, branch.pending);
+            if (!inserted) {
+                it->second = it->second || branch.pending;
+            }
+        }
+        if (pendingByControlPoint.empty()) {
+            continue;
+        }
+        FiberLinkOverlayInfo info;
+        info.fiberId = fiber.id;
+        info.linkGroupId = minIdByRoot.at(findRoot(i));
+        info.linkedControlPoints.assign(pendingByControlPoint.begin(),
+                                        pendingByControlPoint.end());
+        infos.push_back(std::move(info));
+    }
+    return infos;
+}
+
+QString LineAnnotationController::fiberDisplayName(uint64_t fiberId) const
+{
+    for (const StoredFiber& fiber : _fibers) {
+        if (fiber.id == fiberId) {
+            const QString stem =
+                vc3d::displayStemForFiberFile(QString::fromStdString(fiber.fileName));
+            return stem.isEmpty() ? tr("unnamed") : stem;
+        }
+    }
+    return tr("unnamed");
+}
+
 std::vector<std::string> LineAnnotationController::knownFiberTags() const
 {
     return _knownFiberTags;

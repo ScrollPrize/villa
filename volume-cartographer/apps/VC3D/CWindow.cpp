@@ -3484,6 +3484,33 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
                         QMenu menu(this);
 
+                        if (_fiberOverlay && _lineAnnotationController) {
+                            if (const auto hit = _fiberOverlay->hitTestControlPoint(
+                                    viewer, scenePoint, 12.0);
+                                hit && hit->fiberId != 0) {
+                                const uint64_t fiberId = hit->fiberId;
+                                const int controlIndex = hit->controlPointIndex;
+                                QAction* gotoControlPointAction = menu.addAction(
+                                    tr("Go to control point %1 in %2")
+                                        .arg(controlIndex)
+                                        .arg(_lineAnnotationController->fiberDisplayName(fiberId)));
+                                connect(gotoControlPointAction, &QAction::triggered, this,
+                                        [this, fiberId, controlIndex]() {
+                                            if (_fiberWidget) {
+                                                _fiberWidget->selectFiber(fiberId);
+                                            }
+                                            if (_fiberSliceWidget) {
+                                                _fiberSliceWidget->selectFiber(fiberId);
+                                            }
+                                            if (_lineAnnotationController) {
+                                                _lineAnnotationController->openFiberAtControlPoint(
+                                                    fiberId, controlIndex);
+                                            }
+                                        });
+                                menu.addSeparator();
+                            }
+                        }
+
                         QAction* newLineAnnotationAction = menu.addAction(tr("New line annotation"));
                         newLineAnnotationAction->setEnabled(
                             _lineAnnotationController &&
@@ -7381,6 +7408,14 @@ void CWindow::CreateWidgets(void)
             _fiberSliceWidget->setShowFibersChecked(checked);
         }
     };
+    auto syncShowLinkedChecks = [this](bool checked) {
+        if (_fiberWidget) {
+            _fiberWidget->setShowLinkedChecked(checked);
+        }
+        if (_fiberSliceWidget) {
+            _fiberSliceWidget->setShowLinkedChecked(checked);
+        }
+    };
     auto syncFiberViewDistances = [this](double distance) {
         if (_fiberWidget) {
             _fiberWidget->setFiberViewDistance(distance);
@@ -7398,6 +7433,12 @@ void CWindow::CreateWidgets(void)
         }
         syncShowFiberChecks(visible);
     };
+    auto setFiberOverlayShowLinked = [this, syncShowLinkedChecks](bool checked) {
+        if (_fiberOverlay) {
+            _fiberOverlay->setShowLinked(checked);
+        }
+        syncShowLinkedChecks(checked);
+    };
     auto setFiberViewDistance = [this, syncFiberViewDistances](double distance) {
         if (_fiberOverlay) {
             _fiberOverlay->setViewDistance(distance);
@@ -7410,16 +7451,21 @@ void CWindow::CreateWidgets(void)
     if (_fiberWidget) {
         connect(_fiberWidget, &CFiberWidget::showFibersToggled,
                 this, setFiberOverlayVisible);
+        connect(_fiberWidget, &CFiberWidget::showLinkedToggled,
+                this, setFiberOverlayShowLinked);
         connect(_fiberWidget, &CFiberWidget::fiberViewDistanceChanged,
                 this, setFiberViewDistance);
     }
     if (_fiberSliceWidget) {
         connect(_fiberSliceWidget, &CFiberWidget::showFibersToggled,
                 this, setFiberOverlayVisible);
+        connect(_fiberSliceWidget, &CFiberWidget::showLinkedToggled,
+                this, setFiberOverlayShowLinked);
         connect(_fiberSliceWidget, &CFiberWidget::fiberViewDistanceChanged,
                 this, setFiberViewDistance);
     }
     setFiberViewDistance(_fiberWidget->fiberViewDistance());
+    setFiberOverlayShowLinked(_fiberWidget->showLinkedChecked());
 
     if (_lineAnnotationController) {
         auto toFiberWidgetAlignment =
@@ -7487,6 +7533,14 @@ void CWindow::CreateWidgets(void)
                 _fiberSliceWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
             }
 
+            const auto linkInfos = _lineAnnotationController->fiberLinkOverlayInfos();
+            std::unordered_map<uint64_t, const LineAnnotationController::FiberLinkOverlayInfo*>
+                linkInfoById;
+            linkInfoById.reserve(linkInfos.size());
+            for (const auto& info : linkInfos) {
+                linkInfoById.emplace(info.fiberId, &info);
+            }
+
             std::vector<FiberOverlayController::Chain> chains;
             for (const auto& snapshot : _lineAnnotationController->fiberSnapshots()) {
                 if (snapshot.controlPoints.empty()) {
@@ -7499,6 +7553,16 @@ void CWindow::CreateWidgets(void)
                     chain.points.emplace_back(static_cast<float>(point[0]),
                                               static_cast<float>(point[1]),
                                               static_cast<float>(point[2]));
+                }
+                if (const auto it = linkInfoById.find(snapshot.id); it != linkInfoById.end()) {
+                    chain.colorId = it->second->linkGroupId;
+                    chain.pointLinkStates.assign(chain.points.size(), 0);
+                    for (const auto& [cpIndex, pending] : it->second->linkedControlPoints) {
+                        if (cpIndex >= 0 &&
+                            cpIndex < static_cast<int>(chain.pointLinkStates.size())) {
+                            chain.pointLinkStates[cpIndex] = pending ? 1 : 2;
+                        }
+                    }
                 }
                 chains.push_back(std::move(chain));
             }

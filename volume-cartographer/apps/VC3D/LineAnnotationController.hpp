@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -130,6 +131,19 @@ public:
         bool pending = false;
     };
 
+    // Per-fiber data for the fiber overlay's "Show linked" mode. Only fibers
+    // with at least one valid cross-fiber link are returned. linkGroupId is
+    // the smallest fiber id in the fiber's connected component over all
+    // branch links, pending included — same union-find semantics as
+    // fiberSummaries().
+    struct FiberLinkOverlayInfo {
+        uint64_t fiberId = 0;
+        uint64_t linkGroupId = 0;
+        // (local control point index, pending); one entry per linked control
+        // point, pending winning when a point carries both link states.
+        std::vector<std::pair<int, bool>> linkedControlPoints;
+    };
+
     using DatasetPicker =
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
@@ -184,6 +198,9 @@ public:
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
+    [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
+    // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
+    [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage() const;
