@@ -209,6 +209,10 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Creating segments from intersecting horizontal and vertical fibers](https://gist.github.com/jrudolph/3e0ebbd6e731f794733c236a86ff39fb) by Johannes Rudolph
 
+- [Surface geometry failure diagnostic](https://github.com/Jinhojeong/vesuvius-surface-geometry-diagnostic) by Jinho Jeong. Geometry-stratified analysis of where surface models fail in compressed regions (villa #191): compressed sheets are fused rather than missed across three architectures, the CT carries no intensity dip between contacting sheets, and neither the model's probability field nor local CT geometry supplies a boundary either. Includes oracle measurements showing the official topometrics blend does not respond to repairing these merges, a patch-mode eval entry point and sample ground-truth patches so any surface model or splitter can be scored the same way.
+
+- [unmerge-cli](https://github.com/Jinhojeong/vesuvius-unmerge) by Jinho Jeong. Splits fused sheet instances by carrying identity through a contact from the resolved surroundings, using an anisotropic random-walk solve seeded from neighbouring instance labels. On raw predictions it refuses to split and flags the weld instead, since no boundary signal exists there. Applied to the published PHerc1218 instance labels it produced [pherc1218-topological-repair](https://www.kaggle.com/datasets/jhjeong0815/pherc1218-topological-repair), 14,131 repaired fusion sites in two confidence tiers, listed as a companion dataset by [vesuvius-sheet-tools](https://github.com/IyanDopico/vesuvius-sheet-tools).
+
 ### 📊 Visualization
 
 - [Browser-based scroll viewer](https://discord.com/channels/1079907749569237093/1246129199304151052/1246129199304151052) by Yao Hsiao
