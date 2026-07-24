@@ -696,12 +696,17 @@ void CFiberWidget::rebuildModel()
     }
 
     for (const auto& fiber : _fibers) {
+        QString linkText = fiber.linkedFiberCount > 0
+            ? QString::number(fiber.linkedFiberCount)
+            : QString();
+        if (fiber.quarantinedLinkCount > 0) {
+            linkText += QStringLiteral(" (!%1)").arg(fiber.quarantinedLinkCount);
+            linkText = linkText.trimmed();
+        }
         QList<QStandardItem*> row{
             readOnlyItem(displayNameForFiber(fiber)),
             readOnlyItem(directionForFiber(fiber)),
-            readOnlyItem(fiber.linkedFiberCount > 0
-                             ? QString::number(fiber.linkedFiberCount)
-                             : QString()),
+            readOnlyItem(linkText),
             readOnlyItem(fiber.pendingLinkCount > 0
                              ? QString::number(fiber.pendingLinkCount)
                              : QString()),
@@ -713,6 +718,13 @@ void CFiberWidget::rebuildModel()
             readOnlyItem(formatMaxMetric(fiber.alignment, showMetrics)),
         };
         applyRowMetadata(row, fiber.id, false, fiber.alignment, showMetrics);
+        if (fiber.quarantinedLinkCount > 0) {
+            const QString quarantineTip =
+                tr("%1 quarantined link(s): kept on disk, disabled this session")
+                    .arg(fiber.quarantinedLinkCount);
+            row[kLinkColumn]->setToolTip(quarantineTip);
+            row[kPendingColumn]->setToolTip(quarantineTip);
+        }
 
         QStandardItem* root = row[kNameColumn];
         for (const auto& span : fiber.spans) {

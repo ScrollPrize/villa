@@ -7655,6 +7655,7 @@ void CWindow::CreateWidgets(void)
                     fiber.tags,
                     fiber.linkedFiberCount,
                     fiber.pendingLinkCount,
+                    fiber.quarantinedLinkCount,
                 });
             }
             if (_fiberWidget) {

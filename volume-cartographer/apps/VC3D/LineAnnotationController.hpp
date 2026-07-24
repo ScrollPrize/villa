@@ -103,6 +103,9 @@ public:
         int linkedFiberCount = 0;
         // Number of branch links on this fiber still awaiting review approval.
         int pendingLinkCount = 0;
+        // Branch links kept on disk but disabled this session (unresolvable
+        // endpoints/reciprocals or unparseable entries).
+        int quarantinedLinkCount = 0;
     };
 
     struct FiberSnapshotWithPath {
@@ -119,6 +122,13 @@ public:
     // saved-fiber control-point ordering. Any live mutation of control points or
     // branches must go through the private session paths that call
     // syncLinkedBranchMetadataAfterFiberModification().
+    // In-memory resolution state of a loaded branch link; never serialized.
+    // Repaired: an endpoint was re-resolved by position (stale index or
+    // direction from an external edit) and awaits the next legitimate save.
+    // Quarantined: an endpoint or the reciprocal entry could not be resolved;
+    // the link is kept verbatim on disk but excluded from link features.
+    enum class LinkState { Ok, Repaired, Quarantined };
+
     struct FiberBranchRef {
         int controlPointIndex = -1;
         uint64_t branchFiberId = 0;
@@ -130,6 +140,8 @@ public:
         cv::Vec3d branchControlPointPosition{0.0, 0.0, 0.0};
         // Link awaits reviewer approval; kept in sync on both reciprocal refs.
         bool pending = false;
+        LinkState linkState = LinkState::Ok;
+        std::string quarantineReason;
     };
 
     // Per-fiber data for the fiber overlay's "Show linked" mode. Only fibers
@@ -313,7 +325,12 @@ private:
         vc3d::line_annotation::FiberHvClassification hvClassification;
         std::string manualHvTag;
         std::vector<std::string> tags;
+        // In-memory metadata refresh pending; written on the next legitimate
+        // save of this fiber. Loading never acts on this by itself.
         bool needsSave = false;
+        // Branch JSON entries that failed structural parsing; preserved
+        // verbatim and re-emitted on save so a load can never drop data.
+        std::vector<nlohmann::json> unparsedBranchJson;
     };
 
     struct StoredFiberSessionSnapshot {
@@ -334,12 +351,6 @@ private:
         std::vector<FiberSaveSnapshot> snapshots;
         bool showErrors = true;
         std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches;
-    };
-
-    struct BranchLinkValidationIssue {
-        size_t fiberIndex = 0;
-        size_t branchIndex = 0;
-        std::string reason;
     };
 
     struct FiberSaveTaskResult {
@@ -490,8 +501,13 @@ private:
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
-    [[nodiscard]] bool validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
-                                                std::vector<std::string>& errors) const;
+    // Position-first repair/quarantine of loaded branch links; never touches
+    // disk. Quarantine reasons are appended to quarantineNotes.
+    void resolveLoadedFiberLinks(std::vector<StoredFiber>& fibers,
+                                 std::vector<std::string>& quarantineNotes) const;
+    // Explicit user action: erase quarantined/unparsed branch entries from
+    // the loaded fibers and rewrite the affected files.
+    void repairQuarantinedFiberLinks();
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
     [[nodiscard]] std::filesystem::path fibersRootDir() const;
@@ -591,13 +607,6 @@ private:
                                                            const std::filesystem::path& path,
                                                            std::vector<std::string>* branchErrors = nullptr) const;
     [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
-    [[nodiscard]] std::vector<BranchLinkValidationIssue> collectLoadedFiberBranchIssues(
-        const std::vector<StoredFiber>& fibers) const;
-    [[nodiscard]] bool repairLoadedFiberBranchLinks(
-        std::vector<StoredFiber>& fibers,
-        const std::unordered_set<std::string>& fibersWithRemovedBranchEntries,
-        const std::vector<BranchLinkValidationIssue>& initialIssues,
-        std::vector<std::string>& errors) const;
     [[nodiscard]] std::string uniqueImportedFiberFileName(const StoredFiber& fiber,
                                                           std::unordered_set<std::string>& reserved,
                                                           uint64_t& nextSequence) const;

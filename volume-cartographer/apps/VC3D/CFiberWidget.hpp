@@ -61,6 +61,8 @@ public:
         std::vector<std::string> tags;
         int linkedFiberCount = 0;
         int pendingLinkCount = 0;
+        // Links kept on disk but disabled this session (shown as "(!N)").
+        int quarantinedLinkCount = 0;
     };
 
     explicit CFiberWidget(QWidget* parent = nullptr);

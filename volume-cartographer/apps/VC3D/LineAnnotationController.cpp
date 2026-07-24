@@ -791,6 +791,23 @@ bool branchReferencesFiber(const LineAnnotationController::FiberBranchRef& branc
     return !fileName.empty() && branch.branchFileName == fileName;
 }
 
+// Quarantined links stay on disk but are excluded from the link graph,
+// sessions, and link editing until repaired or re-resolved.
+bool branchLinkActive(const LineAnnotationController::FiberBranchRef& branch)
+{
+    return branch.linkState != LineAnnotationController::LinkState::Quarantined;
+}
+
+std::vector<LineAnnotationController::FiberBranchRef> activeBranchLinks(
+    const std::vector<LineAnnotationController::FiberBranchRef>& branches)
+{
+    std::vector<LineAnnotationController::FiberBranchRef> active;
+    active.reserve(branches.size());
+    std::copy_if(branches.begin(), branches.end(), std::back_inserter(active),
+                 branchLinkActive);
+    return active;
+}
+
 bool controlPointHasBranchLink(
     const std::vector<LineAnnotationController::FiberBranchRef>& branches,
     size_t controlPointIndex)
@@ -2230,7 +2247,10 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     session->fiberFileName = it->fileName;
     session->fiberManualHvTag = it->manualHvTag;
     session->fiberTags = it->tags;
-    session->branches = it->branches;
+    // Quarantined links stay out of live sessions (and thus link editing,
+    // side-strip queries, and reciprocal metadata sync); they are preserved
+    // on save by makeStoredFiberSessionSnapshot.
+    session->branches = activeBranchLinks(it->branches);
     session->disableInitialGeneratedHoverFollow =
         controlPointIndex.has_value() || linePointIndex.has_value() ||
         spanControlIndices.has_value();
@@ -5332,6 +5352,9 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
     };
     for (size_t i = 0; i < _fibers.size(); ++i) {
         for (const auto& branch : _fibers[i].branches) {
+            if (!branchLinkActive(branch)) {
+                continue;
+            }
             const auto targetIt = indexById.find(branch.branchFiberId);
             if (targetIt == indexById.end()) {
                 continue;
@@ -5365,7 +5388,16 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
         const int pendingLinkCount = static_cast<int>(
             std::count_if(fiber.branches.begin(),
                           fiber.branches.end(),
-                          [](const FiberBranchRef& branch) { return branch.pending; }));
+                          [](const FiberBranchRef& branch) {
+                              return branchLinkActive(branch) && branch.pending;
+                          }));
+        const int quarantinedLinkCount = static_cast<int>(
+            std::count_if(fiber.branches.begin(),
+                          fiber.branches.end(),
+                          [](const FiberBranchRef& branch) {
+                              return !branchLinkActive(branch);
+                          }) +
+            fiber.unparsedBranchJson.size());
         summaries.push_back(FiberSummary{
             fiber.id,
             fiber.fileName,
@@ -5384,6 +5416,7 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             fiber.tags,
             componentSize >= 2 ? componentSize : 0,
             pendingLinkCount,
+            quarantinedLinkCount,
         });
     }
     std::sort(summaries.begin(), summaries.end(), [](const FiberSummary& a, const FiberSummary& b) {
@@ -5415,6 +5448,9 @@ LineAnnotationController::fiberLinkOverlayInfos() const
     };
     for (size_t i = 0; i < _fibers.size(); ++i) {
         for (const auto& branch : _fibers[i].branches) {
+            if (!branchLinkActive(branch)) {
+                continue;
+            }
             const auto targetIt = indexById.find(branch.branchFiberId);
             if (targetIt == indexById.end()) {
                 continue;
@@ -5437,6 +5473,9 @@ LineAnnotationController::fiberLinkOverlayInfos() const
         // marker precedence.
         std::map<int, bool> pendingByControlPoint;
         for (const auto& branch : fiber.branches) {
+            if (!branchLinkActive(branch)) {
+                continue;
+            }
             if (indexById.find(branch.branchFiberId) == indexById.end()) {
                 continue;
             }
@@ -7688,30 +7727,9 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                   });
     };
 
-    auto loadStrictFibers = [&]() {
-        std::vector<StoredFiber> strictFibers;
-        std::vector<std::string> strictErrors;
-        for (const auto& path : fiberFiles) {
-            try {
-                if (auto fiber = loadFiberFile(path)) {
-                    strictFibers.push_back(std::move(*fiber));
-                }
-            } catch (const std::exception& ex) {
-                strictErrors.push_back(
-                    fiberErrorName(path.filename().string()) + ": " + ex.what());
-            }
-        }
-        sortLoadedFibers(strictFibers);
-        (void)validateLoadedFiberLinks(strictFibers, strictErrors);
-        return std::pair<std::vector<StoredFiber>, std::vector<std::string>>{
-            std::move(strictFibers),
-            std::move(strictErrors)};
-    };
-
     std::vector<StoredFiber> loadedFibers;
     std::vector<std::string> fatalLoadErrors;
-    std::vector<std::string> branchLoadErrors;
-    std::unordered_set<std::string> fibersWithRemovedBranchEntries;
+    std::vector<std::string> quarantineNotes;
     for (const auto& path : fiberFiles) {
         try {
             std::ifstream in(path);
@@ -7719,14 +7737,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                 throw std::runtime_error("Failed to open fiber file");
             }
             const nlohmann::json root = nlohmann::json::parse(in);
-            std::vector<std::string> branchErrors;
-            if (auto fiber = loadFiberJson(root, path, &branchErrors)) {
-                if (!branchErrors.empty()) {
-                    fibersWithRemovedBranchEntries.insert(fiber->fileName);
-                    branchLoadErrors.insert(branchLoadErrors.end(),
-                                            branchErrors.begin(),
-                                            branchErrors.end());
-                }
+            if (auto fiber = loadFiberJson(root, path, &quarantineNotes)) {
                 loadedFibers.push_back(std::move(*fiber));
             }
         } catch (const std::exception& ex) {
@@ -7755,97 +7766,67 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         }
     }
 
-    const auto branchLinkIssues = collectLoadedFiberBranchIssues(loadedFibers);
-    std::vector<std::string> branchErrors = branchLoadErrors;
-    branchErrors.reserve(branchErrors.size() + branchLinkIssues.size());
-    for (const auto& issue : branchLinkIssues) {
-        if (issue.fiberIndex >= loadedFibers.size()) {
-            continue;
-        }
-        branchErrors.push_back(fiberErrorName(loadedFibers[issue.fiberIndex].fileName) +
-                               ": " + issue.reason);
-    }
+    // Repair what can be resolved by position, quarantine the rest. Loading
+    // never writes to disk: repaired metadata persists on the next
+    // legitimate save, quarantined entries only via the explicit repair
+    // action below.
+    resolveLoadedFiberLinks(loadedFibers, quarantineNotes);
 
-    if (!branchErrors.empty()) {
+    bool repairRequested = false;
+    if (!quarantineNotes.empty()) {
         QString details;
-        const size_t shown = std::min<size_t>(branchErrors.size(), 8);
+        const size_t shown = std::min<size_t>(quarantineNotes.size(), 8);
         for (size_t i = 0; i < shown; ++i) {
             if (!details.isEmpty()) {
                 details += QStringLiteral("\n");
             }
-            details += QString::fromStdString(branchErrors[i]);
+            details += QString::fromStdString(quarantineNotes[i]);
         }
-        if (branchErrors.size() > shown) {
-            details += tr("\n... %1 more branch/link error(s)")
-                           .arg(static_cast<int>(branchErrors.size() - shown));
+        if (quarantineNotes.size() > shown) {
+            details += tr("\n... %1 more quarantined link(s)")
+                           .arg(static_cast<int>(quarantineNotes.size() - shown));
         }
 
-        bool repairRequested = false;
         if (_errorDialogsSuppressed) {
-            // Without dialogs, take the conservative "keep files unchanged"
-            // path and log the details.
-            Logger()->warn("Line Annotation (suppressed dialog): broken fiber "
-                           "branch links, keeping files unchanged:\n{}",
+            // Without dialogs (agent-driven sessions), keep the conservative
+            // default: quarantined links stay on disk, disabled this session.
+            Logger()->warn("Line Annotation (suppressed dialog): {} branch "
+                           "link(s) quarantined, kept on disk but disabled:\n{}",
+                           quarantineNotes.size(),
                            details.toStdString());
         } else {
             QMessageBox prompt(_parentWidget.data());
-            prompt.setIcon(QMessageBox::Warning);
-            prompt.setWindowTitle(tr("Broken branch links"));
-            prompt.setText(tr("Some saved fiber branch links are obsolete or inconsistent."));
+            prompt.setIcon(QMessageBox::Information);
+            prompt.setWindowTitle(tr("Quarantined branch links"));
+            prompt.setText(tr("%1 branch link entrie(s) could not be resolved and were "
+                              "quarantined. They are kept on disk but disabled in "
+                              "this session.")
+                               .arg(static_cast<int>(quarantineNotes.size())));
             prompt.setInformativeText(details);
+            auto* keepButton = prompt.addButton(tr("Keep quarantined"),
+                                                QMessageBox::RejectRole);
             auto* repairButton = prompt.addButton(
-                tr("Remove broken branch links and reload"),
+                tr("Repair now (rewrites affected files)"),
                 QMessageBox::AcceptRole);
-            prompt.addButton(tr("Keep files unchanged"), QMessageBox::RejectRole);
-            prompt.setDefaultButton(qobject_cast<QPushButton*>(repairButton));
+            prompt.setDefaultButton(qobject_cast<QPushButton*>(keepButton));
             prompt.exec();
-            repairRequested = (prompt.clickedButton() == repairButton);
+            repairRequested = prompt.clickedButton() == repairButton;
         }
-
-        if (repairRequested) {
-            std::vector<std::string> repairErrors;
-            if (repairLoadedFiberBranchLinks(loadedFibers,
-                                             fibersWithRemovedBranchEntries,
-                                             branchLinkIssues,
-                                             repairErrors)) {
-                loadFibersForCurrentPackage();
-                return;
-            }
-            for (const auto& error : repairErrors) {
-                Logger()->warn("{}", error);
-            }
-            showError(tr("Could not repair broken branch links:\n%1")
-                          .arg(QString::fromStdString(
-                              repairErrors.empty() ? std::string{"unknown error"}
-                                                   : repairErrors.front())));
-        }
-
-        auto strict = loadStrictFibers();
-        loadedFibers = std::move(strict.first);
-        fatalLoadErrors = std::move(strict.second);
     }
 
     std::vector<std::string> loadErrors = std::move(fatalLoadErrors);
-    if (branchErrors.empty()) {
-        (void)validateLoadedFiberLinks(loadedFibers, loadErrors);
-    }
 
     for (auto& fiber : loadedFibers) {
         addKnownFiberTags(fiber.tags);
-        if (fiber.needsSave) {
-            try {
-                fiber.needsSave = false;
-                saveFiberNow(fiber);
-            } catch (const std::exception& ex) {
-                fiber.needsSave = true;
-                Logger()->warn("Could not update VC3D fiber metadata {}: {}",
-                               fiberPath(fiber).string(),
-                               ex.what());
-            }
-        }
     }
 
     _fibers = std::move(loadedFibers);
+
+    if (repairRequested) {
+        // Flows through the guarded save pipeline, so a concurrent external
+        // change still prompts instead of being clobbered.
+        repairQuarantinedFiberLinks();
+    }
     if (!loadErrors.empty()) {
         for (const auto& error : loadErrors) {
             Logger()->warn("{}", error);
@@ -9513,7 +9494,7 @@ LineAnnotationController::makeIntersectionLineSession(
     session->fiberFileName = fiber.fileName;
     session->fiberManualHvTag = fiber.manualHvTag;
     session->fiberTags = fiber.tags;
-    session->branches = fiber.branches;
+    session->branches = activeBranchLinks(fiber.branches);
     session->focusedLinePosition = std::clamp(
         focusLinePosition,
         0.0,
@@ -9698,6 +9679,17 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
         }
     }
 
+    if (existingIt != _fibers.end()) {
+        // Sessions carry only active links; re-attach quarantined branches
+        // and unparsed entries so a legitimate save cannot drop them.
+        for (const auto& branch : existingIt->branches) {
+            if (!branchLinkActive(branch)) {
+                fiber.branches.push_back(branch);
+            }
+        }
+        fiber.unparsedBranchJson = existingIt->unparsedBranchJson;
+    }
+
     fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(fiber.controlPoints);
     fiber.manualHvTag = session.fiberManualHvTag;
     fiber.tags = session.fiberTags;
@@ -9869,6 +9861,30 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
     };
     root["branches"] = nlohmann::json::array();
     for (const auto& branch : serialized.branches) {
+        if (branch.linkState == LinkState::Quarantined) {
+            // Quarantined links are written back exactly as loaded — they
+            // failed resolution, not serialization, and dropping them here
+            // would be the data loss the quarantine exists to prevent. Note
+            // the check runs before every validity test below (a missing
+            // target fiber leaves branchFiberId == 0, for instance).
+            nlohmann::json quarantinedJson = {
+                {"control_point_index", branch.controlPointIndex},
+                {"branch_fiber_id", branch.branchFiberId},
+                {"branch_control_point_index", branch.branchControlPointIndex},
+                {"control_point_direction", pointToJson(branch.controlPointDirection)},
+                {"branch_control_point_direction",
+                 pointToJson(branch.branchControlPointDirection)},
+                {"control_point_position", pointToJson(branch.controlPointPosition)},
+                {"branch_control_point_position",
+                 pointToJson(branch.branchControlPointPosition)},
+                {"branch_file", branch.branchFileName},
+            };
+            if (branch.pending) {
+                quarantinedJson["pending"] = true;
+            }
+            root["branches"].push_back(std::move(quarantinedJson));
+            continue;
+        }
         if (branch.controlPointIndex < 0 || branch.branchFiberId == 0) {
             continue;
         }
@@ -9904,6 +9920,11 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
             branchJson["pending"] = true;
         }
         root["branches"].push_back(std::move(branchJson));
+    }
+    // Structurally unparseable entries survive load->save round trips
+    // verbatim; only the explicit repair action removes them.
+    for (const auto& unparsed : serialized.unparsedBranchJson) {
+        root["branches"].push_back(unparsed);
     }
     root["control_points"] = nlohmann::json::array();
     root["line_points"] = nlohmann::json::array();
@@ -9979,6 +10000,9 @@ void LineAnnotationController::canonicalizeFiberSaveSnapshots(
 
     for (auto& snapshot : snapshots) {
         for (auto& branch : snapshot.fiber.branches) {
+            if (!branchLinkActive(branch)) {
+                continue;  // written back verbatim, never canonicalized
+            }
             if (auto localIndex = matchingStoredControlPointIndex(
                     snapshot.fiber.controlPoints,
                     branch.controlPointIndex,
@@ -10019,6 +10043,9 @@ void LineAnnotationController::canonicalizeFiberSaveSnapshots(
 
     for (auto& snapshot : snapshots) {
         for (auto& branch : snapshot.fiber.branches) {
+            if (!branchLinkActive(branch)) {
+                continue;
+            }
             if (branch.controlPointIndex < 0 ||
                 branch.branchControlPointIndex < 0 ||
                 static_cast<size_t>(branch.controlPointIndex) >=
@@ -10035,7 +10062,8 @@ void LineAnnotationController::canonicalizeFiberSaveSnapshots(
                 target->fiber.branches.begin(),
                 target->fiber.branches.end(),
                 [&snapshot, &branch](const FiberBranchRef& candidate) {
-                    return branchReferencesFiber(candidate,
+                    return branchLinkActive(candidate) &&
+                           branchReferencesFiber(candidate,
                                                  snapshot.fiber.id,
                                                  snapshot.fiber.fileName) &&
                            (candidate.controlPointIndex ==
@@ -10095,6 +10123,9 @@ void LineAnnotationController::validateFiberSaveSnapshots(
 
     for (const auto& snapshot : snapshots) {
         for (const auto& branch : snapshot.fiber.branches) {
+            if (!branchLinkActive(branch)) {
+                continue;  // preserved verbatim; validation would reject it
+            }
             const auto localIndex = matchingStoredControlPointIndex(
                 snapshot.fiber.controlPoints,
                 branch.controlPointIndex,
@@ -10122,7 +10153,8 @@ void LineAnnotationController::validateFiberSaveSnapshots(
                 target->fiber.branches.begin(),
                 target->fiber.branches.end(),
                 [&snapshot, &branch](const FiberBranchRef& candidate) {
-                    return branchReferencesFiber(candidate,
+                    return branchLinkActive(candidate) &&
+                           branchReferencesFiber(candidate,
                                                  snapshot.fiber.id,
                                                  snapshot.fiber.fileName) &&
                            candidate.controlPointIndex == branch.branchControlPointIndex &&
@@ -10406,51 +10438,47 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
     }
 
     if (root.contains("branches")) {
-        auto recordBranchError = [&](const std::string& reason) {
+        // Tolerant parsing: structurally unusable entries are preserved
+        // verbatim in unparsedBranchJson (and re-emitted on save) instead of
+        // being dropped — loading must never lose data. Semantic problems
+        // (stale indices, drifted positions/directions) are NOT checked
+        // here; resolveLoadedFiberLinks() repairs or quarantines them.
+        auto preserveUnparsed = [&](const nlohmann::json& branchJson,
+                                    const std::string& reason) {
+            fiber.unparsedBranchJson.push_back(branchJson);
             if (branchErrors) {
                 branchErrors->push_back(fiberErrorName(fiber.fileName) + ": " + reason);
-                return true;
             }
-            throw std::runtime_error(reason);
         };
         const auto& branches = root.at("branches");
         if (!branches.is_array()) {
-            if (recordBranchError("branches must be an array")) {
-                fiber.needsSave = true;
-            }
+            preserveUnparsed(branches, "branches must be an array");
         } else {
             for (const auto& branchJson : branches) {
                 try {
                     if (!branchJson.is_object()) {
-                        if (recordBranchError("branch entries must be objects")) {
-                            fiber.needsSave = true;
-                            continue;
-                        }
+                        preserveUnparsed(branchJson, "branch entries must be objects");
+                        continue;
                     }
                     if (branchJson.contains("link_direction")) {
-                        if (recordBranchError("obsolete branch metadata: link_direction")) {
-                            fiber.needsSave = true;
-                            continue;
-                        }
+                        preserveUnparsed(branchJson,
+                                         "obsolete branch metadata: link_direction");
+                        continue;
                     }
-                    FiberBranchRef branch;
                     if (!branchJson.contains("control_point_index") ||
                         !branchJson.contains("branch_control_point_index") ||
                         !branchJson.contains("control_point_direction") ||
                         !branchJson.contains("branch_control_point_direction") ||
                         !branchJson.contains("control_point_position") ||
                         !branchJson.contains("branch_control_point_position")) {
-                        if (recordBranchError("invalid branch metadata")) {
-                            fiber.needsSave = true;
-                            continue;
-                        }
+                        preserveUnparsed(branchJson, "invalid branch metadata");
+                        continue;
                     }
                     if (!branchJson.contains("branch_file")) {
-                        if (recordBranchError("missing branch_file")) {
-                            fiber.needsSave = true;
-                            continue;
-                        }
+                        preserveUnparsed(branchJson, "missing branch_file");
+                        continue;
                     }
+                    FiberBranchRef branch;
                     branch.controlPointIndex =
                         branchJson.at("control_point_index").get<int>();
                     branch.branchFiberId =
@@ -10470,40 +10498,9 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
                     branch.branchControlPointPosition =
                         pointFromJson(branchJson.at("branch_control_point_position"));
                     branch.pending = branchJson.value("pending", false);
-                    if (branch.controlPointIndex < 0 ||
-                        static_cast<size_t>(branch.controlPointIndex) >=
-                            fiber.controlPoints.size()) {
-                        if (recordBranchError("local CP index out of range")) {
-                            fiber.needsSave = true;
-                            continue;
-                        }
-                    }
-                    if (branch.branchControlPointIndex < 0) {
-                        if (recordBranchError("linked CP index out of range")) {
-                            fiber.needsSave = true;
-                            continue;
-                        }
-                    }
                     if (branch.branchFileName.empty()) {
-                        if (recordBranchError("missing branch_file")) {
-                            fiber.needsSave = true;
-                            continue;
-                        }
-                    }
-                    if (!finiteDirection(branch.controlPointDirection) ||
-                        !finiteDirection(branch.branchControlPointDirection)) {
-                        if (recordBranchError("invalid branch directions")) {
-                            fiber.needsSave = true;
-                            continue;
-                        }
-                    }
-                    if (!pointsApproximatelyEqual(
-                            fiber.controlPoints[static_cast<size_t>(branch.controlPointIndex)],
-                            branch.controlPointPosition)) {
-                        if (recordBranchError("local CP position mismatch")) {
-                            fiber.needsSave = true;
-                            continue;
-                        }
+                        preserveUnparsed(branchJson, "missing branch_file");
+                        continue;
                     }
                     branch.controlPointDirection =
                         normalizedOrZero(branch.controlPointDirection);
@@ -10511,10 +10508,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
                         normalizedOrZero(branch.branchControlPointDirection);
                     fiber.branches.push_back(std::move(branch));
                 } catch (const std::exception& ex) {
-                    if (recordBranchError(ex.what())) {
-                        fiber.needsSave = true;
-                        continue;
-                    }
+                    preserveUnparsed(branchJson, ex.what());
                 }
             }
         }
@@ -10572,11 +10566,10 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
     return loadFiberJson(root, path);
 }
 
-std::vector<LineAnnotationController::BranchLinkValidationIssue>
-LineAnnotationController::collectLoadedFiberBranchIssues(
-    const std::vector<StoredFiber>& fibers) const
+void LineAnnotationController::resolveLoadedFiberLinks(
+    std::vector<StoredFiber>& fibers,
+    std::vector<std::string>& quarantineNotes) const
 {
-    std::vector<BranchLinkValidationIssue> issues;
     std::unordered_map<std::string, size_t> indexByFileName;
     indexByFileName.reserve(fibers.size());
     for (size_t i = 0; i < fibers.size(); ++i) {
@@ -10585,214 +10578,154 @@ LineAnnotationController::collectLoadedFiberBranchIssues(
         }
     }
 
-    for (size_t fiberIndex = 0; fiberIndex < fibers.size(); ++fiberIndex) {
-        const StoredFiber& fiber = fibers[fiberIndex];
-        for (size_t branchIndex = 0; branchIndex < fiber.branches.size(); ++branchIndex) {
-            const FiberBranchRef& branch = fiber.branches[branchIndex];
-            auto addIssue = [&](const std::string& reason) {
-                issues.push_back({fiberIndex, branchIndex, reason});
-            };
+    auto quarantine = [&quarantineNotes](const StoredFiber& fiber,
+                                         FiberBranchRef& branch,
+                                         const std::string& reason) {
+        branch.linkState = LinkState::Quarantined;
+        branch.quarantineReason = reason;
+        quarantineNotes.push_back(fiberErrorName(fiber.fileName) + ": " + reason);
+    };
 
-            if (branch.controlPointIndex < 0 ||
-                static_cast<size_t>(branch.controlPointIndex) >= fiber.controlPoints.size()) {
-                addIssue("local CP index out of range");
+    // Phase 1: per-branch endpoint resolution, position-first. Both sides
+    // are canonicalized before phase 2 checks reciprocity, so a stale index
+    // on one side cannot hide the reciprocal entry on the other. Everything
+    // here mutates in-memory state only; repaired fibers are flagged
+    // needsSave and persist on their next legitimate save.
+    for (auto& fiber : fibers) {
+        for (auto& branch : fiber.branches) {
+            const auto localIndex = matchingStoredControlPointIndex(
+                fiber.controlPoints,
+                branch.controlPointIndex,
+                branch.controlPointPosition);
+            if (!localIndex) {
+                quarantine(fiber, branch, "local control point not found by position");
                 continue;
             }
-            if (!pointsApproximatelyEqual(
-                    fiber.controlPoints[static_cast<size_t>(branch.controlPointIndex)],
-                    branch.controlPointPosition)) {
-                addIssue("local CP position mismatch");
-                continue;
+            if (*localIndex != branch.controlPointIndex) {
+                branch.controlPointIndex = *localIndex;
+                branch.linkState = LinkState::Repaired;
+                fiber.needsSave = true;
             }
-            if (!finiteDirection(branch.controlPointDirection) ||
-                !finiteDirection(branch.branchControlPointDirection)) {
-                addIssue("invalid branch directions");
-                continue;
-            }
-            if (fiber.linePoints.size() >= 2) {
-                const cv::Vec3d expectedLocal =
-                    endpointTangentFromLinePoints(fiber.linePoints,
-                                                  branch.controlPointPosition);
-                if (!branchDirectionsCompatible(branch.controlPointDirection,
-                                                expectedLocal)) {
-                    addIssue("branch endpoint direction mismatch");
-                    continue;
-                }
-            }
-            if (branch.branchFileName.empty()) {
-                addIssue("missing branch_file");
-                continue;
-            }
-            const auto targetIndex = indexByFileName.find(branch.branchFileName);
-            if (targetIndex == indexByFileName.end()) {
-                addIssue("missing linked fiber");
-                continue;
-            }
-            const StoredFiber& target = fibers[targetIndex->second];
-            if (branch.branchControlPointIndex < 0 ||
-                static_cast<size_t>(branch.branchControlPointIndex) >=
-                    target.controlPoints.size()) {
-                addIssue("linked CP index out of range");
-                continue;
-            }
-            if (!pointsApproximatelyEqual(
-                    target.controlPoints[static_cast<size_t>(branch.branchControlPointIndex)],
-                    branch.branchControlPointPosition)) {
-                addIssue("linked CP position mismatch");
-                continue;
-            }
-            if (target.linePoints.size() >= 2) {
-                const cv::Vec3d expectedLinked =
-                    endpointTangentFromLinePoints(target.linePoints,
-                                                  branch.branchControlPointPosition);
-                if (!branchDirectionsCompatible(branch.branchControlPointDirection,
-                                                expectedLinked)) {
-                    addIssue("branch endpoint direction mismatch");
-                    continue;
-                }
-            }
+            branch.controlPointPosition =
+                fiber.controlPoints[static_cast<size_t>(*localIndex)];
 
-            const auto reciprocal = std::find_if(
+            // Directions always follow the current line tangent: drift from
+            // a re-optimized line is expected, never fatal.
+            const cv::Vec3d refreshedLocal = endpointTangentFromLinePoints(
+                fiber.linePoints, branch.controlPointPosition,
+                branch.controlPointDirection);
+            if (!finiteDirection(refreshedLocal)) {
+                quarantine(fiber, branch, "cannot derive local endpoint direction");
+                continue;
+            }
+            if (!branchDirectionsCompatible(branch.controlPointDirection,
+                                            refreshedLocal)) {
+                branch.linkState = LinkState::Repaired;
+                fiber.needsSave = true;
+            }
+            branch.controlPointDirection = refreshedLocal;
+
+            const auto targetIt = indexByFileName.find(branch.branchFileName);
+            if (targetIt == indexByFileName.end()) {
+                quarantine(fiber, branch,
+                           "missing linked fiber " + branch.branchFileName);
+                continue;
+            }
+            const StoredFiber& target = fibers[targetIt->second];
+            const auto linkedIndex = matchingStoredControlPointIndex(
+                target.controlPoints,
+                branch.branchControlPointIndex,
+                branch.branchControlPointPosition);
+            if (!linkedIndex) {
+                quarantine(fiber, branch, "linked control point not found by position");
+                continue;
+            }
+            if (*linkedIndex != branch.branchControlPointIndex) {
+                branch.branchControlPointIndex = *linkedIndex;
+                branch.linkState = LinkState::Repaired;
+                fiber.needsSave = true;
+            }
+            branch.branchControlPointPosition =
+                target.controlPoints[static_cast<size_t>(*linkedIndex)];
+
+            const cv::Vec3d refreshedLinked = endpointTangentFromLinePoints(
+                target.linePoints, branch.branchControlPointPosition,
+                branch.branchControlPointDirection);
+            if (!finiteDirection(refreshedLinked)) {
+                quarantine(fiber, branch, "cannot derive linked endpoint direction");
+                continue;
+            }
+            if (!branchDirectionsCompatible(branch.branchControlPointDirection,
+                                            refreshedLinked)) {
+                branch.linkState = LinkState::Repaired;
+                fiber.needsSave = true;
+            }
+            branch.branchControlPointDirection = refreshedLinked;
+        }
+    }
+
+    // Phase 2: reciprocal existence, matched on swapped positions only —
+    // phase 1 already canonicalized indices and directions on both sides.
+    // Quarantining a branch never touches other branches or fibers: there
+    // is deliberately no cascade here.
+    for (auto& fiber : fibers) {
+        for (auto& branch : fiber.branches) {
+            if (branch.linkState == LinkState::Quarantined) {
+                continue;
+            }
+            const auto targetIt = indexByFileName.find(branch.branchFileName);
+            if (targetIt == indexByFileName.end()) {
+                continue;  // quarantined in phase 1
+            }
+            const StoredFiber& target = fibers[targetIt->second];
+            const bool hasReciprocal = std::any_of(
                 target.branches.begin(),
                 target.branches.end(),
                 [&fiber, &branch](const FiberBranchRef& candidate) {
-                    return candidate.branchFileName == fiber.fileName &&
-                           candidate.controlPointIndex == branch.branchControlPointIndex &&
-                           candidate.branchControlPointIndex == branch.controlPointIndex &&
+                    return candidate.linkState != LinkState::Quarantined &&
+                           candidate.branchFileName == fiber.fileName &&
                            pointsApproximatelyEqual(candidate.controlPointPosition,
                                                     branch.branchControlPointPosition) &&
                            pointsApproximatelyEqual(candidate.branchControlPointPosition,
-                                                    branch.controlPointPosition) &&
-                           branchDirectionsCompatible(candidate.controlPointDirection,
-                                                      branch.branchControlPointDirection) &&
-                           branchDirectionsCompatible(candidate.branchControlPointDirection,
-                                                      branch.controlPointDirection);
+                                                    branch.controlPointPosition);
                 });
-            if (reciprocal == target.branches.end()) {
-                addIssue("missing reciprocal branch");
+            if (!hasReciprocal) {
+                quarantine(fiber, branch,
+                           "missing reciprocal branch in " + branch.branchFileName);
             }
         }
     }
-    return issues;
 }
 
-bool LineAnnotationController::repairLoadedFiberBranchLinks(
-    std::vector<StoredFiber>& fibers,
-    const std::unordered_set<std::string>& fibersWithRemovedBranchEntries,
-    const std::vector<BranchLinkValidationIssue>& initialIssues,
-    std::vector<std::string>& errors) const
+void LineAnnotationController::repairQuarantinedFiberLinks()
 {
-    std::unordered_set<std::string> changedFiles = fibersWithRemovedBranchEntries;
-
-    auto removeIssues = [&](const std::vector<BranchLinkValidationIssue>& issues) {
-        std::unordered_map<size_t, std::vector<size_t>> branchIndicesByFiber;
-        for (const auto& issue : issues) {
-            if (issue.fiberIndex >= fibers.size()) {
-                continue;
-            }
-            if (issue.branchIndex >= fibers[issue.fiberIndex].branches.size()) {
-                continue;
-            }
-            branchIndicesByFiber[issue.fiberIndex].push_back(issue.branchIndex);
-        }
-
-        bool changed = false;
-        for (auto& [fiberIndex, branchIndices] : branchIndicesByFiber) {
-            auto& fiber = fibers[fiberIndex];
-            std::sort(branchIndices.begin(), branchIndices.end());
-            branchIndices.erase(std::unique(branchIndices.begin(), branchIndices.end()),
-                                branchIndices.end());
-            for (auto it = branchIndices.rbegin(); it != branchIndices.rend(); ++it) {
-                if (*it >= fiber.branches.size()) {
-                    continue;
-                }
-                fiber.branches.erase(fiber.branches.begin() +
-                                     static_cast<std::ptrdiff_t>(*it));
-                fiber.needsSave = true;
-                changedFiles.insert(fiber.fileName);
-                changed = true;
-            }
-        }
-        return changed;
-    };
-
-    (void)removeIssues(initialIssues);
-    for (;;) {
-        const auto issues = collectLoadedFiberBranchIssues(fibers);
-        if (issues.empty()) {
-            break;
-        }
-        if (!removeIssues(issues)) {
-            break;
+    std::vector<uint64_t> affectedFiberIds;
+    for (auto& fiber : _fibers) {
+        const size_t removedBranches = std::erase_if(
+            fiber.branches,
+            [](const FiberBranchRef& branch) {
+                return branch.linkState == LinkState::Quarantined;
+            });
+        const size_t removedUnparsed = fiber.unparsedBranchJson.size();
+        fiber.unparsedBranchJson.clear();
+        if (removedBranches + removedUnparsed > 0) {
+            affectedFiberIds.push_back(fiber.id);
         }
     }
 
-    for (auto& fiber : fibers) {
-        if (changedFiles.find(fiber.fileName) == changedFiles.end() && !fiber.needsSave) {
-            continue;
-        }
-        try {
-            fiber.needsSave = false;
-            saveFiberNow(fiber);
-        } catch (const std::exception& ex) {
-            fiber.needsSave = true;
-            errors.push_back(fiberErrorName(fiber.fileName) + ": " + ex.what());
+    for (uint64_t fiberId : affectedFiberIds) {
+        const auto it = std::find_if(_fibers.begin(), _fibers.end(),
+                                     [fiberId](const StoredFiber& fiber) {
+                                         return fiber.id == fiberId;
+                                     });
+        if (it != _fibers.end()) {
+            scheduleFiberSave(*it);
         }
     }
 
-    return errors.empty();
-}
-
-bool LineAnnotationController::validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
-                                                        std::vector<std::string>& errors) const
-{
-    bool removedInvalidFibers = false;
-    for (;;) {
-        const auto issues = collectLoadedFiberBranchIssues(fibers);
-        if (issues.empty()) {
-            break;
-        }
-
-        std::unordered_set<std::string> invalidFiles;
-        for (const auto& issue : issues) {
-            if (issue.fiberIndex >= fibers.size()) {
-                continue;
-            }
-            const auto& fiber = fibers[issue.fiberIndex];
-            invalidFiles.insert(fiber.fileName);
-            errors.push_back(fiberErrorName(fiber.fileName) + ": " + issue.reason);
-        }
-        if (invalidFiles.empty()) {
-            break;
-        }
-        removedInvalidFibers = true;
-        fibers.erase(std::remove_if(fibers.begin(),
-                                    fibers.end(),
-                                    [&invalidFiles](const StoredFiber& fiber) {
-                                        return invalidFiles.find(fiber.fileName) !=
-                                               invalidFiles.end();
-                                    }),
-                     fibers.end());
+    if (!affectedFiberIds.empty()) {
+        emitFiberSummaries();
     }
-
-    std::unordered_map<std::string, uint64_t> fiberIdByFileName;
-    fiberIdByFileName.reserve(fibers.size());
-    uint64_t runtimeId = 1;
-    for (auto& fiber : fibers) {
-        fiber.id = runtimeId++;
-        if (!fiber.fileName.empty()) {
-            fiberIdByFileName[fiber.fileName] = fiber.id;
-        }
-    }
-    for (auto& fiber : fibers) {
-        for (auto& branch : fiber.branches) {
-            if (auto it = fiberIdByFileName.find(branch.branchFileName);
-                it != fiberIdByFileName.end()) {
-                branch.branchFiberId = it->second;
-            }
-        }
-    }
-    return !removedInvalidFibers;
 }
 
 std::string LineAnnotationController::uniqueImportedFiberFileName(
