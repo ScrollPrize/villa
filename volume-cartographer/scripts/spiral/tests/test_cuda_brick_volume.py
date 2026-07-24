@@ -111,6 +111,52 @@ class CudaBrickVolumeTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_prepared_gather_pins_slots_until_it_is_consumed(self):
+        data = np.empty((2, 2, 4), dtype=np.uint8)
+        data[:, :, :2] = 11
+        data[:, :, 2:] = 22
+        store = CudaBrickVolume(
+            [ArrayFixture(data)], z_origin=0, roi_shape=data.shape,
+            capacity_bytes=2 * 8, brick_size=2, device='cpu')
+        try:
+            prepared = store.prepare(torch.tensor([[0, 0, 0]]))
+            with self.assertRaisesRegex(RuntimeError, 'configured CUDA cache'):
+                store.prepare(torch.tensor([[0, 0, 3]]))
+            actual = store.gather_prepared(prepared)
+            self.assertEqual(actual[..., 0].tolist(), [11])
+            self.assertEqual(
+                int(store.gather(torch.tensor([[0, 0, 3]]))), 22)
+        finally:
+            store.close()
+
+    def test_prepared_gather_is_one_shot(self):
+        data = np.ones((2, 2, 2), dtype=np.uint8)
+        store = CudaBrickVolume(
+            [ArrayFixture(data)], z_origin=0, roi_shape=data.shape,
+            capacity_bytes=2 * 8, brick_size=2, device='cpu')
+        try:
+            prepared = store.prepare(torch.tensor([[0, 0, 0]]))
+            store.gather_prepared(prepared)
+            with self.assertRaisesRegex(RuntimeError, 'already been consumed'):
+                store.gather_prepared(prepared)
+        finally:
+            store.close()
+
+    def test_unused_prepared_gather_can_be_released(self):
+        data = np.empty((2, 2, 4), dtype=np.uint8)
+        data[:, :, :2] = 11
+        data[:, :, 2:] = 22
+        store = CudaBrickVolume(
+            [ArrayFixture(data)], z_origin=0, roi_shape=data.shape,
+            capacity_bytes=2 * 8, brick_size=2, device='cpu')
+        try:
+            prepared = store.prepare(torch.tensor([[0, 0, 0]]))
+            prepared.release()
+            self.assertEqual(
+                int(store.gather(torch.tensor([[0, 0, 3]]))), 22)
+        finally:
+            store.close()
+
     def test_sdt_trilinear_matches_dense_backend(self):
         x = np.arange(8, dtype=np.float32)
         encoded = (np.clip(np.rint(np.abs(x - 3.0) - 1.0), -127, 127)

@@ -16,6 +16,32 @@ import numpy as np
 import torch
 
 
+class _PreparedGather:
+    """One-shot resident gather whose slots stay pinned until consumption."""
+
+    def __init__(
+            self, store, flat, slots, local, original_shape, pinned_slots,
+            ready_event):
+        self._store = store
+        self.flat = flat
+        self.slots = slots
+        self.local = local
+        self.original_shape = original_shape
+        self.pinned_slots = pinned_slots
+        self.ready_event = ready_event
+        self.consumed = False
+
+    def release(self):
+        """Release an unused request without launching its gather."""
+        self._store._release_prepared(self)
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
 class CudaBrickVolume:
     """Lazy fixed-size brick cache shared by aligned uint8 volume channels.
 
@@ -83,6 +109,8 @@ class CudaBrickVolume:
             (self.brick_count,), -1, dtype=torch.int32, device=self.device)
         self._slot_to_brick = np.full(self.slot_count, -1, dtype=np.int64)
         self._last_used = np.zeros(self.slot_count, dtype=np.int64)
+        self._slot_pins = np.zeros(self.slot_count, dtype=np.int32)
+        self._slot_readers = [[] for _index in range(self.slot_count)]
         self._free_slots = list(range(self.slot_count - 1, 0, -1))
         self._epoch = 0
         cpu_count = max(1, int(__import__('os').cpu_count() or 1))
@@ -91,9 +119,11 @@ class CudaBrickVolume:
         self._pool = ThreadPoolExecutor(
             max_workers=self.worker_count, thread_name_prefix='cuda-bricks')
         self._lock = threading.RLock()
-        self.last_timings = {}
+        self._last_timings = {}
         self.total_loaded_bricks = 0
         self.total_evicted_bricks = 0
+        self._table_ready_event = self._record_event()
+        self._pending_timing = None
 
     @property
     def resident_bricks(self):
@@ -107,12 +137,60 @@ class CudaBrickVolume:
     def capacity(self):
         return self.slot_count - 1
 
+    @property
+    def last_timings(self):
+        with self._lock:
+            self._collect_timing()
+            return self._last_timings
+
     def close(self):
         self._pool.shutdown(wait=True, cancel_futures=True)
 
-    def _synchronise(self):
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize(self.device)
+    def _current_stream(self):
+        if self.device.type != 'cuda':
+            return None
+        return torch.cuda.current_stream(self.device)
+
+    def _record_event(self, *, timing=False):
+        stream = self._current_stream()
+        if stream is None:
+            return None
+        event = torch.cuda.Event(enable_timing=timing)
+        event.record(stream)
+        return event
+
+    def _wait_for_table(self):
+        stream = self._current_stream()
+        if stream is not None and self._table_ready_event is not None:
+            stream.wait_event(self._table_ready_event)
+
+    def _wait_for_slot_readers(self, slots):
+        stream = self._current_stream()
+        if stream is None:
+            return
+        for slot in np.asarray(slots, dtype=np.int64):
+            readers = self._slot_readers[int(slot)]
+            for event in readers:
+                stream.wait_event(event)
+            readers.clear()
+
+    def _record_slot_readers(self, slots, event):
+        if event is None:
+            return
+        for slot in np.asarray(slots, dtype=np.int64):
+            readers = self._slot_readers[int(slot)]
+            readers[:] = [reader for reader in readers if not reader.query()]
+            readers.append(event)
+
+    def _collect_timing(self):
+        pending = self._pending_timing
+        if pending is None:
+            return
+        start, end = pending
+        if end.query():
+            self._last_timings['gather_seconds'] = \
+                start.elapsed_time(end) / 1000.0
+            self._pending_timing = None
 
     def _decode_brick_ids(self, brick_ids):
         nz, ny, nx = self.brick_grid_shape
@@ -170,7 +248,8 @@ class CudaBrickVolume:
             self._free_slots.pop() for _index in range(free_count)]
         remaining = count - free_count
         if remaining:
-            candidates = np.flatnonzero(self._slot_to_brick >= 0)
+            candidates = np.flatnonzero(
+                (self._slot_to_brick >= 0) & (self._slot_pins == 0))
             if pinned_slots:
                 pinned = np.fromiter(pinned_slots, dtype=np.int64)
                 candidates = candidates[~np.isin(candidates, pinned)]
@@ -184,6 +263,9 @@ class CudaBrickVolume:
                 victims = candidates[selected]
             else:
                 victims = candidates
+            # Queue reuse after every outstanding reader of these slots.  This
+            # is a stream dependency, not a host or device-wide synchronize.
+            self._wait_for_slot_readers(victims)
             evicted = self._slot_to_brick[victims].copy()
             self._table_cpu[evicted] = -1
             self.table[torch.from_numpy(evicted).to(self.device)] = -1
@@ -238,6 +320,116 @@ class CudaBrickVolume:
         self.total_loaded_bricks += loaded
         return loaded, zero_bricks
 
+    def prepare(self, indices_zyx):
+        """Resolve residency and return a pinned, one-shot gather request.
+
+        Preparation may block while GPU-produced indices are inspected and
+        missing Zarr bricks are read.  :meth:`gather_prepared` performs only
+        CUDA work and returns without synchronizing the host.
+        """
+        started = time.perf_counter()
+        original_shape = tuple(indices_zyx.shape[:-1])
+        flat = indices_zyx.detach().reshape(-1, 3).to(
+            device=self.device, dtype=torch.int64)
+        if not flat.numel():
+            return _PreparedGather(
+                self, flat, torch.empty(
+                    0, dtype=torch.long, device=self.device),
+                torch.empty(0, dtype=torch.long, device=self.device),
+                original_shape, np.empty(0, dtype=np.int64), None)
+
+        with self._lock:
+            self._collect_timing()
+            self._epoch += 1
+            self._wait_for_table()
+            brick_ids = self._brick_ids(flat)
+            # The host owns cache residency and Zarr loading, so preparation
+            # explicitly transfers only the deduplicated brick IDs.
+            requested = torch.unique(brick_ids).cpu().numpy()
+            after_lookup = time.perf_counter()
+            missing = requested[self._table_cpu[requested] < 0]
+            loaded = zero_bricks = 0
+            unique_count = len(requested) if len(missing) else 0
+            if len(missing):
+                loaded, zero_bricks = self._load_missing(missing, requested)
+                self._table_ready_event = self._record_event()
+            resident_slots = self._table_cpu[requested]
+            if bool((resident_slots < 0).any()):
+                raise RuntimeError('CUDA brick table still has misses after load')
+            pinned_slots = np.unique(resident_slots[resident_slots > 0])
+            self._slot_pins[pinned_slots] += 1
+            self._last_used[pinned_slots] = self._epoch
+            slots = self.table[brick_ids].long()
+            global_z = flat[:, 0] + self.z_origin
+            local = (((global_z % self.brick_size) * self.brick_size
+                      + flat[:, 1] % self.brick_size) * self.brick_size
+                     + flat[:, 2] % self.brick_size)
+            ready_event = self._record_event()
+            finished = time.perf_counter()
+            self._last_timings = {
+                'lookup_seconds': after_lookup - started,
+                'load_seconds': finished - after_lookup,
+                'loaded_bricks': loaded,
+                'zero_bricks': zero_bricks,
+                'requested_unique_bricks': unique_count,
+                'resident_bricks': self.resident_bricks,
+                'resident_gb': self.resident_bytes / 1e9,
+            }
+            return _PreparedGather(
+                self, flat, slots, local, original_shape, pinned_slots,
+                ready_event)
+
+    def _release_prepared(self, prepared):
+        with self._lock:
+            if prepared._store is not self or prepared.consumed:
+                return
+            self._slot_pins[prepared.pinned_slots] -= 1
+            prepared.consumed = True
+
+    def gather_prepared(self, prepared, channels=None):
+        """Enqueue a prepared gather and return without CUDA synchronization."""
+        if prepared._store is not self:
+            raise ValueError('prepared gather belongs to another store')
+        if channels is None:
+            channels = tuple(range(self.channel_count))
+        channels = tuple(int(channel) for channel in channels)
+        if any(channel < 0 or channel >= self.channel_count
+               for channel in channels):
+            raise IndexError('brick-volume channel is out of range')
+
+        with self._lock:
+            if prepared.consumed:
+                raise RuntimeError('prepared gather has already been consumed')
+            stream = self._current_stream()
+            if stream is not None and prepared.ready_event is not None:
+                stream.wait_event(prepared.ready_event)
+            if not prepared.flat.numel():
+                prepared.consumed = True
+                return torch.empty(
+                    (*prepared.original_shape, len(channels)),
+                    dtype=torch.uint8, device=self.device)
+
+            started = time.perf_counter()
+            timing_start = self._record_event(timing=True)
+            channel_index = torch.as_tensor(
+                channels, dtype=torch.long, device=self.device)
+            values = self.pool[
+                channel_index[:, None], prepared.slots[None, :],
+                prepared.local[None, :]].transpose(0, 1)
+            timing_end = self._record_event(timing=True)
+            read_event = self._record_event()
+            self._record_slot_readers(prepared.pinned_slots, read_event)
+            self._slot_pins[prepared.pinned_slots] -= 1
+            prepared.consumed = True
+            self._last_timings['gather_enqueue_seconds'] = \
+                time.perf_counter() - started
+            if timing_start is not None:
+                self._pending_timing = (timing_start, timing_end)
+            else:
+                self._last_timings['gather_seconds'] = \
+                    self._last_timings['gather_enqueue_seconds']
+        return values.reshape(*prepared.original_shape, len(channels))
+
     def gather(self, indices_zyx, channel=0):
         """Gather one channel at ROI-local integer coordinates.
 
@@ -247,62 +439,5 @@ class CudaBrickVolume:
         return self.gather_channels(indices_zyx, (channel,))[..., 0]
 
     def gather_channels(self, indices_zyx, channels=None):
-        """Gather selected channels, preserving the original request order."""
-        started = time.perf_counter()
-        if channels is None:
-            channels = tuple(range(self.channel_count))
-        channels = tuple(int(channel) for channel in channels)
-        if any(channel < 0 or channel >= self.channel_count
-               for channel in channels):
-            raise IndexError('brick-volume channel is out of range')
-        original_shape = tuple(indices_zyx.shape[:-1])
-        flat = indices_zyx.detach().reshape(-1, 3).to(
-            device=self.device, dtype=torch.int64)
-        if not flat.numel():
-            return torch.empty(
-                (*original_shape, len(channels)), dtype=torch.uint8,
-                device=self.device)
-
-        with self._lock:
-            self._epoch += 1
-            brick_ids = self._brick_ids(flat)
-            slots = self.table[brick_ids].long()
-            missing_mask = slots < 0
-            after_lookup = time.perf_counter()
-            loaded = zero_bricks = unique_count = 0
-            if bool(missing_mask.any()):
-                requested = torch.unique(brick_ids).cpu().numpy()
-                unique_count = len(requested)
-                missing = requested[self._table_cpu[requested] < 0]
-                if len(missing):
-                    loaded, zero_bricks = self._load_missing(
-                        missing, requested)
-                resident_slots = self._table_cpu[requested]
-                self._last_used[resident_slots[resident_slots > 0]] = self._epoch
-                slots = self.table[brick_ids].long()
-            after_load = time.perf_counter()
-
-            global_z = flat[:, 0] + self.z_origin
-            local = (((global_z % self.brick_size) * self.brick_size
-                      + flat[:, 1] % self.brick_size) * self.brick_size
-                     + flat[:, 2] % self.brick_size)
-            channel_index = torch.as_tensor(
-                channels, dtype=torch.long, device=self.device)
-            values = self.pool[
-                channel_index[:, None], slots.clamp_min(0)[None, :],
-                local[None, :]].transpose(0, 1)
-            if bool((slots < 0).any()):
-                raise RuntimeError('CUDA brick table still has misses after load')
-            self._synchronise()
-            finished = time.perf_counter()
-            self.last_timings = {
-                'lookup_seconds': after_lookup - started,
-                'load_seconds': after_load - after_lookup,
-                'gather_seconds': finished - after_load,
-                'loaded_bricks': loaded,
-                'zero_bricks': zero_bricks,
-                'requested_unique_bricks': unique_count,
-                'resident_bricks': self.resident_bricks,
-                'resident_gb': self.resident_bytes / 1e9,
-            }
-        return values.reshape(*original_shape, len(channels))
+        """Prepare, enqueue, and return selected channels in request order."""
+        return self.gather_prepared(self.prepare(indices_zyx), channels)
