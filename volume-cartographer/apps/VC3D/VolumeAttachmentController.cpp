@@ -97,8 +97,11 @@ bool VolumeAttachmentController::prepare(
             return false;
         }
     } else {
+        auto localPath = vc::project::resolveLocalPath(input);
+        if (localPath.is_relative())
+            localPath = std::filesystem::absolute(localPath);
         prepared.location = QString::fromStdString(
-            vc::project::resolveLocalPath(input).lexically_normal().string());
+            localPath.lexically_normal().string());
     }
 
     prepared.tags = std::move(tags);
