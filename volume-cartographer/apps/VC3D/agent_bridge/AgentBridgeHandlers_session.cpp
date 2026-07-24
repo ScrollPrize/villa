@@ -225,6 +225,106 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
 }
 
 
+QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
+{
+    namespace fs = std::filesystem;
+
+    CState* state = _window ? _window->_state : nullptr;
+    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
+    if (!state || !state->hasVpkg() || !vpkg)
+        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+
+    const QJsonObject p = params.toObject();
+    const QString location = p.value("location").toString();
+    if (location.trimmed().isEmpty()) {
+        throw AgentBridgeError{
+            -32602,
+            "location must not be blank",
+            QJsonObject{{"param", "location"}},
+        };
+    }
+
+    const std::string input = location.toStdString();
+    if (vc::project::isLocationRemote(input)) {
+        throw AgentBridgeError{
+            -32007,
+            "Invalid segments location",
+            QJsonObject{
+                {"kind", "segment"},
+                {"detail", "remote segment locations are not supported"},
+            },
+        };
+    }
+
+    const fs::path localPath =
+        vc::project::resolveLocalPath(input).lexically_normal();
+    if (!localPath.is_absolute()) {
+        throw AgentBridgeError{
+            -32602,
+            "segment path must be absolute",
+            QJsonObject{{"param", "location"}},
+        };
+    }
+    const std::string normalizedLocation = localPath.string();
+
+    const std::string validationError = vc::project::validateLocation(
+        vc::project::Category::Segments, normalizedLocation);
+    if (!validationError.empty()) {
+        throw AgentBridgeError{
+            -32007,
+            "Invalid segments location",
+            QJsonObject{
+                {"kind", "segment"},
+                {"detail", QString::fromStdString(validationError)},
+            },
+        };
+    }
+
+    auto resultFor = [&](bool attached, const std::string& persistedLocation) {
+        return QJsonObject{
+            {"attached", attached},
+            {"alreadyAttached", !attached},
+            {"location", QString::fromStdString(persistedLocation)},
+            {"projectPath", QString::fromStdString(vpkg->path().string())},
+        };
+    };
+
+    if (const auto existing = vpkg->matchingSegmentsEntry(normalizedLocation))
+        return resultFor(false, existing->location);
+
+    std::vector<std::string> tags;
+    const QJsonArray tagValues = p.value("tags").toArray();
+    tags.reserve(tagValues.size());
+    for (const QJsonValue& tag : tagValues)
+        tags.push_back(tag.toString().toStdString());
+
+    try {
+        if (!vpkg->addSegmentsEntry(normalizedLocation, std::move(tags))) {
+            if (const auto existing =
+                    vpkg->matchingSegmentsEntry(normalizedLocation)) {
+                return resultFor(false, existing->location);
+            }
+            throw AgentBridgeError{
+                -32010,
+                "Could not attach segments",
+                QJsonObject{},
+            };
+        }
+        _window->refreshCurrentVolumePackageUi(QString(), true);
+    } catch (const AgentBridgeError&) {
+        throw;
+    } catch (const std::exception& error) {
+        throw AgentBridgeError{
+            -32005,
+            "Could not attach segments",
+            QJsonObject{{"detail", QString::fromUtf8(error.what())}},
+        };
+    }
+
+    return resultFor(true, normalizedLocation);
+}
+
+
 QJsonObject AgentBridgeServer::handleSegmentsList(const QJsonValue& params)
 {
     CState* state = _window ? _window->_state : nullptr;

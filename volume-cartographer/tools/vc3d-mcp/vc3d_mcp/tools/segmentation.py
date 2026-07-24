@@ -17,6 +17,30 @@ class Point3D(TypedDict):
 
 
 @mcp.tool()
+async def vc3d_attach_segments(
+    location: str,
+    tags: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Attach a local tifxyz segment, or a folder containing tifxyz segments,
+    to the open volume package.
+
+    location must be an absolute path on the filesystem where VC3D runs. In a
+    containerized setup, use a path mounted into the VC3D container rather than
+    a host-only path. The directory may be one tifxyz segment with meta.json,
+    or a parent whose immediate subdirectories are tifxyz segments.
+
+    tags are stored on a newly attached project entry. Retrying the same
+    location is an idempotent success and keeps the existing entry and tags.
+    Use vc3d_list_segments afterward to discover the attached segment ids, then
+    vc3d_activate_segment to select one.
+    """
+    return await _call(
+        "segments.attach",
+        _strip_none({"location": location, "tags": tags}),
+    )
+
+
+@mcp.tool()
 async def vc3d_list_segments(only_loaded: bool = False) -> dict[str, Any]:
     """List segments in the open volume package with loaded/active flags."""
     return await _call("segments.list", {"onlyLoaded": only_loaded})

@@ -283,6 +283,10 @@ dialog.
 
 ### Segments and review state
 
+- `segments.attach` adds one absolute local tifxyz path to the open package.
+  The path may identify a segment or a directory of segments. Attachment uses
+  the same validation, persistence, and UI refresh as the GUI and is
+  idempotent by normalized location.
 - `segments.list` reports package segments, whether they are loaded, and the
   active segment.
 - `segments.fetch` materializes an Open Data placeholder. Already-materialized
@@ -403,6 +407,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_add_point_collection` | `points.add_collection` |
 | `vc3d_append_segment_mask` | `segment.append_mask` | Append a volume-image layer to a segment's mask. Blocks until the render completes (130 s client timeout); requires a current volume. |
 | `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
+| `vc3d_attach_segments` | `segments.attach` | Attach a local tifxyz segment, or a folder containing tifxyz segments, to the open volume package. |
 | `vc3d_attach_volume` | `volume.attach` | Attach one local zarr volume or remote `.zarr` URL to the open project without changing the current primary volume. Returns a `volume` job; compose with `vc3d_list_overlay_volumes` and `vc3d_set_overlay` to display it. |
 | `vc3d_atlas_open_result` | `atlas.open_result` |
 | `vc3d_atlas_open` | `atlas.open` |

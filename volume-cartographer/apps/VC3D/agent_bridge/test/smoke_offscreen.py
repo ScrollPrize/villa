@@ -117,6 +117,17 @@ def create_test_volume(volume: Path, volume_id: str) -> Path:
     return volume
 
 
+def create_test_segment(segment: Path, segment_id: str) -> Path:
+    segment.mkdir(parents=True)
+    (segment / "meta.json").write_text(json.dumps({
+        "type": "seg",
+        "uuid": segment_id,
+        "name": segment_id,
+        "format": "tifxyz",
+    }))
+    return segment
+
+
 def create_test_project(root: Path) -> Path:
     create_test_volume(root / "volumes" / "vol1", "vol1")
 
@@ -246,10 +257,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 118
-            and coverage.get("registered") == 118
+            and coverage.get("described") == 119
+            and coverage.get("registered") == 119
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 118
+            and len(snapshot["methods"]) == 119
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -763,6 +774,120 @@ def check_volume_attach(
     results.record("volume_attach_absolute_path", ok, detail)
 
 
+def check_segments_attach(
+    client: BridgeClient,
+    results: Results,
+    root: Path,
+    volpkg: Path,
+) -> None:
+    source = root / "user-segments"
+    create_test_segment(source / "smoke-segment", "smoke-segment")
+
+    try:
+        result, _ = client.call(
+            "segments.attach",
+            {
+                "location": str(source),
+                "tags": ["source:smoke", "status:working"],
+            },
+            timeout=10.0,
+        )
+        listed, _ = client.call("segments.list", {}, timeout=10.0)
+        document = json.loads(volpkg.read_text())
+        matching = [
+            entry
+            for entry in document.get("segments", [])
+            if isinstance(entry, dict) and entry.get("location") == str(source)
+        ]
+        ids = {segment.get("id") for segment in listed.get("segments", [])}
+        valid = (
+            result == {
+                "attached": True,
+                "alreadyAttached": False,
+                "location": str(source),
+                "projectPath": str(volpkg),
+            }
+            and "smoke-segment" in ids
+            and matching == [{
+                "location": str(source),
+                "tags": ["source:smoke", "status:working"],
+            }]
+        )
+        results.record(
+            "segments_attach_local_source",
+            valid,
+            f"result={result} ids={sorted(value for value in ids if value)}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_local_source",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+        return
+
+    try:
+        retry, _ = client.call(
+            "segments.attach",
+            {"location": str(source) + os.sep},
+            timeout=10.0,
+        )
+        document = json.loads(volpkg.read_text())
+        matching = [
+            entry
+            for entry in document.get("segments", [])
+            if isinstance(entry, dict) and entry.get("location") == str(source)
+        ]
+        results.record(
+            "segments_attach_idempotent",
+            retry.get("attached") is False
+            and retry.get("alreadyAttached") is True
+            and matching == [{
+                "location": str(source),
+                "tags": ["source:smoke", "status:working"],
+            }],
+            f"result={retry}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_idempotent",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+    ok, detail = expect_param_error(
+        client,
+        "segments.attach",
+        {"location": "relative/segments"},
+        "location",
+    )
+    results.record("segments_attach_absolute_path", ok, detail)
+
+    try:
+        client.call(
+            "segments.attach",
+            {"location": str(root / "missing-segments")},
+            timeout=10.0,
+        )
+        results.record(
+            "segments_attach_invalid_layout",
+            False,
+            "expected an error, got a result",
+        )
+    except BridgeError as error:
+        results.record(
+            "segments_attach_invalid_layout",
+            error.code == -32007,
+            f"returned code={error.code}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_invalid_layout",
+            False,
+            f"unexpected {type(error).__name__}: {error}",
+        )
+
+
 def check_c4(client: BridgeClient, results: Results, volpkg: str,
              broken_fiber_volpkg: str) -> None:
     # Liveness / dispatch sanity.
@@ -1137,6 +1262,7 @@ def main() -> int:
             check_canvas_normalization(client, results)
 
             check_volume_attach(client, results, tmp_path, volpkg)
+            check_segments_attach(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)

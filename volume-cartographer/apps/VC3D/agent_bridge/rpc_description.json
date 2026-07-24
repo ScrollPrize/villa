@@ -2934,6 +2934,35 @@
         "type": "object"
       }
     },
+    "segments.attach": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32005,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_attach_segments"
+      },
+      "params": {
+        "properties": {
+          "location": {
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "location"
+        ],
+        "type": "object"
+      }
+    },
     "segments.delete": {
       "errors": [
         -32602,

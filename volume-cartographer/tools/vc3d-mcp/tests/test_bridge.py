@@ -50,6 +50,7 @@ from vc3d_mcp.tools.session import (
 )
 from vc3d_mcp.tools.segmentation import (
     vc3d_activate_segment,
+    vc3d_attach_segments,
     vc3d_delete_segment,
     vc3d_fetch_segment,
     vc3d_grow_segment,
@@ -255,6 +256,27 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         result = await vc3d_fetch_segment("seg-ph", wait=False)
         self.assertEqual(result["jobId"], "job-3")
         self.assertNotIn("state", result)
+
+    async def test_vc3d_attach_segments_strips_absent_tags(self) -> None:
+        result = await vc3d_attach_segments("/tmp/my-segments")
+        self.assertTrue(result["attached"])
+        self.assertEqual(
+            self.fake_server.received_requests[-1]["params"],
+            {"location": "/tmp/my-segments"},
+        )
+
+    async def test_vc3d_attach_segments_forwards_tags(self) -> None:
+        await vc3d_attach_segments(
+            "/tmp/my-segments",
+            tags=["source:manual", "status:working"],
+        )
+        self.assertEqual(
+            self.fake_server.received_requests[-1]["params"],
+            {
+                "location": "/tmp/my-segments",
+                "tags": ["source:manual", "status:working"],
+            },
+        )
 
     async def test_vc3d_activate_segment_plain_success(self) -> None:
         result = await vc3d_activate_segment("seg-ready")
