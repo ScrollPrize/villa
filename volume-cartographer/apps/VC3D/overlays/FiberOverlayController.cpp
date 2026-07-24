@@ -198,6 +198,16 @@ void FiberOverlayController::setVisible(bool visible)
     refreshAll();
 }
 
+void FiberOverlayController::setShowLinked(bool show)
+{
+    if (_showLinked == show) {
+        return;
+    }
+    _showLinked = show;
+    // Only colors and link markers change; projections stay valid.
+    refreshAll();
+}
+
 ViewerOverlayControllerBase::PointChainStyle
 FiberOverlayController::fiberStyle(const QColor& color, float distanceTolerance)
 {
@@ -224,6 +234,38 @@ bool FiberOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
     return viewer && _visible && !_chains.empty();
 }
 
+std::optional<FiberOverlayController::ControlPointHit>
+FiberOverlayController::hitTestControlPoint(VolumeViewerBase* viewer,
+                                            const QPointF& scenePoint,
+                                            qreal maxDistancePx) const
+{
+    if (!isOverlayEnabledFor(viewer)) {
+        return std::nullopt;
+    }
+
+    std::optional<ControlPointHit> best;
+    qreal bestDistanceSq = maxDistancePx * maxDistancePx;
+    std::vector<float> opacities;
+    for (const Chain& chain : _chains) {
+        const FilteredPoints filtered =
+            projectedPointChain(viewer, chain.points, _viewDistance, &opacities);
+        for (std::size_t i = 0; i < filtered.scenePoints.size(); ++i) {
+            if (i < opacities.size() && opacities[i] <= 0.0f) {
+                // Boundary projection: line vertex only, no dot drawn.
+                continue;
+            }
+            const QPointF delta = filtered.scenePoints[i] - scenePoint;
+            const qreal distanceSq = delta.x() * delta.x() + delta.y() * delta.y();
+            if (distanceSq < bestDistanceSq && i < filtered.sourceIndices.size()) {
+                bestDistanceSq = distanceSq;
+                best = ControlPointHit{chain.id,
+                                       static_cast<int>(filtered.sourceIndices[i])};
+            }
+        }
+    }
+    return best;
+}
+
 void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                                                OverlayBuilder& builder)
 {
@@ -232,8 +274,52 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
     }
 
     for (std::size_t index = 0; index < _chains.size(); ++index) {
-        const PointChainStyle style = fiberStyle(fiberColor(_chains[index].id), _viewDistance);
-        renderPointChain(viewer, builder, _chains[index].points, style);
+        const Chain& chain = _chains[index];
+        const uint64_t colorId =
+            (_showLinked && chain.colorId != 0) ? chain.colorId : chain.id;
+        const PointChainStyle style = fiberStyle(fiberColor(colorId), _viewDistance);
+        renderPointChain(viewer, builder, chain.points, style);
+    }
+
+    if (!_showLinked) {
+        return;
+    }
+
+    // Linked-control-point rings, appended after every chain's primitives so
+    // they paint last (FiberBatchItem draws commands in insertion order).
+    // Colors match the Line Annotation GUI's branch control-point markers.
+    std::vector<float> opacities;
+    for (const Chain& chain : _chains) {
+        if (chain.pointLinkStates.empty()) {
+            continue;
+        }
+        const FilteredPoints filtered =
+            projectedPointChain(viewer, chain.points, _viewDistance, &opacities);
+        for (std::size_t i = 0; i < filtered.scenePoints.size(); ++i) {
+            const float opacity = i < opacities.size() ? opacities[i] : 1.0f;
+            if (opacity <= 0.0f || i >= filtered.sourceIndices.size()) {
+                continue;
+            }
+            const std::size_t source = filtered.sourceIndices[i];
+            if (source >= chain.pointLinkStates.size()) {
+                continue;
+            }
+            const uint8_t state = chain.pointLinkStates[source];
+            if (state == 0) {
+                continue;
+            }
+            const bool pending = state == 1;
+            OverlayStyle style;
+            style.penColor = pending ? QColor(80, 150, 255, 245)
+                                     : QColor(210, 95, 255, 245);
+            style.brushColor = pending ? QColor(80, 150, 255, 175)
+                                       : QColor(210, 95, 255, 175);
+            style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
+            style.brushColor.setAlphaF(style.brushColor.alphaF() * opacity);
+            style.penWidth = 2.0;
+            style.z = 95.0;
+            builder.addPoint(filtered.scenePoints[i], 6.25, style);
+        }
     }
 }
 

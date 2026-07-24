@@ -923,6 +923,11 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 
     _volume = std::move(vol);
     rebuildChunkArray();
+    if (!_volume) {
+        // No volume means submitRender() below will skip; drop the previous
+        // volume's framebuffer so the view goes blank instead of showing it.
+        clearDisplayedFramebuffer();
+    }
     ensureDefaultSurface();
     if (_volume && isAxisAlignedView() && !hadVolume) {
         const int n = _chunkArray ? _chunkArray->numLevels()
@@ -1128,8 +1133,19 @@ void CChunkedVolumeViewer::onVolumeClosing()
     }
     _chunkArray.reset();
     _volume.reset();
+    clearDisplayedFramebuffer();
     invalidateIntersect();
     onSurfaceChanged(_surfName, nullptr);
+}
+
+void CChunkedVolumeViewer::clearDisplayedFramebuffer()
+{
+    _framebuffer = QImage();
+    _displayedRenderJob.reset();
+    _lastRenderResult.reset();
+    if (_view && _view->viewport()) {
+        _view->viewport()->update();
+    }
 }
 
 void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)

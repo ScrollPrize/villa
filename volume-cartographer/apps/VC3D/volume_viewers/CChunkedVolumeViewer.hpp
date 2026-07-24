@@ -287,6 +287,7 @@ private:
         std::source_location caller = std::source_location::current());
     void updateStatusLabel();
     void rebuildChunkArray();
+    void clearDisplayedFramebuffer();
     void syncCameraTransform();
     void requestDirectPaint();
     void resizeFramebuffer();

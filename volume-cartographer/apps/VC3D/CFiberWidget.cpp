@@ -304,6 +304,16 @@ void CFiberWidget::setupUi()
     connect(_showFibersCheckBox, &QCheckBox::toggled,
             this, &CFiberWidget::showFibersToggled);
 
+    _showLinkedCheckBox = new QCheckBox(tr("Show linked"), mainWidget);
+    _showLinkedCheckBox->setObjectName(QStringLiteral("fiberShowLinkedCheckBox"));
+    _showLinkedCheckBox->setEnabled(false);
+    _showLinkedCheckBox->setToolTip(
+        tr("Color linked fibers as one group and mark linked control points "
+           "(blue = pending, purple = approved)."));
+    fiberDisplayLayout->addWidget(_showLinkedCheckBox);
+    connect(_showLinkedCheckBox, &QCheckBox::toggled,
+            this, &CFiberWidget::showLinkedToggled);
+
     auto* viewDistanceLabel = new QLabel(tr("View distance:"), mainWidget);
     fiberDisplayLayout->addWidget(viewDistanceLabel);
     _fiberViewDistanceSpinBox = new QDoubleSpinBox(mainWidget);
@@ -456,6 +466,7 @@ void CFiberWidget::setupUi()
 void CFiberWidget::setShowFibersAvailable(bool available)
 {
     _showFibersCheckBox->setEnabled(available);
+    _showLinkedCheckBox->setEnabled(available);
     if (!available) {
         setShowFibersChecked(false);
     }
@@ -470,6 +481,17 @@ void CFiberWidget::setShowFibersChecked(bool checked)
 bool CFiberWidget::showFibersChecked() const
 {
     return _showFibersCheckBox->isChecked();
+}
+
+void CFiberWidget::setShowLinkedChecked(bool checked)
+{
+    const QSignalBlocker blocker(_showLinkedCheckBox);
+    _showLinkedCheckBox->setChecked(checked);
+}
+
+bool CFiberWidget::showLinkedChecked() const
+{
+    return _showLinkedCheckBox->isChecked();
 }
 
 void CFiberWidget::setFiberViewDistance(double distance)
