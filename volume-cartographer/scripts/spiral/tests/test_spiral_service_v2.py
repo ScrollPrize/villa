@@ -10,6 +10,7 @@ import argparse
 import io
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import shutil
@@ -23,6 +24,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 import numpy as np
 from PIL import Image
@@ -30,9 +32,11 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import spiral_service
-from spiral_service import (ApiError, ArtifactRegistry, ServiceLogBuffer, ServiceState,
+from spiral_service import (ApiError, ArtifactRegistry, ExclusiveFileLock,
+                            FileLockUnavailable, ServiceLogBuffer, ServiceState,
                             SpiralServer, _prepare_cleaned_lasagna_surface,
-                            load_or_create_api_key, parse_gpu_ids)
+                            load_or_create_api_key, parse_gpu_ids,
+                            parse_session_name)
 from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
 
 
@@ -120,6 +124,22 @@ def _upload_input(state, kind, input_id, files, role=None):
     return upload_id
 
 
+def _commit_pcl_process(dataset, output, input_id, ready, start, result):
+    try:
+        state = ServiceState()
+        _attach_fake_session(state, output, dataset)
+        upload_id = _upload_input(
+            state, "pcl", input_id, PCL_FILES, role="patch_overlap")
+        state.finalize_upload(upload_id)
+        ready.put(input_id)
+        if not start.wait(10):
+            raise RuntimeError("timed out waiting for concurrent commit start")
+        state.commit_inputs()
+        result.put((input_id, "ok"))
+    except BaseException as exc:
+        result.put((input_id, f"{type(exc).__name__}: {exc}"))
+
+
 PATCH_FILES = {
     "meta.json": json.dumps({"format": "tifxyz"}).encode(),
     "x.tif": b"x-raster", "y.tif": b"y-raster", "z.tif": b"z-raster",
@@ -158,6 +178,47 @@ class GpuSelectionTests(unittest.TestCase):
         for value in ("", "0,", "-1", "gpu0", "1,1"):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 parse_gpu_ids(value)
+
+
+class NamedSessionTests(unittest.TestCase):
+    def test_safe_session_names_are_accepted(self):
+        for value in ("alice", "gpu-1", "team_one", "run.2026"):
+            with self.subTest(value=value):
+                self.assertEqual(parse_session_name(value), value)
+
+    def test_unsafe_session_names_are_rejected(self):
+        for value in ("", ".", "..", "../alice", "alice/bob", "a b", "_alice",
+                      "a" * 65):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                parse_session_name(value)
+
+    def test_named_resolution_isolates_output_but_shares_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "umbilicus.json").write_text("{}")
+            (root / "verified_patches").mkdir()
+            unnamed = resolve_dataset_root(root)
+            alice = resolve_dataset_root(root, session_name="alice")
+            bob = resolve_dataset_root(root, session_name="bob")
+            self.assertEqual(unnamed.resolved["output_directory"],
+                             str(root / "spiral_output"))
+            self.assertEqual(alice.resolved["output_directory"],
+                             str(root / "spiral_output" / "alice"))
+            self.assertEqual(bob.resolved["output_directory"],
+                             str(root / "spiral_output" / "bob"))
+            self.assertEqual(alice.resolved["cache_directory"],
+                             bob.resolved["cache_directory"])
+
+    def test_exclusive_lock_rejects_duplicate_live_owner_and_releases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session" / ".spiral-service.lock"
+            first = ExclusiveFileLock(path).acquire()
+            second = ExclusiveFileLock(path)
+            with self.assertRaises(FileLockUnavailable):
+                second.acquire()
+            first.release()
+            second.acquire()
+            second.release()
 
 
 class HttpServiceFixture(unittest.TestCase):
@@ -220,6 +281,7 @@ class AuthenticationTests(HttpServiceFixture):
         self.assertEqual(health["api_version"], API_VERSION)
         self.assertIn("service_version", health)
         self.assertIn("service_name", health)
+        self.assertIn("session_name", health)
         self.assertIn("session_generation", health)
         self.assertIn("service_generation", health)
 
@@ -422,6 +484,17 @@ class DatasetOwnershipTests(unittest.TestCase):
         response = self.state.dataset()
         self.assertEqual(response["root"], str(self.root))
         self.assertIn("umbilicus", response["resolved"])
+
+    def test_dataset_endpoint_advertises_named_session(self):
+        resolution = resolve_dataset_root(self.root, session_name="alice")
+        state = ServiceState(
+            dataset_root=str(self.root), dataset_resolution=resolution,
+            session_name="alice")
+        response = state.dataset()
+        self.assertEqual(response["session_name"], "alice")
+        self.assertEqual(
+            response["resolved"]["output_directory"],
+            str(self.root / "spiral_output" / "alice"))
 
     def test_dataset_resolution_discovers_drawn_control_points(self):
         drawn = self.root / "drawn_control_points.json"
@@ -996,6 +1069,93 @@ class CommitTests(unittest.TestCase):
         self.assertTrue(all(record["committed"] and record["state"] == "pending"
                             for record in inputs))
 
+    def test_concurrent_service_commits_serialize_pcl_merges(self):
+        output_b = self.root / "output-b"
+        output_b.mkdir()
+        state_b = ServiceState()
+        _attach_fake_session(state_b, output_b, self.dataset)
+        upload_a = _upload_input(
+            self.state, "pcl", "pcl-a", PCL_FILES, role="patch_overlap")
+        upload_b = _upload_input(
+            state_b, "pcl", "pcl-b", PCL_FILES, role="patch_overlap")
+        self.state.finalize_upload(upload_a)
+        state_b.finalize_upload(upload_b)
+        target = self.dataset / "patch-overlap-pcls.json"
+        target.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1", "collections": {},
+        }))
+
+        active = 0
+        max_active = 0
+        activity_lock = threading.Lock()
+        original_merge = spiral_service._merge_pcl_documents
+
+        def slow_merge(existing, incoming):
+            nonlocal active, max_active
+            with activity_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.1)
+                return original_merge(existing, incoming)
+            finally:
+                with activity_lock:
+                    active -= 1
+
+        errors = []
+
+        def commit(state):
+            try:
+                state.commit_inputs()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+                spiral_service, "_merge_pcl_documents", side_effect=slow_merge):
+            threads = [
+                threading.Thread(target=commit, args=(self.state,)),
+                threading.Thread(target=commit, args=(state_b,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+        self.assertFalse(errors)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(max_active, 1)
+        merged = json.loads(target.read_text())
+        self.assertEqual(len(merged["collections"]), 2)
+
+    def test_independent_processes_preserve_both_pcl_commits(self):
+        target = self.dataset / "patch-overlap-pcls.json"
+        target.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1", "collections": {},
+        }))
+        context = multiprocessing.get_context("spawn")
+        ready = context.Queue()
+        start = context.Event()
+        result = context.Queue()
+        processes = []
+        for name in ("process-a", "process-b"):
+            output = self.root / name
+            output.mkdir()
+            processes.append(context.Process(
+                target=_commit_pcl_process,
+                args=(str(self.dataset), str(output), name, ready, start, result)))
+        for process in processes:
+            process.start()
+        self.assertEqual({ready.get(timeout=20), ready.get(timeout=20)},
+                         {"process-a", "process-b"})
+        start.set()
+        outcomes = dict(result.get(timeout=30) for _ in processes)
+        for process in processes:
+            process.join(30)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+        self.assertEqual(outcomes, {"process-a": "ok", "process-b": "ok"})
+        merged = json.loads(target.read_text())
+        self.assertEqual(len(merged["collections"]), 2)
+
     def test_drawn_control_points_commit_preserves_line_and_point_order(self):
         existing = {
             "vc_pointcollections_json_version": "1",
@@ -1337,6 +1497,50 @@ class ServiceProcessTests(unittest.TestCase):
             output, _ = process.communicate(timeout=30)
             self.assertEqual(process.returncode, 2)
             self.assertIn("missing required", output)
+
+    def test_named_dataset_service_has_exclusive_restartable_ownership(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            dataset.mkdir()
+            (dataset / "umbilicus.json").write_text("{}")
+            (dataset / "verified_patches").mkdir()
+            key_file = root / "key"
+            arguments = [
+                "--port", "0", "--api-key-file", str(key_file),
+                "--dataset", str(dataset), "--session-name", "alice",
+            ]
+            first = self._launch(arguments, temporary)
+            try:
+                lines = self._read_until_ready(first)
+                self.assertIn("Spiral session name: alice", lines)
+                ready = next(line for line in lines
+                             if line.startswith("SPIRAL_SERVICE_READY"))
+                port = int(ready.split("port=")[1].split()[0])
+                key = key_file.read_text().strip()
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    health = json.loads(response.read())
+                self.assertEqual(health["session_name"], "alice")
+
+                duplicate = self._launch(arguments, temporary)
+                output, _ = duplicate.communicate(timeout=30)
+                self.assertEqual(duplicate.returncode, 2)
+                self.assertIn("already owned", output)
+            finally:
+                first.terminate()
+                first.wait(10)
+                first.stdout.close()
+
+            restarted = self._launch(arguments, temporary)
+            try:
+                self._read_until_ready(restarted)
+            finally:
+                restarted.terminate()
+                restarted.wait(10)
+                restarted.stdout.close()
 
     def test_non_loopback_bind_requires_dataset(self):
         with tempfile.TemporaryDirectory() as temporary:

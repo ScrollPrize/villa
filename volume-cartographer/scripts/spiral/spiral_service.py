@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
+import errno
 import hashlib
 import json
 import math
@@ -49,7 +50,7 @@ from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_BOOLEAN_KEYS,
                          validate_session_request)
 
 
-SERVICE_VERSION = "5.3.0"
+SERVICE_VERSION = "5.4.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -73,9 +74,11 @@ UPLOADED_CHECKPOINTS_DIRNAME = "uploaded-checkpoints"
 MAX_LOG_ENTRIES = 20000
 MAX_LOG_READ_ENTRIES = 1000
 MAX_LOG_ENTRY_CHARS = 8192
+DATASET_COMMIT_LOCK_TIMEOUT_SECONDS = 20.0
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@ -]{0,127}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SAFE_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 _PCL_ROLE_FILES = {
     PclRole.ABSOLUTE.value: "abs_winding.json",
@@ -116,6 +119,81 @@ def parse_gpu_ids(value):
     if len(set(gpu_ids)) != len(gpu_ids):
         raise argparse.ArgumentTypeError("--gpus cannot contain duplicate devices")
     return gpu_ids
+
+
+def parse_session_name(value):
+    """Validate a host-owned name which is also used as one path component."""
+    name = str(value).strip()
+    if not _SAFE_SESSION_NAME.fullmatch(name) or name in {".", ".."}:
+        raise argparse.ArgumentTypeError(
+            "--session-name must be 1-64 characters, start with a letter or "
+            "digit, and contain only letters, digits, '.', '_', or '-'")
+    return name
+
+
+class FileLockUnavailable(RuntimeError):
+    pass
+
+
+class ExclusiveFileLock:
+    """Small stdlib-only advisory lock shared by independent service processes."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._stream = None
+
+    def acquire(self, timeout=0.0):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        stream = self.path.open("a+b")
+        if os.name == "nt":
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._stream = stream
+                return self
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                    stream.close()
+                    raise
+                if time.monotonic() >= deadline:
+                    stream.close()
+                    raise FileLockUnavailable(str(self.path)) from exc
+                time.sleep(0.05)
+
+    def release(self):
+        stream, self._stream = self._stream, None
+        if stream is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+
+    def __enter__(self):
+        if self._stream is None:
+            self.acquire()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        self.release()
 
 
 def _validate_run_influence_config(value):
@@ -901,7 +979,7 @@ def _stop_process_group(process):
 
 class ServiceState:
     def __init__(self, dataset_root=None, dataset_resolution=None,
-                 service_name=None, logs=None, gpu_ids=(0,)):
+                 service_name=None, session_name="", logs=None, gpu_ids=(0,)):
         self.lock = threading.RLock()
         self.session = None
         self.session_id = None
@@ -918,6 +996,7 @@ class ServiceState:
         self.dataset_root = str(dataset_root) if dataset_root else None
         self.dataset_resolution = dataset_resolution
         self.service_name = service_name or socket.gethostname()
+        self.session_name = str(session_name or "")
         self.logs = logs if logs is not None else ServiceLogBuffer()
         self.gpu_ids = tuple(gpu_ids)
         self.artifacts = ArtifactRegistry()
@@ -940,6 +1019,7 @@ class ServiceState:
             "api_version": API_VERSION,
             "service_version": SERVICE_VERSION,
             "service_name": self.service_name,
+            "session_name": self.session_name,
             "session_id": self.session_id,
             "service_generation": self.service_generation,
             "session_generation": self.session_generation,
@@ -1017,7 +1097,11 @@ class ServiceState:
                 raise ApiError(HTTPStatus.FORBIDDEN,
                                "This service resolves only the dataset it was launched with")
             return self.dataset()
-        return {**self._base(), **resolve_dataset_root(root_value).to_dict()}
+        return {
+            **self._base(),
+            **resolve_dataset_root(
+                root_value, session_name=self.session_name).to_dict(),
+        }
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -1890,71 +1974,100 @@ class ServiceState:
             available, reason = self._commit_availability()
             if not available:
                 raise ApiError(HTTPStatus.CONFLICT, f"Commit is unavailable: {reason}")
-            records = [record for record in self.ephemeral_records
-                       if record["state"] in ("pending", "incorporated")
-                       and not record.get("committed")]
-            paths = self.session_paths
-        dataset_root = Path(paths.dataset_root)
-        patches_dir = Path(paths.verified_patches) if paths.verified_patches \
-            else dataset_root / "verified_patches"
-        fibers_dir = Path(paths.fibers) if paths.fibers else dataset_root / "fibers"
+            expected_session_id = self.session_id
+            dataset_root = Path(self.session_paths.dataset_root)
+        commit_lock = ExclusiveFileLock(dataset_root / ".spiral-commit.lock")
+        try:
+            commit_lock.acquire(DATASET_COMMIT_LOCK_TIMEOUT_SECONDS)
+        except FileLockUnavailable as exc:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "Dataset commit is busy in another Spiral session; try again") from exc
+        try:
+            # Re-check after acquiring the process-wide lock: another request
+            # may have completed while this one was waiting.
+            with self.lock:
+                self._require_session()
+                if self.session_id != expected_session_id:
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        "The Spiral session changed while waiting to commit")
+                available, reason = self._commit_availability()
+                if not available:
+                    raise ApiError(
+                        HTTPStatus.CONFLICT, f"Commit is unavailable: {reason}")
+                records = [record for record in self.ephemeral_records
+                           if record["state"] in ("pending", "incorporated")
+                           and not record.get("committed")]
+                paths = self.session_paths
+            dataset_root = Path(paths.dataset_root)
+            patches_dir = Path(paths.verified_patches) if paths.verified_patches \
+                else dataset_root / "verified_patches"
+            fibers_dir = Path(paths.fibers) if paths.fibers else dataset_root / "fibers"
 
-        # Validate everything before moving anything: a patch-id collision is a
-        # commit error, not an overwrite.
-        for record in records:
-            if record["kind"] == "patch" and (patches_dir / record["id"]).exists():
-                raise ApiError(HTTPStatus.CONFLICT,
-                               f"A patch named {record['id']!r} already exists in the dataset")
-            if record["kind"] == "fiber" and (fibers_dir / f"{record['id']}.json").exists():
-                raise ApiError(HTTPStatus.CONFLICT,
-                               f"A fiber named {record['id']!r} already exists in the dataset")
-
-        committed = []
-        for record in records:
-            source = Path(record["path"])
-            # A still-pending record keeps its staged copy: it remains the
-            # incorporation source for the next run, so committing never
-            # removes an input from the live session's queue and never races
-            # a concurrent run over the record's path.
-            keep_source = record["state"] == "pending"
-            if record["kind"] == "patch":
-                _copy_publish(source, patches_dir / record["id"], keep_source)
-            elif record["kind"] == "fiber":
-                _copy_publish(source, fibers_dir / f"{record['id']}.json", keep_source)
-            else:
-                target = dataset_root / _PCL_ROLE_FILES[record["role"]]
-                with source.open("r", encoding="utf-8") as stream:
-                    incoming = json.load(stream)
-                if target.exists():
-                    backup = target.with_name(f"{target.name}.{_utc_stamp()}.bak")
-                    shutil.copy2(target, backup)
-                    with target.open("r", encoding="utf-8") as stream:
-                        existing = json.load(stream)
-                    merged = _merge_pcl_documents(existing, incoming)
-                else:
-                    merged = incoming
-                temp = target.with_name(f".{target.name}.incoming-{secrets.token_hex(4)}")
-                with temp.open("w", encoding="utf-8") as stream:
-                    json.dump(merged, stream, indent=2)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temp, target)
-                if not keep_source:
-                    source.unlink(missing_ok=True)
-            committed.append(record["id"])
-        with self.lock:
+            # Collision checks and publications share the same dataset lock, so
+            # cooperating service processes cannot race an existence check.
             for record in records:
-                record["committed"] = True
-            # Committed records that already joined the resident fit are done;
-            # committed-but-pending ones stay queued so they still join the
-            # fit on the next run.
-            self.ephemeral_records = [record for record in self.ephemeral_records
-                                      if not (record.get("committed")
-                                              and record["state"] == "incorporated")]
-            if self.dataset_resolution is not None:
-                self.dataset_resolution = resolve_dataset_root(self.dataset_root)
-            self.status_generation += 1
-        return {**self.status(), "committed": committed, "accepted": True}
+                if record["kind"] == "patch" and (patches_dir / record["id"]).exists():
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        f"A patch named {record['id']!r} already exists in the dataset")
+                if record["kind"] == "fiber" and \
+                        (fibers_dir / f"{record['id']}.json").exists():
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        f"A fiber named {record['id']!r} already exists in the dataset")
+
+            committed = []
+            for record in records:
+                source = Path(record["path"])
+                # A still-pending record keeps its staged copy: it remains the
+                # incorporation source for the next run, so committing never
+                # removes an input from the live session's queue.
+                keep_source = record["state"] == "pending"
+                if record["kind"] == "patch":
+                    _copy_publish(source, patches_dir / record["id"], keep_source)
+                elif record["kind"] == "fiber":
+                    _copy_publish(source, fibers_dir / f"{record['id']}.json", keep_source)
+                else:
+                    target = dataset_root / _PCL_ROLE_FILES[record["role"]]
+                    with source.open("r", encoding="utf-8") as stream:
+                        incoming = json.load(stream)
+                    if target.exists():
+                        backup = target.with_name(f"{target.name}.{_utc_stamp()}.bak")
+                        shutil.copy2(target, backup)
+                        with target.open("r", encoding="utf-8") as stream:
+                            existing = json.load(stream)
+                        merged = _merge_pcl_documents(existing, incoming)
+                    else:
+                        merged = incoming
+                    temp = target.with_name(
+                        f".{target.name}.incoming-{secrets.token_hex(4)}")
+                    with temp.open("w", encoding="utf-8") as stream:
+                        json.dump(merged, stream, indent=2)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temp, target)
+                    if not keep_source:
+                        source.unlink(missing_ok=True)
+                committed.append(record["id"])
+            with self.lock:
+                for record in records:
+                    record["committed"] = True
+                # Committed records that already joined the resident fit are
+                # done; pending ones stay queued for the next run.
+                self.ephemeral_records = [
+                    record for record in self.ephemeral_records
+                    if not (record.get("committed")
+                            and record["state"] == "incorporated")
+                ]
+                if self.dataset_resolution is not None:
+                    self.dataset_resolution = resolve_dataset_root(
+                        self.dataset_root, session_name=self.session_name)
+                self.status_generation += 1
+            return {**self.status(), "committed": committed, "accepted": True}
+        finally:
+            commit_lock.release()
 
     def remove_input(self, request):
         kind = str(request.get("kind") or "").strip()
@@ -2338,6 +2451,9 @@ def main(argv=None):
                              "non-loopback bind. Clients cannot repoint base inputs.")
     parser.add_argument("--service-name", default=None)
     parser.add_argument(
+        "--session-name", type=parse_session_name, default=None, metavar="NAME",
+        help="Stable output namespace under <dataset>/spiral_output; requires --dataset")
+    parser.add_argument(
         "--gpus", type=parse_gpu_ids, default=(0,), metavar="DEVICE[,DEVICE...]",
         help="Physical CUDA device indices to use (default: 0; example: 0,1,2,3)")
     args = parser.parse_args(argv)
@@ -2354,6 +2470,8 @@ def main(argv=None):
     if not loopback and args.nonce:
         parser.error("--nonce is only for VC3D-owned loopback processes; use the "
                      "API key file for network binds")
+    if args.session_name and not args.dataset:
+        parser.error("--session-name requires --dataset")
 
     credentials = []
     if args.nonce:
@@ -2368,8 +2486,10 @@ def main(argv=None):
               f"into VC3D): {key}", flush=True)
 
     dataset_resolution = None
+    session_lease = None
     if args.dataset:
-        dataset_resolution = resolve_dataset_root(args.dataset)
+        dataset_resolution = resolve_dataset_root(
+            args.dataset, session_name=args.session_name or "")
         if not dataset_resolution.ok:
             print("Refusing to start: the launch dataset is incomplete.",
                   file=sys.stderr, flush=True)
@@ -2381,6 +2501,26 @@ def main(argv=None):
             return 2
         for warning in dataset_resolution.warnings:
             print(f"  dataset warning: {warning}", file=sys.stderr, flush=True)
+        if args.session_name:
+            output_directory = Path(
+                dataset_resolution.resolved["output_directory"])
+            try:
+                output_directory.mkdir(parents=True, exist_ok=True)
+                session_lease = ExclusiveFileLock(
+                    output_directory / ".spiral-service.lock")
+                session_lease.acquire()
+            except FileLockUnavailable:
+                print(
+                    f"Refusing to start: Spiral session {args.session_name!r} "
+                    "is already owned by another service process.",
+                    file=sys.stderr, flush=True)
+                return 2
+            except OSError as exc:
+                print(
+                    f"Refusing to start: cannot create or lock named session "
+                    f"output {output_directory}: {exc}",
+                    file=sys.stderr, flush=True)
+                return 2
 
     logs = ServiceLogBuffer()
     original_stdout, original_stderr = sys.stdout, sys.stderr
@@ -2389,12 +2529,18 @@ def main(argv=None):
     state = ServiceState(dataset_root=args.dataset,
                          dataset_resolution=dataset_resolution,
                          service_name=args.service_name,
+                         session_name=args.session_name or "",
                          logs=logs,
                          gpu_ids=args.gpus)
     # A stable, operator-chosen port must survive TIME_WAIT restarts; an
     # ephemeral port must not reuse an address it did not own.
     SpiralServer.allow_reuse_address = args.port != 0
-    server = SpiralServer((args.bind, args.port), credentials, state)
+    try:
+        server = SpiralServer((args.bind, args.port), credentials, state)
+    except BaseException:
+        if session_lease is not None:
+            session_lease.release()
+        raise
     shutdown = threading.Event()
     _install_parent_watch(args.parent_pid, shutdown)
 
@@ -2416,6 +2562,8 @@ def main(argv=None):
     # remote attach validate compatibility through one code path.
     print(f"Spiral CUDA devices: {','.join(str(gpu_id) for gpu_id in args.gpus)}",
           flush=True)
+    if args.session_name:
+        print(f"Spiral session name: {args.session_name}", flush=True)
     print(f"SPIRAL_SERVICE_READY port={server.server_port}", flush=True)
     server.timeout = 0.5
     try:
@@ -2425,8 +2573,12 @@ def main(argv=None):
             server.handle_request()
     finally:
         server.server_close()
-        state.close()
-        sys.stdout, sys.stderr = original_stdout, original_stderr
+        try:
+            state.close()
+        finally:
+            if session_lease is not None:
+                session_lease.release()
+            sys.stdout, sys.stderr = original_stdout, original_stderr
     if server.restart_requested.is_set():
         restart_args = list(sys.argv[1:] if argv is None else argv)
         os.execv(sys.executable,

@@ -18,9 +18,9 @@ import zipfile
 
 
 
-# Version 7 lets checkpoint upload negotiation return an already-published
-# checkpoint instead of an upload id when the content digest is retained.
-API_VERSION = 8
+# Version 9 adds the host-owned named-session namespace advertised by the
+# service and used to isolate generated output for persistent remote services.
+API_VERSION = 9
 
 
 # Counts which describe how many training objects/points are sampled per
@@ -323,7 +323,11 @@ def _dbm_candidates(root: Path) -> list[str]:
     return sorted(logical)
 
 
-def resolve_dataset_root(root_value: str | os.PathLike[str]) -> SpiralDatasetResolution:
+def resolve_dataset_root(
+    root_value: str | os.PathLike[str],
+    *,
+    session_name: str = "",
+) -> SpiralDatasetResolution:
     root = Path(_normalise_path(root_value))
     result = SpiralDatasetResolution(root=str(root))
     if not root.is_dir():
@@ -367,7 +371,10 @@ def resolve_dataset_root(root_value: str | os.PathLike[str]) -> SpiralDatasetRes
         else:
             result.missing_optional.append("tracks_dbm")
 
-    result.resolved["output_directory"] = _normalise_path(root / "spiral_output")
+    output_directory = root / "spiral_output"
+    if session_name:
+        output_directory /= session_name
+    result.resolved["output_directory"] = _normalise_path(output_directory)
     local_cache = root / ".spiral-cache"
     parent_writable = os.access(root, os.W_OK)
     if local_cache.is_dir() or parent_writable:

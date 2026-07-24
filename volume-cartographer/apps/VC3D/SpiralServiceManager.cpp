@@ -39,7 +39,7 @@ constexpr int kRemoteLogPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 8;
+constexpr int kSupportedApiVersion = 9;
 constexpr int kPreviewCacheKept = 3;
 
 QString stateName(SpiralServiceManager::ConnectionState state)
@@ -338,8 +338,15 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
                                     return makeRequest(path, timeoutMs);
                                 });
     const QString serviceName = health.value(QStringLiteral("service_name")).toString();
-    setConnectionState(ConnectionState::Ready,
-                       serviceName.isEmpty() ? QString() : tr("service %1").arg(serviceName));
+    const QString sessionName = health.value(QStringLiteral("session_name")).toString();
+    QString identity;
+    if (!serviceName.isEmpty())
+        identity = tr("service %1").arg(serviceName);
+    if (!sessionName.isEmpty())
+        identity += identity.isEmpty()
+            ? tr("session %1").arg(sessionName)
+            : tr(" / session %1").arg(sessionName);
+    setConnectionState(ConnectionState::Ready, identity);
     _statusFailures = 0;
     _poll->setInterval(kPollMs);
     _poll->start();

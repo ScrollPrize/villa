@@ -42,12 +42,16 @@ or with conda/pip, install `torch` for your CUDA version and then
 
 ### Internet flow (SSH attach)
 
-Start a persistent loopback service on the GPU host with its dataset. Nothing
-is exposed on the network; VC3D tunnels to it over SSH:
+Start a persistent loopback service on the GPU host with its dataset. Give
+each independently operated service a stable session name, port, and GPU.
+Nothing is exposed on the network; VC3D tunnels to it over SSH:
 
 ```sh
-tmux new -s spiral 'python scripts/spiral/spiral_service.py --port 8765 \
-    --dataset /data/scrolls/s1 --gpus 0'
+tmux new -s spiral-alice 'python scripts/spiral/spiral_service.py --port 8765 \
+    --dataset /data/scrolls/s1 --gpus 0 --session-name alice'
+
+tmux new -s spiral-bob 'python scripts/spiral/spiral_service.py --port 8766 \
+    --dataset /data/scrolls/s1 --gpus 1 --session-name bob'
 ```
 
 The service uses only physical CUDA device `0` by default. Select a different
@@ -62,6 +66,13 @@ python scripts/spiral/spiral_service.py --port 8765 \
 Multi-GPU sessions run one fitter rank per listed device and split the configured
 per-step sample counts across those ranks by default. The device list is fixed for
 the lifetime of the service; restart it to change the selection.
+
+A named service writes autosaves, previews, artifacts, uploaded checkpoints,
+Lasagna output, and ephemeral inputs beneath
+`<dataset>/spiral_output/<session-name>/`. Permanent dataset inputs and the
+dataset-derived `.spiral-cache` remain shared. Two live services cannot own the
+same dataset/session-name pair. Launches without `--session-name` retain the
+legacy `<dataset>/spiral_output/` layout.
 
 On first start the service generates a strong API key at
 `~/.config/vc3d/spiral_api_key` (mode `0600`) and prints it to the console.
@@ -113,7 +124,8 @@ validation and never ignores certificate errors.
 `--dataset` must point at a dataset root containing at least `umbilicus.json`
 and `verified_patches/`; the service refuses to start when required entries
 are missing and prints what was missing. Output goes to
-`<dataset>/spiral_output` by default (from the same resolution VC3D shows).
+`<dataset>/spiral_output` by default, or its named child when the service uses
+`--session-name` (from the same resolution VC3D shows).
 Make sure that directory's filesystem has room for checkpoints and previews.
 If the dataset root is read-only the fit still works, but *Commit current
 inputs* is unavailable and the cache falls back to the user cache directory.
@@ -135,7 +147,10 @@ without a mapping those overlays are simply marked unavailable.
 While a session is active you can right-click a patch in the Surface panel or
 a fiber in the Fibers panel and pick *Add to current spiral fit*. Added inputs
 are uploaded into a session-scoped ephemeral folder, used from the next run
-onward, and can be moved into the dataset with *Commit current inputs*.
+onward, and can be moved into the shared dataset with *Commit current inputs*.
+Commits from multiple service processes are serialized; distinct inputs and
+point collections are preserved, while an existing patch or fiber identifier
+is reported as a conflict and is never overwritten.
 
 Interactive influence settings are scoped to each **Run** request. The fitter
 builds a fresh influence region from only the inputs pending for that run,
