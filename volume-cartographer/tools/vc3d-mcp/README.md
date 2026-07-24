@@ -17,14 +17,12 @@ normal VC3D session is not exposed accidentally.
 | macOS | Unix-domain socket under the user's temporary directory | `run.sh` |
 | Windows 10/11 | Local named pipe | `run.ps1` |
 
-All three use Qt's `QLocalServer` in VC3D. Windows support stays on the native
-named pipe rather than opening a TCP port. Python's Windows event loop provides
-the matching asynchronous pipe transport, so there is no platform-specific
-runtime dependency.
+All three use Qt's `QLocalServer`. On Windows, VC3D keeps the native named
+pipe instead of opening a TCP port. Python's Windows event loop can use that
+pipe directly, so the MCP needs no Windows-only runtime dependency.
 
-The bridge is local to one machine. A Unix socket path or Windows pipe name
-cannot be used to connect across machines. Container use requires the MCP
-process and VC3D endpoint to be visible in the same environment.
+The bridge only connects processes on the same machine. If either process runs
+in a container, both must still have access to the same socket or pipe.
 
 ## Quick start
 
@@ -206,9 +204,9 @@ This changes policy only for that PowerShell process.
 ### The wrong VC3D instance was selected
 
 Pass the exact endpoint with `--socket`, or close the other bridge-enabled
-instances. Discovery tries records newest-first and skips endpoints that do
-not respond or use an incompatible protocol version. It leaves valid registry
-records in place because a busy VC3D can time out temporarily.
+instances. Discovery checks the newest records first and skips endpoints that
+do not respond or use an incompatible protocol version. It leaves valid
+registry records in place because a busy VC3D can time out temporarily.
 
 ### Large screenshots fail
 
@@ -248,8 +246,8 @@ continue. Progress delivery is observational: a slow or failing MCP progress
 sink cannot change the job's terminal result, and task cancellation still
 propagates.
 
-Only asynchronous tools expose `wait`; its presence in the generated input
-schema is authoritative.
+Only asynchronous tools expose `wait`; check the generated input schema to see
+whether a tool supports it.
 
 ## Development
 
@@ -263,8 +261,8 @@ The Python layout is deliberately explicit:
 ```text
 vc3d_mcp/
   bridge_client.py   JSON-RPC requests, responses, and progress
-  transport.py       platform-neutral local stream boundary
-  windows_pipe.py    Windows proactor named-pipe connection
+  transport.py       selects and opens the local endpoint
+  windows_pipe.py    opens Windows named-pipe streams
   core.py            shared MCP call and wait behavior
   tools/             typed tools grouped by domain
   server.py          discovery, auto-launch, and stdio entrypoint
@@ -280,11 +278,11 @@ cd tools/vc3d-mcp
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -v
 ```
 
-The Unix tests use AF_UNIX fake servers. The Windows suite checks the proactor
-stream boundary and verifies that closing a live operating-system pipe
-connection completes. Windows CI also launches the freshly built VC3D, calls
-`ping` and `rpc.describe` through its Qt named pipe, and checks that descriptor
-coverage is complete.
+The Unix tests use AF_UNIX fake servers. The Windows suite exercises the
+named-pipe client and verifies that a live pipe connection closes cleanly.
+Windows CI also launches the freshly built VC3D, calls `ping` and
+`rpc.describe` through its Qt named pipe, and checks that descriptor coverage
+is complete.
 
 For the wire protocol, limits, method descriptions, and error model, see
 [`SPEC.md`](../../apps/VC3D/agent_bridge/SPEC.md).
