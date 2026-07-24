@@ -144,11 +144,11 @@ public:
     bool startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
                                                    QString* errorMessage = nullptr);
 
-    // Renders <segment>/mask.tif on a QtConcurrent worker without opening a
-    // dialog or file browser. onFinished runs on the GUI thread.
-    bool startMaskRenderHeadless(const QString& segmentId, bool append,
-                                 std::function<void(bool, QString)> onFinished,
-                                 QString* errorMessage = nullptr);
+    // Renders <segment>/mask.tif on a QtConcurrent worker. Presentation belongs
+    // to the caller; onFinished runs on the GUI thread.
+    bool startMaskRender(const QString& segmentId, bool append,
+                         std::function<void(bool, QString)> onFinished,
+                         QString* errorMessage = nullptr);
 
 signals:
     // Atlas search progress. phase is in [1, ATLAS_SEARCH_PHASE_COUNT] and

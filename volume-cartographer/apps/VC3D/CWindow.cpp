@@ -9522,35 +9522,27 @@ void CWindow::onEditMaskPressed(const QString& segmentId)
         QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
         return;
     }
-
-    if (_maskRenderInProgress)
+    if (_maskRenderInProgress) {
         return;
-    _maskRenderInProgress = true;
-    showStatusBarMessage(tr("Rendering mask..."));
-    vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-        *surf, *_state->vpkg(), _state->currentVolumeId());
+    }
 
-    auto* watcher = new QFutureWatcher<QString>(this);
-    connect(watcher, &QFutureWatcher<QString>::finished, this,
-            [this, watcher, path]() {
-                watcher->deleteLater();
-                _maskRenderInProgress = false;
-
-                try {
-                    watcher->result();  // rethrows on worker failure
+    QString error;
+    if (!startMaskRender(
+            segmentId, false,
+            [this, path](bool success, const QString& message) {
+                if (success) {
                     showStatusBarMessage(tr("Mask saved"), 3000);
                     QDesktopServices::openUrl(QUrl::fromLocalFile(
                         QString::fromStdString(path.string())));
-                } catch (const std::exception& e) {
+                } else {
                     QMessageBox::critical(this, tr("Error"),
-                                         tr("Failed to render surface: %1").arg(e.what()));
+                                          tr("Failed to render surface: %1").arg(message));
                     clearStatusBarMessage();
                 }
-            });
-
-    watcher->setFuture(QtConcurrent::run([surf, path]() -> QString {
-        return renderSegmentMaskToFile(surf, nullptr, path, /*append=*/false);
-    }));
+            },
+            &error)) {
+        QMessageBox::warning(this, tr("Error"), error);
+    }
 }
 
 void CWindow::onAppendMaskPressed(const QString& segmentId)
@@ -9566,48 +9558,34 @@ void CWindow::onAppendMaskPressed(const QString& segmentId)
         }
         return;
     }
-
-    if (_maskRenderInProgress)
+    if (_maskRenderInProgress) {
         return;
-    _maskRenderInProgress = true;
-    showStatusBarMessage(tr("Rendering mask..."));
+    }
 
     std::filesystem::path path = surf->path/"mask.tif";
-    auto volume = _state->currentVolume();
-    vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-        *surf, *_state->vpkg(), _state->currentVolumeId());
-
-    auto* watcher = new QFutureWatcher<QString>(this);
-    connect(watcher, &QFutureWatcher<QString>::finished, this,
-            [this, watcher, path]() {
-                watcher->deleteLater();
-                _maskRenderInProgress = false;
-
-                try {
-                    QString msg = watcher->result();
-                    showStatusBarMessage(msg, 3000);
+    QString error;
+    if (!startMaskRender(
+            segmentId, true,
+            [this, path](bool success, const QString& message) {
+                if (success) {
+                    showStatusBarMessage(message, 3000);
                     QDesktopServices::openUrl(QUrl::fromLocalFile(
                         QString::fromStdString(path.string())));
-                } catch (const std::exception& e) {
+                } else {
                     QMessageBox::critical(this, tr("Error"),
-                                         tr("Failed to render surface: %1").arg(e.what()));
+                                          tr("Failed to render surface: %1").arg(message));
                     clearStatusBarMessage();
                 }
-            });
-
-    watcher->setFuture(QtConcurrent::run([surf, volume, path]() -> QString {
-        return renderSegmentMaskToFile(surf, volume, path, /*append=*/true);
-    }));
+            },
+            &error)) {
+        QMessageBox::warning(this, tr("Error"), error);
+    }
 }
 
-bool CWindow::startMaskRenderHeadless(const QString& segmentId, bool append,
-                                      std::function<void(bool, QString)> onFinished,
-                                      QString* errorMessage)
+bool CWindow::startMaskRender(const QString& segmentId, bool append,
+                              std::function<void(bool, QString)> onFinished,
+                              QString* errorMessage)
 {
-    // Dialog-free twin of onEditMaskPressed / onAppendMaskPressed: same
-    // renderSegmentMaskToFile worker without the QMessageBox / QDesktopServices
-    // side effects. Completion reported via `onFinished` (GUI thread, watcher
-    // finished signal), which the bridge wires to a deferred JSON-RPC response.
     auto fail = [&](const QString& message) -> bool {
         if (errorMessage) {
             *errorMessage = message;
@@ -9653,11 +9631,16 @@ bool CWindow::startMaskRenderHeadless(const QString& segmentId, bool append,
                 watcher->deleteLater();
                 _maskRenderInProgress = false;
                 clearStatusBarMessage();
+                bool success = false;
+                QString message;
                 try {
-                    const QString msg = watcher->result();
-                    if (onFinished) onFinished(true, msg);
+                    message = watcher->result();
+                    success = true;
                 } catch (const std::exception& e) {
-                    if (onFinished) onFinished(false, QString::fromUtf8(e.what()));
+                    message = QString::fromUtf8(e.what());
+                }
+                if (onFinished) {
+                    onFinished(success, message);
                 }
             });
 

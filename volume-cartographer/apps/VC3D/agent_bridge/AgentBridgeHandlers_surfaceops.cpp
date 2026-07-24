@@ -364,12 +364,12 @@ QJsonObject AgentBridgeServer::handleSegmentMask(const QJsonValue& params, bool 
     // exactly once and then throw AgentBridgeDeferred. Any other exception
     // escaping here would let dispatch send a second reply for an id the pending
     // deferred entry (and its timeout timer) still owns -- a double response.
-    // startMaskRenderHeadless can throw during setup, so catch and convert to a
+    // startMaskRender can throw during setup, so catch and convert to a
     // single deferred error. (Its own scope guard has already cleared
     // _maskRenderInProgress on that path.)
     try {
         QString err;
-        const bool launched = _window->startMaskRenderHeadless(
+        const bool launched = _window->startMaskRender(
             segmentId, append,
             [this, token, maskPathStr, segmentId, append](bool success, QString message) {
                 if (success) {
