@@ -447,6 +447,14 @@ std::shared_ptr<VolumePkg> VolumePkg::newEmpty(
     return pkg;
 }
 
+std::shared_ptr<VolumePkg> VolumePkg::newDetached(
+    const vc::project::LoadOptions& opts)
+{
+    auto pkg = newEmpty(opts);
+    pkg->automaticPersistence_ = false;
+    return pkg;
+}
+
 std::shared_ptr<VolumePkg> VolumePkg::load(const fs::path& jsonFile,
                                            const vc::project::LoadOptions& opts)
 {
@@ -1244,6 +1252,7 @@ void VolumePkg::saveAutosave()
 
 void VolumePkg::persistProjectState()
 {
+    if (!automaticPersistence_) return;
     saveAutosave();
     if (!path_.empty()) {
         writeJsonTo(path_);

@@ -164,6 +164,43 @@ TEST_CASE("VolumePkg: setName persists in memory")
     CHECK(p->name() == "My Project");
 }
 
+TEST_CASE("VolumePkg::newDetached writes only when explicitly saved")
+{
+    const auto autosave = VolumePkg::autosaveFile();
+    fs::create_directories(autosave.parent_path());
+    {
+        std::ofstream out(autosave);
+        out << "current session";
+    }
+
+    auto d = tmpDir("detached");
+    auto target = d / "created.volpkg.json";
+    vc::project::LoadOptions opts;
+    opts.deferResolution = true;
+    auto p = VolumePkg::newDetached(opts);
+    p->setName("Created");
+    CHECK(p->addVolumeEntry("/volume", {"source:test"}));
+
+    std::ifstream beforeSave(autosave);
+    CHECK(std::string(
+              std::istreambuf_iterator<char>(beforeSave),
+              std::istreambuf_iterator<char>()) == "current session");
+    CHECK_FALSE(fs::exists(target));
+
+    p->save(target);
+    REQUIRE(fs::exists(target));
+    auto loaded = VolumePkg::load(target, opts);
+    CHECK(loaded->name() == "Created");
+    REQUIRE(loaded->volumeEntries().size() == 1);
+    CHECK(loaded->volumeEntries().front().location == "/volume");
+
+    std::ifstream afterSave(autosave);
+    CHECK(std::string(
+              std::istreambuf_iterator<char>(afterSave),
+              std::istreambuf_iterator<char>()) == "current session");
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg: addVolumeEntry / removeEntry round-trip")
 {
     auto p = VolumePkg::newEmpty();

@@ -46,6 +46,10 @@ public:
     static std::shared_ptr<VolumePkg> newEmpty();
     static std::shared_ptr<VolumePkg> newEmpty(
         const vc::project::LoadOptions& opts);
+    // Build a package without updating the session autosave or implicitly
+    // persisting later mutations. Call save() when the package is complete.
+    static std::shared_ptr<VolumePkg> newDetached(
+        const vc::project::LoadOptions& opts = {});
     static std::shared_ptr<VolumePkg> load(const std::filesystem::path& jsonFile,
                                            const vc::project::LoadOptions& opts = {});
     static std::shared_ptr<VolumePkg> loadAutosave(const vc::project::LoadOptions& opts = {});
@@ -175,6 +179,7 @@ private:
     int version_ = 1;
     vc::project::LoadOptions opts_;
     std::filesystem::path remoteCacheRoot_;
+    bool automaticPersistence_ = true;
 
     std::vector<vc::project::Entry> volumes_;
     std::vector<vc::project::Entry> segments_;
