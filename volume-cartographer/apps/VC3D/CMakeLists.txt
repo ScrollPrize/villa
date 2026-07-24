@@ -183,6 +183,8 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
+    VolumeAttachmentController.cpp
+    VolumeAttachmentController.hpp
     UnifiedBrowserDialog.cpp
     UnifiedBrowserDialog.hpp
     segmentation/SegmentationModule.cpp

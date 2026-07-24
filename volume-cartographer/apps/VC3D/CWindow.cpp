@@ -149,6 +149,7 @@
 #include "SurfacePanelController.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "MenuActionController.hpp"
+#include "VolumeAttachmentController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "SurfaceAreaCalculator.hpp"
@@ -2763,6 +2764,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
 
     // create UI widgets
     CreateWidgets();
+
+    _volumeAttachmentController =
+        std::make_unique<VolumeAttachmentController>(this);
 
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);

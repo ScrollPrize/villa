@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "MenuActionController.hpp"
+#include "VolumeAttachmentController.hpp"
 
 #include "agent_bridge/AgentBridgeError.hpp"  // AgentBridgeError
 #include "agent_bridge/AgentBridgeMethod.hpp"
@@ -322,7 +323,7 @@ private:
         qint64 startedAtMs = 0;
         qint64 finishedAtMs = 0;  // 0 => null
         // Additive terminal result body. Empty => "result": null on
-        // the wire; catalog jobs carry the catalog.open_sample result body.
+        // the wire; catalog and volume-attachment jobs carry structured bodies.
         QJsonObject resultJson;
     };
     void subscribeJobSignals();

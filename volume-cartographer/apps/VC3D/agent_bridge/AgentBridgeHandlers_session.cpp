@@ -728,17 +728,18 @@ QJsonObject AgentBridgeServer::handleVolumeAttach(const QJsonValue& params)
             QJsonObject{{"param", "location"}},
         };
     }
-    MenuActionController* menu = _window->_menuController.get();
-    if (!menu) {
+    VolumeAttachmentController* attachment =
+        _window->_volumeAttachmentController.get();
+    if (!attachment) {
         throw AgentBridgeError{
             -32010,
             "Internal error",
-            QJsonObject{{"detail", "menu controller is not available"}},
+            QJsonObject{{"detail", "volume attachment controller is not available"}},
         };
     }
 
     requireSourceIdle(QStringLiteral("volume"));
-    if (menu->volumeAttachmentInFlight()) {
+    if (attachment->inFlight()) {
         throw AgentBridgeError{
             -32004,
             "A volume attachment is already in progress",
@@ -759,7 +760,7 @@ QJsonObject AgentBridgeServer::handleVolumeAttach(const QJsonValue& params)
     VolumeAttachmentPreparationFailure preparationFailure =
         VolumeAttachmentPreparationFailure::None;
     QString error;
-    if (!menu->prepareVolumeAttachment(
+    if (!attachment->prepare(
             location,
             std::move(tags),
             VolumeAttachmentPresentation::Silent,
@@ -790,10 +791,12 @@ QJsonObject AgentBridgeServer::handleVolumeAttach(const QJsonValue& params)
     }
 
     request.selection = VolumeAttachmentSelection::PreserveCurrent;
-    if (!menu->startVolumeAttachment(
+    QPointer<AgentBridgeServer> self(this);
+    if (!attachment->start(
             std::move(request),
-            [this](const VolumeAttachmentOutcome& outcome) {
-                completeVolumeAttachmentJob(outcome);
+            [self](const VolumeAttachmentOutcome& outcome) {
+                if (self)
+                    self->completeVolumeAttachmentJob(outcome);
             },
             &error)) {
         throw AgentBridgeError{

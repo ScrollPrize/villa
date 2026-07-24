@@ -9,7 +9,6 @@
 #include <string>
 #include <vector>
 
-#include "vc/core/util/RemoteAuth.hpp"
 #include "OpenDataVolumePrefill.hpp"
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
@@ -34,49 +33,6 @@ class OpenDataCatalogWindow;
 struct OpenDataSampleOpenOptions {
     vc3d::opendata::OpenDataResourceSelection selection;
     bool interactive{true};
-};
-
-enum class VolumeAttachmentSelection {
-    PreserveCurrent,
-    SelectAttached,
-};
-
-enum class VolumeAttachmentPresentation {
-    Silent,
-    Interactive,
-};
-
-enum class VolumeAttachmentPreparationFailure {
-    None,
-    NoProject,
-    InvalidLocation,
-    RemoteConfiguration,
-};
-
-struct VolumeAttachmentRequest {
-    QString location;
-    std::vector<std::string> tags;
-    vc::HttpAuth auth;
-    QString remoteCacheRoot;
-    VolumeAttachmentSelection selection{VolumeAttachmentSelection::PreserveCurrent};
-};
-
-enum class VolumeAttachmentFailure {
-    None,
-    Load,
-    ProjectChanged,
-    VolumeIdConflict,
-    Apply,
-};
-
-struct VolumeAttachmentOutcome {
-    bool success{false};
-    bool alreadyAttached{false};
-    VolumeAttachmentFailure failure{VolumeAttachmentFailure::None};
-    QString error;
-    QString volumeId;
-    QString location;
-    QString projectPath;
 };
 
 class MenuActionController : public QObject
@@ -135,18 +91,6 @@ public:
 
     // True while any sample open is in flight.
     bool openDataSampleOpenInFlight() const;
-    bool prepareVolumeAttachment(
-        const QString& location,
-        std::vector<std::string> tags,
-        VolumeAttachmentPresentation presentation,
-        VolumeAttachmentRequest* request,
-        QString* errorMessage = nullptr,
-        VolumeAttachmentPreparationFailure* failure = nullptr);
-    bool startVolumeAttachment(
-        VolumeAttachmentRequest request,
-        std::function<void(const VolumeAttachmentOutcome&)> onFinished,
-        QString* errorMessage = nullptr);
-    bool volumeAttachmentInFlight() const;
 
 private slots:
     void newProject();
@@ -201,7 +145,6 @@ private:
                             vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr);
     // .cpp-local payload keeps the QtConcurrent result type out of this header.
     struct OpenDataOpenTaskResult;
-    struct VolumeAttachmentTaskResult;
     // Launches the QtConcurrent task without a nested event loop. Its watcher is
     // parented to this; completion and onFinished run on the GUI thread.
     void beginOpenDataSampleOpenTask(
@@ -217,16 +160,10 @@ private:
                                   OpenDataSampleOpenOutcome* outcomeOut);
     void startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume);
     void cancelOpenDataVolumePrefills();
-    bool tryResolveRemoteAuth(const QString& url,
-                              vc::HttpAuth* authOut,
-                              QString* errorMessage = nullptr) const;
     // Runs vc_volpkg_convert against `inputLocation` (legacy folder or remote URL),
     // prompts the user for an output .volpkg.json, and returns the written path
     // via `convertedOut` on success.
     bool runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut);
-    QString remoteCacheDirectory(VolumeAttachmentPresentation presentation);
-    QString configuredRemoteCacheDirectory() const;
-    QString suggestedRemoteCacheDirectory() const;
     QString promptLocation(const QString& title,
                            const QString& hint,
                            const QString& defaultDir,
@@ -281,5 +218,4 @@ private:
     std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
     // True from launch until the finished slot runs; prevents overlapping opens.
     bool _openDataSampleOpenInFlight{false};
-    bool _volumeAttachmentInFlight{false};
 };

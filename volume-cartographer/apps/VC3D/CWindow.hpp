@@ -105,6 +105,7 @@ class FiberAnnotationController;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
+class VolumeAttachmentController;
 class SegmentationGrower;
 class ViewerControlsPanel;
 class QLabel;
@@ -133,6 +134,7 @@ class CWindow : public QMainWindow
     Q_OBJECT
 
     friend class MenuActionController;
+    friend class VolumeAttachmentController;
     friend class RenderBenchReplay;
     friend class AgentBridgeServer;
 
@@ -478,6 +480,7 @@ private:
     std::unique_ptr<FiberOverlayController> _fiberOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
+    std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
     std::unique_ptr<MenuActionController> _menuController;
     std::unique_ptr<SurfaceAffineTransformController> _surfaceAffineTransforms;
     // runner for command line tools

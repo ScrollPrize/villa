@@ -439,7 +439,7 @@ QJsonObject AgentBridgeServer::jobStatusJson(const JobRecord& job) const
     o["finishedAtMs"] = job.finishedAtMs == 0
                             ? QJsonValue(QJsonValue::Null)
                             : QJsonValue(static_cast<double>(job.finishedAtMs));
-    // Additive result body: obj for "catalog" jobs, null otherwise.
+    // Catalog and volume jobs may expose a structured terminal result.
     o["result"] = job.resultJson.isEmpty() ? QJsonValue(QJsonValue::Null)
                                            : QJsonValue(job.resultJson);
     return o;
@@ -835,7 +835,8 @@ QJsonObject AgentBridgeServer::handleJobCancel(const QJsonValue& params)
         _window->_cmdRunner->cancel();
     } else {
         // growth (QtConcurrent future, no cancel), flatten (self-owned job with no
-        // reachable cancel handle), catalog, autosave: no safe cancel authority.
+        // reachable cancel handle), catalog, volume, autosave: no safe cancel
+        // authority.
         QJsonObject data;
         data["kind"] = "job";
         data["reason"] = "not cancellable";
