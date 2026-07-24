@@ -117,6 +117,16 @@ private:
     struct SubmissionResult {
         bool submitted{false};
         QString error;
+
+        static SubmissionResult success()
+        {
+            return {.submitted = true};
+        }
+
+        static SubmissionResult failure(const QString& error)
+        {
+            return {.submitted = false, .error = error};
+        }
     };
 
     void writeSetting(const QString& key, const QVariant& value);

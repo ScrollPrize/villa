@@ -2243,7 +2243,8 @@ SegmentationLasagnaPanel::startAtlasOptimization(
 
     if (!validateLasagnaConfigPath(_atlasConfigFilePath, statusBar, presentation) ||
         !validateAtlasDirPath(_atlasDirPath, statusBar, presentation)) {
-        return {false, tr("Lasagna atlas configuration is invalid.")};
+        return SubmissionResult::failure(
+            tr("Lasagna atlas configuration is invalid."));
     }
 
     auto& mgr = LasagnaServiceManager::instance();
@@ -2251,12 +2252,12 @@ SegmentationLasagnaPanel::startAtlasOptimization(
         if (!mgr.isRunning()) {
             const QString msg = tr("External service not connected. Select a service or check host/port.");
             showStatus(msg, 5000);
-            return {false, msg};
+            return SubmissionResult::failure(msg);
         }
     } else if (!mgr.ensureServiceRunning()) {
         const QString msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
         showStatus(msg, 5000);
-        return {false, msg};
+        return SubmissionResult::failure(msg);
     }
 
     const QString dataInput = lasagnaDataInputPath();
@@ -2264,7 +2265,7 @@ SegmentationLasagnaPanel::startAtlasOptimization(
         const QString msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
         showStatus(msg, 5000);
         showLasagnaConfigError(msg, nullptr, 5000, presentation);
-        return {false, msg};
+        return SubmissionResult::failure(msg);
     }
 
     QFile f(_atlasConfigFilePath);
@@ -2273,7 +2274,7 @@ SegmentationLasagnaPanel::startAtlasOptimization(
             tr("Cannot read Lasagna config %1: %2")
                 .arg(_atlasConfigFilePath, f.errorString());
         showLasagnaConfigError(msg, statusBar, 7000, presentation);
-        return {false, msg};
+        return SubmissionResult::failure(msg);
     }
     QJsonParseError parseError;
     QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &parseError);
@@ -2283,13 +2284,13 @@ SegmentationLasagnaPanel::startAtlasOptimization(
                 .arg(parseError.offset)
                 .arg(parseError.errorString());
         showLasagnaConfigError(msg, statusBar, 7000, presentation);
-        return {false, msg};
+        return SubmissionResult::failure(msg);
     }
     if (!doc.isObject()) {
         const QString msg =
             tr("Invalid Lasagna config JSON: top-level value must be an object.");
         showLasagnaConfigError(msg, statusBar, 7000, presentation);
-        return {false, msg};
+        return SubmissionResult::failure(msg);
     }
     const QJsonObject config = doc.object();
 
@@ -2298,7 +2299,7 @@ SegmentationLasagnaPanel::startAtlasOptimization(
     const std::filesystem::path atlasDir(_atlasDirPath.toStdString());
     if (!buildAtlasRequestArtifacts(atlasDir, volpkgRootForState(state), &artifacts, &error)) {
         showLasagnaConfigError(error, statusBar, 7000, presentation);
-        return {false, error};
+        return SubmissionResult::failure(error);
     }
 
     QString outputDir;
@@ -2335,7 +2336,7 @@ SegmentationLasagnaPanel::startAtlasOptimization(
     mgr.startOptimization(request, outputDir);
     _submittedOutputNames.insert(outputName);
     showStatus(tr("Lasagna atlas optimization started. Output: %1").arg(outputName), 3000);
-    return {true, {}};
+    return SubmissionResult::success();
 }
 
 SegmentationLasagnaPanel::SubmissionResult
@@ -2368,7 +2369,8 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     const bool isNewModel = (launchMode == LasagnaMode::NewModel);
 
     if (!validateLasagnaConfigPath(configPath, statusBar, presentation)) {
-        return {false, tr("Lasagna configuration is invalid.")};
+        return SubmissionResult::failure(
+            tr("Lasagna configuration is invalid."));
     }
 
     if (mgr.isExternal()) {
@@ -2376,14 +2378,14 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
             auto msg = tr("External service not connected. Select a service or check host/port.");
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
-            return {false, msg};
+            return SubmissionResult::failure(msg);
         }
     } else {
         if (!mgr.ensureServiceRunning()) {
             auto msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
-            return {false, msg};
+            return SubmissionResult::failure(msg);
         }
     }
 
@@ -2448,7 +2450,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
         auto msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
         std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
         showStatus(msg, 5000);
-        return {false, msg};
+        return SubmissionResult::failure(msg);
     }
 
     QString outputDir;
@@ -2553,7 +2555,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
             auto msg = tr("Cannot read Lasagna config %1: %2")
                 .arg(configPath, f.errorString());
             showLasagnaConfigError(msg, statusBar, 7000, presentation);
-            return {false, msg};
+            return SubmissionResult::failure(msg);
         }
         configText = QString::fromUtf8(f.readAll()).trimmed();
     }
@@ -2565,12 +2567,12 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
                 .arg(parseError.offset)
                 .arg(parseError.errorString());
             showLasagnaConfigError(msg, statusBar, 7000, presentation);
-            return {false, msg};
+            return SubmissionResult::failure(msg);
         }
         if (!doc.isObject()) {
             auto msg = tr("Invalid Lasagna config JSON: top-level value must be an object.");
             showLasagnaConfigError(msg, statusBar, 7000, presentation);
-            return {false, msg};
+            return SubmissionResult::failure(msg);
         }
         config = doc.object();
     }
@@ -2608,7 +2610,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
             auto msg = tr("No focus position or seed point set. Place the cursor or enter a seed.");
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
-            return {false, msg};
+            return SubmissionResult::failure(msg);
         }
         cx = static_cast<int>(focus->p[0]);
         cy = static_cast<int>(focus->p[1]);
@@ -2704,7 +2706,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
         std::cerr << "[lasagna] " << msg.toStdString()
                   << " segment=" << segPath.string() << std::endl;
         showStatus(msg, 7000);
-        return {false, msg};
+        return SubmissionResult::failure(msg);
     }
 
     QJsonObject request;
@@ -2796,7 +2798,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
             auto msg = tr("Cannot pack selected tifxyz segment for Lasagna artifact sync.");
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
-            return {false, msg};
+            return SubmissionResult::failure(msg);
         }
 
         linkedSurfaces = linkedSurfacesFromMeta(segPath);
@@ -2876,7 +2878,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
             auto msg = tr("Cannot read model file: %1").arg(modelPath);
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
-            return {false, msg};
+            return SubmissionResult::failure(msg);
         }
         jobSpec[QStringLiteral("model")] = modelUpload[QStringLiteral("object")].toObject();
         appendUploadIfNew(modelUpload);
@@ -2925,7 +2927,7 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
         tr("Lasagna optimization started. Output: %1")
             .arg(outputName),
         3000);
-    return {true, {}};
+    return SubmissionResult::success();
 }
 
 // ---------------------------------------------------------------------------
