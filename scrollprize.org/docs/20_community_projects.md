@@ -62,6 +62,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
+- [LayerLens](https://github.com/streetquant/layerlens): CPU-first, label-free local papyrus-layer separability diagnostics for Vesuvius CT volumes. Produces OME-Zarr quality and scan-axis-persistence maps, self-contained HTML reports, and compact VC3D overlays. By streetquant
+
 - [vesuvius-c](https://github.com/ScrollPrize/villa/tree/main/vesuvius-c): C library for accessing Vesuvius Challenge data (deprecated — prefer the [`vesuvius`](https://github.com/scrollprize/vesuvius) Python library or VC3D).
 
 - [vesuvius-gui](https://github.com/jrudolph/vesuvius-gui) is a single binary GUI to render volumes and segments on-the-fly. By Johannes Rudolph
