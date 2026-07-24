@@ -5668,9 +5668,8 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
         updateAtlasSearchDocks();
         return fail(tr("Line annotation is not available."));
     }
-    // A live cancel flag means a search is in flight (created at launch, reset in
-    // the finished handler); the interactive run button is disabled then, so
-    // headless callers need this explicit guard.
+    // A live cancel flag means a search is in flight (created at launch and
+    // reset by the finished handler).
     if (_atlasSearchCancelFlag) {
         return fail(tr("An atlas object search is already running."));
     }
@@ -6632,114 +6631,112 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
 // Dialog-free atlas loading shared by the interactive and direct entry points.
 void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
 {
-    // Bare block preserves the original indentation from the interactive method's
-    // try-block.
-    {
-        if (!_atlasWorkspaceWindow || !_atlasViewer) {
-            createAtlasWorkspace();
-        }
-        auto vpkg = _state ? _state->vpkg() : nullptr;
-        if (!vpkg) {
-            throw std::runtime_error("No volume package is loaded");
-        }
-        const auto resolvedLasagna = resolvedLasagnaForState(_state);
-        if (!resolvedLasagna || resolvedLasagna->manifestPath.empty()) {
-            throw std::runtime_error(
-                "No Lasagna dataset matches the active volume; atlas pred-snap attachments are required");
-        }
-        const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
-        if (!std::filesystem::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna dataset does not exist");
-        }
-        const std::filesystem::path volpkgRoot = vpkg->path().empty()
-            ? std::filesystem::path(vpkg->getVolpkgDirectory())
-            : vpkg->path().parent_path();
-        auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
-        vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(
-                manifestPath,
-                vc::lasagna::LasagnaDatasetOpenOptions{
-                    resolvedLasagna->workingToBaseScale});
-        vc::lasagna::LasagnaNormalSampler sampler(dataset);
-        (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
-        atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
-        _currentAtlasDir = atlasDir;
-        _currentAtlasName = atlas.metadata.name;
-        if (_lineAnnotationController) {
-            _lineAnnotationController->setCurrentAtlasDirectory(_currentAtlasDir);
-        }
-        if (_segmentationWidget && _segmentationWidget->lasagnaPanel()) {
-            _segmentationWidget->lasagnaPanel()->setSelectedAtlasPath(
-                QString::fromStdString(atlasDir.string()));
-        }
-        const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
-        auto baseSurface = std::make_shared<QuadSurface>(basePath);
-        const auto* points = baseSurface->rawPointsPtr();
-        if (!points || points->empty() || points->cols <= 0) {
-            throw std::runtime_error("atlas base mesh has no valid grid");
-        }
-        const cv::Vec2f baseScale = baseSurface->scale();
-        if (!std::isfinite(baseScale[0]) || !std::isfinite(baseScale[1]) ||
-            baseScale[0] <= 0.0f || baseScale[1] <= 0.0f) {
-            throw std::runtime_error("atlas base mesh has invalid scale");
-        }
+    if (!_atlasWorkspaceWindow || !_atlasViewer) {
+        createAtlasWorkspace();
+    }
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        throw std::runtime_error("No volume package is loaded");
+    }
+    const auto resolvedLasagna = resolvedLasagnaForState(_state);
+    if (!resolvedLasagna || resolvedLasagna->manifestPath.empty()) {
+        throw std::runtime_error(
+            "No Lasagna dataset matches the active volume; atlas pred-snap attachments are required");
+    }
+    const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
+    if (!std::filesystem::exists(manifestPath)) {
+        throw std::runtime_error("Selected Lasagna dataset does not exist");
+    }
+    const std::filesystem::path volpkgRoot = vpkg->path().empty()
+        ? std::filesystem::path(vpkg->getVolpkgDirectory())
+        : vpkg->path().parent_path();
+    auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    vc::lasagna::LasagnaDataset dataset =
+        vc::lasagna::LasagnaDataset::open(
+            manifestPath,
+            vc::lasagna::LasagnaDatasetOpenOptions{
+                resolvedLasagna->workingToBaseScale});
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
+    atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    _currentAtlasDir = atlasDir;
+    _currentAtlasName = atlas.metadata.name;
+    if (_lineAnnotationController) {
+        _lineAnnotationController->setCurrentAtlasDirectory(_currentAtlasDir);
+    }
+    if (_segmentationWidget && _segmentationWidget->lasagnaPanel()) {
+        _segmentationWidget->lasagnaPanel()->setSelectedAtlasPath(
+            QString::fromStdString(atlasDir.string()));
+    }
+    const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
+    auto baseSurface = std::make_shared<QuadSurface>(basePath);
+    const auto* points = baseSurface->rawPointsPtr();
+    if (!points || points->empty() || points->cols <= 0) {
+        throw std::runtime_error("atlas base mesh has no valid grid");
+    }
+    const cv::Vec2f baseScale = baseSurface->scale();
+    if (!std::isfinite(baseScale[0]) || !std::isfinite(baseScale[1]) ||
+        baseScale[0] <= 0.0f || baseScale[1] <= 0.0f) {
+        throw std::runtime_error("atlas base mesh has invalid scale");
+    }
 
-        const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(*baseSurface);
-        (void)vc::atlas::layoutAtlasObjects(atlas, periodColumns);
-        const vc::atlas::AtlasDisplayRange displayRange =
-            vc::atlas::atlasDisplayRange(atlas, periodColumns);
-        std::shared_ptr<QuadSurface> displaySurface =
-            vc::atlas::repeatedAtlasDisplaySurface(*baseSurface,
-                                                   displayRange.unwrapCount,
-                                                   atlas.metadata.zeroWindingColumn);
-        displaySurface->id = ATLAS_INTERNAL_SURFACE_NAME;
-        if (_state) {
-            _state->setSurface(ATLAS_INTERNAL_SURFACE_NAME, displaySurface);
-        }
+    const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(*baseSurface);
+    (void)vc::atlas::layoutAtlasObjects(atlas, periodColumns);
+    const vc::atlas::AtlasDisplayRange displayRange =
+        vc::atlas::atlasDisplayRange(atlas, periodColumns);
+    std::shared_ptr<QuadSurface> displaySurface =
+        vc::atlas::repeatedAtlasDisplaySurface(*baseSurface,
+                                               displayRange.unwrapCount,
+                                               atlas.metadata.zeroWindingColumn);
+    displaySurface->id = ATLAS_INTERNAL_SURFACE_NAME;
+    if (_state) {
+        _state->setSurface(ATLAS_INTERNAL_SURFACE_NAME, displaySurface);
+    }
 
-        if (!_atlasOverlay) {
-            _atlasOverlay = std::make_unique<AtlasOverlayController>(this);
+    if (!_atlasOverlay) {
+        _atlasOverlay = std::make_unique<AtlasOverlayController>(this);
+    }
+    if (_atlasViewer) {
+        _atlasOverlay->attachViewer(_atlasViewer);
+    }
+    _atlasOverlay->setAtlas(atlas, displaySurface, displayRange);
+    clearAtlasSearchPreviewState();
+    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
         }
-        if (_atlasViewer) {
-            _atlasOverlay->attachViewer(_atlasViewer);
+        if (auto* tree = dock->widget()->findChild<QTreeWidget*>(
+                QStringLiteral("atlasSearchResultTree"))) {
+            tree->clear();
         }
-        _atlasOverlay->setAtlas(atlas, displaySurface, displayRange);
-        clearAtlasSearchPreviewState();
-        for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-            if (!dock || !dock->widget()) {
-                continue;
-            }
-            if (auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"))) {
-                tree->clear();
-            }
-            if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
-                progress->setRange(0, 100);
-                progress->setValue(0);
-                progress->setFormat(QString());
-            }
+        if (auto* progress = dock->widget()->findChild<QProgressBar*>(
+                QStringLiteral("atlasSearchProgressBar"))) {
+            progress->setRange(0, 100);
+            progress->setValue(0);
+            progress->setFormat(QString());
         }
+    }
 
-        if (_atlasViewer) {
-            if (const auto bounds = _atlasOverlay->surfaceBounds()) {
-                _atlasViewer->centerOnSurfacePoint({
-                    static_cast<float>(bounds->center().x()),
-                    static_cast<float>(bounds->center().y()),
-                }, false);
-            } else {
-                _atlasViewer->fitSurfaceInView();
-            }
+    if (_atlasViewer) {
+        if (const auto bounds = _atlasOverlay->surfaceBounds()) {
+            _atlasViewer->centerOnSurfacePoint({
+                static_cast<float>(bounds->center().x()),
+                static_cast<float>(bounds->center().y()),
+            }, false);
+        } else {
+            _atlasViewer->fitSurfaceInView();
         }
-        refreshAtlasOverviewDocks();
-        updateAtlasFiberDocks();
-        updateAtlasSearchDocks();
-        if (_workspaceTabs && _atlasWorkspaceWindow) {
-            _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
-        }
-        if (statusBar()) {
-            showStatusBarMessage(tr("Displayed atlas %1")
-                                         .arg(QString::fromStdString(atlas.metadata.name)),
-                                     3000);
-        }
+    }
+    refreshAtlasOverviewDocks();
+    updateAtlasFiberDocks();
+    updateAtlasSearchDocks();
+    if (_workspaceTabs && _atlasWorkspaceWindow) {
+        _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
+    }
+    if (statusBar()) {
+        showStatusBarMessage(tr("Displayed atlas %1")
+                                 .arg(QString::fromStdString(atlas.metadata.name)),
+                             3000);
     }
 }
 

@@ -2963,113 +2963,109 @@ bool LineAnnotationController::createAtlasFromFiberHeadless(uint64_t fiberId,
 
 fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
 {
-    // NOTE: body kept verbatim from the pre-split createAtlasFromFiber try
-    // block (indentation preserved); failures propagate as std::exception.
-    {
-        auto vpkg = _state ? _state->vpkg() : nullptr;
-        if (!vpkg) {
-            throw std::runtime_error("No volume package is loaded");
-        }
-        const fs::path volpkgRoot = vpkg->path().empty()
-            ? fs::path(vpkg->getVolpkgDirectory())
-            : vpkg->path().parent_path();
-        if (volpkgRoot.empty()) {
-            throw std::runtime_error("The current volume package has no root directory");
-        }
-
-        auto fiberIt = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
-            return fiber.id == fiberId;
-        });
-        if (fiberIt == _fibers.end()) {
-            throw std::runtime_error("Selected fiber is not available");
-        }
-        if (fiberIt->linePoints.empty()) {
-            throw std::runtime_error("Selected fiber has no line points");
-        }
-
-        const auto resolvedLasagna = resolveAlignmentMetricsManifestPath();
-        if (!resolvedLasagna)
-            throw std::runtime_error("No Lasagna dataset selected");
-        const fs::path manifestPath = resolvedLasagna->first;
-        if (manifestPath.empty() || !fs::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna dataset does not exist");
-        }
-        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
-            manifestPath, {resolvedLasagna->second});
-        vc::lasagna::LasagnaNormalSampler sampler(dataset);
-        const fs::path initShellDir =
-            vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
-        atlasDebug("selected_manifest=" + manifestPath.string());
-        atlasDebug("resolved_init_shell_dir=" + initShellDir.string());
-
-        std::vector<vc::atlas::SurfaceCandidate> candidates =
-            vc::atlas::loadInitShellCandidates(initShellDir);
-        if (atlasDebugEnabled()) {
-            for (const auto& candidate : candidates) {
-                const auto* points = candidate.surface ? candidate.surface->rawPointsPtr() : nullptr;
-                atlasDebug("candidate_shell path=" + candidate.path.string() +
-                           " grid=" + (points
-                               ? std::to_string(points->cols) + "x" + std::to_string(points->rows)
-                               : std::string("invalid")));
-            }
-        }
-
-        vc::atlas::FiberInput input;
-        std::error_code relativeEc;
-        input.fiberPath = fs::relative(fiberPath(*fiberIt), volpkgRoot, relativeEc);
-        if (relativeEc || input.fiberPath.empty()) {
-            input.fiberPath = relativeFiberPath(*fiberIt);
-        }
-        input.controlPoints = fiberIt->controlPoints;
-        input.linePoints = fiberIt->linePoints;
-        vc::atlas::validateFiberInputControlPoints(input);
-        atlasDebug("fiber line_points=" + std::to_string(input.linePoints.size()) +
-                   " control_points=" + std::to_string(input.controlPoints.size()));
-
-        SurfacePatchIndex shellIndex;
-        std::vector<SurfacePatchIndex::SurfacePtr> candidateSurfaces;
-        candidateSurfaces.reserve(candidates.size());
-        for (const auto& candidate : candidates) {
-            if (candidate.surface) {
-                candidateSurfaces.push_back(candidate.surface);
-            }
-        }
-        shellIndex.rebuild(candidateSurfaces);
-        const auto selection = vc::atlas::selectBaseSurfaceBySeedRay(
-            input, candidates, shellIndex, sampler);
-        auto& selected = candidates.at(static_cast<size_t>(selection.surfaceIndex));
-        const int zeroWindingColumn = vc::atlas::computeZeroWindingColumn(*selected.surface);
-        atlasDebug("zero_winding_column=" + std::to_string(zeroWindingColumn));
-
-        SurfacePatchIndex baseIndex;
-        baseIndex.rebuild({selected.surface});
-        auto mapping = vc::atlas::mapFiberToBaseSurface(input, *selected.surface, baseIndex, sampler);
-
-        const std::string atlasName = "fiber_" + std::to_string(fiberId);
-        const fs::path atlasDir = vc::atlas::uniqueAtlasDirectory(volpkgRoot, atlasName);
-        auto atlas = vc::atlas::createSingleFiberAtlas(volpkgRoot,
-                                                       atlasDir.filename().string(),
-                                                       input,
-                                                       selected,
-                                                       zeroWindingColumn,
-                                                       std::move(mapping));
-        const auto coordinateIdentity = coordinateIdentityForState(_state);
-        copyCoordinateIdentityToJson(
-            atlas.metadata.coordinateMetadata, coordinateIdentity);
-        vc3d::opendata::copyCoordinateIdentityToSurface(
-            *selected.surface, coordinateIdentity);
-        vc::atlas::saveAtlasBaseMeshCopy(*selected.surface,
-                                         atlasDir / atlas.metadata.baseMeshPath);
-        atlas.save(atlasDir);
-        if (sampler.hasPredDtChannel() && !atlas.fibers.empty()) {
-            (void)vc::atlas::ensureAtlasPredSnapSet(atlasDir,
-                                                    input,
-                                                    atlas.fibers.front(),
-                                                    *selected.surface,
-                                                    sampler);
-        }
-        return atlasDir;
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        throw std::runtime_error("No volume package is loaded");
     }
+    const fs::path volpkgRoot = vpkg->path().empty()
+        ? fs::path(vpkg->getVolpkgDirectory())
+        : vpkg->path().parent_path();
+    if (volpkgRoot.empty()) {
+        throw std::runtime_error("The current volume package has no root directory");
+    }
+
+    auto fiberIt = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
+        return fiber.id == fiberId;
+    });
+    if (fiberIt == _fibers.end()) {
+        throw std::runtime_error("Selected fiber is not available");
+    }
+    if (fiberIt->linePoints.empty()) {
+        throw std::runtime_error("Selected fiber has no line points");
+    }
+
+    const auto resolvedLasagna = resolveAlignmentMetricsManifestPath();
+    if (!resolvedLasagna)
+        throw std::runtime_error("No Lasagna dataset selected");
+    const fs::path manifestPath = resolvedLasagna->first;
+    if (manifestPath.empty() || !fs::exists(manifestPath)) {
+        throw std::runtime_error("Selected Lasagna dataset does not exist");
+    }
+    vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
+        manifestPath, {resolvedLasagna->second});
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    const fs::path initShellDir =
+        vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
+    atlasDebug("selected_manifest=" + manifestPath.string());
+    atlasDebug("resolved_init_shell_dir=" + initShellDir.string());
+
+    std::vector<vc::atlas::SurfaceCandidate> candidates =
+        vc::atlas::loadInitShellCandidates(initShellDir);
+    if (atlasDebugEnabled()) {
+        for (const auto& candidate : candidates) {
+            const auto* points = candidate.surface ? candidate.surface->rawPointsPtr() : nullptr;
+            atlasDebug("candidate_shell path=" + candidate.path.string() +
+                       " grid=" + (points
+                           ? std::to_string(points->cols) + "x" + std::to_string(points->rows)
+                           : std::string("invalid")));
+        }
+    }
+
+    vc::atlas::FiberInput input;
+    std::error_code relativeEc;
+    input.fiberPath = fs::relative(fiberPath(*fiberIt), volpkgRoot, relativeEc);
+    if (relativeEc || input.fiberPath.empty()) {
+        input.fiberPath = relativeFiberPath(*fiberIt);
+    }
+    input.controlPoints = fiberIt->controlPoints;
+    input.linePoints = fiberIt->linePoints;
+    vc::atlas::validateFiberInputControlPoints(input);
+    atlasDebug("fiber line_points=" + std::to_string(input.linePoints.size()) +
+               " control_points=" + std::to_string(input.controlPoints.size()));
+
+    SurfacePatchIndex shellIndex;
+    std::vector<SurfacePatchIndex::SurfacePtr> candidateSurfaces;
+    candidateSurfaces.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        if (candidate.surface) {
+            candidateSurfaces.push_back(candidate.surface);
+        }
+    }
+    shellIndex.rebuild(candidateSurfaces);
+    const auto selection = vc::atlas::selectBaseSurfaceBySeedRay(
+        input, candidates, shellIndex, sampler);
+    auto& selected = candidates.at(static_cast<size_t>(selection.surfaceIndex));
+    const int zeroWindingColumn = vc::atlas::computeZeroWindingColumn(*selected.surface);
+    atlasDebug("zero_winding_column=" + std::to_string(zeroWindingColumn));
+
+    SurfacePatchIndex baseIndex;
+    baseIndex.rebuild({selected.surface});
+    auto mapping = vc::atlas::mapFiberToBaseSurface(input, *selected.surface, baseIndex, sampler);
+
+    const std::string atlasName = "fiber_" + std::to_string(fiberId);
+    const fs::path atlasDir = vc::atlas::uniqueAtlasDirectory(volpkgRoot, atlasName);
+    auto atlas = vc::atlas::createSingleFiberAtlas(volpkgRoot,
+                                                   atlasDir.filename().string(),
+                                                   input,
+                                                   selected,
+                                                   zeroWindingColumn,
+                                                   std::move(mapping));
+    const auto coordinateIdentity = coordinateIdentityForState(_state);
+    copyCoordinateIdentityToJson(
+        atlas.metadata.coordinateMetadata, coordinateIdentity);
+    vc3d::opendata::copyCoordinateIdentityToSurface(
+        *selected.surface, coordinateIdentity);
+    vc::atlas::saveAtlasBaseMeshCopy(*selected.surface,
+                                     atlasDir / atlas.metadata.baseMeshPath);
+    atlas.save(atlasDir);
+    if (sampler.hasPredDtChannel() && !atlas.fibers.empty()) {
+        (void)vc::atlas::ensureAtlasPredSnapSet(atlasDir,
+                                                input,
+                                                atlas.fibers.front(),
+                                                *selected.surface,
+                                                sampler);
+    }
+    return atlasDir;
 }
 
 void LineAnnotationController::addFiberToPointCollection(uint64_t fiberId)
