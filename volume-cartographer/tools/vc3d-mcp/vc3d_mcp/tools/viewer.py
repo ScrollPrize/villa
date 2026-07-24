@@ -85,7 +85,10 @@ async def vc3d_click(
     point / set focus).
 
     position: {"x","y","z"} in volume space (default), or {"x","y"} in scene
-    space when space="scene".
+    space when space="scene". A volume point must lie on the viewer's current
+    view or the click fails -32003 ("point is not on this viewer's view"); if
+    you lack a known on-view point, vc3d_center_viewer there first or use
+    space="scene" with on-screen pixel coordinates.
     button: "left" | "right" | "middle".
     modifiers: any of "shift", "ctrl", "alt", "meta", "keypad".
 

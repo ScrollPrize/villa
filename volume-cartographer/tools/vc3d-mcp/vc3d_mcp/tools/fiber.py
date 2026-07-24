@@ -32,7 +32,12 @@ async def vc3d_fiber_launch(
 
     position: {"x","y","z"} in volume space (default) or {"x","y"} scene-space
     when space="scene". The point must lie on the target viewer's current
-    view (same round-trip rule as vc3d_click). This opens the workspace and
+    view (same round-trip rule as vc3d_click); guessed volume xyz that is not
+    on the visible slice fails -32003 "point is not on this viewer's view". If
+    you do not already have an on-view point, either vc3d_center_viewer on the
+    target first, or pass space="scene" with on-screen pixel coordinates (e.g.
+    near the visible pane center) rather than guessing volume xyz. This opens
+    the workspace and
     returns {"launched": true} even with no Lasagna dataset -- but TRACING
     needs one: seeding and every control point optimize against a
     manifest-backed Lasagna dataset (a "lasagna"-kind catalog representation)
