@@ -165,6 +165,9 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
     - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput.
+
+- [PHerc1203 Readability Atlas](https://github.com/robertlangdonn/pherc1203-readability-atlas) by Prasad Khake. A CPU-only diagnostic that measures, per location in a scroll's CT volume, whether the geometry can isolate a readable single papyrus sheet in the ink model's 62-layer depth window. Calibrated against the already-read PHerc1667 (which lights up ~90x more than sealed PHerc1203), it publishes ranked candidate dig-site coordinates so segmentation can target the rare readable pockets, and flags where public surfaces sit in packed dead zones. [Write-up](https://prasadkhake.com/blog/pherc1203-readability-atlas).
+    - [Readability Gate](https://github.com/robertlangdonn/vesuvius-readability-gate) by Prasad Khake. The single-surface version: a CPU acceptance test for whether a rendered segment will yield legible ink before spending GPU time.
       
 ### 📦 Materials
 
