@@ -124,6 +124,7 @@ class InteractiveFitSession:
             distributed_initialized = True
 
             config = dict(fitter.default_config)
+            checkpoint_profile_config = None
             if self.paths.checkpoint:
                 from checkpoint_io import load_checkpoint_cpu
                 checkpoint_config = load_checkpoint_cpu(self.paths.checkpoint)
@@ -141,6 +142,10 @@ class InteractiveFitSession:
                             and key in config
                         }
                         config.update(durable)
+                        # The session-scoped Default profile must initially
+                        # reproduce the checkpoint, not a second
+                        # z-range/DDP-scaled or input-gated derivative of it.
+                        checkpoint_profile_config = copy.deepcopy(durable)
                 finally:
                     # This first load exists only to resolve configuration.  Do
                     # not retain a complete model + optimiser checkpoint for the
@@ -149,24 +154,31 @@ class InteractiveFitSession:
             unknown = sorted(set(self.run_config.config) - set(config))
             if unknown:
                 raise ValueError(f"Unknown advanced config keys: {unknown}")
-            # Default is a session-scoped baseline, not the final active
-            # configuration.  It follows the selected input availability,
-            # because those switches determine which samplers can actually be
-            # active, but deliberately excludes every other client override.
-            default_advanced_config = copy.deepcopy(config)
-            for key in (
-                    'use_verified_patches', 'use_unverified_patches',
-                    'use_normals', 'use_surf_sdt', 'use_tracks',
-                    'use_gradient_magnitude', 'use_fibers'):
-                if key in self.run_config.config:
-                    default_advanced_config[key] = self.run_config.config[key]
+            if checkpoint_profile_config is not None:
+                default_advanced_config = checkpoint_profile_config
+            else:
+                # Without a checkpoint, Default is the Python baseline adapted
+                # to the inputs selected for this session.
+                default_advanced_config = copy.deepcopy(config)
+                for key in (
+                        'use_verified_patches', 'use_unverified_patches',
+                        'use_normals', 'use_surf_sdt', 'use_tracks',
+                        'use_gradient_magnitude', 'use_fibers'):
+                    if key in self.run_config.config:
+                        default_advanced_config[key] = self.run_config.config[key]
             # Explicit sample-count overrides are literal active counts. This
             # lets VC3D round-trip the host's post-scaling values through a
             # reload without applying the z-range/DDP transforms twice.
+            # Checkpoint cfg values are resolved fitter values too, so give
+            # their counts the same treatment.
             explicit_sampling_counts = {
-                key: value for key, value in self.run_config.config.items()
+                key: value for key, value in (checkpoint_profile_config or {}).items()
                 if key in RUN_MUTABLE_SAMPLING_KEYS
             }
+            explicit_sampling_counts.update({
+                key: value for key, value in self.run_config.config.items()
+                if key in RUN_MUTABLE_SAMPLING_KEYS
+            })
             config.update(self.run_config.config)
             count_keys = (
                 'num_patches_per_step', 'num_patches_per_step_for_dt',
@@ -179,13 +191,19 @@ class InteractiveFitSession:
                 'min_spacing_independent_samples',
                 'regularisation_num_points', 'shell_num_samples',
             )
-            for prepared in (default_advanced_config, config):
+            scale_counts_for_z_range(
+                config, self.run_config.z_begin, self.run_config.z_end,
+                9500, count_keys, floors=SAMPLING_COUNT_FLOORS)
+            split_counts_across_ranks(config, count_keys)
+            if checkpoint_profile_config is None:
                 scale_counts_for_z_range(
-                    prepared, self.run_config.z_begin, self.run_config.z_end,
-                    9500, count_keys, floors=SAMPLING_COUNT_FLOORS)
-                split_counts_across_ranks(prepared, count_keys)
+                    default_advanced_config, self.run_config.z_begin,
+                    self.run_config.z_end, 9500, count_keys,
+                    floors=SAMPLING_COUNT_FLOORS)
+                split_counts_across_ranks(default_advanced_config, count_keys)
             config.update(explicit_sampling_counts)
-            apply_optional_input_selection(default_advanced_config)
+            if checkpoint_profile_config is None:
+                apply_optional_input_selection(default_advanced_config)
             apply_optional_input_selection(config)
             self.requested_config = dict(config)
             with self._condition:

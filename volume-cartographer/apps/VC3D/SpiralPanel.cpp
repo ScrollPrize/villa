@@ -1268,6 +1268,12 @@ QJsonObject SpiralPanel::runAdvancedConfig() const
     for (const QString& key : _runConfigKeys) {
         if (all.contains(key)) config.insert(key, all.value(key));
     }
+    // Optional-input gating needs the session-scoped spacing mode even though
+    // that key itself is not mutable at a Run boundary. It is removed again
+    // below before the request is sent.
+    const QString spacingModeKey = QStringLiteral("dense_spacing_mode");
+    if (all.contains(spacingModeKey))
+        config.insert(spacingModeKey, all.value(spacingModeKey));
     if (_runConfigKeys.contains(QStringLiteral("save_png_visualizations")))
         config[QStringLiteral("save_png_visualizations")] =
             _savePngVisualizations->isChecked();
@@ -1417,7 +1423,7 @@ void SpiralPanel::applyOptionalInputConfig(QJsonObject& config,
     }
 
     const QString spacingMode =
-        config.value(QStringLiteral("dense_spacing_mode")).toString(QStringLiteral("grad_mag"));
+        config.value(QStringLiteral("dense_spacing_mode")).toString(QStringLiteral("phase"));
     if (!sdt || !normals) {
         zero({"loss_weight_dense_spacing_count", "loss_weight_dense_spacing_density",
               "loss_weight_dense_attachment",
