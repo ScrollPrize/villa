@@ -17,6 +17,40 @@ class _CatalogResources(TypedDict, total=False):
 
 
 @mcp.tool()
+async def vc3d_create_project(
+    path: str,
+    volume: str,
+    name: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Create a .volpkg.json project that references one existing zarr volume.
+    This writes the project but does not open it; call vc3d_open_volume with the
+    returned path when it should become the active project.
+
+    path must be an absolute output path on the filesystem where VC3D runs.
+    volume must be an absolute local zarr path on that same filesystem, or a
+    remote zarr URL. In the containerized development setup, use paths visible
+    inside the container (typically /work/...), not host-only paths. Missing
+    parent directories and the .volpkg.json suffix are added automatically.
+    name and tags customize the project entry; overwrite must be true to
+    replace an existing output file.
+    """
+    return await _call(
+        "project.create",
+        _strip_none(
+            {
+                "path": path,
+                "volume": volume,
+                "name": name,
+                "tags": tags,
+                "overwrite": overwrite,
+            }
+        ),
+    )
+
+
+@mcp.tool()
 async def vc3d_open_volume(path: str, volume_id: Optional[str] = None) -> dict[str, Any]:
     """Open a volume package (.volpkg / .volpkg.json / zarr project) and
     optionally select a volume id."""

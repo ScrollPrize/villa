@@ -224,10 +224,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 116
-            and coverage.get("registered") == 116
+            and coverage.get("described") == 117
+            and coverage.get("registered") == 117
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 116
+            and len(snapshot["methods"]) == 117
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -387,6 +387,144 @@ def check_canvas_normalization(client: BridgeClient, results: Results) -> None:
     except Exception as error:  # noqa: BLE001
         results.record(
             "canvas_drag_step_clamp",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+
+def check_project_create(
+    client: BridgeClient,
+    results: Results,
+    root: Path,
+) -> None:
+    volume = root / "volumes" / "vol1"
+    requested = root / "created" / "agent-project"
+    created = requested.with_suffix(".volpkg.json")
+
+    try:
+        before, _ = client.call("state.get", {}, timeout=10.0)
+        result, _ = client.call(
+            "project.create",
+            {
+                "path": str(requested),
+                "volume": str(volume),
+                "tags": ["source:smoke"],
+            },
+            timeout=10.0,
+        )
+        after, _ = client.call("state.get", {}, timeout=10.0)
+        document = json.loads(created.read_text())
+        volume_entry = document.get("volumes", [{}])[0]
+        valid = (
+            result == {
+                "path": str(created),
+                "name": "agent-project",
+                "volume": str(volume),
+            }
+            and document.get("name") == "agent-project"
+            and document.get("version") == 1
+            and volume_entry == {
+                "location": str(volume),
+                "tags": ["source:smoke"],
+            }
+            and document.get("segments") == []
+            and document.get("normal_grids") == []
+            and document.get("lasagna_datasets") == []
+            and after.get("vpkg") == before.get("vpkg")
+        )
+        results.record(
+            "project_create",
+            valid,
+            f"path={result.get('path')} session_unchanged="
+            f"{after.get('vpkg') == before.get('vpkg')}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "project_create",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+        return
+
+    try:
+        client.call(
+            "project.create",
+            {"path": str(created), "volume": str(volume)},
+            timeout=10.0,
+        )
+        results.record(
+            "project_create_overwrite_guard",
+            False,
+            "expected an error, got a result",
+        )
+    except BridgeError as error:
+        results.record(
+            "project_create_overwrite_guard",
+            error.code == -32005,
+            f"returned code={error.code}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "project_create_overwrite_guard",
+            False,
+            f"unexpected {type(error).__name__}: {error}",
+        )
+
+    invalid_output = root / "created" / "invalid-volume"
+    try:
+        client.call(
+            "project.create",
+            {
+                "path": str(invalid_output),
+                "volume": str(root / "missing.zarr"),
+            },
+            timeout=10.0,
+        )
+        results.record(
+            "project_create_invalid_volume",
+            False,
+            "expected an error, got a result",
+        )
+    except BridgeError as error:
+        detail = error.data.get("detail", "")
+        results.record(
+            "project_create_invalid_volume",
+            error.code == -32007
+            and error.data.get("kind") == "volume"
+            and bool(detail)
+            and not invalid_output.with_suffix(".volpkg.json").exists(),
+            f"returned code={error.code} detail={detail!r}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "project_create_invalid_volume",
+            False,
+            f"unexpected {type(error).__name__}: {error}",
+        )
+
+    ok, detail = expect_param_error(
+        client,
+        "project.create",
+        {"path": "relative/project", "volume": str(volume)},
+        "path",
+    )
+    results.record("project_create_absolute_path", ok, detail)
+
+    try:
+        opened, _ = client.call(
+            "volume.open",
+            {"path": str(created)},
+            timeout=10.0,
+        )
+        results.record(
+            "project_create_then_open",
+            opened.get("opened") is True
+            and "vol1" in opened.get("volumeIds", []),
+            f"opened={opened.get('opened')} volumeIds={opened.get('volumeIds')}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "project_create_then_open",
             False,
             f"{type(error).__name__}: {error}",
         )
@@ -766,6 +904,7 @@ def main() -> int:
             check_canvas_normalization(client, results)
 
             check_c4(client, results, str(volpkg), str(broken_volpkg))
+            check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)
             check_c2_suffix_bypass(sock_path, results)
             check_c3_live_probe(

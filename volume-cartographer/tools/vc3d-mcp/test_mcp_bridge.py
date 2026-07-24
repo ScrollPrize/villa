@@ -41,7 +41,10 @@ from vc3d_mcp.bridge_client import (  # noqa: E402
 )
 from vc3d_mcp import core  # noqa: E402
 from vc3d_mcp.tools.lasagna import vc3d_lasagna_start_optimization  # noqa: E402
-from vc3d_mcp.tools.catalog_volume import vc3d_list_volumes  # noqa: E402
+from vc3d_mcp.tools.catalog_volume import (  # noqa: E402
+    vc3d_create_project,
+    vc3d_list_volumes,
+)
 from vc3d_mcp.tools.misc import (  # noqa: E402
     vc3d_cancel_job,
     vc3d_ping,
@@ -350,6 +353,52 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         result = await vc3d_list_volumes()
         self.assertEqual(result["volumeIds"], ["vol-a", "vol-b"])
         self.assertEqual(result["currentVolumeId"], "vol-a")
+
+    async def test_vc3d_create_project_forwards_defaults_and_returns_created_path(
+        self,
+    ) -> None:
+        result = await vc3d_create_project("/tmp/new-project", "/tmp/volume")
+        self.assertEqual(
+            result,
+            {
+                "path": "/tmp/new-project.volpkg.json",
+                "name": "new-project",
+                "volume": "/tmp/volume",
+            },
+        )
+        self.assertEqual(
+            self.fake_server.received_requests[-1]["params"],
+            {
+                "path": "/tmp/new-project",
+                "volume": "/tmp/volume",
+                "overwrite": False,
+            },
+        )
+
+    async def test_vc3d_create_project_forwards_optional_values(self) -> None:
+        await vc3d_create_project(
+            "/tmp/new-project.volpkg.json",
+            "https://example.test/volume.zarr",
+            name="Example",
+            tags=["source:test"],
+            overwrite=True,
+        )
+        self.assertEqual(
+            self.fake_server.received_requests[-1]["params"],
+            {
+                "path": "/tmp/new-project.volpkg.json",
+                "volume": "https://example.test/volume.zarr",
+                "name": "Example",
+                "tags": ["source:test"],
+                "overwrite": True,
+            },
+        )
+
+    async def test_vc3d_create_project_preserves_bridge_type_errors(self) -> None:
+        with self.assertRaises(BridgeError) as ctx:
+            await vc3d_create_project(123, "/tmp/volume")  # type: ignore[arg-type]
+        self.assertEqual(ctx.exception.code, -32602)
+        self.assertEqual(ctx.exception.data["param"], "path")
 
     async def test_vc3d_delete_segment_confirm_true_forwarded(self) -> None:
         result = await vc3d_delete_segment("seg-ready", confirm=True)

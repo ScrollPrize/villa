@@ -1965,6 +1965,45 @@
         "type": "object"
       }
     },
+    "project.create": {
+      "errors": [
+        -32602,
+        -32007,
+        -32005,
+        -32010
+      ],
+      "mcp": {
+        "tool": "vc3d_create_project"
+      },
+      "params": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "overwrite": {
+            "default": false,
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "volume": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "volume"
+        ],
+        "type": "object"
+      }
+    },
     "render.tifxyz": {
       "errors": [
         -32602,

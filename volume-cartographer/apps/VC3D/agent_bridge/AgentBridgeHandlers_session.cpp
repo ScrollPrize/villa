@@ -12,8 +12,10 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <filesystem>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <unordered_set>
 #include <vector>
 
@@ -603,6 +605,101 @@ QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
 // ---------------------------------------------------------------------------
 // Project/catalog opening
 // ---------------------------------------------------------------------------
+
+QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
+{
+    namespace fs = std::filesystem;
+
+    const QJsonObject p = params.toObject();
+    QString output = p.value("path").toString();
+    const QString volume = p.value("volume").toString();
+    if (output.trimmed().isEmpty()) {
+        QJsonObject data{{"param", "path"}};
+        throw AgentBridgeError{-32602, "path must not be blank", data};
+    }
+    if (volume.trimmed().isEmpty()) {
+        QJsonObject data{{"param", "volume"}};
+        throw AgentBridgeError{-32602, "volume must not be blank", data};
+    }
+    if (!output.endsWith(QStringLiteral(".volpkg.json"), Qt::CaseInsensitive))
+        output += QStringLiteral(".volpkg.json");
+
+    fs::path outputPath = fs::path(output.toStdString()).lexically_normal();
+    if (!outputPath.is_absolute()) {
+        QJsonObject data{{"param", "path"}};
+        throw AgentBridgeError{-32602, "path must be absolute", data};
+    }
+
+    const std::string volumeLocation = volume.toStdString();
+    if (!vc::project::isLocationRemote(volumeLocation) &&
+        !vc::project::resolveLocalPath(volumeLocation).is_absolute()) {
+        QJsonObject data{{"param", "volume"}};
+        throw AgentBridgeError{-32602, "local volume path must be absolute", data};
+    }
+
+    std::error_code existsError;
+    const bool outputExists = fs::exists(outputPath, existsError);
+    if (existsError) {
+        QJsonObject data{{"detail", QString::fromStdString(existsError.message())}};
+        throw AgentBridgeError{-32005, "Could not inspect output path", data};
+    }
+    if (outputExists && !p.value("overwrite").toBool(false)) {
+        QJsonObject data{{"path", QString::fromStdString(outputPath.string())}};
+        throw AgentBridgeError{
+            -32005,
+            "output file already exists; pass overwrite=true to replace",
+            data,
+        };
+    }
+
+    const std::string validationError =
+        vc::project::validateLocation(vc::project::Category::Volumes, volumeLocation);
+    if (!validationError.empty()) {
+        QJsonObject data{
+            {"detail", QString::fromStdString(validationError)},
+            {"kind", "volume"},
+        };
+        throw AgentBridgeError{-32007, "Invalid volume location", data};
+    }
+
+    QString projectName;
+    if (p.contains("name")) {
+        projectName = p.value("name").toString();
+    } else {
+        projectName = QString::fromStdString(outputPath.filename().string());
+        projectName.chop(QStringLiteral(".volpkg.json").size());
+        if (projectName.isEmpty())
+            projectName = QStringLiteral("Untitled");
+    }
+
+    std::vector<std::string> tags;
+    const QJsonArray tagValues = p.value("tags").toArray();
+    tags.reserve(tagValues.size());
+    for (const QJsonValue& tag : tagValues)
+        tags.push_back(tag.toString().toStdString());
+
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    auto package = VolumePkg::newDetached(options);
+    package->setName(projectName.toStdString());
+    if (!package->addVolumeEntry(volumeLocation, std::move(tags)))
+        throw AgentBridgeError{-32010, "Could not add volume to project", {}};
+
+    try {
+        package->save(outputPath);
+    } catch (const std::exception& error) {
+        QJsonObject data{{"detail", QString::fromUtf8(error.what())}};
+        throw AgentBridgeError{-32005, "Project write failed", data};
+    }
+
+    QJsonObject result;
+    result["path"] = QString::fromStdString(outputPath.string());
+    result["name"] = projectName;
+    result["volume"] =
+        QString::fromStdString(package->volumeEntries().front().location);
+    return result;
+}
+
 
 QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
 {

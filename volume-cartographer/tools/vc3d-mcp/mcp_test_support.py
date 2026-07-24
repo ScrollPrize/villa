@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import os
+from pathlib import Path
 
 # A minimal valid 1x1 opaque-red PNG (matches the on-the-wire "base64" the real
 # screenshot.capture bridge method returns for an inline, no-filePath capture).
@@ -363,6 +364,30 @@ class FakeAgentBridgeServer:
                     result={"cancelRequested": True, "jobId": resolved,
                             "source": source or "growth",
                             "kind": self._job_kinds.get(resolved, "segmentation.grow")},
+                )
+        elif method == "project.create":
+            path = params.get("path")
+            volume = params.get("volume")
+            if not isinstance(path, str):
+                await self._reply(
+                    writer,
+                    req_id,
+                    error={
+                        "code": -32602,
+                        "message": "path has the wrong type",
+                        "data": {"param": "path"},
+                    },
+                )
+            else:
+                if not path.lower().endswith(".volpkg.json"):
+                    path += ".volpkg.json"
+                name = params.get("name") or Path(path).name.removesuffix(
+                    ".volpkg.json"
+                )
+                await self._reply(
+                    writer,
+                    req_id,
+                    result={"path": path, "name": name, "volume": volume},
                 )
         elif method == "volume.list":
             await self._reply(

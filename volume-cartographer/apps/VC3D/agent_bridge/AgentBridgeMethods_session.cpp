@@ -163,6 +163,23 @@ void AgentBridgeServer::registerSessionHandlers()
 
     registerMethod(
         {
+            .name = QStringLiteral("project.create"),
+            .params = {
+                Params::requiredString(QStringLiteral("path")),
+                Params::requiredString(QStringLiteral("volume")),
+                Params::optionalString(QStringLiteral("name")),
+                Params::optionalArray(
+                    QStringLiteral("tags"),
+                    AgentBridgeParamType::String),
+                Params::optionalBoolean(QStringLiteral("overwrite"), false),
+            },
+            .errors = {-32602, -32007, -32005, -32010},
+            .mcp = mcp(QStringLiteral("vc3d_create_project")),
+        },
+        [this](const QJsonValue& p) { return handleProjectCreate(p); });
+
+    registerMethod(
+        {
             .name = QStringLiteral("volume.open"),
             .params = {
                 Params::requiredString(QStringLiteral("path")),
