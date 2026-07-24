@@ -65,6 +65,8 @@ public:
     // Download checkpoint: creates a checkpoint on the service, registers it
     // as an artifact, and streams it to a VC3D-local path.
     void downloadCheckpoint(const QString& localPath);
+    void startLasagnaFlatten(const QString& outputName, double voxelSizeUm);
+    void cancelLasagnaFlatten();
     void deleteSession();
     void commitInputs();
     void uploadPatch(const QString& directory, const QString& inputId);
@@ -86,6 +88,10 @@ signals:
     void geometryAvailable(const QString& manifestPath, quint64 generation);
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
+    void lasagnaFlattenProgress(const QJsonObject& status);
+    void lasagnaFlattenFinished(const QString& tifxyzDirectory,
+                                const QString& outputName,
+                                const QString& error);
     void inputUploadFinished(const QString& inputId, const QString& error);
     void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);
@@ -171,4 +177,9 @@ private:
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
     QString _lastGeometryLocalPath;
+    QString _activeLasagnaFlattenJob;
+    QString _reportedLasagnaFlattenJob;
+    QString _installedLasagnaArtifact;
+    QString _fetchingLasagnaArtifact;
+    QString _lastLasagnaLocalPath;
 };

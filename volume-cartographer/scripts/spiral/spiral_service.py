@@ -27,12 +27,16 @@ import shutil
 import signal
 import socket
 import stat
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_BOOLEAN_KEYS,
                          RUN_MUTABLE_SAMPLING_KEYS,
@@ -41,12 +45,13 @@ from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_BOOLEAN_KEYS,
                          validate_session_request)
 
 
-SERVICE_VERSION = "5.2.0"
+SERVICE_VERSION = "5.3.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
 PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
+LASAGNA_ARTIFACTS_KEPT = 2
 MAX_ARTIFACT_FILES = 4096
 MAX_UPLOAD_FILES = 256
 UPLOAD_GC_SECONDS = 3600.0
@@ -686,6 +691,126 @@ def _copy_publish(source, destination, keep_source=False):
         Path(source).unlink(missing_ok=True)
 
 
+class LasagnaFlattenJob:
+    def __init__(self, job_id, session_id, output_name):
+        self.job_id = job_id
+        self.session_id = session_id
+        self.output_name = output_name
+        self.cancel = threading.Event()
+        self._lock = threading.Lock()
+        self._status = {
+            "job_id": job_id, "state": "starting",
+            "stage_name": "Starting temporary Lasagna service",
+            "step": 0, "total_steps": 0, "overall_progress": 0.0,
+            "output_name": output_name, "error": None, "artifact": None,
+        }
+
+    def update(self, **values):
+        with self._lock:
+            self._status.update(values)
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._status)
+
+    def active(self):
+        return self.snapshot()["state"] not in {"finished", "error", "cancelled"}
+
+
+def _find_lasagna_service():
+    configured = str(os.environ.get("LASAGNA_SERVICE_PATH") or "").strip()
+    candidates = [Path(configured).expanduser()] if configured else []
+    here = Path(__file__).resolve()
+    candidates.extend([
+        here.parents[3] / "lasagna" / "fit_service.py",
+        Path.home() / "villa" / "lasagna" / "fit_service.py",
+    ])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise RuntimeError(
+        "Cannot find Lasagna fit_service.py on the Spiral host; "
+        "set LASAGNA_SERVICE_PATH")
+
+
+def _md5_file(path):
+    digest = hashlib.md5(usedforsecurity=False)
+    with Path(path).open("rb") as stream:
+        while True:
+            block = stream.read(TRANSFER_CHUNK_BYTES)
+            if not block:
+                break
+            digest.update(block)
+    return f"md5:{digest.hexdigest()}"
+
+
+def _prepare_lasagna_surface_object(surface_dir, object_store):
+    surface_dir = Path(surface_dir).resolve(strict=True)
+    required = ("meta.json", "x.tif", "y.tif", "z.tif")
+    missing = [name for name in required if not (surface_dir / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"Spiral preview is missing: {', '.join(missing)}")
+    lines = []
+    for path in sorted(p for p in surface_dir.rglob("*") if p.is_file()):
+        relative = path.relative_to(surface_dir).as_posix()
+        lines.append(f"{relative}\t{_md5_file(path)}\n")
+    manifest = hashlib.md5(
+        "".join(lines).encode("utf-8"), usedforsecurity=False).hexdigest()
+    ref = {"type": "tifxyz_segment", "name": surface_dir.name,
+           "hash": f"md5:{manifest}"}
+    destination = (Path(object_store) / ref["type"] / manifest
+                   / quote(ref["name"], safe=""))
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "segment").symlink_to(surface_dir, target_is_directory=True)
+    (destination / "object.json").write_text(
+        json.dumps(ref, indent=2) + "\n", encoding="utf-8")
+    return ref
+
+
+def _fit_service_json(port, path, body=None, timeout=30):
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{int(port)}{path}", data=data,
+        method="GET" if body is None else "POST",
+        headers={"X-Fit-Service-API-Version": "2",
+                 "Content-Type": "application/json",
+                 "X-VC3D-Source": "Spiral host service"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            payload = {}
+        raise RuntimeError(
+            str(payload.get("error") or f"Lasagna HTTP {exc.code}")) from exc
+    if isinstance(payload, dict) and payload.get("error"):
+        raise RuntimeError(str(payload["error"]))
+    return payload
+
+
+def _stop_process_group(process):
+    if process is None or process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 class ServiceState:
     def __init__(self, dataset_root=None, dataset_resolution=None,
                  service_name=None, logs=None, gpu_ids=(0,)):
@@ -714,6 +839,9 @@ class ServiceState:
         self._preview_artifact = None
         self._geometry_artifact = None
         self._registered_geometry_manifest = None
+        self._lasagna_flatten = None
+        self._lasagna_process = None
+        self._lasagna_thread = None
 
     # ------------------------------------------------------------------
     # Status and health
@@ -760,6 +888,9 @@ class ServiceState:
             })
             response["preview_artifact"] = self._preview_artifact
             response["geometry_artifact"] = self._geometry_artifact
+            response["lasagna_flatten"] = (
+                self._lasagna_flatten.snapshot()
+                if self._lasagna_flatten else None)
             response["ephemeral_inputs"] = [
                 {"id": record["id"], "kind": record["kind"],
                  "role": record.get("role"), "state": record["state"],
@@ -880,6 +1011,10 @@ class ServiceState:
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         with self.lock:
+            if self._lasagna_flatten and self._lasagna_flatten.active():
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "Cancel the Lasagna flatten before replacing the session")
             if self.replacing:
                 raise ApiError(HTTPStatus.CONFLICT, "A session replacement is already in progress")
             if self.session and self.session.status()["state"] in {
@@ -1053,6 +1188,10 @@ class ServiceState:
 
     def delete(self):
         with self.lock:
+            if self._lasagna_flatten and self._lasagna_flatten.active():
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "Cancel the Lasagna flatten before deleting the session")
             if not self.session:
                 return {**self.status(), "deleted": False}
             if self.session.status()["state"] in {"Loading", "Running", "Saving", "ExportingPreview"}:
@@ -1075,6 +1214,227 @@ class ServiceState:
             if self.session is None:
                 raise ApiError(HTTPStatus.CONFLICT, "No fit session is loaded")
             return self.session
+
+    # ------------------------------------------------------------------
+    # Host-owned Lasagna flatten
+    # ------------------------------------------------------------------
+
+    def _update_lasagna_flatten(self, job, **values):
+        job.update(**values)
+        with self.lock:
+            if self._lasagna_flatten is job:
+                self.status_generation += 1
+
+    def start_lasagna_flatten(self, request):
+        session = self._require_session()
+        status = session.status()
+        if status.get("state") not in {"Ready", "Paused"}:
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "Lasagna flatten requires the Spiral session to be paused")
+        preview_manifest = status.get("preview_manifest_path")
+        if not preview_manifest or not Path(preview_manifest).is_file():
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "Run Spiral once to create a host-side preview before flattening")
+        output_name = str(request.get("output_name") or "").strip()
+        if (not output_name.endswith(".tifxyz")
+                or not _SAFE_COMPONENT.fullmatch(output_name)):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "output_name must be a safe .tifxyz name")
+        with self.lock:
+            if self._lasagna_flatten and self._lasagna_flatten.active():
+                raise ApiError(HTTPStatus.CONFLICT,
+                               "A Lasagna flatten is already running")
+            job = LasagnaFlattenJob(
+                f"spiral-lasagna-{secrets.token_hex(8)}",
+                self.session_id, output_name)
+            self._lasagna_flatten = job
+            self.status_generation += 1
+            thread = threading.Thread(
+                target=self._run_lasagna_flatten,
+                args=(job, dict(request), str(preview_manifest)),
+                name="spiral-lasagna-flatten", daemon=True)
+            self._lasagna_thread = thread
+            thread.start()
+        response = self.status()
+        response["accepted"] = True
+        return response
+
+    def cancel_lasagna_flatten(self):
+        with self.lock:
+            job = self._lasagna_flatten
+        if job is None or not job.active():
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "No Lasagna flatten is running")
+        job.cancel.set()
+        self._update_lasagna_flatten(
+            job, stage_name="Cancelling temporary Lasagna service")
+        return {**self.status(), "accepted": True}
+
+    def _run_lasagna_flatten(self, job, request, preview_manifest_path):
+        process = None
+        output_path = None
+        fit_job_id = None
+        try:
+            fit_service = _find_lasagna_service()
+            config_path = fit_service.parent / "configs" / "flatten_fast_nofilter.json"
+            if not config_path.is_file():
+                raise RuntimeError(
+                    f"Cannot find Lasagna flatten config: {config_path}")
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            manifest = json.loads(
+                Path(preview_manifest_path).read_text(encoding="utf-8"))
+            surface_path = Path(str(manifest.get("surface_path") or ""))
+            if not surface_path.is_dir():
+                raise RuntimeError(
+                    f"Spiral preview surface does not exist: {surface_path}")
+            voxel_size = request.get("voxel_size_um")
+            if isinstance(voxel_size, (int, float)) and float(voxel_size) > 0:
+                config["voxel_size_um"] = float(voxel_size)
+            output_root = Path(self.session_paths.output_directory).resolve()
+            output_root.mkdir(parents=True, exist_ok=True)
+            output_path = output_root / job.output_name
+            if output_path.exists():
+                raise RuntimeError(
+                    f"Refusing to overwrite Lasagna output: {output_path}")
+
+            with tempfile.TemporaryDirectory(prefix="spiral_lasagna_") as temporary:
+                temporary = Path(temporary)
+                object_store = temporary / "objects"
+                surface_ref = _prepare_lasagna_surface_object(
+                    surface_path, object_store)
+                ready = threading.Event()
+                port_holder = {}
+
+                process = subprocess.Popen(
+                    [sys.executable, str(fit_service), "--port", "0",
+                     "--allow-no-data-dir", "--object-store-dir",
+                     str(object_store)],
+                    cwd=str(fit_service.parent),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, start_new_session=(os.name == "posix"))
+                with self.lock:
+                    if self._lasagna_flatten is job:
+                        self._lasagna_process = process
+
+                def relay_output():
+                    pattern = re.compile(r"listening on http://[^:]+:(\d+)")
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        text = line.rstrip()
+                        if text:
+                            print(f"SPIRAL_LASAGNA {text}", flush=True)
+                        match = pattern.search(text)
+                        if match:
+                            port_holder["port"] = int(match.group(1))
+                            ready.set()
+
+                relay = threading.Thread(
+                    target=relay_output, name="spiral-lasagna-log",
+                    daemon=True)
+                relay.start()
+                if not ready.wait(60):
+                    code = process.poll()
+                    raise RuntimeError(
+                        "Temporary Lasagna service failed to start"
+                        + (f" (exit {code})" if code is not None else ""))
+                if job.cancel.is_set():
+                    raise InterruptedError("Lasagna flatten cancelled")
+
+                port = port_holder["port"]
+                config["external_surfaces"] = [surface_ref]
+                request_body = {
+                    "config": config,
+                    "job_spec": {
+                        "config": config,
+                        "linked_surfaces": [surface_ref],
+                    },
+                    "single_segment": True,
+                    "config_name": "flatten_fast_nofilter.json",
+                    "output_name": job.output_name,
+                    "output_dir": str(output_root),
+                    "source": "Spiral host service",
+                }
+                accepted = _fit_service_json(
+                    port, "/optimize", request_body, timeout=60)
+                fit_job_id = str(accepted.get("job_id") or "")
+                if not fit_job_id:
+                    raise RuntimeError(
+                        "Temporary Lasagna service returned no job id")
+
+                while True:
+                    if job.cancel.is_set():
+                        try:
+                            _fit_service_json(
+                                port, f"/jobs/{fit_job_id}/cancel", {},
+                                timeout=10)
+                        except Exception:
+                            pass
+                        raise InterruptedError("Lasagna flatten cancelled")
+                    fit_status = _fit_service_json(
+                        port, f"/jobs/{fit_job_id}", timeout=15)
+                    state = str(fit_status.get("state") or "")
+                    self._update_lasagna_flatten(
+                        job, state=state or "running",
+                        stage_name=str(
+                            fit_status.get("stage_name")
+                            or fit_status.get("stage") or "Flattening"),
+                        step=int(fit_status.get("step") or 0),
+                        total_steps=int(fit_status.get("total_steps") or 0),
+                        overall_progress=float(
+                            fit_status.get("overall_progress") or 0.0),
+                        loss=fit_status.get("loss"))
+                    if state == "finished":
+                        break
+                    if state == "cancelled":
+                        raise InterruptedError("Lasagna flatten cancelled")
+                    if state == "error":
+                        raise RuntimeError(
+                            str(fit_status.get("error")
+                                or "Lasagna flatten failed"))
+                    time.sleep(0.5)
+
+                metadata = output_path / "meta.json"
+                if not metadata.is_file():
+                    raise RuntimeError(
+                        "Lasagna reported success but produced no tifxyz output")
+                self._update_lasagna_flatten(
+                    job, state="publishing",
+                    stage_name="Publishing flattened surface")
+                with self.lock:
+                    if self.session_id != job.session_id:
+                        raise RuntimeError(
+                            "The Spiral session changed during Lasagna flatten")
+                artifact = self.artifacts.register_directory(
+                    "spiral-lasagna", job.session_id, time.time_ns(),
+                    output_path, "meta.json")
+                self.artifacts.prune(
+                    "spiral-lasagna", job.session_id, LASAGNA_ARTIFACTS_KEPT)
+                self._update_lasagna_flatten(
+                    job, state="finished", stage_name="Finished",
+                    overall_progress=1.0, artifact=artifact)
+        except InterruptedError as exc:
+            if output_path is not None:
+                shutil.rmtree(output_path, ignore_errors=True)
+            self._update_lasagna_flatten(
+                job, state="cancelled", error=str(exc),
+                stage_name="Cancelled")
+        except Exception as exc:
+            if output_path is not None:
+                shutil.rmtree(output_path, ignore_errors=True)
+            print(
+                f"SPIRAL_LASAGNA_ERROR {type(exc).__name__}: {exc}",
+                file=sys.stderr, flush=True)
+            self._update_lasagna_flatten(
+                job, state="error", error=f"{type(exc).__name__}: {exc}",
+                stage_name="Failed")
+        finally:
+            _stop_process_group(process)
+            with self.lock:
+                if self._lasagna_process is process:
+                    self._lasagna_process = None
+                self.status_generation += 1
 
     # ------------------------------------------------------------------
     # Session input uploads
@@ -1543,6 +1903,11 @@ class ServiceState:
         with self.lock:
             session = self.session
             self.session = None
+            flatten = self._lasagna_flatten
+            process = self._lasagna_process
+        if flatten and flatten.active():
+            flatten.cancel.set()
+        _stop_process_group(process)
         if session:
             session.close()
 
@@ -1753,6 +2118,12 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 return state.deduplicated(command_id, lambda: state.save_checkpoint(body))
             if path == "/session/download-checkpoint":
                 return state.deduplicated(command_id, state.download_checkpoint)
+            if path == "/session/lasagna-flatten":
+                return state.deduplicated(
+                    command_id, lambda: state.start_lasagna_flatten(body))
+            if path == "/session/lasagna-flatten/cancel":
+                return state.deduplicated(
+                    command_id, state.cancel_lasagna_flatten)
             if path == "/session/commit-inputs":
                 return state.deduplicated(command_id, state.commit_inputs)
             if path == "/session/export-full":

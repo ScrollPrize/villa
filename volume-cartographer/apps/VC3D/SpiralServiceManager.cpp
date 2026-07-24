@@ -25,6 +25,7 @@
 #include <QUuid>
 #include <QtConcurrent/QtConcurrent>
 
+#include <cmath>
 #include <memory>
 
 namespace {
@@ -38,7 +39,7 @@ constexpr int kRemoteLogPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 7;
+constexpr int kSupportedApiVersion = 8;
 constexpr int kPreviewCacheKept = 3;
 
 QString stateName(SpiralServiceManager::ConnectionState state)
@@ -170,6 +171,11 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _fetchingPreviewArtifact.clear();
     _installedGeometryArtifact.clear();
     _fetchingGeometryArtifact.clear();
+    _activeLasagnaFlattenJob.clear();
+    _reportedLasagnaFlattenJob.clear();
+    _installedLasagnaArtifact.clear();
+    _fetchingLasagnaArtifact.clear();
+    _lastLasagnaLocalPath.clear();
     _statusFailures = 0;
     _hasActiveSession = false;
     _serviceOwnsDataset = false;
@@ -788,6 +794,44 @@ void SpiralServiceManager::deleteSession()
     });
 }
 
+void SpiralServiceManager::startLasagnaFlatten(const QString& outputName,
+                                               double voxelSizeUm)
+{
+    if (!isReady()) {
+        emit lasagnaFlattenFinished(
+            {}, outputName, tr("Spiral service is not connected"));
+        return;
+    }
+    QJsonObject body{
+        {QStringLiteral("command_id"), commandId()},
+        {QStringLiteral("output_name"), outputName},
+    };
+    if (std::isfinite(voxelSizeUm) && voxelSizeUm > 0.0)
+        body[QStringLiteral("voxel_size_um")] = voxelSizeUm;
+    post(QStringLiteral("/session/lasagna-flatten"), body, Timeout::Command,
+         [this](const QJsonObject& response) {
+             const QJsonObject flatten =
+                 response.value(QStringLiteral("lasagna_flatten")).toObject();
+             _activeLasagnaFlattenJob =
+                 flatten.value(QStringLiteral("job_id")).toString();
+             _reportedLasagnaFlattenJob.clear();
+             handleStatus(response);
+         },
+         [this, outputName](const QString& error) {
+             emit lasagnaFlattenFinished({}, outputName, error);
+         });
+}
+
+void SpiralServiceManager::cancelLasagnaFlatten()
+{
+    if (!isReady()) return;
+    post(QStringLiteral("/session/lasagna-flatten/cancel"),
+         {{QStringLiteral("command_id"), commandId()}},
+         Timeout::Command,
+         [this](const QJsonObject& response) { handleStatus(response); },
+         [this](const QString& error) { emit errorOccurred(error); });
+}
+
 void SpiralServiceManager::commitInputs()
 {
     postWithRetry(QStringLiteral("/session/commit-inputs"),
@@ -1131,6 +1175,36 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
         _hasActiveSession = active;
         emit sessionActiveChanged(active);
     }
+    const QJsonObject flatten =
+        status.value(QStringLiteral("lasagna_flatten")).toObject();
+    if (!flatten.isEmpty()) {
+        const QString jobId =
+            flatten.value(QStringLiteral("job_id")).toString();
+        if (_activeLasagnaFlattenJob.isEmpty()
+            && !jobId.isEmpty()
+            && !QStringList{QStringLiteral("finished"),
+                            QStringLiteral("error"),
+                            QStringLiteral("cancelled")}
+                    .contains(flatten.value(QStringLiteral("state")).toString())) {
+            _activeLasagnaFlattenJob = jobId;
+        }
+        if (jobId == _activeLasagnaFlattenJob)
+            emit lasagnaFlattenProgress(flatten);
+        const QString state =
+            flatten.value(QStringLiteral("state")).toString();
+        if ((state == QStringLiteral("error")
+             || state == QStringLiteral("cancelled"))
+            && jobId == _activeLasagnaFlattenJob
+            && jobId != _reportedLasagnaFlattenJob) {
+            _reportedLasagnaFlattenJob = jobId;
+            emit lasagnaFlattenFinished(
+                {}, flatten.value(QStringLiteral("output_name")).toString(),
+                flatten.value(QStringLiteral("error")).toString(
+                    state == QStringLiteral("cancelled")
+                        ? tr("Lasagna flatten was cancelled")
+                        : tr("Lasagna flatten failed")));
+        }
+    }
     syncArtifacts(status);
 }
 
@@ -1164,7 +1238,8 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _lastPreviewLocalPath = entryPath;
                 emit previewAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(sessionId, kPreviewCacheKept,
-                                             {_lastPreviewLocalPath, _lastGeometryLocalPath});
+                                             {_lastPreviewLocalPath, _lastGeometryLocalPath,
+                                              _lastLasagnaLocalPath});
             });
     }
 
@@ -1188,6 +1263,44 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedGeometryArtifact = geometryId;
                 _lastGeometryLocalPath = entryPath;
                 emit geometryAvailable(entryPath, static_cast<quint64>(sessionGeneration));
+            });
+    }
+
+    const QJsonObject flatten =
+        status.value(QStringLiteral("lasagna_flatten")).toObject();
+    const QJsonObject lasagnaRef =
+        flatten.value(QStringLiteral("artifact")).toObject();
+    const QString lasagnaId =
+        lasagnaRef.value(QStringLiteral("id")).toString();
+    const QString lasagnaJobId =
+        flatten.value(QStringLiteral("job_id")).toString();
+    const QString outputName =
+        flatten.value(QStringLiteral("output_name")).toString();
+    if (!lasagnaId.isEmpty()
+        && lasagnaJobId == _activeLasagnaFlattenJob
+        && lasagnaId != _installedLasagnaArtifact
+        && lasagnaId != _fetchingLasagnaArtifact) {
+        _fetchingLasagnaArtifact = lasagnaId;
+        const quint64 generation = _connectionGeneration;
+        _artifactCache->fetchArtifact(
+            sessionId, lasagnaId,
+            [this, lasagnaId, lasagnaJobId, outputName, generation]
+            (const QString& entryPath, const QString& error, bool gone) {
+                if (generation != _connectionGeneration) return;
+                if (_fetchingLasagnaArtifact == lasagnaId)
+                    _fetchingLasagnaArtifact.clear();
+                if (entryPath.isEmpty()) {
+                    if (!gone && lasagnaJobId != _reportedLasagnaFlattenJob) {
+                        _reportedLasagnaFlattenJob = lasagnaJobId;
+                        emit lasagnaFlattenFinished({}, outputName, error);
+                    }
+                    return;
+                }
+                _installedLasagnaArtifact = lasagnaId;
+                _lastLasagnaLocalPath = entryPath;
+                _reportedLasagnaFlattenJob = lasagnaJobId;
+                emit lasagnaFlattenFinished(
+                    QFileInfo(entryPath).absolutePath(), outputName, {});
             });
     }
 }

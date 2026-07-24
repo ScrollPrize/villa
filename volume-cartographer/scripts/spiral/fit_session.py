@@ -20,7 +20,7 @@ import zipfile
 
 # Version 7 lets checkpoint upload negotiation return an already-published
 # checkpoint instead of an upload id when the content digest is retained.
-API_VERSION = 7
+API_VERSION = 8
 
 
 # Counts which describe how many training objects/points are sampled per

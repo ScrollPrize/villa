@@ -25,7 +25,6 @@ class QDialog;
 class QKeyEvent;
 class QProgressDialog;
 class QuadSurface;
-class LasagnaServiceManager;
 class SpiralPanel;
 class SpiralServiceManager;
 class ViewerManager;
@@ -149,15 +148,12 @@ private:
     void initializePreviewFocus();
     void mirrorFocusToMainWorkspace(const cv::Vec3f& position);
     void updateLasagnaFlattenAvailability();
-    QString lasagnaDataDirectorySettingsKey() const;
-    QString resolveLasagnaDataDirectory();
     void startLasagnaFlatten();
     void updateLasagnaFlattenProgress(const QJsonObject& job);
     void failLasagnaFlatten(const QString& error, bool cancelled = false);
-    void releaseLasagnaFlattenService();
     void closeLasagnaFlattenProgress();
-    void handleLasagnaResults(const QString& outputDir,
-                              const QStringList& segmentNames);
+    void handleLasagnaResults(const QString& tifxyzDirectory,
+                              const QString& outputName);
 
     CState* _mainState = nullptr;
     CState* _state = nullptr;
@@ -210,13 +206,9 @@ private:
     bool _haveRunDiffBaseline = false;
     bool _runDiffVisible = false;
     bool _flattenedPreviewActive = false;
-    LasagnaServiceManager* _transientLasagnaManager = nullptr;
-    LasagnaServiceManager* _activeLasagnaManager = nullptr;
     bool _lasagnaFlattenRunning = false;
     bool _lasagnaFlattenCancelRequested = false;
-    QString _pendingLasagnaOutputDir;
     QString _pendingLasagnaOutputName;
-    QString _pendingLasagnaJobId;
     std::shared_ptr<QuadSurface> _pendingLasagnaSource;
     QPointer<QProgressDialog> _lasagnaFlattenProgress;
     bool _updatingLasagnaFlattenProgress = false;
