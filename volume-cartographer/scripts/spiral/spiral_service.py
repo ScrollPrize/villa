@@ -38,6 +38,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+import numpy as np
+from PIL import Image
+import scipy.ndimage
+
 from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_BOOLEAN_KEYS,
                          RUN_MUTABLE_SAMPLING_KEYS,
                          parse_session_request,
@@ -744,6 +748,90 @@ def _md5_file(path):
     return f"md5:{digest.hexdigest()}"
 
 
+def _prepare_cleaned_lasagna_surface(surface_dir, destination,
+                                     erosion_cells=3):
+    """Stage a Lasagna-only TIFXYZ with ragged/disconnected support removed."""
+    surface_dir = Path(surface_dir).resolve(strict=True)
+    destination = Path(destination)
+    required = ("meta.json", "x.tif", "y.tif", "z.tif")
+    missing = [name for name in required if not (surface_dir / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"Spiral preview is missing: {', '.join(missing)}")
+
+    coordinates = []
+    shape = None
+    valid = None
+    for name in ("x.tif", "y.tif", "z.tif"):
+        with Image.open(surface_dir / name) as image:
+            coordinate = np.asarray(image, dtype=np.float32)
+        if coordinate.ndim != 2:
+            raise RuntimeError(
+                f"Spiral preview {name} must be a two-dimensional TIFF")
+        if shape is None:
+            shape = coordinate.shape
+        elif coordinate.shape != shape:
+            raise RuntimeError(
+                "Spiral preview coordinate TIFF dimensions do not match")
+        coordinate = coordinate.copy()
+        coordinates.append(coordinate)
+        coordinate_valid = coordinate != -1.0
+        valid = (coordinate_valid if valid is None
+                 else valid | coordinate_valid)
+
+    cleaned = scipy.ndimage.binary_erosion(
+        valid, iterations=int(erosion_cells), border_value=0)
+    labels, component_count = scipy.ndimage.label(
+        cleaned, structure=scipy.ndimage.generate_binary_structure(2, 1))
+    if component_count == 0:
+        raise RuntimeError(
+            f"Lasagna input cleanup removed every valid TIFXYZ vertex "
+            f"after {int(erosion_cells)}-cell erosion")
+    component_sizes = np.bincount(labels.ravel())
+    component_sizes[0] = 0
+    cleaned = labels == int(np.argmax(component_sizes))
+
+    shutil.copytree(surface_dir, destination)
+    for coordinate, name in zip(coordinates, ("x.tif", "y.tif", "z.tif")):
+        coordinate[~cleaned] = -1.0
+        Image.fromarray(coordinate).save(destination / name)
+
+    metadata_path = destination / "meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["bbox"] = [
+        [float(coordinate[cleaned].min()) for coordinate in coordinates],
+        [float(coordinate[cleaned].max()) for coordinate in coordinates],
+    ]
+    valid_quad = (
+        cleaned[:-1, :-1]
+        & cleaned[1:, :-1]
+        & cleaned[:-1, 1:]
+        & cleaned[1:, 1:]
+    )
+    scale = metadata.get("scale")
+    if (isinstance(scale, list) and len(scale) >= 2
+            and all(isinstance(value, (int, float)) and value > 0
+                    for value in scale[:2])):
+        area_vx2 = float(valid_quad.sum()) / (
+            float(scale[0]) * float(scale[1]))
+        old_area_vx2 = metadata.get("area_vx2")
+        old_area_cm2 = metadata.get("area_cm2")
+        metadata["area_vx2"] = area_vx2
+        if (isinstance(old_area_vx2, (int, float))
+                and old_area_vx2 > 0
+                and isinstance(old_area_cm2, (int, float))):
+            metadata["area_cm2"] = (
+                area_vx2 * float(old_area_cm2) / float(old_area_vx2))
+    metadata["lasagna_input_cleanup"] = {
+        "erosion_cells": int(erosion_cells),
+        "component_connectivity": 4,
+        "components_after_erosion": int(component_count),
+    }
+    metadata_path.write_text(
+        json.dumps(metadata, indent=4) + "\n", encoding="utf-8")
+    return destination
+
+
 def _prepare_lasagna_surface_object(surface_dir, object_store):
     surface_dir = Path(surface_dir).resolve(strict=True)
     required = ("meta.json", "x.tif", "y.tif", "z.tif")
@@ -1306,8 +1394,14 @@ class ServiceState:
             with tempfile.TemporaryDirectory(prefix="spiral_lasagna_") as temporary:
                 temporary = Path(temporary)
                 object_store = temporary / "objects"
+                self._update_lasagna_flatten(
+                    job, stage_name="Preparing Lasagna input surface")
+                cleaned_surface = _prepare_cleaned_lasagna_surface(
+                    surface_path, temporary / "lasagna-input.tifxyz")
+                if job.cancel.is_set():
+                    raise InterruptedError("Lasagna flatten cancelled")
                 surface_ref = _prepare_lasagna_surface_object(
-                    surface_path, object_store)
+                    cleaned_surface, object_store)
                 ready = threading.Event()
                 port_holder = {}
 

@@ -24,11 +24,15 @@ import unittest
 import urllib.error
 import urllib.request
 
+import numpy as np
+from PIL import Image
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import spiral_service
 from spiral_service import (ApiError, ArtifactRegistry, ServiceLogBuffer, ServiceState,
-                            SpiralServer, load_or_create_api_key, parse_gpu_ids)
+                            SpiralServer, _prepare_cleaned_lasagna_surface,
+                            load_or_create_api_key, parse_gpu_ids)
 from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
 
 
@@ -1103,6 +1107,89 @@ class CommitTests(unittest.TestCase):
         self.assertIn("read-only", status["commit_unavailable_reason"])
         with self.assertRaisesRegex(ApiError, "read-only"):
             self.state.commit_inputs()
+
+
+class LasagnaSurfaceCleanupTests(unittest.TestCase):
+    @staticmethod
+    def _write_surface(path, valid):
+        path.mkdir()
+        rows, columns = np.indices(valid.shape)
+        xyz = [
+            columns.astype(np.float32),
+            rows.astype(np.float32),
+            np.full(valid.shape, 10.0, dtype=np.float32),
+        ]
+        for coordinate in xyz:
+            coordinate[~valid] = -1.0
+        for name, coordinate in zip(("x.tif", "y.tif", "z.tif"), xyz):
+            Image.fromarray(coordinate).save(path / name)
+        (path / "meta.json").write_text(json.dumps({
+            "format": "tifxyz",
+            "type": "seg",
+            "uuid": "preview",
+            "scale": [1.0, 1.0],
+            "bbox": [[0.0, 0.0, 0.0], [99.0, 99.0, 99.0]],
+            "area_vx2": 100.0,
+            "area_cm2": 2.0,
+            "winding_column_ranges": [[0, valid.shape[1]]],
+        }))
+
+    def test_erodes_and_keeps_only_largest_component_without_mutating_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "cleaned"
+            valid = np.zeros((16, 28), dtype=bool)
+            valid[1:12, 1:12] = True
+            valid[4:11, 18:25] = True
+            self._write_surface(source, valid)
+            original_files = {
+                name: (source / name).read_bytes()
+                for name in ("meta.json", "x.tif", "y.tif", "z.tif")
+            }
+
+            result = _prepare_cleaned_lasagna_surface(source, destination)
+
+            self.assertEqual(result, destination)
+            for name, contents in original_files.items():
+                self.assertEqual((source / name).read_bytes(), contents)
+            cleaned_coordinates = []
+            for axis in "xyz":
+                with Image.open(destination / f"{axis}.tif") as image:
+                    cleaned_coordinates.append(np.asarray(image).copy())
+            cleaned_xyz = np.stack(cleaned_coordinates, axis=-1)
+            cleaned_valid = np.any(cleaned_xyz != -1.0, axis=-1)
+            expected = np.zeros_like(valid)
+            expected[4:9, 4:9] = True
+            np.testing.assert_array_equal(cleaned_valid, expected)
+            self.assertTrue(np.all(cleaned_xyz[~expected] == -1.0))
+
+            metadata = json.loads(
+                (destination / "meta.json").read_text())
+            self.assertEqual(
+                metadata["bbox"],
+                [[4.0, 4.0, 10.0], [8.0, 8.0, 10.0]])
+            self.assertEqual(metadata["area_vx2"], 16.0)
+            self.assertAlmostEqual(metadata["area_cm2"], 0.32)
+            self.assertEqual(metadata["winding_column_ranges"], [[0, 28]])
+            self.assertEqual(metadata["lasagna_input_cleanup"], {
+                "erosion_cells": 3,
+                "component_connectivity": 4,
+                "components_after_erosion": 2,
+            })
+
+    def test_fails_if_erosion_removes_every_valid_vertex(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            valid = np.ones((6, 6), dtype=bool)
+            self._write_surface(source, valid)
+
+            with self.assertRaisesRegex(
+                    RuntimeError, "removed every valid TIFXYZ vertex"):
+                _prepare_cleaned_lasagna_surface(
+                    source, root / "cleaned")
+            self.assertFalse((root / "cleaned").exists())
 
 
 class ServiceProcessTests(unittest.TestCase):
