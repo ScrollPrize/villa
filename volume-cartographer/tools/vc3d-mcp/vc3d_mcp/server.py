@@ -1,6 +1,6 @@
 """MCP stdio entrypoint for the VC3D Agent Bridge.
 
-Resolves the bridge socket by priority (explicit ``--socket``/env, then the
+Resolves the bridge endpoint by priority (explicit ``--socket``/env, then the
 discovery registry, then auto-launching VC3D), configures the client, and
 runs the FastMCP stdio loop. The ``@mcp.tool()`` functions live in
 :mod:`vc3d_mcp.tools`; importing that package registers them on the shared
@@ -23,8 +23,9 @@ from collections import deque
 from .bridge_client import (
     BridgeClient,
     BridgeClientConfig,
+    BridgeError,
     BridgeConnectionError,
-    discover_registry_socket,
+    discover_registry_entries,
 )
 from .core import configure_client, mcp
 from . import tools  # noqa: F401  - imports every module, registering its @mcp.tool()s
@@ -40,8 +41,31 @@ BRIDGE_PROTOCOL_VERSION = 1
 _launched_process: subprocess.Popen | None = None
 
 
+class BridgeProtocolError(BridgeConnectionError):
+    """The endpoint is live but speaks an incompatible bridge protocol."""
+
+
 def _is_executable(path: str | None) -> bool:
     return bool(path and os.path.isfile(path) and os.access(path, os.X_OK))
+
+
+def _standard_binary_candidates(repo_root: str, platform: str) -> list[str]:
+    executable = "VC3D.exe" if platform == "nt" else "VC3D"
+    presets = (
+        "dev-gcc",
+        "dev-clang",
+        "ci-release-gcc",
+        "ci-release-clang",
+        "ci-windows-mingw",
+        "windows-msvc",
+        "macos-homebrew-llvm",
+    )
+    candidates = [
+        os.path.join(repo_root, "build", preset, "bin", executable)
+        for preset in presets
+    ]
+    candidates.append(os.path.join(repo_root, "build-macos", "bin", executable))
+    return candidates
 
 
 def default_vc3d_binary() -> str | None:
@@ -52,18 +76,7 @@ def default_vc3d_binary() -> str | None:
     """
     here = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.abspath(os.path.join(here, os.pardir, os.pardir, os.pardir))
-    presets = (
-        "dev-gcc",
-        "dev-clang",
-        "ci-release-gcc",
-        "ci-release-clang",
-        "macos-homebrew-llvm",
-    )
-    candidates = [
-        os.path.join(repo_root, "build", preset, "bin", "VC3D")
-        for preset in presets
-    ]
-    candidates.append(os.path.join(repo_root, "build-macos", "bin", "VC3D"))
+    candidates = _standard_binary_candidates(repo_root, os.name)
     return next((path for path in candidates if _is_executable(path)), None)
 
 
@@ -95,18 +108,32 @@ def _launch_command(binary: str, volpkg: str | None) -> list[str]:
 def _validate_protocol(ping: object) -> None:
     actual = ping.get("protocolVersion") if isinstance(ping, dict) else None
     if actual != BRIDGE_PROTOCOL_VERSION:
-        raise BridgeConnectionError(
+        raise BridgeProtocolError(
             "incompatible VC3D agent bridge protocol: "
             f"expected {BRIDGE_PROTOCOL_VERSION}, got {actual!r}"
         )
 
 
-async def verify_bridge_protocol(socket: str, request_timeout: float) -> None:
+async def verify_bridge_protocol(
+    socket: str,
+    request_timeout: float,
+    connect_timeout: float = 5.0,
+) -> None:
     client = BridgeClient(
-        BridgeClientConfig(socket=socket, request_timeout=request_timeout)
+        BridgeClientConfig(
+            socket=socket,
+            connect_timeout=connect_timeout,
+            request_timeout=request_timeout,
+        )
     )
     try:
-        _validate_protocol(await client.call("ping"))
+        try:
+            ping = await client.call("ping")
+        except BridgeError as exc:
+            raise BridgeProtocolError(
+                f"VC3D bridge rejected the compatibility check: {exc}"
+            ) from exc
+        _validate_protocol(ping)
     finally:
         await client.close()
 
@@ -116,7 +143,7 @@ def launch_vc3d(
     volpkg: str | None = None,
     timeout: float = LAUNCH_HANDSHAKE_TIMEOUT_S,
 ) -> str:
-    """Spawn VC3D with the agent bridge enabled and return its socket path.
+    """Spawn VC3D with the agent bridge enabled and return its local endpoint.
 
     A daemon thread drains the child's stdout for the whole process lifetime
     (with stderr merged in): it detects the ``VC3D-AGENT-BRIDGE: listening ...``
@@ -226,10 +253,10 @@ def _terminate_launched_process() -> None:
         pass
 
 
-def resolve_connection(args: argparse.Namespace) -> tuple[str | None, str]:
-    """Determine the bridge socket to use, per the documented priority order.
+async def resolve_connection(args: argparse.Namespace) -> tuple[str | None, str]:
+    """Determine and verify the bridge endpoint to use.
 
-    Returns ``(socket_path_or_None, how)`` where ``how`` describes the source
+    Returns ``(endpoint_or_None, how)`` where ``how`` describes the source
     for diagnostics:
 
     (a) explicit ``--socket`` / ``VC3D_AGENT_BRIDGE_SOCKET`` (highest priority);
@@ -239,11 +266,25 @@ def resolve_connection(args: argparse.Namespace) -> tuple[str | None, str]:
     (d) otherwise ``(None, ...)`` -- the caller prints the usage error.
     """
     if args.socket:
+        await verify_bridge_protocol(args.socket, args.request_timeout)
         return args.socket, "explicit --socket/env"
 
-    discovered = discover_registry_socket()
-    if discovered:
-        return discovered, "discovery registry (already-running VC3D)"
+    incompatible: BridgeProtocolError | None = None
+    for entry in discover_registry_entries():
+        try:
+            await verify_bridge_protocol(
+                entry.endpoint,
+                args.request_timeout,
+                connect_timeout=min(1.0, args.request_timeout),
+            )
+        except BridgeProtocolError as exc:
+            incompatible = exc
+            continue
+        except BridgeConnectionError:
+            # A response timeout can mean VC3D is temporarily busy. Keep the
+            # record so a later MCP process can discover it again.
+            continue
+        return entry.endpoint, "discovery registry (already-running VC3D)"
 
     binary = resolve_launch_binary(args.launch)
     if binary:
@@ -252,8 +293,11 @@ def resolve_connection(args: argparse.Namespace) -> tuple[str | None, str]:
             file=sys.stderr,
         )
         path = launch_vc3d(binary, volpkg=args.volpkg)
+        await verify_bridge_protocol(path, args.request_timeout)
         return path, f"auto-launched VC3D ({binary})"
 
+    if incompatible is not None:
+        raise incompatible
     return None, "no socket, no running bridge, no launchable binary"
 
 
@@ -262,8 +306,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="vc3d-mcp",
         description=(
             "MCP server (stdio) that drives a running VC3D instance via its "
-            "Agent Bridge local socket. In the common case no socket needs to "
-            "be passed: an already-running VC3D is found via the discovery "
+            "Agent Bridge local endpoint. In the common case no endpoint needs "
+            "to be passed: an already-running VC3D is found via the discovery "
             "registry (~/.vc3d/agent_bridge), and if none is running VC3D is "
             "auto-launched."
         ),
@@ -272,12 +316,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--socket",
         default=os.environ.get("VC3D_AGENT_BRIDGE_SOCKET"),
         help=(
-            "VC3D agent bridge socket: an explicit path (e.g. the 'path=' field "
-            "from the VC3D-AGENT-BRIDGE stdout handshake line), or a bare "
-            "QLocalServer name matching --agent-bridge-name. Highest priority "
-            "when set. Defaults to the VC3D_AGENT_BRIDGE_SOCKET env var. When "
-            "unset, an already-running bridge is auto-discovered, else VC3D is "
-            "auto-launched (see --launch)."
+            "VC3D agent bridge endpoint: a Unix socket path, Windows named-pipe "
+            "path, or bare QLocalServer name matching --agent-bridge-name. "
+            "Highest priority when set. Defaults to the "
+            "VC3D_AGENT_BRIDGE_SOCKET env var. When unset, an already-running "
+            "bridge is auto-discovered, else VC3D is auto-launched (see "
+            "--launch)."
         ),
     )
     parser.add_argument(
@@ -304,7 +348,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--request-timeout",
         type=float,
         default=30.0,
-        help="Seconds to wait for a bridge RPC response before failing the tool call (default: 30).",
+        help=(
+            "Seconds to wait for a bridge RPC response before failing the tool "
+            "call (default: 30)."
+        ),
     )
     return parser
 
@@ -314,9 +361,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        socket, how = resolve_connection(args)
+        socket, how = asyncio.run(resolve_connection(args))
     except BridgeConnectionError as exc:
-        print(f"vc3d-mcp: auto-launch failed: {exc}", file=sys.stderr)
+        print(f"vc3d-mcp: could not use the VC3D agent bridge: {exc}", file=sys.stderr)
         return 2
 
     if not socket:
@@ -333,13 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    try:
-        asyncio.run(verify_bridge_protocol(socket, args.request_timeout))
-    except BridgeConnectionError as exc:
-        print(f"vc3d-mcp: bridge compatibility check failed: {exc}", file=sys.stderr)
-        return 2
-
-    print(f"vc3d-mcp: using bridge socket {socket!r} via {how}.", file=sys.stderr)
+    print(f"vc3d-mcp: using bridge endpoint {socket!r} via {how}.", file=sys.stderr)
     configure_client(socket, request_timeout=args.request_timeout)
     mcp.run(transport="stdio")
     return 0

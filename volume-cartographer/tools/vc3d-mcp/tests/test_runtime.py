@@ -12,14 +12,15 @@ import unittest
 from unittest import mock
 
 from vc3d_mcp import core, server as server_module
-from vc3d_mcp.bridge_client import BridgeConnectionError, discover_registry_socket
+from vc3d_mcp.bridge_client import (
+    BridgeConnectionError,
+    RegistryEntry,
+    discover_registry_entries,
+)
+
 
 class RegistryDiscoveryTest(unittest.TestCase):
-    """discover_registry_socket: newest live entry wins, dead entries reaped.
-
-    Mirrors AgentBridgeServer's registry-file convention (~/.vc3d/agent_bridge/
-    <pid>.json with {pid, name, path, startedAt}) and the stale-PID cleanup of
-    LasagnaServiceManager::discoverServices()."""
+    """Registry parsing is platform-neutral; endpoint probes decide liveness."""
 
     def setUp(self) -> None:
         self.registry_dir = tempfile.mkdtemp(prefix="vc3d-registry-test-")
@@ -37,58 +38,121 @@ class RegistryDiscoveryTest(unittest.TestCase):
         return file_path
 
     def test_missing_directory_returns_none(self) -> None:
-        self.assertIsNone(
-            discover_registry_socket(os.path.join(self.registry_dir, "does-not-exist"))
+        self.assertEqual(
+            discover_registry_entries(
+                os.path.join(self.registry_dir, "does-not-exist")
+            ),
+            [],
         )
 
-    def test_empty_directory_returns_none(self) -> None:
-        self.assertIsNone(discover_registry_socket(self.registry_dir))
+    def test_empty_directory_returns_empty_list(self) -> None:
+        self.assertEqual(discover_registry_entries(self.registry_dir), [])
 
-    def test_dead_pid_entry_is_filtered_and_removed(self) -> None:
-        # A PID that is extremely unlikely to be alive. os.kill(pid, 0) must
-        # raise ProcessLookupError, so the entry is treated as stale.
-        dead_pid = 2_000_000_000
-        dead_file = self._write_entry(dead_pid, "/tmp/dead-bridge.sock", started_at=1000.0)
+    def test_discovery_never_signals_registry_pids(self) -> None:
+        path = "/tmp/bridge.sock"
+        self._write_entry(2_000_000_000, path, started_at=1000.0)
 
-        result = discover_registry_socket(self.registry_dir)
+        with mock.patch.object(os, "kill") as kill:
+            entries = discover_registry_entries(self.registry_dir)
 
-        self.assertIsNone(result)
-        self.assertFalse(
-            os.path.exists(dead_file), "stale dead-PID registry file should be removed"
-        )
+        self.assertEqual([entry.endpoint for entry in entries], [path])
+        kill.assert_not_called()
 
-    def test_live_entry_is_found(self) -> None:
-        # os.getpid() is by definition alive right now.
-        live_path = "/tmp/live-bridge.sock"
-        live_file = self._write_entry(os.getpid(), live_path, started_at=1234.0)
-
-        result = discover_registry_socket(self.registry_dir)
-
-        self.assertEqual(result, live_path)
-        self.assertTrue(os.path.exists(live_file), "live registry file must be kept")
-
-    def test_newest_live_entry_wins_and_dead_reaped(self) -> None:
-        # Two live entries (both this process's pid is only one file, so use the
-        # real pid for the newest and the parent pid for an older-but-live one).
+    def test_entries_are_newest_first(self) -> None:
         older_path = "/tmp/older-bridge.sock"
         newer_path = "/tmp/newer-bridge.sock"
-        dead_file = self._write_entry(2_000_000_001, "/tmp/dead2.sock", started_at=9999.0)
-        # Newest startedAt should win even though the dead entry has a larger one.
-        self._write_entry(os.getppid(), older_path, started_at=100.0)
-        self._write_entry(os.getpid(), newer_path, started_at=500.0)
+        self._write_entry(1001, older_path, started_at=100.0)
+        self._write_entry(1002, newer_path, started_at=500.0)
 
-        result = discover_registry_socket(self.registry_dir)
+        entries = discover_registry_entries(self.registry_dir)
 
-        self.assertEqual(result, newer_path)
-        self.assertFalse(os.path.exists(dead_file), "dead entry must be reaped")
+        self.assertEqual(
+            [entry.endpoint for entry in entries],
+            [newer_path, older_path],
+        )
 
     def test_malformed_file_is_reaped(self) -> None:
         bad_file = os.path.join(self.registry_dir, "99999.json")
         with open(bad_file, "w", encoding="utf-8") as f:
             f.write("{ not valid json")
 
-        self.assertIsNone(discover_registry_socket(self.registry_dir))
+        self.assertEqual(discover_registry_entries(self.registry_dir), [])
         self.assertFalse(os.path.exists(bad_file), "malformed registry file should be removed")
+
+    def test_record_without_endpoint_is_reaped(self) -> None:
+        bad_file = os.path.join(self.registry_dir, "99998.json")
+        with open(bad_file, "w", encoding="utf-8") as f:
+            json.dump({"pid": 99998, "startedAt": 1.0}, f)
+
+        self.assertEqual(discover_registry_entries(self.registry_dir), [])
+        self.assertFalse(os.path.exists(bad_file))
+
+
+class RegistryResolutionTest(unittest.IsolatedAsyncioTestCase):
+    def _args(self, socket: str | None = None):
+        return server_module.build_arg_parser().parse_args(
+            ["--socket", socket] if socket is not None else []
+        )
+
+    async def test_unreachable_entry_is_retained_and_next_bridge_is_used(self) -> None:
+        entries = [
+            RegistryEntry("/tmp/stale", "/registry/stale.json", 2.0),
+            RegistryEntry("/tmp/live", "/registry/live.json", 1.0),
+        ]
+        with (
+            mock.patch.object(
+                server_module, "discover_registry_entries", return_value=entries
+            ),
+            mock.patch.object(
+                server_module,
+                "verify_bridge_protocol",
+                mock.AsyncMock(
+                    side_effect=[BridgeConnectionError("closed"), None]
+                ),
+            ) as verify,
+        ):
+            endpoint, source = await server_module.resolve_connection(self._args())
+
+        self.assertEqual(endpoint, "/tmp/live")
+        self.assertIn("discovery registry", source)
+        self.assertEqual(verify.await_count, 2)
+
+    async def test_explicit_endpoint_is_verified_without_fallback(self) -> None:
+        with (
+            mock.patch.object(
+                server_module, "verify_bridge_protocol", mock.AsyncMock()
+            ) as verify,
+            mock.patch.object(server_module, "discover_registry_entries") as discover,
+        ):
+            endpoint, source = await server_module.resolve_connection(
+                self._args(r"\\.\pipe\vc3d-agent-42")
+            )
+
+        self.assertEqual(endpoint, r"\\.\pipe\vc3d-agent-42")
+        self.assertEqual(source, "explicit --socket/env")
+        verify.assert_awaited_once()
+        discover.assert_not_called()
+
+    async def test_incompatible_live_entry_is_skipped_but_kept(self) -> None:
+        entries = [
+            RegistryEntry("/tmp/old", "/registry/old.json", 2.0),
+            RegistryEntry("/tmp/current", "/registry/current.json", 1.0),
+        ]
+        with (
+            mock.patch.object(
+                server_module, "discover_registry_entries", return_value=entries
+            ),
+            mock.patch.object(
+                server_module,
+                "verify_bridge_protocol",
+                mock.AsyncMock(
+                    side_effect=[server_module.BridgeProtocolError("old"), None]
+                ),
+            ),
+        ):
+            endpoint, _ = await server_module.resolve_connection(self._args())
+
+        self.assertEqual(endpoint, "/tmp/current")
 
 
 class AutoLaunchTest(unittest.TestCase):
@@ -106,6 +170,18 @@ class AutoLaunchTest(unittest.TestCase):
         ):
             self.assertEqual(server_module.resolve_launch_binary(None), "/usr/bin/VC3D")
             fallback.assert_not_called()
+
+    def test_windows_build_candidates_use_exe(self) -> None:
+        candidates = server_module._standard_binary_candidates(
+            r"C:\src\volume-cartographer", "nt"
+        )
+
+        self.assertTrue(
+            any(
+                path.endswith(os.path.join("windows-msvc", "bin", "VC3D.exe"))
+                for path in candidates
+            )
+        )
 
     def test_invalid_explicit_binary_does_not_silently_fall_back(self) -> None:
         with (

@@ -1,21 +1,4 @@
-"""Thin asyncio JSON-RPC 2.0 client for the VC3D Agent Bridge AF_UNIX socket.
-
-Socket resolution (see README.md "Socket discovery" for the full writeup):
-
-1. If the configured value is an absolute/relative path that exists on
-   disk, connect to it directly as an AF_UNIX socket.
-2. Otherwise treat it as a bare ``QLocalServer`` name (what
-   ``--agent-bridge-name`` takes) and probe the handful of locations Qt is
-   known to place local-server sockets under on this platform
-   (``$TMPDIR/<name>``, ``/tmp/<name>``). First one that exists wins.
-3. If VC3D was spawned by us (the auto-launch path in ``server.py``),
-   ``BridgeClient.socket_path_from_handshake`` extracts the authoritative
-   path out of the ``VC3D-AGENT-BRIDGE: listening name=... path=...`` stdout
-   line instead of guessing.
-
-Step 1 (an explicit full path, e.g. forwarded via ``VC3D_AGENT_BRIDGE_SOCKET``)
-is the unambiguous option; step 2 is a best-effort fallback.
-"""
+"""Thin asyncio JSON-RPC 2.0 client for the VC3D Agent Bridge."""
 
 from __future__ import annotations
 
@@ -27,52 +10,38 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
+from .transport import (
+    BridgeReader,
+    BridgeWriter,
+    open_local_connection,
+    resolve_local_endpoint,
+)
+
 HANDSHAKE_RE = re.compile(
     r"^VC3D-AGENT-BRIDGE:\s*listening\s+name=(?P<name>\S+)\s+path=(?P<path>.+)$"
 )
 
-# Where a running VC3D publishes its bridge for auto-discovery. Mirrors the
-# ~/.fit_services convention used by LasagnaServiceManager::discoverServices():
-# one JSON file per process ("<pid>.json") holding {pid, name, path, startedAt},
-# with dead-PID entries reaped on scan. See AgentBridgeServer::writeRegistryFile.
 REGISTRY_DIR = os.path.join(os.path.expanduser("~"), ".vc3d", "agent_bridge")
 PROGRESS_QUEUE_SIZE = 64
 
 
-def _pid_alive(pid: int) -> bool:
-    """True if a process with `pid` currently exists (Unix ``kill(pid, 0)``).
-
-    Mirrors the ``kill(pid, 0) != 0 -> stale`` liveness check in
-    ``LasagnaServiceManager::discoverServices()``. A ``PermissionError`` means
-    the process exists but is owned by someone else -- still alive.
-    """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+@dataclass(frozen=True)
+class RegistryEntry:
+    endpoint: str
+    file_path: str
+    started_at: float
 
 
-def discover_registry_socket(registry_dir: str = REGISTRY_DIR) -> str | None:
-    """Scan the bridge registry for the newest live bridge's socket path.
+def discover_registry_entries(registry_dir: str = REGISTRY_DIR) -> list[RegistryEntry]:
+    """Return valid registry records, newest first.
 
-    Reads every ``*.json`` file in ``registry_dir``, dropping (and deleting)
-    entries whose ``pid`` is no longer alive -- the same stale-cleanup behavior
-    as ``LasagnaServiceManager::discoverServices()``. Returns the ``path`` of
-    the live entry with the greatest ``startedAt`` (newest launch), or ``None``
-    when the directory is absent or holds no live entry.
+    Endpoint connection is the liveness check. It is authoritative, avoids PID
+    reuse races, and does not rely on Unix signal behavior.
     """
     if not os.path.isdir(registry_dir):
-        return None
+        return []
 
-    best_path: str | None = None
-    best_started_at = -1.0
+    entries: list[RegistryEntry] = []
     for name in os.listdir(registry_dir):
         if not name.endswith(".json"):
             continue
@@ -81,50 +50,34 @@ def discover_registry_socket(registry_dir: str = REGISTRY_DIR) -> str | None:
             with open(file_path, "r", encoding="utf-8") as f:
                 obj = json.load(f)
         except (OSError, json.JSONDecodeError):
-            # Unreadable / malformed entry: reap it, matching the C++ scanner
-            # which removes non-object files.
-            _remove_registry_file(file_path)
+            remove_registry_entry(file_path)
             continue
 
         if not isinstance(obj, dict):
-            _remove_registry_file(file_path)
-            continue
-
-        pid = obj.get("pid")
-        pid = int(pid) if isinstance(pid, (int, float)) else -1
-        if pid <= 0:
-            _remove_registry_file(file_path)
-            continue
-
-        if not _pid_alive(pid):
-            _remove_registry_file(file_path)
+            remove_registry_entry(file_path)
             continue
 
         path = obj.get("path")
         if not isinstance(path, str) or not path:
+            remove_registry_entry(file_path)
             continue
 
         started_at = obj.get("startedAt")
         started_at = float(started_at) if isinstance(started_at, (int, float)) else 0.0
-        # Tie-break by file mtime so entries lacking a usable startedAt still
-        # order sensibly; startedAt is the primary key.
         if started_at < 0:
             started_at = 0.0
-        key = started_at
-        if key <= 0:
+        if started_at <= 0:
             try:
-                key = os.path.getmtime(file_path)
+                started_at = os.path.getmtime(file_path)
             except OSError:
-                key = 0.0
+                started_at = 0.0
 
-        if key > best_started_at:
-            best_started_at = key
-            best_path = path
+        entries.append(RegistryEntry(path, file_path, started_at))
 
-    return best_path
+    return sorted(entries, key=lambda entry: entry.started_at, reverse=True)
 
 
-def _remove_registry_file(file_path: str) -> None:
+def remove_registry_entry(file_path: str) -> None:
     try:
         os.unlink(file_path)
     except OSError:
@@ -166,8 +119,8 @@ class BridgeClientConfig:
 
 @dataclass
 class _Conn:
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
+    reader: BridgeReader
+    writer: BridgeWriter
     pending: dict[int, "asyncio.Future[Any]"] = field(default_factory=dict)
     read_task: asyncio.Task | None = None
 
@@ -191,25 +144,8 @@ class BridgeClient:
 
     @staticmethod
     def resolve_socket_path(configured: str) -> str:
-        """Turn a configured `--socket`/env-var value into a concrete path.
-
-        See the module docstring's "Socket resolution" writeup.
-        """
-        if os.path.exists(configured):
-            return configured
-
-        candidates = []
-        tmpdir = os.environ.get("TMPDIR")
-        if tmpdir:
-            candidates.append(os.path.join(tmpdir.rstrip("/"), configured))
-        candidates.append(os.path.join("/tmp", configured))
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                return candidate
-
-        # Nothing found on disk; return unmodified so a failed connect() names
-        # what the caller actually asked for, not a synthesized candidate.
-        return configured
+        """Turn a configured QLocalServer name or path into a native endpoint."""
+        return resolve_local_endpoint(configured)
 
     @staticmethod
     def socket_path_from_handshake(line: str) -> tuple[str, str] | None:
@@ -240,9 +176,10 @@ class BridgeClient:
                 return conn
             path = self.resolve_socket_path(self._config.socket)
             try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_unix_connection(path, limit=self._config.read_buffer_limit),
-                    timeout=self._config.connect_timeout,
+                reader, writer = await open_local_connection(
+                    path,
+                    limit=self._config.read_buffer_limit,
+                    connect_timeout=self._config.connect_timeout,
                 )
             except (OSError, asyncio.TimeoutError) as exc:
                 raise BridgeConnectionError(

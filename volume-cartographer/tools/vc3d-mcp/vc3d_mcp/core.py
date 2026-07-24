@@ -48,7 +48,7 @@ def configure_client(socket: str, request_timeout: float = 30.0) -> BridgeClient
 def _get_client() -> BridgeClient:
     if _client is None:
         raise RuntimeError(
-            "vc3d-mcp server was not configured with a bridge socket "
+            "vc3d-mcp server was not configured with a bridge endpoint "
             "(configure_client() was never called before serving requests)"
         )
     return _client

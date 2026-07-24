@@ -169,7 +169,7 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_close_racing_pending_connect_stays_closed(self) -> None:
         # close() concurrent with an in-flight connect() must not leave the
-        # client connected. Delay open_unix_connection so close() runs while
+        # client connected. Delay the Unix transport open so close() runs while
         # connect() is pending; close() then tears down whatever connect built.
         fresh = BridgeClient(BridgeClientConfig(socket=self.socket_path, request_timeout=5))
         started = asyncio.Event()
@@ -181,9 +181,7 @@ class BridgeClientLifecycleTest(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return await real_open(*args, **kwargs)
 
-        with mock.patch(
-            "vc3d_mcp.bridge_client.asyncio.open_unix_connection", slow_open
-        ):
+        with mock.patch("vc3d_mcp.transport.asyncio.open_unix_connection", slow_open):
             conn_task = asyncio.create_task(fresh.connect())
             await asyncio.wait_for(started.wait(), timeout=2.0)
             close_task = asyncio.create_task(fresh.close())
