@@ -32,10 +32,16 @@ async def vc3d_fiber_launch(
 
     position: {"x","y","z"} in volume space (default) or {"x","y"} scene-space
     when space="scene". The point must lie on the target viewer's current
-    view (same round-trip rule as vc3d_click). Requires a Lasagna dataset to
-    be resolvable for the active volume; otherwise fails -32005 with detail
-    (not every catalog sample has one -- check vc3d_describe_catalog_sample
-    for a "lasagna"-kind representation before opening).
+    view (same round-trip rule as vc3d_click). Requires a manifest-backed
+    Lasagna dataset (a "lasagna"-kind catalog representation) resolvable for
+    the CURRENTLY SELECTED volume; otherwise fails -32005 with detail. Not
+    every catalog sample/volume has one, and it resolves per-volume: a
+    "normal_grids"-kind store is a DIFFERENT resource and does NOT satisfy
+    this. Check vc3d_describe_catalog_sample for a "lasagna"-kind
+    representation and vc3d_select_volume to the volume that carries it before
+    launching. This is unrelated to the vc3d_lasagna_* tools and their
+    "lasagna service is not running" error -- tracing needs only this dataset,
+    never the fit service.
     replace_owning: defaults True, which DISCARDS the caller's currently
     open/in-progress fiber workspace (verified: launching a second fiber with
     the default silently drops the first fiber's unsaved control points).
@@ -77,8 +83,10 @@ async def vc3d_fiber_open(
 ) -> dict[str, Any]:
     """Open a saved fiber in the line-annotation workspace, optionally focused
     at a control point, a line-point index, or a [first, second] control-index
-    span. Pass at most one selector. Requires a Lasagna dataset to be
-    resolvable for the active volume; otherwise fails -32005 with detail."""
+    span. Pass at most one selector. Requires a manifest-backed Lasagna
+    dataset (a "lasagna"-kind catalog representation, NOT a "normal_grids"
+    store and NOT the vc3d_lasagna_* fit service) resolvable for the currently
+    selected volume; otherwise fails -32005 with detail."""
     return await _call(
         "fiber.open",
         _strip_none(
@@ -127,8 +135,12 @@ async def vc3d_fiber_set_tag(fiber_id: str, tag: str, enabled: bool) -> dict[str
 async def vc3d_fiber_create_atlas(fiber_id: str) -> dict[str, Any]:
     """Create a single-fiber atlas from a saved fiber and display it
     (dialog-free). SYNCHRONOUS and potentially slow (heavy geometry work on
-    the app thread) -- allow a generous client timeout. Requires a Lasagna
-    dataset resolvable for the active volume. Returns {"atlasDir",
+    the app thread) -- allow a generous client timeout. Requires a
+    manifest-backed Lasagna dataset resolvable for the currently selected
+    volume (a "lasagna"-kind representation, NOT a "normal_grids" store or the
+    vc3d_lasagna_* fit service), AND that dataset's manifest must provide
+    init_shell_dir -- a dataset can resolve for tracing yet still fail atlas
+    creation if that atlas-only field is absent. Returns {"atlasDir",
     "displayed"} (plus displayDetail when display failed but creation
     succeeded)."""
     return await _call("fiber.create_atlas", {"fiberId": fiber_id})
