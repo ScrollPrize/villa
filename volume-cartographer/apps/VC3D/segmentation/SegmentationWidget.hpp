@@ -97,6 +97,10 @@ public:
     void setEraseBrushActive(bool active);
     void setManualAddActive(bool active);
     ManualAddTool::LinePreviewMode cycleManualAddLinePreviewMode();
+    // Route direct changes through the panel so manualAddConfigChanged reaches
+    // the module just as it does for a combo-box edit.
+    ManualAddTool::LinePreviewMode setManualAddLinePreviewMode(ManualAddTool::LinePreviewMode mode);
+    ManualAddTool::InterpolationMode setManualAddInterpolationMode(ManualAddTool::InterpolationMode mode);
 
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);

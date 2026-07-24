@@ -150,6 +150,9 @@ public:
     void setCloseAfterFinalizationAllowed(bool allowed);
     void setWorkspaceEmbedded(bool embedded);
     bool workspaceEmbedded() const { return _workspaceEmbedded; }
+    // Programmatic twin of the "current cut follows strip mouse" toggle.
+    void setCutFollowEnabled(bool enabled);
+    bool cutFollowEnabled() const { return _currentCutFollowsStripMouse; }
 
 signals:
     void paneClosed(const std::string& surfaceName);

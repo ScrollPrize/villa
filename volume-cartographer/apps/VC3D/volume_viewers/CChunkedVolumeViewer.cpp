@@ -2415,15 +2415,10 @@ void CChunkedVolumeViewer::panByF(float dx, float dy)
     emit overlaysUpdated();
 }
 
-void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
+void CChunkedVolumeViewer::zoomByFactorAt(float factor, const QPointF& scenePos)
 {
-    if (steps == 0)
+    if (!std::isfinite(factor) || factor <= 0.0f)
         return;
-    const double zoomMotionPx = std::hypot(double(_view->viewport()->width()),
-                                          double(_view->viewport()->height())) *
-                                0.08 * std::abs(double(steps));
-    markInteractiveMotion(zoomMotionPx);
-    const float factor = std::pow(1.05f, static_cast<float>(steps) * _zoomSensitivity);
     const float newScale = std::clamp(_scale * factor, kMinScale, kMaxScale);
     if (std::abs(newScale - _scale) < _scale * 1e-6f)
         return;
@@ -2447,10 +2442,35 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     emit overlaysUpdated();
 }
 
+void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
+{
+    if (steps == 0)
+        return;
+    const double zoomMotionPx = std::hypot(double(_view->viewport()->width()),
+                                          double(_view->viewport()->height())) *
+                                0.08 * std::abs(double(steps));
+    markInteractiveMotion(zoomMotionPx);
+    const float factor = std::pow(1.05f, static_cast<float>(steps) * _zoomSensitivity);
+    zoomByFactorAt(factor, scenePos);
+}
+
 void CChunkedVolumeViewer::adjustZoomByFactor(float factor)
 {
-    const int steps = (factor > 1.0f) ? 1 : (factor < 1.0f ? -1 : 0);
-    zoomStepsAt(steps, QPointF(_view->viewport()->width() * 0.5, _view->viewport()->height() * 0.5));
+    if (!std::isfinite(factor) || factor <= 0.0f || factor == 1.0f)
+        return;
+    // Apply the true scale multiplier directly, centered on the viewport, and
+    // mark motion proportionally so cache/LOD heuristics treat a large
+    // programmatic zoom like a large wheel zoom.
+    const QPointF center(_view->viewport()->width() * 0.5,
+                         _view->viewport()->height() * 0.5);
+    const double mag = std::abs(std::log(double(factor)) / std::log(1.05));
+    if (mag > 0.0) {
+        const double motionPx = std::hypot(double(_view->viewport()->width()),
+                                           double(_view->viewport()->height())) *
+                                0.08 * mag;
+        markInteractiveMotion(motionPx);
+    }
+    zoomByFactorAt(factor, center);
 }
 
 void CChunkedVolumeViewer::notifyInteractiveViewChange(double motionPx)

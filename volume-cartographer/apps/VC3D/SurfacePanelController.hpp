@@ -118,6 +118,13 @@ public:
 
     void syncSelectionUi(const std::string& surfaceId, QuadSurface* surface);
     bool selectSurfaceById(const std::string& surfaceId);
+    /// Programmatically activate a segment: selects it in the tree (signals blocked,
+    /// via selectSurfaceById) then emits surfaceActivated exactly as a live click would
+    /// (reaching CWindow::onSurfaceActivated). Never shows UI. Returns false with a
+    /// reason in *errorMessage when the id is unknown, unloadable, an unmaterialized
+    /// open-data placeholder, or selection is locked while growth runs.
+    bool activateSurfaceById(const std::string& surfaceId,
+                             QString* errorMessage = nullptr);
     void resetTagUi();
 
     bool isCurrentOnlyFilterEnabled() const;
@@ -130,12 +137,44 @@ public:
     void setVisibleSegmentFolders(std::vector<SegmentFolderSelection> folders);
     void addSingleSegmentation(const std::string& segId);
     void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
+    // Irreversibly deletes each id from disk and refreshes the panel. The
+    // interactive caller is responsible for confirmation.
+    bool deleteSegmentsHeadless(const QStringList& segmentIds, QString* err = nullptr,
+                                int* deletedCount = nullptr);
+    // Replace the whole highlighted-surface set at once and push it to the viewers,
+    // keeping _highlightedSurfaceIds, the source of truth behind the
+    // "Highlight in slice views" checkmarks, in sync.
+    void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
+    std::vector<std::string> highlightedSurfaceIds() const;
     bool cycleToNextVisibleSegment();
     bool cycleToPreviousVisibleSegment();
     void materializeCurrentOpenDataFolder();
     // Enables the "Add to current spiral fit" context action while a Spiral
     // session is active on the connected service.
     void setSpiralFitAvailable(bool available) { _spiralFitAvailable = available; }
+
+    /// Outcome of an asynchronous single-segment fetch request. Only `Started`
+    /// implies the completion callback will fire later (on the main thread);
+    /// the other outcomes are resolved synchronously by the caller with no
+    /// callback.
+    enum class OpenDataFetchOutcome {
+        Started,             ///< async materialize kicked off; onDone will fire
+        AlreadyMaterialized, ///< not a placeholder; nothing to fetch
+        NotFound,            ///< no such segment / surface could not be loaded
+        Busy,                ///< another single-segment materialize is running
+    };
+
+    /// Materialize one open-data placeholder without a progress dialog or
+    /// forced activation. Shares the GUI path's single-flight guard. On a
+    /// `Started` outcome, reloads the surface list on success and invokes
+    /// onDone(success, message) on the main thread.
+    OpenDataFetchOutcome fetchOpenDataSegmentAsync(
+        const std::string& id,
+        std::function<void(bool success, const QString& message)> onDone);
+
+    /// True while a single-segment materialization holds the shared
+    /// single-flight guard.
+    bool isOpenDataMaterializationRunning() const;
 
 signals:
     void surfacesLoaded();

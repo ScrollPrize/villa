@@ -9,8 +9,11 @@
 #include <string>
 #include <vector>
 
-#include "vc/core/util/RemoteAuth.hpp"
 #include "OpenDataVolumePrefill.hpp"
+#include "OpenDataManifest.hpp"
+#include "OpenDataSampleProject.hpp"
+
+#include <functional>
 
 class QAction;
 class QDialog;
@@ -21,8 +24,16 @@ class Volume;
 
 namespace vc3d::opendata {
 struct OpenDataSample;
+struct OpenDataSampleProjectResult;
 class OpenDataCatalogWindow;
 }
+
+// Options for opening an Open Data sample. `selection` restricts attached
+// resources; `interactive` permits prompts, progress dialogs, and message boxes.
+struct OpenDataSampleOpenOptions {
+    vc3d::opendata::OpenDataResourceSelection selection;
+    bool interactive{true};
+};
 
 class MenuActionController : public QObject
 {
@@ -38,9 +49,48 @@ public:
     void updateRecentVolpkgList(const QString& path);
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
-    void openVolpkgAt(const QString& path);
+    bool openVolpkgAt(const QString& path,
+                      bool interactive = true,
+                      QString* errorMessage = nullptr);
     void showOpenDataCatalog();
     bool isOpenDataCatalogVisible() const;
+    // Resolves sampleId against the cached manifest and opens it. When
+    // interactive is false, prompts, progress dialogs, and message boxes are
+    // suppressed.
+    bool openOpenDataSampleById(const QString& sampleId, bool interactive = true);
+
+    // Opens a sample with explicit resource selection. resultOut receives the
+    // attachment counters and messages when provided.
+    bool openOpenDataSampleById(const QString& sampleId,
+                                const OpenDataSampleOpenOptions& options,
+                                QString* errorMessage = nullptr,
+                                vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr);
+
+    // Terminal outcome of an asynchronous Open Data sample open.
+    struct OpenDataSampleOpenOutcome {
+        bool success{false};
+        QString error;                                       // set iff !success
+        vc3d::opendata::OpenDataSampleProjectResult result;  // attach counters/messages
+    };
+
+    // Starts a catalog sample open without spinning a nested event loop and
+    // returns immediately.
+    //
+    // Returns false (with *errorMessage) on synchronous precondition failure (no
+    // window/state, empty/unknown id, manifest unavailable, or an open already in
+    // flight). Returns true once the background task started; exactly one GUI-thread
+    // call to `onFinished` follows. `onProgress`, if set, is invoked on the GUI thread
+    // with the same stream the interactive QProgressDialog consumes.
+    // options.interactive is ignored; this entry point is always non-interactive.
+    bool startOpenDataSampleOpen(
+        const QString& sampleId,
+        const OpenDataSampleOpenOptions& options,
+        std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
+        std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress = {},
+        QString* errorMessage = nullptr);
+
+    // True while any sample open is in flight.
+    bool openDataSampleOpenInFlight() const;
 
 private slots:
     void newProject();
@@ -88,20 +138,32 @@ private:
     void saveRecentRemoteUrls(const QStringList& urls);
     void updateRecentRemoteList(const QString& url);
     void attachRemoteZarrUrl(const QString& url);
-    bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample);
+    bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
+                            bool interactive = true,
+                            const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
+                            QString* errorMessage = nullptr,
+                            vc3d::opendata::OpenDataSampleProjectResult* resultOut = nullptr);
+    // .cpp-local payload keeps the QtConcurrent result type out of this header.
+    struct OpenDataOpenTaskResult;
+    // Launches the QtConcurrent task without a nested event loop. Its watcher is
+    // parented to this; completion and onFinished run on the GUI thread.
+    void beginOpenDataSampleOpenTask(
+        const vc3d::opendata::OpenDataSample& sample,
+        bool interactive,
+        const vc3d::opendata::OpenDataResourceSelection* selection,
+        std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
+        std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress);
+    // Epilogue run on the GUI thread once the open task finishes: setVpkg, UI
+    // refresh, prefill, status message, and (interactive-only) message boxes.
+    void finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
+                                  bool interactive,
+                                  OpenDataSampleOpenOutcome* outcomeOut);
     void startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume);
     void cancelOpenDataVolumePrefills();
-    bool tryResolveRemoteAuth(const QString& url,
-                              vc::HttpAuth* authOut,
-                              bool allowPrompt,
-                              QString* errorMessage = nullptr) const;
     // Runs vc_volpkg_convert against `inputLocation` (legacy folder or remote URL),
     // prompts the user for an output .volpkg.json, and returns the written path
     // via `convertedOut` on success.
     bool runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut);
-    QString remoteCacheDirectory(bool allowPrompt);
-    QString configuredRemoteCacheDirectory() const;
-    QString suggestedRemoteCacheDirectory() const;
     QString promptLocation(const QString& title,
                            const QString& hint,
                            const QString& defaultDir,
@@ -154,4 +216,6 @@ private:
     std::vector<QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>*> _openDataPrefillWatchers;
     std::vector<std::shared_ptr<std::atomic<bool>>> _openDataPrefillCancelFlags;
     std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
+    // True from launch until the finished slot runs; prevents overlapping opens.
+    bool _openDataSampleOpenInFlight{false};
 };

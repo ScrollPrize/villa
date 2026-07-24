@@ -16,6 +16,7 @@
 #include <QSettings>
 #include <QDir>
 #include <QFile>
+#include <QStandardPaths>
 #include <QtConcurrent/QtConcurrent>
 
 #include <opencv2/imgproc.hpp>
@@ -46,6 +47,23 @@ using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
 
 
 namespace {
+
+// Resolve the command-line volume argument for vc_grow_seg_from_seed, mirroring
+// SegmentationCommandHandler::commandPathForVolume: a fully remote/streaming-only volume
+// has an empty Volume::path(), so pass its remote locator instead (an empty path made the
+// child fail instantly — issue #1188). Kept as a file-local helper rather than a shared
+// header, matching how this codebase already duplicates such tiny cross-file helpers.
+QString commandPathForVolume(const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        return QString();
+    }
+    if (volume->isRemote()) {
+        return QString::fromStdString(volume->remoteLocator());
+    }
+    return QString::fromStdString(volume->path().string());
+}
+
 struct SegmentTriangleHit {
     float pathT = 0.0f;
     float distanceSq = std::numeric_limits<float>::max();
@@ -628,15 +646,28 @@ void SeedingWidget::onClearPeaksClicked()
 
 void SeedingWidget::onPreviewRaysClicked()
 {
+    QString errorMessage;
+    if (!previewRaysHeadless(&errorMessage) && !errorMessage.isEmpty()) {
+        QMessageBox::warning(this, tr("Warning"), errorMessage);
+    }
+}
+
+bool SeedingWidget::previewRaysHeadless(QString* errorMessage)
+{
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (currentMode != Mode::PointMode || !currentVolume) {
-        return;
+        if (errorMessage) {
+            *errorMessage = tr("Ray preview requires Point mode and a loaded volume.");
+        }
+        return false;
     }
 
     POI* focus_poi = _state->poi("focus");
     if (!focus_poi) {
-        QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before previewing rays.");
-        return;
+        if (errorMessage) {
+            *errorMessage = tr("No focus point set. Please set a focus point before previewing rays.");
+        }
+        return false;
     }
 
     _point_collection->clearCollection(_point_collection->getCollectionId("ray_preview"));
@@ -668,13 +699,25 @@ void SeedingWidget::onPreviewRaysClicked()
     }
 
     infoLabel->setText(QString("Previewing %1 rays.").arg(numSteps));
+    return true;
 }
 
 void SeedingWidget::onCastRaysClicked()
 {
+    QString errorMessage;
+    if (!castRaysHeadless(&errorMessage) && !errorMessage.isEmpty()) {
+        QMessageBox::warning(this, tr("Warning"), errorMessage);
+    }
+}
+
+bool SeedingWidget::castRaysHeadless(QString* errorMessage)
+{
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (!currentVolume) {
-        return;
+        if (errorMessage) {
+            *errorMessage = tr("No volume loaded.");
+        }
+        return false;
     }
 
     _castRaysWasPointMode = (currentMode == Mode::PointMode);
@@ -682,12 +725,17 @@ void SeedingWidget::onCastRaysClicked()
     if (_castRaysWasPointMode) {
         POI* focusPoi = _state ? _state->poi("focus") : nullptr;
         if (!focusPoi) {
-            QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
-            return;
+            if (errorMessage) {
+                *errorMessage = tr("No focus point set. Please set a focus point before casting rays.");
+            }
+            return false;
         }
     } else {
         if (paths.empty()) {
-            return;
+            if (errorMessage) {
+                *errorMessage = tr("Draw at least one path before casting rays.");
+            }
+            return false;
         }
     }
 
@@ -883,6 +931,7 @@ void SeedingWidget::onCastRaysClicked()
     });
 
     _castRaysWatcher->setFuture(future);
+    return true;
 }
 
 void SeedingWidget::onCastRaysFinished()
@@ -1119,28 +1168,43 @@ void SeedingWidget::findPeaksAlongRay(
 
 void SeedingWidget::onRunSegmentationClicked()
 {
+    // The shared batch launcher reports precondition failures synchronously and
+    // drains child processes through the event loop.
+    QString err;
+    if (!runSegmentationHeadless(&err) && !err.isEmpty()) {
+        QMessageBox::warning(this, tr("Seeding"), err);
+    }
+}
+
+bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
+{
+    auto setError = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+
+    if (jobsRunning) {
+        setError(tr("A seeding batch is already running."));
+        return false;
+    }
+    if (executablePath.isEmpty()) {
+        setError(tr("vc_grow_seg_from_seed executable not found."));
+        return false;
+    }
+
     auto fVpkg = _state ? _state->vpkg() : nullptr;
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    auto currentVolumeId = _state ? _state->currentVolumeId() : std::string{};
-
-    std::cout << "SeedingWidget::onRunSegmentationClicked - START" << std::endl;
-    std::cout << "  currentVolume: " << (currentVolume ? "valid" : "null") << std::endl;
-    std::cout << "  currentVolumeId: " << currentVolumeId << std::endl;
-    std::cout << "  fVpkg: " << (fVpkg ? "valid" : "null") << std::endl;
 
     // Get the selected collection name from the combo box
     std::string sourceCollection = collectionComboBox->currentText().toStdString();
     if (sourceCollection.empty()) {
-        QMessageBox::warning(this, "Warning", "Please select a source collection.");
-        return;
+        setError(tr("Please select a source collection."));
+        return false;
     }
 
     // Combine analysis points and user-placed points for segmentation
     std::vector<ColPoint> allPoints = _point_collection->getPoints(sourceCollection);
 
     if (allPoints.empty() || !fVpkg) {
-        QMessageBox::warning(this, "Error", "No points available for segmentation or volume package not loaded.");
-        return;
+        setError(tr("No points available for segmentation or volume package not loaded."));
+        return false;
     }
 
     const int numProcesses = processesSpinBox->value();
@@ -1158,8 +1222,8 @@ void SeedingWidget::onRunSegmentationClicked()
         seedJsonPath = pathsDir.parent_path() / "seed.json";
     } else {
         if (!fVpkg->hasVolumes()) {
-            QMessageBox::warning(this, "Error", "No volumes in volume package.");
-            return;
+            setError(tr("No volumes in volume package."));
+            return false;
         }
 
         auto vol = fVpkg->volume();
@@ -1168,26 +1232,42 @@ void SeedingWidget::onRunSegmentationClicked()
         seedJsonPath = vpkgPath / "seed.json";
 
         if (!std::filesystem::exists(pathsDir)) {
-            QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
-            return;
+            setError(tr("Segmentation paths directory not found in volume package."));
+            return false;
         }
     }
 
     if (!std::filesystem::exists(seedJsonPath)) {
-        QMessageBox::warning(this, "Error", "seed.json not found in volume package.");
-        return;
+        setError(tr("seed.json not found in volume package."));
+        return false;
     }
 
     if (!currentVolume) {
-        QMessageBox::warning(this, "Error", "No current volume selected.");
-        return;
+        setError(tr("No current volume selected."));
+        return false;
     }
 
-    std::filesystem::path volumePath = currentVolume->path();
-    QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
+    // Validate before begin(); otherwise an early return leaves a phantom batch
+    // that can make a later neural trace look like a cancellable seeding job.
+    _batchVolumePath = commandPathForVolume(currentVolume);
+    if (_batchVolumePath.isEmpty()) {
+        setError(tr("Could not resolve a volume path for segmentation "
+                    "(no local mirror and no remote locator)."));
+        return false;
+    }
+
+    // Keep per-batch configuration in member state for asynchronous callbacks.
+    _batch.begin(QStringLiteral("run"), totalPoints);
+    _batchPoints = std::move(allPoints);
+    _batchNextIndex = 0;
+    _batchOmpThreads = ompThreads;
+    _batchProcessTail.clear();
+    _batchPathsDir = pathsDir;
+    _batchConfigJson = seedJsonPath;
+    _batchWorkingDir = QString::fromStdString(pathsDir.parent_path().string());
 
     // Update UI
-    infoLabel->setText("Running segmentation jobs...");
+    infoLabel->setText(tr("Running segmentation jobs..."));
     runSegmentationButton->setEnabled(false);
     expandSeedsButton->setEnabled(false);
 
@@ -1201,116 +1281,151 @@ void SeedingWidget::onRunSegmentationClicked()
     barOptions.fontPointSize = 11;
     progressUtil->startProgress(totalPoints, &barOptions);
 
-    // Track completion
-    int completedJobs = 0;
-    int nextPointIndex = 0;
-    
-    // Lambda to start a process for a point
-    std::function<void(int)> startProcessForPoint = [&](int pointIndex) {
-        if (pointIndex >= totalPoints || !jobsRunning) {
-            return;
-        }
-        
-        const auto& point = allPoints[pointIndex];
-        QProcess* process = new QProcess(this);
-        process->setProcessChannelMode(QProcess::MergedChannels);
-        process->setWorkingDirectory(workingDir);
-
-        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        if (ompThreads > 0) {
-            env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
-        }
-        process->setProcessEnvironment(env);
-
-        // Connect finished signal
-        connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            [this, process, pointIndex, &completedJobs, &nextPointIndex, &startProcessForPoint, totalPoints]
-            (int exitCode, QProcess::ExitStatus exitStatus) {
-                if (!jobsRunning) {
-                    return;
-                }
-                
-                // Log result
-                if (exitCode != 0) {
-                    std::cerr << "Process for point " << pointIndex << " failed with exit code: " << exitCode << std::endl;
-                } else {
-                    std::cout << "Completed segmentation for point " << pointIndex << std::endl;
-                }
-                
-                // Update progress
-                completedJobs++;
-                progressUtil->updateProgress(completedJobs);
-                
-                // Remove from running list (QPointer will handle null checking)
-                runningProcesses.removeOne(process);
-                process->deleteLater();
-                
-                // Start next process if available
-                if (nextPointIndex < totalPoints && jobsRunning) {
-                    startProcessForPoint(nextPointIndex++);
-                }
-                
-                // Check if all done
-                if (completedJobs >= totalPoints) {
-                    progressUtil->stopProgress();
-                    cancelButton->setVisible(false);
-                    jobsRunning = false;
-                    runningProcesses.clear();
-                    infoLabel->setText(QString("Segmentation complete for %1 points.").arg(totalPoints));
-                    runSegmentationButton->setEnabled(true);
-                    expandSeedsButton->setEnabled(true);
-                    updateButtonStates();
-                    emit sendStatusMessageAvailable(QString("Completed segmentation for %1 points").arg(totalPoints), 5000);
-                }
-            });
-        
-        // Start the process
-        QStringList previewParts;
-        if (ompThreads > 0) {
-            previewParts << QString("OMP_NUM_THREADS=%1").arg(ompThreads);
-        }
-        previewParts << executablePath
-                     << QString("\"%1\"").arg(QString::fromStdString(volumePath.string()))
-                     << QString("\"%1\"").arg(QString::fromStdString(pathsDir.string()))
-                     << QString("\"%1\"").arg(QString::fromStdString(seedJsonPath.string()))
-                     << QString::number(point.p[0])
-                     << QString::number(point.p[1])
-                     << QString::number(point.p[2]);
-
-        std::cout << "Starting job " << pointIndex << ": " << previewParts.join(' ').toStdString() << std::endl;
-        
-        const QStringList toolArgs = QStringList()
-                      << QString::fromStdString(volumePath.string())
-                      << QString::fromStdString(pathsDir.string())
-                      << QString::fromStdString(seedJsonPath.string())
-                      << QString::number(point.p[0])
-                      << QString::number(point.p[1])
-                      << QString::number(point.p[2]);
-#if defined(Q_OS_LINUX)
-        // Background priority so batch growth doesn't starve the UI.
-        process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3"
-                                             << executablePath << toolArgs);
-#elif defined(Q_OS_UNIX)
-        // ionice is Linux-specific; macOS still provides nice.
-        process->start("nice", QStringList() << "-n" << "19" << executablePath << toolArgs);
-#else
-        process->start(executablePath, toolArgs);
-#endif
-        
-        runningProcesses.append(QPointer<QProcess>(process));
-    };
-    
-    // Start initial batch of processes
+    // Start initial batch of processes; the rest chain in via the finished
+    // callback with bounded concurrency.
     for (int i = 0; i < std::min(numProcesses, totalPoints); i++) {
-        startProcessForPoint(nextPointIndex++);
+        startSegmentationProcessForPoint(_batchNextIndex++);
     }
-    
-    // Process events until all jobs complete or cancelled
-    while (jobsRunning && completedJobs < totalPoints) {
-        QApplication::processEvents(QEventLoop::AllEvents, 100);
+    return true;
+}
+
+void SeedingWidget::startSegmentationProcessForPoint(int pointIndex)
+{
+    if (pointIndex >= _batch.total() || !jobsRunning) {
+        return;
     }
+
+    const auto& point = _batchPoints[pointIndex];
+    QProcess* process = new QProcess(this);
+    process->setProcessChannelMode(QProcess::MergedChannels);
+    process->setWorkingDirectory(_batchWorkingDir);
+
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    if (_batchOmpThreads > 0) {
+        env.insert("OMP_NUM_THREADS", QString::number(_batchOmpThreads));
+    }
+    process->setProcessEnvironment(env);
+
+    const QStringList toolArgs = QStringList()
+                  << _batchVolumePath
+                  << QString::fromStdString(_batchPathsDir.string())
+                  << QString::fromStdString(_batchConfigJson.string())
+                  << QString::number(point.p[0])
+                  << QString::number(point.p[1])
+                  << QString::number(point.p[2]);
+
+    std::cout << "Starting seeding job " << pointIndex << ": "
+              << executablePath.toStdString() << " " << toolArgs.join(' ').toStdString()
+              << std::endl;
+
+    launchBatchProcess(process, pointIndex, toolArgs);
+}
+
+void SeedingWidget::handleBatchProcessFinished(QProcess* process, int index, int exitCode,
+                                               QProcess::ExitStatus exitStatus, bool failedToStart)
+{
+    if (!jobsRunning) {
+        return;
+    }
+
+    const bool isExpand = (_batch.kind() == QLatin1String("expand"));
+    const bool crashed = (exitStatus != QProcess::NormalExit);
+
+    // Aggregate the outcome, deduping on the stable child index — not the QProcess*
+    // itself, since process->deleteLater() below frees each finished child mid-batch and
+    // a later QProcess can be allocated at the same address, misreading as already-terminal.
+    const QString label = isExpand ? tr("Expansion iteration %1").arg(index)
+                                   : tr("Segmentation for point %1").arg(index);
+    if (!_batch.recordTerminal(index, failedToStart, crashed, exitCode,
+                               _batchProcessTail.value(process), label)) {
+        return;
+    }
+
+    const bool failed = failedToStart || crashed || exitCode != 0;
+    if (failed) {
+        std::cerr << _batch.failureMessages().constLast().toStdString() << std::endl;
+    } else {
+        std::cout << (isExpand ? "Completed expansion iteration "
+                               : "Completed segmentation for point ")
+                  << index << std::endl;
+    }
+
+    progressUtil->updateProgress(_batch.completed());
+    emit seedingBatchProgressChanged(_batch.kind(), _batch.completed(), _batch.total());
+
+    // Remove from running list (QPointer handles null checking)
+    runningProcesses.removeOne(process);
+    _batchProcessTail.remove(process);
+    process->deleteLater();
+
+    // Continue the remaining batch after an individual failure unless canceled.
+    if (_batchNextIndex < _batch.total() && jobsRunning && !_batch.cancelRequested()) {
+        if (isExpand) {
+            startExpansionProcessForIteration(_batchNextIndex++);
+        } else {
+            startSegmentationProcessForPoint(_batchNextIndex++);
+        }
+    }
+
+    if (_batch.isComplete()) {
+        finalizeSeedingBatch();
+    }
+}
+
+void SeedingWidget::finalizeSeedingBatch()
+{
+    // Common terminal teardown for a run/expand batch OR a cancel of any seeding-widget
+    // process batch. A neural trace shares jobsRunning/runningProcesses/cancelButton but
+    // leaves the tracker kind empty, so the batch-finished signal (and seeding-specific
+    // wording) are only emitted for a real run/expand batch. Idempotent: cancel + the
+    // last child completion can both reach here.
+    if (_batch.finalized()) {
+        return;
+    }
+
+    // Capture kind before finalize() clears it.
+    const QString kind = _batch.kind();
+    const SeedingBatchTracker::Result r = _batch.finalize();
+    const int completed = r.completed;
+    const int total = r.total;
+    const bool canceled = r.canceled;
+    const bool success = r.success;
+    const QString message = r.message;
 
     progressUtil->stopProgress();
+    cancelButton->setVisible(false);
+    jobsRunning = false;
+    runningProcesses.clear();
+
+    if (!kind.isEmpty() && success) {
+        if (kind == QLatin1String("expand")) {
+            infoLabel->setText(tr("Expansion complete after %1 iterations.").arg(total));
+            emit sendStatusMessageAvailable(tr("Completed %1 expansion iterations").arg(total), 5000);
+        } else {
+            infoLabel->setText(tr("Segmentation complete for %1 points.").arg(total));
+            emit sendStatusMessageAvailable(tr("Completed segmentation for %1 points").arg(total), 5000);
+        }
+    } else if (canceled) {
+        infoLabel->setText(tr("Jobs cancelled by user"));
+        emit sendStatusMessageAvailable(tr("Jobs cancelled by user"), 3000);
+    } else if (!kind.isEmpty()) {
+        infoLabel->setText(message);
+        emit sendStatusMessageAvailable(message, 5000);
+    }
+
+    runSegmentationButton->setEnabled(true);
+    expandSeedsButton->setEnabled(true);
+    updateButtonStates();
+
+    // Drop the latched batch config; nothing must dangle past this point.
+    // (_batch retains its finalized outcome for idempotency; begin() resets it.)
+    _batchPoints.clear();
+    _batchPoints.shrink_to_fit();
+    _batchProcessTail.clear();
+
+    if (!kind.isEmpty()) {
+        emit seedingBatchFinished(kind, success, canceled, completed, total, message);
+    }
 }
 
 
@@ -1456,11 +1571,11 @@ void SeedingWidget::analyzePaths()
     for (const auto& path : paths) {
         // Analyze along this path
         findPeaksAlongPath(path);
-        
+
         // Update progress
         pathIndex++;
         progressUtil->updateProgress(pathIndex);
-        QApplication::processEvents();
+        // This synchronous computation must not pump a re-entrant event loop.
     }
 
     progressUtil->stopProgress();
@@ -1476,6 +1591,29 @@ void SeedingWidget::analyzePaths()
     emit sendStatusMessageAvailable(
         QString("Analyzed %1 paths and found %2 intensity peaks").arg(paths.size()).arg(_point_collection->getPoints("seeding_peaks").size()),
         5000);
+}
+
+bool SeedingWidget::runAnalyzePathsHeadless(QString* errorMessage, int* pathsAnalyzed,
+                                            int* peaksFound)
+{
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
+    if (!currentVolume) {
+        if (errorMessage) *errorMessage = tr("No current volume selected.");
+        return false;
+    }
+    if (paths.empty()) {
+        if (errorMessage) *errorMessage = tr("No paths to analyze. Draw paths in Draw mode first.");
+        return false;
+    }
+
+    // analyzePaths is synchronous and completes before this returns.
+    analyzePaths();
+
+    if (pathsAnalyzed) *pathsAnalyzed = static_cast<int>(paths.size());
+    if (peaksFound) {
+        *peaksFound = static_cast<int>(_point_collection->getPoints("seeding_peaks").size());
+    }
+    return true;
 }
 
 void SeedingWidget::findPeaksAlongPath(const PathPrimitive& path)
@@ -2127,12 +2265,33 @@ void SeedingWidget::onMouseRelease(cv::Vec3f vol_point, Qt::MouseButton button, 
 
 void SeedingWidget::onExpandSeedsClicked()
 {
+    // Interactive slot: delegate to the non-blocking headless core (see
+    // onRunSegmentationClicked).
+    QString err;
+    if (!runExpandSeedsHeadless(&err) && !err.isEmpty()) {
+        QMessageBox::warning(this, tr("Seeding"), err);
+    }
+}
+
+bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
+{
+    auto setError = [&](const QString& msg) { if (errorMessage) *errorMessage = msg; };
+
+    if (jobsRunning) {
+        setError(tr("A seeding batch is already running."));
+        return false;
+    }
+    if (executablePath.isEmpty()) {
+        setError(tr("vc_grow_seg_from_seed executable not found."));
+        return false;
+    }
+
     auto fVpkg = _state ? _state->vpkg() : nullptr;
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
 
     if (!fVpkg || !currentVolume) {
-        QMessageBox::warning(this, "Error", "Volume package or volume not loaded.");
-        return;
+        setError(tr("Volume package or volume not loaded."));
+        return false;
     }
 
     const int numProcesses = processesSpinBox->value();
@@ -2150,8 +2309,8 @@ void SeedingWidget::onExpandSeedsClicked()
         expandJsonPath = pathsDir.parent_path() / "expand.json";
     } else {
         if (!fVpkg->hasVolumes()) {
-            QMessageBox::warning(this, "Error", "No volumes in volume package.");
-            return;
+            setError(tr("No volumes in volume package."));
+            return false;
         }
 
         auto vol = fVpkg->volume();
@@ -2160,21 +2319,36 @@ void SeedingWidget::onExpandSeedsClicked()
         expandJsonPath = vpkgPath / "expand.json";
 
         if (!std::filesystem::exists(pathsDir)) {
-            QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
-            return;
+            setError(tr("Segmentation paths directory not found in volume package."));
+            return false;
         }
     }
 
     if (!std::filesystem::exists(expandJsonPath)) {
-        QMessageBox::warning(this, "Error", "expand.json not found in volume package.");
-        return;
+        setError(tr("expand.json not found in volume package."));
+        return false;
     }
 
-    std::filesystem::path volumePath = currentVolume->path();
-    QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
+    // Validate before begin() so an early return cannot leave a phantom batch.
+    _batchVolumePath = commandPathForVolume(currentVolume);
+    if (_batchVolumePath.isEmpty()) {
+        setError(tr("Could not resolve a volume path for expansion "
+                    "(no local mirror and no remote locator)."));
+        return false;
+    }
+
+    // Keep per-batch configuration in member state for asynchronous callbacks.
+    _batch.begin(QStringLiteral("expand"), expansionIterations);
+    _batchPoints.clear();
+    _batchNextIndex = 0;
+    _batchOmpThreads = ompThreads;
+    _batchProcessTail.clear();
+    _batchPathsDir = pathsDir;
+    _batchConfigJson = expandJsonPath;
+    _batchWorkingDir = QString::fromStdString(pathsDir.parent_path().string());
 
     // Update UI
-    infoLabel->setText("Running expansion jobs...");
+    infoLabel->setText(tr("Running expansion jobs..."));
     expandSeedsButton->setEnabled(false);
     runSegmentationButton->setEnabled(false);
 
@@ -2189,158 +2363,143 @@ void SeedingWidget::onExpandSeedsClicked()
     barOptions.prefix = tr("Expansion ");
     progressUtil->startProgress(expansionIterations, &barOptions);
 
-    // Track completion
-    int completedJobs = 0;
-    int nextIterationIndex = 0;
-    
-    // Lambda to start an expansion process
-    std::function<void(int)> startExpansionProcess = [&](int iterationIndex) {
-        if (iterationIndex >= expansionIterations || !jobsRunning) {
-            return;
-        }
-        
-        QProcess* process = new QProcess(this);
-        process->setProcessChannelMode(QProcess::MergedChannels);
-        process->setWorkingDirectory(workingDir);
-
-        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        if (ompThreads > 0) {
-            env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
-        }
-        process->setProcessEnvironment(env);
-
-        // Connect finished signal
-        connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            [this, process, iterationIndex, &completedJobs, &nextIterationIndex, &startExpansionProcess, expansionIterations]
-            (int exitCode, QProcess::ExitStatus exitStatus) {
-                if (!jobsRunning) {
-                    return;
-                }
-                
-                // Log result
-                if (exitCode != 0) {
-                    std::cerr << "Expansion iteration " << iterationIndex << " failed with exit code: " << exitCode << std::endl;
-                } else {
-                    std::cout << "Completed expansion iteration " << iterationIndex << std::endl;
-                }
-                
-                // Update progress
-                completedJobs++;
-                progressUtil->updateProgress(completedJobs);
-                
-                // Remove from running list (QPointer will handle null checking)
-                runningProcesses.removeOne(process);
-                process->deleteLater();
-                
-                // Start next process if available
-                if (nextIterationIndex < expansionIterations && jobsRunning) {
-                    startExpansionProcess(nextIterationIndex++);
-                }
-                
-                // Check if all done
-                if (completedJobs >= expansionIterations) {
-                    progressUtil->stopProgress();
-                    cancelButton->setVisible(false);
-                    jobsRunning = false;
-                    runningProcesses.clear();
-                    infoLabel->setText(QString("Expansion complete after %1 iterations.").arg(expansionIterations));
-                    expandSeedsButton->setEnabled(true);
-                    runSegmentationButton->setEnabled(true);
-                    updateButtonStates();
-                    emit sendStatusMessageAvailable(QString("Completed %1 expansion iterations").arg(expansionIterations), 5000);
-                }
-            });
-        
-        // Start the process
-        QStringList previewParts;
-        if (ompThreads > 0) {
-            previewParts << QString("OMP_NUM_THREADS=%1").arg(ompThreads);
-        }
-        previewParts << executablePath
-                     << QString("\"%1\"").arg(QString::fromStdString(volumePath.string()))
-                     << QString("\"%1\"").arg(QString::fromStdString(pathsDir.string()))
-                     << QString("\"%1\"").arg(QString::fromStdString(expandJsonPath.string()));
-
-        std::cout << "Starting expansion job " << iterationIndex << ": " << previewParts.join(' ').toStdString() << std::endl;
-        
-        const QStringList toolArgs = QStringList()
-                      << QString::fromStdString(volumePath.string())
-                      << QString::fromStdString(pathsDir.string())
-                      << QString::fromStdString(expandJsonPath.string());
-#if defined(Q_OS_LINUX)
-        // Background priority so batch growth doesn't starve the UI.
-        process->start("nice", QStringList() << "-n" << "19" << "ionice" << "-c" << "3"
-                                             << executablePath << toolArgs);
-#elif defined(Q_OS_UNIX)
-        // ionice is Linux-specific; macOS still provides nice.
-        process->start("nice", QStringList() << "-n" << "19" << executablePath << toolArgs);
-#else
-        process->start(executablePath, toolArgs);
-#endif
-        
-        runningProcesses.append(QPointer<QProcess>(process));
-    };
-    
-    // Start initial batch of processes
+    // Start initial batch of processes; the rest chain in via the finished
+    // callback with bounded concurrency.
     for (int i = 0; i < std::min(numProcesses, expansionIterations); i++) {
-        startExpansionProcess(nextIterationIndex++);
+        startExpansionProcessForIteration(_batchNextIndex++);
     }
-    
-    // Process events until all jobs complete or cancelled
-    while (jobsRunning && completedJobs < expansionIterations) {
-        QApplication::processEvents(QEventLoop::AllEvents, 100);
-    }
-
-    progressUtil->stopProgress();
+    return true;
 }
 
-void SeedingWidget::onCancelClicked()
+void SeedingWidget::startExpansionProcessForIteration(int iterationIndex)
 {
-    if (!jobsRunning || runningProcesses.isEmpty()) {
+    if (iterationIndex >= _batch.total() || !jobsRunning) {
         return;
     }
-    
-    // Set flag to stop any new processes from starting
+
+    QProcess* process = new QProcess(this);
+    process->setProcessChannelMode(QProcess::MergedChannels);
+    process->setWorkingDirectory(_batchWorkingDir);
+
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    if (_batchOmpThreads > 0) {
+        env.insert("OMP_NUM_THREADS", QString::number(_batchOmpThreads));
+    }
+    process->setProcessEnvironment(env);
+
+    const QStringList toolArgs = QStringList()
+                  << _batchVolumePath
+                  << QString::fromStdString(_batchPathsDir.string())
+                  << QString::fromStdString(_batchConfigJson.string());
+
+    std::cout << "Starting expansion job " << iterationIndex << ": "
+              << executablePath.toStdString() << " " << toolArgs.join(' ').toStdString()
+              << std::endl;
+
+    launchBatchProcess(process, iterationIndex, toolArgs);
+}
+
+
+void SeedingWidget::launchBatchProcess(QProcess* process, int index, const QStringList& toolArgs)
+{
+    // Drain merged child output continuously so the QProcess buffer never grows
+    // unbounded; retain a bounded per-child tail for terminal failure diagnostics.
+    connect(process, &QProcess::readyReadStandardOutput, this, [this, process]() {
+        const QByteArray chunk = process->readAllStandardOutput();
+        QString& tail = _batchProcessTail[process];
+        tail += QString::fromLocal8Bit(chunk);
+        constexpr int kTailMax = 2048;
+        if (tail.size() > kTailMax)
+            tail = tail.right(kTailMax);
+    });
+
+    // finished() carries the exit code/status; errorOccurred(FailedToStart) never
+    // emits finished(), so route it through the same completion path (once) so a
+    // missing nice/ionice/tool fails the batch instead of stranding it.
+    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+        [this, process, index](int exitCode, QProcess::ExitStatus exitStatus) {
+            handleBatchProcessFinished(process, index, exitCode, exitStatus, /*failedToStart=*/false);
+        });
+    connect(process, &QProcess::errorOccurred, this,
+        [this, process, index](QProcess::ProcessError err) {
+            if (err == QProcess::FailedToStart)
+                handleBatchProcessFinished(process, index, /*exitCode=*/-1,
+                                           QProcess::CrashExit, /*failedToStart=*/true);
+        });
+
+    // Track before start() so synchronous FailedToStart is handled as part of
+    // this batch.
+    runningProcesses.append(QPointer<QProcess>(process));
+
+    // Resolve the priority wrappers: nice/ionice may be absent (macOS has no
+    // ionice at all). Fall back to launching vc_grow_seg_from_seed directly.
+    // FailedToStart is handled on every path by the connection above.
+#if defined(Q_OS_UNIX)
+    const QString nicePath = QStandardPaths::findExecutable(QStringLiteral("nice"));
+#if defined(Q_OS_LINUX)
+    const QString ionicePath = QStandardPaths::findExecutable(QStringLiteral("ionice"));
+#else
+    const QString ionicePath;
+#endif
+    if (!nicePath.isEmpty()) {
+        QStringList args;
+        args << QStringLiteral("-n") << QStringLiteral("19");
+        if (!ionicePath.isEmpty())
+            args << ionicePath << QStringLiteral("-c") << QStringLiteral("3");
+        args << executablePath << toolArgs;
+        process->start(nicePath, args);
+    } else {
+        process->start(executablePath, toolArgs);
+    }
+#else
+    process->start(executablePath, toolArgs);
+#endif
+}
+
+void SeedingWidget::cancelSeedingBatchHeadless()
+{
+    if (!jobsRunning) {
+        return;
+    }
+
+    // Stop launching children and distinguish cancellation from failure.
     jobsRunning = false;
-    
+    _batch.requestCancel();
+
     // using qpointer here to avoid dangling pointers
     for (const QPointer<QProcess>& processPtr : runningProcesses) {
         if (processPtr) {
             QProcess* process = processPtr.data();
-            
+
             // Disconnect all signals to prevent callbacks after cancellation
             process->disconnect();
-            
+
             // Terminate the process if it's still running
             if (process->state() != QProcess::NotRunning) {
                 process->terminate();
-                // Give it a chance to terminate gracefully
+                // Give it a chance to terminate gracefully (bounded, ~1s)
                 if (!process->waitForFinished(1000)) {
                     // Force kill if it didn't terminate
                     process->kill();
                     process->waitForFinished(1000);
                 }
             }
-            
+
             // Schedule deletion
             process->deleteLater();
         }
     }
-    
-    // Clear the list
-   runningProcesses.clear();
-    
-    // Update UI
-    cancelButton->setVisible(false);
-    progressUtil->stopProgress();
-    infoLabel->setText("Jobs cancelled by user");
-    
-    // Re-enable buttons
-    runSegmentationButton->setEnabled(true);
-    expandSeedsButton->setEnabled(true);
-    updateButtonStates();
-    
-    emit sendStatusMessageAvailable("Jobs cancelled by user", 3000);
+    runningProcesses.clear();
+
+    // Common terminal teardown + seedingBatchFinished(kind,false,canceled=true,...)
+    // when a run/expand batch was active.
+    finalizeSeedingBatch();
+}
+
+void SeedingWidget::onCancelClicked()
+{
+    // The shared cancel path performs the bounded child-process teardown.
+    cancelSeedingBatchHeadless();
 }
 
 void SeedingWidget::onSurfacesLoaded()
@@ -2505,6 +2664,8 @@ void SeedingWidget::onNeuralTraceClicked()
     // Update UI
     infoLabel->setText("Running neural trace...");
     _btnNeuralTrace->setEnabled(false);
+    // A neural trace shares the batch teardown but has no seeding batch of its own.
+    _batch.reset();
     jobsRunning = true;
     cancelButton->setVisible(true);
 

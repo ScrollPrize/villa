@@ -478,11 +478,36 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
 
 int attachOpenDataNormalGrids(VolumePkg& pkg,
                               const OpenDataSample& sample,
-                              const std::filesystem::path& remoteCacheRoot)
+                              const std::filesystem::path& remoteCacheRoot,
+                              const OpenDataResourceSelection* selection)
 {
     int attached = 0;
-    for (const auto& volume : sample.volumes) {
+    for (std::size_t volumeIndex = 0; volumeIndex < sample.volumes.size();
+         ++volumeIndex) {
+        const auto& volume = sample.volumes[volumeIndex];
+        if (selection && !selection->allowsVolume(volume.id)) {
+            continue;
+        }
         for (const auto& info : normalGridsArtifacts(sample.id, volume)) {
+            if (selection) {
+                // Map this representation back to its artifact index before
+                // applying the representation filter.
+                std::optional<std::size_t> artifactIndex;
+                for (std::size_t ai = 0; ai < volume.artifacts.size(); ++ai) {
+                    const auto& art = volume.artifacts[ai];
+                    if (art.type == kNormalGridsArtifactType &&
+                        artifactUrl(art) == info.url) {
+                        artifactIndex = ai;
+                        break;
+                    }
+                }
+                if (!artifactIndex ||
+                    !selection->allowsRepresentation(
+                        volumeIndex, *artifactIndex,
+                        OpenDataRepresentationKind::NormalGrids, volume.id)) {
+                    continue;
+                }
+            }
             if (attachStreamingNormalGridsEntry(pkg, info, remoteCacheRoot)) {
                 ++attached;
             }

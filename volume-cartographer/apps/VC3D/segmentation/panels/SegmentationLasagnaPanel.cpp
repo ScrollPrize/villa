@@ -1886,9 +1886,16 @@ void SegmentationLasagnaPanel::repeatLastLasagnaAction()
     launchLasagnaMode(_lastLasagnaMode);
 }
 
+bool SegmentationLasagnaPanel::repeatLastLasagnaActionHeadless(CState* state, QString* errorMessage)
+{
+    return startOptimizationHeadless(state, _lastLasagnaMode, QString(), std::nullopt,
+                                      QString(), errorMessage);
+}
+
 void SegmentationLasagnaPanel::startOptimization(CState* state, QStatusBar* statusBar)
 {
-    startOptimizationWithOverrides(state, statusBar, -1, QString(), false, 0, 0, 0);
+    (void)startOptimizationWithOverrides(
+        state, statusBar, -1, QString(), false, 0, 0, 0);
 }
 
 void SegmentationLasagnaPanel::startOptimizationAtSeed(CState* state,
@@ -1917,8 +1924,9 @@ void SegmentationLasagnaPanel::startOptimizationAtSeed(CState* state,
                     QObject::disconnect(*errConn);
                     delete conn;
                     delete errConn;
-                    startOptimizationWithOverrides(
-                        state, statusBar, static_cast<int>(mode), configPath, true, seedX, seedY, seedZ);
+                    (void)startOptimizationWithOverrides(
+                        state, statusBar, static_cast<int>(mode), configPath,
+                        true, seedX, seedY, seedZ);
                 });
             *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
                 [conn, errConn](const QString&) {
@@ -1931,8 +1939,97 @@ void SegmentationLasagnaPanel::startOptimizationAtSeed(CState* state,
         }
     }
 
-    startOptimizationWithOverrides(
-        state, statusBar, static_cast<int>(mode), configPath, true, seedX, seedY, seedZ);
+    (void)startOptimizationWithOverrides(
+        state, statusBar, static_cast<int>(mode), configPath,
+        true, seedX, seedY, seedZ);
+}
+
+bool SegmentationLasagnaPanel::startOptimizationHeadless(CState* state,
+                                                         LasagnaMode mode,
+                                                         const QString& configPath,
+                                                         std::optional<cv::Vec3i> seed,
+                                                         const QString& atlasPath,
+                                                         QString* errorMessage)
+{
+    auto fail = [errorMessage](const QString& msg) {
+        if (errorMessage) {
+            *errorMessage = msg;
+        }
+        return false;
+    };
+
+    _lastLasagnaMode = mode;
+
+    // Apply an explicit atlas selection before validation.
+    if (!atlasPath.isEmpty()) {
+        setSelectedAtlasPath(atlasPath);
+    }
+
+    // Resolve the config path without validateLasagnaConfigPath, which can open
+    // a message box.
+    const QString resolvedConfig = configPath.isEmpty()
+        ? selectedLasagnaConfigPathForMode(mode)
+        : configPath;
+    {
+        const QFileInfo info(resolvedConfig);
+        if (resolvedConfig.isEmpty() || !info.exists() || !info.isFile()) {
+            return fail(QStringLiteral("Lasagna config file not found: %1")
+                            .arg(resolvedConfig.isEmpty()
+                                     ? QStringLiteral("(none selected)")
+                                     : resolvedConfig));
+        }
+    }
+
+    // For atlas mode the config lives in _atlasConfigFilePath and the atlas dir
+    // in _atlasDirPath; validate both (metadata.json required) up front.
+    if (mode == LasagnaMode::Atlas) {
+        if (!configPath.isEmpty()) {
+            _atlasConfigFilePath = resolvedConfig;
+        }
+        const QString atlasDir = selectedAtlasPath();
+        const QFileInfo dirInfo(atlasDir);
+        const QFileInfo metaInfo(QDir(atlasDir).filePath(QStringLiteral("metadata.json")));
+        if (atlasDir.isEmpty() || !dirInfo.exists() || !dirInfo.isDir() ||
+            !metaInfo.exists() || !metaInfo.isFile()) {
+            return fail(QStringLiteral("Atlas not found or missing metadata.json: %1")
+                            .arg(atlasDir.isEmpty() ? QStringLiteral("(none selected)")
+                                                    : atlasDir));
+        }
+    }
+
+    // Require a live service so failure is returned before dialog-capable
+    // submission paths.
+    auto& mgr = LasagnaServiceManager::instance();
+    if (!mgr.isRunning()) {
+        return fail(QStringLiteral("lasagna service is not running"));
+    }
+
+    int seedX = 0;
+    int seedY = 0;
+    int seedZ = 0;
+    const bool hasSeed = seed.has_value();
+    if (hasSeed) {
+        seedX = (*seed)[0];
+        seedY = (*seed)[1];
+        seedZ = (*seed)[2];
+    }
+
+    SubmissionResult result;
+    if (mode == LasagnaMode::Atlas) {
+        // Atlas mode ignores the seed override (it derives seeds from the atlas).
+        result = startAtlasOptimization(state, nullptr, Presentation::Silent);
+    } else {
+        result = startOptimizationWithOverrides(
+            state, nullptr, static_cast<int>(mode), resolvedConfig,
+            hasSeed, seedX, seedY, seedZ, Presentation::Silent);
+    }
+
+    if (!result.submitted) {
+        return fail(result.error.isEmpty()
+            ? QStringLiteral("Lasagna optimization submission failed before reaching the service")
+            : result.error);
+    }
+    return true;
 }
 
 QString SegmentationLasagnaPanel::selectedLasagnaConfigPathForMode(LasagnaMode mode) const
@@ -1968,7 +2065,8 @@ QStringList SegmentationLasagnaPanel::lasagnaConfigPathsForMode(LasagnaMode mode
 
 void SegmentationLasagnaPanel::showLasagnaConfigError(const QString& message,
                                                       QStatusBar* statusBar,
-                                                      int timeoutMs)
+                                                      int timeoutMs,
+                                                      Presentation presentation)
 {
     std::cerr << "[lasagna] " << message.toStdString() << std::endl;
     if (statusBar) {
@@ -1980,15 +2078,19 @@ void SegmentationLasagnaPanel::showLasagnaConfigError(const QString& message,
         _progressLabel->setVisible(true);
     }
 #ifndef VC_TEST_DISABLE_LASAGNA_DIALOGS
-    QMessageBox::warning(this, tr("Lasagna config error"), message);
+    if (presentation == Presentation::Interactive) {
+        QMessageBox::warning(this, tr("Lasagna config error"), message);
+    }
 #endif
 }
 
 bool SegmentationLasagnaPanel::validateLasagnaConfigPath(const QString& configPath,
-                                                         QStatusBar* statusBar)
+                                                         QStatusBar* statusBar,
+                                                         Presentation presentation)
 {
     if (configPath.isEmpty()) {
-        showLasagnaConfigError(tr("No Lasagna config file selected."), statusBar, 5000);
+        showLasagnaConfigError(
+            tr("No Lasagna config file selected."), statusBar, 5000, presentation);
         return false;
     }
 
@@ -1996,13 +2098,15 @@ bool SegmentationLasagnaPanel::validateLasagnaConfigPath(const QString& configPa
     if (!configInfo.exists()) {
         showLasagnaConfigError(tr("Lasagna config file not found: %1").arg(configPath),
                                statusBar,
-                               7000);
+                               7000,
+                               presentation);
         return false;
     }
     if (!configInfo.isFile()) {
         showLasagnaConfigError(tr("Lasagna config path is not a file: %1").arg(configPath),
                                statusBar,
-                               7000);
+                               7000,
+                               presentation);
         return false;
     }
 
@@ -2010,24 +2114,28 @@ bool SegmentationLasagnaPanel::validateLasagnaConfigPath(const QString& configPa
 }
 
 bool SegmentationLasagnaPanel::validateAtlasDirPath(const QString& atlasDir,
-                                                    QStatusBar* statusBar)
+                                                    QStatusBar* statusBar,
+                                                    Presentation presentation)
 {
     if (atlasDir.isEmpty()) {
-        showLasagnaConfigError(tr("No Atlas selected."), statusBar, 5000);
+        showLasagnaConfigError(
+            tr("No Atlas selected."), statusBar, 5000, presentation);
         return false;
     }
     const QFileInfo info(atlasDir);
     if (!info.exists() || !info.isDir()) {
         showLasagnaConfigError(tr("Atlas directory not found: %1").arg(atlasDir),
                                statusBar,
-                               7000);
+                               7000,
+                               presentation);
         return false;
     }
     const QFileInfo metadata(QDir(atlasDir).filePath(QStringLiteral("metadata.json")));
     if (!metadata.exists() || !metadata.isFile()) {
         showLasagnaConfigError(tr("Atlas metadata.json not found: %1").arg(atlasDir),
                                statusBar,
-                               7000);
+                               7000,
+                               presentation);
         return false;
     }
     return true;
@@ -2105,7 +2213,7 @@ void SegmentationLasagnaPanel::launchAtlasOptimization()
                     QObject::disconnect(*errConn);
                     delete conn;
                     delete errConn;
-                    startAtlasOptimization(_state, nullptr);
+                    (void)startAtlasOptimization(_state, nullptr);
                 });
             *errConn = connect(&mgr, &LasagnaServiceManager::serviceError, this,
                 [conn, errConn](const QString&) {
@@ -2118,10 +2226,14 @@ void SegmentationLasagnaPanel::launchAtlasOptimization()
         }
     }
 
-    startAtlasOptimization(_state, nullptr);
+    (void)startAtlasOptimization(_state, nullptr);
 }
 
-void SegmentationLasagnaPanel::startAtlasOptimization(CState* state, QStatusBar* statusBar)
+SegmentationLasagnaPanel::SubmissionResult
+SegmentationLasagnaPanel::startAtlasOptimization(
+    CState* state,
+    QStatusBar* statusBar,
+    Presentation presentation)
 {
     auto showStatus = [statusBar](const QString& msg, int timeout) {
         if (statusBar) {
@@ -2129,9 +2241,10 @@ void SegmentationLasagnaPanel::startAtlasOptimization(CState* state, QStatusBar*
         }
     };
 
-    if (!validateLasagnaConfigPath(_atlasConfigFilePath, statusBar) ||
-        !validateAtlasDirPath(_atlasDirPath, statusBar)) {
-        return;
+    if (!validateLasagnaConfigPath(_atlasConfigFilePath, statusBar, presentation) ||
+        !validateAtlasDirPath(_atlasDirPath, statusBar, presentation)) {
+        return SubmissionResult::failure(
+            tr("Lasagna atlas configuration is invalid."));
     }
 
     auto& mgr = LasagnaServiceManager::instance();
@@ -2139,47 +2252,45 @@ void SegmentationLasagnaPanel::startAtlasOptimization(CState* state, QStatusBar*
         if (!mgr.isRunning()) {
             const QString msg = tr("External service not connected. Select a service or check host/port.");
             showStatus(msg, 5000);
-            return;
+            return SubmissionResult::failure(msg);
         }
     } else if (!mgr.ensureServiceRunning()) {
         const QString msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
         showStatus(msg, 5000);
-        return;
+        return SubmissionResult::failure(msg);
     }
 
     const QString dataInput = lasagnaDataInputPath();
     if (dataInput.isEmpty()) {
         const QString msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
         showStatus(msg, 5000);
-        showLasagnaConfigError(msg, nullptr, 5000);
-        return;
+        showLasagnaConfigError(msg, nullptr, 5000, presentation);
+        return SubmissionResult::failure(msg);
     }
 
     QFile f(_atlasConfigFilePath);
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        showLasagnaConfigError(
-            tr("Cannot read Lasagna config %1: %2").arg(_atlasConfigFilePath, f.errorString()),
-            statusBar,
-            7000);
-        return;
+        const QString msg =
+            tr("Cannot read Lasagna config %1: %2")
+                .arg(_atlasConfigFilePath, f.errorString());
+        showLasagnaConfigError(msg, statusBar, 7000, presentation);
+        return SubmissionResult::failure(msg);
     }
     QJsonParseError parseError;
     QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &parseError);
     if (parseError.error != QJsonParseError::NoError) {
-        showLasagnaConfigError(
+        const QString msg =
             tr("Invalid Lasagna config JSON at byte %1: %2")
                 .arg(parseError.offset)
-                .arg(parseError.errorString()),
-            statusBar,
-            7000);
-        return;
+                .arg(parseError.errorString());
+        showLasagnaConfigError(msg, statusBar, 7000, presentation);
+        return SubmissionResult::failure(msg);
     }
     if (!doc.isObject()) {
-        showLasagnaConfigError(
-            tr("Invalid Lasagna config JSON: top-level value must be an object."),
-            statusBar,
-            7000);
-        return;
+        const QString msg =
+            tr("Invalid Lasagna config JSON: top-level value must be an object.");
+        showLasagnaConfigError(msg, statusBar, 7000, presentation);
+        return SubmissionResult::failure(msg);
     }
     const QJsonObject config = doc.object();
 
@@ -2187,8 +2298,8 @@ void SegmentationLasagnaPanel::startAtlasOptimization(CState* state, QStatusBar*
     QString error;
     const std::filesystem::path atlasDir(_atlasDirPath.toStdString());
     if (!buildAtlasRequestArtifacts(atlasDir, volpkgRootForState(state), &artifacts, &error)) {
-        showLasagnaConfigError(error, statusBar, 7000);
-        return;
+        showLasagnaConfigError(error, statusBar, 7000, presentation);
+        return SubmissionResult::failure(error);
     }
 
     QString outputDir;
@@ -2225,16 +2336,20 @@ void SegmentationLasagnaPanel::startAtlasOptimization(CState* state, QStatusBar*
     mgr.startOptimization(request, outputDir);
     _submittedOutputNames.insert(outputName);
     showStatus(tr("Lasagna atlas optimization started. Output: %1").arg(outputName), 3000);
+    return SubmissionResult::success();
 }
 
-void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
-                                                              QStatusBar* statusBar,
-                                                              int modeOverride,
-                                                              const QString& configPathOverride,
-                                                              bool hasSeedOverride,
-                                                              int seedX,
-                                                              int seedY,
-                                                              int seedZ)
+SegmentationLasagnaPanel::SubmissionResult
+SegmentationLasagnaPanel::startOptimizationWithOverrides(
+    CState* state,
+    QStatusBar* statusBar,
+    int modeOverride,
+    const QString& configPathOverride,
+    bool hasSeedOverride,
+    int seedX,
+    int seedY,
+    int seedZ,
+    Presentation presentation)
 {
     auto showStatus = [statusBar](const QString& msg, int timeout) {
         if (statusBar) {
@@ -2253,8 +2368,9 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         : _reoptConfigFilePath;
     const bool isNewModel = (launchMode == LasagnaMode::NewModel);
 
-    if (!validateLasagnaConfigPath(configPath, statusBar)) {
-        return;
+    if (!validateLasagnaConfigPath(configPath, statusBar, presentation)) {
+        return SubmissionResult::failure(
+            tr("Lasagna configuration is invalid."));
     }
 
     if (mgr.isExternal()) {
@@ -2262,14 +2378,14 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             auto msg = tr("External service not connected. Select a service or check host/port.");
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
-            return;
+            return SubmissionResult::failure(msg);
         }
     } else {
         if (!mgr.ensureServiceRunning()) {
             auto msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
-            return;
+            return SubmissionResult::failure(msg);
         }
     }
 
@@ -2334,7 +2450,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         auto msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
         std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
         showStatus(msg, 5000);
-        return;
+        return SubmissionResult::failure(msg);
     }
 
     QString outputDir;
@@ -2438,8 +2554,8 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
             auto msg = tr("Cannot read Lasagna config %1: %2")
                 .arg(configPath, f.errorString());
-            showLasagnaConfigError(msg, statusBar, 7000);
-            return;
+            showLasagnaConfigError(msg, statusBar, 7000, presentation);
+            return SubmissionResult::failure(msg);
         }
         configText = QString::fromUtf8(f.readAll()).trimmed();
     }
@@ -2450,13 +2566,13 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             auto msg = tr("Invalid Lasagna config JSON at byte %1: %2")
                 .arg(parseError.offset)
                 .arg(parseError.errorString());
-            showLasagnaConfigError(msg, statusBar, 7000);
-            return;
+            showLasagnaConfigError(msg, statusBar, 7000, presentation);
+            return SubmissionResult::failure(msg);
         }
         if (!doc.isObject()) {
             auto msg = tr("Invalid Lasagna config JSON: top-level value must be an object.");
-            showLasagnaConfigError(msg, statusBar, 7000);
-            return;
+            showLasagnaConfigError(msg, statusBar, 7000, presentation);
+            return SubmissionResult::failure(msg);
         }
         config = doc.object();
     }
@@ -2494,7 +2610,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             auto msg = tr("No focus position or seed point set. Place the cursor or enter a seed.");
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
-            return;
+            return SubmissionResult::failure(msg);
         }
         cx = static_cast<int>(focus->p[0]);
         cy = static_cast<int>(focus->p[1]);
@@ -2590,7 +2706,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         std::cerr << "[lasagna] " << msg.toStdString()
                   << " segment=" << segPath.string() << std::endl;
         showStatus(msg, 7000);
-        return;
+        return SubmissionResult::failure(msg);
     }
 
     QJsonObject request;
@@ -2682,7 +2798,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             auto msg = tr("Cannot pack selected tifxyz segment for Lasagna artifact sync.");
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
-            return;
+            return SubmissionResult::failure(msg);
         }
 
         linkedSurfaces = linkedSurfacesFromMeta(segPath);
@@ -2762,7 +2878,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
             auto msg = tr("Cannot read model file: %1").arg(modelPath);
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
-            return;
+            return SubmissionResult::failure(msg);
         }
         jobSpec[QStringLiteral("model")] = modelUpload[QStringLiteral("object")].toObject();
         appendUploadIfNew(modelUpload);
@@ -2811,6 +2927,7 @@ void SegmentationLasagnaPanel::startOptimizationWithOverrides(CState* state,
         tr("Lasagna optimization started. Output: %1")
             .arg(outputName),
         3000);
+    return SubmissionResult::success();
 }
 
 // ---------------------------------------------------------------------------

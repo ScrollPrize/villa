@@ -187,6 +187,35 @@ public:
     [[nodiscard]] cv::Mat takePendingManualAddTracerMask();
     bool applyManualAddTracerPreview(QuadSurface* surface);
 
+    // Programmatic editing operations shared with the keyboard-driven tools.
+    // Enter or leave manual-add mode without a keypress.
+    bool setManualAddModeActive(bool active, bool apply = true);
+    // Returns false when there is no manual-add constraint to remove.
+    bool undoManualAddConstraint();
+    // Toggle correction-point authoring mode without a keypress.
+    // Activating enforces the same preconditions as the key handler; on failure sets
+    // errorMessage to "editing_disabled" | "no_session" | "growth_in_progress". Unlike the
+    // key, this mode is not auto-cleared on mouse release.
+    bool setCorrectionPointMode(bool active, QString* errorMessage = nullptr);
+    [[nodiscard]] bool correctionPointMode() const { return _correctionDragKeyActive; }
+    // Gaussian push/pull entry points. Distinct names avoid connect()
+    // ambiguity with the private methods.
+    bool startPushPullMode(int direction, std::optional<bool> alphaOverride = std::nullopt);
+    void stopPushPullAll();
+
+    // Snapshot of the autosave bookkeeping.
+    struct AutosaveStatus
+    {
+        bool pending{false};        // a deferred save is queued (edits not yet on disk)
+        bool saveInProgress{false}; // a QtConcurrent save is currently running
+        bool dirtyAfterSave{false}; // more edits arrived while a save was in flight
+    };
+    // Force the pending autosave to run immediately; no-op when nothing is pending, marks
+    // dirty (follow-up save) when one is already in flight.
+    void flushAutosave();
+    // Current autosave bookkeeping snapshot.
+    [[nodiscard]] AutosaveStatus autosaveStatus() const;
+
 public slots:
     void setSelectedAnnotationCollection(uint64_t collectionId);
 
@@ -203,6 +232,8 @@ signals:
                               int steps,
                               bool inpaintOnly);
     void growthInProgressChanged(bool running);
+    // Emitted when an in-flight autosave reaches non-stale completion.
+    void autosaveCompleted(bool success);
     void approvalMaskSaved(const std::string& segmentId);
     void annotationPointSelected(uint64_t pointId);
     void annotationCollectionSelected(uint64_t collectionId);

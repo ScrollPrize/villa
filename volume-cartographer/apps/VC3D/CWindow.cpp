@@ -149,6 +149,7 @@
 #include "SurfacePanelController.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "MenuActionController.hpp"
+#include "VolumeAttachmentController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "SurfaceAreaCalculator.hpp"
@@ -2764,6 +2765,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     // create UI widgets
     CreateWidgets();
 
+    _volumeAttachmentController =
+        std::make_unique<VolumeAttachmentController>(this);
+
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
@@ -4085,24 +4089,31 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     updateOpenDataSegmentTransformState(true);
 }
 
-bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
-                                           const QString& preferredVolumeId)
+CWindow::VolumeAttachResult CWindow::attachVolumeToCurrentPackage(
+    const std::shared_ptr<Volume>& volume,
+    const QString& location,
+    std::vector<std::string> tags,
+    const QString& remoteCacheRoot,
+    const QString& preferredVolumeId)
 {
     if (!_state || !_state->vpkg() || !volume) {
-        return false;
+        throw std::logic_error("cannot attach a volume without an open project");
     }
 
-    if (!_state->vpkg()->addVolume(volume)) {
-        return false;
-    }
+    const auto result = _state->vpkg()->attachPreparedVolume(
+        location.toStdString(),
+        std::move(tags),
+        volume,
+        remoteCacheRoot.toStdString());
+    if (result == VolumePkg::AttachVolumeResult::VolumeIdConflict)
+        return VolumeAttachResult::VolumeIdConflict;
 
     const bool needSurfaceLoad = _surfacePanel && !_surfacePanel->hasSurfaces();
-    refreshCurrentVolumePackageUi(preferredVolumeId.isEmpty()
-                                      ? QString::fromStdString(volume->id())
-                                      : preferredVolumeId,
-                                  needSurfaceLoad);
+    refreshCurrentVolumePackageUi(preferredVolumeId, needSurfaceLoad);
     UpdateView();
-    return true;
+    return result == VolumePkg::AttachVolumeResult::Attached
+        ? VolumeAttachResult::Attached
+        : VolumeAttachResult::AlreadyAttached;
 }
 
 void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
@@ -5077,26 +5088,29 @@ void CWindow::updateAtlasSearchDocks()
     }
 }
 
-void CWindow::remapCurrentAtlas()
+// Dialog-free core shared with remapCurrentAtlas.
+bool CWindow::startAtlasRemapHeadless(QString* errorMessage,
+                                      std::function<void(bool success, const QString& detail)> onFinished)
 {
+    auto fail = [errorMessage](const QString& message) {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
     if (!_currentAtlasDir || !_state || !_state->vpkg()) {
-        QMessageBox::warning(this, tr("Atlas"), tr("Load an atlas before remapping."));
-        return;
+        return fail(tr("Load an atlas before remapping."));
     }
     auto vpkg = _state->vpkg();
     std::optional<vc3d::opendata::ResolvedOpenDataLasagna> resolvedLasagna;
     try {
         resolvedLasagna = resolvedLasagnaForState(_state);
     } catch (const std::exception& ex) {
-        QMessageBox::warning(this, tr("Atlas"), QString::fromStdString(ex.what()));
-        return;
+        return fail(QString::fromStdString(ex.what()));
     }
     if (!resolvedLasagna || resolvedLasagna->manifestPath.empty() ||
         !std::filesystem::exists(resolvedLasagna->manifestPath)) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("No Lasagna dataset matches the active volume."));
-        return;
+        return fail(tr("No Lasagna dataset matches the active volume."));
     }
     const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
     const double workingToBaseScale = resolvedLasagna->workingToBaseScale;
@@ -5127,22 +5141,33 @@ void CWindow::remapCurrentAtlas()
     connect(watcher,
             &QFutureWatcher<QString>::finished,
             this,
-            [this, watcher, atlasDir]() {
+            [this, watcher, atlasDir, onFinished = std::move(onFinished)]() {
         watcher->deleteLater();
         try {
             const QString summary = watcher->result();
-            displayAtlasFromDirectory(atlasDir);
+            // A remap cannot require rebuilding; report redisplay failures
+            // through the completion callback.
+            QString displayError;
+            if (!displayAtlasFromDirectoryHeadless(atlasDir, &displayError)) {
+                throw std::runtime_error(displayError.toStdString());
+            }
             if (statusBar()) {
                 showStatusBarMessage(tr("Remapped atlas fibers. %1").arg(summary), 7000);
+            }
+            if (onFinished) {
+                onFinished(true, summary);
             }
         } catch (const std::exception& ex) {
             refreshAtlasOverviewDocks();
             updateAtlasFiberDocks();
             updateAtlasSearchDocks();
-            QMessageBox::warning(
-                this,
-                tr("Atlas Remap"),
-                tr("Could not remap atlas: %1").arg(QString::fromStdString(ex.what())));
+            const QString detail = QString::fromStdString(ex.what());
+            if (statusBar()) {
+                showStatusBarMessage(tr("Could not remap atlas: %1").arg(detail), 7000);
+            }
+            if (onFinished) {
+                onFinished(false, detail);
+            }
         }
     });
 
@@ -5177,28 +5202,49 @@ void CWindow::remapCurrentAtlas()
         std::cerr << "[atlas-remap] finished" << std::endl;
         return QString::fromStdString(summary.str());
     }));
+    return true;
 }
 
-void CWindow::optimizeAtlasSnapCandidates()
+void CWindow::remapCurrentAtlas()
 {
+    QString errorMessage;
+    const bool started = startAtlasRemapHeadless(
+        &errorMessage,
+        [this](bool success, const QString& detail) {
+            if (!success) {
+                QMessageBox::warning(this,
+                                     tr("Atlas Remap"),
+                                     tr("Could not remap atlas: %1").arg(detail));
+            }
+        });
+    if (!started) {
+        QMessageBox::warning(this, tr("Atlas"), errorMessage);
+    }
+}
+
+// Dialog-free core shared with optimizeAtlasSnapCandidates.
+bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
+                                                  std::function<void(const QString& detail)> onAsyncError)
+{
+    auto fail = [errorMessage](const QString& message) {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
     if (!_currentAtlasDir || !_state || !_state->vpkg()) {
-        QMessageBox::warning(this, tr("Atlas"), tr("Load an atlas before ranking snap candidates."));
-        return;
+        return fail(tr("Load an atlas before ranking snap candidates."));
     }
     auto vpkg = _state->vpkg();
     std::optional<vc3d::opendata::ResolvedOpenDataLasagna> resolvedLasagna;
     try {
         resolvedLasagna = resolvedLasagnaForState(_state);
     } catch (const std::exception& ex) {
-        QMessageBox::warning(this, tr("Atlas"), QString::fromStdString(ex.what()));
-        return;
+        return fail(QString::fromStdString(ex.what()));
     }
     if (!resolvedLasagna || resolvedLasagna->manifestPath.empty() ||
         !std::filesystem::exists(resolvedLasagna->manifestPath)) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("No Lasagna dataset matches the active volume."));
-        return;
+        return fail(tr("No Lasagna dataset matches the active volume."));
     }
     const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
     const double workingToBaseScale = resolvedLasagna->workingToBaseScale;
@@ -5206,25 +5252,26 @@ void CWindow::optimizeAtlasSnapCandidates()
     auto& manager = LasagnaServiceManager::instance();
     if (manager.isExternal()) {
         if (resolvedLasagna->manifestBacked) {
-            QMessageBox::warning(
-                this,
-                tr("Atlas"),
-                tr("Manifest-backed Lasagna is available to local tools only. "
-                   "The external service must use a dataset installed on that service."));
-            return;
+            return fail(tr("Manifest-backed Lasagna is available to local tools only. "
+                           "The external service must use a dataset installed on that service."));
         }
         if (!manager.isRunning()) {
-            QMessageBox::warning(this,
-                                 tr("Atlas"),
-                                 tr("Connect the external Lasagna service before ranking snap candidates."));
-            return;
+            return fail(tr("Connect the external Lasagna service before ranking snap candidates."));
         }
     } else if (!manager.ensureServiceRunning()) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("Failed to start Lasagna service: %1").arg(manager.lastError()));
-        return;
+        return fail(tr("Failed to start Lasagna service: %1").arg(manager.lastError()));
     }
+
+    // Shared failure reporting for the completion paths below. Interactive
+    // callers can add a message box through onAsyncError.
+    auto reportAsyncError = [this, onAsyncError = std::move(onAsyncError)](const QString& message) {
+        if (statusBar()) {
+            showStatusBarMessage(tr("Could not rank snap candidates: %1").arg(message), 7000);
+        }
+        if (onAsyncError) {
+            onAsyncError(message);
+        }
+    };
 
     const std::filesystem::path atlasDir = *_currentAtlasDir;
     const std::filesystem::path volpkgRoot = vpkg->path().empty()
@@ -5251,7 +5298,7 @@ void CWindow::optimizeAtlasSnapCandidates()
 
     QPointer<CWindow> self(this);
     auto startFinish =
-        [this, self, atlasDir, setRankButtonsEnabled](
+        [this, self, atlasDir, setRankButtonsEnabled, reportAsyncError](
             vc::atlas::AtlasSnapPreparedCandidates prepared,
             nlohmann::json rankResponse) {
         if (!self) {
@@ -5264,13 +5311,14 @@ void CWindow::optimizeAtlasSnapCandidates()
         connect(finishWatcher,
                 &QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>::finished,
                 this,
-                [this, finishWatcher, atlasDir, setRankButtonsEnabled]() {
+                [this, finishWatcher, atlasDir, setRankButtonsEnabled, reportAsyncError]() {
             finishWatcher->deleteLater();
             setRankButtonsEnabled(true);
             try {
                 const vc::atlas::AtlasSnapOptimizeReport report = finishWatcher->result();
                 refreshAtlasOverviewDocks();
-                displayAtlasFromDirectory(atlasDir);
+                // Redisplay failures enter the catch below.
+                loadAndDisplayAtlas(atlasDir);
                 if (statusBar()) {
                     showStatusBarMessage(
                         tr("Ranked snap candidates: %1 controls, terms %2 ok / %3 zero / %4 skipped (%5 total), %6 queued, %7 cached.")
@@ -5304,10 +5352,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                 const QString message = extractFutureExceptionMessage(ex);
                 std::cerr << "[atlas-snap] finish failed: "
                           << message.toStdString() << std::endl;
-                QMessageBox::warning(
-                    this,
-                    tr("Atlas Snap Candidates"),
-                    tr("Could not rank snap candidates: %1").arg(message));
+                reportAsyncError(message);
             }
         });
         finishWatcher->setFuture(QtConcurrent::run(
@@ -5327,7 +5372,8 @@ void CWindow::optimizeAtlasSnapCandidates()
              self,
              serviceManifestPath,
              workingToBaseScale,
-             setRankButtonsEnabled]() mutable {
+             setRankButtonsEnabled,
+             reportAsyncError]() mutable {
         prepareWatcher->deleteLater();
         try {
             vc::atlas::AtlasSnapPreparedCandidates prepared = prepareWatcher->result();
@@ -5358,7 +5404,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                               << std::endl;
                     startFinish(prepared, fromQtJsonObject(response));
                 },
-                [self, setRankButtonsEnabled](const QString& message) {
+                [self, setRankButtonsEnabled, reportAsyncError](const QString& message) {
                     if (!self) {
                         return;
                     }
@@ -5367,10 +5413,7 @@ void CWindow::optimizeAtlasSnapCandidates()
                     self->updateAtlasSearchDocks();
                     std::cerr << "[atlas-snap] laplace rank failed: "
                               << message.toStdString() << std::endl;
-                    QMessageBox::warning(
-                        self.data(),
-                        self->tr("Atlas Snap Candidates"),
-                        self->tr("Could not rank snap candidates: %1").arg(message));
+                    reportAsyncError(message);
                 },
                 [self, prepared](int index, const QJsonObject& result) mutable {
                     if (!self) {
@@ -5398,10 +5441,7 @@ void CWindow::optimizeAtlasSnapCandidates()
             const QString message = extractFutureExceptionMessage(ex);
             std::cerr << "[atlas-snap] prepare failed: "
                       << message.toStdString() << std::endl;
-            QMessageBox::warning(
-                this,
-                tr("Atlas Snap Candidates"),
-                tr("Could not rank snap candidates: %1").arg(message));
+            reportAsyncError(message);
         }
     });
 
@@ -5456,6 +5496,22 @@ void CWindow::optimizeAtlasSnapCandidates()
             throw;
         }
     }));
+    return true;
+}
+
+void CWindow::optimizeAtlasSnapCandidates()
+{
+    QString errorMessage;
+    const bool started = optimizeAtlasSnapCandidatesHeadless(
+        &errorMessage,
+        [this](const QString& detail) {
+            QMessageBox::warning(this,
+                                 tr("Atlas Snap Candidates"),
+                                 tr("Could not rank snap candidates: %1").arg(detail));
+        });
+    if (!started) {
+        QMessageBox::warning(this, tr("Atlas"), errorMessage);
+    }
 }
 
 void CWindow::cancelAtlasFiberIntersectionSearch()
@@ -5532,6 +5588,17 @@ void CWindow::updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phas
             progress->setFormat(format);
         }
     }
+
+    // Emit the same normalized progress used by non-widget consumers.
+    double fraction = 0.0;
+    if (total > 0) {
+        fraction = static_cast<double>(_atlasSearchPhaseCompleted) /
+                   static_cast<double>(total);
+    } else if (completed > 0) {
+        fraction = 1.0;
+    }
+    fraction = std::clamp(fraction, 0.0, 1.0);
+    emit atlasSearchProgressChanged(atlasSearchPhaseNumber(phase), fraction);
 }
 
 void CWindow::startAtlasFiberIntersectionSearch()
@@ -5541,10 +5608,9 @@ void CWindow::startAtlasFiberIntersectionSearch()
         return;
     }
 
-    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
-    int searchMode = ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS;
-    QStringList requiredTags;
-    QStringList excludedTags;
+    // Build the shared search parameters from the widgets.
+    AtlasFiberSearchParams params;
+    params.searchMode = ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS;
     auto readSearchControls = [&](QDockWidget* dock) {
         if (!dock || !dock->widget()) {
             return false;
@@ -5552,22 +5618,22 @@ void CWindow::startAtlasFiberIntersectionSearch()
         bool found = false;
         if (auto* combo = dock->widget()->findChild<QComboBox*>(
                 QStringLiteral("atlasSearchTypeCombo"))) {
-            searchMode = combo->currentData().toInt();
+            params.searchMode = combo->currentData().toInt();
             found = true;
         }
         if (auto* tagFilter = dock->widget()->findChild<QLineEdit*>(
                 QStringLiteral("atlasSearchTagFilterEdit"))) {
-            requiredTags = atlasSearchTagList(tagFilter->text());
+            params.requiredTags = atlasSearchTagList(tagFilter->text());
             found = true;
         }
         if (auto* excludeTagFilter = dock->widget()->findChild<QLineEdit*>(
                 QStringLiteral("atlasSearchExcludeTagFilterEdit"))) {
-            excludedTags = atlasSearchTagList(excludeTagFilter->text());
+            params.excludedTags = atlasSearchTagList(excludeTagFilter->text());
             found = true;
         }
         if (auto* spin = dock->widget()->findChild<QDoubleSpinBox*>(
                 QStringLiteral("atlasSearchMaxDistanceSpin"))) {
-            broad.maxDistance = spin->value();
+            params.maxDistance = spin->value();
             found = true;
         }
         return found;
@@ -5585,19 +5651,60 @@ void CWindow::startAtlasFiberIntersectionSearch()
             }
         }
     }
-    if (searchMode != ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS &&
-        searchMode != ATLAS_SEARCH_MODE_NON_ATLAS_ONLY) {
-        QMessageBox::warning(this,
-                             tr("Atlas Object Search"),
-                             tr("Unsupported atlas search type."));
+
+    // No saved fibers: silent no-op in the interactive flow (unchanged: no dialog,
+    // just refresh the docks).
+    if (_lineAnnotationController->fiberSnapshotsFromStorageWithPaths().empty()) {
+        updateAtlasSearchDocks();
         return;
     }
 
+    QString errorMessage;
+    if (!startAtlasFiberIntersectionSearchHeadless(params, &errorMessage)) {
+        QMessageBox::warning(this, tr("Atlas Object Search"), errorMessage);
+    }
+}
+
+// Dialog-free core shared with startAtlasFiberIntersectionSearch.
+bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
+                                                        QString* errorMessage)
+{
+    auto fail = [errorMessage](const QString& message) {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+    if (!_lineAnnotationController) {
+        updateAtlasSearchDocks();
+        return fail(tr("Line annotation is not available."));
+    }
+    // A live cancel flag means a search is in flight (created at launch and
+    // reset by the finished handler).
+    if (_atlasSearchCancelFlag) {
+        return fail(tr("An atlas object search is already running."));
+    }
+
+    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
+    if (params.maxDistance) {
+        broad.maxDistance = *params.maxDistance;
+    } else {
+        // The spin box persists every change, so QSettings holds its current
+        // value without requiring a widget read.
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        broad.maxDistance = settings.value(vc3d::settings::atlas::SEARCH_MAX_DISTANCE,
+                                           broad.maxDistance).toDouble();
+    }
+    const int searchMode = params.searchMode;
+    const QStringList requiredTags = params.requiredTags;
+    const QStringList excludedTags = params.excludedTags;
+    if (searchMode != ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS &&
+        searchMode != ATLAS_SEARCH_MODE_NON_ATLAS_ONLY) {
+        return fail(tr("Unsupported atlas search type."));
+    }
+
     if (!_currentAtlasDir && searchMode == ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 tr("Select an atlas, or choose \"Non-atlas fibers only\"."));
-        return;
+        return fail(tr("Select an atlas, or choose \"Non-atlas fibers only\"."));
     }
 
     vc::atlas::Atlas atlas;
@@ -5607,28 +5714,22 @@ void CWindow::startAtlasFiberIntersectionSearch()
             atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
             haveAtlas = true;
         } catch (const std::exception& ex) {
-            QMessageBox::warning(this,
-                                 tr("Atlas Object Search"),
-                                 tr("Could not load selected atlas: %1")
-                                     .arg(QString::fromStdString(ex.what())));
-            return;
+            return fail(tr("Could not load selected atlas: %1")
+                            .arg(QString::fromStdString(ex.what())));
         }
     }
 
     const auto fiberSnapshots = _lineAnnotationController->fiberSnapshotsFromStorageWithPaths();
     if (fiberSnapshots.empty()) {
         updateAtlasSearchDocks();
-        return;
+        return fail(tr("No saved fibers are available to search."));
     }
 
     std::vector<std::string> atlasFiberPaths = haveAtlas
         ? vc::atlas::atlasMappedFiberPathKeys(atlas)
         : std::vector<std::string>{};
     if (searchMode == ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS && atlasFiberPaths.empty()) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 tr("Selected atlas has no saved fiber mappings."));
-        return;
+        return fail(tr("Selected atlas has no saved fiber mappings."));
     }
 
     const bool debugSearch = atlasSearchDebugEnabled();
@@ -5728,18 +5829,12 @@ void CWindow::startAtlasFiberIntersectionSearch()
         keepTagged(targetFiberIds);
     }
     if (sourceFiberIds.empty()) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY
-                                     ? tr("No saved non-atlas fibers match the search filters.")
-                                     : tr("None of the selected atlas fibers are available in saved fiber files or match the search filters."));
-        return;
+        return fail(searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY
+                        ? tr("No saved non-atlas fibers match the search filters.")
+                        : tr("None of the selected atlas fibers are available in saved fiber files or match the search filters."));
     }
     if (targetFiberIds.empty()) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 tr("No saved non-atlas fibers are available to search or match the search filters."));
-        return;
+        return fail(tr("No saved non-atlas fibers are available to search or match the search filters."));
     }
     if (debugSearch) {
         qInfo().noquote() << QStringLiteral("[atlas-search] split source_ids=%1 target_ids=%2")
@@ -5764,17 +5859,11 @@ void CWindow::startAtlasFiberIntersectionSearch()
             lasagnaWorkingToBaseScale = resolved->workingToBaseScale;
         }
     } catch (const std::exception& ex) {
-        QMessageBox::warning(this,
-                             tr("Atlas Object Search"),
-                             QString::fromStdString(ex.what()));
-        return;
+        return fail(QString::fromStdString(ex.what()));
     }
     if (lasagnaManifestPath.empty()) {
-        QMessageBox::warning(this,
-                             tr("Atlas Object Search"),
-                             tr("Select a local Lasagna dataset before searching. "
-                                "Intersection distance is measured in grad_mag winding-integral space."));
-        return;
+        return fail(tr("Select a local Lasagna dataset before searching. "
+                       "Intersection distance is measured in grad_mag winding-integral space."));
     }
 
     clearAtlasSearchPreviewState();
@@ -5810,10 +5899,24 @@ void CWindow::startAtlasFiberIntersectionSearch()
              watcher,
              cancelFlag = _atlasSearchCancelFlag,
              searchStart]() {
-                const auto workerResult = watcher->result();
                 watcher->deleteLater();
+                // result() can rethrow worker failures. Convert them to a failed
+                // search so the exception cannot escape the event loop.
+                AtlasSearchWorkerResult workerResult;
+                bool workerFailed = false;
+                QString workerError;
+                try {
+                    workerResult = watcher->result();
+                } catch (const std::exception& ex) {
+                    workerFailed = true;
+                    workerError = QString::fromStdString(ex.what());
+                } catch (...) {
+                    workerFailed = true;
+                    workerError = QStringLiteral("unknown error");
+                }
                 const bool canceled = cancelFlag && cancelFlag->load(std::memory_order_relaxed);
-                if (!canceled && !_atlasSearchCancelRequested) {
+                const bool searchSucceeded = !workerFailed && !canceled && !_atlasSearchCancelRequested;
+                if (searchSucceeded) {
                     populateAtlasSearchResults(workerResult.results, workerResult.signedWindings);
                     if (statusBar()) {
                         const QString message = workerResult.skippedSigningCount == 0
@@ -5838,11 +5941,14 @@ void CWindow::startAtlasFiberIntersectionSearch()
                         }
                         if (auto* progress = dock->widget()->findChild<QProgressBar*>(
                                 QStringLiteral("atlasSearchProgressBar"))) {
-                            progress->setFormat(tr("Canceled"));
+                            progress->setFormat(workerFailed ? tr("Failed") : tr("Canceled"));
                         }
                     }
                     if (statusBar()) {
-                        showStatusBarMessage(tr("Atlas object search canceled"), 3000);
+                        showStatusBarMessage(workerFailed
+                                                 ? tr("Atlas object search failed: %1").arg(workerError)
+                                                 : tr("Atlas object search canceled"),
+                                             3000);
                     }
                 }
                 const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -5858,6 +5964,9 @@ void CWindow::startAtlasFiberIntersectionSearch()
                     _atlasSearchCancelFlag.reset();
                 }
                 updateAtlasSearchDocks();
+                // success=false covers cancellation and worker failure.
+                emit atlasSearchFinished(searchSucceeded,
+                                         static_cast<int>(_atlasSearchResults.size()));
             });
 
     vc::atlas::FiberIntersectionCache* cache = &_fiberIntersectionCache;
@@ -5979,6 +6088,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
                                              progressCallback,
                                              debugSearch);
     }));
+    return true;
 }
 
 void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results,
@@ -6529,114 +6639,137 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
     }));
 }
 
+// Dialog-free atlas loading shared by the interactive and direct entry points.
+void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
+{
+    if (!_atlasWorkspaceWindow || !_atlasViewer) {
+        createAtlasWorkspace();
+    }
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        throw std::runtime_error("No volume package is loaded");
+    }
+    const auto resolvedLasagna = resolvedLasagnaForState(_state);
+    if (!resolvedLasagna || resolvedLasagna->manifestPath.empty()) {
+        throw std::runtime_error(
+            "No Lasagna dataset matches the active volume; atlas pred-snap attachments are required");
+    }
+    const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
+    if (!std::filesystem::exists(manifestPath)) {
+        throw std::runtime_error("Selected Lasagna dataset does not exist");
+    }
+    const std::filesystem::path volpkgRoot = vpkg->path().empty()
+        ? std::filesystem::path(vpkg->getVolpkgDirectory())
+        : vpkg->path().parent_path();
+    auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    vc::lasagna::LasagnaDataset dataset =
+        vc::lasagna::LasagnaDataset::open(
+            manifestPath,
+            vc::lasagna::LasagnaDatasetOpenOptions{
+                resolvedLasagna->workingToBaseScale});
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
+    atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    _currentAtlasDir = atlasDir;
+    _currentAtlasName = atlas.metadata.name;
+    if (_lineAnnotationController) {
+        _lineAnnotationController->setCurrentAtlasDirectory(_currentAtlasDir);
+    }
+    if (_segmentationWidget && _segmentationWidget->lasagnaPanel()) {
+        _segmentationWidget->lasagnaPanel()->setSelectedAtlasPath(
+            QString::fromStdString(atlasDir.string()));
+    }
+    const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
+    auto baseSurface = std::make_shared<QuadSurface>(basePath);
+    const auto* points = baseSurface->rawPointsPtr();
+    if (!points || points->empty() || points->cols <= 0) {
+        throw std::runtime_error("atlas base mesh has no valid grid");
+    }
+    const cv::Vec2f baseScale = baseSurface->scale();
+    if (!std::isfinite(baseScale[0]) || !std::isfinite(baseScale[1]) ||
+        baseScale[0] <= 0.0f || baseScale[1] <= 0.0f) {
+        throw std::runtime_error("atlas base mesh has invalid scale");
+    }
+
+    const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(*baseSurface);
+    (void)vc::atlas::layoutAtlasObjects(atlas, periodColumns);
+    const vc::atlas::AtlasDisplayRange displayRange =
+        vc::atlas::atlasDisplayRange(atlas, periodColumns);
+    std::shared_ptr<QuadSurface> displaySurface =
+        vc::atlas::repeatedAtlasDisplaySurface(*baseSurface,
+                                               displayRange.unwrapCount,
+                                               atlas.metadata.zeroWindingColumn);
+    displaySurface->id = ATLAS_INTERNAL_SURFACE_NAME;
+    if (_state) {
+        _state->setSurface(ATLAS_INTERNAL_SURFACE_NAME, displaySurface);
+    }
+
+    if (!_atlasOverlay) {
+        _atlasOverlay = std::make_unique<AtlasOverlayController>(this);
+    }
+    if (_atlasViewer) {
+        _atlasOverlay->attachViewer(_atlasViewer);
+    }
+    _atlasOverlay->setAtlas(atlas, displaySurface, displayRange);
+    clearAtlasSearchPreviewState();
+    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
+        if (!dock || !dock->widget()) {
+            continue;
+        }
+        if (auto* tree = dock->widget()->findChild<QTreeWidget*>(
+                QStringLiteral("atlasSearchResultTree"))) {
+            tree->clear();
+        }
+        if (auto* progress = dock->widget()->findChild<QProgressBar*>(
+                QStringLiteral("atlasSearchProgressBar"))) {
+            progress->setRange(0, 100);
+            progress->setValue(0);
+            progress->setFormat(QString());
+        }
+    }
+
+    if (_atlasViewer) {
+        if (const auto bounds = _atlasOverlay->surfaceBounds()) {
+            _atlasViewer->centerOnSurfacePoint({
+                static_cast<float>(bounds->center().x()),
+                static_cast<float>(bounds->center().y()),
+            }, false);
+        } else {
+            _atlasViewer->fitSurfaceInView();
+        }
+    }
+    refreshAtlasOverviewDocks();
+    updateAtlasFiberDocks();
+    updateAtlasSearchDocks();
+    if (_workspaceTabs && _atlasWorkspaceWindow) {
+        _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
+    }
+    if (statusBar()) {
+        showStatusBarMessage(tr("Displayed atlas %1")
+                                 .arg(QString::fromStdString(atlas.metadata.name)),
+                             3000);
+    }
+}
+
+// Opens an atlas without dialogs or the interactive rebuild prompt.
+bool CWindow::displayAtlasFromDirectoryHeadless(const std::filesystem::path& atlasDir,
+                                                QString* errorMessage)
+{
+    try {
+        loadAndDisplayAtlas(atlasDir);
+        return true;
+    } catch (const std::exception& ex) {
+        if (errorMessage) {
+            *errorMessage = QString::fromStdString(ex.what());
+        }
+        return false;
+    }
+}
+
 void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
 {
     try {
-        if (!_atlasWorkspaceWindow || !_atlasViewer) {
-            createAtlasWorkspace();
-        }
-        auto vpkg = _state ? _state->vpkg() : nullptr;
-        if (!vpkg) {
-            throw std::runtime_error("No volume package is loaded");
-        }
-        const auto resolvedLasagna = resolvedLasagnaForState(_state);
-        if (!resolvedLasagna || resolvedLasagna->manifestPath.empty()) {
-            throw std::runtime_error(
-                "No Lasagna dataset matches the active volume; atlas pred-snap attachments are required");
-        }
-        const std::filesystem::path manifestPath = resolvedLasagna->manifestPath;
-        if (!std::filesystem::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna dataset does not exist");
-        }
-        const std::filesystem::path volpkgRoot = vpkg->path().empty()
-            ? std::filesystem::path(vpkg->getVolpkgDirectory())
-            : vpkg->path().parent_path();
-        auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
-        vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(
-                manifestPath,
-                vc::lasagna::LasagnaDatasetOpenOptions{
-                    resolvedLasagna->workingToBaseScale});
-        vc::lasagna::LasagnaNormalSampler sampler(dataset);
-        (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
-        atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
-        _currentAtlasDir = atlasDir;
-        _currentAtlasName = atlas.metadata.name;
-        if (_lineAnnotationController) {
-            _lineAnnotationController->setCurrentAtlasDirectory(_currentAtlasDir);
-        }
-        if (_segmentationWidget && _segmentationWidget->lasagnaPanel()) {
-            _segmentationWidget->lasagnaPanel()->setSelectedAtlasPath(
-                QString::fromStdString(atlasDir.string()));
-        }
-        const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
-        auto baseSurface = std::make_shared<QuadSurface>(basePath);
-        const auto* points = baseSurface->rawPointsPtr();
-        if (!points || points->empty() || points->cols <= 0) {
-            throw std::runtime_error("atlas base mesh has no valid grid");
-        }
-        const cv::Vec2f baseScale = baseSurface->scale();
-        if (!std::isfinite(baseScale[0]) || !std::isfinite(baseScale[1]) ||
-            baseScale[0] <= 0.0f || baseScale[1] <= 0.0f) {
-            throw std::runtime_error("atlas base mesh has invalid scale");
-        }
-
-        const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(*baseSurface);
-        (void)vc::atlas::layoutAtlasObjects(atlas, periodColumns);
-        const vc::atlas::AtlasDisplayRange displayRange =
-            vc::atlas::atlasDisplayRange(atlas, periodColumns);
-        std::shared_ptr<QuadSurface> displaySurface =
-            vc::atlas::repeatedAtlasDisplaySurface(*baseSurface,
-                                                   displayRange.unwrapCount,
-                                                   atlas.metadata.zeroWindingColumn);
-        displaySurface->id = ATLAS_INTERNAL_SURFACE_NAME;
-        if (_state) {
-            _state->setSurface(ATLAS_INTERNAL_SURFACE_NAME, displaySurface);
-        }
-
-        if (!_atlasOverlay) {
-            _atlasOverlay = std::make_unique<AtlasOverlayController>(this);
-        }
-        if (_atlasViewer) {
-            _atlasOverlay->attachViewer(_atlasViewer);
-        }
-        _atlasOverlay->setAtlas(atlas, displaySurface, displayRange);
-        clearAtlasSearchPreviewState();
-        for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-            if (!dock || !dock->widget()) {
-                continue;
-            }
-            if (auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"))) {
-                tree->clear();
-            }
-            if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
-                progress->setRange(0, 100);
-                progress->setValue(0);
-                progress->setFormat(QString());
-            }
-        }
-
-        if (_atlasViewer) {
-            if (const auto bounds = _atlasOverlay->surfaceBounds()) {
-                _atlasViewer->centerOnSurfacePoint({
-                    static_cast<float>(bounds->center().x()),
-                    static_cast<float>(bounds->center().y()),
-                }, false);
-            } else {
-                _atlasViewer->fitSurfaceInView();
-            }
-        }
-        refreshAtlasOverviewDocks();
-        updateAtlasFiberDocks();
-        updateAtlasSearchDocks();
-        if (_workspaceTabs && _atlasWorkspaceWindow) {
-            _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
-        }
-        if (statusBar()) {
-            showStatusBarMessage(tr("Displayed atlas %1")
-                                         .arg(QString::fromStdString(atlas.metadata.name)),
-                                     3000);
-        }
+        loadAndDisplayAtlas(atlasDir);
     } catch (const std::exception& ex) {
         if (vc::atlas::atlasLoadErrorRequiresRebuild(ex)) {
             const auto choice = QMessageBox::question(
@@ -8184,41 +8317,6 @@ void CWindow::setWidgetsEnabled(bool state)
     }
 }
 
-auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
-{
-    _state->setVpkg(nullptr);
-    updateNormalGridAvailability();
-    if (_segmentationModule && _segmentationModule->editingEnabled()) {
-        _segmentationModule->setEditingEnabled(false);
-    }
-    if (_segmentationModule) {
-        _segmentationModule->setAnnotateMode(false);
-    }
-    if (_segmentationWidget) {
-        if (!_segmentationModule || _segmentationWidget->isEditingEnabled()) {
-            _segmentationWidget->setEditingEnabled(false);
-        }
-        _segmentationWidget->setAvailableVolumes({}, QString());
-        _segmentationWidget->setVolumePackagePath(QString());
-    }
-
-    try {
-        _state->setVpkg(VolumePkg::load(nVpkgPath));
-    } catch (const std::exception& e) {
-        Logger()->error("Failed to initialize volpkg: {}", e.what());
-    }
-
-    if (_state->vpkg() == nullptr) {
-        Logger()->error("Cannot open project: {}", nVpkgPath);
-        QMessageBox::warning(
-            this, "Error",
-            "Project failed to load. Falling back to a new blank project.");
-        _state->setVpkg(VolumePkg::newEmpty());
-        return false;
-    }
-    return true;
-}
-
 // Update the widgets
 void CWindow::UpdateView(void)
 {
@@ -8352,40 +8450,115 @@ void CWindow::onSharedCacheStatsChanged(const QStringList& items)
 }
 
 // Open volume package
-void CWindow::OpenVolume(const QString& path)
+bool CWindow::OpenVolume(const QString& path,
+                         bool interactive,
+                         QString* errorMessage,
+                         const QString& preferredVolumeId,
+                         VolumeOpenError* openError)
 {
+    if (errorMessage) {
+        errorMessage->clear();
+    }
+    if (openError) {
+        *openError = VolumeOpenError::None;
+    }
     QString aVpkgPath = path;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     if (aVpkgPath.isEmpty()) {
+        if (!interactive) {
+            if (errorMessage) {
+                *errorMessage = tr("Project path is empty.");
+            }
+            if (openError) {
+                *openError = VolumeOpenError::PackageLoadFailed;
+            }
+            return false;
+        }
         aVpkgPath = QFileDialog::getOpenFileName(
             this, tr("Open Project"), settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
             tr("Project (*.volpkg.json);;All files (*.*)"),
             nullptr, QFileDialog::DontResolveSymlinks | QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
         if (aVpkgPath.isEmpty()) {
             Logger()->info("Open project canceled");
-            return;
+            return false;
         }
     }
 
-    if (!InitializeVolumePkg(aVpkgPath.toStdString())) {
-        return;
+    std::shared_ptr<VolumePkg> package;
+    QString loadError;
+    try {
+        package = VolumePkg::load(aVpkgPath.toStdString());
+    } catch (const std::exception& e) {
+        Logger()->error("Failed to initialize volpkg: {}", e.what());
+        loadError = QString::fromUtf8(e.what());
+    }
+
+    if (!package) {
+        Logger()->error("Cannot open project: {}", aVpkgPath.toStdString());
+        const QString message = loadError.isEmpty()
+            ? tr("Project failed to load.")
+            : tr("Project failed to load: %1").arg(loadError);
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        if (openError) {
+            *openError = VolumeOpenError::PackageLoadFailed;
+        }
+        if (interactive) {
+            QMessageBox::warning(this, tr("Error"), message);
+        }
+        return false;
     }
 
     // Check version number
-    if (_state->vpkg()->version() < VOLPKG_MIN_VERSION) {
+    if (package->version() < VOLPKG_MIN_VERSION) {
         const auto msg = "Volume package is version " +
-                         std::to_string(_state->vpkg()->version()) +
+                         std::to_string(package->version()) +
                          " but this program requires version " +
                          std::to_string(VOLPKG_MIN_VERSION) + "+.";
         Logger()->error(msg);
-        QMessageBox::warning(this, tr("ERROR"), QString(msg.c_str()));
-        _state->setVpkg(nullptr);
-        updateNormalGridAvailability();
-        return;
+        if (errorMessage) {
+            *errorMessage = QString::fromStdString(msg);
+        }
+        if (interactive) {
+            QMessageBox::warning(this, tr("ERROR"), QString::fromStdString(msg));
+        }
+        if (openError) {
+            *openError = VolumeOpenError::PackageLoadFailed;
+        }
+        return false;
     }
 
-    refreshCurrentVolumePackageUi(QString(), true);
+    if (!preferredVolumeId.isEmpty()) {
+        const auto ids = package->volumeIDs();
+        const auto id = preferredVolumeId.toStdString();
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+            if (errorMessage) {
+                *errorMessage = tr("Unknown volume id: %1").arg(preferredVolumeId);
+            }
+            if (openError) {
+                *openError = VolumeOpenError::VolumeNotFound;
+            }
+            return false;
+        }
+        try {
+            (void)package->volume(id);
+        } catch (const std::exception& e) {
+            if (errorMessage) {
+                *errorMessage = tr("Failed to load volume %1: %2")
+                                    .arg(preferredVolumeId, QString::fromUtf8(e.what()));
+            }
+            if (openError) {
+                *openError = VolumeOpenError::PackageLoadFailed;
+            }
+            return false;
+        }
+    }
+
+    CloseVolume();
+    _state->setVpkg(std::move(package));
+    refreshCurrentVolumePackageUi(preferredVolumeId, true);
     if (_menuController) {
         _menuController->updateRecentVolpkgList(aVpkgPath);
     }
@@ -8393,6 +8566,19 @@ void CWindow::OpenVolume(const QString& path)
     if (_fileWatcher) {
         _fileWatcher->startWatching();
     }
+    return true;
+}
+
+bool CWindow::openVolumePackage(const QString& path,
+                                bool interactive,
+                                QString* errorMessage,
+                                const QString& preferredVolumeId,
+                                VolumeOpenError* openError)
+{
+    const bool opened = OpenVolume(
+        path, interactive, errorMessage, preferredVolumeId, openError);
+    UpdateView();
+    return opened;
 }
 
 std::vector<QComboBox*> CWindow::volumeSelectionControls() const
@@ -9265,6 +9451,70 @@ void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> 
     // (the ID remains valid for lookup - will just return nullptr if surface is gone)
 }
 
+// Renders <segment>/mask.tif on the calling (worker) thread with no GUI side
+// effects. append=false writes a single-layer binary mask; append=true appends a
+// surface-image layer to an existing mask (or creates a two-layer mask+image file).
+// Throws std::runtime_error on failure; returns a status string on success.
+static QString renderSegmentMaskToFile(const std::shared_ptr<QuadSurface>& surf,
+                                       const std::shared_ptr<Volume>& volume,
+                                       const std::filesystem::path& path,
+                                       bool append)
+{
+    cv::Mat_<uint8_t> mask;
+    if (!append) {
+        cv::Mat_<cv::Vec3f> coords;
+        render_binary_mask(surf.get(), mask, coords, 1.0f);
+        // cv::imwrite returns false (rather than throwing) on most write
+        // failures; treat that as an error so no caller reports a false success.
+        if (!cv::imwrite(path.string(), mask)) {
+            throw std::runtime_error("Failed to write mask to " + path.string());
+        }
+        surf->meta["date_last_modified"] = get_surface_time_str();
+        surf->save_meta();
+        return QStringLiteral("Mask saved");
+    }
+
+    cv::Mat_<uint8_t> img;
+    std::vector<cv::Mat> existing_layers;
+    if (std::filesystem::exists(path)) {
+        cv::imreadmulti(path.string(), existing_layers, cv::IMREAD_UNCHANGED);
+        if (existing_layers.empty())
+            throw std::runtime_error("Could not read existing mask file.");
+
+        mask = existing_layers[0];
+        const cv::Size maskSize = mask.size();
+        {
+            const cv::Size rawSize = surf->rawPointsPtr()->size();
+            const cv::Vec3f ptr(0, 0, 0);
+            const cv::Vec3f offset(-rawSize.width / 2.0f, -rawSize.height / 2.0f, 0);
+            const float surfScale = surf->scale()[0];
+            cv::Mat_<cv::Vec3f> coords;
+            surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
+            img.create(coords.size());
+            render_image_from_coords(coords, img, volume.get());
+        }
+        cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
+        existing_layers.push_back(img);
+        atomicImwriteMulti(path, existing_layers);
+
+        surf->meta["date_last_modified"] = get_surface_time_str();
+        surf->save_meta();
+        return QString("Appended surface image to existing mask (now %1 layers)")
+            .arg(existing_layers.size());
+    }
+
+    cv::Mat_<cv::Vec3f> coords;
+    render_binary_mask(surf.get(), mask, coords, 1.0f);
+    render_surface_image(surf.get(), mask, img, volume.get(), 0, 1.0f);
+    cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
+    std::vector<cv::Mat> layers = {mask, img};
+    atomicImwriteMulti(path, layers);
+
+    surf->meta["date_last_modified"] = get_surface_time_str();
+    surf->save_meta();
+    return QString("Created new surface mask with image data");
+}
+
 void CWindow::onEditMaskPressed(const QString& segmentId)
 {
     auto surf = (_state && _state->vpkg())
@@ -9282,34 +9532,27 @@ void CWindow::onEditMaskPressed(const QString& segmentId)
         QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
         return;
     }
-
-    if (_maskRenderInProgress)
+    if (_maskRenderInProgress) {
         return;
-    _maskRenderInProgress = true;
-    showStatusBarMessage(tr("Rendering mask..."));
-    vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-        *surf, *_state->vpkg(), _state->currentVolumeId());
+    }
 
-    auto* watcher = new QFutureWatcher<void>(this);
-    connect(watcher, &QFutureWatcher<void>::finished, this,
-            [this, watcher, surf, path]() {
-                watcher->deleteLater();
-                _maskRenderInProgress = false;
-
-                showStatusBarMessage(tr("Mask saved"), 3000);
-                QDesktopServices::openUrl(QUrl::fromLocalFile(
-                    QString::fromStdString(path.string())));
-            });
-
-    watcher->setFuture(QtConcurrent::run([surf, path]() {
-        cv::Mat_<uint8_t> mask;
-        cv::Mat_<cv::Vec3f> coords;
-        render_binary_mask(surf.get(), mask, coords, 1.0f);
-        cv::imwrite(path.string(), mask);
-
-        surf->meta["date_last_modified"] = get_surface_time_str();
-        surf->save_meta();
-    }));
+    QString error;
+    if (!startMaskRender(
+            segmentId, false,
+            [this, path](bool success, const QString& message) {
+                if (success) {
+                    showStatusBarMessage(tr("Mask saved"), 3000);
+                    QDesktopServices::openUrl(QUrl::fromLocalFile(
+                        QString::fromStdString(path.string())));
+                } else {
+                    QMessageBox::critical(this, tr("Error"),
+                                          tr("Failed to render surface: %1").arg(message));
+                    clearStatusBarMessage();
+                }
+            },
+            &error)) {
+        QMessageBox::warning(this, tr("Error"), error);
+    }
 }
 
 void CWindow::onAppendMaskPressed(const QString& segmentId)
@@ -9325,85 +9568,98 @@ void CWindow::onAppendMaskPressed(const QString& segmentId)
         }
         return;
     }
-
-    if (_maskRenderInProgress)
+    if (_maskRenderInProgress) {
         return;
+    }
+
+    std::filesystem::path path = surf->path/"mask.tif";
+    QString error;
+    if (!startMaskRender(
+            segmentId, true,
+            [this, path](bool success, const QString& message) {
+                if (success) {
+                    showStatusBarMessage(message, 3000);
+                    QDesktopServices::openUrl(QUrl::fromLocalFile(
+                        QString::fromStdString(path.string())));
+                } else {
+                    QMessageBox::critical(this, tr("Error"),
+                                          tr("Failed to render surface: %1").arg(message));
+                    clearStatusBarMessage();
+                }
+            },
+            &error)) {
+        QMessageBox::warning(this, tr("Error"), error);
+    }
+}
+
+bool CWindow::startMaskRender(const QString& segmentId, bool append,
+                              std::function<void(bool, QString)> onFinished,
+                              QString* errorMessage)
+{
+    auto fail = [&](const QString& message) -> bool {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
+    auto surf = (_state && _state->vpkg())
+        ? _state->vpkg()->getSurface(segmentId.toStdString())
+        : nullptr;
+    if (!surf) {
+        return fail(tr("No volume package loaded or invalid segment."));
+    }
+    auto volume = _state ? _state->currentVolume() : nullptr;
+    if (append && !volume) {
+        return fail(tr("No volume loaded."));
+    }
+    if (_maskRenderInProgress) {
+        return fail(tr("A mask render is already in progress."));
+    }
     _maskRenderInProgress = true;
     showStatusBarMessage(tr("Rendering mask..."));
 
-    std::filesystem::path path = surf->path/"mask.tif";
-    auto volume = _state->currentVolume();
+    // The worker's finished slot clears _maskRenderInProgress on completion, but
+    // the setup below (coordinate-identity copy, watcher allocation, future
+    // launch) can throw before the worker is ever queued. Arm a guard that
+    // restores the flag on any such early failure, so a subsequent mask op is not
+    // permanently blocked; it is dismissed once the worker owns the flag.
+    bool workerLaunched = false;
+    struct InProgressGuard {
+        bool& flag;
+        const bool& launched;
+        ~InProgressGuard() { if (!launched) flag = false; }
+    } inProgressGuard{_maskRenderInProgress, workerLaunched};
+
+    const std::filesystem::path path = surf->path / "mask.tif";
     vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
         *surf, *_state->vpkg(), _state->currentVolumeId());
 
     auto* watcher = new QFutureWatcher<QString>(this);
     connect(watcher, &QFutureWatcher<QString>::finished, this,
-            [this, watcher, path]() {
+            [this, watcher, onFinished = std::move(onFinished)]() {
                 watcher->deleteLater();
                 _maskRenderInProgress = false;
-
+                clearStatusBarMessage();
+                bool success = false;
+                QString message;
                 try {
-                    QString msg = watcher->result();
-                    showStatusBarMessage(msg, 3000);
-                    QDesktopServices::openUrl(QUrl::fromLocalFile(
-                        QString::fromStdString(path.string())));
+                    message = watcher->result();
+                    success = true;
                 } catch (const std::exception& e) {
-                    QMessageBox::critical(this, tr("Error"),
-                                         tr("Failed to render surface: %1").arg(e.what()));
-                    clearStatusBarMessage();
+                    message = QString::fromUtf8(e.what());
+                }
+                if (onFinished) {
+                    onFinished(success, message);
                 }
             });
 
-    watcher->setFuture(QtConcurrent::run([surf, volume, path]() -> QString {
-        cv::Mat_<uint8_t> mask;
-        cv::Mat_<uint8_t> img;
-        std::vector<cv::Mat> existing_layers;
-
-        if (std::filesystem::exists(path)) {
-            cv::imreadmulti(path.string(), existing_layers, cv::IMREAD_UNCHANGED);
-
-            if (existing_layers.empty())
-                throw std::runtime_error("Could not read existing mask file.");
-
-            mask = existing_layers[0];
-            cv::Size maskSize = mask.size();
-
-            {
-                cv::Size rawSize = surf->rawPointsPtr()->size();
-                cv::Vec3f ptr(0, 0, 0);
-                cv::Vec3f offset(-rawSize.width/2.0f, -rawSize.height/2.0f, 0);
-                float surfScale = surf->scale()[0];
-                cv::Mat_<cv::Vec3f> coords;
-                surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
-                img.create(coords.size());
-                render_image_from_coords(coords, img, volume.get());
-            }
-            cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
-
-            existing_layers.push_back(img);
-            atomicImwriteMulti(path, existing_layers);
-
-            QString msg = QString("Appended surface image to existing mask (now %1 layers)")
-                              .arg(existing_layers.size());
-
-            surf->meta["date_last_modified"] = get_surface_time_str();
-            surf->save_meta();
-            return msg;
-
-        } else {
-            cv::Mat_<cv::Vec3f> coords;
-            render_binary_mask(surf.get(), mask, coords, 1.0f);
-            render_surface_image(surf.get(), mask, img, volume.get(), 0, 1.0f);
-            cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
-
-            std::vector<cv::Mat> layers = {mask, img};
-            atomicImwriteMulti(path, layers);
-
-            surf->meta["date_last_modified"] = get_surface_time_str();
-            surf->save_meta();
-            return QString("Created new surface mask with image data");
-        }
+    watcher->setFuture(QtConcurrent::run([surf, volume, path, append]() -> QString {
+        return renderSegmentMaskToFile(surf, volume, path, append);
     }));
+
+    workerLaunched = true;  // worker now owns _maskRenderInProgress; disarm the guard
+    return true;
 }
 
 QString CWindow::getCurrentVolumePath() const

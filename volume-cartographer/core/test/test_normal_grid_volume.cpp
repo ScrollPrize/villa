@@ -56,6 +56,37 @@ TEST_CASE("Constructor: missing metadata.json throws")
     fs::remove_all(d);
 }
 
+TEST_CASE("Constructor: remote marker whose fetch fails throws a clean, "
+          "informative error instead of the generic 'Cannot open'")
+{
+    // Regression for the normal-grid remote-streaming crash: the constructor
+    // used to ignore ensure_local_file()'s return value and call
+    // Json::parse_file() unconditionally, so a failed metadata fetch surfaced
+    // as an uncaught std::runtime_error("Cannot open: <path>") that crashed
+    // vc_grow_seg_from_seed. It must now throw an intentional error that names
+    // the remote source. The marker points at a port that refuses connections
+    // so the fetch fails fast without touching external network.
+    auto d = tmpDir("remote_fetch_fail");
+    {
+        std::ofstream f(d / "normal-grids-remote.json");
+        f << "{\"url\": \"http://127.0.0.1:1/nonexistent-normal-grids\"}";
+    }
+    std::string msg;
+    bool threw = false;
+    try {
+        NormalGridVolume v(d.string());
+        (void)v;
+    } catch (const std::exception& e) {
+        threw = true;
+        msg = e.what();
+    }
+    CHECK(threw);
+    CHECK(msg.find("Failed to fetch remote normal-grid") != std::string::npos);
+    CHECK(msg.find("127.0.0.1:1") != std::string::npos);
+    CHECK(msg.find("Cannot open") == std::string::npos);
+    fs::remove_all(d);
+}
+
 TEST_CASE("Constructor + metadata accessor")
 {
     auto d = makeEmptyNgvDir("meta_access", 8);

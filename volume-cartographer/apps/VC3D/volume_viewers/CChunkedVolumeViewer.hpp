@@ -123,6 +123,7 @@ public:
     void setStretchValues(bool) { if (_closing) return; submitRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
     void setPlaneIntersectionLinesVisible(bool visible) override;
+    bool isPlaneIntersectionLinesVisible() const { return _planeIntersectionLinesVisible; }
 
     void setShowDirectionHints(bool on) override { if (_closing) return; _showDirectionHints = on; emit overlaysUpdated(); }
     bool isShowDirectionHints() const override { return _showDirectionHints; }
@@ -179,6 +180,9 @@ public:
     void setIntersectionOpacity(float v) override;
     void setIntersectionThickness(float v) override;
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override;
+    std::vector<std::string> highlightedSurfaceIds() const {
+        return {_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end()};
+    }
     void setSurfacePatchSamplingStride(int s) override;
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
@@ -290,6 +294,10 @@ private:
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
+    // Multiply the current scale by `factor` (clamped to [kMinScale, kMaxScale]),
+    // keeping the scene point under `scenePos` fixed. The shared core of both the
+    // discrete wheel zoom (zoomStepsAt) and the continuous adjustZoomByFactor.
+    void zoomByFactorAt(float factor, const QPointF& scenePos);
     bool isAxisAlignedView() const;
     void ensureDefaultSurface();
     void updateContentBounds();

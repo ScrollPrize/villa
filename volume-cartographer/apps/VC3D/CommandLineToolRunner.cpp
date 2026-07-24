@@ -1,5 +1,4 @@
 #include "CommandLineToolRunner.hpp"
-#include "CWindow.hpp"
 #include <QDir>
 #include <QFileInfo>
 #include <QStatusBar>
@@ -12,6 +11,7 @@
 #include <QApplication>
 
 #include <cmath>
+#include <utility>
 
 
 namespace {
@@ -56,14 +56,16 @@ QString formatCommand(const QString& program, const QStringList& args, int ompTh
 
 } // namespace
 
-CommandLineToolRunner::CommandLineToolRunner(QStatusBar* statusBar, CWindow* mainWindow, QObject* parent)
+CommandLineToolRunner::CommandLineToolRunner(
+    QStatusBar* statusBar,
+    std::function<QString()> currentVolumePath,
+    QObject* parent)
     : QObject(parent)
-    , _mainWindow(mainWindow)
+    , _currentVolumePath(std::move(currentVolumePath))
     , _progressUtil(new ProgressUtil(nullptr, this))
     , _process(nullptr)
     , _consoleOutput(new ConsoleOutputWidget())
     , _consoleDialog(new QDialog(nullptr, Qt::Window))
-    , _autoShowConsole(true)
     , _scale(1.0f)
     , _resolution(0)
     , _layers(31)
@@ -147,6 +149,11 @@ void CommandLineToolRunner::setRenderVoxelSize(double voxelSizeUm, bool enabled)
     _useRenderVoxelSize = enabled && std::isfinite(voxelSizeUm) && voxelSizeUm > 0.0;
 }
 
+void CommandLineToolRunner::setRenderOutputFormat(RenderOutputFormat format)
+{
+    _renderOutputFormat = format;
+}
+
 void CommandLineToolRunner::setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment)
 {
     setVolumePath(volumePath);
@@ -167,9 +174,9 @@ void CommandLineToolRunner::setIncludeTifs(bool include)
     _includeTifs = include;
 }
 
-void CommandLineToolRunner::setOmpThreads(int threads)
+void CommandLineToolRunner::setNextOmpThreads(int threads)
 {
-    _ompThreads = threads;
+    _nextOmpThreads = threads;
 }
 
 void CommandLineToolRunner::setFlattenOptions(bool flatten, int iterations, int downsample)
@@ -207,11 +214,17 @@ void CommandLineToolRunner::setRenderAdvanced(
     _flipAxis = flipAxis;
 }
 
-bool CommandLineToolRunner::execute(Tool tool)
+bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
 {
+    const int ompThreads = std::exchange(_nextOmpThreads, -1);
     const bool isCustom = (tool == Tool::CustomCommand);
+    const auto warn = [&](const QString& title, const QString& message) {
+        if (options.presentation == Presentation::Interactive) {
+            QMessageBox::warning(nullptr, title, message);
+        }
+    };
     if (_process && _process->state() != QProcess::NotRunning) {
-        QMessageBox::warning(nullptr, tr("Warning"), tr("A tool is already running."));
+        warn(tr("Warning"), tr("A tool is already running."));
         return false;
     }
 
@@ -223,7 +236,7 @@ bool CommandLineToolRunner::execute(Tool tool)
     }
 
     if (isCustom && _customCommand.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("Custom command not specified."));
+        warn(tr("Error"), tr("Custom command not specified."));
         return false;
     }
 
@@ -232,8 +245,10 @@ bool CommandLineToolRunner::execute(Tool tool)
     if (!toolInfo.exists() || !toolInfo.isExecutable()) {
         QString errorMsg = tr("Tool executable not found or not executable: %1").arg(toolCmd);
         _consoleOutput->appendOutput(errorMsg);
-        showConsoleOutput();
-        QMessageBox::warning(nullptr, tr("Error"), errorMsg);
+        if (options.showConsole) {
+            showConsoleOutput();
+        }
+        warn(tr("Error"), errorMsg);
         return false;
     }
 
@@ -245,19 +260,19 @@ bool CommandLineToolRunner::execute(Tool tool)
     if (needsVolume) {
         if (_explicitVolumePath) {
             if (_volumePath.isEmpty()) {
-                QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified."));
+                warn(tr("Error"), tr("Volume path not specified."));
                 return false;
             }
         } else {
             QString resolvedVolumePath = _volumePath;
-            if (_mainWindow) {
-                resolvedVolumePath = _mainWindow->getCurrentVolumePath();
+            if (_currentVolumePath) {
+                resolvedVolumePath = _currentVolumePath();
                 if (resolvedVolumePath.isEmpty()) {
-                    QMessageBox::warning(nullptr, tr("Error"), tr("No volume selected."));
+                    warn(tr("Error"), tr("No volume selected."));
                     return false;
                 }
             } else if (resolvedVolumePath.isEmpty()) {
-                QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified and no main window available."));
+                warn(tr("Error"), tr("Volume path not specified and no main window available."));
                 return false;
             }
             _volumePath = resolvedVolumePath;
@@ -268,8 +283,7 @@ bool CommandLineToolRunner::execute(Tool tool)
         const auto lowered = _volumePath.trimmed().toLower();
         if (lowered.startsWith("http://") || lowered.startsWith("https://") ||
             lowered.startsWith("s3://") || lowered.startsWith("s3+")) {
-            QMessageBox::warning(
-                nullptr,
+            warn(
                 tr("Unsupported Remote Volume"),
                 tr("This command accepts only a local volume path. "
                    "Remote locators are rejected without stripping selectors."));
@@ -278,30 +292,30 @@ bool CommandLineToolRunner::execute(Tool tool)
     }
 
     if (tool == Tool::MergeTifxyz && _mergeJsonPath.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("merge.json path not specified."));
+        warn(tr("Error"), tr("merge.json path not specified."));
         return false;
     }
 
     if (tool == Tool::RenderTifXYZ && _segmentPath.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("Segment path not specified."));
+        warn(tr("Error"), tr("Segment path not specified."));
         return false;
     }
 
     if (tool == Tool::GrowSegFromSegment && _srcSegment.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("Source segment not specified."));
+        warn(tr("Error"), tr("Source segment not specified."));
         return false;
     }
 
     if (tool == Tool::NeighborCopy) {
         if (_jsonParams.isEmpty() || _resumeSurfacePath.isEmpty() || _tgtDir.isEmpty()) {
-            QMessageBox::warning(nullptr, tr("Error"), tr("Neighbor copy parameters incomplete."));
+            warn(tr("Error"), tr("Neighbor copy parameters incomplete."));
             return false;
         }
     }
 
     if (tool == Tool::RenderTifXYZ) {
         if (_outputPattern.isEmpty()) {
-            QMessageBox::warning(nullptr, tr("Error"), tr("Output pattern not specified."));
+            warn(tr("Error"), tr("Output pattern not specified."));
             return false;
         }
 
@@ -309,13 +323,17 @@ bool CommandLineToolRunner::execute(Tool tool)
         QDir outputDir = outputInfo.dir();
         if (!outputDir.exists()) {
             if (!outputDir.mkpath(".")) {
-                QMessageBox::warning(nullptr, tr("Error"), tr("Failed to create output directory: %1").arg(outputDir.path()));
+                warn(tr("Error"),
+                     tr("Failed to create output directory: %1").arg(outputDir.path()));
                 return false;
             }
         }
     }
 
     _currentTool = tool;
+    _executionOptions = options;
+    _terminalReported = false;
+    _pendingProcessError.clear();
 
     QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     QString toolBaseName = QFileInfo(toolCmd).baseName();
@@ -363,10 +381,10 @@ bool CommandLineToolRunner::execute(Tool tool)
     // Apply per-run environment variables (e.g., OMP_NUM_THREADS)
     {
         QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        if (_ompThreads > 0) {
-            env.insert("OMP_NUM_THREADS", QString::number(_ompThreads));
+        if (ompThreads > 0) {
+            env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
             if (_logStream) {
-                *_logStream << "ENV: OMP_NUM_THREADS=" << _ompThreads << Qt::endl;
+                *_logStream << "ENV: OMP_NUM_THREADS=" << ompThreads << Qt::endl;
                 _logStream->flush();
             }
         }
@@ -396,7 +414,7 @@ bool CommandLineToolRunner::execute(Tool tool)
 
     QStringList args = isCustom ? _customArgs : buildArguments(tool);
     QString toolCommand = toolCmd;
-    QString formattedCommand = formatCommand(toolCommand, args, _ompThreads);
+    QString formattedCommand = formatCommand(toolCommand, args, ompThreads);
 
     QString startMessage;
     const QString toolLabel = isCustom
@@ -417,7 +435,7 @@ bool CommandLineToolRunner::execute(Tool tool)
         _logStream->flush();
     }
 
-    if (_autoShowConsole) {
+    if (options.showConsole) {
         showConsoleOutput();
     }
 
@@ -428,12 +446,13 @@ bool CommandLineToolRunner::execute(Tool tool)
 
 bool CommandLineToolRunner::executeCustomCommand(const QString& command,
                                                  const QStringList& args,
-                                                 const QString& label)
+                                                 const QString& label,
+                                                 ExecutionOptions options)
 {
     _customCommand = command;
     _customArgs = args;
     _customLabel = label;
-    return execute(Tool::CustomCommand);
+    return execute(Tool::CustomCommand, options);
 }
 
 void CommandLineToolRunner::cancel()
@@ -464,11 +483,6 @@ void CommandLineToolRunner::hideConsoleOutput()
     }
 }
 
-void CommandLineToolRunner::setAutoShowConsoleOutput(bool autoShow)
-{
-    _autoShowConsole = autoShow;
-}
-
 void CommandLineToolRunner::setPreserveConsoleOutput(bool preserve)
 {
     _preserveConsoleOutput = preserve;
@@ -497,16 +511,8 @@ void CommandLineToolRunner::onProcessStarted()
     if (_progressUtil) _progressUtil->startAnimation(message);
 }
 
-void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
+void CommandLineToolRunner::closeLog()
 {
-    if (_logStream) {
-        *_logStream << Qt::endl << "===================================" << Qt::endl;
-        *_logStream << "Process finished at: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;
-        *_logStream << "Exit code: " << exitCode << Qt::endl;
-        *_logStream << "Exit status: " << (exitStatus == QProcess::NormalExit ? "Normal" : "Crashed") << Qt::endl;
-        _logStream->flush();
-    }
-
     if (_logStream) {
         delete _logStream;
         _logStream = nullptr;
@@ -516,10 +522,47 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
         delete _logFile;
         _logFile = nullptr;
     }
+}
 
+void CommandLineToolRunner::finishExecution(bool success,
+                                            const QString& message,
+                                            const QString& outputPath,
+                                            bool copyToClipboard)
+{
+    if (_terminalReported) {
+        return;
+    }
+    _terminalReported = true;
     _explicitVolumePath = false;
 
-    if (exitCode == 0 && exitStatus == QProcess::NormalExit) {
+    // Move the completed run out of the active slot before notifying observers.
+    // A toolFinished handler may synchronously start another process.
+    _completionOptions = _executionOptions;
+    _executionOptions = {};
+    _deliveringCompletion = true;
+    emit toolFinished(
+        _currentTool, success, message, outputPath, copyToClipboard);
+    _deliveringCompletion = false;
+}
+
+void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
+{
+    if (_terminalReported) {
+        return;
+    }
+    if (_logStream) {
+        *_logStream << Qt::endl << "===================================" << Qt::endl;
+        *_logStream << "Process finished at: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;
+        *_logStream << "Exit code: " << exitCode << Qt::endl;
+        *_logStream << "Exit status: " << (exitStatus == QProcess::NormalExit ? "Normal" : "Crashed") << Qt::endl;
+        _logStream->flush();
+    }
+
+    closeLog();
+
+    if (_pendingProcessError.isEmpty() &&
+        exitCode == 0 &&
+        exitStatus == QProcess::NormalExit) {
         QString message = tr("%1 completed successfully").arg(toolName(_currentTool));
         QString outputPath = getOutputPath();
 
@@ -534,15 +577,17 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
             if (_progressUtil) _progressUtil->stopAnimation(message);
         }
 
-        emit toolFinished(_currentTool, true, message, outputPath, copyToClipboard);
+        finishExecution(true, message, outputPath, copyToClipboard);
     } else {
-        QString errorMessage = tr("%1 failed with exit code: %2")
-                                .arg(toolName(_currentTool))
-                                .arg(exitCode);
+        const QString errorMessage = _pendingProcessError.isEmpty()
+            ? tr("%1 failed with exit code: %2")
+                  .arg(toolName(_currentTool))
+                  .arg(exitCode)
+            : _pendingProcessError;
 
         if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
 
-        emit toolFinished(_currentTool, false, errorMessage, QString(), false);
+        finishExecution(false, errorMessage);
     }
 }
 
@@ -563,33 +608,35 @@ void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
 
     QStringList args = buildArguments(_currentTool);
     errorMessage += tr("\nArguments: %1").arg(args.join(" "));
+    _pendingProcessError = errorMessage;
 
     if (_logStream) {
         *_logStream << Qt::endl << "ERROR: " << errorMessage << Qt::endl;
         _logStream->flush();
     }
 
-    if (_logStream) {
-        delete _logStream;
-        _logStream = nullptr;
-    }
-    if (_logFile) {
-        _logFile->close();
-        delete _logFile;
-        _logFile = nullptr;
-    }
-
-    if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
-
-    _explicitVolumePath = false;
-
-    emit toolFinished(_currentTool, false, errorMessage, QString(), false);
+    const bool showConsole = _executionOptions.showConsole;
 
     if (_consoleOutput) {
         _consoleOutput->appendOutput(errorMessage);
     }
 
-    showConsoleOutput();
+    if (showConsole) {
+        showConsoleOutput();
+    }
+
+    // Crashes and other runtime errors are followed by finished(); let that
+    // signal own terminal delivery. FailedToStart is the exception: Qt does not
+    // emit finished() when the process never launched.
+    if (error != QProcess::FailedToStart) {
+        return;
+    }
+
+    closeLog();
+    if (_progressUtil) {
+        _progressUtil->stopAnimation(tr("Process failed"));
+    }
+    finishExecution(false, errorMessage);
 }
 
 QStringList CommandLineToolRunner::buildArguments(Tool tool)
@@ -599,7 +646,10 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
     switch (tool) {
         case Tool::RenderTifXYZ:
             args << "--volume" << _volumePath
-                 << "--tif-output" << _outputPattern
+                 << (_renderOutputFormat == RenderOutputFormat::Zarr
+                         ? QStringLiteral("--zarr-output")
+                         : QStringLiteral("--tif-output"))
+                 << _outputPattern
                  << "--segmentation" << _segmentPath
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)

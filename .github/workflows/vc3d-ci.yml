@@ -85,7 +85,29 @@ jobs:
           cmake --preset "$preset" -DVC_USE_SCCACHE=ON
           ninja -C "build/$preset"
           ctest --preset "$preset"
+          QT_QPA_PLATFORM=offscreen python3 apps/VC3D/agent_bridge/test/smoke_offscreen.py \
+            --vc3d "build/$preset/bin/VC3D"
           sccache --show-stats
+
+  mcp-test:
+    name: MCP unit tests
+    needs: changes
+    if: needs.changes.outputs.vc == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install MCP bridge
+        working-directory: volume-cartographer/tools/vc3d-mcp
+        run: python -m pip install -e .
+      - name: Test MCP bridge
+        working-directory: volume-cartographer/tools/vc3d-mcp
+        env:
+          PYTHONWARNINGS: error::ResourceWarning
+        run: python -m unittest discover -p 'test*.py'
 
   # macOS compile is a hard PR gate (parity with the Ubuntu Release cells).
   # Full packaging and packaged-app smoke checks run after merge and on releases.
@@ -135,9 +157,19 @@ jobs:
       - name: Configure + build
         run: volume-cartographer/scripts/build_macos.sh --sccache
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test MCP bridge
+        working-directory: volume-cartographer/tools/vc3d-mcp
+        run: |
+          python -m pip install -e .
+          python -m unittest discover -p 'test*.py'
+
   ci:
     name: CI
-    needs: [changes, skip, build-test, macos-build]
+    needs: [changes, skip, build-test, mcp-test, macos-build]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -147,13 +179,14 @@ jobs:
           R_CHANGES: ${{ needs.changes.result }}
           R_SKIP: ${{ needs.skip.result }}
           R_BUILD_TEST: ${{ needs.build-test.result }}
+          R_MCP_TEST: ${{ needs.mcp-test.result }}
           R_MACOS: ${{ needs.macos-build.result }}
         run: |
           set -e
-          echo "changes=$R_CHANGES skip=$R_SKIP build-test=$R_BUILD_TEST macos=$R_MACOS"
+          echo "changes=$R_CHANGES skip=$R_SKIP build-test=$R_BUILD_TEST mcp-test=$R_MCP_TEST macos=$R_MACOS"
           # All non-skipped jobs must succeed (or be skipped legitimately).
           fail=0
-          for r in "$R_CHANGES" "$R_SKIP" "$R_BUILD_TEST" "$R_MACOS"; do
+          for r in "$R_CHANGES" "$R_SKIP" "$R_BUILD_TEST" "$R_MCP_TEST" "$R_MACOS"; do
             case "$r" in
               success|skipped) ;;
               *) fail=1 ;;

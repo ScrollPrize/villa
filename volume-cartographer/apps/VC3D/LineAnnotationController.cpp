@@ -2,6 +2,7 @@
 
 #include "CState.hpp"
 #include "FiberNameDisplay.hpp"
+#include "FiberSaveBatchTracker.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 #include "FiberSliceGeometry.hpp"
@@ -143,6 +144,7 @@ struct LineAnnotationController::LineAnnotationSession {
     vc::atlas::AtlasPredSnapSet predSnapSet;
     bool suppressFiberSave = false;
     bool suppressGeneratedViews = false;
+    bool suppressErrorDialogs = false;
     LineAnnotationController::SessionOptimizationState optimizationState =
         LineAnnotationController::SessionOptimizationState::Unoptimized;
     LineAnnotationController::SessionOptimizationState pendingOptimizationState =
@@ -155,6 +157,7 @@ struct LineAnnotationController::LineAnnotationSession {
 
 struct LineAnnotationController::FiberMetricsTaskResult {
     bool ok = false;
+    bool suppressErrorDialogs = false;
     uint64_t generation = 0;
     fs::path manifestPath;
     std::string error;
@@ -186,6 +189,7 @@ struct LineAnnotationController::IntersectionInspectionSession {
     };
 
     QPointer<QMdiArea> targetArea;
+    bool suppressErrorDialogs = false;
     vc::atlas::FiberIntersectionResult result;
     std::optional<fs::path> atlasDir;
     double sourceFocusLinePosition = 0.0;
@@ -1973,6 +1977,8 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     if (!_state || !session) {
         return false;
     }
+    session->suppressErrorDialogs =
+        session->suppressErrorDialogs || _errorDialogsSuppressed;
     if (!prepareForUserFacingLineAnnotationOpen()) {
         return false;
     }
@@ -2112,7 +2118,8 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         }
         auto& session = *pane->session;
         if (session.taskState == LineAnnotationSession::TaskState::Running) {
-            showError(tr("Line optimization is already running."));
+            showError(tr("Line optimization is already running."),
+                      session.suppressErrorDialogs);
             return;
         }
         if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
@@ -2139,7 +2146,8 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                     return;
                 }
                 if (session.taskState == LineAnnotationSession::TaskState::Running) {
-                    showError(tr("Line optimization is already running."));
+                    showError(tr("Line optimization is already running."),
+                              session.suppressErrorDialogs);
                     return;
                 }
                 if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
@@ -2214,6 +2222,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     }
 
     auto session = std::make_shared<LineAnnotationSession>();
+    session->suppressErrorDialogs = _errorDialogsSuppressed;
     session->fiberId = it->id;
     session->fiberUsername = it->username;
     session->fiberStartedAt = it->startedAt;
@@ -2273,7 +2282,8 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     } catch (const std::exception& ex) {
         showError(tr("Could not reopen fiber %1: %2")
                       .arg(fiberId)
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  session->suppressErrorDialogs);
         return;
     }
 
@@ -2579,6 +2589,43 @@ void LineAnnotationController::importFibers()
         return;
     }
 
+    QString errorMessage;
+    int imported = 0;
+    int skipped = 0;
+    if (!importFibersFromPath(options->path, options->scale, &errorMessage,
+                              &imported, &skipped)) {
+        showError(errorMessage);
+        return;
+    }
+    QMessageBox::information(_parentWidget.data(),
+                             tr("Import Fibers"),
+                             skipped > 0
+                                 ? tr("Imported %1 fiber(s). Skipped %2 invalid JSON item(s).")
+                                       .arg(imported)
+                                       .arg(skipped)
+                                 : tr("Imported %1 fiber(s).").arg(imported));
+}
+
+bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
+                                                    double scale,
+                                                    QString* errorMessage,
+                                                    int* importedCount,
+                                                    int* skippedCount)
+{
+    if (importedCount) {
+        *importedCount = 0;
+    }
+    if (skippedCount) {
+        *skippedCount = 0;
+    }
+    const fs::path dir = fibersDir();
+    if (dir.empty()) {
+        if (errorMessage) {
+            *errorMessage = tr("No volume package is loaded.");
+        }
+        return false;
+    }
+
     std::vector<StoredFiber> importedFibers;
     int skipped = 0;
 
@@ -2587,7 +2634,7 @@ void LineAnnotationController::importFibers()
             ++skipped;
             return;
         }
-        scaleStoredFiber(*fiber, options->scale);
+        scaleStoredFiber(*fiber, scale);
         importedFibers.push_back(std::move(*fiber));
     };
     auto bundleEntryPath = [&](const nlohmann::json& item, size_t index) {
@@ -2596,18 +2643,18 @@ void LineAnnotationController::importFibers()
                                              .filename()
                                              .string();
             if (!fileName.empty()) {
-                return options->path.parent_path() / fileName;
+                return importPath.parent_path() / fileName;
             }
         }
-        return options->path.parent_path() /
-               (options->path.stem().string() + "_" + std::to_string(index) + ".json");
+        return importPath.parent_path() /
+               (importPath.stem().string() + "_" + std::to_string(index) + ".json");
     };
 
     try {
         std::error_code ec;
-        if (fs::is_directory(options->path, ec)) {
+        if (fs::is_directory(importPath, ec)) {
             std::vector<fs::path> fiberFiles;
-            for (const auto& entry : fs::directory_iterator(options->path, ec)) {
+            for (const auto& entry : fs::directory_iterator(importPath, ec)) {
                 if (ec) {
                     break;
                 }
@@ -2627,9 +2674,9 @@ void LineAnnotationController::importFibers()
                 }
             }
         } else {
-            std::ifstream in(options->path);
+            std::ifstream in(importPath);
             if (!in) {
-                throw std::runtime_error("Failed to open " + options->path.string());
+                throw std::runtime_error("Failed to open " + importPath.string());
             }
             const nlohmann::json root = nlohmann::json::parse(in);
             if (root.is_array()) {
@@ -2640,12 +2687,12 @@ void LineAnnotationController::importFibers()
                     } catch (const std::exception& ex) {
                         ++skipped;
                         Logger()->warn("Skipping invalid imported fiber entry in {}: {}",
-                                       options->path.string(),
+                                       importPath.string(),
                                        ex.what());
                     }
                 }
             } else if (root.is_object() && root.value("type", std::string{}) == "vc3d_fiber") {
-                tryAddFiber(loadFiberJson(root, options->path));
+                tryAddFiber(loadFiberJson(root, importPath));
             } else {
                 const nlohmann::json* entries = nullptr;
                 if (root.is_object() && root.contains("point_collections")) {
@@ -2665,7 +2712,7 @@ void LineAnnotationController::importFibers()
                     } catch (const std::exception& ex) {
                         ++skipped;
                         Logger()->warn("Skipping invalid imported fiber entry in {}: {}",
-                                       options->path.string(),
+                                       importPath.string(),
                                        ex.what());
                     }
                 }
@@ -2673,11 +2720,16 @@ void LineAnnotationController::importFibers()
         }
 
         if (importedFibers.empty()) {
-            showError(skipped > 0
-                          ? tr("No valid fibers were found. Skipped %1 invalid JSON item(s).")
-                                .arg(skipped)
-                          : tr("No fibers were found."));
-            return;
+            if (skippedCount) {
+                *skippedCount = skipped;
+            }
+            if (errorMessage) {
+                *errorMessage = skipped > 0
+                    ? tr("No valid fibers were found. Skipped %1 invalid JSON item(s).")
+                          .arg(skipped)
+                    : tr("No fibers were found.");
+            }
+            return false;
         }
 
         uint64_t nextSequence = nextFiberSequenceForUsername(currentFiberUsername());
@@ -2701,15 +2753,22 @@ void LineAnnotationController::importFibers()
         }
 
         loadFibersForCurrentPackage();
-        QMessageBox::information(_parentWidget.data(),
-                                 tr("Import Fibers"),
-                                 skipped > 0
-                                     ? tr("Imported %1 fiber(s). Skipped %2 invalid JSON item(s).")
-                                           .arg(importedFibers.size())
-                                           .arg(skipped)
-                                     : tr("Imported %1 fiber(s).").arg(importedFibers.size()));
+        if (importedCount) {
+            *importedCount = static_cast<int>(importedFibers.size());
+        }
+        if (skippedCount) {
+            *skippedCount = skipped;
+        }
+        return true;
     } catch (const std::exception& ex) {
-        showError(tr("Could not import fibers: %1").arg(QString::fromStdString(ex.what())));
+        if (skippedCount) {
+            *skippedCount = skipped;
+        }
+        if (errorMessage) {
+            *errorMessage =
+                tr("Could not import fibers: %1").arg(QString::fromStdString(ex.what()));
+        }
+        return false;
     }
 }
 
@@ -2726,25 +2785,56 @@ void LineAnnotationController::exportFibers()
         return;
     }
 
+    QString errorMessage;
+    int exported = 0;
+    if (!exportFibersToPath(options->path, options->scale, &errorMessage, &exported)) {
+        showError(errorMessage);
+        return;
+    }
+    QMessageBox::information(_parentWidget.data(),
+                             tr("Export Fibers"),
+                             tr("Exported %1 fiber(s) to %2.")
+                                 .arg(exported)
+                                 .arg(QString::fromStdString(options->path.string())));
+}
+
+bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
+                                                  double scale,
+                                                  QString* errorMessage,
+                                                  int* exportedCount)
+{
+    if (exportedCount) {
+        *exportedCount = 0;
+    }
+    if (_fibers.empty()) {
+        if (errorMessage) {
+            *errorMessage = tr("There are no fibers to export.");
+        }
+        return false;
+    }
+
     try {
         nlohmann::json root = nlohmann::json::object();
         root["type"] = "vc3d_fiber_collection";
         root["version"] = 1;
-        root["scale"] = options->scale;
+        root["scale"] = scale;
         copyCoordinateIdentityToJson(root, coordinateIdentityForState(_state));
         root["point_collections"] = nlohmann::json::array();
         for (const auto& fiber : _fibers) {
-            root["point_collections"].push_back(fiberToJson(fiber, options->scale));
+            root["point_collections"].push_back(fiberToJson(fiber, scale));
         }
 
-        writeJsonAtomic(options->path, root);
-        QMessageBox::information(_parentWidget.data(),
-                                 tr("Export Fibers"),
-                                 tr("Exported %1 fiber(s) to %2.")
-                                     .arg(_fibers.size())
-                                     .arg(QString::fromStdString(options->path.string())));
+        writeJsonAtomic(exportPath, root);
+        if (exportedCount) {
+            *exportedCount = static_cast<int>(_fibers.size());
+        }
+        return true;
     } catch (const std::exception& ex) {
-        showError(tr("Could not export fibers: %1").arg(QString::fromStdString(ex.what())));
+        if (errorMessage) {
+            *errorMessage =
+                tr("Could not export fibers: %1").arg(QString::fromStdString(ex.what()));
+        }
+        return false;
     }
 }
 
@@ -2913,112 +3003,138 @@ void LineAnnotationController::requestFiberAlignmentMetrics(uint64_t fiberId)
 void LineAnnotationController::createAtlasFromFiber(uint64_t fiberId)
 {
     try {
-        auto vpkg = _state ? _state->vpkg() : nullptr;
-        if (!vpkg) {
-            throw std::runtime_error("No volume package is loaded");
-        }
-        const fs::path volpkgRoot = vpkg->path().empty()
-            ? fs::path(vpkg->getVolpkgDirectory())
-            : vpkg->path().parent_path();
-        if (volpkgRoot.empty()) {
-            throw std::runtime_error("The current volume package has no root directory");
-        }
-
-        auto fiberIt = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
-            return fiber.id == fiberId;
-        });
-        if (fiberIt == _fibers.end()) {
-            throw std::runtime_error("Selected fiber is not available");
-        }
-        if (fiberIt->linePoints.empty()) {
-            throw std::runtime_error("Selected fiber has no line points");
-        }
-
-        const auto resolvedLasagna = resolveAlignmentMetricsManifestPath();
-        if (!resolvedLasagna)
-            throw std::runtime_error("No Lasagna dataset selected");
-        const fs::path manifestPath = resolvedLasagna->first;
-        if (manifestPath.empty() || !fs::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna dataset does not exist");
-        }
-        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
-            manifestPath, {resolvedLasagna->second});
-        vc::lasagna::LasagnaNormalSampler sampler(dataset);
-        const fs::path initShellDir =
-            vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
-        atlasDebug("selected_manifest=" + manifestPath.string());
-        atlasDebug("resolved_init_shell_dir=" + initShellDir.string());
-
-        std::vector<vc::atlas::SurfaceCandidate> candidates =
-            vc::atlas::loadInitShellCandidates(initShellDir);
-        if (atlasDebugEnabled()) {
-            for (const auto& candidate : candidates) {
-                const auto* points = candidate.surface ? candidate.surface->rawPointsPtr() : nullptr;
-                atlasDebug("candidate_shell path=" + candidate.path.string() +
-                           " grid=" + (points
-                               ? std::to_string(points->cols) + "x" + std::to_string(points->rows)
-                               : std::string("invalid")));
-            }
-        }
-
-        vc::atlas::FiberInput input;
-        std::error_code relativeEc;
-        input.fiberPath = fs::relative(fiberPath(*fiberIt), volpkgRoot, relativeEc);
-        if (relativeEc || input.fiberPath.empty()) {
-            input.fiberPath = relativeFiberPath(*fiberIt);
-        }
-        input.controlPoints = fiberIt->controlPoints;
-        input.linePoints = fiberIt->linePoints;
-        vc::atlas::validateFiberInputControlPoints(input);
-        atlasDebug("fiber line_points=" + std::to_string(input.linePoints.size()) +
-                   " control_points=" + std::to_string(input.controlPoints.size()));
-
-        SurfacePatchIndex shellIndex;
-        std::vector<SurfacePatchIndex::SurfacePtr> candidateSurfaces;
-        candidateSurfaces.reserve(candidates.size());
-        for (const auto& candidate : candidates) {
-            if (candidate.surface) {
-                candidateSurfaces.push_back(candidate.surface);
-            }
-        }
-        shellIndex.rebuild(candidateSurfaces);
-        const auto selection = vc::atlas::selectBaseSurfaceBySeedRay(
-            input, candidates, shellIndex, sampler);
-        auto& selected = candidates.at(static_cast<size_t>(selection.surfaceIndex));
-        const int zeroWindingColumn = vc::atlas::computeZeroWindingColumn(*selected.surface);
-        atlasDebug("zero_winding_column=" + std::to_string(zeroWindingColumn));
-
-        SurfacePatchIndex baseIndex;
-        baseIndex.rebuild({selected.surface});
-        auto mapping = vc::atlas::mapFiberToBaseSurface(input, *selected.surface, baseIndex, sampler);
-
-        const std::string atlasName = "fiber_" + std::to_string(fiberId);
-        const fs::path atlasDir = vc::atlas::uniqueAtlasDirectory(volpkgRoot, atlasName);
-        auto atlas = vc::atlas::createSingleFiberAtlas(volpkgRoot,
-                                                       atlasDir.filename().string(),
-                                                       input,
-                                                       selected,
-                                                       zeroWindingColumn,
-                                                       std::move(mapping));
-        const auto coordinateIdentity = coordinateIdentityForState(_state);
-        copyCoordinateIdentityToJson(
-            atlas.metadata.coordinateMetadata, coordinateIdentity);
-        vc3d::opendata::copyCoordinateIdentityToSurface(
-            *selected.surface, coordinateIdentity);
-        vc::atlas::saveAtlasBaseMeshCopy(*selected.surface,
-                                         atlasDir / atlas.metadata.baseMeshPath);
-        atlas.save(atlasDir);
-        if (sampler.hasPredDtChannel() && !atlas.fibers.empty()) {
-            (void)vc::atlas::ensureAtlasPredSnapSet(atlasDir,
-                                                    input,
-                                                    atlas.fibers.front(),
-                                                    *selected.surface,
-                                                    sampler);
-        }
+        const fs::path atlasDir = createAtlasFromFiberCore(fiberId);
         emit atlasCreated(atlasDir);
     } catch (const std::exception& ex) {
         showError(tr("Could not create atlas: %1").arg(QString::fromStdString(ex.what())));
     }
+}
+
+bool LineAnnotationController::createAtlasFromFiberHeadless(uint64_t fiberId,
+                                                            QString* errorMessage,
+                                                            fs::path* atlasDirOut)
+{
+    // Do not emit atlasCreated: it is connected to the interactive display
+    // path. Direct callers display the returned directory themselves.
+    try {
+        const fs::path atlasDir = createAtlasFromFiberCore(fiberId);
+        if (atlasDirOut) {
+            *atlasDirOut = atlasDir;
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        if (errorMessage) {
+            *errorMessage = QString::fromStdString(ex.what());
+        }
+        return false;
+    }
+}
+
+fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
+{
+    auto vpkg = _state ? _state->vpkg() : nullptr;
+    if (!vpkg) {
+        throw std::runtime_error("No volume package is loaded");
+    }
+    const fs::path volpkgRoot = vpkg->path().empty()
+        ? fs::path(vpkg->getVolpkgDirectory())
+        : vpkg->path().parent_path();
+    if (volpkgRoot.empty()) {
+        throw std::runtime_error("The current volume package has no root directory");
+    }
+
+    auto fiberIt = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
+        return fiber.id == fiberId;
+    });
+    if (fiberIt == _fibers.end()) {
+        throw std::runtime_error("Selected fiber is not available");
+    }
+    if (fiberIt->linePoints.empty()) {
+        throw std::runtime_error("Selected fiber has no line points");
+    }
+
+    const auto resolvedLasagna = resolveAlignmentMetricsManifestPath();
+    if (!resolvedLasagna)
+        throw std::runtime_error("No Lasagna dataset selected");
+    const fs::path manifestPath = resolvedLasagna->first;
+    if (manifestPath.empty() || !fs::exists(manifestPath)) {
+        throw std::runtime_error("Selected Lasagna dataset does not exist");
+    }
+    vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
+        manifestPath, {resolvedLasagna->second});
+    vc::lasagna::LasagnaNormalSampler sampler(dataset);
+    const fs::path initShellDir =
+        vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
+    atlasDebug("selected_manifest=" + manifestPath.string());
+    atlasDebug("resolved_init_shell_dir=" + initShellDir.string());
+
+    std::vector<vc::atlas::SurfaceCandidate> candidates =
+        vc::atlas::loadInitShellCandidates(initShellDir);
+    if (atlasDebugEnabled()) {
+        for (const auto& candidate : candidates) {
+            const auto* points = candidate.surface ? candidate.surface->rawPointsPtr() : nullptr;
+            atlasDebug("candidate_shell path=" + candidate.path.string() +
+                       " grid=" + (points
+                           ? std::to_string(points->cols) + "x" + std::to_string(points->rows)
+                           : std::string("invalid")));
+        }
+    }
+
+    vc::atlas::FiberInput input;
+    std::error_code relativeEc;
+    input.fiberPath = fs::relative(fiberPath(*fiberIt), volpkgRoot, relativeEc);
+    if (relativeEc || input.fiberPath.empty()) {
+        input.fiberPath = relativeFiberPath(*fiberIt);
+    }
+    input.controlPoints = fiberIt->controlPoints;
+    input.linePoints = fiberIt->linePoints;
+    vc::atlas::validateFiberInputControlPoints(input);
+    atlasDebug("fiber line_points=" + std::to_string(input.linePoints.size()) +
+               " control_points=" + std::to_string(input.controlPoints.size()));
+
+    SurfacePatchIndex shellIndex;
+    std::vector<SurfacePatchIndex::SurfacePtr> candidateSurfaces;
+    candidateSurfaces.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        if (candidate.surface) {
+            candidateSurfaces.push_back(candidate.surface);
+        }
+    }
+    shellIndex.rebuild(candidateSurfaces);
+    const auto selection = vc::atlas::selectBaseSurfaceBySeedRay(
+        input, candidates, shellIndex, sampler);
+    auto& selected = candidates.at(static_cast<size_t>(selection.surfaceIndex));
+    const int zeroWindingColumn = vc::atlas::computeZeroWindingColumn(*selected.surface);
+    atlasDebug("zero_winding_column=" + std::to_string(zeroWindingColumn));
+
+    SurfacePatchIndex baseIndex;
+    baseIndex.rebuild({selected.surface});
+    auto mapping = vc::atlas::mapFiberToBaseSurface(input, *selected.surface, baseIndex, sampler);
+
+    const std::string atlasName = "fiber_" + std::to_string(fiberId);
+    const fs::path atlasDir = vc::atlas::uniqueAtlasDirectory(volpkgRoot, atlasName);
+    auto atlas = vc::atlas::createSingleFiberAtlas(volpkgRoot,
+                                                   atlasDir.filename().string(),
+                                                   input,
+                                                   selected,
+                                                   zeroWindingColumn,
+                                                   std::move(mapping));
+    const auto coordinateIdentity = coordinateIdentityForState(_state);
+    copyCoordinateIdentityToJson(
+        atlas.metadata.coordinateMetadata, coordinateIdentity);
+    vc3d::opendata::copyCoordinateIdentityToSurface(
+        *selected.surface, coordinateIdentity);
+    vc::atlas::saveAtlasBaseMeshCopy(*selected.surface,
+                                     atlasDir / atlas.metadata.baseMeshPath);
+    atlas.save(atlasDir);
+    if (sampler.hasPredDtChannel() && !atlas.fibers.empty()) {
+        (void)vc::atlas::ensureAtlasPredSnapSet(atlasDir,
+                                                input,
+                                                atlas.fibers.front(),
+                                                *selected.surface,
+                                                sampler);
+    }
+    return atlasDir;
 }
 
 void LineAnnotationController::addFiberToPointCollection(uint64_t fiberId)
@@ -3187,6 +3303,20 @@ void LineAnnotationController::showIntersectionInspection(
     QMdiArea* targetArea,
     std::optional<fs::path> atlasDir)
 {
+    QString errorMessage;
+    if (!showIntersectionInspectionHeadless(result, targetArea, std::move(atlasDir),
+                                            &errorMessage)) {
+        showError(tr("Could not show intersection inspection: %1").arg(errorMessage));
+    }
+}
+
+// Dialog-free intersection inspection.
+bool LineAnnotationController::showIntersectionInspectionHeadless(
+    const vc::atlas::FiberIntersectionResult& result,
+    QMdiArea* targetArea,
+    std::optional<fs::path> atlasDir,
+    QString* errorMessage)
+{
     try {
         if (!_state || !_viewerManager || !targetArea) {
             throw std::runtime_error("Intersections workspace is not available");
@@ -3194,6 +3324,7 @@ void LineAnnotationController::showIntersectionInspection(
         cleanupIntersectionInspectionSurfaces();
         _intersectionInspection = std::make_unique<IntersectionInspectionSession>();
         _intersectionInspection->targetArea = targetArea;
+        _intersectionInspection->suppressErrorDialogs = _errorDialogsSuppressed;
         _intersectionInspection->result = result;
         _intersectionInspection->atlasDir = std::move(atlasDir);
         targetArea->installEventFilter(this);
@@ -3206,10 +3337,12 @@ void LineAnnotationController::showIntersectionInspection(
         connect(followShortcut, &QShortcut::activated, this, [this]() {
             (void)handleIntersectionFollowKeyPress(Qt::Key_Space, Qt::NoModifier);
         });
-        rebuildIntersectionInspection();
+        return rebuildIntersectionInspection(errorMessage);
     } catch (const std::exception& ex) {
-        showError(tr("Could not show intersection inspection: %1")
-                      .arg(QString::fromStdString(ex.what())));
+        if (errorMessage) {
+            *errorMessage = QString::fromStdString(ex.what());
+        }
+        return false;
     }
 }
 
@@ -3577,7 +3710,7 @@ bool LineAnnotationController::eventFilter(QObject* watched, QEvent* event)
     return QObject::eventFilter(watched, event);
 }
 
-void LineAnnotationController::rebuildIntersectionInspection()
+bool LineAnnotationController::rebuildIntersectionInspection(QString* errorMessage)
 {
     namespace fslice = vc3d::fiber_slice;
 
@@ -3620,7 +3753,7 @@ void LineAnnotationController::rebuildIntersectionInspection()
 
     try {
         if (!_intersectionInspection || !_state || !_viewerManager) {
-            return;
+            return true;  // nothing to rebuild; not a failure
         }
         auto* targetArea = _intersectionInspection->targetArea.data();
         if (!targetArea) {
@@ -4481,9 +4614,15 @@ void LineAnnotationController::rebuildIntersectionInspection()
                 }
             }
         }
+        return true;
     } catch (const std::exception& ex) {
-        showError(tr("Could not show intersection inspection: %1")
-                      .arg(QString::fromStdString(ex.what())));
+        if (errorMessage) {
+            *errorMessage = QString::fromStdString(ex.what());
+        } else {
+            showError(tr("Could not show intersection inspection: %1")
+                          .arg(QString::fromStdString(ex.what())));
+        }
+        return false;
     }
 }
 
@@ -4531,22 +4670,30 @@ void LineAnnotationController::refreshIntersectionInspectionAfterEdit(uint64_t e
             oldSourceArclength,
             oldTargetArclength);
         if (!nearest) {
+            const bool suppressErrorDialogs =
+                _intersectionInspection->suppressErrorDialogs || _errorDialogsSuppressed;
             cleanupIntersectionInspectionSurfaces();
             _intersectionInspection.reset();
-            QMessageBox::warning(_parentWidget,
-                                 tr("Intersections"),
-                                 tr("The edited fiber pair no longer has an intersection result."));
+            if (suppressErrorDialogs) {
+                showError(tr("The edited fiber pair no longer has an intersection result."),
+                          true);
+            } else {
+                QMessageBox::warning(_parentWidget,
+                                     tr("Intersections"),
+                                     tr("The edited fiber pair no longer has an intersection result."));
+            }
             return;
         }
         _intersectionInspection->result = results[*nearest];
         rebuildIntersectionInspection();
     } catch (const std::exception& ex) {
         showError(tr("Could not refresh intersection inspection: %1")
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  _intersectionInspection && _intersectionInspection->suppressErrorDialogs);
     }
 }
 
-void LineAnnotationController::saveOpenFibers()
+void LineAnnotationController::saveOpenFibersCore()
 {
     for (const auto& pane : _panes) {
         if (!pane.session || pane.session->suppressFiberSave) {
@@ -4564,7 +4711,35 @@ void LineAnnotationController::saveOpenFibers()
         saveSessionAsFiber(session);
         session.suppressFiberSave = true;
     }
+}
+
+void LineAnnotationController::saveOpenFibers()
+{
+    saveOpenFibersCore();
     waitForFiberSaves();
+}
+
+void LineAnnotationController::saveOpenFibersHeadless(FiberSaveCompletion onFinished)
+{
+    auto batch = std::make_shared<FiberSaveBatchTracker>(std::move(onFinished));
+    _activeFiberSaveBatch = batch;
+    try {
+        saveOpenFibersCore();
+    } catch (const std::exception& ex) {
+        batch->addError(QString::fromUtf8(ex.what()));
+    }
+    _activeFiberSaveBatch.reset();
+    batch->finishScheduling();
+}
+
+LineAnnotationDialog* LineAnnotationController::mostRecentLineAnnotationDialog() const
+{
+    for (auto it = _panes.rbegin(); it != _panes.rend(); ++it) {
+        if (it->dialog) {
+            return it->dialog.data();
+        }
+    }
+    return nullptr;
 }
 
 void LineAnnotationController::closeFiberWindowForSurface(const std::string& surfaceName)
@@ -4891,9 +5066,14 @@ LineAnnotationController::resolveAlignmentMetricsManifestPath()
     const fs::path startDir = vpkg->path().empty()
         ? fs::path{}
         : vpkg->path().parent_path();
-    auto picked = _datasetPicker ? _datasetPicker(_parentWidget, startDir)
-                                 : std::optional<std::string>{};
+    // Suppressed callers cannot open the dataset picker.
+    auto picked = (_datasetPicker && !_errorDialogsSuppressed)
+        ? _datasetPicker(_parentWidget, startDir)
+        : std::optional<std::string>{};
     if (!picked || picked->empty()) {
+        if (_errorDialogsSuppressed) {
+            showError(tr("No Lasagna dataset is selected for the active volume."));
+        }
         return std::nullopt;
     }
     selected = *picked;
@@ -4917,6 +5097,16 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
     fiberIds = std::move(orderedFiberIds);
     if (fiberIds.empty()) {
         return;
+    }
+
+    bool suppressErrorDialogs = _errorDialogsSuppressed;
+    if (!suppressErrorDialogs) {
+        suppressErrorDialogs = std::any_of(
+            _panes.begin(), _panes.end(), [&fiberIds](const PaneRecord& pane) {
+                return pane.session && pane.session->suppressErrorDialogs &&
+                       std::find(fiberIds.begin(), fiberIds.end(), pane.session->fiberId) !=
+                           fiberIds.end();
+            });
     }
 
     std::vector<StoredFiber> fibers;
@@ -4975,6 +5165,7 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
             });
     QPointer<LineAnnotationController> self(this);
     watcher->setFuture(QtConcurrent::run([generation,
+                                           suppressErrorDialogs,
                                            self,
                                            resolvedManifestPath = manifestPath->first,
                                            workingToBaseScale = manifestPath->second,
@@ -4982,6 +5173,7 @@ void LineAnnotationController::requestFiberAlignmentMetricsForFibers(std::vector
                                            requestTokens = std::move(requestTokens)]() mutable {
         FiberMetricsTaskResult result;
         result.ok = true;
+        result.suppressErrorDialogs = suppressErrorDialogs;
         result.generation = generation;
         result.manifestPath = resolvedManifestPath;
         result.requestedFiberIds.reserve(fibers.size());
@@ -5349,7 +5541,8 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
 
     auto& session = *pane->session;
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."));
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
         return;
     }
 
@@ -5380,7 +5573,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
 
     auto& session = *pane->session;
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."));
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
         return;
     }
     if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
@@ -5500,7 +5694,9 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                                                              *session.normalSampler,
                                                              updateConfig);
     } catch (const std::exception& ex) {
-        showError(tr("Could not update line control point: %1").arg(QString::fromStdString(ex.what())));
+        showError(tr("Could not update line control point: %1")
+                      .arg(QString::fromStdString(ex.what())),
+                  session.suppressErrorDialogs);
         return;
     }
     session.optimizedLine = lineModelFromPoints(update.linePoints, session.normalSampler.get());
@@ -5542,7 +5738,8 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
 
     auto& parentSession = *pane->session;
     if (parentSession.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."));
+        showError(tr("Line optimization is already running."),
+                  parentSession.suppressErrorDialogs);
         return;
     }
     if (controlPointIndex >= parentSession.controlPoints.size()) {
@@ -5568,12 +5765,14 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     }
     const cv::Vec3d linkedPoint = toVec3d(linkedControlPoint);
     if (!finitePoint(linkedPoint)) {
-        showError(tr("Could not determine a finite linked-fiber point from the clicked location."));
+        showError(tr("Could not determine a finite linked-fiber point from the clicked location."),
+                  parentSession.suppressErrorDialogs);
         return;
     }
     cv::Vec3d linkDirection = toVec3d(requestedLinkDirection);
     if (!finiteDirection(linkDirection)) {
-        showError(tr("Could not determine a finite linked-fiber direction from the current view."));
+        showError(tr("Could not determine a finite linked-fiber direction from the current view."),
+                  parentSession.suppressErrorDialogs);
         return;
     }
     linkDirection = normalizedOrZero(linkDirection);
@@ -5584,6 +5783,7 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     const cv::Vec3d linkedInitialDirection = linkDirection;
 
     auto linkedSeedRecord = std::make_shared<LineAnnotationSession>();
+    linkedSeedRecord->suppressErrorDialogs = parentSession.suppressErrorDialogs;
     linkedSeedRecord->fiberId = std::max(nextFiberId(), parentFiberId + 1);
     linkedSeedRecord->sourceSliceNormal = linkedInitialDirection;
     linkedSeedRecord->initialDirectionMode = InitialDirectionMode::ZInOut;
@@ -5682,7 +5882,8 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
                 true);
         }
         showError(tr("Could not save linked fiber: %1")
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  parentSession.suppressErrorDialogs);
         return;
     }
 
@@ -6230,7 +6431,8 @@ void LineAnnotationController::handleGeneratedPredSnapPoint(const std::string& s
         }
     } catch (const std::exception& ex) {
         showError(tr("Could not save pred-snap point: %1")
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  session.suppressErrorDialogs);
     }
 }
 
@@ -6245,7 +6447,8 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
 
     auto& session = *pane->session;
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."));
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
         return;
     }
     if (session.optimizedLine.points.empty() || session.controlPoints.size() <= 1) {
@@ -6373,8 +6576,9 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
 
 bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& session)
 {
+    const bool headless = session.suppressErrorDialogs || _errorDialogsSuppressed;
     if (!_state || !_state->vpkg()) {
-        showError(tr("No volume package loaded."));
+        showError(tr("No volume package loaded."), headless);
         return false;
     }
 
@@ -6393,7 +6597,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         }
     } catch (const std::exception& ex) {
         showError(tr("Cannot resolve Lasagna for the active volume: %1")
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  headless);
         return false;
     }
 
@@ -6401,9 +6606,14 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         const fs::path startDir = vpkg->path().empty()
             ? fs::path{}
             : vpkg->path().parent_path();
-        auto picked = _datasetPicker ? _datasetPicker(_parentWidget, startDir)
-                                     : std::optional<std::string>{};
+        // Suppressed callers cannot open the dataset picker.
+        auto picked = (_datasetPicker && !headless)
+            ? _datasetPicker(_parentWidget, startDir)
+            : std::optional<std::string>{};
         if (!picked || picked->empty()) {
+            if (headless) {
+                showError(tr("No Lasagna dataset is selected for the active volume."), true);
+            }
             return false;
         }
         selected = *picked;
@@ -6416,7 +6626,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             session.dataset = std::move(dataset);
             session.normalSampler = std::move(sampler);
         } catch (const std::exception& ex) {
-            showError(tr("Invalid Lasagna dataset: %1").arg(QString::fromStdString(ex.what())));
+            showError(tr("Invalid Lasagna dataset: %1").arg(QString::fromStdString(ex.what())),
+                      headless);
             return false;
         }
         vpkg->setSelectedLasagnaDataset(selected);
@@ -6432,7 +6643,8 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
                 session.normalSampler = std::move(sampler);
             } catch (const std::exception& ex) {
                 showError(tr("Invalid selected Lasagna dataset: %1")
-                              .arg(QString::fromStdString(ex.what())));
+                              .arg(QString::fromStdString(ex.what())),
+                          headless);
                 return false;
             }
         }
@@ -6480,7 +6692,8 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
         session.taskState = LineAnnotationSession::TaskState::Failed;
         session.error = task.error;
         showError(tr("Lasagna line optimization failed: %1")
-                      .arg(QString::fromStdString(task.error)));
+                      .arg(QString::fromStdString(task.error)),
+                  session.suppressErrorDialogs);
         return false;
     }
 
@@ -6582,7 +6795,8 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
         return false;
     }
     if (!session.normalSampler) {
-        showError(tr("Could not run final line optimization: no Lasagna dataset is loaded."));
+        showError(tr("Could not run final line optimization: no Lasagna dataset is loaded."),
+                  session.suppressErrorDialogs);
         return false;
     }
 
@@ -6627,7 +6841,8 @@ void LineAnnotationController::requestFinalizedClose(const std::string& surfaceN
 
     auto& session = *pane->session;
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."));
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
         return;
     }
     if (!needsFinalOptimization(session)) {
@@ -6801,7 +7016,8 @@ void LineAnnotationController::finishFiberAlignmentMetrics(
 
     if (!result.ok) {
         showError(tr("Could not calculate fiber alignment metrics: %1")
-                      .arg(QString::fromStdString(result.error)));
+                      .arg(QString::fromStdString(result.error)),
+                  result.suppressErrorDialogs);
     }
 
     for (uint64_t fiberId : result.requestedFiberIds) {
@@ -6896,7 +7112,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
 {
     if (!_state) {
         session.error = "No active application state.";
-        showError(tr("Could not create line annotation views: no active application state."));
+        showError(tr("Could not create line annotation views: no active application state."),
+                  session.suppressErrorDialogs);
         return false;
     }
 
@@ -6906,7 +7123,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     } catch (const std::exception& ex) {
         session.error = ex.what();
         showError(tr("Could not create line annotation views: %1")
-                      .arg(QString::fromStdString(session.error)));
+                      .arg(QString::fromStdString(session.error)),
+                  session.suppressErrorDialogs);
         return false;
     }
 
@@ -7020,7 +7238,8 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         }
         session.generatedSurfaceNames.clear();
         session.error = "Failed to create generated annotation viewers.";
-        showError(tr("Could not create generated line annotation viewers."));
+        showError(tr("Could not create generated line annotation viewers."),
+                  session.suppressErrorDialogs);
         return false;
     }
     if (session.fiberId != 0 &&
@@ -7041,7 +7260,8 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
 
     auto& session = *pane->session;
     if (session.taskState != LineAnnotationSession::TaskState::Succeeded) {
-        showError(tr("Run line optimization before exporting generated meshes."));
+        showError(tr("Run line optimization before exporting generated meshes."),
+                  session.suppressErrorDialogs);
         return;
     }
     if (!finalizeSessionOptimizationSynchronously(session, false)) {
@@ -7054,7 +7274,8 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
     try {
         const auto savedPaths = saveGeneratedQuadMeshes(session);
         if (savedPaths.empty()) {
-            showError(tr("No generated line quad meshes are available to export."));
+            showError(tr("No generated line quad meshes are available to export."),
+                      session.suppressErrorDialogs);
             return;
         }
 
@@ -7063,13 +7284,16 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
         for (const auto& path : savedPaths) {
             labels.push_back(QString::fromStdString(path.filename().string()));
         }
-        QMessageBox::information(_parentWidget,
-                                 tr("Line Annotation"),
-                                 tr("Saved generated mesh surfaces in paths:\n%1")
-                                     .arg(labels.join(QStringLiteral("\n"))));
+        if (!session.suppressErrorDialogs && !_errorDialogsSuppressed) {
+            QMessageBox::information(_parentWidget,
+                                     tr("Line Annotation"),
+                                     tr("Saved generated mesh surfaces in paths:\n%1")
+                                         .arg(labels.join(QStringLiteral("\n"))));
+        }
     } catch (const std::exception& ex) {
         showError(tr("Could not save generated line meshes: %1")
-                      .arg(QString::fromStdString(ex.what())));
+                      .arg(QString::fromStdString(ex.what())),
+                  session.suppressErrorDialogs);
     }
 }
 
@@ -7472,19 +7696,29 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                            .arg(static_cast<int>(branchErrors.size() - shown));
         }
 
-        QMessageBox prompt(_parentWidget.data());
-        prompt.setIcon(QMessageBox::Warning);
-        prompt.setWindowTitle(tr("Broken branch links"));
-        prompt.setText(tr("Some saved fiber branch links are obsolete or inconsistent."));
-        prompt.setInformativeText(details);
-        auto* repairButton = prompt.addButton(
-            tr("Remove broken branch links and reload"),
-            QMessageBox::AcceptRole);
-        prompt.addButton(tr("Keep files unchanged"), QMessageBox::RejectRole);
-        prompt.setDefaultButton(qobject_cast<QPushButton*>(repairButton));
-        prompt.exec();
+        bool repairRequested = false;
+        if (_errorDialogsSuppressed) {
+            // Without dialogs, take the conservative "keep files unchanged"
+            // path and log the details.
+            Logger()->warn("Line Annotation (suppressed dialog): broken fiber "
+                           "branch links, keeping files unchanged:\n{}",
+                           details.toStdString());
+        } else {
+            QMessageBox prompt(_parentWidget.data());
+            prompt.setIcon(QMessageBox::Warning);
+            prompt.setWindowTitle(tr("Broken branch links"));
+            prompt.setText(tr("Some saved fiber branch links are obsolete or inconsistent."));
+            prompt.setInformativeText(details);
+            auto* repairButton = prompt.addButton(
+                tr("Remove broken branch links and reload"),
+                QMessageBox::AcceptRole);
+            prompt.addButton(tr("Keep files unchanged"), QMessageBox::RejectRole);
+            prompt.setDefaultButton(qobject_cast<QPushButton*>(repairButton));
+            prompt.exec();
+            repairRequested = (prompt.clickedButton() == repairButton);
+        }
 
-        if (prompt.clickedButton() == repairButton) {
+        if (repairRequested) {
             std::vector<std::string> repairErrors;
             if (repairLoadedFiberBranchLinks(loadedFibers,
                                              fibersWithRemovedBranchEntries,
@@ -7966,6 +8200,8 @@ void LineAnnotationController::handleGeneratedSideStripIntersectionQuery(
     }
 
     SideStripIntersectionRequest request;
+    request.suppressErrorDialogs =
+        pane->session->suppressErrorDialogs || _errorDialogsSuppressed;
     request.surfaceName = surfaceName;
     request.sourceFiberId = pane->session->fiberId;
     request.stripPoints = stripPointsPtr->clone();
@@ -8083,6 +8319,7 @@ LineAnnotationController::runSideStripIntersectionQuery(
     SideStripCancelCallback cancelCallback)
 {
     SideStripIntersectionTaskResult result;
+    result.suppressErrorDialogs = request.suppressErrorDialogs;
     result.token = request.token;
     result.cacheKey = request.cacheKey;
     result.surfaceName = request.surfaceName;
@@ -8456,7 +8693,8 @@ void LineAnnotationController::finishSideStripIntersectionQuery(
                     pane->dialog->setGeneratedSideStripIntersectionError();
                 }
                 showError(tr("Could not query strip fiber intersections: %1")
-                              .arg(QString::fromStdString(result.error)));
+                              .arg(QString::fromStdString(result.error)),
+                          result.suppressErrorDialogs);
             }
         }
     } else if (!hasPendingRequest) {
@@ -8764,6 +9002,15 @@ bool LineAnnotationController::confirmLinkedControlPointEdit(
 {
     if (!controlPointHasBranch(session, controlPointIndex)) {
         return true;
+    }
+    if (session.suppressErrorDialogs || _errorDialogsSuppressed) {
+        // Without confirmation UI, conservatively refuse the linked edit.
+        showError(
+            tr("%1 was rejected: the control point is linked to another "
+               "fiber and confirmation prompts are disabled in headless mode.")
+                .arg(action),
+            true);
+        return false;
     }
     const auto response = QMessageBox::question(
         _parentWidget.data(),
@@ -9170,6 +9417,9 @@ LineAnnotationController::makeIntersectionLineSession(
     std::function<void()> onOptimizationSucceeded)
 {
     auto session = std::make_shared<LineAnnotationSession>();
+    session->suppressErrorDialogs =
+        (_intersectionInspection && _intersectionInspection->suppressErrorDialogs) ||
+        _errorDialogsSuppressed;
     session->surfaceName = surfaceName;
     session->sourceAnnotationSurfaceName = surfaceName;
     session->fiberId = fiber.id;
@@ -9467,14 +9717,16 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                     snapshots.push_back(makeFiberSaveSnapshot(*linkedIt));
                 }
             }
-            scheduleFiberSaveSnapshots(std::move(snapshots));
+            scheduleFiberSaveSnapshots(std::move(snapshots),
+                                       !session.suppressErrorDialogs);
         }
         invalidateFiberAlignmentMetrics(savedFiberId, true);
         addKnownFiberTags(session.fiberTags);
         emitFiberSummaries();
         refreshBranchLineViews(savedFiberId);
     } catch (const std::exception& ex) {
-        showError(tr("Could not save fiber: %1").arg(QString::fromStdString(ex.what())));
+        showError(tr("Could not save fiber: %1").arg(QString::fromStdString(ex.what())),
+                  session.suppressErrorDialogs);
     }
 }
 
@@ -9826,7 +10078,9 @@ void LineAnnotationController::scheduleFiberPairSave(const StoredFiber& first,
     scheduleFiberSaveSnapshots(std::move(snapshots));
 }
 
-void LineAnnotationController::scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots)
+void LineAnnotationController::scheduleFiberSaveSnapshots(
+    std::vector<FiberSaveSnapshot> snapshots,
+    bool showErrors)
 {
     if (snapshots.empty()) {
         return;
@@ -9847,11 +10101,21 @@ void LineAnnotationController::scheduleFiberSaveSnapshots(std::vector<FiberSaveS
     FiberSaveJob job;
     job.sequence = ++_nextFiberSaveSequence;
     job.snapshots = std::move(snapshots);
+    job.showErrors = showErrors && !_activeFiberSaveBatch && !_errorDialogsSuppressed;
+    if (_activeFiberSaveBatch) {
+        _activeFiberSaveBatch->addJob();
+        job.batches.push_back(_activeFiberSaveBatch);
+    }
     FiberSaveJob probe = job;
     const auto key = jobKey(probe);
     for (auto& pending : _pendingFiberSaveJobs) {
         if (jobKey(pending) == key) {
-            pending = std::move(job);
+            pending.sequence = job.sequence;
+            pending.snapshots = std::move(job.snapshots);
+            pending.showErrors = pending.showErrors || job.showErrors;
+            pending.batches.insert(pending.batches.end(),
+                                   std::make_move_iterator(job.batches.begin()),
+                                   std::make_move_iterator(job.batches.end()));
             startNextFiberSaveJob();
             return;
         }
@@ -9869,14 +10133,16 @@ void LineAnnotationController::startNextFiberSaveJob()
     FiberSaveJob job = std::move(_pendingFiberSaveJobs.front());
     _pendingFiberSaveJobs.pop_front();
     _fiberSaveRunning = true;
+    const bool showErrors = job.showErrors;
+    auto batches = std::move(job.batches);
 
     auto* watcher = new QFutureWatcher<FiberSaveTaskResult>(this);
     _fiberSaveWatcher = watcher;
     connect(watcher,
             &QFutureWatcher<FiberSaveTaskResult>::finished,
             this,
-            [this, watcher]() {
-                finishFiberSaveJob(watcher);
+            [this, watcher, showErrors, batches = std::move(batches)]() mutable {
+                finishFiberSaveJob(watcher, showErrors, std::move(batches));
             });
 
     watcher->setFuture(QtConcurrent::run([job = std::move(job)]() mutable {
@@ -9911,7 +10177,10 @@ void LineAnnotationController::startNextFiberSaveJob()
     }));
 }
 
-void LineAnnotationController::finishFiberSaveJob(QFutureWatcher<FiberSaveTaskResult>* watcher)
+void LineAnnotationController::finishFiberSaveJob(
+    QFutureWatcher<FiberSaveTaskResult>* watcher,
+    bool showErrors,
+    std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches)
 {
     FiberSaveTaskResult result;
     try {
@@ -9927,6 +10196,7 @@ void LineAnnotationController::finishFiberSaveJob(QFutureWatcher<FiberSaveTaskRe
     }
     watcher->deleteLater();
 
+    QString errorMessage;
     if (result.ok) {
         for (size_t i = 0; i < result.fiberIds.size(); ++i) {
             const uint64_t generation =
@@ -9934,15 +10204,27 @@ void LineAnnotationController::finishFiberSaveJob(QFutureWatcher<FiberSaveTaskRe
             emit fiberSaved(result.fiberIds[i], generation);
         }
     } else {
-        QString message = tr("Could not save fiber data: %1")
-                              .arg(QString::fromStdString(result.error));
+        errorMessage = tr("Could not save fiber data: %1")
+                           .arg(QString::fromStdString(result.error));
         if (!result.recoveryFiles.empty()) {
-            message += tr("\nRecovery backups were kept:");
+            errorMessage += tr("\nRecovery backups were kept:");
             for (const auto& path : result.recoveryFiles) {
-                message += QStringLiteral("\n") + QString::fromStdString(path.string());
+                errorMessage += QStringLiteral("\n") + QString::fromStdString(path.string());
             }
         }
-        showError(message);
+        if (showErrors) {
+            showError(errorMessage);
+        } else if (batches.empty()) {
+            Logger()->warn("Line Annotation (headless save): {}",
+                           errorMessage.toStdString());
+        }
+    }
+
+    for (const auto& batch : batches) {
+        if (!batch) {
+            continue;
+        }
+        batch->finishJob(errorMessage);
     }
 
     startNextFiberSaveJob();
@@ -10478,11 +10760,43 @@ std::string LineAnnotationController::uniqueImportedFiberFileName(
     throw std::runtime_error("Could not find an available imported fiber file name");
 }
 
-void LineAnnotationController::showError(const QString& message) const
+void LineAnnotationController::showError(const QString& message, bool suppressDialog) const
 {
+    if (_activeFiberSaveBatch) {
+        _activeFiberSaveBatch->addError(message);
+        Logger()->warn("Line Annotation (headless save): {}", message.toStdString());
+        return;
+    }
+    if (_errorDialogsSuppressed || suppressDialog) {
+        if (_errorDialogsSuppressed) {
+            _lastSuppressedError = message;
+        }
+        Logger()->warn("Line Annotation (suppressed dialog): {}", message.toStdString());
+        return;
+    }
     if (_parentWidget) {
         QMessageBox::warning(_parentWidget, tr("Line Annotation"), message);
     } else {
         Logger()->warn("Line Annotation: {}", message.toStdString());
     }
+}
+
+void LineAnnotationController::setErrorDialogsSuppressed(bool suppressed)
+{
+    _errorDialogsSuppressed = suppressed;
+    if (!suppressed) {
+        _lastSuppressedError.clear();
+    }
+}
+
+bool LineAnnotationController::errorDialogsSuppressed() const
+{
+    return _errorDialogsSuppressed;
+}
+
+QString LineAnnotationController::takeLastSuppressedError()
+{
+    QString message = _lastSuppressedError;
+    _lastSuppressedError.clear();
+    return message;
 }
