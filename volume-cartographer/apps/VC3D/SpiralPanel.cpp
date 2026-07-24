@@ -304,6 +304,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _lasagnaScale->setValue(4);
     _storageBackend = new QComboBox(lasagnaContents);
     _storageBackend->addItem(tr("Auto"), QStringLiteral("auto"));
+    _storageBackend->addItem(tr("CUDA bricks"), QStringLiteral("cuda_bricks"));
     _storageBackend->addItem(tr("Memory mapped"), QStringLiteral("mmap"));
     _storageBackend->addItem(tr("Dense CUDA (legacy)"), QStringLiteral("dense_cuda"));
     addPathRow(lasagnaForm, "cache_directory", tr("Cache directory"), true);

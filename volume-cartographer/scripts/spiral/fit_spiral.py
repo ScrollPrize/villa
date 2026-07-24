@@ -139,8 +139,9 @@ z_begin, z_end = 4000, 17000
 voxel_size_um = 9.6
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 lasagna_scale = 4
-# mmap is the default everywhere: the SDT store must be mmap-served, and the
-# session API already resolved 'auto' to mmap before this changed.
+# ``auto`` uses bounded lazy CUDA bricks when a positive cache budget is
+# supplied below, while explicit mmap/dense_cuda remain available for
+# comparison and rollback.
 lasagna_storage_backend = 'auto'
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
 _active_lasagna_store = None
@@ -294,6 +295,14 @@ default_config = {
     # extension past the shell + the chunk half-diagonal (~110 wv at 64x2).
     'volume_paging_chunk': 64,
     'volume_interior_margin': 300.0,
+    # Generic lazy CUDA brick caches. Rays and loss samples are unchanged:
+    # only exact uint8 voxel retrieval is grouped behind a bounded resident
+    # pool. SDT and Lasagna use independent budgets so one field cannot evict
+    # the other's working set. Set a budget to 0 to restore auto's legacy
+    # dense/paged/mmap selection for that field.
+    'volume_cuda_brick_size': 64,
+    'sdt_cuda_brick_cache_gb': 24.0,
+    'lasagna_cuda_brick_cache_gb': 24.0,
     'regularisation_num_points': 4500,
     'grad_mag_encode_scale': 1000.0,
     'grad_mag_factor': 0.25,
@@ -1251,6 +1260,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     #           ~38 GB/rank: SDT pool + both would OOM (observed 2026-07-19,
     #           z8500-16500: 27.4 + 10.4 + ~38 > 79 GiB).
     paged_stores = os.environ.get('FIT_SPIRAL_PAGED_STORES', 'all').strip().lower()
+    brick_size = int(cfg['volume_cuda_brick_size'])
+    if brick_size <= 0:
+        raise ValueError('volume_cuda_brick_size must be positive')
+    sdt_brick_gb = float(os.environ.get(
+        'FIT_SPIRAL_SDT_CUDA_BRICK_CACHE_GB',
+        cfg['sdt_cuda_brick_cache_gb']))
+    lasagna_brick_gb = float(os.environ.get(
+        'FIT_SPIRAL_LASAGNA_CUDA_BRICK_CACHE_GB',
+        cfg['lasagna_cuda_brick_cache_gb']))
+    if sdt_brick_gb < 0 or lasagna_brick_gb < 0:
+        raise ValueError('CUDA brick cache budgets must be non-negative')
     lasagna_backend_choice = lasagna_storage_backend
     lasagna_interior_fn = volume_interior_fn
     if paged_stores == 'sdt':
@@ -1272,8 +1292,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         cache_directory=cache_path,
         interior_fn=lasagna_interior_fn,
         paged_chunk=int(cfg['volume_paging_chunk']) or 64,
+        brick_cache_bytes=int(lasagna_brick_gb * 1024 ** 3),
+        brick_size=brick_size,
     )
-    if interactive_driver is not None and lasagna_volume and lasagna_volume.get('backend') == 'mmap':
+    if (interactive_driver is not None and lasagna_volume
+            and lasagna_volume.get('store') is not None):
         _active_lasagna_store = lasagna_volume['store']
 
     # Surf-SDT store: a core input of the whole phase bundle (registration,
@@ -1299,8 +1322,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             storage_backend=lasagna_storage_backend,
             interior_fn=volume_interior_fn,
             paged_chunk=int(cfg['volume_paging_chunk']) or 64,
+            brick_cache_bytes=int(sdt_brick_gb * 1024 ** 3),
+            brick_size=brick_size,
         )
-        if interactive_driver is not None and sdt_volume.get('backend') == 'mmap':
+        if (interactive_driver is not None
+                and sdt_volume.get('store') is not None):
             _active_scalar_stores.append(sdt_volume['store'])
 
     def phase_mode_active():
@@ -2720,7 +2746,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 # Release before the generator builds the next loss's graph,
                 # or both large transform graphs are resident at peak.
                 del dense_loss_value
-            if lasagna_volume.get('backend') == 'mmap':
+            if lasagna_volume.get('backend') in ('mmap', 'cuda_bricks'):
                 log_metrics.update({
                     f'lasagna_{name}': value
                     for name, value in lasagna_volume['store'].last_timings.items()
@@ -2777,12 +2803,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 backward_family(pending_shared)
             del pending_shared
             if (phase_components_active
-                    and lasagna_volume['backend'] == 'mmap'):
+                    and lasagna_volume['backend'] in ('mmap', 'cuda_bricks')):
                 log_metrics.update({
                     f'dense_spacing_phase_normal_{name}': value
                     for name, value in lasagna_volume['store'].last_timings.items()
                 })
-            if phase_components_active and sdt_volume['backend'] == 'mmap':
+            if (phase_components_active
+                    and sdt_volume['backend'] in ('mmap', 'cuda_bricks')):
                 log_metrics.update({
                     f'dense_spacing_phase_sdt_store_{name}': value
                     for name, value in sdt_volume['store'].last_timings.items()

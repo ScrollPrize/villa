@@ -251,6 +251,8 @@ def prepare_lasagna_volume(
     yx_bounds_working=None,
     interior_fn=None,
     paged_chunk=64,
+    brick_cache_bytes=None,
+    brick_size=64,
 ):
     # Densely load the precomputed nx/ny normal-component and grad_mag
     # (windings-per-base-voxel) zarrs over the z-ROI into a compact uint8 volume.
@@ -300,6 +302,51 @@ def prepare_lasagna_volume(
         raise RuntimeError(f'lasagna z-ROI [{z_lo}, {z_hi}) is empty (zarr z size {z_size})')
 
     roi_shape = (z_hi - z_lo, reference_shape[1], reference_shape[2])
+    if (storage_backend == 'cuda_bricks'
+            and (brick_cache_bytes is None or int(brick_cache_bytes) <= 0)):
+        raise ValueError('cuda_bricks storage requires a positive cache budget')
+    if (storage_backend in ('auto', 'cuda_bricks')
+            and brick_cache_bytes is not None and int(brick_cache_bytes) > 0):
+        if not torch.cuda.is_available():
+            if storage_backend == 'cuda_bricks':
+                raise RuntimeError('cuda_bricks storage requires CUDA')
+        else:
+            from cuda_brick_volume import CudaBrickVolume
+            arrays = []
+            channel_map = {}
+            if use_normals:
+                channel_map['normal_x'] = len(arrays)
+                arrays.append(nx_array)
+                channel_map['normal_y'] = len(arrays)
+                arrays.append(ny_array)
+            if use_spacing:
+                channel_map['gradient_magnitude'] = len(arrays)
+                arrays.append(grad_mag_array)
+            try:
+                store = CudaBrickVolume(
+                    arrays, z_origin=z_lo, roi_shape=roi_shape,
+                    capacity_bytes=int(brick_cache_bytes),
+                    brick_size=int(brick_size), no_data_value=0)
+            except ValueError:
+                if storage_backend == 'cuda_bricks':
+                    raise
+            else:
+                print(
+                    f'lasagna: lazy CUDA brick cache '
+                    f'({store.capacity * store.channel_count * store.brick_voxels / 1e9:.1f} '
+                    f'GB, {store.channel_count} channels, '
+                    f'{store.brick_size}^3 bricks)')
+                return {
+                    'backend': 'cuda_bricks',
+                    'store': store,
+                    'z_origin': z_lo,
+                    'lasagna_scale': lasagna_scale,
+                    'shape': roi_shape,
+                    'normal_channels': (
+                        channel_map.get('normal_x'),
+                        channel_map.get('normal_y')),
+                    'grad_channel': channel_map.get('gradient_magnitude'),
+                }
     if storage_backend in ('auto', 'mmap'):
         from lasagna_mmap import prepare_lasagna_mmap
         progress = _TqdmSlabProgress('lasagna mmap cache:')
@@ -432,6 +479,8 @@ def prepare_surf_sdt_volume(
     yx_bounds_working=None,
     interior_fn=None,
     paged_chunk=64,
+    brick_cache_bytes=None,
+    brick_size=64,
 ):
     """Resolve and validate a surf-SDT store as a mmap-served Lasagna input.
 
@@ -512,6 +561,43 @@ def prepare_surf_sdt_volume(
         'git_commit': attrs.get('git_commit'),
     }
 
+    shape = (z_hi - z_lo, int(array.shape[1]), int(array.shape[2]))
+    common = {
+        'kind': volume_kind,
+        'z_origin': z_lo,
+        'scale_zyx': tuple(scale_zyx),
+        'unit': unit,
+        'offset': offset,
+        'cap': cap,
+        'shape': shape,
+        'fingerprint': fingerprint,
+    }
+    if (storage_backend == 'cuda_bricks'
+            and (brick_cache_bytes is None or int(brick_cache_bytes) <= 0)):
+        raise ValueError('cuda_bricks storage requires a positive cache budget')
+    if (storage_backend in ('auto', 'cuda_bricks')
+            and brick_cache_bytes is not None and int(brick_cache_bytes) > 0):
+        if not torch.cuda.is_available():
+            if storage_backend == 'cuda_bricks':
+                raise RuntimeError('cuda_bricks storage requires CUDA')
+        else:
+            from cuda_brick_volume import CudaBrickVolume
+            try:
+                store = CudaBrickVolume(
+                    [array], z_origin=z_lo, roi_shape=shape,
+                    capacity_bytes=int(brick_cache_bytes),
+                    brick_size=int(brick_size), no_data_value=0,
+                    workers=workers)
+            except ValueError:
+                if storage_backend == 'cuda_bricks':
+                    raise
+            else:
+                print(
+                    f'surf_sdt: lazy CUDA brick cache '
+                    f'({store.capacity * store.brick_voxels / 1e9:.1f} GB, '
+                    f'{store.brick_size}^3 bricks)')
+                return {'backend': 'cuda_bricks', 'store': store, **common}
+
     from lasagna_mmap import prepare_scalar_mmap
     progress = _TqdmSlabProgress('surf_sdt mmap cache:')
     try:
@@ -524,17 +610,6 @@ def prepare_surf_sdt_volume(
         )
     finally:
         progress.close()
-    shape = (z_hi - z_lo, int(array.shape[1]), int(array.shape[2]))
-    common = {
-        'kind': volume_kind,
-        'z_origin': z_lo,
-        'scale_zyx': tuple(scale_zyx),
-        'unit': unit,
-        'offset': offset,
-        'cap': cap,
-        'shape': shape,
-        'fingerprint': fingerprint,
-    }
     if interior_fn is not None and storage_backend == 'auto':
         keep = _paged_chunk_mask(interior_fn, shape, scale_zyx, z_lo, paged_chunk)
         pool_bytes = int(keep.sum()) * paged_chunk ** 3

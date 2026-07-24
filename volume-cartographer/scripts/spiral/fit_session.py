@@ -492,8 +492,10 @@ def validate_session_request(
         errors.append({"field": "outward_sense", "message": "Must be CW or ACW"})
     if run.lasagna_scale <= 0:
         errors.append({"field": "lasagna_scale", "message": "Must be positive"})
-    if run.storage_backend not in {"auto", "mmap", "dense_cuda"}:
-        errors.append({"field": "storage_backend", "message": "Must be auto, mmap, or dense_cuda"})
+    if run.storage_backend not in {"auto", "cuda_bricks", "mmap", "dense_cuda"}:
+        errors.append({
+            "field": "storage_backend",
+            "message": "Must be auto, cuda_bricks, mmap, or dense_cuda"})
 
     if not paths.output_directory:
         errors.append({"field": "output_directory", "message": "Output directory is required"})

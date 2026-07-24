@@ -170,6 +170,9 @@ def sample_sdt_trilinear(sdt_volume, points_working_zyx):
     if sdt_volume['backend'] == 'mmap':
         values_u8 = sdt_volume['store'].gather(
             clamped.reshape(-1, 3), device).reshape(clamped.shape[:2])
+    elif sdt_volume['backend'] == 'cuda_bricks':
+        values_u8 = sdt_volume['store'].gather(
+            clamped.reshape(-1, 3), channel=0).reshape(clamped.shape[:2])
     elif sdt_volume['backend'] == 'dense_cuda_paged':
         from lasagna_data import gather_paged_u8
         values_u8 = gather_paged_u8(
@@ -469,6 +472,12 @@ def sample_lasagna_normals_nearest(lasagna_volume, points_working_zyx):
         empty = torch.zeros([0, 3], dtype=torch.long, device=device)
         normal_u8, _ = lasagna_volume['store'].gather_pair(
             normal_indices, empty, device)
+        nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
+    elif lasagna_volume['backend'] == 'cuda_bricks':
+        normal_indices = torch.stack([zi, yi, xi], dim=-1)
+        channels = lasagna_volume['normal_channels']
+        normal_u8 = lasagna_volume['store'].gather_channels(
+            normal_indices, channels)
         nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
     elif lasagna_volume['backend'] == 'dense_cuda_paged':
         from lasagna_data import gather_paged_u8

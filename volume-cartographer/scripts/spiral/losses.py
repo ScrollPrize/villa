@@ -1309,6 +1309,22 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
         nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
         if compute_spacing:
             grad_mag_u8 = grad_mag_u8.reshape(izi.shape)
+    elif backend == 'cuda_bricks':
+        normal_channels = lasagna_volume['normal_channels']
+        if all(channel is not None for channel in normal_channels):
+            normal_indices = torch.stack([zi, yi, xi], dim=-1)
+            normal_u8 = lasagna_volume['store'].gather_channels(
+                normal_indices, normal_channels)
+            nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
+        else:
+            nx_u8 = torch.zeros_like(zi, dtype=torch.uint8)
+            ny_u8 = torch.zeros_like(zi, dtype=torch.uint8)
+        if compute_spacing:
+            grad_indices = torch.stack([izi, iyi, ixi], dim=-1)
+            grad_mag_u8 = lasagna_volume['store'].gather(
+                grad_indices, lasagna_volume['grad_channel'])
+        else:
+            grad_mag_u8 = None
     elif backend == 'dense_cuda_paged':
         from lasagna_data import gather_paged_u8
         nx_u8 = gather_paged_u8(lasagna_volume, zi, yi, xi, channel=0)
