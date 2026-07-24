@@ -414,7 +414,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 });
     };
     connectLasagnaManager(_transientLasagnaManager);
-    connectLasagnaManager(&LasagnaServiceManager::instance());
     connect(_transientLasagnaManager, &LasagnaServiceManager::optimizationError,
             this, [this](const QString& error) {
                 if (_activeLasagnaManager == _transientLasagnaManager)
@@ -1400,22 +1399,9 @@ void SpiralWorkspace::startLasagnaFlatten()
         return;
     }
 
-    auto& sharedLasagna = LasagnaServiceManager::instance();
-    LasagnaServiceManager* lasagna = nullptr;
-    QString dataDirectory;
-    if (sharedLasagna.isExternal()) {
-        if (!sharedLasagna.isRunning()) {
-            QMessageBox::warning(
-                this, tr("Lasagna service"),
-                tr("The configured external Lasagna service is not connected."));
-            return;
-        }
-        lasagna = &sharedLasagna;
-    } else {
-        dataDirectory = resolveLasagnaDataDirectory();
-        if (dataDirectory.isEmpty()) return;
-        lasagna = _transientLasagnaManager;
-    }
+    const QString dataDirectory = resolveLasagnaDataDirectory();
+    if (dataDirectory.isEmpty()) return;
+    LasagnaServiceManager* const lasagna = _transientLasagnaManager;
 
     QJsonObject config = configDocument.object();
     config[QStringLiteral("external_surfaces")] = QJsonArray{sourceRef};
@@ -1475,28 +1461,24 @@ void SpiralWorkspace::startLasagnaFlatten()
                 if (!manager) return;
                 if (!_pendingLasagnaJobId.isEmpty()) {
                     manager->cancelJob(_pendingLasagnaJobId);
-                } else if (!manager->isExternal()) {
-                    manager->stopService();
                 } else {
-                    manager->stopOptimization();
+                    manager->stopService();
                 }
                 statusBar()->showMessage(
                     tr("Cancelling Lasagna flatten…"), 5000);
             });
     _lasagnaFlattenProgress->show();
 
-    if (!lasagna->isExternal()) {
-        _lasagnaFlattenProgress->setLabelText(
-            tr("Starting Lasagna service…"));
-        if (!lasagna->ensureServiceRunning({}, dataDirectory)) {
-            const bool cancelled = _lasagnaFlattenCancelRequested;
-            failLasagnaFlatten(
-                cancelled ? tr("Lasagna job was cancelled")
-                          : tr("Cannot start Lasagna: %1")
-                                .arg(lasagna->lastError()),
-                cancelled);
-            return;
-        }
+    _lasagnaFlattenProgress->setLabelText(
+        tr("Starting local Lasagna service…"));
+    if (!lasagna->ensureServiceRunning({}, dataDirectory)) {
+        const bool cancelled = _lasagnaFlattenCancelRequested;
+        failLasagnaFlatten(
+            cancelled ? tr("Lasagna job was cancelled")
+                      : tr("Cannot start local Lasagna: %1")
+                            .arg(lasagna->lastError()),
+            cancelled);
+        return;
     }
     if (_lasagnaFlattenCancelRequested) {
         failLasagnaFlatten(tr("Lasagna job was cancelled"), true);

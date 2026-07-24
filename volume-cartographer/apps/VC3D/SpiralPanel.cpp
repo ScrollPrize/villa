@@ -553,16 +553,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _save = new QPushButton(tr("Save Checkpoint on Service"), runContents); _save->setEnabled(false);
     _downloadCheckpoint = new QPushButton(tr("Download Checkpoint…"), runContents);
     _downloadCheckpoint->setEnabled(false);
-    checkpointControls->addWidget(_save);
-    checkpointControls->addWidget(_downloadCheckpoint);
-    checkpointControls->addStretch(1);
-    runLayout->addLayout(checkpointControls);
     _flattenWithLasagna = new QPushButton(tr("Flatten with Lasagna"), runContents);
     _flattenWithLasagna->setObjectName(QStringLiteral("spiralFlattenWithLasagna"));
     _flattenWithLasagna->setEnabled(false);
     _flattenWithLasagna->setToolTip(
-        tr("Flatten the complete latest Spiral output with Lasagna"));
-    runLayout->addWidget(_flattenWithLasagna);
+        tr("Flatten the complete latest Spiral output with Lasagna on this device"));
+    checkpointControls->addWidget(_save);
+    checkpointControls->addWidget(_downloadCheckpoint);
+    checkpointControls->addWidget(_flattenWithLasagna);
+    checkpointControls->addStretch(1);
+    runLayout->addLayout(checkpointControls);
 
     auto* ephemeralLabel = new QLabel(tr("Inputs added to the running fit:"), runContents);
     _ephemeralList = new QListWidget(runContents);
@@ -1132,7 +1132,7 @@ void SpiralPanel::setLasagnaFlattenAvailable(bool available, const QString& reas
     _flattenWithLasagna->setEnabled(available);
     _flattenWithLasagna->setToolTip(
         reason.isEmpty()
-            ? tr("Flatten the complete latest Spiral output with Lasagna")
+            ? tr("Flatten the complete latest Spiral output with Lasagna on this device")
             : reason);
 }
 
