@@ -1396,12 +1396,23 @@ class ServiceState:
                 object_store = temporary / "objects"
                 self._update_lasagna_flatten(
                     job, stage_name="Preparing Lasagna input surface")
-                cleaned_surface = _prepare_cleaned_lasagna_surface(
-                    surface_path, temporary / "lasagna-input.tifxyz")
+                metadata = json.loads(
+                    (surface_path / "meta.json").read_text(encoding="utf-8"))
+                cleanup = metadata.get("lasagna_input_cleanup")
+                if (not isinstance(cleanup, dict)
+                        or cleanup.get("erosion_cells") != 3
+                        or cleanup.get("component_connectivity") != 4
+                        or not isinstance(cleanup.get("components_after_erosion"), int)
+                        or cleanup["components_after_erosion"] < 1
+                        or manifest.get("schema_version") != 2
+                        or "components" in metadata):
+                    raise RuntimeError(
+                        "Spiral preview was not published with authoritative "
+                        "connected-surface cleanup")
                 if job.cancel.is_set():
                     raise InterruptedError("Lasagna flatten cancelled")
                 surface_ref = _prepare_lasagna_surface_object(
-                    cleaned_surface, object_store)
+                    surface_path, object_store)
                 ready = threading.Event()
                 port_holder = {}
 

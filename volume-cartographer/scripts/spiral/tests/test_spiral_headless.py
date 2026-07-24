@@ -144,6 +144,35 @@ class HandoffTests(unittest.TestCase):
             self.assertTrue(np.all(x[:, 1] == 10))
             self.assertTrue(np.all(x[:, 2] == 11))
 
+    def test_combined_preview_cleanup_publishes_one_authoritative_component(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "generation-1"
+            block = np.full((18, 32, 3), -1.0, dtype=np.float32)
+            block[1:15, 1:16] = [10.0, 20.0, 30.0]
+            block[5:13, 23:30] = [40.0, 50.0, 60.0]
+            save_combined_tifxyz(
+                {10: block}, destination, "preview", 1, 9.6, "test",
+                cleanup_erosion_cells=3)
+
+            metadata = json.loads(
+                (destination / "preview" / "meta.json").read_text())
+            self.assertNotIn("components", metadata)
+            self.assertEqual(metadata["lasagna_input_cleanup"], {
+                "erosion_cells": 3,
+                "component_connectivity": 4,
+                "components_after_erosion": 2,
+            })
+            from PIL import Image
+            coordinates = [
+                np.asarray(Image.open(destination / "preview" / f"{axis}.tif"))
+                for axis in "xyz"
+            ]
+            valid = np.isfinite(coordinates).all(axis=0) & ~np.all(
+                np.stack(coordinates, axis=-1) == -1.0, axis=-1)
+            self.assertEqual(int(valid.sum()), 72)
+            self.assertTrue(valid[4:12, 4:13].all())
+            self.assertFalse(valid[:, 20:].any())
+
 
 class PreviewRangeTests(unittest.TestCase):
     def test_many_short_tracks_are_transformed_in_point_batches(self):

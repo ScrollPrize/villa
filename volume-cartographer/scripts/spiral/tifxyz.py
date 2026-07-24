@@ -381,6 +381,7 @@ def save_combined_tifxyz(
     source,
     *,
     first_winding=10,
+    cleanup_erosion_cells=None,
 ):
     """Atomically write consecutive winding grids as one QuadSurface.
 
@@ -425,6 +426,33 @@ def save_combined_tifxyz(
         cursor += block.shape[1]
         components.append([start, cursor])
     combined = np.concatenate(blocks, axis=1)
+    cleanup_metadata = None
+    if cleanup_erosion_cells is not None:
+        import scipy.ndimage
+
+        erosion_cells = int(cleanup_erosion_cells)
+        if erosion_cells < 0:
+            raise ValueError("cleanup_erosion_cells must be non-negative")
+        valid = np.isfinite(combined).all(axis=-1) & ~np.all(combined == -1.0, axis=-1)
+        if erosion_cells:
+            valid = scipy.ndimage.binary_erosion(
+                valid, iterations=erosion_cells, border_value=0)
+        labels, component_count = scipy.ndimage.label(
+            valid, structure=scipy.ndimage.generate_binary_structure(2, 1))
+        if component_count == 0:
+            raise ValueError(
+                "Preview cleanup removed every valid TIFXYZ vertex "
+                f"after {erosion_cells}-cell erosion")
+        component_sizes = np.bincount(labels.ravel())
+        component_sizes[0] = 0
+        valid = labels == int(np.argmax(component_sizes))
+        combined = combined.copy()
+        combined[~valid] = -1.0
+        cleanup_metadata = {
+            "erosion_cells": erosion_cells,
+            "component_connectivity": 4,
+            "components_after_erosion": int(component_count),
+        }
     destination = os.path.abspath(os.fspath(path))
     parent = os.path.dirname(destination)
     os.makedirs(parent, exist_ok=True)
@@ -464,6 +492,8 @@ def save_combined_tifxyz(
             "output_first_winding": ids[0],
             "output_last_winding": ids[-1],
         }
+        if cleanup_metadata is not None:
+            metadata["lasagna_input_cleanup"] = cleanup_metadata
         meta_path = os.path.join(surface_dir, "meta.json")
         with open(meta_path, "w", encoding="utf-8") as stream:
             json.dump(metadata, stream, indent=4)

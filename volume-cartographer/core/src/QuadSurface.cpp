@@ -544,6 +544,49 @@ void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
     }
 }
 
+void warpQuadValidityConstU8(const cv::Mat_<uint8_t>& vertexValidity,
+                             cv::Mat_<uint8_t>& dst,
+                             double ox, double oy,
+                             double sx, double sy,
+                             uint8_t border)
+{
+    const int sc = vertexValidity.cols;
+    const int sr = vertexValidity.rows;
+    const int dw = dst.cols;
+    const int dh = dst.rows;
+    if (sc < 2 || sr < 2) {
+        dst.setTo(border);
+        return;
+    }
+
+    const double maxX = static_cast<double>(sc - 1);
+    const double maxY = static_cast<double>(sr - 1);
+#pragma omp parallel for schedule(dynamic, 8)
+    for (int dy = 0; dy < dh; ++dy) {
+        const double fy = oy + static_cast<double>(dy) * sy;
+        uint8_t* output = dst[dy];
+        if (fy < 0.0 || fy > maxY) {
+            std::memset(output, border, static_cast<std::size_t>(dw));
+            continue;
+        }
+        const int row = std::min(static_cast<int>(std::floor(fy)), sr - 2);
+        const uint8_t* top = vertexValidity[row];
+        const uint8_t* bottom = vertexValidity[row + 1];
+        for (int dx = 0; dx < dw; ++dx) {
+            const double fx = ox + static_cast<double>(dx) * sx;
+            if (fx < 0.0 || fx > maxX) {
+                output[dx] = border;
+                continue;
+            }
+            const int col = std::min(static_cast<int>(std::floor(fx)), sc - 2);
+            output[dx] = top[col] && top[col + 1]
+                              && bottom[col] && bottom[col + 1]
+                ? uint8_t{255}
+                : uint8_t{0};
+        }
+    }
+}
+
 void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
                            cv::Mat_<cv::Vec3f>& dst,
                            double ox, double oy,
@@ -810,6 +853,88 @@ cv::Vec3f QuadSurface::center() const
     return _center;
 }
 
+cv::Vec2d QuadSurface::surfaceToGrid(const cv::Vec2d& surface) const
+{
+    return {
+        (surface[0] + static_cast<double>(_center[0]))
+            * static_cast<double>(_scale[0]),
+        (surface[1] + static_cast<double>(_center[1]))
+            * static_cast<double>(_scale[1]),
+    };
+}
+
+cv::Vec2d QuadSurface::gridToSurface(const cv::Vec2d& grid) const
+{
+    if (!std::isfinite(_scale[0]) || !std::isfinite(_scale[1])
+        || _scale[0] <= 0.0f || _scale[1] <= 0.0f) {
+        return {NAN, NAN};
+    }
+    return {
+        grid[0] / static_cast<double>(_scale[0])
+            - static_cast<double>(_center[0]),
+        grid[1] / static_cast<double>(_scale[1])
+            - static_cast<double>(_center[1]),
+    };
+}
+
+QuadSurface::SurfaceSample QuadSurface::sampleAtSurface(
+    const cv::Vec2d& surface) const
+{
+    SurfaceSample result;
+    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1])) {
+        result.status = SurfaceSample::Status::NonFinite;
+        return result;
+    }
+    if (!std::isfinite(_scale[0]) || !std::isfinite(_scale[1])
+        || _scale[0] <= 0.0f || _scale[1] <= 0.0f) {
+        result.status = SurfaceSample::Status::InvalidScale;
+        return result;
+    }
+
+    const_cast<QuadSurface*>(this)->ensureLoaded();
+    if (!_points || _points->cols < 2 || _points->rows < 2) {
+        result.status = SurfaceSample::Status::MissingPoints;
+        return result;
+    }
+
+    result.grid = surfaceToGrid(surface);
+    const double maxCol = static_cast<double>(_points->cols - 1);
+    const double maxRow = static_cast<double>(_points->rows - 1);
+    if (result.grid[0] < 0.0 || result.grid[1] < 0.0
+        || result.grid[0] > maxCol || result.grid[1] > maxRow) {
+        result.status = SurfaceSample::Status::OutsideGrid;
+        return result;
+    }
+
+    const int col = std::min(
+        static_cast<int>(std::floor(result.grid[0])), _points->cols - 2);
+    const int row = std::min(
+        static_cast<int>(std::floor(result.grid[1])), _points->rows - 2);
+    const cv::Vec3f& p00 = (*_points)(row, col);
+    const cv::Vec3f& p01 = (*_points)(row, col + 1);
+    const cv::Vec3f& p10 = (*_points)(row + 1, col);
+    const cv::Vec3f& p11 = (*_points)(row + 1, col + 1);
+    if (!isValidPointSample(p00) || !isValidPointSample(p01)
+        || !isValidPointSample(p10) || !isValidPointSample(p11)) {
+        result.status = SurfaceSample::Status::InvalidQuad;
+        return result;
+    }
+
+    const float colFraction =
+        static_cast<float>(result.grid[0] - static_cast<double>(col));
+    const float rowFraction =
+        static_cast<float>(result.grid[1] - static_cast<double>(row));
+    const cv::Vec3f top = p00 * (1.0f - colFraction) + p01 * colFraction;
+    const cv::Vec3f bottom = p10 * (1.0f - colFraction) + p11 * colFraction;
+    result.volume = top * (1.0f - rowFraction) + bottom * rowFraction;
+    if (!isValidPointSample(result.volume)) {
+        result.status = SurfaceSample::Status::NonFinite;
+        return result;
+    }
+    result.status = SurfaceSample::Status::Valid;
+    return result;
+}
+
 cv::Vec2f QuadSurface::ptrToGrid(const cv::Vec3f& ptr) const
 {
     return {ptr[0] + _center[0] * _scale[0],
@@ -1055,7 +1180,9 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     // Trigger the cache build + set _validMaskAllValid before deciding
     // whether we need the validity warp below.
     cv::Mat_<uint8_t> valid_src = validMask();
-    bool skipValidity = _validMaskAllValid;
+    // Strict mode must still evaluate cell support on an all-valid vertex
+    // mask so degenerate one-row/one-column components cannot render.
+    bool skipValidity = _validMaskAllValid && !_strictQuadRenderValidity;
 
     // --- warp coords and validity ----------------------------------------
     // Per-call scratch is thread_local: gen() runs concurrently per-tile from
@@ -1092,7 +1219,13 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
             if (!skipValidity) {
                 cv::Mat_<uint8_t> compValid = valid_src(cv::Rect(c0, 0, cw, rows));
                 compValidBig.create(h + 8, w + 8);
-                warpNearestConstU8(compValid, compValidBig, ox - c0, oy, sx, sy, 0);
+                if (_strictQuadRenderValidity) {
+                    warpQuadValidityConstU8(
+                        compValid, compValidBig, ox - c0, oy, sx, sy, 0);
+                } else {
+                    warpNearestConstU8(
+                        compValid, compValidBig, ox - c0, oy, sx, sy, 0);
+                }
                 compCoords.copyTo(coords_big, compValidBig);
                 cv::bitwise_or(valid_big, compValidBig, valid_big);
             } else {
@@ -1114,7 +1247,11 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
         coords_big.create(h + 8, w + 8);
         warpBilinearReplicateVec3f(*_points, coords_big, ox, oy, sx, sy);
         valid_big.create(h + 8, w + 8);
-        warpNearestConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
+        if (_strictQuadRenderValidity) {
+            warpQuadValidityConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
+        } else {
+            warpNearestConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
+        }
         skipValidity = false;  // force invalidation pass below
     }
 

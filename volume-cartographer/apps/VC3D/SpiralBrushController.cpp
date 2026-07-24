@@ -239,6 +239,30 @@ QPainterPath SpiralBrushController::deviceToSurface(const QPainterPath& path) co
     return sceneToSurface.map(viewportToScene.map(path));
 }
 
+std::optional<QPointF> SpiralBrushController::scenePointToSurface(
+    const QPointF& point) const
+{
+    if (!_viewer) return std::nullopt;
+    bool valid = false;
+    const QTransform transform = surfaceToSceneTransform(_viewer).inverted(&valid);
+    if (!valid) return std::nullopt;
+    const QPointF surface = transform.map(point);
+    if (!std::isfinite(surface.x()) || !std::isfinite(surface.y()))
+        return std::nullopt;
+    return surface;
+}
+
+std::optional<QPointF> SpiralBrushController::devicePointToSurface(
+    const QPointF& point) const
+{
+    auto* view = _viewer ? _viewer->graphicsView() : nullptr;
+    if (!view) return std::nullopt;
+    bool valid = false;
+    const QTransform viewportToScene = view->viewportTransform().inverted(&valid);
+    if (!valid) return std::nullopt;
+    return scenePointToSurface(viewportToScene.map(point));
+}
+
 QPainterPath SpiralBrushController::surfaceToScene(const QPainterPath& path) const
 {
     if (!_viewer) return {};
@@ -251,16 +275,18 @@ void SpiralBrushController::beginPaint(const QPointF& devicePos)
     auto* sourceRaw = dynamic_cast<QuadSurface*>(_viewer->currentSurface());
     if (!sourceRaw || !_paintSurface || _paintSurface.get() != sourceRaw) return;
     std::shared_ptr<QuadSurface> source = _paintSurface;
-    const cv::Vec2f scale = sourceRaw->scale();
-    if (!std::isfinite(scale[0]) || !std::isfinite(scale[1])
-        || std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) return;
-    const cv::Vec3f center = sourceRaw->center();
+    const cv::Vec2d gridOrigin = sourceRaw->gridToSurface({0.0, 0.0});
+    const cv::Vec2d gridColumn = sourceRaw->gridToSurface({1.0, 0.0});
+    const cv::Vec2d gridRow = sourceRaw->gridToSurface({0.0, 1.0});
+    if (!std::isfinite(gridOrigin[0]) || !std::isfinite(gridOrigin[1])) return;
     Gesture gesture;
     gesture.color = nextColor();
     gesture.source = std::move(source);
-    gesture.gridOrigin = QPointF(-center[0], -center[1]);
-    gesture.columnStep = QPointF(1.0 / scale[0], 0.0);
-    gesture.rowStep = QPointF(0.0, 1.0 / scale[1]);
+    gesture.gridOrigin = QPointF(gridOrigin[0], gridOrigin[1]);
+    gesture.columnStep =
+        QPointF(gridColumn[0] - gridOrigin[0], gridColumn[1] - gridOrigin[1]);
+    gesture.rowStep =
+        QPointF(gridRow[0] - gridOrigin[0], gridRow[1] - gridOrigin[1]);
     gesture.shape = deviceToSurface(deviceDisk(devicePos));
     _gestures.push_back(std::move(gesture));
     _activeGesture = static_cast<int>(_gestures.size()) - 1;
@@ -274,48 +300,55 @@ std::optional<std::pair<QPointF, cv::Vec3f>>
 SpiralBrushController::pointOnSurface(
     const QPointF& devicePos, const std::shared_ptr<QuadSurface>& source) const
 {
-    auto* view = _viewer ? _viewer->graphicsView() : nullptr;
-    if (!view || !source || source.get() != _viewer->currentSurface()) return std::nullopt;
-    bool transformValid = false;
-    const QTransform viewportToScene = view->viewportTransform().inverted(&transformValid);
-    if (!transformValid) return std::nullopt;
-    const QPointF scenePos = viewportToScene.map(devicePos);
-    const cv::Vec2f surface = _viewer->sceneToSurfaceCoords(scenePos);
-    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1])) return std::nullopt;
-    const QPointF surfacePoint(surface[0], surface[1]);
-    const auto volume = volumePointOnSurface(surfacePoint, source);
+    if (!source || source.get() != (_viewer ? _viewer->currentSurface() : nullptr))
+        return std::nullopt;
+    const auto surfacePoint = devicePointToSurface(devicePos);
+    if (!surfacePoint) return std::nullopt;
+    const auto volume = volumePointOnSurface(*surfacePoint, source);
     if (!volume) return std::nullopt;
-    return std::make_pair(surfacePoint, *volume);
+    return std::make_pair(*surfacePoint, *volume);
 }
 
 std::optional<cv::Vec3f> SpiralBrushController::volumePointOnSurface(
     const QPointF& surfacePos, const std::shared_ptr<QuadSurface>& source) const
 {
     if (!source) return std::nullopt;
-    const auto* points = source->rawPointsPtr();
-    const cv::Vec2f scale = source->scale();
-    const cv::Vec3f center = source->center();
-    if (!points || points->empty() || !std::isfinite(scale[0]) || !std::isfinite(scale[1])
-        || std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) return std::nullopt;
-    const float col = (static_cast<float>(surfacePos.x()) + center[0]) * scale[0];
-    const float row = (static_cast<float>(surfacePos.y()) + center[1]) * scale[1];
-    const int col0 = static_cast<int>(std::floor(col));
-    const int row0 = static_cast<int>(std::floor(row));
-    if (col0 < 0 || row0 < 0 || col0 + 1 >= points->cols || row0 + 1 >= points->rows)
-        return std::nullopt;
-    const cv::Vec3f& p00 = (*points)(row0, col0);
-    const cv::Vec3f& p01 = (*points)(row0, col0 + 1);
-    const cv::Vec3f& p10 = (*points)(row0 + 1, col0);
-    const cv::Vec3f& p11 = (*points)(row0 + 1, col0 + 1);
-    if (!validPoint(p00) || !validPoint(p01) || !validPoint(p10) || !validPoint(p11))
-        return std::nullopt;
-    const float colFraction = col - static_cast<float>(col0);
-    const float rowFraction = row - static_cast<float>(row0);
-    const cv::Vec3f top = p00 * (1.0f - colFraction) + p01 * colFraction;
-    const cv::Vec3f bottom = p10 * (1.0f - colFraction) + p11 * colFraction;
-    const cv::Vec3f point = top * (1.0f - rowFraction) + bottom * rowFraction;
-    if (!validPoint(point)) return std::nullopt;
-    return point;
+    const auto sample = source->sampleAtSurface(
+        {static_cast<double>(surfacePos.x()), static_cast<double>(surfacePos.y())});
+    return sample ? std::optional<cv::Vec3f>{sample.volume} : std::nullopt;
+}
+
+bool SpiralBrushController::surfaceSegmentValid(
+    const QPointF& from, const QPointF& to,
+    const std::shared_ptr<QuadSurface>& source) const
+{
+    if (!source || !volumePointOnSurface(from, source)
+        || !volumePointOnSurface(to, source))
+        return false;
+    const cv::Vec2d a = source->surfaceToGrid({from.x(), from.y()});
+    const cv::Vec2d b = source->surfaceToGrid({to.x(), to.y()});
+    std::vector<double> crossings{0.0, 1.0};
+    auto appendCrossings = [&](double start, double end) {
+        if (start == end) return;
+        const double low = std::min(start, end);
+        const double high = std::max(start, end);
+        for (double boundary = std::floor(low) + 1.0; boundary < high; boundary += 1.0)
+            crossings.push_back((boundary - start) / (end - start));
+    };
+    appendCrossings(a[0], b[0]);
+    appendCrossings(a[1], b[1]);
+    std::sort(crossings.begin(), crossings.end());
+    crossings.erase(std::unique(crossings.begin(), crossings.end(),
+                                [](double l, double r) {
+                                    return std::abs(l - r) < 1e-12;
+                                }),
+                    crossings.end());
+    for (std::size_t index = 1; index < crossings.size(); ++index) {
+        const double t = (crossings[index - 1] + crossings[index]) * 0.5;
+        const QPointF midpoint = from * (1.0 - t) + to * t;
+        if (!volumePointOnSurface(midpoint, source)) return false;
+    }
+    return true;
 }
 
 bool SpiralBrushController::appendPolylinePoint(const QPointF& devicePos)
@@ -325,6 +358,9 @@ bool SpiralBrushController::appendPolylinePoint(const QPointF& devicePos)
     auto& line = _polylines[static_cast<std::size_t>(_activePolyline)];
     const auto sample = pointOnSurface(devicePos, line.source);
     if (!sample) return false;
+    if (!line.surfacePoints.empty()
+        && !surfaceSegmentValid(line.surfacePoints.back(), sample->first, line.source))
+        return false;
     if (!line.volumePoints.empty()) {
         const cv::Vec3f delta = sample->second - line.volumePoints.back();
         if (delta.dot(delta) < 1e-4f) return true;
@@ -418,7 +454,10 @@ bool SpiralBrushController::rebuildAnchoredPolyline(PolylineGesture& line)
         [this, source = line.source](const QPointF& surface) {
             return volumePointOnSurface(surface, source);
         },
-        kAnchoredPolylineSpacingVoxels);
+        kAnchoredPolylineSpacingVoxels,
+        [this, source = line.source](const QPointF& from, const QPointF& to) {
+            return surfaceSegmentValid(from, to, source);
+        });
     if (result.error != vc3d::spiral::PointChainBuildError::None) return false;
     line.surfacePoints.clear();
     line.volumePoints.clear();
@@ -467,7 +506,10 @@ void SpiralBrushController::appendAnchoredPoint(const QPointF& devicePos)
         [this, source = line.source](const QPointF& surface) {
             return volumePointOnSurface(surface, source);
         },
-        kAnchoredPolylineSpacingVoxels);
+        kAnchoredPolylineSpacingVoxels,
+        [this, source = line.source](const QPointF& from, const QPointF& to) {
+            return surfaceSegmentValid(from, to, source);
+        });
     if (result.error != vc3d::spiral::PointChainBuildError::None) {
         line.anchors.pop_back();
         const QString reason =
@@ -634,15 +676,26 @@ void SpiralBrushController::eraseWith(const QPainterPath& deviceShape)
             std::vector<cv::Vec3f> anchorVolumes;
             anchorVolumes.reserve(line->anchors.size());
             for (const auto& anchor : line->anchors) anchorVolumes.push_back(anchor.volume);
-            const FilteredPoints projected = projectPointChainForHitTest(
-                _viewer, anchorVolumes, kPolylineProjectionToleranceVoxels);
             std::vector<bool> touched(line->anchors.size(), false);
-            for (std::size_t index = 0; index < projected.scenePoints.size(); ++index) {
-                const std::size_t sourceIndex = projected.sourceIndices[index];
-                const QPointF devicePoint =
-                    view->viewportTransform().map(projected.scenePoints[index]);
-                if (sourceIndex < touched.size() && deviceShape.contains(devicePoint))
-                    touched[sourceIndex] = true;
+            if (line->source.get() == current) {
+                for (std::size_t index = 0; index < line->anchors.size(); ++index) {
+                    const QPointF scenePoint = _viewer->surfaceCoordsToScene(
+                        static_cast<float>(line->anchors[index].surface.x()),
+                        static_cast<float>(line->anchors[index].surface.y()));
+                    const QPointF devicePoint =
+                        view->viewportTransform().map(scenePoint);
+                    if (deviceShape.contains(devicePoint)) touched[index] = true;
+                }
+            } else {
+                const FilteredPoints projected = projectPointChainForHitTest(
+                    _viewer, anchorVolumes, kPolylineProjectionToleranceVoxels);
+                for (std::size_t index = 0; index < projected.scenePoints.size(); ++index) {
+                    const std::size_t sourceIndex = projected.sourceIndices[index];
+                    const QPointF devicePoint =
+                        view->viewportTransform().map(projected.scenePoints[index]);
+                    if (sourceIndex < touched.size() && deviceShape.contains(devicePoint))
+                        touched[sourceIndex] = true;
+                }
             }
             const auto decision = vc3d::spiral::classifyAnchorErase(touched);
             if (line->kind == PolylineGesture::Kind::PointCollection) {
@@ -739,11 +792,11 @@ void SpiralBrushController::updateCursorWidget()
 void SpiralBrushController::sampleColor(const QPointF& scenePos)
 {
     Surface* current = _viewer ? _viewer->currentSurface() : nullptr;
-    const cv::Vec2f surface = _viewer ? _viewer->sceneToSurfaceCoords(scenePos) : cv::Vec2f{};
-    const QPointF surfacePos(surface[0], surface[1]);
+    const auto surfacePos = scenePointToSurface(scenePos);
+    if (!surfacePos) return;
     for (auto it = _gestures.rbegin(); it != _gestures.rend(); ++it) {
         if (it->state == GestureState::Painted && it->source.get() == current
-            && it->shape.contains(surfacePos)) {
+            && it->shape.contains(*surfacePos)) {
             _sampledColor = it->color;
             return;
         }
@@ -975,7 +1028,35 @@ void SpiralBrushController::collectPrimitives(VolumeViewerBase* viewer, OverlayB
         style.distanceTolerance = kPolylineProjectionToleranceVoxels;
         if (line.kind == PolylineGesture::Kind::PointCollection)
             style.drawLines = false;
-        renderPointChain(viewer, builder, line.volumePoints, style);
+        const bool sameSurface = line.source.get() == current
+            && line.surfacePoints.size() == line.volumePoints.size();
+        if (sameSurface) {
+            std::vector<cv::Vec2f> surfacePoints;
+            surfacePoints.reserve(line.surfacePoints.size());
+            for (const QPointF& point : line.surfacePoints) {
+                surfacePoints.emplace_back(
+                    static_cast<float>(point.x()), static_cast<float>(point.y()));
+            }
+            if (style.drawLines && surfacePoints.size() >= 2) {
+                OverlayStyle lineStyle;
+                lineStyle.penColor = style.color;
+                lineStyle.penColor.setAlphaF(style.lineOpacity);
+                lineStyle.penWidth = style.lineWidth;
+                lineStyle.z = style.lineZ;
+                builder.addSurfaceLineStrip(surfacePoints, false, lineStyle);
+            }
+            if (style.drawPoints) {
+                OverlayStyle pointStyle;
+                pointStyle.penColor = style.pointBorderColor;
+                pointStyle.penWidth = style.pointPenWidth;
+                pointStyle.brushColor = style.color;
+                pointStyle.z = style.pointZ;
+                for (const cv::Vec2f& point : surfacePoints)
+                    builder.addSurfacePoint(point, style.pointRadius, pointStyle);
+            }
+        } else {
+            renderPointChain(viewer, builder, line.volumePoints, style);
+        }
         if (line.kind == PolylineGesture::Kind::Anchored && !line.anchors.empty()) {
             std::vector<cv::Vec3f> anchorPoints;
             anchorPoints.reserve(line.anchors.size());
@@ -986,7 +1067,21 @@ void SpiralBrushController::collectPrimitives(VolumeViewerBase* viewer, OverlayB
             anchorStyle.pointPenWidth = 1.5;
             anchorStyle.pointZ = 121.0;
             anchorStyle.drawLines = false;
-            renderPointChain(viewer, builder, anchorPoints, anchorStyle);
+            if (line.source.get() == current) {
+                OverlayStyle pointStyle;
+                pointStyle.penColor = anchorStyle.pointBorderColor;
+                pointStyle.penWidth = anchorStyle.pointPenWidth;
+                pointStyle.brushColor = anchorStyle.color;
+                pointStyle.z = anchorStyle.pointZ;
+                for (const auto& anchor : line.anchors) {
+                    builder.addSurfacePoint(
+                        cv::Vec2f(static_cast<float>(anchor.surface.x()),
+                                  static_cast<float>(anchor.surface.y())),
+                        anchorStyle.pointRadius, pointStyle);
+                }
+            } else {
+                renderPointChain(viewer, builder, anchorPoints, anchorStyle);
+            }
         }
     }
 }

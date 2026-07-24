@@ -89,6 +89,22 @@ TEST_CASE("Spiral point chain rejects a self-intersecting candidate")
     CHECK(result.samples.empty());
 }
 
+TEST_CASE("Spiral point chain rejects a curve segment that crosses invalid support")
+{
+    int validations = 0;
+    const auto result = vc3d::spiral::buildPointChain(
+        {anchor(0.0f, 0.0f), anchor(60.0f, 0.0f)},
+        planarSample,
+        30.0f,
+        [&validations](const QPointF& from, const QPointF& to) {
+            ++validations;
+            return !(from.x() < 31.0 && to.x() > 29.0);
+        });
+    CHECK(validations > 0);
+    CHECK(result.error == vc3d::spiral::PointChainBuildError::InvalidSurface);
+    CHECK(result.samples.empty());
+}
+
 TEST_CASE("Spiral anchor eraser trims only contiguous ends")
 {
     using vc3d::spiral::AnchorEraseAction;

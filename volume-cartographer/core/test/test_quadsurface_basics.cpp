@@ -143,6 +143,50 @@ TEST_CASE("isPointValid / isQuadValid honor -1 sentinels")
     CHECK(qs.isQuadValid(2, 2));
 }
 
+TEST_CASE("surface/grid conversion and sampling use one exact affine convention")
+{
+    cv::Mat_<cv::Vec3f> points(3, 4);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            points(row, col) = cv::Vec3f(
+                100.0f + 2.0f * col + 3.0f * row,
+                200.0f - 4.0f * col + 5.0f * row,
+                300.0f + 7.0f * col - 2.0f * row);
+        }
+    }
+    QuadSurface surface(points, cv::Vec2f(2.0f, 4.0f));
+    const cv::Vec2d grid(1.25, 0.5);
+    const cv::Vec2d flat = surface.gridToSurface(grid);
+    const cv::Vec2d roundTrip = surface.surfaceToGrid(flat);
+    CHECK(roundTrip[0] == doctest::Approx(grid[0]).epsilon(1e-12));
+    CHECK(roundTrip[1] == doctest::Approx(grid[1]).epsilon(1e-12));
+
+    const auto sample = surface.sampleAtSurface(flat);
+    REQUIRE(sample);
+    CHECK(sample.grid[0] == doctest::Approx(1.25));
+    CHECK(sample.grid[1] == doctest::Approx(0.5));
+    CHECK(sample.volume[0] == doctest::Approx(104.0f));
+    CHECK(sample.volume[1] == doctest::Approx(197.5f));
+    CHECK(sample.volume[2] == doctest::Approx(307.75f));
+
+    // The outermost grid edge belongs to the final quad and is clickable.
+    const auto edge = surface.sampleAtSurface(
+        surface.gridToSurface({3.0, 2.0}));
+    REQUIRE(edge);
+    CHECK(edge.volume == points(2, 3));
+}
+
+TEST_CASE("surface sampling rejects any location owned by an invalid quad")
+{
+    auto points = makePlanarGrid(3, 3);
+    points(1, 1) = cv::Vec3f(-1.0f, -1.0f, -1.0f);
+    QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
+    const auto sample = surface.sampleAtSurface(
+        surface.gridToSurface({0.25, 0.25}));
+    CHECK_FALSE(sample);
+    CHECK(sample.status == QuadSurface::SurfaceSample::Status::InvalidQuad);
+}
+
 TEST_CASE("countValidPoints / countValidQuads on dense grid")
 {
     auto pts = makePlanarGrid(3, 3);

@@ -37,6 +37,8 @@ struct PointChainBuildResult {
 
 using SurfacePointSampler =
     std::function<std::optional<cv::Vec3f>(const QPointF&)>;
+using SurfaceSegmentValidator =
+    std::function<bool(const QPointF&, const QPointF&)>;
 
 // Interpolate the anchors in their existing order. Each anchor is retained
 // exactly, and derived samples are placed at spacing, 2*spacing, ... strictly
@@ -44,7 +46,8 @@ using SurfacePointSampler =
 PointChainBuildResult buildPointChain(
     const std::vector<PointChainAnchor>& anchors,
     const SurfacePointSampler& sampleSurface,
-    float spacing = 30.0f);
+    float spacing = 30.0f,
+    const SurfaceSegmentValidator& validateSegment = {});
 
 // Return true when candidate is at least minimumSpacing voxels from every
 // existing volume point. A point exactly on the boundary is accepted.

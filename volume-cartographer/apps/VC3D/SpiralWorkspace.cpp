@@ -1312,6 +1312,7 @@ void SpiralWorkspace::handleLasagnaResults(
     watcher->setFuture(QtConcurrent::run([resultPath]() {
         try {
             auto loaded = load_quad_from_tifxyz(resultPath.toStdString());
+            loaded->setStrictQuadRenderValidity(true);
             return std::shared_ptr<QuadSurface>(std::move(loaded));
         } catch (...) {
             return std::shared_ptr<QuadSurface>{};
@@ -1386,6 +1387,7 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             // compact display surface.
             auto surface = std::make_shared<QuadSurface>(surfacePath.toStdString());
             surface->id = surfaceId.toStdString();
+            surface->setStrictQuadRenderValidity(true);
             const cv::Size gridSize = surface->gridSize();
             std::vector<PreviewLoadResult::LossMap> lossMaps;
             const QString artifactRoot = QFileInfo(manifestPath).absolutePath();
@@ -1866,6 +1868,7 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
                     load_quad_from_tifxyz_region(source->path, region);
                 loaded->id = selection.registrationId.toStdString();
                 loaded->setComponents(selection.surfaceComponents);
+                loaded->setStrictQuadRenderValidity(true);
                 return std::shared_ptr<QuadSurface>(std::move(loaded));
             } catch (const std::exception&) {
                 return std::shared_ptr<QuadSurface>{};

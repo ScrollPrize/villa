@@ -66,6 +66,7 @@ struct SpanCurve {
     QPointF p2;
     QPointF p3;
     const SurfacePointSampler* sampler = nullptr;
+    const SurfaceSegmentValidator* segmentValidator = nullptr;
 
     QPointF surfaceAt(qreal parameter) const
     {
@@ -87,6 +88,9 @@ bool appendAdaptiveNodes(
     int depth,
     std::vector<CurveNode>& output)
 {
+    if (curve.segmentValidator && *curve.segmentValidator
+        && !(*curve.segmentValidator)(left.surface, right.surface))
+        return false;
     const qreal middleParameter = (left.parameter + right.parameter) * 0.5;
     const QPointF middleSurface = curve.surfaceAt(middleParameter);
     const auto middleVolume = (*curve.sampler)(middleSurface);
@@ -160,7 +164,8 @@ bool selfIntersects(const std::vector<QPointF>& points)
 PointChainBuildResult buildPointChain(
     const std::vector<PointChainAnchor>& anchors,
     const SurfacePointSampler& sampleSurface,
-    float spacing)
+    float spacing,
+    const SurfaceSegmentValidator& validateSegment)
 {
     PointChainBuildResult result;
     if (anchors.empty()) return result;
@@ -189,7 +194,8 @@ PointChainBuildResult buildPointChain(
         const QPointF p3 = span + 2 < anchors.size()
             ? anchors[span + 2].surface
             : end.surface * 2.0 - start.surface;
-        const SpanCurve curve{p0, start.surface, end.surface, p3, &sampleSurface};
+        const SpanCurve curve{
+            p0, start.surface, end.surface, p3, &sampleSurface, &validateSegment};
         std::vector<CurveNode> nodes;
         nodes.push_back({0.0, start.surface, start.volume});
         const CurveNode last{1.0, end.surface, end.volume};

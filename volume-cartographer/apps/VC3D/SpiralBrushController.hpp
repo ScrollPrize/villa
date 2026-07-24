@@ -96,6 +96,8 @@ private:
     QPainterPath deviceDisk(const QPointF& center) const;
     QPainterPath deviceSweep(const QPointF& from, const QPointF& to) const;
     QPainterPath deviceToSurface(const QPainterPath& path) const;
+    std::optional<QPointF> devicePointToSurface(const QPointF& point) const;
+    std::optional<QPointF> scenePointToSurface(const QPointF& point) const;
     QPainterPath surfaceToScene(const QPainterPath& path) const;
     void beginPaint(const QPointF& devicePos);
     void beginPolyline(const QPointF& devicePos);
@@ -116,6 +118,9 @@ private:
         const QPointF& devicePos, const std::shared_ptr<QuadSurface>& source) const;
     std::optional<cv::Vec3f> volumePointOnSurface(
         const QPointF& surfacePos, const std::shared_ptr<QuadSurface>& source) const;
+    bool surfaceSegmentValid(
+        const QPointF& from, const QPointF& to,
+        const std::shared_ptr<QuadSurface>& source) const;
     void resamplePolyline(PolylineGesture& gesture);
     PreparedPatch makePatch(Gesture& gesture) const;
 
