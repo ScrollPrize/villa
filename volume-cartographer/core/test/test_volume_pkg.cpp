@@ -257,6 +257,25 @@ TEST_CASE("VolumePkg: addSegmentsEntry sets outputSegments on first add")
     CHECK_FALSE(p->addSegmentsEntry(""));
 }
 
+TEST_CASE("VolumePkg: segment entries match normalized local paths")
+{
+    auto d = tmpDir("segment_entry_identity");
+    fs::create_directories(d / "segments");
+
+    auto p = VolumePkg::newEmpty();
+    p->save(d / "project.volpkg.json");
+    REQUIRE(p->addSegmentsEntry("segments", {"source:test"}));
+
+    const auto matching = p->matchingSegmentsEntry((d / "segments").string() + "/");
+    REQUIRE(matching);
+    CHECK(matching->location == "segments");
+    CHECK(matching->tags == std::vector<std::string>{"source:test"});
+    CHECK_FALSE(p->addSegmentsEntry((d / "segments").string()));
+    CHECK(p->segmentEntries().size() == 1);
+
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg: segment discovery skips transient cache directories")
 {
     auto d = tmpDir("seg_transients");

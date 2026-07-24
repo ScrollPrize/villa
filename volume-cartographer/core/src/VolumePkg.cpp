@@ -625,6 +625,16 @@ VolumePkg::matchingVolumeEntry(const std::string& location) const
         : std::optional<vc::project::Entry>(*entry);
 }
 
+std::optional<vc::project::Entry>
+VolumePkg::matchingSegmentsEntry(const std::string& location) const
+{
+    const auto* entry =
+        findSegmentsEntryByLocation(segments_, location, path_.parent_path());
+    return entry
+        ? std::optional<vc::project::Entry>(*entry)
+        : std::nullopt;
+}
+
 bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::string> tags)
 {
     if (location.empty()) return false;
@@ -889,7 +899,7 @@ bool VolumePkg::mergeVolumeEntryTags(const std::string& location, const std::vec
 bool VolumePkg::addSegmentsEntry(const std::string& location, std::vector<std::string> tags)
 {
     if (location.empty()) return false;
-    for (const auto& e : segments_) if (e.location == location) return false;
+    if (matchingSegmentsEntry(location)) return false;
     segments_.push_back({location, std::move(tags)});
     if (!outputSegments_) {
         outputSegments_ = location;

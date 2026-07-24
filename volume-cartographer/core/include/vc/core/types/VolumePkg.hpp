@@ -85,6 +85,8 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& lasagnaDatasetEntries() const;
     [[nodiscard]] std::optional<vc::project::Entry>
     matchingVolumeEntry(const std::string& location) const;
+    [[nodiscard]] std::optional<vc::project::Entry>
+    matchingSegmentsEntry(const std::string& location) const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
     // Persist an already-loaded volume and its tags as one project mutation.
