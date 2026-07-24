@@ -68,6 +68,10 @@ public:
         std::unique_ptr<QTemporaryFile> paramsFile;
     };
 
+    struct AlphaCompJob {
+        std::unique_ptr<QTemporaryFile> paramsFile;
+    };
+
     struct GrowPatchSeedJob {
         QString outputDir;
         QString paramsPath;
@@ -321,11 +325,10 @@ public:
     /// Dialog-free core of onCropSurfaceToValidRegion (the interactive slot wraps
     /// this). Crops the surface grid to its tightest valid bounds, writes it in
     /// place, and refreshes metrics; failures via `errorMessage` (never a dialog)
-    /// so the bridge returns a real error, not a false success. Returns true on
-    /// success, including the already-tightest no-op. Failure sentences: "No volume
-    /// package or volume loaded", "Invalid segment or segment not loaded", "Missing
-    /// coordinate grid", "does not contain any valid vertices", channel-size
-    /// mismatch, and save failures.
+    /// distinguish failure from the already-tightest no-op. Failure sentences:
+    /// "No volume package or volume loaded", "Invalid segment or segment not
+    /// loaded", "Missing coordinate grid", "does not contain any valid vertices",
+    /// channel-size mismatch, and save failures.
     bool cropSurfaceToValidRegion(const std::string& segmentId,
                                   QString* errorMessage = nullptr);
 
@@ -411,8 +414,7 @@ private:
 
     /**
      * The default alpha-comp refinement output path (<src>_refined, preserving
-     * any file suffix), shared by the interactive dialog default and the
-     * headless empty-outputDir default.
+     * any file suffix), shared by the dialog and direct-launch defaults.
      */
     static QString defaultRefinedOutputPath(const QFileInfo& srcInfo);
 
@@ -424,6 +426,7 @@ private:
 
     std::optional<NeighborCopyJob> _neighborCopyJob;
     std::optional<ResumeLocalJob> _resumeLocalJob;
+    std::optional<AlphaCompJob> _alphaCompJob;
     std::optional<GrowPatchSeedJob> _growPatchSeedJob;
 
     // Callbacks for CWindow-specific operations

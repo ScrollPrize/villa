@@ -12,6 +12,7 @@
 #include <QApplication>
 
 #include <cmath>
+#include <utility>
 
 
 namespace {
@@ -171,9 +172,9 @@ void CommandLineToolRunner::setIncludeTifs(bool include)
     _includeTifs = include;
 }
 
-void CommandLineToolRunner::setOmpThreads(int threads)
+void CommandLineToolRunner::setNextOmpThreads(int threads)
 {
-    _ompThreads = threads;
+    _nextOmpThreads = threads;
 }
 
 void CommandLineToolRunner::setFlattenOptions(bool flatten, int iterations, int downsample)
@@ -213,6 +214,7 @@ void CommandLineToolRunner::setRenderAdvanced(
 
 bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
 {
+    const int ompThreads = std::exchange(_nextOmpThreads, -1);
     const bool isCustom = (tool == Tool::CustomCommand);
     const auto warn = [&](const QString& title, const QString& message) {
         if (options.presentation == Presentation::Interactive) {
@@ -377,10 +379,10 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     // Apply per-run environment variables (e.g., OMP_NUM_THREADS)
     {
         QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        if (_ompThreads > 0) {
-            env.insert("OMP_NUM_THREADS", QString::number(_ompThreads));
+        if (ompThreads > 0) {
+            env.insert("OMP_NUM_THREADS", QString::number(ompThreads));
             if (_logStream) {
-                *_logStream << "ENV: OMP_NUM_THREADS=" << _ompThreads << Qt::endl;
+                *_logStream << "ENV: OMP_NUM_THREADS=" << ompThreads << Qt::endl;
                 _logStream->flush();
             }
         }
@@ -410,7 +412,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
 
     QStringList args = isCustom ? _customArgs : buildArguments(tool);
     QString toolCommand = toolCmd;
-    QString formattedCommand = formatCommand(toolCommand, args, _ompThreads);
+    QString formattedCommand = formatCommand(toolCommand, args, ompThreads);
 
     QString startMessage;
     const QString toolLabel = isCustom

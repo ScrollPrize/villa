@@ -1465,7 +1465,7 @@ private:
     double  keepPercent_ = 100.0;
     bool    inpaintHoles_ = false;
     double  voxelSize_ = 0.0;
-    bool    suppressDialogs_ = false;   // headless (bridge): capture, never show
+    bool    suppressDialogs_ = false;   // capture failures without presenting UI
     bool    finishedEmitted_ = false;   // guards single flattenJobFinished emit
 
     // process & progress
@@ -2060,7 +2060,7 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
         renderVolume &&
             (renderVolume->baseScaleLevel() > 0 ||
              renderVolume->hasExplicitVoxelSizeOverride()));
-    _cmdRunner->setOmpThreads(dlg.ompThreads());
+    _cmdRunner->setNextOmpThreads(dlg.ompThreads());
     _cmdRunner->setVolumePath(dlg.volumePath());
     const bool useRemoteVolume = dlg.volumePath() == volumePath && !remoteVolumeUrl.isEmpty();
     _cmdRunner->setRemoteVolumeUrl(useRemoteVolume ? remoteVolumeUrl : QString());
@@ -2381,13 +2381,12 @@ bool SegmentationCommandHandler::startRunTraceImpl(
         QString::fromStdString(tgtDir.string()),
         mergedJsonPath,
         srcSegment);
-    _cmdRunner->setOmpThreads(params.ompThreads);
+    _cmdRunner->setNextOmpThreads(params.ompThreads);
     const auto options = interactive
         ? CommandLineToolRunner::ExecutionOptions{}
         : CommandLineToolRunner::ExecutionOptions::silent();
     if (!_cmdRunner->execute(
             CommandLineToolRunner::Tool::GrowSegFromSegment, options)) {
-        _cmdRunner->setOmpThreads(-1);
         setErr(tr("Failed to start Run Trace."));
         return false;
     }
@@ -2503,8 +2502,6 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
     _cmdRunner->setRenderAdvanced(0, 0, 0, 0, QString(), false, 1.0f, 0.0, -1);
     _cmdRunner->setIncludeTifs(false);
     _cmdRunner->setFlattenOptions(false, 10, 1);
-    _cmdRunner->setOmpThreads(-1);
-
     if (!_cmdRunner->execute(
             CommandLineToolRunner::Tool::RenderTifXYZ,
             CommandLineToolRunner::ExecutionOptions::silent())) {
@@ -2866,7 +2863,6 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
                                -1)) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to launch neighbor copy pass."));
         _neighborCopyJob.reset();
-        _cmdRunner->setOmpThreads(-1);
         return;
     }
 
@@ -3084,9 +3080,8 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
     if (_cmdRunner->isRunning()) {
         return fail(tr("A command line tool is already running."), CommandLaunchError::Busy);
     }
-    // Preflight the tool binary the same way startRenderSegment does: execute()
-    // would otherwise pop a blocking QMessageBox on a missing binary, hanging an
-    // unattended bridge run. Tool::NeighborCopy launches vc_grow_seg_from_seed.
+    // Return a typed launch error before the runner reaches its interactive
+    // missing-tool warning. Tool::NeighborCopy launches vc_grow_seg_from_seed.
     const QString toolPath =
         QCoreApplication::applicationDirPath() + QStringLiteral("/vc_grow_seg_from_seed");
     if (const QFileInfo toolInfo(toolPath); !toolInfo.exists() || !toolInfo.isExecutable()) {
@@ -3157,7 +3152,7 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
                                       outputDirPath,
                                       QStringLiteral("local"));
     configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
-    _cmdRunner->setOmpThreads(params.ompThreads);
+    _cmdRunner->setNextOmpThreads(params.ompThreads);
     const auto options = interactive
         ? CommandLineToolRunner::ExecutionOptions{}
         : CommandLineToolRunner::ExecutionOptions::silent();
@@ -3167,7 +3162,6 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
         // Nothing was launched, so toolFinished (which clears resumeLocalJob()
         // in the CWindow slot) will never fire: undo our own bookkeeping here.
         _resumeLocalJob.reset();
-        _cmdRunner->setOmpThreads(-1);
         return fail(tr("Failed to start resume-opt local GrowPatch."));
     }
 
@@ -3190,7 +3184,7 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
     bool interactive,
     CommandLaunchError* error)
 {
-    // Never opens a dialog; typed failures let the bridge preserve error codes.
+    // Never opens a dialog; callers receive typed launch failures.
     auto fail = [&](const QString& message,
                     CommandLaunchError::Kind kind = CommandLaunchError::Other) -> bool {
         if (error) *error = {kind, message};
@@ -3376,11 +3370,11 @@ bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
         disconnect(*connection);
         _growPatchSeedJob.reset();
 
-        const bool bridgeDriven =
+        const bool silentExecution =
             _cmdRunner && _cmdRunner->currentExecutionIsSilent();
 
         if (!success) {
-            if (!bridgeDriven) {
+            if (!silentExecution) {
                 QMessageBox::critical(_parentWidget,
                                       tr("Error"),
                                       tr("vc_grow_seg_from_seed failed.\n%1").arg(message));
@@ -3578,7 +3572,7 @@ void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)
     }
 
     _cmdRunner->setToObjParams(dlg.tifxyzPath(), dlg.objPath());
-    _cmdRunner->setOmpThreads(dlg.ompThreads());
+    _cmdRunner->setNextOmpThreads(dlg.ompThreads());
     _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
     _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj);
     emit statusMessage(tr("Converting segment to OBJ: %1").arg(QString::fromStdString(segmentId)), 5000);
@@ -3918,9 +3912,8 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
         return fail(tr("Alpha-comp refinement accepts only local volumes."),
                     CommandLaunchError::RemoteVolume);
     }
-    // Preflight the tool binary (as startRenderSegment does): a missing binary
-    // would otherwise trip execute()'s blocking QMessageBox, hanging a headless
-    // bridge run. Tool::AlphaCompRefine launches vc_objrefine.
+    // Return a typed launch error before the runner reaches its interactive
+    // missing-tool warning. Tool::AlphaCompRefine launches vc_objrefine.
     const QString toolPath =
         QCoreApplication::applicationDirPath() + QStringLiteral("/vc_objrefine");
     if (const QFileInfo toolInfo(toolPath); !toolInfo.exists() || !toolInfo.isExecutable()) {
@@ -3964,19 +3957,31 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
         QJsonDocument(alphaCompRefineParamsJson(params)).toJson(QJsonDocument::Indented));
     paramsFile->flush();
     const QString paramsPath = paramsFile->fileName();
-    // The runner reads the file after this scope.
-    paramsFile->setAutoRemove(false);
     paramsFile->close();
 
+    _alphaCompJob = AlphaCompJob{std::move(paramsFile)};
+    auto completion = std::make_shared<QMetaObject::Connection>();
+    *completion = connect(
+        _cmdRunner, &CommandLineToolRunner::toolFinished, this,
+        [this, completion](CommandLineToolRunner::Tool tool, bool, const QString&,
+                           const QString&, bool) {
+            if (tool != CommandLineToolRunner::Tool::AlphaCompRefine) {
+                return;
+            }
+            disconnect(*completion);
+            _alphaCompJob.reset();
+        });
+
     _cmdRunner->setObjRefineParams(volumePath, srcPath, dstPath, paramsPath);
-    _cmdRunner->setOmpThreads(params.ompThreads);
+    _cmdRunner->setNextOmpThreads(params.ompThreads);
     const auto options = interactive
         ? CommandLineToolRunner::ExecutionOptions{}
         : CommandLineToolRunner::ExecutionOptions::silent();
     const bool started =
         _cmdRunner->execute(CommandLineToolRunner::Tool::AlphaCompRefine, options);
     if (!started) {
-        _cmdRunner->setOmpThreads(-1);
+        disconnect(*completion);
+        _alphaCompJob.reset();
         return fail(tr("Failed to start alpha-comp refinement."));
     }
 
@@ -3994,7 +3999,6 @@ void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)
 
     auto& job = *_neighborCopyJob;
     if (!success) {
-        _cmdRunner->setOmpThreads(-1);
         _neighborCopyJob.reset();
         return;
     }
@@ -4005,7 +4009,6 @@ void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)
             QMessageBox::warning(_parentWidget, tr("Error"),
                                  tr("Could not locate the newly generated neighbor surface in %1.")
                                      .arg(job.outputDir));
-            _cmdRunner->setOmpThreads(-1);
             _neighborCopyJob.reset();
             return;
         }
@@ -4026,8 +4029,6 @@ void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)
     const bool copyOut = job.copyOut;
     const QString surfaceName = QFileInfo(job.generatedSurfacePath).fileName();
     _neighborCopyJob.reset();
-    _cmdRunner->setOmpThreads(-1);
-
     if (_surfacePanel) {
         _surfacePanel->reloadSurfacesFromDisk();
     }
@@ -4085,7 +4086,7 @@ bool SegmentationCommandHandler::startNeighborCopyPass(const QString& paramsPath
         resumeSurface,
         job.outputDir,
         resumeOpt);
-    _cmdRunner->setOmpThreads(ompThreads);
+    _cmdRunner->setNextOmpThreads(ompThreads);
     _cmdRunner->showConsoleOutput();
     return _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
 }
@@ -4108,7 +4109,6 @@ void SegmentationCommandHandler::launchNeighborCopySecondPass()
                                    resumeSurface,
                                    QStringLiteral("local"),
                                    std::max(1, _neighborCopyJob->pass2OmpThreads))) {
-            _cmdRunner->setOmpThreads(-1);
             QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to launch the second neighbor copy pass."));
             _neighborCopyJob.reset();
             return;
@@ -4480,7 +4480,7 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
                                dlg.ransacSeed(),
                                dlg.anchorCap(),
                                dlg.stripCols());
-    if (dlg.ompThreads() > 0) _cmdRunner->setOmpThreads(dlg.ompThreads());
+    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
     const QJsonObject outputCoordinateIdentity = coordinateIdentityObject(
         vc3d::opendata::coordinateIdentityForVolume(
             *vpkg, _state->currentVolumeId()));
@@ -4578,7 +4578,7 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
                                     dlg.ransacMadK(),
                                     dlg.ransacSeed(),
                                     dlg.anchorCap());
-    if (dlg.ompThreads() > 0) _cmdRunner->setOmpThreads(dlg.ompThreads());
+    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
 
     // One-shot handler: on success, force-refresh the parent (and any
     // other modified) surface from disk. The mask.tif mtime drives the

@@ -1054,12 +1054,11 @@ bool CWindow::initializeCommandLineRunner()
                                            _segmentationCommandHandler->neighborCopyJob()->stage ==
                                                SegmentationCommandHandler::NeighborCopyJob::Stage::FirstPass;
 
-                    // Unattended runs suppress the modal so later
-                    // toolFinished observers always receive completion.
-                    const bool bridgeDriven =
+                    const bool silentExecution =
                         _cmdRunner && _cmdRunner->currentExecutionIsSilent();
 
-                    const bool suppressDialogs = bridgeDriven || neighborFirstPassSuppress;
+                    const bool suppressDialogs =
+                        silentExecution || neighborFirstPassSuppress;
 
                     if (!suppressDialogs) {
                         if (success) {
@@ -1082,7 +1081,6 @@ bool CWindow::initializeCommandLineRunner()
                         if (success && _surfacePanel) {
                             _surfacePanel->reloadSurfacesFromDisk();
                         }
-                        _cmdRunner->setOmpThreads(-1);
                         _segmentationCommandHandler->resumeLocalJob().reset();
                     }
                 });

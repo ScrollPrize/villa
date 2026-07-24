@@ -145,7 +145,8 @@ public:
     void showConsoleOutput();
     void hideConsoleOutput();
     void setIncludeTifs(bool include);
-    void setOmpThreads(int threads);
+    // Applies to the next execute() attempt only.
+    void setNextOmpThreads(int threads);
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
     void setPreserveConsoleOutput(bool preserve);
 
@@ -237,7 +238,7 @@ private:
     QFile* _logFile;
     QTextStream* _logStream;
 
-    int _ompThreads{-1};
+    int _nextOmpThreads{-1};
     bool _explicitVolumePath{false};
     ExecutionOptions _executionOptions;
     ExecutionOptions _completionOptions;
