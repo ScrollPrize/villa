@@ -46,11 +46,14 @@ struct GeneratedOverlay {
         struct BranchLink {
             uint64_t fiberId = 0;
             int controlPointIndex = -1;
+            bool pending = false;
         };
 
         size_t controlIndex = std::numeric_limits<size_t>::max();
         bool isSeed = false;
         bool hasBranches = false;
+        bool hasPendingLinks = false;
+        bool isLinkCandidate = false;
         std::vector<uint64_t> branchIds;
         std::vector<BranchLink> branchLinks;
     };
@@ -96,6 +99,8 @@ struct GeneratedOverlay {
         double arclength = std::numeric_limits<double>::quiet_NaN();
         double distance = std::numeric_limits<double>::quiet_NaN();
         bool projectedBranchLink = false;
+        bool pendingBranchLink = false;
+        bool isLinkCandidateFiber = false;
         std::optional<cv::Vec3f> connectorStart;
     };
 
@@ -897,8 +902,23 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
             }
         }
     }
+
+    for (const auto& intersection : views.fiberIntersections) {
+        if (!finiteGeneratedPoint(intersection.point)) {
+            continue;
+        }
+        const float distance = pointDistance(intersection.point);
+        if (std::isfinite(distance) && std::abs(distance) <= *controlDistanceThreshold) {
+            overlay.fiberIntersections.push_back(intersection);
+        }
+    }
     return overlay;
 }
+
+struct GeneratedLinkCandidateMenuState {
+    bool enabled = false;
+    QString label;
+};
 
 struct GeneratedControlPointContextMenuOptions {
     QWidget* parent = nullptr;
@@ -907,15 +927,24 @@ struct GeneratedControlPointContextMenuOptions {
     QPointF scenePoint;
     QPoint globalPos;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
+    std::vector<GeneratedOverlay::FiberIntersectionMarker> fiberIntersections;
     size_t linePointCount = 0;
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
+    bool linkWithCandidateEnabled = false;
+    QString linkWithCandidateLabel;
     cv::Vec3f branchLinkDirection{std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN(),
                                   std::numeric_limits<float>::quiet_NaN()};
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
     std::function<void(size_t, cv::Vec3f, bool, cv::Vec3f)> addBranch;
     std::function<void(uint64_t, int)> openBranch;
+    std::function<void(size_t, uint64_t, int)> unlinkBranch;
+    // (controlIndex, linkedFiberId, linkedControlPointIndex, newPendingState)
+    std::function<void(size_t, uint64_t, int, bool)> setBranchLinkPending;
+    std::function<void(size_t, cv::Vec3f)> designateLinkCandidate;
+    std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
+    std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
 };
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
