@@ -166,6 +166,13 @@ vc_add_test(NAME test_fiber_widget
 
 qt6_wrap_cpp(lasagna_service_manager_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaServiceManager.hpp)
 qt6_wrap_cpp(lasagna_batch_window_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.hpp)
+vc_add_test(NAME test_lasagna_service_manager_factory
+    SOURCES test_lasagna_service_manager_factory.cpp
+            test_lasagna_service_manager_stub.cpp
+            ${lasagna_service_manager_moc}
+    LIBS Qt6::Core vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_lasagna_batch_window
     SOURCES test_lasagna_batch_window.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.cpp

@@ -173,6 +173,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
 
     _service = new SpiralServiceManager(this);
+    _transientLasagnaManager = LasagnaServiceManager::createTransient(this);
 
     _pythonOutputDialog = new QDialog(this, Qt::Window);
     _pythonOutputDialog->setObjectName(QStringLiteral("spiralPythonOutputDialog"));
@@ -376,32 +377,62 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
     connect(_panel, &SpiralPanel::flattenWithLasagnaRequested,
             this, &SpiralWorkspace::startLasagnaFlatten);
-    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::resultsPlaced,
-            this, &SpiralWorkspace::handleLasagnaResults);
-    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::jobsUpdated,
-            this, [this](const QJsonArray& jobs) {
-                if (!_lasagnaFlattenRunning) return;
-                for (const QJsonValue& value : jobs) {
-                    const QJsonObject job = value.toObject();
-                    if (job.value(QStringLiteral("output_name")).toString()
-                        != _pendingLasagnaOutputName) continue;
-                    _pendingLasagnaJobId =
-                        job.value(QStringLiteral("job_id")).toString();
-                    const QString state = job.value(QStringLiteral("state")).toString();
-                    if (state == QStringLiteral("error")
-                        || state == QStringLiteral("cancelled")) {
-                        failLasagnaFlatten(
-                            job.value(QStringLiteral("error")).toString(
-                                state == QStringLiteral("cancelled")
-                                    ? tr("Lasagna job was cancelled")
-                                    : tr("Lasagna job failed")),
-                            state == QStringLiteral("cancelled"));
+
+    auto connectLasagnaManager = [this](LasagnaServiceManager* manager) {
+        connect(manager, &LasagnaServiceManager::resultsPlaced,
+                this, [this, manager](const QString& outputDir,
+                                     const QStringList& segmentNames) {
+                    if (_activeLasagnaManager != manager) return;
+                    handleLasagnaResults(outputDir, segmentNames);
+                });
+        connect(manager, &LasagnaServiceManager::jobsUpdated,
+                this, [this, manager](const QJsonArray& jobs) {
+                    if (_activeLasagnaManager != manager || !_lasagnaFlattenRunning) return;
+                    for (const QJsonValue& value : jobs) {
+                        const QJsonObject job = value.toObject();
+                        if (job.value(QStringLiteral("output_name")).toString()
+                            != _pendingLasagnaOutputName) continue;
+                        _pendingLasagnaJobId =
+                            job.value(QStringLiteral("job_id")).toString();
+                        const QString state = job.value(QStringLiteral("state")).toString();
+                        if (state == QStringLiteral("error")
+                            || state == QStringLiteral("cancelled")) {
+                            failLasagnaFlatten(
+                                job.value(QStringLiteral("error")).toString(
+                                    state == QStringLiteral("cancelled")
+                                        ? tr("Lasagna job was cancelled")
+                                        : tr("Lasagna job failed")),
+                                state == QStringLiteral("cancelled"));
+                            return;
+                        }
+                        updateLasagnaFlattenProgress(job);
                         return;
                     }
-                    updateLasagnaFlattenProgress(job);
-                    return;
+                });
+    };
+    connectLasagnaManager(_transientLasagnaManager);
+    connectLasagnaManager(&LasagnaServiceManager::instance());
+    connect(_transientLasagnaManager, &LasagnaServiceManager::optimizationError,
+            this, [this](const QString& error) {
+                if (_activeLasagnaManager == _transientLasagnaManager)
+                    failLasagnaFlatten(error);
+            }, Qt::QueuedConnection);
+    connect(_transientLasagnaManager, &LasagnaServiceManager::serviceError,
+            this, [this](const QString& error) {
+                if (_activeLasagnaManager == _transientLasagnaManager)
+                    failLasagnaFlatten(error);
+            }, Qt::QueuedConnection);
+    connect(_transientLasagnaManager, &LasagnaServiceManager::serviceStopped,
+            this, [this]() {
+                if (_activeLasagnaManager == _transientLasagnaManager
+                    && _lasagnaFlattenRunning) {
+                    failLasagnaFlatten(
+                        _lasagnaFlattenCancelRequested
+                            ? tr("Lasagna job was cancelled")
+                            : tr("The Lasagna service stopped unexpectedly"),
+                        _lasagnaFlattenCancelRequested);
                 }
-            });
+            }, Qt::QueuedConnection);
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString&) {
@@ -964,6 +995,8 @@ void SpiralWorkspace::maybeCommitForPendingExit()
 SpiralWorkspace::~SpiralWorkspace()
 {
     _shuttingDown = true;
+    _activeLasagnaManager = nullptr;
+    if (_transientLasagnaManager) _transientLasagnaManager->stopService();
     if (_viewerManager) _viewerManager->beginShutdown();
     // Disconnecting never terminates a service VC3D did not launch; only an
     // owned local process is stopped.
@@ -1300,6 +1333,7 @@ void SpiralWorkspace::failLasagnaFlatten(const QString& error, bool cancelled)
     _lasagnaFlattenCancelRequested = false;
     _pendingLasagnaSource.reset();
     _pendingLasagnaJobId.clear();
+    releaseLasagnaFlattenService();
     _panel->setLasagnaFlattenRunning(false);
     closeLasagnaFlattenProgress();
     updateLasagnaFlattenAvailability();
@@ -1310,6 +1344,14 @@ void SpiralWorkspace::failLasagnaFlatten(const QString& error, bool cancelled)
             this, tr("Flatten with Lasagna"),
             tr("Lasagna flatten failed: %1").arg(error));
     }
+}
+
+void SpiralWorkspace::releaseLasagnaFlattenService()
+{
+    LasagnaServiceManager* manager = _activeLasagnaManager;
+    _activeLasagnaManager = nullptr;
+    if (manager && manager == _transientLasagnaManager)
+        manager->stopService();
 }
 
 void SpiralWorkspace::startLasagnaFlatten()
@@ -1355,18 +1397,21 @@ void SpiralWorkspace::startLasagnaFlatten()
         return;
     }
 
-    auto& lasagna = LasagnaServiceManager::instance();
+    auto& sharedLasagna = LasagnaServiceManager::instance();
+    LasagnaServiceManager* lasagna = nullptr;
     QString dataDirectory;
-    if (lasagna.isExternal()) {
-        if (!lasagna.isRunning()) {
+    if (sharedLasagna.isExternal()) {
+        if (!sharedLasagna.isRunning()) {
             QMessageBox::warning(
                 this, tr("Lasagna service"),
                 tr("The configured external Lasagna service is not connected."));
             return;
         }
+        lasagna = &sharedLasagna;
     } else {
         dataDirectory = resolveLasagnaDataDirectory();
         if (dataDirectory.isEmpty()) return;
+        lasagna = _transientLasagnaManager;
     }
 
     QJsonObject config = configDocument.object();
@@ -1407,6 +1452,7 @@ void SpiralWorkspace::startLasagnaFlatten()
     _pendingLasagnaOutputDir = QFileInfo(localOutput).absoluteFilePath();
     _pendingLasagnaOutputName = outputName;
     _pendingLasagnaJobId.clear();
+    _activeLasagnaManager = lasagna;
     _panel->setLasagnaFlattenRunning(true);
 
     closeLasagnaFlattenProgress();
@@ -1422,28 +1468,29 @@ void SpiralWorkspace::startLasagnaFlatten()
             this, [this]() {
                 if (!_lasagnaFlattenRunning) return;
                 _lasagnaFlattenCancelRequested = true;
-                auto& manager = LasagnaServiceManager::instance();
+                LasagnaServiceManager* manager = _activeLasagnaManager;
+                if (!manager) return;
                 if (!_pendingLasagnaJobId.isEmpty()) {
-                    manager.cancelJob(_pendingLasagnaJobId);
-                } else if (!manager.isExternal()) {
-                    manager.stopService();
+                    manager->cancelJob(_pendingLasagnaJobId);
+                } else if (!manager->isExternal()) {
+                    manager->stopService();
                 } else {
-                    manager.stopOptimization();
+                    manager->stopOptimization();
                 }
                 statusBar()->showMessage(
                     tr("Cancelling Lasagna flatten…"), 5000);
             });
     _lasagnaFlattenProgress->show();
 
-    if (!lasagna.isExternal()) {
+    if (!lasagna->isExternal()) {
         _lasagnaFlattenProgress->setLabelText(
             tr("Starting Lasagna service…"));
-        if (!lasagna.ensureServiceRunning({}, dataDirectory)) {
+        if (!lasagna->ensureServiceRunning({}, dataDirectory)) {
             const bool cancelled = _lasagnaFlattenCancelRequested;
             failLasagnaFlatten(
                 cancelled ? tr("Lasagna job was cancelled")
                           : tr("Cannot start Lasagna: %1")
-                                .arg(lasagna.lastError()),
+                                .arg(lasagna->lastError()),
                 cancelled);
             return;
         }
@@ -1457,7 +1504,7 @@ void SpiralWorkspace::startLasagnaFlatten()
             tr("Preparing Spiral surface for Lasagna…"));
     }
     statusBar()->showMessage(tr("Queued Lasagna flatten: %1").arg(outputName));
-    lasagna.startOptimization(request, localOutput);
+    lasagna->startOptimization(request, localOutput);
 }
 
 void SpiralWorkspace::handleLasagnaResults(
@@ -1479,6 +1526,9 @@ void SpiralWorkspace::handleLasagnaResults(
             tr("Loading flattened surface…"));
         _lasagnaFlattenProgress->setCancelButton(nullptr);
     }
+    // resultsPlaced means the archive is safely local; Python/Torch is no
+    // longer needed while the surface is parsed on the C++ worker.
+    releaseLasagnaFlattenService();
 
     auto* watcher = new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
     connect(watcher, &QFutureWatcher<std::shared_ptr<QuadSurface>>::finished,

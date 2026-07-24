@@ -32,6 +32,14 @@ class LasagnaServiceManager : public QObject
 
 public:
     static LasagnaServiceManager& instance();
+    /**
+     * Create an isolated manager for a short-lived, locally owned service.
+     *
+     * Unlike instance(), this manager is parent-owned and contains the local
+     * Python process tree so destroying or stopping it cannot leave workers
+     * behind. External services are still only disconnected, never killed.
+     */
+    static LasagnaServiceManager* createTransient(QObject* parent);
 
     /**
      * Ensure the service process is running (internal mode).
@@ -136,7 +144,8 @@ signals:
     void datasetsReceived(const QJsonArray& datasets);
 
 private:
-    explicit LasagnaServiceManager(QObject* parent = nullptr);
+    explicit LasagnaServiceManager(QObject* parent = nullptr,
+                                   bool containProcessTree = false);
     ~LasagnaServiceManager() override;
 
     LasagnaServiceManager(const LasagnaServiceManager&) = delete;
@@ -182,6 +191,10 @@ private:
     std::unique_ptr<QProcess> _process;
     QNetworkAccessManager* _nam{nullptr};
     QTimer* _pollTimer{nullptr};
+    bool _containProcessTree{false};
+#ifdef Q_OS_WIN
+    void* _processJob{nullptr};
+#endif
 
     struct ArtifactUploadJob
     {

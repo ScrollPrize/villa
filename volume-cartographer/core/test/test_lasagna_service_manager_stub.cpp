@@ -12,8 +12,14 @@ LasagnaServiceManager& LasagnaServiceManager::instance()
     return manager;
 }
 
-LasagnaServiceManager::LasagnaServiceManager(QObject* parent)
+LasagnaServiceManager* LasagnaServiceManager::createTransient(QObject* parent)
+{
+    return new LasagnaServiceManager(parent, true);
+}
+
+LasagnaServiceManager::LasagnaServiceManager(QObject* parent, bool containProcessTree)
     : QObject(parent)
+    , _containProcessTree(containProcessTree)
 {
 }
 
@@ -31,6 +37,8 @@ void LasagnaServiceManager::connectToExternal(const QString&, int)
 
 void LasagnaServiceManager::stopService()
 {
+    _serviceReady = false;
+    emit serviceStopped();
 }
 
 bool LasagnaServiceManager::isRunning() const

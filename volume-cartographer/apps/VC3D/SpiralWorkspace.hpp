@@ -25,6 +25,7 @@ class QDialog;
 class QKeyEvent;
 class QProgressDialog;
 class QuadSurface;
+class LasagnaServiceManager;
 class SpiralPanel;
 class SpiralServiceManager;
 class ViewerManager;
@@ -153,6 +154,7 @@ private:
     void startLasagnaFlatten();
     void updateLasagnaFlattenProgress(const QJsonObject& job);
     void failLasagnaFlatten(const QString& error, bool cancelled = false);
+    void releaseLasagnaFlattenService();
     void closeLasagnaFlattenProgress();
     void handleLasagnaResults(const QString& outputDir,
                               const QStringList& segmentNames);
@@ -208,6 +210,8 @@ private:
     bool _haveRunDiffBaseline = false;
     bool _runDiffVisible = false;
     bool _flattenedPreviewActive = false;
+    LasagnaServiceManager* _transientLasagnaManager = nullptr;
+    LasagnaServiceManager* _activeLasagnaManager = nullptr;
     bool _lasagnaFlattenRunning = false;
     bool _lasagnaFlattenCancelRequested = false;
     QString _pendingLasagnaOutputDir;

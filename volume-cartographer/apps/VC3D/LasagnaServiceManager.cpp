@@ -33,6 +33,14 @@
 
 #ifdef Q_OS_UNIX
 #include <signal.h>
+#include <unistd.h>
+#endif
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 // Avahi client library for mDNS service discovery
@@ -454,8 +462,15 @@ LasagnaServiceManager& LasagnaServiceManager::instance()
     return inst;
 }
 
-LasagnaServiceManager::LasagnaServiceManager(QObject* parent)
+LasagnaServiceManager* LasagnaServiceManager::createTransient(QObject* parent)
+{
+    return new LasagnaServiceManager(parent, true);
+}
+
+LasagnaServiceManager::LasagnaServiceManager(QObject* parent,
+                                             bool containProcessTree)
     : QObject(parent)
+    , _containProcessTree(containProcessTree)
 {
     _nam = new QNetworkAccessManager(this);
     _pollTimer = new QTimer(this);
@@ -622,6 +637,35 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
     _process = std::make_unique<QProcess>();
     _process->setProcessChannelMode(QProcess::SeparateChannels);
 
+#ifdef Q_OS_UNIX
+    if (_containProcessTree) {
+        // Give this service a private process group. Its Python workers inherit
+        // the group, allowing the transient Spiral workflow to reap the whole
+        // tree even if the HTTP service has to be killed.
+        _process->setChildProcessModifier([] {
+            ::setpgid(0, 0);
+        });
+    }
+#endif
+
+#ifdef Q_OS_WIN
+    if (_containProcessTree) {
+        auto* job = CreateJobObjectW(nullptr, nullptr);
+        if (job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+            limits.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (SetInformationJobObject(
+                    job, JobObjectExtendedLimitInformation, &limits,
+                    sizeof(limits))) {
+                _processJob = job;
+            } else {
+                CloseHandle(job);
+            }
+        }
+    }
+#endif
+
     connect(_process.get(), QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, &LasagnaServiceManager::handleProcessFinished);
     connect(_process.get(), &QProcess::errorOccurred,
@@ -665,9 +709,29 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
         _lastError = tr("Failed to start lasagna service process");
         emit serviceError(_lastError);
         _process.reset();
+#ifdef Q_OS_WIN
+        if (_processJob) {
+            CloseHandle(static_cast<HANDLE>(_processJob));
+            _processJob = nullptr;
+        }
+#endif
         _dataDirectory.clear();
         return false;
     }
+
+#ifdef Q_OS_WIN
+    if (_containProcessTree && _processJob) {
+        HANDLE process = OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE, static_cast<DWORD>(_process->processId()));
+        if (!process ||
+            !AssignProcessToJobObject(static_cast<HANDLE>(_processJob), process)) {
+            CloseHandle(static_cast<HANDLE>(_processJob));
+            _processJob = nullptr;
+        }
+        if (process) CloseHandle(process);
+    }
+#endif
 
     emit statusMessage(tr("Waiting for lasagna service to initialize..."));
 
@@ -737,12 +801,38 @@ void LasagnaServiceManager::stopService()
     std::cout << "Stopping lasagna service..." << std::endl;
 
     if (_process->state() == QProcess::Running) {
-        _process->terminate();
-        if (!_process->waitForFinished(kServiceStopTimeoutMs)) {
-            _process->kill();
-            _process->waitForFinished(1000);
+#ifdef Q_OS_UNIX
+        if (_containProcessTree && _process->processId() > 0) {
+            const auto processGroup = static_cast<pid_t>(_process->processId());
+            ::kill(-processGroup, SIGTERM);
+            _process->waitForFinished(kServiceStopTimeoutMs);
+            // The group signal is intentional even when the leader exited:
+            // workers can outlive it and must not survive this transient job.
+            ::kill(-processGroup, SIGKILL);
+            if (_process->state() != QProcess::NotRunning) {
+                _process->kill();
+                _process->waitForFinished(1000);
+            }
+        } else
+#endif
+        {
+            _process->terminate();
+            if (!_process->waitForFinished(kServiceStopTimeoutMs)) {
+                _process->kill();
+                _process->waitForFinished(1000);
+            }
         }
     }
+
+#ifdef Q_OS_WIN
+    if (_processJob) {
+        // Graceful termination above gives the service a chance to flush. The
+        // job is the backstop for any worker processes that remain.
+        TerminateJobObject(static_cast<HANDLE>(_processJob), 1);
+        CloseHandle(static_cast<HANDLE>(_processJob));
+        _processJob = nullptr;
+    }
+#endif
 
     _process.reset();
     _serviceReady = false;
