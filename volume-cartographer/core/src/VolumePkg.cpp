@@ -920,11 +920,6 @@ VolumePkg::AttachSegmentsResult VolumePkg::attachSegmentsEntry(
 
     const auto existing = matchingSegmentsEntry(location);
     const bool insertEntry = !existing;
-    if (insertEntry &&
-        matchingSegmentsEntryByDirectoryName(
-            normalizedPathName(location))) {
-        return AttachSegmentsResult::SourceNameConflict;
-    }
     const std::string persistedLocation =
         existing ? existing->location : location;
     const vc::project::Entry target{persistedLocation, {}};
@@ -2061,30 +2056,32 @@ void VolumePkg::setSegmentationDirectory(const std::string& dirName)
 
 void VolumePkg::refreshSegmentations()
 {
-    decltype(loadedSegmentations_) previousLoadedSegmentations;
-    decltype(segmentationsByLocation_) previousSegmentationsByLocation;
     std::string previousActiveSegmentsLocation;
     decltype(segmentationTagsByID_) previousSegmentationTags;
     auto previousOutputSegments = outputSegments_;
-
-    {
-        std::lock_guard<std::mutex> lk(segmentsMutex_);
-        previousLoadedSegmentations = loadedSegmentations_;
-        previousSegmentationsByLocation = segmentationsByLocation_;
-        previousActiveSegmentsLocation = activeSegmentsLocation_;
-        previousSegmentationTags = segmentationTagsByID_;
-
-        // Retain the outgoing directory's segmentations so switching back to
-        // it reuses them (and their loaded surfaces) without hitting disk.
-        if (!activeSegmentsLocation_.empty()) {
-            segmentationsByLocation_[activeSegmentsLocation_] = loadedSegmentations_;
-        }
-        activeSegmentsLocation_.clear();
-        loadedSegmentations_.clear();
-        segmentationTagsByID_.clear();
-    }
+    decltype(loadedSegmentations_) previousUnscopedSegmentations;
+    bool stateCleared = false;
 
     try {
+        {
+            std::lock_guard<std::mutex> lk(segmentsMutex_);
+            previousActiveSegmentsLocation = activeSegmentsLocation_;
+            previousSegmentationTags = segmentationTagsByID_;
+
+            // Retain the outgoing directory's segmentations so switching back
+            // reuses their loaded surfaces without hitting disk.
+            if (!activeSegmentsLocation_.empty()) {
+                segmentationsByLocation_[activeSegmentsLocation_] =
+                    loadedSegmentations_;
+            } else {
+                previousUnscopedSegmentations = loadedSegmentations_;
+            }
+            activeSegmentsLocation_.clear();
+            loadedSegmentations_.clear();
+            segmentationTagsByID_.clear();
+            stateCleared = true;
+        }
+
         const vc::project::Entry* selectedSegments = nullptr;
         if (outputSegments_) {
             selectedSegments = findSegmentsEntryByLocation(
@@ -2113,14 +2110,23 @@ void VolumePkg::refreshSegmentations()
                 loadedSegmentations_;
         }
     } catch (...) {
-        std::lock_guard<std::mutex> lk(segmentsMutex_);
-        loadedSegmentations_ = std::move(previousLoadedSegmentations);
-        segmentationsByLocation_ =
-            std::move(previousSegmentationsByLocation);
-        activeSegmentsLocation_ =
-            std::move(previousActiveSegmentsLocation);
-        segmentationTagsByID_ = std::move(previousSegmentationTags);
-        outputSegments_ = std::move(previousOutputSegments);
+        if (stateCleared) {
+            std::lock_guard<std::mutex> lk(segmentsMutex_);
+            if (previousActiveSegmentsLocation.empty()) {
+                loadedSegmentations_ =
+                    std::move(previousUnscopedSegmentations);
+            } else if (const auto previous =
+                           segmentationsByLocation_.find(
+                               previousActiveSegmentsLocation);
+                       previous != segmentationsByLocation_.end()) {
+                loadedSegmentations_ = previous->second;
+            }
+            activeSegmentsLocation_ =
+                std::move(previousActiveSegmentsLocation);
+            segmentationTagsByID_ =
+                std::move(previousSegmentationTags);
+            outputSegments_ = std::move(previousOutputSegments);
+        }
         throw;
     }
 }

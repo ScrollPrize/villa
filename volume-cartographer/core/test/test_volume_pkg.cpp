@@ -290,11 +290,10 @@ TEST_CASE("VolumePkg: segment entries match normalized local paths")
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg: segment directory names are case-insensitive")
+TEST_CASE("VolumePkg: segment directory-name lookup is case-insensitive")
 {
     auto d = tmpDir("segment_source_name");
     fs::create_directories(d / "one" / "User-Segments");
-    fs::create_directories(d / "two" / "user-segments");
 
     auto p = VolumePkg::newEmpty();
     p->save(d / "project.volpkg.json");
@@ -306,11 +305,6 @@ TEST_CASE("VolumePkg: segment directory names are case-insensitive")
     REQUIRE(matching);
     CHECK(matching->location ==
           (d / "one" / "User-Segments").string());
-    CHECK(
-        p->attachSegmentsEntry(
-            (d / "two" / "user-segments").string(), {}, false) ==
-        VolumePkg::AttachSegmentsResult::SourceNameConflict);
-    CHECK(p->segmentEntries().size() == 1);
 
     fs::remove_all(d);
 }

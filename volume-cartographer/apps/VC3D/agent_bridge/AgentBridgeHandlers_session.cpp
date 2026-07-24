@@ -311,25 +311,18 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
     const std::string persistedLocation =
         existing ? existing->location : normalizedLocation;
     const std::string sourceName = localPath.filename().string();
-    auto sourceNameConflictError =
-        [&](const vc::project::Entry* conflict) {
-            QJsonObject data{
-                {"sourceName", QString::fromStdString(sourceName)},
-            };
-            if (conflict) {
-                data["existingLocation"] =
-                    QString::fromStdString(conflict->location);
-            }
-            return AgentBridgeError{
-                -32010,
-                "A segment source with the same directory name is already attached",
-                data,
-            };
-        };
     if (!existing) {
         if (const auto conflict =
                 vpkg->matchingSegmentsEntryByDirectoryName(sourceName)) {
-            throw sourceNameConflictError(&*conflict);
+            throw AgentBridgeError{
+                -32010,
+                "A segment source with the same directory name is already attached",
+                QJsonObject{
+                    {"sourceName", QString::fromStdString(sourceName)},
+                    {"existingLocation",
+                     QString::fromStdString(conflict->location)},
+                },
+            };
         }
     }
 
@@ -365,11 +358,6 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
             QJsonObject{{"detail", QString::fromUtf8(error.what())}},
         };
     }
-    if (attachResult ==
-        VolumePkg::AttachSegmentsResult::SourceNameConflict) {
-        throw sourceNameConflictError(nullptr);
-    }
-
     if (reloadSurfaces) {
         try {
             _window->refreshCurrentVolumePackageUi(QString(), true);

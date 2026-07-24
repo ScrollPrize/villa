@@ -53,7 +53,6 @@ public:
     enum class AttachSegmentsResult {
         Attached,
         AlreadyAttached,
-        SourceNameConflict,
     };
 
     static std::shared_ptr<VolumePkg> newEmpty();
