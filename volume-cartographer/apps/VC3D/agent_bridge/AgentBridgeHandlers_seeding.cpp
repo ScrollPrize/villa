@@ -513,19 +513,10 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
                                    QStringLiteral("Run Trace"),
                                    /*broadcastStart=*/false);
 
-    // Suppress the runner's interactive "Operation Complete" QMessageBox for this
-    // headless run so the modal dialog cannot starve the toolFinished slots that
-    // transition the job out of "running" (auto-cleared on toolFinished; also
-    // cleared on the synchronous-failure path below).
-    if (_window->_cmdRunner)
-        _window->_cmdRunner->setSuppressCompletionDialogs(true);
-
     CommandLaunchError error;
     QString outputDir;
     if (!handler->startRunTrace(
             segmentIdQ.toStdString(), rt, &error, &outputDir)) {
-        if (_window->_cmdRunner)
-            _window->_cmdRunner->setSuppressCompletionDialogs(false);
         _activeJobs.remove(QStringLiteral("tool"));
         throwCommandLaunchError(error, "Failed to start Run Trace",
                                 segmentIdQ, "tool");
@@ -620,17 +611,10 @@ QJsonObject AgentBridgeServer::handleRenderTifxyz(const QJsonValue& params)
                                    QStringLiteral("Render segment"),
                                    /*broadcastStart=*/false);
 
-    // Same dialog-suppression pattern as tracer.run_trace /
-    // segmentation.grow_patch_from_seed (see tracer.run_trace above for why).
-    if (_window->_cmdRunner)
-        _window->_cmdRunner->setSuppressCompletionDialogs(true);
-
     CommandLaunchError error;
     QString outputDir;
     if (!handler->startRenderSegment(
             segmentIdQ.toStdString(), rp, &error, &outputDir)) {
-        if (_window->_cmdRunner)
-            _window->_cmdRunner->setSuppressCompletionDialogs(false);
         _activeJobs.remove(QStringLiteral("tool"));
         throwCommandLaunchError(error, "Failed to start render",
                                 segmentIdQ, "tool");

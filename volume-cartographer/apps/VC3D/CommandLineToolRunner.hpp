@@ -37,6 +37,29 @@ public:
         CustomCommand
     };
 
+    enum class Presentation {
+        Interactive,
+        Silent
+    };
+
+    struct ExecutionOptions {
+        constexpr ExecutionOptions(
+            Presentation presentation = Presentation::Interactive,
+            bool showConsole = true)
+            : presentation(presentation)
+            , showConsole(showConsole)
+        {
+        }
+
+        static constexpr ExecutionOptions silent()
+        {
+            return {Presentation::Silent, false};
+        }
+
+        Presentation presentation;
+        bool showConsole;
+    };
+
     // Output format for Tool::RenderTifXYZ: a per-slice TIFF stack or an
     // OME-Zarr store. Interactive launches reset this to TifStack.
     enum class RenderOutputFormat {
@@ -55,7 +78,8 @@ public:
 
     bool executeCustomCommand(const QString& command,
                              const QStringList& args,
-                             const QString& label = QString());
+                             const QString& label = QString(),
+                             ExecutionOptions options = {});
 
     // tool specific params 
     void setRenderParams(float scale, int resolution, int layers);
@@ -114,29 +138,22 @@ public:
                              double ransacMadK,
                              int ransacSeed,
                              int anchorCap);
-    bool execute(Tool tool);
+    bool execute(Tool tool, ExecutionOptions options = {});
     void cancel();
     bool isRunning() const;
     
     void showConsoleOutput();
     void hideConsoleOutput();
-    void setAutoShowConsoleOutput(bool autoShow);
-    // Read back the auto-show flag so a headless (bridge) launcher can save it,
-    // turn auto-show off for a single execute(), then restore the prior value
-    // (see SegmentationCommandHandler's start* methods).
-    bool autoShowConsoleOutput() const { return _autoShowConsole; }
     void setIncludeTifs(bool include);
     void setOmpThreads(int threads);
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
     void setPreserveConsoleOutput(bool preserve);
 
-    // When set, the interactive toolFinished handler must NOT pop a blocking
-    // completion/error QMessageBox for the current run, and onProcessError skips
-    // its error-path console-dock pop -- so an unattended (headless/offscreen)
-    // run isn't starved by a modal no one can dismiss. Scoped to a single run:
-    // cleared automatically once toolFinished has been emitted.
-    void setSuppressCompletionDialogs(bool suppress) { _suppressCompletionDialogs = suppress; }
-    bool suppressCompletionDialogs() const { return _suppressCompletionDialogs; }
+    // Valid while toolFinished is being delivered for the current process.
+    bool currentExecutionIsSilent() const
+    {
+        return _executionOptions.presentation == Presentation::Silent;
+    }
 
 signals:
     void toolStarted(Tool tool, const QString& message);
@@ -160,7 +177,6 @@ private:
     QProcess* _process;
     ConsoleOutputWidget* _consoleOutput;
     QDialog* _consoleDialog;
-    bool _autoShowConsole;
     
     QString _volumePath;
     QString _remoteVolumeUrl;
@@ -216,9 +232,7 @@ private:
 
     int _ompThreads{-1};
     bool _explicitVolumePath{false};
-    // Suppresses the interactive completion QMessageBox for the current run only;
-    // cleared after toolFinished. See setSuppressCompletionDialogs.
-    bool _suppressCompletionDialogs{false};
+    ExecutionOptions _executionOptions;
 
     QString _objOutputDir;
     float _objStretchFactor = 1000.0f;

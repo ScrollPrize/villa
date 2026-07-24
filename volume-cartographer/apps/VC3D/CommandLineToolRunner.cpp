@@ -63,7 +63,6 @@ CommandLineToolRunner::CommandLineToolRunner(QStatusBar* statusBar, CWindow* mai
     , _process(nullptr)
     , _consoleOutput(new ConsoleOutputWidget())
     , _consoleDialog(new QDialog(nullptr, Qt::Window))
-    , _autoShowConsole(true)
     , _scale(1.0f)
     , _resolution(0)
     , _layers(31)
@@ -212,11 +211,16 @@ void CommandLineToolRunner::setRenderAdvanced(
     _flipAxis = flipAxis;
 }
 
-bool CommandLineToolRunner::execute(Tool tool)
+bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
 {
     const bool isCustom = (tool == Tool::CustomCommand);
+    const auto warn = [&](const QString& title, const QString& message) {
+        if (options.presentation == Presentation::Interactive) {
+            QMessageBox::warning(nullptr, title, message);
+        }
+    };
     if (_process && _process->state() != QProcess::NotRunning) {
-        QMessageBox::warning(nullptr, tr("Warning"), tr("A tool is already running."));
+        warn(tr("Warning"), tr("A tool is already running."));
         return false;
     }
 
@@ -228,7 +232,7 @@ bool CommandLineToolRunner::execute(Tool tool)
     }
 
     if (isCustom && _customCommand.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("Custom command not specified."));
+        warn(tr("Error"), tr("Custom command not specified."));
         return false;
     }
 
@@ -237,8 +241,10 @@ bool CommandLineToolRunner::execute(Tool tool)
     if (!toolInfo.exists() || !toolInfo.isExecutable()) {
         QString errorMsg = tr("Tool executable not found or not executable: %1").arg(toolCmd);
         _consoleOutput->appendOutput(errorMsg);
-        showConsoleOutput();
-        QMessageBox::warning(nullptr, tr("Error"), errorMsg);
+        if (options.showConsole) {
+            showConsoleOutput();
+        }
+        warn(tr("Error"), errorMsg);
         return false;
     }
 
@@ -250,7 +256,7 @@ bool CommandLineToolRunner::execute(Tool tool)
     if (needsVolume) {
         if (_explicitVolumePath) {
             if (_volumePath.isEmpty()) {
-                QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified."));
+                warn(tr("Error"), tr("Volume path not specified."));
                 return false;
             }
         } else {
@@ -258,11 +264,11 @@ bool CommandLineToolRunner::execute(Tool tool)
             if (_mainWindow) {
                 resolvedVolumePath = _mainWindow->getCurrentVolumePath();
                 if (resolvedVolumePath.isEmpty()) {
-                    QMessageBox::warning(nullptr, tr("Error"), tr("No volume selected."));
+                    warn(tr("Error"), tr("No volume selected."));
                     return false;
                 }
             } else if (resolvedVolumePath.isEmpty()) {
-                QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified and no main window available."));
+                warn(tr("Error"), tr("Volume path not specified and no main window available."));
                 return false;
             }
             _volumePath = resolvedVolumePath;
@@ -273,8 +279,7 @@ bool CommandLineToolRunner::execute(Tool tool)
         const auto lowered = _volumePath.trimmed().toLower();
         if (lowered.startsWith("http://") || lowered.startsWith("https://") ||
             lowered.startsWith("s3://") || lowered.startsWith("s3+")) {
-            QMessageBox::warning(
-                nullptr,
+            warn(
                 tr("Unsupported Remote Volume"),
                 tr("This command accepts only a local volume path. "
                    "Remote locators are rejected without stripping selectors."));
@@ -283,30 +288,30 @@ bool CommandLineToolRunner::execute(Tool tool)
     }
 
     if (tool == Tool::MergeTifxyz && _mergeJsonPath.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("merge.json path not specified."));
+        warn(tr("Error"), tr("merge.json path not specified."));
         return false;
     }
 
     if (tool == Tool::RenderTifXYZ && _segmentPath.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("Segment path not specified."));
+        warn(tr("Error"), tr("Segment path not specified."));
         return false;
     }
 
     if (tool == Tool::GrowSegFromSegment && _srcSegment.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("Source segment not specified."));
+        warn(tr("Error"), tr("Source segment not specified."));
         return false;
     }
 
     if (tool == Tool::NeighborCopy) {
         if (_jsonParams.isEmpty() || _resumeSurfacePath.isEmpty() || _tgtDir.isEmpty()) {
-            QMessageBox::warning(nullptr, tr("Error"), tr("Neighbor copy parameters incomplete."));
+            warn(tr("Error"), tr("Neighbor copy parameters incomplete."));
             return false;
         }
     }
 
     if (tool == Tool::RenderTifXYZ) {
         if (_outputPattern.isEmpty()) {
-            QMessageBox::warning(nullptr, tr("Error"), tr("Output pattern not specified."));
+            warn(tr("Error"), tr("Output pattern not specified."));
             return false;
         }
 
@@ -314,13 +319,15 @@ bool CommandLineToolRunner::execute(Tool tool)
         QDir outputDir = outputInfo.dir();
         if (!outputDir.exists()) {
             if (!outputDir.mkpath(".")) {
-                QMessageBox::warning(nullptr, tr("Error"), tr("Failed to create output directory: %1").arg(outputDir.path()));
+                warn(tr("Error"),
+                     tr("Failed to create output directory: %1").arg(outputDir.path()));
                 return false;
             }
         }
     }
 
     _currentTool = tool;
+    _executionOptions = options;
 
     QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     QString toolBaseName = QFileInfo(toolCmd).baseName();
@@ -422,7 +429,7 @@ bool CommandLineToolRunner::execute(Tool tool)
         _logStream->flush();
     }
 
-    if (_autoShowConsole) {
+    if (options.showConsole) {
         showConsoleOutput();
     }
 
@@ -433,12 +440,13 @@ bool CommandLineToolRunner::execute(Tool tool)
 
 bool CommandLineToolRunner::executeCustomCommand(const QString& command,
                                                  const QStringList& args,
-                                                 const QString& label)
+                                                 const QString& label,
+                                                 ExecutionOptions options)
 {
     _customCommand = command;
     _customArgs = args;
     _customLabel = label;
-    return execute(Tool::CustomCommand);
+    return execute(Tool::CustomCommand, options);
 }
 
 void CommandLineToolRunner::cancel()
@@ -467,11 +475,6 @@ void CommandLineToolRunner::hideConsoleOutput()
     if (_consoleDialog) {
         _consoleDialog->hide();
     }
-}
-
-void CommandLineToolRunner::setAutoShowConsoleOutput(bool autoShow)
-{
-    _autoShowConsole = autoShow;
 }
 
 void CommandLineToolRunner::setPreserveConsoleOutput(bool preserve)
@@ -550,9 +553,7 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
         emit toolFinished(_currentTool, false, errorMessage, QString(), false);
     }
 
-    // Completion-dialog suppression is scoped to a single run: clear it now
-    // that every toolFinished slot has observed it for this process.
-    _suppressCompletionDialogs = false;
+    _executionOptions = {};
 }
 
 void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
@@ -594,18 +595,14 @@ void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
 
     emit toolFinished(_currentTool, false, errorMessage, QString(), false);
 
-    // A bridge-driven headless run suppresses GUI pops for an unwatched process --
-    // including this console dock, not just the completion QMessageBox. Capture
-    // the flag before the per-run reset below so the error-path console pop is
-    // suppressed too; interactive runs still surface the console on failure.
-    const bool suppressed = _suppressCompletionDialogs;
-    _suppressCompletionDialogs = false;
+    const bool showConsole = _executionOptions.showConsole;
+    _executionOptions = {};
 
     if (_consoleOutput) {
         _consoleOutput->appendOutput(errorMessage);
     }
 
-    if (!suppressed) {
+    if (showConsole) {
         showConsoleOutput();
     }
 }

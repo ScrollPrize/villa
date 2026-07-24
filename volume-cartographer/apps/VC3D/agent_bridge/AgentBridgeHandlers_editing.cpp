@@ -578,18 +578,9 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
                                    QStringLiteral("GrowPatch from seed"),
                                    /*broadcastStart=*/false);
 
-    // Suppress the interactive "Operation Complete" QMessageBox for this run so
-    // the modal dialog cannot starve the toolFinished slots that transition the
-    // job out of "running"; auto-cleared on toolFinished, also cleared below on
-    // the synchronous-failure path.
-    if (_window->_cmdRunner)
-        _window->_cmdRunner->setSuppressCompletionDialogs(true);
-
     const QVector3D seedQ(seed[0], seed[1], seed[2]);
     CommandLaunchError error;
     if (!handler->startGrowPatchFromSeed(seedQ, gp, &error)) {
-        if (_window->_cmdRunner)
-            _window->_cmdRunner->setSuppressCompletionDialogs(false);
         _activeJobs.remove(QStringLiteral("tool"));
         throwCommandLaunchError(error, "Failed to start GrowPatch from seed",
                                 {}, "tool");

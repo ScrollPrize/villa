@@ -383,6 +383,15 @@ private:
                                        bool interactive,
                                        CommandLaunchError* error,
                                        QString* resolvedOutputDir);
+    bool startRunTraceImpl(const std::string& segmentId,
+                           const RunTraceParams& params,
+                           bool interactive,
+                           CommandLaunchError* error,
+                           QString* resolvedOutputDir);
+    bool startGrowPatchFromSeedImpl(const QVector3D& seedPoint,
+                                    const GrowPatchSeedParams& params,
+                                    bool interactive,
+                                    CommandLaunchError* error);
     bool startAlphaCompRefineImpl(const std::string& segmentId,
                                   const AlphaCompRefineParams& params,
                                   bool interactive,

@@ -193,18 +193,10 @@ QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
                                    QStringLiteral("Reoptimize segment"),
                                    /*broadcastStart=*/false);
 
-    // Suppress the runner's interactive completion dialog for this headless run
-    // (auto-cleared on toolFinished; cleared on the sync-failure path below), so
-    // a modal cannot starve the toolFinished slots that resolve the job.
-    if (_window->_cmdRunner)
-        _window->_cmdRunner->setSuppressCompletionDialogs(true);
-
     CommandLaunchError error;
     QString outputDir;
     if (!handler->startResumeLocalGrowPatch(
             segmentId.toStdString(), rp, &error, &outputDir)) {
-        if (_window->_cmdRunner)
-            _window->_cmdRunner->setSuppressCompletionDialogs(false);
         _activeJobs.remove(QStringLiteral("tool"));
         throwCommandLaunchError(error, "Failed to start reoptimize",
                                 segmentId, "tool");
@@ -279,15 +271,10 @@ QJsonObject AgentBridgeServer::handleSegmentRefineAlphaComp(const QJsonValue& pa
                                    QStringLiteral("Refine segment (alpha-comp)"),
                                    /*broadcastStart=*/false);
 
-    if (_window->_cmdRunner)
-        _window->_cmdRunner->setSuppressCompletionDialogs(true);
-
     CommandLaunchError error;
     QString outputDir;
     if (!handler->startAlphaCompRefine(
             segmentId.toStdString(), rp, &error, &outputDir)) {
-        if (_window->_cmdRunner)
-            _window->_cmdRunner->setSuppressCompletionDialogs(false);
         _activeJobs.remove(QStringLiteral("tool"));
         throwCommandLaunchError(error, "Failed to start refinement",
                                 segmentId, "tool");

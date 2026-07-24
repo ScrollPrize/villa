@@ -2268,12 +2268,11 @@ void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& seg
     params.tgtDir = dlg.tgtDir();
 
     CommandLaunchError error;
-    if (!startRunTrace(segmentId, params, &error)) {
+    if (!startRunTraceImpl(segmentId, params, /*interactive=*/true, &error, nullptr)) {
         QMessageBox::warning(_parentWidget, tr("Error"), error.message);
         return;
     }
 
-    _cmdRunner->showConsoleOutput();
     emit statusMessage(tr("Growing segment from: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
@@ -2281,6 +2280,17 @@ bool SegmentationCommandHandler::startRunTrace(const std::string& segmentId,
                                               const RunTraceParams& params,
                                               CommandLaunchError* error,
                                               QString* resolvedOutputDir)
+{
+    return startRunTraceImpl(segmentId, params, /*interactive=*/false,
+                             error, resolvedOutputDir);
+}
+
+bool SegmentationCommandHandler::startRunTraceImpl(
+    const std::string& segmentId,
+    const RunTraceParams& params,
+    bool interactive,
+    CommandLaunchError* error,
+    QString* resolvedOutputDir)
 {
     const CommandLaunchErrorSetter setErr{error};
 
@@ -2372,7 +2382,15 @@ bool SegmentationCommandHandler::startRunTrace(const std::string& segmentId,
         mergedJsonPath,
         srcSegment);
     _cmdRunner->setOmpThreads(params.ompThreads);
-    _cmdRunner->execute(CommandLineToolRunner::Tool::GrowSegFromSegment);
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    if (!_cmdRunner->execute(
+            CommandLineToolRunner::Tool::GrowSegFromSegment, options)) {
+        _cmdRunner->setOmpThreads(-1);
+        setErr(tr("Failed to start Run Trace."));
+        return false;
+    }
 
     if (resolvedOutputDir)
         *resolvedOutputDir = QString::fromStdString(tgtDir.string());
@@ -2487,7 +2505,12 @@ bool SegmentationCommandHandler::startRenderSegment(const std::string& segmentId
     _cmdRunner->setFlattenOptions(false, 10, 1);
     _cmdRunner->setOmpThreads(-1);
 
-    _cmdRunner->execute(CommandLineToolRunner::Tool::RenderTifXYZ);
+    if (!_cmdRunner->execute(
+            CommandLineToolRunner::Tool::RenderTifXYZ,
+            CommandLineToolRunner::ExecutionOptions::silent())) {
+        setErr(tr("Failed to start render."));
+        return false;
+    }
 
     if (resolvedOutputDir)
         *resolvedOutputDir = outputPattern;
@@ -3135,15 +3158,11 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
                                       QStringLiteral("local"));
     configureCommandRunnerRemoteAuthForVolumePath(selectedVolumePath);
     _cmdRunner->setOmpThreads(params.ompThreads);
-    if (interactive) {
-        _cmdRunner->showConsoleOutput();
-    }
-    const bool prevAutoShow = _cmdRunner->autoShowConsoleOutput();
-    if (!interactive) {
-        _cmdRunner->setAutoShowConsoleOutput(false);
-    }
-    const bool started = _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
-    _cmdRunner->setAutoShowConsoleOutput(prevAutoShow);
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    const bool started =
+        _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy, options);
     if (!started) {
         // Nothing was launched, so toolFinished (which clears resumeLocalJob()
         // in the CWindow slot) will never fire: undo our own bookkeeping here.
@@ -3161,6 +3180,15 @@ bool SegmentationCommandHandler::startResumeLocalGrowPatchImpl(
 bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoint,
                                                        const GrowPatchSeedParams& params,
                                                        CommandLaunchError* error)
+{
+    return startGrowPatchFromSeedImpl(seedPoint, params, /*interactive=*/false, error);
+}
+
+bool SegmentationCommandHandler::startGrowPatchFromSeedImpl(
+    const QVector3D& seedPoint,
+    const GrowPatchSeedParams& params,
+    bool interactive,
+    CommandLaunchError* error)
 {
     // Never opens a dialog; typed failures let the bridge preserve error codes.
     auto fail = [&](const QString& message,
@@ -3348,11 +3376,8 @@ bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoi
         disconnect(*connection);
         _growPatchSeedJob.reset();
 
-        // Bridge-driven runs are unattended (often headless): never pop a
-        // blocking modal, which would hang the process with no one to dismiss
-        // it. The runner's per-run flag still reads true here because it is
-        // cleared only after all toolFinished slots have run.
-        const bool bridgeDriven = _cmdRunner && _cmdRunner->suppressCompletionDialogs();
+        const bool bridgeDriven =
+            _cmdRunner && _cmdRunner->currentExecutionIsSilent();
 
         if (!success) {
             if (!bridgeDriven) {
@@ -3393,7 +3418,11 @@ bool SegmentationCommandHandler::startGrowPatchFromSeed(const QVector3D& seedPoi
             5000);
     });
 
-    if (!_cmdRunner->executeCustomCommand(executable, args, QStringLiteral("vc_grow_seg_from_seed"))) {
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    if (!_cmdRunner->executeCustomCommand(
+            executable, args, QStringLiteral("vc_grow_seg_from_seed"), options)) {
         QObject::disconnect(*connection);
         _growPatchSeedJob.reset();
         return fail(tr("Failed to start vc_grow_seg_from_seed."));
@@ -3519,9 +3548,6 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
     }
     settings.setValue(QStringLiteral("growpatch_seed/volume_id"), selectedVolumeId);
 
-    // Console output is interactive-only UI; the headless path must not pop it.
-    _cmdRunner->showConsoleOutput();
-
     GrowPatchSeedParams patchParams;
     patchParams.volumeId = selectedVolumeId;
     patchParams.iterations = iterations;
@@ -3529,7 +3555,8 @@ void SegmentationCommandHandler::onCreateSegmentGrowPatchFromSeed(const QVector3
     patchParams.outputDir = outputDirPath;
 
     CommandLaunchError error;
-    if (!startGrowPatchFromSeed(seedPoint, patchParams, &error)) {
+    if (!startGrowPatchFromSeedImpl(
+            seedPoint, patchParams, /*interactive=*/true, &error)) {
         QMessageBox::warning(_parentWidget, tr("Error"), error.message);
     }
 }
@@ -3943,14 +3970,11 @@ bool SegmentationCommandHandler::startAlphaCompRefineImpl(
 
     _cmdRunner->setObjRefineParams(volumePath, srcPath, dstPath, paramsPath);
     _cmdRunner->setOmpThreads(params.ompThreads);
-    const bool prevAutoShow = _cmdRunner->autoShowConsoleOutput();
-    if (!interactive) {
-        _cmdRunner->setAutoShowConsoleOutput(false);
-    }
-    const bool started = _cmdRunner->execute(CommandLineToolRunner::Tool::AlphaCompRefine);
-    if (!interactive) {
-        _cmdRunner->setAutoShowConsoleOutput(prevAutoShow);
-    }
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    const bool started =
+        _cmdRunner->execute(CommandLineToolRunner::Tool::AlphaCompRefine, options);
     if (!started) {
         _cmdRunner->setOmpThreads(-1);
         return fail(tr("Failed to start alpha-comp refinement."));

@@ -1056,7 +1056,8 @@ bool CWindow::initializeCommandLineRunner()
 
                     // Unattended runs suppress the modal so later
                     // toolFinished observers always receive completion.
-                    const bool bridgeDriven = _cmdRunner && _cmdRunner->suppressCompletionDialogs();
+                    const bool bridgeDriven =
+                        _cmdRunner && _cmdRunner->currentExecutionIsSilent();
 
                     const bool suppressDialogs = bridgeDriven || neighborFirstPassSuppress;
 
