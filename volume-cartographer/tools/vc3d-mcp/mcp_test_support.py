@@ -381,8 +381,9 @@ class FakeAgentBridgeServer:
             else:
                 if not path.lower().endswith(".volpkg.json"):
                     path += ".volpkg.json"
-                name = params.get("name") or Path(path).name.removesuffix(
-                    ".volpkg.json"
+                name = params.get(
+                    "name",
+                    Path(path).name.removesuffix(".volpkg.json") or "Untitled",
                 )
                 await self._reply(
                     writer,
