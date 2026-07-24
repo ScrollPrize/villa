@@ -426,11 +426,19 @@ std::string validateSingleVolumeLocation(const std::string& location)
 
     const auto path = resolveLocalPath(location);
     std::error_code ec;
-    if (!fs::exists(path, ec)) return "Path does not exist: " + path.string();
-    if (!fs::is_directory(path, ec)) return "Path is not a directory: " + path.string();
-    if (!isSingleZarrVolumeDir(path)) {
-        return "Not a zarr volume (expected volume metadata plus chunk-level "
-               ".zarray or zarr.json).";
+    const bool exists = fs::exists(path, ec);
+    if (ec) return "Could not inspect path: " + ec.message();
+    if (!exists) return "Path does not exist: " + path.string();
+    const bool directory = fs::is_directory(path, ec);
+    if (ec) return "Could not inspect path: " + ec.message();
+    if (!directory) return "Path is not a directory: " + path.string();
+    try {
+        if (!isSingleZarrVolumeDir(path)) {
+            return "Not a zarr volume (expected volume metadata plus chunk-level "
+                   ".zarray or zarr.json).";
+        }
+    } catch (const fs::filesystem_error& error) {
+        return "Could not inspect path: " + std::string(error.what());
     }
     return {};
 }
