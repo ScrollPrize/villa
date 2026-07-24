@@ -144,6 +144,27 @@ constexpr const char* kDirectRemoteZarrRequired =
     "remote Zarr volume locations must point directly to a .zarr root; "
     "collection listing is not supported";
 
+std::string validateRemoteVolumeLocation(
+    const std::string& location,
+    bool requireDirectZarr)
+{
+    const auto schemeEnd = location.find("://");
+    if (schemeEnd == std::string::npos) {
+        return "Remote URL is missing scheme separator (expected '://').";
+    }
+    if (location.size() <= schemeEnd + 3) {
+        return "Remote URL is missing host/bucket after scheme.";
+    }
+    try {
+        (void)vc::parseRemoteVolumeSpec(location);
+    } catch (const std::invalid_argument& error) {
+        return error.what();
+    }
+    if (requireDirectZarr && !isDirectRemoteZarrLocation(location))
+        return kDirectRemoteZarrRequired;
+    return {};
+}
+
 std::string tagValueWithPrefix(const std::vector<std::string>& tags, std::string_view prefix)
 {
     for (const auto& tag : tags) {
@@ -372,19 +393,7 @@ std::string validateLocation(Category category, const std::string& location)
         if (category != Category::Volumes) {
             return "Remote locations are only supported for volumes.";
         }
-        const auto schemeEnd = location.find("://");
-        if (schemeEnd == std::string::npos) {
-            return "Remote URL is missing scheme separator (expected '://').";
-        }
-        if (location.size() <= schemeEnd + 3) {
-            return "Remote URL is missing host/bucket after scheme.";
-        }
-        try {
-            (void)vc::parseRemoteVolumeSpec(location);
-        } catch (const std::invalid_argument& error) {
-            return error.what();
-        }
-        return {};
+        return validateRemoteVolumeLocation(location, false);
     }
 
     const auto path = resolveLocalPath(location);
@@ -407,6 +416,23 @@ std::string validateLocation(Category category, const std::string& location)
             return "Not a normal-grid directory (expected xy/, xz/, yz/ subdirs and metadata.json).";
     }
     return "Unknown category.";
+}
+
+std::string validateSingleVolumeLocation(const std::string& location)
+{
+    if (location.empty()) return "Location is empty.";
+    if (isLocationRemote(location))
+        return validateRemoteVolumeLocation(location, true);
+
+    const auto path = resolveLocalPath(location);
+    std::error_code ec;
+    if (!fs::exists(path, ec)) return "Path does not exist: " + path.string();
+    if (!fs::is_directory(path, ec)) return "Path is not a directory: " + path.string();
+    if (!isSingleZarrVolumeDir(path)) {
+        return "Not a zarr volume (expected volume metadata plus chunk-level "
+               ".zarray or zarr.json).";
+    }
+    return {};
 }
 
 }

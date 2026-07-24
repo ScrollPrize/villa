@@ -37,6 +37,7 @@ std::filesystem::path resolveLocalPath(const std::string& location,
                                        const std::filesystem::path& base = {});
 
 std::string validateLocation(Category category, const std::string& location);
+std::string validateSingleVolumeLocation(const std::string& location);
 
 }
 

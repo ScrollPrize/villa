@@ -470,67 +470,56 @@ def check_project_create(
             f"unexpected {type(error).__name__}: {error}",
         )
 
-    invalid_output = root / "created" / "invalid-volume"
-    try:
-        client.call(
-            "project.create",
-            {
-                "path": str(invalid_output),
-                "volume": str(root / "missing.zarr"),
-            },
-            timeout=10.0,
-        )
-        results.record(
-            "project_create_invalid_volume",
-            False,
-            "expected an error, got a result",
-        )
-    except BridgeError as error:
-        detail = error.data.get("detail", "")
-        results.record(
-            "project_create_invalid_volume",
-            error.code == -32007
-            and error.data.get("kind") == "volume"
-            and bool(detail)
-            and not invalid_output.with_suffix(".volpkg.json").exists(),
-            f"returned code={error.code} detail={detail!r}",
-        )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "project_create_invalid_volume",
-            False,
-            f"unexpected {type(error).__name__}: {error}",
-        )
+    def expect_volume_error(
+        name: str,
+        candidate: str,
+        expected_detail: str,
+    ) -> None:
+        output = root / "created" / name
+        try:
+            client.call(
+                "project.create",
+                {"path": str(output), "volume": candidate},
+                timeout=10.0,
+            )
+            results.record(name, False, "expected an error, got a result")
+        except BridgeError as error:
+            detail = error.data.get("detail", "")
+            results.record(
+                name,
+                error.code == -32007
+                and error.data.get("kind") == "volume"
+                and expected_detail in detail
+                and not output.with_suffix(".volpkg.json").exists(),
+                f"returned code={error.code} detail={detail!r}",
+            )
+        except Exception as error:  # noqa: BLE001
+            results.record(
+                name,
+                False,
+                f"unexpected {type(error).__name__}: {error}",
+            )
 
-    try:
-        client.call(
-            "project.create",
-            {
-                "path": str(root / "created" / "invalid-selector"),
-                "volume": "https://example.test/volume.zarr#unknown=2",
-            },
-            timeout=10.0,
-        )
-        results.record(
-            "project_create_invalid_remote_selector",
-            False,
-            "expected an error, got a result",
-        )
-    except BridgeError as error:
-        results.record(
-            "project_create_invalid_remote_selector",
-            error.code == -32007
-            and error.data.get("kind") == "volume"
-            and "unsupported remote volume selector"
-            in error.data.get("detail", ""),
-            f"returned code={error.code} detail={error.data.get('detail')!r}",
-        )
-    except Exception as error:  # noqa: BLE001
-        results.record(
-            "project_create_invalid_remote_selector",
-            False,
-            f"unexpected {type(error).__name__}: {error}",
-        )
+    expect_volume_error(
+        "project_create_invalid_volume",
+        str(root / "missing.zarr"),
+        "Path does not exist",
+    )
+    expect_volume_error(
+        "project_create_invalid_remote_selector",
+        "https://example.test/volume.zarr#unknown=2",
+        "unsupported remote volume selector",
+    )
+    expect_volume_error(
+        "project_create_remote_requires_zarr",
+        "https://example.test/not-a-zarr",
+        "must point directly to a .zarr root",
+    )
+    expect_volume_error(
+        "project_create_rejects_volume_collection",
+        str(root / "volumes"),
+        "Not a zarr volume",
+    )
 
     ok, detail = expect_param_error(
         client,

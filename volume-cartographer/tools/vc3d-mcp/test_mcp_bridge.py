@@ -394,6 +394,13 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_vc3d_create_project_derives_name_case_insensitively(self) -> None:
+        result = await vc3d_create_project(
+            "/tmp/Upper.VOLPKG.JSON",
+            "/tmp/volume",
+        )
+        self.assertEqual(result["name"], "Upper")
+
     async def test_vc3d_create_project_preserves_bridge_type_errors(self) -> None:
         with self.assertRaises(BridgeError) as ctx:
             await vc3d_create_project(123, "/tmp/volume")  # type: ignore[arg-type]

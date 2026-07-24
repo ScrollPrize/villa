@@ -383,7 +383,7 @@ class FakeAgentBridgeServer:
                     path += ".volpkg.json"
                 name = params.get(
                     "name",
-                    Path(path).name.removesuffix(".volpkg.json") or "Untitled",
+                    Path(path).name[:-len(".volpkg.json")] or "Untitled",
                 )
                 await self._reply(
                     writer,

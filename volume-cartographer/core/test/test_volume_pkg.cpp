@@ -18,6 +18,7 @@ using vc::project::Category;
 using vc::project::isLocationRemote;
 using vc::project::resolveLocalPath;
 using vc::project::validateLocation;
+using vc::project::validateSingleVolumeLocation;
 
 namespace {
 
@@ -98,6 +99,25 @@ TEST_CASE("validateLocation: malformed remote URLs are rejected")
     CHECK_FALSE(validateLocation(
         Category::Volumes,
         "https://example.test/volume.zarr#unknown=2").empty());
+}
+
+TEST_CASE("validateSingleVolumeLocation requires exactly one zarr")
+{
+    auto root = tmpDir("single_volume");
+    auto volume = root / "volume";
+    fs::create_directories(volume / "0");
+    { std::ofstream(volume / "meta.json") << "{}"; }
+    { std::ofstream(volume / "0" / ".zarray") << "{}"; }
+
+    CHECK(validateSingleVolumeLocation(volume.string()).empty());
+    CHECK_FALSE(validateSingleVolumeLocation(root.string()).empty());
+    CHECK(validateSingleVolumeLocation(
+        "s3://bucket/volume.zarr#vc-base-scale=2").empty());
+    CHECK_FALSE(validateSingleVolumeLocation(
+        "https://example.test/not-a-zarr").empty());
+    CHECK_FALSE(validateSingleVolumeLocation(
+        "https://example.test/volume.zarr#unknown=2").empty());
+    fs::remove_all(root);
 }
 
 TEST_CASE("validateLocation: nonexistent local path is rejected")
@@ -196,6 +216,9 @@ TEST_CASE("VolumePkg::newDetached writes only when explicitly saved")
     CHECK(loaded->name() == "Created");
     REQUIRE(loaded->volumeEntries().size() == 1);
     CHECK(loaded->volumeEntries().front().location == "/volume");
+
+    p->setName("Changed later");
+    CHECK(VolumePkg::load(target, opts)->name() == "Created");
 
     std::ifstream afterSave(autosave);
     CHECK(std::string(

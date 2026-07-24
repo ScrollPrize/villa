@@ -24,9 +24,11 @@ async def vc3d_create_project(
     tags: Optional[list[str]] = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Create a .volpkg.json project that references one existing zarr volume.
+    """Create a .volpkg.json project that references one local zarr volume or
+    remote .zarr URL.
     This writes the project but does not open it; call vc3d_open_volume with the
-    returned path when it should become the active project.
+    returned path when it should become the active project. Remote availability
+    is checked when the project is opened.
 
     path must be an absolute output path on the filesystem where VC3D runs.
     volume must be an absolute local zarr path on that same filesystem, or a

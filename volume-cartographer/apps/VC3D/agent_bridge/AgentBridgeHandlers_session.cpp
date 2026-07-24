@@ -653,7 +653,7 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     }
 
     const std::string validationError =
-        vc::project::validateLocation(vc::project::Category::Volumes, volumeLocation);
+        vc::project::validateSingleVolumeLocation(volumeLocation);
     if (!validationError.empty()) {
         QJsonObject data{
             {"detail", QString::fromStdString(validationError)},

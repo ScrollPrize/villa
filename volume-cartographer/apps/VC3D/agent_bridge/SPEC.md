@@ -260,9 +260,10 @@ dialog.
 - `ping` reports process, application, and protocol identity.
 - `state.get` is a non-mutating snapshot of the current package, volume,
   active segment, editing modes, viewers, point state, and active jobs.
-- `project.create` writes a new `.volpkg.json` referencing one existing local
-  or remote zarr volume. It does not change the current session; compose it
-  with `volume.open` when the new project should be opened.
+- `project.create` writes a new `.volpkg.json` referencing one local zarr
+  volume or remote `.zarr` URL. It does not change the current session;
+  remote availability is checked by `volume.open` when the new project is
+  opened.
 - `volume.open` opens a local project and may select a volume. Failed opens do
   not discard the current project.
 - `volume.select` is a no-op success when the requested volume is already
@@ -415,7 +416,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_commit_points` | `points.commit` | Add annotation points (volume space) to a named collection, optionally with a winding annotation. |
 | `vc3d_commit_wrap_annotation` | `wrap_annotation.commit` | Commit the seeded same-wrap annotation preview into the point collection (the tutorial's shift+E). Requires the mode enabled. |
 | `vc3d_corrections_set_point_mode` | `segmentation.corrections.set_point_mode` |
-| `vc3d_create_project` | `project.create` | Create a `.volpkg.json` that references one existing zarr volume without opening it. |
+| `vc3d_create_project` | `project.create` | Create a `.volpkg.json` that references one local zarr volume or remote `.zarr` URL without opening it. |
 | `vc3d_crop_segment_bounds` | `segment.crop_bounds` | Crop a segment's surface grid to its tightest valid bounds. Synchronous. |
 | `vc3d_delete_segment` | `segments.delete` | Delete a segment from disk. **Irreversible** — requires `confirm=true`. Fails while segmentation editing is enabled; deleting the active segment is allowed. |
 | `vc3d_describe_catalog_sample` | `catalog.describe_sample` |
