@@ -391,6 +391,16 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
         )
         expect(overlay, "windowLow", 10)
         expect(overlay, "windowHigh", 11)
+
+        overlay, _ = client.call(
+            "viewer.set_overlay",
+            {"colormap": ""},
+            timeout=10.0,
+        )
+        expect(overlay, "colormap", "")
+        overlay, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
+        expect(overlay, "colormap", "")
     except Exception as error:  # noqa: BLE001
         failures.append(f"{type(error).__name__}: {error}")
 
@@ -635,6 +645,29 @@ def check_volume_attach(
             {"volumeId": "vol2", "opacity": 0.4},
             timeout=10.0,
         )
+        overlay_read, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
+        selected, _ = client.call(
+            "viewer.list_overlay_volumes", {}, timeout=10.0)
+        render_result, _ = client.call(
+            "viewer.set_render_settings",
+            {"overlayOpacity": 0.35},
+            timeout=10.0,
+        )
+        overlay_after_render, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
+        results.record(
+            "viewer_overlay_controller_sync",
+            overlay_read.get("volumeId") == "vol2"
+            and selected.get("overlayVolumeId") == "vol2"
+            and abs(render_result.get("overlayOpacity", -1) - 0.35) < 1e-6
+            and overlay_after_render.get("volumeId") == "vol2"
+            and abs(overlay_after_render.get("opacity", -1) - 0.35) < 1e-6,
+            f"set={overlay_result} get={overlay_read} "
+            f"list_id={selected.get('overlayVolumeId')} "
+            f"render_opacity={render_result.get('overlayOpacity')} "
+            f"overlay_opacity={overlay_after_render.get('opacity')}",
+        )
         document = json.loads(volpkg.read_text())
         entries = document.get("volumes", [])
         attached_entry = next(
@@ -678,6 +711,35 @@ def check_volume_attach(
             f"{type(error).__name__}: {error}",
         )
         return
+
+    try:
+        expected_overlay, _ = client.call(
+            "viewer.set_overlay",
+            {
+                "colormap": "",
+                "opacity": 0.35,
+                "window": {"low": 17, "high": 201},
+            },
+            timeout=10.0,
+        )
+        client.call(
+            "volume.open",
+            {"path": str(volpkg)},
+            timeout=10.0,
+        )
+        restored_overlay, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
+        results.record(
+            "viewer_overlay_reopen",
+            restored_overlay == expected_overlay,
+            f"expected={expected_overlay} restored={restored_overlay}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "viewer_overlay_reopen",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
 
     try:
         retry, _ = client.call(
@@ -1031,6 +1093,8 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
     results.record("c4_volume_path_number", ok, detail)
 
     try:
+        overlay_before_error, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
         client.call(
             "viewer.set_overlay",
             {"volumeId": "__missing__"},
@@ -1042,10 +1106,14 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
             "expected -32007, got a result",
         )
     except BridgeError as error:
+        overlay_after_error, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
         results.record(
             "viewer_overlay_unknown_volume",
-            error.code == -32007,
-            f"returned code={error.code}",
+            error.code == -32007
+            and overlay_after_error == overlay_before_error,
+            f"returned code={error.code} "
+            f"state_unchanged={overlay_after_error == overlay_before_error}",
         )
     except Exception as error:  # noqa: BLE001
         results.record(

@@ -225,6 +225,10 @@ ViewerManager::ViewerManager(CState* state,
 
     if (_state) {
         connect(_state,
+                &CState::volumeChanged,
+                this,
+                &ViewerManager::currentVolumeChanged);
+        connect(_state,
                 &CState::surfaceChanged,
                 this,
                 &ViewerManager::handleSurfaceChanged);
