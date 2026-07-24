@@ -59,6 +59,8 @@ public:
         std::string automaticHvTag;
         std::string manualHvTag;
         std::vector<std::string> tags;
+        int linkedFiberCount = 0;
+        int pendingLinkCount = 0;
     };
 
     explicit CFiberWidget(QWidget* parent = nullptr);
@@ -85,6 +87,8 @@ public:
     void setShowFibersAvailable(bool available);
     void setShowFibersChecked(bool checked);
     [[nodiscard]] bool showFibersChecked() const;
+    void setShowLinkedChecked(bool checked);
+    [[nodiscard]] bool showLinkedChecked() const;
     void setFiberViewDistance(double distance);
     [[nodiscard]] double fiberViewDistance() const;
 
@@ -104,6 +108,7 @@ signals:
     void exportFibersRequested();
     void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);
     void showFibersToggled(bool checked);
+    void showLinkedToggled(bool checked);
     void fiberViewDistanceChanged(double distance);
 
 private slots:
@@ -153,6 +158,7 @@ private:
 
     QCheckBox* _calcMetricsCheckBox;
     QCheckBox* _showFibersCheckBox;
+    QCheckBox* _showLinkedCheckBox;
     QDoubleSpinBox* _fiberViewDistanceSpinBox;
     QTreeView* _treeView;
     QStandardItemModel* _model;

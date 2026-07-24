@@ -42,15 +42,30 @@ def expm_2x2(L):
 
 
 @maybe_compile
-def bilinear_atlas_lookup(zyxs_flat, offsets, widths, patch_indices, ijs):
-    """Bilinearly sample packed patch grids at fractional ``(i, j)`` coordinates."""
+def bilinear_atlas_lookup(zyxs_flat, offsets, widths, patch_indices, ijs, heights=None):
+    """Bilinearly sample packed patch grids at fractional ``(i, j)`` coordinates.
+
+    When ``heights`` is given, the four bilinear corners are clamped inside the
+    addressed patch. Callers relying on "floor(ij) lies on a valid quad" should
+    pass it: jitters drawn as float64 in [0, 1) and cast to float32 can round
+    to exactly 1.0, which pushes a sample one cell past the last valid quad
+    row/column - the corner gather then silently reads the next patch's first
+    row (or trips a device-side assert on the atlas's last patch).
+    """
     base = offsets[patch_indices]
     width = widths[patch_indices]
     ijs = ijs.to(torch.float32)
     i0 = ijs[..., 0].floor().to(torch.int64)
     j0 = ijs[..., 1].floor().to(torch.int64)
-    di = (ijs[..., 0] - i0.to(torch.float32)).unsqueeze(-1)
-    dj = (ijs[..., 1] - j0.to(torch.float32)).unsqueeze(-1)
+    if heights is not None:
+        height = heights[patch_indices]
+        i0 = torch.minimum(i0.clamp(min=0), height - 2)
+        j0 = torch.minimum(j0.clamp(min=0), width - 2)
+        di = (ijs[..., 0] - i0.to(torch.float32)).unsqueeze(-1).clamp(0., 1.)
+        dj = (ijs[..., 1] - j0.to(torch.float32)).unsqueeze(-1).clamp(0., 1.)
+    else:
+        di = (ijs[..., 0] - i0.to(torch.float32)).unsqueeze(-1)
+        dj = (ijs[..., 1] - j0.to(torch.float32)).unsqueeze(-1)
 
     flat_tl = base + i0 * width + j0
     tl = zyxs_flat[flat_tl]

@@ -300,6 +300,9 @@ class FitResult3D:
 	flatten_source_xyz: torch.Tensor | None = None       # (Hs, Ws, 3) frozen source surface
 	flatten_source_valid: torch.Tensor | None = None     # (Hs, Ws) bool frozen source vertices
 	flatten_source_cell_valid: torch.Tensor | None = None  # (Hs-1, Ws-1) bool frozen source quads
+	flatten_source_metric: torch.Tensor | None = None    # (Hs-1, Ws-1, 3) frozen g00,g01,g11
+	flatten_identity_y: torch.Tensor | None = None       # (Hmap,) frozen canonical row coordinates
+	flatten_identity_x: torch.Tensor | None = None       # (Wmap,) frozen canonical column coordinates
 	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
 	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
 	# Shapes: (D, H_ext, W_ext, ...). Model quad corners are re-gathered from xyz_lr in the loss.
@@ -453,6 +456,21 @@ class Model3D(nn.Module):
 		self.register_buffer("flatten_target_step", torch.tensor(float(mesh_step), device=device, dtype=torch.float32))
 		self.register_buffer("flatten_avg_offset_mask", torch.empty(0, 0, device=device, dtype=torch.bool))
 		self.register_buffer("flatten_initial_avg_offset", torch.zeros(2, device=device, dtype=torch.float32))
+		self.register_buffer(
+			"flatten_source_metric",
+			torch.empty(0, 0, 3, device=device, dtype=torch.float32),
+			persistent=False,
+		)
+		self.register_buffer(
+			"flatten_identity_y",
+			torch.empty(0, device=device, dtype=torch.float32),
+			persistent=False,
+		)
+		self.register_buffer(
+			"flatten_identity_x",
+			torch.empty(0, device=device, dtype=torch.float32),
+			persistent=False,
+		)
 		self.flatten_source_filter_stats: dict[str, float] = {}
 
 		# Amplitude and bias for data matching (deferred but needed for FitResult3D)
@@ -2848,6 +2866,26 @@ class Model3D(nn.Module):
 		return torch.zeros(2, device=map_yx.device, dtype=map_yx.dtype)
 
 	@staticmethod
+	def _flatten_source_metric(xyz: torch.Tensor) -> torch.Tensor:
+		"""Precompute the fixed first fundamental form for each source quad."""
+		if xyz.ndim != 3 or int(xyz.shape[-1]) != 3:
+			raise ValueError(f"flatten source xyz must have shape (H,W,3), got {tuple(xyz.shape)}")
+		p00 = xyz[:-1, :-1]
+		p10 = xyz[1:, :-1]
+		p01 = xyz[:-1, 1:]
+		p11 = xyz[1:, 1:]
+		xy = 0.5 * ((p10 - p00) + (p11 - p01))
+		xx = 0.5 * ((p01 - p00) + (p11 - p10))
+		return torch.stack(
+			(
+				(xy * xy).sum(dim=-1),
+				(xy * xx).sum(dim=-1),
+				(xx * xx).sum(dim=-1),
+			),
+			dim=-1,
+		).contiguous()
+
+	@staticmethod
 	def _source_cell_valid(valid: torch.Tensor) -> torch.Tensor:
 		if int(valid.shape[0]) < 2 or int(valid.shape[1]) < 2:
 			return torch.zeros(max(0, int(valid.shape[0]) - 1), max(0, int(valid.shape[1]) - 1),
@@ -3308,6 +3346,8 @@ class Model3D(nn.Module):
 		self.bias = nn.Parameter(torch.zeros(1, 1, map_h, map_w, device=device, dtype=torch.float32), requires_grad=False)
 		self.flatten_source_xyz = xyz_dev
 		self.flatten_source_valid = valid_dev
+		self.flatten_identity_y = torch.arange(map_h, device=device, dtype=torch.float32)
+		self.flatten_identity_x = torch.arange(map_w, device=device, dtype=torch.float32)
 		source_cell_valid = self._source_cell_valid(valid_dev)
 		if bool(flatten_filter_source_angles):
 			source_cell_valid, filter_stats = self._filter_source_cells_by_angle(
@@ -3329,6 +3369,11 @@ class Model3D(nn.Module):
 				"cell_valid_after": float(source_cell_valid.to(dtype=torch.float32).sum().detach().cpu()),
 			}
 		self.flatten_source_cell_valid = source_cell_valid
+		self.flatten_source_metric = (
+			self._flatten_source_metric(xyz_dev).detach()
+			if direction == "forward"
+			else torch.empty(0, 0, 3, device=device, dtype=torch.float32)
+		)
 		self.flatten_target_step = self._measured_flatten_target_step(
 			xyz_dev,
 			valid_dev,
@@ -3433,13 +3478,8 @@ class Model3D(nn.Module):
 		torch.Tensor,
 	]:
 		map_yx = self.flatten_map()
-		xyz = torch.where(
-			self.flatten_source_valid.unsqueeze(-1),
-			self.flatten_source_xyz,
-			torch.zeros_like(self.flatten_source_xyz),
-		)
 		quad_mask = self.flatten_source_cell_valid.unsqueeze(0)
-		return map_yx, xyz.unsqueeze(0), self.flatten_source_valid, quad_mask
+		return map_yx, self.flatten_source_xyz.unsqueeze(0), self.flatten_source_valid, quad_mask
 
 	def _flatten_sample_current(self) -> tuple[
 		torch.Tensor,
@@ -4140,6 +4180,9 @@ class Model3D(nn.Module):
 			flatten_source_xyz=self.flatten_source_xyz if self.flatten_enabled else None,
 			flatten_source_valid=self.flatten_source_valid if self.flatten_enabled else None,
 			flatten_source_cell_valid=self.flatten_source_cell_valid if self.flatten_enabled else None,
+			flatten_source_metric=self.flatten_source_metric if self.flatten_enabled else None,
+			flatten_identity_y=self.flatten_identity_y if self.flatten_enabled else None,
+			flatten_identity_x=self.flatten_identity_x if self.flatten_enabled else None,
 		)
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
@@ -4242,6 +4285,9 @@ class Model3D(nn.Module):
 		st.pop("flatten_target_step", None)
 		st.pop("flatten_avg_offset_mask", None)
 		st.pop("flatten_initial_avg_offset", None)
+		st.pop("flatten_source_metric", None)
+		st.pop("flatten_identity_y", None)
+		st.pop("flatten_identity_x", None)
 		st.pop("flatten_map_flat", None)
 		st.pop("flatten_point_mask", None)
 		incompat = super().load_state_dict(st, strict=bool(strict))

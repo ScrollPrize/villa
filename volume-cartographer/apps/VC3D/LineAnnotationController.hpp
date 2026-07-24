@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -96,6 +97,11 @@ public:
         std::string automaticHvTag;
         std::string manualHvTag;
         std::vector<std::string> tags;
+        // Number of fibers in this fiber's branch-link connected component
+        // (including itself); 0 when the fiber has no links.
+        int linkedFiberCount = 0;
+        // Number of branch links on this fiber still awaiting review approval.
+        int pendingLinkCount = 0;
     };
 
     struct FiberSnapshotWithPath {
@@ -121,6 +127,21 @@ public:
         cv::Vec3d branchControlPointDirection{0.0, 0.0, 0.0};
         cv::Vec3d controlPointPosition{0.0, 0.0, 0.0};
         cv::Vec3d branchControlPointPosition{0.0, 0.0, 0.0};
+        // Link awaits reviewer approval; kept in sync on both reciprocal refs.
+        bool pending = false;
+    };
+
+    // Per-fiber data for the fiber overlay's "Show linked" mode. Only fibers
+    // with at least one valid cross-fiber link are returned. linkGroupId is
+    // the smallest fiber id in the fiber's connected component over all
+    // branch links, pending included — same union-find semantics as
+    // fiberSummaries().
+    struct FiberLinkOverlayInfo {
+        uint64_t fiberId = 0;
+        uint64_t linkGroupId = 0;
+        // (local control point index, pending); one entry per linked control
+        // point, pending winning when a point carries both link states.
+        std::vector<std::pair<int, bool>> linkedControlPoints;
     };
 
     using DatasetPicker =
@@ -177,6 +198,9 @@ public:
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
+    [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
+    // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
+    [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage() const;
@@ -366,6 +390,30 @@ private:
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
+    void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
+                                                  size_t controlPointIndex,
+                                                  cv::Vec3f volumePoint);
+    void handleGeneratedControlPointLinkWithCandidate(const std::string& surfaceName,
+                                                      size_t controlPointIndex,
+                                                      cv::Vec3f volumePoint);
+    void handleGeneratedOpenNearbyAnnotation(uint64_t fiberId, cv::Vec3f volumePoint);
+    void handleGeneratedControlPointUnlink(const std::string& surfaceName,
+                                           size_t controlPointIndex,
+                                           uint64_t branchFiberId,
+                                           int branchControlPointIndex);
+    void handleGeneratedControlPointSetLinkPending(const std::string& surfaceName,
+                                                   size_t controlPointIndex,
+                                                   uint64_t branchFiberId,
+                                                   int branchControlPointIndex,
+                                                   bool pending);
+    [[nodiscard]] std::vector<vc3d::line_annotation::GeneratedOverlay::ControlPointMarker>
+        controlMarkersForSession(const LineAnnotationSession& session) const;
+    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
+        linkCandidateMenuState(const LineAnnotationSession& session) const;
+    [[nodiscard]] std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker>
+        markLinkCandidateFiberIntersections(
+            std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers,
+            const std::vector<FiberBranchRef>& branches) const;
     bool ensureDatasetForSession(LineAnnotationSession& session);
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
@@ -598,4 +646,15 @@ private:
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
+
+    // Transient (in-memory only) staging state for linking two existing control
+    // points across fibers. Position is the primary key; the stored index is a
+    // hint re-resolved at link time because indices are remapped on save.
+    struct LinkCandidate {
+        uint64_t fiberId = 0;
+        std::string fiberFileName;
+        cv::Vec3d position{0.0, 0.0, 0.0};
+        int storedControlPointIndexHint = -1;
+    };
+    std::optional<LinkCandidate> _linkCandidate;
 };

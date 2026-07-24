@@ -369,6 +369,13 @@ protected:
     // chain storage is replaced or mutated.
     void clearPointChainProjectionCache();
 
+    // Projects a chain onto the viewer's surface with per-point opacity;
+    // cached — see clearPointChainProjectionCache().
+    FilteredPoints projectedPointChain(VolumeViewerBase* viewer,
+                                       const std::vector<cv::Vec3f>& points,
+                                       float tolerance,
+                                       std::vector<float>* opacities) const;
+
     // The default implementation materializes primitives as QGraphicsItems.
     // High-volume overlays may override this to retain their graphics items
     // across refreshes while continuing to use the common primitive builder.
@@ -410,10 +417,6 @@ private:
         std::vector<float> opacities;
     };
 
-    FilteredPoints projectedPointChain(VolumeViewerBase* viewer,
-                                       const std::vector<cv::Vec3f>& points,
-                                       float tolerance,
-                                       std::vector<float>* opacities) const;
     void clearPointChainProjectionCache(VolumeViewerBase* viewer);
 
     struct ViewerEntry {
