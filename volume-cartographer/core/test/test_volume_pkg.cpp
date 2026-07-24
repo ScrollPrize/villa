@@ -18,6 +18,7 @@ using vc::project::Category;
 using vc::project::isLocationRemote;
 using vc::project::resolveLocalPath;
 using vc::project::validateLocation;
+using vc::project::validateSingleVolumeLocation;
 
 namespace {
 
@@ -95,6 +96,28 @@ TEST_CASE("validateLocation: malformed remote URLs are rejected")
 {
     CHECK_FALSE(validateLocation(Category::Volumes, "s3:").empty());
     CHECK_FALSE(validateLocation(Category::Volumes, "s3://").empty());
+    CHECK_FALSE(validateLocation(
+        Category::Volumes,
+        "https://example.test/volume.zarr#unknown=2").empty());
+}
+
+TEST_CASE("validateSingleVolumeLocation requires exactly one zarr")
+{
+    auto root = tmpDir("single_volume");
+    auto volume = root / "volume";
+    fs::create_directories(volume / "0");
+    { std::ofstream(volume / "meta.json") << "{}"; }
+    { std::ofstream(volume / "0" / ".zarray") << "{}"; }
+
+    CHECK(validateSingleVolumeLocation(volume.string()).empty());
+    CHECK_FALSE(validateSingleVolumeLocation(root.string()).empty());
+    CHECK(validateSingleVolumeLocation(
+        "s3://bucket/volume.zarr#vc-base-scale=2").empty());
+    CHECK_FALSE(validateSingleVolumeLocation(
+        "https://example.test/not-a-zarr").empty());
+    CHECK_FALSE(validateSingleVolumeLocation(
+        "https://example.test/volume.zarr#unknown=2").empty());
+    fs::remove_all(root);
 }
 
 TEST_CASE("validateLocation: nonexistent local path is rejected")
@@ -162,6 +185,46 @@ TEST_CASE("VolumePkg: setName persists in memory")
     auto p = VolumePkg::newEmpty();
     p->setName("My Project");
     CHECK(p->name() == "My Project");
+}
+
+TEST_CASE("VolumePkg::newDetached writes only when explicitly saved")
+{
+    const auto autosave = VolumePkg::autosaveFile();
+    fs::create_directories(autosave.parent_path());
+    {
+        std::ofstream out(autosave);
+        out << "current session";
+    }
+
+    auto d = tmpDir("detached");
+    auto target = d / "created.volpkg.json";
+    vc::project::LoadOptions opts;
+    opts.deferResolution = true;
+    auto p = VolumePkg::newDetached(opts);
+    p->setName("Created");
+    CHECK(p->addVolumeEntry("/volume", {"source:test"}));
+
+    std::ifstream beforeSave(autosave);
+    CHECK(std::string(
+              std::istreambuf_iterator<char>(beforeSave),
+              std::istreambuf_iterator<char>()) == "current session");
+    CHECK_FALSE(fs::exists(target));
+
+    p->save(target);
+    REQUIRE(fs::exists(target));
+    auto loaded = VolumePkg::load(target, opts);
+    CHECK(loaded->name() == "Created");
+    REQUIRE(loaded->volumeEntries().size() == 1);
+    CHECK(loaded->volumeEntries().front().location == "/volume");
+
+    p->setName("Changed later");
+    CHECK(VolumePkg::load(target, opts)->name() == "Created");
+
+    std::ifstream afterSave(autosave);
+    CHECK(std::string(
+              std::istreambuf_iterator<char>(afterSave),
+              std::istreambuf_iterator<char>()) == "current session");
+    fs::remove_all(d);
 }
 
 TEST_CASE("VolumePkg: addVolumeEntry / removeEntry round-trip")
