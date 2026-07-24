@@ -1275,6 +1275,7 @@ class ServiceState:
     def _run_lasagna_flatten(self, job, request, preview_manifest_path):
         process = None
         output_path = None
+        staging_root = None
         fit_job_id = None
         try:
             fit_service = _find_lasagna_service()
@@ -1298,6 +1299,9 @@ class ServiceState:
             if output_path.exists():
                 raise RuntimeError(
                     f"Refusing to overwrite Lasagna output: {output_path}")
+            staging_root = output_root / ".spiral-lasagna" / job.job_id
+            staging_root.mkdir(parents=True, exist_ok=False)
+            staged_output_path = staging_root / job.output_name
 
             with tempfile.TemporaryDirectory(prefix="spiral_lasagna_") as temporary:
                 temporary = Path(temporary)
@@ -1353,7 +1357,7 @@ class ServiceState:
                     "single_segment": True,
                     "config_name": "flatten_fast_nofilter.json",
                     "output_name": job.output_name,
-                    "output_dir": str(output_root),
+                    "output_dir": str(staging_root),
                     "source": "Spiral host service",
                 }
                 accepted = _fit_service_json(
@@ -1395,7 +1399,7 @@ class ServiceState:
                                 or "Lasagna flatten failed"))
                     time.sleep(0.5)
 
-                metadata = output_path / "meta.json"
+                metadata = staged_output_path / "meta.json"
                 if not metadata.is_file():
                     raise RuntimeError(
                         "Lasagna reported success but produced no tifxyz output")
@@ -1406,6 +1410,7 @@ class ServiceState:
                     if self.session_id != job.session_id:
                         raise RuntimeError(
                             "The Spiral session changed during Lasagna flatten")
+                os.replace(staged_output_path, output_path)
                 artifact = self.artifacts.register_directory(
                     "spiral-lasagna", job.session_id, time.time_ns(),
                     output_path, "meta.json")
@@ -1431,6 +1436,8 @@ class ServiceState:
                 stage_name="Failed")
         finally:
             _stop_process_group(process)
+            if staging_root is not None:
+                shutil.rmtree(staging_root, ignore_errors=True)
             with self.lock:
                 if self._lasagna_process is process:
                     self._lasagna_process = None
