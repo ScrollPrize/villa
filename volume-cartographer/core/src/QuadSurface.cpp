@@ -900,11 +900,15 @@ QuadSurface::SurfaceSample QuadSurface::sampleAtSurface(
     result.grid = surfaceToGrid(surface);
     const double maxCol = static_cast<double>(_points->cols - 1);
     const double maxRow = static_cast<double>(_points->rows - 1);
-    if (result.grid[0] < 0.0 || result.grid[1] < 0.0
-        || result.grid[0] > maxCol || result.grid[1] > maxRow) {
+    constexpr double gridTolerance = 1e-6;
+    if (result.grid[0] < -gridTolerance || result.grid[1] < -gridTolerance
+        || result.grid[0] > maxCol + gridTolerance
+        || result.grid[1] > maxRow + gridTolerance) {
         result.status = SurfaceSample::Status::OutsideGrid;
         return result;
     }
+    result.grid[0] = std::clamp(result.grid[0], 0.0, maxCol);
+    result.grid[1] = std::clamp(result.grid[1], 0.0, maxRow);
 
     const int col = std::min(
         static_cast<int>(std::floor(result.grid[0])), _points->cols - 2);

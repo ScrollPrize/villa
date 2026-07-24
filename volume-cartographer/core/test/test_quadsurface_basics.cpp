@@ -174,6 +174,10 @@ TEST_CASE("surface/grid conversion and sampling use one exact affine convention"
         surface.gridToSurface({3.0, 2.0}));
     REQUIRE(edge);
     CHECK(edge.volume == points(2, 3));
+    const cv::Vec2d nearEdge = surface.gridToSurface({3.0 + 5e-7, 2.0});
+    CHECK(surface.sampleAtSurface(nearEdge));
+    const cv::Vec2d outside = surface.gridToSurface({3.0 + 2e-6, 2.0});
+    CHECK_FALSE(surface.sampleAtSurface(outside));
 }
 
 TEST_CASE("surface sampling rejects any location owned by an invalid quad")
