@@ -581,6 +581,30 @@ def check_volume_attach(
     conflict = create_test_volume(root / "conflicts" / "vol2", "vol2")
 
     try:
+        retry, _ = client.call(
+            "volume.attach",
+            {"location": str(root / "volumes" / "vol1")},
+            timeout=10.0,
+        )
+        terminal = wait_for_job(client, retry["jobId"])
+        document = json.loads(volpkg.read_text())
+        result = terminal.get("result") or {}
+        results.record(
+            "volume_attach_existing_relative_entry",
+            terminal.get("state") == "succeeded"
+            and result.get("attached") is False
+            and result.get("alreadyAttached") is True
+            and document.get("volumes") == ["volumes"],
+            f"state={terminal.get('state')} result={result}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "volume_attach_existing_relative_entry",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+    try:
         before, _ = client.call("volume.list", {}, timeout=10.0)
         started, _ = client.call(
             "volume.attach",
