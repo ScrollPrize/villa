@@ -36,7 +36,10 @@ async def vc3d_lasagna_ensure_service(
     port: Optional[int] = None,
 ) -> dict[str, Any]:
     """Ensure a Lasagna fit service is available, starting or connecting to one
-    as needed. Two modes, selected by whether host+port are given:
+    as needed. This service powers ONLY the vc3d_lasagna_* optimization panel;
+    fiber tracing (vc3d_fiber_launch) and atlas creation do NOT use it -- they
+    need a "lasagna"-kind dataset resolvable for the current volume, not this
+    service. Two modes, selected by whether host+port are given:
 
     - Internal (default): omit both host and port. Launches a local service
     process (optionally using python_path as the interpreter) and blocks until
@@ -62,9 +65,11 @@ async def vc3d_lasagna_ensure_service(
 
 @mcp.tool()
 async def vc3d_lasagna_list_datasets() -> dict[str, Any]:
-    """List the datasets the Lasagna fit service knows about. Requires the
-    service to be running (see vc3d_lasagna_ensure_service). Deferred (~10 s cap)
-    while the service is queried.
+    """List the datasets the Lasagna fit service knows about -- the optimization
+    panel's server-side datasets, NOT the "lasagna"-kind dataset that
+    vc3d_fiber_launch / atlas creation resolve for the current volume. Requires
+    the service to be running (see vc3d_lasagna_ensure_service). Deferred
+    (~10 s cap) while the service is queried.
 
     Returns {"datasets": [...]} -- the service's dataset objects passed through
     verbatim (the bridge does not reshape service JSON). Errors: -32005 (service

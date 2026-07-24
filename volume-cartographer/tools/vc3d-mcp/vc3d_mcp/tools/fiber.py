@@ -32,16 +32,19 @@ async def vc3d_fiber_launch(
 
     position: {"x","y","z"} in volume space (default) or {"x","y"} scene-space
     when space="scene". The point must lie on the target viewer's current
-    view (same round-trip rule as vc3d_click). Requires a manifest-backed
-    Lasagna dataset (a "lasagna"-kind catalog representation) resolvable for
-    the CURRENTLY SELECTED volume; otherwise fails -32005 with detail. Not
-    every catalog sample/volume has one, and it resolves per-volume: a
-    "normal_grids"-kind store is a DIFFERENT resource and does NOT satisfy
-    this. Check vc3d_describe_catalog_sample for a "lasagna"-kind
-    representation and vc3d_select_volume to the volume that carries it before
-    launching. This is unrelated to the vc3d_lasagna_* tools and their
-    "lasagna service is not running" error -- tracing needs only this dataset,
-    never the fit service.
+    view (same round-trip rule as vc3d_click). This opens the workspace and
+    returns {"launched": true} even with no Lasagna dataset -- but TRACING
+    needs one: seeding and every control point optimize against a
+    manifest-backed Lasagna dataset (a "lasagna"-kind catalog representation)
+    resolvable for the CURRENTLY SELECTED volume. Without one the panes open
+    but no optimized line is produced (over the bridge the interactive "load
+    lasagna normals" picker is suppressed, so the dataset must already be
+    attached and its volume selected). Not every catalog sample/volume has one,
+    and it resolves per-volume: a "normal_grids"-kind store is a DIFFERENT
+    resource and does NOT satisfy this. Check vc3d_describe_catalog_sample for a
+    "lasagna"-kind representation and vc3d_select_volume to the volume that
+    carries it before tracing. This is unrelated to the vc3d_lasagna_* fit
+    service.
     replace_owning: defaults True, which DISCARDS the caller's currently
     open/in-progress fiber workspace (verified: launching a second fiber with
     the default silently drops the first fiber's unsaved control points).
