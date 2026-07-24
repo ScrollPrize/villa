@@ -938,6 +938,46 @@ def check_segments_attach(
             f"{type(error).__name__}: {error}",
         )
 
+    try:
+        client.call(
+            "volume.open",
+            {"path": str(volpkg)},
+            timeout=10.0,
+        )
+        reopened, _ = client.call("segments.list", {}, timeout=10.0)
+        retry, _ = client.call(
+            "segments.attach",
+            {"location": str(source)},
+            timeout=10.0,
+        )
+        document = json.loads(volpkg.read_text())
+        matching = [
+            entry
+            for entry in document.get("segments", [])
+            if isinstance(entry, dict) and entry.get("location") == str(source)
+        ]
+        ids = {
+            segment.get("id")
+            for segment in reopened.get("segments", [])
+        }
+        results.record(
+            "segments_attach_reopen",
+            segment_id in ids
+            and retry.get("alreadyAttached") is True
+            and retry.get("selected") is True
+            and matching == [{
+                "location": str(source),
+                "tags": ["source:smoke", "status:working"],
+            }],
+            f"ids={sorted(value for value in ids if value)} retry={retry}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_reopen",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
     editing_enabled = False
     try:
         client.call(

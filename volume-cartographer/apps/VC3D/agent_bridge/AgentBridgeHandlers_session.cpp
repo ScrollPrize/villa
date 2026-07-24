@@ -34,6 +34,7 @@
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/Logging.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 QJsonObject AgentBridgeServer::handlePing(const QJsonValue&)
@@ -349,13 +350,10 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
     for (const QJsonValue& tag : tagValues)
         tags.push_back(tag.toString().toStdString());
 
-    bool attached = false;
+    VolumePkg::AttachSegmentsResult attachResult;
     try {
-        attached = vpkg->attachSegmentsEntry(
-                       normalizedLocation, std::move(tags), select) ==
-                   VolumePkg::AttachSegmentsResult::Attached;
-        if (reloadSurfaces)
-            _window->refreshCurrentVolumePackageUi(QString(), true);
+        attachResult = vpkg->attachSegmentsEntry(
+            normalizedLocation, std::move(tags), select);
     } catch (const std::exception& error) {
         throw AgentBridgeError{
             -32005,
@@ -364,6 +362,23 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
         };
     }
 
+    if (reloadSurfaces) {
+        try {
+            _window->refreshCurrentVolumePackageUi(QString(), true);
+        } catch (const std::exception& error) {
+            Logger()->warn(
+                "Segment attachment committed, but the VC3D UI could not "
+                "refresh: {}",
+                error.what());
+        } catch (...) {
+            Logger()->warn(
+                "Segment attachment committed, but the VC3D UI could not "
+                "refresh");
+        }
+    }
+
+    const bool attached =
+        attachResult == VolumePkg::AttachSegmentsResult::Attached;
     return resultFor(attached, persistedLocation);
 }
 

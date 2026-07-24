@@ -948,8 +948,20 @@ VolumePkg::AttachSegmentsResult VolumePkg::attachSegmentsEntry(
         }
         throw;
     }
-    if (!opts_.deferResolution)
-        refreshSegmentations();
+    if (!opts_.deferResolution) {
+        try {
+            refreshSegmentations();
+        } catch (const std::exception& error) {
+            Logger()->warn(
+                "Attached segment source '{}', but could not refresh it: {}",
+                persistedLocation,
+                error.what());
+        } catch (...) {
+            Logger()->warn(
+                "Attached segment source '{}', but could not refresh it",
+                persistedLocation);
+        }
+    }
 
     return insertEntry ? AttachSegmentsResult::Attached
                        : AttachSegmentsResult::AlreadyAttached;
@@ -2033,8 +2045,19 @@ void VolumePkg::setSegmentationDirectory(const std::string& dirName)
 
 void VolumePkg::refreshSegmentations()
 {
+    decltype(loadedSegmentations_) previousLoadedSegmentations;
+    decltype(segmentationsByLocation_) previousSegmentationsByLocation;
+    std::string previousActiveSegmentsLocation;
+    decltype(segmentationTagsByID_) previousSegmentationTags;
+    auto previousOutputSegments = outputSegments_;
+
     {
         std::lock_guard<std::mutex> lk(segmentsMutex_);
+        previousLoadedSegmentations = loadedSegmentations_;
+        previousSegmentationsByLocation = segmentationsByLocation_;
+        previousActiveSegmentsLocation = activeSegmentsLocation_;
+        previousSegmentationTags = segmentationTagsByID_;
+
         // Retain the outgoing directory's segmentations so switching back to
         // it reuses them (and their loaded surfaces) without hitting disk.
         if (!activeSegmentsLocation_.empty()) {
@@ -2045,27 +2068,44 @@ void VolumePkg::refreshSegmentations()
         segmentationTagsByID_.clear();
     }
 
-    const vc::project::Entry* selectedSegments = nullptr;
-    if (outputSegments_) {
-        selectedSegments = findSegmentsEntryByLocation(segments_, *outputSegments_, path_.parent_path());
-    }
-    if (!selectedSegments && loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
-        selectedSegments = findSegmentsEntryByDirectoryName(
-            segments_, *loadFirstSegmentationDir_, path_.parent_path());
-        if (!selectedSegments) {
-            Logger()->warn("Requested load-first segmentation directory '{}' not available; using the selected segmentation directory.",
-                           *loadFirstSegmentationDir_);
+    try {
+        const vc::project::Entry* selectedSegments = nullptr;
+        if (outputSegments_) {
+            selectedSegments = findSegmentsEntryByLocation(
+                segments_, *outputSegments_, path_.parent_path());
         }
-    }
-    if (!selectedSegments) {
-        selectedSegments = firstLocalSegmentsEntry(segments_);
-    }
-    if (selectedSegments) {
-        outputSegments_ = selectedSegments->location;
-        resolveSegmentsEntry(*selectedSegments);
+        if (!selectedSegments && loadFirstSegmentationDir_ &&
+            !loadFirstSegmentationDir_->empty()) {
+            selectedSegments = findSegmentsEntryByDirectoryName(
+                segments_, *loadFirstSegmentationDir_, path_.parent_path());
+            if (!selectedSegments) {
+                Logger()->warn(
+                    "Requested load-first segmentation directory '{}' not "
+                    "available; using the selected segmentation directory.",
+                    *loadFirstSegmentationDir_);
+            }
+        }
+        if (!selectedSegments) {
+            selectedSegments = firstLocalSegmentsEntry(segments_);
+        }
+        if (selectedSegments) {
+            outputSegments_ = selectedSegments->location;
+            resolveSegmentsEntry(*selectedSegments);
+            std::lock_guard<std::mutex> lk(segmentsMutex_);
+            activeSegmentsLocation_ = selectedSegments->location;
+            segmentationsByLocation_[activeSegmentsLocation_] =
+                loadedSegmentations_;
+        }
+    } catch (...) {
         std::lock_guard<std::mutex> lk(segmentsMutex_);
-        activeSegmentsLocation_ = selectedSegments->location;
-        segmentationsByLocation_[activeSegmentsLocation_] = loadedSegmentations_;
+        loadedSegmentations_ = std::move(previousLoadedSegmentations);
+        segmentationsByLocation_ =
+            std::move(previousSegmentationsByLocation);
+        activeSegmentsLocation_ =
+            std::move(previousActiveSegmentsLocation);
+        segmentationTagsByID_ = std::move(previousSegmentationTags);
+        outputSegments_ = std::move(previousOutputSegments);
+        throw;
     }
 }
 
