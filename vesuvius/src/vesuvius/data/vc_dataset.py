@@ -44,6 +44,7 @@ class VCDataset(Dataset):
             domain: Optional[str] = None,
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
             anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
+            return_zero_mask: bool = False,  # Also return per-patch mask of raw==0 voxels (see issue #1114)
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -87,6 +88,7 @@ class VCDataset(Dataset):
         self.return_as_tensor = True # Dataset __getitem__ always returns tensors
         self.skip_empty_patches = skip_empty_patches
         self.anon = anon
+        self.return_zero_mask = return_zero_mask
         self.empty_patches_skipped = 0  # Counter for skipped patches
         self.non_empty_mask = None  # Per-patch bool mask; populated below for infer mode with zarr input
 
@@ -205,6 +207,7 @@ class VCDataset(Dataset):
                 domain=domain,
                 path=use_path,
                 anon=self.anon,
+                return_zero_mask=self.return_zero_mask,
             )
 
             # Get shape and dtype from the primary resolution level (0)
@@ -481,8 +484,12 @@ class VCDataset(Dataset):
                 # For 3D input (Z, Y, X), we always create a single-channel tensor
                 # The model expects a single channel regardless of how many output classes it produces
                 
-                # Volume returns (Z, Y, X) tensor
-                extracted_tensor = self.volume[z_slice, y_slice, x_slice]
+                # Volume returns (Z, Y, X) tensor, plus a raw==0 mask when enabled
+                extracted_zero_mask = None
+                if self.return_zero_mask:
+                    extracted_tensor, extracted_zero_mask = self.volume[z_slice, y_slice, x_slice]
+                else:
+                    extracted_tensor = self.volume[z_slice, y_slice, x_slice]
                 
                 # Fast check for empty patch - skip if all zeros or all values are the same
                 # This avoids processing empty patches which won't contain any information
@@ -506,9 +513,14 @@ class VCDataset(Dataset):
                 # Use the dtype returned by Volume
                 # ALWAYS use a single channel (1) here since we're coming from Z,Y,X data
                 patch_tensor = torch.zeros((1, pZ, pY, pX), dtype=extracted_tensor.dtype)
-                
+
                 # Copy fetched data into the patch tensor
                 patch_tensor[0, :fetched_z, :fetched_y, :fetched_x] = extracted_tensor
+
+                if self.return_zero_mask:
+                    # Padding regions lie outside the volume -> treat as empty (True)
+                    zero_mask_tensor = torch.ones((1, pZ, pY, pX), dtype=torch.bool)
+                    zero_mask_tensor[0, :fetched_z, :fetched_y, :fetched_x] = extracted_zero_mask
 
             elif len(self.input_shape) == 4: # Input is C, Z, Y, X
                 # Volume returns (C, Z, Y, X) tensor
@@ -525,7 +537,11 @@ class VCDataset(Dataset):
                     print(f"4D input: Extracting {self.num_input_channels} channels from data with {available_channels} channels")
                 
                 # Take exactly what the model expects
-                extracted_tensor = self.volume[:self.num_input_channels, z_slice, y_slice, x_slice]
+                extracted_zero_mask = None
+                if self.return_zero_mask:
+                    extracted_tensor, extracted_zero_mask = self.volume[:self.num_input_channels, z_slice, y_slice, x_slice]
+                else:
+                    extracted_tensor = self.volume[:self.num_input_channels, z_slice, y_slice, x_slice]
                 
                 # Check for empty patch - flag if all values are the same
                 is_empty = False
@@ -559,6 +575,12 @@ class VCDataset(Dataset):
                 
                 # Copy fetched data
                 patch_tensor[:, :fetched_z, :fetched_y, :fetched_x] = extracted_tensor
+
+                if self.return_zero_mask:
+                    # Padding regions lie outside the volume -> treat as empty (True).
+                    # A voxel counts as empty only if ALL input channels are raw 0.
+                    zero_mask_tensor = torch.ones((1, pZ, pY, pX), dtype=torch.bool)
+                    zero_mask_tensor[0, :fetched_z, :fetched_y, :fetched_x] = extracted_zero_mask.all(dim=0)
             else:
                  # Should have been caught in init, but safety check
                  raise RuntimeError(f"Unsupported volume shape encountered in getitem: {self.input_shape}")
@@ -578,12 +600,15 @@ class VCDataset(Dataset):
 
         position_tuple = (int(z), int(y), int(x))
 
-        return {
+        item = {
             "data": patch_tensor, # Key required by nnUNet inference
             "pos": position_tuple, # Pass position for potential stitching later
             "index": idx, # Pass original index
             "is_empty": is_empty # Flag to indicate if patch is empty (to skip model inference)
         }
+        if self.return_zero_mask:
+            item["zero_mask"] = zero_mask_tensor
+        return item
     
     @staticmethod
     def collate_fn(batch):
@@ -595,10 +620,13 @@ class VCDataset(Dataset):
         pos = [item["pos"] for item in batch]
         indices = [item["index"] for item in batch]
         is_empty = [item.get("is_empty", False) for item in batch]
-        
-        return {
+
+        result = {
             "data": data,
             "pos": pos,
             "index": indices,
             "is_empty": is_empty
         }
+        if "zero_mask" in batch[0]:
+            result["zero_mask"] = torch.stack([item["zero_mask"] for item in batch])
+        return result

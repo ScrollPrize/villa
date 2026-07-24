@@ -377,6 +377,23 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.
     return gaussian_map_np
 
 
+def normalize_blended_logits(chunk_logits, chunk_weights):
+    """Divide accumulated logit*weight sums by the accumulated weights, in place.
+
+    Voxels with weight 0 had no contributions: chunk_logits is already 0
+    there and `where=...` leaves them untouched. Dividing by the exact
+    weight (no epsilon) preserves the weighted average at every covered
+    voxel. A denominator epsilon pulls logits toward 0 wherever the total
+    weight is not far above it: a lone outer-corner Gaussian contribution
+    at a volume edge weighs ~exp(-24) regardless of patch size, which a
+    1e-8 epsilon shrinks by ~265x - enough to read as p ~ 0.5 downstream
+    no matter what the model predicted (see the #1173 review).
+    """
+    weights_b = chunk_weights[np.newaxis, :, :, :]
+    np.divide(chunk_logits, weights_b, out=chunk_logits, where=weights_b > 0)
+    return chunk_logits
+
+
 # --- Worker Process State ---
 _worker_state = {}
 
@@ -407,7 +424,7 @@ def _init_worker(part_files, output_path, gaussian_map, patch_size, num_classes,
     })
 
 
-def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
+def process_chunk(chunk_info, chunk_patches):
     """
     Process a single chunk using worker-cached zarr stores.
 
@@ -417,7 +434,6 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
         chunk_info: Dictionary with chunk boundaries
         chunk_patches: Dict {part_id: [(patch_idx, z, y, x), ...]} precomputed
                        for this chunk (non-empty, intersecting patches only)
-        epsilon: Small value for numerical stability
     """
     part_files = _worker_state['part_files']
     gaussian_map = _worker_state['gaussian_map']
@@ -519,11 +535,7 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
             slice(x_start, x_end)
         )
 
-        # Divide in place: voxels with weight==0 had no contributions so
-        # chunk_logits is already 0 there, and `where=...` leaves them untouched.
-        weights_b = chunk_weights[np.newaxis, :, :, :]
-        np.divide(chunk_logits, weights_b + epsilon,
-                  out=chunk_logits, where=weights_b > 0)
+        normalize_blended_logits(chunk_logits, chunk_weights)
 
         finalize_config = _worker_state.get('finalize_config')
         if finalize_config is not None:

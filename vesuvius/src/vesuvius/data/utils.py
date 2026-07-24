@@ -121,6 +121,11 @@ def open_zarr(path: str, mode: str = 'r',
     if verbose:
         print(f"Opening zarr store at {path} with mode={mode}")
     
+    # zarr 3.x raises TypeError when storage_options is provided (even {}) for
+    # non-URI stores such as local paths; only pass it for fsspec URIs.
+    if "://" not in path:
+        storage_options = None
+
     # If we're creating a new array (mode='w') and shape is provided, pass creation parameters
     if mode == 'w' and shape is not None:
         create_kwargs = {}
