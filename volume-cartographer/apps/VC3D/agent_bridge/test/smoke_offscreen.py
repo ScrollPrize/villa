@@ -1033,7 +1033,7 @@ def check_segments_attach(
                     f"{type(error).__name__}: {error}",
                 )
 
-    conflicting = root / "other" / source.name
+    conflicting = root / "other" / source.name.upper()
     create_test_segment(
         conflicting / "conflicting-segment", "conflicting-segment")
     before = json.loads(volpkg.read_text())
@@ -1052,7 +1052,9 @@ def check_segments_attach(
         after = json.loads(volpkg.read_text())
         results.record(
             "segments_attach_source_name_conflict",
-            error.code == -32010 and after == before,
+            error.code == -32010
+            and error.data.get("sourceName") == source.name.upper()
+            and after == before,
             f"returned code={error.code} project_unchanged={after == before}",
         )
     except Exception as error:  # noqa: BLE001

@@ -29,8 +29,9 @@ async def vc3d_attach_segments(
     containerized setup, use a path mounted into the VC3D container rather than
     a host-only path. The directory may be one tifxyz segment with meta.json,
     or a parent whose immediate subdirectories are tifxyz segments. Its
-    directory name must be unique among the project's segment sources because
-    the VC3D source picker identifies them by that name.
+    directory name must be unique, case-insensitively, among the project's
+    segment sources because the VC3D source picker identifies them by that
+    name.
 
     tags are stored on a newly attached project entry. select defaults to true,
     making this source the current segment directory so vc3d_list_segments can

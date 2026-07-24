@@ -53,6 +53,7 @@ public:
     enum class AttachSegmentsResult {
         Attached,
         AlreadyAttached,
+        SourceNameConflict,
     };
 
     static std::shared_ptr<VolumePkg> newEmpty();
@@ -91,6 +92,9 @@ public:
     matchingVolumeEntry(const std::string& location) const;
     [[nodiscard]] std::optional<vc::project::Entry>
     matchingSegmentsEntry(const std::string& location) const;
+    [[nodiscard]] std::optional<vc::project::Entry>
+    matchingSegmentsEntryByDirectoryName(
+        const std::string& directoryName) const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
     // Persist an already-loaded volume and its tags as one project mutation.

@@ -310,22 +310,26 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
         vpkg->matchingSegmentsEntry(normalizedLocation);
     const std::string persistedLocation =
         existing ? existing->location : normalizedLocation;
-    if (!existing) {
-        const std::string sourceName = localPath.filename().string();
-        for (const auto& entry : vpkg->segmentEntries()) {
-            const fs::path entryPath = vc::project::resolveLocalPath(
-                entry.location, vpkg->path().parent_path()).lexically_normal();
-            if (entryPath.filename() == localPath.filename()) {
-                throw AgentBridgeError{
-                    -32010,
-                    "A segment source with the same directory name is already attached",
-                    QJsonObject{
-                        {"sourceName", QString::fromStdString(sourceName)},
-                        {"existingLocation",
-                         QString::fromStdString(entry.location)},
-                    },
-                };
+    const std::string sourceName = localPath.filename().string();
+    auto sourceNameConflictError =
+        [&](const vc::project::Entry* conflict) {
+            QJsonObject data{
+                {"sourceName", QString::fromStdString(sourceName)},
+            };
+            if (conflict) {
+                data["existingLocation"] =
+                    QString::fromStdString(conflict->location);
             }
+            return AgentBridgeError{
+                -32010,
+                "A segment source with the same directory name is already attached",
+                data,
+            };
+        };
+    if (!existing) {
+        if (const auto conflict =
+                vpkg->matchingSegmentsEntryByDirectoryName(sourceName)) {
+            throw sourceNameConflictError(&*conflict);
         }
     }
 
@@ -360,6 +364,10 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
             "Could not attach segments",
             QJsonObject{{"detail", QString::fromUtf8(error.what())}},
         };
+    }
+    if (attachResult ==
+        VolumePkg::AttachSegmentsResult::SourceNameConflict) {
+        throw sourceNameConflictError(nullptr);
     }
 
     if (reloadSurfaces) {

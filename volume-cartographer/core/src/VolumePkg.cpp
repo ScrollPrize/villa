@@ -638,6 +638,17 @@ VolumePkg::matchingSegmentsEntry(const std::string& location) const
         : std::nullopt;
 }
 
+std::optional<vc::project::Entry>
+VolumePkg::matchingSegmentsEntryByDirectoryName(
+    const std::string& directoryName) const
+{
+    const auto* entry = findSegmentsEntryByDirectoryName(
+        segments_, directoryName, path_.parent_path());
+    return entry
+        ? std::optional<vc::project::Entry>(*entry)
+        : std::nullopt;
+}
+
 bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::string> tags)
 {
     if (location.empty()) return false;
@@ -909,6 +920,11 @@ VolumePkg::AttachSegmentsResult VolumePkg::attachSegmentsEntry(
 
     const auto existing = matchingSegmentsEntry(location);
     const bool insertEntry = !existing;
+    if (insertEntry &&
+        matchingSegmentsEntryByDirectoryName(
+            normalizedPathName(location))) {
+        return AttachSegmentsResult::SourceNameConflict;
+    }
     const std::string persistedLocation =
         existing ? existing->location : location;
     const vc::project::Entry target{persistedLocation, {}};
