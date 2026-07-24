@@ -1468,6 +1468,19 @@ class SpiralServer(ThreadingHTTPServer):
         super().__init__(address, SpiralHandler)
         self.credentials = list(credentials)
         self.state = state
+        self.restart_requested = threading.Event()
+        self._restart_lock = threading.Lock()
+        self._restart_scheduled = False
+
+    def request_restart(self):
+        """Acknowledge first, then ask main() to close and re-exec the service."""
+        with self._restart_lock:
+            if not self._restart_scheduled:
+                self._restart_scheduled = True
+                timer = threading.Timer(0.1, self.restart_requested.set)
+                timer.daemon = True
+                timer.start()
+        return {**self.state._base(), "restarting": True}
 
 
 class SpiralHandler(BaseHTTPRequestHandler):
@@ -1637,6 +1650,8 @@ class SpiralHandler(BaseHTTPRequestHandler):
             command_id = body.get("command_id")
             if path == "/dataset/resolve":
                 return state.resolve(body.get("dataset_root", ""))
+            if path == "/service/restart":
+                return state.deduplicated(command_id, self.server.request_restart)
             if path == "/session/inputs":
                 return state.begin_upload(body)
             if path == "/session/load":
@@ -1833,11 +1848,17 @@ def main(argv=None):
     server.timeout = 0.5
     try:
         while not shutdown.is_set():
+            if server.restart_requested.is_set():
+                break
             server.handle_request()
     finally:
         server.server_close()
         state.close()
         sys.stdout, sys.stderr = original_stdout, original_stderr
+    if server.restart_requested.is_set():
+        restart_args = list(sys.argv[1:] if argv is None else argv)
+        os.execv(sys.executable,
+                 [sys.executable, str(Path(__file__).resolve()), *restart_args])
     return 0
 
 

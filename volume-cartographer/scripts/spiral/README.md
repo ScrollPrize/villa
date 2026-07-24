@@ -76,6 +76,10 @@ accept it — VC3D deliberately never auto-trusts host keys.
 
 The fit survives viewer disconnects, laptop sleep, and network drops;
 disconnecting or closing VC3D never terminates a service it did not launch.
+While connected, the circular-arrow button beside the connection controls
+restarts the remote service and reconnects automatically. The service replaces
+its own process in place, so a containing `tmux` session remains alive and an
+attached terminal is not disconnected.
 
 ### Trusted-LAN flow (direct HTTP)
 
@@ -159,9 +163,11 @@ it tears the fit session down at a safe boundary. Logs go to the service's
 stdout/stderr on the host — for a `tmux` session, `tmux attach -t spiral`; for
 an unowned service VC3D's Python-output dialog only reminds you of this. A
 service started on an explicit port can be restarted immediately (the socket
-uses `SO_REUSEADDR`). Note that a large artifact download during a running fit
-competes with the fitter for the Python interpreter and can slow iterations
-somewhat.
+uses `SO_REUSEADDR`). VC3D's remote restart control does not run
+`tmux kill-session`; it gracefully closes the fit and re-executes the service
+with the same interpreter, arguments, and process ID. Note that a large artifact
+download during a running fit competes with the fitter for the Python
+interpreter and can slow iterations somewhat.
 
 ### Optional systemd user unit
 

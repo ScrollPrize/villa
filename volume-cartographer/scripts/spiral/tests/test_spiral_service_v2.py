@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -217,6 +218,33 @@ class AuthenticationTests(HttpServiceFixture):
         self.assertIn("service_name", health)
         self.assertIn("session_generation", health)
         self.assertIn("service_generation", health)
+
+
+class RestartTests(HttpServiceFixture):
+    def test_restart_requires_authentication_and_command_id(self):
+        status, _, _ = self.request(
+            "POST", "/service/restart", token=None,
+            body={"command_id": "restart-1"})
+        self.assertEqual(status, 401)
+        self.assertFalse(self.server.restart_requested.is_set())
+
+        status, payload, _ = self.request("POST", "/service/restart", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("command_id", json.loads(payload)["error"])
+        self.assertFalse(self.server.restart_requested.is_set())
+
+    def test_restart_is_acknowledged_and_duplicate_requests_are_idempotent(self):
+        body = {"command_id": "restart-1"}
+        status, payload, _ = self.request("POST", "/service/restart", body=body)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(payload)["restarting"])
+
+        status, duplicate, _ = self.request("POST", "/service/restart", body=body)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(duplicate), json.loads(payload))
+
+        self.assertTrue(self.server._restart_scheduled)
+        self.assertTrue(self.server.restart_requested.wait(2))
 
 
 class LogStreamingTests(HttpServiceFixture):
@@ -992,6 +1020,44 @@ class ServiceProcessTests(unittest.TestCase):
             finally:
                 process.terminate()
                 process.wait(10)
+                process.stdout.close()
+
+    def test_restart_reexecs_in_place_and_reuses_the_fixed_port(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            key_file = Path(temporary) / "key"
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            process = self._launch(
+                ["--port", str(port), "--api-key-file", str(key_file)],
+                temporary)
+            try:
+                self._read_until_ready(process)
+                original_pid = process.pid
+                key = key_file.read_text().strip()
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/service/restart",
+                    method="POST",
+                    data=json.dumps({"command_id": "restart-integration"}).encode(),
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    })
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    acknowledgement = json.loads(response.read())
+                self.assertTrue(acknowledgement["restarting"])
+
+                self._read_until_ready(process)
+                self.assertEqual(process.pid, original_pid)
+                health_request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(health_request, timeout=10) as response:
+                    self.assertTrue(json.loads(response.read())["ready"])
+            finally:
+                process.terminate()
+                process.wait(10)
+                process.stdout.close()
 
     def test_selected_gpus_are_reported_by_health(self):
         with tempfile.TemporaryDirectory() as temporary:

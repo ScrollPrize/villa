@@ -32,6 +32,8 @@ constexpr int kPollMs = 500;
 constexpr int kPollBackoffMs = 2000;
 constexpr int kPollReconnectMs = 5000;
 constexpr int kRemoteLogPollMs = 10000;
+constexpr int kRestartProbeMs = 500;
+constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
 constexpr int kSupportedApiVersion = 6;
 constexpr int kPreviewCacheKept = 3;
@@ -169,6 +171,7 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _hasActiveSession = false;
     _serviceOwnsDataset = false;
     _remoteLogsInFlight = false;
+    _restartInProgress = false;
     _remoteLogFailures = 0;
     _lastRemoteLogSequence = 0;
     _advertisedDataset = {};
@@ -359,6 +362,7 @@ void SpiralServiceManager::disconnectFromService()
     _remoteLogPoll->stop();
     _statusInFlight = false;
     _remoteLogsInFlight = false;
+    _restartInProgress = false;
     _artifactCache->clearEndpoint();
     _tunnel->stop();
     // Disconnecting from an independently started service never shuts the
@@ -375,6 +379,82 @@ void SpiralServiceManager::reconnect()
 {
     if (_profile.id.isEmpty()) return;
     connectToService(_profile);
+}
+
+void SpiralServiceManager::restartRemoteService()
+{
+    if (!_profile.isRemote()) {
+        emit errorOccurred(tr("Only a remote Spiral service can be restarted"));
+        return;
+    }
+    if (!isReady() || _restartInProgress) {
+        emit errorOccurred(tr("Spiral service is not connected"));
+        return;
+    }
+
+    post(QStringLiteral("/service/restart"),
+         {{QStringLiteral("command_id"), commandId()}},
+         Timeout::Command,
+         [this](const QJsonObject&) {
+             // Invalidate every request from the old process before probing
+             // the replacement. The SSH tunnel itself remains alive.
+             ++_connectionGeneration;
+             _poll->stop();
+             _remoteLogPoll->stop();
+             _statusInFlight = false;
+             _remoteLogsInFlight = false;
+             _statusFailures = 0;
+             _lastStatusGeneration = -1;
+             _installedPreviewArtifact.clear();
+             _fetchingPreviewArtifact.clear();
+             _installedGeometryArtifact.clear();
+             _fetchingGeometryArtifact.clear();
+             _lastRemoteLogSequence = 0;
+             _advertisedDataset = {};
+             if (_hasActiveSession) {
+                 _hasActiveSession = false;
+                 emit sessionActiveChanged(false);
+             }
+             _restartInProgress = true;
+             _restartElapsed.start();
+             setConnectionState(ConnectionState::Reconnecting,
+                                tr("Restarting remote service…"));
+             emit logMessage(tr("Remote Spiral service accepted the restart request"));
+             QTimer::singleShot(kRestartProbeMs, this,
+                                &SpiralServiceManager::probeRestartedService);
+         },
+         [this](const QString& error) {
+             emit errorOccurred(tr("Could not restart the Spiral service: %1").arg(error));
+         });
+}
+
+void SpiralServiceManager::probeRestartedService()
+{
+    if (!_restartInProgress
+        || _connectionState != ConnectionState::Reconnecting)
+        return;
+
+    const quint64 generation = _connectionGeneration;
+    get(QStringLiteral("/health"), Timeout::Quick,
+        [this, generation](const QJsonObject& health) {
+            if (generation != _connectionGeneration || !_restartInProgress) return;
+            _restartInProgress = false;
+            emit logMessage(tr("Remote Spiral service restarted successfully"));
+            handleHealth(health);
+        },
+        [this, generation](const QString& error) {
+            if (generation != _connectionGeneration || !_restartInProgress) return;
+            if (_restartElapsed.elapsed() >= kRestartTimeoutMs) {
+                _restartInProgress = false;
+                const QString message =
+                    tr("The Spiral service did not return after restarting: %1").arg(error);
+                setConnectionState(ConnectionState::Failed, message);
+                emit errorOccurred(message);
+                return;
+            }
+            QTimer::singleShot(kRestartProbeMs, this,
+                               &SpiralServiceManager::probeRestartedService);
+        });
 }
 
 void SpiralServiceManager::ensureStarted()

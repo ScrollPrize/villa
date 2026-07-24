@@ -32,6 +32,7 @@
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSlider>
+#include <QStyle>
 #include <QToolButton>
 #include <QUuid>
 #include <QVBoxLayout>
@@ -148,8 +149,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _connectButton = new QPushButton(tr("Connect"), connectRow);
     _disconnectButton = new QPushButton(tr("Disconnect"), connectRow);
     _disconnectButton->setEnabled(false);
+    _restartServiceButton = new QToolButton(connectRow);
+    _restartServiceButton->setObjectName(QStringLiteral("restartSpiralServiceButton"));
+    _restartServiceButton->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
+    _restartServiceButton->setToolTip(tr("Restart service"));
+    _restartServiceButton->setAutoRaise(true);
+    _restartServiceButton->setEnabled(false);
+    _restartServiceButton->setVisible(false);
     connectLayout->addWidget(_connectButton);
     connectLayout->addWidget(_disconnectButton);
+    connectLayout->addWidget(_restartServiceButton);
     connectLayout->addStretch(1);
     serviceForm->addRow(QString(), connectRow);
     _connectionStatus = new QLabel(tr("Disconnected"), serviceContents);
@@ -644,6 +653,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 _connected = state == CS::Ready;
                 _connectButton->setEnabled(state == CS::Disconnected || state == CS::Failed);
                 _disconnectButton->setEnabled(state != CS::Disconnected);
+                _restartServiceButton->setEnabled(_remoteMode && state == CS::Ready);
                 // Connection must succeed before dataset resolution or fit
                 // controls are enabled.
                 _load->setEnabled(_connected);
@@ -870,6 +880,18 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_disconnectButton, &QPushButton::clicked, this, [this]() {
         guardSessionExit([this]() { _service->disconnectFromService(); });
     });
+    connect(_restartServiceButton, &QToolButton::clicked, this, [this]() {
+        guardSessionExit([this]() {
+            if (_service->hasActiveSession()
+                && QMessageBox::question(
+                       this, tr("Restart Spiral service"),
+                       tr("Restarting the remote service ends the loaded in-memory fit "
+                          "session. Continue?"))
+                       != QMessageBox::Yes)
+                return;
+            _service->restartRemoteService();
+        });
+    });
 
     // Load saved profiles and select the previous one.
     {
@@ -1001,6 +1023,8 @@ void SpiralPanel::guardSessionExit(std::function<void()> action)
 void SpiralPanel::setRemoteMode(bool remote)
 {
     _remoteMode = remote;
+    _restartServiceButton->setVisible(remote);
+    _restartServiceButton->setEnabled(remote && _service->isReady());
     // Remote services own their base inputs: the path rows populate read-only
     // from the service's advertised dataset resolution, and there is nothing
     // local to browse. The checkpoint and tracks selections stay editable

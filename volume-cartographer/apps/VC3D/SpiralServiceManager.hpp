@@ -3,6 +3,7 @@
 #include "SpiralServiceProfile.hpp"
 
 #include <QJsonObject>
+#include <QElapsedTimer>
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
@@ -39,6 +40,7 @@ public:
     void connectToService(const SpiralServiceProfile& profile);
     void disconnectFromService();
     void reconnect();
+    void restartRemoteService();
 
     // Convenience for the built-in local profile (compatibility with callers
     // that only ever used the auto-launched loopback service).
@@ -104,6 +106,7 @@ private:
     void startLocalProcess();
     void startTunnel();
     void beginHandshake();
+    void probeRestartedService();
     void handleHealth(const QJsonObject& health);
     QNetworkRequest makeRequest(const QString& path, int timeoutMs) const;
     void post(const QString& path, QJsonObject body, Timeout timeout,
@@ -153,6 +156,8 @@ private:
     bool _hasActiveSession = false;
     bool _serviceOwnsDataset = false;
     bool _remoteLogsInFlight = false;
+    bool _restartInProgress = false;
+    QElapsedTimer _restartElapsed;
     int _remoteLogFailures = 0;
     qint64 _lastRemoteLogSequence = 0;
     QJsonObject _advertisedDataset;
