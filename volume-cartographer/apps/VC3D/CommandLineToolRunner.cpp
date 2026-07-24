@@ -328,6 +328,8 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
 
     _currentTool = tool;
     _executionOptions = options;
+    _terminalReported = false;
+    _pendingProcessError.clear();
 
     QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     QString toolBaseName = QFileInfo(toolCmd).baseName();
@@ -505,16 +507,8 @@ void CommandLineToolRunner::onProcessStarted()
     if (_progressUtil) _progressUtil->startAnimation(message);
 }
 
-void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
+void CommandLineToolRunner::closeLog()
 {
-    if (_logStream) {
-        *_logStream << Qt::endl << "===================================" << Qt::endl;
-        *_logStream << "Process finished at: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;
-        *_logStream << "Exit code: " << exitCode << Qt::endl;
-        *_logStream << "Exit status: " << (exitStatus == QProcess::NormalExit ? "Normal" : "Crashed") << Qt::endl;
-        _logStream->flush();
-    }
-
     if (_logStream) {
         delete _logStream;
         _logStream = nullptr;
@@ -524,8 +518,43 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
         delete _logFile;
         _logFile = nullptr;
     }
+}
 
+void CommandLineToolRunner::finishExecution(bool success,
+                                            const QString& message,
+                                            const QString& outputPath,
+                                            bool copyToClipboard)
+{
+    if (_terminalReported) {
+        return;
+    }
+    _terminalReported = true;
     _explicitVolumePath = false;
+
+    // Move the completed run out of the active slot before notifying observers.
+    // A toolFinished handler may synchronously start another process.
+    _completionOptions = _executionOptions;
+    _executionOptions = {};
+    _deliveringCompletion = true;
+    emit toolFinished(
+        _currentTool, success, message, outputPath, copyToClipboard);
+    _deliveringCompletion = false;
+}
+
+void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
+{
+    if (_terminalReported) {
+        return;
+    }
+    if (_logStream) {
+        *_logStream << Qt::endl << "===================================" << Qt::endl;
+        *_logStream << "Process finished at: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;
+        *_logStream << "Exit code: " << exitCode << Qt::endl;
+        *_logStream << "Exit status: " << (exitStatus == QProcess::NormalExit ? "Normal" : "Crashed") << Qt::endl;
+        _logStream->flush();
+    }
+
+    closeLog();
 
     if (exitCode == 0 && exitStatus == QProcess::NormalExit) {
         QString message = tr("%1 completed successfully").arg(toolName(_currentTool));
@@ -542,18 +571,18 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
             if (_progressUtil) _progressUtil->stopAnimation(message);
         }
 
-        emit toolFinished(_currentTool, true, message, outputPath, copyToClipboard);
+        finishExecution(true, message, outputPath, copyToClipboard);
     } else {
-        QString errorMessage = tr("%1 failed with exit code: %2")
-                                .arg(toolName(_currentTool))
-                                .arg(exitCode);
+        const QString errorMessage = _pendingProcessError.isEmpty()
+            ? tr("%1 failed with exit code: %2")
+                  .arg(toolName(_currentTool))
+                  .arg(exitCode)
+            : _pendingProcessError;
 
         if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
 
-        emit toolFinished(_currentTool, false, errorMessage, QString(), false);
+        finishExecution(false, errorMessage);
     }
-
-    _executionOptions = {};
 }
 
 void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
@@ -573,30 +602,14 @@ void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
 
     QStringList args = buildArguments(_currentTool);
     errorMessage += tr("\nArguments: %1").arg(args.join(" "));
+    _pendingProcessError = errorMessage;
 
     if (_logStream) {
         *_logStream << Qt::endl << "ERROR: " << errorMessage << Qt::endl;
         _logStream->flush();
     }
 
-    if (_logStream) {
-        delete _logStream;
-        _logStream = nullptr;
-    }
-    if (_logFile) {
-        _logFile->close();
-        delete _logFile;
-        _logFile = nullptr;
-    }
-
-    if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
-
-    _explicitVolumePath = false;
-
-    emit toolFinished(_currentTool, false, errorMessage, QString(), false);
-
     const bool showConsole = _executionOptions.showConsole;
-    _executionOptions = {};
 
     if (_consoleOutput) {
         _consoleOutput->appendOutput(errorMessage);
@@ -605,6 +618,19 @@ void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
     if (showConsole) {
         showConsoleOutput();
     }
+
+    // Crashes and other runtime errors are followed by finished(); let that
+    // signal own terminal delivery. FailedToStart is the exception: Qt does not
+    // emit finished() when the process never launched.
+    if (error != QProcess::FailedToStart) {
+        return;
+    }
+
+    closeLog();
+    if (_progressUtil) {
+        _progressUtil->stopAnimation(tr("Process failed"));
+    }
+    finishExecution(false, errorMessage);
 }
 
 QStringList CommandLineToolRunner::buildArguments(Tool tool)

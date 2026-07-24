@@ -149,10 +149,12 @@ public:
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
     void setPreserveConsoleOutput(bool preserve);
 
-    // Valid while toolFinished is being delivered for the current process.
+    // Valid while toolFinished is being delivered for the completed process.
     bool currentExecutionIsSilent() const
     {
-        return _executionOptions.presentation == Presentation::Silent;
+        const auto& options =
+            _deliveringCompletion ? _completionOptions : _executionOptions;
+        return options.presentation == Presentation::Silent;
     }
 
 signals:
@@ -170,6 +172,11 @@ private:
     QStringList buildArguments(Tool tool);
     QString toolName(Tool tool) const;
     QString getOutputPath() const;
+    void closeLog();
+    void finishExecution(bool success,
+                         const QString& message,
+                         const QString& outputPath = {},
+                         bool copyToClipboard = false);
 
     CWindow* _mainWindow;
     ProgressUtil* _progressUtil;
@@ -233,6 +240,10 @@ private:
     int _ompThreads{-1};
     bool _explicitVolumePath{false};
     ExecutionOptions _executionOptions;
+    ExecutionOptions _completionOptions;
+    bool _deliveringCompletion{false};
+    bool _terminalReported{true};
+    QString _pendingProcessError;
 
     QString _objOutputDir;
     float _objStretchFactor = 1000.0f;
