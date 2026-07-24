@@ -1245,7 +1245,14 @@ QJsonObject SpiralPanel::sessionAdvancedConfig() const
 {
     const QJsonDocument advanced =
         QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
-    QJsonObject config = !_advancedProfiles->isDefaultProfile() && advanced.isObject()
+    // A checkpoint-backed session starts from the checkpoint's own durable
+    // configuration. A previously selected saved profile can be chosen again
+    // after the checkpoint session is ready, but must not override its load.
+    const bool loadingCheckpoint =
+        !_paths.value(QStringLiteral("checkpoint"))->text().trimmed().isEmpty();
+    QJsonObject config =
+        !loadingCheckpoint && !_advancedProfiles->isDefaultProfile()
+            && advanced.isObject()
         ? advanced.object() : QJsonObject{};
     for (auto it = config.begin(); it != config.end();) {
         if (it.key().startsWith(QStringLiteral("interactive_influence_"))
@@ -1474,6 +1481,9 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
             _defaultAdvancedConfig = defaultConfig;
             _applyingResolution = true;
             _advancedProfiles->setSessionDefault(defaultConfig);
+            if (!_paths.value(QStringLiteral("checkpoint"))
+                     ->text().trimmed().isEmpty())
+                _advancedProfiles->showSessionDefault();
             _applyingResolution = false;
         }
         applySessionRunConfig(runConfig, sessionGeneration);

@@ -138,6 +138,16 @@ int main(int argc, char** argv)
 
     combo->setCurrentIndex(combo->findData(QStringLiteral("p1")));
     editor.setCurrentText(QStringLiteral("{\"saved\":3}"));
+    editor.setSessionDefault(
+        QJsonObject{{QStringLiteral("checkpoint_value"), 17}});
+    require(editor.currentProfileId() == QStringLiteral("p1"),
+            "Updating Session Default must not implicitly change profiles");
+    editor.showSessionDefault();
+    require(editor.currentProfileId() == QStringLiteral("default")
+                && QJsonDocument::fromJson(editor.currentText().toUtf8())
+                       .object().value(QStringLiteral("checkpoint_value")).toInt() == 17,
+            "Checkpoint load must be able to show its Session Default profile");
+    combo->setCurrentIndex(combo->findData(QStringLiteral("p1")));
     auto* save = editor.findChild<QPushButton*>(QStringLiteral("spiralAdvancedProfileSave"));
     require(save && save->isEnabled(), "Dirty persisted profile must enable Save");
     save->click();
