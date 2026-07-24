@@ -379,6 +379,11 @@ std::string validateLocation(Category category, const std::string& location)
         if (location.size() <= schemeEnd + 3) {
             return "Remote URL is missing host/bucket after scheme.";
         }
+        try {
+            (void)vc::parseRemoteVolumeSpec(location);
+        } catch (const std::invalid_argument& error) {
+            return error.what();
+        }
         return {};
     }
 

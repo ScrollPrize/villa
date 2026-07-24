@@ -95,6 +95,9 @@ TEST_CASE("validateLocation: malformed remote URLs are rejected")
 {
     CHECK_FALSE(validateLocation(Category::Volumes, "s3:").empty());
     CHECK_FALSE(validateLocation(Category::Volumes, "s3://").empty());
+    CHECK_FALSE(validateLocation(
+        Category::Volumes,
+        "https://example.test/volume.zarr#unknown=2").empty());
 }
 
 TEST_CASE("validateLocation: nonexistent local path is rejected")

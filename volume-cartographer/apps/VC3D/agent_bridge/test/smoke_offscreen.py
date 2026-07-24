@@ -502,6 +502,36 @@ def check_project_create(
             f"unexpected {type(error).__name__}: {error}",
         )
 
+    try:
+        client.call(
+            "project.create",
+            {
+                "path": str(root / "created" / "invalid-selector"),
+                "volume": "https://example.test/volume.zarr#unknown=2",
+            },
+            timeout=10.0,
+        )
+        results.record(
+            "project_create_invalid_remote_selector",
+            False,
+            "expected an error, got a result",
+        )
+    except BridgeError as error:
+        results.record(
+            "project_create_invalid_remote_selector",
+            error.code == -32007
+            and error.data.get("kind") == "volume"
+            and "unsupported remote volume selector"
+            in error.data.get("detail", ""),
+            f"returned code={error.code} detail={error.data.get('detail')!r}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "project_create_invalid_remote_selector",
+            False,
+            f"unexpected {type(error).__name__}: {error}",
+        )
+
     ok, detail = expect_param_error(
         client,
         "project.create",
