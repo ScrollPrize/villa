@@ -54,7 +54,7 @@ class DatasetResolverTests(unittest.TestCase):
             self.assertEqual(result.resolved["fibers"], str(root / "fibers"))
             self.assertNotIn("unverified_patches", result.resolved)
             self.assertEqual([item["role"] for item in result.pcl_inputs],
-                             ["absolute", "relative"])
+                             ["absolute", "relative", "same_winding"])
             self.assertEqual(resolve_logical_dbm(root / "tracks" / "only.dbm.db"),
                              str(root / "tracks" / "only.dbm"))
 

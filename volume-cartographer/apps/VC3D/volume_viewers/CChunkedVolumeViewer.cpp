@@ -52,7 +52,9 @@
 #include <queue>
 #include <source_location>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <opencv2/imgproc.hpp>
 
@@ -71,6 +73,7 @@ constexpr float kResolutionLodZoomBias = 0.5f;
 constexpr float kSegmentationResolutionLodZoomBias = 1.0f;
 constexpr int kSurfaceResolutionLevelBias = 1;
 constexpr int kInitialSegmentationSurfaceLevel = 5;
+constexpr std::size_t kOverlayTargetPageMaximumBytes = 128ULL * 1024ULL * 1024ULL;
 constexpr float kPanSmoothingAlpha = 0.65f;
 constexpr int kSurfaceCellTileSize = 64;
 constexpr std::array<QRgb, 12> kIntersectionPalette = {
@@ -1437,6 +1440,10 @@ struct CChunkedVolumeViewer::RenderResult {
     cv::Mat_<uint8_t> coverage;
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
+    // Pixels already sampled at overlayStartLevel. Unlike overlayCoverage,
+    // this excludes coarse fallback pixels so a static view can progressively
+    // complete without needing its entire 3D overlay working set resident.
+    cv::Mat_<uint8_t> overlayTargetCoverage;
     float surfacePtrX = 0.0f;
     float surfacePtrY = 0.0f;
     float scale = 1.0f;
@@ -1495,9 +1502,118 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     cv::Mat_<uint8_t> coverage(ctx.fbH, ctx.fbW, uint8_t(0));
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
-    const vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
-    const vc::render::ChunkedPlaneSampler::Options overlayOptions(
+    cv::Mat_<uint8_t> overlayTargetCoverage;
+    const bool continuingSameGeometry =
+        ctx.prevResult && !ctx.genCacheDirty &&
+        renderJobsSameGeometry(ctx.renderJob, ctx.prevResult->renderJob);
+    vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
+    vc::render::ChunkedPlaneSampler::Options overlayOptions(
         ctx.overlaySamplingMethod, options.tileSize);
+    // A new view may queue one adjacent coarse level for a quick preview.
+    // Once that geometry has produced a frame, only the requested level may
+    // create more cache work. Resident fallback chunks can still fill holes,
+    // but those reads do not promote them over the target working set.
+    options.queuedFallbackLevels = continuingSameGeometry ? 0 : 1;
+    overlayOptions.queuedFallbackLevels = 0;
+
+    auto initializeOverlayProgress = [&]() {
+        overlayValues.create(ctx.fbH, ctx.fbW);
+        overlayCoverage.create(ctx.fbH, ctx.fbW);
+        overlayTargetCoverage.create(ctx.fbH, ctx.fbW);
+        overlayValues.setTo(0);
+        overlayCoverage.setTo(0);
+        overlayTargetCoverage.setTo(0);
+
+        const RenderResult* prev = ctx.prevResult.get();
+        if (!continuingSameGeometry || !prev ||
+            prev->overlayValues.size() != overlayValues.size() ||
+            prev->overlayCoverage.size() != overlayCoverage.size() ||
+            prev->overlayTargetCoverage.size() != overlayTargetCoverage.size()) {
+            return;
+        }
+
+        for (int y = 0; y < overlayValues.rows; ++y) {
+            auto* dstValue = overlayValues.ptr<uint8_t>(y);
+            auto* dstCoverage = overlayCoverage.ptr<uint8_t>(y);
+            auto* dstTarget = overlayTargetCoverage.ptr<uint8_t>(y);
+            const auto* srcValue = prev->overlayValues.ptr<uint8_t>(y);
+            const auto* srcCoverage = prev->overlayCoverage.ptr<uint8_t>(y);
+            const auto* srcTarget = prev->overlayTargetCoverage.ptr<uint8_t>(y);
+            for (int x = 0; x < overlayValues.cols; ++x) {
+                if (!srcTarget[x])
+                    continue;
+                dstValue[x] = srcValue[x];
+                dstCoverage[x] = srcCoverage[x];
+                dstTarget[x] = 1;
+            }
+        }
+    };
+
+    auto overlayFallbackOptions = [&]() {
+        auto fallback = overlayOptions;
+        fallback.queueMisses = false;
+        fallback.queuedFallbackLevels = 0;
+        return fallback;
+    };
+
+    auto overlayResidentOptions = overlayOptions;
+    overlayResidentOptions.queueMisses = false;
+
+    std::size_t overlayRequestBytesRemaining = 0;
+    if (ctx.overlayChunkArray) {
+        const std::size_t capacity =
+            ctx.overlayChunkArray->stats().decodedByteCapacity;
+        overlayRequestBytesRemaining = std::min(
+            kOverlayTargetPageMaximumBytes, capacity / 8);
+    }
+    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash>
+        overlayRequestsThisFrame;
+    auto queueOverlayTargetPage =
+        [&](const std::vector<vc::render::ChunkKey>& dependencies) {
+            if (!ctx.overlayChunkArray || overlayRequestBytesRemaining == 0)
+                return;
+
+            auto orderedDependencies = dependencies;
+            std::sort(
+                orderedDependencies.begin(), orderedDependencies.end(),
+                [](const vc::render::ChunkKey& lhs,
+                   const vc::render::ChunkKey& rhs) {
+                    return std::tie(lhs.level, lhs.iz, lhs.iy, lhs.ix) <
+                           std::tie(rhs.level, rhs.iz, rhs.iy, rhs.ix);
+                });
+            std::vector<vc::render::ChunkKey> page;
+            for (const auto& key : orderedDependencies) {
+                if (!overlayRequestsThisFrame.insert(key).second)
+                    continue;
+                const auto chunkShape = ctx.overlayChunkArray->chunkShape(key.level);
+                std::size_t chunkBytes =
+                    ctx.overlayChunkArray->dtype() == vc::render::ChunkDtype::UInt16 ? 2 : 1;
+                for (const int dimension : chunkShape) {
+                    if (dimension <= 0 ||
+                        chunkBytes > std::numeric_limits<std::size_t>::max() /
+                                         static_cast<std::size_t>(dimension)) {
+                        chunkBytes = std::numeric_limits<std::size_t>::max();
+                        break;
+                    }
+                    chunkBytes *= static_cast<std::size_t>(dimension);
+                }
+                if (chunkBytes > overlayRequestBytesRemaining) {
+                    if (!page.empty())
+                        break;
+                    // A single valid chunk must be admitted even if its decoded
+                    // size exceeds the normal page target.
+                    page.push_back(key);
+                    overlayRequestBytesRemaining = 0;
+                    break;
+                }
+                page.push_back(key);
+                overlayRequestBytesRemaining -= chunkBytes;
+                if (overlayRequestBytesRemaining == 0)
+                    break;
+            }
+            if (!page.empty())
+                ctx.overlayChunkArray->prefetchChunks(page, false);
+        };
 
     auto streamingCompositeUnsupported = [&]() {
         return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method) ||
@@ -1525,7 +1641,9 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const int numLayers = front + behind + 1;
         const int zStart = -behind;
         const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
-        const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(vc::Sampling::Nearest, options.tileSize);
+        auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(
+            vc::Sampling::Nearest, options.tileSize);
+        compositeOptions.queuedFallbackLevels = options.queuedFallbackLevels;
         std::vector<cv::Mat_<uint8_t>> layerValues;
         std::vector<cv::Mat_<uint8_t>> layerCoverage;
         layerValues.reserve(numLayers);
@@ -1572,16 +1690,24 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                      int layersBehind,
                                      float zStep,
                                      const CompositeParams& params,
-                                     const vc::render::ChunkedPlaneSampler::Options& samplingOptions) {
+                                     const vc::render::ChunkedPlaneSampler::Options& samplingOptions,
+                                     cv::Mat_<uint8_t>* targetResolved,
+                                     const vc::render::ChunkedPlaneSampler::Options* fallbackOptions) {
         const int front = std::max(0, layersFront);
         const int behind = std::max(0, layersBehind);
         const int numLayers = front + behind + 1;
         const int zStart = -behind;
         std::vector<cv::Mat_<uint8_t>> layerValues;
         std::vector<cv::Mat_<uint8_t>> layerCoverage;
+        std::vector<cv::Mat_<uint8_t>> layerTargetCoverage;
+        cv::Mat_<uint8_t> resolvedBefore;
+        if (targetResolved)
+            resolvedBefore = targetResolved->clone();
         cv::Mat_<cv::Vec3f> layerCoords(coords.rows, coords.cols);
         layerValues.reserve(numLayers);
         layerCoverage.reserve(numLayers);
+        if (targetResolved)
+            layerTargetCoverage.reserve(numLayers);
         for (int i = 0; i < numLayers; ++i) {
             const float offset = float(zStart + i) * zStep;
             for (int y = 0; y < coords.rows; ++y) {
@@ -1597,9 +1723,26 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             }
             layerValues.emplace_back(dst.rows, dst.cols, uint8_t(0));
             layerCoverage.emplace_back(dst.rows, dst.cols, uint8_t(0));
-            vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                array, startLevel, layerCoords,
-                layerValues.back(), layerCoverage.back(), samplingOptions);
+            if (targetResolved) {
+                layerTargetCoverage.push_back(resolvedBefore.clone());
+                vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
+                    array, startLevel, layerCoords,
+                    layerValues.back(), layerTargetCoverage.back(), samplingOptions);
+                queueOverlayTargetPage(
+                    vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
+                        array, startLevel, layerCoords,
+                        layerTargetCoverage.back(), samplingOptions));
+                layerCoverage.back() = layerTargetCoverage.back().clone();
+                if (fallbackOptions && startLevel + 1 < array.numLevels()) {
+                    vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                        array, startLevel + 1, layerCoords,
+                        layerValues.back(), layerCoverage.back(), *fallbackOptions);
+                }
+            } else {
+                vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                    array, startLevel, layerCoords,
+                    layerValues.back(), layerCoverage.back(), samplingOptions);
+            }
         }
         LayerStack stack;
         stack.values.resize(numLayers);
@@ -1607,8 +1750,13 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             auto* dstRow = dst.ptr<uint8_t>(y);
             auto* covRow = cov.ptr<uint8_t>(y);
             for (int x = 0; x < dst.cols; ++x) {
+                if (targetResolved && resolvedBefore(y, x))
+                    continue;
                 stack.validCount = 0;
+                bool allLayersAtTarget = targetResolved != nullptr;
                 for (int i = 0; i < numLayers; ++i) {
+                    if (targetResolved && !layerTargetCoverage[i](y, x))
+                        allLayersAtTarget = false;
                     if (!layerCoverage[i](y, x))
                         continue;
                     const float value = static_cast<float>(layerValues[i](y, x));
@@ -1621,6 +1769,8 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                         compositeLayerStack(stack, params), 0.0f, 255.0f));
                     covRow[x] = 1;
                 }
+                if (allLayersAtTarget)
+                    (*targetResolved)(y, x) = 1;
             }
         }
     };
@@ -1640,12 +1790,14 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         }
 
         const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
-        const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(
+        auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(
             vc::Sampling::Nearest, options.tileSize);
+        compositeOptions.queuedFallbackLevels = options.queuedFallbackLevels;
         sampleCoordsComposite(coords, normals, dst, cov, array, ctx.startLevel,
                               ctx.compositeSettings.layersFront,
                               ctx.compositeSettings.layersBehind,
-                              zStep, ctx.compositeSettings.params, compositeOptions);
+                              zStep, ctx.compositeSettings.params, compositeOptions,
+                              nullptr, nullptr);
     };
 
     const bool planeView = dynamic_cast<PlaneSurface*>(ctx.surf.get()) != nullptr;
@@ -1665,14 +1817,22 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         samplePlane(origin, vxStep, vyStep, n, values, coverage, *ctx.chunkArray);
         if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
         if (ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f) {
-            overlayValues.create(ctx.fbH, ctx.fbW);
-            overlayCoverage.create(ctx.fbH, ctx.fbW);
-            overlayValues.setTo(0);
-            overlayCoverage.setTo(0);
+            initializeOverlayProgress();
             const int level = std::clamp(ctx.overlayStartLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
-            vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
+            vc::render::ChunkedPlaneSampler::samplePlaneLevel(
                 *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
-                overlayValues, overlayCoverage, overlayOptions);
+                overlayValues, overlayTargetCoverage, overlayResidentOptions);
+            queueOverlayTargetPage(
+                vc::render::ChunkedPlaneSampler::collectPlaneDependencies(
+                    *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
+                    overlayTargetCoverage, overlayResidentOptions));
+            overlayCoverage.setTo(1, overlayTargetCoverage);
+            if (level + 1 < ctx.overlayChunkArray->numLevels()) {
+                const auto fallback = overlayFallbackOptions();
+                vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
+                    *ctx.overlayChunkArray, level + 1, origin, vxStep, vyStep,
+                    overlayValues, overlayCoverage, fallback);
+            }
         }
     } else {
         cv::Mat_<cv::Vec3f> coords;
@@ -1746,25 +1906,35 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             sampleCoords(coords, normals, values, coverage, *ctx.chunkArray);
             if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
             if (overlayActive) {
-                overlayValues.create(ctx.fbH, ctx.fbW);
-                overlayCoverage.create(ctx.fbH, ctx.fbW);
-                overlayValues.setTo(0);
-                overlayCoverage.setTo(0);
+                initializeOverlayProgress();
                 const int level = std::clamp(ctx.overlayStartLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
                 if (overlayWantsComposite && !normals.empty()) {
                     // Keep "front" pointing the same physical direction as the primary composite.
                     const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
                     CompositeParams overlayParams;
                     overlayParams.method = ctx.overlayComposite.method;
+                    const auto fallback = overlayFallbackOptions();
                     sampleCoordsComposite(coords, normals, overlayValues, overlayCoverage,
                                           *ctx.overlayChunkArray, level,
                                           ctx.overlayComposite.layersFront,
                                           ctx.overlayComposite.layersBehind,
-                                          zStep, overlayParams, overlayOptions);
+                                          zStep, overlayParams, overlayResidentOptions,
+                                          &overlayTargetCoverage, &fallback);
                 } else {
-                    vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                        *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage,
-                        overlayOptions);
+                    vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
+                        *ctx.overlayChunkArray, level, coords, overlayValues,
+                        overlayTargetCoverage, overlayResidentOptions);
+                    queueOverlayTargetPage(
+                        vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
+                            *ctx.overlayChunkArray, level, coords,
+                            overlayTargetCoverage, overlayResidentOptions));
+                    overlayCoverage.setTo(1, overlayTargetCoverage);
+                    if (level + 1 < ctx.overlayChunkArray->numLevels()) {
+                        const auto fallback = overlayFallbackOptions();
+                        vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                            *ctx.overlayChunkArray, level + 1, coords,
+                            overlayValues, overlayCoverage, fallback);
+                    }
                 }
             }
         }
@@ -1806,6 +1976,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.coverage = coverage;
     result.overlayValues = overlayValues;
     result.overlayCoverage = overlayCoverage;
+    result.overlayTargetCoverage = overlayTargetCoverage;
 
     if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};

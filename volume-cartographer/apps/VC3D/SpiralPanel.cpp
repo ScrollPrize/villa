@@ -761,8 +761,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         if (QMessageBox::question(this, tr("Commit inputs"),
                                   tr("Move the added inputs into the dataset? Patches go to "
                                      "verified_patches/, fibers to fibers/, and PCL documents "
-                                     "merge into their conventional role file (drawn control "
-                                     "points go to drawn_control_points.json)."))
+                                     "merge into their conventional role file (control-point "
+                                     "lines go to drawn_control_points.json; "
+                                     "same-winding point collections go to same_windings.json)."))
             != QMessageBox::Yes) return;
         _service->commitInputs();
     });

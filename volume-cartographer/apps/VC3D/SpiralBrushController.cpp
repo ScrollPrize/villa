@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 
 namespace {
@@ -148,6 +149,8 @@ void SpiralBrushController::resetSession()
     _polylineBlocked = false;
     _vHeld = false;
     _vClickConsumed = false;
+    _qHeld = false;
+    _qClickConsumed = false;
     refreshAll();
     emit paintStateChanged();
 }
@@ -502,6 +505,59 @@ void SpiralBrushController::finishAnchoredPolyline()
     emit paintStateChanged();
 }
 
+void SpiralBrushController::appendPointCollectionPoint(const QPointF& devicePos)
+{
+    if (!_viewer || _viewer->surfName() != "segmentation"
+        || _dragMode != DragMode::None)
+        return;
+    auto* sourceRaw = dynamic_cast<QuadSurface*>(_viewer->currentSurface());
+    if (!sourceRaw || !_paintSurface || _paintSurface.get() != sourceRaw) return;
+
+    const auto sample = pointOnSurface(devicePos, _paintSurface);
+    if (!sample) {
+        emit pointPlacementRejected(tr("Point must lie on valid Spiral surface data"));
+        return;
+    }
+    if (_activePolyline < 0) {
+        PolylineGesture collection;
+        collection.kind = PolylineGesture::Kind::PointCollection;
+        collection.color = nextColor();
+        collection.source = _paintSurface;
+        collection.creationTime = QDateTime::currentMSecsSinceEpoch();
+        collection.sequence = _nextPolylineSequence++;
+        _polylines.push_back(std::move(collection));
+        _activePolyline = static_cast<int>(_polylines.size()) - 1;
+    }
+    if (_activePolyline >= static_cast<int>(_polylines.size())
+        || _polylines[static_cast<std::size_t>(_activePolyline)].kind
+            != PolylineGesture::Kind::PointCollection)
+        return;
+
+    auto& collection = _polylines[static_cast<std::size_t>(_activePolyline)];
+    collection.anchors.push_back({sample->first, sample->second});
+    collection.surfacePoints.push_back(sample->first);
+    collection.volumePoints.push_back(sample->second);
+    clearPointChainProjectionCache();
+    refreshViewer(_viewer);
+    emit paintStateChanged();
+}
+
+void SpiralBrushController::finishPointCollection()
+{
+    if (_activePolyline >= 0 && _activePolyline < static_cast<int>(_polylines.size())) {
+        const auto index = static_cast<std::size_t>(_activePolyline);
+        if (_polylines[index].kind == PolylineGesture::Kind::PointCollection) {
+            if (_polylines[index].volumePoints.size() < 2)
+                _polylines.erase(_polylines.begin() + _activePolyline);
+            _activePolyline = -1;
+        }
+    }
+    _qClickConsumed = false;
+    clearPointChainProjectionCache();
+    refreshViewer(_viewer);
+    emit paintStateChanged();
+}
+
 void SpiralBrushController::beginErase(const QPointF& devicePos)
 {
     if (!_viewer || _viewer->surfName() != "segmentation"
@@ -580,6 +636,30 @@ void SpiralBrushController::eraseWith(const QPainterPath& deviceShape)
                     touched[sourceIndex] = true;
             }
             const auto decision = vc3d::spiral::classifyAnchorErase(touched);
+            if (line->kind == PolylineGesture::Kind::PointCollection) {
+                for (std::size_t index = touched.size(); index-- > 0;) {
+                    if (!touched[index]) continue;
+                    line->anchors.erase(line->anchors.begin()
+                        + static_cast<std::ptrdiff_t>(index));
+                    line->surfacePoints.erase(line->surfacePoints.begin()
+                        + static_cast<std::ptrdiff_t>(index));
+                    line->volumePoints.erase(line->volumePoints.begin()
+                        + static_cast<std::ptrdiff_t>(index));
+                }
+                if (line->volumePoints.size() < 2) {
+                    const int lineIndex = static_cast<int>(
+                        std::distance(_polylines.begin(), line));
+                    if (_activePolyline == lineIndex)
+                        _activePolyline = -1;
+                    else if (_activePolyline > lineIndex)
+                        --_activePolyline;
+                    line = _polylines.erase(line);
+                } else {
+                    ++line;
+                }
+                pointChainsChanged = true;
+                continue;
+            }
             if (decision.action == vc3d::spiral::AnchorEraseAction::None) {
                 ++line;
                 continue;
@@ -682,10 +762,19 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
         }
         if (key->key() == Qt::Key_V && !key->isAutoRepeat()) {
             if (event->type() == QEvent::KeyPress) {
-                _vHeld = true;
+                if (!_qHeld) _vHeld = true;
             } else {
                 _vHeld = false;
                 finishAnchoredPolyline();
+            }
+            return true;
+        }
+        if (key->key() == Qt::Key_Q && !key->isAutoRepeat()) {
+            if (event->type() == QEvent::KeyPress) {
+                if (!_vHeld) _qHeld = true;
+            } else {
+                _qHeld = false;
+                finishPointCollection();
             }
             return true;
         }
@@ -697,6 +786,8 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
         _controlHeld = false;
         if (_vHeld) finishAnchoredPolyline();
         _vHeld = false;
+        if (_qHeld) finishPointCollection();
+        _qHeld = false;
         updateCursorWidget();
         return false;
     }
@@ -706,6 +797,8 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
         _controlHeld = false;
         if (_vHeld) finishAnchoredPolyline();
         _vHeld = false;
+        if (_qHeld) finishPointCollection();
+        _qHeld = false;
         updateCursorWidget();
         return false;
     }
@@ -754,7 +847,7 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
             extendDrag(devicePos);
             return true;
         }
-        if (_vHeld && mouse->buttons().testFlag(Qt::LeftButton)) return true;
+        if ((_vHeld || _qHeld) && mouse->buttons().testFlag(Qt::LeftButton)) return true;
         return false;
     }
     if (event->type() == QEvent::MouseButtonPress) {
@@ -770,6 +863,11 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
         if (_vHeld && mouse->button() == Qt::LeftButton) {
             appendAnchoredPoint(devicePos);
             _vClickConsumed = true;
+            return true;
+        }
+        if (_qHeld && mouse->button() == Qt::LeftButton) {
+            appendPointCollectionPoint(devicePos);
+            _qClickConsumed = true;
             return true;
         }
         if (mouse->button() == Qt::LeftButton && mouse->modifiers() == Qt::ShiftModifier) {
@@ -806,6 +904,11 @@ bool SpiralBrushController::eventFilter(QObject* watched, QEvent* event)
         }
         if (mouse->button() == Qt::LeftButton && _vClickConsumed) {
             _vClickConsumed = false;
+            updateCursor(devicePos);
+            return true;
+        }
+        if (mouse->button() == Qt::LeftButton && _qClickConsumed) {
+            _qClickConsumed = false;
             updateCursor(devicePos);
             return true;
         }
@@ -861,6 +964,8 @@ void SpiralBrushController::collectPrimitives(VolumeViewerBase* viewer, OverlayB
         style.pointZ = 120.0;
         style.lineZ = 119.0;
         style.distanceTolerance = kPolylineProjectionToleranceVoxels;
+        if (line.kind == PolylineGesture::Kind::PointCollection)
+            style.drawLines = false;
         renderPointChain(viewer, builder, line.volumePoints, style);
         if (line.kind == PolylineGesture::Kind::Anchored && !line.anchors.empty()) {
             std::vector<cv::Vec3f> anchorPoints;
@@ -982,56 +1087,76 @@ SpiralBrushController::preparePatches(QStringList& warnings)
     return patches;
 }
 
-SpiralBrushController::PreparedPointCollections
+std::vector<SpiralBrushController::PreparedPointCollections>
 SpiralBrushController::preparePointCollections(QStringList& warnings)
 {
-    PreparedPointCollections result;
+    std::vector<PreparedPointCollections> results;
     if (_dragMode != DragMode::None) {
         warnings.push_back(tr("Release the mouse button before finalizing control-point lines"));
-        return result;
+        return results;
     }
-    QJsonObject collections;
-    int collectionId = 0;
-    for (auto& line : _polylines) {
-        if (line.state != GestureState::Painted || line.volumePoints.size() < 2) continue;
-        QJsonObject points;
-        for (int index = 0; index < static_cast<int>(line.volumePoints.size()); ++index) {
-            const cv::Vec3f& point = line.volumePoints[static_cast<std::size_t>(index)];
-            points[QString::number(index)] = QJsonObject{
-                {QStringLiteral("p"), QJsonArray{point[0], point[1], point[2]}},
-                {QStringLiteral("wind_a"), QJsonValue::Null},
-                {QStringLiteral("creation_time"), line.creationTime + index},
+    const auto prepareKinds = [this, &results](
+                                  std::initializer_list<PolylineGesture::Kind> kinds,
+                                  const QString& role, const QString& idPrefix,
+                                  const QString& namePrefix) {
+        const auto includesKind = [kinds](PolylineGesture::Kind kind) {
+            return std::find(kinds.begin(), kinds.end(), kind) != kinds.end();
+        };
+        QJsonObject collections;
+        int collectionId = 0;
+        for (auto& line : _polylines) {
+            if (!includesKind(line.kind) || line.state != GestureState::Painted
+                || line.volumePoints.size() < 2)
+                continue;
+            QJsonObject points;
+            for (int index = 0; index < static_cast<int>(line.volumePoints.size()); ++index) {
+                const cv::Vec3f& point = line.volumePoints[static_cast<std::size_t>(index)];
+                points[QString::number(index)] = QJsonObject{
+                    {QStringLiteral("p"), QJsonArray{point[0], point[1], point[2]}},
+                    {QStringLiteral("wind_a"), QJsonValue::Null},
+                    {QStringLiteral("creation_time"), line.creationTime + index},
+                };
+            }
+            collections[QString::number(collectionId++)] = QJsonObject{
+                {QStringLiteral("name"),
+                 QStringLiteral("%1_%2").arg(namePrefix).arg(
+                     line.sequence, 4, 10, QLatin1Char('0'))},
+                {QStringLiteral("points"), points},
+                {QStringLiteral("metadata"),
+                 QJsonObject{{QStringLiteral("winding_is_absolute"), false}}},
+                {QStringLiteral("color"),
+                 QJsonArray{line.color.redF(), line.color.greenF(), line.color.blueF()}},
             };
         }
-        collections[QString::number(collectionId++)] = QJsonObject{
-            {QStringLiteral("name"),
-             QStringLiteral("drawn_line_%1").arg(line.sequence, 4, 10, QLatin1Char('0'))},
-            {QStringLiteral("points"), points},
-            {QStringLiteral("metadata"),
-             QJsonObject{{QStringLiteral("winding_is_absolute"), false}}},
-            {QStringLiteral("color"),
-             QJsonArray{line.color.redF(), line.color.greenF(), line.color.blueF()}},
-        };
-    }
-    if (collections.isEmpty()) return result;
-    const QString stamp = QDateTime::currentDateTimeUtc().toString(
-        QStringLiteral("yyyyMMdd_HHmmss_zzz"));
-    const QString suffix = QString::number(QRandomGenerator::global()->generate(), 16)
-                               .rightJustified(8, '0');
-    result.id = QStringLiteral("drawn_control_points_%1_%2").arg(stamp, suffix);
-    result.document = QJsonDocument(QJsonObject{
-        {QStringLiteral("vc_pointcollections_json_version"), QStringLiteral("1")},
-        {QStringLiteral("collections"), collections},
-    });
-    for (auto& line : _polylines) {
-        if (line.state == GestureState::Painted && line.volumePoints.size() >= 2) {
-            line.id = result.id;
-            line.state = GestureState::Finalizing;
+        if (collections.isEmpty()) return;
+        const QString stamp = QDateTime::currentDateTimeUtc().toString(
+            QStringLiteral("yyyyMMdd_HHmmss_zzz"));
+        const QString suffix = QString::number(QRandomGenerator::global()->generate(), 16)
+                                   .rightJustified(8, '0');
+        PreparedPointCollections result;
+        result.id = QStringLiteral("%1_%2_%3").arg(idPrefix, stamp, suffix);
+        result.role = role;
+        result.document = QJsonDocument(QJsonObject{
+            {QStringLiteral("vc_pointcollections_json_version"), QStringLiteral("1")},
+            {QStringLiteral("collections"), collections},
+        });
+        for (auto& line : _polylines) {
+            if (includesKind(line.kind) && line.state == GestureState::Painted
+                && line.volumePoints.size() >= 2) {
+                line.id = result.id;
+                line.state = GestureState::Finalizing;
+            }
         }
-    }
+        results.push_back(std::move(result));
+    };
+    prepareKinds({PolylineGesture::Kind::Freehand, PolylineGesture::Kind::Anchored},
+                 QStringLiteral("drawn_control_points"),
+                 QStringLiteral("drawn_control_points"), QStringLiteral("drawn_line"));
+    prepareKinds({PolylineGesture::Kind::PointCollection}, QStringLiteral("same_winding"),
+                 QStringLiteral("same_winding_points"), QStringLiteral("same_winding"));
     refreshAll();
     emit paintStateChanged();
-    return result;
+    return results;
 }
 
 void SpiralBrushController::finalizationSucceeded(const QString& id)

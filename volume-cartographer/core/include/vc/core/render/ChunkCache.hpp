@@ -96,6 +96,7 @@ public:
     LevelTransform levelTransform(int level) const override;
 
     ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override;
+    ChunkResult getChunkIfCached(int level, int iz, int iy, int ix) override;
     ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override;
     void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) override;
 
@@ -188,7 +189,8 @@ private:
         std::shared_ptr<PersistentZarrCacheBudget> persistentBudget_;
     };
 
-    static ChunkResult resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry);
+    static ChunkResult resultFromEntryLocked(
+        State& state, const ChunkKey& key, Entry& entry, bool promote = true);
     static int fetchBasePriority(const State& state, const ChunkKey& key, int priorityOffset);
     static void queueFetchLocked(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,

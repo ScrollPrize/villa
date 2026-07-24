@@ -57,6 +57,25 @@ public:
 
     vc::render::ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override
     {
+        if (level >= 0 && level < numLevels())
+            ++queuedLookups[level];
+        return chunkResult(level, iz, iy, ix);
+    }
+
+    vc::render::ChunkResult getChunkIfCached(
+        int level, int iz, int iy, int ix) override
+    {
+        if (level >= 0 && level < numLevels())
+            ++cachedLookups[level];
+        return chunkResult(level, iz, iy, ix);
+    }
+
+    std::array<int, 2> queuedLookups{};
+    std::array<int, 2> cachedLookups{};
+
+private:
+    vc::render::ChunkResult chunkResult(int level, int iz, int iy, int ix)
+    {
         vc::render::ChunkResult result;
         result.dtype = vc::render::ChunkDtype::UInt8;
         if (level < 0 || level >= numLevels() || iz != 0 || iy != 0 || ix != 0) {
@@ -76,9 +95,10 @@ public:
         return result;
     }
 
+public:
     vc::render::ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override
     {
-        return tryGetChunk(level, iz, iy, ix);
+        return chunkResult(level, iz, iy, ix);
     }
 
     void prefetchChunks(const std::vector<vc::render::ChunkKey>&, bool, int) override {}
@@ -233,4 +253,38 @@ TEST_CASE("ChunkedPlaneSampler base and overlay buffers fall back independently"
     CHECK(baseOut(0, 0) == 11);
     CHECK(overlayCoverage(0, 0) == 1);
     CHECK(overlayOut(0, 0) == 99);
+}
+
+TEST_CASE("ChunkedPlaneSampler can use fallback without queueing or promoting it")
+{
+    PyramidChunkedArray array(vc::render::ChunkStatus::MissQueued, 0,
+                              vc::render::ChunkStatus::MissQueued, 0);
+    cv::Mat_<uint8_t> out(1, 1, uint8_t(0));
+    cv::Mat_<uint8_t> coverage(1, 1, uint8_t(0));
+    vc::render::ChunkedPlaneSampler::Options options(vc::Sampling::Nearest, 1);
+    options.queuedFallbackLevels = 0;
+
+    vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+        array, 0, singleCoord({1.0f, 1.0f, 1.0f}), out, coverage, options);
+
+    CHECK(array.queuedLookups[0] > 0);
+    CHECK(array.queuedLookups[1] == 0);
+    CHECK(array.cachedLookups[1] > 0);
+}
+
+TEST_CASE("ChunkedPlaneSampler can bound transition work to one fallback level")
+{
+    PyramidChunkedArray array(vc::render::ChunkStatus::MissQueued, 0,
+                              vc::render::ChunkStatus::MissQueued, 0);
+    cv::Mat_<uint8_t> out(1, 1, uint8_t(0));
+    cv::Mat_<uint8_t> coverage(1, 1, uint8_t(0));
+    vc::render::ChunkedPlaneSampler::Options options(vc::Sampling::Nearest, 1);
+    options.queuedFallbackLevels = 1;
+
+    vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+        array, 0, singleCoord({1.0f, 1.0f, 1.0f}), out, coverage, options);
+
+    CHECK(array.queuedLookups[0] > 0);
+    CHECK(array.queuedLookups[1] > 0);
+    CHECK(array.cachedLookups[1] == 0);
 }

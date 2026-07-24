@@ -35,6 +35,7 @@ public:
     };
     struct PreparedPointCollections {
         QString id;
+        QString role;
         QJsonDocument document;
     };
 
@@ -49,7 +50,7 @@ public:
     int brushDiameter() const { return _diameterPx; }
 
     std::vector<PreparedPatch> preparePatches(QStringList& warnings);
-    PreparedPointCollections preparePointCollections(QStringList& warnings);
+    std::vector<PreparedPointCollections> preparePointCollections(QStringList& warnings);
     void finalizationSucceeded(const QString& id);
     void finalizationFailed(const QString& id);
     void discardUnfinalized();
@@ -77,7 +78,7 @@ private:
         GestureState state = GestureState::Painted;
     };
     struct PolylineGesture {
-        enum class Kind { Freehand, Anchored };
+        enum class Kind { Freehand, Anchored, PointCollection };
         QString id;
         QColor color;
         std::shared_ptr<QuadSurface> source;
@@ -100,6 +101,8 @@ private:
     void beginPolyline(const QPointF& devicePos);
     void appendAnchoredPoint(const QPointF& devicePos);
     void finishAnchoredPolyline();
+    void appendPointCollectionPoint(const QPointF& devicePos);
+    void finishPointCollection();
     void beginErase(const QPointF& devicePos);
     void extendDrag(const QPointF& devicePos);
     void finishDrag(const QPointF& devicePos);
@@ -140,4 +143,6 @@ private:
     bool _controlHeld = false;
     bool _vHeld = false;
     bool _vClickConsumed = false;
+    bool _qHeld = false;
+    bool _qClickConsumed = false;
 };

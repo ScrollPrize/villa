@@ -388,6 +388,19 @@ class DatasetOwnershipTests(unittest.TestCase):
             "path": str(drawn), "role": "drawn_control_points", "required": False,
         }])
 
+    def test_dataset_resolution_discovers_same_winding_collections(self):
+        same_winding = self.root / "same_windings.json"
+        same_winding.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "same_winding_0001", "points": {}}},
+        }))
+        resolution = resolve_dataset_root(self.root)
+        entries = [entry for entry in resolution.pcl_inputs
+                   if entry["role"] == "same_winding"]
+        self.assertEqual(entries, [{
+            "path": str(same_winding), "role": "same_winding", "required": False,
+        }])
+
     def test_arbitrary_root_resolution_is_refused(self):
         with self.assertRaises(ApiError) as caught:
             self.state.resolve("/somewhere/else")
@@ -839,6 +852,31 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(list(merged["collections"]["5"]["points"]), ["0", "1"])
         self.assertEqual(len(list(self.dataset.glob(
             "drawn_control_points.json.*.bak"))), 1)
+
+    def test_same_winding_commit_preserves_collection_and_point_order(self):
+        existing = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"2": {"name": "existing", "points": {}}},
+        }
+        target = self.dataset / "same_windings.json"
+        target.write_text(json.dumps(existing))
+        incoming = {"same.json": json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {"name": "same_winding_0001", "points": {
+                    "0": {"p": [1, 2, 3]}, "1": {"p": [4, 5, 6]}}},
+                "1": {"name": "same_winding_0002", "points": {
+                    "0": {"p": [7, 8, 9]}, "1": {"p": [10, 11, 12]}}},
+            },
+        }).encode()}
+        self._finalize("pcl", "same-1", incoming, role="same_winding")
+        self.state.commit_inputs()
+        merged = json.loads(target.read_text())
+        self.assertEqual([collection["name"] for collection in merged["collections"].values()],
+                         ["existing", "same_winding_0001", "same_winding_0002"])
+        self.assertEqual(list(merged["collections"]["3"]["points"]), ["0", "1"])
+        self.assertEqual(len(list(self.dataset.glob(
+            "same_windings.json.*.bak"))), 1)
 
     def test_commit_keeps_pending_inputs_queued_and_incorporation_retires_them(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)

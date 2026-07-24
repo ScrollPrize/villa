@@ -28,6 +28,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
+#include <QGuiApplication>
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -43,6 +44,7 @@
 #include <QStatusBar>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QWindow>
 #include <QtEndian>
 #include <QtConcurrent/QtConcurrent>
 
@@ -295,10 +297,27 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     });
     auto* dock = new QDockWidget(tr("Spiral"), this);
     dock->setObjectName(QStringLiteral("spiralControlDock"));
-    dock->setFeatures(QDockWidget::NoDockWidgetFeatures);
+    dock->setFeatures(QDockWidget::DockWidgetMovable
+                      | QDockWidget::DockWidgetFloatable);
     dock->setWidget(_panel);
     addDockWidget(Qt::LeftDockWidgetArea, dock);
     resizeDocks({dock}, {390}, Qt::Horizontal);
+
+    // Match the workaround used by Main's other movable docks. On Wayland,
+    // Qt can retain a failed mouse grab after a dock drag and stop delivering
+    // mouse events until that grab is explicitly released.
+    if (QGuiApplication::platformName() == QLatin1String("wayland")) {
+        auto releaseStaleMouseGrab = []() {
+            QTimer::singleShot(100, []() {
+                if (auto* grabber = QWidget::mouseGrabber())
+                    grabber->releaseMouse();
+                for (auto* window : QGuiApplication::topLevelWindows())
+                    window->setMouseGrabEnabled(false);
+            });
+        };
+        connect(dock, &QDockWidget::topLevelChanged, this, releaseStaleMouseGrab);
+        connect(dock, &QDockWidget::dockLocationChanged, this, releaseStaleMouseGrab);
+    }
 
     connect(_panel, &SpiralPanel::volumeSelected, this, &SpiralWorkspace::selectVolume);
     connect(_panel, &SpiralPanel::pythonOutputRequested, this, [this]() {
@@ -672,8 +691,10 @@ void SpiralWorkspace::updatePendingPatchIds(const QJsonObject& status)
             pendingPatches.insert(input.value(QStringLiteral("id")).toString());
         }
         if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("pcl")
-            && input.value(QStringLiteral("role")).toString()
-                   == QStringLiteral("drawn_control_points")
+            && (input.value(QStringLiteral("role")).toString()
+                    == QStringLiteral("drawn_control_points")
+                || input.value(QStringLiteral("role")).toString()
+                    == QStringLiteral("same_winding"))
             && !input.value(QStringLiteral("committed")).toBool()) {
             uncommittedDrawnPointCollections.insert(
                 input.value(QStringLiteral("id")).toString());
@@ -787,15 +808,15 @@ void SpiralWorkspace::finalizeBrushPaint()
     auto patches = _brush->preparePatches(warnings);
     auto pointCollections = _brush->preparePointCollections(warnings);
     if (!warnings.isEmpty()) statusBar()->showMessage(warnings.join(QStringLiteral("; ")), 10000);
-    if (patches.empty() && pointCollections.id.isEmpty()) {
+    if (patches.empty() && pointCollections.empty()) {
         maybeCommitForPendingExit();
         return;
     }
     const QString root = provisionalBrushRoot();
     if (!QDir().mkpath(root)) {
         for (const auto& patch : patches) _brush->finalizationFailed(patch.id);
-        if (!pointCollections.id.isEmpty())
-            _brush->finalizationFailed(pointCollections.id);
+        for (const auto& document : pointCollections)
+            _brush->finalizationFailed(document.id);
         QMessageBox::warning(this, tr("Cannot save drawn inputs"),
                              tr("Could not create %1").arg(root));
         _pendingExitAction = {};
@@ -836,21 +857,21 @@ void SpiralWorkspace::finalizeBrushPaint()
             }
         }));
     }
-    if (!pointCollections.id.isEmpty()) {
-        const QString path = QDir(root).filePath(pointCollections.id + QStringLiteral(".json"));
+    for (const auto& document : pointCollections) {
+        const QString path = QDir(root).filePath(document.id + QStringLiteral(".json"));
         QSaveFile file(path);
         if (!file.open(QIODevice::WriteOnly)
-            || file.write(pointCollections.document.toJson(QJsonDocument::Indented)) < 0
+            || file.write(document.document.toJson(QJsonDocument::Indented)) < 0
             || !file.commit()) {
-            _brush->finalizationFailed(pointCollections.id);
+            _brush->finalizationFailed(document.id);
             _commitAfterBrushUploads = false;
             _pendingExitAction = {};
-            QMessageBox::warning(this, tr("Cannot save control-point lines"),
+            QMessageBox::warning(this, tr("Cannot save point collections"),
                                  tr("Could not write %1").arg(path));
         } else {
-            _pendingPointCollectionPaths[pointCollections.id] = path;
-            _service->uploadJsonInput(QStringLiteral("pcl"), path, pointCollections.id,
-                                      QStringLiteral("drawn_control_points"));
+            _pendingPointCollectionPaths[document.id] = path;
+            _service->uploadJsonInput(QStringLiteral("pcl"), path, document.id,
+                                      document.role);
         }
     }
 }
@@ -898,7 +919,8 @@ void SpiralWorkspace::requestSessionExit(std::function<void()> continuation)
         return;
     }
     QMessageBox box(QMessageBox::Warning, tr("Uncommitted Spiral drawn inputs"),
-                    tr("This Spiral session contains brush paint or control-point lines that "
+                    tr("This Spiral session contains brush paint, control-point lines, or "
+                       "same-winding point collections that "
                        "have not been committed to the dataset."), QMessageBox::NoButton, this);
     auto* commit = box.addButton(tr("Commit"), QMessageBox::AcceptRole);
     auto* exit = box.addButton(tr("Exit Without Commit"), QMessageBox::DestructiveRole);

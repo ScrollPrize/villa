@@ -149,6 +149,44 @@ TEST_CASE("ChunkCache: first tryGetChunk queues; second returns the data")
     CHECK(f->fetchCalls.load() == callsAfter);
 }
 
+TEST_CASE("ChunkCache: cache-only reads neither queue nor promote decoded chunks")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    for (int ix = 0; ix < 3; ++ix) {
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = makeBytes(64, std::byte{static_cast<unsigned char>(ix + 1)});
+        f->setCanned({0, 0, 0, ix}, std::move(result));
+    }
+
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 12}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options opts;
+    opts.decodedByteCapacity = 1024;
+    opts.decodedByteBudget = std::make_shared<DecodedChunkCacheBudget>(128);
+    opts.maxConcurrentReads = 1;
+    opts.detectAllFillChunks = false;
+    ChunkCache cache(
+        std::move(levels),
+        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
+        0.0, ChunkDtype::UInt8, opts);
+
+    CHECK(cache.getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(f->fetchCalls.load() == 0);
+    REQUIRE(waitForResolved(cache, 0, 0, 0, 0).status == ChunkStatus::Data);
+    REQUIRE(waitForResolved(cache, 0, 0, 0, 1).status == ChunkStatus::Data);
+
+    // Looking at the oldest chunk as a fallback must not make it newer than
+    // the target working set.
+    CHECK(cache.getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+    REQUIRE(waitForResolved(cache, 0, 0, 0, 2).status == ChunkStatus::Data);
+
+    CHECK(cache.getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(cache.getChunkIfCached(0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(cache.getChunkIfCached(0, 0, 0, 2).status == ChunkStatus::Data);
+}
+
 TEST_CASE("ChunkCache: getChunkBlocking returns Data immediately for a found chunk")
 {
     auto f = std::make_shared<CountingFetcher>();

@@ -23,8 +23,10 @@ struct LocalChunkCache {
     // unbounded decoded-byte cache.
     static constexpr std::size_t kMaxPinnedChunks = 8;
 
-    explicit LocalChunkCache(IChunkedArray& a, std::size_t expectedChunks = 0)
+    explicit LocalChunkCache(
+        IChunkedArray& a, std::size_t expectedChunks = 0, bool queueMisses_ = true)
         : array(a)
+        , queueMisses(queueMisses_)
     {
         if (expectedChunks > 0) {
             chunks.reserve(std::min(expectedChunks, kMaxPinnedChunks));
@@ -47,8 +49,11 @@ struct LocalChunkCache {
                 lastResult = nullptr;
                 chunks.clear();
             }
-            ChunkResult result = array.tryGetChunk(key.level, key.iz, key.iy, key.ix);
-            if (result.status == ChunkStatus::MissQueued && requestedKeys.insert(key).second)
+            ChunkResult result = queueMisses
+                ? array.tryGetChunk(key.level, key.iz, key.iy, key.ix)
+                : array.getChunkIfCached(key.level, key.iz, key.iy, key.ix);
+            if (queueMisses && result.status == ChunkStatus::MissQueued &&
+                requestedKeys.insert(key).second)
                 ++requested;
             if (result.status == ChunkStatus::Error && errorKeys.insert(key).second)
                 ++errors;
@@ -61,6 +66,7 @@ struct LocalChunkCache {
     }
 
     IChunkedArray& array;
+    bool queueMisses = true;
     std::unordered_map<ChunkKey, ChunkResult, ChunkKeyHash> chunks;
     std::unordered_set<ChunkKey, ChunkKeyHash> requestedKeys;
     std::unordered_set<ChunkKey, ChunkKeyHash> errorKeys;
@@ -124,11 +130,12 @@ struct MissingLevelContext {
     MissingLevelContext(IChunkedArray& array_,
                         int level_,
                         LevelAccess access_,
+                        bool queueMisses_,
                         LevelPlane plane_ = {})
         : level(level_)
         , access(access_)
         , plane(plane_)
-        , cache(array_, 64)
+        , cache(array_, 64, queueMisses_)
     {
     }
 
@@ -681,7 +688,11 @@ ChunkedPlaneSampler::Stats markKnownMissingPlanePixels(
         const LevelAccess access = makeLevelAccess(array, level);
         if (!hasSampleableLevel(access))
             continue;
-        levels.emplace_back(array, level, access,
+        const bool queueMisses =
+            options.queueMisses &&
+            (options.queuedFallbackLevels < 0 ||
+             level - firstLevel <= options.queuedFallbackLevels);
+        levels.emplace_back(array, level, access, queueMisses,
                             toLevelPlane(access, origin, vxStep, vyStep));
     }
     std::vector<ChunkKey> keys;
@@ -745,7 +756,11 @@ ChunkedPlaneSampler::Stats markKnownMissingCoordsPixels(
         const LevelAccess access = makeLevelAccess(array, level);
         if (!hasSampleableLevel(access))
             continue;
-        levels.emplace_back(array, level, access);
+        const bool queueMisses =
+            options.queueMisses &&
+            (options.queuedFallbackLevels < 0 ||
+             level - firstLevel <= options.queuedFallbackLevels);
+        levels.emplace_back(array, level, access, queueMisses);
     }
     std::vector<ChunkKey> keys;
     keys.reserve(8);
@@ -899,7 +914,7 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestPlaneDependencies(
     if (!hasSampleableLevel(access))
         return stats;
     const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
-    LocalChunkCache chunkCache(array, 64);
+    LocalChunkCache chunkCache(array, 64, options.queueMisses);
     const int tile = std::max(1, options.tileSize);
     std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
     tileKeys.reserve(std::size_t(tile) * std::size_t(tile) * 2);
@@ -939,7 +954,7 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestCoordsDependencies(
     const LevelAccess access = makeLevelAccess(array, level);
     if (!hasSampleableLevel(access))
         return stats;
-    LocalChunkCache chunkCache(array, 64);
+    LocalChunkCache chunkCache(array, 64, options.queueMisses);
     const int tile = std::max(1, options.tileSize);
     const int h = std::min(coords.rows, coverage.rows);
     const int w = std::min(coords.cols, coverage.cols);
@@ -999,7 +1014,8 @@ ChunkedPlaneSampler::Stats samplePlaneLevelImpl(
 
     auto processTileRange = [&](std::size_t begin, std::size_t end) {
         ChunkedPlaneSampler::Stats localStats;
-        LocalChunkCache chunkCache(array, std::max<std::size_t>(16, (end - begin) * 4));
+        LocalChunkCache chunkCache(
+            array, std::max<std::size_t>(16, (end - begin) * 4), options.queueMisses);
         for (std::size_t i = begin; i < end; ++i) {
             const SampleTile& sampleTile = tiles[i];
             for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
@@ -1082,7 +1098,8 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
 
     auto processTileRange = [&](std::size_t begin, std::size_t end) {
         ChunkedPlaneSampler::Stats localStats;
-        LocalChunkCache chunkCache(array, std::max<std::size_t>(16, (end - begin) * 4));
+        LocalChunkCache chunkCache(
+            array, std::max<std::size_t>(16, (end - begin) * 4), options.queueMisses);
         for (std::size_t i = begin; i < end; ++i) {
             const SampleTile& sampleTile = tiles[i];
             for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
@@ -1168,9 +1185,15 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneFineToCoarse(
 {
     Stats total;
     int remaining = countUncovered(coverage);
-    for (int level = std::max(0, startLevel); level < array.numLevels(); ++level) {
+    const int firstLevel = std::max(0, startLevel);
+    for (int level = firstLevel; level < array.numLevels(); ++level) {
+        Options levelOptions = options;
+        levelOptions.queueMisses =
+            options.queueMisses &&
+            (options.queuedFallbackLevels < 0 ||
+             level - firstLevel <= options.queuedFallbackLevels);
         Stats stats = samplePlaneLevel(array, level, origin, vxStep, vyStep,
-                                       out, coverage, options);
+                                       out, coverage, levelOptions);
         addStats(total, stats);
         remaining -= stats.coveredPixels;
         if (remaining <= 0)
@@ -1194,8 +1217,15 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsFineToCoarse(
 {
     Stats total;
     int remaining = countSampleableCoords(coverage, coords);
-    for (int level = std::max(0, startLevel); level < array.numLevels(); ++level) {
-        Stats stats = sampleCoordsLevel(array, level, coords, out, coverage, options);
+    const int firstLevel = std::max(0, startLevel);
+    for (int level = firstLevel; level < array.numLevels(); ++level) {
+        Options levelOptions = options;
+        levelOptions.queueMisses =
+            options.queueMisses &&
+            (options.queuedFallbackLevels < 0 ||
+             level - firstLevel <= options.queuedFallbackLevels);
+        Stats stats = sampleCoordsLevel(
+            array, level, coords, out, coverage, levelOptions);
         addStats(total, stats);
         remaining -= stats.coveredPixels;
         if (remaining <= 0)

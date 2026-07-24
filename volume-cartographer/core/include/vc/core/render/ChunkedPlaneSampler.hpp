@@ -15,16 +15,28 @@ public:
         Options()
             : sampling(vc::Sampling::Nearest)
             , tileSize(32)
+            , queueMisses(true)
+            , queuedFallbackLevels(-1)
         {
         }
         Options(vc::Sampling sampling_, int tileSize_)
             : sampling(sampling_)
             , tileSize(tileSize_)
+            , queueMisses(true)
+            , queuedFallbackLevels(-1)
         {
         }
 
         vc::Sampling sampling;
         int tileSize;
+        // When false, sample only decoded chunks already resident in memory.
+        // Resident-only reads also leave the shared cache's LRU order alone.
+        bool queueMisses;
+        // Fine-to-coarse sampling always queues the requested start level.
+        // Limit how many following fallback levels may also queue misses:
+        // -1 preserves the general-purpose "all levels" behavior, while 0
+        // makes every fallback lookup resident-only.
+        int queuedFallbackLevels;
     };
 
     struct Stats {

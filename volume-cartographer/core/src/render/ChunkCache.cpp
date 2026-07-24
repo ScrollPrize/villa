@@ -295,6 +295,35 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
     return ChunkResult{ChunkStatus::MissQueued, state->dtype_, state->levels_[level].chunkShape, {}, {}};
 }
 
+ChunkResult ChunkCache::getChunkIfCached(int level, int iz, int iy, int ix)
+{
+    auto state = state_;
+    const ChunkKey key{level, iz, iy, ix};
+    if (level >= 0 && level < static_cast<int>(state->fetchers_.size()) &&
+        !state->fetchers_[static_cast<std::size_t>(level)]) {
+        return ChunkResult{
+            ChunkStatus::Missing,
+            state->dtype_,
+            state->levels_[static_cast<std::size_t>(level)].chunkShape,
+            {},
+            {}};
+    }
+    if (!isValidKey(*state, key))
+        return ChunkResult{ChunkStatus::AllFill, state->dtype_, {}, {}, {}};
+
+    std::lock_guard lock(state->mutex_);
+    auto it = state->entries_.find(key);
+    if (it == state->entries_.end() || it->second.status == EntryStatus::InFlight) {
+        return ChunkResult{
+            ChunkStatus::MissQueued,
+            state->dtype_,
+            state->levels_[static_cast<std::size_t>(level)].chunkShape,
+            {},
+            {}};
+    }
+    return resultFromEntryLocked(*state, key, it->second, false);
+}
+
 ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
 {
     auto state = state_;
@@ -453,7 +482,8 @@ void ChunkCache::waitForPersistentWrites() const
     });
 }
 
-ChunkResult ChunkCache::resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry)
+ChunkResult ChunkCache::resultFromEntryLocked(
+    State& state, const ChunkKey& key, Entry& entry, bool promote)
 {
     ChunkResult result;
     result.dtype = state.dtype_;
@@ -465,21 +495,25 @@ ChunkResult ChunkCache::resultFromEntryLocked(State& state, const ChunkKey& key,
         break;
     case EntryStatus::Missing:
         result.status = ChunkStatus::Missing;
-        touchLocked(state, key, entry);
+        if (promote)
+            touchLocked(state, key, entry);
         break;
     case EntryStatus::AllFill:
         result.status = ChunkStatus::AllFill;
-        touchLocked(state, key, entry);
+        if (promote)
+            touchLocked(state, key, entry);
         break;
     case EntryStatus::Data:
         result.status = ChunkStatus::Data;
         result.bytes = entry.bytes;
-        touchLocked(state, key, entry);
+        if (promote)
+            touchLocked(state, key, entry);
         break;
     case EntryStatus::Error:
         result.status = ChunkStatus::Error;
         result.error = entry.error;
-        touchLocked(state, key, entry);
+        if (promote)
+            touchLocked(state, key, entry);
         break;
     }
     return result;
