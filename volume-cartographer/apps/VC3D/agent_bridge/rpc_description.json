@@ -3578,6 +3578,39 @@
         "type": "object"
       }
     },
+    "volume.attach": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32007,
+        -32005,
+        -32010
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "tool": "vc3d_attach_volume"
+      },
+      "params": {
+        "properties": {
+          "location": {
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "location"
+        ],
+        "type": "object"
+      }
+    },
     "volume.list": {
       "errors": [
         -32000

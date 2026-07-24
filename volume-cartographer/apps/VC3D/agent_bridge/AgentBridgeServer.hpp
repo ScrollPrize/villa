@@ -199,6 +199,7 @@ private:
     QJsonObject handlePointsLoadSegmentPath(const QJsonValue& params);
     QJsonObject handleProjectCreate(const QJsonValue& params);
     QJsonObject handleVolumeOpen(const QJsonValue& params);
+    QJsonObject handleVolumeAttach(const QJsonValue& params);
     QJsonObject handleVolumeSelect(const QJsonValue& params);
     QJsonObject handleVolumeList(const QJsonValue& params);
     QJsonObject handleCatalogOpenSample(const QJsonValue& params);
@@ -387,6 +388,7 @@ private:
     // Resolves the active "catalog" job when an async catalog.open_sample
     // finishes: stores the result body in the job record and calls finishJob.
     void completeCatalogOpenJob(const MenuActionController::OpenDataSampleOpenOutcome& outcome);
+    void completeVolumeAttachmentJob(const VolumeAttachmentOutcome& outcome);
 
     // --- Deferred responses ---
     // A handler calls beginDeferred() to stash the current (socket, id), arm a

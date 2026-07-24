@@ -405,7 +405,7 @@ class ToolSchemaTest(unittest.IsolatedAsyncioTestCase):
     """Official-SDK schema assertions over the whole registered tool surface."""
 
     # Assert the exact registered count so schema drift (added/removed tools) is caught.
-    EXPECTED_TOOL_COUNT = 117
+    EXPECTED_TOOL_COUNT = 118
 
     async def test_tool_surface_and_schemas(self) -> None:
         tools = await core.mcp.list_tools()

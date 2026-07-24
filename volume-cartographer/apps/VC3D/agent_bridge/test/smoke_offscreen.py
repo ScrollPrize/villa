@@ -86,16 +86,15 @@ def launch(
     )
 
 
-def create_test_project(root: Path) -> Path:
-    volume = root / "volumes" / "vol1"
+def create_test_volume(volume: Path, volume_id: str) -> Path:
     level = volume / "0"
     level.mkdir(parents=True)
     (volume / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
     (volume / ".zattrs").write_text(json.dumps({}))
     (volume / "meta.json").write_text(json.dumps({
         "type": "vol",
-        "uuid": "vol1",
-        "name": "vol1",
+        "uuid": volume_id,
+        "name": volume_id,
         "format": "zarr",
         "width": 16,
         "height": 16,
@@ -115,6 +114,11 @@ def create_test_project(root: Path) -> Path:
         "filters": None,
         "dimension_separator": ".",
     }))
+    return volume
+
+
+def create_test_project(root: Path) -> Path:
+    create_test_volume(root / "volumes" / "vol1", "vol1")
 
     volpkg = root / "smoke.volpkg.json"
     volpkg.write_text(json.dumps({
@@ -123,6 +127,24 @@ def create_test_project(root: Path) -> Path:
         "volumes": ["volumes"],
     }))
     return volpkg
+
+
+def wait_for_job(
+    client: BridgeClient,
+    job_id: str,
+    timeout: float = 20.0,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, _ = client.call(
+            "job.status",
+            {"jobId": job_id},
+            timeout=min(10.0, timeout),
+        )
+        if status.get("state") != "running":
+            return status
+        time.sleep(0.02)
+    raise TimeoutError(f"job {job_id} did not finish within {timeout}s")
 
 
 def expect_param_error(client: BridgeClient, method: str, params: object,
@@ -224,10 +246,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 117
-            and coverage.get("registered") == 117
+            and coverage.get("described") == 118
+            and coverage.get("registered") == 118
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 117
+            and len(snapshot["methods"]) == 118
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -547,6 +569,174 @@ def check_project_create(
             False,
             f"{type(error).__name__}: {error}",
         )
+
+
+def check_volume_attach(
+    client: BridgeClient,
+    results: Results,
+    root: Path,
+    volpkg: Path,
+) -> None:
+    overlay = create_test_volume(root / "overlays" / "vol2", "vol2")
+    conflict = create_test_volume(root / "conflicts" / "vol2", "vol2")
+
+    try:
+        before, _ = client.call("volume.list", {}, timeout=10.0)
+        started, _ = client.call(
+            "volume.attach",
+            {
+                "location": str(overlay),
+                "tags": ["role:overlay", "source:smoke"],
+            },
+            timeout=10.0,
+        )
+        terminal = wait_for_job(client, started["jobId"])
+        volumes, _ = client.call("volume.list", {}, timeout=10.0)
+        available, _ = client.call(
+            "viewer.list_overlay_volumes", {}, timeout=10.0)
+        overlay_result, _ = client.call(
+            "viewer.set_overlay",
+            {"volumeId": "vol2", "opacity": 0.4},
+            timeout=10.0,
+        )
+        document = json.loads(volpkg.read_text())
+        entries = document.get("volumes", [])
+        attached_entry = next(
+            (
+                entry
+                for entry in entries
+                if isinstance(entry, dict)
+                and entry.get("location") == str(overlay)
+            ),
+            None,
+        )
+        listed = {item.get("id"): item for item in available.get("volumes", [])}
+        result = terminal.get("result") or {}
+        valid = (
+            started.get("kind") == "volume.attach"
+            and started.get("source") == "volume"
+            and terminal.get("state") == "succeeded"
+            and result.get("attached") is True
+            and result.get("alreadyAttached") is False
+            and result.get("volumeId") == "vol2"
+            and before.get("currentVolumeId") == "vol1"
+            and volumes.get("currentVolumeId") == "vol1"
+            and set(volumes.get("volumeIds", [])) == {"vol1", "vol2"}
+            and listed.get("vol2", {}).get("current") is False
+            and overlay_result.get("volumeId") == "vol2"
+            and attached_entry == {
+                "location": str(overlay),
+                "tags": ["role:overlay", "source:smoke"],
+            }
+        )
+        results.record(
+            "volume_attach_overlay_workflow",
+            valid,
+            f"state={terminal.get('state')} volumeIds={volumes.get('volumeIds')} "
+            f"overlay={overlay_result.get('volumeId')}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "volume_attach_overlay_workflow",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+        return
+
+    try:
+        retry, _ = client.call(
+            "volume.attach",
+            {"location": str(overlay), "tags": ["replacement:ignored"]},
+            timeout=10.0,
+        )
+        terminal = wait_for_job(client, retry["jobId"])
+        document = json.loads(volpkg.read_text())
+        matching = [
+            entry
+            for entry in document.get("volumes", [])
+            if isinstance(entry, dict) and entry.get("location") == str(overlay)
+        ]
+        result = terminal.get("result") or {}
+        results.record(
+            "volume_attach_idempotent",
+            terminal.get("state") == "succeeded"
+            and result.get("attached") is False
+            and result.get("alreadyAttached") is True
+            and matching == [{
+                "location": str(overlay),
+                "tags": ["role:overlay", "source:smoke"],
+            }],
+            f"state={terminal.get('state')} result={result}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "volume_attach_idempotent",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+    try:
+        started, _ = client.call(
+            "volume.attach",
+            {"location": str(conflict)},
+            timeout=10.0,
+        )
+        terminal = wait_for_job(client, started["jobId"])
+        volumes, _ = client.call("volume.list", {}, timeout=10.0)
+        document = json.loads(volpkg.read_text())
+        persisted = [
+            entry
+            for entry in document.get("volumes", [])
+            if isinstance(entry, dict) and entry.get("location") == str(conflict)
+        ]
+        results.record(
+            "volume_attach_id_conflict",
+            terminal.get("state") == "failed"
+            and "different volume with id" in terminal.get("message", "").lower()
+            and set(volumes.get("volumeIds", [])) == {"vol1", "vol2"}
+            and not persisted,
+            f"state={terminal.get('state')} message={terminal.get('message')!r}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "volume_attach_id_conflict",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+    try:
+        client.call(
+            "volume.attach",
+            {"location": str(root / "volumes")},
+            timeout=10.0,
+        )
+        results.record(
+            "volume_attach_rejects_collection",
+            False,
+            "expected an error, got a result",
+        )
+    except BridgeError as error:
+        results.record(
+            "volume_attach_rejects_collection",
+            error.code == -32007
+            and error.data.get("kind") == "volume"
+            and "Not a zarr volume" in error.data.get("detail", ""),
+            f"returned code={error.code} detail={error.data.get('detail')!r}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "volume_attach_rejects_collection",
+            False,
+            f"unexpected {type(error).__name__}: {error}",
+        )
+
+    ok, detail = expect_param_error(
+        client,
+        "volume.attach",
+        {"location": "relative/overlay.zarr"},
+        "location",
+    )
+    results.record("volume_attach_absolute_path", ok, detail)
 
 
 def check_c4(client: BridgeClient, results: Results, volpkg: str,
@@ -922,6 +1112,7 @@ def main() -> int:
             check_viewer_normalization(client, results)
             check_canvas_normalization(client, results)
 
+            check_volume_attach(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)

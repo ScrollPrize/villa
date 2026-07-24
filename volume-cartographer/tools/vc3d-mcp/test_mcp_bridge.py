@@ -42,6 +42,7 @@ from vc3d_mcp.bridge_client import (  # noqa: E402
 from vc3d_mcp import core  # noqa: E402
 from vc3d_mcp.tools.lasagna import vc3d_lasagna_start_optimization  # noqa: E402
 from vc3d_mcp.tools.catalog_volume import (  # noqa: E402
+    vc3d_attach_volume,
     vc3d_create_project,
     vc3d_list_volumes,
 )
@@ -353,6 +354,33 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         result = await vc3d_list_volumes()
         self.assertEqual(result["volumeIds"], ["vol-a", "vol-b"])
         self.assertEqual(result["currentVolumeId"], "vol-a")
+
+    async def test_vc3d_attach_volume_returns_job_and_forwards_tags(self) -> None:
+        result = await vc3d_attach_volume(
+            "/tmp/overlay.zarr",
+            tags=["role:overlay"],
+        )
+        self.assertEqual(result["jobId"], "job-7")
+        self.assertNotIn("state", result)
+        self.assertEqual(
+            self.fake_server.received_requests[-1]["params"],
+            {
+                "location": "/tmp/overlay.zarr",
+                "tags": ["role:overlay"],
+            },
+        )
+
+    async def test_vc3d_attach_volume_waits_for_terminal_result(self) -> None:
+        result = await vc3d_attach_volume(
+            "https://example.test/overlay.zarr",
+            wait=True,
+        )
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual(result["result"]["volumeId"], "vol-c")
+        self.assertEqual(
+            result["result"]["location"],
+            "https://example.test/overlay.zarr",
+        )
 
     async def test_vc3d_create_project_forwards_defaults_and_returns_created_path(
         self,

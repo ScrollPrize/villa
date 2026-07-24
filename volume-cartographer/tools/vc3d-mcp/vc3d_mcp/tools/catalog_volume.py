@@ -60,6 +60,35 @@ async def vc3d_open_volume(path: str, volume_id: Optional[str] = None) -> dict[s
 
 
 @mcp.tool()
+async def vc3d_attach_volume(
+    location: str,
+    tags: Optional[list[str]] = None,
+    wait: bool = False,
+    ctx: Optional[Context] = None,
+) -> dict[str, Any]:
+    """Attach one local zarr volume or remote .zarr URL to the open project.
+    The current primary volume is preserved; use vc3d_list_overlay_volumes and
+    vc3d_set_overlay afterward to display the newly attached volume as an
+    overlay.
+
+    location must be an absolute path on the filesystem where VC3D runs, or a
+    direct remote .zarr URL. In the containerized development setup, use a path
+    visible inside the container (typically /work/...), not a host-only path.
+    tags are stored on a newly attached project entry. Retrying the same
+    location is an idempotent success and does not replace its existing tags.
+
+    Returns a volume.attach job immediately. Pass wait=true to return its
+    terminal job.status record, whose result identifies the volume, canonical
+    location, project path, and whether the operation attached a new entry.
+    """
+    result = await _call(
+        "volume.attach",
+        _strip_none({"location": location, "tags": tags}),
+    )
+    return await _wait_for_job(result["jobId"], wait, result, ctx)
+
+
+@mcp.tool()
 async def vc3d_open_catalog_sample(
     sample_id: str,
     resources: Optional[_CatalogResources] = None,

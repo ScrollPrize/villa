@@ -46,6 +46,13 @@ enum class VolumeAttachmentPresentation {
     Interactive,
 };
 
+enum class VolumeAttachmentPreparationFailure {
+    None,
+    NoProject,
+    InvalidLocation,
+    RemoteConfiguration,
+};
+
 struct VolumeAttachmentRequest {
     QString location;
     std::vector<std::string> tags;
@@ -133,7 +140,8 @@ public:
         std::vector<std::string> tags,
         VolumeAttachmentPresentation presentation,
         VolumeAttachmentRequest* request,
-        QString* errorMessage = nullptr);
+        QString* errorMessage = nullptr,
+        VolumeAttachmentPreparationFailure* failure = nullptr);
     bool startVolumeAttachment(
         VolumeAttachmentRequest request,
         std::function<void(const VolumeAttachmentOutcome&)> onFinished,
@@ -211,13 +219,12 @@ private:
     void cancelOpenDataVolumePrefills();
     bool tryResolveRemoteAuth(const QString& url,
                               vc::HttpAuth* authOut,
-                              bool allowPrompt,
                               QString* errorMessage = nullptr) const;
     // Runs vc_volpkg_convert against `inputLocation` (legacy folder or remote URL),
     // prompts the user for an output .volpkg.json, and returns the written path
     // via `convertedOut` on success.
     bool runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut);
-    QString remoteCacheDirectory(bool allowPrompt);
+    QString remoteCacheDirectory(VolumeAttachmentPresentation presentation);
     QString configuredRemoteCacheDirectory() const;
     QString suggestedRemoteCacheDirectory() const;
     QString promptLocation(const QString& title,

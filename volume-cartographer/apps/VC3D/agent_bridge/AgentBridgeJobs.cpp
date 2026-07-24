@@ -111,6 +111,36 @@ void AgentBridgeServer::completeCatalogOpenJob(
     finishJob(QStringLiteral("catalog"), outcome.success, message, vpkgPath);
 }
 
+void AgentBridgeServer::completeVolumeAttachmentJob(
+    const VolumeAttachmentOutcome& outcome)
+{
+    auto it = _activeJobs.find(QStringLiteral("volume"));
+    if (it == _activeJobs.end())
+        return;
+
+    if (outcome.success) {
+        it->resultJson = {
+            {"attached", !outcome.alreadyAttached},
+            {"alreadyAttached", outcome.alreadyAttached},
+            {"volumeId", outcome.volumeId},
+            {"location", outcome.location},
+            {"projectPath", outcome.projectPath},
+        };
+    }
+    const QString message = outcome.success
+        ? outcome.alreadyAttached
+            ? QStringLiteral("Volume %1 is already attached").arg(outcome.volumeId)
+            : QStringLiteral("Attached volume %1").arg(outcome.volumeId)
+        : outcome.error.isEmpty()
+            ? QStringLiteral("Volume attachment failed")
+            : outcome.error;
+    finishJob(
+        QStringLiteral("volume"),
+        outcome.success,
+        message,
+        outcome.projectPath);
+}
+
 // ---------------------------------------------------------------------------
 // Job tracking
 // ---------------------------------------------------------------------------

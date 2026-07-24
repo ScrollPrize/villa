@@ -647,16 +647,23 @@ bool MenuActionController::prepareVolumeAttachment(
     std::vector<std::string> tags,
     VolumeAttachmentPresentation presentation,
     VolumeAttachmentRequest* request,
-    QString* errorMessage)
+    QString* errorMessage,
+    VolumeAttachmentPreparationFailure* failure)
 {
+    if (failure)
+        *failure = VolumeAttachmentPreparationFailure::None;
     if (!request) {
         if (errorMessage)
             *errorMessage = QObject::tr("No attachment request output was provided.");
+        if (failure)
+            *failure = VolumeAttachmentPreparationFailure::RemoteConfiguration;
         return false;
     }
     if (!_window || !_window->_state || !_window->_state->vpkg()) {
         if (errorMessage)
             *errorMessage = QObject::tr("Open a volume package before attaching a volume.");
+        if (failure)
+            *failure = VolumeAttachmentPreparationFailure::NoProject;
         return false;
     }
 
@@ -664,6 +671,8 @@ bool MenuActionController::prepareVolumeAttachment(
     if (trimmed.isEmpty()) {
         if (errorMessage)
             *errorMessage = QObject::tr("Volume location must not be blank.");
+        if (failure)
+            *failure = VolumeAttachmentPreparationFailure::InvalidLocation;
         return false;
     }
 
@@ -673,6 +682,8 @@ bool MenuActionController::prepareVolumeAttachment(
     if (!validationError.empty()) {
         if (errorMessage)
             *errorMessage = QString::fromStdString(validationError);
+        if (failure)
+            *failure = VolumeAttachmentPreparationFailure::InvalidLocation;
         return false;
     }
 
@@ -684,17 +695,19 @@ bool MenuActionController::prepareVolumeAttachment(
         if (!tryResolveRemoteAuth(
                 prepared.location,
                 &prepared.auth,
-                presentation == VolumeAttachmentPresentation::Interactive,
                 errorMessage)) {
+            if (failure)
+                *failure = VolumeAttachmentPreparationFailure::RemoteConfiguration;
             return false;
         }
-        prepared.remoteCacheRoot = remoteCacheDirectory(
-            presentation == VolumeAttachmentPresentation::Interactive);
+        prepared.remoteCacheRoot = remoteCacheDirectory(presentation);
         if (prepared.remoteCacheRoot.isEmpty()) {
             if (errorMessage && errorMessage->isEmpty() &&
                 presentation == VolumeAttachmentPresentation::Silent) {
                 *errorMessage = QObject::tr("Could not resolve the remote volume cache.");
             }
+            if (failure)
+                *failure = VolumeAttachmentPreparationFailure::RemoteConfiguration;
             return false;
         }
     } else {
@@ -752,7 +765,8 @@ bool MenuActionController::startVolumeAttachment(
                     "The open project changed while the volume was loading.");
             } else {
                 outcome.volumeId = QString::fromStdString(task.volume->id());
-                outcome.projectPath = _window->_state->vpkgPath();
+                outcome.projectPath =
+                    QString::fromStdString(targetPackage->path().string());
                 try {
                     const QString preferredVolumeId =
                         request.selection == VolumeAttachmentSelection::SelectAttached
@@ -1242,7 +1256,6 @@ void MenuActionController::cancelOpenDataVolumePrefills()
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,
                                                 vc::HttpAuth* authOut,
-                                                bool allowPrompt,
                                                 QString* errorMessage) const
 {
     if (!authOut) {
@@ -1311,11 +1324,13 @@ QString MenuActionController::configuredRemoteCacheDirectory() const
     return {};
 }
 
-QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
+QString MenuActionController::remoteCacheDirectory(
+    VolumeAttachmentPresentation presentation)
 {
     QString cacheDir = configuredRemoteCacheDirectory();
 
-    if (cacheDir.isEmpty() && allowPrompt) {
+    if (cacheDir.isEmpty() &&
+        presentation == VolumeAttachmentPresentation::Interactive) {
         bool ok = false;
         cacheDir = QInputDialog::getText(
             _window,
@@ -1876,7 +1891,7 @@ QString MenuActionController::promptLocation(const QString& title,
     dlg.setAcceptsFiles(acceptFiles);
     dlg.setAcceptsDirs(acceptDirs);
     dlg.setAuthResolver([this](const QString& url, vc::HttpAuth* out, QString* err) {
-        return tryResolveRemoteAuth(url, out, true, err);
+        return tryResolveRemoteAuth(url, out, err);
     });
     if (dlg.exec() != QDialog::Accepted) return {};
     QString uri = dlg.selectedUri();

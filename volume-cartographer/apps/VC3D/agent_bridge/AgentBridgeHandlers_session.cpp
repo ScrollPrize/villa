@@ -700,6 +700,125 @@ QJsonObject AgentBridgeServer::handleProjectCreate(const QJsonValue& params)
     return result;
 }
 
+QJsonObject AgentBridgeServer::handleVolumeAttach(const QJsonValue& params)
+{
+    const QJsonObject p = params.toObject();
+    const QString location = p.value("location").toString();
+    if (location.trimmed().isEmpty()) {
+        throw AgentBridgeError{
+            -32602,
+            "location must not be blank",
+            QJsonObject{{"param", "location"}},
+        };
+    }
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        throw AgentBridgeError{
+            -32000,
+            "No volume package loaded",
+            QJsonObject{},
+        };
+    }
+
+    const std::string input = location.toStdString();
+    if (!vc::project::isLocationRemote(input) &&
+        !vc::project::resolveLocalPath(input).is_absolute()) {
+        throw AgentBridgeError{
+            -32602,
+            "local volume path must be absolute",
+            QJsonObject{{"param", "location"}},
+        };
+    }
+    MenuActionController* menu = _window->_menuController.get();
+    if (!menu) {
+        throw AgentBridgeError{
+            -32010,
+            "Internal error",
+            QJsonObject{{"detail", "menu controller is not available"}},
+        };
+    }
+
+    requireSourceIdle(QStringLiteral("volume"));
+    if (menu->volumeAttachmentInFlight()) {
+        throw AgentBridgeError{
+            -32004,
+            "A volume attachment is already in progress",
+            QJsonObject{
+                {"source", "volume"},
+                {"detail", "an interactive volume attachment is in progress"},
+            },
+        };
+    }
+
+    std::vector<std::string> tags;
+    const QJsonArray tagValues = p.value("tags").toArray();
+    tags.reserve(tagValues.size());
+    for (const QJsonValue& tag : tagValues)
+        tags.push_back(tag.toString().toStdString());
+
+    VolumeAttachmentRequest request;
+    VolumeAttachmentPreparationFailure preparationFailure =
+        VolumeAttachmentPreparationFailure::None;
+    QString error;
+    if (!menu->prepareVolumeAttachment(
+            location,
+            std::move(tags),
+            VolumeAttachmentPresentation::Silent,
+            &request,
+            &error,
+            &preparationFailure)) {
+        if (preparationFailure ==
+            VolumeAttachmentPreparationFailure::InvalidLocation) {
+            throw AgentBridgeError{
+                -32007,
+                "Invalid volume location",
+                QJsonObject{{"detail", error}, {"kind", "volume"}},
+            };
+        }
+        if (preparationFailure ==
+            VolumeAttachmentPreparationFailure::NoProject) {
+            throw AgentBridgeError{
+                -32000,
+                "No volume package loaded",
+                QJsonObject{},
+            };
+        }
+        throw AgentBridgeError{
+            -32005,
+            "Could not prepare volume attachment",
+            QJsonObject{{"detail", error}},
+        };
+    }
+
+    request.selection = VolumeAttachmentSelection::PreserveCurrent;
+    if (!menu->startVolumeAttachment(
+            std::move(request),
+            [this](const VolumeAttachmentOutcome& outcome) {
+                completeVolumeAttachmentJob(outcome);
+            },
+            &error)) {
+        throw AgentBridgeError{
+            -32005,
+            "Could not start volume attachment",
+            QJsonObject{{"detail", error}},
+        };
+    }
+
+    // The watcher completes through the GUI event loop, after this handler has
+    // installed the corresponding job record.
+    const QString jobId = beginJob(
+        QStringLiteral("volume"),
+        QStringLiteral("volume.attach"),
+        QStringLiteral("attach volume %1").arg(location),
+        /*broadcastStart=*/true);
+
+    return {
+        {"jobId", jobId},
+        {"kind", "volume.attach"},
+        {"source", "volume"},
+        {"location", location},
+    };
+}
+
 
 QJsonObject AgentBridgeServer::handleVolumeOpen(const QJsonValue& params)
 {

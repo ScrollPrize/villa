@@ -266,6 +266,10 @@ dialog.
   opened.
 - `volume.open` opens a local project and may select a volume. Failed opens do
   not discard the current project.
+- `volume.attach` loads one local zarr or remote `.zarr` URL asynchronously,
+  then persists it in the project only if the same project is still open. It
+  preserves the current primary volume, is idempotent by location, and rejects
+  a different location that resolves to an existing volume id.
 - `volume.select` is a no-op success when the requested volume is already
   current; otherwise it uses the same state and selector synchronization as
   the GUI.
@@ -399,6 +403,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_add_point_collection` | `points.add_collection` |
 | `vc3d_append_segment_mask` | `segment.append_mask` | Append a volume-image layer to a segment's mask. Blocks until the render completes (130 s client timeout); requires a current volume. |
 | `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
+| `vc3d_attach_volume` | `volume.attach` | Attach one local zarr volume or remote `.zarr` URL to the open project without changing the current primary volume. Returns a `volume` job; compose with `vc3d_list_overlay_volumes` and `vc3d_set_overlay` to display it. |
 | `vc3d_atlas_open_result` | `atlas.open_result` |
 | `vc3d_atlas_open` | `atlas.open` |
 | `vc3d_atlas_optimize_snap_candidates` | `atlas.optimize_snap_candidates` |
@@ -408,7 +413,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_atlas_search_start` | `atlas.search_start` |
 | `vc3d_atlas_status` | `atlas.status` |
 | `vc3d_auto_fill_windings` | `points.auto_fill_windings` |
-| `vc3d_cancel_job` | `job.cancel` | Request cancellation of a running job by `jobId` (or by `source`). Only `tool`/`atlas`/`seeding`/`lasagna` jobs are cancellable; `growth`/`flatten`/`catalog`/`autosave` return an error. Request-only — poll `vc3d_job_status` for the terminal state. |
+| `vc3d_cancel_job` | `job.cancel` | Request cancellation of a running job by `jobId` (or by `source`). Only `tool`/`atlas`/`seeding`/`lasagna` jobs are cancellable; `growth`/`flatten`/`catalog`/`volume`/`autosave` return an error. Request-only — poll `vc3d_job_status` for the terminal state. |
 | `vc3d_center_viewer` | `viewer.center_on_point` | Center a viewer pane on a 3D volume point. |
 | `vc3d_clear_all_points` | `points.clear_all` |
 | `vc3d_clear_point_collection` | `points.clear_collection` |

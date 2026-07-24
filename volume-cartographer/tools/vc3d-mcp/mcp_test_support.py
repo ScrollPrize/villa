@@ -344,6 +344,7 @@ class FakeAgentBridgeServer:
                     "message": rec.get("message"),
                     "success": rec.get("success"),
                     "outputPath": rec.get("outputPath"),
+                    "result": rec.get("result"),
                     "consoleTail": list(rec["consoleTail"]),
                     "progressHistory": list(rec["progressHistory"]),
                 },
@@ -390,6 +391,27 @@ class FakeAgentBridgeServer:
                     req_id,
                     result={"path": path, "name": name, "volume": volume},
                 )
+        elif method == "volume.attach":
+            job_id = "job-7"
+            self._job_kinds[job_id] = "volume.attach"
+            await self._reply(
+                writer,
+                req_id,
+                result={
+                    "jobId": job_id,
+                    "kind": "volume.attach",
+                    "source": "volume",
+                    "location": params.get("location"),
+                },
+            )
+            self._start_job(job_id)
+            self._jobs[job_id]["result"] = {
+                "attached": True,
+                "alreadyAttached": False,
+                "volumeId": "vol-c",
+                "location": params.get("location"),
+                "projectPath": "/tmp/project.volpkg.json",
+            }
         elif method == "volume.list":
             await self._reply(
                 writer, req_id,
@@ -482,7 +504,7 @@ class FakeAgentBridgeServer:
         if self.emit_job_progress:
             await self._emit_job_progress(
                 rec, phase="finished", success=True, message="finished",
-                outputPath=None, result=None,
+                outputPath=None, result=rec.get("result"),
             )
 
     async def _reply(self, writer: asyncio.StreamWriter, req_id, *, result=None, error=None) -> None:

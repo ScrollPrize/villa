@@ -192,6 +192,23 @@ void AgentBridgeServer::registerSessionHandlers()
 
     registerMethod(
         {
+            .name = QStringLiteral("volume.attach"),
+            .params = {
+                Params::requiredString(QStringLiteral("location")),
+                Params::optionalArray(
+                    QStringLiteral("tags"),
+                    AgentBridgeParamType::String),
+            },
+            .errors = {-32602, -32000, -32004, -32007, -32005, -32010},
+            .mcp = mcp(
+                QStringLiteral("vc3d_attach_volume"),
+                false,
+                {QStringLiteral("wait")}),
+        },
+        [this](const QJsonValue& p) { return handleVolumeAttach(p); });
+
+    registerMethod(
+        {
             .name = QStringLiteral("volume.select"),
             .params = {
                 Params::requiredString(QStringLiteral("volumeId")),
