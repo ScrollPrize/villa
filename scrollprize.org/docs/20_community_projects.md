@@ -165,6 +165,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
     - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput.
+    - [HIP/ROCm port of ScrollFiesta's MLS for AMD GPUs](https://github.com/altommo/scrollfiesta-mls-hip) by Alan Thompson (altommo) — clean-room HIP port of the MLS-midpoint kernel, validated on RX 9070 / gfx1201: ~16.8x kernel, ~5.8x multi-cube, topology-equivalent weld-safe mesh. ([upstream PR](https://github.com/Hob3rMallow/scrollfiesta_public/pull/4))
+    - [CubeCL port of ScrollFiesta's MLS (portable GPU: AMD/NVIDIA/WGPU)](https://github.com/altommo/scrollfiesta-mls-cubecl) by Alan Thompson (altommo) — Rust/CubeCL reimplementation of the same MLS kernel from a single source; validated on RX 9070 / gfx1201 against the HIP port, passing the 0.25-voxel weld-safety gate and 5-pass strict parity vs clean HIP.
       
 ### 📦 Materials
 
