@@ -404,13 +404,16 @@ void SpiralServiceManager::restartRemoteService()
              _statusInFlight = false;
              _remoteLogsInFlight = false;
              _statusFailures = 0;
+             _remoteLogFailures = 0;
              _lastStatusGeneration = -1;
              _installedPreviewArtifact.clear();
              _fetchingPreviewArtifact.clear();
              _installedGeometryArtifact.clear();
              _fetchingGeometryArtifact.clear();
              _lastRemoteLogSequence = 0;
+             _serviceOwnsDataset = false;
              _advertisedDataset = {};
+             _artifactCache->clearEndpoint();
              if (_hasActiveSession) {
                  _hasActiveSession = false;
                  emit sessionActiveChanged(false);
