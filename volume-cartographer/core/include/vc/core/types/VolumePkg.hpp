@@ -38,6 +38,7 @@ std::filesystem::path resolveLocalPath(const std::string& location,
 
 std::string validateLocation(Category category, const std::string& location);
 std::string validateSingleVolumeLocation(const std::string& location);
+utils::Json volumeMetadataFromEntryTags(const std::vector<std::string>& tags);
 
 }
 
@@ -82,8 +83,12 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& segmentEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& normalGridEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& lasagnaDatasetEntries() const;
+    [[nodiscard]] std::optional<vc::project::Entry>
+    matchingVolumeEntry(const std::string& location) const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
+    // Persist an already-loaded volume and its tags as one project mutation.
+    // `volume` must have been loaded from `location`.
     AttachVolumeResult attachPreparedVolume(
         const std::string& location,
         std::vector<std::string> tags,

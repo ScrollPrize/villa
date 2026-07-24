@@ -9,6 +9,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/Segmentation.hpp"
+#include "vc/core/util/RemoteUrl.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -282,6 +283,132 @@ TEST_CASE("VolumePkg::attachPreparedVolume persists one loaded entry idempotentl
     CHECK(reloaded->volumeEntries().front().tags ==
           std::vector<std::string>{"overlay"});
     fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg::attachPreparedVolume recognizes a loaded relative entry")
+{
+    auto d = tmpDir("attach_relative");
+    const auto volumePath = makeLocalVolume(d, "vol1");
+    const auto project = d / "project.volpkg.json";
+
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto detached = VolumePkg::newDetached(deferred);
+    REQUIRE(detached->addVolumeEntry("volumes/vol1", {"original"}));
+    detached->save(project);
+
+    const auto relativeProject = fs::relative(project, fs::current_path());
+    auto package = VolumePkg::load(relativeProject);
+    auto prepared = Volume::New(volumePath);
+    REQUIRE(prepared);
+    CHECK(
+        package->attachPreparedVolume(
+            volumePath.string(), {"ignored"}, prepared) ==
+        VolumePkg::AttachVolumeResult::AlreadyAttached);
+    REQUIRE(package->volumeEntries().size() == 1);
+    CHECK(package->volumeEntries().front().location == "volumes/vol1");
+    CHECK(package->volumeEntries().front().tags ==
+          std::vector<std::string>{"original"});
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg::attachPreparedVolume persists a directly loaded volume")
+{
+    auto d = tmpDir("attach_loaded_only");
+    const auto volumePath = makeLocalVolume(d, "vol1");
+    const auto project = d / "project.volpkg.json";
+
+    auto package = VolumePkg::newEmpty();
+    package->save(project);
+    auto prepared = Volume::New(volumePath);
+    REQUIRE(prepared);
+    REQUIRE(package->addVolume(prepared));
+
+    CHECK(
+        package->attachPreparedVolume(
+            volumePath.string(), {"source:direct"}, prepared) ==
+        VolumePkg::AttachVolumeResult::Attached);
+    REQUIRE(package->volumeEntries().size() == 1);
+    CHECK(package->volumeEntries().front().location == volumePath.string());
+    CHECK(package->volumeEntries().front().tags ==
+          std::vector<std::string>{"source:direct"});
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg does not treat a direct Zarr as a collection entry")
+{
+    auto d = tmpDir("attach_nested_direct");
+    const auto parentPath = makeLocalVolume(d, "parent");
+    const auto stagedChild = makeLocalVolume(d / "staging", "child");
+    const auto childPath = parentPath / "child";
+    fs::rename(stagedChild, childPath);
+    const auto project = d / "project.volpkg.json";
+
+    auto package = VolumePkg::newEmpty();
+    package->save(project);
+    REQUIRE(package->addVolumeEntry(parentPath.string()));
+    CHECK_FALSE(package->matchingVolumeEntry(childPath.string()));
+
+    auto prepared = Volume::New(childPath);
+    REQUIRE(prepared);
+    CHECK(
+        package->attachPreparedVolume(childPath.string(), {}, prepared) ==
+        VolumePkg::AttachVolumeResult::Attached);
+    CHECK(package->volumeEntries().size() == 2);
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg matches legacy remote entries by resolved identity")
+{
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto package = VolumePkg::newDetached(deferred);
+    const std::string legacy = "s3://example-bucket/path/volume.zarr";
+    REQUIRE(package->addVolumeEntry(
+        legacy, {"vc-open-data-voxel-size-um:7.91"}));
+
+    const auto canonical = vc::parseRemoteVolumeSpec(legacy).portableLocator;
+    const auto matching = package->matchingVolumeEntry(canonical);
+    REQUIRE(matching);
+    CHECK(matching->location == legacy);
+    CHECK(matching->tags ==
+          std::vector<std::string>{"vc-open-data-voxel-size-um:7.91"});
+}
+
+TEST_CASE("VolumePkg::attachPreparedVolume restores autosave after write failure")
+{
+    auto d = tmpDir("attach_rollback");
+    const auto volumePath = makeLocalVolume(d, "vol1");
+    const auto project = d / "project.volpkg.json";
+
+    auto package = VolumePkg::newEmpty();
+    package->save(project);
+    fs::remove(project);
+    fs::create_directory(project);
+
+    auto prepared = Volume::New(volumePath);
+    REQUIRE(prepared);
+    CHECK_THROWS(
+        package->attachPreparedVolume(volumePath.string(), {}, prepared));
+    CHECK(package->volumeEntries().empty());
+    CHECK(package->volume("vol1") == nullptr);
+
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto autosave = VolumePkg::load(VolumePkg::autosaveFile(), deferred);
+    CHECK(autosave->volumeEntries().empty());
+
+    fs::remove_all(d);
+}
+
+TEST_CASE("Volume entry tags produce remote-volume metadata")
+{
+    const auto metadata = vc::project::volumeMetadataFromEntryTags({
+        "vc-open-data-voxel-size-um:7.91",
+        "vc-open-data-name:Overlay",
+    });
+    CHECK(metadata.at("voxelsize").get_double() == doctest::Approx(7.91));
+    CHECK(metadata.at("name").get_string() == "Overlay");
 }
 
 TEST_CASE("VolumePkg::setOutputSegments / clearOutputSegments toggle")
