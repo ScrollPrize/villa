@@ -212,6 +212,20 @@ bool samePersistedVolumeIdentity(const std::string& a, const std::string& b)
     }
 }
 
+bool loadedVolumeMatchesLocation(
+    const std::shared_ptr<Volume>& volume,
+    const std::string& location)
+{
+    if (!volume)
+        return false;
+    if (volume->isRemote())
+        return samePersistedVolumeIdentity(volume->remoteLocator(), location);
+    if (vc::project::isLocationRemote(location))
+        return false;
+    return volume->path().lexically_normal() ==
+           vc::project::resolveLocalPath(location).lexically_normal();
+}
+
 std::vector<fs::path> immediateSubdirs(const fs::path& dir)
 {
     std::vector<fs::path> out;
@@ -563,6 +577,82 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
         resolveVolumeEntry(volumes_.back());
     persistProjectState();
     return true;
+}
+
+VolumePkg::AttachVolumeResult VolumePkg::attachPreparedVolume(
+    const std::string& location,
+    std::vector<std::string> tags,
+    const std::shared_ptr<Volume>& volume,
+    const fs::path& remoteCacheRoot)
+{
+    if (location.empty() || !volume)
+        throw std::invalid_argument("volume location and prepared volume are required");
+
+    std::string persistedLocation = location;
+    if (vc::project::isLocationRemote(location)) {
+        const auto spec = vc::parseRemoteVolumeSpec(location);
+        if (spec.hasBaseScaleSelector)
+            persistedLocation = spec.portableLocator;
+    }
+
+    auto entry = std::find_if(
+        volumes_.begin(), volumes_.end(), [&](const auto& candidate) {
+            return samePersistedVolumeIdentity(
+                candidate.location, persistedLocation);
+        });
+    const bool entryExists = entry != volumes_.end();
+    const std::string volumeId = volume->id();
+    auto loaded = loadedVolumes_.find(volumeId);
+    if (loaded != loadedVolumes_.end() &&
+        !loadedVolumeMatchesLocation(loaded->second, persistedLocation)) {
+        return AttachVolumeResult::VolumeIdConflict;
+    }
+
+    const bool insertVolume = loaded == loadedVolumes_.end();
+    const bool updateCacheRoot =
+        remoteCacheRoot_.empty() && !remoteCacheRoot.empty();
+    if (entryExists && !insertVolume && !updateCacheRoot)
+        return AttachVolumeResult::AlreadyAttached;
+
+    const fs::path previousCacheRoot = remoteCacheRoot_;
+    const fs::path previousOptionCacheRoot = opts_.remoteCacheRoot;
+    const auto previousTags = volumeTagsByID_.find(volumeId);
+    const std::optional<std::vector<std::string>> savedTags =
+        previousTags == volumeTagsByID_.end()
+            ? std::nullopt
+            : std::optional(previousTags->second);
+
+    if (!entryExists)
+        volumes_.push_back({persistedLocation, std::move(tags)});
+    if (insertVolume)
+        loadedVolumes_.emplace(volumeId, volume);
+
+    const auto& appliedTags = entryExists ? entry->tags : volumes_.back().tags;
+    if (!appliedTags.empty())
+        volumeTagsByID_[volumeId] = appliedTags;
+    if (updateCacheRoot) {
+        remoteCacheRoot_ = remoteCacheRoot;
+        opts_.remoteCacheRoot = remoteCacheRoot;
+    }
+
+    try {
+        persistProjectState();
+    } catch (...) {
+        if (!entryExists)
+            volumes_.pop_back();
+        if (insertVolume)
+            loadedVolumes_.erase(volumeId);
+        if (savedTags)
+            volumeTagsByID_[volumeId] = *savedTags;
+        else
+            volumeTagsByID_.erase(volumeId);
+        remoteCacheRoot_ = previousCacheRoot;
+        opts_.remoteCacheRoot = previousOptionCacheRoot;
+        throw;
+    }
+
+    return entryExists ? AttachVolumeResult::AlreadyAttached
+                       : AttachVolumeResult::Attached;
 }
 
 bool VolumePkg::reconcileVolumeEntryTags(

@@ -237,6 +237,53 @@ TEST_CASE("VolumePkg::addVolume directly inserts a constructed Volume")
     fs::remove_all(d);
 }
 
+TEST_CASE("VolumePkg::attachPreparedVolume persists one loaded entry idempotently")
+{
+    auto d = tmpDir("attach_prepared");
+    const auto firstPath = makeLocalVolume(d, "vol1");
+    const auto secondRoot = d / "second";
+    const auto secondPath = makeLocalVolume(secondRoot, "vol1");
+    const auto project = d / "project.volpkg.json";
+
+    auto package = VolumePkg::newEmpty();
+    package->save(project);
+    auto first = Volume::New(firstPath);
+    REQUIRE(first);
+    CHECK(
+        package->attachPreparedVolume(
+            firstPath.string(), {"overlay"}, first) ==
+        VolumePkg::AttachVolumeResult::Attached);
+    CHECK(package->volume("vol1") == first);
+    REQUIRE(package->volumeEntries().size() == 1);
+    CHECK(package->volumeEntries().front().tags ==
+          std::vector<std::string>{"overlay"});
+
+    CHECK(
+        package->attachPreparedVolume(
+            firstPath.string(), {"ignored-on-retry"}, first) ==
+        VolumePkg::AttachVolumeResult::AlreadyAttached);
+    CHECK(package->volumeEntries().size() == 1);
+    CHECK(package->volumeEntries().front().tags ==
+          std::vector<std::string>{"overlay"});
+
+    auto conflicting = Volume::New(secondPath);
+    REQUIRE(conflicting);
+    CHECK(
+        package->attachPreparedVolume(
+            secondPath.string(), {}, conflicting) ==
+        VolumePkg::AttachVolumeResult::VolumeIdConflict);
+    CHECK(package->volumeEntries().size() == 1);
+
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto reloaded = VolumePkg::load(project, deferred);
+    REQUIRE(reloaded->volumeEntries().size() == 1);
+    CHECK(reloaded->volumeEntries().front().location == firstPath.string());
+    CHECK(reloaded->volumeEntries().front().tags ==
+          std::vector<std::string>{"overlay"});
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg::setOutputSegments / clearOutputSegments toggle")
 {
     auto p = VolumePkg::newEmpty();

@@ -44,6 +44,12 @@ std::string validateSingleVolumeLocation(const std::string& location);
 class VolumePkg : public std::enable_shared_from_this<VolumePkg>
 {
 public:
+    enum class AttachVolumeResult {
+        Attached,
+        AlreadyAttached,
+        VolumeIdConflict,
+    };
+
     static std::shared_ptr<VolumePkg> newEmpty();
     static std::shared_ptr<VolumePkg> newEmpty(
         const vc::project::LoadOptions& opts);
@@ -78,6 +84,11 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& lasagnaDatasetEntries() const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
+    AttachVolumeResult attachPreparedVolume(
+        const std::string& location,
+        std::vector<std::string> tags,
+        const std::shared_ptr<Volume>& volume,
+        const std::filesystem::path& remoteCacheRoot = {});
     bool mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags);
     // Replace singleton keyed tags and merge ordinary tags in one operation,
     // refreshing a loaded remote volume at most once.
