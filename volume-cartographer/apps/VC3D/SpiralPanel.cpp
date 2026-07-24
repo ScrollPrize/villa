@@ -557,7 +557,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _flattenWithLasagna->setObjectName(QStringLiteral("spiralFlattenWithLasagna"));
     _flattenWithLasagna->setEnabled(false);
     _flattenWithLasagna->setToolTip(
-        tr("Flatten the complete latest Spiral output with Lasagna on this device"));
+        tr("Flatten the complete latest Spiral output with Lasagna"));
     checkpointControls->addWidget(_save);
     checkpointControls->addWidget(_downloadCheckpoint);
     checkpointControls->addWidget(_flattenWithLasagna);
@@ -1132,7 +1132,7 @@ void SpiralPanel::setLasagnaFlattenAvailable(bool available, const QString& reas
     _flattenWithLasagna->setEnabled(available);
     _flattenWithLasagna->setToolTip(
         reason.isEmpty()
-            ? tr("Flatten the complete latest Spiral output with Lasagna on this device")
+            ? tr("Flatten the complete latest Spiral output with Lasagna")
             : reason);
 }
 

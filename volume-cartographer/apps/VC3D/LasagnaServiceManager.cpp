@@ -19,6 +19,7 @@
 #include <QSet>
 #include <QSysInfo>
 #include <QTemporaryDir>
+#include <QTemporaryFile>
 #include <QUrl>
 #include <QtConcurrent/QtConcurrent>
 
@@ -116,34 +117,94 @@ QString md5Ref(const QByteArray& bytes)
         QCryptographicHash::hash(bytes, QCryptographicHash::Md5).toHex()));
 }
 
-QJsonObject materializeLocalArtifactUpload(const QJsonObject& upload)
+QString md5DigestRef(const QByteArray& digest)
 {
-    if (upload.contains(QStringLiteral("data")) || upload.contains(QStringLiteral("files"))) {
-        return upload;
+    return QStringLiteral("md5:%1").arg(QString::fromLatin1(digest.toHex()));
+}
+
+QByteArray jsonString(const QString& value)
+{
+    QByteArray encoded =
+        QJsonDocument(QJsonArray{value}).toJson(QJsonDocument::Compact);
+    return encoded.mid(1, encoded.size() - 2);
+}
+
+void writeUploadBytes(QIODevice& output, const QByteArray& bytes)
+{
+    if (output.write(bytes) != bytes.size()) {
+        throw std::runtime_error("Cannot write temporary artifact upload");
     }
+}
+
+QString writeBase64File(QIODevice& output, const QString& path)
+{
+    QFile input(path);
+    if (!input.open(QIODevice::ReadOnly)) {
+        throw std::runtime_error(
+            QStringLiteral("Cannot read artifact file: %1").arg(path).toStdString());
+    }
+
+    constexpr qint64 kChunkBytes = 3 * 1024 * 1024;
+    QCryptographicHash hash(QCryptographicHash::Md5);
+    while (!input.atEnd()) {
+        const QByteArray chunk = input.read(kChunkBytes);
+        if (chunk.isEmpty() && input.error() != QFileDevice::NoError) {
+            throw std::runtime_error(
+                QStringLiteral("Cannot read artifact file: %1").arg(path).toStdString());
+        }
+        hash.addData(chunk);
+        writeUploadBytes(output, chunk.toBase64());
+    }
+    return md5DigestRef(hash.result());
+}
+
+std::shared_ptr<QTemporaryFile> materializeLocalArtifactUpload(
+    const QJsonObject& upload)
+{
+    auto body = std::make_shared<QTemporaryFile>(
+        QDir::temp().filePath(QStringLiteral("vc3d-lasagna-upload-XXXXXX.json")));
+    body->setAutoRemove(true);
+    if (!body->open()) {
+        throw std::runtime_error("Cannot create temporary artifact upload");
+    }
+
+    if (upload.contains(QStringLiteral("data"))
+        || upload.contains(QStringLiteral("files"))) {
+        writeUploadBytes(
+            *body, QJsonDocument(upload).toJson(QJsonDocument::Compact));
+        body->seek(0);
+        return body;
+    }
+
     const QJsonObject ref = upload[QStringLiteral("object")].toObject();
     const QString payload = upload[QStringLiteral("_local_payload")].toString();
     const QString localPath = upload[QStringLiteral("_local_path")].toString();
-    if (ref.isEmpty() || payload.isEmpty() || localPath.isEmpty()) {
-        return upload;
+    if (ref.isEmpty()) {
+        throw std::runtime_error("Artifact upload is missing its object reference");
     }
 
-    QJsonObject out;
-    out[QStringLiteral("object")] = ref;
+    writeUploadBytes(
+        *body,
+        QByteArrayLiteral("{\"object\":")
+            + QJsonDocument(ref).toJson(QJsonDocument::Compact));
+
+    if (payload.isEmpty() || localPath.isEmpty()) {
+        throw std::runtime_error("Artifact upload is missing its local payload");
+    }
+
     if (payload == QStringLiteral("file")) {
-        QFile f(localPath);
-        if (!f.open(QIODevice::ReadOnly)) {
-            throw std::runtime_error(QStringLiteral("Cannot read artifact file: %1").arg(localPath).toStdString());
-        }
-        const QByteArray bytes = f.readAll();
-        const QString actualHash = md5Ref(bytes);
+        writeUploadBytes(*body, QByteArrayLiteral(",\"data\":\""));
+        const QString actualHash = writeBase64File(*body, localPath);
         if (actualHash != ref[QStringLiteral("hash")].toString()) {
-            throw std::runtime_error(QStringLiteral("Artifact file hash mismatch for %1: declared %2 actual %3")
-                                         .arg(ref[QStringLiteral("name")].toString(), ref[QStringLiteral("hash")].toString(), actualHash)
-                                         .toStdString());
+            throw std::runtime_error(
+                QStringLiteral("Artifact file hash mismatch for %1: declared %2 actual %3")
+                    .arg(ref[QStringLiteral("name")].toString(),
+                         ref[QStringLiteral("hash")].toString(), actualHash)
+                    .toStdString());
         }
-        out[QStringLiteral("data")] = QString::fromLatin1(bytes.toBase64());
-        return out;
+        writeUploadBytes(*body, QByteArrayLiteral("\"}"));
+        body->seek(0);
+        return body;
     }
 
     if (payload == QStringLiteral("directory")) {
@@ -162,39 +223,44 @@ QJsonObject materializeLocalArtifactUpload(const QJsonObject& upload)
         std::sort(files.begin(), files.end());
 
         QByteArray manifest;
-        QJsonObject encodedFiles;
+        writeUploadBytes(*body, QByteArrayLiteral(",\"files\":{"));
+        bool first = true;
         for (const auto& path : files) {
-            QFile f(QString::fromStdString(path.string()));
-            if (!f.open(QIODevice::ReadOnly)) {
-                throw std::runtime_error(QStringLiteral("Cannot read artifact file: %1")
-                                             .arg(QString::fromStdString(path.string()))
-                                             .toStdString());
-            }
-            const QByteArray bytes = f.readAll();
             const auto relPath = fs::relative(path, root, ec);
             if (ec) {
-                throw std::runtime_error(QStringLiteral("Cannot compute artifact relative path: %1")
-                                             .arg(QString::fromStdString(path.string()))
-                                             .toStdString());
+                throw std::runtime_error(
+                    QStringLiteral("Cannot compute artifact relative path: %1")
+                        .arg(QString::fromStdString(path.string()))
+                        .toStdString());
             }
             const QString rel = QString::fromStdString(relPath.generic_string());
+            if (!first) writeUploadBytes(*body, QByteArrayLiteral(","));
+            first = false;
+            writeUploadBytes(*body, jsonString(rel) + QByteArrayLiteral(":\""));
+            const QString fileHash = writeBase64File(
+                *body, QString::fromStdString(path.string()));
+            writeUploadBytes(*body, QByteArrayLiteral("\""));
             manifest.append(rel.toUtf8());
             manifest.append('\t');
-            manifest.append(md5Ref(bytes).toUtf8());
+            manifest.append(fileHash.toUtf8());
             manifest.append('\n');
-            encodedFiles[rel] = QString::fromLatin1(bytes.toBase64());
         }
         const QString actualHash = md5Ref(manifest);
         if (actualHash != ref[QStringLiteral("hash")].toString()) {
-            throw std::runtime_error(QStringLiteral("Artifact directory hash mismatch for %1: declared %2 actual %3")
-                                         .arg(ref[QStringLiteral("name")].toString(), ref[QStringLiteral("hash")].toString(), actualHash)
-                                         .toStdString());
+            throw std::runtime_error(
+                QStringLiteral("Artifact directory hash mismatch for %1: declared %2 actual %3")
+                    .arg(ref[QStringLiteral("name")].toString(),
+                         ref[QStringLiteral("hash")].toString(), actualHash)
+                    .toStdString());
         }
-        out[QStringLiteral("files")] = encodedFiles;
-        return out;
+        writeUploadBytes(*body, QByteArrayLiteral("}}"));
+        body->seek(0);
+        return body;
     }
 
-    throw std::runtime_error(QStringLiteral("Unknown local artifact payload kind: %1").arg(payload).toStdString());
+    throw std::runtime_error(
+        QStringLiteral("Unknown local artifact payload kind: %1")
+            .arg(payload).toStdString());
 }
 
 void appendObjectRefIfNew(QJsonArray& refs, QSet<QString>& refKeys, const QJsonObject& ref)
@@ -1724,9 +1790,9 @@ void LasagnaServiceManager::processNextArtifactUpload()
             QNetworkRequest req = fitServiceRequest(url);
             req.setRawHeader(kVc3dSourceHeader, source.toUtf8());
             req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-            QJsonObject upload;
+            std::shared_ptr<QTemporaryFile> uploadBody;
             try {
-                upload = materializeLocalArtifactUpload(uploadSource);
+                uploadBody = materializeLocalArtifactUpload(uploadSource);
             } catch (const std::exception& ex) {
                 const QString msg = tr("Artifact packing failed: %1").arg(QString::fromStdString(ex.what()));
                 updateLocalUploadJob(localJobId, {
@@ -1738,13 +1804,16 @@ void LasagnaServiceManager::processNextArtifactUpload()
                 processNextArtifactUpload();
                 return;
             }
-            const QByteArray body = QJsonDocument(upload).toJson(QJsonDocument::Compact);
-            QNetworkReply* reply = _nam->post(req, body);
+            req.setHeader(QNetworkRequest::ContentLengthHeader,
+                          uploadBody->size());
+            QNetworkReply* reply = _nam->post(req, uploadBody.get());
             _activeArtifactReply = reply;
             _activeArtifactReplyJobId = localJobId;
+            auto lastProgressPermille = std::make_shared<int>(-1);
             connect(reply, &QNetworkReply::uploadProgress,
                     this,
-                    [this, localJobId, uploads, index](qint64 bytesSent, qint64 bytesTotal) {
+                    [this, localJobId, uploads, index, lastProgressPermille]
+                    (qint64 bytesSent, qint64 bytesTotal) {
                 if (bytesTotal <= 0 || uploads->isEmpty()
                     || _cancelledLocalUploadJobs.contains(localJobId)) {
                     return;
@@ -1753,12 +1822,16 @@ void LasagnaServiceManager::processNextArtifactUpload()
                     static_cast<double>(bytesSent) / static_cast<double>(bytesTotal), 0.0, 1.0);
                 const double progress = (static_cast<double>(*index) + objectProgress)
                     / static_cast<double>(uploads->size());
+                const int permille = static_cast<int>(progress * 1000.0);
+                if (permille == *lastProgressPermille) return;
+                *lastProgressPermille = permille;
                 updateLocalUploadJob(localJobId, {
                     {QStringLiteral("upload_progress"), progress},
                 });
             });
             connect(reply, &QNetworkReply::finished, this,
-                    [this, reply, uploads, index, localJobId, generation, uploadNext]() {
+                    [this, reply, uploads, index, localJobId, generation,
+                     uploadNext, uploadBody]() {
                 if (generation != _requestGeneration) {
                     reply->deleteLater();
                     return;

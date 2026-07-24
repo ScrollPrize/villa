@@ -219,6 +219,7 @@ private:
     QString _pendingLasagnaJobId;
     std::shared_ptr<QuadSurface> _pendingLasagnaSource;
     QPointer<QProgressDialog> _lasagnaFlattenProgress;
+    bool _updatingLasagnaFlattenProgress = false;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;
