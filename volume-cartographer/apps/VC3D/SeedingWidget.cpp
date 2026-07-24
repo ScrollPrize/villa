@@ -1183,7 +1183,10 @@ void SeedingWidget::onRunSegmentationClicked()
         return;
     }
 
-    std::filesystem::path volumePath = currentVolume->path();
+    // Remote-aware: use the volume's command locator so streaming-only volumes
+    // (no local mirror, e.g. Open Data catalog samples) pass a usable volume
+    // argument to vc_grow_seg_from_seed instead of an empty path (issue #1188).
+    const QString volumeArg = QString::fromStdString(currentVolume->commandLocator());
     QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
 
     // Update UI
@@ -1270,7 +1273,7 @@ void SeedingWidget::onRunSegmentationClicked()
             previewParts << QString("OMP_NUM_THREADS=%1").arg(ompThreads);
         }
         previewParts << executablePath
-                     << QString("\"%1\"").arg(QString::fromStdString(volumePath.string()))
+                     << QString("\"%1\"").arg(volumeArg)
                      << QString("\"%1\"").arg(QString::fromStdString(pathsDir.string()))
                      << QString("\"%1\"").arg(QString::fromStdString(seedJsonPath.string()))
                      << QString::number(point.p[0])
@@ -1280,7 +1283,7 @@ void SeedingWidget::onRunSegmentationClicked()
         std::cout << "Starting job " << pointIndex << ": " << previewParts.join(' ').toStdString() << std::endl;
         
         const QStringList toolArgs = QStringList()
-                      << QString::fromStdString(volumePath.string())
+                      << volumeArg
                       << QString::fromStdString(pathsDir.string())
                       << QString::fromStdString(seedJsonPath.string())
                       << QString::number(point.p[0])
@@ -2170,7 +2173,10 @@ void SeedingWidget::onExpandSeedsClicked()
         return;
     }
 
-    std::filesystem::path volumePath = currentVolume->path();
+    // Remote-aware: use the volume's command locator so streaming-only volumes
+    // (no local mirror, e.g. Open Data catalog samples) pass a usable volume
+    // argument to vc_grow_seg_from_seed instead of an empty path (issue #1188).
+    const QString volumeArg = QString::fromStdString(currentVolume->commandLocator());
     QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
 
     // Update UI
@@ -2257,14 +2263,14 @@ void SeedingWidget::onExpandSeedsClicked()
             previewParts << QString("OMP_NUM_THREADS=%1").arg(ompThreads);
         }
         previewParts << executablePath
-                     << QString("\"%1\"").arg(QString::fromStdString(volumePath.string()))
+                     << QString("\"%1\"").arg(volumeArg)
                      << QString("\"%1\"").arg(QString::fromStdString(pathsDir.string()))
                      << QString("\"%1\"").arg(QString::fromStdString(expandJsonPath.string()));
 
         std::cout << "Starting expansion job " << iterationIndex << ": " << previewParts.join(' ').toStdString() << std::endl;
         
         const QStringList toolArgs = QStringList()
-                      << QString::fromStdString(volumePath.string())
+                      << volumeArg
                       << QString::fromStdString(pathsDir.string())
                       << QString::fromStdString(expandJsonPath.string());
 #if defined(Q_OS_LINUX)
