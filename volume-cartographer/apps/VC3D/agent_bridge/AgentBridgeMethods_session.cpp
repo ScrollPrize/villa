@@ -222,7 +222,7 @@ void AgentBridgeServer::registerSessionHandlers()
         {
             .name = QStringLiteral("volume.list"),
             .errors = {-32000},
-            .mcp = mcp(QStringLiteral("vc3d_list_volumes")),
+            .mcp = mcp(QStringLiteral("vc3d_list_attached_volumes")),
         },
         [this](const QJsonValue& p) { return handleVolumeList(p); });
 

@@ -3616,7 +3616,7 @@
         -32000
       ],
       "mcp": {
-        "tool": "vc3d_list_volumes"
+        "tool": "vc3d_list_attached_volumes"
       },
       "params": {
         "properties": {},

@@ -95,9 +95,9 @@ async def vc3d_open_catalog_sample(
     wait: bool = False,
     ctx: Optional[Context] = None,
 ) -> dict[str, Any]:
-    """Open an Open Data catalog sample by its manifest sample id. Async: a
-    remote open is a multi-second-to-multi-minute network operation, so this
-    returns a jobId immediately.
+    """Open a sample returned by vc3d_list_catalog_samples, using its manifest
+    sample id. Async: a remote open is a multi-second-to-multi-minute network
+    operation, so this returns a jobId immediately.
 
     resources: optional resource-selection filter to attach only a subset.
     Omit it to attach everything. Shape:
@@ -124,8 +124,14 @@ async def vc3d_open_catalog_sample(
 
 @mcp.tool()
 async def vc3d_list_catalog_samples(refresh: bool = False) -> dict[str, Any]:
-    """List Open Data catalog samples from the manifest (id, type, description,
-    volume/segment/scan counts).
+    """List the samples available to open from VC3D's Open Data catalog,
+    including each sample's id, type, description, and volume/segment/scan
+    counts.
+
+    Use this to discover data or volumes that can be opened, especially when no
+    volume package is currently loaded. Pass a returned id to
+    vc3d_describe_catalog_sample for volume details or
+    vc3d_open_catalog_sample to open the sample.
 
     refresh: force a fresh manifest fetch (up to 30 s) instead of serving the
     cached copy; also fetches automatically when nothing is cached yet.
@@ -150,13 +156,15 @@ async def vc3d_describe_catalog_sample(
 
 
 @mcp.tool()
-async def vc3d_list_volumes() -> dict[str, Any]:
-    """List the volumes attached to the open volume package, with the currently
-    selected one.
+async def vc3d_list_attached_volumes() -> dict[str, Any]:
+    """List only the volumes already attached to the currently open volume
+    package, with the selected one.
 
     Use this to discover the volume ids you can pass to vc3d_select_volume (or
-    other volume-scoped tools) without scraping vc3d_get_state. Requires a
-    volume package to be open.
+    other volume-scoped tools) without scraping vc3d_get_state. This does not
+    discover data or packages available to open. When no package is loaded, or
+    when asked what data is available to open, use vc3d_list_catalog_samples
+    instead.
 
     Returns {"volumeIds": [str...], "currentVolumeId": str|null}, and may
     include a "volumes" array of {id, path, voxelSize} objects when that detail

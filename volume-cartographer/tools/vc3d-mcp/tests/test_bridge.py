@@ -41,7 +41,7 @@ from vc3d_mcp.tools.lasagna import vc3d_lasagna_start_optimization
 from vc3d_mcp.tools.catalog_volume import (
     vc3d_attach_volume,
     vc3d_create_project,
-    vc3d_list_volumes,
+    vc3d_list_attached_volumes,
 )
 from vc3d_mcp.tools.jobs import vc3d_cancel_job
 from vc3d_mcp.tools.session import (
@@ -347,8 +347,8 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
         sent = self.fake_server.received_requests[-1]["params"]
         self.assertEqual(sent, {"source": "lasagna"})  # jobId=None dropped
 
-    async def test_vc3d_list_volumes_roundtrip(self) -> None:
-        result = await vc3d_list_volumes()
+    async def test_vc3d_list_attached_volumes_roundtrip(self) -> None:
+        result = await vc3d_list_attached_volumes()
         self.assertEqual(result["volumeIds"], ["vol-a", "vol-b"])
         self.assertEqual(result["currentVolumeId"], "vol-a")
 

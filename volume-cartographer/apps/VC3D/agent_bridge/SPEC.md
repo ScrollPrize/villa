@@ -457,11 +457,11 @@ is the sole bridge method without an MCP tool.
 | `vc3d_lasagna_select_output` | `lasagna.select_output_segment` |
 | `vc3d_lasagna_service_status` | `lasagna.service_status` |
 | `vc3d_lasagna_start_optimization` | `lasagna.start_optimization` |
-| `vc3d_list_catalog_samples` | `catalog.list_samples` |
+| `vc3d_list_catalog_samples` | `catalog.list_samples` | List samples available to open from the Open Data catalog; use this for discovery when no volume package is loaded. |
 | `vc3d_list_overlay_volumes` | `viewer.list_overlay_volumes` | List every volume id in the open package, for picking an overlay volume. |
 | `vc3d_list_points` | `points.list` | List point collections and their points. |
 | `vc3d_list_segments` | `segments.list` | List segments in the open volume package with loaded/active flags. |
-| `vc3d_list_volumes` | `volume.list` | List the volume ids in the open volume package and which one is current, without force-loading any (possibly remote) volume. |
+| `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
 | `vc3d_load_points_json` | `points.load_json` |
 | `vc3d_load_points_segment_path` | `points.load_segment_path` |
 | `vc3d_manual_add_begin` | `segmentation.manual_add.begin` |
@@ -469,7 +469,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
 | `vc3d_manual_add_undo_constraint` | `segmentation.manual_add.undo_constraint` |
-| `vc3d_open_catalog_sample` | `catalog.open_sample` | Open an Open Data catalog sample by its manifest sample id. |
+| `vc3d_open_catalog_sample` | `catalog.open_sample` | Open a sample returned by `vc3d_list_catalog_samples`, using its manifest sample id. |
 | `vc3d_open_volume` | `volume.open` | Open a volume package (.volpkg / .volpkg.json / zarr project) and optionally select a volume id. |
 | `vc3d_ping` | `ping` | Check the VC3D bridge is alive; returns pid, app version, and protocol version. |
 | `vc3d_push_pull_set_config` | `segmentation.push_pull.set_config` |

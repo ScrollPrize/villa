@@ -100,6 +100,22 @@ class BridgeContractTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(method=method, tool=tool_name):
                 self._assert_mcp_contract(contract, registered)
 
+    async def test_volume_discovery_descriptions_distinguish_catalog_from_project(
+        self,
+    ) -> None:
+        registered = {
+            tool.name: tool.description for tool in await core.mcp.list_tools()
+        }
+        catalog = " ".join(registered["vc3d_list_catalog_samples"].split())
+        current = " ".join(registered["vc3d_list_attached_volumes"].split())
+
+        self.assertIn("available to open", catalog)
+        self.assertIn("no volume package is currently loaded", catalog)
+        self.assertIn("vc3d_open_catalog_sample", catalog)
+        self.assertIn("already attached", current)
+        self.assertIn("does not discover", current)
+        self.assertIn("vc3d_list_catalog_samples", current)
+
     def _assert_mcp_contract(
         self,
         contract: dict[str, Any],

@@ -316,7 +316,7 @@ async def vc3d_set_overlay(
     change.
 
     volume_id: id of the volume to overlay (see vc3d_list_overlay_volumes /
-    vc3d_list_volumes). An empty string clears the overlay, same as
+    vc3d_list_attached_volumes). An empty string clears the overlay, same as
     clear=True. Unknown id raises -32007.
     clear: True clears the overlay volume (equivalent to volume_id="").
     colormap: colormap id, one of "fire", "viridis", "magma", "red", "green",
