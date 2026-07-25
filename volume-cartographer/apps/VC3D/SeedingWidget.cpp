@@ -2459,8 +2459,21 @@ void SeedingWidget::onNeuralTraceClicked()
         return;
     }
 
-    // Get volume zarr path
+    // Get volume zarr path. trace.py declares --volume_zarr as
+    // click.Path(exists=True), so it needs a directory that exists on this
+    // filesystem and cannot take a remote locator. A streaming-only volume has
+    // an empty path(), and forwarding that gets the child killed in argument
+    // parsing, which reaches the user only as "Neural trace failed (exit code
+    // 2)". NeuralTraceServiceManager already screens the same argument before
+    // starting the trace service; this is the equivalent screen for the
+    // one-shot path.
     std::filesystem::path volumePath = currentVolume->path();
+    if (volumePath.empty()) {
+        QMessageBox::warning(this, "Error",
+            "Neural tracing needs a local volume: trace.py reads the zarr from "
+            "disk and cannot stream from a remote volume.");
+        return;
+    }
     QString volumeZarr = QString::fromStdString(volumePath.string());
 
     // Get output path (paths directory in the volume package)
