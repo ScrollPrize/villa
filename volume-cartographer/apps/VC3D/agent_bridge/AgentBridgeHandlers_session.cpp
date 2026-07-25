@@ -34,6 +34,7 @@
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/Logging.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 QJsonObject AgentBridgeServer::handlePing(const QJsonValue&)
@@ -222,6 +223,159 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     }
 
     return result;
+}
+
+
+QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
+{
+    namespace fs = std::filesystem;
+
+    CState* state = _window ? _window->_state : nullptr;
+    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
+    if (!state || !state->hasVpkg() || !vpkg)
+        throw AgentBridgeError{-32000, "No volume package loaded", {}};
+
+    const QJsonObject p = params.toObject();
+    const QString location = p.value("location").toString();
+    if (location.trimmed().isEmpty()) {
+        throw AgentBridgeError{
+            -32602,
+            "location must not be blank",
+            QJsonObject{{"param", "location"}},
+        };
+    }
+
+    const std::string input = location.toStdString();
+    if (vc::project::isLocationRemote(input)) {
+        throw AgentBridgeError{
+            -32007,
+            "Invalid segments location",
+            QJsonObject{
+                {"kind", "segment"},
+                {"detail", "remote segment locations are not supported"},
+            },
+        };
+    }
+
+    fs::path localPath =
+        vc::project::resolveLocalPath(input).lexically_normal();
+    while (localPath.has_relative_path() && localPath.filename().empty())
+        localPath = localPath.parent_path();
+    if (!localPath.is_absolute()) {
+        throw AgentBridgeError{
+            -32602,
+            "segment path must be absolute",
+            QJsonObject{{"param", "location"}},
+        };
+    }
+    const std::string normalizedLocation = localPath.string();
+
+    const std::string validationError = vc::project::validateLocation(
+        vc::project::Category::Segments, normalizedLocation);
+    if (!validationError.empty()) {
+        throw AgentBridgeError{
+            -32007,
+            "Invalid segments location",
+            QJsonObject{
+                {"kind", "segment"},
+                {"detail", QString::fromStdString(validationError)},
+            },
+        };
+    }
+
+    const bool select = p.value("select").toBool(true);
+    auto sourceIsSelected = [&](const std::string& persistedLocation) {
+        const fs::path selected =
+            vpkg->outputSegmentsPath().lexically_normal();
+        const fs::path source = vc::project::resolveLocalPath(
+            persistedLocation, vpkg->path().parent_path()).lexically_normal();
+        if (selected.empty())
+            return false;
+        std::error_code ec;
+        if (fs::equivalent(selected, source, ec))
+            return true;
+        return selected == source;
+    };
+    auto resultFor = [&](bool attached, const std::string& persistedLocation) {
+        return QJsonObject{
+            {"attached", attached},
+            {"alreadyAttached", !attached},
+            {"location", QString::fromStdString(persistedLocation)},
+            {"projectPath", QString::fromStdString(vpkg->path().string())},
+            {"selected", sourceIsSelected(persistedLocation)},
+        };
+    };
+
+    const auto existing =
+        vpkg->matchingSegmentsEntry(normalizedLocation);
+    const std::string persistedLocation =
+        existing ? existing->location : normalizedLocation;
+    const std::string sourceName = localPath.filename().string();
+    if (!existing) {
+        if (const auto conflict =
+                vpkg->matchingSegmentsEntryByDirectoryName(sourceName)) {
+            throw AgentBridgeError{
+                -32010,
+                "A segment source with the same directory name is already attached",
+                QJsonObject{
+                    {"sourceName", QString::fromStdString(sourceName)},
+                    {"existingLocation",
+                     QString::fromStdString(conflict->location)},
+                },
+            };
+        }
+    }
+
+    const bool selectionChanged =
+        select && !sourceIsSelected(persistedLocation);
+    const bool reloadSurfaces = !existing || selectionChanged;
+    if (reloadSurfaces && _window->_segmentationWidget &&
+        _window->_segmentationWidget->isEditingEnabled()) {
+        throw AgentBridgeError{
+            -32004,
+            "Cannot attach segments while editing",
+            QJsonObject{
+                {"detail",
+                 "disable segmentation editing before changing segment sources"},
+            },
+        };
+    }
+
+    std::vector<std::string> tags;
+    const QJsonArray tagValues = p.value("tags").toArray();
+    tags.reserve(tagValues.size());
+    for (const QJsonValue& tag : tagValues)
+        tags.push_back(tag.toString().toStdString());
+
+    VolumePkg::AttachSegmentsResult attachResult;
+    try {
+        attachResult = vpkg->attachSegmentsEntry(
+            normalizedLocation, std::move(tags), select);
+    } catch (const std::exception& error) {
+        throw AgentBridgeError{
+            -32005,
+            "Could not attach segments",
+            QJsonObject{{"detail", QString::fromUtf8(error.what())}},
+        };
+    }
+    if (reloadSurfaces) {
+        try {
+            _window->refreshCurrentVolumePackageUi(QString(), true);
+        } catch (const std::exception& error) {
+            Logger()->warn(
+                "Segment attachment committed, but the VC3D UI could not "
+                "refresh: {}",
+                error.what());
+        } catch (...) {
+            Logger()->warn(
+                "Segment attachment committed, but the VC3D UI could not "
+                "refresh");
+        }
+    }
+
+    const bool attached =
+        attachResult == VolumePkg::AttachSegmentsResult::Attached;
+    return resultFor(attached, persistedLocation);
 }
 
 

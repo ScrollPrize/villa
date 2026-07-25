@@ -257,6 +257,94 @@ TEST_CASE("VolumePkg: addSegmentsEntry sets outputSegments on first add")
     CHECK_FALSE(p->addSegmentsEntry(""));
 }
 
+TEST_CASE("VolumePkg: segment entries match normalized local paths")
+{
+    auto d = tmpDir("segment_entry_identity");
+    fs::create_directories(d / "segments");
+
+    auto p = VolumePkg::newEmpty();
+    p->save(d / "project.volpkg.json");
+    REQUIRE(p->addSegmentsEntry("segments", {"source:test"}));
+
+    const auto matching = p->matchingSegmentsEntry((d / "segments").string() + "/");
+    REQUIRE(matching);
+    CHECK(matching->location == "segments");
+    CHECK(matching->tags == std::vector<std::string>{"source:test"});
+    CHECK_FALSE(p->addSegmentsEntry((d / "segments").string()));
+    CHECK(p->segmentEntries().size() == 1);
+
+    std::error_code symlinkError;
+    fs::create_directory_symlink(
+        d / "segments", d / "segments-alias", symlinkError);
+    if (!symlinkError) {
+        CHECK(p->matchingSegmentsEntry((d / "segments-alias").string()));
+        CHECK_FALSE(p->addSegmentsEntry((d / "segments-alias").string()));
+    }
+
+#ifndef _WIN32
+    fs::create_directories(d / "segments\\");
+    CHECK_FALSE(p->matchingSegmentsEntry((d / "segments\\").string()));
+    CHECK(p->addSegmentsEntry((d / "segments\\").string()));
+#endif
+
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: segment directory-name lookup is case-insensitive")
+{
+    auto d = tmpDir("segment_source_name");
+    fs::create_directories(d / "one" / "User-Segments");
+
+    auto p = VolumePkg::newEmpty();
+    p->save(d / "project.volpkg.json");
+    REQUIRE(p->addSegmentsEntry(
+        (d / "one" / "User-Segments").string()));
+
+    const auto matching =
+        p->matchingSegmentsEntryByDirectoryName("user-segments");
+    REQUIRE(matching);
+    CHECK(matching->location ==
+          (d / "one" / "User-Segments").string());
+
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: segment attachment rolls back after a write failure")
+{
+    auto d = tmpDir("segment_attach_rollback");
+    auto makeSegment = [](const fs::path& path, const std::string& id) {
+        fs::create_directories(path);
+        std::ofstream meta(path / "meta.json");
+        meta << R"({"type":"seg","uuid":")" << id
+             << R"(","format":"tifxyz"})";
+    };
+    makeSegment(d / "initial", "initial");
+    makeSegment(d / "new", "new");
+
+    const auto project = d / "project.volpkg.json";
+    auto p = VolumePkg::newEmpty();
+    p->save(project);
+    REQUIRE(p->addSegmentsEntry((d / "initial").string()));
+    fs::remove(project);
+    fs::create_directory(project);
+
+    CHECK_THROWS(p->attachSegmentsEntry(
+        (d / "new").string(), {"source:test"}, true));
+    REQUIRE(p->segmentEntries().size() == 1);
+    CHECK(p->segmentEntries().front().location == (d / "initial").string());
+    CHECK(p->outputSegmentsPath() == d / "initial");
+    CHECK(p->segmentationIDs() == std::vector<std::string>{"initial"});
+
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto autosave = VolumePkg::load(VolumePkg::autosaveFile(), deferred);
+    REQUIRE(autosave->segmentEntries().size() == 1);
+    CHECK(autosave->segmentEntries().front().location ==
+          (d / "initial").string());
+
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg: segment discovery skips transient cache directories")
 {
     auto d = tmpDir("seg_transients");
