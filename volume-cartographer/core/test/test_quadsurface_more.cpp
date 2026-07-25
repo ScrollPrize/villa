@@ -85,6 +85,61 @@ TEST_CASE("loc_raw returns finite output for a default ptr")
     CHECK(finiteVec(l));
 }
 
+TEST_CASE("strict quad rendering is opt-in and default rendering is unchanged")
+{
+    auto points = makePlanarGrid(6, 6);
+    points(2, 2) = cv::Vec3f(-1.0f, -1.0f, -1.0f);
+    QuadSurface implicitLegacy(points, cv::Vec2f(1.0f, 1.0f));
+    QuadSurface explicitLegacy(points, cv::Vec2f(1.0f, 1.0f));
+    explicitLegacy.setStrictQuadRenderValidity(false);
+    CHECK_FALSE(implicitLegacy.strictQuadRenderValidity());
+
+    cv::Mat_<cv::Vec3f> implicitCoords;
+    cv::Mat_<cv::Vec3f> explicitCoords;
+    implicitLegacy.gen(
+        &implicitCoords, nullptr, cv::Size(20, 20),
+        cv::Vec3f(0, 0, 0), 1.0f, cv::Vec3f(0, 0, 0));
+    explicitLegacy.gen(
+        &explicitCoords, nullptr, cv::Size(20, 20),
+        cv::Vec3f(0, 0, 0), 1.0f, cv::Vec3f(0, 0, 0));
+    REQUIRE(implicitCoords.size() == explicitCoords.size());
+    for (int row = 0; row < implicitCoords.rows; ++row) {
+        for (int col = 0; col < implicitCoords.cols; ++col) {
+            for (int channel = 0; channel < 3; ++channel) {
+                const float left = implicitCoords(row, col)[channel];
+                const float right = explicitCoords(row, col)[channel];
+                CHECK((left == right || (std::isnan(left) && std::isnan(right))));
+            }
+        }
+    }
+}
+
+TEST_CASE("strict quad rendering never exposes more support than legacy rendering")
+{
+    auto points = makePlanarGrid(8, 8);
+    points(5, 5) = cv::Vec3f(-1.0f, -1.0f, -1.0f);
+    QuadSurface legacy(points, cv::Vec2f(1.0f, 1.0f));
+    QuadSurface strict(points, cv::Vec2f(1.0f, 1.0f));
+    strict.setStrictQuadRenderValidity(true);
+    cv::Mat_<cv::Vec3f> legacyCoords;
+    cv::Mat_<cv::Vec3f> strictCoords;
+    legacy.gen(&legacyCoords, nullptr, cv::Size(24, 24),
+               cv::Vec3f(0, 0, 0), 4.0f, cv::Vec3f(0, 0, 0));
+    strict.gen(&strictCoords, nullptr, cv::Size(24, 24),
+               cv::Vec3f(0, 0, 0), 4.0f, cv::Vec3f(0, 0, 0));
+    int legacyFinite = 0;
+    int strictFinite = 0;
+    for (int row = 0; row < legacyCoords.rows; ++row) {
+        for (int col = 0; col < legacyCoords.cols; ++col) {
+            legacyFinite += finiteVec(legacyCoords(row, col));
+            strictFinite += finiteVec(strictCoords(row, col));
+            if (finiteVec(strictCoords(row, col)))
+                CHECK(finiteVec(legacyCoords(row, col)));
+        }
+    }
+    CHECK(strictFinite <= legacyFinite);
+}
+
 TEST_CASE("resample (single factor) downscales by 0.5")
 {
     auto pts = makePlanarGrid(20, 20);

@@ -477,6 +477,16 @@ class TestBundleComposition:
         components = run_bundle(volume, normals, PerfectSpiralToX(), 8, cfg)
         assert set(components) == {'dense_spacing_count'}
 
+    def test_zero_shared_pair_budget_skips_active_phase_bundle(self):
+        volume = sheet_volume(100, [10, 20, 30, 40, 50, 60, 70, 80])
+        normals = normal_volume(volume['shape'])
+        cfg = phase_cfg(
+            dense_spacing_num_pairs=0,
+            dense_spacing_density_extra_pairs=0,
+        )
+        assert run_bundle(
+            volume, normals, PerfectSpiralToX(), 8, cfg) == {}
+
     def test_bundle_requires_a_signed_distance_store(self):
         surf = make_volume(np.full([4, 4, 8], 200, np.uint8), kind='surf',
                            unit=None, cap=None)

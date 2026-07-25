@@ -1595,20 +1595,37 @@ int Volume::finestPresentScaleLevelAtOrBelow(int level) const
 
 vc::render::IChunkedArray* Volume::chunkedCache()
 {
+    return sharedChunkCache().get();
+}
+
+std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
+{
     std::lock_guard<std::mutex> lock(cacheMutex_);
     if (!chunkedCache_) {
         vc::render::ChunkCache::Options options;
         options.decodedByteCapacity = cacheBudgetHot_;
+        options.decodedByteBudget = decodedCacheBudget_;
         options.maxConcurrentReads = ioThreads_ > 0 ? static_cast<std::size_t>(ioThreads_) : 16;
-        chunkedCache_ = createChunkCache(std::move(options));
+        chunkedCache_ = createChunkCacheConfigured(std::move(options));
         if (!chunkedCache_) {
             throw std::runtime_error("Volume::chunkedCache failed to create chunk cache");
         }
     }
-    return chunkedCache_.get();
+    return chunkedCache_;
 }
 
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
+    vc::render::ChunkCache::Options options) const
+{
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        if (!options.decodedByteBudget)
+            options.decodedByteBudget = decodedCacheBudget_;
+    }
+    return createChunkCacheConfigured(std::move(options));
+}
+
+std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
     vc::render::ChunkCache::Options options) const
 {
     if (isRemote_ && !remoteCacheRoot_.empty())
@@ -1636,29 +1653,56 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
         std::move(options));
 }
 
-void Volume::setCacheBudget(size_t hotBytes)
+void Volume::setCacheBudget(
+    size_t hotBytes,
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget)
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (cacheBudgetHot_ == hotBytes) {
+    if (cacheBudgetHot_ == hotBytes && decodedCacheBudget_ == decodedBudget) {
         // Re-applying the same budget must not drop the warm cache; multiple
         // workspaces share Volume instances and each applies its budget on
         // volume selection.
         return;
     }
     cacheBudgetHot_ = hotBytes;
+    decodedCacheBudget_ = std::move(decodedBudget);
+    if (chunkedCache_)
+        chunkedCache_->invalidate();
     chunkedCache_.reset();
+}
+
+void Volume::retainCacheClient()
+{
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    ++cacheClientCount_;
+}
+
+void Volume::releaseCacheClient()
+{
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    if (cacheClientCount_ == 0)
+        return;
+    --cacheClientCount_;
+    if (cacheClientCount_ == 0 && chunkedCache_) {
+        chunkedCache_->invalidate();
+        chunkedCache_.reset();
+    }
 }
 
 void Volume::setIOThreads(int count)
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
     ioThreads_ = count;
+    if (chunkedCache_)
+        chunkedCache_->invalidate();
     chunkedCache_.reset();
 }
 
 void Volume::invalidateCache()
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
+    if (chunkedCache_)
+        chunkedCache_->invalidate();
     chunkedCache_.reset();
 }
 

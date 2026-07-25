@@ -9,7 +9,6 @@ add_library(vc_core
         src/VolumePkg.cpp
         src/SurfacePatchIndex.cpp
         src/PointIndex.cpp
-        src/PolylineIndex.cpp
         src/Logging.cpp
         src/CrashHandler.cpp
         src/MemMap.cpp
@@ -37,8 +36,10 @@ add_library(vc_core
         src/Thinning.cpp
         src/Umbilicus.cpp
         src/render/ChunkCache.cpp
+        src/render/DecodedChunkCacheBudget.cpp
         src/render/PersistentZarrCacheBudget.cpp
         src/render/ChunkedPlaneSampler.cpp
+        src/render/SurfaceCache.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
         src/render/ZarrChunkFetcher.cpp

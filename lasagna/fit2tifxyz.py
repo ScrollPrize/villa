@@ -1030,10 +1030,16 @@ def _export_flatten_checkpoint(
 		y = np.where(mask_np, y, -1.0).astype(np.float32, copy=False)
 		z = np.where(mask_np, z, -1.0).astype(np.float32, copy=False)
 
-	mesh_step = 100
+	xy_step_fullres = 100.0
 	if model_params is not None:
-		mesh_step = int(model_params.get("mesh_step", 100))
-	xy_step_fullres = float(mesh_step)
+		xy_step_fullres = float(
+			model_params.get(
+				"flatten_output_step",
+				model_params.get("mesh_step", 100),
+			)
+		)
+	if not math.isfinite(xy_step_fullres) or xy_step_fullres <= 0.0:
+		raise ValueError("flatten output step must be finite and positive")
 	xy_step_export = xy_step_fullres * float(export_factor)
 	meta_scale = 1.0 / xy_step_export
 

@@ -115,6 +115,12 @@ auto main(int argc, char* argv[]) -> int
 
 #if defined(__GLIBC__) && !defined(VC_HAVE_MIMALLOC)
     // Tune glibc's malloc to give freed pages back to the OS more aggressively.
+    // Bound per-thread arenas before VC3D creates its worker pools. Smaller
+    // volume chunks increasingly use arena allocations rather than independent
+    // mmaps; allowing glibc's default (up to 8 * CPU count) let OpenMP/thread
+    // pool multiplication retain tens of GiB in 128-MiB arena mappings even
+    // after the cache references were released.
+    ::mallopt(M_ARENA_MAX, 4);
     // Lower M_MMAP_THRESHOLD pushes bigger allocations through mmap (returned
     // independently on free), reducing main-heap fragmentation. Lower
     // M_TRIM_THRESHOLD runs sbrk-trim more often. Only takes effect when

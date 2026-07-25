@@ -17,6 +17,7 @@ class Patch:
     overlapping_ids: Optional[list[str]]  # None implies no overlapping.json (hence unknown overlaps)
     winding: Optional[Union[Literal['single'], torch.Tensor]]  # None means no winding.tif found
     uuid: Optional[str] = None
+    erosion_cells_override: Optional[int] = None
     _valid_vertex_indices: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
     _valid_quad_indices: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
     _valid_zyxs: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
@@ -64,6 +65,11 @@ class Patch:
         self._valid_vertex_indices = None
         self._valid_quad_indices = None
         self._valid_zyxs = None
+
+    def erosion_cells(self, default: int) -> int:
+        """Return this patch's requested erosion, falling back to fit config."""
+        return int(default if self.erosion_cells_override is None
+                   else self.erosion_cells_override)
 
     def ij_to_zyx(self, ij: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Bilinearly interpolate zyx coordinates at fractional (i, j) pixel locations.
@@ -300,6 +306,7 @@ def load_tifxyz(path):
         metadata = json.load(meta_json)
         scale = torch.tensor(metadata['scale'])
         uuid = metadata.get('uuid')
+        erosion_cells_override = metadata.get('spiral_patch_erode_cells')
     zyxs_np = np.stack([np.array(Image.open(f'{path}/{coord}.tif')) for coord in 'zyx'], axis=-1)
 
     # Some patches mark invalid vertices via mask.tif (mask == 0) rather than the -1 sentinel in
@@ -332,7 +339,8 @@ def load_tifxyz(path):
     else:
         winding_value = None
 
-    return Patch(zyxs, scale, overlapping_ids, winding_value, uuid)
+    return Patch(zyxs, scale, overlapping_ids, winding_value, uuid,
+                 erosion_cells_override)
 
 
 def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source):
@@ -373,14 +381,14 @@ def save_combined_tifxyz(
     source,
     *,
     first_winding=10,
+    cleanup_erosion_cells=None,
 ):
-    """Atomically write disconnected winding grids as one QuadSurface.
+    """Atomically write consecutive winding grids as one QuadSurface.
 
     ``winding_zyxs`` is a mapping from integer winding id to equally tall
-    ``[z, theta, 3]`` ZYX float arrays.  Components use half-open column ranges,
-    matching QuadSurface's metadata contract.  An invalid separator column is
-    inserted between every pair even though components are also recorded; the
-    redundancy keeps old readers from constructing cross-winding quads.
+    ``[z, theta, 3]`` ZYX float arrays. Winding ranges use half-open column
+    bounds for display filtering, but they are not QuadSurface components:
+    adjacent windings remain joined by quads across their shared seam.
     """
     import os
     import shutil
@@ -417,11 +425,34 @@ def save_combined_tifxyz(
         blocks.append(block)
         cursor += block.shape[1]
         components.append([start, cursor])
-        if index + 1 < len(ids):
-            blocks.append(np.full((rows, 1, 3), -1.0, dtype=np.float32))
-            cursor += 1
-
     combined = np.concatenate(blocks, axis=1)
+    cleanup_metadata = None
+    if cleanup_erosion_cells is not None:
+        import scipy.ndimage
+
+        erosion_cells = int(cleanup_erosion_cells)
+        if erosion_cells < 0:
+            raise ValueError("cleanup_erosion_cells must be non-negative")
+        valid = np.isfinite(combined).all(axis=-1) & ~np.all(combined == -1.0, axis=-1)
+        if erosion_cells:
+            valid = scipy.ndimage.binary_erosion(
+                valid, iterations=erosion_cells, border_value=0)
+        labels, component_count = scipy.ndimage.label(
+            valid, structure=scipy.ndimage.generate_binary_structure(2, 1))
+        if component_count == 0:
+            raise ValueError(
+                "Preview cleanup removed every valid TIFXYZ vertex "
+                f"after {erosion_cells}-cell erosion")
+        component_sizes = np.bincount(labels.ravel())
+        component_sizes[0] = 0
+        valid = labels == int(np.argmax(component_sizes))
+        combined = combined.copy()
+        combined[~valid] = -1.0
+        cleanup_metadata = {
+            "erosion_cells": erosion_cells,
+            "component_connectivity": 4,
+            "components_after_erosion": int(component_count),
+        }
     destination = os.path.abspath(os.fspath(path))
     parent = os.path.dirname(destination)
     os.makedirs(parent, exist_ok=True)
@@ -456,11 +487,13 @@ def save_combined_tifxyz(
             "type": "seg",
             "uuid": uuid,
             "source": source,
-            "components": components,
+            "winding_column_ranges": components,
             "component_winding_ids": ids,
             "output_first_winding": ids[0],
             "output_last_winding": ids[-1],
         }
+        if cleanup_metadata is not None:
+            metadata["lasagna_input_cleanup"] = cleanup_metadata
         meta_path = os.path.join(surface_dir, "meta.json")
         with open(meta_path, "w", encoding="utf-8") as stream:
             json.dump(metadata, stream, indent=4)
@@ -468,13 +501,13 @@ def save_combined_tifxyz(
             os.fsync(stream.fileno())
 
         published = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "spiral_combined_preview",
             "surface_path": os.path.join(destination, uuid),
             "surface_id": uuid,
             "first_winding": ids[0],
             "last_winding": ids[-1],
-            "components": components,
+            "winding_column_ranges": components,
             "winding_ids": ids,
             "manifest_path": os.path.join(destination, "manifest.json"),
         }
