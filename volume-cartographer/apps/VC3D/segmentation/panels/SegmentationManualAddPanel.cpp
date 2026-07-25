@@ -155,6 +155,37 @@ ManualAddTool::LinePreviewMode SegmentationManualAddPanel::cycleLinePreviewMode(
     return static_cast<ManualAddTool::LinePreviewMode>(_comboLinePreviewMode->currentData().toInt());
 }
 
+ManualAddTool::LinePreviewMode SegmentationManualAddPanel::setLinePreviewMode(ManualAddTool::LinePreviewMode mode)
+{
+    const int index = _comboLinePreviewMode->findData(static_cast<int>(mode));
+    if (index >= 0) {
+        // setCurrentIndex fires currentIndexChanged -> persist -> configChanged,
+        // matching a human combo edit. Assigning the same index is a no-op, so
+        // force the persist path when the mode is already selected.
+        if (index == _comboLinePreviewMode->currentIndex()) {
+            persistFromUi();
+            emit configChanged();
+        } else {
+            _comboLinePreviewMode->setCurrentIndex(index);
+        }
+    }
+    return static_cast<ManualAddTool::LinePreviewMode>(_comboLinePreviewMode->currentData().toInt());
+}
+
+ManualAddTool::InterpolationMode SegmentationManualAddPanel::setInterpolationMode(ManualAddTool::InterpolationMode mode)
+{
+    const int index = _comboInterpolationMode->findData(static_cast<int>(mode));
+    if (index >= 0) {
+        if (index == _comboInterpolationMode->currentIndex()) {
+            persistFromUi();
+            emit configChanged();
+        } else {
+            _comboInterpolationMode->setCurrentIndex(index);
+        }
+    }
+    return static_cast<ManualAddTool::InterpolationMode>(_comboInterpolationMode->currentData().toInt());
+}
+
 void SegmentationManualAddPanel::restoreSettings(QSettings& settings)
 {
     _restoringSettings = true;

@@ -25,6 +25,8 @@
 #include <unordered_map>
 #include <map>
 
+#include <functional>
+
 #include "CPointCollectionWidget.hpp"
 #include "CFiberWidget.hpp"
 #include "CState.hpp"
@@ -82,6 +84,15 @@ struct AtlasSearchFiberSnapshot {
     std::vector<std::string> tags;
 };
 
+// Parameters for an atlas fiber-intersection search. The GUI slot builds the
+// same value from its widgets.
+struct AtlasFiberSearchParams {
+    int searchMode{0};                 // ATLAS_SEARCH_MODE_* (CWindow.cpp)
+    QStringList requiredTags;
+    QStringList excludedTags;
+    std::optional<double> maxDistance; // -> FiberIntersectionBroadPhaseOptions::maxDistance
+};
+
 #define MAX_RECENT_VOLPKG 10
 
 // Project JSON schema version required by this app.
@@ -94,6 +105,7 @@ class FiberAnnotationController;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
+class VolumeAttachmentController;
 class SegmentationGrower;
 class ViewerControlsPanel;
 class QLabel;
@@ -108,11 +120,13 @@ class AxisAlignedSliceController;
 class SegmentationCommandHandler;
 class ViewerTransformsPanel;
 class LineAnnotationController;
+class FiberOverlayController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
+class SpiralWorkspace;
 
 class CWindow : public QMainWindow
 {
@@ -120,14 +134,34 @@ class CWindow : public QMainWindow
     Q_OBJECT
 
     friend class MenuActionController;
+    friend class VolumeAttachmentController;
     friend class RenderBenchReplay;
+    friend class AgentBridgeServer;
 
 public:
+    // Starts an atlas fiber-intersection search without opening a dialog.
+    // Progress and completion use the atlasSearch signals below.
+    // Distinct name (not an overload): the slot is used as a member-function
+    // pointer in new-style connect(), which an overload would make ambiguous.
+    bool startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
+                                                   QString* errorMessage = nullptr);
+
+    // Renders <segment>/mask.tif on a QtConcurrent worker. Presentation belongs
+    // to the caller; onFinished runs on the GUI thread.
+    bool startMaskRender(const QString& segmentId, bool append,
+                         std::function<void(bool, QString)> onFinished,
+                         QString* errorMessage = nullptr);
+
 signals:
+    // Atlas search progress. phase is in [1, ATLAS_SEARCH_PHASE_COUNT] and
+    // fraction is in [0, 1] within that phase.
+    void atlasSearchProgressChanged(int phase, double fraction);
+    // Terminal atlas-search notification. success is false for cancellation
+    // and error; resultCount equals _atlasSearchResults.size().
+    void atlasSearchFinished(bool success, int resultCount);
 
 public slots:
     void onShowStatusMessage(QString text, int timeout);
-    void onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onVisLasagnaObj(const std::string& segmentId);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
@@ -139,9 +173,21 @@ public slots:
     void onFocusViewsRequested(uint64_t collectionId, uint64_t pointId);
 
 public:
+    enum class VolumeOpenError {
+        None,
+        PackageLoadFailed,
+        VolumeNotFound,
+    };
+
     explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
                      RenderBenchOptions benchOptions = {});
     ~CWindow(void);
+
+    bool openVolumePackage(const QString& path,
+                           bool interactive = true,
+                           QString* errorMessage = nullptr,
+                           const QString& preferredVolumeId = {},
+                           VolumeOpenError* openError = nullptr);
 
     // Helper method to get the current volume path
     QString getCurrentVolumePath() const;
@@ -155,14 +201,32 @@ protected:
 private:
     void CreateWidgets(void);
     QMainWindow* segmentWorkspaceWindow() const { return _segmentWorkspaceWindow; }
+    ViewerManager* activeWorkspaceViewerManager() const;
+    void updateActiveWorkspaceViewerControls();
     void populateDockToggleMenu(QMenu* menu) const;
     void createAtlasWorkspace();
     void displayAtlasFromDirectory(const std::filesystem::path& atlasDir);
+    // Dialog-free core of displayAtlasFromDirectory: loads/displays the atlas,
+    // letting std::exception propagate (no QMessageBox). Shared by the interactive
+    // method and the headless variant below.
+    void loadAndDisplayAtlas(const std::filesystem::path& atlasDir);
+    // Opens an atlas without dialogs or the rebuild prompt. The distinct name
+    // avoids ambiguity where displayAtlasFromDirectory is used in connect().
+    bool displayAtlasFromDirectoryHeadless(const std::filesystem::path& atlasDir,
+                                           QString* errorMessage = nullptr);
     void refreshAtlasOverviewDocks();
     void updateAtlasFiberDocks();
     void updateAtlasSearchDocks();
     void remapCurrentAtlas();
+    // Starts atlas remapping without dialogs. The interactive caller can add
+    // its completion UI through onFinished.
+    bool startAtlasRemapHeadless(QString* errorMessage = nullptr,
+                                 std::function<void(bool success, const QString& detail)> onFinished = {});
     void optimizeAtlasSnapCandidates();
+    // Starts snap-candidate optimization without dialogs. Async failures go to
+    // the status bar and stderr, plus onAsyncError when provided.
+    bool optimizeAtlasSnapCandidatesHeadless(QString* errorMessage = nullptr,
+                                             std::function<void(const QString& detail)> onAsyncError = {});
     void startAtlasFiberIntersectionSearch();
     void cancelAtlasFiberIntersectionSearch();
     void updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phase,
@@ -201,15 +265,26 @@ private:
 
     void setWidgetsEnabled(bool state);
 
-    bool InitializeVolumePkg(const std::string& nVpkgPath);
-
-    void OpenVolume(const QString& path);
+    bool OpenVolume(const QString& path,
+                    bool interactive = true,
+                    QString* errorMessage = nullptr,
+                    const QString& preferredVolumeId = {},
+                    VolumeOpenError* openError = nullptr);
     void CloseVolume(void);
 
 
     void setVolume(std::shared_ptr<Volume> newvol);
-    bool attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
-                                      const QString& preferredVolumeId = QString());
+    enum class VolumeAttachResult {
+        Attached,
+        AlreadyAttached,
+        VolumeIdConflict,
+    };
+    VolumeAttachResult attachVolumeToCurrentPackage(
+        const std::shared_ptr<Volume>& volume,
+        const QString& location,
+        std::vector<std::string> tags = {},
+        const QString& remoteCacheRoot = {},
+        const QString& preferredVolumeId = {});
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
     void syncVolumeSelectionControls(const QString& activeVolumeId = QString());
@@ -341,6 +416,8 @@ private:
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
     QMainWindow* _intersectionsWorkspaceWindow{nullptr};
+    QMainWindow* _spiralWorkspaceWindow{nullptr};
+    SpiralWorkspace* _spiralWorkspace{nullptr};
     QDockWidget* _atlasOverviewDock{nullptr};
     QDockWidget* _atlasSearchDock{nullptr};
     QDockWidget* _inkDetectionDock{nullptr};
@@ -371,7 +448,6 @@ private:
     QMdiArea *mdiArea;
     QMdiArea* _fiberSliceMdiArea{nullptr};
     QMdiArea* _intersectionsMdiArea{nullptr};
-    VolumeViewerBase* _activeBaseViewer{nullptr};
 
     bool can_change_volume_();
 
@@ -401,8 +477,10 @@ private:
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
     std::unique_ptr<AtlasOverlayController> _atlasOverlay;
     std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
+    std::unique_ptr<FiberOverlayController> _fiberOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
+    std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
     std::unique_ptr<MenuActionController> _menuController;
     std::unique_ptr<SurfaceAffineTransformController> _surfaceAffineTransforms;
     // runner for command line tools

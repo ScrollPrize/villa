@@ -16,6 +16,7 @@ import {
 } from './automation-cli.mjs';
 import { runCli } from './cli.mjs';
 import { PROGRESS_PRIZE_MARKERS } from './markdown.mjs';
+import { ROLLOVER_FAULTS, RolloverFaultError } from './rollover.mjs';
 
 const PRIVATE = Object.freeze({
   token: 'private-wif-access-token',
@@ -197,6 +198,73 @@ test('automation failure diagnostics are single-line, bounded, and fully redacte
   assert.equal(forged.includes(forgedOpaqueId), false);
 });
 
+test('automation diagnostics expose only allowlisted staging fault labels', () => {
+  for (const step of Object.values(ROLLOVER_FAULTS)) {
+    const expected = `progress-prizes: Injected staging rollover failure at ${step}`;
+    const diagnostic = formatAutomationError(new RolloverFaultError(step), {
+      env: stagingEnv(),
+    });
+    assert.equal(diagnostic, expected);
+    assert.equal(
+      safeAutomationDiagnostic(Buffer.from(`${diagnostic}\n`), { env: stagingEnv() }),
+      expected,
+    );
+
+    const plainError = new Error(`Injected staging rollover failure at ${step}`);
+    assert.equal(
+      formatAutomationError(plainError, { env: stagingEnv() }),
+      AUTOMATION_ERROR_FALLBACK,
+    );
+
+    const spoofedError = new Error(plainError.message);
+    spoofedError.name = 'RolloverFaultError';
+    spoofedError.step = step;
+    assert.equal(
+      formatAutomationError(spoofedError, { env: stagingEnv() }),
+      AUTOMATION_ERROR_FALLBACK,
+    );
+
+    const sanitizedImitation = new Error(`\u0000Injected staging rollover failure at ${step}`);
+    const imitationDiagnostic = formatAutomationError(sanitizedImitation, {
+      env: stagingEnv(),
+    });
+    assert.notEqual(imitationDiagnostic, expected);
+    if (step === ROLLOVER_FAULTS.AFTER_COPY) {
+      assert.equal(imitationDiagnostic, AUTOMATION_ERROR_FALLBACK);
+    }
+  }
+
+  const privateStep = 'private-long-fault-step';
+  const diagnostic = formatAutomationError(new RolloverFaultError(privateStep), {
+    env: stagingEnv(),
+  });
+  assert.equal(diagnostic.includes(privateStep), false);
+  assert.match(diagnostic, /\[REDACTED\]/);
+
+  const privateTyped = new RolloverFaultError(PRIVATE.form);
+  const privateTypedDiagnostic = formatAutomationError(privateTyped, { env: stagingEnv() });
+  assert.equal(privateTypedDiagnostic.includes(PRIVATE.form), false);
+
+  const mutatedKnownError = new RolloverFaultError(ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE);
+  mutatedKnownError.message = PRIVATE.token;
+  assert.equal(
+    formatAutomationError(mutatedKnownError, { env: stagingEnv() }),
+    `progress-prizes: Injected staging rollover failure at ${ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE}`,
+  );
+
+  const forged = safeAutomationDiagnostic(Buffer.from(
+    `progress-prizes: Injected staging rollover failure at ${privateStep}\n`,
+  ), { env: stagingEnv() });
+  assert.equal(forged.includes(privateStep), false);
+  assert.match(forged, /\[REDACTED\]/);
+
+  const suffixed = safeAutomationDiagnostic(Buffer.from(
+    `progress-prizes: Injected staging rollover failure at ${ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE} ${PRIVATE.token}\n`,
+  ), { env: stagingEnv() });
+  assert.equal(suffixed.includes(ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE), false);
+  assert.equal(suffixed.includes(PRIVATE.token), false);
+});
+
 test('automation failure formatter fails closed for hostile errors and environments', () => {
   const hostileError = new Proxy(new Error('private-message'), {
     get(target, property, receiver) {
@@ -273,6 +341,134 @@ test('production-only guards reject staging controls before token access, client
         PROGRESS_PRIZE_TARGET_BRANCH: 'private-test-base',
       }),
       /alternate target branch/,
+    ],
+    [
+      [
+        'bootstrap',
+        '--source-cycle', '2026-07',
+        '--target-cycle', '2026-08',
+        '--allow-activation-rewind',
+      ],
+      productionEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /activation rewind is forbidden in production/,
+    ],
+  ]) {
+    let clientCalls = 0;
+    let fileCalls = 0;
+    let fetchCalls = 0;
+    await assert.rejects(
+      runAutomationCli(argv, {
+        env,
+        googleFactory: () => { clientCalls += 1; return {}; },
+        read: async () => { fileCalls += 1; return ''; },
+        write: async () => { fileCalls += 1; },
+        fetchImpl: async () => { fetchCalls += 1; return new Response(); },
+        output: () => {},
+      }),
+      expected,
+    );
+    assert.equal(clientCalls, 0);
+    assert.equal(fileCalls, 0);
+    assert.equal(fetchCalls, 0);
+  }
+});
+
+test('activation rewind controls fail closed before token access, client creation, file IO, or network', async () => {
+  for (const [argv, env, expected] of [
+    [
+      ['prepare', '--target-cycle', '2026-08', '--allow-activation-rewind'],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /accepted only by bootstrap/,
+    ],
+    [
+      ['bootstrap', '--source-cycle', '2026-07', '--allow-activation-rewind'],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /Missing required option --target-cycle/,
+    ],
+    [
+      ['bootstrap', '--target-cycle', '2026-08', '--allow-activation-rewind'],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /Missing required option --source-cycle/,
+    ],
+    [
+      [
+        'bootstrap',
+        '--source-cycle', '2026-07',
+        '--target-cycle', '2026-09',
+        '--allow-activation-rewind',
+      ],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /must immediately follow the source cycle/,
+    ],
+    [
+      [
+        'bootstrap',
+        '--source-cycle', '2026-08',
+        '--target-cycle', '2026-09',
+        '--allow-activation-rewind',
+      ],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /restricted to the initial 2026-07 source cycle/,
+    ],
+    [
+      [
+        'bootstrap',
+        '--source-cycle', '2026-07',
+        '--target-cycle', '2026-08',
+        '--allow-activation-rewind',
+      ],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined, GITHUB_EVENT_NAME: 'schedule' }),
+      /manually dispatched staging run/,
+    ],
+    [
+      [
+        'bootstrap',
+        '--source-cycle', '2026-07',
+        '--target-cycle', '2026-08',
+        '--allow-activation-rewind',
+      ],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined, PROGRESS_PRIZE_SERVICE_ACCOUNT_EMAIL: 'wrong@example.org' }),
+      /staging service account/,
+    ],
+    [
+      [
+        'bootstrap',
+        '--source-cycle', '2026-07',
+        '--target-cycle', '2026-08',
+        '--allow-activation-rewind',
+      ],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined, PROGRESS_PRIZE_FOLDER_ID: 'wrong-folder' }),
+      /staging folder/,
+    ],
+    [
+      [
+        'bootstrap',
+        '--source-cycle', '2026-07',
+        '--target-cycle', '2026-08',
+        '--allow-activation-rewind',
+      ],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined, PROGRESS_PRIZE_BRANCH: 'feature/not-smoke' }),
+      /smoke branch prefix/,
+    ],
+    [
+      [
+        'bootstrap',
+        '--source-cycle', '2026-07',
+        '--target-cycle', '2026-08',
+        '--allow-activation-rewind=true',
+      ],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /does not accept a value/,
+    ],
+    [
+      [
+        'bootstrap',
+        '--source-cycle', '2026-07',
+        '--target-cycle', '2026-08',
+        '--allow-activation-rewind', 'false',
+      ],
+      stagingEnv({ GOOGLE_ACCESS_TOKEN: undefined }),
+      /Unexpected positional argument/,
     ],
   ]) {
     let clientCalls = 0;
@@ -508,4 +704,27 @@ test('bootstrap, verify, and cleanup commands map to the corresponding service o
     assert.equal(capture.method, method);
     if (expectedMode !== undefined) assert.equal(capture.input.mode, expectedMode);
   }
+});
+
+test('bootstrap routes the explicit staging activation rewind and consecutive target cycle', async () => {
+  const capture = {};
+  await runAutomationCli([
+    'bootstrap',
+    '--source-cycle', '2026-07',
+    '--target-cycle', '2026-08',
+    '--allow-activation-rewind',
+  ], {
+    env: stagingEnv(),
+    googleFactory: () => ({}),
+    rolloverFactory: fakeRolloverFactory({
+      capture,
+      result: { status: 'active', cycle: '2026-07' },
+    }),
+    output: () => {},
+  });
+  assert.equal(capture.method, 'bootstrapStagingSource');
+  assert.equal(capture.input.sourceCycle, '2026-07');
+  assert.equal(capture.input.targetCycle, '2026-08');
+  assert.equal(capture.input.allowActivationRewind, true);
+  assert.equal(capture.dependencies.runtime.environment, 'staging');
 });

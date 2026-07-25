@@ -9,10 +9,12 @@ import { createClock } from './clock.mjs';
 import { createGoogleApiClient, redactForLog } from './google-api.mjs';
 import { assertPublicResponderUri } from './markdown.mjs';
 import {
+  ROLLOVER_FAULTS,
+  RolloverFaultError,
   assertRolloverRuntimeSafety,
   createRolloverService,
 } from './rollover.mjs';
-import { parseCycle, previousCycle } from './dates.mjs';
+import { nextCycle, parseCycle, previousCycle } from './dates.mjs';
 import {
   GOOGLE_CLI_USAGE,
   GOOGLE_COMMANDS,
@@ -29,6 +31,10 @@ const GIT_SHA_PATTERN = /^[a-f0-9]{40}$/i;
 const AUTOMATION_ERROR_INPUT_MAX_UNITS = 4_096;
 const AUTOMATION_ERROR_MAX_BYTES = 600;
 export const AUTOMATION_ERROR_FALLBACK = 'progress-prizes: Automation failed without a safe diagnostic';
+const ALLOWED_ROLLOVER_FAULT_STEPS = new Set([
+  ROLLOVER_FAULTS.AFTER_COPY,
+  ROLLOVER_FAULTS.AFTER_CLOSE_SOURCE,
+]);
 const OUTPUT_STATUSES = new Set([
   'active',
   'archived',
@@ -249,6 +255,17 @@ function privateValues(env) {
   return PRIVATE_ENV_NAMES.map((name) => optionalEnv(env, name)).filter(Boolean);
 }
 
+function knownRolloverFaultDiagnostic(step) {
+  if (!ALLOWED_ROLLOVER_FAULT_STEPS.has(step)) return undefined;
+  return `progress-prizes: Injected staging rollover failure at ${step}`;
+}
+
+function knownRolloverFaultStep(diagnostic) {
+  return [...ALLOWED_ROLLOVER_FAULT_STEPS].find(
+    (step) => diagnostic === knownRolloverFaultDiagnostic(step),
+  );
+}
+
 /**
  * Produce one bounded log line without retaining private Google configuration,
  * ACL identities, URLs, opaque identifiers, or control characters.
@@ -256,6 +273,13 @@ function privateValues(env) {
 export function formatAutomationError(error, { env = process.env } = {}) {
   try {
     if (!(error instanceof Error) || typeof error.message !== 'string') {
+      return AUTOMATION_ERROR_FALLBACK;
+    }
+    if (error instanceof RolloverFaultError) {
+      const diagnostic = knownRolloverFaultDiagnostic(error.step);
+      if (diagnostic !== undefined) return diagnostic;
+    }
+    if (knownRolloverFaultStep(`progress-prizes: ${error.message}`) !== undefined) {
       return AUTOMATION_ERROR_FALLBACK;
     }
     const oversized = error.message.length > AUTOMATION_ERROR_INPUT_MAX_UNITS;
@@ -274,6 +298,7 @@ export function formatAutomationError(error, { env = process.env } = {}) {
     if (redacted === '') return AUTOMATION_ERROR_FALLBACK;
 
     const value = `progress-prizes: ${redacted}`;
+    if (knownRolloverFaultStep(value) !== undefined) return AUTOMATION_ERROR_FALLBACK;
     if (Buffer.byteLength(value, 'utf8') <= AUTOMATION_ERROR_MAX_BYTES) return value;
     let low = 0;
     let high = value.length;
@@ -302,6 +327,10 @@ export function safeAutomationDiagnostic(value, { env = process.env } = {}) {
     const match = decoded.match(/^(progress-prizes: [\x20-\x7e]{1,583})\n$/);
     if (!match) return AUTOMATION_ERROR_FALLBACK;
     const message = match[1].slice('progress-prizes: '.length);
+    const knownFaultStep = knownRolloverFaultStep(match[1]);
+    if (knownFaultStep !== undefined) {
+      return formatAutomationError(new RolloverFaultError(knownFaultStep), { env });
+    }
     return formatAutomationError(new Error(message), { env });
   } catch {
     return AUTOMATION_ERROR_FALLBACK;
@@ -331,6 +360,32 @@ function assertAutomationOptions(command, options) {
   }
   if (options.fault !== undefined && !['bootstrap', 'prepare', 'activate'].includes(command)) {
     throw new Error('--fault is accepted only by bootstrap, prepare, and activate');
+  }
+  if (command === 'bootstrap') {
+    const sourceCycle = requireOption(options, 'source-cycle');
+    parseCycle(sourceCycle);
+    if (sourceCycle !== '2026-07') {
+      throw new Error('Staging bootstrap is restricted to the initial 2026-07 source cycle');
+    }
+  }
+  if (options['allow-activation-rewind'] === true && command !== 'bootstrap') {
+    throw new Error('--allow-activation-rewind is accepted only by bootstrap');
+  }
+  if (options['allow-activation-rewind'] === true) {
+    const sourceCycle = requireOption(options, 'source-cycle');
+    const targetCycle = requireOption(options, 'target-cycle');
+    parseCycle(sourceCycle);
+    parseCycle(targetCycle);
+    if (nextCycle(sourceCycle) !== targetCycle) {
+      throw new Error('Activation rewind target cycle must immediately follow the source cycle');
+    }
+  }
+  if (
+    command === 'bootstrap'
+    && options['target-cycle'] !== undefined
+    && options['allow-activation-rewind'] !== true
+  ) {
+    throw new Error('--target-cycle requires --allow-activation-rewind for bootstrap');
   }
   for (const shaOption of ['head-sha', 'verified-sha']) {
     if (options[shaOption] !== undefined && command !== 'activate') {
@@ -420,7 +475,10 @@ export async function runAutomationCli(argv, {
   // This validation deliberately precedes token access, Google client creation,
   // responder URL resolution, and every filesystem/network call.
   const runtime = buildRuntime(options, env);
-  assertRolloverRuntimeSafety(runtime, { faultInjection: options.fault });
+  assertRolloverRuntimeSafety(runtime, {
+    faultInjection: options.fault,
+    allowActivationRewind: options['allow-activation-rewind'] === true,
+  });
   const clock = createClock({
     environment: runtime.environment,
     eventName: runtime.eventName,
@@ -466,12 +524,21 @@ export async function runAutomationCli(argv, {
   } else if (command === 'bootstrap') {
     const sourceCycle = requireOption(options, 'source-cycle');
     parseCycle(sourceCycle);
+    const allowActivationRewind = options['allow-activation-rewind'] === true;
+    let targetCycle;
+    if (allowActivationRewind) {
+      targetCycle = requireOption(options, 'target-cycle');
+      parseCycle(targetCycle);
+      assertSourceCycleMatchesTarget(options, targetCycle);
+    }
     result = await rollover.bootstrapStagingSource({
       sourceFormId: requiredEnv(env, AUTOMATION_ENV.SOURCE_FORM_ID),
       sourceCycle,
+      targetCycle,
       collaboratorPermissions: collaborators,
       dryRun: options['dry-run'] === true,
       faultInjection: options.fault,
+      allowActivationRewind,
     });
   } else {
     const targetCycle = requireOption(options, 'target-cycle');

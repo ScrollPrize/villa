@@ -15,12 +15,13 @@ const API = 'https://api.github.com';
 const SMOKE_HEAD = 'codex/progress-prize-smoke-20260720';
 const SMOKE_BASE = 'codex/progress-prize-smoke-base-20260720';
 const PREVIEW_CONTEXT = 'progress-prizes/vercel-preview';
-const PREVIEW_WORKFLOW_NAME = 'Progress Prize Vercel preview gate';
+const PREVIEW_DESCRIPTION = 'Exact Progress Prize preview verified';
 const PREVIEW_WORKFLOW_PATH = '.github/workflows/progress-prizes-vercel-preview.yml';
 const TEST_CHECK = 'Public no-secret tests';
 const SUCCESSFUL_CONCLUSIONS = new Set(['success', 'neutral', 'skipped']);
 const REPOSITORY_ID = 890972577;
 const OWNER_ID = 121906140;
+const GITHUB_ACTIONS_BOT_ID = 41898282;
 const PAGE_PATH = 'scrollprize.org/docs/34_prizes.md';
 
 function previewRunId(status) {
@@ -33,7 +34,16 @@ function isTrustedPreviewStatus(status) {
   return status?.context === PREVIEW_CONTEXT
     && status.state === 'success'
     && status.creator?.login === 'github-actions[bot]'
+    && status.creator?.id === GITHUB_ACTIONS_BOT_ID
+    && status.creator?.type === 'Bot'
+    && status.description === PREVIEW_DESCRIPTION
     && previewRunId(status) !== undefined;
+}
+
+function latestPreviewStatus(statuses) {
+  return Array.isArray(statuses)
+    ? statuses.find((status) => status.context === PREVIEW_CONTEXT)
+    : undefined;
 }
 
 function fail(message) {
@@ -80,26 +90,36 @@ export function assertAutomationBranch(head, base) {
   fail('Head/base pair is outside the Progress Prize automation allowlist.');
 }
 
+function assertPullAssociation(pull, { head, base } = {}) {
+  assertAutomationBranch(head, base);
+  if (
+    pull?.state !== 'open'
+    || pull.head?.ref !== head
+    || pull.base?.ref !== base
+    || pull.head?.repo?.id !== REPOSITORY_ID
+    || pull.base?.repo?.id !== REPOSITORY_ID
+    || pull.head?.repo?.full_name !== `${OWNER}/${REPO}`
+    || pull.base?.repo?.full_name !== `${OWNER}/${REPO}`
+  ) {
+    fail('Automation pull request association failed.');
+  }
+  return pull;
+}
+
+function pullShasMatch(pull, { headSha, baseSha }) {
+  return pull?.head?.sha === headSha && pull?.base?.sha === baseSha;
+}
+
 export function assertPullBinding(pull, {
   head,
   base,
   headSha,
   baseSha,
 } = {}) {
-  assertAutomationBranch(head, base);
+  assertPullAssociation(pull, { head, base });
   assertSha(headSha);
   assertSha(baseSha);
-  if (
-    pull?.state !== 'open'
-    || pull.head?.ref !== head
-    || pull.base?.ref !== base
-    || pull.head?.sha !== headSha
-    || pull.base?.sha !== baseSha
-    || pull.head?.repo?.id !== REPOSITORY_ID
-    || pull.base?.repo?.id !== REPOSITORY_ID
-    || pull.head?.repo?.full_name !== `${OWNER}/${REPO}`
-    || pull.base?.repo?.full_name !== `${OWNER}/${REPO}`
-  ) {
+  if (!pullShasMatch(pull, { headSha, baseSha })) {
     fail('Automation pull request is not bound to the expected immutable refs.');
   }
   return pull;
@@ -153,13 +173,30 @@ export function assertSinglePageCommit(commit, { headSha, baseSha } = {}) {
   return commit;
 }
 
+export function activationCommitNeedsRefresh(commit, { headSha, baseSha } = {}) {
+  assertSha(headSha);
+  assertSha(baseSha);
+  if (
+    commit?.sha !== headSha
+    || commit.parents?.length !== 1
+    || commit.files?.length !== 1
+    || commit.files[0]?.filename !== PAGE_PATH
+    || commit.files[0]?.status !== 'modified'
+  ) {
+    fail('Only a page-only commit with a stale parent may be refreshed.');
+  }
+  const parentSha = assertSha(commit.parents[0]?.sha ?? '');
+  return parentSha !== baseSha;
+}
+
 export function isTrustedPreviewRun({ status, run, expectedSha } = {}) {
   const sha = assertSha(expectedSha);
   const runId = previewRunId(status);
+  const expectedRunName = `Progress Prize Vercel preview ${sha}`;
   return isTrustedPreviewStatus(status)
     && String(run?.id ?? '') === runId
     && run?.html_url === status.target_url
-    && run?.name === PREVIEW_WORKFLOW_NAME
+    && run?.name === expectedRunName
     && run?.path === PREVIEW_WORKFLOW_PATH
     && run?.event === 'repository_dispatch'
     && run?.actor?.login === 'vercel[bot]'
@@ -173,7 +210,7 @@ export function isTrustedPreviewRun({ status, run, expectedSha } = {}) {
     && run?.head_branch === 'main'
     && run?.status === 'completed'
     && run?.conclusion === 'success'
-    && run?.display_title === `Progress Prize Vercel preview ${sha}`;
+    && run?.display_title === expectedRunName;
 }
 
 async function github(path, { method = 'GET', body, token = process.env.GITHUB_TOKEN } = {}) {
@@ -194,6 +231,37 @@ async function github(path, { method = 'GET', body, token = process.env.GITHUB_T
   return response.status === 204 ? undefined : response.json();
 }
 
+export async function waitForPullBinding({
+  number,
+  head,
+  base,
+  headSha,
+  baseSha,
+} = {}, {
+  attempts = 12,
+  delayMs = 5_000,
+  readPull = (pullNumber) => github(`/repos/${OWNER}/${REPO}/pulls/${pullNumber}`),
+  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+} = {}) {
+  if (!Number.isInteger(number) || number < 1) fail('Invalid pull request number.');
+  assertAutomationBranch(head, base);
+  assertSha(headSha);
+  assertSha(baseSha);
+  if (!Number.isInteger(attempts) || attempts < 1 || attempts > 12) {
+    fail('Invalid pull request convergence attempts.');
+  }
+  if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > 5_000) {
+    fail('Invalid pull request convergence delay.');
+  }
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const pull = await readPull(number);
+    assertPullAssociation(pull, { head, base });
+    if (pullShasMatch(pull, { headSha, baseSha })) return pull;
+    if (attempt < attempts) await sleep(delayMs);
+  }
+  fail('Automation pull request immutable refs did not converge.');
+}
+
 async function findPull(head, base) {
   assertAutomationBranch(head, base);
   const pulls = await github(
@@ -201,55 +269,77 @@ async function findPull(head, base) {
   );
   if (!Array.isArray(pulls) || pulls.length !== 1) fail('Expected exactly one open automation pull request.');
   const pull = pulls[0];
-  if (
-    pull.head?.ref !== head
-    || pull.base?.ref !== base
-    || pull.head?.repo?.id !== REPOSITORY_ID
-    || pull.base?.repo?.id !== REPOSITORY_ID
-    || pull.head?.repo?.full_name !== `${OWNER}/${REPO}`
-    || pull.base?.repo?.full_name !== `${OWNER}/${REPO}`
-  ) {
-    fail('Automation pull request association failed.');
-  }
-  return pull;
+  return assertPullAssociation(pull, { head, base });
 }
 
-async function activationState(options) {
-  const head = required(options, 'head');
-  const base = required(options, 'base');
-  const cycle = assertCycle(required(options, 'cycle'));
+export async function resolveProductionActivationState({
+  head,
+  base,
+  cycle,
+  expectedBaseSha,
+} = {}, {
+  listPulls = () => github(
+    `/repos/${OWNER}/${REPO}/pulls?state=open&head=${encodeURIComponent(`${OWNER}:${head}`)}&base=${encodeURIComponent(base)}&per_page=10`,
+  ),
+  readCommit = (sha) => github(`/repos/${OWNER}/${REPO}/commits/${sha}`),
+  readMainRef = () => github(`/repos/${OWNER}/${REPO}/git/ref/heads/main`),
+  readPage = (sha) => readPageAt(sha),
+} = {}) {
+  if (typeof head !== 'string' || head === '') fail('Missing production activation head.');
+  if (typeof base !== 'string' || base === '') fail('Missing production activation base.');
+  const targetCycle = assertCycle(cycle);
+  const trustedBaseSha = assertSha(expectedBaseSha);
   const contract = assertAutomationBranch(head, base);
   if (contract.kind !== 'production') fail('Activation-state recovery is production-only.');
-  const pulls = await github(
-    `/repos/${OWNER}/${REPO}/pulls?state=open&head=${encodeURIComponent(`${OWNER}:${head}`)}&base=${encodeURIComponent(base)}&per_page=10`,
-  );
+  const pulls = await listPulls();
   if (!Array.isArray(pulls) || pulls.length > 1) fail('Production activation PR state is ambiguous.');
   let state;
   let sha;
   let baseSha;
   let number = '';
+  let refreshRequired = false;
   if (pulls.length === 1) {
     const pull = pulls[0];
     sha = assertSha(pull.head?.sha ?? '');
     baseSha = assertSha(pull.base?.sha ?? '');
+    if (baseSha !== trustedBaseSha) fail('Production main moved after the workflow was dispatched.');
     assertPullBinding(pull, { head, base, headSha: sha, baseSha });
+    const commit = await readCommit(sha);
+    refreshRequired = activationCommitNeedsRefresh(commit, { headSha: sha, baseSha });
     state = 'pending';
     number = String(pull.number);
   } else {
-    const ref = await github(`/repos/${OWNER}/${REPO}/git/ref/heads/main`);
+    const ref = await readMainRef();
     sha = assertSha(ref?.object?.sha ?? '');
+    if (sha !== trustedBaseSha) fail('Production main moved after the workflow was dispatched.');
     baseSha = sha;
-    const page = await readPageAt(sha);
-    if (page.cycle !== cycle) fail('Neither a pending PR nor a completed production cycle exists.');
+    const page = await readPage(sha);
+    if (page.cycle !== targetCycle) fail('Neither a pending PR nor a completed production cycle exists.');
     state = 'completed';
   }
+  return {
+    state,
+    headSha: sha,
+    baseSha,
+    pullNumber: number,
+    refreshRequired,
+  };
+}
+
+async function activationState(options) {
+  const result = await resolveProductionActivationState({
+    head: required(options, 'head'),
+    base: required(options, 'base'),
+    cycle: required(options, 'cycle'),
+    expectedBaseSha: required(options, 'expected-base-sha'),
+  });
   if (process.env.GITHUB_OUTPUT) {
     await appendFile(
       process.env.GITHUB_OUTPUT,
-      `state=${state}\nhead-sha=${sha}\nbase-sha=${baseSha}\npr-number=${number}\n`,
+      `state=${result.state}\nhead-sha=${result.headSha}\nbase-sha=${result.baseSha}\npr-number=${result.pullNumber}\nrefresh-required=${result.refreshRequired}\n`,
     );
   }
-  return { state, headSha: sha, baseSha, pullNumber: number };
+  return result;
 }
 
 async function readPageMarkdownAt(sha) {
@@ -321,7 +411,7 @@ async function readPreviewRun(status, expectedSha) {
 }
 
 export function gateSnapshot({ statuses, checks, previewRun, expectedSha }) {
-  const preview = statuses?.statuses?.find((status) => status.context === PREVIEW_CONTEXT);
+  const preview = latestPreviewStatus(statuses);
   const runs = checks?.check_runs;
   const publicTest = Array.isArray(runs) && runs.find((run) => run.name === TEST_CHECK);
   const allFinishedSuccessfully = Array.isArray(runs)
@@ -364,7 +454,7 @@ async function gate(options) {
     });
     if (sha !== expectedSha) fail('Pull request head changed after preparation.');
     const [statuses, checks] = await Promise.all([
-      github(`/repos/${OWNER}/${REPO}/commits/${sha}/status`),
+      github(`/repos/${OWNER}/${REPO}/commits/${sha}/statuses?per_page=100`),
       github(`/repos/${OWNER}/${REPO}/commits/${sha}/check-runs?per_page=100`),
       verifyPageDelta({
         head,
@@ -375,7 +465,7 @@ async function gate(options) {
         targetCycle,
       }),
     ]);
-    const preview = statuses?.statuses?.find((status) => status.context === PREVIEW_CONTEXT);
+    const preview = latestPreviewStatus(statuses);
     const previewRun = await readPreviewRun(preview, expectedSha);
     if (gateSnapshot({ statuses, checks, previewRun, expectedSha }).ready) {
       if (process.env.GITHUB_OUTPUT) {
@@ -404,14 +494,14 @@ async function waitPreview(options) {
   while (true) {
     const [ref, statuses, page] = await Promise.all([
       github(`/repos/${OWNER}/${REPO}/git/ref/heads/${encodeURIComponent(branch)}`),
-      github(`/repos/${OWNER}/${REPO}/commits/${sha}/status`),
+      github(`/repos/${OWNER}/${REPO}/commits/${sha}/statuses?per_page=100`),
       readPageAt(sha),
     ]);
     if (ref?.object?.type !== 'commit' || ref.object.sha !== sha) {
       fail('Fixed smoke base changed while waiting for its preview.');
     }
     if (page.cycle !== cycle) fail('Post-merge smoke base has the wrong page cycle.');
-    const preview = statuses?.statuses?.find((status) => status.context === PREVIEW_CONTEXT);
+    const preview = latestPreviewStatus(statuses);
     const previewRun = await readPreviewRun(preview, sha);
     if (previewRun) return { headSha: sha };
     if (Date.now() >= deadline) fail('Timed out waiting for the post-merge smoke preview.');
@@ -439,8 +529,9 @@ async function ensurePull(options) {
     responderUri,
   });
   const pulls = await github(
-    `/repos/${OWNER}/${REPO}/pulls?state=open&head=${encodeURIComponent(`${OWNER}:${head}`)}&base=${encodeURIComponent(base)}&per_page=10`,
+    `/repos/${OWNER}/${REPO}/pulls?state=open&head=${encodeURIComponent(`${OWNER}:${head}`)}&per_page=10`,
   );
+  if (!Array.isArray(pulls)) fail('Automation pull request listing failed.');
   let pull;
   if (pulls.length === 0) {
     pull = await github(`/repos/${OWNER}/${REPO}/pulls`, {
@@ -454,13 +545,18 @@ async function ensurePull(options) {
       },
     });
   } else if (pulls.length === 1) {
-    pull = pulls[0];
+    pull = assertPullAssociation(pulls[0], { head, base });
   } else {
-    fail('Multiple automation pull requests match the fixed head/base pair.');
+    fail('Multiple open pull requests use the fixed automation head.');
   }
   if (!Number.isInteger(pull?.number) || pull.number < 1) fail('Pull request creation failed.');
-  pull = await github(`/repos/${OWNER}/${REPO}/pulls/${pull.number}`);
-  assertPullBinding(pull, { head, base, headSha, baseSha });
+  pull = await waitForPullBinding({
+    number: pull.number,
+    head,
+    base,
+    headSha,
+    baseSha,
+  });
   await verifyPageDelta({
     head,
     base,

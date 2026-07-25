@@ -6,19 +6,24 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  activationCommitNeedsRefresh,
   assertAutomationBranch,
   assertDeterministicPageDelta,
   assertPullBinding,
   assertSinglePageCommit,
   gateSnapshot,
   isTrustedPreviewRun,
+  resolveProductionActivationState,
+  waitForPullBinding,
 } from '../../../.github/progress-prizes-github.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const workflowNames = [
   'progress-prizes-page-pr.yml',
   'progress-prizes-pr-safety.yml',
+  'progress-prizes-production.yml',
   'progress-prizes-rehearsal.yml',
+  'progress-prizes-schedule.yml',
   'progress-prizes-vercel-preview.yml',
 ];
 const googleJobNames = [
@@ -150,6 +155,10 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
     'Google-secret jobs must not be reintroduced behind workflow_call',
   );
   assert.match(rehearsal, /^on:\n  workflow_dispatch:/m);
+  assert.match(
+    rehearsal,
+    /^concurrency:\n  group: progress-prizes-staging-rehearsal\n  cancel-in-progress: false$/m,
+  );
   assert.doesNotMatch(rehearsal, /workflow_call:|pull_request(?:_target)?:/);
   assert.doesNotMatch(rehearsal, /uses: \.\/\.github\/workflows\/progress-prizes-google\.yml/);
   assert.doesNotMatch(rehearsal, /secrets:\s*inherit/);
@@ -210,15 +219,25 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   );
   assert.equal(
     [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL/g)].length,
-    1,
-    'only protected production validation may receive the staging identity',
+    googleJobNames.length,
+    'every Google job must receive an independently protected staging identity',
   );
+  assert.doesNotMatch(productionValidationJob, /staging-folder-id|PROGRESS_PRIZE_STAGING_FOLDER_ID/);
   for (const name of googleJobNames.filter((name) => name !== 'validate-production')) {
-    assert.doesNotMatch(
-      jobBlock(rehearsal, name),
-      /staging-service-account-email|PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL/,
+    const stagingJob = jobBlock(rehearsal, name);
+    assert.match(
+      stagingJob,
+      /^          staging-service-account-email: \$\{\{ secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \}\}$/m,
+    );
+    assert.match(
+      stagingJob,
+      /^          staging-folder-id: \$\{\{ secrets\.PROGRESS_PRIZE_STAGING_FOLDER_ID \}\}$/m,
     );
   }
+  assert.equal(
+    [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_FOLDER_ID/g)].length,
+    googleJobNames.length - 1,
+  );
 
   for (const name of jobNames(rehearsal).filter((name) => !googleJobNames.includes(name))) {
     const ordinaryJob = jobBlock(rehearsal, name);
@@ -239,16 +258,25 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   );
   assert.match(
     action,
+    /^  staging-folder-id:\n(?:    .*\n)*?    required: false\n    default: ""$/m,
+  );
+  assert.match(
+    action,
     /PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL:\s+\$\{\{ inputs\['staging-service-account-email'\] \}\}/,
   );
   assert.match(
     action,
-    /PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \\\n\s+PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL/,
-    'the staging identity must be masked before protected configuration validation',
+    /PROGRESS_PRIZE_STAGING_FOLDER_ID:\s+\$\{\{ inputs\['staging-folder-id'\] \}\}/,
   );
   assert.match(
     action,
-    /inputs\.environment == 'staging' && inputs\['service-account-email'\] \|\| inputs\['staging-service-account-email'\]/,
+    /PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \\\n\s+PROGRESS_PRIZE_STAGING_FOLDER_ID \\\n\s+PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL/,
+    'the independent staging identity and folder must be masked before validation',
+  );
+  assert.doesNotMatch(
+    action,
+    /inputs\.environment == 'staging' && inputs\['(?:service-account-email|folder-id)'\]/,
+    'the expected staging identity and folder must not be derived from operational inputs',
   );
   assert.doesNotMatch(
     action,
@@ -273,6 +301,14 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
     /if test "\$AUTOMATION_ENVIRONMENT" = production \\\n\s+&& test "\$OPERATION" = validate \\\n\s+&& test "\$SOURCE_CYCLE" = 2026-07\n\s+then\n\s+test -n "\$PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL"/,
     'initial production validation must require the exact staging identity before authentication',
   );
+  assert.match(
+    action,
+    /test "\$GOOGLE_SERVICE_ACCOUNT_EMAIL" = "\$PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL"/,
+  );
+  assert.match(
+    action,
+    /test "\$PROGRESS_PRIZE_FOLDER_ID" = "\$PROGRESS_PRIZE_STAGING_FOLDER_ID"/,
+  );
   assert.equal([...action.matchAll(/access_token_lifetime: 1200s/g)].length, 2);
   assert.doesNotMatch(action, /access_token_scopes: >-/);
   assert.match(
@@ -287,10 +323,10 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   assert.match(action, /automation-cli\.mjs/);
   assert.match(action, /error-diagnostic-cli\.mjs/);
   assert.doesNotMatch(action, /(?:cat|head|tail|read|wc) .*progress-prizes-error/);
-  assert.equal([...action.matchAll(/grep .*progress-prizes-error/g)].length, 1);
+  assert.equal([...action.matchAll(/\bgrep\b/g)].length, 1);
   assert.match(
     action,
-    /grep -Fq "Injected staging rollover failure at \$FAULT" "\$RUNNER_TEMP\/progress-prizes-error\.txt"/,
+    /grep -Fxq "progress-prizes: Injected staging rollover failure at \$FAULT" \\\n\s+"\$RUNNER_TEMP\/progress-prizes-error\.txt"/,
   );
   assert.doesNotMatch(`${rehearsal}\n${action}`, /credentials_json|service_account_key|private_key/i);
 
@@ -318,6 +354,8 @@ test('secret-free preflight and composite guards reject unsafe controls before O
   assert.match(preflight, /allowedOperations\.has\(process\.env\.OPERATION/);
   assert.match(preflight, /SOURCE_CYCLE/);
   assert.match(preflight, /TARGET_CYCLE/);
+  assert.match(preflight, /assert\.equal\(process\.env\.SOURCE_CYCLE, '2026-07'\)/);
+  assert.match(preflight, /assert\.equal\(process\.env\.TARGET_CYCLE, '2026-08'\)/);
   assert.match(preflight, /PREPARATION_NOW/);
   assert.match(preflight, /ACTIVATION_NOW/);
   assert.match(jobBlock(rehearsal, 'validate-production'), /needs: preflight/);
@@ -329,6 +367,13 @@ test('secret-free preflight and composite guards reject unsafe controls before O
   assert.match(action, /test "\$REF" = refs\/heads\/main/);
   assert.match(action, /test "\$OPERATION" != bootstrap/);
   assert.match(action, /test "\$OPERATION" != cleanup/);
+  assert.match(action, /test "\$SOURCE_CYCLE" = 2026-07/);
+  assert.match(
+    action,
+    /test "\$OPERATION" = bootstrap && test -n "\$TARGET_CYCLE"/,
+  );
+  assert.match(action, /test "\$ALLOW_ACTIVATION_REWIND" = true/);
+  assert.match(action, /test "\$TARGET_CYCLE" = 2026-08/);
 
   const actionOutputs = action.slice(action.indexOf('outputs:\n'), action.indexOf('\nruns:'));
   const actionOutputNames = [...actionOutputs.matchAll(/^  ([a-z][a-z-]+):\n/gm)]
@@ -342,7 +387,7 @@ test('secret-free preflight and composite guards reject unsafe controls before O
 
 test('composite boolean inputs stay strings across authentication and fault handling', async () => {
   const action = await googleAction();
-  for (const input of ['expect-fault', 'dry-run']) {
+  for (const input of ['expect-fault', 'dry-run', 'allow-activation-rewind']) {
     assert.match(
       action,
       new RegExp(`^  ${input}:\\n(?:    .*\\n)*?    default: "false"$`, 'm'),
@@ -352,7 +397,118 @@ test('composite boolean inputs stay strings across authentication and fault hand
   assert.match(action, /inputs\['dry-run'\] != 'true'/);
   assert.match(action, /case "\$EXPECT_FAULT" in true\|false/);
   assert.match(action, /case "\$DRY_RUN" in true\|false/);
+  assert.match(action, /case "\$ALLOW_ACTIVATION_REWIND" in true\|false/);
   assert.match(action, /test "\$DRY_RUN" = false \|\| arguments\+=\(--dry-run\)/);
+  assert.match(
+    action,
+    /test "\$ALLOW_ACTIVATION_REWIND" = false \|\| arguments\+=\(--allow-activation-rewind\)/,
+  );
+});
+
+test('composite pre-auth guard executes the activation rewind matrix before OIDC', async () => {
+  const action = await googleAction();
+  const guard = literalRunScripts(action)[0]?.source;
+  assert.equal(typeof guard, 'string');
+  const valid = {
+    REPOSITORY: 'ScrollPrize/villa',
+    REPOSITORY_ID: '890972577',
+    REPOSITORY_OWNER_ID: '121906140',
+    REF: 'refs/heads/main',
+    AUTOMATION_ENVIRONMENT: 'staging',
+    EVENT_NAME: 'workflow_dispatch',
+    OPERATION: 'bootstrap',
+    SIMULATED_NOW: '',
+    FAULT: '',
+    EXPECT_FAULT: 'false',
+    DRY_RUN: 'false',
+    ALLOW_ACTIVATION_REWIND: 'true',
+    VERIFY_MODE: 'prepared',
+    BRANCH: 'codex/progress-prize-smoke-20260720',
+    TARGET_BRANCH: 'codex/progress-prize-smoke-base-20260720',
+    SOURCE_CYCLE: '2026-07',
+    TARGET_CYCLE: '2026-08',
+    HEAD_SHA: '',
+    BASE_SHA: '',
+  };
+  const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
+    input: guard,
+    encoding: 'utf8',
+    env: { ...valid, ...override },
+  });
+
+  assert.equal(run().status, 0);
+  for (const override of [
+    { ALLOW_ACTIVATION_REWIND: 'TRUE' },
+    { ALLOW_ACTIVATION_REWIND: '1' },
+    { ALLOW_ACTIVATION_REWIND: '' },
+    { ALLOW_ACTIVATION_REWIND: 'false' },
+    { TARGET_CYCLE: '' },
+    { TARGET_CYCLE: '2026-09' },
+    { SOURCE_CYCLE: '2026-12', TARGET_CYCLE: '2027-01' },
+    { OPERATION: 'prepare' },
+    { EVENT_NAME: 'schedule' },
+    { BRANCH: 'feature/not-smoke' },
+    { TARGET_BRANCH: 'main' },
+    {
+      AUTOMATION_ENVIRONMENT: 'production',
+      BRANCH: 'main',
+      TARGET_BRANCH: 'main',
+    },
+    {
+      AUTOMATION_ENVIRONMENT: 'production',
+      EVENT_NAME: 'schedule',
+      BRANCH: 'main',
+      TARGET_BRANCH: 'main',
+    },
+  ]) {
+    assert.notEqual(run(override).status, 0, JSON.stringify(override));
+  }
+});
+
+test('composite production activation guard requires an exact immutable base lease', async () => {
+  const action = await googleAction();
+  const guard = literalRunScripts(action)[0]?.source;
+  const valid = {
+    REPOSITORY: 'ScrollPrize/villa',
+    REPOSITORY_ID: '890972577',
+    REPOSITORY_OWNER_ID: '121906140',
+    REF: 'refs/heads/main',
+    AUTOMATION_ENVIRONMENT: 'production',
+    EVENT_NAME: 'workflow_dispatch',
+    OPERATION: 'activate',
+    SIMULATED_NOW: '',
+    FAULT: '',
+    EXPECT_FAULT: 'false',
+    DRY_RUN: 'false',
+    ALLOW_ACTIVATION_REWIND: 'false',
+    VERIFY_MODE: 'prepared',
+    BRANCH: 'codex/progress-prize-2026-08',
+    TARGET_BRANCH: 'main',
+    SOURCE_CYCLE: '2026-07',
+    TARGET_CYCLE: '2026-08',
+    HEAD_SHA: 'a'.repeat(40),
+    BASE_SHA: 'b'.repeat(40),
+  };
+  const run = (override = {}) => spawnSync('bash', ['--noprofile', '--norc'], {
+    input: guard,
+    encoding: 'utf8',
+    env: { ...valid, ...override },
+  });
+
+  assert.equal(run().status, 0);
+  for (const override of [
+    { BASE_SHA: '' },
+    { BASE_SHA: 'not-a-sha' },
+    { EVENT_NAME: 'schedule' },
+    { BRANCH: 'main' },
+    { TARGET_BRANCH: 'release' },
+    { SIMULATED_NOW: '2026-08-01T07:01:00.000Z' },
+    { FAULT: 'after-close-source' },
+    { DRY_RUN: 'true' },
+    { VERIFY_MODE: 'invalid' },
+  ]) {
+    assert.notEqual(run(override).status, 0, JSON.stringify(override));
+  }
 });
 
 test('rehearsal controls are fixed to staging and its ephemeral branches', async () => {
@@ -377,6 +533,22 @@ test('rehearsal controls are fixed to staging and its ephemeral branches', async
   assert.match(rehearsal, /actions: read\n      contents: read\n      statuses: read/);
   assert.match(rehearsal, /--base-sha \"\$EXPECTED_BASE_SHA\"/);
   assert.match(rehearsal, /--source-cycle \"\$SOURCE_CYCLE\"/);
+
+  const bootstrap = jobBlock(rehearsal, 'bootstrap-staging');
+  assert.equal([...rehearsal.matchAll(/allow-activation-rewind:/g)].length, 1);
+  assert.match(bootstrap, /^          operation: bootstrap$/m);
+  assert.match(bootstrap, /^          environment: staging$/m);
+  assert.match(
+    bootstrap,
+    /^          allow-activation-rewind: \$\{\{ inputs\.operation == 'full-rehearsal' \|\| inputs\.operation == 'activation-fault-recovery' \}\}$/m,
+  );
+  assert.match(
+    bootstrap,
+    /^          target-cycle: \$\{\{ \(inputs\.operation == 'full-rehearsal' \|\| inputs\.operation == 'activation-fault-recovery'\) && inputs\['target-cycle'\] \|\| '' \}\}$/m,
+  );
+  for (const name of googleJobNames.filter((name) => name !== 'bootstrap-staging')) {
+    assert.doesNotMatch(jobBlock(rehearsal, name), /allow-activation-rewind/);
+  }
 
   const pagePr = await workflow('progress-prizes-page-pr.yml');
   assert.match(pagePr, /--force-with-lease=\"refs\/heads\/\$HEAD_BRANCH:\$REMOTE_HEAD_SHA\"/);
@@ -426,6 +598,31 @@ test('Vercel verification runs trusted default-branch code and requires GitHub a
   assert.doesNotMatch(vercel, /checkout.*(?:HEAD_SHA|deployment|pull_request)/i);
 });
 
+test('preview gates use creator-bearing newest-first commit status history', async () => {
+  const helper = await readFile(
+    resolve(repositoryRoot, '.github/progress-prizes-github.mjs'),
+    'utf8',
+  );
+  const historyEndpoint = 'github(`/repos/${OWNER}/${REPO}/commits/${sha}/statuses?per_page=100`)';
+  const combinedEndpoint = 'github(`/repos/${OWNER}/${REPO}/commits/${sha}/status`)';
+  assert.equal(helper.split(historyEndpoint).length - 1, 2);
+  assert.equal(helper.includes(combinedEndpoint), false);
+});
+
+test('PR preparation discovers by immutable head and waits for exact SHA convergence', async () => {
+  const helper = await readFile(
+    resolve(repositoryRoot, '.github/progress-prizes-github.mjs'),
+    'utf8',
+  );
+  const start = helper.indexOf('async function ensurePull(options)');
+  const end = helper.indexOf('async function merge(options)', start);
+  assert.ok(start >= 0 && end > start);
+  const ensurePull = helper.slice(start, end);
+  assert.match(ensurePull, /pulls\?state=open&head=/);
+  assert.doesNotMatch(ensurePull, /&base=/);
+  assert.match(ensurePull, /waitForPullBinding/);
+});
+
 test('trusted branch and exact-check gate helpers reject ambiguous automation state', () => {
   assert.deepEqual(
     assertAutomationBranch(
@@ -439,18 +636,17 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
 
   const expectedSha = 'a'.repeat(40);
   const baseSha = 'b'.repeat(40);
-  const statuses = {
-    statuses: [{
-      context: 'progress-prizes/vercel-preview',
-      state: 'success',
-      creator: { login: 'github-actions[bot]' },
-      target_url: 'https://github.com/ScrollPrize/villa/actions/runs/12345',
-    }],
-  };
+  const statuses = [{
+    context: 'progress-prizes/vercel-preview',
+    state: 'success',
+    description: 'Exact Progress Prize preview verified',
+    creator: { login: 'github-actions[bot]', id: 41898282, type: 'Bot' },
+    target_url: 'https://github.com/ScrollPrize/villa/actions/runs/12345',
+  }];
   const previewRun = {
     id: 12345,
-    html_url: statuses.statuses[0].target_url,
-    name: 'Progress Prize Vercel preview gate',
+    html_url: statuses[0].target_url,
+    name: `Progress Prize Vercel preview ${expectedSha}`,
     path: '.github/workflows/progress-prizes-vercel-preview.yml',
     event: 'repository_dispatch',
     actor: { login: 'vercel[bot]', type: 'Bot' },
@@ -483,8 +679,20 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
       },
     ],
   };
-  assert.equal(isTrustedPreviewRun({ status: statuses.statuses[0], run: previewRun, expectedSha }), true);
+  assert.equal(isTrustedPreviewRun({ status: statuses[0], run: previewRun, expectedSha }), true);
   assert.equal(gateSnapshot({ statuses, checks: successfulChecks, previewRun, expectedSha }).ready, true);
+  assert.equal(gateSnapshot({
+    statuses: { statuses },
+    checks: successfulChecks,
+    previewRun,
+    expectedSha,
+  }).ready, false, 'the obsolete combined-status response shape must fail closed');
+  assert.equal(gateSnapshot({
+    statuses: [{ context: 'unrelated', state: 'failure' }, statuses[0]],
+    checks: successfulChecks,
+    previewRun,
+    expectedSha,
+  }).ready, true, 'the first matching context is the newest preview status');
   assert.equal(gateSnapshot({
     statuses,
     checks: { total_count: 1, check_runs: successfulChecks.check_runs.slice(1) },
@@ -510,19 +718,42 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
     expectedSha,
   }).ready, false);
   assert.equal(gateSnapshot({
-    statuses: {
-      statuses: [{
-        ...statuses.statuses[0],
-        creator: { login: 'spoofed-user' },
-      }],
-    },
+    statuses: [{
+      ...statuses[0],
+      creator: { login: 'spoofed-user' },
+    }, statuses[0]],
     checks: successfulChecks,
     previewRun,
     expectedSha,
-  }).ready, false);
+  }).ready, false, 'an older trusted success must not override the newest matching status');
+  assert.equal(gateSnapshot({
+    statuses: [{ ...statuses[0], state: 'pending' }, statuses[0]],
+    checks: successfulChecks,
+    previewRun,
+    expectedSha,
+  }).ready, false, 'an older success must not override a newer pending status');
+  assert.equal(gateSnapshot({
+    statuses: [statuses[0], { ...statuses[0], state: 'failure' }],
+    checks: successfulChecks,
+    previewRun,
+    expectedSha,
+  }).ready, true, 'a newer trusted success supersedes older statuses');
+
+  for (const status of [
+    { ...statuses[0], context: 'untrusted/context' },
+    { ...statuses[0], state: 'failure' },
+    { ...statuses[0], description: 'Looks plausible but is not exact' },
+    { ...statuses[0], creator: undefined },
+    { ...statuses[0], creator: null },
+    { ...statuses[0], creator: { ...statuses[0].creator, login: 'spoofed-user' } },
+    { ...statuses[0], creator: { ...statuses[0].creator, id: 1 } },
+    { ...statuses[0], creator: { ...statuses[0].creator, type: 'User' } },
+  ]) {
+    assert.equal(isTrustedPreviewRun({ status, run: previewRun, expectedSha }), false);
+  }
 
   for (const [field, value] of [
-    ['name', 'Untrusted workflow'],
+    ['name', `Progress Prize Vercel preview ${baseSha}`],
     ['path', '.github/workflows/untrusted.yml'],
     ['event', 'workflow_dispatch'],
     ['head_branch', 'feature/untrusted'],
@@ -531,23 +762,33 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
     ['display_title', `Progress Prize Vercel preview ${baseSha}`],
   ]) {
     assert.equal(isTrustedPreviewRun({
-      status: statuses.statuses[0],
+      status: statuses[0],
       run: { ...previewRun, [field]: value },
       expectedSha,
     }), false);
   }
   assert.equal(isTrustedPreviewRun({
-    status: statuses.statuses[0],
+    status: statuses[0],
     run: { ...previewRun, actor: { login: 'attacker', type: 'User' } },
     expectedSha,
   }), false);
   assert.equal(isTrustedPreviewRun({
-    status: statuses.statuses[0],
+    status: statuses[0],
+    run: { ...previewRun, actor: { login: 'vercel[bot]', type: 'User' } },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: statuses[0],
     run: { ...previewRun, triggering_actor: { login: 'human', type: 'User' } },
     expectedSha,
   }), false);
   assert.equal(isTrustedPreviewRun({
-    status: statuses.statuses[0],
+    status: statuses[0],
+    run: { ...previewRun, triggering_actor: { login: 'vercel[bot]', type: 'User' } },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: statuses[0],
     run: {
       ...previewRun,
       repository: { ...previewRun.repository, id: 1 },
@@ -555,7 +796,7 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
     expectedSha,
   }), false);
   assert.equal(isTrustedPreviewRun({
-    status: statuses.statuses[0],
+    status: statuses[0],
     run: {
       ...previewRun,
       repository: {
@@ -566,12 +807,34 @@ test('trusted branch and exact-check gate helpers reject ambiguous automation st
     expectedSha,
   }), false);
   assert.equal(isTrustedPreviewRun({
-    status: statuses.statuses[0],
+    status: statuses[0],
     run: { ...previewRun, head_repository: { id: 1 } },
     expectedSha,
   }), false);
   assert.equal(isTrustedPreviewRun({
-    status: { ...statuses.statuses[0], target_url: 'https://github.com/ScrollPrize/villa/actions/runs/999' },
+    status: statuses[0],
+    run: { ...previewRun, id: 999 },
+    expectedSha,
+  }), false);
+  assert.equal(isTrustedPreviewRun({
+    status: statuses[0],
+    run: { ...previewRun, html_url: 'https://github.com/ScrollPrize/villa/actions/runs/999' },
+    expectedSha,
+  }), false);
+  for (const target_url of [
+    'https://github.com/ScrollPrize/villa/actions/runs/12345/',
+    'https://github.com/ScrollPrize/villa/actions/runs/12345?trusted=false',
+    'https://github.com/ScrollPrize/villa/actions/runs/12345#spoofed',
+    'https://github.com/attacker/villa/actions/runs/12345',
+  ]) {
+    assert.equal(isTrustedPreviewRun({
+      status: { ...statuses[0], target_url },
+      run: previewRun,
+      expectedSha,
+    }), false);
+  }
+  assert.equal(isTrustedPreviewRun({
+    status: { ...statuses[0], target_url: 'https://github.com/ScrollPrize/villa/actions/runs/999' },
     run: previewRun,
     expectedSha,
   }), false);
@@ -633,8 +896,207 @@ test('the GitHub helper binds the PR and exact deterministic page-only commit', 
     files: [{ filename: 'scrollprize.org/docs/34_prizes.md', status: 'modified' }],
   };
   assert.equal(assertSinglePageCommit(commit, { headSha, baseSha }), commit);
+  assert.equal(activationCommitNeedsRefresh(commit, { headSha, baseSha }), false);
   assert.throws(() => assertSinglePageCommit({
     ...commit,
     files: [...commit.files, { filename: '.github/workflows/untrusted.yml', status: 'added' }],
   }, { headSha, baseSha }), /one page-only commit/);
+  assert.equal(activationCommitNeedsRefresh({
+    ...commit,
+    parents: [{ sha: 'c'.repeat(40) }],
+  }, { headSha, baseSha }), true);
+  assert.throws(() => activationCommitNeedsRefresh({
+    ...commit,
+    files: [...commit.files, { filename: '.github/workflows/untrusted.yml', status: 'added' }],
+  }, { headSha, baseSha }), /Only a page-only commit/);
+  assert.throws(() => activationCommitNeedsRefresh({
+    ...commit,
+    parents: [{ sha: baseSha }, { sha: 'c'.repeat(40) }],
+  }, { headSha, baseSha }), /Only a page-only commit/);
+});
+
+test('production activation-state recovery distinguishes exact, stale, and completed state', async () => {
+  const head = 'codex/progress-prize-2026-08';
+  const base = 'main';
+  const headSha = 'a'.repeat(40);
+  const baseSha = 'b'.repeat(40);
+  const staleSha = 'c'.repeat(40);
+  const pull = {
+    number: 42,
+    state: 'open',
+    head: {
+      ref: head,
+      sha: headSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+    base: {
+      ref: base,
+      sha: baseSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+  };
+  const exactCommit = {
+    sha: headSha,
+    parents: [{ sha: baseSha }],
+    files: [{ filename: 'scrollprize.org/docs/34_prizes.md', status: 'modified' }],
+  };
+  const options = { head, base, cycle: '2026-08', expectedBaseSha: baseSha };
+
+  const pending = await resolveProductionActivationState(options, {
+    listPulls: async () => [pull],
+    readCommit: async () => exactCommit,
+  });
+  assert.deepEqual(pending, {
+    state: 'pending',
+    headSha,
+    baseSha,
+    pullNumber: '42',
+    refreshRequired: false,
+  });
+
+  const stale = await resolveProductionActivationState(options, {
+    listPulls: async () => [pull],
+    readCommit: async () => ({ ...exactCommit, parents: [{ sha: staleSha }] }),
+  });
+  assert.equal(stale.refreshRequired, true);
+
+  const completed = await resolveProductionActivationState(options, {
+    listPulls: async () => [],
+    readMainRef: async () => ({ object: { sha: baseSha } }),
+    readPage: async () => ({ cycle: '2026-08' }),
+  });
+  assert.deepEqual(completed, {
+    state: 'completed',
+    headSha: baseSha,
+    baseSha,
+    pullNumber: '',
+    refreshRequired: false,
+  });
+});
+
+test('production activation-state recovery fails closed on ambiguous or drifting state', async () => {
+  const head = 'codex/progress-prize-2026-08';
+  const base = 'main';
+  const headSha = 'a'.repeat(40);
+  const baseSha = 'b'.repeat(40);
+  const pull = {
+    number: 42,
+    state: 'open',
+    head: {
+      ref: head,
+      sha: headSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+    base: {
+      ref: base,
+      sha: baseSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+  };
+  const options = { head, base, cycle: '2026-08', expectedBaseSha: baseSha };
+
+  await assert.rejects(
+    resolveProductionActivationState(options, { listPulls: async () => [pull, pull] }),
+    /ambiguous/,
+  );
+  await assert.rejects(
+    resolveProductionActivationState(options, {
+      listPulls: async () => [{ ...pull, base: { ...pull.base, sha: 'c'.repeat(40) } }],
+    }),
+    /main moved/,
+  );
+  await assert.rejects(
+    resolveProductionActivationState(options, {
+      listPulls: async () => [],
+      readMainRef: async () => ({ object: { sha: baseSha } }),
+      readPage: async () => ({ cycle: '2026-07' }),
+    }),
+    /Neither a pending PR nor a completed production cycle exists/,
+  );
+});
+
+test('PR binding retry tolerates only bounded stale SHAs', async () => {
+  const head = 'codex/progress-prize-smoke-20260720';
+  const base = 'codex/progress-prize-smoke-base-20260720';
+  const headSha = 'a'.repeat(40);
+  const baseSha = 'b'.repeat(40);
+  const exactPull = {
+    number: 1194,
+    state: 'open',
+    head: {
+      ref: head,
+      sha: headSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+    base: {
+      ref: base,
+      sha: baseSha,
+      repo: { id: 890972577, full_name: 'ScrollPrize/villa' },
+    },
+  };
+  const stalePull = {
+    ...exactPull,
+    head: { ...exactPull.head, sha: 'c'.repeat(40) },
+    base: { ...exactPull.base, sha: 'd'.repeat(40) },
+  };
+  const responses = [stalePull, stalePull, exactPull];
+  const sleeps = [];
+  const result = await waitForPullBinding({
+    number: exactPull.number,
+    head,
+    base,
+    headSha,
+    baseSha,
+  }, {
+    attempts: 3,
+    delayMs: 7,
+    readPull: async () => responses.shift(),
+    sleep: async (milliseconds) => sleeps.push(milliseconds),
+  });
+  assert.equal(result, exactPull);
+  assert.deepEqual(sleeps, [7, 7]);
+
+  let unsafeReads = 0;
+  let unsafeSleeps = 0;
+  await assert.rejects(
+    waitForPullBinding({
+      number: exactPull.number,
+      head,
+      base,
+      headSha,
+      baseSha,
+    }, {
+      attempts: 3,
+      delayMs: 0,
+      readPull: async () => {
+        unsafeReads += 1;
+        return { ...stalePull, base: { ...stalePull.base, ref: 'main' } };
+      },
+      sleep: async () => { unsafeSleeps += 1; },
+    }),
+    /association failed/,
+  );
+  assert.equal(unsafeReads, 1);
+  assert.equal(unsafeSleeps, 0);
+
+  let staleReads = 0;
+  await assert.rejects(
+    waitForPullBinding({
+      number: exactPull.number,
+      head,
+      base,
+      headSha,
+      baseSha,
+    }, {
+      attempts: 2,
+      delayMs: 0,
+      readPull: async () => {
+        staleReads += 1;
+        return stalePull;
+      },
+      sleep: async () => {},
+    }),
+    /immutable refs did not converge/,
+  );
+  assert.equal(staleReads, 2);
 });

@@ -174,7 +174,58 @@ AxisAlignedSliceController::AxisAlignedSliceController(CState* state, QObject* p
     connect(_rotationTimer, &QTimer::timeout, this, &AxisAlignedSliceController::processOrientationUpdate);
 }
 
-void AxisAlignedSliceController::setEnabled(bool enabled, QCheckBox* overlayCheckbox, QSpinBox* overlayOpacitySpin)
+void AxisAlignedSliceController::setViewerManager(ViewerManager* mgr)
+{
+    _viewerManager = mgr;
+    if (!mgr) {
+        return;
+    }
+    // The manager drives plane reorientation on focus changes, so it needs
+    // to know its workspace's slice controller.
+    mgr->setAxisAlignedSliceController(this);
+    // Rotation/tilt interaction is per viewer; wire every viewer this
+    // workspace has or will create.
+    connect(mgr, &ViewerManager::baseViewerCreated,
+            this, &AxisAlignedSliceController::attachViewer);
+    for (auto* viewer : mgr->baseViewers()) {
+        attachViewer(viewer);
+    }
+}
+
+void AxisAlignedSliceController::attachViewer(VolumeViewerBase* baseViewer)
+{
+    auto* viewer = baseViewer ? qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject()) : nullptr;
+    if (!viewer) {
+        return;
+    }
+
+    const std::string& surfName = viewer->surfName();
+    if ((surfName == "seg xz" || surfName == "seg yz") && !viewer->property("vc_axisaligned_bound").toBool()) {
+        connect(viewer, &CChunkedVolumeViewer::sendMousePressVolume,
+                this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                    onMousePress(viewer, volLoc, button, modifiers);
+                });
+
+        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
+                this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
+                    onMouseMove(viewer, volLoc, buttons, modifiers);
+                });
+
+        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
+                this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                    onMouseRelease(viewer, button, modifiers);
+                });
+
+        viewer->setProperty("vc_axisaligned_bound", true);
+    }
+
+    // Middle-button pan mode and tilt-handle binding/visibility for the new
+    // viewer (idempotent across all viewers).
+    updateSliceInteraction();
+}
+
+void AxisAlignedSliceController::setEnabled(bool enabled, QCheckBox* overlayCheckbox, QSpinBox* overlayOpacitySpin,
+                                            bool persistSetting)
 {
     _enabled = enabled;
     if (enabled) {
@@ -193,8 +244,10 @@ void AxisAlignedSliceController::setEnabled(bool enabled, QCheckBox* overlayChec
     if (overlayOpacitySpin) {
         overlayOpacitySpin->setEnabled(enabled && (!overlayCheckbox || overlayCheckbox->isChecked()));
     }
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
+    if (persistSetting) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
+    }
     updateSliceInteraction();
     applyOrientation();
 }

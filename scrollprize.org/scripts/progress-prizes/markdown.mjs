@@ -119,12 +119,21 @@ export function assertPublicResponderUri(responderUri) {
   return url.toString();
 }
 
+export function assertCanonicalPublicResponderUri(responderUri) {
+  const normalized = assertPublicResponderUri(responderUri);
+  const url = new URL(normalized);
+  if (url.search !== '') {
+    throw new TypeError('responderUri must not contain query parameters');
+  }
+  return normalized;
+}
+
 function parseFormLine(line) {
   const match = /^\[Submission Form\]\((https:\/\/[^\s)]+)\)$/.exec(line);
   if (!match) {
     throw new Error('Managed form line has an unexpected format');
   }
-  return assertPublicResponderUri(match[1]);
+  return assertCanonicalPublicResponderUri(match[1]);
 }
 
 export function parseProgressPrizeMarkdown(markdown) {
@@ -176,7 +185,7 @@ export function updateProgressPrizeMarkdown(markdown, {
 } = {}) {
   const current = parseProgressPrizeMarkdown(markdown);
   const targetDeadline = getCycleDeadline(targetCycle);
-  const normalizedResponderUri = assertPublicResponderUri(responderUri);
+  const normalizedResponderUri = assertCanonicalPublicResponderUri(responderUri);
   const next = Object.freeze({
     cycle: targetCycle,
     deadline: targetDeadline,

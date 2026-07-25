@@ -26,6 +26,7 @@ export {
 
 export {
   PROGRESS_PRIZE_MARKERS,
+  assertCanonicalPublicResponderUri,
   assertPublicResponderUri,
   parseProgressPrizeMarkdown,
   updateProgressPrizeMarkdown,

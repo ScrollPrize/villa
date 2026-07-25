@@ -123,6 +123,7 @@ public:
     void setStretchValues(bool) { if (_closing) return; submitRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
     void setPlaneIntersectionLinesVisible(bool visible) override;
+    bool isPlaneIntersectionLinesVisible() const { return _planeIntersectionLinesVisible; }
 
     void setShowDirectionHints(bool on) override { if (_closing) return; _showDirectionHints = on; emit overlaysUpdated(); }
     bool isShowDirectionHints() const override { return _showDirectionHints; }
@@ -136,6 +137,7 @@ public:
     void setOverlayVolume(std::shared_ptr<Volume> volume) override;
     void setOverlayOpacity(float opacity) override;
     void setOverlayColormap(const std::string& colormapId) override;
+    void setOverlaySamplingMethod(vc::Sampling method) override;
     void setOverlayThreshold(float threshold) override;
     void setOverlayWindow(float low, float high) override;
     void setOverlayMaxDisplayedResolution(int level) override;
@@ -178,6 +180,9 @@ public:
     void setIntersectionOpacity(float v) override;
     void setIntersectionThickness(float v) override;
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override;
+    std::vector<std::string> highlightedSurfaceIds() const {
+        return {_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end()};
+    }
     void setSurfacePatchSamplingStride(int s) override;
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
@@ -282,6 +287,7 @@ private:
         std::source_location caller = std::source_location::current());
     void updateStatusLabel();
     void rebuildChunkArray();
+    void clearDisplayedFramebuffer();
     void syncCameraTransform();
     void requestDirectPaint();
     void resizeFramebuffer();
@@ -289,6 +295,10 @@ private:
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
+    // Multiply the current scale by `factor` (clamped to [kMinScale, kMaxScale]),
+    // keeping the scene point under `scenePos` fixed. The shared core of both the
+    // discrete wheel zoom (zoomStepsAt) and the continuous adjustZoomByFactor.
+    void zoomByFactorAt(float factor, const QPointF& scenePos);
     bool isAxisAlignedView() const;
     void ensureDefaultSurface();
     void updateContentBounds();
@@ -307,6 +317,7 @@ private:
         int startLevel = 0;
         int overlayStartLevel = 0;
         vc::Sampling samplingMethod = vc::Sampling::Trilinear;
+        vc::Sampling overlaySamplingMethod = vc::Sampling::Nearest;
         CompositeRenderSettings compositeSettings;
         float windowLow = 0.0f;
         float windowHigh = 255.0f;
@@ -351,6 +362,7 @@ private:
     struct RenderResult;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
+    void maybeDegradeForCachePressure(const RenderResult& result);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
@@ -427,6 +439,10 @@ private:
     float _scale = 1.0f;
     float _dsScale = 1.0f;
     int _dsScaleIdx = 0;
+    // Extra pyramid levels applied on top of _dsScaleIdx when the shared
+    // chunk cache reports view-protection stalls (live working set larger
+    // than capacity). Reset when the zoom crosses a level boundary.
+    int _cachePressureLevelBias = 0;
     float _zOff = 0.0f;
     float _camSurfX = 0.0f;
     float _camSurfY = 0.0f;
@@ -441,6 +457,7 @@ private:
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
+    vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
     int _overlayMaxDisplayedResolution = 0;

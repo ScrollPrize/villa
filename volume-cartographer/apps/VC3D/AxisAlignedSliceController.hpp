@@ -22,14 +22,17 @@ class AxisAlignedSliceController : public QObject
 public:
     explicit AxisAlignedSliceController(CState* state, QObject* parent = nullptr);
 
-    void setViewerManager(ViewerManager* mgr) { _viewerManager = mgr; }
+    void setViewerManager(ViewerManager* mgr);
     void setPlaneSlicingOverlay(PlaneSlicingOverlayController* overlay) { _planeSlicingOverlay = overlay; }
 
     bool isEnabled() const { return _enabled; }
 
     // Called when user toggles the checkbox
-    // overlayCheckbox and overlayOpacitySpin are passed for UI state management
-    void setEnabled(bool enabled, QCheckBox* overlayCheckbox = nullptr, QSpinBox* overlayOpacitySpin = nullptr);
+    // overlayCheckbox and overlayOpacitySpin are passed for UI state management.
+    // persistSetting=false applies the mode without writing the global setting
+    // (for workspaces that force a mode rather than reflect the user's choice).
+    void setEnabled(bool enabled, QCheckBox* overlayCheckbox = nullptr, QSpinBox* overlayOpacitySpin = nullptr,
+                    bool persistSetting = true);
 
     void resetRotations();
     void resetTilt();
@@ -84,4 +87,5 @@ private:
     void processOrientationUpdate();
     void notifyInteractiveOrientationViewers(double motionPx);
     void updateTiltHandles();
+    void attachViewer(VolumeViewerBase* baseViewer);
 };
