@@ -162,6 +162,10 @@ class S3SyncManager:
 
         self.use_rclone = self._detect_rclone()
 
+        # Per-run cache of remote content hashes (path -> md5 or None),
+        # used when an ETag cannot prove content equality.
+        self._remote_md5_cache = {}
+
     def _detect_rclone(self):
         """Use rclone only if the binary exists AND can read the sync directory.
 
@@ -361,8 +365,35 @@ class S3SyncManager:
 
     @staticmethod
     def _etag_is_md5(etag):
-        """True when an S3 ETag is a plain MD5 (single-part, non-KMS upload)."""
+        """True when an S3 ETag has plain-MD5 shape (single-part upload).
+
+        Shape alone is not proof of content MD5 (SSE-KMS/SSE-C ETags are
+        also 32-hex but opaque), so callers may use a matching ETag as
+        POSITIVE evidence of equality only — never a mismatch as proof of
+        difference."""
         return bool(etag) and '-' not in etag
+
+    def _remote_md5(self, path):
+        """Definitive remote content hash: download the object to a temp
+        file and hash it. Cached per run; returns None when the fetch
+        fails. Only used for hash-scoped (annotation-sized JSON) files
+        whose ETag cannot prove equality."""
+        if path in self._remote_md5_cache:
+            return self._remote_md5_cache[path]
+        tmp = self._merge_tmp_path(path, '.hashcheck')
+        md5 = None
+        try:
+            self._run_aws_command(['aws', 's3', 'cp', self._get_s3_url(path), tmp])
+            md5 = self._file_md5(tmp)
+        except Exception:
+            md5 = None
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        self._remote_md5_cache[path] = md5
+        return md5
 
     # --- shadow copies: the file content as of the last successful sync ---
     # These are the base versions for three-way merging of divergent
@@ -527,11 +558,15 @@ class S3SyncManager:
     def _attempt_auto_merge(self, path, local_info, s3_info, dry_run=False):
         """Try a fiber-aware three-way merge for a conflicting file.
 
-        Returns 'merged' after writing a clean merge to the local file (the
-        caller uploads it), a preview string in dry-run mode, or None when
-        the file is not eligible, no base is available, or the merge has
-        genuine conflicts (pre-merge copies are stashed in that case and
-        the caller falls back to the interactive prompt).
+        The local file is NEVER modified here: a clean merge is written to
+        a pending temp file and returned as
+        {'pending': ..., 'remote_tmp': ..., 'summary': ...} for the caller
+        to apply with _apply_pending_merges() AFTER the user confirms the
+        sync (or discard with _discard_pending_merges() on cancellation).
+        Returns a preview string in dry-run mode, or None when the file is
+        not eligible, no base is available, or the merge has genuine
+        conflicts (all three versions are stashed in that case and the
+        caller falls back to the interactive prompt).
         """
         if fiber_merge is None or not local_info or not s3_info:
             return None
@@ -565,8 +600,15 @@ class S3SyncManager:
                     pass
             return None
 
+        keep_remote_tmp = False
         try:
-            result = fiber_merge.merge_fibers(base_doc, local_doc, remote_doc)
+            # A merger bug on malformed input must degrade to manual
+            # resolution, never abort the whole sync.
+            try:
+                result = fiber_merge.merge_fibers(base_doc, local_doc, remote_doc)
+            except Exception as ex:
+                print(f"  ⚠️  merge failed for {path} ({ex}); manual resolution")
+                return None
             summary = fiber_merge.summarize(result)
             if dry_run:
                 return f"would auto-merge ({summary})" if result['ok'] else None
@@ -583,23 +625,49 @@ class S3SyncManager:
                     self._stash_conflict_copy(path, 'base', source=shadow)
                 return None
 
-            self._stash_conflict_copy(path, 'local')
-            self._stash_conflict_copy(path, 'remote', source=remote_tmp)
-            tmp = local_path + '.merge-tmp'
-            with open(tmp, 'w') as f:
+            # Plan only: the local file is untouched until the user confirms
+            pending = self._merge_tmp_path(path, '.merged')
+            with open(pending, 'w') as f:
                 json.dump(result['merged'], f, indent=2)
                 f.write('\n')
-            os.replace(tmp, local_path)
-            print(f"  ✓ auto-merged {path}: {summary}")
+            print(f"  ✓ will auto-merge {path}: {summary}")
             for note in result['notes']:
                 print(f"      note: {note}")
-            return 'merged'
+            print("      (applied after you confirm the sync)")
+            keep_remote_tmp = True
+            return {'pending': pending, 'remote_tmp': remote_tmp,
+                    'summary': summary}
         finally:
-            if remote_tmp:
+            if remote_tmp and not keep_remote_tmp:
                 try:
                     os.remove(remote_tmp)
                 except OSError:
                     pass
+
+    def _apply_pending_merges(self, pending_merges):
+        """Apply confirmed merges: stash the versions being replaced, then
+        atomically swap the merged result into place."""
+        for path, plan in pending_merges:
+            self._stash_conflict_copy(path, 'local')
+            if plan['remote_tmp']:
+                self._stash_conflict_copy(path, 'remote', source=plan['remote_tmp'])
+            os.replace(plan['pending'], os.path.join(self.local_dir, path))
+            print(f"  ✓ applied auto-merge: {path}")
+            if plan['remote_tmp']:
+                try:
+                    os.remove(plan['remote_tmp'])
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _discard_pending_merges(pending_merges):
+        for _, plan in pending_merges:
+            for temp in (plan['pending'], plan['remote_tmp']):
+                if temp:
+                    try:
+                        os.remove(temp)
+                    except OSError:
+                        pass
 
     def scan_local_files(self, include_backups=False):
         """Scan local directory for files"""
@@ -892,14 +960,26 @@ class S3SyncManager:
                     # No tracking history
                     if local_info['local_size'] != s3_info['s3_size']:
                         actions[path] = (SyncAction.CONFLICT, "Files differ (no sync history)")
-                    elif (current_md5 and self._etag_is_md5(s3_etag) and
-                          current_md5 != s3_etag):
-                        # Same size but different bytes: without this check a
-                        # divergent same-size file is silently declared synced
-                        actions[path] = (SyncAction.CONFLICT,
-                                         "Same size but different content (no sync history)")
-                    else:
+                    elif not current_md5:
                         actions[path] = (SyncAction.SKIP, "Files appear to be in sync")
+                    elif self._etag_is_md5(s3_etag) and current_md5 == s3_etag:
+                        actions[path] = (SyncAction.SKIP,
+                                         "Files verified identical (no sync history)")
+                    else:
+                        # The ETag cannot prove equality (mismatch, or an
+                        # opaque multipart/KMS ETag). For annotation files,
+                        # "unknown" must not silently become "in sync":
+                        # settle it by hashing the actual remote content.
+                        remote_md5 = self._remote_md5(path)
+                        if remote_md5 == current_md5:
+                            actions[path] = (SyncAction.SKIP,
+                                             "Files verified identical (no sync history)")
+                        elif remote_md5 is None:
+                            actions[path] = (SyncAction.CONFLICT,
+                                             "Content could not be verified (no sync history)")
+                        else:
+                            actions[path] = (SyncAction.CONFLICT,
+                                             "Same size but different content (no sync history)")
 
             # File deleted from both
             elif path in tracked_files and not local_info and not s3_info:
@@ -931,29 +1011,30 @@ class S3SyncManager:
             # Backup-pattern files are excluded: they are upload-only, and
             # analyze_changes deliberately re-uploads them when untracked
             # (even on a size match). The upload itself records tracking.
-            # Hashable files must additionally match content (md5 vs a
-            # plain-MD5 ETag) — a same-size divergent file is a conflict,
-            # not an in-sync pair.
-            def content_compatible(path):
+            # Hashable files must additionally be verified identical — by a
+            # matching plain-MD5 ETag, or by hashing the remote content
+            # when the ETag proves nothing. Unverified pairs stay untracked
+            # rather than becoming a false baseline.
+            def content_verified(path):
                 md5 = local_files[path].get('local_md5')
+                if not md5:
+                    return True  # not hash-scoped: size heuristic as before
                 etag = s3_files[path].get('s3_etag') or ''
-                if md5 and self._etag_is_md5(etag):
-                    return md5 == etag
-                return True
+                if self._etag_is_md5(etag) and md5 == etag:
+                    return True
+                return self._remote_md5(path) == md5
 
             healed = [path for path in local_files.keys() & s3_files.keys()
                       if path not in tracked and
                       not local_files[path].get('is_backup') and
                       local_files[path]['local_size'] == s3_files[path]['s3_size'] and
-                      content_compatible(path)]
+                      content_verified(path)]
 
             for path in healed:
                 self._track_file(conn, path, local_files[path], s3_files[path])
 
         for path in healed:
-            md5 = local_files[path].get('local_md5')
-            etag = s3_files[path].get('s3_etag') or ''
-            if md5 and self._etag_is_md5(etag) and md5 == etag:
+            if local_files[path].get('local_md5'):
                 # Content-verified identical: safe to adopt as a merge base
                 self._update_shadow(path)
 
@@ -1027,25 +1108,21 @@ class S3SyncManager:
         }
 
         # Track the pre-upload stats: if the file changed during upload, the next
-        # scan will see a local difference and schedule a re-upload
+        # scan will see a local difference and schedule a re-upload.
+        # The ETag is only positive evidence of content (SSE-KMS ETags are
+        # opaque); a mismatch is never treated as a failed transfer — the
+        # CLI already checksums the transfer itself.
         local_info = {'local_size': pre_stat.st_size,
                       'local_mtime': pre_stat.st_mtime}
-        content_verified = False
-        if self._should_hash(path, pre_stat.st_size) and \
-                self._etag_is_md5(s3_info['s3_etag']):
-            local_md5 = self._file_md5(local_path)
-            if local_md5 == s3_info['s3_etag']:
-                local_info['local_md5'] = local_md5
-                content_verified = True
-            else:
-                print(f"  ⚠️  Content verification failed for {path} "
-                      f"(changed during upload?); will retry on next sync")
-                return False
+        stable = (post_stat.st_size, post_stat.st_mtime) == \
+                 (pre_stat.st_size, pre_stat.st_mtime)
+        if self._should_hash(path, pre_stat.st_size) and stable:
+            local_info['local_md5'] = self._file_md5(local_path)
 
         with self._get_db() as conn:
             self._track_file(conn, path, local_info, s3_info)
 
-        if content_verified:
+        if 'local_md5' in local_info:
             self._update_shadow(path)
 
         return True
@@ -1065,17 +1142,14 @@ class S3SyncManager:
 
         print(f"  ✓ Downloaded: {path}")
 
-        # Update database with the downloaded file's actual stats
+        # Update database with the downloaded file's actual stats. The file
+        # just written IS the synced content (the CLI checksums transfers),
+        # so its own hash is the tracking/base truth; the ETag is not
+        # consulted (it is opaque for SSE-KMS objects).
         stat = os.stat(local_path)
         local_info = {'local_size': stat.st_size, 'local_mtime': stat.st_mtime}
-        s3_etag = s3_files[path].get('s3_etag') or ''
         if self._should_hash(path, stat.st_size):
-            local_md5 = self._file_md5(local_path)
-            if self._etag_is_md5(s3_etag) and local_md5 != s3_etag:
-                print(f"  ❌ Content verification failed for {path}; "
-                      f"will retry on next sync")
-                return False
-            local_info['local_md5'] = local_md5
+            local_info['local_md5'] = self._file_md5(local_path)
 
         with self._get_db() as conn:
             self._track_file(conn, path, local_info, s3_files[path])
@@ -1330,18 +1404,20 @@ class S3SyncManager:
                     print(f"  ❌ Upload not verified for {path}; will retry on next sync")
                     continue
                 local_info = {'local_size': size, 'local_mtime': mtime}
-                s3_etag = s3_info.get('s3_etag') or ''
-                if self._should_hash(path, size) and self._etag_is_md5(s3_etag):
+                if self._should_hash(path, size):
+                    # Record the content hash only when the file was stable
+                    # through the upload, so the tracked hash matches what
+                    # actually reached S3. ETags are not consulted (opaque
+                    # under SSE-KMS); the CLI checksums the transfer.
                     try:
-                        local_md5 = self._file_md5(os.path.join(self.local_dir, path))
+                        stat = os.stat(os.path.join(self.local_dir, path))
+                        stable = (stat.st_size, stat.st_mtime) == (size, mtime)
+                        if stable:
+                            local_info['local_md5'] = self._file_md5(
+                                os.path.join(self.local_dir, path))
+                            shadow_updates.append(path)
                     except OSError:
-                        local_md5 = None
-                    if local_md5 != s3_etag:
-                        print(f"  ❌ Content verification failed for {path} "
-                              f"(changed during upload?); will retry on next sync")
-                        continue
-                    local_info['local_md5'] = local_md5
-                    shadow_updates.append(path)
+                        pass
                 self._track_file(conn, path, local_info, s3_info)
                 success_count += 1
 
@@ -1382,18 +1458,13 @@ class S3SyncManager:
                 local_info = {'local_size': stat.st_size,
                               'local_mtime': stat.st_mtime}
                 if self._should_hash(path, stat.st_size):
+                    # The downloaded bytes are the synced content; hash them
+                    # for tracking/base truth. ETags are not consulted.
                     try:
-                        local_md5 = self._file_md5(local_path)
+                        local_info['local_md5'] = self._file_md5(local_path)
+                        shadow_updates.append(path)
                     except OSError:
-                        local_md5 = None
-                    s3_etag = s3_files[path].get('s3_etag') or ''
-                    if local_md5 is None or (self._etag_is_md5(s3_etag) and
-                                             local_md5 != s3_etag):
-                        print(f"  ❌ Content verification failed for {path}; "
-                              f"will retry on next sync")
-                        continue
-                    local_info['local_md5'] = local_md5
-                    shadow_updates.append(path)
+                        pass
                 self._track_file(conn, path, local_info, s3_files[path])
                 success_count += 1
 
@@ -1554,27 +1625,29 @@ class S3SyncManager:
             print("\n--dry-run mode: No changes will be made")
             return
 
-        # Process conflicts first: auto-merge what we safely can, prompt for
-        # the rest
+        # Process conflicts first: plan auto-merges for what we safely can,
+        # prompt for the rest. Merges are only applied after confirmation.
         resolved_actions = []
-        merged_count = 0
+        pending_merges = []
         for path, reason in conflicts:
             local_info = local_files.get(path)
             s3_info = s3_files.get(path)
 
-            if auto_merge and self._attempt_auto_merge(
-                    path, local_info, s3_info) == 'merged':
-                uploads.append((path, "Auto-merged local + remote changes"))
-                merged_count += 1
-                continue
+            if auto_merge:
+                plan = self._attempt_auto_merge(path, local_info, s3_info)
+                if isinstance(plan, dict):
+                    pending_merges.append((path, plan))
+                    uploads.append((path, "Auto-merged local + remote changes"))
+                    continue
 
             action = self.resolve_conflict(path, reason, local_info, s3_info)
             if action != SyncAction.SKIP:
                 resolved_actions.append((path, action))
 
+        merged_count = len(pending_merges)
         if merged_count:
-            print(f"\n✓ Auto-merged {merged_count} conflicting file(s); "
-                  f"merged versions will be uploaded")
+            print(f"\n✓ {merged_count} conflicting file(s) will be auto-merged "
+                  f"and uploaded after confirmation")
 
         # Let the user decide what to do with suspect upload candidates
         invalid_uploads += self._validate_upload_candidates(
@@ -1620,12 +1693,17 @@ class S3SyncManager:
 
         print(f"\n{total_operations} operations will be performed.")
         if not confirm("Continue? [y/N]: "):
-            print("Sync cancelled.")
+            self._discard_pending_merges(pending_merges)
+            print("Sync cancelled. No files were modified.")
             return
 
         # Perform operations
         print("\nSyncing...")
         success_count = 0
+
+        # Confirmed: swap the planned merge results into place (stashing the
+        # pre-merge local and remote versions first)
+        self._apply_pending_merges(pending_merges)
 
         # Last line of defense before downloads overwrite local files: stash
         # any local copy whose content diverges from its tracked state (or

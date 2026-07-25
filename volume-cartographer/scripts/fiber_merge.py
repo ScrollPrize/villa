@@ -33,6 +33,7 @@ overlapping edits. Callers keep pre-merge copies of every input.
 """
 
 import copy
+import json
 import math
 
 POS_TOL = 1.0e-6
@@ -58,11 +59,6 @@ def pos_eq(a, b, tol=POS_TOL):
                     for x, y in zip(a, b)))
     except TypeError:
         return False
-
-
-def qpos(p):
-    """Quantized position usable as a dict key (matches POS_TOL scale)."""
-    return tuple(round(float(x), 6) for x in p)
 
 
 def _seq_eq(a, b):
@@ -156,83 +152,143 @@ def merge_control_points(base, local, remote):
     return merged, regions, conflicts
 
 
-def _branch_key(branch):
-    return (branch.get('branch_file', ''),
-            qpos(branch.get('control_point_position', (0, 0, 0))),
-            qpos(branch.get('branch_control_point_position', (0, 0, 0))))
-
-
 def _branches_of(doc):
     branches = doc.get('branches', [])
     return branches if isinstance(branches, list) else []
 
 
-def _branch_signature(branch):
-    """What counts as a meaningful edit to a link (indices and directions
-    are derived/re-resolved elsewhere; pending is the review state)."""
-    return (bool(branch.get('pending', False)),
-            _branch_key(branch))
+def _valid_vec3(value):
+    try:
+        return (len(value) == 3 and
+                all(isinstance(x, (int, float)) and math.isfinite(x)
+                    for x in value))
+    except TypeError:
+        return False
+
+
+def _structured_branch(branch):
+    """A branch entry this module understands well enough to merge."""
+    return (isinstance(branch, dict) and
+            isinstance(branch.get('branch_file'), str) and
+            _valid_vec3(branch.get('control_point_position')) and
+            _valid_vec3(branch.get('branch_control_point_position')))
+
+
+def split_branches(doc):
+    """(structured, opaque) partition of a document's branch entries.
+
+    Opaque entries (non-objects, missing or malformed fields) are data
+    this module cannot interpret; they are preserved as-is and merged
+    only by whole-value comparison — never silently dropped."""
+    structured = []
+    opaque = []
+    for branch in _branches_of(doc):
+        (structured if _structured_branch(branch) else opaque).append(branch)
+    return structured, opaque
+
+
+def _canon_opaque(entries):
+    return sorted(json.dumps(entry, sort_keys=True) for entry in entries)
+
+
+def merge_opaque_branches(base_opaque, local_opaque, remote_opaque):
+    """Whole-value base-aware merge of uninterpretable branch entries.
+    Returns (merged_entries, conflict_message_or_None)."""
+    if _canon_opaque(local_opaque) == _canon_opaque(remote_opaque):
+        return copy.deepcopy(local_opaque), None
+    if _canon_opaque(local_opaque) == _canon_opaque(base_opaque):
+        return copy.deepcopy(remote_opaque), None
+    if _canon_opaque(remote_opaque) == _canon_opaque(base_opaque):
+        return copy.deepcopy(local_opaque), None
+    return [], ("branches: structurally unparseable entries differ between "
+                "local and remote; refusing to merge them")
+
+
+def _same_link(a, b):
+    """Tolerant link identity: same target file and both endpoint positions
+    within POS_TOL — the same geometric predicate used for control-point
+    alignment. (Rounded-coordinate keys would split positions that sit on
+    opposite sides of a rounding bucket despite being within tolerance.)"""
+    return (a.get('branch_file') == b.get('branch_file') and
+            pos_eq(a.get('control_point_position'),
+                   b.get('control_point_position')) and
+            pos_eq(a.get('branch_control_point_position'),
+                   b.get('branch_control_point_position')))
+
+
+def _find_link(entries, branch, used):
+    for i, entry in enumerate(entries):
+        if i not in used and _same_link(entry, branch):
+            return i
+    return None
+
+
+def _link_modified(entry, base_entry):
+    """The review state is the meaningful mutable field on a link; indices
+    and directions are derived and re-resolved elsewhere."""
+    return (bool(entry.get('pending', False)) !=
+            bool(base_entry.get('pending', False)))
 
 
 def merge_branches(base_doc, local_doc, remote_doc, merged_cps, prefer_local):
-    base_by_key = {}
-    for branch in _branches_of(base_doc):
-        if isinstance(branch, dict):
-            base_by_key[_branch_key(branch)] = branch
-    local_entries = [b for b in _branches_of(local_doc) if isinstance(b, dict)]
-    remote_entries = [b for b in _branches_of(remote_doc) if isinstance(b, dict)]
-    local_by_key = {_branch_key(b): b for b in local_entries}
-    remote_by_key = {_branch_key(b): b for b in remote_entries}
-
-    ordered_keys = [_branch_key(b) for b in local_entries]
-    ordered_keys += [_branch_key(b) for b in remote_entries
-                     if _branch_key(b) not in local_by_key]
+    base_entries, _ = split_branches(base_doc)
+    local_entries, _ = split_branches(local_doc)
+    remote_entries, _ = split_branches(remote_doc)
 
     merged = []
     notes = []
     stats = {'links_kept': 0, 'links_added_local': 0, 'links_added_remote': 0,
              'links_deleted': 0, 'links_approved': 0}
-    seen = set()
-    for key in ordered_keys:
-        if key in seen:
-            continue
-        seen.add(key)
-        in_local = key in local_by_key
-        in_remote = key in remote_by_key
-        in_base = key in base_by_key
+    used_remote = set()
+    used_base = set()
 
-        if in_local and in_remote:
-            local_entry = local_by_key[key]
-            remote_entry = remote_by_key[key]
-            local_pending = bool(local_entry.get('pending', False))
-            remote_pending = bool(remote_entry.get('pending', False))
-            if local_pending != remote_pending:
-                # Approval (pending -> absent/False) always wins.
-                chosen = remote_entry if local_pending else local_entry
-                stats['links_approved'] += 1
-            else:
-                chosen = local_entry if prefer_local else remote_entry
-            merged.append(copy.deepcopy(chosen))
-            stats['links_kept'] += 1
-            continue
+    def base_match(branch):
+        index = _find_link(base_entries, branch, used_base)
+        if index is None:
+            return None
+        used_base.add(index)
+        return base_entries[index]
 
-        side_entry = local_by_key.get(key) or remote_by_key.get(key)
-        side_name = 'local' if in_local else 'remote'
-        if not in_base:
-            merged.append(copy.deepcopy(side_entry))
+    def merge_one_sided(entry, side_name):
+        base_entry = base_match(entry)
+        if base_entry is None:
+            merged.append(copy.deepcopy(entry))
             stats['links_added_%s' % side_name] += 1
-            continue
+            return
         # Present in base, gone from the other side: deletion unless this
         # side meaningfully modified it (approving a link beats deleting it).
-        if _branch_signature(side_entry) == _branch_signature(base_by_key[key]):
+        if not _link_modified(entry, base_entry):
             stats['links_deleted'] += 1
-            notes.append(f"link to {key[0]} deleted on "
-                         f"{'remote' if in_local else 'local'}")
-            continue
-        merged.append(copy.deepcopy(side_entry))
-        notes.append(f"kept link to {key[0]} modified on {side_name} "
-                     "but deleted on the other side")
+            notes.append(f"link to {entry.get('branch_file', '?')} deleted on "
+                         f"{'remote' if side_name == 'local' else 'local'}")
+            return
+        merged.append(copy.deepcopy(entry))
+        notes.append(f"kept link to {entry.get('branch_file', '?')} modified "
+                     f"on {side_name} but deleted on the other side")
         stats['links_kept'] += 1
+
+    for local_entry in local_entries:
+        remote_index = _find_link(remote_entries, local_entry, used_remote)
+        if remote_index is None:
+            merge_one_sided(local_entry, 'local')
+            continue
+        used_remote.add(remote_index)
+        base_match(local_entry)  # consume the base entry, if any
+        remote_entry = remote_entries[remote_index]
+        local_pending = bool(local_entry.get('pending', False))
+        remote_pending = bool(remote_entry.get('pending', False))
+        if local_pending != remote_pending:
+            # Approval (pending -> absent/False) always wins.
+            chosen = remote_entry if local_pending else local_entry
+            stats['links_approved'] += 1
+        else:
+            chosen = local_entry if prefer_local else remote_entry
+        merged.append(copy.deepcopy(chosen))
+        stats['links_kept'] += 1
+
+    for i, remote_entry in enumerate(remote_entries):
+        if i not in used_remote:
+            merge_one_sided(remote_entry, 'remote')
 
     # Local anchor indices may have shifted; re-resolve them against the
     # merged control points. (VC3D's loader also resolves by position, so
@@ -290,7 +346,19 @@ def merge_line_points(local_doc, remote_doc, regions, anchor_positions):
     if not local_owns:
         return list(remote_line), None
 
+    def anchor_match_tol2(line):
+        # An anchor control point must actually lie ON the polyline (lines
+        # pass through their control points); allow up to twice the median
+        # sample spacing. Without this bound, two unrelated polylines would
+        # be considered splicable via arbitrarily distant "matches".
+        spacings = sorted(_dist2(a, b) for a, b in zip(line[:-1], line[1:]))
+        if not spacings:
+            return 1.0e-6
+        median_d2 = spacings[len(spacings) // 2]
+        return max(4.0 * median_d2, 1.0e-6)  # (2 x spacing)^2
+
     def anchor_line_indices(line):
+        tol2 = anchor_match_tol2(line)
         indices = []
         start = 0
         for position in anchor_positions:
@@ -301,7 +369,7 @@ def merge_line_points(local_doc, remote_doc, regions, anchor_positions):
                 if d2 < best_d2:
                     best_d2 = d2
                     best_index = i
-            if best_index is None:
+            if best_index is None or best_d2 > tol2:
                 return None
             indices.append(best_index)
             start = best_index + 1
@@ -310,7 +378,8 @@ def merge_line_points(local_doc, remote_doc, regions, anchor_positions):
     local_idx = anchor_line_indices(local_line)
     remote_idx = anchor_line_indices(remote_line)
     if local_idx is None or remote_idx is None:
-        return list(local_line), "line splice failed (non-monotone anchors)"
+        return (list(local_line),
+                "line splice failed (anchors not on both polylines)")
 
     merged = []
     for k, region in enumerate(regions):
@@ -362,6 +431,17 @@ def merge_fibers(base, local, remote):
         result['conflicts'] = cp_conflicts
         return result
 
+    # Branch entries this module cannot interpret are preserved by
+    # whole-value comparison; a clean merge must never discard input.
+    _, base_opaque = split_branches(base)
+    _, local_opaque = split_branches(local)
+    _, remote_opaque = split_branches(remote)
+    opaque_branches, opaque_conflict = merge_opaque_branches(
+        base_opaque, local_opaque, remote_opaque)
+    if opaque_conflict:
+        result['conflicts'] = [opaque_conflict]
+        return result
+
     generation_local = int(local.get('generation', 1) or 1)
     generation_remote = int(remote.get('generation', 1) or 1)
     prefer_local = generation_local >= generation_remote
@@ -369,6 +449,10 @@ def merge_fibers(base, local, remote):
 
     merged_branches, branch_notes, branch_stats = merge_branches(
         base, local, remote, merged_cps, prefer_local)
+    merged_branches = merged_branches + opaque_branches
+    if opaque_branches:
+        branch_notes.append(f"{len(opaque_branches)} unparseable branch "
+                            "entrie(s) carried through unchanged")
 
     anchor_positions = []
     for k, region in enumerate(regions[:-1]):

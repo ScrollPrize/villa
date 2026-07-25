@@ -171,10 +171,14 @@ class TestAnalyzeChanges:
         assert row[1] == info['local_md5']
         assert os.path.exists(manager._shadow_path('f.json'))
 
-    def test_untracked_same_size_different_content_is_conflict(self, manager):
+    def test_untracked_same_size_different_content_is_conflict(self, manager,
+                                                               monkeypatch):
         write_local(manager, 'f.json', '{"a": 5}')
         info = local_info(manager, 'f.json')
         remote = s3_info(info['local_size'], 'f' * 32)  # same size, other bytes
+        # The mismatching ETag alone is not proof (could be SSE-KMS); the
+        # remote content settles it.
+        monkeypatch.setattr(manager, '_remote_md5', lambda p: 'f' * 32)
         actions = manager.analyze_changes({'f.json': info}, {'f.json': remote})
         assert actions['f.json'][0] == SyncAction.CONFLICT
 
@@ -185,13 +189,43 @@ class TestAnalyzeChanges:
         actions = manager.analyze_changes({'f.json': info}, {'f.json': remote})
         assert actions['f.json'][0] == SyncAction.SKIP
 
-    def test_untracked_multipart_etag_keeps_size_heuristic(self, manager):
-        """Non-MD5 etags cannot prove divergence -> keep today's SKIP."""
+    def test_untracked_opaque_etag_resolved_by_remote_hash(self, manager,
+                                                           monkeypatch):
+        """A multipart/KMS ETag proves nothing: the remote content is hashed
+        to decide, instead of silently assuming in-sync."""
         write_local(manager, 'f.json', '{"a": 7}')
         info = local_info(manager, 'f.json')
         remote = s3_info(info['local_size'], 'abc123-4')
+
+        monkeypatch.setattr(manager, '_remote_md5', lambda p: info['local_md5'])
         actions = manager.analyze_changes({'f.json': info}, {'f.json': remote})
         assert actions['f.json'][0] == SyncAction.SKIP
+
+        monkeypatch.setattr(manager, '_remote_md5', lambda p: '9' * 32)
+        actions = manager.analyze_changes({'f.json': info}, {'f.json': remote})
+        assert actions['f.json'][0] == SyncAction.CONFLICT
+
+    def test_untracked_unverifiable_content_is_conflict(self, manager,
+                                                        monkeypatch):
+        """If the remote cannot be fetched for hashing, 'unknown' surfaces
+        as a conflict rather than becoming a false baseline."""
+        write_local(manager, 'f.json', '{"a": 7}')
+        info = local_info(manager, 'f.json')
+        remote = s3_info(info['local_size'], 'abc123-4')
+        monkeypatch.setattr(manager, '_remote_md5', lambda p: None)
+        actions = manager.analyze_changes({'f.json': info}, {'f.json': remote})
+        assert actions['f.json'][0] == SyncAction.CONFLICT
+
+    def test_untracked_non_hashed_file_keeps_size_heuristic(self, manager):
+        """Files outside the hash scope keep the historical size heuristic."""
+        write_local(manager, 'vol2.tif', 'eight ch')
+        path = os.path.join(manager.local_dir, 'vol2.tif')
+        stat = os.stat(path)
+        info = {'path': 'vol2.tif', 'local_size': stat.st_size,
+                'local_mtime': stat.st_mtime, 'is_backup': False}
+        remote = s3_info(stat.st_size, 'abc123-4')
+        actions = manager.analyze_changes({'vol2.tif': info}, {'vol2.tif': remote})
+        assert actions['vol2.tif'][0] == SyncAction.SKIP
 
     def test_md5_backfill_with_record(self, manager):
         """Row predating hashing gets its md5 adopted when stats match."""
@@ -343,7 +377,9 @@ class TestAutoMerge:
         monkeypatch.setattr(manager, '_fetch_remote_json', fake_fetch)
         return path, local_path, info
 
-    def test_clean_merge_written_and_stashed(self, manager, monkeypatch):
+    def test_clean_merge_deferred_until_applied(self, manager, monkeypatch):
+        """Planning never touches the local file; _apply_pending_merges (run
+        after user confirmation) performs the swap and the stashing."""
         base = self.fiber([0, 0, 0, 0])
         local = self.fiber([0, 0, 0, 0], generation=2)
         local['branches'] = [self.link('kb_b.json', local['control_points'][1])]
@@ -351,17 +387,52 @@ class TestAutoMerge:
         remote['branches'] = [self.link('kb_c.json', remote['control_points'][2])]
         path, local_path, info = self.setup_scenario(
             manager, monkeypatch, base, local, remote)
+        before = open(local_path).read()
 
-        outcome = manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32))
+        plan = manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32))
 
-        assert outcome == 'merged'
+        assert isinstance(plan, dict) and os.path.exists(plan['pending'])
+        assert open(local_path).read() == before  # untouched until confirmed
+        stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
+
+        def stashes():
+            # Actual conflict copies only — not the .tmp planning scratch
+            return [f for _, _, fs_ in os.walk(stash_root)
+                    for f in fs_ if '.conflict-' in f]
+
+        assert stashes() == []
+
+        manager._apply_pending_merges([(path, plan)])
+
         merged = json.load(open(local_path))
         targets = sorted(b['branch_file'] for b in merged['branches'])
         assert targets == ['kb_b.json', 'kb_c.json']
         assert merged['generation'] == 3
+        assert len(stashes()) == 2  # local + remote pre-merge copies
+        assert not os.path.exists(plan['pending'])
+        assert not os.path.exists(plan['remote_tmp'])
+
+    def test_cancelled_merge_discarded_without_touching_local(self, manager,
+                                                              monkeypatch):
+        base = self.fiber([0, 0, 0, 0])
+        local = self.fiber([0, 0, 0, 0], generation=2)
+        local['tags'] = ['from-local']
+        remote = self.fiber([0, 0, 0, 0], generation=2)
+        remote['tags'] = ['from-remote']
+        path, local_path, info = self.setup_scenario(
+            manager, monkeypatch, base, local, remote)
+        before = open(local_path).read()
+
+        plan = manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32))
+        assert isinstance(plan, dict)
+        manager._discard_pending_merges([(path, plan)])
+
+        assert open(local_path).read() == before
+        assert not os.path.exists(plan['pending'])
+        assert not os.path.exists(plan['remote_tmp'])
         stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
-        stashed = [f for _, _, fs_ in os.walk(stash_root) for f in fs_]
-        assert len(stashed) == 2  # local + remote pre-merge copies
+        assert [f for _, _, fs_ in os.walk(stash_root)
+                for f in fs_ if '.conflict-' in f] == []
 
     def test_dry_run_probes_without_writing(self, manager, monkeypatch):
         base = self.fiber([0, 0, 0, 0])
@@ -412,14 +483,38 @@ class TestAutoMerge:
 
 
 class TestRecordUntrackedSynced:
-    def test_same_size_divergent_content_not_healed(self, manager):
+    def test_same_size_divergent_content_not_healed(self, manager, monkeypatch):
         write_local(manager, 'f.json', '{"a": 1}')
         info = local_info(manager, 'f.json')
         remote = s3_info(info['local_size'], 'd' * 32)  # same size, other bytes
+        monkeypatch.setattr(manager, '_remote_md5', lambda p: 'd' * 32)
         manager._record_untracked_synced({'f.json': info}, {'f.json': remote})
         with sqlite3.connect(manager.db_file) as conn:
             rows = conn.execute('SELECT COUNT(*) FROM files').fetchone()[0]
         assert rows == 0
+
+    def test_unverifiable_pair_not_healed(self, manager, monkeypatch):
+        """No content proof (opaque etag, remote unreachable) -> stays
+        untracked instead of becoming a false baseline."""
+        write_local(manager, 'f.json', '{"a": 1}')
+        info = local_info(manager, 'f.json')
+        remote = s3_info(info['local_size'], 'abc123-4')
+        monkeypatch.setattr(manager, '_remote_md5', lambda p: None)
+        manager._record_untracked_synced({'f.json': info}, {'f.json': remote})
+        with sqlite3.connect(manager.db_file) as conn:
+            rows = conn.execute('SELECT COUNT(*) FROM files').fetchone()[0]
+        assert rows == 0
+
+    def test_opaque_etag_healed_via_remote_hash(self, manager, monkeypatch):
+        write_local(manager, 'f.json', '{"a": 1}')
+        info = local_info(manager, 'f.json')
+        remote = s3_info(info['local_size'], 'abc123-4')
+        monkeypatch.setattr(manager, '_remote_md5', lambda p: info['local_md5'])
+        manager._record_untracked_synced({'f.json': info}, {'f.json': remote})
+        with sqlite3.connect(manager.db_file) as conn:
+            rows = conn.execute('SELECT COUNT(*) FROM files').fetchone()[0]
+        assert rows == 1
+        assert os.path.exists(manager._shadow_path('f.json'))
 
     def test_verified_pair_healed_with_shadow(self, manager):
         write_local(manager, 'f.json', '{"a": 1}')

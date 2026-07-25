@@ -332,3 +332,85 @@ def test_link_anchor_removed_by_merged_geometry_dropped_with_note():
     assert result['ok']
     assert result['merged']['branches'] == []
     assert any('removed by the merged geometry' in n for n in result['notes'])
+
+
+# --- review findings (PR #1223) ---
+
+
+def test_opaque_branch_entries_survive_merge():
+    """Structurally unparseable entries must never vanish from a clean
+    merge (they'd be data loss the C++ loader deliberately preserves)."""
+    opaque = 'unparseable-link'
+    base = make_fiber(BASE_CPS, branches=[opaque])
+    local = make_fiber(BASE_CPS, branches=[opaque], tags=['from-local'])
+    remote = make_fiber(BASE_CPS, branches=[opaque], tags=['from-remote'])
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['branches'] == [opaque]
+
+
+def test_divergent_opaque_entries_conflict():
+    base = make_fiber(BASE_CPS, branches=['legacy-a'])
+    local = make_fiber(BASE_CPS, branches=['legacy-b'], tags=['x'])
+    remote = make_fiber(BASE_CPS, branches=['legacy-c'], tags=['y'])
+    result = merge_fibers(base, local, remote)
+    assert not result['ok']
+    assert any('unparseable' in c for c in result['conflicts'])
+
+
+def test_opaque_entry_deleted_on_one_side_merges():
+    base = make_fiber(BASE_CPS, branches=['legacy-a'])
+    local = make_fiber(BASE_CPS, branches=[], tags=['x'])       # deleted it
+    remote = make_fiber(BASE_CPS, branches=['legacy-a'], tags=['y'])
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['branches'] == []
+
+
+def test_malformed_dict_branch_is_opaque_not_a_crash():
+    """A dict entry with missing/non-vector positions must not reach the
+    geometric code paths (previously an uncaught TypeError)."""
+    broken = {'branch_file': 'kb_a.json', 'control_point_position': 'oops'}
+    base = make_fiber(BASE_CPS, branches=[broken])
+    local = make_fiber(BASE_CPS, branches=[broken], tags=['from-local'])
+    remote = make_fiber(BASE_CPS, branches=[broken], tags=['from-remote'])
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['branches'] == [broken]
+
+
+def test_link_identity_is_tolerance_based_not_rounding_based():
+    """Positions within POS_TOL but on opposite sides of a rounding bucket
+    must still be the SAME link (previously produced a duplicate)."""
+    pos_a = [100.0000004, 200.0, 300.0]
+    pos_b = [100.0000013, 200.0, 300.0]  # within 1e-6 of pos_a
+    cps = [pos_a] + [cp(i) for i in range(1, 4)]
+    approved = link('kb_a.json', pos_a, OTHER, 0, pending=False)
+    jittered_pending = link('kb_a.json', pos_b, OTHER, 0, pending=True)
+    base = make_fiber(cps)
+    local = make_fiber(cps, branches=[approved], generation=2)
+    remote = make_fiber(cps, branches=[jittered_pending], generation=2)
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    branches = result['merged']['branches']
+    assert len(branches) == 1
+    assert branches[0]['pending'] is False  # approval won
+
+
+def test_splice_rejected_when_anchors_not_on_both_lines():
+    """Anchors must actually lie on both polylines; unrelated lines fall
+    back to the local line + reoptimization tag instead of a fake splice."""
+    base = make_fiber(BASE_CPS)
+    local_cps = copy.deepcopy(BASE_CPS)
+    local_cps[1] = cp(1, dz=5.0)          # local owns a region
+    remote_cps = copy.deepcopy(BASE_CPS)
+    remote_cps[6] = cp(6, dz=-5.0)        # remote owns a region
+    local = make_fiber(local_cps, generation=2)
+    remote = make_fiber(remote_cps, generation=2)
+    # Remote's line is unrelated garbage far from every anchor
+    remote['line_points'] = [[-900.0 - i, -900.0, -900.0] for i in range(40)]
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['line_points'] == local['line_points']
+    assert any('splice failed' in n for n in result['notes'])
+    assert REOPTIMIZE_TAG in result['merged']['tags']
