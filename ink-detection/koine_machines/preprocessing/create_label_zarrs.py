@@ -572,6 +572,55 @@ def _convert_tiled_tiff(
     )
 
 
+def _write_image_level_zero(
+    image_2d: np.ndarray,
+    dataset: zarr.Array,
+) -> None:
+    height, width = int(image_2d.shape[0]), int(image_2d.shape[1])
+
+    for block_y, block_x, block_height, block_width in _iter_block_slices(height, width):
+        dataset[
+            DEFAULT_LABEL_SLICE,
+            block_y : block_y + block_height,
+            block_x : block_x + block_width,
+        ] = image_2d[
+            block_y : block_y + block_height,
+            block_x : block_x + block_width,
+        ]
+
+
+def _convert_untiled_image(
+    input_path: Path,
+    output_path: Path,
+    *,
+    levels: int,
+    overwrite: bool,
+    downsample_mode: Literal["nearest", "mean"],
+    chunk_workers: int,
+    use_compression: bool,
+) -> None:
+    # Only the 2D image is held in memory; the label volume and its pyramid are
+    # written through zarr. Building them in memory instead costs DEFAULT_DEPTH
+    # times the image per level, which is tens of GiB for a full-size segment
+    # label even though 64 of the 65 slices are zeros.
+    image = load_image(input_path)
+    datasets = _create_ome_zarr_datasets(
+        output_path,
+        image_shape=(int(image.shape[0]), int(image.shape[1])),
+        dtype=image.dtype,
+        levels=levels,
+        overwrite=overwrite,
+        use_compression=use_compression,
+    )
+    _write_image_level_zero(image, datasets[0])
+    del image
+    _build_downsample_levels_from_zarr(
+        datasets,
+        downsample_mode=downsample_mode,
+        chunk_workers=chunk_workers,
+    )
+
+
 def convert_image(
     input_path: Path,
     *,
@@ -607,16 +656,13 @@ def convert_image(
                 use_compression=use_compression,
             )
         else:
-            image = load_image(input_path)
-            pyramid = build_pyramid_with_mode(
-                image,
-                levels=levels,
-                downsample_mode=downsample_mode,
-            )
-            write_ome_zarr(
-                pyramid,
+            _convert_untiled_image(
+                input_path,
                 output_path,
+                levels=levels,
                 overwrite=overwrite,
+                downsample_mode=downsample_mode,
+                chunk_workers=chunk_workers,
                 use_compression=use_compression,
             )
         wrote_primary = True
