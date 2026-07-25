@@ -1339,6 +1339,36 @@ class CommitTests(unittest.TestCase):
 
 
 class MappedPreviewArtifactTests(unittest.TestCase):
+    def test_failed_flatten_keeps_previous_preview_and_discards_raw_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous = root / "previous"
+            current = root / "current"
+            previous.mkdir()
+            current.mkdir()
+            previous_manifest = previous / "manifest.json"
+            current_manifest = current / "manifest.json"
+            previous_manifest.write_text("{}")
+            current_manifest.write_text("{}")
+            state = ServiceState()
+            state.session_id = "session"
+            state._previous_raw_preview_manifest = str(previous_manifest)
+            state._preview_artifact = {"id": "previous-preview"}
+
+            with mock.patch.object(
+                    state, "_publish_flattened_preview",
+                    side_effect=RuntimeError("flatten failed")):
+                state._maybe_register_artifacts({
+                    "preview_generation": 1,
+                    "preview_manifest_path": str(current_manifest),
+                })
+
+            self.assertEqual(
+                state._preview_artifact, {"id": "previous-preview"})
+            self.assertTrue(previous.exists())
+            self.assertFalse(current.exists())
+            self.assertIn("flatten failed", state._preview_publish_error)
+
     def test_winding_membership_uses_flatten_correspondence(self):
         manifest = {
             "winding_ids": [7, 9],

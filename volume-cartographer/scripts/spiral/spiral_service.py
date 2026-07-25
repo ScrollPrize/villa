@@ -1453,6 +1453,15 @@ class ServiceState:
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             print(f"SPIRAL_PREVIEW_ERROR {error}", file=sys.stderr, flush=True)
+            # A failed raw generation is never exposed or retried. Keep only
+            # the previous successful raw generation, which is needed to map
+            # the next run-difference overlay.
+            failed_raw = Path(preview_manifest).parent
+            with self.lock:
+                retained_raw = self._previous_raw_preview_manifest
+            if (not retained_raw
+                    or failed_raw != Path(retained_raw).parent):
+                shutil.rmtree(failed_raw, ignore_errors=True)
             with self.lock:
                 if self.session_id == session_id:
                     self._preview_publish_error = error

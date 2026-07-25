@@ -702,6 +702,9 @@ class FlattenLossTest(unittest.TestCase):
 	def test_flatten_stats_track_validity_transitions(self) -> None:
 		opt_loss_flatten.configure(reset_history=True)
 		mdl = _make_flatten_model(_flat_grid(5, 5), mesh_step=1)
+		initial_map = mdl.flatten_map().detach().clone()
+		initial_map[0, 0] = torch.tensor([-1.0, -1.0])
+		_set_flatten_map(mdl, initial_map)
 		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
 		opt_loss_flatten.flatten_sdir_loss(res=res)
 
@@ -714,7 +717,7 @@ class FlattenLossTest(unittest.TestCase):
 		stats = opt_loss_flatten.last_stats()
 
 		self.assertAlmostEqual(stats["flatten_valid_to_invalid"], 1.0 / 25.0, places=6)
-		self.assertAlmostEqual(stats["flatten_invalid_to_valid"], 1.0 / 36.0, places=6)
+		self.assertAlmostEqual(stats["flatten_invalid_to_valid"], 1.0 / 25.0, places=6)
 		self.assertIn("flatten_sdir_no_new", stats)
 
 	def test_flatten_export_writes_invalid_points_as_minus_one(self) -> None:
