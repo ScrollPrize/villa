@@ -19,8 +19,9 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <opencv2/imgcodecs.hpp>
+
 #include <QDialog>
-#include <QDateTime>
 #include <QDockWidget>
 #include <QDir>
 #include <QFile>
@@ -33,7 +34,6 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QMessageBox>
-#include <QProgressDialog>
 #include <QRegularExpression>
 #include <QScopedValueRollback>
 #include <QSettings>
@@ -50,44 +50,27 @@
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <set>
 #include <unordered_map>
 
 namespace {
 
-QRgb runDiffMagnitudeColor(float magnitudeFraction)
+QImage maskOverlayToSurface(
+    QImage image, const std::shared_ptr<QuadSurface>& surface)
 {
-    struct ColorStop {
-        float position;
-        int red;
-        int green;
-        int blue;
-    };
-
-    // Keep the low end bright enough to remain legible over grayscale slices.
-    // Linear interpolation between stops avoids visually implying discrete bands.
-    constexpr std::array<ColorStop, 5> stops{{
-        {0.00f,   0,  96, 255}, // blue
-        {0.25f,   0, 200,  80}, // green
-        {0.50f, 255, 224,   0}, // yellow
-        {0.75f, 255, 128,   0}, // orange
-        {1.00f, 255,  24,  16}, // red
-    }};
-
-    const float fraction = std::clamp(magnitudeFraction, 0.0f, 1.0f);
-    for (std::size_t index = 1; index < stops.size(); ++index) {
-        if (fraction > stops[index].position) continue;
-        const ColorStop& lower = stops[index - 1];
-        const ColorStop& upper = stops[index];
-        const float blend = (fraction - lower.position)
-                          / (upper.position - lower.position);
-        const auto interpolate = [blend](int from, int to) {
-            return static_cast<int>(std::lround(from + blend * (to - from)));
-        };
-        return qRgba(interpolate(lower.red, upper.red),
-                     interpolate(lower.green, upper.green),
-                     interpolate(lower.blue, upper.blue), 220);
+    if (image.isNull() || !surface) return {};
+    image = image.convertToFormat(QImage::Format_ARGB32);
+    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+    if (!points || points->cols != image.width() || points->rows != image.height())
+        return {};
+    for (int row = 0; row < points->rows; ++row) {
+        QRgb* pixels = reinterpret_cast<QRgb*>(image.scanLine(row));
+        for (int column = 0; column < points->cols; ++column) {
+            if ((*points)(row, column)[0] == -1.0f)
+                pixels[column] = qRgba(0, 0, 0, 0);
+        }
     }
-    return qRgba(stops.back().red, stops.back().green, stops.back().blue, 220);
+    return image;
 }
 
 } // namespace
@@ -375,25 +358,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _lossMapOpacity = opacity;
                 updateLossMapOverlay();
             });
-    connect(_panel, &SpiralPanel::flattenWithLasagnaRequested,
-            this, &SpiralWorkspace::startLasagnaFlatten);
-    connect(_service, &SpiralServiceManager::lasagnaFlattenProgress,
-            this, &SpiralWorkspace::updateLasagnaFlattenProgress);
-    connect(_service, &SpiralServiceManager::lasagnaFlattenFinished,
-            this, [this](const QString& tifxyzDirectory,
-                         const QString& outputName,
-                         const QString& error) {
-                if (!_lasagnaFlattenRunning
-                    || outputName != _pendingLasagnaOutputName) return;
-                if (!error.isEmpty()) {
-                    failLasagnaFlatten(
-                        error, _lasagnaFlattenCancelRequested
-                            || error.contains(QStringLiteral("cancel"),
-                                              Qt::CaseInsensitive));
-                    return;
-                }
-                handleLasagnaResults(tifxyzDirectory, outputName);
-            });
     connect(_service, &SpiralServiceManager::previewAvailable, this, &SpiralWorkspace::loadPreview);
     connect(_service, &SpiralServiceManager::connectionStateChanged, this,
             [this](SpiralServiceManager::ConnectionState state, const QString&) {
@@ -402,9 +366,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _requestedPreviewGeneration = -1;
                     _inputSurfaceGeneration = 0;
                     _pendingPatchIds.clear();
-                    _haveRunDiffBaseline = false;
-                    _runDiffPreviousSource.reset();
-                    _runDiffPreviousComponents.clear();
+                    _previewRunDiffImagePath.clear();
                     ++_runDiffRequestRevision;
                     _previewRunDiffImage = {};
                     _previewLossMaps.clear();
@@ -433,17 +395,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 const qint64 generation =
                     status.value(QStringLiteral("session_generation")).toInteger();
                 _sessionPaths = paths;
-                _flattenedPreviewActive = false;
                 _previewSource.reset();
                 _previewComponents.clear();
-                _previewConnected = false;
-                _runDiffPreviousSource.reset();
-                _runDiffPreviousComponents.clear();
-                _lasagnaFlattenRunning = false;
-                _lasagnaFlattenCancelRequested = false;
-                _pendingLasagnaSource.reset();
-                closeLasagnaFlattenProgress();
-                _panel->setLasagnaFlattenRunning(false);
+                _previewWindingIds.release();
+                _previewRunDiffImagePath.clear();
                 _brush->resetSession();
                 _pendingBrushPatches.clear();
                 _brushProvisionalPaths.clear();
@@ -457,9 +412,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _uncommittedPointCollectionIds.clear();
                 _visibleUncommittedPointCollectionIds.clear();
                 _brush->setVisiblePointCollectionIds({});
-                // A newly loaded fit starts a new comparison sequence even when
-                // it reuses the existing service connection.
-                _haveRunDiffBaseline = false;
                 ++_runDiffRequestRevision;
                 _previewRunDiffImage = {};
                 _previewLossMaps.clear();
@@ -471,7 +423,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _overlay->publishRunDiff({}, {});
                 _overlay->publishLossMap({}, {}, _lossMapOpacity);
                 loadInputSurfaces(paths, static_cast<quint64>(generation));
-                updateLasagnaFlattenAvailability();
             });
     if (_mainState) {
         connect(_mainState, &CState::vpkgChanged, this, [this](const std::shared_ptr<VolumePkg>&) { refreshVolumes(); });
@@ -1064,252 +1015,6 @@ void SpiralWorkspace::selectVolume(const QString& id)
     for (auto* viewer : _viewerManager->baseViewers()) if (viewer) viewer->requestRender("Spiral display volume changed");
 }
 
-void SpiralWorkspace::updateLasagnaFlattenAvailability()
-{
-    if (!_panel) return;
-    QString reason;
-    bool available = !_lasagnaFlattenRunning && _service->isReady()
-        && _previewSource && _previewConnected;
-    if (!_service->isReady()) {
-        reason = tr("Connect to the Spiral service before flattening");
-    } else if (!_previewSource) {
-        reason = tr("Run Spiral once to create a preview before flattening");
-    } else if (!_previewConnected) {
-        reason = tr("Run Spiral again to create a connected schema-v2 preview");
-    }
-    _panel->setLasagnaFlattenAvailable(available, reason);
-}
-
-void SpiralWorkspace::updateLasagnaFlattenProgress(const QJsonObject& job)
-{
-    if (!_lasagnaFlattenProgress || _updatingLasagnaFlattenProgress) return;
-    QScopedValueRollback<bool> updating(
-        _updatingLasagnaFlattenProgress, true);
-
-    const QString state = job.value(QStringLiteral("state")).toString();
-    if (state == QStringLiteral("starting")
-        || state == QStringLiteral("publishing")) {
-        _lasagnaFlattenProgress->setRange(0, 0);
-        _lasagnaFlattenProgress->setLabelText(
-            job.value(QStringLiteral("stage_name")).toString(
-                state == QStringLiteral("publishing")
-                    ? tr("Publishing flattened surface…")
-                    : tr("Starting Lasagna on Spiral host…")));
-        return;
-    }
-    if (state == QStringLiteral("upload")) {
-        const double progress = std::clamp(
-            job.value(QStringLiteral("upload_progress")).toDouble(), 0.0, 1.0);
-        const int current =
-            job.value(QStringLiteral("upload_current")).toInt();
-        const int total = job.value(QStringLiteral("upload_total")).toInt();
-        QString label =
-            job.value(QStringLiteral("upload_label")).toString();
-        if (label.isEmpty()) label = tr("Uploading Spiral surface");
-        if (total > 0) {
-            label += tr(" (%1/%2)").arg(current).arg(total);
-        }
-        _lasagnaFlattenProgress->setRange(0, 1000);
-        _lasagnaFlattenProgress->setValue(
-            static_cast<int>(progress * 1000.0));
-        _lasagnaFlattenProgress->setLabelText(label);
-        return;
-    }
-
-    if (state == QStringLiteral("waiting")) {
-        const int position =
-            job.value(QStringLiteral("queue_position")).toInt();
-        _lasagnaFlattenProgress->setRange(0, 0);
-        _lasagnaFlattenProgress->setLabelText(
-            position > 0
-                ? tr("Waiting for Lasagna (queue position %1)…").arg(position)
-                : tr("Waiting for Lasagna…"));
-        return;
-    }
-
-    if (state == QStringLiteral("running")) {
-        double progress =
-            job.value(QStringLiteral("overall_progress")).toDouble();
-        const int step = job.value(QStringLiteral("step")).toInt();
-        const int total = job.value(QStringLiteral("total_steps")).toInt();
-        if (progress <= 0.0 && step > 0 && total > 0) {
-            progress = static_cast<double>(step) / static_cast<double>(total);
-        }
-        progress = std::clamp(progress, 0.0, 1.0);
-        QString stage =
-            job.value(QStringLiteral("stage_name")).toString();
-        if (stage.isEmpty()) {
-            stage = job.value(QStringLiteral("stage")).toString();
-        }
-        if (stage.isEmpty()) stage = tr("Flattening");
-
-        QString label = total > 0
-            ? tr("%1 — step %2/%3").arg(stage).arg(step).arg(total)
-            : stage;
-        if (job.contains(QStringLiteral("loss"))) {
-            label += tr(" — loss %1")
-                         .arg(job.value(QStringLiteral("loss")).toDouble(),
-                              0, 'g', 5);
-        }
-        _lasagnaFlattenProgress->setRange(0, 1000);
-        _lasagnaFlattenProgress->setValue(
-            static_cast<int>(progress * 1000.0));
-        _lasagnaFlattenProgress->setLabelText(label);
-        return;
-    }
-
-    if (state == QStringLiteral("finished")) {
-        _lasagnaFlattenProgress->setRange(0, 0);
-        _lasagnaFlattenProgress->setLabelText(
-            tr("Downloading Lasagna result…"));
-    }
-}
-
-void SpiralWorkspace::closeLasagnaFlattenProgress()
-{
-    if (!_lasagnaFlattenProgress) return;
-    _lasagnaFlattenProgress->close();
-    _lasagnaFlattenProgress->deleteLater();
-    _lasagnaFlattenProgress = nullptr;
-}
-
-void SpiralWorkspace::failLasagnaFlatten(const QString& error, bool cancelled)
-{
-    if (!_lasagnaFlattenRunning) return;
-    _lasagnaFlattenRunning = false;
-    _lasagnaFlattenCancelRequested = false;
-    _pendingLasagnaSource.reset();
-    _panel->setLasagnaFlattenRunning(false);
-    closeLasagnaFlattenProgress();
-    updateLasagnaFlattenAvailability();
-    statusBar()->showMessage(
-        tr("Lasagna flatten failed: %1").arg(error), 15000);
-    if (!_shuttingDown && !cancelled) {
-        QMessageBox::warning(
-            this, tr("Flatten with Lasagna"),
-            tr("Lasagna flatten failed: %1").arg(error));
-    }
-}
-
-void SpiralWorkspace::startLasagnaFlatten()
-{
-    updateLasagnaFlattenAvailability();
-    if (_lasagnaFlattenRunning || !_previewSource || !_previewConnected) return;
-
-    QString stem = _previewSourceId;
-    stem.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")),
-                 QStringLiteral("-"));
-    const QString outputName = QStringLiteral("%1-lasagna-flat-%2.tifxyz")
-        .arg(stem)
-        .arg(QDateTime::currentMSecsSinceEpoch());
-
-    _lasagnaFlattenRunning = true;
-    _lasagnaFlattenCancelRequested = false;
-    _pendingLasagnaSource = _previewSource;
-    _pendingLasagnaOutputName = outputName;
-    _panel->setLasagnaFlattenRunning(true);
-
-    closeLasagnaFlattenProgress();
-    _lasagnaFlattenProgress = new QProgressDialog(
-        tr("Preparing Spiral surface for Lasagna…"), tr("Cancel"),
-        0, 0, this);
-    _lasagnaFlattenProgress->setWindowTitle(tr("Flatten with Lasagna"));
-    _lasagnaFlattenProgress->setWindowModality(Qt::WindowModal);
-    _lasagnaFlattenProgress->setMinimumDuration(0);
-    _lasagnaFlattenProgress->setAutoClose(false);
-    _lasagnaFlattenProgress->setAutoReset(false);
-    connect(_lasagnaFlattenProgress, &QProgressDialog::canceled,
-            this, [this]() {
-                if (!_lasagnaFlattenRunning) return;
-                _lasagnaFlattenCancelRequested = true;
-                _service->cancelLasagnaFlatten();
-                statusBar()->showMessage(
-                    tr("Cancelling Lasagna flatten…"), 5000);
-            });
-    _lasagnaFlattenProgress->show();
-
-    double voxelSize = 0.0;
-    if (_state && _state->currentVolume()) {
-        try {
-            voxelSize = _state->currentVolume()->voxelSize();
-        } catch (...) {
-        }
-    }
-    statusBar()->showMessage(
-        tr("Starting host-side Lasagna flatten: %1").arg(outputName));
-    _service->startLasagnaFlatten(outputName, voxelSize);
-}
-
-void SpiralWorkspace::handleLasagnaResults(
-    const QString& tifxyzDirectory, const QString& outputName)
-{
-    if (!_lasagnaFlattenRunning
-        || outputName != _pendingLasagnaOutputName
-        || !QFileInfo(tifxyzDirectory).isDir()) {
-        return;
-    }
-
-    const QString resultPath = QFileInfo(tifxyzDirectory).absoluteFilePath();
-    const auto source = _pendingLasagnaSource;
-    if (_lasagnaFlattenProgress) {
-        _lasagnaFlattenProgress->setRange(0, 0);
-        _lasagnaFlattenProgress->setLabelText(
-            tr("Loading flattened surface…"));
-        _lasagnaFlattenProgress->setCancelButton(nullptr);
-    }
-    auto* watcher = new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
-    connect(watcher, &QFutureWatcher<std::shared_ptr<QuadSurface>>::finished,
-            this, [this, watcher, source, outputName]() {
-                const auto flattened = watcher->result();
-                watcher->deleteLater();
-                _lasagnaFlattenRunning = false;
-                _lasagnaFlattenCancelRequested = false;
-                _pendingLasagnaSource.reset();
-                _panel->setLasagnaFlattenRunning(false);
-                closeLasagnaFlattenProgress();
-                updateLasagnaFlattenAvailability();
-                if (!flattened) {
-                    statusBar()->showMessage(
-                        tr("Lasagna finished, but its output could not be loaded"), 15000);
-                    if (!_shuttingDown) {
-                        QMessageBox::warning(
-                            this, tr("Flatten with Lasagna"),
-                            tr("Lasagna finished, but its output could not be loaded."));
-                    }
-                    return;
-                }
-                if (_shuttingDown || source != _previewSource) {
-                    statusBar()->showMessage(
-                        tr("Lasagna output was saved but not displayed because a newer Spiral run exists"),
-                        10000);
-                    return;
-                }
-
-                const quint64 revision = ++_previewDisplayRevision;
-                const QString registrationId =
-                    QStringLiteral("%1-active").arg(outputName);
-                flattened->id = registrationId.toStdString();
-                _flattenedPreviewActive = true;
-                _overlay->publishRunDiff({}, {});
-                _overlay->publishLossMap({}, {}, _lossMapOpacity);
-                _state->setSurface(registrationId.toStdString(), flattened);
-                installPreviewAliasWhenIndexed(
-                    flattened, registrationId, _requestedPreviewGeneration,
-                    revision, true, 0);
-                statusBar()->showMessage(
-                    tr("Lasagna flatten ready: %1").arg(outputName), 10000);
-            });
-    watcher->setFuture(QtConcurrent::run([resultPath]() {
-        try {
-            auto loaded = load_quad_from_tifxyz(resultPath.toStdString());
-            loaded->setStrictQuadRenderValidity(true);
-            return std::shared_ptr<QuadSurface>(std::move(loaded));
-        } catch (...) {
-            return std::shared_ptr<QuadSurface>{};
-        }
-    }));
-}
-
 void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation)
 {
     if (_shuttingDown || generation < _requestedPreviewGeneration) return;
@@ -1321,56 +1026,139 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
         if (!_shuttingDown && generation == _requestedPreviewGeneration) installPreview(result, generation);
     });
     watcher->setFuture(QtConcurrent::run([manifestPath]() -> PreviewLoadResult {
+        auto failure = [](const QString& message) {
+            PreviewLoadResult result;
+            result.error = message;
+            return result;
+        };
         QFile file(manifestPath);
-        if (!file.open(QIODevice::ReadOnly)) return {{}, {}, {}, QObject::tr("Cannot read Spiral preview manifest")};
+        if (!file.open(QIODevice::ReadOnly))
+            return failure(QObject::tr("Cannot read Spiral preview manifest"));
         const QJsonObject manifest = QJsonDocument::fromJson(file.readAll()).object();
         const int schemaVersion = manifest.value(QStringLiteral("schema_version")).toInt();
-        if ((schemaVersion != 1 && schemaVersion != 2)
+        if (schemaVersion != 3
             || manifest.value(QStringLiteral("kind")).toString() != QStringLiteral("spiral_combined_preview"))
-            return {{}, {}, {}, QObject::tr("Unsupported Spiral preview manifest")};
+            return failure(QObject::tr("Unsupported Spiral preview manifest"));
         QString surfacePath = manifest.value(QStringLiteral("surface_path")).toString();
         const QString surfaceId = manifest.value(QStringLiteral("surface_id")).toString();
-        if (surfacePath.isEmpty() || surfaceId.isEmpty()) return {{}, {}, {}, QObject::tr("Malformed Spiral preview manifest")};
+        if (surfacePath.isEmpty() || surfaceId.isEmpty())
+            return failure(QObject::tr("Malformed Spiral preview manifest"));
         // The manifest's surface_path is a service-host path; a cache-resident
         // artifact keeps the surface directory (named by its id) beside the
         // manifest, so prefer that local layout when it exists.
         const QString localSurfacePath = QDir(QFileInfo(manifestPath).absolutePath()).filePath(surfaceId);
         if (QFileInfo(QDir(localSurfacePath).filePath(QStringLiteral("meta.json"))).isFile())
             surfacePath = localSurfacePath;
-        const bool connected = schemaVersion >= 2;
-        const QString rangesKey = connected
-            ? QStringLiteral("winding_column_ranges")
-            : QStringLiteral("components");
-        const QJsonArray components = manifest.value(rangesKey).toArray();
+
+        const QJsonArray bounds = manifest.value(QStringLiteral("winding_bounds")).toArray();
         const QJsonArray windingIds = manifest.value(QStringLiteral("winding_ids")).toArray();
-        if (components.isEmpty() || components.size() != windingIds.size()
-            || windingIds.at(0).toInt() != 10)
-            return {{}, {}, {}, QObject::tr("Invalid Spiral preview components/winding mapping")};
+        if (bounds.isEmpty() || bounds.size() != windingIds.size()
+            || std::abs(manifest.value(QStringLiteral("output_step_vx")).toDouble()
+                        - 20.0) > 1.0e-9)
+            return failure(QObject::tr("Invalid Spiral preview winding mapping"));
         std::vector<PreviewComponent> previewComponents;
-        previewComponents.reserve(components.size());
-        int previousEnd = -1;
-        for (int index = 0; index < components.size(); ++index) {
-            const QJsonArray range = components[index].toArray();
-            const int rangeStart = range.size() == 2 ? range[0].toInt() : -1;
-            const bool invalidStart = connected
-                ? (index == 0 ? rangeStart != 0 : rangeStart != previousEnd)
-                : rangeStart <= previousEnd;
-            if (range.size() != 2 || invalidStart
-                || range[1].toInt() <= range[0].toInt()
-                || windingIds[index].toInt() != 10 + index)
-                return {{}, {}, {}, QObject::tr("Invalid Spiral winding column range")};
-            previewComponents.push_back(
-                {range[0].toInt(), range[1].toInt(), windingIds[index].toInt()});
-            previousEnd = range[1].toInt();
+        std::set<int> expectedWindingIds;
+        previewComponents.reserve(bounds.size());
+        for (int index = 0; index < bounds.size(); ++index) {
+            const QJsonObject entry = bounds[index].toObject();
+            const PreviewComponent component{
+                entry.value(QStringLiteral("row_begin")).toInt(-1),
+                entry.value(QStringLiteral("row_end")).toInt(-1),
+                entry.value(QStringLiteral("column_begin")).toInt(-1),
+                entry.value(QStringLiteral("column_end")).toInt(-1),
+                entry.value(QStringLiteral("winding")).toInt(-1),
+            };
+            if (component.rowBegin < 0 || component.rowEnd <= component.rowBegin
+                || component.columnBegin < 0
+                || component.columnEnd <= component.columnBegin
+                || component.winding != windingIds[index].toInt()
+                || component.winding < 0
+                || !expectedWindingIds.insert(component.winding).second)
+                return failure(QObject::tr("Invalid Spiral winding bounds"));
+            previewComponents.push_back(component);
         }
+
+        const QString artifactRoot = QFileInfo(manifestPath).absolutePath();
+        const QString windingMapName =
+            QDir::cleanPath(manifest.value(QStringLiteral("winding_id_map")).toString());
+        if (windingMapName.isEmpty() || QDir::isAbsolutePath(windingMapName)
+            || windingMapName == QStringLiteral("..")
+            || windingMapName.startsWith(QStringLiteral("../")))
+            return failure(QObject::tr("Invalid Spiral winding-ID map path"));
+        const QString windingMapPath = QDir(artifactRoot).filePath(windingMapName);
+        cv::Mat windingImage = cv::imread(
+            windingMapPath.toStdString(), cv::IMREAD_UNCHANGED);
+        if (windingImage.empty() || windingImage.channels() != 1)
+            return failure(QObject::tr("Cannot read Spiral winding-ID map"));
+        cv::Mat windingValues;
+        windingImage.convertTo(windingValues, CV_64F);
+        cv::Mat_<int32_t> mappedWindings;
+        mappedWindings.create(windingImage.rows, windingImage.cols);
+        std::map<int, PreviewComponent> actualBounds;
+        for (int row = 0; row < windingValues.rows; ++row) {
+            const double* values = windingValues.ptr<double>(row);
+            for (int column = 0; column < windingValues.cols; ++column) {
+                const double value = values[column];
+                const double rounded = std::nearbyint(value);
+                if (!std::isfinite(value) || std::abs(value - rounded) > 1.0e-6
+                    || rounded < -1.0
+                    || rounded > std::numeric_limits<int32_t>::max())
+                    return failure(QObject::tr(
+                        "Spiral winding-ID map contains a non-integer value"));
+                const int winding = static_cast<int>(rounded);
+                mappedWindings(row, column) = winding;
+                if (winding == -1) continue;
+                if (expectedWindingIds.find(winding)
+                    == expectedWindingIds.end())
+                    return failure(QObject::tr(
+                        "Spiral winding-ID map contains an undeclared winding"));
+                auto [found, inserted] = actualBounds.try_emplace(
+                    winding,
+                    PreviewComponent{
+                        row, row + 1, column, column + 1, winding});
+                if (!inserted) {
+                    found->second.rowBegin =
+                        std::min(found->second.rowBegin, row);
+                    found->second.rowEnd =
+                        std::max(found->second.rowEnd, row + 1);
+                    found->second.columnBegin =
+                        std::min(found->second.columnBegin, column);
+                    found->second.columnEnd =
+                        std::max(found->second.columnEnd, column + 1);
+                }
+            }
+        }
+        if (actualBounds.size() != previewComponents.size())
+            return failure(QObject::tr(
+                "Spiral winding-ID map omits a declared winding"));
+        for (const PreviewComponent& expected : previewComponents) {
+            const auto found = actualBounds.find(expected.winding);
+            if (found == actualBounds.end()
+                || found->second.rowBegin != expected.rowBegin
+                || found->second.rowEnd != expected.rowEnd
+                || found->second.columnBegin != expected.columnBegin
+                || found->second.columnEnd != expected.columnEnd)
+                return failure(QObject::tr(
+                    "Spiral winding bounds do not match the winding-ID map"));
+        }
+
         QFile metadata(QDir(surfacePath).filePath(QStringLiteral("meta.json")));
         if (!metadata.open(QIODevice::ReadOnly))
-            return {{}, {}, {}, QObject::tr("Spiral preview surface metadata is missing")};
+            return failure(QObject::tr("Spiral preview surface metadata is missing"));
         const QJsonObject meta = QJsonDocument::fromJson(metadata.readAll()).object();
-        if (meta.value(rangesKey) != manifest.value(rangesKey)
-            || meta.value(QStringLiteral("component_winding_ids")) != manifest.value(QStringLiteral("winding_ids"))
+        if (meta.value(QStringLiteral("winding_id_map"))
+                != manifest.value(QStringLiteral("winding_id_map"))
+            || meta.value(QStringLiteral("winding_bounds"))
+                != manifest.value(QStringLiteral("winding_bounds"))
+            || meta.value(QStringLiteral("component_winding_ids"))
+                != manifest.value(QStringLiteral("winding_ids"))
+            || meta.value(QStringLiteral("grid_shape"))
+                != manifest.value(QStringLiteral("grid_shape"))
+            || meta.value(QStringLiteral("output_step_vx"))
+                != manifest.value(QStringLiteral("output_step_vx"))
             || meta.value(QStringLiteral("uuid")).toString() != surfaceId)
-            return {{}, {}, {}, QObject::tr("Spiral preview metadata does not match its generation manifest")};
+            return failure(QObject::tr(
+                "Spiral preview metadata does not match its generation manifest"));
         try {
             // Keep the artifact as a lazy descriptor. Only the selected winding
             // columns are decoded when applyPreviewWindingRange() builds the
@@ -1379,8 +1167,22 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             surface->id = surfaceId.toStdString();
             surface->setStrictQuadRenderValidity(true);
             const cv::Size gridSize = surface->gridSize();
+            const QJsonArray gridShape =
+                manifest.value(QStringLiteral("grid_shape")).toArray();
+            if (mappedWindings.cols != gridSize.width
+                || mappedWindings.rows != gridSize.height
+                || gridShape.size() != 2
+                || gridShape[0].toInt(-1) != gridSize.height
+                || gridShape[1].toInt(-1) != gridSize.width)
+                return failure(QObject::tr(
+                    "Spiral winding-ID map dimensions do not match the surface"));
+            for (const PreviewComponent& component : previewComponents) {
+                if (component.rowEnd > gridSize.height
+                    || component.columnEnd > gridSize.width)
+                    return failure(QObject::tr(
+                        "Spiral winding bounds exceed the surface grid"));
+            }
             std::vector<PreviewLoadResult::LossMap> lossMaps;
-            const QString artifactRoot = QFileInfo(manifestPath).absolutePath();
             for (const QJsonValue& value : manifest.value(QStringLiteral("loss_maps")).toArray()) {
                 const QJsonObject entry = value.toObject();
                 const QString name = entry.value(QStringLiteral("name")).toString();
@@ -1419,10 +1221,30 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
                 map.supportedPixels = entry.value(QStringLiteral("supported_pixels")).toInteger();
                 lossMaps.push_back(std::move(map));
             }
-            return {surface, surfaceId, std::move(previewComponents), {},
-                    std::move(lossMaps), connected};
+            QString runDiffPath;
+            const QString runDiffRelative = QDir::cleanPath(
+                manifest.value(QStringLiteral("run_diff")).toObject()
+                    .value(QStringLiteral("path")).toString());
+            if (!runDiffRelative.isEmpty()
+                && !QDir::isAbsolutePath(runDiffRelative)
+                && runDiffRelative != QStringLiteral("..")
+                && !runDiffRelative.startsWith(QStringLiteral("../"))) {
+                const QString candidate = QDir(artifactRoot).filePath(runDiffRelative);
+                QImageReader reader(candidate);
+                if (reader.canRead() && reader.size().width() == gridSize.width
+                    && reader.size().height() == gridSize.height)
+                    runDiffPath = candidate;
+            }
+            PreviewLoadResult result;
+            result.surface = std::move(surface);
+            result.surfaceId = surfaceId;
+            result.components = std::move(previewComponents);
+            result.windingIds = std::move(mappedWindings);
+            result.lossMaps = std::move(lossMaps);
+            result.runDiffImagePath = runDiffPath;
+            return result;
         } catch (const std::exception& error) {
-            return {{}, {}, {}, QString::fromUtf8(error.what())};
+            return failure(QString::fromUtf8(error.what()));
         }
     }));
 }
@@ -1430,18 +1252,11 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
 void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 generation)
 {
     if (!result.surface) { statusBar()->showMessage(result.error, 15000); return; }
-    _flattenedPreviewActive = false;
-    if (_haveRunDiffBaseline && _previewSource) {
-        _runDiffPreviousSource = _previewSource;
-        _runDiffPreviousComponents = _previewComponents;
-    } else {
-        _runDiffPreviousSource.reset();
-        _runDiffPreviousComponents.clear();
-    }
     _previewSource = result.surface;
     _previewSourceId = result.surfaceId;
     _previewComponents = result.components;
-    _previewConnected = result.connected;
+    _previewWindingIds = result.windingIds;
+    _previewRunDiffImagePath = result.runDiffImagePath;
     ++_runDiffRequestRevision;
     _previewRunDiffImage = {};
     _previewLossMaps.clear();
@@ -1456,237 +1271,61 @@ void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 gen
     _overlay->publishRunDiff({}, {});
     _overlay->publishLossMap({}, {}, _lossMapOpacity);
     applyPreviewWindingRange(false);
-    _haveRunDiffBaseline = true;
-    updateLasagnaFlattenAvailability();
+    if (_runDiffVisible) loadRunDiff();
 }
 
 void SpiralWorkspace::loadRunDiff()
 {
-    ++_runDiffRequestRevision;
+    const quint64 requestRevision = ++_runDiffRequestRevision;
     _previewRunDiffImage = {};
-    if (!_runDiffVisible || _flattenedPreviewActive || !_runDiffPreviousSource
-        || !_currentPreview || _currentPreviewComponents.empty()) {
+    if (!_runDiffVisible || !_currentPreview
+        || _previewRunDiffImagePath.isEmpty()) {
         updateRunDiffOverlay();
         return;
     }
-
-    std::vector<PreviewComponent> previousSelected;
-    for (const PreviewComponent& component : _runDiffPreviousComponents) {
-        if (component.winding < _minimumDisplayedWinding) continue;
-        if (_maximumDisplayedWinding >= 0
-            && component.winding > _maximumDisplayedWinding)
-            continue;
-        previousSelected.push_back(component);
-    }
-    if (previousSelected.empty()) {
-        updateRunDiffOverlay();
-        return;
-    }
-
-    const int firstColumn = previousSelected.front().firstColumn;
-    const int endColumn = previousSelected.back().endColumn;
-    const cv::Size previousGridSize = _runDiffPreviousSource->gridSize();
-    if (firstColumn < 0 || endColumn > previousGridSize.width
-        || firstColumn >= endColumn || previousGridSize.height <= 0) {
-        updateRunDiffOverlay();
-        return;
-    }
-    for (PreviewComponent& component : previousSelected) {
-        component.firstColumn -= firstColumn;
-        component.endColumn -= firstColumn;
-    }
-
-    const auto previousSource = _runDiffPreviousSource;
     const auto current = _currentPreview;
-    const auto currentComponents = _currentPreviewComponents;
-    const qint64 generation = _requestedPreviewGeneration;
-    const quint64 displayRevision = _previewDisplayRevision;
-    const quint64 requestRevision = _runDiffRequestRevision;
-    const cv::Rect region(firstColumn, 0, endColumn - firstColumn,
-                          previousGridSize.height);
+    const QString imagePath = _previewRunDiffImagePath;
+    const auto selection = displayedPreviewSelection();
+    if (!selection) {
+        updateRunDiffOverlay();
+        return;
+    }
     auto* watcher = new QFutureWatcher<QImage>(this);
     connect(watcher, &QFutureWatcher<QImage>::finished, this,
-            [this, watcher, previousSource, current, generation,
-             displayRevision, requestRevision]() {
+            [this, watcher, current, requestRevision]() {
                 const QImage image = watcher->result();
                 watcher->deleteLater();
                 if (_shuttingDown || !_runDiffVisible
-                    || generation != _requestedPreviewGeneration
-                    || displayRevision != _previewDisplayRevision
                     || requestRevision != _runDiffRequestRevision
-                    || previousSource != _runDiffPreviousSource
                     || current != _currentPreview)
                     return;
                 _previewRunDiffImage = image;
                 updateRunDiffOverlay();
             });
-    watcher->setFuture(QtConcurrent::run(
-        [previousSource, previousSelected, current, currentComponents, region]() {
-            try {
-                auto loaded = load_quad_from_tifxyz_region(
-                    previousSource->path, region);
-                auto previous = std::shared_ptr<QuadSurface>(std::move(loaded));
-                return buildRunDiffImage(previous, previousSelected,
-                                         current, currentComponents);
-            } catch (const std::exception&) {
-                return QImage{};
-            }
-        }));
-}
-
-QImage SpiralWorkspace::buildRunDiffImage(
-    const std::shared_ptr<QuadSurface>& previous,
-    const std::vector<PreviewComponent>& previousComponents,
-    const std::shared_ptr<QuadSurface>& current,
-    const std::vector<PreviewComponent>& currentComponents)
-{
-    if (!previous || !current) return {};
-    const cv::Mat_<cv::Vec3f>* previousPoints = previous->rawPointsPtr();
-    const cv::Mat_<cv::Vec3f>* currentPoints = current->rawPointsPtr();
-    if (!previousPoints || !currentPoints || previousPoints->empty() || currentPoints->empty())
-        return {};
-
-    std::unordered_map<int, PreviewComponent> previousByWinding;
-    previousByWinding.reserve(previousComponents.size());
-    for (const PreviewComponent& component : previousComponents)
-        previousByWinding.emplace(component.winding, component);
-
-    struct ComponentPair {
-        PreviewComponent previous;
-        PreviewComponent current;
-        int width = 0;
-    };
-    std::vector<ComponentPair> pairs;
-    pairs.reserve(currentComponents.size());
-    for (const PreviewComponent& currentComponent : currentComponents) {
-        const auto found = previousByWinding.find(currentComponent.winding);
-        if (found == previousByWinding.end()) continue;
-        const int width = std::min(
-            currentComponent.endColumn - currentComponent.firstColumn,
-            found->second.endColumn - found->second.firstColumn);
-        if (width > 0)
-            pairs.push_back({found->second, currentComponent, width});
-    }
-
-    const int commonRows = std::min(previousPoints->rows, currentPoints->rows);
-    auto forEachMagnitude = [&](const auto& visitor) {
-        for (const ComponentPair& pair : pairs) {
-            for (int row = 0; row < commonRows; ++row) {
-                for (int offset = 0; offset < pair.width; ++offset) {
-                    const int currentColumn = pair.current.firstColumn + offset;
-                    const int previousColumn = pair.previous.firstColumn + offset;
-                    if (currentColumn < 0 || currentColumn >= currentPoints->cols
-                        || previousColumn < 0
-                        || previousColumn >= previousPoints->cols)
-                        continue;
-                    const cv::Vec3f& before =
-                        (*previousPoints)(row, previousColumn);
-                    const cv::Vec3f& after =
-                        (*currentPoints)(row, currentColumn);
-                    if (before[0] == -1.0f || after[0] == -1.0f
-                        || !std::isfinite(before[0])
-                        || !std::isfinite(before[1])
-                        || !std::isfinite(before[2])
-                        || !std::isfinite(after[0])
-                        || !std::isfinite(after[1])
-                        || !std::isfinite(after[2]))
-                        continue;
-                    const cv::Vec3f delta = after - before;
-                    const float magnitude = std::sqrt(delta.dot(delta));
-                    if (!(magnitude > 1e-6f)
-                        || !std::isfinite(magnitude))
-                        continue;
-                    visitor(row, currentColumn, magnitude);
-                }
-            }
-        }
-    };
-
-    float minimumPositive = std::numeric_limits<float>::infinity();
-    float maximum = 0.0f;
-    std::size_t changedCount = 0;
-    forEachMagnitude([&](int, int, float magnitude) {
-        minimumPositive = std::min(minimumPositive, magnitude);
-        maximum = std::max(maximum, magnitude);
-        ++changedCount;
-    });
-
-    QImage image(currentPoints->cols, currentPoints->rows, QImage::Format_ARGB32);
-    if (image.isNull()) return {};
-    image.fill(Qt::transparent);
-    if (changedCount == 0) return image;
-
-    // Revisit the compact ranges to build a logarithmic histogram. The extra
-    // arithmetic pass is much cheaper than retaining a surface-sized float
-    // magnitude matrix.
-    constexpr std::size_t histogramSize = 2048;
-    std::array<std::size_t, histogramSize> histogram{};
-    const double logMinimum = std::log(static_cast<double>(minimumPositive));
-    const double logMaximum = std::log(static_cast<double>(maximum));
-    const double logSpan = logMaximum - logMinimum;
-    forEachMagnitude([&](int, int, float magnitude) {
-        std::size_t bin = 0;
-        if (logSpan > 1e-12) {
-            const double fraction =
-                (std::log(static_cast<double>(magnitude)) - logMinimum)
-                / logSpan;
-            bin = std::min(histogramSize - 1,
-                           static_cast<std::size_t>(
-                               fraction * histogramSize));
-        }
-        ++histogram[bin];
-    });
-    const std::size_t percentileTarget = (changedCount * 95 + 99) / 100;
-    std::size_t accumulated = 0;
-    std::size_t percentileBin = histogramSize - 1;
-    for (std::size_t bin = 0; bin < histogramSize; ++bin) {
-        accumulated += histogram[bin];
-        if (accumulated >= percentileTarget) {
-            percentileBin = bin;
-            break;
-        }
-    }
-    const float displayMaximum = logSpan > 1e-12
-        ? static_cast<float>(std::exp(logMinimum
-              + logSpan * static_cast<double>(percentileBin + 1) / histogramSize))
-        : maximum;
-
-    const double displayLogMaximum = std::log(static_cast<double>(displayMaximum));
-    const double displayLogSpan = displayLogMaximum - logMinimum;
-    forEachMagnitude([&](int row, int col, float magnitude) {
-        QRgb* pixels = reinterpret_cast<QRgb*>(image.scanLine(row));
-        const float magnitudeFraction = displayLogSpan > 1e-12
-            ? static_cast<float>(
-                  (std::log(static_cast<double>(magnitude)) - logMinimum)
-                  / displayLogSpan)
-            : 1.0f;
-        pixels[col] = runDiffMagnitudeColor(magnitudeFraction);
-    });
-    return image;
+    watcher->setFuture(QtConcurrent::run([imagePath, region = selection->region]() {
+        const QImage image(imagePath);
+        if (image.isNull()) return QImage{};
+        return image.copy(region.x, region.y, region.width, region.height)
+            .convertToFormat(QImage::Format_ARGB32);
+    }));
 }
 
 void SpiralWorkspace::updateRunDiffOverlay()
 {
-    if (_flattenedPreviewActive) {
-        _overlay->publishRunDiff({}, {});
-        return;
-    }
     if (!_runDiffVisible || !_currentPreview || _previewRunDiffImage.isNull()) {
         _overlay->publishRunDiff({}, {});
         return;
     }
-    _overlay->publishRunDiff(_currentPreview, _previewRunDiffImage);
+    _overlay->publishRunDiff(
+        _currentPreview,
+        maskOverlayToSurface(_previewRunDiffImage, _currentPreview));
 }
 
 void SpiralWorkspace::updateLossMapOverlay()
 {
-    if (_flattenedPreviewActive) {
-        _overlay->publishLossMap({}, {}, _lossMapOpacity);
-        return;
-    }
     const auto found = _previewLossMaps.constFind(_selectedLossMap);
     if (_selectedLossMap.isEmpty() || found == _previewLossMaps.constEnd()
-        || !_currentPreview || _currentPreviewComponents.empty()
+        || !_currentPreview
         || found->imagePath.isEmpty()) {
         _overlay->publishLossMap({}, {}, _lossMapOpacity);
         _panel->setLossMapLegend({});
@@ -1722,33 +1361,24 @@ void SpiralWorkspace::updateLossMapOverlay()
             .arg(map.offSurfaceSampleCount)
             .arg(map.omittedSampleCount)
             .arg(map.eligibleSampleCount));
-    if (_currentPreview == _previewSource) {
-        _overlay->publishLossMap(_currentPreview, _loadedLossMapImage, _lossMapOpacity);
-        return;
-    }
-
-    std::vector<PreviewComponent> selected;
-    for (const PreviewComponent& component : _previewComponents) {
-        if (component.winding < _minimumDisplayedWinding) continue;
-        if (_maximumDisplayedWinding >= 0 && component.winding > _maximumDisplayedWinding)
-            continue;
-        selected.push_back(component);
-    }
-    if (selected.empty()) {
+    const auto selection = displayedPreviewSelection();
+    if (!selection) {
         _overlay->publishLossMap({}, {}, _lossMapOpacity);
         return;
     }
-    const int firstColumn = selected.front().firstColumn;
-    const int endColumn = selected.back().endColumn;
-    if (firstColumn < 0 || endColumn > _loadedLossMapImage.width()
-        || firstColumn >= endColumn) {
+    const cv::Rect& region = selection->region;
+    if (region.x < 0 || region.y < 0
+        || region.x + region.width > _loadedLossMapImage.width()
+        || region.y + region.height > _loadedLossMapImage.height()) {
         _overlay->publishLossMap({}, {}, _lossMapOpacity);
         return;
     }
     _overlay->publishLossMap(
         _currentPreview,
-        _loadedLossMapImage.copy(firstColumn, 0, endColumn - firstColumn,
-                                 _loadedLossMapImage.height()),
+        maskOverlayToSurface(
+            _loadedLossMapImage.copy(
+                region.x, region.y, region.width, region.height),
+            _currentPreview),
         _lossMapOpacity);
 }
 
@@ -1765,23 +1395,21 @@ SpiralWorkspace::displayedPreviewSelection() const
         selected.push_back(component);
     }
     if (selected.empty()) return std::nullopt;
-    const int firstColumn = selected.front().firstColumn;
-    const int endColumn = selected.back().endColumn;
+    int rowBegin = std::numeric_limits<int>::max();
+    int rowEnd = 0;
+    int columnBegin = std::numeric_limits<int>::max();
+    int columnEnd = 0;
+    for (const PreviewComponent& component : selected) {
+        rowBegin = std::min(rowBegin, component.rowBegin);
+        rowEnd = std::max(rowEnd, component.rowEnd);
+        columnBegin = std::min(columnBegin, component.columnBegin);
+        columnEnd = std::max(columnEnd, component.columnEnd);
+    }
     PreviewDisplaySelection selection;
-    selection.firstColumn = firstColumn;
-    selection.endColumn = endColumn;
-    selection.diffComponents = selected;
-    for (PreviewComponent& component : selection.diffComponents) {
-        component.firstColumn -= firstColumn;
-        component.endColumn -= firstColumn;
-    }
-    if (!_previewConnected) {
-        selection.surfaceComponents.reserve(selected.size());
-        for (const PreviewComponent& component : selection.diffComponents) {
-            selection.surfaceComponents.emplace_back(component.firstColumn,
-                                                     component.endColumn);
-        }
-    }
+    selection.region = cv::Rect(
+        columnBegin, rowBegin, columnEnd - columnBegin, rowEnd - rowBegin);
+    selection.minimumWinding = _minimumDisplayedWinding;
+    selection.maximumWinding = _maximumDisplayedWinding;
     selection.registrationId = QStringLiteral("%1-display-%2")
                                    .arg(_previewSourceId)
                                    .arg(_previewDisplayRevision);
@@ -1790,11 +1418,10 @@ SpiralWorkspace::displayedPreviewSelection() const
 
 void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
 {
-    if (_shuttingDown || !_previewSource || _flattenedPreviewActive) return;
+    if (_shuttingDown || !_previewSource) return;
     const quint64 revision = ++_previewDisplayRevision;
     ++_runDiffRequestRevision;
     _previewRunDiffImage = {};
-    _currentPreviewComponents.clear();
     _overlay->publishRunDiff({}, {});
     _overlay->publishLossMap({}, {}, _lossMapOpacity);
 
@@ -1803,7 +1430,6 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
         if (_outputVisible) _state->setSurface("segmentation", nullptr);
         const QString previousRegistration = _currentPreviewRegistrationId;
         _currentPreview.reset();
-        _currentPreviewComponents.clear();
         _brush->setPaintSurface({});
         _currentPreviewRegistrationId.clear();
         updateSurfaceIntersections();
@@ -1814,18 +1440,18 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
 
     const auto source = _previewSource;
     const cv::Size sourceSize = source->gridSize();
-    if (selection->firstColumn < 0
-        || selection->endColumn > sourceSize.width
-        || selection->firstColumn >= selection->endColumn
-        || sourceSize.height <= 0) {
+    if (selection->region.x < 0 || selection->region.y < 0
+        || selection->region.width <= 0 || selection->region.height <= 0
+        || selection->region.x + selection->region.width > sourceSize.width
+        || selection->region.y + selection->region.height > sourceSize.height) {
         statusBar()->showMessage(tr("Spiral preview winding range is out of bounds"),
                                  15000);
         return;
     }
     const qint64 generation = _requestedPreviewGeneration;
-    const cv::Rect region(selection->firstColumn, 0,
-                          selection->endColumn - selection->firstColumn,
-                          sourceSize.height);
+    const cv::Rect region = selection->region;
+    const cv::Mat_<int32_t> windingRegion =
+        _previewWindingIds(region).clone();
     auto* watcher =
         new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
     connect(watcher,
@@ -1849,15 +1475,26 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
                                    preview);
                 installPreviewAliasWhenIndexed(
                     preview, selection.registrationId, generation, revision,
-                    preserveFocus, 0, selection.diffComponents);
+                    preserveFocus, 0);
             });
     watcher->setFuture(QtConcurrent::run(
-        [source, selection = *selection, region]() {
+        [source, selection = *selection, region, windingRegion]() {
             try {
                 auto loaded =
                     load_quad_from_tifxyz_region(source->path, region);
                 loaded->id = selection.registrationId.toStdString();
-                loaded->setComponents(selection.surfaceComponents);
+                cv::Mat_<cv::Vec3f>* points = loaded->rawPointsPtr();
+                for (int row = 0; row < points->rows; ++row) {
+                    for (int column = 0; column < points->cols; ++column) {
+                        const int winding = windingRegion(row, column);
+                        if (winding < selection.minimumWinding
+                            || (selection.maximumWinding >= 0
+                                && winding > selection.maximumWinding)) {
+                            (*points)(row, column) =
+                                cv::Vec3f(-1.0f, -1.0f, -1.0f);
+                        }
+                    }
+                }
                 loaded->setStrictQuadRenderValidity(true);
                 return std::shared_ptr<QuadSurface>(std::move(loaded));
             } catch (const std::exception&) {
@@ -1868,8 +1505,7 @@ void SpiralWorkspace::applyPreviewWindingRange(bool preserveFocus)
 
 void SpiralWorkspace::installPreviewAliasWhenIndexed(
     const std::shared_ptr<QuadSurface>& preview, const QString& registrationId,
-    qint64 generation, quint64 revision, bool preserveFocus, int attempt,
-    std::vector<PreviewComponent> diffComponents)
+    qint64 generation, quint64 revision, bool preserveFocus, int attempt)
 {
     const bool stale = _shuttingDown || generation != _requestedPreviewGeneration
                        || revision != _previewDisplayRevision;
@@ -1888,17 +1524,14 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
             return;
         }
         QTimer::singleShot(50, this, [this, preview, registrationId, generation,
-                                     revision, preserveFocus, attempt,
-                                     diffComponents]() {
+                                     revision, preserveFocus, attempt]() {
             installPreviewAliasWhenIndexed(preview, registrationId, generation, revision,
-                                           preserveFocus, attempt + 1,
-                                           diffComponents);
+                                           preserveFocus, attempt + 1);
         });
         return;
     }
     const QString previousRegistration = _currentPreviewRegistrationId;
     _currentPreview = preview;
-    _currentPreviewComponents = std::move(diffComponents);
     _brush->setPaintSurface(preview);
     _currentPreviewRegistrationId = registrationId;
     if (_outputVisible) _state->setSurface("segmentation", preview, false, preserveFocus);

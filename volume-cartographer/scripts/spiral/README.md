@@ -74,6 +74,16 @@ dataset-derived `.spiral-cache` remain shared. Two live services cannot own the
 same dataset/session-name pair. Launches without `--session-name` retain the
 legacy `<dataset>/spiral_output/` layout.
 
+Every completed Spiral preview is flattened by the host's Lasagna service
+before it becomes downloadable in VC3D. The published grid uses a fixed
+20-voxel output step: each dimension is
+`ceil(((source_points - 1) * source_step) / 20) + 1`. Winding membership,
+loss-map overlays, and run differences are transferred through Lasagna's
+output-to-source correspondence so they remain aligned when the output grid
+dimensions differ from the Spiral grid. If flattening or artifact mapping
+fails, the service reports the publication error and VC3D keeps displaying the
+previous successfully published preview.
+
 On first start the service generates a strong API key at
 `~/.config/vc3d/spiral_api_key` (mode `0600`) and prints it to the console.
 For an SSH profile you never copy it: VC3D reads that file over SSH.

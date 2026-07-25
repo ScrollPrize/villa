@@ -2,7 +2,9 @@
 	"args": {
 		"model-init": "flatten",
 		"flatten_solver": "forward",
-		"flatten_initial_inversion": false
+		"flatten_initial_inversion": false,
+		"flatten_output_step": 20.0,
+		"flatten_output_margin": 0.0
 	},
 	"base": {
 		"flatten_sdir": 1.0,

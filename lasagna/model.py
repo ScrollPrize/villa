@@ -553,12 +553,26 @@ class Model3D(nn.Module):
 		return count
 
 	@staticmethod
-	def _flatten_output_shape_for_source(h: int, w: int) -> tuple[int, int]:
-		def _scaled_vertex_count(n: int) -> int:
-			extent = max(1, int(n) - 1)
-			return max(2, int(math.ceil(float(extent) * 1.2)) + 1)
+	def _flatten_output_shape_for_source(
+		h: int,
+		w: int,
+		*,
+		source_step: float,
+		output_step: float,
+	) -> tuple[int, int]:
+		"""Derive vertex counts from physical span and requested density."""
+		if not math.isfinite(float(source_step)) or float(source_step) <= 0.0:
+			raise ValueError("flatten source_step must be finite and positive")
+		if not math.isfinite(float(output_step)) or float(output_step) <= 0.0:
+			raise ValueError("flatten output_step must be finite and positive")
 
-		return _scaled_vertex_count(h), _scaled_vertex_count(w)
+		def _vertex_count(n: int) -> int:
+			# N vertices contain N-1 physical intervals.
+			intervals = max(1, int(n) - 1)
+			physical_span = float(intervals) * float(source_step)
+			return max(2, int(math.ceil(physical_span / float(output_step))) + 1)
+
+		return _vertex_count(h), _vertex_count(w)
 
 	@staticmethod
 	def _centered_flatten_source_map(
@@ -3084,7 +3098,12 @@ class Model3D(nn.Module):
 		xyz = source_xyz.detach().cpu().numpy().astype(np.float64, copy=False)
 		cell_valid = source_cell_valid.detach().cpu().numpy().astype(bool, copy=False)
 		Hs, Ws = int(uv.shape[0]), int(uv.shape[1])
-		min_h, min_w = min_shape if min_shape is not None else Model3D._flatten_output_shape_for_source(Hs, Ws)
+		min_h, min_w = min_shape if min_shape is not None else Model3D._flatten_output_shape_for_source(
+			Hs,
+			Ws,
+			source_step=1.0,
+			output_step=1.0,
+		)
 		min_h = max(2, int(min_h))
 		min_w = max(2, int(min_w))
 
@@ -3145,17 +3164,28 @@ class Model3D(nn.Module):
 		lo = uv_corners.min(axis=0)
 		hi = uv_corners.max(axis=0)
 		span = np.maximum(hi - lo, 1.0)
-		pad = np.maximum(float(output_margin), 0.0) * span
-		lo = lo - pad
-		hi = hi + pad
-		out_h = max(min_h, int(math.ceil(float(hi[0] - lo[0]))) + 1)
-		out_w = max(min_w, int(math.ceil(float(hi[1] - lo[1]))) + 1)
-		if out_h > int(math.ceil(float(hi[0] - lo[0]))) + 1:
-			extra = 0.5 * float(out_h - (int(math.ceil(float(hi[0] - lo[0]))) + 1))
-			lo[0] -= extra
-		if out_w > int(math.ceil(float(hi[1] - lo[1]))) + 1:
-			extra = 0.5 * float(out_w - (int(math.ceil(float(hi[1] - lo[1]))) + 1))
-			lo[1] -= extra
+		if min_shape is not None and float(output_margin) <= 0.0:
+			# The caller supplied the density-derived output shape.  Center the
+			# optimized UV extent in that exact grid instead of silently
+			# increasing the number of samples.
+			out_h, out_w = min_h, min_w
+			center = 0.5 * (lo + hi)
+			lo = center - 0.5 * np.asarray(
+				[max(0, out_h - 1), max(0, out_w - 1)],
+				dtype=np.float64,
+			)
+		else:
+			pad = np.maximum(float(output_margin), 0.0) * span
+			lo = lo - pad
+			hi = hi + pad
+			out_h = max(min_h, int(math.ceil(float(hi[0] - lo[0]))) + 1)
+			out_w = max(min_w, int(math.ceil(float(hi[1] - lo[1]))) + 1)
+			if out_h > int(math.ceil(float(hi[0] - lo[0]))) + 1:
+				extra = 0.5 * float(out_h - (int(math.ceil(float(hi[0] - lo[0]))) + 1))
+				lo[0] -= extra
+			if out_w > int(math.ceil(float(hi[1] - lo[1]))) + 1:
+				extra = 0.5 * float(out_w - (int(math.ceil(float(hi[1] - lo[1]))) + 1))
+				lo[1] -= extra
 
 		centers = 0.25 * (q00 + q10 + q01 + q11)
 		k = max(1, min(int(k_candidates), int(centers.shape[0])))
@@ -3311,6 +3341,7 @@ class Model3D(nn.Module):
 		flatten_filter_radius: int = 2,
 		flatten_direction: str = "inverse",
 		flatten_output_margin: float = 0.10,
+		flatten_output_step: float | None = None,
 	) -> None:
 		if xyz.ndim != 3 or int(xyz.shape[-1]) != 3:
 			raise ValueError(f"flatten source xyz must have shape (H,W,3), got {tuple(xyz.shape)}")
@@ -3323,7 +3354,17 @@ class Model3D(nn.Module):
 		xyz_dev = xyz.detach().to(device=device, dtype=torch.float32)
 		valid_dev = valid.detach().to(device=device, dtype=torch.bool) & torch.isfinite(xyz_dev).all(dim=-1)
 		xyz_dev = torch.where(valid_dev.unsqueeze(-1), xyz_dev, torch.zeros_like(xyz_dev))
-		Hout, Wout = self._flatten_output_shape_for_source(H, W)
+		output_step = (
+			float(mesh_step)
+			if flatten_output_step is None
+			else float(flatten_output_step)
+		)
+		Hout, Wout = self._flatten_output_shape_for_source(
+			H,
+			W,
+			source_step=float(mesh_step),
+			output_step=output_step,
+		)
 		direction = self._normalize_flatten_direction(flatten_direction)
 		map_h, map_w = (H, W) if direction == "forward" else (Hout, Wout)
 
@@ -3333,13 +3374,13 @@ class Model3D(nn.Module):
 		self.pyramid_d = False
 		self.params = replace(
 			self.params,
-			mesh_step=int(mesh_step),
+			mesh_step=max(1, int(round(output_step))),
 			winding_step=int(winding_step),
 			subsample_mesh=int(subsample_mesh),
 			subsample_winding=int(subsample_winding),
 			pyramid_d=False,
-			model_h=float(max(1, Hout - 1) * max(1, int(mesh_step))),
-			model_w=float(max(1, Wout - 1) * max(1, int(mesh_step))),
+			model_h=float(max(1, Hout - 1) * output_step),
+			model_w=float(max(1, Wout - 1) * output_step),
 		)
 		self.conn_offsets = torch.zeros(4, 1, map_h, map_w, device=device, dtype=torch.float32)
 		self.amp = nn.Parameter(torch.ones(1, 1, map_h, map_w, device=device, dtype=torch.float32), requires_grad=False)
@@ -3374,11 +3415,11 @@ class Model3D(nn.Module):
 			if direction == "forward"
 			else torch.empty(0, 0, 3, device=device, dtype=torch.float32)
 		)
-		self.flatten_target_step = self._measured_flatten_target_step(
-			xyz_dev,
-			valid_dev,
-			fallback=float(mesh_step),
-		).detach()
+		self.flatten_target_step = torch.tensor(
+			output_step,
+			device=device,
+			dtype=torch.float32,
+		)
 		if direction == "forward":
 			identity = self._centered_flatten_forward_uv_map(
 				source_h=H,
@@ -3439,9 +3480,20 @@ class Model3D(nn.Module):
 		flatten_filter_radius: int = 2,
 		flatten_direction: str = "inverse",
 		flatten_output_margin: float = 0.10,
+		flatten_output_step: float | None = None,
 	) -> "Model3D":
 		H, W, _ = xyz.shape
-		Hout, Wout = Model3D._flatten_output_shape_for_source(H, W)
+		output_step = (
+			float(mesh_step)
+			if flatten_output_step is None
+			else float(flatten_output_step)
+		)
+		Hout, Wout = Model3D._flatten_output_shape_for_source(
+			H,
+			W,
+			source_step=float(mesh_step),
+			output_step=output_step,
+		)
 		direction = Model3D._normalize_flatten_direction(flatten_direction)
 		init_h, init_w = (H, W) if direction == "forward" else (Hout, Wout)
 		mdl = Model3D(
@@ -3468,6 +3520,7 @@ class Model3D(nn.Module):
 			flatten_filter_radius=flatten_filter_radius,
 			flatten_direction=direction,
 			flatten_output_margin=flatten_output_margin,
+			flatten_output_step=output_step,
 		)
 		return mdl
 

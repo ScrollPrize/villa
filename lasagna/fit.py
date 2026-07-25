@@ -1321,6 +1321,10 @@ def _run_flatten_mode(
 		"flatten_output_margin",
 		flatten_args.get("flatten_forward_output_margin", 0.10),
 	))
+	flatten_output_step = float(flatten_args.get(
+		"flatten_output_step",
+		mesh_step,
+	))
 	filter_source_angles = _truthy_config_bool(flatten_args.get("flatten_filter_source_angles", True))
 	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
 	filter_radius = int(flatten_args.get("flatten_filter_radius", 2))
@@ -1338,6 +1342,7 @@ def _run_flatten_mode(
 		flatten_filter_radius=filter_radius,
 		flatten_direction=flatten_direction,
 		flatten_output_margin=flatten_output_margin,
+		flatten_output_step=flatten_output_step,
 	)
 	data = _dummy_flatten_data()
 

@@ -408,6 +408,11 @@ class InteractiveFitSession:
         with self._condition:
             self._preview_generation = generation
             self._preview_manifest = str(manifest["manifest_path"])
+        # Publish while the session is still in ExportingPreview.  The host
+        # service synchronously Lasagna-flattens and packages this generation
+        # from the status callback, so clients cannot start another Run while
+        # the downloadable preview is still being prepared.
+        self._publish_status()
 
     def session_finished(self):
         raise RuntimeError("Interactive optimizer loop ended unexpectedly")

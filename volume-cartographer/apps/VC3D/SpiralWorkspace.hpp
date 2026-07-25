@@ -6,11 +6,12 @@
 #include <QImage>
 #include <QJsonObject>
 #include <QColor>
-#include <QPointer>
 #include <QSet>
 #include <QStringList>
+#include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -23,7 +24,6 @@ class CState;
 class ConsoleOutputWidget;
 class QDialog;
 class QKeyEvent;
-class QProgressDialog;
 class QuadSurface;
 class SpiralPanel;
 class SpiralServiceManager;
@@ -60,14 +60,17 @@ protected:
 
 private:
     struct PreviewComponent {
-        int firstColumn = 0;
-        int endColumn = 0;
+        int rowBegin = 0;
+        int rowEnd = 0;
+        int columnBegin = 0;
+        int columnEnd = 0;
         int winding = 0;
     };
     struct PreviewLoadResult {
         std::shared_ptr<QuadSurface> surface;
         QString surfaceId;
         std::vector<PreviewComponent> components;
+        cv::Mat_<int32_t> windingIds;
         QString error;
         struct LossMap {
             QString name;
@@ -85,13 +88,12 @@ private:
             qint64 supportedPixels = 0;
         };
         std::vector<LossMap> lossMaps;
-        bool connected = false;
+        QString runDiffImagePath;
     };
     struct PreviewDisplaySelection {
-        int firstColumn = 0;
-        int endColumn = 0;
-        std::vector<PreviewComponent> diffComponents;
-        std::vector<std::pair<int, int>> surfaceComponents;
+        cv::Rect region;
+        int minimumWinding = 0;
+        int maximumWinding = -1;
         QString registrationId;
     };
     struct InputSurfaceEntry {
@@ -112,19 +114,13 @@ private:
     void installPreview(const PreviewLoadResult& result, qint64 generation);
     void applyPreviewWindingRange(bool preserveFocus);
     void loadRunDiff();
-    static QImage buildRunDiffImage(
-        const std::shared_ptr<QuadSurface>& previous,
-        const std::vector<PreviewComponent>& previousComponents,
-        const std::shared_ptr<QuadSurface>& current,
-        const std::vector<PreviewComponent>& currentComponents);
     void updateRunDiffOverlay();
     void updateLossMapOverlay();
     std::optional<PreviewDisplaySelection> displayedPreviewSelection() const;
     void installPreviewAliasWhenIndexed(const std::shared_ptr<QuadSurface>& preview,
                                         const QString& registrationId,
                                         qint64 generation, quint64 revision,
-                                        bool preserveFocus, int attempt,
-                                        std::vector<PreviewComponent> diffComponents = {});
+                                        bool preserveFocus, int attempt);
     void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
     void registerPendingPatchSurface(const QString& inputId,
@@ -140,13 +136,6 @@ private:
     void ensureInitialFocus();
     void initializePreviewFocus();
     void mirrorFocusToMainWorkspace(const cv::Vec3f& position);
-    void updateLasagnaFlattenAvailability();
-    void startLasagnaFlatten();
-    void updateLasagnaFlattenProgress(const QJsonObject& job);
-    void failLasagnaFlatten(const QString& error, bool cancelled = false);
-    void closeLasagnaFlattenProgress();
-    void handleLasagnaResults(const QString& tifxyzDirectory,
-                              const QString& outputName);
 
     CState* _mainState = nullptr;
     CState* _state = nullptr;
@@ -175,11 +164,9 @@ private:
     std::shared_ptr<QuadSurface> _previewSource;
     QString _previewSourceId;
     std::vector<PreviewComponent> _previewComponents;
-    bool _previewConnected = false;
-    std::shared_ptr<QuadSurface> _runDiffPreviousSource;
-    std::vector<PreviewComponent> _runDiffPreviousComponents;
+    cv::Mat_<int32_t> _previewWindingIds;
+    QString _previewRunDiffImagePath;
     std::shared_ptr<QuadSurface> _currentPreview;
-    std::vector<PreviewComponent> _currentPreviewComponents;
     QString _currentPreviewRegistrationId;
     QImage _previewRunDiffImage;
     QHash<QString, PreviewLoadResult::LossMap> _previewLossMaps;
@@ -195,15 +182,7 @@ private:
     bool _showSurfaceIntersections = true;
     bool _showSurfaceOverlap = true;
     bool _pendingPatchesOnly = false;
-    bool _haveRunDiffBaseline = false;
     bool _runDiffVisible = false;
-    bool _flattenedPreviewActive = false;
-    bool _lasagnaFlattenRunning = false;
-    bool _lasagnaFlattenCancelRequested = false;
-    QString _pendingLasagnaOutputName;
-    std::shared_ptr<QuadSurface> _pendingLasagnaSource;
-    QPointer<QProgressDialog> _lasagnaFlattenProgress;
-    bool _updatingLasagnaFlattenProgress = false;
     // True while the focus is the automatic volume-center default (no user
     // interaction and no preview yet); the first preview may then retarget it.
     bool _focusIsAutoDefault = false;

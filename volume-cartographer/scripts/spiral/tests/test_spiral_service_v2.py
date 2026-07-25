@@ -34,7 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import spiral_service
 from spiral_service import (ApiError, ArtifactRegistry, ExclusiveFileLock,
                             FileLockUnavailable, ServiceLogBuffer, ServiceState,
-                            SpiralServer, _prepare_cleaned_lasagna_surface,
+                            SpiralServer, _mapped_winding_ids,
+                            _prepare_cleaned_lasagna_surface,
+                            _raw_run_diff_rgba, _sample_rgba_through_map,
                             load_or_create_api_key, parse_gpu_ids,
                             parse_session_name)
 from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
@@ -1334,6 +1336,83 @@ class CommitTests(unittest.TestCase):
         self.assertIn("read-only", status["commit_unavailable_reason"])
         with self.assertRaisesRegex(ApiError, "read-only"):
             self.state.commit_inputs()
+
+
+class MappedPreviewArtifactTests(unittest.TestCase):
+    def test_winding_membership_uses_flatten_correspondence(self):
+        manifest = {
+            "winding_ids": [7, 9],
+            "winding_column_ranges": [[0, 2], [2, 4]],
+        }
+        source_yx = np.asarray([
+            [[0.0, 3.0], [1.0, 0.0], [1.0, 2.0]],
+            [[9.0, 9.0], [0.0, 1.0], [0.0, 2.0]],
+        ], dtype=np.float32)
+        output_valid = np.asarray([
+            [True, True, True],
+            [True, False, True],
+        ])
+
+        winding_ids, bounds = _mapped_winding_ids(
+            manifest, (2, 4), source_yx, output_valid)
+
+        np.testing.assert_array_equal(winding_ids, np.asarray([
+            [9, 7, 9],
+            [-1, -1, 9],
+        ], dtype=np.int32))
+        self.assertEqual(bounds, [
+            {
+                "winding": 7, "row_begin": 0, "row_end": 1,
+                "column_begin": 1, "column_end": 2,
+            },
+            {
+                "winding": 9, "row_begin": 0, "row_end": 2,
+                "column_begin": 0, "column_end": 3,
+            },
+        ])
+
+    def test_loss_overlay_is_bilinearly_warped_with_alpha(self):
+        source = np.zeros((2, 2, 4), dtype=np.uint8)
+        source[0, 0] = [200, 0, 0, 255]
+        source[0, 1] = [0, 0, 200, 255]
+        source_yx = np.asarray([[
+            [0.0, 0.0], [0.0, 0.5], [0.0, 1.0],
+        ]], dtype=np.float32)
+
+        mapped = _sample_rgba_through_map(
+            source, source_yx, np.asarray([[True, True, False]]))
+
+        np.testing.assert_array_equal(mapped[0, 0], [200, 0, 0, 255])
+        np.testing.assert_allclose(mapped[0, 1], [100, 0, 100, 255], atol=1)
+        np.testing.assert_array_equal(mapped[0, 2], [0, 0, 0, 0])
+
+    @staticmethod
+    def _write_surface(path, xyz):
+        path.mkdir()
+        for axis, values in zip("xyz", np.moveaxis(xyz, -1, 0)):
+            Image.fromarray(values.astype(np.float32)).save(
+                path / f"{axis}.tif")
+
+    def test_run_diff_matches_windings_before_flatten_mapping(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous = np.zeros((2, 4, 3), dtype=np.float32)
+            current = previous.copy()
+            current[:, 2:, 2] = 3.0
+            self._write_surface(root / "previous", previous)
+            self._write_surface(root / "current", current)
+            common = {
+                "winding_ids": [1, 2],
+                "winding_column_ranges": [[0, 2], [2, 4]],
+            }
+
+            rgba, changed = _raw_run_diff_rgba(
+                {**common, "surface_path": str(root / "previous")},
+                {**common, "surface_path": str(root / "current")})
+
+            self.assertEqual(changed, 4)
+            self.assertTrue(np.all(rgba[:, :2, 3] == 0))
+            self.assertTrue(np.all(rgba[:, 2:, 3] > 0))
 
 
 class LasagnaSurfaceCleanupTests(unittest.TestCase):

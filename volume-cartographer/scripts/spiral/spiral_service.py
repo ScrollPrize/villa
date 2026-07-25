@@ -50,13 +50,13 @@ from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_BOOLEAN_KEYS,
                          validate_session_request)
 
 
-SERVICE_VERSION = "5.5.0"
+SERVICE_VERSION = "6.0.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
 PREVIEW_ARTIFACTS_KEPT = 3
 CHECKPOINT_ARTIFACTS_KEPT = 2
-LASAGNA_ARTIFACTS_KEPT = 2
+LASAGNA_PREVIEW_OUTPUT_STEP_VX = 20.0
 MAX_ARTIFACT_FILES = 4096
 MAX_UPLOAD_FILES = 256
 UPLOAD_GC_SECONDS = 3600.0
@@ -773,32 +773,6 @@ def _copy_publish(source, destination, keep_source=False):
         Path(source).unlink(missing_ok=True)
 
 
-class LasagnaFlattenJob:
-    def __init__(self, job_id, session_id, output_name):
-        self.job_id = job_id
-        self.session_id = session_id
-        self.output_name = output_name
-        self.cancel = threading.Event()
-        self._lock = threading.Lock()
-        self._status = {
-            "job_id": job_id, "state": "starting",
-            "stage_name": "Starting temporary Lasagna service",
-            "step": 0, "total_steps": 0, "overall_progress": 0.0,
-            "output_name": output_name, "error": None, "artifact": None,
-        }
-
-    def update(self, **values):
-        with self._lock:
-            self._status.update(values)
-
-    def snapshot(self):
-        with self._lock:
-            return dict(self._status)
-
-    def active(self):
-        return self.snapshot()["state"] not in {"finished", "error", "cancelled"}
-
-
 def _find_lasagna_service():
     configured = str(os.environ.get("LASAGNA_SERVICE_PATH") or "").strip()
     candidates = [Path(configured).expanduser()] if configured else []
@@ -934,6 +908,181 @@ def _prepare_lasagna_surface_object(surface_dir, object_store):
     return ref
 
 
+def _surface_xyz(surface_dir):
+    """Load one TIFXYZ grid as HxWx3 float32 plus its validity mask."""
+    coordinates = []
+    for name in ("x.tif", "y.tif", "z.tif"):
+        with Image.open(Path(surface_dir) / name) as image:
+            coordinates.append(np.asarray(image, dtype=np.float32).copy())
+    if not coordinates or any(value.shape != coordinates[0].shape
+                              for value in coordinates[1:]):
+        raise RuntimeError("TIFXYZ coordinate TIFF dimensions do not match")
+    xyz = np.stack(coordinates, axis=-1)
+    valid = np.isfinite(xyz).all(axis=-1) & ~np.all(xyz == -1.0, axis=-1)
+    return xyz, valid
+
+
+def _load_flatten_correspondence(checkpoint_path):
+    """Read Lasagna's flattened-output -> Spiral-source grid map."""
+    import torch
+
+    state = torch.load(
+        str(checkpoint_path), map_location="cpu", weights_only=False)
+    if not isinstance(state, dict) or "flatten_map_flat" not in state:
+        raise RuntimeError(
+            "Lasagna flatten checkpoint contains no output-to-source map")
+    value = state["flatten_map_flat"]
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    mapping = np.asarray(value, dtype=np.float32)
+    if mapping.ndim != 3 or mapping.shape[-1] != 2:
+        raise RuntimeError(
+            "Lasagna output-to-source map must have shape (rows, columns, 2)")
+    if not np.isfinite(mapping).all():
+        raise RuntimeError("Lasagna output-to-source map contains non-finite values")
+    return mapping
+
+
+def _sample_rgba_through_map(source_rgba, source_yx, output_valid):
+    """Bilinearly warp RGBA using premultiplied alpha."""
+    source = np.asarray(source_rgba, dtype=np.float32) / 255.0
+    if source.ndim != 3 or source.shape[-1] != 4:
+        raise RuntimeError("Mapped preview overlay must be RGBA")
+    alpha = source[..., 3]
+    premultiplied = source[..., :3] * alpha[..., None]
+    coordinates = [source_yx[..., 0], source_yx[..., 1]]
+    sampled_alpha = scipy.ndimage.map_coordinates(
+        alpha, coordinates, order=1, mode="constant", cval=0.0,
+        prefilter=False)
+    sampled_rgb = np.stack([
+        scipy.ndimage.map_coordinates(
+            premultiplied[..., channel], coordinates,
+            order=1, mode="constant", cval=0.0, prefilter=False)
+        for channel in range(3)
+    ], axis=-1)
+    nonzero = sampled_alpha > 1.0e-8
+    sampled_rgb[nonzero] /= sampled_alpha[nonzero, None]
+    sampled_rgb[~nonzero] = 0.0
+    sampled_alpha = np.where(output_valid, sampled_alpha, 0.0)
+    sampled_rgb = np.where(output_valid[..., None], sampled_rgb, 0.0)
+    result = np.empty((*sampled_alpha.shape, 4), dtype=np.uint8)
+    result[..., :3] = np.clip(
+        np.rint(sampled_rgb * 255.0), 0, 255).astype(np.uint8)
+    result[..., 3] = np.clip(
+        np.rint(sampled_alpha * 255.0), 0, 255).astype(np.uint8)
+    return result
+
+
+def _mapped_winding_ids(source_manifest, source_shape, source_yx,
+                        output_valid):
+    """Categorically map source winding membership onto a flattened grid."""
+    ranges = source_manifest.get("winding_column_ranges")
+    windings = source_manifest.get("winding_ids")
+    if (not isinstance(ranges, list) or not isinstance(windings, list)
+            or len(ranges) != len(windings) or not ranges):
+        raise RuntimeError("Spiral source preview has no winding mapping")
+    source_labels = np.full(source_shape, -1, dtype=np.int32)
+    for bounds, winding in zip(ranges, windings):
+        if not isinstance(bounds, list) or len(bounds) != 2:
+            raise RuntimeError("Malformed Spiral winding column range")
+        begin, end = int(bounds[0]), int(bounds[1])
+        if begin < 0 or end <= begin or end > source_shape[1]:
+            raise RuntimeError("Spiral winding column range is out of bounds")
+        source_labels[:, begin:end] = int(winding)
+
+    rows = np.rint(source_yx[..., 0]).astype(np.int64)
+    columns = np.rint(source_yx[..., 1]).astype(np.int64)
+    in_bounds = (
+        output_valid
+        & (rows >= 0) & (rows < source_shape[0])
+        & (columns >= 0) & (columns < source_shape[1])
+    )
+    result = np.full(output_valid.shape, -1, dtype=np.int32)
+    result[in_bounds] = source_labels[rows[in_bounds], columns[in_bounds]]
+    result[~output_valid] = -1
+
+    bounds = []
+    for winding in sorted(int(value) for value in np.unique(result)
+                          if int(value) >= 0):
+        yy, xx = np.nonzero(result == winding)
+        bounds.append({
+            "winding": winding,
+            "row_begin": int(yy.min()),
+            "row_end": int(yy.max()) + 1,
+            "column_begin": int(xx.min()),
+            "column_end": int(xx.max()) + 1,
+        })
+    if not bounds:
+        raise RuntimeError("Lasagna correspondence mapped no preview windings")
+    return result, bounds
+
+
+def _raw_run_diff_rgba(previous_manifest, current_manifest):
+    """Build a current-source-grid displacement overlay by winding identity."""
+    current_surface = Path(current_manifest["surface_path"])
+    current_xyz, current_valid = _surface_xyz(current_surface)
+    rgba = np.zeros((*current_valid.shape, 4), dtype=np.uint8)
+    if previous_manifest is None:
+        return rgba, 0
+    previous_xyz, previous_valid = _surface_xyz(
+        Path(previous_manifest["surface_path"]))
+    previous_by_winding = {
+        int(winding): bounds
+        for winding, bounds in zip(
+            previous_manifest.get("winding_ids", []),
+            previous_manifest.get("winding_column_ranges", []))
+    }
+    magnitudes = np.full(current_valid.shape, np.nan, dtype=np.float32)
+    for winding, current_bounds in zip(
+            current_manifest.get("winding_ids", []),
+            current_manifest.get("winding_column_ranges", [])):
+        previous_bounds = previous_by_winding.get(int(winding))
+        if previous_bounds is None:
+            continue
+        current_begin, current_end = map(int, current_bounds)
+        previous_begin, previous_end = map(int, previous_bounds)
+        rows = min(current_xyz.shape[0], previous_xyz.shape[0])
+        width = min(current_end - current_begin,
+                    previous_end - previous_begin)
+        if rows <= 0 or width <= 0:
+            continue
+        current_region = current_xyz[:rows, current_begin:current_begin + width]
+        previous_region = previous_xyz[
+            :rows, previous_begin:previous_begin + width]
+        valid = (
+            current_valid[:rows, current_begin:current_begin + width]
+            & previous_valid[:rows, previous_begin:previous_begin + width]
+        )
+        delta = np.linalg.norm(current_region - previous_region, axis=-1)
+        target = magnitudes[:rows, current_begin:current_begin + width]
+        target[valid] = delta[valid]
+    finite = np.isfinite(magnitudes) & (magnitudes > 1.0e-6)
+    if not finite.any():
+        return rgba, 0
+    display_maximum = float(np.percentile(magnitudes[finite], 95))
+    if not math.isfinite(display_maximum) or display_maximum <= 0.0:
+        display_maximum = float(np.nanmax(magnitudes))
+    intensity = np.zeros_like(magnitudes)
+    intensity[finite] = np.clip(
+        magnitudes[finite] / display_maximum, 0.0, 1.0)
+    # Match VC3D's blue/cyan/yellow/red diagnostic palette closely.
+    stops = np.asarray(
+        [[32, 64, 220], [20, 210, 235], [255, 220, 35], [255, 45, 20]],
+        dtype=np.float32)
+    scaled = intensity * (len(stops) - 1)
+    lower = np.minimum(scaled.astype(np.int32), len(stops) - 2)
+    fraction = (scaled - lower)[..., None]
+    rgba[..., :3] = np.clip(
+        stops[lower] * (1.0 - fraction)
+        + stops[lower + 1] * fraction,
+        0, 255).astype(np.uint8)
+    rgba[..., 3] = np.where(
+        finite,
+        np.clip(28.0 + 207.0 * np.sqrt(intensity), 0, 235),
+        0).astype(np.uint8)
+    return rgba, int(finite.sum())
+
+
 def _fit_service_json(port, path, body=None, timeout=30):
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
@@ -1004,10 +1153,13 @@ class ServiceState:
         self.uploads = {}
         self.ephemeral_records = []
         self._registered_preview_generation = 0
+        self._processed_preview_generation = 0
+        self._publishing_preview_generation = 0
         self._preview_artifact = None
-        self._lasagna_flatten = None
-        self._lasagna_process = None
-        self._lasagna_thread = None
+        self._preview_publish = None
+        self._preview_publish_error = None
+        self._preview_process = None
+        self._previous_raw_preview_manifest = None
 
     # ------------------------------------------------------------------
     # Status and health
@@ -1055,9 +1207,15 @@ class ServiceState:
             })
             response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview_artifact
-            response["lasagna_flatten"] = (
-                self._lasagna_flatten.snapshot()
-                if self._lasagna_flatten else None)
+            response["preview_publish"] = (
+                dict(self._preview_publish)
+                if self._preview_publish else None)
+            response["preview_publish_error"] = self._preview_publish_error
+            if self._preview_publish:
+                stage_name = str(
+                    self._preview_publish.get("stage_name") or "").strip()
+                if stage_name:
+                    response["phase"] = stage_name
             response["ephemeral_inputs"] = [
                 {"id": record["id"], "kind": record["kind"],
                  "role": record.get("role"), "state": record["state"],
@@ -1182,10 +1340,6 @@ class ServiceState:
         if errors:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Session validation failed", errors)
         with self.lock:
-            if self._lasagna_flatten and self._lasagna_flatten.active():
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "Cancel the Lasagna flatten before replacing the session")
             if self.replacing:
                 raise ApiError(HTTPStatus.CONFLICT, "A session replacement is already in progress")
             if self.session and self.session.status()["state"] in {
@@ -1242,10 +1396,19 @@ class ServiceState:
                 self.replacing = False
 
     def _reset_session_scope(self):
+        previous_raw = self._previous_raw_preview_manifest
         self.ephemeral_records = []
         self.uploads = {}
         self._registered_preview_generation = 0
+        self._processed_preview_generation = 0
+        self._publishing_preview_generation = 0
         self._preview_artifact = None
+        self._preview_publish = None
+        self._preview_publish_error = None
+        self._previous_raw_preview_manifest = None
+        if previous_raw:
+            shutil.rmtree(
+                Path(previous_raw).parent, ignore_errors=True)
 
     def _status_changed(self, status):
         # Runs on the fitter thread inside the pause/export window, so artifact
@@ -1263,19 +1426,56 @@ class ServiceState:
             session_id = self.session_id
             preview_generation = int(status.get("preview_generation") or 0)
             preview_manifest = status.get("preview_manifest_path")
-            register_preview = (preview_manifest
-                                and preview_generation > self._registered_preview_generation)
-        if register_preview:
-            manifest_path = Path(preview_manifest)
+            publish_preview = (
+                preview_manifest
+                and preview_generation > self._processed_preview_generation
+                and preview_generation != self._publishing_preview_generation)
+            if publish_preview:
+                self._publishing_preview_generation = preview_generation
+                self._preview_publish_error = None
+        if not publish_preview:
+            return
+
+        try:
+            published_manifest = self._publish_flattened_preview(
+                session_id, preview_generation, Path(preview_manifest))
             ref = self.artifacts.register_directory(
                 "spiral-preview", session_id, preview_generation,
-                manifest_path.parent, manifest_path.name,
+                published_manifest.parent, published_manifest.name,
                 delete_root_on_prune=True)
             with self.lock:
                 if self.session_id == session_id:
                     self._preview_artifact = ref
                     self._registered_preview_generation = preview_generation
-            self.artifacts.prune("spiral-preview", session_id, PREVIEW_ARTIFACTS_KEPT)
+                    self._preview_publish_error = None
+            self.artifacts.prune(
+                "spiral-preview", session_id, PREVIEW_ARTIFACTS_KEPT)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            print(f"SPIRAL_PREVIEW_ERROR {error}", file=sys.stderr, flush=True)
+            with self.lock:
+                if self.session_id == session_id:
+                    self._preview_publish_error = error
+        finally:
+            with self.lock:
+                if self.session_id == session_id:
+                    self._processed_preview_generation = max(
+                        self._processed_preview_generation,
+                        preview_generation)
+                    if self._publishing_preview_generation == preview_generation:
+                        self._publishing_preview_generation = 0
+                    self._preview_publish = None
+                    self.status_generation += 1
+
+    def _update_preview_publish(self, generation, **values):
+        with self.lock:
+            if self._publishing_preview_generation != generation:
+                return
+            current = dict(self._preview_publish or {})
+            current.update(values)
+            current["generation"] = generation
+            self._preview_publish = current
+            self.status_generation += 1
     def run(self, request):
         session = self._require_session()
         status = session.status()
@@ -1356,10 +1556,6 @@ class ServiceState:
 
     def delete(self):
         with self.lock:
-            if self._lasagna_flatten and self._lasagna_flatten.active():
-                raise ApiError(
-                    HTTPStatus.CONFLICT,
-                    "Cancel the Lasagna flatten before deleting the session")
             if not self.session:
                 return {**self.status(), "deleted": False}
             if self.session.status()["state"] in {"Loading", "Running", "Saving", "ExportingPreview"}:
@@ -1385,67 +1581,13 @@ class ServiceState:
             return self.session
 
     # ------------------------------------------------------------------
-    # Host-owned Lasagna flatten
+    # Automatic host-owned Lasagna preview publication
     # ------------------------------------------------------------------
 
-    def _update_lasagna_flatten(self, job, **values):
-        job.update(**values)
-        with self.lock:
-            if self._lasagna_flatten is job:
-                self.status_generation += 1
-
-    def start_lasagna_flatten(self, request):
-        session = self._require_session()
-        status = session.status()
-        if status.get("state") not in {"Ready", "Paused"}:
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                "Lasagna flatten requires the Spiral session to be paused")
-        preview_manifest = status.get("preview_manifest_path")
-        if not preview_manifest or not Path(preview_manifest).is_file():
-            raise ApiError(
-                HTTPStatus.CONFLICT,
-                "Run Spiral once to create a host-side preview before flattening")
-        output_name = str(request.get("output_name") or "").strip()
-        if (not output_name.endswith(".tifxyz")
-                or not _SAFE_COMPONENT.fullmatch(output_name)):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           "output_name must be a safe .tifxyz name")
-        with self.lock:
-            if self._lasagna_flatten and self._lasagna_flatten.active():
-                raise ApiError(HTTPStatus.CONFLICT,
-                               "A Lasagna flatten is already running")
-            job = LasagnaFlattenJob(
-                f"spiral-lasagna-{secrets.token_hex(8)}",
-                self.session_id, output_name)
-            self._lasagna_flatten = job
-            self.status_generation += 1
-            thread = threading.Thread(
-                target=self._run_lasagna_flatten,
-                args=(job, dict(request), str(preview_manifest)),
-                name="spiral-lasagna-flatten", daemon=True)
-            self._lasagna_thread = thread
-            thread.start()
-        response = self.status()
-        response["accepted"] = True
-        return response
-
-    def cancel_lasagna_flatten(self):
-        with self.lock:
-            job = self._lasagna_flatten
-        if job is None or not job.active():
-            raise ApiError(HTTPStatus.CONFLICT,
-                           "No Lasagna flatten is running")
-        job.cancel.set()
-        self._update_lasagna_flatten(
-            job, stage_name="Cancelling temporary Lasagna service")
-        return {**self.status(), "accepted": True}
-
-    def _run_lasagna_flatten(self, job, request, preview_manifest_path):
+    def _publish_flattened_preview(
+            self, session_id, generation, preview_manifest_path):
         process = None
-        output_path = None
-        staging_root = None
-        fit_job_id = None
+        publish_root = None
         try:
             fit_service = _find_lasagna_service()
             config_path = fit_service.parent / "configs" / "flatten_fast_nofilter.json"
@@ -1453,30 +1595,48 @@ class ServiceState:
                 raise RuntimeError(
                     f"Cannot find Lasagna flatten config: {config_path}")
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            manifest = json.loads(
-                Path(preview_manifest_path).read_text(encoding="utf-8"))
+            manifest = json.loads(preview_manifest_path.read_text(encoding="utf-8"))
             surface_path = Path(str(manifest.get("surface_path") or ""))
             if not surface_path.is_dir():
                 raise RuntimeError(
                     f"Spiral preview surface does not exist: {surface_path}")
-            voxel_size = request.get("voxel_size_um")
-            if isinstance(voxel_size, (int, float)) and float(voxel_size) > 0:
+
+            args = config.get("args")
+            if not isinstance(args, dict):
+                args = {}
+            args["flatten_output_step"] = LASAGNA_PREVIEW_OUTPUT_STEP_VX
+            args["flatten_output_margin"] = 0.0
+            config["args"] = args
+            run_request = (self.session_request or {}).get("run") or {}
+            voxel_size = run_request.get("voxel_size_um")
+            if isinstance(voxel_size, (int, float)) and float(voxel_size) > 0.0:
                 config["voxel_size_um"] = float(voxel_size)
+
             output_root = Path(self.session_paths.output_directory).resolve()
             output_root.mkdir(parents=True, exist_ok=True)
-            output_path = output_root / job.output_name
-            if output_path.exists():
+            publish_parent = output_root / ".spiral-published" / session_id
+            publish_parent.mkdir(parents=True, exist_ok=True)
+            final_root = publish_parent / f"generation-{generation}"
+            if final_root.exists():
                 raise RuntimeError(
-                    f"Refusing to overwrite Lasagna output: {output_path}")
-            staging_root = output_root / ".spiral-lasagna" / job.job_id
-            staging_root.mkdir(parents=True, exist_ok=False)
-            staged_output_path = staging_root / job.output_name
+                    f"Refusing to overwrite published preview: {final_root}")
+            publish_root = publish_parent / (
+                f".generation-{generation}.incoming-{secrets.token_hex(5)}")
+            publish_root.mkdir(parents=True, exist_ok=False)
+            source_id = str(manifest.get("surface_id") or "")
+            if not source_id:
+                raise RuntimeError("Spiral preview manifest has no surface id")
+            surface_id = f"{source_id}-lasagna.tifxyz"
+            flattened_surface = publish_root / surface_id
+            model_output = publish_root / "flatten-model.pt"
 
             with tempfile.TemporaryDirectory(prefix="spiral_lasagna_") as temporary:
                 temporary = Path(temporary)
                 object_store = temporary / "objects"
-                self._update_lasagna_flatten(
-                    job, stage_name="Preparing Lasagna input surface")
+                self._update_preview_publish(
+                    generation, state="preparing",
+                    stage_name="Preparing Lasagna input surface",
+                    output_step_vx=LASAGNA_PREVIEW_OUTPUT_STEP_VX)
                 metadata = json.loads(
                     (surface_path / "meta.json").read_text(encoding="utf-8"))
                 cleanup = metadata.get("lasagna_input_cleanup")
@@ -1490,8 +1650,6 @@ class ServiceState:
                     raise RuntimeError(
                         "Spiral preview was not published with authoritative "
                         "connected-surface cleanup")
-                if job.cancel.is_set():
-                    raise InterruptedError("Lasagna flatten cancelled")
                 surface_ref = _prepare_lasagna_surface_object(
                     surface_path, object_store)
                 ready = threading.Event()
@@ -1505,8 +1663,9 @@ class ServiceState:
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1, start_new_session=(os.name == "posix"))
                 with self.lock:
-                    if self._lasagna_flatten is job:
-                        self._lasagna_process = process
+                    if (self.session_id == session_id
+                            and self._publishing_preview_generation == generation):
+                        self._preview_process = process
 
                 def relay_output():
                     pattern = re.compile(r"listening on http://[^:]+:(\d+)")
@@ -1529,9 +1688,6 @@ class ServiceState:
                     raise RuntimeError(
                         "Temporary Lasagna service failed to start"
                         + (f" (exit {code})" if code is not None else ""))
-                if job.cancel.is_set():
-                    raise InterruptedError("Lasagna flatten cancelled")
-
                 port = port_holder["port"]
                 config["external_surfaces"] = [surface_ref]
                 request_body = {
@@ -1542,8 +1698,9 @@ class ServiceState:
                     },
                     "single_segment": True,
                     "config_name": "flatten_fast_nofilter.json",
-                    "output_name": job.output_name,
-                    "output_dir": str(staging_root),
+                    "output_name": surface_id,
+                    "output_dir": str(publish_root),
+                    "model_output": str(model_output),
                     "source": "Spiral host service",
                 }
                 accepted = _fit_service_json(
@@ -1554,19 +1711,15 @@ class ServiceState:
                         "Temporary Lasagna service returned no job id")
 
                 while True:
-                    if job.cancel.is_set():
-                        try:
-                            _fit_service_json(
-                                port, f"/jobs/{fit_job_id}/cancel", {},
-                                timeout=10)
-                        except Exception:
-                            pass
-                        raise InterruptedError("Lasagna flatten cancelled")
+                    with self.lock:
+                        if self.session_id != session_id:
+                            raise RuntimeError(
+                                "The Spiral session changed while publishing its preview")
                     fit_status = _fit_service_json(
                         port, f"/jobs/{fit_job_id}", timeout=15)
                     state = str(fit_status.get("state") or "")
-                    self._update_lasagna_flatten(
-                        job, state=state or "running",
+                    self._update_preview_publish(
+                        generation, state=state or "running",
                         stage_name=str(
                             fit_status.get("stage_name")
                             or fit_status.get("stage") or "Flattening"),
@@ -1578,55 +1731,153 @@ class ServiceState:
                     if state == "finished":
                         break
                     if state == "cancelled":
-                        raise InterruptedError("Lasagna flatten cancelled")
+                        raise RuntimeError("Lasagna preview flatten was cancelled")
                     if state == "error":
                         raise RuntimeError(
                             str(fit_status.get("error")
                                 or "Lasagna flatten failed"))
                     time.sleep(0.5)
 
-                metadata = staged_output_path / "meta.json"
-                if not metadata.is_file():
+                flattened_metadata_path = flattened_surface / "meta.json"
+                if not flattened_metadata_path.is_file():
                     raise RuntimeError(
                         "Lasagna reported success but produced no tifxyz output")
-                self._update_lasagna_flatten(
-                    job, state="publishing",
-                    stage_name="Publishing flattened surface")
+                self._update_preview_publish(
+                    generation, state="mapping",
+                    stage_name="Mapping Spiral preview artifacts")
+
+                correspondence = _load_flatten_correspondence(model_output)
+                flattened_xyz, flattened_valid = _surface_xyz(flattened_surface)
+                if correspondence.shape[:2] != flattened_xyz.shape[:2]:
+                    raise RuntimeError(
+                        "Lasagna correspondence dimensions do not match "
+                        "the flattened surface")
+                winding_ids, winding_bounds = _mapped_winding_ids(
+                    manifest, _surface_xyz(surface_path)[0].shape[:2],
+                    correspondence, flattened_valid)
+                winding_map_name = "winding-ids.tif"
+                # OpenCV/Qt do not portably decode signed-int TIFF samples.
+                # IEEE float32 represents every supported winding id exactly
+                # and is converted back to int32 after validation in VC3D.
+                Image.fromarray(
+                    winding_ids.astype(np.float32), mode="F").save(
+                    publish_root / winding_map_name)
+
+                mapped_loss_maps = []
+                loss_output = publish_root / "loss-maps"
+                loss_output.mkdir(exist_ok=True)
+                for entry in manifest.get("loss_maps", []):
+                    if not isinstance(entry, dict):
+                        continue
+                    relative = str(entry.get("path") or "")
+                    source_overlay = preview_manifest_path.parent / relative
+                    if not source_overlay.is_file():
+                        continue
+                    with Image.open(source_overlay) as image:
+                        source_rgba = np.asarray(
+                            image.convert("RGBA"), dtype=np.uint8)
+                    mapped = _sample_rgba_through_map(
+                        source_rgba, correspondence, flattened_valid)
+                    destination = loss_output / Path(relative).name
+                    Image.fromarray(mapped, mode="RGBA").save(destination)
+                    mapped_entry = dict(entry)
+                    mapped_entry["path"] = (
+                        Path("loss-maps") / destination.name).as_posix()
+                    mapped_entry["supported_pixels"] = int(
+                        np.count_nonzero(mapped[..., 3]))
+                    mapped_loss_maps.append(mapped_entry)
+
+                previous_manifest = None
                 with self.lock:
-                    if self.session_id != job.session_id:
-                        raise RuntimeError(
-                            "The Spiral session changed during Lasagna flatten")
-                os.replace(staged_output_path, output_path)
-                artifact = self.artifacts.register_directory(
-                    "spiral-lasagna", job.session_id, time.time_ns(),
-                    output_path, "meta.json")
-                self.artifacts.prune(
-                    "spiral-lasagna", job.session_id, LASAGNA_ARTIFACTS_KEPT)
-                self._update_lasagna_flatten(
-                    job, state="finished", stage_name="Finished",
-                    overall_progress=1.0, artifact=artifact)
-        except InterruptedError as exc:
-            if output_path is not None:
-                shutil.rmtree(output_path, ignore_errors=True)
-            self._update_lasagna_flatten(
-                job, state="cancelled", error=str(exc),
-                stage_name="Cancelled")
-        except Exception as exc:
-            if output_path is not None:
-                shutil.rmtree(output_path, ignore_errors=True)
-            print(
-                f"SPIRAL_LASAGNA_ERROR {type(exc).__name__}: {exc}",
-                file=sys.stderr, flush=True)
-            self._update_lasagna_flatten(
-                job, state="error", error=f"{type(exc).__name__}: {exc}",
-                stage_name="Failed")
+                    previous_path = self._previous_raw_preview_manifest
+                if previous_path and Path(previous_path).is_file():
+                    previous_manifest = json.loads(
+                        Path(previous_path).read_text(encoding="utf-8"))
+                raw_diff, changed_pixels = _raw_run_diff_rgba(
+                    previous_manifest, manifest)
+                mapped_diff = _sample_rgba_through_map(
+                    raw_diff, correspondence, flattened_valid)
+                run_diff = None
+                if changed_pixels:
+                    run_diff_name = "run-diff.png"
+                    Image.fromarray(mapped_diff, mode="RGBA").save(
+                        publish_root / run_diff_name)
+                    run_diff = {
+                        "path": run_diff_name,
+                        "changed_source_pixels": changed_pixels,
+                        "supported_pixels": int(
+                            np.count_nonzero(mapped_diff[..., 3])),
+                    }
+
+                flattened_metadata = json.loads(
+                    flattened_metadata_path.read_text(encoding="utf-8"))
+                flattened_metadata.pop("components", None)
+                flattened_metadata.pop("winding_column_ranges", None)
+                flattened_metadata.pop("model_source", None)
+                flattened_metadata["uuid"] = surface_id
+                flattened_metadata["name"] = surface_id
+                flattened_metadata["scale"] = [
+                    1.0 / LASAGNA_PREVIEW_OUTPUT_STEP_VX,
+                    1.0 / LASAGNA_PREVIEW_OUTPUT_STEP_VX,
+                ]
+                flattened_metadata["grid_shape"] = [
+                    int(flattened_xyz.shape[0]), int(flattened_xyz.shape[1])]
+                flattened_metadata["output_step_vx"] = (
+                    LASAGNA_PREVIEW_OUTPUT_STEP_VX)
+                flattened_metadata["winding_id_map"] = winding_map_name
+                flattened_metadata["winding_id_dtype"] = "float32_integer"
+                flattened_metadata["winding_bounds"] = winding_bounds
+                flattened_metadata["component_winding_ids"] = [
+                    item["winding"] for item in winding_bounds]
+                flattened_metadata_path.write_text(
+                    json.dumps(flattened_metadata, indent=4) + "\n",
+                    encoding="utf-8")
+
+                published = dict(manifest)
+                published["schema_version"] = 3
+                published["surface_id"] = surface_id
+                published["surface_path"] = str(final_root / surface_id)
+                published["manifest_path"] = str(final_root / "manifest.json")
+                published["output_step_vx"] = LASAGNA_PREVIEW_OUTPUT_STEP_VX
+                published["grid_shape"] = [
+                    int(flattened_xyz.shape[0]), int(flattened_xyz.shape[1])]
+                published["winding_ids"] = [
+                    item["winding"] for item in winding_bounds]
+                published["winding_id_map"] = winding_map_name
+                published["winding_id_dtype"] = "float32_integer"
+                published["winding_bounds"] = winding_bounds
+                published["loss_maps"] = mapped_loss_maps
+                published.pop("winding_column_ranges", None)
+                published.pop("components", None)
+                if run_diff is None:
+                    published.pop("run_diff", None)
+                else:
+                    published["run_diff"] = run_diff
+                (publish_root / "manifest.json").write_text(
+                    json.dumps(published, indent=2) + "\n",
+                    encoding="utf-8")
+
+                model_output.unlink(missing_ok=True)
+                os.replace(publish_root, final_root)
+                publish_root = None
+
+                with self.lock:
+                    old_raw = self._previous_raw_preview_manifest
+                    self._previous_raw_preview_manifest = str(
+                        preview_manifest_path)
+                if old_raw and old_raw != str(preview_manifest_path):
+                    shutil.rmtree(Path(old_raw).parent, ignore_errors=True)
+                self._update_preview_publish(
+                    generation, state="finished", stage_name="Finished",
+                    overall_progress=1.0)
+                return final_root / "manifest.json"
         finally:
             _stop_process_group(process)
-            if staging_root is not None:
-                shutil.rmtree(staging_root, ignore_errors=True)
+            if publish_root is not None:
+                shutil.rmtree(publish_root, ignore_errors=True)
             with self.lock:
-                if self._lasagna_process is process:
-                    self._lasagna_process = None
+                if self._preview_process is process:
+                    self._preview_process = None
                 self.status_generation += 1
 
     # ------------------------------------------------------------------
@@ -2125,10 +2376,7 @@ class ServiceState:
         with self.lock:
             session = self.session
             self.session = None
-            flatten = self._lasagna_flatten
-            process = self._lasagna_process
-        if flatten and flatten.active():
-            flatten.cancel.set()
+            process = self._preview_process
         _stop_process_group(process)
         if session:
             session.close()
@@ -2340,12 +2588,6 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 return state.deduplicated(command_id, lambda: state.save_checkpoint(body))
             if path == "/session/download-checkpoint":
                 return state.deduplicated(command_id, state.download_checkpoint)
-            if path == "/session/lasagna-flatten":
-                return state.deduplicated(
-                    command_id, lambda: state.start_lasagna_flatten(body))
-            if path == "/session/lasagna-flatten/cancel":
-                return state.deduplicated(
-                    command_id, state.cancel_lasagna_flatten)
             if path == "/session/commit-inputs":
                 return state.deduplicated(command_id, state.commit_inputs)
             if path == "/session/export-full":

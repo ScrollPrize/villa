@@ -281,6 +281,34 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(calls, ["finish", "save", "preview"])
         self.assertEqual(session._state, "Paused")
 
+    def test_preview_is_announced_before_exporting_state_can_pause(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            session = InteractiveFitSession.__new__(InteractiveFitSession)
+            session._condition = threading.Condition()
+            session._preview_generation = 0
+            session._preview_session_id = "test-session"
+            session.paths = type(
+                "Paths", (), {"output_directory": temporary})()
+            states = []
+            session._state = "ExportingPreview"
+            session._export_preview = lambda destination, surface_id: {
+                "manifest_path": str(Path(destination) / "manifest.json"),
+            }
+            session._publish_status = lambda: states.append((
+                session._state,
+                session._preview_generation,
+                session._preview_manifest,
+            ))
+
+            session._publish_preview()
+
+            self.assertEqual(states, [(
+                "ExportingPreview",
+                1,
+                str(Path(temporary) / ".spiral-preview" / "test-session"
+                    / "generation-1" / "manifest.json"),
+            )])
+
     def test_secondary_gpu_rank_pauses_without_publishing_outputs(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()

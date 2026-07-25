@@ -69,6 +69,24 @@ def _set_flatten_map(mdl: fit_model.Model3D, map_yx: torch.Tensor) -> None:
 
 
 class FlattenLossTest(unittest.TestCase):
+	def test_flatten_output_shape_uses_physical_span_and_requested_step(self) -> None:
+		shape = fit_model.Model3D._flatten_output_shape_for_source
+
+		self.assertEqual(
+			shape(101, 51, source_step=20.0, output_step=20.0),
+			(101, 51),
+		)
+		self.assertEqual(
+			shape(101, 51, source_step=40.0, output_step=20.0),
+			(201, 101),
+		)
+		self.assertEqual(
+			shape(101, 51, source_step=10.0, output_step=20.0),
+			(51, 26),
+		)
+		with self.assertRaisesRegex(ValueError, "output_step"):
+			shape(101, 51, source_step=20.0, output_step=0.0)
+
 	def test_flatten_stage_defaults_disable_volume_losses(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"args": {"model-init": "flatten"},

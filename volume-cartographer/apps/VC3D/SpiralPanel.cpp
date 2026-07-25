@@ -553,14 +553,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _save = new QPushButton(tr("Save Checkpoint on Service"), runContents); _save->setEnabled(false);
     _downloadCheckpoint = new QPushButton(tr("Download Checkpoint…"), runContents);
     _downloadCheckpoint->setEnabled(false);
-    _flattenWithLasagna = new QPushButton(tr("Flatten with Lasagna"), runContents);
-    _flattenWithLasagna->setObjectName(QStringLiteral("spiralFlattenWithLasagna"));
-    _flattenWithLasagna->setEnabled(false);
-    _flattenWithLasagna->setToolTip(
-        tr("Flatten the complete latest Spiral output with Lasagna"));
     checkpointControls->addWidget(_save);
     checkpointControls->addWidget(_downloadCheckpoint);
-    checkpointControls->addWidget(_flattenWithLasagna);
     checkpointControls->addStretch(1);
     runLayout->addLayout(checkpointControls);
 
@@ -744,8 +738,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                                 runAdvancedConfig());
     });
     connect(_stop, &QPushButton::clicked, _service, &SpiralServiceManager::stopAfterIteration);
-    connect(_flattenWithLasagna, &QPushButton::clicked,
-            this, &SpiralPanel::flattenWithLasagnaRequested);
     connect(_save, &QPushButton::clicked, this, [this]() {
         const QString initial = QDir(_paths["output_directory"]->text())
             .filePath(QStringLiteral("checkpoint_manual.ckpt"));
@@ -1122,25 +1114,6 @@ void SpiralPanel::setLossMapOptions(const QStringList& names)
 void SpiralPanel::setLossMapLegend(const QString& text)
 {
     if (_lossMapLegend) _lossMapLegend->setText(text);
-}
-
-void SpiralPanel::setLasagnaFlattenAvailable(bool available, const QString& reason)
-{
-    if (!_flattenWithLasagna) return;
-    _lasagnaFlattenAvailable = available;
-    _flattenWithLasagna->setEnabled(available);
-    _flattenWithLasagna->setToolTip(
-        reason.isEmpty()
-            ? tr("Flatten the complete latest Spiral output with Lasagna")
-            : reason);
-}
-
-void SpiralPanel::setLasagnaFlattenRunning(bool running)
-{
-    if (!_flattenWithLasagna) return;
-    _flattenWithLasagna->setEnabled(!running && _lasagnaFlattenAvailable);
-    _flattenWithLasagna->setText(
-        running ? tr("Flattening with Lasagna…") : tr("Flatten with Lasagna"));
 }
 
 void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
@@ -1640,6 +1613,11 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     QStringList diagnostics;
     const QString error = status.value(QStringLiteral("error")).toString();
     if (!error.isEmpty()) diagnostics.push_back(error);
+    const QString previewError =
+        status.value(QStringLiteral("preview_publish_error")).toString();
+    if (!previewError.isEmpty())
+        diagnostics.push_back(
+            tr("Preview publication failed: %1").arg(previewError));
     for (const QJsonValue& warning : status.value(QStringLiteral("warnings")).toArray()) {
         const QString text = warning.toString().trimmed();
         if (!text.isEmpty()) diagnostics.push_back(text);

@@ -34,8 +34,6 @@ public:
     void setVolumes(const QVector<VolumeSelector::VolumeOption>& volumes, const QString& selectedId);
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
-    void setLasagnaFlattenAvailable(bool available, const QString& reason = {});
-    void setLasagnaFlattenRunning(bool running);
     void setSessionExitGuard(
         std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
 
@@ -49,7 +47,6 @@ signals:
     void surfaceIntersectionStrideChanged(int stride);
     void surfaceOverlapChanged(bool shown);
     void pythonOutputRequested();
-    void flattenWithLasagnaRequested();
 
 private:
     QLineEdit* addPathRow(QFormLayout* form, const QString& key, const QString& label,
@@ -138,7 +135,6 @@ private:
     QPushButton* _stop = nullptr;
     QPushButton* _save = nullptr;
     QPushButton* _downloadCheckpoint = nullptr;
-    QPushButton* _flattenWithLasagna = nullptr;
     QPushButton* _refill = nullptr;
     QLabel* _state = nullptr;
     QLabel* _metrics = nullptr;
@@ -183,7 +179,6 @@ private:
     bool _sessionRunnable = false;
     bool _remoteMode = false;
     bool _connected = false;
-    bool _lasagnaFlattenAvailable = false;
     int _ephemeralCount = 0;
     int _uncommittedCount = 0;
     std::function<void(std::function<void()>)> _sessionExitGuard;

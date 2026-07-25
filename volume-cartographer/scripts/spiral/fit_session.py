@@ -18,9 +18,9 @@ import zipfile
 
 
 
-# Version 10 adds the canonical active session request to status responses so
-# late-attaching VC3D clients can adopt the resident fit without reloading it.
-API_VERSION = 10
+# Version 11 makes preview artifacts host-published Lasagna flatten results
+# with correspondence-mapped winding, loss-map, and run-diff metadata.
+API_VERSION = 11
 
 
 # Counts which describe how many training objects/points are sampled per
