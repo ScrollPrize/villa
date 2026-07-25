@@ -275,8 +275,16 @@ def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: st
     
     network.eval()
     
-    # Compile by default unless explicitly disabled
-    should_compile = os.environ.get('nnUNet_compile', 'true').lower() in ('true', '1', 't')
+    # Compile by default on CUDA unless explicitly disabled. torch.compile is
+    # lazy, so an unusable inductor backend does not raise here - it raises at
+    # the first forward pass, past the except below, killing the run partway
+    # through inference. On CPU that is the common case (inductor needs a C++
+    # toolchain) for little gain, so CPU opts in rather than out.
+    compile_setting = os.environ.get('nnUNet_compile')
+    if compile_setting is None:
+        should_compile = device.type == 'cuda'
+    else:
+        should_compile = compile_setting.lower() in ('true', '1', 't')
     if should_compile and not isinstance(network, OptimizedModule):
         if should_print:
             print('Using torch.compile for potential performance improvement')
