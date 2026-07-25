@@ -332,9 +332,10 @@ private:
         std::string manualHvTag;
         std::vector<std::string> tags;
         // Vestigial marker: set where in-memory metadata drifted from disk
-        // (e.g. position-repaired links), but nothing consumes it anymore —
-        // the load-time save loop it used to drive was removed so that
-        // loading never writes. Kept as documentation of repair state.
+        // (e.g. a recomputed hv classification), but nothing consumes it
+        // anymore — the load-time save loop it used to drive was removed so
+        // that loading never writes. Link repairs are tracked separately by
+        // FiberBranchRef::linkState (Repaired).
         bool needsSave = false;
         // Branch JSON entries that failed structural parsing; preserved
         // verbatim and re-emitted on save so a load can never drop data.

@@ -389,10 +389,7 @@ class S3SyncManager:
         except Exception:
             md5 = None
         finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            self._remove_merge_tmp(tmp)
         self._remote_md5_cache[path] = md5
         return md5
 
@@ -489,6 +486,26 @@ class S3SyncManager:
         os.makedirs(os.path.dirname(tmp), exist_ok=True)
         return tmp
 
+    def _remove_merge_tmp(self, tmp):
+        """Remove a merge temp file and prune the now-empty mirrored
+        directories beneath .tmp/ so status/dry-run leave no residue."""
+        if not tmp:
+            return
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        tmp_root = os.path.join(self.local_dir, CONFLICT_DIR_NAME, '.tmp')
+        dirpath = os.path.dirname(tmp)
+        while dirpath.startswith(tmp_root + os.sep) or dirpath == tmp_root:
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                break
+            if dirpath == tmp_root:
+                break
+            dirpath = os.path.dirname(dirpath)
+
     def _load_base(self, path, tracked):
         """Return the parsed last-synced (base) version of a file, or None.
 
@@ -540,10 +557,7 @@ class S3SyncManager:
         except Exception:
             return None
         finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            self._remove_merge_tmp(tmp)
 
     def _fetch_remote_json(self, path):
         """Fetch the current remote object. Returns (parsed_json, temp_path)
@@ -554,10 +568,7 @@ class S3SyncManager:
             with open(tmp) as f:
                 return json.load(f), tmp
         except Exception:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+            self._remove_merge_tmp(tmp)
             return None, None
 
     def _attempt_auto_merge(self, path, local_info, s3_info, dry_run=False):
@@ -643,11 +654,8 @@ class S3SyncManager:
             return {'pending': pending, 'remote_tmp': remote_tmp,
                     'summary': summary}
         finally:
-            if remote_tmp and not keep_remote_tmp:
-                try:
-                    os.remove(remote_tmp)
-                except OSError:
-                    pass
+            if not keep_remote_tmp:
+                self._remove_merge_tmp(remote_tmp)
 
     def _apply_pending_merges(self, pending_merges):
         """Apply confirmed merges: stash the versions being replaced, then
@@ -658,21 +666,12 @@ class S3SyncManager:
                 self._stash_conflict_copy(path, 'remote', source=plan['remote_tmp'])
             os.replace(plan['pending'], os.path.join(self.local_dir, path))
             print(f"  ✓ applied auto-merge: {path}")
-            if plan['remote_tmp']:
-                try:
-                    os.remove(plan['remote_tmp'])
-                except OSError:
-                    pass
+            self._remove_merge_tmp(plan['remote_tmp'])
 
-    @staticmethod
-    def _discard_pending_merges(pending_merges):
+    def _discard_pending_merges(self, pending_merges):
         for _, plan in pending_merges:
-            for temp in (plan['pending'], plan['remote_tmp']):
-                if temp:
-                    try:
-                        os.remove(temp)
-                    except OSError:
-                        pass
+            self._remove_merge_tmp(plan['pending'])
+            self._remove_merge_tmp(plan['remote_tmp'])
 
     def scan_local_files(self, include_backups=False):
         """Scan local directory for files"""
@@ -817,9 +816,70 @@ class S3SyncManager:
         s3_files = self.scan_s3_files(include_backups)
 
         self._record_untracked_synced(local_files, s3_files)
+        self._seed_tracked_shadows(local_files, s3_files)
         self._prune_stale_tracking(set(local_files) | set(s3_files), include_backups)
 
         print("File tracking refreshed")
+
+    def _seed_tracked_shadows(self, local_files, s3_files):
+        """Backfill md5 tracking and shadow merge bases for already-tracked,
+        verifiably in-sync annotation files.
+
+        This is the upgrade path: rows created before content hashing have
+        no md5 and no shadow, and _record_untracked_synced deliberately
+        skips tracked paths — without this, such files would have no merge
+        base until their next real transfer.
+        """
+        with self._get_db() as conn:
+            cursor = conn.execute('SELECT * FROM files')
+            tracked_rows = {row['path']: dict(row) for row in cursor}
+
+        seeded = 0
+        md5_updates = []
+        for path, tracked in tracked_rows.items():
+            local_info = local_files.get(path)
+            s3_info = s3_files.get(path)
+            if not local_info or not s3_info:
+                continue
+            current_md5 = local_info.get('local_md5')
+            if not current_md5:
+                continue  # not hash-scoped
+            if tracked.get('local_md5') and os.path.exists(self._shadow_path(path)):
+                continue  # already seeded
+
+            # Only seed files with no pending change on either side: the
+            # local file must match its tracked state and the remote object
+            # its tracked ETag/size, and both contents must verifiably agree.
+            local_unchanged = (
+                (tracked.get('local_md5') == current_md5) or
+                (not tracked.get('local_md5') and
+                 tracked.get('local_size') == local_info['local_size'] and
+                 tracked.get('local_mtime') is not None and
+                 abs(tracked['local_mtime'] - local_info['local_mtime']) <= 1))
+            remote_unchanged = (
+                tracked.get('s3_size') == s3_info['s3_size'] and
+                tracked.get('s3_etag') == s3_info.get('s3_etag'))
+            if not (local_unchanged and remote_unchanged):
+                continue
+
+            etag = s3_info.get('s3_etag') or ''
+            if self._etag_is_md5(etag) and current_md5 == etag:
+                verified = True
+            else:
+                verified = self._remote_md5(path) == current_md5
+            if not verified:
+                continue
+
+            md5_updates.append((current_md5, path))
+            self._update_shadow(path)
+            seeded += 1
+
+        if md5_updates:
+            with self._get_db() as conn:
+                conn.executemany('UPDATE files SET local_md5 = ? WHERE path = ?',
+                                 md5_updates)
+        if seeded:
+            print(f"Seeded merge bases for {seeded} tracked in-sync file(s)")
 
     def reset_tracking(self, include_backups=False):
         """Stamp the current local and S3 state as the synced baseline.

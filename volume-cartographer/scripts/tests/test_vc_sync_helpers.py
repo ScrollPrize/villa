@@ -525,6 +525,47 @@ class TestAutoMerge:
         assert manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32)) is None
 
 
+class TestSeedTrackedShadows:
+    """The 'update' upgrade path: tracked-but-unhashed files get md5 + shadow
+    when verifiably in sync (previously only untracked files were seeded)."""
+
+    def test_tracked_row_without_md5_gets_seeded(self, manager):
+        write_local(manager, 'fibers/f.json', '{"a": 1}')
+        info = local_info(manager, 'fibers/f.json')
+        remote = s3_info(info['local_size'], info['local_md5'])
+        # Pre-upgrade row: stats match, no md5
+        track_row(manager, 'fibers/f.json', info['local_size'],
+                  info['local_mtime'], info['local_size'], info['local_md5'])
+        manager._seed_tracked_shadows({'fibers/f.json': info},
+                                      {'fibers/f.json': remote})
+        with sqlite3.connect(manager.db_file) as conn:
+            row = conn.execute('SELECT local_md5 FROM files').fetchone()
+        assert row[0] == info['local_md5']
+        assert os.path.exists(manager._shadow_path('fibers/f.json'))
+
+    def test_locally_changed_file_not_seeded(self, manager):
+        write_local(manager, 'fibers/f.json', '{"a": 2}')
+        info = local_info(manager, 'fibers/f.json')
+        remote = s3_info(info['local_size'], info['local_md5'])
+        # Tracked stats differ from the current file: pending local change
+        track_row(manager, 'fibers/f.json', info['local_size'] + 5, 0.0,
+                  info['local_size'], info['local_md5'])
+        manager._seed_tracked_shadows({'fibers/f.json': info},
+                                      {'fibers/f.json': remote})
+        assert not os.path.exists(manager._shadow_path('fibers/f.json'))
+
+    def test_unverifiable_remote_not_seeded(self, manager, monkeypatch):
+        write_local(manager, 'fibers/f.json', '{"a": 3}')
+        info = local_info(manager, 'fibers/f.json')
+        remote = s3_info(info['local_size'], 'abc123-4')  # opaque etag
+        track_row(manager, 'fibers/f.json', info['local_size'],
+                  info['local_mtime'], info['local_size'], 'abc123-4')
+        monkeypatch.setattr(manager, '_remote_md5', lambda p: None)
+        manager._seed_tracked_shadows({'fibers/f.json': info},
+                                      {'fibers/f.json': remote})
+        assert not os.path.exists(manager._shadow_path('fibers/f.json'))
+
+
 class TestRecordUntrackedSynced:
     def test_same_size_divergent_content_not_healed(self, manager, monkeypatch):
         write_local(manager, 'f.json', '{"a": 1}')

@@ -720,11 +720,9 @@ void CFiberWidget::rebuildModel()
         };
         applyRowMetadata(row, fiber.id, false, fiber.alignment, showMetrics);
         if (fiber.quarantinedLinkCount > 0) {
-            const QString quarantineTip =
+            row[kLinkColumn]->setToolTip(
                 tr("%1 quarantined link(s): kept on disk, disabled this session")
-                    .arg(fiber.quarantinedLinkCount);
-            row[kLinkColumn]->setToolTip(quarantineTip);
-            row[kPendingColumn]->setToolTip(quarantineTip);
+                    .arg(fiber.quarantinedLinkCount));
         }
 
         QStandardItem* root = row[kNameColumn];

@@ -394,6 +394,26 @@ def test_link_identity_is_tolerance_based_not_rounding_based():
     assert branches[0]['pending'] is False  # approval won
 
 
+def test_link_survives_jittered_geometry_within_tolerance():
+    """Re-resolving link anchors must use the same per-axis pos_eq predicate
+    as everything else. A pure Euclidean^2 <= POS_TOL^2 bound was up to 3x
+    stricter and silently dropped a valid link when one side's geometry
+    carried sub-tolerance jitter on every axis."""
+    jitter = [[p[0] + 8e-7, p[1] + 8e-7, p[2] + 8e-7] for p in BASE_CPS]
+    base = make_fiber(BASE_CPS)
+    local = make_fiber(jitter, tags=['touched'], generation=2)  # "unchanged"
+    remote = make_fiber(BASE_CPS,
+                        branches=[link('kb_a.json', BASE_CPS[2], OTHER, 2)],
+                        generation=2)
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    branches = result['merged']['branches']
+    assert len(branches) == 1, result['notes']
+    assert fiber_merge.pos_eq(
+        result['merged']['control_points'][branches[0]['control_point_index']],
+        branches[0]['control_point_position'])
+
+
 def test_line_only_reoptimization_is_never_dropped_silently():
     """A side can re-optimize line_points without moving any control point;
     region ownership cannot see that, but it must not vanish untagged."""

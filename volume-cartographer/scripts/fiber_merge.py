@@ -297,11 +297,17 @@ def merge_branches(base_doc, local_doc, remote_doc, merged_cps, prefer_local):
     surviving = []
     for branch in merged:
         position = branch.get('control_point_position')
+        # Candidacy uses pos_eq — the same per-axis predicate as every other
+        # position comparison. (A pure Euclidean² <= POS_TOL² bound is up to
+        # 3x stricter than pos_eq and dropped links whose anchor pos_eq-
+        # matched a merged point.) Nearest pos_eq match wins.
         index = None
-        best = POS_TOL * POS_TOL
+        best = math.inf
         for i, cp in enumerate(merged_cps):
+            if not pos_eq(cp, position):
+                continue
             d2 = _dist2(cp, position)
-            if d2 <= best:
+            if d2 < best:
                 best = d2
                 index = i
         if index is None:

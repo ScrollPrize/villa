@@ -6428,6 +6428,9 @@ void LineAnnotationController::handleGeneratedControlPointSetLinkPending(
                                                  const FiberBranchRef& updatedBranch) {
         bool changed = false;
         for (auto& candidate : targetBranches) {
+            if (!branchLinkActive(candidate)) {
+                continue;  // quarantined links are excluded from link editing
+            }
             const bool pointsToSession =
                 candidate.branchFiberId == session.fiberId ||
                 (!session.fiberFileName.empty() &&
@@ -7823,8 +7826,10 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     _fibers = std::move(loadedFibers);
 
     if (repairRequested) {
-        // Flows through the guarded save pipeline, so a concurrent external
-        // change still prompts instead of being clobbered.
+        // Explicit user action: rewrites the affected files. Note the save
+        // pipeline has NO staleness guard (deliberately deferred), so a
+        // repair racing an external sync write follows last-writer-wins;
+        // vc_sync's conflict copies are the safety net for that case.
         repairQuarantinedFiberLinks();
     }
     if (!loadErrors.empty()) {
@@ -9112,6 +9117,12 @@ std::vector<uint64_t> LineAnnotationController::syncBranchEndpointPositions(
                                 const cv::Vec3d& targetPoint,
                                 const cv::Vec3d& sourcePoint) {
         for (auto& reciprocal : targetBranches) {
+            if (!branchLinkActive(reciprocal)) {
+                // Quarantined entries are excluded from link editing; they
+                // serialize from sourceJson verbatim, so mutating them here
+                // would only desynchronize the in-memory copy.
+                continue;
+            }
             const bool pointsToSession =
                 reciprocal.branchFiberId == session.fiberId ||
                 (!session.fiberFileName.empty() &&
@@ -10481,6 +10492,10 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
         };
         const auto& branches = root.at("branches");
         if (!branches.is_array()) {
+            // The value is preserved but the shape changes: a non-array
+            // "branches" round-trips to an array containing that value
+            // (save always emits an array). Content survives; the original
+            // malformed shape does not.
             preserveUnparsed(branches, "branches must be an array");
         } else {
             for (const auto& branchJson : branches) {
@@ -10621,8 +10636,8 @@ void LineAnnotationController::resolveLoadedFiberLinks(
     // Phase 1: per-branch endpoint resolution, position-first. Both sides
     // are canonicalized before phase 2 checks reciprocity, so a stale index
     // on one side cannot hide the reciprocal entry on the other. Everything
-    // here mutates in-memory state only; repaired fibers are flagged
-    // needsSave and persist on their next legitimate save.
+    // here mutates in-memory state only (marked LinkState::Repaired);
+    // repairs persist whenever the fiber is next legitimately saved.
     for (auto& fiber : fibers) {
         for (auto& branch : fiber.branches) {
             const auto localIndex = matchingStoredControlPointIndex(
@@ -10636,7 +10651,6 @@ void LineAnnotationController::resolveLoadedFiberLinks(
             if (*localIndex != branch.controlPointIndex) {
                 branch.controlPointIndex = *localIndex;
                 branch.linkState = LinkState::Repaired;
-                fiber.needsSave = true;
             }
             branch.controlPointPosition =
                 fiber.controlPoints[static_cast<size_t>(*localIndex)];
@@ -10653,7 +10667,6 @@ void LineAnnotationController::resolveLoadedFiberLinks(
             if (!branchDirectionsCompatible(branch.controlPointDirection,
                                             refreshedLocal)) {
                 branch.linkState = LinkState::Repaired;
-                fiber.needsSave = true;
             }
             branch.controlPointDirection = refreshedLocal;
 
@@ -10675,7 +10688,6 @@ void LineAnnotationController::resolveLoadedFiberLinks(
             if (*linkedIndex != branch.branchControlPointIndex) {
                 branch.branchControlPointIndex = *linkedIndex;
                 branch.linkState = LinkState::Repaired;
-                fiber.needsSave = true;
             }
             branch.branchControlPointPosition =
                 target.controlPoints[static_cast<size_t>(*linkedIndex)];
@@ -10690,7 +10702,6 @@ void LineAnnotationController::resolveLoadedFiberLinks(
             if (!branchDirectionsCompatible(branch.branchControlPointDirection,
                                             refreshedLinked)) {
                 branch.linkState = LinkState::Repaired;
-                fiber.needsSave = true;
             }
             branch.branchControlPointDirection = refreshedLinked;
         }
@@ -10698,8 +10709,11 @@ void LineAnnotationController::resolveLoadedFiberLinks(
 
     // Phase 2: reciprocal existence, matched on swapped positions only —
     // phase 1 already canonicalized indices and directions on both sides.
-    // Quarantining a branch never touches other branches or fibers: there
-    // is deliberately no cascade here.
+    // Quarantining is bounded to the link pair: excluding quarantined
+    // candidates below means the reciprocal half of a broken pair
+    // quarantines too (so a one-sided problem is flagged on both fibers,
+    // and appears as two notes in the dialog), but it never propagates
+    // further — no whole-fiber removal, no chain reaction across links.
     for (auto& fiber : fibers) {
         for (auto& branch : fiber.branches) {
             if (branch.linkState == LinkState::Quarantined) {
