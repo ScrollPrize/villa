@@ -2,6 +2,10 @@ Segmentation growth and editing is now supported within the segmentation widget.
 
 This is relatively untested, but (should) work. It's possible to easily create relatively large segmentations rather quickly -- i created this nearly 22cm segmentation in less than 5 minutes. ![grow_example.png](grow_example.png)
 
+**rotate and flip a surface**
+
+Select a segmentation, then open `Actions > Transforms > Rotate`. Adjust the angle and, if needed, enable `Flip horizontally`; the segmentation view previews rotation followed by the horizontal flip. Select `Apply` to write the transformed surface. Rotation preview remains available for surfaces with multipage `multilayer_mask.tif` sidecars or disconnected component ranges, but `Apply` is disabled because those structures cannot yet be transformed safely.
+
 **prerequisites** 
 - you must have computed normal grids in the volpkg directory stored as `/path/to/example.volpkg/normal_grids/`
   - to compute these, run `/path/to/build/bin/vc_compute_normal_grids` , use the help option to see the options (or just enter it without any arguments)

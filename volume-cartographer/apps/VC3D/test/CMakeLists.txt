@@ -1,3 +1,22 @@
+find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
+
+add_executable(test_surface_rotation_transform
+    test_surface_rotation_transform.cpp)
+
+target_include_directories(test_surface_rotation_transform PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_surface_rotation_transform PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+set_target_properties(test_surface_rotation_transform PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+add_test(NAME surface_rotation_transform COMMAND test_surface_rotation_transform)
+vc_register_test_target(test_surface_rotation_transform)
+vc_register_ctest(surface_rotation_transform test_surface_rotation_transform)
+
 # Standalone unit test for SeedingBatchTracker (apps/VC3D/SeedingBatchTracker.*),
 # the honest run/expand batch-outcome aggregation extracted from SeedingWidget.
 # Deterministic, no process launch, no volume data — safe for the default ctest
@@ -7,8 +26,6 @@
 # so we compile its source straight into the test and link just Qt6::Core (for
 # QString et al.) + Qt6::Test (the QTest harness). No other VC3D code is pulled
 # in, keeping the test fast and self-contained.
-find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Test Widgets)
-
 add_executable(test_unified_browser_dialog
     test_unified_browser_dialog.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/UnifiedBrowserDialog.cpp
