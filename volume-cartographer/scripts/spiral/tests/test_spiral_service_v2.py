@@ -10,9 +10,11 @@ import argparse
 import io
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -22,12 +24,22 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
+
+import numpy as np
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import spiral_service
-from spiral_service import (ApiError, ArtifactRegistry, ServiceLogBuffer, ServiceState,
-                            SpiralServer, load_or_create_api_key, parse_gpu_ids)
+from spiral_service import (ApiError, ArtifactRegistry, ExclusiveFileLock,
+                            FileLockUnavailable, ServiceLogBuffer, ServiceState,
+                            SpiralServer, _mapped_winding_ids,
+                            _prepare_cleaned_lasagna_surface,
+                            _raw_run_diff_rgba, _sample_rgba_through_map,
+                            _validate_tifxyz_output_step,
+                            load_or_create_api_key, parse_gpu_ids,
+                            parse_session_name)
 from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
 
 
@@ -60,7 +72,6 @@ class FakeSession:
             "state": self.state, "phase": self.state, "current_iteration": 5,
             "target_iteration": 5, "latest_metrics": {}, "warnings": [],
             "error": None, "preview_manifest_path": None, "preview_generation": 0,
-            "geometry_snapshot_manifest_path": None,
             "supports_input_incorporation": True,
             "run_config": dict(self.run_config),
             "run_config_limits": {"max_track_crossing_per_step": 8},
@@ -115,6 +126,22 @@ def _upload_input(state, kind, input_id, files, role=None):
     return upload_id
 
 
+def _commit_pcl_process(dataset, output, input_id, ready, start, result):
+    try:
+        state = ServiceState()
+        _attach_fake_session(state, output, dataset)
+        upload_id = _upload_input(
+            state, "pcl", input_id, PCL_FILES, role="patch_overlap")
+        state.finalize_upload(upload_id)
+        ready.put(input_id)
+        if not start.wait(10):
+            raise RuntimeError("timed out waiting for concurrent commit start")
+        state.commit_inputs()
+        result.put((input_id, "ok"))
+    except BaseException as exc:
+        result.put((input_id, f"{type(exc).__name__}: {exc}"))
+
+
 PATCH_FILES = {
     "meta.json": json.dumps({"format": "tifxyz"}).encode(),
     "x.tif": b"x-raster", "y.tif": b"y-raster", "z.tif": b"z-raster",
@@ -153,6 +180,47 @@ class GpuSelectionTests(unittest.TestCase):
         for value in ("", "0,", "-1", "gpu0", "1,1"):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 parse_gpu_ids(value)
+
+
+class NamedSessionTests(unittest.TestCase):
+    def test_safe_session_names_are_accepted(self):
+        for value in ("alice", "gpu-1", "team_one", "run.2026"):
+            with self.subTest(value=value):
+                self.assertEqual(parse_session_name(value), value)
+
+    def test_unsafe_session_names_are_rejected(self):
+        for value in ("", ".", "..", "../alice", "alice/bob", "a b", "_alice",
+                      "a" * 65):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                parse_session_name(value)
+
+    def test_named_resolution_isolates_output_but_shares_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "umbilicus.json").write_text("{}")
+            (root / "verified_patches").mkdir()
+            unnamed = resolve_dataset_root(root)
+            alice = resolve_dataset_root(root, session_name="alice")
+            bob = resolve_dataset_root(root, session_name="bob")
+            self.assertEqual(unnamed.resolved["output_directory"],
+                             str(root / "spiral_output"))
+            self.assertEqual(alice.resolved["output_directory"],
+                             str(root / "spiral_output" / "alice"))
+            self.assertEqual(bob.resolved["output_directory"],
+                             str(root / "spiral_output" / "bob"))
+            self.assertEqual(alice.resolved["cache_directory"],
+                             bob.resolved["cache_directory"])
+
+    def test_exclusive_lock_rejects_duplicate_live_owner_and_releases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session" / ".spiral-service.lock"
+            first = ExclusiveFileLock(path).acquire()
+            second = ExclusiveFileLock(path)
+            with self.assertRaises(FileLockUnavailable):
+                second.acquire()
+            first.release()
+            second.acquire()
+            second.release()
 
 
 class HttpServiceFixture(unittest.TestCase):
@@ -215,8 +283,36 @@ class AuthenticationTests(HttpServiceFixture):
         self.assertEqual(health["api_version"], API_VERSION)
         self.assertIn("service_version", health)
         self.assertIn("service_name", health)
+        self.assertIn("session_name", health)
         self.assertIn("session_generation", health)
         self.assertIn("service_generation", health)
+
+
+class RestartTests(HttpServiceFixture):
+    def test_restart_requires_authentication_and_command_id(self):
+        status, _, _ = self.request(
+            "POST", "/service/restart", token=None,
+            body={"command_id": "restart-1"})
+        self.assertEqual(status, 401)
+        self.assertFalse(self.server.restart_requested.is_set())
+
+        status, payload, _ = self.request("POST", "/service/restart", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("command_id", json.loads(payload)["error"])
+        self.assertFalse(self.server.restart_requested.is_set())
+
+    def test_restart_is_acknowledged_and_duplicate_requests_are_idempotent(self):
+        body = {"command_id": "restart-1"}
+        status, payload, _ = self.request("POST", "/service/restart", body=body)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(payload)["restarting"])
+
+        status, duplicate, _ = self.request("POST", "/service/restart", body=body)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(duplicate), json.loads(payload))
+
+        self.assertTrue(self.server._restart_scheduled)
+        self.assertTrue(self.server.restart_requested.wait(2))
 
 
 class LogStreamingTests(HttpServiceFixture):
@@ -271,6 +367,22 @@ class LogStreamingTests(HttpServiceFixture):
         logs.write("stderr", "useful fitter warning\n")
         self.assertEqual([entry["text"] for entry in logs.read_after(0)["entries"]],
                          ["useful fitter warning"])
+
+    def test_carriage_return_progress_redraws_are_relayed_as_complete_lines(self):
+        logs = ServiceLogBuffer()
+        logs.write("stderr", "\rloading patches:  25%|██▌       | 1/4")
+        logs.write("stderr", "\rloading patches: 100%|██████████| 4/4\n")
+        logs.write("stderr", "\r 40%|████      | 400/1000")
+        logs.write("stderr", "\r100%|██████████| 1000/1000\n")
+
+        self.assertEqual(
+            [entry["text"] for entry in logs.read_after(0)["entries"]],
+            [
+                "loading patches:  25%|██▌       | 1/4",
+                "loading patches: 100%|██████████| 4/4",
+                " 40%|████      | 400/1000",
+                "100%|██████████| 1000/1000",
+            ])
 
 
 class ArtifactHttpTests(HttpServiceFixture):
@@ -375,6 +487,43 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(response["root"], str(self.root))
         self.assertIn("umbilicus", response["resolved"])
 
+    def test_dataset_endpoint_advertises_named_session(self):
+        resolution = resolve_dataset_root(self.root, session_name="alice")
+        state = ServiceState(
+            dataset_root=str(self.root), dataset_resolution=resolution,
+            session_name="alice")
+        response = state.dataset()
+        self.assertEqual(response["session_name"], "alice")
+        self.assertEqual(
+            response["resolved"]["output_directory"],
+            str(self.root / "spiral_output" / "alice"))
+
+    def test_dataset_resolution_discovers_drawn_control_points(self):
+        drawn = self.root / "drawn_control_points.json"
+        drawn.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "drawn", "points": {}}},
+        }))
+        resolution = resolve_dataset_root(self.root)
+        entries = [entry for entry in resolution.pcl_inputs
+                   if entry["role"] == "drawn_control_points"]
+        self.assertEqual(entries, [{
+            "path": str(drawn), "role": "drawn_control_points", "required": False,
+        }])
+
+    def test_dataset_resolution_discovers_same_winding_collections(self):
+        same_winding = self.root / "same_windings.json"
+        same_winding.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "same_winding_0001", "points": {}}},
+        }))
+        resolution = resolve_dataset_root(self.root)
+        entries = [entry for entry in resolution.pcl_inputs
+                   if entry["role"] == "same_winding"]
+        self.assertEqual(entries, [{
+            "path": str(same_winding), "role": "same_winding", "required": False,
+        }])
+
     def test_arbitrary_root_resolution_is_refused(self):
         with self.assertRaises(ApiError) as caught:
             self.state.resolve("/somewhere/else")
@@ -414,6 +563,74 @@ class DatasetOwnershipTests(unittest.TestCase):
                       "normal_y", "surf_sdt", "tracks_dbm",
                       "gradient_magnitude", "fibers"):
             self.assertEqual(request["paths"][field], "")
+
+    def test_status_advertises_canonical_active_session_request(self):
+        config = {
+            "use_verified_patches": True,
+            "use_unverified_patches": False,
+            "use_normals": False,
+            "use_surf_sdt": False,
+            "use_tracks": False,
+            "use_gradient_magnitude": False,
+            "use_fibers": False,
+            "loss_weight_shell_outer": 0,
+            "loss_weight_shell_patch_radius": 0,
+            "loss_weight_patch_radius": 7.5,
+        }
+        request = {
+            "run": {
+                "z_begin": 100,
+                "z_end": 900,
+                "scroll_name": "attached-scroll",
+                "config": config,
+            },
+            "preview": {"first_winding": 12, "variant": "raw"},
+        }
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()):
+            response = self.state.load(request)
+
+        attached = response["session_request"]
+        self.assertEqual(attached, self.state.status()["session_request"])
+        self.assertEqual(attached["paths"]["dataset_root"], str(self.root))
+        self.assertEqual(attached["paths"]["verified_patches"],
+                         str(self.root / "verified_patches"))
+        self.assertEqual(attached["paths"]["fibers"], "")
+        self.assertEqual(attached["run"]["z_begin"], 100)
+        self.assertEqual(attached["run"]["z_end"], 900)
+        self.assertEqual(attached["run"]["scroll_name"], "attached-scroll")
+        self.assertEqual(attached["run"]["config"], config)
+        self.assertEqual(attached["preview"],
+                         {"first_winding": 12, "variant": "raw"})
+
+        self.state.delete()
+        self.assertIsNone(self.state.status()["session_request"])
+
+    def test_failed_load_does_not_advertise_a_session_request(self):
+        request = {
+            "run": {
+                "z_begin": 0,
+                "z_end": 10,
+                "config": {
+                    "use_verified_patches": False,
+                    "use_unverified_patches": False,
+                    "use_normals": False,
+                    "use_surf_sdt": False,
+                    "use_tracks": False,
+                    "use_gradient_magnitude": False,
+                    "use_fibers": False,
+                    "loss_weight_shell_outer": 0,
+                    "loss_weight_shell_patch_radius": 0,
+                },
+            },
+        }
+        with mock.patch("spiral_runtime.create_session",
+                        side_effect=RuntimeError("startup failed")):
+            with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                self.state.load(request)
+        status = self.state.status()
+        self.assertIsNone(status["session_id"])
+        self.assertIsNone(status["session_request"])
 
     def test_save_checkpoint_is_constrained_to_output_directory(self):
         _attach_fake_session(self.state, self.root / "spiral_output", self.root)
@@ -518,6 +735,16 @@ class UploadTests(unittest.TestCase):
         with self.assertRaisesRegex(ApiError, "role"):
             self.state.begin_upload({"kind": "pcl", "id": "roleless", "files": [
                 {"name": "pcl.json", "size": 1, "sha256": "0" * 64}]})
+
+    def test_drawn_control_points_are_forwarded_to_the_next_run(self):
+        session = self._session()
+        upload_id = _upload_input(self.state, "pcl", "drawn-1", PCL_FILES,
+                                  role="drawn_control_points")
+        self.state.finalize_upload(upload_id)
+        self.state.run({"iterations": 2})
+        _, pending, _, _, _ = session.run_calls[-1]
+        self.assertEqual([(record["id"], record["role"]) for record in pending],
+                         [("drawn-1", "drawn_control_points")])
 
     def test_quota_is_enforced(self):
         self._session()
@@ -657,12 +884,12 @@ class UploadTests(unittest.TestCase):
         self.assertFalse(ephemeral_dir.exists())
 
 
-def _zip_checkpoint_bytes():
+def _zip_checkpoint_bytes(payload=b"payload"):
     import io as _io
     import zipfile
     buffer = _io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("data.pkl", b"payload")
+        archive.writestr("data.pkl", payload)
     return buffer.getvalue()
 
 
@@ -683,7 +910,21 @@ class CheckpointUploadTests(unittest.TestCase):
 
     def _upload_checkpoint(self, name, data=None):
         data = data if data is not None else _zip_checkpoint_bytes()
-        upload_id = _upload_input(self.state, "checkpoint", name, {name: data})
+        request = {
+            "kind": "checkpoint",
+            "id": name,
+            "files": [{
+                "name": name,
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        }
+        begin = self.state.begin_upload(request)
+        if begin.get("deduplicated"):
+            return begin["input"]
+        upload_id = begin["upload_id"]
+        self.state.receive_upload_file(
+            upload_id, name, io.BytesIO(data), len(data))
         return self.state.finalize_upload(upload_id)["input"]
 
     def test_checkpoint_upload_works_without_a_session_in_dataset_mode(self):
@@ -717,15 +958,121 @@ class CheckpointUploadTests(unittest.TestCase):
                          if (self.root / "spiral_output" / "uploaded-checkpoints").exists()
                          else False)
 
-    def test_name_collision_is_uniquified_not_overwritten(self):
+    def test_identical_checkpoint_is_reused_without_an_upload(self):
         first = self._upload_checkpoint("resume.ckpt")
-        second = self._upload_checkpoint("resume.ckpt")
+        data = _zip_checkpoint_bytes()
+        begin = self.state.begin_upload({
+            "kind": "checkpoint",
+            "id": "renamed.ckpt",
+            "files": [{
+                "name": "renamed.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        self.assertNotIn("upload_id", begin)
+        second = begin["input"]
+        self.assertEqual(first["path"], second["path"])
+        self.assertEqual(second["id"], "renamed.ckpt")
+        self.assertTrue(Path(first["path"]).is_file())
+
+    def test_same_name_with_different_content_is_not_reused(self):
+        first = self._upload_checkpoint("resume.ckpt", _zip_checkpoint_bytes(b"first"))
+        second = self._upload_checkpoint("resume.ckpt", _zip_checkpoint_bytes(b"second"))
         self.assertNotEqual(first["path"], second["path"])
         self.assertTrue(Path(first["path"]).is_file())
         self.assertTrue(Path(second["path"]).is_file())
 
+    def test_checkpoint_deduplication_survives_service_restart(self):
+        first = self._upload_checkpoint("resume.ckpt")
+        restarted = ServiceState(dataset_root=str(self.root),
+                                 dataset_resolution=self.resolution)
+        data = _zip_checkpoint_bytes()
+        begin = restarted.begin_upload({
+            "kind": "checkpoint",
+            "id": "after-restart.ckpt",
+            "files": [{
+                "name": "after-restart.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        self.assertEqual(begin["input"]["path"], first["path"])
+
+    def test_legacy_named_checkpoint_is_found_by_digest(self):
+        root = self.root / "spiral_output" / "uploaded-checkpoints"
+        root.mkdir()
+        data = _zip_checkpoint_bytes()
+        legacy = root / "resume-before-v7.ckpt"
+        legacy.write_bytes(data)
+        begin = self.state.begin_upload({
+            "kind": "checkpoint",
+            "id": "resume.ckpt",
+            "files": [{
+                "name": "resume.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        self.assertEqual(Path(begin["input"]["path"]), legacy)
+
+    def test_concurrent_identical_uploads_converge_on_one_file(self):
+        data = _zip_checkpoint_bytes()
+        request = {
+            "kind": "checkpoint",
+            "id": "resume.ckpt",
+            "files": [{
+                "name": "resume.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        }
+        first_id = self.state.begin_upload(request)["upload_id"]
+        second_id = self.state.begin_upload(request)["upload_id"]
+        for upload_id in (first_id, second_id):
+            self.state.receive_upload_file(
+                upload_id, "resume.ckpt", io.BytesIO(data), len(data))
+        first = self.state.finalize_upload(first_id)["input"]
+        second = self.state.finalize_upload(second_id)["input"]
+        self.assertEqual(first["path"], second["path"])
+        root = self.root / "spiral_output" / "uploaded-checkpoints"
+        self.assertEqual([Path(first["path"])], list(root.iterdir()))
+
+    def test_reusing_a_checkpoint_refreshes_retention_recency(self):
+        payloads = [str(i).encode() for i in range(
+            spiral_service.UPLOADED_CHECKPOINTS_KEPT)]
+        published = [
+            Path(self._upload_checkpoint(
+                f"resume-{i}.ckpt", _zip_checkpoint_bytes(payload))["path"])
+            for i, payload in enumerate(payloads)
+        ]
+        base_time = time.time() - 100
+        for age, path in enumerate(published):
+            os.utime(path, (base_time + age, base_time + age))
+
+        reused_data = _zip_checkpoint_bytes(payloads[0])
+        begin = self.state.begin_upload({
+            "kind": "checkpoint",
+            "id": "reuse.ckpt",
+            "files": [{
+                "name": "reuse.ckpt",
+                "size": len(reused_data),
+                "sha256": _digest(reused_data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        newest = Path(self._upload_checkpoint(
+            "new.ckpt", _zip_checkpoint_bytes(b"new"))["path"])
+        self.assertTrue(published[0].exists())
+        self.assertFalse(published[1].exists())
+        self.assertTrue(newest.exists())
+
     def test_retention_prunes_old_uploads(self):
-        published = [Path(self._upload_checkpoint(f"resume-{i}.ckpt")["path"])
+        published = [Path(self._upload_checkpoint(
+            f"resume-{i}.ckpt", _zip_checkpoint_bytes(str(i).encode()))["path"])
                      for i in range(spiral_service.UPLOADED_CHECKPOINTS_KEPT + 2)]
         for old_age, path in enumerate(published):
             if path.exists():
@@ -792,6 +1139,143 @@ class CommitTests(unittest.TestCase):
         self.assertTrue(all(record["committed"] and record["state"] == "pending"
                             for record in inputs))
 
+    def test_concurrent_service_commits_serialize_pcl_merges(self):
+        output_b = self.root / "output-b"
+        output_b.mkdir()
+        state_b = ServiceState()
+        _attach_fake_session(state_b, output_b, self.dataset)
+        upload_a = _upload_input(
+            self.state, "pcl", "pcl-a", PCL_FILES, role="patch_overlap")
+        upload_b = _upload_input(
+            state_b, "pcl", "pcl-b", PCL_FILES, role="patch_overlap")
+        self.state.finalize_upload(upload_a)
+        state_b.finalize_upload(upload_b)
+        target = self.dataset / "patch-overlap-pcls.json"
+        target.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1", "collections": {},
+        }))
+
+        active = 0
+        max_active = 0
+        activity_lock = threading.Lock()
+        original_merge = spiral_service._merge_pcl_documents
+
+        def slow_merge(existing, incoming):
+            nonlocal active, max_active
+            with activity_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.1)
+                return original_merge(existing, incoming)
+            finally:
+                with activity_lock:
+                    active -= 1
+
+        errors = []
+
+        def commit(state):
+            try:
+                state.commit_inputs()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+                spiral_service, "_merge_pcl_documents", side_effect=slow_merge):
+            threads = [
+                threading.Thread(target=commit, args=(self.state,)),
+                threading.Thread(target=commit, args=(state_b,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+        self.assertFalse(errors)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(max_active, 1)
+        merged = json.loads(target.read_text())
+        self.assertEqual(len(merged["collections"]), 2)
+
+    def test_independent_processes_preserve_both_pcl_commits(self):
+        target = self.dataset / "patch-overlap-pcls.json"
+        target.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1", "collections": {},
+        }))
+        context = multiprocessing.get_context("spawn")
+        ready = context.Queue()
+        start = context.Event()
+        result = context.Queue()
+        processes = []
+        for name in ("process-a", "process-b"):
+            output = self.root / name
+            output.mkdir()
+            processes.append(context.Process(
+                target=_commit_pcl_process,
+                args=(str(self.dataset), str(output), name, ready, start, result)))
+        for process in processes:
+            process.start()
+        self.assertEqual({ready.get(timeout=20), ready.get(timeout=20)},
+                         {"process-a", "process-b"})
+        start.set()
+        outcomes = dict(result.get(timeout=30) for _ in processes)
+        for process in processes:
+            process.join(30)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+        self.assertEqual(outcomes, {"process-a": "ok", "process-b": "ok"})
+        merged = json.loads(target.read_text())
+        self.assertEqual(len(merged["collections"]), 2)
+
+    def test_drawn_control_points_commit_preserves_line_and_point_order(self):
+        existing = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"4": {"name": "existing", "points": {}}},
+        }
+        target = self.dataset / "drawn_control_points.json"
+        target.write_text(json.dumps(existing))
+        incoming = {"drawn.json": json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {"name": "first", "points": {
+                    "0": {"p": [0, 0, 0]}, "1": {"p": [30, 0, 0]}}},
+                "1": {"name": "second", "points": {
+                    "0": {"p": [0, 1, 0]}, "1": {"p": [30, 1, 0]}}},
+            },
+        }).encode()}
+        self._finalize("pcl", "drawn-1", incoming, role="drawn_control_points")
+        self.state.commit_inputs()
+        merged = json.loads(target.read_text())
+        self.assertEqual([collection["name"] for collection in merged["collections"].values()],
+                         ["existing", "first", "second"])
+        self.assertEqual(list(merged["collections"]["5"]["points"]), ["0", "1"])
+        self.assertEqual(len(list(self.dataset.glob(
+            "drawn_control_points.json.*.bak"))), 1)
+
+    def test_same_winding_commit_preserves_collection_and_point_order(self):
+        existing = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"2": {"name": "existing", "points": {}}},
+        }
+        target = self.dataset / "same_windings.json"
+        target.write_text(json.dumps(existing))
+        incoming = {"same.json": json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {"name": "same_winding_0001", "points": {
+                    "0": {"p": [1, 2, 3]}, "1": {"p": [4, 5, 6]}}},
+                "1": {"name": "same_winding_0002", "points": {
+                    "0": {"p": [7, 8, 9]}, "1": {"p": [10, 11, 12]}}},
+            },
+        }).encode()}
+        self._finalize("pcl", "same-1", incoming, role="same_winding")
+        self.state.commit_inputs()
+        merged = json.loads(target.read_text())
+        self.assertEqual([collection["name"] for collection in merged["collections"].values()],
+                         ["existing", "same_winding_0001", "same_winding_0002"])
+        self.assertEqual(list(merged["collections"]["3"]["points"]), ["0", "1"])
+        self.assertEqual(len(list(self.dataset.glob(
+            "same_windings.json.*.bak"))), 1)
+
     def test_commit_keeps_pending_inputs_queued_and_incorporation_retires_them(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)
         staged = Path(record["path"])
@@ -855,6 +1339,205 @@ class CommitTests(unittest.TestCase):
             self.state.commit_inputs()
 
 
+class MappedPreviewArtifactTests(unittest.TestCase):
+    def test_lasagna_output_scale_must_match_requested_step(self):
+        self.assertEqual(
+            _validate_tifxyz_output_step(
+                {"scale": [0.05, 0.05]}, 20.0),
+            [0.05, 0.05])
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            _validate_tifxyz_output_step(
+                {"scale": [0.04, 0.04]}, 20.0)
+
+    def test_failed_flatten_keeps_previous_preview_and_discards_raw_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous = root / "previous"
+            current = root / "current"
+            previous.mkdir()
+            current.mkdir()
+            previous_manifest = previous / "manifest.json"
+            current_manifest = current / "manifest.json"
+            previous_manifest.write_text("{}")
+            current_manifest.write_text("{}")
+            state = ServiceState()
+            state.session_id = "session"
+            state._previous_raw_preview_manifest = str(previous_manifest)
+            state._preview_artifact = {"id": "previous-preview"}
+
+            with mock.patch.object(
+                    state, "_publish_flattened_preview",
+                    side_effect=RuntimeError("flatten failed")):
+                state._maybe_register_artifacts({
+                    "preview_generation": 1,
+                    "preview_manifest_path": str(current_manifest),
+                })
+
+            self.assertEqual(
+                state._preview_artifact, {"id": "previous-preview"})
+            self.assertTrue(previous.exists())
+            self.assertFalse(current.exists())
+            self.assertIn("flatten failed", state._preview_publish_error)
+
+    def test_winding_membership_uses_flatten_correspondence(self):
+        manifest = {
+            "winding_ids": [7, 9],
+            "winding_column_ranges": [[0, 2], [2, 4]],
+        }
+        source_yx = np.asarray([
+            [[0.0, 3.0], [1.0, 0.0], [1.0, 2.0]],
+            [[9.0, 9.0], [0.0, 1.0], [0.0, 2.0]],
+        ], dtype=np.float32)
+        output_valid = np.asarray([
+            [True, True, True],
+            [True, False, True],
+        ])
+
+        winding_ids, bounds = _mapped_winding_ids(
+            manifest, (2, 4), source_yx, output_valid)
+
+        np.testing.assert_array_equal(winding_ids, np.asarray([
+            [9, 7, 9],
+            [-1, -1, 9],
+        ], dtype=np.int32))
+        self.assertEqual(bounds, [
+            {
+                "winding": 7, "row_begin": 0, "row_end": 1,
+                "column_begin": 1, "column_end": 2,
+            },
+            {
+                "winding": 9, "row_begin": 0, "row_end": 2,
+                "column_begin": 0, "column_end": 3,
+            },
+        ])
+
+    def test_loss_overlay_is_bilinearly_warped_with_alpha(self):
+        source = np.zeros((2, 2, 4), dtype=np.uint8)
+        source[0, 0] = [200, 0, 0, 255]
+        source[0, 1] = [0, 0, 200, 255]
+        source_yx = np.asarray([[
+            [0.0, 0.0], [0.0, 0.5], [0.0, 1.0],
+        ]], dtype=np.float32)
+
+        mapped = _sample_rgba_through_map(
+            source, source_yx, np.asarray([[True, True, False]]))
+
+        np.testing.assert_array_equal(mapped[0, 0], [200, 0, 0, 255])
+        np.testing.assert_allclose(mapped[0, 1], [100, 0, 100, 255], atol=1)
+        np.testing.assert_array_equal(mapped[0, 2], [0, 0, 0, 0])
+
+    @staticmethod
+    def _write_surface(path, xyz):
+        path.mkdir()
+        for axis, values in zip("xyz", np.moveaxis(xyz, -1, 0)):
+            Image.fromarray(values.astype(np.float32)).save(
+                path / f"{axis}.tif")
+
+    def test_run_diff_matches_windings_before_flatten_mapping(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous = np.zeros((2, 4, 3), dtype=np.float32)
+            current = previous.copy()
+            current[:, 2:, 2] = 3.0
+            self._write_surface(root / "previous", previous)
+            self._write_surface(root / "current", current)
+            common = {
+                "winding_ids": [1, 2],
+                "winding_column_ranges": [[0, 2], [2, 4]],
+            }
+
+            rgba, changed = _raw_run_diff_rgba(
+                {**common, "surface_path": str(root / "previous")},
+                {**common, "surface_path": str(root / "current")})
+
+            self.assertEqual(changed, 4)
+            self.assertTrue(np.all(rgba[:, :2, 3] == 0))
+            self.assertTrue(np.all(rgba[:, 2:, 3] > 0))
+
+
+class LasagnaSurfaceCleanupTests(unittest.TestCase):
+    @staticmethod
+    def _write_surface(path, valid):
+        path.mkdir()
+        rows, columns = np.indices(valid.shape)
+        xyz = [
+            columns.astype(np.float32),
+            rows.astype(np.float32),
+            np.full(valid.shape, 10.0, dtype=np.float32),
+        ]
+        for coordinate in xyz:
+            coordinate[~valid] = -1.0
+        for name, coordinate in zip(("x.tif", "y.tif", "z.tif"), xyz):
+            Image.fromarray(coordinate).save(path / name)
+        (path / "meta.json").write_text(json.dumps({
+            "format": "tifxyz",
+            "type": "seg",
+            "uuid": "preview",
+            "scale": [1.0, 1.0],
+            "bbox": [[0.0, 0.0, 0.0], [99.0, 99.0, 99.0]],
+            "area_vx2": 100.0,
+            "area_cm2": 2.0,
+            "winding_column_ranges": [[0, valid.shape[1]]],
+        }))
+
+    def test_erodes_and_keeps_only_largest_component_without_mutating_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "cleaned"
+            valid = np.zeros((16, 28), dtype=bool)
+            valid[1:12, 1:12] = True
+            valid[4:11, 18:25] = True
+            self._write_surface(source, valid)
+            original_files = {
+                name: (source / name).read_bytes()
+                for name in ("meta.json", "x.tif", "y.tif", "z.tif")
+            }
+
+            result = _prepare_cleaned_lasagna_surface(source, destination)
+
+            self.assertEqual(result, destination)
+            for name, contents in original_files.items():
+                self.assertEqual((source / name).read_bytes(), contents)
+            cleaned_coordinates = []
+            for axis in "xyz":
+                with Image.open(destination / f"{axis}.tif") as image:
+                    cleaned_coordinates.append(np.asarray(image).copy())
+            cleaned_xyz = np.stack(cleaned_coordinates, axis=-1)
+            cleaned_valid = np.any(cleaned_xyz != -1.0, axis=-1)
+            expected = np.zeros_like(valid)
+            expected[4:9, 4:9] = True
+            np.testing.assert_array_equal(cleaned_valid, expected)
+            self.assertTrue(np.all(cleaned_xyz[~expected] == -1.0))
+
+            metadata = json.loads(
+                (destination / "meta.json").read_text())
+            self.assertEqual(
+                metadata["bbox"],
+                [[4.0, 4.0, 10.0], [8.0, 8.0, 10.0]])
+            self.assertEqual(metadata["area_vx2"], 16.0)
+            self.assertAlmostEqual(metadata["area_cm2"], 0.32)
+            self.assertEqual(metadata["winding_column_ranges"], [[0, 28]])
+            self.assertEqual(metadata["lasagna_input_cleanup"], {
+                "erosion_cells": 3,
+                "component_connectivity": 4,
+                "components_after_erosion": 2,
+            })
+
+    def test_fails_if_erosion_removes_every_valid_vertex(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            valid = np.ones((6, 6), dtype=bool)
+            self._write_surface(source, valid)
+
+            with self.assertRaisesRegex(
+                    RuntimeError, "removed every valid TIFXYZ vertex"):
+                _prepare_cleaned_lasagna_surface(
+                    source, root / "cleaned")
+            self.assertFalse((root / "cleaned").exists())
+
+
 class ServiceProcessTests(unittest.TestCase):
     """End-to-end launch of the real service process (no torch import)."""
 
@@ -906,6 +1589,44 @@ class ServiceProcessTests(unittest.TestCase):
             finally:
                 process.terminate()
                 process.wait(10)
+                process.stdout.close()
+
+    def test_restart_reexecs_in_place_and_reuses_the_fixed_port(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            key_file = Path(temporary) / "key"
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            process = self._launch(
+                ["--port", str(port), "--api-key-file", str(key_file)],
+                temporary)
+            try:
+                self._read_until_ready(process)
+                original_pid = process.pid
+                key = key_file.read_text().strip()
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/service/restart",
+                    method="POST",
+                    data=json.dumps({"command_id": "restart-integration"}).encode(),
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    })
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    acknowledgement = json.loads(response.read())
+                self.assertTrue(acknowledgement["restarting"])
+
+                self._read_until_ready(process)
+                self.assertEqual(process.pid, original_pid)
+                health_request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(health_request, timeout=10) as response:
+                    self.assertTrue(json.loads(response.read())["ready"])
+            finally:
+                process.terminate()
+                process.wait(10)
+                process.stdout.close()
 
     def test_selected_gpus_are_reported_by_health(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -962,6 +1683,50 @@ class ServiceProcessTests(unittest.TestCase):
             output, _ = process.communicate(timeout=30)
             self.assertEqual(process.returncode, 2)
             self.assertIn("missing required", output)
+
+    def test_named_dataset_service_has_exclusive_restartable_ownership(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            dataset.mkdir()
+            (dataset / "umbilicus.json").write_text("{}")
+            (dataset / "verified_patches").mkdir()
+            key_file = root / "key"
+            arguments = [
+                "--port", "0", "--api-key-file", str(key_file),
+                "--dataset", str(dataset), "--session-name", "alice",
+            ]
+            first = self._launch(arguments, temporary)
+            try:
+                lines = self._read_until_ready(first)
+                self.assertIn("Spiral session name: alice", lines)
+                ready = next(line for line in lines
+                             if line.startswith("SPIRAL_SERVICE_READY"))
+                port = int(ready.split("port=")[1].split()[0])
+                key = key_file.read_text().strip()
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    health = json.loads(response.read())
+                self.assertEqual(health["session_name"], "alice")
+
+                duplicate = self._launch(arguments, temporary)
+                output, _ = duplicate.communicate(timeout=30)
+                self.assertEqual(duplicate.returncode, 2)
+                self.assertIn("already owned", output)
+            finally:
+                first.terminate()
+                first.wait(10)
+                first.stdout.close()
+
+            restarted = self._launch(arguments, temporary)
+            try:
+                self._read_until_ready(restarted)
+            finally:
+                restarted.terminate()
+                restarted.wait(10)
+                restarted.stdout.close()
 
     def test_non_loopback_bind_requires_dataset(self):
         with tempfile.TemporaryDirectory() as temporary:

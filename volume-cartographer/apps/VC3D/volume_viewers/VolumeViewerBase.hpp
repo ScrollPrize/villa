@@ -5,6 +5,7 @@
 #include <QPointF>
 #include <QRectF>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -134,6 +135,14 @@ public:
     virtual void setOverlayComposite(const OverlayCompositeSettings& settings) = 0;
     virtual void reloadPerfSettings() = 0;
 
+    // Re-acquire the chunk source from the ViewerManager, e.g. after the
+    // workspace opts into a private bounded pool or its capacity grows.
+    virtual void refreshChunkSource() {}
+    // SurfaceCache budgets for the flattened segmentation view (base, overlay).
+    // Zero disables that channel; viewers that are not a flattened
+    // QuadSurface view ignore both.
+    virtual void setSurfaceCacheBudgets(std::size_t, std::size_t) {}
+
     // --- Interaction state ---
     virtual uint64_t highlightedPointId() const = 0;
     virtual uint64_t selectedPointId() const = 0;
@@ -180,6 +189,7 @@ public:
     // --- Surface overlays ---
     virtual bool surfaceOverlayEnabled() const = 0;
     virtual const std::map<std::string, cv::Vec3b>& surfaceOverlays() const = 0;
+    virtual std::uint64_t surfaceOverlaysRevision() const = 0;
     virtual float surfaceOverlapThreshold() const = 0;
     virtual void setSurfaceOverlayEnabled(bool enabled) = 0;
     virtual void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) = 0;

@@ -179,9 +179,15 @@ public:
 
     bool surfaceOverlayEnabled() const override { return false; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override { return surfaceOverlays_; }
+    std::uint64_t surfaceOverlaysRevision() const override { return surfaceOverlaysRevision_; }
     float surfaceOverlapThreshold() const override { return 0.0f; }
     void setSurfaceOverlayEnabled(bool) override {}
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override { surfaceOverlays_ = overlays; }
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override
+    {
+        if (surfaceOverlays_ == overlays) return;
+        surfaceOverlays_ = overlays;
+        ++surfaceOverlaysRevision_;
+    }
     void setSurfaceOverlapThreshold(float) override {}
 
     const ActiveSegmentationHandle& activeSegmentationHandle() const override { return activeSegmentation_; }
@@ -200,6 +206,7 @@ private:
     CompositeRenderSettings compositeSettings_;
     std::vector<ViewerOverlayControllerBase::PathPrimitive> paths_;
     std::map<std::string, cv::Vec3b> surfaceOverlays_;
+    std::uint64_t surfaceOverlaysRevision_{0};
     ActiveSegmentationHandle activeSegmentation_;
     std::map<std::string, std::vector<QGraphicsItem*>> overlayGroups_;
     std::string surfName_{"fake"};
@@ -319,6 +326,31 @@ private slots:
         }
         QVERIFY(sawLine);
         QVERIFY(sawPoint);
+    }
+
+    void painterPathPrimitivePreservesFilledShapeAndHoles()
+    {
+        FakeViewer viewer;
+        QPainterPath shape;
+        shape.addEllipse(QPointF(20.0, 20.0), 10.0, 10.0);
+        QPainterPath erased;
+        erased.addEllipse(QPointF(20.0, 20.0), 3.0, 3.0);
+        shape = shape.subtracted(erased);
+
+        ViewerOverlayControllerBase::OverlayStyle style;
+        style.penColor = Qt::transparent;
+        style.brushColor = QColor(255, 0, 0, 115);
+        ViewerOverlayControllerBase::applyPrimitives(&viewer, "paint_shape", {
+            ViewerOverlayControllerBase::PainterPathPrimitive{shape, style},
+        });
+
+        const auto items = viewer.scene().items();
+        QCOMPARE(items.size(), 1);
+        auto* pathItem = qgraphicsitem_cast<QGraphicsPathItem*>(items.front());
+        QVERIFY(pathItem != nullptr);
+        QVERIFY(pathItem->path().contains(QPointF(20.0, 11.0)));
+        QVERIFY(!pathItem->path().contains(QPointF(20.0, 20.0)));
+        QCOMPARE(pathItem->brush().color().alpha(), 115);
     }
 
     void atlasOverlayControllerEmitsLineAndAnchorPoints()

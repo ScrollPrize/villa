@@ -242,6 +242,7 @@ def _flatten_forward_combined_core(
 	vertex_valid: torch.Tensor,
 	cell_valid: torch.Tensor,
 	domain_step: torch.Tensor,
+	map_step: torch.Tensor,
 	avg_mask: torch.Tensor,
 	avg_target: torch.Tensor,
 	identity_y: torch.Tensor,
@@ -300,14 +301,14 @@ def _flatten_forward_combined_core(
 		sdir_sum * 0.0,
 	)
 
-	dy0 = uv[1:, :, 0] - uv[:-1, :, 0] - 1.0
+	dy0 = uv[1:, :, 0] - uv[:-1, :, 0] - map_step
 	dy1 = uv[1:, :, 1] - uv[:-1, :, 1]
 	dy_lm = dy0 * dy0 + dy1 * dy1
 	dy_valid = torch.isfinite(dy_lm) & vertex_valid[1:, :] & vertex_valid[:-1, :]
 	dy_mask = dy_valid.to(dtype=uv.dtype)
 	dy_safe = torch.nan_to_num(dy_lm, nan=0.0, posinf=1.0e12, neginf=0.0)
 	dx0 = uv[:, 1:, 0] - uv[:, :-1, 0]
-	dx1 = uv[:, 1:, 1] - uv[:, :-1, 1] - 1.0
+	dx1 = uv[:, 1:, 1] - uv[:, :-1, 1] - map_step
 	dx_lm = dx0 * dx0 + dx1 * dx1
 	dx_valid = torch.isfinite(dx_lm) & vertex_valid[:, 1:] & vertex_valid[:, :-1]
 	dx_mask = dx_valid.to(dtype=uv.dtype)
@@ -379,6 +380,11 @@ def flatten_combined_loss(
 		if res.flatten_target_step is None
 		else res.flatten_target_step.to(device=uv.device, dtype=uv.dtype)
 	).clamp_min(1.0e-12)
+	map_step = (
+		uv.new_tensor(1.0)
+		if res.flatten_map_step is None
+		else res.flatten_map_step.to(device=uv.device, dtype=uv.dtype)
+	).clamp_min(1.0e-12)
 	return _run_compiled_flatten_core(
 		"combined",
 		_flatten_forward_combined_core,
@@ -387,6 +393,7 @@ def flatten_combined_loss(
 		vertex_valid.to(device=uv.device, dtype=torch.bool),
 		cell_valid.to(device=uv.device, dtype=torch.bool),
 		domain_step,
+		map_step,
 		avg_mask.to(device=uv.device, dtype=torch.bool),
 		avg_target.to(device=uv.device, dtype=uv.dtype).reshape(2),
 		identity_y,
@@ -452,8 +459,8 @@ def flatten_sdir_loss(
 	"""Symmetric Dirichlet energy for the flatten inverse map output surface.
 
 	The surface samples live in fullres coordinates.  The 2D output grid domain
-	uses the measured average spacing of the source tifxyz grid, so flattening
-	does not impose global scaling from metadata.
+	uses the explicitly requested output spacing; measured source spacing is
+	diagnostic only and never changes the exported scale contract.
 	"""
 	if _is_forward(res):
 		return _flatten_forward_sdir_loss(res=res)
@@ -541,7 +548,7 @@ def flatten_map_step_loss(
 	*,
 	res: fit_model.FitResult3D,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Regularize the inverse map to advance one source-grid cell per output step."""
+	"""Regularize map increments around the requested source/output step ratio."""
 	map_yx = res.flatten_map
 	if map_yx is None:
 		raise RuntimeError("flatten_map_step requires flatten_map")
@@ -574,14 +581,19 @@ def flatten_map_step_loss(
 		source_valid = res.flatten_source_valid.to(device=map_yx.device, dtype=torch.bool)
 		if tuple(source_valid.shape) != tuple(map_yx.shape[:2]):
 			raise RuntimeError("forward flatten source mask shape does not match map")
+	map_step = (
+		map_yx.new_tensor(1.0)
+		if res.flatten_map_step is None
+		else res.flatten_map_step.to(device=map_yx.device, dtype=map_yx.dtype)
+	).clamp_min(1.0e-12)
 
 	if H > 1:
-		target_y = torch.tensor([1.0, 0.0], device=map_yx.device, dtype=map_yx.dtype)
+		target_y = torch.stack((map_step, map_step.new_zeros(())))
 		dy = map_yx[1:, :] - map_yx[:-1, :] - target_y
 		valid_edge = None if source_valid is None else (source_valid[1:, :] & source_valid[:-1, :])
 		_accumulate((dy * dy).sum(dim=-1), valid_edge)
 	if W > 1:
-		target_x = torch.tensor([0.0, 1.0], device=map_yx.device, dtype=map_yx.dtype)
+		target_x = torch.stack((map_step.new_zeros(()), map_step))
 		dx = map_yx[:, 1:] - map_yx[:, :-1] - target_x
 		valid_edge = None if source_valid is None else (source_valid[:, 1:] & source_valid[:, :-1])
 		_accumulate((dx * dx).sum(dim=-1), valid_edge)
