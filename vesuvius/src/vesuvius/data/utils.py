@@ -145,7 +145,16 @@ def open_zarr(path: str, mode: str = 'r',
 
         # Add any other kwargs
         create_kwargs.update(kwargs)
-        
+
+        # zarr 3 derives `overwrite` from the mode, so passing it alongside
+        # mode='w' raises "got multiple values for keyword argument 'overwrite'".
+        # mode='w' already means truncate, so an explicit overwrite=True is
+        # redundant; drop it rather than making every caller know this.
+        if create_kwargs.pop('overwrite', None) is False:
+            raise ValueError(
+                "open_zarr(mode='w') always truncates; overwrite=False is contradictory"
+            )
+
         if verbose:
             print(f"Creating new zarr array with shape={shape}, chunks={chunks}, dtype={dtype}")
         

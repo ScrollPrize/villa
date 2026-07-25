@@ -37,6 +37,21 @@ def test_numcodecs_compressor_accepted(tmp_path: Path) -> None:
     assert open_zarr(path=str(path), mode="r")[0].max() == 1.0
 
 
+def test_redundant_overwrite_kwarg_is_accepted(tmp_path: Path) -> None:
+    # finalize_outputs passes overwrite=True alongside mode='w'; zarr 3 derives
+    # overwrite from the mode and rejects the duplicate.
+    path = tmp_path / "overwritten.zarr"
+    open_zarr(path=str(path), mode="w", shape=(4, 8, 8), chunks=(1, 8, 8),
+              dtype="u1", overwrite=True)
+    assert _stored_format(path) == 2
+
+
+def test_contradictory_overwrite_false_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        open_zarr(path=str(tmp_path / "no.zarr"), mode="w", shape=(4, 8, 8),
+                  chunks=(1, 8, 8), dtype="u1", overwrite=False)
+
+
 def test_explicit_zarr_format_3_still_possible(tmp_path: Path) -> None:
     path = tmp_path / "v3.zarr"
     open_zarr(path=str(path), mode="w", shape=(4, 8, 8), chunks=(1, 8, 8),
