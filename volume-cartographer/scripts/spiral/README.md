@@ -42,12 +42,16 @@ or with conda/pip, install `torch` for your CUDA version and then
 
 ### Internet flow (SSH attach)
 
-Start a persistent loopback service on the GPU host with its dataset. Nothing
-is exposed on the network; VC3D tunnels to it over SSH:
+Start a persistent loopback service on the GPU host with its dataset. Give
+each independently operated service a stable session name, port, and GPU.
+Nothing is exposed on the network; VC3D tunnels to it over SSH:
 
 ```sh
-tmux new -s spiral 'python scripts/spiral/spiral_service.py --port 8765 \
-    --dataset /data/scrolls/s1 --gpus 0'
+tmux new -s spiral-alice 'python scripts/spiral/spiral_service.py --port 8765 \
+    --dataset /data/scrolls/s1 --gpus 0 --session-name alice'
+
+tmux new -s spiral-bob 'python scripts/spiral/spiral_service.py --port 8766 \
+    --dataset /data/scrolls/s1 --gpus 1 --session-name bob'
 ```
 
 The service uses only physical CUDA device `0` by default. Select a different
@@ -63,6 +67,23 @@ Multi-GPU sessions run one fitter rank per listed device and split the configure
 per-step sample counts across those ranks by default. The device list is fixed for
 the lifetime of the service; restart it to change the selection.
 
+A named service writes autosaves, previews, artifacts, uploaded checkpoints,
+Lasagna output, and ephemeral inputs beneath
+`<dataset>/spiral_output/<session-name>/`. Permanent dataset inputs and the
+dataset-derived `.spiral-cache` remain shared. Two live services cannot own the
+same dataset/session-name pair. Launches without `--session-name` retain the
+legacy `<dataset>/spiral_output/` layout.
+
+Every completed Spiral preview is flattened by the host's Lasagna service
+before it becomes downloadable in VC3D. The published grid uses a fixed
+20-voxel output step: each dimension is
+`ceil(((source_points - 1) * source_step) / 20) + 1`. Winding membership,
+loss-map overlays, and run differences are transferred through Lasagna's
+output-to-source correspondence so they remain aligned when the output grid
+dimensions differ from the Spiral grid. If flattening or artifact mapping
+fails, the service reports the publication error and VC3D keeps displaying the
+previous successfully published preview.
+
 On first start the service generates a strong API key at
 `~/.config/vc3d/spiral_api_key` (mode `0600`) and prints it to the console.
 For an SSH profile you never copy it: VC3D reads that file over SSH.
@@ -76,6 +97,10 @@ accept it — VC3D deliberately never auto-trusts host keys.
 
 The fit survives viewer disconnects, laptop sleep, and network drops;
 disconnecting or closing VC3D never terminates a service it did not launch.
+While connected, the circular-arrow button beside the connection controls
+restarts the remote service and reconnects automatically. The service replaces
+its own process in place, so a containing `tmux` session remains alive and an
+attached terminal is not disconnected.
 
 ### Trusted-LAN flow (direct HTTP)
 
@@ -109,7 +134,8 @@ validation and never ignores certificate errors.
 `--dataset` must point at a dataset root containing at least `umbilicus.json`
 and `verified_patches/`; the service refuses to start when required entries
 are missing and prints what was missing. Output goes to
-`<dataset>/spiral_output` by default (from the same resolution VC3D shows).
+`<dataset>/spiral_output` by default, or its named child when the service uses
+`--session-name` (from the same resolution VC3D shows).
 Make sure that directory's filesystem has room for checkpoints and previews.
 If the dataset root is read-only the fit still works, but *Commit current
 inputs* is unavailable and the cache falls back to the user cache directory.
@@ -131,7 +157,10 @@ without a mapping those overlays are simply marked unavailable.
 While a session is active you can right-click a patch in the Surface panel or
 a fiber in the Fibers panel and pick *Add to current spiral fit*. Added inputs
 are uploaded into a session-scoped ephemeral folder, used from the next run
-onward, and can be moved into the dataset with *Commit current inputs*.
+onward, and can be moved into the shared dataset with *Commit current inputs*.
+Commits from multiple service processes are serialized; distinct inputs and
+point collections are preserved, while an existing patch or fiber identifier
+is reported as a conflict and is never overwritten.
 
 Interactive influence settings are scoped to each **Run** request. The fitter
 builds a fresh influence region from only the inputs pending for that run,
@@ -147,10 +176,11 @@ service-advertised checkpoint (a `*.ckpt` at the dataset root), a service path
 under the output directory (for example the autosave), or a **client-local
 `.ckpt` file** — use the browse button. A local file is uploaded to the
 service's `<output>/uploaded-checkpoints/` directory before the session loads
-(the panel shows progress; the transfer restarts if interrupted). The service
-validates the archive, never overwrites an existing upload, and keeps the
-newest few uploaded checkpoints. To bring a fit result back to the client, use
-*Download Checkpoint…*.
+(the panel shows progress; the transfer restarts if interrupted). Checkpoints
+are identified by SHA-256, so selecting content the service already retains
+reuses it without transferring the file again. The service validates new
+archives and keeps the newest few unique uploaded checkpoints. To bring a fit
+result back to the client, use *Download Checkpoint…*.
 
 ### Shutdown and logs
 
@@ -159,9 +189,11 @@ it tears the fit session down at a safe boundary. Logs go to the service's
 stdout/stderr on the host — for a `tmux` session, `tmux attach -t spiral`; for
 an unowned service VC3D's Python-output dialog only reminds you of this. A
 service started on an explicit port can be restarted immediately (the socket
-uses `SO_REUSEADDR`). Note that a large artifact download during a running fit
-competes with the fitter for the Python interpreter and can slow iterations
-somewhat.
+uses `SO_REUSEADDR`). VC3D's remote restart control does not run
+`tmux kill-session`; it gracefully closes the fit and re-executes the service
+with the same interpreter, arguments, and process ID. Note that a large artifact
+download during a running fit competes with the fitter for the Python
+interpreter and can slow iterations somewhat.
 
 ### Optional systemd user unit
 

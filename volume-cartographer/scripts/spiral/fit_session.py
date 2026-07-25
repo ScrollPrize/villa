@@ -18,9 +18,9 @@ import zipfile
 
 
 
-# Version 6 exposes the session's effective Python/checkpoint Advanced-config
-# baseline independently from client overrides.
-API_VERSION = 6
+# Version 11 makes preview artifacts host-published Lasagna flatten results
+# with correspondence-mapped winding, loss-map, and run-diff metadata.
+API_VERSION = 11
 
 
 # Counts which describe how many training objects/points are sampled per
@@ -130,6 +130,7 @@ class PclRole(str, Enum):
     PATCH_OVERLAP = "patch_overlap"
     RELATIVE = "relative"
     SAME_WINDING = "same_winding"
+    DRAWN_CONTROL_POINTS = "drawn_control_points"
 
 
 @dataclass(frozen=True)
@@ -221,11 +222,19 @@ class SpiralRunConfig:
             config=dict(value.get("config", {})),
         )
 
+    def manifest(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["config"] = dict(self.config)
+        return result
+
 
 @dataclass(frozen=True)
 class SpiralPreviewConfig:
     first_winding: int = 10
     variant: str = "raw"
+
+    def manifest(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -263,6 +272,8 @@ _CONVENTIONAL_ENTRIES: tuple[tuple[str, str, str, bool], ...] = (
 _PCL_ENTRIES: tuple[tuple[PclRole, str, bool], ...] = (
     (PclRole.ABSOLUTE, "abs_winding.json", False),
     (PclRole.RELATIVE, "relative_windings.json", False),
+    (PclRole.SAME_WINDING, "same_windings.json", False),
+    (PclRole.DRAWN_CONTROL_POINTS, "drawn_control_points.json", False),
 )
 
 
@@ -320,7 +331,11 @@ def _dbm_candidates(root: Path) -> list[str]:
     return sorted(logical)
 
 
-def resolve_dataset_root(root_value: str | os.PathLike[str]) -> SpiralDatasetResolution:
+def resolve_dataset_root(
+    root_value: str | os.PathLike[str],
+    *,
+    session_name: str = "",
+) -> SpiralDatasetResolution:
     root = Path(_normalise_path(root_value))
     result = SpiralDatasetResolution(root=str(root))
     if not root.is_dir():
@@ -364,7 +379,10 @@ def resolve_dataset_root(root_value: str | os.PathLike[str]) -> SpiralDatasetRes
         else:
             result.missing_optional.append("tracks_dbm")
 
-    result.resolved["output_directory"] = _normalise_path(root / "spiral_output")
+    output_directory = root / "spiral_output"
+    if session_name:
+        output_directory /= session_name
+    result.resolved["output_directory"] = _normalise_path(output_directory)
     local_cache = root / ".spiral-cache"
     parent_writable = os.access(root, os.W_OK)
     if local_cache.is_dir() or parent_writable:

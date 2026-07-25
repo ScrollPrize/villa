@@ -377,6 +377,14 @@ ManualAddTool::LinePreviewMode SegmentationWidget::cycleManualAddLinePreviewMode
 {
     return _manualAddPanel->cycleLinePreviewMode();
 }
+ManualAddTool::LinePreviewMode SegmentationWidget::setManualAddLinePreviewMode(ManualAddTool::LinePreviewMode mode)
+{
+    return _manualAddPanel->setLinePreviewMode(mode);
+}
+ManualAddTool::InterpolationMode SegmentationWidget::setManualAddInterpolationMode(ManualAddTool::InterpolationMode mode)
+{
+    return _manualAddPanel->setInterpolationMode(mode);
+}
 std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const { return _growthPanel->allowedGrowthDirections(); }
 std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const { return _growthPanel->correctionsZRange(); }
 

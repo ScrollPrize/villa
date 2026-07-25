@@ -170,6 +170,38 @@ TEST_CASE("Volume: chunkExists turns true after writeChunk")
     fs::remove_all(d);
 }
 
+TEST_CASE("Volume: final cache client release drops decoded chunks")
+{
+    auto d = tmpDir("cache-client");
+    auto v = Volume::New(d, makeOpts({32, 32, 32}, {32, 32, 32}, 1));
+    REQUIRE(v);
+    std::vector<std::byte> chunk(v->chunkByteSize(0), std::byte{0x5a});
+    v->writeChunk(0, {0, 0, 0}, chunk);
+
+    auto budget =
+        std::make_shared<vc::render::DecodedChunkCacheBudget>(64 * 1024);
+    v->setCacheBudget(64 * 1024, budget);
+    v->retainCacheClient();
+    v->retainCacheClient();
+    auto cache = v->sharedChunkCache();
+    REQUIRE(cache);
+    CHECK(v->chunkedCache() == cache.get());
+    CHECK(cache->getChunkBlocking(0, 0, 0, 0).status ==
+          vc::render::ChunkStatus::Data);
+    CHECK(budget->stats().decodedBytes == chunk.size());
+
+    v->releaseCacheClient();
+    CHECK(budget->stats().decodedBytes == chunk.size());
+    v->releaseCacheClient();
+    CHECK(budget->stats().decodedBytes == 0);
+    CHECK(cache->stats().decodedBytes == 0);
+
+    std::weak_ptr<vc::render::ChunkCache> weakCache = cache;
+    cache.reset();
+    CHECK(weakCache.expired());
+    fs::remove_all(d);
+}
+
 TEST_CASE("Volume: removeChunk drops the chunk file")
 {
     auto d = tmpDir("rm");
