@@ -7798,7 +7798,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
             QMessageBox prompt(_parentWidget.data());
             prompt.setIcon(QMessageBox::Information);
             prompt.setWindowTitle(tr("Quarantined branch links"));
-            prompt.setText(tr("%1 branch link entrie(s) could not be resolved and were "
+            prompt.setText(tr("%1 branch link(s) could not be resolved and were "
                               "quarantined. They are kept on disk but disabled in "
                               "this session.")
                                .arg(static_cast<int>(quarantineNotes.size())));
@@ -9682,8 +9682,28 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
     if (existingIt != _fibers.end()) {
         // Sessions carry only active links; re-attach quarantined branches
         // and unparsed entries so a legitimate save cannot drop them.
+        // Exception: when the session holds an active link to the same
+        // endpoints (the user re-created a link they saw quarantined), the
+        // new link supersedes the stale entry — writing both would come
+        // back as duplicate active links once the quarantined copy's
+        // reciprocal resolves again.
         for (const auto& branch : existingIt->branches) {
-            if (!branchLinkActive(branch)) {
+            if (branchLinkActive(branch)) {
+                continue;
+            }
+            const bool supersededByActive = std::any_of(
+                fiber.branches.begin(),
+                fiber.branches.end(),
+                [&branch](const FiberBranchRef& active) {
+                    return branchLinkActive(active) &&
+                           active.branchFileName == branch.branchFileName &&
+                           pointsApproximatelyEqual(active.controlPointPosition,
+                                                    branch.controlPointPosition) &&
+                           pointsApproximatelyEqual(
+                               active.branchControlPointPosition,
+                               branch.branchControlPointPosition);
+                });
+            if (!supersededByActive) {
                 fiber.branches.push_back(branch);
             }
         }
@@ -10711,7 +10731,7 @@ void LineAnnotationController::resolveLoadedFiberLinks(
 
 void LineAnnotationController::repairQuarantinedFiberLinks()
 {
-    std::vector<uint64_t> affectedFiberIds;
+    bool anyRemoved = false;
     for (auto& fiber : _fibers) {
         const size_t removedBranches = std::erase_if(
             fiber.branches,
@@ -10721,21 +10741,12 @@ void LineAnnotationController::repairQuarantinedFiberLinks()
         const size_t removedUnparsed = fiber.unparsedBranchJson.size();
         fiber.unparsedBranchJson.clear();
         if (removedBranches + removedUnparsed > 0) {
-            affectedFiberIds.push_back(fiber.id);
+            scheduleFiberSave(fiber);
+            anyRemoved = true;
         }
     }
 
-    for (uint64_t fiberId : affectedFiberIds) {
-        const auto it = std::find_if(_fibers.begin(), _fibers.end(),
-                                     [fiberId](const StoredFiber& fiber) {
-                                         return fiber.id == fiberId;
-                                     });
-        if (it != _fibers.end()) {
-            scheduleFiberSave(*it);
-        }
-    }
-
-    if (!affectedFiberIds.empty()) {
+    if (anyRemoved) {
         emitFiberSummaries();
     }
 }

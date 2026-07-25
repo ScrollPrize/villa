@@ -470,6 +470,49 @@ class TestAutoMerge:
         assert len(stashed) == 3  # local + remote + base
         assert any('-base' in name for name in stashed)
 
+    def test_same_basename_conflicts_do_not_collide(self, manager, monkeypatch):
+        """Two conflicting files sharing a basename in different directories
+        must get independent pending/remote temp files; flattening to the
+        basename cross-contaminated their merged content."""
+        plans = {}
+        for pkg, tag in (('pkgA', 'from-a'), ('pkgB', 'from-b')):
+            base = self.fiber([0, 0, 0, 0])
+            local = self.fiber([0, 0, 0, 0], generation=2)
+            local['tags'] = [tag + '-local']
+            remote = self.fiber([0, 0, 0, 0], generation=2)
+            remote['tags'] = [tag + '-remote']
+            path = f'{pkg}/fibers/f.json'
+            local_path = write_local(manager, path, json.dumps(local))
+            shadow = manager._shadow_path(path)
+            os.makedirs(os.path.dirname(shadow), exist_ok=True)
+            with open(shadow, 'w') as f:
+                json.dump(base, f)
+            info = local_info(manager, path)
+            track_row(manager, path, 10, 0.0, 10, 'a' * 32,
+                      manager._file_md5(shadow))
+
+            def fake_fetch(p, remote_doc=remote):
+                tmp = manager._merge_tmp_path(p, '.remote')
+                with open(tmp, 'w') as f:
+                    json.dump(remote_doc, f)
+                return remote_doc, tmp
+
+            monkeypatch.setattr(manager, '_fetch_remote_json', fake_fetch)
+            plan = manager._attempt_auto_merge(path, info, s3_info(10, 'b' * 32))
+            assert isinstance(plan, dict)
+            plans[path] = (local_path, plan)
+
+        pending_paths = [plan['pending'] for _, plan in plans.values()]
+        assert len(set(pending_paths)) == 2  # no shared temp file
+
+        manager._apply_pending_merges(
+            [(path, plan) for path, (_, plan) in plans.items()])
+        for path, (local_path, _) in plans.items():
+            merged = json.load(open(local_path))
+            marker = 'from-a' if 'pkgA' in path else 'from-b'
+            assert any(marker in t for t in merged['tags']), \
+                f"{path} received another file's merged content"
+
     def test_no_base_means_no_merge(self, manager, monkeypatch):
         local = self.fiber([0, 0, 0, 0], generation=2)
         path = 'fibers/f.json'

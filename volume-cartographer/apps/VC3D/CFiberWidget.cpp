@@ -696,13 +696,14 @@ void CFiberWidget::rebuildModel()
     }
 
     for (const auto& fiber : _fibers) {
-        QString linkText = fiber.linkedFiberCount > 0
-            ? QString::number(fiber.linkedFiberCount)
-            : QString();
-        if (fiber.quarantinedLinkCount > 0) {
-            linkText += QStringLiteral(" (!%1)").arg(fiber.quarantinedLinkCount);
-            linkText = linkText.trimmed();
+        QStringList linkParts;
+        if (fiber.linkedFiberCount > 0) {
+            linkParts << QString::number(fiber.linkedFiberCount);
         }
+        if (fiber.quarantinedLinkCount > 0) {
+            linkParts << QStringLiteral("(!%1)").arg(fiber.quarantinedLinkCount);
+        }
+        const QString linkText = linkParts.join(QLatin1Char(' '));
         QList<QStandardItem*> row{
             readOnlyItem(displayNameForFiber(fiber)),
             readOnlyItem(directionForFiber(fiber)),

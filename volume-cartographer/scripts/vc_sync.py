@@ -380,6 +380,7 @@ class S3SyncManager:
         whose ETag cannot prove equality."""
         if path in self._remote_md5_cache:
             return self._remote_md5_cache[path]
+        print(f"  Fetching remote copy of {path} to verify content...")
         tmp = self._merge_tmp_path(path, '.hashcheck')
         md5 = None
         try:
@@ -480,9 +481,13 @@ class S3SyncManager:
     # --- fiber-aware three-way merge (see fiber_merge.py) ---
 
     def _merge_tmp_path(self, path, suffix):
-        tmp_dir = os.path.join(self.local_dir, CONFLICT_DIR_NAME, '.tmp')
-        os.makedirs(tmp_dir, exist_ok=True)
-        return os.path.join(tmp_dir, os.path.basename(path) + suffix)
+        # Mirror the relative path (like _shadow_path) — flattening to the
+        # basename would let two same-named files in different directories
+        # overwrite each other's pending merge data mid-run.
+        tmp = os.path.join(self.local_dir, CONFLICT_DIR_NAME, '.tmp',
+                           path + suffix)
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        return tmp
 
     def _load_base(self, path, tracked):
         """Return the parsed last-synced (base) version of a file, or None.
@@ -1613,7 +1618,8 @@ class S3SyncManager:
                 for path, problem in invalid_uploads:
                     print(f"  {path}: {problem}")
             if conflicts and auto_merge and fiber_merge is not None:
-                print("\nMerge preview for conflicts:")
+                print("\nMerge preview for conflicts (fetches remote copies "
+                      "to test-merge; local files are not touched):")
                 for path, reason in conflicts:
                     probe = self._attempt_auto_merge(path,
                                                      local_files.get(path),

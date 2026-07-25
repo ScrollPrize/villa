@@ -331,10 +331,11 @@ def merge_tags(base_doc, local_doc, remote_doc):
     return merged
 
 
-def merge_line_points(local_doc, remote_doc, regions, anchor_positions):
+def merge_line_points(base_doc, local_doc, remote_doc, regions, anchor_positions):
     """Piecewise line splice. Returns (line_points, note) — note is None on
-    the clean paths and a human-readable reason when falling back to the
-    local line (caller adds the reoptimize tag)."""
+    the clean paths and a self-contained explanation whenever one side's
+    line data could not be carried (the caller adds the reoptimize tag)."""
+    base_line = base_doc.get('line_points', [])
     local_line = local_doc.get('line_points', [])
     remote_line = remote_doc.get('line_points', [])
     owners = [region['owner'] for region in regions]
@@ -342,9 +343,23 @@ def merge_line_points(local_doc, remote_doc, regions, anchor_positions):
     local_owns = 'local' in owners or 'both' in owners
 
     if not remote_owns:
-        return list(local_line), None
+        chosen = list(local_line)
+        # A side can re-optimize its line WITHOUT moving control points;
+        # region ownership cannot see that. Never drop it silently.
+        if (not _seq_eq(remote_line, base_line) and
+                not _seq_eq(remote_line, chosen)):
+            return chosen, ("remote re-optimized the line without moving "
+                            "control points; kept the local line and tagged "
+                            "for reoptimization")
+        return chosen, None
     if not local_owns:
-        return list(remote_line), None
+        chosen = list(remote_line)
+        if (not _seq_eq(local_line, base_line) and
+                not _seq_eq(local_line, chosen)):
+            return chosen, ("local re-optimized the line without moving "
+                            "control points; kept the remote line and tagged "
+                            "for reoptimization")
+        return chosen, None
 
     def anchor_match_tol2(line):
         # An anchor control point must actually lie ON the polyline (lines
@@ -379,7 +394,8 @@ def merge_line_points(local_doc, remote_doc, regions, anchor_positions):
     remote_idx = anchor_line_indices(remote_line)
     if local_idx is None or remote_idx is None:
         return (list(local_line),
-                "line splice failed (anchors not on both polylines)")
+                "line splice failed (anchors not on both polylines); kept "
+                "the local line and tagged for reoptimization")
 
     merged = []
     for k, region in enumerate(regions):
@@ -389,7 +405,9 @@ def merge_line_points(local_doc, remote_doc, regions, anchor_positions):
         lo = 0 if k == 0 else idx[k - 1]
         hi = len(line) if k == len(regions) - 1 else idx[k]
         if hi < lo:
-            return list(local_line), "line splice failed (crossed segments)"
+            return (list(local_line),
+                    "line splice failed (crossed segments); kept the local "
+                    "line and tagged for reoptimization")
         merged.extend(line[lo:hi])
     return merged, None
 
@@ -451,8 +469,9 @@ def merge_fibers(base, local, remote):
         base, local, remote, merged_cps, prefer_local)
     merged_branches = merged_branches + opaque_branches
     if opaque_branches:
+        noun = 'entry' if len(opaque_branches) == 1 else 'entries'
         branch_notes.append(f"{len(opaque_branches)} unparseable branch "
-                            "entrie(s) carried through unchanged")
+                            f"{noun} carried through unchanged")
 
     anchor_positions = []
     for k, region in enumerate(regions[:-1]):
@@ -461,7 +480,7 @@ def merge_fibers(base, local, remote):
 
     geometry_merged = any(region['owner'] in ('local', 'remote', 'both')
                           for region in regions)
-    line_points, line_note = merge_line_points(local, remote, regions,
+    line_points, line_note = merge_line_points(base, local, remote, regions,
                                                anchor_positions)
 
     merged = copy.deepcopy(newer)
@@ -476,7 +495,7 @@ def merge_fibers(base, local, remote):
 
     notes = list(branch_notes)
     if line_note:
-        notes.append(line_note + "; kept local line, tagged for reoptimization")
+        notes.append(line_note)
 
     stats = dict(branch_stats)
     stats['cp_regions_local'] = sum(1 for r in regions if r['owner'] == 'local')

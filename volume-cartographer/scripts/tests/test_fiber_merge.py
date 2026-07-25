@@ -138,11 +138,8 @@ def test_adjacent_cp_edits_without_anchor_conflict():
     local_cps[3] = cp(3, dz=5.0)
     remote_cps = copy.deepcopy(BASE_CPS)
     remote_cps[4] = cp(4, dz=-5.0)
-    # CP3 and CP4 are adjacent: no unchanged anchor separates the edits...
-    # but diff3 segmentation places them in separate regions because CP4 is
-    # still an anchor for local and CP3 for remote? No: an anchor must be
-    # unchanged on BOTH sides. CP3 changed locally, CP4 remotely, so the
-    # region between anchors CP2 and CP5 contains both edits -> conflict.
+    # An anchor must be unchanged on BOTH sides, so the region between the
+    # anchors CP2 and CP5 contains both edits -> conflict.
     result = merge_fibers(base, make_fiber(local_cps), make_fiber(remote_cps))
     assert not result['ok']
 
@@ -395,6 +392,21 @@ def test_link_identity_is_tolerance_based_not_rounding_based():
     branches = result['merged']['branches']
     assert len(branches) == 1
     assert branches[0]['pending'] is False  # approval won
+
+
+def test_line_only_reoptimization_is_never_dropped_silently():
+    """A side can re-optimize line_points without moving any control point;
+    region ownership cannot see that, but it must not vanish untagged."""
+    base = make_fiber(BASE_CPS)
+    local = make_fiber(BASE_CPS, tags=['meta-edit'], generation=2)
+    remote = make_fiber(BASE_CPS, generation=2)
+    remote['line_points'] = [[p[0], p[1] + 0.5, p[2]]
+                             for p in remote['line_points']]
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['line_points'] == local['line_points']
+    assert any('re-optimized the line' in n for n in result['notes'])
+    assert REOPTIMIZE_TAG in result['merged']['tags']
 
 
 def test_splice_rejected_when_anchors_not_on_both_lines():

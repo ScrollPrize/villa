@@ -331,8 +331,10 @@ private:
         vc3d::line_annotation::FiberHvClassification hvClassification;
         std::string manualHvTag;
         std::vector<std::string> tags;
-        // In-memory metadata refresh pending; written on the next legitimate
-        // save of this fiber. Loading never acts on this by itself.
+        // Vestigial marker: set where in-memory metadata drifted from disk
+        // (e.g. position-repaired links), but nothing consumes it anymore —
+        // the load-time save loop it used to drive was removed so that
+        // loading never writes. Kept as documentation of repair state.
         bool needsSave = false;
         // Branch JSON entries that failed structural parsing; preserved
         // verbatim and re-emitted on save so a load can never drop data.
