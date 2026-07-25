@@ -244,20 +244,20 @@ class FlattenLossTest(unittest.TestCase):
 		mdl = _make_flatten_model(_flat_grid(5, 9), mesh_step=1)
 		shapes = [(int(p.shape[2]), int(p.shape[3])) for p in mdl.flatten_map_ms]
 
-		self.assertEqual(shapes, [(6, 11), (3, 6), (2, 3), (2, 2)])
+		self.assertEqual(shapes, [(5, 9), (3, 5), (2, 3), (2, 2)])
 		self.assertEqual(max(shapes[-1]), 2)
 
-	def test_flatten_init_uses_centered_twenty_percent_larger_output_canvas(self) -> None:
+	def test_flatten_init_uses_density_derived_output_canvas(self) -> None:
 		mdl = _make_flatten_model(_flat_grid(11, 21), mesh_step=1)
 		map_yx = mdl.flatten_map().detach()
 
-		self.assertEqual(tuple(map_yx.shape), (13, 25, 2))
-		self.assertEqual(mdl.mesh_h, 13)
-		self.assertEqual(mdl.mesh_w, 25)
-		self.assertAlmostEqual(float(map_yx[0, 0, 0]), -1.0, places=6)
-		self.assertAlmostEqual(float(map_yx[0, 0, 1]), -2.0, places=6)
-		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 11.0, places=6)
-		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 22.0, places=6)
+		self.assertEqual(tuple(map_yx.shape), (11, 21, 2))
+		self.assertEqual(mdl.mesh_h, 11)
+		self.assertEqual(mdl.mesh_w, 21)
+		self.assertAlmostEqual(float(map_yx[0, 0, 0]), 0.0, places=6)
+		self.assertAlmostEqual(float(map_yx[0, 0, 1]), 0.0, places=6)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 10.0, places=6)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 20.0, places=6)
 
 	def test_forward_flatten_init_optimizes_source_sized_uv_map(self) -> None:
 		mdl = _make_flatten_model(_flat_grid(11, 21), mesh_step=1, flatten_direction="forward")
@@ -267,11 +267,11 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertEqual(tuple(map_yx.shape), (11, 21, 2))
 		self.assertEqual(mdl.mesh_h, 11)
 		self.assertEqual(mdl.mesh_w, 21)
-		self.assertEqual(mdl.flatten_output_shape, (13, 25))
-		self.assertAlmostEqual(float(map_yx[0, 0, 0]), 1.0, places=6)
-		self.assertAlmostEqual(float(map_yx[0, 0, 1]), 2.0, places=6)
-		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 11.0, places=6)
-		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 22.0, places=6)
+		self.assertEqual(mdl.flatten_output_shape, (11, 21))
+		self.assertAlmostEqual(float(map_yx[0, 0, 0]), 0.0, places=6)
+		self.assertAlmostEqual(float(map_yx[0, 0, 1]), 0.0, places=6)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 10.0, places=6)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 20.0, places=6)
 
 	def test_initial_forward_inversion_can_be_skipped(self) -> None:
 		mdl = _make_flatten_model(_flat_grid(5, 7), mesh_step=1, flatten_direction="forward")
@@ -680,7 +680,7 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertEqual(stats["flatten_orient_fold_frac"], 1.0)
 		self.assertEqual(stats["flatten_orient_lowdet_frac"], 1.0)
 		self.assertLess(stats["flatten_orient_min_det"], 0.0)
-		self.assertEqual(int(masks[0].sum().detach()), 36)
+		self.assertEqual(int(masks[0].sum().detach()), 25)
 
 	def test_forward_orient_regularizer_rejects_negative_uv_area(self) -> None:
 		opt_loss_flatten.configure(orient_min_det=0.0, reset_history=True)
@@ -713,7 +713,7 @@ class FlattenLossTest(unittest.TestCase):
 		opt_loss_flatten.flatten_sdir_loss(res=res)
 		stats = opt_loss_flatten.last_stats()
 
-		self.assertAlmostEqual(stats["flatten_valid_to_invalid"], 1.0 / 36.0, places=6)
+		self.assertAlmostEqual(stats["flatten_valid_to_invalid"], 1.0 / 25.0, places=6)
 		self.assertAlmostEqual(stats["flatten_invalid_to_valid"], 1.0 / 36.0, places=6)
 		self.assertIn("flatten_sdir_no_new", stats)
 

@@ -568,9 +568,11 @@ class Model3D(nn.Module):
 
 		def _vertex_count(n: int) -> int:
 			# N vertices contain N-1 physical intervals.
-			intervals = max(1, int(n) - 1)
+			if int(n) < 1:
+				raise ValueError("flatten source dimensions must be positive")
+			intervals = int(n) - 1
 			physical_span = float(intervals) * float(source_step)
-			return max(2, int(math.ceil(physical_span / float(output_step))) + 1)
+			return int(math.ceil(physical_span / float(output_step))) + 1
 
 		return _vertex_count(h), _vertex_count(w)
 
@@ -3415,11 +3417,14 @@ class Model3D(nn.Module):
 			if direction == "forward"
 			else torch.empty(0, 0, 3, device=device, dtype=torch.float32)
 		)
-		self.flatten_target_step = torch.tensor(
-			output_step,
-			device=device,
-			dtype=torch.float32,
-		)
+		# The requested output density determines the exported grid size, while
+		# the strain losses still target the surface's measured physical edge
+		# length.
+		self.flatten_target_step = self._measured_flatten_target_step(
+			xyz_dev,
+			valid_dev,
+			fallback=float(mesh_step),
+		).detach()
 		if direction == "forward":
 			identity = self._centered_flatten_forward_uv_map(
 				source_h=H,
