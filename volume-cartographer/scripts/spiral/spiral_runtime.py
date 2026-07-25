@@ -56,7 +56,6 @@ class InteractiveFitSession:
         self._preview_manifest = None
         self._preview_generation = 0
         self._preview_session_id = uuid.uuid4().hex
-        self._geometry_snapshot_manifest = None
         self._save_checkpoint = None
         self._export_preview = None
         self._incorporate_inputs = None
@@ -82,7 +81,6 @@ class InteractiveFitSession:
                 "warnings": list(self._warnings), "error": self._error,
                 "preview_manifest_path": self._preview_manifest,
                 "preview_generation": self._preview_generation,
-                "geometry_snapshot_manifest_path": self._geometry_snapshot_manifest,
                 "supports_input_incorporation": self._incorporate_inputs is not None,
             }
             if self._run_config is not None:
@@ -275,7 +273,7 @@ class InteractiveFitSession:
 
     # Fitter-thread callbacks.
     def on_ready(self, *, completed_iterations, output_path,
-                 save_checkpoint, export_preview, geometry_snapshot_manifest=None,
+                 save_checkpoint, export_preview,
                  incorporate_inputs=None, finish_run=None, configure_run=None):
         with self._condition:
             self._completed = self._target = completed_iterations
@@ -285,7 +283,6 @@ class InteractiveFitSession:
             self._incorporate_inputs = incorporate_inputs
             self._finish_run = finish_run
             self._configure_run = configure_run
-            self._geometry_snapshot_manifest = geometry_snapshot_manifest
         if self.paths.checkpoint and getattr(self, "publishes_outputs", True):
             self._set_state("ExportingPreview", "Exporting restored checkpoint preview")
             self._publish_preview()
@@ -563,7 +560,7 @@ class DistributedInteractiveFitSession:
             "current_iteration": 0, "target_iteration": 0,
             "session_horizon": None, "latest_metrics": {}, "warnings": [],
             "error": None, "preview_manifest_path": None,
-            "preview_generation": 0, "geometry_snapshot_manifest_path": None,
+            "preview_generation": 0,
             "supports_input_incorporation": False,
         }
         self._acks = {}

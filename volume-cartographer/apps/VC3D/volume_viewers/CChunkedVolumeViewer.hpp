@@ -389,6 +389,7 @@ private:
         int fbW,
         int fbH,
         std::chrono::steady_clock::time_point submittedAt);
+    void requestSurfaceViewForJob(const PendingRenderJob& job);
     void startRenderJob(PendingRenderJob job);
     void submitPendingRenderJobIfNeeded();
     void updateDisplayedFramebufferMapping();
@@ -490,9 +491,15 @@ private:
     std::uint64_t _surfaceCacheGeometryEpoch = 0;
     Volume* _overlaySurfaceCacheVolume = nullptr;
     std::uint64_t _surfaceCacheEpoch = 0;
+    // Number of SurfaceCache instances this viewer has built. Should settle at
+    // one per surface generation.
+    std::uint64_t _surfaceCacheBuildCount = 0;
     std::uint64_t _surfaceViewGeneration = 0;
     std::uint64_t _surfaceTileCbId = 0;
     std::uint64_t _overlaySurfaceTileCbId = 0;
+    // Tile fills finish in bursts. Only one UI callback/render needs to
+    // represent all tiles that became resident during a short debounce window.
+    std::atomic_bool _surfaceTileRenderQueued{false};
     // Last frame fell outside the stored band and used the legacy path, so the
     // status bar can make that performance cliff legible.
     bool _surfaceCacheOutOfBand = false;

@@ -514,8 +514,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             this, [emitLossMap](int) { emitLossMap(); });
 
     for (const auto& item : std::initializer_list<std::pair<const char*, const char*>>{
-             {"output", "Output"}, {"fibers", "Fibers"}, {"tracks", "Tracks"},
-             {"pcls", "Winding/PCL inputs"}, {"verified", "Verified patches"},
+             {"output", "Output"}, {"verified", "Verified patches"},
              {"unverified", "Unverified patches"}, {"pending_only", "Pending patches only"},
              {"shell", "Shell"}, {"lasagna", "Lasagna inputs"}}) {
         auto* check = new QCheckBox(tr(item.second), _displayDialog);
@@ -1208,7 +1207,14 @@ QJsonObject SpiralPanel::sessionRequest() const
                     {"run_tag", _runTag->text()},
                     {"render_volume_scale", _renderVolumeScale->value()},
                     {"config", config}};
-    return {{"paths", paths}, {"run", run}, {"preview", QJsonObject{{"first_winding", 10}}}};
+    return {
+        {"paths", paths},
+        {"run", run},
+        {"preview", QJsonObject{
+            {"first_winding", 10},
+            {"variant", QStringLiteral("raw")},
+        }},
+    };
 }
 
 QJsonObject SpiralPanel::influenceConfig() const
@@ -1561,7 +1567,10 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
 
     _hasManualEdits = false;
     _hasSession = true;
-    _loadedSessionRequest = request;
+    // Reload comparisons use the panel's adopted representation. The host
+    // request is canonical and sparse, whereas the form expands defaults and
+    // applies optional-input gating; both describe the same resident fit.
+    _loadedSessionRequest = sessionRequest();
     _reloadRequired = false;
     for (auto it = _visibilityChecks.begin(); it != _visibilityChecks.end(); ++it)
         it.value()->setChecked(it.key() == QStringLiteral("output"));
@@ -1578,23 +1587,25 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         status.value(QStringLiteral("default_advanced_config")).toObject();
     if (sessionGeneration >= 0 && sessionGeneration != _advancedSessionGeneration
         && !runConfig.isEmpty()) {
-        if (!defaultConfig.isEmpty()) {
-            _defaultAdvancedConfig = defaultConfig;
-            const QJsonObject effectiveConfig =
-                vc3d::effectiveSpiralSessionConfig(
-                    _loadedSessionRequest, defaultConfig, runConfig);
-            _attachedAdvancedConfig = effectiveConfig;
-            _applyingResolution = true;
-            _advancedProfiles->setSessionDefault(effectiveConfig);
-            _advancedProfiles->showSessionDefault();
-            _savePngVisualizations->setChecked(
-                effectiveConfig
-                    .value(QStringLiteral("save_png_visualizations"))
-                    .toBool(false));
-            syncTrackSamplingControlsFromAdvanced();
-            _applyingResolution = false;
-        }
+        const bool completingSynchronization =
+            _hasSession && _advancedSessionGeneration < 0 && !_reloadRequired;
+        _defaultAdvancedConfig = defaultConfig;
+        const QJsonObject effectiveConfig =
+            vc3d::effectiveSpiralSessionConfig(
+                _loadedSessionRequest, defaultConfig, runConfig);
+        _attachedAdvancedConfig = effectiveConfig;
+        _applyingResolution = true;
+        _advancedProfiles->setSessionDefault(effectiveConfig);
+        _advancedProfiles->showSessionDefault();
+        _savePngVisualizations->setChecked(
+            effectiveConfig
+                .value(QStringLiteral("save_png_visualizations"))
+                .toBool(false));
+        syncTrackSamplingControlsFromAdvanced();
+        _applyingResolution = false;
         applySessionRunConfig(runConfig, sessionGeneration);
+        if (completingSynchronization)
+            _loadedSessionRequest = sessionRequest();
         refreshReloadRequired();
     }
     const QJsonValue crossingLimit =

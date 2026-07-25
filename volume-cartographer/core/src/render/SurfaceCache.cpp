@@ -1,18 +1,25 @@
 #include "vc/core/render/SurfaceCache.hpp"
+#include "vc/core/render/SurfaceMemoryTrace.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <utils/thread_pool.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <limits>
 #include <list>
 #include <mutex>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -22,11 +29,19 @@ namespace {
 
 constexpr int kTileSize = SurfaceCache::kTileSize;
 
-// Sub-block used when collecting a tile's volume-chunk dependencies. Each
-// block contributes the chunk-space bounding box of its samples' normal
-// segments; smaller blocks bound a curved tile more tightly at the cost of
-// more (deduplicated) key insertions.
-constexpr int kDependencyBlock = 8;
+// These are hard metadata bounds, independent of the decoded cache. A
+// discontinuity inside a surface tile used to expand an 8x8 sample AABB into
+// hundreds of millions of ChunkKeys before any cache limit was involved.
+constexpr std::size_t kMaxDependencyMetadataKeys = 8192;
+constexpr std::size_t kMaxDependencyBoxExpansion = 256;
+// Eight fill workers share a 2-GiB decoded pool by default. Keeping each
+// blocking batch near 256 MiB lets all eight make progress without forcing the
+// first worker's freshly-prefetched chunks out before it samples them.
+constexpr std::size_t kDependencyDecodedBytesPerBatch = 256ULL << 20;
+
+std::atomic_uint64_t g_geometryTraceOrdinal{0};
+std::atomic_uint64_t g_fillTraceOrdinal{0};
+std::atomic_uint64_t g_sampleTraceOrdinal{0};
 
 // How many times a tile that came back incomplete is refilled before it is left
 // alone until new chunk data arrives.
@@ -43,12 +58,27 @@ std::uint64_t packTile(int tu, int tv)
     return (std::uint64_t(std::uint32_t(tv)) << 32) | std::uint32_t(tu);
 }
 
+std::size_t envSize(const char* name, std::size_t fallback)
+{
+    if (const char* value = std::getenv(name)) {
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (end != value && parsed > 0)
+            return std::size_t(parsed);
+    }
+    return fallback;
+}
+
+// Fill workers spend most of their time blocked on a chunk prefetch rather than
+// sampling, so some oversubscription pays. It is capped because every concurrent
+// fill has a live chunk working set: raising this multiplies decoded-byte
+// residency as well as throughput. VC_SURFACE_FILL_WORKERS overrides for tuning.
 std::size_t defaultWorkerCount()
 {
     const unsigned hardware = std::thread::hardware_concurrency();
-    if (hardware <= 2)
-        return 1;
-    return std::size_t(std::clamp<int>(int(hardware) - 2, 1, 8));
+    const std::size_t cores = hardware == 0 ? 4 : std::size_t(hardware);
+    return envSize("VC_SURFACE_FILL_WORKERS",
+                   std::clamp<std::size_t>(cores > 2 ? cores - 2 : 1, 1, 8));
 }
 
 // One pool for tile fills. Fills block on ChunkCache prefetches (the
@@ -141,10 +171,23 @@ bool inLevelBounds(const std::array<int, 3>& shape, float z, float y, float x)
            y < float(shape[1]) && x < float(shape[2]);
 }
 
-// Chunks resolved for one tile fill. The blocking prefetch that precedes the
-// fill has already forced this exact set into the backing cache, so pinning it
-// wholesale is bounded by the tile's own footprint.
+// Chunks resolved for one tile fill.
+//
+// A ChunkResult owns a shared_ptr to the decoded bytes, so retaining every
+// result a fill touches keeps that memory alive even after the backing pool has
+// evicted it -- the pool then reports itself at capacity while the process holds
+// far more. This is the same trap ChunkedPlaneSampler::LocalChunkCache documents,
+// and it scales with the fill worker count, so an unbounded version here turned
+// every concurrent fill into another decoded-byte cache with no ceiling.
+//
+// A small window keeps the hot consecutive-lookup fast path -- the `w`-innermost
+// kernel walks one voxel at a time along the normal, so successive taps
+// overwhelmingly hit the same chunk -- while bounding what one fill can pin. The
+// blocking prefetch has already made the tile's whole dependency set resident, so
+// a lookup that falls out of the window is a cheap re-read, not a refetch.
 struct FillChunkSet {
+    static constexpr std::size_t kMaxPinnedChunks = 8;
+
     explicit FillChunkSet(IChunkedArray& array_) : array(array_) {}
 
     const ChunkResult& get(const ChunkKey& key)
@@ -153,6 +196,10 @@ struct FillChunkSet {
             return *lastResult;
         auto it = chunks.find(key);
         if (it == chunks.end()) {
+            if (chunks.size() >= kMaxPinnedChunks) {
+                lastResult = nullptr;
+                chunks.clear();
+            }
             it = chunks
                      .emplace(key,
                               array.getChunkIfCached(key.level, key.iz, key.iy, key.ix))
@@ -420,6 +467,16 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
         return nullptr;
 
     const TileKey key{level, tu, tv};
+    const std::uint64_t traceOrdinal =
+        g_geometryTraceOrdinal.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool traceMemory = surfaceMemoryTraceSampleFill(traceOrdinal);
+    if (traceMemory) {
+        surfaceMemoryTrace(
+            "geometry_get_begin",
+            std::format("ordinal={} cache={} level={} tu={} tv={}",
+                        traceOrdinal,
+                        reinterpret_cast<std::uintptr_t>(this), level, tu, tv));
+    }
     std::shared_ptr<State::Slot> slot;
     std::uint64_t epoch = 0;
     {
@@ -432,6 +489,13 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
                 // Another thread is computing this tile; wait for it instead
                 // of duplicating the gen().
                 _state->ready.wait(lock, [&] { return slot->ready; });
+            }
+            if (traceMemory) {
+                surfaceMemoryTrace(
+                    "geometry_get_hit",
+                    std::format("ordinal={} slots={} lru={} tile={}",
+                                traceOrdinal, _state->slots.size(),
+                                _state->lru.size(), bool(slot->tile)));
             }
             return slot->tile;
         }
@@ -461,6 +525,13 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
         coords.release();
         normals.release();
     }
+    if (traceMemory) {
+        surfaceMemoryTrace(
+            "geometry_get_generated",
+            std::format("ordinal={} coords_bytes={} normals_bytes={}",
+                        traceOrdinal, coords.total() * coords.elemSize(),
+                        normals.total() * normals.elemSize()));
+    }
 
     if (!coords.empty() && coords.rows >= kTileSize && coords.cols >= kTileSize) {
         auto built = std::make_shared<Tile>();
@@ -486,6 +557,7 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
         tile = std::move(built);
     }
 
+    std::size_t publishedSlots = 0;
     {
         std::lock_guard lock(_state->mutex);
         slot->tile = tile;
@@ -497,7 +569,21 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
         } else {
             _state->trimLocked();
         }
+        publishedSlots = _state->slots.size();
         _state->ready.notify_all();
+    }
+    if (traceMemory) {
+        const std::size_t tileBytes =
+            tile ? tile->coords.total() * tile->coords.elemSize() +
+                       tile->normals.total() * tile->normals.elemSize() +
+                       tile->valid.total() * tile->valid.elemSize() +
+                       tile->validOffset.total() * tile->validOffset.elemSize()
+                 : 0;
+        surfaceMemoryTrace(
+            "geometry_get_end",
+            std::format("ordinal={} owned_tile_bytes={} slots={} tile={}",
+                        traceOrdinal, tileBytes, publishedSlots,
+                        bool(tile)));
     }
     return tile;
 }
@@ -585,6 +671,8 @@ struct SurfaceCache::State {
     std::size_t bytes = 0;
     std::size_t capacity = 0;
     std::size_t incomplete = 0;
+    std::atomic_size_t peakDependencyKeys{0};
+    std::atomic_size_t dependencyRegionSplits{0};
     std::unordered_set<TileKey, TileKeyHash> outstanding;
     std::unordered_set<TileKey, TileKeyHash> viewTiles;
     // Fills that stored an incomplete tile, per tile. A tile can be incomplete
@@ -647,78 +735,206 @@ struct SurfaceCache::State {
 
 namespace {
 
-// Collect the volume chunks a tile's whole band depends on. Each
-// kDependencyBlock x kDependencyBlock block of samples contributes the
-// chunk-space bounding box of its normal segments; a segment is straight, so
-// its bbox is the bbox of its two endpoints.
-std::vector<ChunkKey> collectTileDependencies(const SurfaceGeometryTileCache::Tile& geometry,
-                                              const LevelAccess& access,
-                                              int level,
-                                              int wMin,
-                                              int wCount)
+struct DependencyBatch {
+    std::vector<ChunkKey> keys;
+    bool overflow = false;
+};
+
+struct ChunkBox {
+    int cx0 = 0;
+    int cx1 = -1;
+    int cy0 = 0;
+    int cy1 = -1;
+    int cz0 = 0;
+    int cz1 = -1;
+};
+
+std::size_t chunkBoxCountCapped(const ChunkBox& box, std::size_t cap)
+{
+    if (box.cx1 < box.cx0 || box.cy1 < box.cy0 || box.cz1 < box.cz0)
+        return 0;
+    std::size_t count = 1;
+    for (const std::size_t extent :
+         {std::size_t(box.cx1 - box.cx0 + 1),
+          std::size_t(box.cy1 - box.cy0 + 1),
+          std::size_t(box.cz1 - box.cz0 + 1)}) {
+        if (extent > cap / count)
+            return cap + 1;
+        count *= extent;
+    }
+    return count;
+}
+
+// Collect one region's source chunks without allowing a surface discontinuity
+// to materialize its full 3-D AABB. Regions whose box is too large are
+// subdivided down to individual pixels; a single pixel then contributes only
+// the exact integer normal samples the filler will read.
+DependencyBatch collectRegionDependencies(
+    const SurfaceGeometryTileCache::Tile& geometry,
+    const LevelAccess& access,
+    int level,
+    int wMin,
+    int wCount,
+    int xBegin,
+    int xEnd,
+    int yBegin,
+    int yEnd,
+    std::size_t maxKeys)
 {
     std::unordered_set<ChunkKey, ChunkKeyHash> keys;
+    keys.reserve(std::min<std::size_t>(maxKeys, 1024));
     const auto& chunkShape = access.chunkShape;
     const auto& shape = access.shape;
     const float wLow = float(wMin);
     const float wHigh = float(wMin + wCount - 1);
 
-    for (int by = 0; by < kTileSize; by += kDependencyBlock) {
-        const int yEnd = std::min(by + kDependencyBlock, kTileSize);
-        for (int bx = 0; bx < kTileSize; bx += kDependencyBlock) {
-            const int xEnd = std::min(bx + kDependencyBlock, kTileSize);
-            double lo[3] = {std::numeric_limits<double>::max(),
-                            std::numeric_limits<double>::max(),
-                            std::numeric_limits<double>::max()};
-            double hi[3] = {std::numeric_limits<double>::lowest(),
-                            std::numeric_limits<double>::lowest(),
-                            std::numeric_limits<double>::lowest()};
-            bool any = false;
-            for (int y = by; y < yEnd; ++y) {
-                const cv::Vec3f* coordRow = geometry.coords.ptr<cv::Vec3f>(y);
-                const cv::Vec3f* normalRow = geometry.normals.ptr<cv::Vec3f>(y);
-                const uint8_t* validRow = geometry.valid.ptr<uint8_t>(y);
-                const uint8_t* offsetRow = geometry.validOffset.ptr<uint8_t>(y);
-                for (int x = bx; x < xEnd; ++x) {
-                    if (!validRow[x])
-                        continue;
-                    const cv::Vec3f& coord = coordRow[x];
-                    cv::Vec3f ends[2] = {coord, coord};
-                    if (offsetRow[x]) {
-                        ends[0] = coord + normalRow[x] * wLow;
-                        ends[1] = coord + normalRow[x] * wHigh;
+    DependencyBatch result;
+    auto addKey = [&](const ChunkKey& key) {
+        if (keys.contains(key))
+            return true;
+        if (keys.size() >= maxKeys) {
+            result.overflow = true;
+            return false;
+        }
+        keys.insert(key);
+        return true;
+    };
+
+    auto addPoint = [&](const cv::Vec3f& p0) {
+        const cv::Vec3f p = toLevelCoord(access, p0);
+        if (!finiteCoord(p) || !inLevelBounds(shape, p[2], p[1], p[0]))
+            return true;
+        const int vx0 = std::clamp(int(std::floor(p[0])), 0, shape[2] - 1);
+        const int vy0 = std::clamp(int(std::floor(p[1])), 0, shape[1] - 1);
+        const int vz0 = std::clamp(int(std::floor(p[2])), 0, shape[0] - 1);
+        const int vx1 = std::min(vx0 + 1, shape[2] - 1);
+        const int vy1 = std::min(vy0 + 1, shape[1] - 1);
+        const int vz1 = std::min(vz0 + 1, shape[0] - 1);
+        for (const int vz : {vz0, vz1}) {
+            for (const int vy : {vy0, vy1}) {
+                for (const int vx : {vx0, vx1}) {
+                    if (!addKey({level, vz / chunkShape[0],
+                                 vy / chunkShape[1], vx / chunkShape[2]})) {
+                        return false;
                     }
-                    for (const cv::Vec3f& end : ends) {
-                        const cv::Vec3f p = toLevelCoord(access, end);
-                        if (!finiteCoord(p))
-                            continue;
-                        for (int axis = 0; axis < 3; ++axis) {
-                            lo[axis] = std::min(lo[axis], double(p[axis]));
-                            hi[axis] = std::max(hi[axis], double(p[axis]));
-                        }
-                        any = true;
-                    }
-                }
-            }
-            if (!any)
-                continue;
-            // +1 on the high side covers the trilinear neighbour tap.
-            const int x0 = std::clamp(int(std::floor(lo[0])), 0, shape[2] - 1);
-            const int x1 = std::clamp(int(std::floor(hi[0])) + 1, 0, shape[2] - 1);
-            const int y0 = std::clamp(int(std::floor(lo[1])), 0, shape[1] - 1);
-            const int y1 = std::clamp(int(std::floor(hi[1])) + 1, 0, shape[1] - 1);
-            const int z0 = std::clamp(int(std::floor(lo[2])), 0, shape[0] - 1);
-            const int z1 = std::clamp(int(std::floor(hi[2])) + 1, 0, shape[0] - 1);
-            for (int cz = z0 / chunkShape[0]; cz <= z1 / chunkShape[0]; ++cz) {
-                for (int cy = y0 / chunkShape[1]; cy <= y1 / chunkShape[1]; ++cy) {
-                    for (int cx = x0 / chunkShape[2]; cx <= x1 / chunkShape[2]; ++cx)
-                        keys.insert({level, cz, cy, cx});
                 }
             }
         }
-    }
+        return true;
+    };
 
-    return {keys.begin(), keys.end()};
+    auto clampedVoxel = [](double value, int extent, bool high) {
+        double voxel = std::floor(value);
+        if (high)
+            voxel += 1.0; // trilinear neighbour
+        if (voxel <= 0.0)
+            return 0;
+        if (voxel >= double(extent - 1))
+            return extent - 1;
+        return static_cast<int>(voxel);
+    };
+
+    std::function<void(int, int, int, int)> collect;
+    collect = [&](int x0, int x1, int y0, int y1) {
+        if (result.overflow || x0 >= x1 || y0 >= y1)
+            return;
+
+        double lo[3] = {std::numeric_limits<double>::max(),
+                        std::numeric_limits<double>::max(),
+                        std::numeric_limits<double>::max()};
+        double hi[3] = {std::numeric_limits<double>::lowest(),
+                        std::numeric_limits<double>::lowest(),
+                        std::numeric_limits<double>::lowest()};
+        bool any = false;
+        for (int y = y0; y < y1; ++y) {
+            const cv::Vec3f* coordRow = geometry.coords.ptr<cv::Vec3f>(y);
+            const cv::Vec3f* normalRow = geometry.normals.ptr<cv::Vec3f>(y);
+            const uint8_t* validRow = geometry.valid.ptr<uint8_t>(y);
+            const uint8_t* offsetRow = geometry.validOffset.ptr<uint8_t>(y);
+            for (int x = x0; x < x1; ++x) {
+                if (!validRow[x])
+                    continue;
+                const cv::Vec3f& coord = coordRow[x];
+                cv::Vec3f ends[2] = {coord, coord};
+                if (offsetRow[x]) {
+                    ends[0] = coord + normalRow[x] * wLow;
+                    ends[1] = coord + normalRow[x] * wHigh;
+                }
+                for (const cv::Vec3f& end : ends) {
+                    const cv::Vec3f p = toLevelCoord(access, end);
+                    if (!finiteCoord(p))
+                        continue;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        lo[axis] = std::min(lo[axis], double(p[axis]));
+                        hi[axis] = std::max(hi[axis], double(p[axis]));
+                    }
+                    any = true;
+                }
+            }
+        }
+        if (!any)
+            return;
+
+        const ChunkBox box{
+            clampedVoxel(lo[0], shape[2], false) / chunkShape[2],
+            clampedVoxel(hi[0], shape[2], true) / chunkShape[2],
+            clampedVoxel(lo[1], shape[1], false) / chunkShape[1],
+            clampedVoxel(hi[1], shape[1], true) / chunkShape[1],
+            clampedVoxel(lo[2], shape[0], false) / chunkShape[0],
+            clampedVoxel(hi[2], shape[0], true) / chunkShape[0],
+        };
+        if (chunkBoxCountCapped(box, kMaxDependencyBoxExpansion) <=
+            kMaxDependencyBoxExpansion) {
+            for (int cz = box.cz0; cz <= box.cz1 && !result.overflow; ++cz) {
+                for (int cy = box.cy0; cy <= box.cy1 && !result.overflow; ++cy) {
+                    for (int cx = box.cx0; cx <= box.cx1; ++cx) {
+                        if (!addKey({level, cz, cy, cx}))
+                            break;
+                    }
+                }
+            }
+            return;
+        }
+
+        const int width = x1 - x0;
+        const int height = y1 - y0;
+        if (width > 1 || height > 1) {
+            if (width >= height && width > 1) {
+                const int middle = x0 + width / 2;
+                collect(x0, middle, y0, y1);
+                collect(middle, x1, y0, y1);
+            } else {
+                const int middle = y0 + height / 2;
+                collect(x0, x1, y0, middle);
+                collect(x0, x1, middle, y1);
+            }
+            return;
+        }
+
+        // A single malformed or extremely oblique normal must not expand a
+        // diagonal bounding box. Queue only the points the sampling loop reads.
+        const cv::Vec3f& coord = geometry.coords(y0, x0);
+        if (!geometry.validOffset(y0, x0)) {
+            (void)addPoint(coord);
+            return;
+        }
+        const cv::Vec3f& normal = geometry.normals(y0, x0);
+        for (int k = 0; k < wCount && !result.overflow; ++k)
+            (void)addPoint(coord + normal * float(wMin + k));
+    };
+
+    collect(std::clamp(xBegin, 0, kTileSize),
+            std::clamp(xEnd, 0, kTileSize),
+            std::clamp(yBegin, 0, kTileSize),
+            std::clamp(yEnd, 0, kTileSize));
+
+    result.keys.assign(keys.begin(), keys.end());
+    std::sort(result.keys.begin(), result.keys.end(),
+              [](const ChunkKey& lhs, const ChunkKey& rhs) {
+                  return std::tie(lhs.level, lhs.iz, lhs.iy, lhs.ix) <
+                         std::tie(rhs.level, rhs.iz, rhs.iy, rhs.ix);
+              });
+    return result;
 }
 
 } // namespace
@@ -742,11 +958,26 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
                                   TileKey key,
                                   std::uint64_t epoch)
 {
+    const std::uint64_t traceOrdinal =
+        g_fillTraceOrdinal.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool traceMemory = surfaceMemoryTraceSampleFill(traceOrdinal);
+    if (traceMemory) {
+        surfaceMemoryTrace(
+            "fill_begin",
+            std::format("ordinal={} cache={} epoch={} level={} tu={} tv={}",
+                        traceOrdinal,
+                        reinterpret_cast<std::uintptr_t>(self.get()), epoch,
+                        key.level, key.tu, key.tv));
+    }
+#if defined(_OPENMP)
+    // QuadSurface::gen() has OpenMP loops, but runFill is already parallel at
+    // tile granularity. Avoid building a full nested team for every fill.
+    omp_set_num_threads(1);
+#endif
+
     bool published = false;
     {
         std::lock_guard lock(self->mutex);
-        // Started fills always finish and store; queued fills whose view has
-        // been superseded are dropped here instead.
         if (self->shuttingDown || epoch != self->epoch || !self->viewTiles.count(key)) {
             self->outstanding.erase(key);
             return;
@@ -761,6 +992,19 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
     std::shared_ptr<const SurfaceGeometryTileCache::Tile> geometry;
     if (self->geometry)
         geometry = self->geometry->get(key.level, key.tu, key.tv);
+    if (traceMemory) {
+        const std::size_t geometryBytes =
+            geometry ? geometry->coords.total() * geometry->coords.elemSize() +
+                           geometry->normals.total() * geometry->normals.elemSize() +
+                           geometry->valid.total() * geometry->valid.elemSize() +
+                           geometry->validOffset.total() *
+                               geometry->validOffset.elemSize()
+                     : 0;
+        surfaceMemoryTrace(
+            "fill_geometry_ready",
+            std::format("ordinal={} geometry_bytes={}", traceOrdinal,
+                        geometryBytes));
+    }
     if (!geometry || !self->volume) {
         release();
         return;
@@ -785,47 +1029,166 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
         std::memcpy(tile->validOffset.data() + std::size_t(y) * kTileSize,
                     geometry->validOffset.ptr<uint8_t>(y), kTileSize);
     }
-    if (self->zeroIndex < 0) {
-        // A band that excludes w == 0 can only ever be read through the
-        // offset mask.
+    if (self->zeroIndex < 0)
         tile->valid = tile->validOffset;
+    if (traceMemory) {
+        surfaceMemoryTrace(
+            "fill_tile_allocated",
+            std::format(
+                "ordinal={} data_size={} data_capacity={} valid_capacity={} "
+                "valid_offset_capacity={} explicit_scratch_bytes={}",
+                traceOrdinal, tile->data.size(), tile->data.capacity(),
+                tile->valid.capacity(), tile->validOffset.capacity(),
+                tile->data.capacity() * sizeof(uint8_t) +
+                    tile->valid.capacity() * sizeof(uint8_t) +
+                    tile->validOffset.capacity() * sizeof(uint8_t)));
     }
 
-    const std::vector<ChunkKey> dependencies =
-        collectTileDependencies(*geometry, access, key.level, wMin, wCount);
-    if (!dependencies.empty())
-        self->volume->prefetchChunks(dependencies, /*wait=*/true);
-
-    FillChunkSet chunks(*self->volume);
     const vc::Sampling sampling = self->options.sampling;
+    std::size_t decodedChunkBytes =
+        self->volume->dtype() == ChunkDtype::UInt16 ? 2 : 1;
+    for (const int dimension : access.chunkShape) {
+        if (dimension <= 0 ||
+            decodedChunkBytes >
+                std::numeric_limits<std::size_t>::max() /
+                    static_cast<std::size_t>(dimension)) {
+            decodedChunkBytes = std::numeric_limits<std::size_t>::max();
+            break;
+        }
+        decodedChunkBytes *= static_cast<std::size_t>(dimension);
+    }
+    const std::size_t dependencyKeyLimit = std::min(
+        kMaxDependencyMetadataKeys,
+        std::max<std::size_t>(
+            1, kDependencyDecodedBytesPerBatch /
+                   std::max<std::size_t>(1, decodedChunkBytes)));
+
     bool complete = true;
-    for (int y = 0; y < kTileSize; ++y) {
-        const cv::Vec3f* coordRow = geometry->coords.ptr<cv::Vec3f>(y);
-        const cv::Vec3f* normalRow = geometry->normals.ptr<cv::Vec3f>(y);
-        for (int x = 0; x < kTileSize; ++x) {
-            const std::size_t index = std::size_t(y) * kTileSize + std::size_t(x);
-            if (!tile->valid[index] && !tile->validOffset[index])
-                continue;
-            uint8_t* out = tile->data.data() + index * std::size_t(wCount);
-            if (!tile->validOffset[index]) {
-                // No usable normal: only the w == 0 slice is ever read here.
-                if (self->zeroIndex >= 0 &&
-                    !sampleLevelPoint(chunks, access, key.level, coordRow[x], sampling,
-                                      out[self->zeroIndex]))
-                    complete = false;
-                continue;
+    auto stillCurrent = [&]() {
+        std::lock_guard lock(self->mutex);
+        return !self->shuttingDown && epoch == self->epoch &&
+               self->viewTiles.count(key);
+    };
+    auto noteDependencyPeak = [&](std::size_t count) {
+        auto peak = self->peakDependencyKeys.load(std::memory_order_relaxed);
+        while (peak < count &&
+               !self->peakDependencyKeys.compare_exchange_weak(
+                   peak, count, std::memory_order_relaxed)) {
+        }
+    };
+
+    // The normal case remains one parallel prefetch for the whole tile.
+    // Pathological/discontinuous geometry is adaptively split only when its
+    // exact dependency set exceeds the hard metadata bound.
+    std::function<bool(int, int, int, int)> fillRegion;
+    fillRegion = [&](int x0, int x1, int y0, int y1) {
+        if (!stillCurrent())
+            return false;
+
+        DependencyBatch dependencies = collectRegionDependencies(
+            *geometry, access, key.level, wMin, wCount, x0, x1, y0, y1,
+            dependencyKeyLimit);
+        noteDependencyPeak(dependencies.keys.size());
+        if (traceMemory || (surfaceMemoryTraceEnabled() && dependencies.overflow)) {
+            surfaceMemoryTrace(
+                "fill_dependencies",
+                std::format(
+                    "ordinal={} region=[{},{})x[{},{}) keys={} capacity={} "
+                    "metadata_bytes={} limit={} overflow={}",
+                    traceOrdinal, x0, x1, y0, y1,
+                    dependencies.keys.size(), dependencies.keys.capacity(),
+                    dependencies.keys.capacity() * sizeof(ChunkKey),
+                    dependencyKeyLimit, dependencies.overflow));
+        }
+        if (dependencies.overflow) {
+            const int width = x1 - x0;
+            const int height = y1 - y0;
+            if (width <= 1 && height <= 1) {
+                complete = false;
+                return true;
             }
-            const cv::Vec3f& coord = coordRow[x];
-            const cv::Vec3f& normal = normalRow[x];
-            // `w` innermost: consecutive taps walk one voxel along the normal
-            // and so overwhelmingly hit the same chunk, which is what makes
-            // the 32-slice band nearly free relative to a single slice.
-            for (int k = 0; k < wCount; ++k) {
-                const cv::Vec3f p = coord + normal * float(wMin + k);
-                if (!sampleLevelPoint(chunks, access, key.level, p, sampling, out[k]))
-                    complete = false;
+            self->dependencyRegionSplits.fetch_add(1, std::memory_order_relaxed);
+            std::vector<ChunkKey>().swap(dependencies.keys);
+            if (width >= height && width > 1) {
+                const int middle = x0 + width / 2;
+                return fillRegion(x0, middle, y0, y1) &&
+                       fillRegion(middle, x1, y0, y1);
+            }
+            const int middle = y0 + height / 2;
+            return fillRegion(x0, x1, y0, middle) &&
+                   fillRegion(x0, x1, middle, y1);
+        }
+
+        if (!dependencies.keys.empty()) {
+            if (traceMemory) {
+                surfaceMemoryTrace(
+                    "fill_prefetch_begin",
+                    std::format("ordinal={} keys={} decoded_working_bound={}",
+                                traceOrdinal, dependencies.keys.size(),
+                                dependencies.keys.size() * decodedChunkBytes));
+            }
+            self->volume->prefetchChunks(dependencies.keys, /*wait=*/true);
+            if (traceMemory) {
+                surfaceMemoryTrace(
+                    "fill_prefetch_end",
+                    std::format("ordinal={} keys={}", traceOrdinal,
+                                dependencies.keys.size()));
             }
         }
+        if (!stillCurrent())
+            return false;
+        std::vector<ChunkKey>().swap(dependencies.keys);
+
+        FillChunkSet chunks(*self->volume);
+        if (traceMemory) {
+            surfaceMemoryTrace(
+                "fill_sample_region_begin",
+                std::format("ordinal={} region=[{},{})x[{},{})", traceOrdinal,
+                            x0, x1, y0, y1));
+        }
+        for (int y = y0; y < y1; ++y) {
+            const cv::Vec3f* coordRow = geometry->coords.ptr<cv::Vec3f>(y);
+            const cv::Vec3f* normalRow = geometry->normals.ptr<cv::Vec3f>(y);
+            for (int x = x0; x < x1; ++x) {
+                const std::size_t index =
+                    std::size_t(y) * kTileSize + std::size_t(x);
+                if (!tile->valid[index] && !tile->validOffset[index])
+                    continue;
+                uint8_t* out =
+                    tile->data.data() + index * std::size_t(wCount);
+                if (!tile->validOffset[index]) {
+                    if (self->zeroIndex >= 0 &&
+                        !sampleLevelPoint(chunks, access, key.level,
+                                          coordRow[x], sampling,
+                                          out[self->zeroIndex])) {
+                        complete = false;
+                    }
+                    continue;
+                }
+                const cv::Vec3f& coord = coordRow[x];
+                const cv::Vec3f& normal = normalRow[x];
+                for (int k = 0; k < wCount; ++k) {
+                    const cv::Vec3f p =
+                        coord + normal * float(wMin + k);
+                    if (!sampleLevelPoint(chunks, access, key.level, p,
+                                          sampling, out[k])) {
+                        complete = false;
+                    }
+                }
+            }
+        }
+        if (traceMemory) {
+            surfaceMemoryTrace(
+                "fill_sample_region_end",
+                std::format("ordinal={} region=[{},{})x[{},{}) complete={}",
+                            traceOrdinal, x0, x1, y0, y1, complete));
+        }
+        return true;
+    };
+
+    if (!fillRegion(0, kTileSize, 0, kTileSize)) {
+        release();
+        return;
     }
     tile->complete = complete;
 
@@ -848,6 +1211,25 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
             self->enforceCapacityLocked();
             published = true;
         }
+    }
+
+    if (traceMemory) {
+        std::size_t ownedBytes = 0;
+        std::size_t ownedTiles = 0;
+        std::size_t outstanding = 0;
+        {
+            std::lock_guard lock(self->mutex);
+            ownedBytes = self->bytes;
+            ownedTiles = self->tiles.size();
+            outstanding = self->outstanding.size();
+        }
+        surfaceMemoryTrace(
+            "fill_end",
+            std::format(
+                "ordinal={} published={} complete={} cache_bytes={} "
+                "cache_tiles={} outstanding={}",
+                traceOrdinal, published, complete, ownedBytes, ownedTiles,
+                outstanding));
     }
 
     if (published)
@@ -876,9 +1258,15 @@ SurfaceCache::SurfaceCache(std::shared_ptr<IChunkedArray> volume,
     _state->geometry = options.geometry
                            ? options.geometry
                            : std::make_shared<SurfaceGeometryTileCache>(_state->surface);
+    // Keep at most one running and one queued tile per fill worker. The worker
+    // pool is the consumer; admitting hundreds of tile producers merely lets
+    // repeated pans build a large stale-work queue ahead of it.
+    const std::size_t fillWorkers =
+        options.fillWorkers > 0 ? options.fillWorkers
+                                : surfaceFillPool().worker_count();
     _state->maxOutstandingFills =
-        2 * (options.fillWorkers > 0 ? options.fillWorkers
-                                     : surfaceFillPool().worker_count());
+        envSize("VC_SURFACE_MAX_OUTSTANDING_FILLS",
+                std::max<std::size_t>(1, 2 * fillWorkers));
 
     // New chunk data is the one event that can turn an incomplete tile
     // complete, so it is what re-arms the retry bound. Captured weakly: this
@@ -892,6 +1280,18 @@ SurfaceCache::SurfaceCache(std::shared_ptr<IChunkedArray> volume,
                 state->failedAttempts.clear();
             }
         });
+    }
+    if (surfaceMemoryTraceEnabled()) {
+        surfaceMemoryTrace(
+            "cache_created",
+            std::format(
+                "cache={} capacity={} tile_bytes={} levels={} w_min={} "
+                "w_count={} fill_workers={} max_outstanding={} supersede={}",
+                reinterpret_cast<std::uintptr_t>(_state.get()),
+                _state->capacity, _state->tileBytes, _state->levels,
+                _state->wMin, _state->wCount, fillWorkers,
+                _state->maxOutstandingFills,
+                _state->options.supersedeChunkRequests));
     }
 }
 
@@ -910,6 +1310,8 @@ void SurfaceCache::shutdown()
     // and then releases the last reference. Clearing the listeners here is what
     // guarantees no callback fires after this returns.
     IChunkedArray::ChunkReadyCallbackId chunkReadyId = 0;
+    std::size_t ownedBytes = 0;
+    std::size_t ownedTiles = 0;
     {
         std::lock_guard lock(_state->mutex);
         _state->shuttingDown = true;
@@ -917,10 +1319,21 @@ void SurfaceCache::shutdown()
         _state->listeners.clear();
         chunkReadyId = _state->chunkReadyId;
         _state->chunkReadyId = 0;
+        ownedBytes = _state->bytes;
+        ownedTiles = _state->tiles.size();
     }
     if (chunkReadyId != 0 && _state->volume)
         _state->volume->removeChunkReadyListener(chunkReadyId);
+    if (surfaceMemoryTraceEnabled()) {
+        surfaceMemoryTrace(
+            "cache_shutdown",
+            std::format("cache={} owned_bytes={} owned_tiles={}",
+                        reinterpret_cast<std::uintptr_t>(_state.get()),
+                        ownedBytes, ownedTiles));
+    }
 }
+
+std::size_t SurfaceCache::fillWorkerCount() { return surfaceFillPool().worker_count(); }
 
 int SurfaceCache::levels() const { return _state->levels; }
 int SurfaceCache::wMin() const { return _state->wMin; }
@@ -948,6 +1361,10 @@ SurfaceCache::Stats SurfaceCache::stats() const
     stats.tiles = _state->tiles.size();
     stats.tilesInFlight = _state->outstanding.size();
     stats.tilesIncomplete = _state->incomplete;
+    stats.peakDependencyKeys =
+        _state->peakDependencyKeys.load(std::memory_order_relaxed);
+    stats.dependencyRegionSplits =
+        _state->dependencyRegionSplits.load(std::memory_order_relaxed);
     return stats;
 }
 
@@ -1054,11 +1471,28 @@ void SurfaceCache::requestView(int startLevel,
         double distance = 0.0;
     };
     const std::size_t tileCount = std::size_t(tu1 - tu0 + 1) * std::size_t(tv1 - tv0 + 1);
+    if (surfaceMemoryTraceEnabled()) {
+        surfaceMemoryTrace(
+            "request_view_plan",
+            std::format(
+                "cache={} generation={} fb={}x{} scale={} level={} "
+                "tile_bounds=[{},{}]x[{},{}] tile_count={} "
+                "candidate_bytes_if_full={}",
+                reinterpret_cast<std::uintptr_t>(_state.get()), viewGeneration,
+                fbW, fbH, scale, level, tu0, tu1, tv0, tv1, tileCount,
+                tileCount * sizeof(Candidate)));
+    }
     std::vector<Candidate> candidates;
     std::unordered_set<TileKey, TileKeyHash> viewTiles;
     viewTiles.reserve(tileCount);
     candidates.reserve(tileCount);
 
+    bool viewChanged = false;
+    std::size_t stateViewTiles = 0;
+    std::size_t stateViewBuckets = 0;
+    std::size_t stateOwnedTiles = 0;
+    std::size_t stateOwnedBytes = 0;
+    std::size_t stateOutstanding = 0;
     {
         std::lock_guard lock(_state->mutex);
         if (_state->shuttingDown)
@@ -1086,15 +1520,47 @@ void SurfaceCache::requestView(int startLevel,
                 candidates.push_back({key, std::hypot(tileU - uCenter, tileV - vCenter)});
             }
         }
+        viewChanged = _state->viewTiles != viewTiles;
         _state->viewTiles = std::move(viewTiles);
         _state->viewGeneration = viewGeneration;
+        stateViewTiles = _state->viewTiles.size();
+        stateViewBuckets = _state->viewTiles.bucket_count();
+        stateOwnedTiles = _state->tiles.size();
+        stateOwnedBytes = _state->bytes;
+        stateOutstanding = _state->outstanding.size();
     }
+    if (surfaceMemoryTraceEnabled()) {
+        const std::size_t candidateMetadataBytes =
+            candidates.capacity() * sizeof(Candidate);
+        const std::size_t viewMetadataBytes =
+            stateViewBuckets * sizeof(void*) +
+            stateViewTiles * (sizeof(TileKey) + 2 * sizeof(void*));
+        surfaceMemoryTrace(
+            "request_view_materialized",
+            std::format(
+                "cache={} generation={} candidates={}/{} "
+                "candidate_metadata_bytes={} view_tiles={} view_buckets={} "
+                "view_metadata_estimate={} owned_tiles={} owned_bytes={} "
+                "outstanding={} changed={}",
+                reinterpret_cast<std::uintptr_t>(_state.get()), viewGeneration,
+                candidates.size(), candidates.capacity(),
+                candidateMetadataBytes, stateViewTiles, stateViewBuckets,
+                viewMetadataBytes, stateOwnedTiles, stateOwnedBytes,
+                stateOutstanding, viewChanged));
+    }
+
+    // The base Spiral surface cache has an exclusive chunk pool. Smaller
+    // volume chunks make a tile's dependency list large, so keeping unresolved
+    // batches from old pans would otherwise grow the fetch queue without bound.
+    if (viewChanged && _state->options.supersedeChunkRequests)
+        _state->volume->beginViewRequest(/*discardPending=*/true);
 
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& a, const Candidate& b) { return a.distance < b.distance; });
 
     const std::size_t pageTiles = std::max<std::size_t>(
-        1, _state->options.admissionPageBytes / std::max<std::size_t>(1, _state->tileBytes));
+        1, envSize("VC_SURFACE_ADMISSION_PAGE_BYTES", _state->options.admissionPageBytes) /
+               std::max<std::size_t>(1, _state->tileBytes));
     std::size_t admitted = 0;
     for (const Candidate& candidate : candidates) {
         if (admitted >= pageTiles)
@@ -1115,6 +1581,14 @@ void SurfaceCache::requestView(int startLevel,
         const TileKey key = candidate.key;
         surfaceFillPool().enqueue(
             [state, key, epoch]() { State::runFill(state, key, epoch); });
+    }
+    if (surfaceMemoryTraceEnabled()) {
+        surfaceMemoryTrace(
+            "request_view_end",
+            std::format(
+                "cache={} generation={} candidates={} page_tiles={} admitted={}",
+                reinterpret_cast<std::uintptr_t>(_state.get()), viewGeneration,
+                candidates.size(), pageTiles, admitted));
     }
 }
 
@@ -1255,6 +1729,33 @@ SurfaceCache::SampleStats SurfaceCache::State::sampleReduced(const State& self,
     if (fbH <= 0 || fbW <= 0)
         return stats;
 
+    const std::uint64_t traceOrdinal =
+        g_sampleTraceOrdinal.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool traceMemory = surfaceMemoryTraceEnabled();
+    if (traceMemory) {
+        std::size_t cacheBytes = 0;
+        std::size_t cacheTiles = 0;
+        std::size_t outstanding = 0;
+        std::size_t viewTiles = 0;
+        {
+            std::lock_guard lock(self.mutex);
+            cacheBytes = self.bytes;
+            cacheTiles = self.tiles.size();
+            outstanding = self.outstanding.size();
+            viewTiles = self.viewTiles.size();
+        }
+        surfaceMemoryTrace(
+            "sample_view_begin",
+            std::format(
+                "ordinal={} cache={} fb={}x{} scale={} start_level={} "
+                "cache_bytes={} cache_tiles={} outstanding={} view_tiles={} "
+                "out_bytes={} coverage_bytes={}",
+                traceOrdinal, reinterpret_cast<std::uintptr_t>(&self), fbW,
+                fbH, scale, startLevel, cacheBytes, cacheTiles, outstanding,
+                viewTiles, out.total() * out.elemSize(),
+                coverage.total() * coverage.elemSize()));
+    }
+
     const int wCount = self.wCount;
     const int wMin = self.wMin;
     double wLow = 0.0, wHigh = 0.0;
@@ -1312,6 +1813,23 @@ SurfaceCache::SampleStats SurfaceCache::State::sampleReduced(const State& self,
                     const_cast<State&>(self).touchLocked({level, tu, tv});
                 }
             }
+        }
+        if (traceMemory) {
+            const std::size_t levelMetadataBytes =
+                levelTiles.bucket_count() * sizeof(void*) +
+                levelTiles.size() *
+                    (sizeof(std::uint64_t) + sizeof(SurfaceTilePtr) +
+                     2 * sizeof(void*));
+            surfaceMemoryTrace(
+                "sample_view_level_tiles",
+                std::format(
+                    "ordinal={} level={} tile_bounds=[{},{}]x[{},{}] "
+                    "tile_refs={} buckets={} ref_metadata_estimate={} "
+                    "pinned_payload_estimate={} missing={}",
+                    traceOrdinal, level, tu0, tu1, tv0, tv1,
+                    levelTiles.size(), levelTiles.bucket_count(),
+                    levelMetadataBytes, levelTiles.size() * self.tileBytes,
+                    missing));
         }
         if (level == startClamped)
             stats.missingTiles = missing;
@@ -1413,6 +1931,15 @@ SurfaceCache::SampleStats SurfaceCache::State::sampleReduced(const State& self,
         stats.coveredPixels += covered;
         if (level > startClamped && covered > 0)
             stats.usedCoarseFallback = true;
+    }
+
+    if (traceMemory) {
+        surfaceMemoryTrace(
+            "sample_view_end",
+            std::format(
+                "ordinal={} covered_pixels={} missing_tiles={} coarse={}",
+                traceOrdinal, stats.coveredPixels, stats.missingTiles,
+                stats.usedCoarseFallback));
     }
 
     return stats;

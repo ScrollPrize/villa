@@ -11,8 +11,8 @@
 class QNetworkAccessManager;
 class QNetworkRequest;
 
-// Downloads immutable service artifacts (previews, geometry snapshots,
-// checkpoints) into a local cache and publishes each completed artifact
+// Downloads immutable service artifacts (previews and checkpoints) into a
+// local cache and publishes each completed artifact
 // directory atomically. The same path is used for loopback and remote
 // services so local use exercises the network implementation.
 //

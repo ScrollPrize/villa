@@ -169,8 +169,6 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _lastStatusGeneration = -1;
     _installedPreviewArtifact.clear();
     _fetchingPreviewArtifact.clear();
-    _installedGeometryArtifact.clear();
-    _fetchingGeometryArtifact.clear();
     _synchronizedSessionId.clear();
     _activeLasagnaFlattenJob.clear();
     _reportedLasagnaFlattenJob.clear();
@@ -430,8 +428,6 @@ void SpiralServiceManager::restartRemoteService()
              _lastStatusGeneration = -1;
              _installedPreviewArtifact.clear();
              _fetchingPreviewArtifact.clear();
-             _installedGeometryArtifact.clear();
-             _fetchingGeometryArtifact.clear();
              _synchronizedSessionId.clear();
              _lastRemoteLogSequence = 0;
              _serviceOwnsDataset = false;
@@ -1253,32 +1249,9 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 _installedPreviewArtifact = previewId;
                 _lastPreviewLocalPath = entryPath;
                 emit previewAvailable(entryPath, sequence);
-                _artifactCache->pruneSession(sessionId, kPreviewCacheKept,
-                                             {_lastPreviewLocalPath, _lastGeometryLocalPath,
-                                              _lastLasagnaLocalPath});
-            });
-    }
-
-    const QJsonObject geometryRef = status.value(QStringLiteral("geometry_artifact")).toObject();
-    const QString geometryId = geometryRef.value(QStringLiteral("id")).toString();
-    if (!geometryId.isEmpty() && geometryId != _installedGeometryArtifact
-        && geometryId != _fetchingGeometryArtifact) {
-        _fetchingGeometryArtifact = geometryId;
-        const quint64 generation = _connectionGeneration;
-        const qint64 sessionGeneration = status.value(QStringLiteral("session_generation")).toInteger();
-        _artifactCache->fetchArtifact(
-            sessionId, geometryId,
-            [this, geometryId, sessionGeneration, generation](const QString& entryPath,
-                                                              const QString& error, bool gone) {
-                if (generation != _connectionGeneration) return;
-                if (_fetchingGeometryArtifact == geometryId) _fetchingGeometryArtifact.clear();
-                if (entryPath.isEmpty()) {
-                    if (!gone) emit errorOccurred(error);
-                    return;
-                }
-                _installedGeometryArtifact = geometryId;
-                _lastGeometryLocalPath = entryPath;
-                emit geometryAvailable(entryPath, static_cast<quint64>(sessionGeneration));
+                _artifactCache->pruneSession(
+                    sessionId, kPreviewCacheKept,
+                    {_lastPreviewLocalPath, _lastLasagnaLocalPath});
             });
     }
 

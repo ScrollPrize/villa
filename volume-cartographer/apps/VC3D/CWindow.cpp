@@ -7582,9 +7582,6 @@ void CWindow::CreateWidgets(void)
         if (_fiberOverlay) {
             _fiberOverlay->setViewDistance(distance);
         }
-        if (_spiralWorkspace) {
-            _spiralWorkspace->setFiberViewDistance(distance);
-        }
         syncFiberViewDistances(distance);
     };
     if (_fiberWidget) {

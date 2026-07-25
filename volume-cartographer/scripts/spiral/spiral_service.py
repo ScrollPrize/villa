@@ -5,7 +5,7 @@ The service binds to loopback by default. Non-loopback binds are explicit and
 always carry bearer authentication; every client — including VC3D talking to a
 process it launched itself — uses the same authenticated HTTP protocol.
 
-Generated display data (previews, geometry snapshots, downloadable
+Generated display data (previews, downloadable
 checkpoints) is published as immutable, opaque artifacts and transferred
 through ``/artifacts/...`` instead of host filesystem paths. Session inputs
 (patches, fibers, PCL documents) can be uploaded into a session-scoped
@@ -1005,8 +1005,6 @@ class ServiceState:
         self.ephemeral_records = []
         self._registered_preview_generation = 0
         self._preview_artifact = None
-        self._geometry_artifact = None
-        self._registered_geometry_manifest = None
         self._lasagna_flatten = None
         self._lasagna_process = None
         self._lasagna_thread = None
@@ -1057,7 +1055,6 @@ class ServiceState:
             })
             response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview_artifact
-            response["geometry_artifact"] = self._geometry_artifact
             response["lasagna_flatten"] = (
                 self._lasagna_flatten.snapshot()
                 if self._lasagna_flatten else None)
@@ -1249,8 +1246,6 @@ class ServiceState:
         self.uploads = {}
         self._registered_preview_generation = 0
         self._preview_artifact = None
-        self._geometry_artifact = None
-        self._registered_geometry_manifest = None
 
     def _status_changed(self, status):
         # Runs on the fitter thread inside the pause/export window, so artifact
@@ -1268,11 +1263,8 @@ class ServiceState:
             session_id = self.session_id
             preview_generation = int(status.get("preview_generation") or 0)
             preview_manifest = status.get("preview_manifest_path")
-            geometry_manifest = status.get("geometry_snapshot_manifest_path")
             register_preview = (preview_manifest
                                 and preview_generation > self._registered_preview_generation)
-            register_geometry = (geometry_manifest
-                                 and geometry_manifest != self._registered_geometry_manifest)
         if register_preview:
             manifest_path = Path(preview_manifest)
             ref = self.artifacts.register_directory(
@@ -1284,16 +1276,6 @@ class ServiceState:
                     self._preview_artifact = ref
                     self._registered_preview_generation = preview_generation
             self.artifacts.prune("spiral-preview", session_id, PREVIEW_ARTIFACTS_KEPT)
-        if register_geometry:
-            manifest_path = Path(geometry_manifest)
-            ref = self.artifacts.register_directory(
-                "spiral-geometry", session_id, 1,
-                manifest_path.parent, manifest_path.name)
-            with self.lock:
-                if self.session_id == session_id:
-                    self._geometry_artifact = ref
-                    self._registered_geometry_manifest = geometry_manifest
-
     def run(self, request):
         session = self._require_session()
         status = session.status()

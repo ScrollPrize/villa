@@ -47,12 +47,21 @@ public:
         // Stored band; tile depth. Never widened at runtime.
         int wMin = -16;
         int wCount = 32;
-        // Bounds this cache's concurrent outstanding fills. The worker pool
-        // itself is process-wide and always hardware-sized; 0 tracks it.
+        // Bounds this cache's queued-plus-running fills. 0 derives it from the
+        // process-wide pool; admission stays within two tiles per worker so
+        // panning cannot outrun the fill consumers.
         std::size_t fillWorkers = 0;
         // Upper bound on the tile bytes admitted by one requestView() call.
-        std::size_t admissionPageBytes = 32ULL << 20;
+        // Sized so one screenful at the matching zoom (~96 tiles) is admitted in
+        // a single round: each extra round costs a full render round-trip before
+        // the next batch is queued, which is what makes a pan fill in visible
+        // steps. VC_SURFACE_ADMISSION_PAGE_BYTES overrides.
+        std::size_t admissionPageBytes = 64ULL << 20;
         vc::Sampling sampling = vc::Sampling::Trilinear;
+        // True only when this cache owns its backing chunk array exclusively.
+        // A changed viewport then discards unresolved dependencies from the
+        // previous view instead of accumulating stale small-chunk fetches.
+        bool supersedeChunkRequests = false;
         // Share one coords/normals tile cache with a second SurfaceCache over
         // the same surface (the overlay channel) so each tile's gen() runs
         // once and fills both. Created privately when null.
@@ -65,6 +74,11 @@ public:
         std::size_t tiles = 0;
         std::size_t tilesInFlight = 0;
         std::size_t tilesIncomplete = 0;
+        // Dependency discovery is separately bounded from decoded/tile bytes.
+        // These counters expose discontinuous geometry that requires adaptive
+        // region splitting instead of one whole-tile dependency batch.
+        std::size_t peakDependencyKeys = 0;
+        std::size_t dependencyRegionSplits = 0;
     };
 
     struct SampleStats {
@@ -84,6 +98,11 @@ public:
 
     SurfaceCache(const SurfaceCache&) = delete;
     SurfaceCache& operator=(const SurfaceCache&) = delete;
+
+    // Concurrent tile fills the process-wide pool can run. Callers sizing a
+    // chunk pool for the filler need this: one round of fills is what has to be
+    // resident at once.
+    [[nodiscard]] static std::size_t fillWorkerCount();
 
     [[nodiscard]] int levels() const;
     [[nodiscard]] int wMin() const;

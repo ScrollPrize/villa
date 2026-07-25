@@ -1,0 +1,102 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Non-interposing VC3D allocation tracer.
+ *
+ * Usage:
+ *   sudo bpftrace trace_vc3d_allocs.bt <VC3D-pid>
+ *
+ * Launch VC3D normally, connect the Spiral workspace, start this script, then
+ * reproduce the memory growth. The tracer stops automatically after observing
+ * 40 GiB of qualifying allocations (or after 60 seconds). The final report
+ * ranks native user-space call stacks by cumulative requested bytes.
+ */
+
+BEGIN
+{
+    printf("Tracing VC3D pid %d allocations >= 256 KiB.\n", $1);
+    printf("Will report after 40 GiB observed or 60 seconds.\n");
+}
+
+uprobe:/lib/aarch64-linux-gnu/libc.so.6:malloc
+/pid == $1 && arg0 >= 262144/
+{
+    @alloc_bytes[ustack(40)] = sum(arg0);
+    @alloc_count[ustack(40)] = count();
+    @size_hist = hist(arg0);
+    @total_bytes = sum(arg0);
+    @total_count = count();
+    @cutoff_bytes = @cutoff_bytes + arg0;
+}
+
+uprobe:/lib/aarch64-linux-gnu/libc.so.6:calloc
+/pid == $1 && arg0 * arg1 >= 262144/
+{
+    $bytes = arg0 * arg1;
+    @alloc_bytes[ustack(40)] = sum($bytes);
+    @alloc_count[ustack(40)] = count();
+    @size_hist = hist($bytes);
+    @total_bytes = sum($bytes);
+    @total_count = count();
+    @cutoff_bytes = @cutoff_bytes + $bytes;
+}
+
+uprobe:/lib/aarch64-linux-gnu/libc.so.6:realloc
+/pid == $1 && arg1 >= 262144/
+{
+    @alloc_bytes[ustack(40)] = sum(arg1);
+    @alloc_count[ustack(40)] = count();
+    @size_hist = hist(arg1);
+    @total_bytes = sum(arg1);
+    @total_count = count();
+    @cutoff_bytes = @cutoff_bytes + arg1;
+}
+
+uprobe:/lib/aarch64-linux-gnu/libc.so.6:__libc_memalign
+/pid == $1 && arg1 >= 262144/
+{
+    @alloc_bytes[ustack(40)] = sum(arg1);
+    @alloc_count[ustack(40)] = count();
+    @size_hist = hist(arg1);
+    @total_bytes = sum(arg1);
+    @total_count = count();
+    @cutoff_bytes = @cutoff_bytes + arg1;
+}
+
+interval:s:5
+{
+    time("%H:%M:%S ");
+    print(@total_bytes);
+    print(@total_count);
+}
+
+interval:s:1
+{
+    if (@cutoff_bytes >= (uint64)42949672960) {
+        printf("Observed at least 40 GiB; generating allocation-owner report.\n");
+        exit();
+    }
+}
+
+interval:s:60
+{
+    printf("Reached 60-second timeout; generating allocation-owner report.\n");
+    exit();
+}
+
+END
+{
+    printf("\nTop allocation call stacks by cumulative requested bytes:\n");
+    print(@alloc_bytes, 30);
+    printf("\nThe same call stacks ranked by allocation count:\n");
+    print(@alloc_count, 30);
+    printf("\nQualifying allocation-size histogram:\n");
+    print(@size_hist);
+
+    clear(@alloc_bytes);
+    clear(@alloc_count);
+    clear(@size_hist);
+    clear(@total_bytes);
+    clear(@total_count);
+    clear(@cutoff_bytes);
+}

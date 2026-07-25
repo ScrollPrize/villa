@@ -11,7 +11,6 @@ import torch
 
 from fit_session import (PclInputSpec, PclRole, resolve_dataset_root,
                          resolve_logical_dbm, validate_checkpoint_container)
-from geometry_snapshot import validate_geometry_snapshot, write_geometry_snapshot
 from spiral_runtime import DistributedInteractiveFitSession, InteractiveFitSession
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
@@ -72,58 +71,6 @@ class DatasetResolverTests(unittest.TestCase):
 
 
 class HandoffTests(unittest.TestCase):
-    def test_geometry_snapshot_converts_zyx_to_xyz(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "snapshot"
-            write_geometry_snapshot(destination, {
-                "fibers": [np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)]
-            }, input_order="ZYX")
-            validate_geometry_snapshot(destination)
-            points = np.fromfile(destination / "fibers.points.xyz.f32le", dtype="<f4").reshape(-1, 3)
-            np.testing.assert_array_equal(points, [[3, 2, 1], [6, 5, 4]])
-
-    def test_geometry_snapshot_streams_offset_buffer_boundaries(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "snapshot"
-            line = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
-            write_geometry_snapshot(destination, {"tracks": [line] * 70_000}, input_order="ZYX")
-            manifest = validate_geometry_snapshot(destination)
-            entry = manifest["categories"]["tracks"]
-            self.assertEqual(entry["polyline_count"], 70_000)
-            self.assertEqual(entry["point_count"], 140_000)
-
-    def test_geometry_snapshot_uses_bulk_packed_protocol(self):
-        class PackedLines:
-            def __iter__(self):
-                raise AssertionError("packed geometry must not iterate polylines")
-
-            def as_packed_polylines(self):
-                return (
-                    np.array([
-                        [1, 2, 3], [4, 5, 6],
-                        [7, 8, 9], [10, 11, 12], [13, 14, 15],
-                    ], dtype=np.float32),
-                    np.array([0, 2, 5], dtype=np.int64),
-                )
-
-        with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "snapshot"
-            manifest = write_geometry_snapshot(
-                destination, {"tracks": PackedLines()}, input_order="ZYX")
-            validate_geometry_snapshot(destination)
-            entry = manifest["categories"]["tracks"]
-            self.assertEqual(entry["polyline_count"], 2)
-            self.assertEqual(entry["point_count"], 5)
-            np.testing.assert_array_equal(
-                np.fromfile(destination / entry["offsets_file"], dtype="<u8"),
-                [0, 2, 5],
-            )
-            np.testing.assert_array_equal(
-                np.fromfile(destination / entry["points_file"], dtype="<f4").reshape(-1, 3),
-                [[3, 2, 1], [6, 5, 4], [9, 8, 7],
-                 [12, 11, 10], [15, 14, 13]],
-            )
-
     def test_combined_preview_is_connected_with_ordered_winding_ranges(self):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "generation-1"

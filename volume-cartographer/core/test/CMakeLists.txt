@@ -458,8 +458,6 @@ vc_add_test(NAME test_logging)
 
 vc_add_test(NAME test_plane_surface_branches)
 
-vc_add_test(NAME test_polyline_index)
-
 vc_add_test(NAME test_affine_transform_surface)
 
 vc_add_test(NAME test_quadsurface_more)
@@ -515,6 +513,17 @@ vc_add_test(NAME test_zarr_helpers)
 vc_add_test(NAME test_chunked_plane_sampler)
 
 vc_add_test(NAME test_surface_cache)
+
+vc_add_test(NAME test_priority_thread_pool
+    LIBS doctest::doctest
+    INCLUDES ${PROJECT_SOURCE_DIR}/utils/include)
+
+# Header-only, Qt-free arithmetic lifted out of CChunkedVolumeViewer so the
+# chunk-pool sizing rule can be tested without a viewer.
+vc_add_test(NAME test_frame_chunk_footprint
+    SOURCES test_frame_chunk_footprint.cpp
+    LIBS doctest::doctest
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_slicing)
 

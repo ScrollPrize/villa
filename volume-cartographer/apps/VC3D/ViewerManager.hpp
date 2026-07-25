@@ -104,9 +104,9 @@ public:
     // working set nor be evicted by it, and they die with the workspace.
     enum class ChunkCachePolicy { SharedVolumeCache, PrivateBounded };
     // Plane views interleave in time (you use one pane at a time), so one
-    // capped pool beats three. The surface-tile filler gets its own so plane
-    // panning and tile filling cannot evict each other's chunks.
-    enum class ChunkCachePool { PlaneViews, SurfaceTiles };
+    // capped pool beats three. Each surface-tile channel gets its own so plane,
+    // base-tile, and overlay-tile requests can supersede independently.
+    enum class ChunkCachePool { PlaneViews, SurfaceTiles, OverlaySurfaceTiles };
 
     // Opt this manager into the spiral cache policy and (re-)read all three
     // spiral cache settings. Called once when the workspace is built and again
@@ -123,8 +123,15 @@ public:
     std::size_t effectiveChunkCacheCapacity(ChunkCachePool pool) const;
     // Raise a pool's floor from an observed one-frame (or one-tile-set) chunk
     // footprint. Doubling it is what keeps a render from re-reading chunks it
-    // just evicted, since the sampler only pins a small window at a time.
+    // just evicted, since the sampler only pins a small window at a time. The
+    // raise is capped (see below) so a bad estimate degrades into thrashing
+    // rather than unbounded retention.
     void noteChunkFootprint(ChunkCachePool pool, std::size_t footprintBytes);
+    // How far a derived footprint may raise the configured floor, and the
+    // absolute ceiling on a private pool regardless of setting.
+    static constexpr std::size_t kChunkCacheDerivedFloorMultiplier = 8;
+    static constexpr std::size_t kChunkCacheAbsoluteCapBytes =
+        16ULL * 1024 * 1024 * 1024;
     std::shared_ptr<vc::render::ChunkCache> chunkCacheFor(
         const std::shared_ptr<Volume>& volume,
         ChunkCachePool pool = ChunkCachePool::PlaneViews);
@@ -320,6 +327,9 @@ private:
         bool success{false};
     };
 
+    // Union of every viewer's cache-stat items plus this manager's private
+    // pools, so no single line can hide another's.
+    QStringList aggregatedCacheStatItems() const;
     void registerOverlay(ViewerOverlayControllerBase* overlay);
     VolumeViewerBase* initializeChunkedViewer(CChunkedVolumeViewer* chunkedViewer,
                                               const std::string& surfaceName,
@@ -351,6 +361,7 @@ private:
     // submit immediately, while deferred intersections/status are serviced here.
     QTimer* _globalClock{nullptr};
     std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
+    std::unordered_map<VolumeViewerBase*, QStringList> _cacheStatItems;
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
     std::shared_ptr<Volume> _overlayVolume;
@@ -387,7 +398,7 @@ private:
         std::size_t requiredBytes{0};
         std::size_t builtCapacity{0};
     };
-    std::array<PrivateChunkPool, 2> _privateChunkPools;
+    std::array<PrivateChunkPool, 3> _privateChunkPools;
     PrivateChunkPool& privateChunkPool(ChunkCachePool pool)
     {
         return _privateChunkPools[static_cast<std::size_t>(pool)];

@@ -69,7 +69,6 @@ class FakeSession:
             "state": self.state, "phase": self.state, "current_iteration": 5,
             "target_iteration": 5, "latest_metrics": {}, "warnings": [],
             "error": None, "preview_manifest_path": None, "preview_generation": 0,
-            "geometry_snapshot_manifest_path": None,
             "supports_input_incorporation": True,
             "run_config": dict(self.run_config),
             "run_config_limits": {"max_track_crossing_per_step": 8},

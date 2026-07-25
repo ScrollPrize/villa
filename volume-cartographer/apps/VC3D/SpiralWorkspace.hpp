@@ -30,7 +30,6 @@ class SpiralServiceManager;
 class ViewerManager;
 class ViewerSplitGrid;
 class VolumePkg;
-class PolylineIndex;
 class SpiralOverlayController;
 class SpiralBrushController;
 class SegmentationOverlayController;
@@ -44,7 +43,6 @@ public:
     ~SpiralWorkspace() override;
 
     ViewerManager* viewerManager() const { return _viewerManager.get(); }
-    void setFiberViewDistance(double distance);
 
     // Cross-panel entry points for "Add to current spiral fit".
     bool hasActiveSpiralSession() const;
@@ -96,10 +94,6 @@ private:
         std::vector<std::pair<int, int>> surfaceComponents;
         QString registrationId;
     };
-    struct GeometryLoadResult {
-        std::shared_ptr<PolylineIndex> index;
-        QString error;
-    };
     struct InputSurfaceEntry {
         QString category;
         QString id;
@@ -131,7 +125,6 @@ private:
                                         qint64 generation, quint64 revision,
                                         bool preserveFocus, int attempt,
                                         std::vector<PreviewComponent> diffComponents = {});
-    void loadGeometrySnapshot(const QString& manifestPath, quint64 generation);
     void loadInputSurfaces(const QJsonObject& paths, quint64 generation);
     void installInputSurfaces(const InputSurfaceLoadResult& result, quint64 generation);
     void registerPendingPatchSurface(const QString& inputId,
@@ -169,7 +162,6 @@ private:
     ViewerSplitGrid* _grid = nullptr;
     VolumeViewerBase* _flattenedViewer = nullptr;
     qint64 _requestedPreviewGeneration = -1;
-    QString _geometryManifestPath;
     QJsonObject _sessionPaths;
     QHash<QString, QStringList> _surfaceCategoryIds;
     QHash<QString, QString> _surfaceSourceIds;

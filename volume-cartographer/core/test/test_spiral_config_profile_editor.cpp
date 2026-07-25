@@ -130,6 +130,22 @@ int main(int argc, char** argv)
     require(attachedConfig.value(QStringLiteral("requested_only")).toBool(),
             "Canonical request-only settings must survive attachment");
 
+    QJsonObject canonicalPreviewRequest = sparseDefaultRequest;
+    canonicalPreviewRequest[QStringLiteral("preview")] = QJsonObject{
+        {QStringLiteral("first_winding"), 10},
+        {QStringLiteral("variant"), QStringLiteral("raw")},
+    };
+    QJsonObject legacyPanelPreviewRequest = sparseDefaultRequest;
+    legacyPanelPreviewRequest[QStringLiteral("preview")] = QJsonObject{
+        {QStringLiteral("first_winding"), 10},
+    };
+    require(
+        vc3d::normalizedSpiralReloadRequest(
+            canonicalPreviewRequest, defaults, runKeys)
+            == vc3d::normalizedSpiralReloadRequest(
+                legacyPanelPreviewRequest, defaults, runKeys),
+        "Expanded host preview defaults must not require a reload after attachment");
+
     editor.setSessionDefault(QJsonObject{{QStringLiteral("python_default"), 7}});
     require(editor.currentText().contains(QStringLiteral("python_default")),
             "Session Default did not update the editor");

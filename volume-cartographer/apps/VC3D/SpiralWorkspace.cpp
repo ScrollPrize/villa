@@ -43,15 +43,11 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWindow>
-#include <QtEndian>
 #include <QtConcurrent/QtConcurrent>
 
 #include <array>
-#include <bit>
 #include <cmath>
-#include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <limits>
 #include <map>
 #include <unordered_map>
@@ -337,8 +333,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             _outputVisible = shown;
             _state->setSurface("segmentation", shown ? _currentPreview : nullptr);
             updateSurfaceIntersections();
-        } else if (category == QStringLiteral("fibers") || category == QStringLiteral("tracks") || category == QStringLiteral("pcls")) {
-            _overlay->setCategoryVisible(category, shown);
         } else if (category == QStringLiteral("pending_only")) {
             _pendingPatchesOnly = shown;
             updateSurfaceIntersections();
@@ -407,7 +401,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 if (state == CS::Starting || state == CS::Connecting) {
                     _requestedPreviewGeneration = -1;
                     _inputSurfaceGeneration = 0;
-                    _geometryManifestPath.clear();
                     _pendingPatchIds.clear();
                     _haveRunDiffBaseline = false;
                     _runDiffPreviousSource.reset();
@@ -479,14 +472,6 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _overlay->publishLossMap({}, {}, _lossMapOpacity);
                 loadInputSurfaces(paths, static_cast<quint64>(generation));
                 updateLasagnaFlattenAvailability();
-            });
-    // Geometry snapshots arrive as artifacts already transferred to the local
-    // cache; the manager hands over a local manifest path.
-    connect(_service, &SpiralServiceManager::geometryAvailable, this,
-            [this](const QString& manifestPath, quint64 generation) {
-                if (manifestPath.isEmpty() || manifestPath == _geometryManifestPath) return;
-                _geometryManifestPath = manifestPath;
-                loadGeometrySnapshot(manifestPath, generation);
             });
     if (_mainState) {
         connect(_mainState, &CState::vpkgChanged, this, [this](const std::shared_ptr<VolumePkg>&) { refreshVolumes(); });
@@ -973,11 +958,6 @@ SpiralWorkspace::~SpiralWorkspace()
         _state->setVpkg(nullptr); // the package is borrowed from Main; drop it so closeAll() cannot unload Main's surfaces
         _state->closeAll();
     }
-}
-
-void SpiralWorkspace::setFiberViewDistance(double distance)
-{
-    _overlay->setFiberViewDistance(distance);
 }
 
 void SpiralWorkspace::keyPressEvent(QKeyEvent* event)
@@ -1937,74 +1917,4 @@ void SpiralWorkspace::installPreviewAliasWhenIndexed(
     }
     if (!previousRegistration.isEmpty() && previousRegistration != registrationId)
         _state->setSurface(previousRegistration.toStdString(), nullptr);
-}
-
-void SpiralWorkspace::loadGeometrySnapshot(const QString& manifestPath, quint64 generation)
-{
-    auto* watcher = new QFutureWatcher<GeometryLoadResult>(this);
-    connect(watcher, &QFutureWatcher<GeometryLoadResult>::finished, this, [this, watcher, generation]() {
-        const auto result = watcher->result();
-        watcher->deleteLater();
-        if (_shuttingDown) return;
-        if (!result.index) { statusBar()->showMessage(result.error, 15000); return; }
-        _overlay->publishIndex(result.index, generation);
-    });
-    watcher->setFuture(QtConcurrent::run([manifestPath]() -> GeometryLoadResult {
-        try {
-            QFile manifestFile(manifestPath);
-            if (!manifestFile.open(QIODevice::ReadOnly)) throw std::runtime_error("Cannot read geometry manifest");
-            const QJsonObject manifest = QJsonDocument::fromJson(manifestFile.readAll()).object();
-            if (manifest.value("schema_version").toInt() != 1 || manifest.value("coordinate_order").toString() != "XYZ")
-                throw std::runtime_error("Unsupported Spiral geometry snapshot schema");
-            const std::filesystem::path root = QFileInfo(manifestPath).absolutePath().toStdString();
-            std::vector<PolylineIndex::Polyline> polylines;
-            uint64_t objectId = 0;
-            const QJsonObject categories = manifest.value("categories").toObject();
-            for (auto category = categories.begin(); category != categories.end(); ++category) {
-                const QJsonObject entry = category.value().toObject();
-                const uint64_t pointCount = static_cast<uint64_t>(entry.value("point_count").toInteger());
-                const uint64_t polylineCount = static_cast<uint64_t>(entry.value("polyline_count").toInteger());
-                if (pointCount > 1'000'000'000ULL || polylineCount > pointCount)
-                    throw std::runtime_error("Geometry snapshot counts exceed limits");
-                const auto offsetsPath = root / entry.value("offsets_file").toString().toStdString();
-                const auto pointsPath = root / entry.value("points_file").toString().toStdString();
-                if (std::filesystem::file_size(offsetsPath) != (polylineCount + 1) * sizeof(uint64_t)
-                    || std::filesystem::file_size(pointsPath) != pointCount * 3 * sizeof(float))
-                    throw std::runtime_error("Geometry snapshot file size mismatch");
-                std::ifstream offsetsStream(offsetsPath, std::ios::binary);
-                std::vector<uint64_t> offsets(polylineCount + 1);
-                offsetsStream.read(reinterpret_cast<char*>(offsets.data()), static_cast<std::streamsize>(offsets.size() * sizeof(uint64_t)));
-                for (auto& offset : offsets) offset = qFromLittleEndian(offset);
-                if (offsets.empty() || offsets.front() != 0 || offsets.back() != pointCount)
-                    throw std::runtime_error("Geometry snapshot offsets are out of range");
-                std::ifstream pointsStream(pointsPath, std::ios::binary);
-                for (uint64_t line = 0; line < polylineCount; ++line) {
-                    if (offsets[line + 1] <= offsets[line]) throw std::runtime_error("Zero-length geometry polyline");
-                    PolylineIndex::Polyline polyline;
-                    polyline.objectId = objectId++;
-                    polyline.category = category.key().toStdString();
-                    polyline.points.resize(static_cast<std::size_t>(offsets[line + 1] - offsets[line]));
-                    pointsStream.read(reinterpret_cast<char*>(polyline.points.data()),
-                                      static_cast<std::streamsize>(polyline.points.size() * sizeof(cv::Vec3f)));
-                    if (!pointsStream) throw std::runtime_error("Truncated geometry point file");
-                    if constexpr (std::endian::native == std::endian::big) {
-                        for (auto& point : polyline.points) for (int axis = 0; axis < 3; ++axis) {
-                            uint32_t bits; std::memcpy(&bits, &point[axis], sizeof(bits));
-                            bits = qFromLittleEndian(bits); std::memcpy(&point[axis], &bits, sizeof(bits));
-                        }
-                    }
-                    for (const auto& point : polyline.points)
-                        for (int axis = 0; axis < 3; ++axis)
-                            if (!std::isfinite(point[axis]))
-                                throw std::runtime_error("Geometry snapshot contains a non-finite coordinate");
-                    polylines.push_back(std::move(polyline));
-                }
-            }
-            auto index = std::make_shared<PolylineIndex>();
-            index->build(std::move(polylines), 2.0f);
-            return {index, {}};
-        } catch (const std::exception& error) {
-            return {{}, QString::fromUtf8(error.what())};
-        }
-    }));
 }

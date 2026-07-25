@@ -1,5 +1,6 @@
 #include "vc/core/util/QuadSurface.hpp"
 
+#include "vc/core/render/SurfaceMemoryTrace.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -24,6 +25,7 @@
 #include <thread>
 #include <vector>
 #include <fstream>
+#include <format>
 #include <iomanip>
 #include <chrono>
 #include <atomic>
@@ -682,6 +684,14 @@ QuadSurface::QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &sca
     _bounds = {0,0,_points->cols-1,_points->rows-1};
     _scale = scale;
     _center = surfaceCenterFor(*_points, _scale);
+    if (vc::render::surfaceMemoryTraceEnabled()) {
+        vc::render::surfaceMemoryTrace(
+            "quad_surface_construct_clone",
+            std::format("surface={} points={}x{} point_bytes={}",
+                        reinterpret_cast<std::uintptr_t>(this), _points->cols,
+                        _points->rows,
+                        _points->total() * _points->elemSize()));
+    }
 }
 
 QuadSurface::QuadSurface(cv::Mat_<cv::Vec3f> *points, const cv::Vec2f &scale)
@@ -691,6 +701,14 @@ QuadSurface::QuadSurface(cv::Mat_<cv::Vec3f> *points, const cv::Vec2f &scale)
     _bounds = {0,0,_points->cols-1,_points->rows-1};
     _scale = scale;
     _center = surfaceCenterFor(*_points, _scale);
+    if (vc::render::surfaceMemoryTraceEnabled()) {
+        vc::render::surfaceMemoryTrace(
+            "quad_surface_construct_adopt",
+            std::format("surface={} points={}x{} point_bytes={}",
+                        reinterpret_cast<std::uintptr_t>(this), _points->cols,
+                        _points->rows,
+                        _points->total() * _points->elemSize()));
+    }
 }
 
 namespace {
@@ -793,6 +811,16 @@ void QuadSurface::ensureLoaded()
 
     // Mark as loaded (after all data is set)
     _needsLoad = false;
+    if (vc::render::surfaceMemoryTraceEnabled()) {
+        vc::render::surfaceMemoryTrace(
+            "quad_surface_loaded",
+            std::format(
+                "surface={} id='{}' path='{}' points={}x{} point_bytes={} channels={}",
+                reinterpret_cast<std::uintptr_t>(this), id, path.string(),
+                _points ? _points->cols : 0, _points ? _points->rows : 0,
+                _points ? _points->total() * _points->elemSize() : 0,
+                _channels.size()));
+    }
 }
 
 QuadSurface::~QuadSurface() = default;
@@ -1088,6 +1116,15 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
 
     const int rows = _points->rows;
     const int cols = _points->cols;
+    if (vc::render::surfaceMemoryTraceEnabled()) {
+        vc::render::surfaceMemoryTrace(
+            "quad_surface_valid_mask_begin",
+            std::format(
+                "surface={} id='{}' points={}x{} point_bytes={} mask_bytes={}",
+                reinterpret_cast<std::uintptr_t>(this), id, cols, rows,
+                _points->total() * _points->elemSize(),
+                std::size_t(rows) * std::size_t(cols)));
+    }
     cv::Mat_<uint8_t> mask(rows, cols);
 
     // Tight per-row loop:
@@ -1118,6 +1155,15 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
     for (uint8_t v : anyInvalidPerRow) anyInvalid |= v;
     _validMaskAllValid = (anyInvalid == 0);
     _validMaskCache = mask;
+    if (vc::render::surfaceMemoryTraceEnabled()) {
+        vc::render::surfaceMemoryTrace(
+            "quad_surface_valid_mask_end",
+            std::format(
+                "surface={} id='{}' mask_bytes={} all_valid={}",
+                reinterpret_cast<std::uintptr_t>(this), id,
+                _validMaskCache.total() * _validMaskCache.elemSize(),
+                _validMaskAllValid.load(std::memory_order_relaxed)));
+    }
     return mask;
 }
 
@@ -1271,6 +1317,17 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
         {
             std::lock_guard<std::mutex> cacheLock(_cacheMutex);
             if (_normalCache.empty() || _normalCache.size() != _points->size()) {
+                if (vc::render::surfaceMemoryTraceEnabled()) {
+                    vc::render::surfaceMemoryTrace(
+                        "quad_surface_normal_cache_begin",
+                        std::format(
+                            "surface={} id='{}' points={}x{} point_bytes={} "
+                            "normal_bytes={}",
+                            reinterpret_cast<std::uintptr_t>(this), id,
+                            _points->cols, _points->rows,
+                            _points->total() * _points->elemSize(),
+                            _points->total() * sizeof(cv::Vec3f)));
+                }
                 _normalCache.create(_points->rows, _points->cols);
                 const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
                                    std::numeric_limits<float>::quiet_NaN(),
@@ -1296,6 +1353,14 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                             dst[c] = grid_normal_int(*_points, r, c);
                         }
                     }
+                }
+                if (vc::render::surfaceMemoryTraceEnabled()) {
+                    vc::render::surfaceMemoryTrace(
+                        "quad_surface_normal_cache_end",
+                        std::format(
+                            "surface={} id='{}' normal_bytes={}",
+                            reinterpret_cast<std::uintptr_t>(this), id,
+                            _normalCache.total() * _normalCache.elemSize()));
                 }
             }
         }

@@ -293,6 +293,19 @@ endif()
 
 add_executable(VC3D ${srcs} resources.qrc)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Diagnostic-only LD_PRELOAD helper. It is never linked into VC3D and does
+    # no work unless VC_SURFACE_ALLOC_TRACE is explicitly enabled.
+    add_library(vc_surface_alloc_trace SHARED
+        diagnostics/SurfaceAllocTrace.cpp
+    )
+    target_link_libraries(vc_surface_alloc_trace PRIVATE ${CMAKE_DL_LIBS})
+    target_compile_options(vc_surface_alloc_trace PRIVATE -fno-omit-frame-pointer)
+    set_target_properties(vc_surface_alloc_trace PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    )
+endif()
+
 if(WIN32)
     # GUI subsystem so double-click launch doesn't open a console window.
     set_target_properties(VC3D PROPERTIES WIN32_EXECUTABLE ON)

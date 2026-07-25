@@ -91,10 +91,22 @@ public:
         return build(level, iz, iy, ix);
     }
 
-    void prefetchChunks(const std::vector<ChunkKey>&, bool, int) override {}
+    void prefetchChunks(const std::vector<ChunkKey>&, bool, int) override
+    {
+        ++prefetchRequests_;
+    }
+    void beginViewRequest(bool discardPending) override
+    {
+        ++viewRequests_;
+        if (discardPending)
+            ++discardRequests_;
+    }
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override { return 0; }
     void removeChunkReadyListener(ChunkReadyCallbackId) override {}
 
+    int viewRequests() const { return viewRequests_.load(); }
+    int discardRequests() const { return discardRequests_.load(); }
+    int prefetchRequests() const { return prefetchRequests_.load(); }
 private:
     ChunkResult build(int level, int iz, int iy, int ix)
     {
@@ -143,6 +155,61 @@ private:
     std::mutex mutex_;
     std::unordered_map<ChunkKey, std::shared_ptr<const std::vector<std::byte>>, ChunkKeyHash>
         chunks_;
+    std::atomic<int> viewRequests_{0};
+    std::atomic<int> discardRequests_{0};
+    std::atomic<int> prefetchRequests_{0};
+};
+
+// No decoded storage: used to exercise dependency discovery over a huge
+// logical volume without making the test's memory proportional to that volume.
+class SparseAllFillArray : public vc::render::IChunkedArray {
+public:
+    int numLevels() const override { return 1; }
+    std::array<int, 3> shape(int) const override
+    {
+        return {1'000'000, 1'000'000, 1'000'000};
+    }
+    std::array<int, 3> chunkShape(int) const override { return {32, 32, 32}; }
+    vc::render::ChunkDtype dtype() const override
+    {
+        return vc::render::ChunkDtype::UInt8;
+    }
+    double fillValue() const override { return 0.0; }
+    LevelTransform levelTransform(int) const override { return {}; }
+
+    ChunkResult tryGetChunk(int, int, int, int) override { return allFill(); }
+    ChunkResult getChunkIfCached(int, int, int, int) override { return allFill(); }
+    ChunkResult getChunkBlocking(int, int, int, int) override { return allFill(); }
+
+    void prefetchChunks(const std::vector<ChunkKey>& keys, bool, int) override
+    {
+        ++prefetchRequests_;
+        auto peak = maxPrefetchKeys_.load();
+        while (peak < keys.size() &&
+               !maxPrefetchKeys_.compare_exchange_weak(peak, keys.size())) {
+        }
+    }
+    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override
+    {
+        return 0;
+    }
+    void removeChunkReadyListener(ChunkReadyCallbackId) override {}
+
+    std::size_t maxPrefetchKeys() const { return maxPrefetchKeys_.load(); }
+    int prefetchRequests() const { return prefetchRequests_.load(); }
+
+private:
+    static ChunkResult allFill()
+    {
+        ChunkResult result;
+        result.status = ChunkStatus::AllFill;
+        result.dtype = vc::render::ChunkDtype::UInt8;
+        result.shape = {32, 32, 32};
+        return result;
+    }
+
+    std::atomic_size_t maxPrefetchKeys_{0};
+    std::atomic<int> prefetchRequests_{0};
 };
 
 // A gently curved sheet whose nominal spacing is one voxel, so SurfaceCache's
@@ -167,6 +234,22 @@ std::shared_ptr<QuadSurface> makeSurface(int gridCols = 48,
         }
     }
     return std::make_shared<QuadSurface>(points, cv::Vec2f(1.0f / gridStep, 1.0f / gridStep));
+}
+
+std::shared_ptr<QuadSurface> makeStretchedSurface()
+{
+    constexpr int gridSize = 48;
+    constexpr float nominalStep = 8.0f;
+    constexpr float volumeStep = 20'000.0f;
+    cv::Mat_<cv::Vec3f> points(gridSize, gridSize);
+    for (int r = 0; r < gridSize; ++r) {
+        for (int c = 0; c < gridSize; ++c) {
+            points(r, c) = {40.0f + float(c) * volumeStep,
+                            40.0f + float(r) * volumeStep, 500'000.0f};
+        }
+    }
+    return std::make_shared<QuadSurface>(
+        points, cv::Vec2f(1.0f / nominalStep, 1.0f / nominalStep));
 }
 
 struct LegacyFrame {
@@ -398,6 +481,60 @@ TEST_CASE("SurfaceCache bandCovers covers exactly the stored band")
     CHECK_FALSE(cache.bandCovers(0.0, 15.5));
     CHECK_FALSE(cache.bandCovers(0.0, 40.0));
     CHECK_FALSE(cache.bandCovers(std::nan(""), 0.0));
+}
+
+TEST_CASE("SurfaceCache supersedes chunk dependencies only when its view changes")
+{
+    auto array = std::make_shared<SyntheticArray>();
+    auto options = defaultOptions();
+    options.supersedeChunkRequests = true;
+    SurfaceCache cache(array, makeSurface(), options);
+
+    cache.requestView(0, 0.0, 0.0, 1.0, 128, 128, 1);
+    CHECK(array->viewRequests() == 1);
+    CHECK(array->discardRequests() == 1);
+
+    // Progressive rerenders of the same viewport must not cancel their own
+    // fills merely because the viewer's presentation generation advanced.
+    cache.requestView(0, 0.0, 0.0, 1.0, 128, 128, 2);
+    CHECK(array->viewRequests() == 1);
+
+    cache.requestView(0, 256.0, 0.0, 1.0, 128, 128, 3);
+    CHECK(array->viewRequests() == 2);
+    CHECK(array->discardRequests() == 2);
+}
+
+TEST_CASE("SurfaceCache prefetches each tile as one parallel dependency batch")
+{
+    auto array = std::make_shared<SyntheticArray>();
+    SurfaceCache cache(array, makeSurface(), defaultOptions());
+
+    REQUIRE(fillView(cache, 0, 0.0, 0.0, 1.0,
+                     SurfaceCache::kTileSize, SurfaceCache::kTileSize));
+    const auto stats = cache.stats();
+    REQUIRE(stats.tiles > 0);
+    CHECK(array->prefetchRequests() > 0);
+    // The slow workaround issued up to 256 blocking prefetches per tile.
+    // Invalid edge tiles may need no source chunks, hence the upper bound.
+    CHECK(std::size_t(array->prefetchRequests()) <= stats.tiles);
+    CHECK(stats.dependencyRegionSplits == 0);
+}
+
+TEST_CASE("SurfaceCache bounds dependency metadata for a pathological tile AABB")
+{
+    auto array = std::make_shared<SparseAllFillArray>();
+    SurfaceCache cache(array, makeStretchedSurface(), defaultOptions());
+
+    // The old 8x8-block AABB collector attempted to enumerate billions of
+    // chunks here. Adaptive discovery should split only this pathological
+    // region while keeping every individual prefetch batch bounded.
+    REQUIRE(fillView(cache, 0, 0.0, 0.0, 1.0,
+                     SurfaceCache::kTileSize, SurfaceCache::kTileSize));
+    const auto stats = cache.stats();
+    CHECK(stats.dependencyRegionSplits > 0);
+    CHECK(stats.peakDependencyKeys <= 8192);
+    CHECK(array->prefetchRequests() > 1);
+    CHECK(array->maxPrefetchKeys() <= 8192);
 }
 
 TEST_CASE("SurfaceCache reproduces the legacy plain frame")

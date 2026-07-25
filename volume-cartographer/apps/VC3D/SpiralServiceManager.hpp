@@ -88,7 +88,6 @@ signals:
     void sessionActiveChanged(bool active);
     // Local (cache) filesystem paths: artifact transfers already happened.
     void previewAvailable(const QString& manifestPath, qint64 generation);
-    void geometryAvailable(const QString& manifestPath, quint64 generation);
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
     void lasagnaFlattenProgress(const QJsonObject& status);
@@ -174,11 +173,8 @@ private:
     qint64 _lastStatusGeneration = -1;
     QString _installedPreviewArtifact;
     QString _fetchingPreviewArtifact;
-    QString _installedGeometryArtifact;
-    QString _fetchingGeometryArtifact;
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
-    QString _lastGeometryLocalPath;
     QString _activeLasagnaFlattenJob;
     QString _reportedLasagnaFlattenJob;
     QString _installedLasagnaArtifact;

@@ -77,6 +77,13 @@ public:
     // Viewer rendering paths must not call this on the Qt/main thread.
     virtual ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) = 0;
     virtual void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) = 0;
+    // Starts a newer interactive request. An exclusively-owned backing array
+    // may discard unresolved work from the superseded view; resident chunks
+    // are preserved.
+    virtual void beginViewRequest(bool discardPending = false)
+    {
+        (void)discardPending;
+    }
 
     virtual ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) = 0;
     virtual void removeChunkReadyListener(ChunkReadyCallbackId id) = 0;
