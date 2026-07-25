@@ -41,6 +41,8 @@ def _make_flatten_model(
 	flatten_filter_angle_deg: float = 90.0,
 	flatten_filter_radius: int = 2,
 	flatten_direction: str = "inverse",
+	flatten_output_step: float | None = None,
+	flatten_output_margin: float = 0.10,
 ) -> fit_model.Model3D:
 	if valid is None:
 		valid = torch.ones(xyz.shape[:2], dtype=torch.bool)
@@ -56,6 +58,8 @@ def _make_flatten_model(
 		flatten_filter_angle_deg=flatten_filter_angle_deg,
 		flatten_filter_radius=flatten_filter_radius,
 		flatten_direction=flatten_direction,
+		flatten_output_step=flatten_output_step,
+		flatten_output_margin=flatten_output_margin,
 	)
 
 
@@ -86,6 +90,56 @@ class FlattenLossTest(unittest.TestCase):
 		)
 		with self.assertRaisesRegex(ValueError, "output_step"):
 			shape(101, 51, source_step=20.0, output_step=0.0)
+
+	def test_requested_output_step_controls_forward_map_and_domain(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(4, 4, sx=40.0, sy=40.0),
+			mesh_step=40,
+			flatten_direction="forward",
+			flatten_output_step=20.0,
+			flatten_output_margin=0.0,
+		)
+		map_yx = mdl.flatten_map().detach()
+
+		self.assertEqual(mdl.flatten_output_shape, (7, 7))
+		self.assertEqual(mdl.params.mesh_step, 20)
+		self.assertEqual(mdl.params.flatten_output_step, 20.0)
+		self.assertAlmostEqual(float(mdl.flatten_target_step), 20.0)
+		self.assertAlmostEqual(float(mdl.flatten_map_step), 2.0)
+		self.assertAlmostEqual(float(mdl.flatten_measured_source_step), 40.0)
+		self.assertAlmostEqual(float(map_yx[0, 0, 0]), 0.0)
+		self.assertAlmostEqual(float(map_yx[0, 0, 1]), 0.0)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 6.0)
+		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 6.0)
+
+		_map, xyz, mask, _quad = mdl._flatten_sample_current()
+		self.assertEqual(tuple(mask.shape), (7, 7))
+		self.assertTrue(bool(mask.all()))
+		xyz = xyz[0]
+		h_step = (xyz[1:] - xyz[:-1]).norm(dim=-1)
+		w_step = (xyz[:, 1:] - xyz[:, :-1]).norm(dim=-1)
+		self.assertAlmostEqual(float(h_step.mean()), 20.0, places=5)
+		self.assertAlmostEqual(float(w_step.mean()), 20.0, places=5)
+
+	def test_forward_inversion_expands_minimum_canvas_to_fitted_extent(self) -> None:
+		xyz = _flat_grid(3, 3)
+		uv = xyz[..., :2].flip(-1) * 2.0
+		cell_valid = torch.ones(2, 2, dtype=torch.bool)
+
+		map_yx, _sampled, mask = fit_model.Model3D._flatten_invert_forward_uv_map(
+			xyz,
+			cell_valid,
+			uv,
+			output_margin=0.0,
+			min_shape=(3, 3),
+		)
+
+		self.assertEqual(tuple(mask.shape), (5, 5))
+		self.assertTrue(bool(mask.all()))
+		self.assertAlmostEqual(float(map_yx[mask, 0].min()), 0.0, places=5)
+		self.assertAlmostEqual(float(map_yx[mask, 0].max()), 2.0, places=5)
+		self.assertAlmostEqual(float(map_yx[mask, 1].min()), 0.0, places=5)
+		self.assertAlmostEqual(float(map_yx[mask, 1].max()), 2.0, places=5)
 
 	def test_flatten_stage_defaults_disable_volume_losses(self) -> None:
 		stages = optimizer.load_stages_cfg({
@@ -348,7 +402,12 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertGreater(int(res.flatten_quad_mask.sum()), 0)
 
 	def test_forward_identity_flat_regular_grid_has_near_zero_sdir(self) -> None:
-		mdl = _make_flatten_model(_flat_grid(5, 5, sx=3.0, sy=3.0), mesh_step=20, flatten_direction="forward")
+		mdl = _make_flatten_model(
+			_flat_grid(5, 5, sx=3.0, sy=3.0),
+			mesh_step=3,
+			flatten_direction="forward",
+			flatten_output_step=3.0,
+		)
 		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
 
 		loss, _lms, _masks = opt_loss_flatten.flatten_sdir_loss(res=res)
@@ -526,14 +585,12 @@ class FlattenLossTest(unittest.TestCase):
 			opt_loss_flatten.configure(diagnostics=True, orient_min_det=0.0, reset_history=True)
 			opt_loss_flatten.configure_compile(enabled=False)
 
-	def test_flatten_target_step_is_measured_not_mesh_step(self) -> None:
+	def test_requested_output_step_overrides_measured_source_step(self) -> None:
 		mdl = _make_flatten_model(_flat_grid(5, 5, sx=3.0, sy=3.0), mesh_step=20)
 		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
 
-		loss, _lms, _masks = opt_loss_flatten.flatten_sdir_loss(res=res)
-
-		self.assertAlmostEqual(float(res.flatten_target_step.detach()), 3.0, places=5)
-		self.assertLess(float(loss.detach()), 1.0e-6)
+		self.assertAlmostEqual(float(res.flatten_target_step.detach()), 20.0, places=5)
+		self.assertAlmostEqual(float(mdl.flatten_measured_source_step.detach()), 3.0, places=5)
 
 	def test_anisotropic_deformation_increases_sdir(self) -> None:
 		mdl = _make_flatten_model(_flat_grid(7, 7), mesh_step=1)
@@ -742,6 +799,48 @@ class FlattenLossTest(unittest.TestCase):
 			y = tifffile.imread(str(out / "flatten.tifxyz" / "y.tif"))
 			z = tifffile.imread(str(out / "flatten.tifxyz" / "z.tif"))
 			self.assertTrue(bool(((x == -1.0) & (y == -1.0) & (z == -1.0)).any()))
+
+	def test_flatten_export_preserves_fractional_output_step(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(4, 4, sx=20.0, sy=20.0),
+			mesh_step=20,
+			flatten_output_step=20.5,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			out = Path(td)
+			fit._export_flatten_result(
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				out_dir=out,
+				scale=1.0 / 20.0,
+				voxel_size_um=None,
+				fit_config={},
+				model_source=None,
+			)
+			meta = json.loads(
+				(out / "flatten.tifxyz" / "meta.json").read_text(
+					encoding="utf-8"))
+			self.assertAlmostEqual(meta["scale"][0], 1.0 / 20.5)
+			self.assertAlmostEqual(meta["scale"][1], 1.0 / 20.5)
+
+			model_path = out / "flatten_model.pt"
+			checkpoint_out = out / "checkpoint_out"
+			fit._save_flatten_model(
+				str(model_path),
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				fit_config={"args": {"model-init": "flatten"}},
+			)
+			fit2tifxyz.main([
+				"--input", str(model_path),
+				"--output", str(checkpoint_out),
+				"--output-name", "fractional.tifxyz",
+			])
+			checkpoint_meta = json.loads(
+				(checkpoint_out / "fractional.tifxyz" / "meta.json").read_text(
+					encoding="utf-8"))
+			self.assertAlmostEqual(checkpoint_meta["scale"][0], 1.0 / 20.5)
+			self.assertAlmostEqual(checkpoint_meta["scale"][1], 1.0 / 20.5)
 
 	def test_forward_flatten_export_inverts_uv_and_keeps_holes_invalid(self) -> None:
 		xyz = _flat_grid(4, 4)

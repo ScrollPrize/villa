@@ -23,6 +23,7 @@ class ModelParams3D:
 	model_w: float | None = None
 	model_h: float | None = None
 	depth_windings: tuple[int, ...] = field(default_factory=tuple)
+	flatten_output_step: float | None = None
 
 
 def _normalize_depth_windings(raw, *, depth: int, where: str) -> tuple[int, ...]:
@@ -293,7 +294,8 @@ class FitResult3D:
 	flatten_xyz: torch.Tensor | None = None              # (1, Hout, Wout, 3) sampled frozen source surface
 	flatten_point_mask: torch.Tensor | None = None       # (Hout, Wout) bool
 	flatten_quad_mask: torch.Tensor | None = None        # (1, Hout-1, Wout-1) bool
-	flatten_target_step: torch.Tensor | None = None      # scalar measured source spacing
+	flatten_target_step: torch.Tensor | None = None      # scalar requested output spacing
+	flatten_map_step: torch.Tensor | None = None         # scalar map increment per grid edge
 	flatten_avg_offset_mask: torch.Tensor | None = None  # (Hout, Wout) bool fixed init-valid anchor mask
 	flatten_initial_avg_offset: torch.Tensor | None = None  # (2,) initial mean map offset over anchor mask
 	flatten_direction: str = "inverse"                   # inverse: output->source, forward: source->output UV
@@ -454,6 +456,8 @@ class Model3D(nn.Module):
 		self.register_buffer("flatten_source_valid", torch.empty(0, 0, device=device, dtype=torch.bool))
 		self.register_buffer("flatten_source_cell_valid", torch.empty(0, 0, device=device, dtype=torch.bool))
 		self.register_buffer("flatten_target_step", torch.tensor(float(mesh_step), device=device, dtype=torch.float32))
+		self.register_buffer("flatten_map_step", torch.tensor(1.0, device=device, dtype=torch.float32))
+		self.register_buffer("flatten_measured_source_step", torch.tensor(float(mesh_step), device=device, dtype=torch.float32))
 		self.register_buffer("flatten_avg_offset_mask", torch.empty(0, 0, device=device, dtype=torch.bool))
 		self.register_buffer("flatten_initial_avg_offset", torch.zeros(2, device=device, dtype=torch.float32))
 		self.register_buffer(
@@ -583,16 +587,27 @@ class Model3D(nn.Module):
 		source_w: int,
 		out_h: int,
 		out_w: int,
+		source_step: float,
+		output_step: float,
 		device: torch.device,
 		dtype: torch.dtype,
 	) -> torch.Tensor:
 		map_yx = Model3D._identity_flatten_map(h=out_h, w=out_w, device=device, dtype=dtype)
-		offset = torch.tensor(
-			[0.5 * float(out_h - source_h), 0.5 * float(out_w - source_w)],
+		source_per_output = float(output_step) / float(source_step)
+		output_center = torch.tensor(
+			[0.5 * float(out_h - 1), 0.5 * float(out_w - 1)],
 			device=device,
 			dtype=dtype,
 		)
-		return (map_yx - offset.reshape(1, 1, 2)).contiguous()
+		source_center = torch.tensor(
+			[0.5 * float(source_h - 1), 0.5 * float(source_w - 1)],
+			device=device,
+			dtype=dtype,
+		)
+		return (
+			(map_yx - output_center.reshape(1, 1, 2)) * source_per_output
+			+ source_center.reshape(1, 1, 2)
+		).contiguous()
 
 	@staticmethod
 	def _normalize_flatten_direction(raw: str | None) -> str:
@@ -610,16 +625,27 @@ class Model3D(nn.Module):
 		source_w: int,
 		out_h: int,
 		out_w: int,
+		source_step: float,
+		output_step: float,
 		device: torch.device,
 		dtype: torch.dtype,
 	) -> torch.Tensor:
 		uv_yx = Model3D._identity_flatten_map(h=source_h, w=source_w, device=device, dtype=dtype)
-		offset = torch.tensor(
-			[0.5 * float(out_h - source_h), 0.5 * float(out_w - source_w)],
+		output_per_source = float(source_step) / float(output_step)
+		source_center = torch.tensor(
+			[0.5 * float(source_h - 1), 0.5 * float(source_w - 1)],
 			device=device,
 			dtype=dtype,
 		)
-		return (uv_yx + offset.reshape(1, 1, 2)).contiguous()
+		output_center = torch.tensor(
+			[0.5 * float(out_h - 1), 0.5 * float(out_w - 1)],
+			device=device,
+			dtype=dtype,
+		)
+		return (
+			(uv_yx - source_center.reshape(1, 1, 2)) * output_per_source
+			+ output_center.reshape(1, 1, 2)
+		).contiguous()
 
 	def _shell_delta_scale_count(self) -> int:
 		return max(1, int(getattr(self, "cyl_shell_n_scales", 5)))
@@ -3166,28 +3192,17 @@ class Model3D(nn.Module):
 		lo = uv_corners.min(axis=0)
 		hi = uv_corners.max(axis=0)
 		span = np.maximum(hi - lo, 1.0)
-		if min_shape is not None and float(output_margin) <= 0.0:
-			# The caller supplied the density-derived output shape.  Center the
-			# optimized UV extent in that exact grid instead of silently
-			# increasing the number of samples.
-			out_h, out_w = min_h, min_w
-			center = 0.5 * (lo + hi)
-			lo = center - 0.5 * np.asarray(
-				[max(0, out_h - 1), max(0, out_w - 1)],
-				dtype=np.float64,
-			)
-		else:
-			pad = np.maximum(float(output_margin), 0.0) * span
-			lo = lo - pad
-			hi = hi + pad
-			out_h = max(min_h, int(math.ceil(float(hi[0] - lo[0]))) + 1)
-			out_w = max(min_w, int(math.ceil(float(hi[1] - lo[1]))) + 1)
-			if out_h > int(math.ceil(float(hi[0] - lo[0]))) + 1:
-				extra = 0.5 * float(out_h - (int(math.ceil(float(hi[0] - lo[0]))) + 1))
-				lo[0] -= extra
-			if out_w > int(math.ceil(float(hi[1] - lo[1]))) + 1:
-				extra = 0.5 * float(out_w - (int(math.ceil(float(hi[1] - lo[1]))) + 1))
-				lo[1] -= extra
+		pad = np.maximum(float(output_margin), 0.0) * span
+		lo = lo - pad
+		hi = hi + pad
+		extent_h = int(math.ceil(float(hi[0] - lo[0]))) + 1
+		extent_w = int(math.ceil(float(hi[1] - lo[1]))) + 1
+		out_h = max(min_h, extent_h)
+		out_w = max(min_w, extent_w)
+		if out_h > extent_h:
+			lo[0] -= 0.5 * float(out_h - extent_h)
+		if out_w > extent_w:
+			lo[1] -= 0.5 * float(out_w - extent_w)
 
 		centers = 0.25 * (q00 + q10 + q01 + q11)
 		k = max(1, min(int(k_candidates), int(centers.shape[0])))
@@ -3383,6 +3398,7 @@ class Model3D(nn.Module):
 			pyramid_d=False,
 			model_h=float(max(1, Hout - 1) * output_step),
 			model_w=float(max(1, Wout - 1) * output_step),
+			flatten_output_step=output_step,
 		)
 		self.conn_offsets = torch.zeros(4, 1, map_h, map_w, device=device, dtype=torch.float32)
 		self.amp = nn.Parameter(torch.ones(1, 1, map_h, map_w, device=device, dtype=torch.float32), requires_grad=False)
@@ -3417,20 +3433,31 @@ class Model3D(nn.Module):
 			if direction == "forward"
 			else torch.empty(0, 0, 3, device=device, dtype=torch.float32)
 		)
-		# The requested output density determines the exported grid size, while
-		# the strain losses still target the surface's measured physical edge
-		# length.
-		self.flatten_target_step = self._measured_flatten_target_step(
+		self.flatten_target_step = torch.tensor(
+			output_step,
+			device=device,
+			dtype=torch.float32,
+		)
+		self.flatten_measured_source_step = self._measured_flatten_target_step(
 			xyz_dev,
 			valid_dev,
 			fallback=float(mesh_step),
 		).detach()
+		self.flatten_map_step = torch.tensor(
+			float(mesh_step) / output_step
+			if direction == "forward"
+			else output_step / float(mesh_step),
+			device=device,
+			dtype=torch.float32,
+		)
 		if direction == "forward":
 			identity = self._centered_flatten_forward_uv_map(
 				source_h=H,
 				source_w=W,
 				out_h=Hout,
 				out_w=Wout,
+				source_step=float(mesh_step),
+				output_step=output_step,
 				device=device,
 				dtype=torch.float32,
 			)
@@ -3441,6 +3468,8 @@ class Model3D(nn.Module):
 				source_w=W,
 				out_h=Hout,
 				out_w=Wout,
+				source_step=float(mesh_step),
+				output_step=output_step,
 				device=device,
 				dtype=torch.float32,
 			)
@@ -4232,6 +4261,7 @@ class Model3D(nn.Module):
 			flatten_point_mask=flatten_point_mask,
 			flatten_quad_mask=flatten_quad_mask,
 			flatten_target_step=self.flatten_target_step if self.flatten_enabled else None,
+			flatten_map_step=self.flatten_map_step if self.flatten_enabled else None,
 			flatten_avg_offset_mask=self.flatten_avg_offset_mask if self.flatten_enabled else None,
 			flatten_initial_avg_offset=self.flatten_initial_avg_offset if self.flatten_enabled else None,
 			flatten_direction=self.flatten_direction if self.flatten_enabled else "inverse",
@@ -4341,6 +4371,8 @@ class Model3D(nn.Module):
 		st.pop("flatten_source_valid", None)
 		st.pop("flatten_source_cell_valid", None)
 		st.pop("flatten_target_step", None)
+		st.pop("flatten_map_step", None)
+		st.pop("flatten_measured_source_step", None)
 		st.pop("flatten_avg_offset_mask", None)
 		st.pop("flatten_initial_avg_offset", None)
 		st.pop("flatten_source_metric", None)
@@ -4387,6 +4419,11 @@ class Model3D(nn.Module):
 			mdl.params,
 			model_w=None if mp.get("model_w") is None else float(mp["model_w"]),
 			model_h=None if mp.get("model_h") is None else float(mp["model_h"]),
+			flatten_output_step=(
+				None
+				if mp.get("flatten_output_step") is None
+				else float(mp["flatten_output_step"])
+			),
 			depth_windings=_normalize_depth_windings(
 				mp.get("depth_windings"),
 				depth=D,

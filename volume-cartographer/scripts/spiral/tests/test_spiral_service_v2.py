@@ -37,6 +37,7 @@ from spiral_service import (ApiError, ArtifactRegistry, ExclusiveFileLock,
                             SpiralServer, _mapped_winding_ids,
                             _prepare_cleaned_lasagna_surface,
                             _raw_run_diff_rgba, _sample_rgba_through_map,
+                            _validate_tifxyz_output_step,
                             load_or_create_api_key, parse_gpu_ids,
                             parse_session_name)
 from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
@@ -1339,6 +1340,15 @@ class CommitTests(unittest.TestCase):
 
 
 class MappedPreviewArtifactTests(unittest.TestCase):
+    def test_lasagna_output_scale_must_match_requested_step(self):
+        self.assertEqual(
+            _validate_tifxyz_output_step(
+                {"scale": [0.05, 0.05]}, 20.0),
+            [0.05, 0.05])
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            _validate_tifxyz_output_step(
+                {"scale": [0.04, 0.04]}, 20.0)
+
     def test_failed_flatten_keeps_previous_preview_and_discards_raw_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

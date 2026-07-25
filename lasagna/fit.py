@@ -1247,14 +1247,19 @@ def _export_flatten_result(
 	x = np.where(mask_np, xyz_np[..., 0], -1.0).astype(np.float32, copy=False)
 	y = np.where(mask_np, xyz_np[..., 1], -1.0).astype(np.float32, copy=False)
 	z = np.where(mask_np, xyz_np[..., 2], -1.0).astype(np.float32, copy=False)
-	mesh_step = 1.0 / float(scale) if float(scale) > 0.0 else float(mdl.params.mesh_step)
-	area = fit2tifxyz._get_area(x, y, z, mesh_step, voxel_size_um)
+	output_step = (
+		float(mdl.params.flatten_output_step)
+		if mdl.params.flatten_output_step is not None
+		else (1.0 / float(scale) if float(scale) > 0.0 else float(mdl.params.mesh_step))
+	)
+	output_scale = 1.0 / output_step
+	area = fit2tifxyz._get_area(x, y, z, output_step, voxel_size_um)
 	fit2tifxyz._write_tifxyz(
 		out_dir=out_dir / "flatten.tifxyz",
 		x=x,
 		y=y,
 		z=z,
-		scale=scale,
+		scale=output_scale,
 		model_source=model_source,
 		fit_config=fit_config,
 		area=area,
@@ -1353,7 +1358,8 @@ def _run_flatten_mode(
 		f"[fit] model-init=flatten solver={flatten_direction} source={ext0['path']} "
 		f"shape={tuple(xyz.shape)} valid={int(valid.sum())}/{valid.numel()} "
 		f"model_shape={mdl.mesh_h}x{mdl.mesh_w} "
-		f"mesh_step={mesh_step} target_step={float(mdl.flatten_target_step.detach().cpu()):.6g}",
+		f"source_step={mesh_step} output_step={flatten_output_step:.6g} "
+		f"measured_source_step={float(mdl.flatten_measured_source_step.detach().cpu()):.6g}",
 		flush=True,
 	)
 	filter_stats = getattr(mdl, "flatten_source_filter_stats", {})

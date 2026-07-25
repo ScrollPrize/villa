@@ -922,6 +922,32 @@ def _surface_xyz(surface_dir):
     return xyz, valid
 
 
+def _validate_tifxyz_output_step(metadata, expected_step):
+    """Require exported TIFXYZ scale to match the requested grid step."""
+    expected = float(expected_step)
+    scale = metadata.get("scale") if isinstance(metadata, dict) else None
+    if (not math.isfinite(expected) or expected <= 0.0
+            or not isinstance(scale, list) or len(scale) < 2):
+        raise RuntimeError(
+            "Lasagna output metadata has no valid two-axis scale")
+    expected_scale = 1.0 / expected
+    values = []
+    for raw in scale[:2]:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "Lasagna output metadata has a non-numeric scale") from None
+        if (not math.isfinite(value) or value <= 0.0
+                or not math.isclose(
+                    value, expected_scale, rel_tol=1.0e-6, abs_tol=1.0e-9)):
+            raise RuntimeError(
+                "Lasagna output scale does not match requested preview step "
+                f"{expected:g}")
+        values.append(value)
+    return values
+
+
 def _load_flatten_correspondence(checkpoint_path):
     """Read Lasagna's flattened-output -> Spiral-source grid map."""
     import torch
@@ -1820,15 +1846,13 @@ class ServiceState:
 
                 flattened_metadata = json.loads(
                     flattened_metadata_path.read_text(encoding="utf-8"))
+                _validate_tifxyz_output_step(
+                    flattened_metadata, LASAGNA_PREVIEW_OUTPUT_STEP_VX)
                 flattened_metadata.pop("components", None)
                 flattened_metadata.pop("winding_column_ranges", None)
                 flattened_metadata.pop("model_source", None)
                 flattened_metadata["uuid"] = surface_id
                 flattened_metadata["name"] = surface_id
-                flattened_metadata["scale"] = [
-                    1.0 / LASAGNA_PREVIEW_OUTPUT_STEP_VX,
-                    1.0 / LASAGNA_PREVIEW_OUTPUT_STEP_VX,
-                ]
                 flattened_metadata["grid_shape"] = [
                     int(flattened_xyz.shape[0]), int(flattened_xyz.shape[1])]
                 flattened_metadata["output_step_vx"] = (
