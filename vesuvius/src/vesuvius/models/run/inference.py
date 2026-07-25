@@ -786,16 +786,20 @@ class Inferer():
         return concatenated
         
     def _get_zarr_compressor(self):
-        if self.compressor_name.lower() == 'zstd':
-            return zarr.Blosc(cname='zstd', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'lz4':
-            return zarr.Blosc(cname='lz4', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'zlib':
-            return zarr.Blosc(cname='zlib', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'none':
+        # numcodecs.Blosc, not zarr.Blosc: zarr 3 dropped that re-export, and the rest
+        # of the package (blending, finalize_outputs) already builds compressors here.
+        shuffle = numcodecs.blosc.SHUFFLE
+        name = self.compressor_name.lower()
+        if name == 'zstd':
+            return numcodecs.Blosc(cname='zstd', clevel=self.compression_level, shuffle=shuffle)
+        elif name == 'lz4':
+            return numcodecs.Blosc(cname='lz4', clevel=self.compression_level, shuffle=shuffle)
+        elif name == 'zlib':
+            return numcodecs.Blosc(cname='zlib', clevel=self.compression_level, shuffle=shuffle)
+        elif name == 'none':
             return None
         else:
-            return zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
+            return numcodecs.Blosc(cname='zstd', clevel=1, shuffle=shuffle)
 
     def _create_output_stores(self):
         if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
