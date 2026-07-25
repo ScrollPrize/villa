@@ -1,4 +1,5 @@
 #include "SurfaceRotationOverlayController.hpp"
+#include "SurfaceRotationTransform.hpp"
 
 #include "../CState.hpp"
 #include "../volume_viewers/CVolumeViewerView.hpp"
@@ -9,6 +10,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QDoubleSpinBox>
 #include <QFutureWatcher>
 #include <QGraphicsProxyWidget>
@@ -33,6 +35,8 @@
 namespace
 {
 constexpr const char* kOverlayGroupKey = "surface_transform_rotate";
+constexpr const char* kHorizontalFlipObjectName = "surfaceHorizontalFlipCheckBox";
+constexpr const char* kApplyTransformObjectName = "surfaceTransformApplyButton";
 constexpr double kPi = 3.14159265358979323846;
 
 struct RotationSaveResult {
@@ -43,6 +47,52 @@ struct RotationSaveResult {
 bool hasFileMetadata(const std::shared_ptr<QuadSurface>& surface)
 {
     return surface && !surface->path.empty() && !surface->id.empty();
+}
+
+vc3d::surface_rotation::TransformPersistenceCompatibility surfaceTransformPersistenceCompatibility(
+    const std::shared_ptr<QuadSurface>& surface)
+{
+    if (!surface) {
+        return {};
+    }
+
+    const bool hasComponents =
+        surface->meta.contains("components") && surface->meta["components"].is_array() && surface->meta["components"].size() > 0;
+    return vc3d::surface_rotation::transformPersistenceCompatibility(surface->path, hasComponents);
+}
+
+QString horizontalFlipUnavailableTooltip(const vc3d::surface_rotation::TransformPersistenceCompatibility& compatibility)
+{
+    if (compatibility.hasMultipageMask && compatibility.hasDisconnectedComponents) {
+        return QObject::tr(
+            "Horizontal flip is unavailable because this surface has a multipage mask and "
+            "disconnected component ranges.");
+    }
+    if (compatibility.hasMultipageMask) {
+        return QObject::tr(
+            "Horizontal flip is unavailable because this surface has a multipage "
+            "multilayer_mask.tif sidecar.");
+    }
+    return QObject::tr(
+        "Horizontal flip is unavailable because this surface has disconnected component "
+        "ranges.");
+}
+
+QString transformPersistenceUnavailableTooltip(const vc3d::surface_rotation::TransformPersistenceCompatibility& compatibility)
+{
+    if (compatibility.hasMultipageMask && compatibility.hasDisconnectedComponents) {
+        return QObject::tr(
+            "Apply is unavailable because multipage masks and disconnected component "
+            "ranges cannot yet be transformed safely.");
+    }
+    if (compatibility.hasMultipageMask) {
+        return QObject::tr(
+            "Apply is unavailable because multipage multilayer_mask.tif sidecars cannot "
+            "yet be transformed safely.");
+    }
+    return QObject::tr(
+        "Apply is unavailable because disconnected component ranges cannot yet be "
+        "transformed safely.");
 }
 
 class RotationDial final : public QWidget
@@ -169,7 +219,13 @@ public:
         _spin->setFixedWidth(92);
         controls->addWidget(_spin);
 
+        _horizontalFlip = new QCheckBox(tr("Flip horizontally"), this);
+        _horizontalFlip->setObjectName(QString::fromLatin1(kHorizontalFlipObjectName));
+        _horizontalFlip->setStyleSheet("QCheckBox { color: white; }");
+        controls->addWidget(_horizontalFlip);
+
         auto* apply = new QPushButton(tr("Apply"), this);
+        apply->setObjectName(QString::fromLatin1(kApplyTransformObjectName));
         controls->addWidget(apply);
         layout->addLayout(controls);
 
@@ -194,6 +250,11 @@ public:
                                  angleChanged(value);
                              }
                          });
+        QObject::connect(_horizontalFlip, &QCheckBox::toggled, this, [this](bool enabled) {
+            if (horizontalFlipChanged) {
+                horizontalFlipChanged(enabled);
+            }
+        });
         QObject::connect(apply, &QPushButton::clicked, this, [this]() {
             if (applyRequested) {
                 applyRequested();
@@ -209,6 +270,7 @@ public:
     }
 
     std::function<void(double)> angleChanged;
+    std::function<void(bool)> horizontalFlipChanged;
     std::function<void()> applyRequested;
 
 protected:
@@ -225,6 +287,7 @@ protected:
 private:
     RotationDial* _dial{nullptr};
     QDoubleSpinBox* _spin{nullptr};
+    QCheckBox* _horizontalFlip{nullptr};
 };
 } // namespace
 
@@ -288,6 +351,7 @@ void SurfaceRotationOverlayController::beginRotate()
     cancelRotate();
     _sourceSurface = std::move(source);
     _angleDeg = 0.0;
+    _horizontalFlip = false;
     _rotateActive = true;
     ensureWidgetForTarget();
 }
@@ -296,20 +360,21 @@ void SurfaceRotationOverlayController::cancelRotate()
 {
     // Restore the un-previewed source surface — but only if no save
     // worker is currently mutating it. Publishing _sourceSurface
-    // while applyRotation()'s background rotate() / saveOverwrite()
+    // while applyRotation()'s background transform / saveOverwrite()
     // is running would point surfaceChanged consumers at a cv::Mat
     // the worker is concurrently writing, racing on _points and the
     // ancillary channels. Whatever was previously active (typically
     // the last _previewSurface from a dial drag) stays in place; the
     // worker's finished slot already drops its own setSurface via
     // the stale-completion guard, so the UI never sees the
-    // cancelled-session's post-rotate output either. A user who
-    // wants the on-disk post-rotate state can reopen the segment.
+    // cancelled-session's transformed output either. A user who
+    // wants the on-disk transformed state can reopen the segment.
     if (_rotateActive && _state && _sourceSurface && !_saveInFlight) {
         _state->setSurface("segmentation", _sourceSurface, false, true);
     }
     _rotateActive = false;
     _angleDeg = 0.0;
+    _horizontalFlip = false;
     _sourceSurface.reset();
     _previewSurface.reset();
     // Invalidate any in-flight save worker — the session it was
@@ -446,6 +511,7 @@ void SurfaceRotationOverlayController::ensureWidgetForTarget()
     auto* widget = new RotationWidget();
     widget->setAngle(_angleDeg);
     widget->angleChanged = [this](double angle) { setAngle(angle); };
+    widget->horizontalFlipChanged = [this](bool enabled) { setHorizontalFlip(enabled); };
     widget->applyRequested = [this]() { applyRotation(); };
 
     auto* proxy = new QGraphicsProxyWidget();
@@ -454,6 +520,11 @@ void SurfaceRotationOverlayController::ensureWidgetForTarget()
     viewer->graphicsView()->scene()->addItem(proxy);
     it->proxy = proxy;
     viewer->setOverlayGroup(kOverlayGroupKey, {proxy});
+    const bool flipWasSelected = _horizontalFlip;
+    synchronizeTransformPersistenceCompatibility();
+    if (flipWasSelected && !_horizontalFlip) {
+        updatePreview();
+    }
     positionWidget(*it);
 }
 
@@ -487,6 +558,47 @@ void SurfaceRotationOverlayController::setAngle(double angleDeg)
     updatePreview();
 }
 
+bool SurfaceRotationOverlayController::setHorizontalFlip(bool enabled)
+{
+    const bool previouslySelected = _horizontalFlip;
+    _horizontalFlip = enabled;
+    const bool available = synchronizeTransformPersistenceCompatibility();
+    if (_horizontalFlip != previouslySelected) {
+        updatePreview();
+    }
+    if (enabled && !available) {
+        return false;
+    }
+    return true;
+}
+
+bool SurfaceRotationOverlayController::synchronizeTransformPersistenceCompatibility()
+{
+    const auto compatibility = surfaceTransformPersistenceCompatibility(_sourceSurface);
+    const auto selection = vc3d::surface_rotation::reconcileHorizontalFlipSelection(_horizontalFlip, compatibility);
+    _horizontalFlip = selection.selected;
+
+    const bool available = compatibility.allowed();
+    const QString tooltip = available ? QString{} : horizontalFlipUnavailableTooltip(compatibility);
+    for (const auto& entry : _viewers) {
+        if (!entry.proxy || !entry.proxy->widget()) {
+            continue;
+        }
+        if (auto* checkbox = entry.proxy->widget()->findChild<QCheckBox*>(QString::fromLatin1(kHorizontalFlipObjectName))) {
+            const QSignalBlocker blocker(checkbox);
+            checkbox->setChecked(_horizontalFlip);
+            checkbox->setEnabled(available);
+            checkbox->setToolTip(tooltip);
+        }
+
+        if (auto* apply = entry.proxy->widget()->findChild<QPushButton*>(QString::fromLatin1(kApplyTransformObjectName))) {
+            apply->setEnabled(available);
+            apply->setToolTip(available ? QString{} : transformPersistenceUnavailableTooltip(compatibility));
+        }
+    }
+    return available;
+}
+
 void SurfaceRotationOverlayController::updatePreview()
 {
     if (!_rotateActive || !_state || !_sourceSurface) {
@@ -501,7 +613,9 @@ void SurfaceRotationOverlayController::updatePreview()
         return;
     }
 
-    if (std::abs(_angleDeg) < 0.01) {
+    synchronizeTransformPersistenceCompatibility();
+    const vc3d::surface_rotation::Transform transform{static_cast<float>(_angleDeg), _horizontalFlip};
+    if (transform.isNoOp()) {
         _previewSurface.reset();
         _state->setSurface("segmentation", _sourceSurface, false, true);
         return;
@@ -511,7 +625,7 @@ void SurfaceRotationOverlayController::updatePreview()
     if (!_previewSurface) {
         return;
     }
-    _previewSurface->rotate(static_cast<float>(_angleDeg));
+    transform.applyInMemory(*_previewSurface);
     _state->setSurface("segmentation", _previewSurface, false, true);
 }
 
@@ -530,11 +644,27 @@ void SurfaceRotationOverlayController::applyRotation()
         return;
     }
 
-    // Trivial rotation: no I/O, nothing to do off-thread.
-    if (std::abs(_angleDeg) < 0.01) {
+    const bool flipWasSelected = _horizontalFlip;
+    const bool persistenceAvailable = synchronizeTransformPersistenceCompatibility();
+    if (!persistenceAvailable) {
+        if (flipWasSelected && !_horizontalFlip) {
+            updatePreview();
+        }
+        QMessageBox::warning(
+            nullptr,
+            tr("Surface Transform Unavailable"),
+            transformPersistenceUnavailableTooltip(surfaceTransformPersistenceCompatibility(_sourceSurface)));
+        return;
+    }
+
+    const vc3d::surface_rotation::Transform transform{static_cast<float>(_angleDeg), _horizontalFlip};
+
+    // No transform: no I/O, nothing to do off-thread.
+    if (transform.isNoOp()) {
         _state->setSurface("segmentation", _sourceSurface, false, true);
         _rotateActive = false;
         _angleDeg = 0.0;
+        _horizontalFlip = false;
         _previewSurface.reset();
         _sourceSurface.reset();
         clearWidgets();
@@ -542,24 +672,19 @@ void SurfaceRotationOverlayController::applyRotation()
     }
 
     if (!hasFileMetadata(_sourceSurface)) {
-        QMessageBox::warning(nullptr,
-                             tr("Rotation Failed"),
-                             tr("Failed to save the rotated surface: the selected surface is missing file metadata."));
+        QMessageBox::warning(nullptr, tr("Surface Transform Failed"), tr("Failed to save the transformed surface: the selected surface is missing file metadata."));
         return;
     }
 
     // Clone the source before dispatching the worker. The worker can then
-    // rotate/save without racing the live surface used by the preview, and a
+    // transform/save without racing the live surface used by the preview, and a
     // failed save leaves the in-memory source unchanged.
     auto surface = cloneSurface(_sourceSurface);
     if (!surface) {
-        QMessageBox::warning(nullptr,
-                             tr("Rotation Failed"),
-                             tr("Failed to save the rotated surface: could not copy the selected surface."));
+        QMessageBox::warning(nullptr, tr("Surface Transform Failed"), tr("Failed to save the transformed surface: could not copy the selected surface."));
         return;
     }
 
-    const float angleDeg = static_cast<float>(_angleDeg);
     const int session = ++_saveSessionId;
     _saveInFlight = true;
     QPointer<SurfaceRotationOverlayController> self(this);
@@ -603,12 +728,14 @@ void SurfaceRotationOverlayController::applyRotation()
                     }
                     self->clearWidgets();
                     self->_rotateActive = false;
+                    self->_angleDeg = 0.0;
+                    self->_horizontalFlip = false;
                     self->_previewSurface.reset();
                     self->_sourceSurface.reset();
-                    QMessageBox::warning(nullptr,
-                                         tr("Rotation Failed"),
-                                         tr("Failed to save the rotated surface: %1").arg(
-                                             result.error.isEmpty() ? tr("no surface was written") : result.error));
+                    QMessageBox::warning(
+                        nullptr,
+                        tr("Surface Transform Failed"),
+                        tr("Failed to save the transformed surface: %1").arg(result.error.isEmpty() ? tr("no surface was written") : result.error));
                     return;
                 }
 
@@ -619,19 +746,18 @@ void SurfaceRotationOverlayController::applyRotation()
 
                 self->_rotateActive = false;
                 self->_angleDeg = 0.0;
+                self->_horizontalFlip = false;
                 self->_previewSurface.reset();
                 self->_sourceSurface.reset();
                 self->clearWidgets();
             });
 
-    auto future = QtConcurrent::run([surface, angleDeg]() -> RotationSaveResult {
-        // saveOverwrite() snapshots the on-disk state before
-        // overwriting it. rotate() only mutates _points in memory,
-        // so the on-disk x/y/z.tif are still pre-rotate when the
-        // snapshot is taken — the backup ring captures the
-        // pre-rotation files automatically.
+    auto future = QtConcurrent::run([surface, transform]() -> RotationSaveResult {
+        // applyInMemory() keeps rotation in memory and temporarily hides the
+        // backing path while flipping. saveOverwrite() remains the one
+        // persistence step and can snapshot the pre-transform files first.
         try {
-            surface->rotate(angleDeg);
+            transform.applyInMemory(*surface);
             surface->saveOverwrite();
         } catch (const std::exception& e) {
             return RotationSaveResult{nullptr, QString::fromUtf8(e.what())};

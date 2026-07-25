@@ -165,6 +165,7 @@ set(srcs
     overlays/PlaneSlicingOverlayController.hpp
     overlays/SurfaceRotationOverlayController.cpp
     overlays/SurfaceRotationOverlayController.hpp
+    overlays/SurfaceRotationTransform.hpp
     overlays/AtlasOverlayController.cpp
     overlays/AtlasOverlayController.hpp
     overlays/AtlasControlPointsOverlayController.cpp
