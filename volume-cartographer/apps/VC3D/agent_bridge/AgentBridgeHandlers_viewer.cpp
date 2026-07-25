@@ -20,6 +20,7 @@
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
+#include "overlays/VolumeOverlayController.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
@@ -28,7 +29,7 @@
 #include "vc/core/util/Compositing.hpp"
 
 // ---------------------------------------------------------------------------
-// ViewerManager-backed overlay controls and per-viewer intersection sets.
+// Overlay controls and per-viewer intersection sets.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -44,23 +45,36 @@ ViewerManager* requireViewerManager(ViewerManager* mgr)
     return mgr;
 }
 
-QJsonObject overlaySettingsJson(ViewerManager* mgr)
+VolumeOverlayController* requireVolumeOverlay(
+    VolumeOverlayController* overlay)
+{
+    if (!overlay) {
+        QJsonObject data;
+        data["detail"] = "volume overlay controller is not available";
+        throw AgentBridgeError{
+            -32010, "Volume overlay unavailable", data};
+    }
+    return overlay;
+}
+
+QJsonObject overlaySettingsJson(
+    const VolumeOverlayController::State& state)
 {
     QJsonObject o;
-    o["volumeId"] = QString::fromStdString(mgr->overlayVolumeId());
-    o["colormap"] = QString::fromStdString(mgr->overlayColormap());
-    o["opacity"] = mgr->overlayOpacity();
-    o["threshold"] = mgr->overlayThreshold();
-    o["windowLow"] = mgr->overlayWindowLow();
-    o["windowHigh"] = mgr->overlayWindowHigh();
-    o["maxDisplayedResolution"] = mgr->overlayMaxDisplayedResolution();
+    o["volumeId"] = QString::fromStdString(state.volumeId);
+    o["colormap"] = QString::fromStdString(state.colormap);
+    o["opacity"] = state.opacity;
+    o["threshold"] = state.window.low;
+    o["windowLow"] = state.window.low;
+    o["windowHigh"] = state.window.high;
+    o["maxDisplayedResolution"] = state.maxDisplayedResolution;
 
-    const OverlayCompositeSettings& c = mgr->overlayComposite();
     QJsonObject composite;
-    composite["enabled"] = c.enabled;
-    composite["method"] = QString::fromStdString(c.method);
-    composite["layersFront"] = c.layersFront;
-    composite["layersBehind"] = c.layersBehind;
+    composite["enabled"] = state.composite.enabled;
+    composite["method"] =
+        QString::fromStdString(state.composite.method);
+    composite["layersFront"] = state.composite.layersFront;
+    composite["layersBehind"] = state.composite.layersBehind;
     o["composite"] = composite;
     return o;
 }
@@ -70,14 +84,16 @@ QJsonObject overlaySettingsJson(ViewerManager* mgr)
 
 QJsonObject AgentBridgeServer::handleViewerGetOverlay(const QJsonValue&)
 {
-    ViewerManager* mgr = requireViewerManager(_window ? _window->_viewerManager.get() : nullptr);
-    return overlaySettingsJson(mgr);
+    auto* overlay = requireVolumeOverlay(
+        _window ? _window->_volumeOverlay.get() : nullptr);
+    return overlaySettingsJson(overlay->state());
 }
 
 
 QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
 {
-    ViewerManager* mgr = requireViewerManager(_window ? _window->_viewerManager.get() : nullptr);
+    auto* overlay = requireVolumeOverlay(
+        _window ? _window->_volumeOverlay.get() : nullptr);
     const QJsonObject p = params.toObject();
 
     // Mechanical input validation has already run from the method descriptor.
@@ -92,22 +108,6 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
     const QString volumeId = hasVolumeId ? p.value("volumeId").toString() : QString();
     const bool clearVolume = clear || (hasVolumeId && volumeId.isEmpty());
     const bool setVolume = !clearVolume && hasVolumeId;
-    // Resolve the overlay Volume shared_ptr up front so the -32007 unknown-volume
-    // check happens in this validation phase, before any setter runs.
-    std::shared_ptr<Volume> overlayVolume;
-    if (setVolume) {
-        CState* state = _window->_state;
-        std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-        if (!state || !state->hasVpkg() || !vpkg)
-            throw AgentBridgeError{-32000, "No volume package loaded", {}};
-        overlayVolume = vpkg->volume(volumeId.toStdString());
-        if (!overlayVolume) {
-            QJsonObject data;
-            data["kind"] = "volume";
-            data["id"] = volumeId;
-            throw AgentBridgeError{-32007, QStringLiteral("Unknown volume id: %1").arg(volumeId), data};
-        }
-    }
 
     const bool hasColormap = p.contains("colormap");
     const QString colormap =
@@ -141,7 +141,7 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
 
         // Merge over current settings so a caller can tweak one sub-key without
         // restating the rest (a read, so it stays in the validation phase).
-        composite = mgr->overlayComposite();
+        composite = overlay->state().composite;
         if (object.contains("enabled"))
             composite.enabled = object.value("enabled").toBool();
         if (object.contains("method"))
@@ -152,45 +152,64 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
             composite.layersBehind = object.value("layersBehind").toInt();
     }
 
-    // Apply only after every semantic precondition has passed.
-    if (clearVolume) {
-        mgr->setOverlayVolume(nullptr, "");
-    } else if (setVolume) {
-        // ViewerManager re-validates the coordinate space against the base
-        // volume and may silently null a mismatched selection; the echoed
-        // overlayVolumeId reflects whatever actually stuck.
-        mgr->setOverlayVolume(overlayVolume, volumeId.toStdString());
-    }
+    VolumeOverlayController::Update update;
+    if (clearVolume)
+        update.volumeId = std::string{};
+    else if (setVolume)
+        update.volumeId = volumeId.toStdString();
     if (hasColormap)
-        mgr->setOverlayColormap(colormap.toStdString());
+        update.colormap = colormap.toStdString();
     if (hasOpacity)
-        mgr->setOverlayOpacity(opacity);
+        update.opacity = opacity;
     if (hasThreshold)
-        mgr->setOverlayThreshold(threshold);
-    if (hasWindow)
-        mgr->setOverlayWindow(windowLow, windowHigh);
+        update.threshold = threshold;
+    if (hasWindow) {
+        update.window = VolumeOverlayController::Window{
+            .low = windowLow,
+            .high = windowHigh,
+        };
+    }
     if (hasMaxRes)
-        mgr->setOverlayMaxDisplayedResolution(maxRes);
+        update.maxDisplayedResolution = maxRes;
     if (hasComposite)
-        mgr->setOverlayComposite(composite);
+        update.composite = composite;
 
-    // Echo the resulting full overlay settings (unknown keys are ignored).
-    return overlaySettingsJson(mgr);
+    const auto applyResult = overlay->apply(update);
+    if (applyResult ==
+        VolumeOverlayController::ApplyResult::NoVolumePackage) {
+        throw AgentBridgeError{
+            -32000, "No volume package loaded", {}};
+    }
+    if (applyResult ==
+        VolumeOverlayController::ApplyResult::UnknownVolume) {
+        QJsonObject data;
+        data["kind"] = "volume";
+        data["id"] = volumeId;
+        throw AgentBridgeError{
+            -32007,
+            QStringLiteral("Unknown volume id: %1").arg(volumeId),
+            data,
+        };
+    }
+
+    return overlaySettingsJson(overlay->state());
 }
 
 
 QJsonObject AgentBridgeServer::handleViewerListOverlayVolumes(const QJsonValue&)
 {
-    ViewerManager* mgr = requireViewerManager(_window ? _window->_viewerManager.get() : nullptr);
+    auto* overlay = requireVolumeOverlay(
+        _window ? _window->_volumeOverlay.get() : nullptr);
     CState* state = _window->_state;
     std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
     if (!state || !state->hasVpkg() || !vpkg)
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    // Not filtered by coordinate-space compatibility: setOverlayVolume()
-    // re-validates and silently nulls a mismatched pick, so listing every
+    // Not filtered by coordinate-space compatibility: the overlay controller
+    // re-validates and clears a mismatched pick, so listing every
     // volume lets the agent see (and diagnose) that rejection itself.
-    const std::string currentId = state->currentVolumeId();
+    const auto overlayState = overlay->state();
+    const std::string& currentId = overlayState.currentVolumeId;
     QJsonArray volumes;
     for (const auto& id : vpkg->volumeIDs()) {
         QJsonObject v;
@@ -201,7 +220,8 @@ QJsonObject AgentBridgeServer::handleViewerListOverlayVolumes(const QJsonValue&)
 
     QJsonObject result;
     result["volumes"] = volumes;
-    result["overlayVolumeId"] = QString::fromStdString(mgr->overlayVolumeId());
+    result["overlayVolumeId"] =
+        QString::fromStdString(overlayState.volumeId);
     return result;
 }
 
@@ -270,7 +290,12 @@ QJsonObject AgentBridgeServer::viewerRenderSettingsJson() const
     QJsonObject o;
     o["intersectionOpacity"] = mgr->intersectionOpacity();
     o["intersectionThickness"] = mgr->intersectionThickness();
-    o["overlayOpacity"] = mgr->overlayOpacity();
+    if (_window->_volumeOverlay) {
+        o["overlayOpacity"] =
+            _window->_volumeOverlay->state().opacity;
+    } else {
+        o["overlayOpacity"] = mgr->overlayOpacity();
+    }
     o["intersectionMaxSurfaces"] = mgr->intersectionMaxSurfaces();
     // ViewerManager-backed, so meaningful with zero viewers instantiated too.
     QJsonObject volumeWindow;
@@ -367,6 +392,10 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         const double v = p.value("overlayOpacity").toDouble();
         overlayOpacity = static_cast<float>(std::clamp(v, 0.0, 1.0));
     }
+    VolumeOverlayController* volumeOverlay = hasOverlayOpacity
+        ? requireVolumeOverlay(
+              _window ? _window->_volumeOverlay.get() : nullptr)
+        : nullptr;
 
     const bool hasIntersectionMaxSurfaces = p.contains("intersectionMaxSurfaces");
     int intersectionMaxSurfaces = 0;
@@ -442,8 +471,11 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
         mgr->setIntersectionOpacity(intersectionOpacity);
     if (hasIntersectionThickness)
         mgr->setIntersectionThickness(intersectionThickness);
-    if (hasOverlayOpacity)
-        mgr->setOverlayOpacity(overlayOpacity);
+    if (volumeOverlay) {
+        VolumeOverlayController::Update update;
+        update.opacity = overlayOpacity;
+        volumeOverlay->apply(update);
+    }
     if (hasIntersectionMaxSurfaces)
         mgr->setIntersectionMaxSurfaces(intersectionMaxSurfaces);
     if (hasHighlightedSurfaceIds) {

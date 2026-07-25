@@ -283,6 +283,13 @@ dialog.
 
 ### Segments and review state
 
+- `segments.attach` adds one absolute local tifxyz path to the open package.
+  The path may identify a segment or a directory of segments. Attachment uses
+  the same validation, persistence, and UI refresh as the GUI and is
+  idempotent by normalized location. It selects the attached segment source by
+  default; `select: false` preserves the current source. A source whose
+  directory name is already used case-insensitively by another attachment is
+  rejected because the VC3D source picker identifies entries by that name.
 - `segments.list` reports package segments, whether they are loaded, and the
   active segment.
 - `segments.fetch` materializes an Open Data placeholder. Already-materialized
@@ -403,6 +410,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_add_point_collection` | `points.add_collection` |
 | `vc3d_append_segment_mask` | `segment.append_mask` | Append a volume-image layer to a segment's mask. Blocks until the render completes (130 s client timeout); requires a current volume. |
 | `vc3d_apply_anchor_offset` | `points.apply_anchor_offset` |
+| `vc3d_attach_segments` | `segments.attach` | Attach a local tifxyz segment, or a folder containing tifxyz segments, to the open volume package. |
 | `vc3d_attach_volume` | `volume.attach` | Attach one local zarr volume or remote `.zarr` URL to the open project without changing the current primary volume. Returns a `volume` job; compose with `vc3d_list_overlay_volumes` and `vc3d_set_overlay` to display it. |
 | `vc3d_atlas_open_result` | `atlas.open_result` |
 | `vc3d_atlas_open` | `atlas.open` |
@@ -443,7 +451,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_flatten_straighten` | `flatten.straighten` |
 | `vc3d_generate_segment_mask` | `segment.generate_mask` | Render a segment's binary mask. Blocks until the render completes (130 s client timeout); no job to poll. |
 | `vc3d_get_cursor_point` | `canvas.get_cursor_volume_point` | Resolve a viewer scene position (or the current cursor) to a 3D volume point + surface normal. |
-| `vc3d_get_overlay` | `viewer.get_overlay` | Read the current overlay-volume settings. |
+| `vc3d_get_overlay` | `viewer.get_overlay` | Read the active workspace's overlay-volume settings, shared with the GUI controls. |
 | `vc3d_get_render_settings` | `viewer.get_render_settings` | Read the shared viewer render/overlay settings (intersection lines, overlay opacity, surface normals, direction hints, highlighted surfaces). |
 | `vc3d_get_state` | `state.get` | Snapshot of VC3D: open volume package, current volume, active segment, viewers (ids/names), editing mode, running job. Call this first. |
 | `vc3d_grow_patch_from_seed` | `segmentation.grow_patch_from_seed` | Create a brand-new segment by growing a patch from a 3D seed point (headless GrowPatch). Async: returns a jobId and outputDir. |
@@ -458,7 +466,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_lasagna_service_status` | `lasagna.service_status` |
 | `vc3d_lasagna_start_optimization` | `lasagna.start_optimization` |
 | `vc3d_list_catalog_samples` | `catalog.list_samples` | List samples available to open from the Open Data catalog; use this for discovery when no volume package is loaded. |
-| `vc3d_list_overlay_volumes` | `viewer.list_overlay_volumes` | List every volume id in the open package, for picking an overlay volume. |
+| `vc3d_list_overlay_volumes` | `viewer.list_overlay_volumes` | List every volume id in the open package and the active workspace's selection. |
 | `vc3d_list_points` | `points.list` | List point collections and their points. |
 | `vc3d_list_segments` | `segments.list` | List segments in the open volume package with loaded/active flags. |
 | `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
@@ -503,7 +511,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_set_auto_fill_mode` | `points.set_auto_fill_mode` |
 | `vc3d_set_axis_aligned_slices` | `viewer.set_axis_aligned_slices` | Enable/disable axis-aligned slice mode (checkbox equivalent) — prerequisite for `viewer.rotate`. |
 | `vc3d_set_intersects` | `viewer.set_intersects` | Set which surfaces' intersection lines a viewer draws. |
-| `vc3d_set_overlay` | `viewer.set_overlay` | Update the overlay-volume settings (volume, colormap, opacity, threshold, window, resolution cap, composite); any subset. |
+| `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, threshold, window, resolution cap, composite); any subset. |
 | `vc3d_set_point_collection_color` | `points.set_collection_color` |
 | `vc3d_set_point_collection_metadata` | `points.set_collection_metadata` |
 | `vc3d_set_point_collection_tag` | `points.set_collection_tag` |

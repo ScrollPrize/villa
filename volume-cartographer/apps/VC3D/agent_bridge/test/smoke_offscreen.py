@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -115,6 +116,17 @@ def create_test_volume(volume: Path, volume_id: str) -> Path:
         "dimension_separator": ".",
     }))
     return volume
+
+
+def create_test_segment(segment: Path, segment_id: str) -> Path:
+    segment.mkdir(parents=True)
+    (segment / "meta.json").write_text(json.dumps({
+        "type": "seg",
+        "uuid": segment_id,
+        "name": segment_id,
+        "format": "tifxyz",
+    }))
+    return segment
 
 
 def create_test_project(root: Path) -> Path:
@@ -246,10 +258,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 118
-            and coverage.get("registered") == 118
+            and coverage.get("described") == 119
+            and coverage.get("registered") == 119
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 118
+            and len(snapshot["methods"]) == 119
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -379,6 +391,16 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
         )
         expect(overlay, "windowLow", 10)
         expect(overlay, "windowHigh", 11)
+
+        overlay, _ = client.call(
+            "viewer.set_overlay",
+            {"colormap": ""},
+            timeout=10.0,
+        )
+        expect(overlay, "colormap", "")
+        overlay, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
+        expect(overlay, "colormap", "")
     except Exception as error:  # noqa: BLE001
         failures.append(f"{type(error).__name__}: {error}")
 
@@ -623,6 +645,29 @@ def check_volume_attach(
             {"volumeId": "vol2", "opacity": 0.4},
             timeout=10.0,
         )
+        overlay_read, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
+        selected, _ = client.call(
+            "viewer.list_overlay_volumes", {}, timeout=10.0)
+        render_result, _ = client.call(
+            "viewer.set_render_settings",
+            {"overlayOpacity": 0.35},
+            timeout=10.0,
+        )
+        overlay_after_render, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
+        results.record(
+            "viewer_overlay_controller_sync",
+            overlay_read.get("volumeId") == "vol2"
+            and selected.get("overlayVolumeId") == "vol2"
+            and abs(render_result.get("overlayOpacity", -1) - 0.35) < 1e-6
+            and overlay_after_render.get("volumeId") == "vol2"
+            and abs(overlay_after_render.get("opacity", -1) - 0.35) < 1e-6,
+            f"set={overlay_result} get={overlay_read} "
+            f"list_id={selected.get('overlayVolumeId')} "
+            f"render_opacity={render_result.get('overlayOpacity')} "
+            f"overlay_opacity={overlay_after_render.get('opacity')}",
+        )
         document = json.loads(volpkg.read_text())
         entries = document.get("volumes", [])
         attached_entry = next(
@@ -666,6 +711,35 @@ def check_volume_attach(
             f"{type(error).__name__}: {error}",
         )
         return
+
+    try:
+        expected_overlay, _ = client.call(
+            "viewer.set_overlay",
+            {
+                "colormap": "",
+                "opacity": 0.35,
+                "window": {"low": 17, "high": 201},
+            },
+            timeout=10.0,
+        )
+        client.call(
+            "volume.open",
+            {"path": str(volpkg)},
+            timeout=10.0,
+        )
+        restored_overlay, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
+        results.record(
+            "viewer_overlay_reopen",
+            restored_overlay == expected_overlay,
+            f"expected={expected_overlay} restored={restored_overlay}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "viewer_overlay_reopen",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
 
     try:
         retry, _ = client.call(
@@ -763,6 +837,266 @@ def check_volume_attach(
     results.record("volume_attach_absolute_path", ok, detail)
 
 
+def check_segments_attach(
+    client: BridgeClient,
+    results: Results,
+    root: Path,
+    volpkg: Path,
+) -> None:
+    initial = root / "initial-segments"
+    create_test_segment(initial / "initial-segment", "initial-segment")
+    source = root / "user-segments"
+    segment_id = "20241113080880"
+    shutil.copytree(
+        REPO_ROOT / "core" / "test" / "data" / "segments" / segment_id,
+        source / segment_id,
+    )
+
+    try:
+        initial_result, _ = client.call(
+            "segments.attach",
+            {"location": str(initial) + os.sep},
+            timeout=10.0,
+        )
+        result, _ = client.call(
+            "segments.attach",
+            {
+                "location": str(source),
+                "tags": ["source:smoke", "status:working"],
+            },
+            timeout=10.0,
+        )
+        listed, _ = client.call("segments.list", {}, timeout=10.0)
+        document = json.loads(volpkg.read_text())
+        initial_locations = {
+            entry.get("location") if isinstance(entry, dict) else entry
+            for entry in document.get("segments", [])
+        }
+        matching = [
+            entry
+            for entry in document.get("segments", [])
+            if isinstance(entry, dict) and entry.get("location") == str(source)
+        ]
+        ids = {segment.get("id") for segment in listed.get("segments", [])}
+        valid = (
+            initial_result.get("location") == str(initial)
+            and str(initial) in initial_locations
+            and result == {
+                "attached": True,
+                "alreadyAttached": False,
+                "location": str(source),
+                "projectPath": str(volpkg),
+                "selected": True,
+            }
+            and segment_id in ids
+            and matching == [{
+                "location": str(source),
+                "tags": ["source:smoke", "status:working"],
+            }]
+        )
+        results.record(
+            "segments_attach_local_source",
+            valid,
+            f"initial={initial_result} initial_locations={initial_locations} "
+            f"result={result} ids={sorted(value for value in ids if value)}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_local_source",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+        return
+
+    try:
+        retry, _ = client.call(
+            "segments.attach",
+            {"location": str(source) + os.sep},
+            timeout=10.0,
+        )
+        document = json.loads(volpkg.read_text())
+        matching = [
+            entry
+            for entry in document.get("segments", [])
+            if isinstance(entry, dict) and entry.get("location") == str(source)
+        ]
+        results.record(
+            "segments_attach_idempotent",
+            retry.get("attached") is False
+            and retry.get("alreadyAttached") is True
+            and retry.get("selected") is True
+            and matching == [{
+                "location": str(source),
+                "tags": ["source:smoke", "status:working"],
+            }],
+            f"result={retry}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_idempotent",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+    try:
+        client.call(
+            "volume.open",
+            {"path": str(volpkg)},
+            timeout=10.0,
+        )
+        reopened, _ = client.call("segments.list", {}, timeout=10.0)
+        retry, _ = client.call(
+            "segments.attach",
+            {"location": str(source)},
+            timeout=10.0,
+        )
+        document = json.loads(volpkg.read_text())
+        matching = [
+            entry
+            for entry in document.get("segments", [])
+            if isinstance(entry, dict) and entry.get("location") == str(source)
+        ]
+        ids = {
+            segment.get("id")
+            for segment in reopened.get("segments", [])
+        }
+        results.record(
+            "segments_attach_reopen",
+            segment_id in ids
+            and retry.get("alreadyAttached") is True
+            and retry.get("selected") is True
+            and matching == [{
+                "location": str(source),
+                "tags": ["source:smoke", "status:working"],
+            }],
+            f"ids={sorted(value for value in ids if value)} retry={retry}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_reopen",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+    editing_enabled = False
+    try:
+        client.call(
+            "segments.activate",
+            {"segmentId": segment_id},
+            timeout=10.0,
+        )
+        client.call(
+            "segmentation.enable_editing",
+            {"enabled": True},
+            timeout=10.0,
+        )
+        editing_enabled = True
+        blocked = root / "blocked-segments"
+        create_test_segment(blocked / "blocked-segment", "blocked-segment")
+        before = json.loads(volpkg.read_text())
+        try:
+            client.call(
+                "segments.attach",
+                {"location": str(blocked), "select": False},
+                timeout=10.0,
+            )
+            results.record(
+                "segments_attach_editing_guard",
+                False,
+                "expected an error, got a result",
+            )
+        except BridgeError as error:
+            after = json.loads(volpkg.read_text())
+            results.record(
+                "segments_attach_editing_guard",
+                error.code == -32004 and after == before,
+                f"returned code={error.code} project_unchanged={after == before}",
+            )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_editing_guard",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+    finally:
+        if editing_enabled:
+            try:
+                client.call(
+                    "segmentation.enable_editing",
+                    {"enabled": False},
+                    timeout=10.0,
+                )
+            except Exception as error:  # noqa: BLE001
+                results.record(
+                    "segments_attach_editing_cleanup",
+                    False,
+                    f"{type(error).__name__}: {error}",
+                )
+
+    conflicting = root / "other" / source.name.upper()
+    create_test_segment(
+        conflicting / "conflicting-segment", "conflicting-segment")
+    before = json.loads(volpkg.read_text())
+    try:
+        client.call(
+            "segments.attach",
+            {"location": str(conflicting)},
+            timeout=10.0,
+        )
+        results.record(
+            "segments_attach_source_name_conflict",
+            False,
+            "expected an error, got a result",
+        )
+    except BridgeError as error:
+        after = json.loads(volpkg.read_text())
+        results.record(
+            "segments_attach_source_name_conflict",
+            error.code == -32010
+            and error.data.get("sourceName") == source.name.upper()
+            and after == before,
+            f"returned code={error.code} project_unchanged={after == before}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_source_name_conflict",
+            False,
+            f"unexpected {type(error).__name__}: {error}",
+        )
+
+    ok, detail = expect_param_error(
+        client,
+        "segments.attach",
+        {"location": "relative/segments"},
+        "location",
+    )
+    results.record("segments_attach_absolute_path", ok, detail)
+
+    try:
+        client.call(
+            "segments.attach",
+            {"location": str(root / "missing-segments")},
+            timeout=10.0,
+        )
+        results.record(
+            "segments_attach_invalid_layout",
+            False,
+            "expected an error, got a result",
+        )
+    except BridgeError as error:
+        results.record(
+            "segments_attach_invalid_layout",
+            error.code == -32007,
+            f"returned code={error.code}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segments_attach_invalid_layout",
+            False,
+            f"unexpected {type(error).__name__}: {error}",
+        )
+
+
 def check_c4(client: BridgeClient, results: Results, volpkg: str,
              broken_fiber_volpkg: str) -> None:
     # Liveness / dispatch sanity.
@@ -801,6 +1135,8 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
     results.record("c4_volume_path_number", ok, detail)
 
     try:
+        overlay_before_error, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
         client.call(
             "viewer.set_overlay",
             {"volumeId": "__missing__"},
@@ -812,10 +1148,14 @@ def check_c4(client: BridgeClient, results: Results, volpkg: str,
             "expected -32007, got a result",
         )
     except BridgeError as error:
+        overlay_after_error, _ = client.call(
+            "viewer.get_overlay", {}, timeout=10.0)
         results.record(
             "viewer_overlay_unknown_volume",
-            error.code == -32007,
-            f"returned code={error.code}",
+            error.code == -32007
+            and overlay_after_error == overlay_before_error,
+            f"returned code={error.code} "
+            f"state_unchanged={overlay_after_error == overlay_before_error}",
         )
     except Exception as error:  # noqa: BLE001
         results.record(
@@ -1137,6 +1477,7 @@ def main() -> int:
             check_canvas_normalization(client, results)
 
             check_volume_attach(client, results, tmp_path, volpkg)
+            check_segments_attach(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_project_create(client, results, tmp_path)
             check_c2_oversized(sock_path, results)
