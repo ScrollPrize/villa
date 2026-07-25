@@ -2247,6 +2247,14 @@ SegmentationLasagnaPanel::startAtlasOptimization(
             tr("Lasagna atlas configuration is invalid."));
     }
 
+    const QString dataInput = lasagnaDataInputPath();
+    if (dataInput.isEmpty()) {
+        const QString msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
+        showStatus(msg, 5000);
+        showLasagnaConfigError(msg, nullptr, 5000, presentation);
+        return SubmissionResult::failure(msg);
+    }
+
     auto& mgr = LasagnaServiceManager::instance();
     if (mgr.isExternal()) {
         if (!mgr.isRunning()) {
@@ -2254,17 +2262,10 @@ SegmentationLasagnaPanel::startAtlasOptimization(
             showStatus(msg, 5000);
             return SubmissionResult::failure(msg);
         }
-    } else if (!mgr.ensureServiceRunning()) {
+    } else if (!mgr.ensureServiceRunning(
+                   {}, QFileInfo(dataInput).absolutePath())) {
         const QString msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
         showStatus(msg, 5000);
-        return SubmissionResult::failure(msg);
-    }
-
-    const QString dataInput = lasagnaDataInputPath();
-    if (dataInput.isEmpty()) {
-        const QString msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
-        showStatus(msg, 5000);
-        showLasagnaConfigError(msg, nullptr, 5000, presentation);
         return SubmissionResult::failure(msg);
     }
 
@@ -2373,6 +2374,14 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
             tr("Lasagna configuration is invalid."));
     }
 
+    QString dataInput = lasagnaDataInputPath();
+    if (dataInput.isEmpty()) {
+        auto msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
+        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+        showStatus(msg, 5000);
+        return SubmissionResult::failure(msg);
+    }
+
     if (mgr.isExternal()) {
         if (!mgr.isRunning()) {
             auto msg = tr("External service not connected. Select a service or check host/port.");
@@ -2381,7 +2390,8 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
             return SubmissionResult::failure(msg);
         }
     } else {
-        if (!mgr.ensureServiceRunning()) {
+        if (!mgr.ensureServiceRunning(
+                {}, QFileInfo(dataInput).absolutePath())) {
             auto msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
             std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
             showStatus(msg, 5000);
@@ -2443,14 +2453,6 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
         if (modelPath.isEmpty() && !selectedSegmentMeta.isEmpty()) {
             modelPath = localModelPathFromMeta(segPath, selectedSegmentMeta);
         }
-    }
-
-    QString dataInput = lasagnaDataInputPath();
-    if (dataInput.isEmpty()) {
-        auto msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
-        std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-        showStatus(msg, 5000);
-        return SubmissionResult::failure(msg);
     }
 
     QString outputDir;

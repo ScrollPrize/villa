@@ -19,6 +19,7 @@
 #include <QSet>
 #include <QSysInfo>
 #include <QTemporaryDir>
+#include <QTemporaryFile>
 #include <QUrl>
 #include <QtConcurrent/QtConcurrent>
 
@@ -33,6 +34,14 @@
 
 #ifdef Q_OS_UNIX
 #include <signal.h>
+#include <unistd.h>
+#endif
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 // Avahi client library for mDNS service discovery
@@ -108,34 +117,94 @@ QString md5Ref(const QByteArray& bytes)
         QCryptographicHash::hash(bytes, QCryptographicHash::Md5).toHex()));
 }
 
-QJsonObject materializeLocalArtifactUpload(const QJsonObject& upload)
+QString md5DigestRef(const QByteArray& digest)
 {
-    if (upload.contains(QStringLiteral("data")) || upload.contains(QStringLiteral("files"))) {
-        return upload;
+    return QStringLiteral("md5:%1").arg(QString::fromLatin1(digest.toHex()));
+}
+
+QByteArray jsonString(const QString& value)
+{
+    QByteArray encoded =
+        QJsonDocument(QJsonArray{value}).toJson(QJsonDocument::Compact);
+    return encoded.mid(1, encoded.size() - 2);
+}
+
+void writeUploadBytes(QIODevice& output, const QByteArray& bytes)
+{
+    if (output.write(bytes) != bytes.size()) {
+        throw std::runtime_error("Cannot write temporary artifact upload");
     }
+}
+
+QString writeBase64File(QIODevice& output, const QString& path)
+{
+    QFile input(path);
+    if (!input.open(QIODevice::ReadOnly)) {
+        throw std::runtime_error(
+            QStringLiteral("Cannot read artifact file: %1").arg(path).toStdString());
+    }
+
+    constexpr qint64 kChunkBytes = 3 * 1024 * 1024;
+    QCryptographicHash hash(QCryptographicHash::Md5);
+    while (!input.atEnd()) {
+        const QByteArray chunk = input.read(kChunkBytes);
+        if (chunk.isEmpty() && input.error() != QFileDevice::NoError) {
+            throw std::runtime_error(
+                QStringLiteral("Cannot read artifact file: %1").arg(path).toStdString());
+        }
+        hash.addData(chunk);
+        writeUploadBytes(output, chunk.toBase64());
+    }
+    return md5DigestRef(hash.result());
+}
+
+std::shared_ptr<QTemporaryFile> materializeLocalArtifactUpload(
+    const QJsonObject& upload)
+{
+    auto body = std::make_shared<QTemporaryFile>(
+        QDir::temp().filePath(QStringLiteral("vc3d-lasagna-upload-XXXXXX.json")));
+    body->setAutoRemove(true);
+    if (!body->open()) {
+        throw std::runtime_error("Cannot create temporary artifact upload");
+    }
+
+    if (upload.contains(QStringLiteral("data"))
+        || upload.contains(QStringLiteral("files"))) {
+        writeUploadBytes(
+            *body, QJsonDocument(upload).toJson(QJsonDocument::Compact));
+        body->seek(0);
+        return body;
+    }
+
     const QJsonObject ref = upload[QStringLiteral("object")].toObject();
     const QString payload = upload[QStringLiteral("_local_payload")].toString();
     const QString localPath = upload[QStringLiteral("_local_path")].toString();
-    if (ref.isEmpty() || payload.isEmpty() || localPath.isEmpty()) {
-        return upload;
+    if (ref.isEmpty()) {
+        throw std::runtime_error("Artifact upload is missing its object reference");
     }
 
-    QJsonObject out;
-    out[QStringLiteral("object")] = ref;
+    writeUploadBytes(
+        *body,
+        QByteArrayLiteral("{\"object\":")
+            + QJsonDocument(ref).toJson(QJsonDocument::Compact));
+
+    if (payload.isEmpty() || localPath.isEmpty()) {
+        throw std::runtime_error("Artifact upload is missing its local payload");
+    }
+
     if (payload == QStringLiteral("file")) {
-        QFile f(localPath);
-        if (!f.open(QIODevice::ReadOnly)) {
-            throw std::runtime_error(QStringLiteral("Cannot read artifact file: %1").arg(localPath).toStdString());
-        }
-        const QByteArray bytes = f.readAll();
-        const QString actualHash = md5Ref(bytes);
+        writeUploadBytes(*body, QByteArrayLiteral(",\"data\":\""));
+        const QString actualHash = writeBase64File(*body, localPath);
         if (actualHash != ref[QStringLiteral("hash")].toString()) {
-            throw std::runtime_error(QStringLiteral("Artifact file hash mismatch for %1: declared %2 actual %3")
-                                         .arg(ref[QStringLiteral("name")].toString(), ref[QStringLiteral("hash")].toString(), actualHash)
-                                         .toStdString());
+            throw std::runtime_error(
+                QStringLiteral("Artifact file hash mismatch for %1: declared %2 actual %3")
+                    .arg(ref[QStringLiteral("name")].toString(),
+                         ref[QStringLiteral("hash")].toString(), actualHash)
+                    .toStdString());
         }
-        out[QStringLiteral("data")] = QString::fromLatin1(bytes.toBase64());
-        return out;
+        writeUploadBytes(*body, QByteArrayLiteral("\"}"));
+        body->seek(0);
+        return body;
     }
 
     if (payload == QStringLiteral("directory")) {
@@ -154,39 +223,44 @@ QJsonObject materializeLocalArtifactUpload(const QJsonObject& upload)
         std::sort(files.begin(), files.end());
 
         QByteArray manifest;
-        QJsonObject encodedFiles;
+        writeUploadBytes(*body, QByteArrayLiteral(",\"files\":{"));
+        bool first = true;
         for (const auto& path : files) {
-            QFile f(QString::fromStdString(path.string()));
-            if (!f.open(QIODevice::ReadOnly)) {
-                throw std::runtime_error(QStringLiteral("Cannot read artifact file: %1")
-                                             .arg(QString::fromStdString(path.string()))
-                                             .toStdString());
-            }
-            const QByteArray bytes = f.readAll();
             const auto relPath = fs::relative(path, root, ec);
             if (ec) {
-                throw std::runtime_error(QStringLiteral("Cannot compute artifact relative path: %1")
-                                             .arg(QString::fromStdString(path.string()))
-                                             .toStdString());
+                throw std::runtime_error(
+                    QStringLiteral("Cannot compute artifact relative path: %1")
+                        .arg(QString::fromStdString(path.string()))
+                        .toStdString());
             }
             const QString rel = QString::fromStdString(relPath.generic_string());
+            if (!first) writeUploadBytes(*body, QByteArrayLiteral(","));
+            first = false;
+            writeUploadBytes(*body, jsonString(rel) + QByteArrayLiteral(":\""));
+            const QString fileHash = writeBase64File(
+                *body, QString::fromStdString(path.string()));
+            writeUploadBytes(*body, QByteArrayLiteral("\""));
             manifest.append(rel.toUtf8());
             manifest.append('\t');
-            manifest.append(md5Ref(bytes).toUtf8());
+            manifest.append(fileHash.toUtf8());
             manifest.append('\n');
-            encodedFiles[rel] = QString::fromLatin1(bytes.toBase64());
         }
         const QString actualHash = md5Ref(manifest);
         if (actualHash != ref[QStringLiteral("hash")].toString()) {
-            throw std::runtime_error(QStringLiteral("Artifact directory hash mismatch for %1: declared %2 actual %3")
-                                         .arg(ref[QStringLiteral("name")].toString(), ref[QStringLiteral("hash")].toString(), actualHash)
-                                         .toStdString());
+            throw std::runtime_error(
+                QStringLiteral("Artifact directory hash mismatch for %1: declared %2 actual %3")
+                    .arg(ref[QStringLiteral("name")].toString(),
+                         ref[QStringLiteral("hash")].toString(), actualHash)
+                    .toStdString());
         }
-        out[QStringLiteral("files")] = encodedFiles;
-        return out;
+        writeUploadBytes(*body, QByteArrayLiteral("}}"));
+        body->seek(0);
+        return body;
     }
 
-    throw std::runtime_error(QStringLiteral("Unknown local artifact payload kind: %1").arg(payload).toStdString());
+    throw std::runtime_error(
+        QStringLiteral("Unknown local artifact payload kind: %1")
+            .arg(payload).toStdString());
 }
 
 void appendObjectRefIfNew(QJsonArray& refs, QSet<QString>& refKeys, const QJsonObject& ref)
@@ -423,6 +497,9 @@ QString findLasagnaServiceScript()
 {
     QString appDir = QCoreApplication::applicationDirPath();
     QStringList searchPaths = {
+        // Current monorepo layout: build/bin -> villa/lasagna.
+        QDir(appDir).filePath("../../../lasagna/fit_service.py"),
+        QDir::home().filePath("villa/lasagna/fit_service.py"),
         // Development: build dir is volume-cartographer/build/bin/
         QDir(appDir).filePath("../../vesuvius/src/vesuvius/exps_2d_model/fit_service.py"),
         QDir(appDir).filePath("../../../vesuvius/src/vesuvius/exps_2d_model/fit_service.py"),
@@ -451,8 +528,15 @@ LasagnaServiceManager& LasagnaServiceManager::instance()
     return inst;
 }
 
-LasagnaServiceManager::LasagnaServiceManager(QObject* parent)
+LasagnaServiceManager* LasagnaServiceManager::createTransient(QObject* parent)
+{
+    return new LasagnaServiceManager(parent, true);
+}
+
+LasagnaServiceManager::LasagnaServiceManager(QObject* parent,
+                                             bool containProcessTree)
     : QObject(parent)
+    , _containProcessTree(containProcessTree)
 {
     _nam = new QNetworkAccessManager(this);
     _pollTimer = new QTimer(this);
@@ -497,15 +581,26 @@ QString LasagnaServiceManager::localSourceName() const
 // Service lifecycle
 // ---------------------------------------------------------------------------
 
-bool LasagnaServiceManager::ensureServiceRunning(const QString& pythonPath)
+bool LasagnaServiceManager::ensureServiceRunning(const QString& pythonPath,
+                                                 const QString& dataDirectory)
 {
     if (_isExternal && _serviceReady) {
         return true;
     }
+    const QString requestedDataDirectory =
+        dataDirectory.trimmed().isEmpty()
+            ? QString{}
+            : QFileInfo(dataDirectory).absoluteFilePath();
     if (_process && _process->state() == QProcess::Running && _serviceReady) {
-        return true;
+        if (requestedDataDirectory.isEmpty() ||
+            requestedDataDirectory == _dataDirectory) {
+            return true;
+        }
+        // The fit service discovers datasets only at startup. Switch its data
+        // directory when the active project/volume changes.
+        stopService();
     }
-    return startService(pythonPath);
+    return startService(pythonPath, requestedDataDirectory);
 }
 
 void LasagnaServiceManager::connectToExternal(const QString& host, int port)
@@ -569,7 +664,8 @@ void LasagnaServiceManager::connectToExternal(const QString& host, int port)
     });
 }
 
-bool LasagnaServiceManager::startService(const QString& pythonPath)
+bool LasagnaServiceManager::startService(const QString& pythonPath,
+                                         const QString& dataDirectory)
 {
     ++_requestGeneration;
     clearLocalUploadJobs();
@@ -589,8 +685,52 @@ bool LasagnaServiceManager::startService(const QString& pythonPath)
         return false;
     }
 
+    const QFileInfo dataDirectoryInfo(dataDirectory);
+    const QDir dataDir(dataDirectoryInfo.absoluteFilePath());
+    if (dataDirectory.trimmed().isEmpty() || !dataDirectoryInfo.isDir() ||
+        dataDir.entryList(QStringList{QStringLiteral("*.lasagna.json")},
+                          QDir::Files | QDir::Readable | QDir::NoDotAndDotDot)
+            .isEmpty()) {
+        _lastError = dataDirectory.trimmed().isEmpty()
+            ? tr("No Lasagna data directory was provided")
+            : tr("Lasagna data directory contains no .lasagna.json datasets: %1")
+                  .arg(dataDirectory);
+        emit serviceError(_lastError);
+        return false;
+    }
+    _dataDirectory = dataDirectoryInfo.absoluteFilePath();
+
     _process = std::make_unique<QProcess>();
     _process->setProcessChannelMode(QProcess::SeparateChannels);
+
+#ifdef Q_OS_UNIX
+    if (_containProcessTree) {
+        // Give this service a private process group. Its Python workers inherit
+        // the group, allowing the transient Spiral workflow to reap the whole
+        // tree even if the HTTP service has to be killed.
+        _process->setChildProcessModifier([] {
+            ::setpgid(0, 0);
+        });
+    }
+#endif
+
+#ifdef Q_OS_WIN
+    if (_containProcessTree) {
+        auto* job = CreateJobObjectW(nullptr, nullptr);
+        if (job) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+            limits.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (SetInformationJobObject(
+                    job, JobObjectExtendedLimitInformation, &limits,
+                    sizeof(limits))) {
+                _processJob = job;
+            } else {
+                CloseHandle(job);
+            }
+        }
+    }
+#endif
 
     connect(_process.get(), QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, &LasagnaServiceManager::handleProcessFinished);
@@ -617,7 +757,10 @@ bool LasagnaServiceManager::startService(const QString& pythonPath)
     QString python = pythonPath.isEmpty() ? findPythonExecutable() : pythonPath;
 
     // Port 0 = auto-select
-    QStringList args = {scriptPath, "--port", "0"};
+    QStringList args = {
+        scriptPath, QStringLiteral("--port"), QStringLiteral("0"),
+        QStringLiteral("--data-dir"), _dataDirectory
+    };
 
     emit statusMessage(tr("Starting lasagna service..."));
     std::cout << "Starting lasagna service: " << python.toStdString();
@@ -632,8 +775,29 @@ bool LasagnaServiceManager::startService(const QString& pythonPath)
         _lastError = tr("Failed to start lasagna service process");
         emit serviceError(_lastError);
         _process.reset();
+#ifdef Q_OS_WIN
+        if (_processJob) {
+            CloseHandle(static_cast<HANDLE>(_processJob));
+            _processJob = nullptr;
+        }
+#endif
+        _dataDirectory.clear();
         return false;
     }
+
+#ifdef Q_OS_WIN
+    if (_containProcessTree && _processJob) {
+        HANDLE process = OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE, static_cast<DWORD>(_process->processId()));
+        if (!process ||
+            !AssignProcessToJobObject(static_cast<HANDLE>(_processJob), process)) {
+            CloseHandle(static_cast<HANDLE>(_processJob));
+            _processJob = nullptr;
+        }
+        if (process) CloseHandle(process);
+    }
+#endif
 
     emit statusMessage(tr("Waiting for lasagna service to initialize..."));
 
@@ -677,6 +841,7 @@ void LasagnaServiceManager::stopService()
         _serviceReady = false;
         _optimizationRunning = false;
         _isExternal = false;
+        _dataDirectory.clear();
         _host = QStringLiteral("127.0.0.1");
         _port = 0;
         _activeJobId.clear();
@@ -702,15 +867,42 @@ void LasagnaServiceManager::stopService()
     std::cout << "Stopping lasagna service..." << std::endl;
 
     if (_process->state() == QProcess::Running) {
-        _process->terminate();
-        if (!_process->waitForFinished(kServiceStopTimeoutMs)) {
-            _process->kill();
-            _process->waitForFinished(1000);
+#ifdef Q_OS_UNIX
+        if (_containProcessTree && _process->processId() > 0) {
+            const auto processGroup = static_cast<pid_t>(_process->processId());
+            ::kill(-processGroup, SIGTERM);
+            _process->waitForFinished(kServiceStopTimeoutMs);
+            // The group signal is intentional even when the leader exited:
+            // workers can outlive it and must not survive this transient job.
+            ::kill(-processGroup, SIGKILL);
+            if (_process->state() != QProcess::NotRunning) {
+                _process->kill();
+                _process->waitForFinished(1000);
+            }
+        } else
+#endif
+        {
+            _process->terminate();
+            if (!_process->waitForFinished(kServiceStopTimeoutMs)) {
+                _process->kill();
+                _process->waitForFinished(1000);
+            }
         }
     }
 
+#ifdef Q_OS_WIN
+    if (_processJob) {
+        // Graceful termination above gives the service a chance to flush. The
+        // job is the backstop for any worker processes that remain.
+        TerminateJobObject(static_cast<HANDLE>(_processJob), 1);
+        CloseHandle(static_cast<HANDLE>(_processJob));
+        _processJob = nullptr;
+    }
+#endif
+
     _process.reset();
     _serviceReady = false;
+    _dataDirectory.clear();
     _port = 0;
     _optimizationRunning = false;
     _activeJobId.clear();
@@ -735,6 +927,68 @@ bool LasagnaServiceManager::isRunning() const
         return _serviceReady;
     }
     return _process && _process->state() == QProcess::Running && _serviceReady;
+}
+
+QString LasagnaServiceManager::findConfigFile(const QString& fileName)
+{
+    const QString serviceScript = findLasagnaServiceScript();
+    if (serviceScript.isEmpty() || fileName.trimmed().isEmpty()) {
+        return {};
+    }
+    const QString candidate = QDir(QFileInfo(serviceScript).absolutePath())
+                                  .filePath(QStringLiteral("configs/%1").arg(fileName));
+    return QFileInfo(candidate).isFile() ? QFileInfo(candidate).absoluteFilePath()
+                                         : QString{};
+}
+
+QJsonObject LasagnaServiceManager::makeTifxyzArtifactUpload(
+    const QString& tifxyzDirectory)
+{
+    namespace fs = std::filesystem;
+    const fs::path root(tifxyzDirectory.toStdString());
+    std::error_code ec;
+    if (!fs::is_directory(root, ec)) {
+        return {};
+    }
+
+    std::vector<fs::path> files;
+    for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
+        if (entry.is_regular_file()) {
+            files.push_back(entry.path());
+        }
+    }
+    if (ec || files.empty()) {
+        return {};
+    }
+    std::sort(files.begin(), files.end());
+
+    QByteArray manifest;
+    for (const auto& path : files) {
+        QFile file(QString::fromStdString(path.string()));
+        if (!file.open(QIODevice::ReadOnly)) {
+            return {};
+        }
+        const QByteArray bytes = file.readAll();
+        const fs::path relative = fs::relative(path, root, ec);
+        if (ec) {
+            return {};
+        }
+        manifest.append(QString::fromStdString(relative.generic_string()).toUtf8());
+        manifest.append('\t');
+        manifest.append(md5Ref(bytes).toUtf8());
+        manifest.append('\n');
+    }
+
+    QJsonObject ref;
+    ref[QStringLiteral("type")] = QStringLiteral("tifxyz_segment");
+    ref[QStringLiteral("name")] = QFileInfo(tifxyzDirectory).fileName();
+    ref[QStringLiteral("hash")] = md5Ref(manifest);
+
+    QJsonObject upload;
+    upload[QStringLiteral("object")] = ref;
+    upload[QStringLiteral("_local_payload")] = QStringLiteral("directory");
+    upload[QStringLiteral("_local_path")] = QFileInfo(tifxyzDirectory).absoluteFilePath();
+    return upload;
 }
 
 void LasagnaServiceManager::rankLaplaceSnapPairs(
@@ -1536,9 +1790,9 @@ void LasagnaServiceManager::processNextArtifactUpload()
             QNetworkRequest req = fitServiceRequest(url);
             req.setRawHeader(kVc3dSourceHeader, source.toUtf8());
             req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-            QJsonObject upload;
+            std::shared_ptr<QTemporaryFile> uploadBody;
             try {
-                upload = materializeLocalArtifactUpload(uploadSource);
+                uploadBody = materializeLocalArtifactUpload(uploadSource);
             } catch (const std::exception& ex) {
                 const QString msg = tr("Artifact packing failed: %1").arg(QString::fromStdString(ex.what()));
                 updateLocalUploadJob(localJobId, {
@@ -1550,13 +1804,16 @@ void LasagnaServiceManager::processNextArtifactUpload()
                 processNextArtifactUpload();
                 return;
             }
-            const QByteArray body = QJsonDocument(upload).toJson(QJsonDocument::Compact);
-            QNetworkReply* reply = _nam->post(req, body);
+            req.setHeader(QNetworkRequest::ContentLengthHeader,
+                          uploadBody->size());
+            QNetworkReply* reply = _nam->post(req, uploadBody.get());
             _activeArtifactReply = reply;
             _activeArtifactReplyJobId = localJobId;
+            auto lastProgressPermille = std::make_shared<int>(-1);
             connect(reply, &QNetworkReply::uploadProgress,
                     this,
-                    [this, localJobId, uploads, index](qint64 bytesSent, qint64 bytesTotal) {
+                    [this, localJobId, uploads, index, lastProgressPermille]
+                    (qint64 bytesSent, qint64 bytesTotal) {
                 if (bytesTotal <= 0 || uploads->isEmpty()
                     || _cancelledLocalUploadJobs.contains(localJobId)) {
                     return;
@@ -1565,12 +1822,16 @@ void LasagnaServiceManager::processNextArtifactUpload()
                     static_cast<double>(bytesSent) / static_cast<double>(bytesTotal), 0.0, 1.0);
                 const double progress = (static_cast<double>(*index) + objectProgress)
                     / static_cast<double>(uploads->size());
+                const int permille = static_cast<int>(progress * 1000.0);
+                if (permille == *lastProgressPermille) return;
+                *lastProgressPermille = permille;
                 updateLocalUploadJob(localJobId, {
                     {QStringLiteral("upload_progress"), progress},
                 });
             });
             connect(reply, &QNetworkReply::finished, this,
-                    [this, reply, uploads, index, localJobId, generation, uploadNext]() {
+                    [this, reply, uploads, index, localJobId, generation,
+                     uploadNext, uploadBody]() {
                 if (generation != _requestGeneration) {
                     reply->deleteLater();
                     return;

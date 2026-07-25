@@ -292,11 +292,12 @@ async def vc3d_set_render_settings(
 
 @mcp.tool()
 async def vc3d_get_overlay() -> dict[str, Any]:
-    """Read the current overlay-volume settings (the semi-transparent second
-    volume rendered on top of the base volume).
+    """Read the active workspace's overlay-volume settings (the
+    semi-transparent second volume rendered on top of the base volume). These
+    are the same settings shown in VC3D's Overlay Volume controls.
 
     Returns {"volumeId" (str, "" when no overlay is set), "colormap" (str, ""
-    when unset), "opacity" (0..1), "threshold" (0..255), "windowLow"/
+    for grayscale), "opacity" (0..1), "threshold" (0..255), "windowLow"/
     "windowHigh" (0..255), "maxDisplayedResolution" (int 0..5),
     "composite": {"enabled" (bool), "method" ("max"|"mean"|"min"),
     "layersFront"/"layersBehind" (int 0..64)}}."""
@@ -323,7 +324,7 @@ async def vc3d_set_overlay(
     clear=True. Unknown id raises -32007.
     clear: True clears the overlay volume (equivalent to volume_id="").
     colormap: colormap id, one of "fire", "viridis", "magma", "red", "green",
-    "blue", "cyan", "magenta", "glasbey_black0"; empty string clears it.
+    "blue", "cyan", "magenta", "glasbey_black0"; empty string uses grayscale.
     An unrecognized id raises -32602 rather than being silently ignored.
     opacity: overlay opacity, clamped 0..1.
     threshold: overlay display threshold, clamped 0..255.
@@ -334,9 +335,10 @@ async def vc3d_set_overlay(
     An unrecognized method raises -32602.
 
     Returns the full resulting overlay settings object (same shape as
-    vc3d_get_overlay). Note: ViewerManager re-validates the overlay volume's
-    coordinate space against the base volume and may silently reject a
-    mismatched volume_id -- check the echoed "volumeId" to confirm it stuck.
+    vc3d_get_overlay). The active workspace and its Overlay Volume controls
+    update together. VC3D re-validates the overlay volume's coordinate space
+    against the base volume and may silently reject a mismatched volume_id --
+    check the echoed "volumeId" to confirm it stuck.
     """
     return await _call(
         "viewer.set_overlay",
@@ -358,9 +360,9 @@ async def vc3d_set_overlay(
 @mcp.tool()
 async def vc3d_list_overlay_volumes() -> dict[str, Any]:
     """List every volume id in the open package, for picking an overlay
-    volume via vc3d_set_overlay. Not filtered by coordinate-space
-    compatibility with the base volume -- vc3d_set_overlay re-validates and
-    may silently reject a mismatched pick.
+    volume in the active workspace via vc3d_set_overlay. Not filtered by
+    coordinate-space compatibility with the base volume --
+    vc3d_set_overlay re-validates and may silently reject a mismatched pick.
 
     Returns {"volumes": [{"id", "current" (bool, true for the base volume)}],
     "overlayVolumeId" (str, "" when no overlay is set)}."""

@@ -232,6 +232,16 @@ void ViewerOverlayControllerBase::OverlayBuilder::addRect(const QRectF& rect,
     _primitives.emplace_back(std::move(prim));
 }
 
+void ViewerOverlayControllerBase::OverlayBuilder::addPainterPath(
+    const QPainterPath& path, OverlayStyle style)
+{
+    if (path.isEmpty()) return;
+    PainterPathPrimitive prim;
+    prim.path = path;
+    prim.style = style;
+    _primitives.emplace_back(std::move(prim));
+}
+
 void ViewerOverlayControllerBase::OverlayBuilder::addText(const QPointF& position,
                                                           const QString& text,
                                                           const QFont& font,
@@ -783,6 +793,21 @@ ViewerOverlayControllerBase::projectedPointChain(VolumeViewerBase* viewer,
     return filtered;
 }
 
+ViewerOverlayControllerBase::FilteredPoints
+ViewerOverlayControllerBase::projectPointChainForHitTest(
+    VolumeViewerBase* viewer,
+    const std::vector<cv::Vec3f>& points,
+    float tolerance)
+{
+    // Hit-test callers commonly assemble a temporary point vector. Do not let
+    // its transient data pointer alias a resident render-cache key.
+    clearPointChainProjectionCache(viewer);
+    std::vector<float> opacities;
+    FilteredPoints result = projectedPointChain(viewer, points, tolerance, &opacities);
+    clearPointChainProjectionCache(viewer);
+    return result;
+}
+
 void ViewerOverlayControllerBase::clearPointChainProjectionCache()
 {
     _pointChainProjectionCache.clear();
@@ -1192,6 +1217,10 @@ void ViewerOverlayControllerBase::applyPrimitives(VolumeViewerBase* viewer,
                         style.brushColor = Qt::transparent;
                     }
                     addItem(item, style);
+                } else if constexpr (std::is_same_v<T, PainterPathPrimitive>) {
+                    flushPointGroups();
+                    auto* item = new QGraphicsPathItem(prim.path);
+                    addItem(item, prim.style);
                 } else if constexpr (std::is_same_v<T, TextPrimitive>) {
                     flushPointGroups();
                     if (prim.outlined) {

@@ -7,6 +7,7 @@
 #include "StatusDockPanelHost.hpp"
 
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/render/DecodedChunkCacheBudget.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -2519,7 +2520,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    _state = new CState(_cacheSizeBytes, this);
+    _decodedChunkCacheBudget =
+        std::make_shared<vc::render::DecodedChunkCacheBudget>(_cacheSizeBytes);
+    vc::render::ChunkCache::setDecodedByteBudgetDefault(
+        _decodedChunkCacheBudget);
+    _state = new CState(_cacheSizeBytes, this, _decodedChunkCacheBudget);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
     connect(_state, &CState::vpkgChanged, this,
@@ -2722,12 +2727,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             [this](const QString& message, int timeout) {
                 if (statusBar()) {
                     showStatusBarMessage(message, timeout);
-                }
-            });
-    connect(_state, &CState::volumeChanged, _volumeOverlay.get(),
-            [this](const std::shared_ptr<Volume>&, const std::string&) {
-                if (_volumeOverlay && activeWorkspaceViewerManager() == _viewerManager.get()) {
-                    _volumeOverlay->refreshForCurrentVolume();
                 }
             });
     _viewerManager->setVolumeOverlay(_volumeOverlay.get());
@@ -5285,7 +5284,8 @@ bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
         if (!manager.isRunning()) {
             return fail(tr("Connect the external Lasagna service before ranking snap candidates."));
         }
-    } else if (!manager.ensureServiceRunning()) {
+    } else if (!manager.ensureServiceRunning(
+                   {}, QString::fromStdString(manifestPath.parent_path().string()))) {
         return fail(tr("Failed to start Lasagna service: %1").arg(manager.lastError()));
     }
 
@@ -7576,9 +7576,6 @@ void CWindow::CreateWidgets(void)
         if (_fiberOverlay) {
             _fiberOverlay->setViewDistance(distance);
         }
-        if (_spiralWorkspace) {
-            _spiralWorkspace->setFiberViewDistance(distance);
-        }
         syncFiberViewDistances(distance);
     };
     if (_fiberWidget) {
@@ -8342,6 +8339,15 @@ void CWindow::saveWindowState()
 
 void CWindow::closeEvent(QCloseEvent* event)
 {
+    if (_spiralWorkspace && !_spiralCloseGuardBypass
+        && _spiralWorkspace->hasPendingBrushWork()) {
+        event->ignore();
+        _spiralWorkspace->requestSessionExit([this]() {
+            _spiralCloseGuardBypass = true;
+            close();
+        });
+        return;
+    }
     _destroyingWindow = true;
     // Flush a render-bench recording (if any) before teardown.
     if (_benchRecorder && _benchRecorder->attached()) {

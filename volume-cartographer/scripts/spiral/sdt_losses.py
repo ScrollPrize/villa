@@ -1647,6 +1647,28 @@ def _phase_and_count_losses(
         return
     started = time.perf_counter()
     num_pairs = int(cfg['dense_spacing_num_pairs'])
+    if num_pairs <= 0:
+        # A zero shared-ray budget disables phase/count sampling. Be defensive
+        # here because session configuration is remote and may come from an
+        # older client with independently mutable weights and counts. Density's
+        # supplemental budget remains usable without a shared batch.
+        if density_active:
+            total_density_pairs = max(
+                0, int(cfg['dense_spacing_density_extra_pairs']))
+            chunk_cap = max(
+                1, int(cfg['dense_spacing_density_chunk_pairs']))
+            remaining = total_density_pairs
+            while remaining > 0:
+                n_chunk = min(chunk_cap, remaining)
+                remaining -= n_chunk
+                chunk_loss, chunk_metrics = _density_only_batch(
+                    slice_to_spiral_transform, dr_per_winding, sdt_volume,
+                    normal_volume, cfg, inner, outer, n_chunk, device,
+                    z_begin, z_end, generator)
+                yield ('dense_spacing_density',
+                       chunk_loss * (n_chunk / total_density_pairs),
+                       chunk_metrics)
+        return
     k, pair_m, theta, z = _sample_spacing_pairs(
         cfg, inner, outer, num_pairs, device, z_begin, z_end, generator)
     m_f = pair_m.to(k.dtype)
