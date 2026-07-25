@@ -30,6 +30,9 @@ class SpiralServiceManager : public QObject
 {
     Q_OBJECT
 public:
+    using FetchPreviewFileCallback =
+        std::function<void(const QString& localPath, const QString& error)>;
+
     enum class ConnectionState { Disconnected, Starting, Connecting, Ready,
                                  Reconnecting, Failed };
     Q_ENUM(ConnectionState)
@@ -72,6 +75,11 @@ public:
                          const QString& inputId, const QString& role = {});
     // Remove an added input that has not joined the resident fit yet.
     void removeEphemeralInput(const QString& kind, const QString& inputId);
+    // Fetch a file intentionally omitted from the initial preview transfer.
+    // Only files declared by the currently installed preview artifact are
+    // accepted by the cache.
+    void fetchPreviewFile(const QString& relativeName,
+                          FetchPreviewFileCallback done);
 
 signals:
     void connectionStateChanged(SpiralServiceManager::ConnectionState state,
@@ -166,6 +174,7 @@ private:
     quint64 _commandCounter = 0;
     qint64 _lastStatusGeneration = -1;
     QString _installedPreviewArtifact;
+    QString _installedPreviewSession;
     QString _fetchingPreviewArtifact;
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;

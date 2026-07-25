@@ -74,6 +74,7 @@ private:
         QString error;
         struct LossMap {
             QString name;
+            QString relativePath;
             QString imagePath;
             double weight = 0.0;
             double p50 = 0.0;
@@ -172,6 +173,7 @@ private:
     QHash<QString, PreviewLoadResult::LossMap> _previewLossMaps;
     QString _selectedLossMap;
     QString _loadedLossMap;
+    QSet<QString> _fetchingLossMaps;
     QImage _loadedLossMapImage;
     qreal _lossMapOpacity = 0.8;
     quint64 _previewDisplayRevision = 0;

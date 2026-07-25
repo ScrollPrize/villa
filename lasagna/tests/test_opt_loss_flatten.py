@@ -36,7 +36,7 @@ def _make_flatten_model(
 	valid: torch.Tensor | None = None,
 	*,
 	device: torch.device | None = None,
-	mesh_step: int = 1,
+	mesh_step: float = 1,
 	flatten_filter_source_angles: bool = False,
 	flatten_filter_angle_deg: float = 90.0,
 	flatten_filter_radius: int = 2,
@@ -111,6 +111,16 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertAlmostEqual(float(map_yx[0, 0, 1]), 0.0)
 		self.assertAlmostEqual(float(map_yx[-1, -1, 0]), 6.0)
 		self.assertAlmostEqual(float(map_yx[-1, -1, 1]), 6.0)
+
+		res = mdl(
+			fit._dummy_flatten_data(),
+			needs=fit_model.ModelForwardNeeds(flatten=True),
+		)
+		sdir_loss, _maps, _masks = opt_loss_flatten.flatten_sdir_loss(res=res)
+		map_step_loss, _maps, _masks = opt_loss_flatten.flatten_map_step_loss(
+			res=res)
+		self.assertLess(float(sdir_loss.detach()), 1.0e-6)
+		self.assertLess(float(map_step_loss.detach()), 1.0e-6)
 
 		_map, xyz, mask, _quad = mdl._flatten_sample_current()
 		self.assertEqual(tuple(mask.shape), (7, 7))
@@ -842,6 +852,38 @@ class FlattenLossTest(unittest.TestCase):
 			self.assertAlmostEqual(checkpoint_meta["scale"][0], 1.0 / 20.5)
 			self.assertAlmostEqual(checkpoint_meta["scale"][1], 1.0 / 20.5)
 
+	def test_default_flatten_output_step_preserves_fractional_source_step(self) -> None:
+		source_step = fit._flatten_source_step_from_tifxyz_meta(
+			{"scale": [1.0 / 20.5, 1.0 / 20.5]},
+			100,
+		)
+		mdl = _make_flatten_model(
+			_flat_grid(4, 4, sx=source_step, sy=source_step),
+			mesh_step=source_step,
+		)
+
+		self.assertAlmostEqual(source_step, 20.5)
+		self.assertAlmostEqual(mdl.params.flatten_output_step, 20.5)
+		self.assertEqual(mdl.flatten_output_shape, (4, 4))
+		self.assertAlmostEqual(float(mdl.flatten_map_step), 1.0)
+
+		with tempfile.TemporaryDirectory() as td:
+			out = Path(td)
+			fit._export_flatten_result(
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				out_dir=out,
+				scale=1.0 / source_step,
+				voxel_size_um=None,
+				fit_config={},
+				model_source=None,
+			)
+			meta = json.loads(
+				(out / "flatten.tifxyz" / "meta.json").read_text(
+					encoding="utf-8"))
+			self.assertAlmostEqual(meta["scale"][0], 1.0 / source_step)
+			self.assertAlmostEqual(meta["scale"][1], 1.0 / source_step)
+
 	def test_forward_flatten_export_inverts_uv_and_keeps_holes_invalid(self) -> None:
 		xyz = _flat_grid(4, 4)
 		valid = torch.ones(4, 4, dtype=torch.bool)
@@ -900,11 +942,19 @@ class FlattenLossTest(unittest.TestCase):
 			root = Path(td)
 			tifxyz = root / "input.tifxyz"
 			tifxyz.mkdir()
-			xyz = _flat_grid(4, 4).numpy()
+			source_step = 20.5
+			xyz = _flat_grid(
+				4,
+				4,
+				sx=source_step,
+				sy=source_step,
+			).numpy()
 			tifffile.imwrite(str(tifxyz / "x.tif"), xyz[..., 0].astype("float32"))
 			tifffile.imwrite(str(tifxyz / "y.tif"), xyz[..., 1].astype("float32"))
 			tifffile.imwrite(str(tifxyz / "z.tif"), xyz[..., 2].astype("float32"))
-			(tifxyz / "meta.json").write_text(json.dumps({"scale": [1.0, 1.0]}), encoding="utf-8")
+			(tifxyz / "meta.json").write_text(json.dumps({
+				"scale": [1.0 / source_step, 1.0 / source_step],
+			}), encoding="utf-8")
 			cfg_path = root / "flatten_forward.json"
 			cfg_path.write_text(json.dumps({
 				"args": {
@@ -931,6 +981,15 @@ class FlattenLossTest(unittest.TestCase):
 			st = torch.load(out / "model_final.pt", map_location="cpu", weights_only=False)
 			self.assertIn("flatten_map_flat", st)
 			self.assertEqual(tuple(st["flatten_map_flat"].shape[-1:]), (2,))
+			self.assertAlmostEqual(
+				st["_model_params_"]["flatten_output_step"],
+				source_step,
+			)
+			meta = json.loads(
+				(out / "tifxyz" / "flatten.tifxyz" / "meta.json").read_text(
+					encoding="utf-8"))
+			self.assertAlmostEqual(meta["scale"][0], 1.0 / source_step)
+			self.assertAlmostEqual(meta["scale"][1], 1.0 / source_step)
 
 
 if __name__ == "__main__":

@@ -168,6 +168,7 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     // every new connection resets the status/preview high-water marks.
     _lastStatusGeneration = -1;
     _installedPreviewArtifact.clear();
+    _installedPreviewSession.clear();
     _fetchingPreviewArtifact.clear();
     _synchronizedSessionId.clear();
     _statusFailures = 0;
@@ -422,6 +423,7 @@ void SpiralServiceManager::restartRemoteService()
              _remoteLogFailures = 0;
              _lastStatusGeneration = -1;
              _installedPreviewArtifact.clear();
+             _installedPreviewSession.clear();
              _fetchingPreviewArtifact.clear();
              _synchronizedSessionId.clear();
              _lastRemoteLogSequence = 0;
@@ -1135,6 +1137,7 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     }
     if (!active) {
         _synchronizedSessionId.clear();
+        _installedPreviewSession.clear();
     } else if (sessionId != _synchronizedSessionId) {
         const QJsonObject request =
             status.value(QStringLiteral("session_request")).toObject();
@@ -1174,6 +1177,7 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                 // Previews are installed in order; a stale download is ignored.
                 if (sequence < _previewSequence) return;
                 _installedPreviewArtifact = previewId;
+                _installedPreviewSession = sessionId;
                 _lastPreviewLocalPath = entryPath;
                 emit previewAvailable(entryPath, sequence);
                 _artifactCache->pruneSession(
@@ -1181,4 +1185,27 @@ void SpiralServiceManager::syncArtifacts(const QJsonObject& status)
                     {_lastPreviewLocalPath});
             });
     }
+}
+
+void SpiralServiceManager::fetchPreviewFile(const QString& relativeName,
+                                            FetchPreviewFileCallback done)
+{
+    if (_installedPreviewArtifact.isEmpty() || _installedPreviewSession.isEmpty()) {
+        done({}, tr("No Spiral preview artifact is installed"));
+        return;
+    }
+    const QString artifactId = _installedPreviewArtifact;
+    const QString sessionId = _installedPreviewSession;
+    const quint64 generation = _connectionGeneration;
+    _artifactCache->fetchFile(
+        sessionId, artifactId, relativeName,
+        [this, artifactId, generation, done = std::move(done)](
+            const QString& localPath, const QString& error, bool gone) {
+            if (generation != _connectionGeneration
+                || artifactId != _installedPreviewArtifact)
+                return;
+            done(localPath,
+                 gone ? tr("The Spiral preview was pruned before the file was downloaded")
+                      : error);
+        });
 }

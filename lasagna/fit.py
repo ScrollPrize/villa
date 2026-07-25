@@ -1108,18 +1108,18 @@ def _dummy_flatten_data() -> fit_data.FitData3D:
 	)
 
 
-def _mesh_step_from_tifxyz_meta(meta: dict, fallback: int) -> int:
+def _flatten_source_step_from_tifxyz_meta(meta: dict, fallback: int) -> float:
 	scale = meta.get("scale") if isinstance(meta, dict) else None
 	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
-		return max(1, int(round(1.0 / float(scale[0]))))
-	return max(1, int(fallback))
+		return 1.0 / float(scale[0])
+	return float(max(1, int(fallback)))
 
 
-def _scale_from_tifxyz_meta(meta: dict, mesh_step: int) -> float:
+def _scale_from_tifxyz_meta(meta: dict, source_step: float) -> float:
 	scale = meta.get("scale") if isinstance(meta, dict) else None
 	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
 		return float(scale[0])
-	return 1.0 / float(max(1, int(mesh_step)))
+	return 1.0 / float(source_step)
 
 
 def _shape_list(shape: tuple[int, int, int] | None) -> list[int] | None:
@@ -1305,8 +1305,8 @@ def _run_flatten_mode(
 	device = torch.device(str(getattr(args, "device", "cuda")))
 	from tifxyz_io import load_tifxyz
 	xyz, valid, meta = load_tifxyz(str(ext0["path"]), device=device)
-	mesh_step = _mesh_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
-	scale = _scale_from_tifxyz_meta(meta, mesh_step)
+	source_step = _flatten_source_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
+	scale = _scale_from_tifxyz_meta(meta, source_step)
 
 	stage_cfg = copy.deepcopy(cfg)
 	for key in ("external_surfaces", "tifxyz", "voxel_size_um", "corr_points"):
@@ -1328,7 +1328,7 @@ def _run_flatten_mode(
 	))
 	flatten_output_step = float(flatten_args.get(
 		"flatten_output_step",
-		mesh_step,
+		source_step,
 	))
 	filter_source_angles = _truthy_config_bool(flatten_args.get("flatten_filter_source_angles", True))
 	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
@@ -1338,7 +1338,7 @@ def _run_flatten_mode(
 		xyz,
 		valid,
 		device=device,
-		mesh_step=mesh_step,
+		mesh_step=source_step,
 		winding_step=model_cfg.winding_step,
 		subsample_mesh=model_cfg.subsample_mesh,
 		subsample_winding=model_cfg.subsample_winding,
@@ -1358,7 +1358,7 @@ def _run_flatten_mode(
 		f"[fit] model-init=flatten solver={flatten_direction} source={ext0['path']} "
 		f"shape={tuple(xyz.shape)} valid={int(valid.sum())}/{valid.numel()} "
 		f"model_shape={mdl.mesh_h}x{mdl.mesh_w} "
-		f"source_step={mesh_step} output_step={flatten_output_step:.6g} "
+		f"source_step={source_step:.6g} output_step={flatten_output_step:.6g} "
 		f"measured_source_step={float(mdl.flatten_measured_source_step.detach().cpu()):.6g}",
 		flush=True,
 	)

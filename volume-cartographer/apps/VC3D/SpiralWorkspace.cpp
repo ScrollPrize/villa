@@ -370,6 +370,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     ++_runDiffRequestRevision;
                     _previewRunDiffImage = {};
                     _previewLossMaps.clear();
+                    _fetchingLossMaps.clear();
                     _loadedLossMap.clear();
                     _loadedLossMapImage = {};
                     _selectedLossMap.clear();
@@ -415,6 +416,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 ++_runDiffRequestRevision;
                 _previewRunDiffImage = {};
                 _previewLossMaps.clear();
+                _fetchingLossMaps.clear();
                 _loadedLossMap.clear();
                 _loadedLossMapImage = {};
                 _selectedLossMap.clear();
@@ -1193,15 +1195,11 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
                     || relativePath == QStringLiteral("..")
                     || relativePath.startsWith(QStringLiteral("../")))
                     continue;
-                const QString imagePath = QDir(artifactRoot).filePath(relativePath);
-                QImageReader reader(imagePath);
-                if (!reader.canRead()
-                    || reader.size().width() != gridSize.width
-                    || reader.size().height() != gridSize.height)
-                    continue;
                 PreviewLoadResult::LossMap map;
                 map.name = name;
-                map.imagePath = imagePath;
+                map.relativePath = relativePath;
+                const QString imagePath = QDir(artifactRoot).filePath(relativePath);
+                if (QFileInfo::exists(imagePath)) map.imagePath = imagePath;
                 map.weight = entry.value(QStringLiteral("weight")).toDouble();
                 map.p50 = entry.value(QStringLiteral("p50")).toDouble();
                 map.p95 = entry.value(QStringLiteral("p95")).toDouble();
@@ -1260,6 +1258,7 @@ void SpiralWorkspace::installPreview(const PreviewLoadResult& result, qint64 gen
     ++_runDiffRequestRevision;
     _previewRunDiffImage = {};
     _previewLossMaps.clear();
+    _fetchingLossMaps.clear();
     _loadedLossMap.clear();
     _loadedLossMapImage = {};
     QStringList lossMapNames;
@@ -1323,16 +1322,61 @@ void SpiralWorkspace::updateRunDiffOverlay()
 
 void SpiralWorkspace::updateLossMapOverlay()
 {
-    const auto found = _previewLossMaps.constFind(_selectedLossMap);
-    if (_selectedLossMap.isEmpty() || found == _previewLossMaps.constEnd()
-        || !_currentPreview
-        || found->imagePath.isEmpty()) {
+    auto found = _previewLossMaps.find(_selectedLossMap);
+    if (_selectedLossMap.isEmpty() || found == _previewLossMaps.end()
+        || !_currentPreview) {
         _overlay->publishLossMap({}, {}, _lossMapOpacity);
         _panel->setLossMapLegend({});
         return;
     }
 
-    const auto& map = found.value();
+    auto& map = found.value();
+    if (map.imagePath.isEmpty()) {
+        _overlay->publishLossMap({}, {}, _lossMapOpacity);
+        if (_fetchingLossMaps.contains(map.name)) {
+            _panel->setLossMapLegend(tr("Downloading loss overlay %1…").arg(map.name));
+            return;
+        }
+        const QString requestedName = map.name;
+        const QString relativePath = map.relativePath;
+        const qint64 previewGeneration = _requestedPreviewGeneration;
+        _fetchingLossMaps.insert(requestedName);
+        _panel->setLossMapLegend(tr("Downloading loss overlay %1…").arg(requestedName));
+        _service->fetchPreviewFile(
+            relativePath,
+            [this, requestedName, relativePath, previewGeneration](
+                const QString& localPath, const QString& error) {
+                if (_shuttingDown
+                    || previewGeneration != _requestedPreviewGeneration)
+                    return;
+                _fetchingLossMaps.remove(requestedName);
+                if (localPath.isEmpty()) {
+                    if (requestedName == _selectedLossMap)
+                        _panel->setLossMapLegend(
+                            tr("Could not download loss overlay %1: %2")
+                                .arg(requestedName, error));
+                    return;
+                }
+                QImageReader reader(localPath);
+                const cv::Size expected =
+                    _previewSource ? _previewSource->gridSize() : cv::Size{};
+                if (!reader.canRead() || reader.size().width() != expected.width
+                    || reader.size().height() != expected.height) {
+                    if (requestedName == _selectedLossMap)
+                        _panel->setLossMapLegend(
+                            tr("Downloaded loss overlay %1 has invalid dimensions")
+                                .arg(requestedName));
+                    return;
+                }
+                auto current = _previewLossMaps.find(requestedName);
+                if (current == _previewLossMaps.end()
+                    || current->relativePath != relativePath)
+                    return;
+                current->imagePath = localPath;
+                if (requestedName == _selectedLossMap) updateLossMapOverlay();
+            });
+        return;
+    }
     if (_loadedLossMap != map.name) {
         QImage image(map.imagePath);
         if (image.isNull()) {
