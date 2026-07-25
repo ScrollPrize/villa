@@ -60,10 +60,6 @@ public:
         // CacheCompression.hpp). Combined (max) with the process-wide
         // default below at construction.
         int cacheQuantBinWidth = 1;
-        // Test/tool override. The application enables the same counters with
-        // VC_SURFACE_CACHE_MEMORY_TRACE, leaving the hot lookup path untouched
-        // during normal use.
-        bool collectAccessDiagnostics = false;
     };
 
     struct Stats {
@@ -78,40 +74,8 @@ public:
         std::size_t persistentCacheMinimumFreeBytes = 0;
         std::optional<std::size_t> persistentCacheMaximumBytes;
         std::size_t remoteFetchesInFlight = 0;
-        std::size_t pendingChunkRequests = 0;
-        std::size_t queuedChunkTasks = 0;
-        std::size_t supersededChunkRequests = 0;
         double remoteDownloadBytesPerSecond = 0.0;
-        std::size_t persistentWriteBytesInFlight = 0;
-        std::size_t persistentWritesSkippedForBackpressure = 0;
 
-        // Opt-in cumulative diagnostics for distinguishing a bounded resident
-        // cache from an unexpectedly large transient lookup/fetch workload.
-        bool accessDiagnosticsEnabled = false;
-        std::uint64_t tryGetCalls = 0;
-        std::uint64_t cacheOnlyGetCalls = 0;
-        std::uint64_t blockingGetCalls = 0;
-        std::uint64_t prefetchCalls = 0;
-        std::uint64_t prefetchKeys = 0;
-        std::uint64_t lookupMissQueuedResults = 0;
-        std::uint64_t lookupDataResults = 0;
-        std::uint64_t lookupAllFillResults = 0;
-        std::uint64_t lookupMissingResults = 0;
-        std::uint64_t lookupErrorResults = 0;
-        std::uint64_t entriesCreated = 0;
-        std::uint64_t prefetchEntriesCreated = 0;
-        std::uint64_t prefetchEntriesReprioritized = 0;
-        std::uint64_t fetchRequestsQueued = 0;
-        std::uint64_t fetchTasksSubmitted = 0;
-        std::uint64_t fetchTasksStarted = 0;
-        std::uint64_t fetchTasksFinished = 0;
-        std::uint64_t fetchResultsStored = 0;
-        std::uint64_t fetchResultsDiscarded = 0;
-        std::uint64_t entriesEvicted = 0;
-        std::uint64_t decodedBytesEvicted = 0;
-        std::size_t localEntryCount = 0;
-        std::size_t localLruEntryCount = 0;
-        std::size_t localDecodedBytes = 0;
     };
 
     ChunkCache(std::vector<LevelInfo> levels,
@@ -226,47 +190,16 @@ private:
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;
         std::size_t remoteFetchesInFlight_ = 0;
-        std::atomic_size_t supersededChunkRequests_{0};
         std::deque<std::pair<std::chrono::steady_clock::time_point, std::size_t>> remoteDownloadHistory_;
         std::atomic<std::int64_t> persistentCacheBytes_{0};
         std::atomic_bool persistentCacheScanInFlight_{false};
         std::atomic_size_t persistentWritesInFlight_{0};
-        std::atomic_size_t persistentWriteBytesInFlight_{0};
-        std::atomic_size_t persistentWritesSkippedForBackpressure_{0};
         std::shared_ptr<PersistentZarrCacheBudget> persistentBudget_;
 
-        bool collectAccessDiagnostics_ = false;
-        std::atomic_uint64_t tryGetCalls_{0};
-        std::atomic_uint64_t cacheOnlyGetCalls_{0};
-        std::atomic_uint64_t blockingGetCalls_{0};
-        std::atomic_uint64_t prefetchCalls_{0};
-        std::atomic_uint64_t prefetchKeys_{0};
-        std::atomic_uint64_t lookupMissQueuedResults_{0};
-        std::atomic_uint64_t lookupDataResults_{0};
-        std::atomic_uint64_t lookupAllFillResults_{0};
-        std::atomic_uint64_t lookupMissingResults_{0};
-        std::atomic_uint64_t lookupErrorResults_{0};
-        std::atomic_uint64_t entriesCreated_{0};
-        std::atomic_uint64_t prefetchEntriesCreated_{0};
-        std::atomic_uint64_t prefetchEntriesReprioritized_{0};
-        std::atomic_uint64_t fetchRequestsQueued_{0};
-        std::atomic_uint64_t fetchTasksSubmitted_{0};
-        std::atomic_uint64_t fetchTasksStarted_{0};
-        std::atomic_uint64_t fetchTasksFinished_{0};
-        std::atomic_uint64_t fetchResultsStored_{0};
-        std::atomic_uint64_t fetchResultsDiscarded_{0};
-        std::atomic_uint64_t entriesEvicted_{0};
-        std::atomic_uint64_t decodedBytesEvicted_{0};
-        std::atomic_int64_t nextAccessTraceMs_{0};
     };
 
     static ChunkResult resultFromEntryLocked(
         State& state, const ChunkKey& key, Entry& entry, bool promote = true);
-    static void recordLookupResult(State& state, ChunkStatus status);
-    static void maybeTraceAccessDiagnostics(
-        const std::shared_ptr<State>& state,
-        const char* reason,
-        bool force = false);
     static int fetchBasePriority(const State& state, const ChunkKey& key, int priorityOffset);
     static void queueFetchLocked(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,

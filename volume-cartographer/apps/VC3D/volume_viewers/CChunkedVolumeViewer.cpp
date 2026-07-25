@@ -11,7 +11,6 @@
 #include "render/ChunkCache.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/render/SurfaceCache.hpp"
-#include "vc/core/render/SurfaceMemoryTrace.hpp"
 #include "FrameChunkFootprint.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -81,15 +80,6 @@ constexpr int kSurfaceTileRenderDebounceMs = 50;
 constexpr float kPanSmoothingAlpha = 0.65f;
 constexpr int kSurfaceCellTileSize = 64;
 
-std::size_t matOwnedBytes(const cv::Mat& mat)
-{
-    return mat.empty() ? 0 : mat.total() * mat.elemSize();
-}
-
-std::size_t imageOwnedBytes(const QImage& image)
-{
-    return image.isNull() ? 0 : static_cast<std::size_t>(image.sizeInBytes());
-}
 constexpr std::array<QRgb, 12> kIntersectionPalette = {
     qRgb(255, 120, 120), qRgb(120, 200, 255), qRgb(120, 255, 140),
     qRgb(255, 220, 100), qRgb(220, 140, 255), qRgb(255, 160, 200),
@@ -1152,20 +1142,6 @@ void CChunkedVolumeViewer::ensureSurfaceCaches()
         _surfaceCacheSurface = surf.get();
         _surfaceCacheGeometryEpoch = _surfaceGeometryEpoch;
         ++_surfaceCacheEpoch;
-        // One instance per (volume, surface, geometry epoch) is the contract. A
-        // climbing count means something is churning instances, each of which
-        // can hold up to its whole budget until the render jobs referencing it
-        // are replaced -- so this number is the first thing to check if RSS
-        // grows while the reported cache sizes stay inside their caps.
-        ++_surfaceCacheBuildCount;
-        Logger()->info(
-            "surface cache built #{} for surf='{}' budget={:.2f} GiB "
-            "(overlay budget={:.2f} GiB, geometry tiles={})",
-            _surfaceCacheBuildCount, quad->id.empty() ? _surfName : quad->id,
-            double(_surfaceCacheBudgetBytes) / double(1ULL << 30),
-            double(_overlaySurfaceCacheBudgetBytes) / double(1ULL << 30),
-            _surfaceGeometryTiles ? _surfaceGeometryTiles->size() : 0);
-
         QPointer<CChunkedVolumeViewer> guard(this);
         _surfaceTileCbId = _surfaceCache->addTileReadyListener([guard]() {
             if (!guard || guard->_surfaceTileRenderQueued.exchange(
@@ -1873,23 +1849,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.workerStartedAt = std::chrono::steady_clock::now();
     result.framebuffer = QImage(std::max(1, ctx.fbW), std::max(1, ctx.fbH), QImage::Format_RGB32);
     result.framebuffer.fill(QColor(64, 64, 64));
-    if (vc::render::surfaceMemoryTraceEnabled()) {
-        const auto surfaceStats =
-            ctx.surfaceCache ? ctx.surfaceCache->stats()
-                             : vc::render::SurfaceCache::Stats{};
-        vc::render::surfaceMemoryTrace(
-            "render_frame_begin",
-            std::format(
-                "serial={} request={} fb={}x{} scale={} level={} "
-                "framebuffer_bytes={} prev_result={} surface_cache={} "
-                "surface_owned_bytes={} surface_tiles={}",
-                ctx.serial, ctx.renderJob.requestId, ctx.fbW, ctx.fbH,
-                ctx.scale, ctx.startLevel, imageOwnedBytes(result.framebuffer),
-                bool(ctx.prevResult),
-                reinterpret_cast<std::uintptr_t>(ctx.surfaceCache.get()),
-                surfaceStats.bytes, surfaceStats.tiles));
-    }
-
     auto finishRenderFrameProfile = [&]() {
         result.renderFrameElapsedMs = static_cast<double>(renderTimer.nsecsElapsed()) / 1000000.0;
         result.workerFinishedAt = std::chrono::steady_clock::now();
@@ -2355,16 +2314,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             if (profilePhases) phaseTimer.restart();
             ctx.surfaceCache->sampleView(ctx.startLevel, uMin, vMin, double(ctx.scale),
                                          double(ctx.zOff), cacheComposite, values, coverage);
-            if (vc::render::surfaceMemoryTraceEnabled()) {
-                vc::render::surfaceMemoryTrace(
-                    "render_surface_sampled",
-                    std::format(
-                        "serial={} values_bytes={} coverage_bytes={} "
-                        "coords_bytes={} normals_bytes={}",
-                        ctx.serial, matOwnedBytes(values),
-                        matOwnedBytes(coverage), matOwnedBytes(coords),
-                        matOwnedBytes(normals)));
-            }
             if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
         }
         if (overlayActive && overlayCacheUsable) {
@@ -2464,24 +2413,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     result.overlayValues = overlayValues;
     result.overlayCoverage = overlayCoverage;
     result.overlayTargetCoverage = overlayTargetCoverage;
-    if (vc::render::surfaceMemoryTraceEnabled()) {
-        const std::size_t resultMatrixBytes =
-            matOwnedBytes(result.values) + matOwnedBytes(result.coverage) +
-            matOwnedBytes(result.overlayValues) +
-            matOwnedBytes(result.overlayCoverage) +
-            matOwnedBytes(result.overlayTargetCoverage);
-        vc::render::surfaceMemoryTrace(
-            "render_result_buffers",
-            std::format(
-                "serial={} result_matrix_bytes={} values={} coverage={} "
-                "overlay_values={} overlay_coverage={} overlay_target={}",
-                ctx.serial, resultMatrixBytes, matOwnedBytes(result.values),
-                matOwnedBytes(result.coverage),
-                matOwnedBytes(result.overlayValues),
-                matOwnedBytes(result.overlayCoverage),
-                matOwnedBytes(result.overlayTargetCoverage)));
-    }
-
     if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};
     vc::buildWindowLevelColormapLut(lut, ctx.windowLow, ctx.windowHigh, ctx.baseColormapId);
@@ -2511,12 +2442,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         }
     }
     if (profilePhases) phaseBlitMs = phaseTimer.elapsed();
-    if (vc::render::surfaceMemoryTraceEnabled()) {
-        vc::render::surfaceMemoryTrace(
-            "render_frame_end",
-            std::format("serial={} framebuffer_bytes={}", ctx.serial,
-                        imageOwnedBytes(result.framebuffer)));
-    }
     finishRenderFrameProfile();
     return result;
 }
@@ -2591,25 +2516,6 @@ void CChunkedVolumeViewer::requestSurfaceViewForJob(const PendingRenderJob& job)
     const double vMin =
         double(job.surfacePtrY) - double(job.fbH) / (2.0 * double(job.scale));
     const std::uint64_t generation = ++_surfaceViewGeneration;
-    if (vc::render::surfaceMemoryTraceEnabled()) {
-        const int levelCount = job.surfaceCache
-            ? std::min(job.surfaceCache->levels(), job.chunkArray->numLevels())
-            : job.chunkArray->numLevels();
-        vc::render::surfaceMemoryTrace(
-            "viewer_request_view_begin",
-            std::format(
-                "viewer={} request={} generation={} fb={}x{} scale={} "
-                "ds_scale={} ds_scale_idx={} max_displayed={} level_count={} "
-                "start_level={} overlay_start_level={} u_min={} v_min={} "
-                "base_cache={} overlay_cache={}",
-                reinterpret_cast<std::uintptr_t>(this), job.requestId,
-                generation, job.fbW, job.fbH, job.scale, _dsScale,
-                _dsScaleIdx, _maxDisplayedResolution, levelCount,
-                job.startLevel, job.overlayStartLevel, uMin, vMin,
-                reinterpret_cast<std::uintptr_t>(job.surfaceCache.get()),
-                reinterpret_cast<std::uintptr_t>(
-                    job.overlaySurfaceCache.get())));
-    }
     if (job.surfaceCache) {
         job.surfaceCache->requestView(job.startLevel, uMin, vMin,
                                       double(job.scale), job.fbW, job.fbH,
@@ -2619,13 +2525,6 @@ void CChunkedVolumeViewer::requestSurfaceViewForJob(const PendingRenderJob& job)
         job.overlaySurfaceCache->requestView(
             job.overlayStartLevel, uMin, vMin, double(job.scale), job.fbW,
             job.fbH, generation);
-    }
-    if (vc::render::surfaceMemoryTraceEnabled()) {
-        vc::render::surfaceMemoryTrace(
-            "viewer_request_view_end",
-            std::format("viewer={} request={} generation={}",
-                        reinterpret_cast<std::uintptr_t>(this),
-                        job.requestId, generation));
     }
 }
 
@@ -2889,26 +2788,6 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
         return;
     }
 
-    if (vc::render::surfaceMemoryTraceEnabled()) {
-        auto resultBytes = [](const std::shared_ptr<RenderResult>& value) {
-            if (!value)
-                return std::size_t{0};
-            return imageOwnedBytes(value->framebuffer) +
-                   matOwnedBytes(value->values) +
-                   matOwnedBytes(value->coverage) +
-                   matOwnedBytes(value->overlayValues) +
-                   matOwnedBytes(value->overlayCoverage) +
-                   matOwnedBytes(value->overlayTargetCoverage);
-        };
-        vc::render::surfaceMemoryTrace(
-            "render_result_replace",
-            std::format(
-                "viewer={} serial={} incoming_explicit_bytes={} "
-                "previous_explicit_bytes={} previous_use_count={}",
-                reinterpret_cast<std::uintptr_t>(this), result->serial,
-                resultBytes(result), resultBytes(_lastRenderResult),
-                _lastRenderResult ? _lastRenderResult.use_count() : 0));
-    }
     const bool intersectionInputsChanged =
         !_displayedRenderJob ||
         !renderJobsSameGeometry(result->renderJob, *_displayedRenderJob);
@@ -2928,15 +2807,6 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     _view->viewport()->update();
     emit renderFrameCompleted(result->serial, result->renderFrameElapsedMs);
     updateStatusLabel();
-    if (vc::render::surfaceMemoryTraceEnabled()) {
-        vc::render::surfaceMemoryTrace(
-            "render_result_published",
-            std::format(
-                "viewer={} serial={} framebuffer_bytes={} result_use_count={}",
-                reinterpret_cast<std::uintptr_t>(this), result->serial,
-                imageOwnedBytes(_framebuffer), result.use_count()));
-    }
-
     if (_pendingRenderJob &&
         renderJobsEquivalentForDisplay(*_pendingRenderJob, result->renderJob)) {
         _pendingRenderJob.reset();
@@ -4754,24 +4624,6 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
                                                         std::source_location caller)
 {
     ProfileScope profile("renderFlattenedIntersections", reason, caller);
-    const bool traceMemory = vc::render::surfaceMemoryTraceEnabled();
-    if (traceMemory) {
-        vc::render::surfaceMemoryTrace(
-            "intersection_flattened_begin",
-            std::format(
-                "viewer={} reason='{}' surface={} targets={} cache_valid={} "
-                "cached_cells={} cell_buckets={} cached_tiles={} tile_buckets={} "
-                "items={} dirty_cells={}",
-                reinterpret_cast<std::uintptr_t>(this), reason ? reason : "",
-                reinterpret_cast<std::uintptr_t>(surf.get()),
-                _intersectTgts.size(), _flattenedIntersectionCache.valid,
-                _flattenedIntersectionCache.cellLines.size(),
-                _flattenedIntersectionCache.cellLines.bucket_count(),
-                _flattenedIntersectionCache.tileItems.size(),
-                _flattenedIntersectionCache.tileItems.bucket_count(),
-                _intersectionItems.size(),
-                bool(_flattenedIntersectionDirtyCells)));
-    }
     if (profile.enabled()) {
         profile.setDetails(std::format("surf='{}' targets={}", _surfName, _intersectTgts.size()));
     }
@@ -4893,40 +4745,12 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         cacheCompatible &&
         !_flattenedIntersectionDirtyCells;
     const bool needsFullRebuild = !cacheCompatible;
-    const std::uint64_t totalCells =
-        std::uint64_t(std::max(0, points->cols - 1)) *
-        std::uint64_t(std::max(0, points->rows - 1));
-    if (traceMemory) {
-        vc::render::surfaceMemoryTrace(
-            "intersection_flattened_plan",
-            std::format(
-                "viewer={} points={}x{} points_bytes={} total_cells={} "
-                "planes={} fp_match={} cache_compatible={} full_rebuild={} "
-                "display_only={} cached_cells={} cached_tiles={} items={}",
-                reinterpret_cast<std::uintptr_t>(this), points->cols,
-                points->rows, points->total() * points->elemSize(), totalCells,
-                planes.size(), _lastIntersectFp == fp, cacheCompatible,
-                needsFullRebuild, displayOnlyRefresh,
-                _flattenedIntersectionCache.cellLines.size(),
-                _flattenedIntersectionCache.tileItems.size(),
-                _intersectionItems.size()));
-    }
     // An empty intersection result is still a valid cached result. Requiring a
     // QGraphicsItem here made every stable surface-cache frame rescan the
     // complete Spiral grid whenever the selected planes did not cross it.
     if (_lastIntersectFp == fp && cacheCompatible &&
         !_flattenedIntersectionDirtyCells) {
         updateIntersectionPreviewTransform();
-        if (traceMemory) {
-            vc::render::surfaceMemoryTrace(
-                "intersection_flattened_cache_hit",
-                std::format(
-                    "viewer={} cells={} tiles={} items={}",
-                    reinterpret_cast<std::uintptr_t>(this),
-                    _flattenedIntersectionCache.cellLines.size(),
-                    _flattenedIntersectionCache.tileItems.size(),
-                    _intersectionItems.size()));
-        }
         if (profile.enabled()) {
             profile.setDetails(std::format("action=cache_hit planes={} items={}",
                                            planes.size(), _intersectionItems.size()));
@@ -5008,20 +4832,6 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         if (cells.empty()) {
             return;
         }
-        if (traceMemory) {
-            vc::render::surfaceMemoryTrace(
-                "intersection_flattened_cells_begin",
-                std::format(
-                    "viewer={} cells=[{},{} {}x{}] requested_cell_count={} "
-                    "existing_cells={} existing_buckets={}",
-                    reinterpret_cast<std::uintptr_t>(this), cells.x, cells.y,
-                    cells.width, cells.height,
-                    std::uint64_t(cells.width) *
-                        std::uint64_t(cells.height),
-                    _flattenedIntersectionCache.cellLines.size(),
-                    _flattenedIntersectionCache.cellLines.bucket_count()));
-        }
-
         const cv::Vec3f center = activeSeg->center();
         const cv::Vec2f gridScale = activeSeg->scale();
         const float cx = center[0] * gridScale[0];
@@ -5032,17 +4842,6 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         const int rowEnd = cells.y + cells.height;
         const int colEnd = cells.x + cells.width;
         for (int row = rowStart; row < rowEnd && row < points->rows - 1; row += stride) {
-            if (traceMemory && (row == rowStart || (row - rowStart) % 256 == 0)) {
-                vc::render::surfaceMemoryTrace(
-                    "intersection_flattened_cells_progress",
-                    std::format(
-                        "viewer={} row={}/{} cached_cells={} cell_buckets={} "
-                        "dirty_tiles={} dirty_buckets={}",
-                        reinterpret_cast<std::uintptr_t>(this), row, rowEnd,
-                        _flattenedIntersectionCache.cellLines.size(),
-                        _flattenedIntersectionCache.cellLines.bucket_count(),
-                        dirtyTilePlanes.size(), dirtyTilePlanes.bucket_count()));
-            }
             for (int col = colStart; col < colEnd && col < points->cols - 1; col += stride) {
                 const std::uint64_t key = surfaceTileKey(col, row);
                 std::vector<FlattenedIntersectionLine> lines;
@@ -5126,32 +4925,9 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
                 }
             }
         }
-        if (traceMemory) {
-            vc::render::surfaceMemoryTrace(
-                "intersection_flattened_cells_end",
-                std::format(
-                    "viewer={} cached_cells={} cell_buckets={} dirty_tiles={} "
-                    "dirty_buckets={}",
-                    reinterpret_cast<std::uintptr_t>(this),
-                    _flattenedIntersectionCache.cellLines.size(),
-                    _flattenedIntersectionCache.cellLines.bucket_count(),
-                    dirtyTilePlanes.size(), dirtyTilePlanes.bucket_count()));
-        }
     };
 
     if (needsFullRebuild) {
-        if (traceMemory) {
-            vc::render::surfaceMemoryTrace(
-                "intersection_flattened_full_rebuild_begin",
-                std::format(
-                    "viewer={} old_cells={} old_cell_buckets={} old_tiles={} "
-                    "old_items={}",
-                    reinterpret_cast<std::uintptr_t>(this),
-                    _flattenedIntersectionCache.cellLines.size(),
-                    _flattenedIntersectionCache.cellLines.bucket_count(),
-                    _flattenedIntersectionCache.tileItems.size(),
-                    _intersectionItems.size()));
-        }
         clearIntersectionItems();
         _flattenedIntersectionCache = {};
         _flattenedIntersectionCache.surface = activeSeg.get();
@@ -5172,16 +4948,6 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
             std::min(sampledCells, expectedIntersectedCells));
         rebuildFlattenedCells(cellBounds());
         _flattenedIntersectionCache.valid = true;
-        if (traceMemory) {
-            vc::render::surfaceMemoryTrace(
-                "intersection_flattened_full_rebuild_end",
-                std::format(
-                    "viewer={} cells={} cell_buckets={} dirty_tiles={}",
-                    reinterpret_cast<std::uintptr_t>(this),
-                    _flattenedIntersectionCache.cellLines.size(),
-                    _flattenedIntersectionCache.cellLines.bucket_count(),
-                    dirtyTilePlanes.size()));
-        }
     } else if (_flattenedIntersectionDirtyCells) {
         rebuildFlattenedCells(*_flattenedIntersectionDirtyCells);
     } else if (!cacheCompatible) {
@@ -5224,32 +4990,9 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
                 planes.size(), _flattenedIntersectionCache.cellLines.size(),
                 _intersectionItems.size()));
         }
-        if (traceMemory) {
-            vc::render::surfaceMemoryTrace(
-                "intersection_flattened_no_dirty_tiles",
-                std::format(
-                    "viewer={} cells={} cell_buckets={} tiles={} items={}",
-                    reinterpret_cast<std::uintptr_t>(this),
-                    _flattenedIntersectionCache.cellLines.size(),
-                    _flattenedIntersectionCache.cellLines.bucket_count(),
-                    _flattenedIntersectionCache.tileItems.size(),
-                    _intersectionItems.size()));
-        }
         return;
     }
 
-    if (traceMemory) {
-        vc::render::surfaceMemoryTrace(
-            "intersection_flattened_paths_begin",
-            std::format(
-                "viewer={} dirty_tiles={} dirty_buckets={} cached_cells={} "
-                "cached_tiles={} items={}",
-                reinterpret_cast<std::uintptr_t>(this),
-                dirtyTilePlanes.size(), dirtyTilePlanes.bucket_count(),
-                _flattenedIntersectionCache.cellLines.size(),
-                _flattenedIntersectionCache.tileItems.size(),
-                _intersectionItems.size()));
-    }
     std::unordered_map<std::uint64_t, std::vector<QPainterPath>> tilePaths;
     tilePaths.reserve(dirtyTilePlanes.size());
     for (const auto& [tileKey, _] : dirtyTilePlanes) {
@@ -5357,19 +5100,6 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
                 planes.size(), _flattenedIntersectionCache.cellLines.size(),
                 dirtyTilePlanes.size()));
         }
-        if (traceMemory) {
-            vc::render::surfaceMemoryTrace(
-                "intersection_flattened_end_empty",
-                std::format(
-                    "viewer={} cells={} cell_buckets={} tiles={} tile_buckets={} "
-                    "dirty_tiles={} items=0",
-                    reinterpret_cast<std::uintptr_t>(this),
-                    _flattenedIntersectionCache.cellLines.size(),
-                    _flattenedIntersectionCache.cellLines.bucket_count(),
-                    _flattenedIntersectionCache.tileItems.size(),
-                    _flattenedIntersectionCache.tileItems.bucket_count(),
-                    dirtyTilePlanes.size()));
-        }
         return;
     }
 
@@ -5384,20 +5114,6 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
             planes.size(), _flattenedIntersectionCache.cellLines.size(),
             dirtyTilePlanes.size(), _intersectionItems.size(), needsFullRebuild,
             bool(_flattenedIntersectionDirtyCells)));
-    }
-    if (traceMemory) {
-        vc::render::surfaceMemoryTrace(
-            "intersection_flattened_end",
-            std::format(
-                "viewer={} cells={} cell_buckets={} tiles={} tile_buckets={} "
-                "dirty_tiles={} paths={} items={}",
-                reinterpret_cast<std::uintptr_t>(this),
-                _flattenedIntersectionCache.cellLines.size(),
-                _flattenedIntersectionCache.cellLines.bucket_count(),
-                _flattenedIntersectionCache.tileItems.size(),
-                _flattenedIntersectionCache.tileItems.bucket_count(),
-                dirtyTilePlanes.size(), tilePaths.size(),
-                _intersectionItems.size()));
     }
 }
 
@@ -6051,22 +5767,6 @@ void CChunkedVolumeViewer::updateStatusLabel()
         } else {
             sharedCacheItems << QStringLiteral("network idle");
         }
-        if (stats.pendingChunkRequests > 0) {
-            sharedCacheItems << QString("queued chunks %1")
-                .arg(stats.pendingChunkRequests);
-        }
-        if (stats.queuedChunkTasks > 0) {
-            sharedCacheItems << QString("executor tasks %1")
-                .arg(stats.queuedChunkTasks);
-        }
-        if (stats.persistentWriteBytesInFlight > 0) {
-            sharedCacheItems << QString("writeback %1")
-                .arg(formatByteSize(stats.persistentWriteBytesInFlight));
-        }
-        if (stats.persistentWritesSkippedForBackpressure > 0) {
-            sharedCacheItems << QString("writeback throttled %1")
-                .arg(stats.persistentWritesSkippedForBackpressure);
-        }
     }
 
     // The RAM figure above already reports the *effective* chunk-cache
@@ -6086,11 +5786,6 @@ void CChunkedVolumeViewer::updateStatusLabel()
             item += QString(", %1 filling").arg(stats.tilesInFlight);
         if (stats.tilesIncomplete > 0)
             item += QString(", %1 partial").arg(stats.tilesIncomplete);
-        if (stats.dependencyRegionSplits > 0) {
-            item += QString(", deps %1 peak/%2 splits")
-                        .arg(stats.peakDependencyKeys)
-                        .arg(stats.dependencyRegionSplits);
-        }
         item += QStringLiteral(")");
         sharedCacheItems << item;
     };

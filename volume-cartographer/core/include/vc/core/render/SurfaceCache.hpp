@@ -74,11 +74,6 @@ public:
         std::size_t tiles = 0;
         std::size_t tilesInFlight = 0;
         std::size_t tilesIncomplete = 0;
-        // Dependency discovery is separately bounded from decoded/tile bytes.
-        // These counters expose discontinuous geometry that requires adaptive
-        // region splitting instead of one whole-tile dependency batch.
-        std::size_t peakDependencyKeys = 0;
-        std::size_t dependencyRegionSplits = 0;
     };
 
     struct SampleStats {

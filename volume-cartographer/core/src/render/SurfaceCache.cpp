@@ -1,5 +1,4 @@
 #include "vc/core/render/SurfaceCache.hpp"
-#include "vc/core/render/SurfaceMemoryTrace.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -39,9 +38,6 @@ constexpr std::size_t kMaxDependencyBoxExpansion = 256;
 // first worker's freshly-prefetched chunks out before it samples them.
 constexpr std::size_t kDependencyDecodedBytesPerBatch = 256ULL << 20;
 
-std::atomic_uint64_t g_geometryTraceOrdinal{0};
-std::atomic_uint64_t g_fillTraceOrdinal{0};
-std::atomic_uint64_t g_sampleTraceOrdinal{0};
 
 // How many times a tile that came back incomplete is refilled before it is left
 // alone until new chunk data arrives.
@@ -467,16 +463,6 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
         return nullptr;
 
     const TileKey key{level, tu, tv};
-    const std::uint64_t traceOrdinal =
-        g_geometryTraceOrdinal.fetch_add(1, std::memory_order_relaxed) + 1;
-    const bool traceMemory = surfaceMemoryTraceSampleFill(traceOrdinal);
-    if (traceMemory) {
-        surfaceMemoryTrace(
-            "geometry_get_begin",
-            std::format("ordinal={} cache={} level={} tu={} tv={}",
-                        traceOrdinal,
-                        reinterpret_cast<std::uintptr_t>(this), level, tu, tv));
-    }
     std::shared_ptr<State::Slot> slot;
     std::uint64_t epoch = 0;
     {
@@ -489,13 +475,6 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
                 // Another thread is computing this tile; wait for it instead
                 // of duplicating the gen().
                 _state->ready.wait(lock, [&] { return slot->ready; });
-            }
-            if (traceMemory) {
-                surfaceMemoryTrace(
-                    "geometry_get_hit",
-                    std::format("ordinal={} slots={} lru={} tile={}",
-                                traceOrdinal, _state->slots.size(),
-                                _state->lru.size(), bool(slot->tile)));
             }
             return slot->tile;
         }
@@ -525,14 +504,6 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
         coords.release();
         normals.release();
     }
-    if (traceMemory) {
-        surfaceMemoryTrace(
-            "geometry_get_generated",
-            std::format("ordinal={} coords_bytes={} normals_bytes={}",
-                        traceOrdinal, coords.total() * coords.elemSize(),
-                        normals.total() * normals.elemSize()));
-    }
-
     if (!coords.empty() && coords.rows >= kTileSize && coords.cols >= kTileSize) {
         auto built = std::make_shared<Tile>();
         built->coords = coords(cv::Rect(0, 0, kTileSize, kTileSize)).clone();
@@ -557,7 +528,6 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
         tile = std::move(built);
     }
 
-    std::size_t publishedSlots = 0;
     {
         std::lock_guard lock(_state->mutex);
         slot->tile = tile;
@@ -569,21 +539,7 @@ SurfaceGeometryTileCache::get(int level, int tu, int tv)
         } else {
             _state->trimLocked();
         }
-        publishedSlots = _state->slots.size();
         _state->ready.notify_all();
-    }
-    if (traceMemory) {
-        const std::size_t tileBytes =
-            tile ? tile->coords.total() * tile->coords.elemSize() +
-                       tile->normals.total() * tile->normals.elemSize() +
-                       tile->valid.total() * tile->valid.elemSize() +
-                       tile->validOffset.total() * tile->validOffset.elemSize()
-                 : 0;
-        surfaceMemoryTrace(
-            "geometry_get_end",
-            std::format("ordinal={} owned_tile_bytes={} slots={} tile={}",
-                        traceOrdinal, tileBytes, publishedSlots,
-                        bool(tile)));
     }
     return tile;
 }
@@ -671,8 +627,6 @@ struct SurfaceCache::State {
     std::size_t bytes = 0;
     std::size_t capacity = 0;
     std::size_t incomplete = 0;
-    std::atomic_size_t peakDependencyKeys{0};
-    std::atomic_size_t dependencyRegionSplits{0};
     std::unordered_set<TileKey, TileKeyHash> outstanding;
     std::unordered_set<TileKey, TileKeyHash> viewTiles;
     // Fills that stored an incomplete tile, per tile. A tile can be incomplete
@@ -958,17 +912,6 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
                                   TileKey key,
                                   std::uint64_t epoch)
 {
-    const std::uint64_t traceOrdinal =
-        g_fillTraceOrdinal.fetch_add(1, std::memory_order_relaxed) + 1;
-    const bool traceMemory = surfaceMemoryTraceSampleFill(traceOrdinal);
-    if (traceMemory) {
-        surfaceMemoryTrace(
-            "fill_begin",
-            std::format("ordinal={} cache={} epoch={} level={} tu={} tv={}",
-                        traceOrdinal,
-                        reinterpret_cast<std::uintptr_t>(self.get()), epoch,
-                        key.level, key.tu, key.tv));
-    }
 #if defined(_OPENMP)
     // QuadSurface::gen() has OpenMP loops, but runFill is already parallel at
     // tile granularity. Avoid building a full nested team for every fill.
@@ -992,19 +935,6 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
     std::shared_ptr<const SurfaceGeometryTileCache::Tile> geometry;
     if (self->geometry)
         geometry = self->geometry->get(key.level, key.tu, key.tv);
-    if (traceMemory) {
-        const std::size_t geometryBytes =
-            geometry ? geometry->coords.total() * geometry->coords.elemSize() +
-                           geometry->normals.total() * geometry->normals.elemSize() +
-                           geometry->valid.total() * geometry->valid.elemSize() +
-                           geometry->validOffset.total() *
-                               geometry->validOffset.elemSize()
-                     : 0;
-        surfaceMemoryTrace(
-            "fill_geometry_ready",
-            std::format("ordinal={} geometry_bytes={}", traceOrdinal,
-                        geometryBytes));
-    }
     if (!geometry || !self->volume) {
         release();
         return;
@@ -1031,19 +961,6 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
     }
     if (self->zeroIndex < 0)
         tile->valid = tile->validOffset;
-    if (traceMemory) {
-        surfaceMemoryTrace(
-            "fill_tile_allocated",
-            std::format(
-                "ordinal={} data_size={} data_capacity={} valid_capacity={} "
-                "valid_offset_capacity={} explicit_scratch_bytes={}",
-                traceOrdinal, tile->data.size(), tile->data.capacity(),
-                tile->valid.capacity(), tile->validOffset.capacity(),
-                tile->data.capacity() * sizeof(uint8_t) +
-                    tile->valid.capacity() * sizeof(uint8_t) +
-                    tile->validOffset.capacity() * sizeof(uint8_t)));
-    }
-
     const vc::Sampling sampling = self->options.sampling;
     std::size_t decodedChunkBytes =
         self->volume->dtype() == ChunkDtype::UInt16 ? 2 : 1;
@@ -1069,14 +986,6 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
         return !self->shuttingDown && epoch == self->epoch &&
                self->viewTiles.count(key);
     };
-    auto noteDependencyPeak = [&](std::size_t count) {
-        auto peak = self->peakDependencyKeys.load(std::memory_order_relaxed);
-        while (peak < count &&
-               !self->peakDependencyKeys.compare_exchange_weak(
-                   peak, count, std::memory_order_relaxed)) {
-        }
-    };
-
     // The normal case remains one parallel prefetch for the whole tile.
     // Pathological/discontinuous geometry is adaptively split only when its
     // exact dependency set exceeds the hard metadata bound.
@@ -1088,18 +997,6 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
         DependencyBatch dependencies = collectRegionDependencies(
             *geometry, access, key.level, wMin, wCount, x0, x1, y0, y1,
             dependencyKeyLimit);
-        noteDependencyPeak(dependencies.keys.size());
-        if (traceMemory || (surfaceMemoryTraceEnabled() && dependencies.overflow)) {
-            surfaceMemoryTrace(
-                "fill_dependencies",
-                std::format(
-                    "ordinal={} region=[{},{})x[{},{}) keys={} capacity={} "
-                    "metadata_bytes={} limit={} overflow={}",
-                    traceOrdinal, x0, x1, y0, y1,
-                    dependencies.keys.size(), dependencies.keys.capacity(),
-                    dependencies.keys.capacity() * sizeof(ChunkKey),
-                    dependencyKeyLimit, dependencies.overflow));
-        }
         if (dependencies.overflow) {
             const int width = x1 - x0;
             const int height = y1 - y0;
@@ -1107,7 +1004,6 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
                 complete = false;
                 return true;
             }
-            self->dependencyRegionSplits.fetch_add(1, std::memory_order_relaxed);
             std::vector<ChunkKey>().swap(dependencies.keys);
             if (width >= height && width > 1) {
                 const int middle = x0 + width / 2;
@@ -1120,32 +1016,13 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
         }
 
         if (!dependencies.keys.empty()) {
-            if (traceMemory) {
-                surfaceMemoryTrace(
-                    "fill_prefetch_begin",
-                    std::format("ordinal={} keys={} decoded_working_bound={}",
-                                traceOrdinal, dependencies.keys.size(),
-                                dependencies.keys.size() * decodedChunkBytes));
-            }
             self->volume->prefetchChunks(dependencies.keys, /*wait=*/true);
-            if (traceMemory) {
-                surfaceMemoryTrace(
-                    "fill_prefetch_end",
-                    std::format("ordinal={} keys={}", traceOrdinal,
-                                dependencies.keys.size()));
-            }
         }
         if (!stillCurrent())
             return false;
         std::vector<ChunkKey>().swap(dependencies.keys);
 
         FillChunkSet chunks(*self->volume);
-        if (traceMemory) {
-            surfaceMemoryTrace(
-                "fill_sample_region_begin",
-                std::format("ordinal={} region=[{},{})x[{},{})", traceOrdinal,
-                            x0, x1, y0, y1));
-        }
         for (int y = y0; y < y1; ++y) {
             const cv::Vec3f* coordRow = geometry->coords.ptr<cv::Vec3f>(y);
             const cv::Vec3f* normalRow = geometry->normals.ptr<cv::Vec3f>(y);
@@ -1177,12 +1054,6 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
                 }
             }
         }
-        if (traceMemory) {
-            surfaceMemoryTrace(
-                "fill_sample_region_end",
-                std::format("ordinal={} region=[{},{})x[{},{}) complete={}",
-                            traceOrdinal, x0, x1, y0, y1, complete));
-        }
         return true;
     };
 
@@ -1211,25 +1082,6 @@ void SurfaceCache::State::runFill(const std::shared_ptr<State>& self,
             self->enforceCapacityLocked();
             published = true;
         }
-    }
-
-    if (traceMemory) {
-        std::size_t ownedBytes = 0;
-        std::size_t ownedTiles = 0;
-        std::size_t outstanding = 0;
-        {
-            std::lock_guard lock(self->mutex);
-            ownedBytes = self->bytes;
-            ownedTiles = self->tiles.size();
-            outstanding = self->outstanding.size();
-        }
-        surfaceMemoryTrace(
-            "fill_end",
-            std::format(
-                "ordinal={} published={} complete={} cache_bytes={} "
-                "cache_tiles={} outstanding={}",
-                traceOrdinal, published, complete, ownedBytes, ownedTiles,
-                outstanding));
     }
 
     if (published)
@@ -1281,18 +1133,6 @@ SurfaceCache::SurfaceCache(std::shared_ptr<IChunkedArray> volume,
             }
         });
     }
-    if (surfaceMemoryTraceEnabled()) {
-        surfaceMemoryTrace(
-            "cache_created",
-            std::format(
-                "cache={} capacity={} tile_bytes={} levels={} w_min={} "
-                "w_count={} fill_workers={} max_outstanding={} supersede={}",
-                reinterpret_cast<std::uintptr_t>(_state.get()),
-                _state->capacity, _state->tileBytes, _state->levels,
-                _state->wMin, _state->wCount, fillWorkers,
-                _state->maxOutstandingFills,
-                _state->options.supersedeChunkRequests));
-    }
 }
 
 SurfaceCache::~SurfaceCache()
@@ -1310,8 +1150,6 @@ void SurfaceCache::shutdown()
     // and then releases the last reference. Clearing the listeners here is what
     // guarantees no callback fires after this returns.
     IChunkedArray::ChunkReadyCallbackId chunkReadyId = 0;
-    std::size_t ownedBytes = 0;
-    std::size_t ownedTiles = 0;
     {
         std::lock_guard lock(_state->mutex);
         _state->shuttingDown = true;
@@ -1319,18 +1157,9 @@ void SurfaceCache::shutdown()
         _state->listeners.clear();
         chunkReadyId = _state->chunkReadyId;
         _state->chunkReadyId = 0;
-        ownedBytes = _state->bytes;
-        ownedTiles = _state->tiles.size();
     }
     if (chunkReadyId != 0 && _state->volume)
         _state->volume->removeChunkReadyListener(chunkReadyId);
-    if (surfaceMemoryTraceEnabled()) {
-        surfaceMemoryTrace(
-            "cache_shutdown",
-            std::format("cache={} owned_bytes={} owned_tiles={}",
-                        reinterpret_cast<std::uintptr_t>(_state.get()),
-                        ownedBytes, ownedTiles));
-    }
 }
 
 std::size_t SurfaceCache::fillWorkerCount() { return surfaceFillPool().worker_count(); }
@@ -1361,10 +1190,6 @@ SurfaceCache::Stats SurfaceCache::stats() const
     stats.tiles = _state->tiles.size();
     stats.tilesInFlight = _state->outstanding.size();
     stats.tilesIncomplete = _state->incomplete;
-    stats.peakDependencyKeys =
-        _state->peakDependencyKeys.load(std::memory_order_relaxed);
-    stats.dependencyRegionSplits =
-        _state->dependencyRegionSplits.load(std::memory_order_relaxed);
     return stats;
 }
 
@@ -1471,28 +1296,12 @@ void SurfaceCache::requestView(int startLevel,
         double distance = 0.0;
     };
     const std::size_t tileCount = std::size_t(tu1 - tu0 + 1) * std::size_t(tv1 - tv0 + 1);
-    if (surfaceMemoryTraceEnabled()) {
-        surfaceMemoryTrace(
-            "request_view_plan",
-            std::format(
-                "cache={} generation={} fb={}x{} scale={} level={} "
-                "tile_bounds=[{},{}]x[{},{}] tile_count={} "
-                "candidate_bytes_if_full={}",
-                reinterpret_cast<std::uintptr_t>(_state.get()), viewGeneration,
-                fbW, fbH, scale, level, tu0, tu1, tv0, tv1, tileCount,
-                tileCount * sizeof(Candidate)));
-    }
     std::vector<Candidate> candidates;
     std::unordered_set<TileKey, TileKeyHash> viewTiles;
     viewTiles.reserve(tileCount);
     candidates.reserve(tileCount);
 
     bool viewChanged = false;
-    std::size_t stateViewTiles = 0;
-    std::size_t stateViewBuckets = 0;
-    std::size_t stateOwnedTiles = 0;
-    std::size_t stateOwnedBytes = 0;
-    std::size_t stateOutstanding = 0;
     {
         std::lock_guard lock(_state->mutex);
         if (_state->shuttingDown)
@@ -1523,30 +1332,6 @@ void SurfaceCache::requestView(int startLevel,
         viewChanged = _state->viewTiles != viewTiles;
         _state->viewTiles = std::move(viewTiles);
         _state->viewGeneration = viewGeneration;
-        stateViewTiles = _state->viewTiles.size();
-        stateViewBuckets = _state->viewTiles.bucket_count();
-        stateOwnedTiles = _state->tiles.size();
-        stateOwnedBytes = _state->bytes;
-        stateOutstanding = _state->outstanding.size();
-    }
-    if (surfaceMemoryTraceEnabled()) {
-        const std::size_t candidateMetadataBytes =
-            candidates.capacity() * sizeof(Candidate);
-        const std::size_t viewMetadataBytes =
-            stateViewBuckets * sizeof(void*) +
-            stateViewTiles * (sizeof(TileKey) + 2 * sizeof(void*));
-        surfaceMemoryTrace(
-            "request_view_materialized",
-            std::format(
-                "cache={} generation={} candidates={}/{} "
-                "candidate_metadata_bytes={} view_tiles={} view_buckets={} "
-                "view_metadata_estimate={} owned_tiles={} owned_bytes={} "
-                "outstanding={} changed={}",
-                reinterpret_cast<std::uintptr_t>(_state.get()), viewGeneration,
-                candidates.size(), candidates.capacity(),
-                candidateMetadataBytes, stateViewTiles, stateViewBuckets,
-                viewMetadataBytes, stateOwnedTiles, stateOwnedBytes,
-                stateOutstanding, viewChanged));
     }
 
     // The base Spiral surface cache has an exclusive chunk pool. Smaller
@@ -1581,14 +1366,6 @@ void SurfaceCache::requestView(int startLevel,
         const TileKey key = candidate.key;
         surfaceFillPool().enqueue(
             [state, key, epoch]() { State::runFill(state, key, epoch); });
-    }
-    if (surfaceMemoryTraceEnabled()) {
-        surfaceMemoryTrace(
-            "request_view_end",
-            std::format(
-                "cache={} generation={} candidates={} page_tiles={} admitted={}",
-                reinterpret_cast<std::uintptr_t>(_state.get()), viewGeneration,
-                candidates.size(), pageTiles, admitted));
     }
 }
 
@@ -1729,33 +1506,6 @@ SurfaceCache::SampleStats SurfaceCache::State::sampleReduced(const State& self,
     if (fbH <= 0 || fbW <= 0)
         return stats;
 
-    const std::uint64_t traceOrdinal =
-        g_sampleTraceOrdinal.fetch_add(1, std::memory_order_relaxed) + 1;
-    const bool traceMemory = surfaceMemoryTraceEnabled();
-    if (traceMemory) {
-        std::size_t cacheBytes = 0;
-        std::size_t cacheTiles = 0;
-        std::size_t outstanding = 0;
-        std::size_t viewTiles = 0;
-        {
-            std::lock_guard lock(self.mutex);
-            cacheBytes = self.bytes;
-            cacheTiles = self.tiles.size();
-            outstanding = self.outstanding.size();
-            viewTiles = self.viewTiles.size();
-        }
-        surfaceMemoryTrace(
-            "sample_view_begin",
-            std::format(
-                "ordinal={} cache={} fb={}x{} scale={} start_level={} "
-                "cache_bytes={} cache_tiles={} outstanding={} view_tiles={} "
-                "out_bytes={} coverage_bytes={}",
-                traceOrdinal, reinterpret_cast<std::uintptr_t>(&self), fbW,
-                fbH, scale, startLevel, cacheBytes, cacheTiles, outstanding,
-                viewTiles, out.total() * out.elemSize(),
-                coverage.total() * coverage.elemSize()));
-    }
-
     const int wCount = self.wCount;
     const int wMin = self.wMin;
     double wLow = 0.0, wHigh = 0.0;
@@ -1813,23 +1563,6 @@ SurfaceCache::SampleStats SurfaceCache::State::sampleReduced(const State& self,
                     const_cast<State&>(self).touchLocked({level, tu, tv});
                 }
             }
-        }
-        if (traceMemory) {
-            const std::size_t levelMetadataBytes =
-                levelTiles.bucket_count() * sizeof(void*) +
-                levelTiles.size() *
-                    (sizeof(std::uint64_t) + sizeof(SurfaceTilePtr) +
-                     2 * sizeof(void*));
-            surfaceMemoryTrace(
-                "sample_view_level_tiles",
-                std::format(
-                    "ordinal={} level={} tile_bounds=[{},{}]x[{},{}] "
-                    "tile_refs={} buckets={} ref_metadata_estimate={} "
-                    "pinned_payload_estimate={} missing={}",
-                    traceOrdinal, level, tu0, tu1, tv0, tv1,
-                    levelTiles.size(), levelTiles.bucket_count(),
-                    levelMetadataBytes, levelTiles.size() * self.tileBytes,
-                    missing));
         }
         if (level == startClamped)
             stats.missingTiles = missing;
@@ -1931,15 +1664,6 @@ SurfaceCache::SampleStats SurfaceCache::State::sampleReduced(const State& self,
         stats.coveredPixels += covered;
         if (level > startClamped && covered > 0)
             stats.usedCoarseFallback = true;
-    }
-
-    if (traceMemory) {
-        surfaceMemoryTrace(
-            "sample_view_end",
-            std::format(
-                "ordinal={} covered_pixels={} missing_tiles={} coarse={}",
-                traceOrdinal, stats.coveredPixels, stats.missingTiles,
-                stats.usedCoarseFallback));
     }
 
     return stats;

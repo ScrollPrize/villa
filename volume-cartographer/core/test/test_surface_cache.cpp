@@ -517,7 +517,6 @@ TEST_CASE("SurfaceCache prefetches each tile as one parallel dependency batch")
     // The slow workaround issued up to 256 blocking prefetches per tile.
     // Invalid edge tiles may need no source chunks, hence the upper bound.
     CHECK(std::size_t(array->prefetchRequests()) <= stats.tiles);
-    CHECK(stats.dependencyRegionSplits == 0);
 }
 
 TEST_CASE("SurfaceCache bounds dependency metadata for a pathological tile AABB")
@@ -530,9 +529,6 @@ TEST_CASE("SurfaceCache bounds dependency metadata for a pathological tile AABB"
     // region while keeping every individual prefetch batch bounded.
     REQUIRE(fillView(cache, 0, 0.0, 0.0, 1.0,
                      SurfaceCache::kTileSize, SurfaceCache::kTileSize));
-    const auto stats = cache.stats();
-    CHECK(stats.dependencyRegionSplits > 0);
-    CHECK(stats.peakDependencyKeys <= 8192);
     CHECK(array->prefetchRequests() > 1);
     CHECK(array->maxPrefetchKeys() <= 8192);
 }

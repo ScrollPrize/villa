@@ -36,14 +36,10 @@
 #include <QLoggingCategory>
 #include <algorithm>
 #include <cmath>
-#include <fstream>
 #include <exception>
 #include <iostream>
 #include <optional>
 #include <string_view>
-#if defined(__linux__)
-#include <unistd.h>
-#endif
 #include <unordered_set>
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
@@ -403,17 +399,6 @@ std::shared_ptr<vc::render::ChunkCache> ViewerManager::chunkCacheFor(
         // process-wide chunk I/O workers instead of starting its own.
         slot.cache = volume->createChunkCache(std::move(options));
         slot.builtCapacity = wanted;
-        const char* poolName = "overlay surface tiles";
-        if (pool == ChunkCachePool::PlaneViews)
-            poolName = "plane views";
-        else if (pool == ChunkCachePool::SurfaceTiles)
-            poolName = "surface tiles";
-        Logger()->info(
-            "spiral private chunk pool ({}) built: capacity {:.2f} GiB "
-            "(floor {:.2f} GiB, derived {:.2f} GiB)",
-            poolName,
-            double(wanted) / double(1ULL << 30), double(slot.floorBytes) / double(1ULL << 30),
-            double(slot.requiredBytes) / double(1ULL << 30));
     } catch (const std::exception& e) {
         Logger()->warn("spiral private chunk cache unavailable: {}", e.what());
         slot.cache.reset();
@@ -437,97 +422,6 @@ void ViewerManager::setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t ov
         if (viewer)
             viewer->setSurfaceCacheBudgets(baseBytes, overlayBytes);
     });
-}
-
-namespace {
-
-// Resident set of this process, in bytes; 0 when unavailable. Shown next to the
-// cache figures so the gap between "what the caches hold" and "what the process
-// holds" is visible rather than something to be inferred.
-std::size_t processResidentBytes()
-{
-#if defined(__linux__)
-    std::ifstream statm("/proc/self/statm");
-    long long totalPages = 0;
-    long long residentPages = 0;
-    if (statm >> totalPages >> residentPages && residentPages > 0) {
-        static const long pageSize = ::sysconf(_SC_PAGESIZE);
-        if (pageSize > 0)
-            return std::size_t(residentPages) * std::size_t(pageSize);
-    }
-#endif
-    return 0;
-}
-
-} // namespace
-
-QStringList ViewerManager::aggregatedCacheStatItems() const
-{
-    QStringList items;
-    auto append = [&items](const QString& item) {
-        if (!item.isEmpty() && !items.contains(item))
-            items << item;
-    };
-
-    auto formatBytes = [](std::size_t bytes) {
-        constexpr double gib = 1024.0 * 1024.0 * 1024.0;
-        return QString::number(double(bytes) / gib, 'f', 2);
-    };
-
-    // The private pools belong to the manager, so report them here rather than
-    // through a viewer: the tile filler has no viewer of its own and was
-    // therefore never shown at all.
-    if (_chunkCachePolicy == ChunkCachePolicy::PrivateBounded) {
-        struct PoolLabel {
-            ChunkCachePool pool;
-            const char* label;
-        };
-        for (const PoolLabel& entry : {PoolLabel{ChunkCachePool::PlaneViews, "planes"},
-                                       PoolLabel{ChunkCachePool::SurfaceTiles, "tiles"},
-                                       PoolLabel{ChunkCachePool::OverlaySurfaceTiles,
-                                                 "overlay tiles"}}) {
-            const auto& slot = privateChunkPool(entry.pool);
-            if (!slot.cache)
-                continue;
-            const auto stats = slot.cache->stats();
-            append(QString("%1 RAM %2/%3 GB")
-                       .arg(QString::fromUtf8(entry.label))
-                       .arg(formatBytes(stats.decodedBytes))
-                       .arg(formatBytes(stats.decodedByteCapacity)));
-            if (stats.pendingChunkRequests > 0) {
-                append(QString("%1 queued %2")
-                           .arg(QString::fromUtf8(entry.label))
-                           .arg(stats.pendingChunkRequests));
-            }
-            if (stats.queuedChunkTasks > 0) {
-                append(QString("%1 executor %2")
-                           .arg(QString::fromUtf8(entry.label))
-                           .arg(stats.queuedChunkTasks));
-            }
-            if (stats.supersededChunkRequests > 0) {
-                append(QString("%1 superseded %2")
-                           .arg(QString::fromUtf8(entry.label))
-                           .arg(stats.supersededChunkRequests));
-            }
-            if (stats.persistentWriteBytesInFlight > 0) {
-                append(QString("%1 writeback %2 GB")
-                           .arg(QString::fromUtf8(entry.label))
-                           .arg(formatBytes(stats.persistentWriteBytesInFlight)));
-            }
-        }
-    }
-
-    // Per-viewer items: shared RAM/disk/network plus, from the flattened viewer
-    // only, the surface-cache lines.
-    for (const auto& [viewer, viewerItems] : _cacheStatItems) {
-        (void)viewer;
-        for (const QString& item : viewerItems)
-            append(item);
-    }
-
-    if (const std::size_t resident = processResidentBytes(); resident > 0)
-        append(QString("RSS %1 GB").arg(formatBytes(resident)));
-    return items;
 }
 
 void ViewerManager::onGlobalTick()
@@ -628,15 +522,8 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
         connect(chunkedViewer, &CChunkedVolumeViewer::sendVolumeClicked,
                 this, &ViewerManager::handleVolumeClicked);
     }
-    connect(chunkedViewer, &CChunkedVolumeViewer::sharedCacheStatsChanged, this,
-            [this, baseViewer](const QStringList& items) {
-                // Forwarding each viewer's line directly meant the last emitter
-                // won, so the flattened viewer's surface-cache stats were
-                // clobbered by a plane pane's. Keep them per viewer and publish
-                // the union.
-                _cacheStatItems[baseViewer] = items;
-                emit sharedCacheStatsChanged(aggregatedCacheStatItems());
-            });
+    connect(chunkedViewer, &CChunkedVolumeViewer::sharedCacheStatsChanged,
+            this, &ViewerManager::sharedCacheStatsChanged);
 
     if (auto* graphicsView = chunkedViewer->graphicsView()) {
         auto markActiveViewer = [this, baseViewer]() { _activeViewer = baseViewer; };
@@ -685,8 +572,6 @@ void ViewerManager::unregisterViewer(VolumeViewerBase* viewer)
     if (!viewer) {
         return;
     }
-    _cacheStatItems.erase(viewer);
-
     const auto viewerIt = std::find(_baseViewers.begin(), _baseViewers.end(), viewer);
     const bool knownViewer = viewerIt != _baseViewers.end() ||
                              _resetDefaults.find(viewer) != _resetDefaults.end();

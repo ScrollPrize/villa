@@ -327,9 +327,6 @@ private:
         bool success{false};
     };
 
-    // Union of every viewer's cache-stat items plus this manager's private
-    // pools, so no single line can hide another's.
-    QStringList aggregatedCacheStatItems() const;
     void registerOverlay(ViewerOverlayControllerBase* overlay);
     VolumeViewerBase* initializeChunkedViewer(CChunkedVolumeViewer* chunkedViewer,
                                               const std::string& surfaceName,
@@ -361,7 +358,6 @@ private:
     // submit immediately, while deferred intersections/status are serviced here.
     QTimer* _globalClock{nullptr};
     std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
-    std::unordered_map<VolumeViewerBase*, QStringList> _cacheStatItems;
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
     std::shared_ptr<Volume> _overlayVolume;

@@ -8,7 +8,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <format>
 #include <future>
 #include <iomanip>
 #include <iostream>
@@ -34,7 +33,6 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Logging.hpp"
-#include "vc/core/render/SurfaceMemoryTrace.hpp"
 
 
 namespace bg = boost::geometry;
@@ -1977,17 +1975,6 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces,
     impl_->tileStride = Impl::computeTileStride(impl_->samplingStride);
     const int stride = impl_->tileStride;
     const float padding = bboxPadding;
-    const bool traceMemory = vc::render::surfaceMemoryTraceEnabled();
-
-    if (traceMemory) {
-        vc::render::surfaceMemoryTrace(
-            "surface_index_rebuild_begin",
-            std::format(
-                "requested_surfaces={} available_surfaces={} sampling_stride={} "
-                "tile_stride={} use_mapped={}",
-                surfaces.size(), surfaceCount, impl_->samplingStride,
-                impl_->tileStride, useMappedSurfaces));
-    }
 
     const bool debugLogging = DebugLoggingEnabled();
 
@@ -2002,20 +1989,6 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces,
         rec.mask.ensureSize(std::max(0, item.rows - 1),
                             std::max(0, item.cols - 1),
                             stride);
-        if (traceMemory) {
-            vc::render::surfaceMemoryTrace(
-                "surface_index_mask_allocated",
-                std::format(
-                    "surface='{}' rows={} cols={} mapped={} tile_rows={} "
-                    "tile_cols={} state_size={} state_capacity={} "
-                    "box_size={} box_capacity={} explicit_bytes={}",
-                    item.surface->id, item.rows, item.cols, bool(item.mapped),
-                    rec.mask.tileRows, rec.mask.tileCols,
-                    rec.mask.states.size(), rec.mask.states.capacity(),
-                    rec.mask.cachedBoxes.size(), rec.mask.cachedBoxes.capacity(),
-                    rec.mask.states.capacity() * sizeof(std::uint8_t) +
-                        rec.mask.cachedBoxes.capacity() * sizeof(Impl::QBox)));
-        }
     }
 
     // Per-surface entries for parallel collection. Rebuild does not need
@@ -2049,19 +2022,6 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces,
             }
         }
 
-        if (traceMemory) {
-            const auto& entries = perSurfaceEntries[i];
-            vc::render::surfaceMemoryTrace(
-                "surface_index_surface_collected",
-                std::format(
-                    "surface='{}' ordinal={} rows={} cols={} mapped={} "
-                    "entries={} capacity={} entry_size={} explicit_bytes={}",
-                    surface->id, i, indexSurfaces[i].rows,
-                    indexSurfaces[i].cols, bool(indexSurfaces[i].mapped),
-                    entries.size(), entries.capacity(), sizeof(Impl::Entry),
-                    entries.capacity() * sizeof(Impl::Entry)));
-        }
-
         const size_t done = indexedSurfaces.fetch_add(1, std::memory_order_relaxed) + 1;
         if (debugLogging && (done == surfaceCount || done % 1000 == 0)) {
             #pragma omp critical(surface_patch_index_progress)
@@ -2080,33 +2040,12 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces,
         std::cout << "[SurfacePatchIndex] merging entries" << std::endl;
     }
     size_t totalEntries = 0;
-    size_t perSurfaceCapacity = 0;
     for (const auto& entriesForSurface : perSurfaceEntries) {
         totalEntries += entriesForSurface.size();
-        perSurfaceCapacity += entriesForSurface.capacity();
-    }
-    if (traceMemory) {
-        vc::render::surfaceMemoryTrace(
-            "surface_index_merge_begin",
-            std::format(
-                "surfaces={} total_entries={} entry_size={} "
-                "per_surface_capacity={} per_surface_explicit_bytes={} "
-                "merged_requested_bytes={}",
-                surfaceCount, totalEntries, sizeof(Impl::Entry),
-                perSurfaceCapacity,
-                perSurfaceCapacity * sizeof(Impl::Entry),
-                totalEntries * sizeof(Impl::Entry)));
     }
 
     std::vector<Impl::Entry> entries;
     entries.reserve(totalEntries);
-    if (traceMemory) {
-        vc::render::surfaceMemoryTrace(
-            "surface_index_merged_allocated",
-            std::format("entries={} capacity={} explicit_bytes={}",
-                        entries.size(), entries.capacity(),
-                        entries.capacity() * sizeof(Impl::Entry)));
-    }
 
     for (auto& entriesForSurface : perSurfaceEntries) {
         entries.insert(entries.end(),
@@ -2114,13 +2053,6 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces,
                        std::make_move_iterator(entriesForSurface.end()));
         entriesForSurface.clear();
         entriesForSurface.shrink_to_fit();
-    }
-    if (traceMemory) {
-        vc::render::surfaceMemoryTrace(
-            "surface_index_merge_end",
-            std::format("entries={} capacity={} explicit_bytes={}",
-                        entries.size(), entries.capacity(),
-                        entries.capacity() * sizeof(Impl::Entry)));
     }
 
     impl_->patchCount = entries.size();
@@ -2130,30 +2062,11 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces,
         if (debugLogging) {
             std::cout << "[SurfacePatchIndex] building R-tree with " << entries.size() << " entries" << std::endl;
         }
-        if (traceMemory) {
-            vc::render::surfaceMemoryTrace(
-                "surface_index_tree_begin",
-                std::format("entries={} source_capacity={} source_bytes={}",
-                            entries.size(), entries.capacity(),
-                            entries.capacity() * sizeof(Impl::Entry)));
-        }
         impl_->tree = std::make_unique<Impl::PatchTree>(entries.begin(), entries.end());
-        if (traceMemory) {
-            vc::render::surfaceMemoryTrace(
-                "surface_index_tree_end",
-                std::format("entries={} patches={}", entries.size(),
-                            impl_->patchCount));
-        }
     }
     if (debugLogging) {
         std::cout << "[SurfacePatchIndex] rebuild complete: surfaces=" << surfaceCount
                   << " patches=" << impl_->patchCount << std::endl;
-    }
-    if (traceMemory) {
-        vc::render::surfaceMemoryTrace(
-            "surface_index_rebuild_end",
-            std::format("surfaces={} patches={}", surfaceCount,
-                        impl_->patchCount));
     }
     globalGeneration_.fetch_add(1, std::memory_order_relaxed);
 }

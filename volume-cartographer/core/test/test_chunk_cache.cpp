@@ -269,68 +269,6 @@ TEST_CASE("ChunkCache: stats reflect decoded byte budget and activity")
     CHECK_FALSE(s.persistentCacheEnabled);
 }
 
-TEST_CASE("ChunkCache: opt-in access diagnostics count lookups and fetch admission")
-{
-    auto f = std::make_shared<CountingFetcher>();
-    ChunkFetchResult found;
-    found.status = ChunkFetchStatus::Found;
-    found.bytes = makeBytes(64, std::byte{5});
-    f->setCanned({0, 0, 0, 0}, std::move(found));
-
-    std::vector<ChunkCache::LevelInfo> levels = {
-        {{8, 8, 8}, {4, 4, 4}, {}},
-    };
-    ChunkCache::Options opts;
-    opts.maxConcurrentReads = 1;
-    opts.detectAllFillChunks = false;
-    opts.collectAccessDiagnostics = true;
-    ChunkCache cache(
-        std::move(levels),
-        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
-        0.0, ChunkDtype::UInt8, opts);
-
-    REQUIRE(waitForResolved(cache, 0, 0, 0, 0).status ==
-            ChunkStatus::Data);
-    const auto before = cache.stats();
-    REQUIRE(before.accessDiagnosticsEnabled);
-
-    CHECK(cache.tryGetChunk(0, 0, 0, 0).status == ChunkStatus::Data);
-    CHECK(cache.getChunkIfCached(0, 0, 0, 0).status ==
-          ChunkStatus::Data);
-    CHECK(cache.tryGetChunk(0, 99, 0, 0).status ==
-          ChunkStatus::AllFill);
-
-    // A new valid key exercises prefetch insertion and fetch admission. The
-    // default CountingFetcher result is Missing, but wait=true guarantees the
-    // task has resolved before the counters are inspected.
-    cache.prefetchChunks({{0, 1, 0, 0}}, true);
-
-    const auto after = cache.stats();
-    CHECK(after.tryGetCalls == before.tryGetCalls + 2);
-    CHECK(after.cacheOnlyGetCalls == before.cacheOnlyGetCalls + 1);
-    CHECK(after.lookupDataResults == before.lookupDataResults + 2);
-    CHECK(after.lookupAllFillResults ==
-          before.lookupAllFillResults + 1);
-    CHECK(after.prefetchCalls == before.prefetchCalls + 1);
-    CHECK(after.prefetchKeys == before.prefetchKeys + 1);
-    CHECK(after.entriesCreated == before.entriesCreated + 1);
-    CHECK(after.prefetchEntriesCreated ==
-          before.prefetchEntriesCreated + 1);
-    CHECK(after.fetchRequestsQueued ==
-          before.fetchRequestsQueued + 1);
-    CHECK(after.fetchTasksSubmitted ==
-          before.fetchTasksSubmitted + 1);
-    CHECK(after.fetchTasksStarted ==
-          before.fetchTasksStarted + 1);
-    CHECK(after.fetchTasksFinished ==
-          before.fetchTasksFinished + 1);
-    CHECK(after.fetchResultsStored ==
-          before.fetchResultsStored + 1);
-    CHECK(after.fetchResultsDiscarded ==
-          before.fetchResultsDiscarded);
-    CHECK(after.localEntryCount == 2);
-}
-
 TEST_CASE("ChunkCache: invalidate clears decoded entries")
 {
     auto f = std::make_shared<CountingFetcher>();
@@ -745,13 +683,7 @@ TEST_CASE("ChunkCache: an exclusive new view discards unresolved old-view fetche
     f->waitFirstStarted();
     for (int ix = 1; ix < 4; ++ix)
         (void)c->tryGetChunk(0, 0, 0, ix);
-    CHECK(c->stats().pendingChunkRequests == 4);
-    CHECK(c->stats().queuedChunkTasks == 3);
-
     c->beginViewRequest(/*discardPending=*/true);
-    CHECK(c->stats().pendingChunkRequests == 0);
-    CHECK(c->stats().queuedChunkTasks == 0);
-    CHECK(c->stats().supersededChunkRequests == 4);
 
     // Repeated pans while the old fetch is still running must not accumulate
     // executor work outside the ChunkCache entry map.
@@ -759,10 +691,7 @@ TEST_CASE("ChunkCache: an exclusive new view discards unresolved old-view fetche
         const int firstChunk = 5 + view * 32;
         for (int ix = firstChunk; ix < firstChunk + 32; ++ix)
             (void)c->tryGetChunk(0, 0, 0, ix);
-        CHECK(c->stats().queuedChunkTasks == 32);
         c->beginViewRequest(/*discardPending=*/true);
-        CHECK(c->stats().pendingChunkRequests == 0);
-        CHECK(c->stats().queuedChunkTasks == 0);
     }
 
     f->release();

@@ -491,9 +491,6 @@ private:
     std::uint64_t _surfaceCacheGeometryEpoch = 0;
     Volume* _overlaySurfaceCacheVolume = nullptr;
     std::uint64_t _surfaceCacheEpoch = 0;
-    // Number of SurfaceCache instances this viewer has built. Should settle at
-    // one per surface generation.
-    std::uint64_t _surfaceCacheBuildCount = 0;
     std::uint64_t _surfaceViewGeneration = 0;
     std::uint64_t _surfaceTileCbId = 0;
     std::uint64_t _overlaySurfaceTileCbId = 0;
