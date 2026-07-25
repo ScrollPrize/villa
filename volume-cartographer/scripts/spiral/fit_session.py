@@ -18,9 +18,9 @@ import zipfile
 
 
 
-# Version 9 adds the host-owned named-session namespace advertised by the
-# service and used to isolate generated output for persistent remote services.
-API_VERSION = 9
+# Version 10 adds the canonical active session request to status responses so
+# late-attaching VC3D clients can adopt the resident fit without reloading it.
+API_VERSION = 10
 
 
 # Counts which describe how many training objects/points are sampled per
@@ -222,11 +222,19 @@ class SpiralRunConfig:
             config=dict(value.get("config", {})),
         )
 
+    def manifest(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["config"] = dict(self.config)
+        return result
+
 
 @dataclass(frozen=True)
 class SpiralPreviewConfig:
     first_winding: int = 10
     variant: str = "raw"
+
+    def manifest(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass

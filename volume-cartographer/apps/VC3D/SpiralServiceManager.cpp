@@ -39,7 +39,7 @@ constexpr int kRemoteLogPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 9;
+constexpr int kSupportedApiVersion = 10;
 constexpr int kPreviewCacheKept = 3;
 
 QString stateName(SpiralServiceManager::ConnectionState state)
@@ -171,6 +171,7 @@ void SpiralServiceManager::connectToService(const SpiralServiceProfile& profile)
     _fetchingPreviewArtifact.clear();
     _installedGeometryArtifact.clear();
     _fetchingGeometryArtifact.clear();
+    _synchronizedSessionId.clear();
     _activeLasagnaFlattenJob.clear();
     _reportedLasagnaFlattenJob.clear();
     _installedLasagnaArtifact.clear();
@@ -302,7 +303,11 @@ void SpiralServiceManager::startLocalProcess()
 
 void SpiralServiceManager::beginHandshake()
 {
-    setConnectionState(ConnectionState::Connecting);
+    // Keep a tunnel recovery distinguishable from an explicit new
+    // connection. Consumers retain the synchronized session and preview while
+    // the same endpoint is briefly unreachable.
+    if (_connectionState != ConnectionState::Reconnecting)
+        setConnectionState(ConnectionState::Connecting);
     const quint64 generation = _connectionGeneration;
     get(QStringLiteral("/health"), Timeout::Quick,
         [this, generation](const QJsonObject& health) {
@@ -380,6 +385,7 @@ void SpiralServiceManager::disconnectFromService()
     _remoteLogsInFlight = false;
     _restartInProgress = false;
     _artifactCache->clearEndpoint();
+    _synchronizedSessionId.clear();
     _tunnel->stop();
     // Disconnecting from an independently started service never shuts the
     // service down; only a process this manager launched is terminated.
@@ -426,6 +432,7 @@ void SpiralServiceManager::restartRemoteService()
              _fetchingPreviewArtifact.clear();
              _installedGeometryArtifact.clear();
              _fetchingGeometryArtifact.clear();
+             _synchronizedSessionId.clear();
              _lastRemoteLogSequence = 0;
              _serviceOwnsDataset = false;
              _advertisedDataset = {};
@@ -528,29 +535,28 @@ void SpiralServiceManager::resolveDataset(const QString& root)
 
 void SpiralServiceManager::loadSession(QJsonObject request)
 {
-    QJsonObject inputPaths = request.value(QStringLiteral("paths")).toObject();
     if (!_serviceOwnsDataset) {
         request[QStringLiteral("command_id")] = commandId();
-        sendLoadRequest(request, inputPaths);
+        sendLoadRequest(request);
         return;
     }
     // The service owns its base inputs; a remote load request carries run
     // parameters plus the client-selectable checkpoint/tracks values only.
-    const QJsonObject requested = inputPaths;
-    inputPaths = remoteInputPaths();
+    const QJsonObject requested =
+        request.value(QStringLiteral("paths")).toObject();
     QJsonObject selectable;
     const QString tracks = requested.value(QStringLiteral("tracks_dbm")).toString().trimmed();
     if (!tracks.isEmpty()) selectable[QStringLiteral("tracks_dbm")] = tracks;
     const QString checkpoint = requested.value(QStringLiteral("checkpoint")).toString().trimmed();
 
-    auto finish = [this, request, inputPaths, selectable](const QString& checkpointHostPath) mutable {
+    auto finish = [this, request, selectable](const QString& checkpointHostPath) mutable {
         if (!checkpointHostPath.isEmpty())
             selectable[QStringLiteral("checkpoint")] = checkpointHostPath;
         QJsonObject load = request;
         if (selectable.isEmpty()) load.remove(QStringLiteral("paths"));
         else load[QStringLiteral("paths")] = selectable;
         load[QStringLiteral("command_id")] = commandId();
-        sendLoadRequest(load, inputPaths);
+        sendLoadRequest(load);
     };
 
     if (checkpoint.isEmpty()) {
@@ -587,12 +593,11 @@ void SpiralServiceManager::loadSession(QJsonObject request)
                               });
 }
 
-void SpiralServiceManager::sendLoadRequest(QJsonObject request, const QJsonObject& inputPaths)
+void SpiralServiceManager::sendLoadRequest(QJsonObject request)
 {
     postWithRetry(QStringLiteral("/session/load"), request, Timeout::Load, kMutationRetries,
-                  [this, inputPaths](const QJsonObject& response) {
-                      emit sessionAccepted(inputPaths,
-                                           response.value(QStringLiteral("session_generation")).toInteger());
+                  [this](const QJsonObject& response) {
+                      handleStatus(response);
                   });
 }
 
@@ -706,17 +711,6 @@ void SpiralServiceManager::uploadCheckpointForResume(
     }));
 }
 
-QJsonObject SpiralServiceManager::remoteInputPaths() const
-{
-    QJsonObject paths;
-    const QJsonObject resolved = _advertisedDataset.value(QStringLiteral("resolved")).toObject();
-    for (auto it = resolved.begin(); it != resolved.end(); ++it)
-        paths[it.key()] = it.value();
-    paths[QStringLiteral("dataset_root")] = _advertisedDataset.value(QStringLiteral("root"));
-    paths[QStringLiteral("pcls")] = _advertisedDataset.value(QStringLiteral("pcl_inputs"));
-    return paths;
-}
-
 void SpiralServiceManager::runIterations(int iterations,
                                          const QJsonObject& influenceConfig,
                                          const QJsonObject& runConfig)
@@ -797,7 +791,10 @@ void SpiralServiceManager::deleteSession()
                                               QJsonDocument(body).toJson(QJsonDocument::Compact));
     const quint64 generation = _connectionGeneration;
     connect(reply, &QNetworkReply::finished, this, [this, reply, generation]() {
-        handleReply(reply, generation, {}, {});
+        handleReply(reply, generation,
+                    [this](const QJsonObject& response) {
+                        handleStatus(response);
+                    }, {});
     });
 }
 
@@ -1175,13 +1172,25 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     const qint64 generation = status.value(QStringLiteral("generation")).toInteger(-1);
     if (generation < _lastStatusGeneration) return;
     _lastStatusGeneration = generation;
-    emit sessionStatusChanged(status);
-    const bool active = !status.value(QStringLiteral("session_id")).toString().isEmpty()
+    const QString sessionId =
+        status.value(QStringLiteral("session_id")).toString();
+    const bool active = !sessionId.isEmpty()
         && status.value(QStringLiteral("state")).toString() != QStringLiteral("Empty");
     if (active != _hasActiveSession) {
         _hasActiveSession = active;
         emit sessionActiveChanged(active);
     }
+    if (!active) {
+        _synchronizedSessionId.clear();
+    } else if (sessionId != _synchronizedSessionId) {
+        const QJsonObject request =
+            status.value(QStringLiteral("session_request")).toObject();
+        if (!request.isEmpty()) {
+            _synchronizedSessionId = sessionId;
+            emit sessionSynchronized(request, status);
+        }
+    }
+    emit sessionStatusChanged(status);
     const QJsonObject flatten =
         status.value(QStringLiteral("lasagna_flatten")).toObject();
     if (!flatten.isEmpty()) {

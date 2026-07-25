@@ -21,6 +21,8 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/DecodedChunkCacheBudget.hpp"
 
 #include <QApplication>
 #include <QCursor>
@@ -257,6 +259,161 @@ const std::vector<ViewerManager*>& ViewerManager::allManagers()
     return managerRegistry();
 }
 
+void ViewerManager::applySpiralCacheSettings()
+{
+    using namespace vc3d::settings;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    constexpr std::size_t mib = 1024ULL * 1024ULL;
+    constexpr std::size_t gib = 1024ULL * mib;
+    const auto planeMb = std::max<qlonglong>(
+        0, settings.value(spiral::PLANE_CHUNK_CACHE_MB,
+                          spiral::PLANE_CHUNK_CACHE_MB_DEFAULT).toLongLong());
+    const auto surfaceGb = std::max<qlonglong>(
+        0, settings.value(spiral::SURFACE_CACHE_GB,
+                          spiral::SURFACE_CACHE_GB_DEFAULT).toLongLong());
+    const auto overlayGb = std::max<qlonglong>(
+        0, settings.value(spiral::OVERLAY_SURFACE_CACHE_GB,
+                          spiral::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toLongLong());
+
+    if (_chunkCachePolicy == ChunkCachePolicy::PrivateBounded)
+        setChunkCacheFloorBytes(ChunkCachePool::PlaneViews, std::size_t(planeMb) * mib);
+    else
+        setChunkCachePolicy(ChunkCachePolicy::PrivateBounded, std::size_t(planeMb) * mib);
+    setSurfaceCacheBudgets(std::size_t(surfaceGb) * gib, std::size_t(overlayGb) * gib);
+}
+
+void ViewerManager::setChunkCachePolicy(ChunkCachePolicy policy, std::size_t capacityBytes)
+{
+    const bool policyChanged = _chunkCachePolicy != policy;
+    _chunkCachePolicy = policy;
+    privateChunkPool(ChunkCachePool::PlaneViews).floorBytes = capacityBytes;
+    // The tile filler's pool is not a user setting: it is sized like the plane
+    // pool by default and, like it, raised when one round of concurrent tile
+    // fills cannot fit. Exposing it later is a one-line change.
+    constexpr std::size_t kSurfaceTilePoolFloorBytes = 2ULL * 1024 * 1024 * 1024;
+    privateChunkPool(ChunkCachePool::SurfaceTiles).floorBytes = kSurfaceTilePoolFloorBytes;
+    if (policyChanged) {
+        for (auto& pool : _privateChunkPools) {
+            pool.cache.reset();
+            pool.budget.reset();
+            pool.volume.reset();
+            pool.builtCapacity = 0;
+        }
+    }
+    // Viewers created before the opt-in are already holding a cache from the
+    // previous policy, so make them re-acquire.
+    forEachBaseViewer([](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->refreshChunkSource();
+    });
+}
+
+std::size_t ViewerManager::chunkCacheFloorBytes(ChunkCachePool pool) const
+{
+    return privateChunkPool(pool).floorBytes;
+}
+
+void ViewerManager::setChunkCacheFloorBytes(ChunkCachePool pool, std::size_t bytes)
+{
+    auto& slot = privateChunkPool(pool);
+    if (slot.floorBytes == bytes)
+        return;
+    slot.floorBytes = bytes;
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded)
+        return;
+    forEachBaseViewer([](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->refreshChunkSource();
+    });
+}
+
+std::size_t ViewerManager::effectiveChunkCacheCapacity(ChunkCachePool pool) const
+{
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded)
+        return 0;
+    const auto& slot = privateChunkPool(pool);
+    return std::max(slot.floorBytes, slot.requiredBytes);
+}
+
+void ViewerManager::noteChunkFootprint(ChunkCachePool pool, std::size_t footprintBytes)
+{
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded || footprintBytes == 0)
+        return;
+    // The sampler pins only a small window of chunks at a time and re-reads the
+    // rest through the cache across tiles, so a cap that merely equals one
+    // frame's footprint still thrashes. Two frames' worth is the working
+    // minimum.
+    const std::size_t required = footprintBytes <= std::numeric_limits<std::size_t>::max() / 2
+                                     ? footprintBytes * 2
+                                     : std::numeric_limits<std::size_t>::max();
+    auto& slot = privateChunkPool(pool);
+    slot.requiredBytes = std::max(slot.requiredBytes, required);
+}
+
+std::shared_ptr<vc::render::ChunkCache> ViewerManager::chunkCacheFor(
+    const std::shared_ptr<Volume>& volume, ChunkCachePool pool)
+{
+    if (!volume)
+        return nullptr;
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded) {
+        // Byte-for-byte the pre-policy behaviour, including Volume's refusal to
+        // drop a warm cache when a second workspace re-applies its budget.
+        return volume->sharedChunkCache();
+    }
+
+    auto& slot = privateChunkPool(pool);
+    const std::size_t wanted = std::max(slot.floorBytes, slot.requiredBytes);
+    // Exact comparison, not >=, so lowering the setting shrinks the pool rather
+    // than silently keeping the larger one until something else rebuilds it.
+    if (slot.cache && slot.volume.lock() == volume && slot.builtCapacity == wanted)
+        return slot.cache;
+
+    // Releasing the previous pool here is what bounds retention: it is dropped
+    // on a volume switch or a capacity growth, and never accumulates with
+    // browsing history. An in-flight render holding the old cache keeps it
+    // alive until that frame finishes.
+    slot.cache.reset();
+    slot.budget.reset();
+    slot.builtCapacity = 0;
+    slot.volume = volume;
+
+    try {
+        vc::render::ChunkCache::Options options;
+        options.decodedByteCapacity = wanted;
+        // A private budget of the same size, rather than the process-wide one:
+        // Volume::createChunkCache substitutes its own budget for a null here,
+        // which would rejoin this pool to the shared ceiling.
+        slot.budget = std::make_shared<vc::render::DecodedChunkCacheBudget>(wanted);
+        options.decodedByteBudget = slot.budget;
+        // maxConcurrentReads is left at the default so this pool shares the
+        // process-wide chunk I/O workers instead of starting its own.
+        slot.cache = volume->createChunkCache(std::move(options));
+        slot.builtCapacity = wanted;
+    } catch (const std::exception& e) {
+        Logger()->warn("spiral private chunk cache unavailable: {}", e.what());
+        slot.cache.reset();
+        slot.budget.reset();
+        slot.volume.reset();
+        slot.builtCapacity = 0;
+    }
+    return slot.cache;
+}
+
+void ViewerManager::setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes)
+{
+    _surfaceCacheEnabled = true;
+    if (_surfaceCacheBudgetBytes == baseBytes &&
+        _overlaySurfaceCacheBudgetBytes == overlayBytes) {
+        return;
+    }
+    _surfaceCacheBudgetBytes = baseBytes;
+    _overlaySurfaceCacheBudgetBytes = overlayBytes;
+    forEachBaseViewer([baseBytes, overlayBytes](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->setSurfaceCacheBudgets(baseBytes, overlayBytes);
+    });
+}
+
 void ViewerManager::onGlobalTick()
 {
     for (auto* v : _baseViewers) {
@@ -388,6 +545,10 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
     baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     baseViewer->setOverlayComposite(_overlayComposite);
+    if (_surfaceCacheEnabled) {
+        baseViewer->setSurfaceCacheBudgets(_surfaceCacheBudgetBytes,
+                                           _overlaySurfaceCacheBudgetBytes);
+    }
 
     if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);

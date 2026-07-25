@@ -80,7 +80,10 @@ signals:
                                 const QString& message);
     void serviceStateChanged(const QString& state);
     void datasetResolved(const QJsonObject& resolution);
-    void sessionAccepted(const QJsonObject& inputPaths, qint64 sessionGeneration);
+    // Emitted once when this connection first observes a resident session,
+    // whether VC3D loaded it or attached after another client did.
+    void sessionSynchronized(const QJsonObject& sessionRequest,
+                             const QJsonObject& status);
     void sessionStatusChanged(const QJsonObject& status);
     void sessionActiveChanged(bool active);
     // Local (cache) filesystem paths: artifact transfers already happened.
@@ -135,10 +138,9 @@ private:
     void fetchAdvertisedDataset();
     QString commandId();
     QString endpointFingerprint() const;
-    QJsonObject remoteInputPaths() const;
     void continueUpload(const QString& uploadId, const QString& inputId,
                         const QString& baseDir, QStringList pendingFiles);
-    void sendLoadRequest(QJsonObject request, const QJsonObject& inputPaths);
+    void sendLoadRequest(QJsonObject request);
     // Streams a client-local resume checkpoint into the service's
     // uploaded-checkpoints directory and reports the resulting host path.
     void uploadCheckpointForResume(const QString& localPath,
@@ -182,4 +184,5 @@ private:
     QString _installedLasagnaArtifact;
     QString _fetchingLasagnaArtifact;
     QString _lastLasagnaLocalPath;
+    QString _synchronizedSessionId;
 };

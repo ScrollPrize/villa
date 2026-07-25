@@ -205,6 +205,7 @@ set(srcs
     SpiralServiceManager.cpp
     SpiralServiceManager.hpp
     SpiralServiceProfile.hpp
+    SpiralSessionSync.hpp
     SpiralSshTunnel.cpp
     SpiralSshTunnel.hpp
     SpiralPanel.cpp

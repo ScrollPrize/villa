@@ -108,6 +108,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
         this,
         _mainState ? _mainState->decodedCacheBudget() : nullptr);
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
+    // Spiral's plane panes get their own hard-capped decoded-chunk pool instead
+    // of sharing the Volume's, so browsing slices here can never displace the
+    // main workspace's working set, and the flattened pane renders from tiles of
+    // resampled surface space. Applied before the viewers exist so they pick up
+    // the policy on construction.
+    _viewerManager->applySpiralCacheSettings();
     // Spiral can trade some intersection detail for substantially cheaper
     // input-patch indexing without changing the main workspace preference.
     _viewerManager->setSurfacePatchSamplingStride(4, false);
@@ -427,8 +433,12 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             &SpiralWorkspace::spiralSessionActiveChanged);
     connect(_service, &SpiralServiceManager::sessionStatusChanged, this,
             &SpiralWorkspace::updatePendingPatchIds);
-    connect(_service, &SpiralServiceManager::sessionAccepted, this,
-            [this](const QJsonObject& paths, qint64 generation) {
+    connect(_service, &SpiralServiceManager::sessionSynchronized, this,
+            [this](const QJsonObject& request, const QJsonObject& status) {
+                const QJsonObject paths =
+                    request.value(QStringLiteral("paths")).toObject();
+                const qint64 generation =
+                    status.value(QStringLiteral("session_generation")).toInteger();
                 _sessionPaths = paths;
                 _flattenedPreviewActive = false;
                 _previewSource.reset();

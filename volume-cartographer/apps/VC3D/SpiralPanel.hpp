@@ -67,6 +67,8 @@ private:
     bool optionalInputEnabled(const QString& key) const;
     void updateOptionalInputUi();
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
+    void synchronizeSession(const QJsonObject& request,
+                            const QJsonObject& status);
     void applyResolution(const QJsonObject& resolution, bool force);
     void updateStatus(const QJsonObject& status);
     QJsonObject normalizedReloadRequest(QJsonObject request) const;
@@ -166,7 +168,7 @@ private:
     QLabel* _commitHint = nullptr;
     QJsonArray _lastEphemeral;
     QJsonObject _loadedSessionRequest;
-    QJsonObject _pendingSessionRequest;
+    QJsonObject _attachedAdvancedConfig;
     QJsonObject _defaultAdvancedConfig;
     QSet<QString> _runConfigKeys;
     qint64 _advancedSessionGeneration = -1;

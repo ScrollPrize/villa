@@ -50,7 +50,7 @@ from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_BOOLEAN_KEYS,
                          validate_session_request)
 
 
-SERVICE_VERSION = "5.4.0"
+SERVICE_VERSION = "5.5.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -984,6 +984,7 @@ class ServiceState:
         self.session = None
         self.session_id = None
         self.session_paths = None
+        self.session_request = None
         self.service_generation = 1
         self.session_generation = 0
         self.command_generation = 0
@@ -1054,6 +1055,7 @@ class ServiceState:
                 "target_iteration": 0, "latest_metrics": {}, "warnings": [],
                 "error": None, "preview_manifest_path": None, "preview_generation": 0,
             })
+            response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview_artifact
             response["geometry_artifact"] = self._geometry_artifact
             response["lasagna_flatten"] = (
@@ -1208,6 +1210,7 @@ class ServiceState:
                         self.session = None
                         self.session_id = None
                         self.session_paths = None
+                        self.session_request = None
                     self._reset_session_scope()
                     self.replacement_old_session_released = True
                     self.status_generation += 1
@@ -1218,10 +1221,21 @@ class ServiceState:
                 self.session_generation += 1
                 self.session_id = f"spiral-{self.session_generation}-{secrets.token_hex(5)}"
                 self.session_paths = paths
+                self.session_request = {
+                    "paths": paths.manifest(),
+                    "run": run.manifest(),
+                    "preview": preview.manifest(),
+                }
                 self._reset_session_scope()
-                self.session = create_session(
-                    paths, run, preview, self._status_changed,
-                    gpu_ids=self.gpu_ids)
+                try:
+                    self.session = create_session(
+                        paths, run, preview, self._status_changed,
+                        gpu_ids=self.gpu_ids)
+                except BaseException:
+                    self.session_id = None
+                    self.session_paths = None
+                    self.session_request = None
+                    raise
                 self.status_generation += 1
                 response = self.status()
                 response["accepted"] = True
@@ -1373,6 +1387,7 @@ class ServiceState:
             self.session = None
             self.session_id = None
             self.session_paths = None
+            self.session_request = None
             self.session_generation += 1
             self.status_generation += 1
             self._reset_session_scope()

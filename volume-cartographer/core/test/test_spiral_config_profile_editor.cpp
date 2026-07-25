@@ -9,6 +9,7 @@
 #include <QTemporaryDir>
 
 #include "SpiralReloadComparison.hpp"
+#include "SpiralSessionSync.hpp"
 #include "elements/SpiralConfigProfileEditor.hpp"
 
 #include <cstdlib>
@@ -107,6 +108,27 @@ int main(int argc, char** argv)
             != vc3d::normalizedSpiralReloadRequest(
                 sessionChange, defaults, runKeys),
         "A changed session-scoped Advanced value must require reload");
+
+    const QJsonObject attachedRequest{
+        {QStringLiteral("run"), QJsonObject{
+            {QStringLiteral("config"), QJsonObject{
+                {QStringLiteral("session_value"), 13},
+                {QStringLiteral("requested_only"), true},
+            }},
+        }},
+    };
+    const QJsonObject activeRunConfig{
+        {QStringLiteral("run_value"), 29},
+    };
+    const QJsonObject attachedConfig =
+        vc3d::effectiveSpiralSessionConfig(
+            attachedRequest, defaults, activeRunConfig);
+    require(attachedConfig.value(QStringLiteral("session_value")).toInt() == 13,
+            "The canonical request must override the host default");
+    require(attachedConfig.value(QStringLiteral("run_value")).toInt() == 29,
+            "The active Run configuration must override the canonical request");
+    require(attachedConfig.value(QStringLiteral("requested_only")).toBool(),
+            "Canonical request-only settings must survive attachment");
 
     editor.setSessionDefault(QJsonObject{{QStringLiteral("python_default"), 7}});
     require(editor.currentText().contains(QStringLiteral("python_default")),

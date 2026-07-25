@@ -562,6 +562,74 @@ class DatasetOwnershipTests(unittest.TestCase):
                       "gradient_magnitude", "fibers"):
             self.assertEqual(request["paths"][field], "")
 
+    def test_status_advertises_canonical_active_session_request(self):
+        config = {
+            "use_verified_patches": True,
+            "use_unverified_patches": False,
+            "use_normals": False,
+            "use_surf_sdt": False,
+            "use_tracks": False,
+            "use_gradient_magnitude": False,
+            "use_fibers": False,
+            "loss_weight_shell_outer": 0,
+            "loss_weight_shell_patch_radius": 0,
+            "loss_weight_patch_radius": 7.5,
+        }
+        request = {
+            "run": {
+                "z_begin": 100,
+                "z_end": 900,
+                "scroll_name": "attached-scroll",
+                "config": config,
+            },
+            "preview": {"first_winding": 12, "variant": "raw"},
+        }
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()):
+            response = self.state.load(request)
+
+        attached = response["session_request"]
+        self.assertEqual(attached, self.state.status()["session_request"])
+        self.assertEqual(attached["paths"]["dataset_root"], str(self.root))
+        self.assertEqual(attached["paths"]["verified_patches"],
+                         str(self.root / "verified_patches"))
+        self.assertEqual(attached["paths"]["fibers"], "")
+        self.assertEqual(attached["run"]["z_begin"], 100)
+        self.assertEqual(attached["run"]["z_end"], 900)
+        self.assertEqual(attached["run"]["scroll_name"], "attached-scroll")
+        self.assertEqual(attached["run"]["config"], config)
+        self.assertEqual(attached["preview"],
+                         {"first_winding": 12, "variant": "raw"})
+
+        self.state.delete()
+        self.assertIsNone(self.state.status()["session_request"])
+
+    def test_failed_load_does_not_advertise_a_session_request(self):
+        request = {
+            "run": {
+                "z_begin": 0,
+                "z_end": 10,
+                "config": {
+                    "use_verified_patches": False,
+                    "use_unverified_patches": False,
+                    "use_normals": False,
+                    "use_surf_sdt": False,
+                    "use_tracks": False,
+                    "use_gradient_magnitude": False,
+                    "use_fibers": False,
+                    "loss_weight_shell_outer": 0,
+                    "loss_weight_shell_patch_radius": 0,
+                },
+            },
+        }
+        with mock.patch("spiral_runtime.create_session",
+                        side_effect=RuntimeError("startup failed")):
+            with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                self.state.load(request)
+        status = self.state.status()
+        self.assertIsNone(status["session_id"])
+        self.assertIsNone(status["session_request"])
+
     def test_save_checkpoint_is_constrained_to_output_directory(self):
         _attach_fake_session(self.state, self.root / "spiral_output", self.root)
         with self.assertRaises(ApiError) as caught:
