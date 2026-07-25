@@ -453,6 +453,9 @@ vc_add_test(NAME test_quadsurface_more)
 
 vc_add_test(NAME test_thinning)
 
+vc_add_test(NAME test_abf_flattening
+    LIBS doctest::doctest vc_core vc_flattening)
+
 vc_add_test(NAME test_umbilicus)
 
 vc_add_test(NAME test_colormaps)
