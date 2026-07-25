@@ -37,15 +37,31 @@ std::filesystem::path resolveLocalPath(const std::string& location,
                                        const std::filesystem::path& base = {});
 
 std::string validateLocation(Category category, const std::string& location);
+std::string validateSingleVolumeLocation(const std::string& location);
+utils::Json volumeMetadataFromEntryTags(const std::vector<std::string>& tags);
 
 }
 
 class VolumePkg : public std::enable_shared_from_this<VolumePkg>
 {
 public:
+    enum class AttachVolumeResult {
+        Attached,
+        AlreadyAttached,
+        VolumeIdConflict,
+    };
+    enum class AttachSegmentsResult {
+        Attached,
+        AlreadyAttached,
+    };
+
     static std::shared_ptr<VolumePkg> newEmpty();
     static std::shared_ptr<VolumePkg> newEmpty(
         const vc::project::LoadOptions& opts);
+    // Build a package without updating the session autosave or implicitly
+    // persisting later mutations. Call save() when the package is complete.
+    static std::shared_ptr<VolumePkg> newDetached(
+        const vc::project::LoadOptions& opts = {});
     static std::shared_ptr<VolumePkg> load(const std::filesystem::path& jsonFile,
                                            const vc::project::LoadOptions& opts = {});
     static std::shared_ptr<VolumePkg> loadAutosave(const vc::project::LoadOptions& opts = {});
@@ -71,8 +87,22 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& segmentEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& normalGridEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& lasagnaDatasetEntries() const;
+    [[nodiscard]] std::optional<vc::project::Entry>
+    matchingVolumeEntry(const std::string& location) const;
+    [[nodiscard]] std::optional<vc::project::Entry>
+    matchingSegmentsEntry(const std::string& location) const;
+    [[nodiscard]] std::optional<vc::project::Entry>
+    matchingSegmentsEntryByDirectoryName(
+        const std::string& directoryName) const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
+    // Persist an already-loaded volume and its tags as one project mutation.
+    // `volume` must have been loaded from `location`.
+    AttachVolumeResult attachPreparedVolume(
+        const std::string& location,
+        std::vector<std::string> tags,
+        const std::shared_ptr<Volume>& volume,
+        const std::filesystem::path& remoteCacheRoot = {});
     bool mergeVolumeEntryTags(const std::string& location, const std::vector<std::string>& tags);
     // Replace singleton keyed tags and merge ordinary tags in one operation,
     // refreshing a loaded remote volume at most once.
@@ -92,6 +122,10 @@ public:
                                const std::string& newLocation);
     bool relocateNormalGridEntry(const std::string& oldLocation,
                                  const std::string& newLocation);
+    AttachSegmentsResult attachSegmentsEntry(
+        const std::string& location,
+        std::vector<std::string> tags,
+        bool select);
     bool addSegmentsEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addNormalGridEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addLasagnaDatasetEntry(const std::string& location,
@@ -175,6 +209,7 @@ private:
     int version_ = 1;
     vc::project::LoadOptions opts_;
     std::filesystem::path remoteCacheRoot_;
+    bool automaticPersistence_ = true;
 
     std::vector<vc::project::Entry> volumes_;
     std::vector<vc::project::Entry> segments_;

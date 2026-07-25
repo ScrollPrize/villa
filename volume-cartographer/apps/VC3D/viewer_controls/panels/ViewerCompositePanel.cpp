@@ -88,7 +88,6 @@ ViewerCompositePanel::ViewerCompositePanel(const UiRefs& uiRefs,
                                            QWidget* parent)
     : QWidget(parent)
     , _uiRefs(uiRefs)
-    , _viewerManager(viewerManager)
 {
     if (_uiRefs.scrollArea && _uiRefs.scrollArea->widget() == _uiRefs.contents) {
         _uiRefs.scrollArea->takeWidget();
@@ -108,12 +107,25 @@ ViewerCompositePanel::ViewerCompositePanel(const UiRefs& uiRefs,
     }
 
     setupControls();
-    initializeExistingViewers();
+    setViewerManager(viewerManager);
+}
 
+void ViewerCompositePanel::setViewerManager(ViewerManager* viewerManager)
+{
+    if (_viewerManager == viewerManager) {
+        syncUiFromManager();
+        return;
+    }
+
+    if (_viewerManager) {
+        disconnect(_viewerManager, nullptr, this, nullptr);
+    }
+    _viewerManager = viewerManager;
     if (_viewerManager) {
         connect(_viewerManager, &ViewerManager::baseViewerCreated,
                 this, &ViewerCompositePanel::applyInitialSettingsToViewer);
     }
+    syncUiFromManager();
 }
 
 void ViewerCompositePanel::toggleSegmentationComposite()
@@ -282,16 +294,6 @@ void ViewerCompositePanel::setupControls()
     updateCompositeParamsVisibility();
 }
 
-void ViewerCompositePanel::initializeExistingViewers()
-{
-    if (!_viewerManager) {
-        return;
-    }
-    for (auto* viewer : _viewerManager->baseViewers()) {
-        applyInitialSettingsToViewer(viewer);
-    }
-}
-
 void ViewerCompositePanel::applyInitialSettingsToViewer(VolumeViewerBase* viewer)
 {
     if (!viewer) {
@@ -303,6 +305,88 @@ void ViewerCompositePanel::applyInitialSettingsToViewer(VolumeViewerBase* viewer
     if (viewer->surfName() == "segmentation") {
         setSegmentationCompositeChecked(s.enabled);
     }
+}
+
+void ViewerCompositePanel::syncUiFromManager()
+{
+    if (!_viewerManager) {
+        return;
+    }
+
+    VolumeViewerBase* segmentationViewer = nullptr;
+    VolumeViewerBase* firstPlaneViewer = nullptr;
+    for (auto* viewer : _viewerManager->baseViewers()) {
+        if (!viewer) {
+            continue;
+        }
+        if (viewer->surfName() == "segmentation") {
+            segmentationViewer = viewer;
+        } else if (!firstPlaneViewer && isPlaneViewer(viewer->surfName())) {
+            firstPlaneViewer = viewer;
+        }
+
+        QCheckBox* planeCheck = nullptr;
+        if (viewer->surfName() == "xy plane") planeCheck = _uiRefs.planeCompositeXY;
+        else if (viewer->surfName() == "seg xz") planeCheck = _uiRefs.planeCompositeXZ;
+        else if (viewer->surfName() == "seg yz") planeCheck = _uiRefs.planeCompositeYZ;
+        if (planeCheck) {
+            const QSignalBlocker blocker(planeCheck);
+            planeCheck->setChecked(viewer->compositeRenderSettings().planeEnabled);
+        }
+    }
+
+    if (segmentationViewer) {
+        const auto& settings = segmentationViewer->compositeRenderSettings();
+        if (_uiRefs.compositeEnabled) {
+            const QSignalBlocker blocker(_uiRefs.compositeEnabled);
+            _uiRefs.compositeEnabled->setChecked(settings.enabled);
+        }
+        if (_uiRefs.compositeMode) {
+            const QSignalBlocker blocker(_uiRefs.compositeMode);
+            _uiRefs.compositeMode->setCurrentIndex(compositeModeIndexForMethod(settings.params.method));
+        }
+        if (_uiRefs.layersInFront) {
+            const QSignalBlocker blocker(_uiRefs.layersInFront);
+            _uiRefs.layersInFront->setValue(settings.layersFront);
+        }
+        if (_uiRefs.layersBehind) {
+            const QSignalBlocker blocker(_uiRefs.layersBehind);
+            _uiRefs.layersBehind->setValue(settings.layersBehind);
+        }
+        if (_uiRefs.alphaMin) {
+            const QSignalBlocker blocker(_uiRefs.alphaMin);
+            _uiRefs.alphaMin->setValue(static_cast<int>(std::lround(settings.params.alphaMin * 255.0f)));
+        }
+        if (_uiRefs.alphaMax) {
+            const QSignalBlocker blocker(_uiRefs.alphaMax);
+            _uiRefs.alphaMax->setValue(static_cast<int>(std::lround(settings.params.alphaMax * 255.0f)));
+        }
+        if (_uiRefs.alphaThreshold) {
+            const QSignalBlocker blocker(_uiRefs.alphaThreshold);
+            _uiRefs.alphaThreshold->setValue(static_cast<int>(std::lround(settings.params.alphaCutoff * 10000.0f)));
+        }
+        if (_uiRefs.material) {
+            const QSignalBlocker blocker(_uiRefs.material);
+            _uiRefs.material->setValue(static_cast<int>(std::lround(settings.params.alphaOpacity * 255.0f)));
+        }
+        if (_uiRefs.reverseDirection) {
+            const QSignalBlocker blocker(_uiRefs.reverseDirection);
+            _uiRefs.reverseDirection->setChecked(settings.reverseDirection);
+        }
+    }
+
+    if (firstPlaneViewer) {
+        const auto& settings = firstPlaneViewer->compositeRenderSettings();
+        if (_uiRefs.planeLayersFront) {
+            const QSignalBlocker blocker(_uiRefs.planeLayersFront);
+            _uiRefs.planeLayersFront->setValue(settings.planeLayersFront);
+        }
+        if (_uiRefs.planeLayersBehind) {
+            const QSignalBlocker blocker(_uiRefs.planeLayersBehind);
+            _uiRefs.planeLayersBehind->setValue(settings.planeLayersBehind);
+        }
+    }
+    updateCompositeParamsVisibility();
 }
 
 void ViewerCompositePanel::updateCompositeParamsVisibility()

@@ -1028,7 +1028,8 @@ void CWindow::onVisLasagnaObj(const std::string& segmentId)
 bool CWindow::initializeCommandLineRunner()
 {
     if (!_cmdRunner) {
-        _cmdRunner = new CommandLineToolRunner(statusBar(), this, this);
+        _cmdRunner = new CommandLineToolRunner(
+            statusBar(), [this] { return getCurrentVolumePath(); }, this);
 
         if (_segmentationCommandHandler) {
             _segmentationCommandHandler->setCmdRunner(_cmdRunner);
@@ -1050,9 +1051,15 @@ bool CWindow::initializeCommandLineRunner()
                         _segmentationCommandHandler->resumeLocalJob().has_value() &&
                         tool == CommandLineToolRunner::Tool::NeighborCopy;
 
-                    bool suppressDialogs = neighborJobActive && success &&
+                    const bool neighborFirstPassSuppress = neighborJobActive && success &&
                                            _segmentationCommandHandler->neighborCopyJob()->stage ==
                                                SegmentationCommandHandler::NeighborCopyJob::Stage::FirstPass;
+
+                    const bool silentExecution =
+                        _cmdRunner && _cmdRunner->currentExecutionIsSilent();
+
+                    const bool suppressDialogs =
+                        silentExecution || neighborFirstPassSuppress;
 
                     if (!suppressDialogs) {
                         if (success) {
@@ -1064,7 +1071,7 @@ bool CWindow::initializeCommandLineRunner()
                             showStatusBarMessage(tr("Operation failed"), 5000);
                             QMessageBox::critical(this, tr("Error"), message);
                         }
-                    } else {
+                    } else if (neighborFirstPassSuppress) {
                         showStatusBarMessage(tr("Neighbor copy pass 1 complete"), 2000);
                     }
 
@@ -1075,7 +1082,6 @@ bool CWindow::initializeCommandLineRunner()
                         if (success && _surfacePanel) {
                             _surfacePanel->reloadSurfacesFromDisk();
                         }
-                        _cmdRunner->setOmpThreads(-1);
                         _segmentationCommandHandler->resumeLocalJob().reset();
                     }
                 });

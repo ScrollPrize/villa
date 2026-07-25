@@ -18,6 +18,14 @@ html.docs-doc-id-get_started main .container article {
 .docs-doc-id-get_started .hash-link {
   display: none !important;
 }
+/* Tailwind's .container cap steps per breakpoint (1280px, then 1536px only
+   at ≥1536): between ~1300–1535 the stale 1280px cap leaves the clipped
+   bands/hero floating with outsized side gaps that vanish at 1536. Keep the
+   boxed look but make the gap steady: same 1536px ceiling, constant 32px
+   gutters below it. ≤996 overrides below still lift the cap entirely. */
+.docs-doc-id-get_started main > .container {
+  max-width: min(1536px, calc(100% - 64px));
+}
 .docs-doc-id-get_started .pagination-nav {
   display: none;
 }
@@ -28,8 +36,14 @@ html.docs-doc-id-get_started main .container article {
   overflow-x: clip; /* full-bleed bands use the 50vw margin trick */
 }
 .vc-gs-container {
-  max-width: 1080px;
+  /* the inline padding exists for mid widths (~1000–1160px)
+     where the docs container leaves less than 1080px: margin auto
+     collapses to 0 there and text would sit flush against the band edge.
+     max-width includes the padding (border-box) so wide screens still get
+     1080px of content. */
+  max-width: calc(1080px + 2 * clamp(20px, 5vw, 28px));
   margin: 0 auto;
+  padding-inline: clamp(20px, 5vw, 28px);
 }
 .vc-gs a {
   text-decoration-color: color-mix(in srgb, var(--vc-accent) 55%, transparent);
@@ -94,11 +108,21 @@ html.docs-doc-id-get_started main .container article {
   /* higher-res unwrapped strip with the white knocked out to transparent
      and the bottom wave + credit trimmed; sized a touch larger than the
      text column so the writing reads bigger without upscaling to mush */
-  background-size: 300% auto;
+  /* fixed pixel size so the zoom of the writing never changes with width:
+     9870px is exactly what the old `300% auto` resolved to at a 3290px CSS
+     viewport (a 4K panel reports ~3290 innerWidth) — the "fully zoomed in"
+     framing we want everywhere. Narrower screens crop the strip rather than
+     shrinking it. Phones override this below (whole strip shown as a band). */
+  background-size: 9870px auto;
   /* the strip's right half is the continuous, dense-text stretch — show
      that (stopping short of the dark damage at the very end); the left
-     half is fragmentary */
-  background-position: 90% 50%;
+     half is fragmentary. */
+  /* pinned to the layout center (the one reference the centered text column
+     shares at every width): with calc(50% + Xpx) the 0.5·width term exactly
+     tracks the centered content as the viewport changes, so the SAME image
+     pixel always sits at content-center — no sliding, no resizing. The
+     -2632px offset reproduces the old `90%` framing at 3290px. */
+  background-position: calc(50% - 2632px) center;
   background-repeat: no-repeat;
   opacity: 0.55;
   pointer-events: none;
@@ -1039,9 +1063,6 @@ html.docs-doc-id-get_started main .container article {
   .docs-doc-id-get_started main > .container > .row > .col {
     padding: 0 !important;
   }
-  .vc-gs-container {
-    padding-inline: clamp(20px, 5vw, 28px);
-  }
 }
 @media (max-width: 768px) {
   .vc-gs-demo__panes {
@@ -1076,8 +1097,11 @@ html.docs-doc-id-get_started main .container article {
   .vc-gs-hero__bg {
     inset: auto 0 12px 0;
     height: 96px;
-    background-size: 360% auto;
-    background-position: 50% 50%;
+    /* the WHOLE strip, shown once and fixed: width fits the band exactly, so
+       phones of any width see the entire scroll (no crop, no device-dependent
+       zoom). Vertically centered in the band. */
+    background-size: 100% auto;
+    background-position: center;
     opacity: 0.5;
     -webkit-mask-image: linear-gradient(
       90deg,

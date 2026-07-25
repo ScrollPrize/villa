@@ -3,11 +3,13 @@
 #include <atomic>
 #include <filesystem>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <string>
 
@@ -262,6 +264,29 @@ private:
 class QuadSurface : public Surface
 {
 public:
+    struct SurfaceSample {
+        enum class Status {
+            Valid,
+            NonFinite,
+            InvalidScale,
+            MissingPoints,
+            OutsideGrid,
+            InvalidQuad,
+        };
+
+        Status status = Status::MissingPoints;
+        cv::Vec2d grid{
+            std::numeric_limits<double>::quiet_NaN(),
+            std::numeric_limits<double>::quiet_NaN()};
+        cv::Vec3f volume{
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN()};
+
+        [[nodiscard]] bool valid() const { return status == Status::Valid; }
+        explicit operator bool() const { return valid(); }
+    };
+
     QuadSurface() = default;
     // points will be cloned in constructor
     QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale);
@@ -287,8 +312,20 @@ public:
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000,
                   class SurfacePatchIndex* surfaceIndex = nullptr, class PointIndex* pointIndex = nullptr) override;
     cv::Size size();
+    // Raw grid dimensions without forcing a lazy surface to load its XYZ data.
+    [[nodiscard]] cv::Size gridSize() const;
     [[nodiscard]] cv::Vec2f scale() const;
     [[nodiscard]] cv::Vec3f center() const;
+    [[nodiscard]] cv::Vec2d surfaceToGrid(const cv::Vec2d& surface) const;
+    [[nodiscard]] cv::Vec2d gridToSurface(const cv::Vec2d& grid) const;
+    [[nodiscard]] SurfaceSample sampleAtSurface(const cv::Vec2d& surface) const;
+
+    // The legacy renderer treats native vertex validity as pixel coverage.
+    // Spiral's drawn-input view opts into the stricter contract that a rendered
+    // location must be backed by a complete bilinear quad. The default remains
+    // false so existing QuadSurface consumers retain their current behavior.
+    void setStrictQuadRenderValidity(bool enabled) { _strictQuadRenderValidity = enabled; }
+    [[nodiscard]] bool strictQuadRenderValidity() const { return _strictQuadRenderValidity; }
 
     // Convert ptr-space coordinates to absolute grid row/col.
     // ptr-space stores (col - center.x*scale.x, row - center.y*scale.y, 0).
@@ -308,6 +345,12 @@ public:
 
     // True iff this surface was loaded from disk and can be safely unloaded.
     bool canUnload() const { return !path.empty(); }
+
+    // Override disconnected component column ranges for an in-memory view.
+    void setComponents(std::vector<std::pair<int, int>> components)
+    {
+        _components = std::move(components);
+    }
 
     // Drop _points and all derived caches; ensureLoaded() will re-read from
     // disk on next access. No-op for in-memory-only surfaces.
@@ -448,6 +491,7 @@ protected:
     // Column ranges of disconnected surface components (from meta.json "components").
     // Each pair is [col_start, col_end). Empty = single contiguous surface.
     std::vector<std::pair<int,int>> _components;
+    bool _strictQuadRenderValidity = false;
     float dpi_ = 0.f;
 
 private:
@@ -472,6 +516,8 @@ private:
 };
 
 std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags = 0);
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz_region(
+    const std::filesystem::path &path, const cv::Rect &region, int flags = 0);
 
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3d> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);

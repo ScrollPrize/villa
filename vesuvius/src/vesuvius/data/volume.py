@@ -349,7 +349,7 @@ class Volume:
                     self.dtype = np.dtype(self.data.dtype)
                 else:
                     self.dtype = self.data.dtype
-            elif isinstance(self.data, zarr.hierarchy.Group):
+            elif isinstance(self.data, zarr.Group):
                 # Group case (e.g., OME-Zarr with multiscales)
                 # Find the first array in the group - typically '0' for highest resolution
                 first_key = None
@@ -419,7 +419,7 @@ class Volume:
         print(f"Number of Resolution Levels: {len(self.data)}")
         if isinstance(self.data, zarr.Array):
             print(f"  Level 0 Shape: {self.data.shape}, Dtype: {self.data.dtype}")
-        elif isinstance(self.data, zarr.hierarchy.Group):
+        elif isinstance(self.data, zarr.Group):
             for key in sorted(self.data.keys(), key=lambda x: int(x) if x.isdigit() else x):
                 arr = self.data[key]
                 if isinstance(arr, zarr.Array):
