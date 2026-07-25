@@ -287,6 +287,7 @@ public:
 signals:
     void baseViewerCreated(VolumeViewerBase* viewer);
     void baseViewerClosing(VolumeViewerBase* viewer);
+    void currentVolumeChanged();
     // Emitted whenever the user explicitly places the focus (Ctrl+click,
     // focus-on-cursor key, point activation, ...).
     void focusCenteredByUser(const cv::Vec3f& position);

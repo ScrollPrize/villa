@@ -50,6 +50,10 @@ public:
         AlreadyAttached,
         VolumeIdConflict,
     };
+    enum class AttachSegmentsResult {
+        Attached,
+        AlreadyAttached,
+    };
 
     static std::shared_ptr<VolumePkg> newEmpty();
     static std::shared_ptr<VolumePkg> newEmpty(
@@ -85,6 +89,11 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& lasagnaDatasetEntries() const;
     [[nodiscard]] std::optional<vc::project::Entry>
     matchingVolumeEntry(const std::string& location) const;
+    [[nodiscard]] std::optional<vc::project::Entry>
+    matchingSegmentsEntry(const std::string& location) const;
+    [[nodiscard]] std::optional<vc::project::Entry>
+    matchingSegmentsEntryByDirectoryName(
+        const std::string& directoryName) const;
 
     bool addVolumeEntry(const std::string& location, std::vector<std::string> tags = {});
     // Persist an already-loaded volume and its tags as one project mutation.
@@ -113,6 +122,10 @@ public:
                                const std::string& newLocation);
     bool relocateNormalGridEntry(const std::string& oldLocation,
                                  const std::string& newLocation);
+    AttachSegmentsResult attachSegmentsEntry(
+        const std::string& location,
+        std::vector<std::string> tags,
+        bool select);
     bool addSegmentsEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addNormalGridEntry(const std::string& location, std::vector<std::string> tags = {});
     bool addLasagnaDatasetEntry(const std::string& location,

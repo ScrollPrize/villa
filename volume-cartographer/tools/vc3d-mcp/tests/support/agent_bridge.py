@@ -247,6 +247,18 @@ class FakeAgentBridgeServer:
                     error={"code": -32007, "message": "Segment not found",
                            "data": {"kind": "segment", "id": seg}},
                 )
+        elif method == "segments.attach":
+            await self._reply(
+                writer,
+                req_id,
+                result={
+                    "attached": True,
+                    "alreadyAttached": False,
+                    "location": params.get("location"),
+                    "projectPath": "/tmp/project.volpkg.json",
+                    "selected": params.get("select", True),
+                },
+            )
         elif method == "viewer.rotate":
             plane = params.get("plane")
             norm = {"xz": "seg xz", "yz": "seg yz",
