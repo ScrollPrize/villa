@@ -19,16 +19,24 @@ constexpr const char* kVolumeUrl =
     "s3://vesuvius-challenge-open-data/PHerc0172/volumes/"
     "20241024131838-7.910um-53keV-masked.zarr";
 
+// kVolumeUrl above is a legacy export: its meta.json carries a top-level
+// "voxelsize". Most of the bucket now ships the newer metadata.json form, where
+// the size is only under scan.tomo.acquisition.detector.samplePixelSize -- the
+// case that regressed in #1226. 45.532 um, per the volume's own name.
+constexpr const char* kNestedVoxelSizeVolumeUrl =
+    "s3://vesuvius-challenge-open-data/PHercParis4/volumes/"
+    "20260310173927-45.532um-11.0m-110keV-masked.zarr";
+
 bool requireNetwork()
 {
     const char* env = std::getenv("VC_TEST_REQUIRE_NETWORK");
     return env && env[0] && env[0] != '0';
 }
 
-std::shared_ptr<Volume> openOrSkip()
+std::shared_ptr<Volume> openUrlOrSkip(const char* url)
 {
     try {
-        return Volume::NewFromUrl(kVolumeUrl);
+        return Volume::NewFromUrl(url);
     } catch (const std::exception& e) {
         if (requireNetwork()) FAIL("Volume::NewFromUrl failed: " << e.what());
         MESSAGE("Skipping (network unavailable?): " << e.what());
@@ -36,7 +44,20 @@ std::shared_ptr<Volume> openOrSkip()
     }
 }
 
+std::shared_ptr<Volume> openOrSkip() { return openUrlOrSkip(kVolumeUrl); }
+
 } // namespace
+
+TEST_CASE("Volume::NewFromUrl: voxel size from nested acquisition metadata")
+{
+    auto v = openUrlOrSkip(kNestedVoxelSizeVolumeUrl);
+    if (!v) return;
+    CHECK(v->isRemote());
+    CHECK(v->baseScaleLevel() == 0);
+    // Without the samplePixelSize fallback this is 0, and every downstream
+    // area computation collapses with it.
+    CHECK(v->voxelSize() == doctest::Approx(45.532).epsilon(0.0001));
+}
 
 TEST_CASE("Volume::NewFromUrl: opens the PHerc 0172 zarr")
 {
