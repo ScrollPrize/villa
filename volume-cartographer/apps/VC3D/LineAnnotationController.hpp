@@ -142,6 +142,12 @@ public:
         bool pending = false;
         LinkState linkState = LinkState::Ok;
         std::string quarantineReason;
+        // The exact JSON this branch was parsed from (empty for branches
+        // created in-session). Quarantined links are serialized from this
+        // verbatim so loading + saving cannot normalize directions,
+        // sanitize branch_file, leak runtime branch_fiber_id values, or
+        // drop fields VC3D does not understand.
+        nlohmann::json sourceJson;
     };
 
     // Per-fiber data for the fiber overlay's "Show linked" mode. Only fibers

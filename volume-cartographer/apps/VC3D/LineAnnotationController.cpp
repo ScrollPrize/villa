@@ -9863,10 +9863,19 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
     for (const auto& branch : serialized.branches) {
         if (branch.linkState == LinkState::Quarantined) {
             // Quarantined links are written back exactly as loaded — they
-            // failed resolution, not serialization, and dropping them here
-            // would be the data loss the quarantine exists to prevent. Note
-            // the check runs before every validity test below (a missing
-            // target fiber leaves branchFiberId == 0, for instance).
+            // failed resolution, not serialization, and dropping or
+            // altering them here would be the data loss the quarantine
+            // exists to prevent. The original JSON is used verbatim:
+            // loading and resolution normalize directions, sanitize
+            // branch_file, and remap branch_fiber_id to a runtime id, none
+            // of which may leak into the file. Note the check runs before
+            // every validity test below.
+            if (!branch.sourceJson.is_null() && !branch.sourceJson.empty()) {
+                root["branches"].push_back(branch.sourceJson);
+                continue;
+            }
+            // Fallback (should not happen: quarantine is only assigned to
+            // loaded branches, which carry their source JSON).
             nlohmann::json quarantinedJson = {
                 {"control_point_index", branch.controlPointIndex},
                 {"branch_fiber_id", branch.branchFiberId},
@@ -10506,6 +10515,9 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
                         normalizedOrZero(branch.controlPointDirection);
                     branch.branchControlPointDirection =
                         normalizedOrZero(branch.branchControlPointDirection);
+                    // Retained so a later quarantine can serialize the entry
+                    // exactly as it appeared on disk.
+                    branch.sourceJson = branchJson;
                     fiber.branches.push_back(std::move(branch));
                 } catch (const std::exception& ex) {
                     preserveUnparsed(branchJson, ex.what());
