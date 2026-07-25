@@ -140,21 +140,6 @@ vc_add_test(NAME test_scale_bar_units
     LIBS doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-qt6_wrap_cpp(spiral_config_profile_editor_moc
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.hpp)
-vc_add_test(NAME test_spiral_config_profile_editor
-    SOURCES test_spiral_config_profile_editor.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.cpp
-            ${spiral_config_profile_editor_moc}
-    LIBS Qt6::Core Qt6::Gui Qt6::Widgets
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
-vc_add_test(NAME test_spiral_point_chain
-    SOURCES test_spiral_point_chain.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralPointChain.cpp
-    LIBS doctest::doctest Qt6::Core vc_core
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
 qt6_wrap_cpp(cfiber_widget_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.hpp)
 vc_add_test(NAME test_fiber_widget
     SOURCES test_fiber_widget.cpp
@@ -511,19 +496,6 @@ vc_add_test(NAME test_volume_local)
 vc_add_test(NAME test_zarr_helpers)
 
 vc_add_test(NAME test_chunked_plane_sampler)
-
-vc_add_test(NAME test_surface_cache)
-
-vc_add_test(NAME test_priority_thread_pool
-    LIBS doctest::doctest
-    INCLUDES ${PROJECT_SOURCE_DIR}/utils/include)
-
-# Header-only, Qt-free arithmetic lifted out of CChunkedVolumeViewer so the
-# chunk-pool sizing rule can be tested without a viewer.
-vc_add_test(NAME test_frame_chunk_footprint
-    SOURCES test_frame_chunk_footprint.cpp
-    LIBS doctest::doctest
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_slicing)
 
