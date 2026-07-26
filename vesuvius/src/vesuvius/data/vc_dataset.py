@@ -351,9 +351,16 @@ class VCDataset(Dataset):
 
             # Apply Z-axis partitioning if num_parts > 1
             if self.num_parts > 1:
-                # Partition the tiled Z extent: with a bbox active, splitting the full
-                # volume range would leave most parts empty, so split the ROI instead.
-                part_z0, part_z1 = (roi[0] if roi is not None else (0, image_size[0]))
+                # Partition the Z span the selected patches actually occupy. With a
+                # bbox active, splitting the full volume range would leave most parts
+                # empty; splitting the ROI range instead would silently drop the
+                # patches that start before it, since the grid comes from the whole
+                # volume and the first patch covering the ROI usually begins outside.
+                if self.all_positions:
+                    occupied_z = sorted({pos[0] for pos in self.all_positions})
+                    part_z0, part_z1 = occupied_z[0], occupied_z[-1] + 1
+                else:
+                    part_z0, part_z1 = (0, image_size[0])
                 z_per_part = (part_z1 - part_z0) / self.num_parts
                 z_start = part_z0 + int(z_per_part * self.part_id)
                 z_end = part_z0 + int(z_per_part * (self.part_id + 1)) if self.part_id < self.num_parts - 1 else part_z1
