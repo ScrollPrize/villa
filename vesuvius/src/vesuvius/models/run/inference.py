@@ -2,7 +2,12 @@ import torch
 import numpy as np
 import zarr
 import os
-import fcntl
+import errno
+try:
+    import fcntl  # POSIX-only; used to serialize model-cache downloads
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+    import msvcrt
 import hashlib
 import multiprocessing
 import subprocess
@@ -156,13 +161,34 @@ class _InferenceDeepSupervisionWrapper(torch.nn.Module):
 DEFAULT_MODEL_CACHE_DIR = os.environ.get('VESUVIUS_MODEL_CACHE_DIR', '/tmp/vesuvius-models')
 
 
+def _lock_file_exclusive(fh):
+    """Take an exclusive advisory lock on an open file, on POSIX or Windows.
+
+    Released when the handle closes, matching the previous fcntl.flock usage.
+    """
+    if fcntl is not None:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    else:
+        # msvcrt locks a byte range; one byte suffices for a lockfile. LK_LOCK
+        # retries for ~10 s and then raises, so loop to mirror LOCK_EX's
+        # blocking. Only contention is worth retrying: anything else (a bad
+        # descriptor, a full disk) would spin here forever, so re-raise it.
+        while True:
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EDEADLK):
+                    raise
+
+
 def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) -> str:
     """Resolve a model_path, downloading from S3 to a local cache if needed.
 
     For s3:// URLs, runs `aws s3 sync` into `<cache_dir>/<sha256(url)>/` and
     returns the local directory path. A `.done` sentinel marks successful
     completion so re-runs reuse the cache. Concurrent downloads of the same
-    model are serialized with fcntl.flock on a per-model lockfile.
+    model are serialized with an exclusive lock on a per-model lockfile.
 
     For non-S3 paths, returns the input unchanged.
     """
@@ -181,7 +207,7 @@ def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) 
         return target
 
     with open(lock_path, 'w') as lock_fh:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        _lock_file_exclusive(lock_fh)
         # Re-check after acquiring the lock in case another process completed.
         if os.path.exists(done):
             if verbose:
@@ -238,6 +264,7 @@ class Inferer():
                  hf_token: str = None,
                  model_type: str = 'auto',
                  input_anon: bool = False,
+                 read_retries: int = 4,
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
@@ -274,6 +301,7 @@ class Inferer():
         self.hf_token = hf_token
         self.model_type = model_type
         self.input_anon = input_anon
+        self.read_retries = read_retries
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
         self.bbox = tuple(bbox) if bbox is not None else None
@@ -708,6 +736,7 @@ class Inferer():
             resolution=self.resolution,
             anon=self.input_anon,
             bbox=self.bbox,
+            read_retries=self.read_retries,
         )
 
         expected_attr_name = 'all_positions'
@@ -1150,6 +1179,11 @@ def main():
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
+    parser.add_argument('--read-retries', dest='read_retries', type=int, default=4,
+                      help='Attempts per patch read (default 4). Transient remote failures '
+                           '(dropped connections, truncated payloads, 429/5xx) are retried '
+                           'with exponential backoff so one hiccup does not abort a long '
+                           'streaming run. Set to 1 to disable.')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')
@@ -1224,6 +1258,7 @@ def main():
         hf_token=args.hf_token,
         model_type=args.model_type,
         input_anon=args.input_anon,
+        read_retries=args.read_retries,
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
         bbox=bbox,
