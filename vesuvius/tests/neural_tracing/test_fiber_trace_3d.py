@@ -122,6 +122,110 @@ def _straight_fiber() -> Vc3dFiber:
     )
 
 
+def _centered_fiber() -> Vc3dFiber:
+    x = np.arange(120, 137, dtype=np.float32)
+    y = np.full_like(x, 128.0)
+    z = np.full_like(x, 128.0)
+    points = np.stack([x, y, z], axis=1)
+    return Vc3dFiber(
+        path=None,
+        version=1,
+        line_points_xyz=points,
+        control_points_xyz=points[8:9].copy(),
+        generation=1,
+        metadata={},
+    )
+
+
+class _FakeChunkedVolume:
+    def __init__(
+        self,
+        *,
+        shape: tuple[int, int, int] = (256, 256, 256),
+        chunks: tuple[int, int, int] = (16, 16, 16),
+    ) -> None:
+        self.shape = tuple(int(v) for v in shape)
+        self.chunks = tuple(int(v) for v in chunks)
+
+
+class _CapturingDependencySampler:
+    def __init__(self, *, chunks: tuple[int, int, int] = (16, 16, 16)) -> None:
+        self.chunks = np.asarray(chunks, dtype=np.int64)
+        self.calls: list[tuple[np.ndarray, np.ndarray]] = []
+        self.store = object()
+
+    def chunk_requests_for_coords(
+        self,
+        coords_zyx_base: np.ndarray,
+        valid_mask: np.ndarray,
+    ) -> list[ZarrChunkRequest]:
+        del coords_zyx_base, valid_mask
+        raise AssertionError("3D prefetch must use bbox dependency requests")
+
+    def chunk_requests_for_bbox(
+        self,
+        start_zyx: np.ndarray,
+        end_zyx: np.ndarray,
+    ) -> list[ZarrChunkRequest]:
+        start = np.asarray(start_zyx, dtype=np.int64)
+        end = np.asarray(end_zyx, dtype=np.int64)
+        self.calls.append((start.copy(), end.copy()))
+        if not bool(np.all(end > start)):
+            return []
+        chunk_start = np.floor_divide(start, self.chunks)
+        chunk_end = np.floor_divide(end - 1, self.chunks) + 1
+        axes = [
+            np.arange(int(chunk_start[axis]), int(chunk_end[axis]), dtype=np.int64)
+            for axis in range(3)
+        ]
+        zz, yy, xx = np.meshgrid(axes[0], axes[1], axes[2], indexing="ij")
+        unique = np.stack([zz.ravel(), yy.ravel(), xx.ravel()], axis=1)
+        return [
+            ZarrChunkRequest(
+                store=self.store,
+                store_identity="fake-dependency-store",
+                key=f"0/{int(chunk[0])}/{int(chunk[1])}/{int(chunk[2])}",
+            )
+            for chunk in unique
+        ]
+
+
+def _prefetch_dependency_test_loader(raw: dict) -> FiberTrace3DLoader:
+    config = config_from_mapping(
+        {
+            "datasets": [{"array_records": True}],
+            "batch_size": 1,
+            "patch_shape_zyx": [16, 16, 16],
+            "seed": 5,
+            "cp_margin_voxels": 3,
+            "presence_radius_voxels": 1.5,
+            "image_normalization": "none",
+            "round_source_to_chunk_boundaries": True,
+            **raw,
+        }
+    )
+    volume = _FakeChunkedVolume()
+    sampler = _CapturingDependencySampler(chunks=volume.chunks)
+    record = loader3d_module._Record(
+        fiber=_centered_fiber(),
+        volume=volume,
+        sampler=sampler,
+        volume_path="fake",
+        volume_scale=0,
+        volume_spacing_base=1.0,
+        base_shape_zyx=volume.shape,
+        fiber_identity="fake-centered-fiber",
+        dataset_config={},
+    )
+    loader = FiberTrace3DLoader.__new__(FiberTrace3DLoader)
+    loader.config = config
+    loader.records = [record]
+    loader._flat_offsets = [0]
+    loader._flat_sample_count = 1
+    loader._random_pass_cache = {}
+    return loader
+
+
 def _long_segment_fiber(*, source_format: str | None = None) -> Vc3dFiber:
     points = np.asarray(
         [
@@ -310,6 +414,86 @@ def test_3d_config_preserves_explicit_volume_cache_budget() -> None:
 
     assert config.volume_cache_memory_mib == 128.0
     assert config.volume_cache_memory_bytes == 128 * 1024 * 1024
+
+
+def test_3d_prefetch_dependency_uses_augmentation_envelope_not_sampled_params(
+    monkeypatch,
+) -> None:
+    loader = _prefetch_dependency_test_loader(
+        {
+            "augment_enabled": True,
+            "augment_shift_zyx": [7, 5, 3],
+            "augment_rotation_degrees": 180.0,
+            "augment_scale_min": 0.75,
+            "augment_scale_max": 1.25,
+            "augment_smooth_displacement_mode": "3d",
+            "augment_smooth_displacement_amplitude_zyx": [4, 2, 6],
+            "augment_smooth_displacement_probability": 1.0,
+        }
+    )
+
+    def fail_sampled_augmentation(*_args, **_kwargs):
+        raise AssertionError("_sample_augment_params must not drive prefetch dependencies")
+
+    monkeypatch.setattr(loader, "_sample_augment_params", fail_sampled_augmentation)
+
+    valid_a, requests_a = loader._chunk_requests_and_valid_voxels_for_sample_index(
+        0,
+        sample_index_limit=1,
+    )
+    valid_b, requests_b = loader._chunk_requests_and_valid_voxels_for_sample_index(
+        99,
+        sample_index_limit=1,
+    )
+
+    assert valid_a == valid_b
+    assert valid_a > 0
+    assert sorted(request.key for request in requests_a) == sorted(
+        request.key for request in requests_b
+    )
+    sampler = loader.records[0].sampler
+    assert isinstance(sampler, _CapturingDependencySampler)
+    assert len(sampler.calls) == 2
+    assert sampler.calls[0][0].shape == (3,)
+    assert sampler.calls[0][1].shape == (3,)
+
+
+def test_3d_prefetch_envelope_extrema_expand_dependency_region() -> None:
+    base_loader = _prefetch_dependency_test_loader(
+        {
+            "augment_enabled": False,
+            "augment_shift_zyx": [32, 32, 32],
+            "augment_scale_min": 0.5,
+            "augment_smooth_displacement_mode": "3d",
+            "augment_smooth_displacement_amplitude_zyx": [16, 16, 16],
+        }
+    )
+    augmented_loader = _prefetch_dependency_test_loader(
+        {
+            "augment_enabled": True,
+            "augment_shift_zyx": [32, 32, 32],
+            "augment_scale_min": 0.5,
+            "augment_scale_max": 2.0,
+            "augment_rotation_degrees": 180.0,
+            "augment_smooth_displacement_mode": "3d",
+            "augment_smooth_displacement_amplitude_zyx": [16, 16, 16],
+            "augment_smooth_displacement_probability": 1.0,
+        }
+    )
+
+    base_valid, base_requests = base_loader._chunk_requests_and_valid_voxels_for_sample_index(
+        0,
+        sample_index_limit=1,
+    )
+    augmented_valid, augmented_requests = (
+        augmented_loader._chunk_requests_and_valid_voxels_for_sample_index(
+            0,
+            sample_index_limit=1,
+        )
+    )
+
+    assert augmented_valid > base_valid
+    assert len(augmented_requests) > len(base_requests)
 
 
 def _load_materialized_batch(
@@ -1210,6 +1394,64 @@ def test_vc3d_dependency_prefetch_flattens_3d_coords_like_training_sampling() ->
     assert fake.calls == [(12, 5, 3)]
     assert [request.key for request in requests] == ["2/0/0/0", "2/shared"]
     assert requests[0].cache_path is not None
+
+
+def test_vc3d_dependency_prefetch_uses_bbox_metadata() -> None:
+    class _FakeVolume:
+        remote_url = "s3://example/volume.zarr"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[int, int, int], tuple[int, int, int], int]] = []
+
+        def collect_bbox_dependencies(
+            self,
+            offset: tuple[int, int, int],
+            shape: tuple[int, int, int],
+            level: int,
+        ) -> list[dict[str, object]]:
+            self.calls.append((tuple(offset), tuple(shape), int(level)))
+            return [
+                {
+                    "key": "2/3/4/5",
+                    "cache_path": "/tmp/cache/2/3/4/5.bin",
+                    "empty_path": "/tmp/cache/2/3/4/5.empty",
+                    "remote_url": "https://example.invalid/volume.zarr/2/3/4/5",
+                    "remote_chunk_key": "2/3/4/5",
+                    "cache_payload_format": "source_bytes",
+                    "persistent_extension": ".bin",
+                }
+            ]
+
+    fake = _FakeVolume()
+    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
+    sampler.volume = fake
+    sampler.level = 2
+    sampler.sampling = "trilinear"
+    sampler.blocking = True
+
+    requests = sampler.chunk_requests_for_bbox(
+        np.asarray([1.2, 2.0, 3.1], dtype=np.float32),
+        np.asarray([5.0, 7.9, 9.0], dtype=np.float32),
+    )
+
+    assert fake.calls == [((1, 2, 3), (4, 6, 6), 2)]
+    assert [request.key for request in requests] == ["2/3/4/5"]
+    assert requests[0].cache_path == Path("/tmp/cache/2/3/4/5.bin")
+    assert requests[0].cache_payload_format == "source_bytes"
+
+
+def test_vc3d_bbox_dependency_reports_missing_binding() -> None:
+    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
+    sampler.volume = SimpleNamespace(remote_url="s3://example/volume.zarr")
+    sampler.level = 2
+    sampler.sampling = "trilinear"
+    sampler.blocking = True
+
+    with pytest.raises(RuntimeError, match="collect_bbox_dependencies"):
+        sampler.chunk_requests_for_bbox(
+            np.asarray([0, 0, 0], dtype=np.int64),
+            np.asarray([1, 1, 1], dtype=np.int64),
+        )
 
 
 def test_3d_model_and_losses_smoke() -> None:

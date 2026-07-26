@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-20
+
+- Changed 3D prefetch dependency generation to use a CP-centered configured
+  augmentation envelope instead of one concrete sampled augmentation. The
+  prefetcher now passes the selected-level envelope bbox to VC3D
+  `collect_bbox_dependencies`, consumes VC3D-returned chunk metadata, and no
+  longer materializes representative dependency coordinates.
+
 ## 2026-07-18
 
 - Refactored Trace2CP strip-source construction so original CP-pair strips,

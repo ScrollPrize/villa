@@ -44,6 +44,11 @@ class CoordinateSampler:
     ) -> list[ZarrChunkRequest]:
         raise NotImplementedError
 
+    def chunk_requests_for_bbox(
+        self, start_zyx: np.ndarray, end_zyx: np.ndarray
+    ) -> list[ZarrChunkRequest]:
+        raise NotImplementedError
+
 
 def _sample_coord_batch_flattened(
     sampler: CoordinateSampler,
@@ -195,38 +200,6 @@ class Vc3dCoordinateSampler(CoordinateSampler):
                 "valid_mask must match coords_zyx_base without the coordinate channel"
             )
 
-        def append_dependency(dependency: Any) -> None:
-            if isinstance(dependency, dict):
-                def _path_or_none(name: str) -> Path | None:
-                    value = str(dependency.get(name, "") or "")
-                    return Path(value) if value else None
-
-                key = str(dependency.get("key", ""))
-                if not key:
-                    level = int(dependency["level"])
-                    iz = int(dependency["iz"])
-                    iy = int(dependency["iy"])
-                    ix = int(dependency["ix"])
-                    key = f"{level}/{iz}/{iy}/{ix}"
-                request = ZarrChunkRequest(
-                    store=store,
-                    store_identity=self.store_identity,
-                    key=key,
-                    cache_path=_path_or_none("cache_path"),
-                    empty_path=_path_or_none("empty_path"),
-                    remote_url=str(dependency.get("remote_url", "")) or None,
-                    remote_chunk_key=str(dependency.get("remote_chunk_key", "")) or None,
-                    cache_payload_format=str(dependency.get("cache_payload_format", "")) or None,
-                    persistent_extension=str(dependency.get("persistent_extension", "")) or None,
-                )
-                requests_by_identity.setdefault((request.store_identity, request.key), request)
-                return
-            raise RuntimeError(
-                "VC3D collect_coords_dependencies returned legacy tuple dependencies. "
-                "Rebuild/use the updated volume-cartographer Python bindings so chunk "
-                "metadata includes remote_url, cache_path, empty_path, and cache_payload_format."
-            )
-
         def collect_flattened(flat_coords: np.ndarray, flat_valid: np.ndarray) -> None:
             if not bool(np.asarray(flat_valid, dtype=bool).any()):
                 return
@@ -238,7 +211,8 @@ class Vc3dCoordinateSampler(CoordinateSampler):
                 32,
             )
             for dependency in dependencies:
-                append_dependency(dependency)
+                request = self._request_from_dependency(store, dependency)
+                requests_by_identity.setdefault((request.store_identity, request.key), request)
 
         height = int(np.prod(coords.shape[:-2], dtype=np.int64))
         width = int(coords.shape[-2])
@@ -246,6 +220,69 @@ class Vc3dCoordinateSampler(CoordinateSampler):
         flat_valid = np.ascontiguousarray(valid.reshape(height, width))
         collect_flattened(flat_coords, flat_valid)
         return list(requests_by_identity.values())
+
+    def chunk_requests_for_bbox(
+        self, start_zyx: np.ndarray, end_zyx: np.ndarray
+    ) -> list[ZarrChunkRequest]:
+        collect_bbox_dependencies = getattr(self.volume, "collect_bbox_dependencies", None)
+        if collect_bbox_dependencies is None:
+            raise RuntimeError(
+                "VC3D volume binding does not expose collect_bbox_dependencies; "
+                "rebuild volume-cartographer so 3D bbox prefetch can use VC3D-owned "
+                "chunk metadata"
+            )
+        start = np.floor(np.asarray(start_zyx, dtype=np.float64)).astype(np.int64)
+        end = np.ceil(np.asarray(end_zyx, dtype=np.float64)).astype(np.int64)
+        if start.shape != (3,) or end.shape != (3,):
+            raise ValueError("start_zyx and end_zyx must each have shape (3,)")
+        shape = np.maximum(end - start, 0)
+        if not bool(np.all(shape > 0)):
+            return []
+        dependencies = collect_bbox_dependencies(
+            tuple(int(v) for v in start),
+            tuple(int(v) for v in shape),
+            self.level,
+        )
+        store = _Vc3dChunkStore(self.volume)
+        requests_by_identity: dict[tuple[str, str], ZarrChunkRequest] = {}
+        for dependency in dependencies:
+            request = self._request_from_dependency(store, dependency)
+            requests_by_identity.setdefault((request.store_identity, request.key), request)
+        return list(requests_by_identity.values())
+
+    def _request_from_dependency(
+        self,
+        store: _Vc3dChunkStore,
+        dependency: Any,
+    ) -> ZarrChunkRequest:
+        if isinstance(dependency, dict):
+            def _path_or_none(name: str) -> Path | None:
+                value = str(dependency.get(name, "") or "")
+                return Path(value) if value else None
+
+            key = str(dependency.get("key", ""))
+            if not key:
+                level = int(dependency["level"])
+                iz = int(dependency["iz"])
+                iy = int(dependency["iy"])
+                ix = int(dependency["ix"])
+                key = f"{level}/{iz}/{iy}/{ix}"
+            return ZarrChunkRequest(
+                store=store,
+                store_identity=self.store_identity,
+                key=key,
+                cache_path=_path_or_none("cache_path"),
+                empty_path=_path_or_none("empty_path"),
+                remote_url=str(dependency.get("remote_url", "")) or None,
+                remote_chunk_key=str(dependency.get("remote_chunk_key", "")) or None,
+                cache_payload_format=str(dependency.get("cache_payload_format", "")) or None,
+                persistent_extension=str(dependency.get("persistent_extension", "")) or None,
+            )
+        raise RuntimeError(
+            "VC3D dependency collection returned legacy tuple dependencies. "
+            "Rebuild/use the updated volume-cartographer Python bindings so chunk "
+            "metadata includes remote_url, cache_path, empty_path, and cache_payload_format."
+        )
 
 
 class _Vc3dChunkStore:
@@ -272,6 +309,12 @@ class NumpyZarrCoordinateSampler(CoordinateSampler):
     ) -> list[ZarrChunkRequest]:
         coords_zyx_level = np.asarray(coords_zyx_base, dtype=np.float32) / self.level_spacing_base
         return chunk_requests_for_coords(self.array, coords_zyx_level, valid_mask)
+
+    def chunk_requests_for_bbox(
+        self, start_zyx: np.ndarray, end_zyx: np.ndarray
+    ) -> list[ZarrChunkRequest]:
+        del start_zyx, end_zyx
+        return []
 
     def prefetch_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> dict[str, Any]:
         requests = self.chunk_requests_for_coords(coords_zyx_base, valid_mask)

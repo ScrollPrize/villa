@@ -582,26 +582,10 @@ std::string joinUrl(std::string base, const std::string& key)
     return base.empty() ? std::string{} : base + "/" + key;
 }
 
-nb::list collectCoordsDependencies(
+nb::list chunkDependenciesToPython(
     Volume& volume,
-    const FloatCoords& coordsXyz,
-    const BoolMask& validMask,
-    int level,
-    const std::string& sampling,
-    int tileSize)
+    const std::vector<vc::render::ChunkKey>& keys)
 {
-    auto coords = coordsArrayToMat(coordsXyz);
-    auto coverage = skipCoverageFromValidMask(validMask, coords.rows, coords.cols);
-    std::vector<vc::render::ChunkKey> keys;
-    {
-        nb::gil_scoped_release release;
-        keys = vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
-            *volume.chunkedCache(),
-            level,
-            coords,
-            coverage,
-            vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
-    }
     nb::list out;
     const std::string remoteUrl = volume.remoteUrl();
     auto* cache = dynamic_cast<vc::render::ChunkCache*>(volume.chunkedCache());
@@ -639,6 +623,40 @@ nb::list collectCoordsDependencies(
         out.append(std::move(item));
     }
     return out;
+}
+
+nb::list collectCoordsDependencies(
+    Volume& volume,
+    const FloatCoords& coordsXyz,
+    const BoolMask& validMask,
+    int level,
+    const std::string& sampling,
+    int tileSize)
+{
+    auto coords = coordsArrayToMat(coordsXyz);
+    auto coverage = skipCoverageFromValidMask(validMask, coords.rows, coords.cols);
+    std::vector<vc::render::ChunkKey> keys;
+    {
+        nb::gil_scoped_release release;
+        keys = vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
+            *volume.chunkedCache(),
+            level,
+            coords,
+            coverage,
+            vc::render::ChunkedPlaneSampler::Options(parseSampling(sampling), tileSize));
+    }
+    return chunkDependenciesToPython(volume, keys);
+}
+
+nb::list collectBBoxDependencies(
+    Volume& volume,
+    const std::array<int, 3>& offset,
+    const std::array<size_t, 3>& shape,
+    int level)
+{
+    return chunkDependenciesToPython(
+        volume,
+        collectChunkKeys(volume, offset, shape, level));
 }
 
 } // namespace
@@ -715,6 +733,10 @@ NB_MODULE(volume, m)
             "level"_a = 0,
             "sampling"_a = "trilinear",
             "tile_size"_a = 32)
+        .def("collect_bbox_dependencies", &collectBBoxDependencies,
+            "offset"_a,
+            "shape"_a,
+            "level"_a = 0)
         .def("__getitem__",
             [](Volume& self, const nb::object& key) {
                 const auto region = parseSliceKey(key, self.shape());

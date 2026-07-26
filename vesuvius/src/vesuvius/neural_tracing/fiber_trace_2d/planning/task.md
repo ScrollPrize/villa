@@ -1,13 +1,13 @@
-# Trace2CP Shared Strip Builder And Tighter Reset Threshold
+# VC3D BBox Dependency Metadata For 3D Prefetch
 
-Regenerated/refined native 3D Trace2CP strips should not depend on the original
-source strip grid. The actual side/top strip construction must be shared with
-the original CP-pair strip path; only the argument preparation should differ.
+Add a VC3D Python binding that returns the same per-chunk dependency metadata
+as `collect_coords_dependencies`, but for a selected-level ZYX bbox directly.
 
-The shared builder should take an explicit vector of 3D line points plus the
-line-local metadata needed to build a `FiberStripLineWindow`, sample/align
-Lasagna normals, and construct the side/top grids. It must not assume that all
-inputs come from `record.fiber` or from an old source-strip coordinate system.
+The 3D fiber prefetcher should then pass its augmentation-envelope bbox to that
+API instead of materializing representative coordinates or converting bbox
+chunks in Python. Chunk conversion and persistent-cache path/remote metadata
+must remain VC3D-owned.
 
-Also lower the native whole-fiber CP-plane reset/error threshold from 100
-selected-scale voxels to 10 selected-scale voxels.
+Because the direct bbox API removes coordinate generation from 3D prefetch, the
+intermediate `prefetch_sampler_device` knob is no longer meaningful and should
+be removed rather than carried as dead configuration.

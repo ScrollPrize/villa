@@ -244,8 +244,12 @@ build CP-local source strips and collect chunk dependencies. Prefetch
 temporarily forces PyTorch CPU intra-op threads to `1` and restores the previous
 value afterward, so each producer does not fan out over the full machine.
 The same split now applies to `fiber_trace_3d --prefetch`; 3D producers build
-one CP-centered augmentation-envelope volume dependency set per sample instead
-of 2D strip-z/top-view dependencies.
+one CP-centered augmentation-envelope bbox dependency set per sample instead
+of 2D strip-z/top-view dependencies. 3D prefetch uses configured augmentation
+extrema for that envelope, not the concrete deterministic augmentation draw
+for one raw sample. VC3D owns bbox-to-chunk conversion through
+`Volume.collect_bbox_dependencies`; there is no 3D prefetch device knob because
+the bbox path does not materialize dependency coordinate tensors.
 
 The old `strip_coord_cache_dir` CP-local dense source-coordinate cache has been
 removed. The loader now builds a compact in-RAM fiber-line geometry store at

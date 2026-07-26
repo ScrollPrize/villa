@@ -261,21 +261,20 @@
   `gpu_mask`, `linePts`, `dirPts`, and `posK`). With worker processes, the
   first `loader_workers` benchmark rows can include worker-local loader
   construction and should not be used as steady-state throughput.
-- 3D prefetch computes chunk dependencies from the same explicit coordinate
-  path used by training and the VC3D sampler. It follows the 2D step-count
+- 3D prefetch computes chunk dependencies from a CP-centered selected-level
+  augmentation-envelope bbox and asks VC3D to convert that bbox to authoritative
+  chunk dependency metadata. It follows the 2D step-count
   sentinel rules: omitted `--prefetch-steps` uses `training.max_steps`;
   positive values override config; explicit `--prefetch-steps 0` means every
   selected training CP once; negative values fail clearly. A positive
   `training.max_sample_index` bounds the prefetched training prefix, and
   full/config-driven prefetch also covers held-out test CPs once in flat order
   when `test_datasets` is configured.
-- VC3D dependency collection currently accepts 2D coordinate surfaces shaped
-  `[H,W,3]`. When 3D prefetch has a regular coordinate volume shaped
-  `[Z,Y,X,3]` or another higher-rank `[...,H,W,3]` grid, the sampler wrapper
-  flattens it into one 2D surface using the same convention as training
-  sampling (`[Z,Y,X,3] -> [Z*Y,X,3]`), collects dependency metadata once, and
-  de-duplicates chunks by `(store_identity, key)`. It must preserve VC3D
-  returned metadata rather than reconstructing cache paths in Python.
+- VC3D dependency collection exposes both coordinate-surface metadata
+  (`collect_coords_dependencies`) for 2D strip/top-slice surfaces and selected
+  ZYX bbox metadata (`collect_bbox_dependencies`) for regular 3D prefetch
+  envelopes. Python must preserve VC3D-returned metadata rather than
+  reconstructing cache paths or remote chunk keys.
 - 3D prefetch must follow the same streaming dependency/download state machine
   as 2D prefetch: bounded dependency producers controlled by
   `prefetch_sampler_workers`, bounded download workers controlled by
@@ -288,6 +287,16 @@
 - The only intentional 3D differences from 2D prefetch are that one 3D sample
   produces one CP-centered 3D augmentation-envelope dependency volume, valid
   counts are voxels, and there is no strip-z offset loop or top-view branch.
+- The 3D augmentation-envelope dependency volume is
+  augmentation-sample-independent, not augmentation-config-independent:
+  configured augmentation extrema define the conservative source range, but
+  one deterministic random augmentation draw must not decide which chunks are
+  prefetched.
+- 3D prefetch dependency generation must not call `_sample_augment_params` or
+  otherwise sample concrete augmentation parameters. It must generate
+  a selected-level bbox from the configured envelope and call VC3D bbox
+  dependency discovery without `sample_coords`, coordinate materialization,
+  image decoding, normalization, or target construction.
 - V0 3D prefetch uses VC3D chunk dependency metadata and the shared Python
   prefetch writer with atomic cache-file renames and `.empty` marker handling.
   It does not prefetch Lasagna manifest channels.
@@ -845,7 +854,7 @@
 - The tester/runner loads a batch from a specified deterministic control-point sample index.
 - Prefetch uses the same shared source-strip implementation as training and augment-vis.
 - Prefetch remains CPU-pinned, but it still uses the same torch-native source-grid and strip-offset path, converting to NumPy only once for VC3D dependency discovery.
-- Prefetch is independent of any one random augmentation draw: for each selected CP and strip-z offset it covers the configured maximum augmentation envelope represented by the oversized source-strip coordinates.
+- Prefetch is independent of any one random augmentation draw: for each selected CP and strip-z offset it covers the configured maximum augmentation envelope represented by the oversized source-strip coordinates. In 3D this same rule means one CP-centered volume envelope per sample, not one concrete sampled 3D augmentation.
 - Prefetch may conservatively cover more chunks than one concrete augmented training sample, but it should avoid misses for later random augmentations within the configured extrema.
 - Prefetch must use dependency-only chunk discovery for the base-volume sampler. For VC3D this means `collect_coords_dependencies` over the same conservative source-envelope coordinates, without `sample_coords`, image-value sampling, or discarded sampled pixels.
 - VC3D dependency discovery must return explicit per-chunk metadata for Python prefetch: remote chunk key/URL, final persistent cache data path, `.empty` marker path, persistent extension, and cache payload format.

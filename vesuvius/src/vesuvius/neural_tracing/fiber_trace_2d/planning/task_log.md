@@ -1,45 +1,40 @@
-# Task Log: Shared Trace2CP Strip Builder
+# VC3D BBox Dependency Metadata For 3D Prefetch Task Log
 
 ## Implementation Notes
 
-- Added a shared Trace2CP source builder in `fiber_trace_2d.loader` that takes
-  an explicit `FiberStripLineWindow`, target-local index, shape, anchor column,
-  strip offset, and Lasagna normals, then calls the existing
-  `build_side_strip_patch_grid_tensor_from_line_window(...)`.
-- Original CP-pair `build_trace2cp_segment_source(...)` now computes the
-  sample/record/window metadata and delegates the common source construction to
-  the shared helper.
-- Added `build_trace2cp_volume_trace_segment_source(...)` for native 3D
-  regenerated/fused strips. It accepts base-volume XYZ trace points, filters
-  only non-finite/consecutive-duplicate points, samples fresh Lasagna normals
-  at the traced points, sign-aligns them along the traced line, and delegates
-  to the shared helper.
-- Native 3D single-pair fused-strip rendering and whole-fiber regenerated rows
-  now call `build_trace2cp_volume_trace_segment_source(...)` with actual traced
-  volume coordinates instead of converting through the original source-strip
-  grid.
-- Lowered the native whole-fiber error threshold default from 100 to 10
-  selected-scale voxels in both `NativeTrace2CpConfig` and the CLI parser.
-- Updated planning specs, code-structure docs, and changelog.
+- Added `Volume.collect_bbox_dependencies(offset, shape, level=0)` to the
+  VC3D Python binding. It reuses the existing selected-level ZYX
+  `collectChunkKeys(...)` conversion and the same per-chunk metadata dict
+  emitted by `collect_coords_dependencies(...)`.
+- Added `CoordinateSampler.chunk_requests_for_bbox(start_zyx, end_zyx)` and
+  implemented it for `Vc3dCoordinateSampler` by calling the new VC3D binding.
+  Local `NumpyZarrCoordinateSampler` returns no remote chunk requests.
+- Switched 3D prefetch to compute a clamped selected-level augmentation-envelope
+  bbox and pass that bbox directly to the sampler. The previous chunk-center
+  coordinate materialization path is gone from 3D prefetch. The prefetch bbox
+  is no longer rounded to zarr chunk boundaries in Python; VC3D owns bbox-to-
+  chunk conversion.
+- Removed `prefetch_sampler_device` from 3D config parsing, tests, and the
+  active `train_s1a_nml_all_64_sd2.json` config. The remaining producer
+  concurrency knob is `prefetch_sampler_workers`.
+- Updated specs, code-structure docs, local-development notes, and changelog to
+  describe VC3D-owned bbox-to-chunk dependency metadata.
 
-## Deviations / Boundaries
+## Deviations / Deferred Items
 
-- `build_trace2cp_refined_segment_source(...)` remains as the existing 2D
-  refinement compatibility adapter for source-strip `(x,y,z)` traces because
-  `fiber_trace_2d.runner` still uses that API. Its final side-strip
-  construction now goes through the shared helper, but the adapter still
-  converts old 2D source-strip trace coordinates into volume points before
-  delegating. Native 3D regenerated/fused strips bypass this adapter entirely.
+- No planned runtime behavior was intentionally skipped.
+- VC3D bbox smoke was limited to checking that the installed binding exposes
+  `Volume.collect_bbox_dependencies`; no live remote-volume prefetch was run.
 
 ## Validation
 
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py -k 'trace2cp_refined or trace2cp_segment_source or volume_trace_segment_source'`
-  passed: 7 passed, 270 deselected.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k 'trace2cp_defaults or whole_fiber_span_panels or whole_fiber_span_source or converts_volume_trace'`
-  passed: 4 passed, 102 deselected.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py`
-  passed: 277 passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k 'prefetch or dependency'`
+  passed: 9 passed, 101 deselected.
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/loader.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/sampling.py`
+  passed.
+- `python -m pip install -e volume-cartographer --no-deps --break-system-packages`
+  rebuilt and reinstalled the editable VC3D package without dependency changes.
+- `python -c "from vc.volume import Volume; print(hasattr(Volume, 'collect_bbox_dependencies'))"`
+  printed `True`.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: 106 passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_2d_loader.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: 383 passed.
+  passed: 110 passed.

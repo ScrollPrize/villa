@@ -5,6 +5,7 @@
   "cp_margin_voxels": 4,
   "presence_radius_voxels": 2.0,
   "prefetch_workers": 16,
+  "prefetch_sampler_workers": 4,
   "round_source_to_chunk_boundaries": true,
   "image_normalization": "zscore",
   "augment_enabled": true,

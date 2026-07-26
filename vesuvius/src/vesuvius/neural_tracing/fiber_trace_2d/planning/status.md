@@ -1,11 +1,15 @@
-# Trace2CP Shared Strip Builder And Tighter Reset Threshold Status
+# VC3D BBox Dependency Metadata For 3D Prefetch Status
 
-- [x] Read local workflow and inspect original/refined Trace2CP strip builders.
-- [x] Write current task description.
+- [x] Read local workflow instructions.
+- [x] Inspect VC3D coordinate dependency binding and existing bbox chunk-key helper.
+- [x] Inspect Python sampler dependency wrapper and current 3D prefetch path.
+- [x] Write task description.
 - [x] Write task plan with spec/docs/test coverage.
-- [x] Refactor shared strip-source construction helper.
-- [x] Replace native regenerated/fused old-grid dependency with volume-trace input.
-- [x] Lower native whole-fiber error threshold default to 10 voxels.
-- [x] Update specs/changelog/docs as needed.
+- [x] Review plan before implementation.
+- [x] Implement VC3D bbox dependency metadata binding.
+- [x] Add Python sampler bbox dependency wrapper.
+- [x] Switch 3D prefetch from representative coords to bbox dependency calls.
+- [x] Remove `prefetch_sampler_device` from 3D prefetch config/docs/tests.
+- [x] Update specs/docs/changelog.
 - [x] Add focused regression tests.
-- [x] Run focused verification.
+- [x] Rebuild/run verification.

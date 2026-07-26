@@ -408,19 +408,20 @@ side/top strip input loading.
   blocks over the requested strip coordinates, projects direction/presence into
   the 2D frame, logs `test/trace2cp_error`, and uses that value for `best.pt`
   selection. Dense 3D test loss remains a diagnostic.
-- 3D prefetch uses the same explicit coordinate path as training, then asks
-  VC3D for chunk dependency metadata. Because the VC3D dependency binding
-  accepts 2D coordinate surfaces, rank-4 regular patch coordinates such as
-  `[Z,Y,X,3]` are flattened to `[Z*Y,X,3]`, matching the regular training
-  sampling adapter.
+- 3D prefetch computes a CP-centered selected-level augmentation-envelope bbox
+  and asks VC3D for authoritative bbox-to-chunk dependency metadata. This avoids
+  materializing representative coordinates or reconstructing chunk paths in
+  Python.
 - 3D prefetch follows the 2D streaming prefetch architecture: bounded
   dependency producer workers controlled by `prefetch_sampler_workers`,
   bounded transfer workers controlled by `prefetch_workers`, immediate
   cache-hit / `.empty` / download classification, earliest-sample download
   priority, deterministic safe-prefix `idx`, and live progress while
   dependencies are still being generated. The 3D-only simplification is that
-  each sample contributes one CP-centered 3D augmentation-envelope volume; no
-  strip-z loop or top-view branch exists in 3D.
+  each sample contributes one CP-centered 3D augmentation-envelope volume
+  derived from configured augmentation extrema rather than one sampled
+  augmentation draw; no strip-z loop, coordinate-envelope tensor, or top-view
+  branch exists in 3D.
 - 3D prefetch follows the 2D step-count sentinels: omitted `--prefetch-steps`
   uses `training.max_steps`; positive values override config; explicit
   `--prefetch-steps 0` means every selected training CP once; negative values
@@ -1682,7 +1683,10 @@ until explicit codec support is added.
 Prefetch covers the configured augmentation envelope, not a single random
 augmentation draw. It may fetch a conservative superset for one patch, but later
 training draws within the configured extrema should be covered by the same
-cached base-volume chunks.
+cached base-volume chunks. For 3D, this is implemented as a CP-centered
+selected-level bbox: the prefetcher passes the bbox to VC3D
+`collect_bbox_dependencies`, and VC3D returns the same authoritative metadata
+used by coordinate-surface dependency discovery.
 
 Prefetch is only for addressed base-volume image chunks. Lasagna channels are
 local manifest channels in the current Staticsheep config and are not part of

@@ -1479,12 +1479,23 @@ class FiberTrace3DLoader:
     ) -> tuple[np.ndarray, np.ndarray]:
         cp = self._control_point_volume_zyx(record, cp_index)
         patch = np.asarray(self.config.patch_shape_zyx, dtype=np.float64)
-        min_scale = max(float(self.config.augment_scale_min), 1.0e-6)
-        shift = np.asarray(self.config.augment_shift_zyx, dtype=np.float64)
-        smooth_amp = np.asarray(
-            self.config.augment_smooth_displacement_amplitude_zyx,
-            dtype=np.float64,
-        )
+        if self.config.augment_enabled:
+            min_scale = max(float(self.config.augment_scale_min), 1.0e-6)
+            shift = np.asarray(self.config.augment_shift_zyx, dtype=np.float64)
+            if (
+                self.config.augment_smooth_displacement_mode != "none"
+                and float(self.config.augment_smooth_displacement_probability) > 0.0
+            ):
+                smooth_amp = np.asarray(
+                    self.config.augment_smooth_displacement_amplitude_zyx,
+                    dtype=np.float64,
+                )
+            else:
+                smooth_amp = np.zeros((3,), dtype=np.float64)
+        else:
+            min_scale = 1.0
+            shift = np.zeros((3,), dtype=np.float64)
+            smooth_amp = np.zeros((3,), dtype=np.float64)
         radius = (
             float(np.linalg.norm(patch - 1.0)) / min_scale
             + float(np.max(shift))
@@ -1493,9 +1504,23 @@ class FiberTrace3DLoader:
         )
         start = np.floor(cp - radius).astype(np.int64)
         end = np.ceil(cp + radius + 1.0).astype(np.int64)
-        if self.config.round_source_to_chunk_boundaries:
-            start, end = _round_bbox_to_chunks(record.volume, start, end)
         return start, end
+
+    def _prefetch_envelope_bbox_selected(
+        self,
+        record: _Record,
+        cp_index: int,
+    ) -> tuple[int, np.ndarray, np.ndarray]:
+        start_selected, end_selected = self._prefetch_source_bbox(record, cp_index)
+        selected_shape = np.asarray(
+            _volume_shape_zyx(record.volume, label="3D prefetch selected base volume"),
+            dtype=np.int64,
+        )
+        start = np.maximum(np.asarray(start_selected, dtype=np.int64), 0)
+        end = np.minimum(np.asarray(end_selected, dtype=np.int64), selected_shape)
+        extent = np.maximum(end - start, 0)
+        valid_voxels = int(np.prod(extent, dtype=np.int64)) if bool(np.all(extent > 0)) else 0
+        return int(valid_voxels), start.astype(np.int64), end.astype(np.int64)
 
     def _build_geometry_maps(
         self,
@@ -2070,20 +2095,14 @@ class FiberTrace3DLoader:
             data_sample_index,
             sample_mode=sample_mode,
         )
-        params = self._sample_augment_params(record, cp_index, int(sample_index))
-        geometry = self._build_geometry_maps(
-            params,
-            device=torch.device("cpu"),
+        valid_voxels, start_selected, end_selected = self._prefetch_envelope_bbox_selected(
+            record,
+            cp_index,
         )
-        coords_selected = geometry.backward_source_zyx.detach().cpu().numpy().astype(np.float32)
-        coords_base = np.ascontiguousarray(coords_selected * float(record.volume_spacing_base))
-        base_shape = np.asarray(record.base_shape_zyx, dtype=np.float32)
-        valid = np.isfinite(coords_base).all(axis=-1)
-        valid &= (coords_base[..., 0] >= 0.0) & (coords_base[..., 0] <= float(base_shape[0] - 1.0))
-        valid &= (coords_base[..., 1] >= 0.0) & (coords_base[..., 1] <= float(base_shape[1] - 1.0))
-        valid &= (coords_base[..., 2] >= 0.0) & (coords_base[..., 2] <= float(base_shape[2] - 1.0))
-        valid = np.ascontiguousarray(valid)
-        return int(np.count_nonzero(valid)), record.sampler.chunk_requests_for_coords(coords_base, valid)
+        return int(valid_voxels), record.sampler.chunk_requests_for_bbox(
+            start_selected,
+            end_selected,
+        )
 
     def chunk_requests_for_sample_index(
         self,
@@ -2135,7 +2154,7 @@ class FiberTrace3DLoader:
             f"samples={total_samples} workers={worker_count} "
             f"sampler_workers={producer_count} sample_mode={sample_mode} "
             f"sample_index_limit={0 if sample_index_limit is None else int(sample_index_limit)} "
-            "mode=dependency_chunks",
+            "mode=augmentation_envelope_bbox",
             flush=True,
         )
 
