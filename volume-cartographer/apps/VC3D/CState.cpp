@@ -180,9 +180,13 @@ std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surf
 
 } // namespace
 
-CState::CState(size_t cacheSizeBytes, QObject* parent)
+CState::CState(
+    size_t cacheSizeBytes,
+    QObject* parent,
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget)
     : QObject(parent)
     , _cacheSizeBytes(cacheSizeBytes)
+    , _decodedCacheBudget(std::move(decodedCacheBudget))
 {
     _pointCollection = new VCCollection(this);
 
@@ -194,7 +198,11 @@ CState::CState(size_t cacheSizeBytes, QObject* parent)
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{1,0,0}));
 }
 
-CState::~CState() = default;
+CState::~CState()
+{
+    if (_currentVolume)
+        _currentVolume->releaseCacheClient();
+}
 
 std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 
@@ -220,8 +228,18 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
+    if (_currentVolume == vol) {
+        applyCacheBudget(vol);
+        resolveCurrentVolumeId();
+        emit volumeChanged(_currentVolume, _currentVolumeId);
+        return;
+    }
+    if (_currentVolume)
+        _currentVolume->releaseCacheClient();
     _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
+    if (_currentVolume)
+        _currentVolume->retainCacheClient();
     resolveCurrentVolumeId();
     _pointCollection->setFileMetadata(
         (_vpkg && !_currentVolumeId.empty())
@@ -268,10 +286,16 @@ VCCollection* CState::pointCollection() const { return _pointCollection; }
 
 size_t CState::cacheSizeBytes() const { return _cacheSizeBytes; }
 
+std::shared_ptr<vc::render::DecodedChunkCacheBudget>
+CState::decodedCacheBudget() const
+{
+    return _decodedCacheBudget;
+}
+
 void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
-        vol->setCacheBudget(_cacheSizeBytes);
+        vol->setCacheBudget(_cacheSizeBytes, _decodedCacheBudget);
     }
 }
 
@@ -312,6 +336,8 @@ void CState::closeAll()
         }
     }
 
+    if (_currentVolume)
+        _currentVolume->releaseCacheClient();
     _currentVolume = nullptr;
     _currentVolumeId.clear();
     _segmentationGrowthVolumeId.clear();
@@ -332,7 +358,8 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     if (sameSurface && !isEditUpdate && surf != nullptr) {
         return;
     }
-    if (it != _surfs.end() && it->second && it->second != surf) {
+    if (_surfaceBatchDepth == 0 && it != _surfs.end() && it->second &&
+        it->second != surf) {
         emit surfaceWillBeDeleted(name, it->second);
     }
 
@@ -341,7 +368,7 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
         resetViewOnSurfaceChangeEnabled()) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
             try {
-                auto focusPoi = createSegmentationFocusPoi(this, *quad);
+                auto focusPoi = createSurfaceFocusPoi(*quad);
                 if (focusPoi) {
                     delayedFocusPoi = focusPoi.get();
                     _pois["focus"] = std::move(focusPoi);
@@ -360,9 +387,12 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
         // Edit updates re-set the same pointer every frame; only a mapping
         // change should invalidate cached views of the surface map.
         ++_surfacesVersion;
+        if (_surfaceBatchDepth > 0) {
+            _surfaceBatchChanged = true;
+        }
     }
 
-    if (!noSignalSend || surf == nullptr) {
+    if (_surfaceBatchDepth == 0 && (!noSignalSend || surf == nullptr)) {
         emit surfaceChanged(name, surf, isEditUpdate);
     }
 
@@ -374,6 +404,37 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
             delayedFocusPoi->suppressTransientPlaneIntersections = false;
         }
     }
+}
+
+void CState::setSurfacesBatch(
+    const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& updates)
+{
+    const bool outermost = _surfaceBatchDepth == 0;
+    if (outermost) {
+        _surfaceBatchChanged = false;
+    }
+    ++_surfaceBatchDepth;
+
+    auto finishBatch = [this, outermost]() {
+        --_surfaceBatchDepth;
+        if (outermost) {
+            const bool changed = _surfaceBatchChanged;
+            _surfaceBatchChanged = false;
+            if (changed) {
+                emit surfaceChanged("", nullptr, false);
+            }
+        }
+    };
+
+    try {
+        for (const auto& [name, surface] : updates) {
+            setSurface(name, surface, true, false);
+        }
+    } catch (...) {
+        finishBatch();
+        throw;
+    }
+    finishBatch();
 }
 
 void CState::emitSurfacesChanged()
@@ -430,6 +491,11 @@ std::vector<std::string> CState::surfaceNames()
 }
 
 // --- POI methods (from CSurfaceCollection) ---
+
+std::unique_ptr<POI> CState::createSurfaceFocusPoi(QuadSurface& surface)
+{
+    return createSegmentationFocusPoi(this, surface);
+}
 
 void CState::setPOI(const std::string& name, POI* poi)
 {

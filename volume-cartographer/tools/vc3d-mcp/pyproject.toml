@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vc3d-mcp"
+version = "0.1.0"
+description = "MCP server that drives a running VC3D instance through its Agent Bridge local socket."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.6.0,<2",
+    "typing-extensions>=4.8",
+]
+
+[project.scripts]
+vc3d-mcp = "vc3d_mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["vc3d_mcp*"]

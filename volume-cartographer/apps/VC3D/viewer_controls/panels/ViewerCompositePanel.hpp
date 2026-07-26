@@ -47,13 +47,14 @@ public:
                                   ViewerManager* viewerManager,
                                   QWidget* parent = nullptr);
 
+    void setViewerManager(ViewerManager* viewerManager);
     void toggleSegmentationComposite();
     void setSegmentationCompositeChecked(bool checked);
 
 private:
     void setupControls();
-    void initializeExistingViewers();
     void applyInitialSettingsToViewer(VolumeViewerBase* viewer);
+    void syncUiFromManager();
     void updateCompositeParamsVisibility();
     void applyToSegmentationViewer(const std::function<void(VolumeViewerBase*)>& apply);
     void applyToAllViewers(const std::function<void(VolumeViewerBase*)>& apply);

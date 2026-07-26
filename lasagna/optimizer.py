@@ -29,6 +29,7 @@ import opt_loss_atlas_line
 from snap_surf import map_global as snap_surf_map_global
 from progress_table import format_progress_value, print_progress_legend
 import opt_loss_flatten
+from flatten_clamped_adam import FlattenClampedAdam
 
 
 def _debug_cuda_sync(label: str) -> None:
@@ -2088,6 +2089,10 @@ def optimize(
 			if "map_flatten_ms" in opt_cfg.params and bool(getattr(model, "flatten_enabled", False))
 			else 0.0
 		)
+		fused_flatten_adam_clamp = _truthy(os.environ.get(
+			"LASAGNA_FUSED_FLATTEN_ADAM_CLAMP",
+			stage_args.get("fused_flatten_adam_clamp", False),
+		))
 		if opt_timing_enabled and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: opt timing enabled interval={opt_timing_interval} "
@@ -2252,10 +2257,87 @@ def optimize(
 			flush=True,
 		)
 
+		_flatten_diagnostics = _truthy(os.environ.get(
+			"LASAGNA_FLATTEN_DIAGNOSTICS",
+			stage_args.get("flatten_diagnostics", True),
+		))
 		opt_loss_flatten.configure(
 			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
 			orient_min_det=float(stage_args.get("flatten_orient_min_det", 0.0)),
+			diagnostics=_flatten_diagnostics,
 		)
+		_compile_flatten = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN",
+			stage_args.get("compile_flatten", False),
+		))
+		_compile_flatten_backend = os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_BACKEND",
+			stage_args.get("compile_flatten_backend", None),
+		)
+		_compile_flatten_mode = os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_MODE",
+			stage_args.get("compile_flatten_mode", None),
+		)
+		_compile_flatten_dynamic = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_DYNAMIC",
+			stage_args.get("compile_flatten_dynamic", False),
+		))
+		_compile_flatten_fullgraph = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_FULLGRAPH",
+			stage_args.get("compile_flatten_fullgraph", False),
+		))
+		_compile_flatten_combined = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_COMBINED",
+			stage_args.get("compile_flatten_combined", True),
+		))
+		opt_loss_flatten.configure_compile(
+			enabled=_compile_flatten,
+			backend=_compile_flatten_backend,
+			mode=_compile_flatten_mode,
+			dynamic=_compile_flatten_dynamic,
+			fullgraph=_compile_flatten_fullgraph,
+		)
+		if not _flatten_diagnostics and "map_flatten_ms" in opt_cfg.params:
+			print(f"[optimizer] {label}: flatten_diagnostics=0", flush=True)
+		if _compile_flatten and "map_flatten_ms" in opt_cfg.params:
+			_details = []
+			if _compile_flatten_backend:
+				_details.append(f"backend={_compile_flatten_backend}")
+			if _compile_flatten_mode:
+				_details.append(f"mode={_compile_flatten_mode}")
+			if _compile_flatten_dynamic:
+				_details.append("dynamic=1")
+			if _compile_flatten_fullgraph:
+				_details.append("fullgraph=1")
+			if (
+				_compile_flatten_combined
+				and not _flatten_diagnostics
+				and str(getattr(model, "flatten_direction", "inverse")) == "forward"
+			):
+				_details.append("combined=1")
+			_detail_str = " " + " ".join(_details) if _details else ""
+			print(f"[optimizer] {label}: compile_flatten=1{_detail_str}", flush=True)
+		_flatten_combined_names = (
+			"flatten_sdir",
+			"flatten_map_step",
+			"flatten_avg_offset",
+			"flatten_orient",
+		)
+		_flatten_combined_weights = None
+		if (
+			_compile_flatten
+			and _compile_flatten_combined
+			and not _flatten_diagnostics
+			and "map_flatten_ms" in opt_cfg.params
+			and str(getattr(model, "flatten_direction", "inverse")) == "forward"
+		):
+			_flatten_weight_values = tuple(_need_term(name, stage_eff) for name in _flatten_combined_names)
+			if all(weight != 0.0 for weight in _flatten_weight_values):
+				_flatten_combined_weights = torch.tensor(
+					_flatten_weight_values,
+					device=next(model.parameters()).device,
+					dtype=torch.float32,
+				)
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",
 			stage_args.get("compile_cyl_normal", False),
@@ -2341,7 +2423,10 @@ def optimize(
 					for pi, p in enumerate(group):
 						if pi < k0:
 							continue
-						param_groups_.append({"params": [p], "lr": _lr_scalespace(lr=settings.lr, scale_i=pi)})
+						param_group = {"params": [p], "lr": _lr_scalespace(lr=settings.lr, scale_i=pi)}
+						if name == "map_flatten_ms":
+							param_group["_flatten_scale_i"] = pi
+						param_groups_.append(param_group)
 				elif name == "cyl_params" and bool(getattr(model, "cyl_shell_mode", False)):
 					scale_count = 0
 					if hasattr(model, "cyl_param_scale_count"):
@@ -2360,16 +2445,35 @@ def optimize(
 						param_groups_.append({"params": [p], "lr": lr_last})
 			return all_params_, param_groups_
 
+		def _make_optimizer(
+			param_groups_: list[dict],
+			opt_settings: OptSettings | None = None,
+		) -> torch.optim.Optimizer:
+			settings = opt_settings if opt_settings is not None else opt_cfg
+			if (
+				fused_flatten_adam_clamp
+				and flatten_max_update > 0.0
+				and settings.params == ["map_flatten_ms"]
+			):
+				return FlattenClampedAdam(param_groups_, base_step=flatten_max_update)
+			return torch.optim.Adam(param_groups_)
+
 		_t = _stage_start(f"{label}.build_optimizer")
 		all_params, param_groups = _make_param_groups()
 		if not param_groups:
 			return data
-		opt = torch.optim.Adam(param_groups)
+		opt = _make_optimizer(param_groups)
 		_capture_optimizer_target_lrs(opt)
 		if flatten_max_update > 0.0 and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: flatten_max_update={flatten_max_update:g} "
 				f"(per-scale cap doubles at each coarser level)",
+				flush=True,
+			)
+		if isinstance(opt, FlattenClampedAdam) and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: fused_flatten_adam_clamp=1 "
+				f"(Triton CUDA with PyTorch fallback)",
 				flush=True,
 			)
 		_stage_done(f"{label}.build_optimizer", _t)
@@ -2394,7 +2498,7 @@ def optimize(
 				all_params, param_groups = _make_param_groups()
 				if not param_groups:
 					return data
-				opt = torch.optim.Adam(param_groups)
+				opt = _make_optimizer(param_groups)
 				_capture_optimizer_target_lrs(opt)
 		_stage_done(f"{label}.winding_offset_autocrop", _t)
 
@@ -3158,7 +3262,38 @@ def optimize(
 			if stage_uses_cyl_loss:
 				opt_loss_cyl.reset_candidate_terms()
 			D = res_.xyz_lr.shape[0]
+			if _flatten_combined_weights is not None:
+				for name in _flatten_combined_names:
+					t = terms[name]
+					missing = _missing_loss_fields(
+						name=name,
+						required=t.get("needs", Needs()),
+						res_=res_,
+					)
+					if missing:
+						raise RuntimeError(
+							f"{profile_label or label}: active combined flatten loss missing "
+							f"artifact(s) for '{name}': {', '.join(missing)}"
+						)
+				loss_label = f"{profile_label or label}.flatten_combined"
+				_log_cuda_memory(f"{loss_label}.before")
+				_t_loss = _stage_start(loss_label) if profile_label is not None else None
+				_t_loss_wall = time.perf_counter() if timing is not None else None
+				combined_loss = opt_loss_flatten.flatten_combined_loss(
+					res=res_,
+					weights=_flatten_combined_weights,
+				)
+				_debug_cuda_sync(loss_label)
+				_log_cuda_memory(f"{loss_label}.after_raw")
+				if timing is not None and _t_loss_wall is not None:
+					timing.sync()
+					timing.add("loss:flatten_combined", time.perf_counter() - _t_loss_wall)
+				if _t_loss is not None:
+					_stage_done(loss_label, _t_loss)
+				total = total + combined_loss
 			for name, t in terms.items():
+				if _flatten_combined_weights is not None and name in _flatten_combined_names:
+					continue
 				min_d = t.get("min_depth", 1)
 				if D < min_d:
 					continue
@@ -3218,7 +3353,10 @@ def optimize(
 				else:
 					lv, lms, masks = result
 					w = _need_term(name, eff_)
-					tv[name] = float(lv.detach().cpu())
+					is_flatten_term = name in (
+						"flatten_sdir", "flatten_map_step", "flatten_avg_offset", "flatten_orient")
+					if _flatten_diagnostics or not is_flatten_term:
+						tv[name] = float(lv.detach().cpu())
 					if name == "pred_dt":
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					if name == "cyl_outside":
@@ -3227,7 +3365,7 @@ def optimize(
 						tv.update(opt_loss_snap_surf.last_stats())
 					if name == "atlas_line":
 						tv.update(opt_loss_atlas_line.last_stats())
-					if name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
+					if _flatten_diagnostics and name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
 						tv.update(opt_loss_flatten.last_stats())
 					total = total + w * lv
 			display_loss: float | None = None
@@ -3412,7 +3550,7 @@ def optimize(
 				all_params, param_groups = _make_param_groups(pass_settings)
 				if not param_groups:
 					raise RuntimeError(f"{shell_label}: no cylinder parameters available to optimize")
-				opt = torch.optim.Adam(param_groups)
+				opt = _make_optimizer(param_groups, pass_settings)
 				_capture_optimizer_target_lrs(opt)
 				resample_count = 0
 				resampled_this_pass = False
@@ -4116,7 +4254,11 @@ def optimize(
 			_t_part = time.perf_counter()
 			_flatten_update_before = None
 			_flatten_update_params = all_params.get("flatten_map_ms", [])
-			if flatten_max_update > 0.0 and _flatten_update_params:
+			if (
+				flatten_max_update > 0.0
+				and _flatten_update_params
+				and not isinstance(opt, FlattenClampedAdam)
+			):
 				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
 			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
 			_log_cuda_memory(f"{label}.{step + 1}.opt_step.before")

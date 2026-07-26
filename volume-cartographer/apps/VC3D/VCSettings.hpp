@@ -64,7 +64,10 @@ inline QString remoteCachePath(const QString& suggestion = {})
 inline QString settingsFilePath()
 {
     // Settings must stay in the user's home — /ephemeral is lost on stop.
-    const QString configDir = QDir::homePath() + "/.VC3D";
+    // Tests may redirect the otherwise fixed per-user directory without
+    // changing production behavior.
+    QString configDir = qEnvironmentVariable("VC3D_CONFIG_DIR").trimmed();
+    if (configDir.isEmpty()) configDir = QDir::homePath() + "/.VC3D";
     QDir dir;
     if (!dir.exists(configDir)) {
         dir.mkpath(configDir);
@@ -272,6 +275,35 @@ namespace perf {
 }
 
 // -----------------------------------------------------------------------------
+// Spiral Workspace Settings
+//
+// Spiral-only and independent of perf::RAM_CACHE_SIZE_GB, which keeps governing
+// the main workspace's shared decoded-chunk budget. All three apply without a
+// restart.
+// -----------------------------------------------------------------------------
+namespace spiral {
+    // Budget for the flattened view's cache of resampled surface space, for the
+    // displayed (base) volume. 0 disables it, so the flattened view samples the
+    // volume every frame as it did before the cache existed.
+    constexpr auto SURFACE_CACHE_GB = "spiral/surface_cache_gb";
+    constexpr int SURFACE_CACHE_GB_DEFAULT = 4;
+
+    // Same, for the overlay volume. Its own budget because overlay and base
+    // compete for nothing else. 0 disables it and leaves the overlay channel on
+    // its existing resident-only sampling path.
+    constexpr auto OVERLAY_SURFACE_CACHE_GB = "spiral/overlay_surface_cache_gb";
+    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 0;
+
+    // LRU cap for the private decoded-chunk pool behind the spiral slice panes.
+    // A floor rather than a ceiling: it is raised automatically when it cannot
+    // hold one frame (otherwise a single render thrashes), and the status bar
+    // reports the effective value. The surface-tile filler gets a pool of the
+    // same size as an internal constant.
+    constexpr auto PLANE_CHUNK_CACHE_MB = "spiral/plane_chunk_cache_mb";
+    constexpr int PLANE_CHUNK_CACHE_MB_DEFAULT = 2048;
+}
+
+// -----------------------------------------------------------------------------
 // Main Window Settings
 // -----------------------------------------------------------------------------
 namespace window {
@@ -458,6 +490,7 @@ namespace volume_overlay {
     constexpr auto WINDOW_HIGH = "window_high";
     constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
+    constexpr auto SAMPLING_METHOD = "sampling_method";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
     constexpr auto COMPOSITE_ENABLED = "composite_enabled";
     constexpr auto COMPOSITE_METHOD = "composite_method";
@@ -465,6 +498,7 @@ namespace volume_overlay {
     constexpr auto COMPOSITE_LAYERS_BEHIND = "composite_layers_behind";
 
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr auto SAMPLING_METHOD_DEFAULT = "nearest";
     constexpr bool COMPOSITE_ENABLED_DEFAULT = false;
     constexpr auto COMPOSITE_METHOD_DEFAULT = "max";
     constexpr int COMPOSITE_LAYERS_FRONT_DEFAULT = 8;
