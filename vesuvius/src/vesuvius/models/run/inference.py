@@ -238,6 +238,7 @@ class Inferer():
                  hf_token: str = None,
                  model_type: str = 'auto',
                  input_anon: bool = False,
+                 read_retries: int = 4,
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
@@ -274,6 +275,7 @@ class Inferer():
         self.hf_token = hf_token
         self.model_type = model_type
         self.input_anon = input_anon
+        self.read_retries = read_retries
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
         self.bbox = tuple(bbox) if bbox is not None else None
@@ -708,6 +710,7 @@ class Inferer():
             resolution=self.resolution,
             anon=self.input_anon,
             bbox=self.bbox,
+            read_retries=self.read_retries,
         )
 
         expected_attr_name = 'all_positions'
@@ -1150,6 +1153,11 @@ def main():
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
+    parser.add_argument('--read-retries', dest='read_retries', type=int, default=4,
+                      help='Attempts per patch read (default 4). Transient remote failures '
+                           '(dropped connections, truncated payloads, 429/5xx) are retried '
+                           'with exponential backoff so one hiccup does not abort a long '
+                           'streaming run. Set to 1 to disable.')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')
@@ -1224,6 +1232,7 @@ def main():
         hf_token=args.hf_token,
         model_type=args.model_type,
         input_anon=args.input_anon,
+        read_retries=args.read_retries,
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
         bbox=bbox,

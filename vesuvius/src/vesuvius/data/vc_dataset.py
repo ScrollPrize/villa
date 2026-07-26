@@ -45,6 +45,7 @@ class VCDataset(Dataset):
             domain: Optional[str] = None,
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
             anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
+            read_retries: int = 4,  # Attempts per read, forwarded to Volume
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -83,6 +84,9 @@ class VCDataset(Dataset):
                              (e.g., 'np.float16', 'np.float32'). Default is 'np.float32'.
             domain: Data source domain for Volume ('dl.ash2txt', 'local'). Auto-detected if None.
             anon: Use anonymous requests for input S3 reads.
+            read_retries: Attempts per read, forwarded to Volume (default 4). Transient
+                remote failures are retried with exponential backoff so one dropped
+                connection does not abort a long streaming run. Pass 1 to disable.
         """
         self.input_path = input_path
         self.input_format = input_format # Keep for informational purposes
@@ -228,6 +232,7 @@ class VCDataset(Dataset):
                 domain=domain,
                 path=use_path,
                 anon=self.anon,
+                read_retries=read_retries,
             )
 
             # Get shape and dtype from the primary resolution level (0)
