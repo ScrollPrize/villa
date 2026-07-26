@@ -22,10 +22,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "vc/core/util/MemMap.hpp"
 
 #include <boost/geometry.hpp>
 #include <boost/geometry/index/rtree.hpp>
@@ -475,76 +472,21 @@ public:
     FileMapping() = default;
     FileMapping(const FileMapping&) = delete;
     FileMapping& operator=(const FileMapping&) = delete;
-    FileMapping(FileMapping&& other) noexcept { moveFrom(other); }
-    FileMapping& operator=(FileMapping&& other) noexcept
-    {
-        if (this != &other) {
-            close();
-            moveFrom(other);
-        }
-        return *this;
-    }
-    ~FileMapping() { close(); }
+    FileMapping(FileMapping&&) noexcept = default;
+    FileMapping& operator=(FileMapping&&) noexcept = default;
 
-    void open(const std::filesystem::path& path)
-    {
-        close();
-        fd_ = ::open(path.c_str(), O_RDONLY);
-        if (fd_ < 0) {
-            throw std::runtime_error("mmap open failed: " + path.string());
-        }
-        struct stat st {};
-        if (::fstat(fd_, &st) != 0 || st.st_size <= 0) {
-            close();
-            throw std::runtime_error("mmap stat failed: " + path.string());
-        }
-        size_ = static_cast<std::size_t>(st.st_size);
-        data_ = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-        if (data_ == MAP_FAILED) {
-            data_ = nullptr;
-            close();
-            throw std::runtime_error("mmap failed: " + path.string());
-        }
-        // The mapping owns the pages; the descriptor is only needed for mmap().
-        ::close(fd_);
-        fd_ = -1;
-    }
+    void open(const std::filesystem::path& path) { map_.open(path); }
 
     const std::uint8_t* bytes(std::uint64_t offset, std::uint64_t size) const
     {
-        if (!data_ || offset > size_ || size > size_ - offset) {
+        if (!map_ || offset > map_.size() || size > map_.size() - offset) {
             throw std::runtime_error("mmap TIFF strip points outside file");
         }
-        return static_cast<const std::uint8_t*>(data_) + offset;
+        return static_cast<const std::uint8_t*>(map_.data()) + offset;
     }
 
 private:
-    void close()
-    {
-        if (data_) {
-            ::munmap(data_, size_);
-            data_ = nullptr;
-        }
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
-        size_ = 0;
-    }
-
-    void moveFrom(FileMapping& other) noexcept
-    {
-        fd_ = other.fd_;
-        data_ = other.data_;
-        size_ = other.size_;
-        other.fd_ = -1;
-        other.data_ = nullptr;
-        other.size_ = 0;
-    }
-
-    int fd_ = -1;
-    void* data_ = nullptr;
-    std::size_t size_ = 0;
+    vc::memmap::MappedFileRO map_;
 };
 
 class MappedTifBand {

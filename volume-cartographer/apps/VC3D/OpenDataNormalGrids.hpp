@@ -16,6 +16,7 @@ namespace vc3d::opendata {
 struct OpenDataArtifact;
 struct OpenDataSample;
 struct OpenDataVolume;
+struct OpenDataResourceSelection;
 
 inline constexpr std::string_view kNormalGridsArtifactType = "normal-grids";
 inline constexpr std::string_view kOpenDataSampleIdTagPrefix = "vc-open-data-sample-id:";
@@ -29,9 +30,14 @@ struct OpenDataNormalGridsInfo {
     std::string sampleId;
     std::string volumeId;
     std::string url;
+    int sourceCoordinateLevel = 0;
+    bool levelWasExplicit = false;
 };
 
 [[nodiscard]] const OpenDataArtifact* normalGridsArtifact(const OpenDataVolume& volume);
+[[nodiscard]] std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
+    const std::string& sampleId,
+    const OpenDataVolume& volume);
 [[nodiscard]] std::string normalGridsArtifactUrl(const OpenDataVolume& volume);
 
 // Recover the pairing from a loaded volume's project tags. Returns nullopt when
@@ -43,7 +49,9 @@ struct OpenDataNormalGridsInfo {
 [[nodiscard]] std::filesystem::path normalGridsCacheDir(
     const std::filesystem::path& remoteCacheRoot,
     const std::string& sampleId,
-    const std::string& volumeId);
+    const std::string& volumeId,
+    int sourceCoordinateLevel = 0,
+    std::string_view artifactUrl = {});
 
 // True when the directory looks like a complete normal-grid store
 // (metadata.json plus xy/, xz/, yz/).
@@ -57,10 +65,12 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
                                      const std::filesystem::path& remoteCacheRoot);
 
 // Set up streaming normal grids for every volume of this sample that has a
-// normal-grids artifact. Returns the number of entries attached.
+// normal-grids artifact. Returns the number of entries attached. selection
+// optionally restricts volumes and representations; nullptr attaches all.
 int attachOpenDataNormalGrids(VolumePkg& pkg,
                               const OpenDataSample& sample,
-                              const std::filesystem::path& remoteCacheRoot);
+                              const std::filesystem::path& remoteCacheRoot,
+                              const OpenDataResourceSelection* selection = nullptr);
 
 // On-disk cache state of one volume's normal grids.
 struct NormalGridsCacheState {

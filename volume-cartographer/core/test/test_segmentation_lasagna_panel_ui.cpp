@@ -503,20 +503,23 @@ int main(int argc, char** argv)
         std::filesystem::path(tempDir.filePath(QStringLiteral("missing_model.pt")).toStdString()),
         std::filesystem::path((segBrokenModelDir + QStringLiteral("/model.pt")).toStdString()),
         symlinkErr);
-    require(!symlinkErr, "Failed to create broken model symlink");
-    auto brokenModelSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
-    brokenModelSurface->path = std::filesystem::path(segBrokenModelDir.toStdString());
-    state.setSurface("segmentation", brokenModelSurface, true);
-    panel.startOptimizationAtSeed(
-        &state,
-        &statusBar,
-        SegmentationLasagnaPanel::LasagnaMode::ReOptimize,
-        reoptModelConfigPath,
-        4,
-        5,
-        6);
-    require(statusBar.currentMessage().contains(QStringLiteral("broken symlink")),
-            "Re-optimize should reject a broken local model.pt symlink");
+    if (!symlinkErr) {
+        auto brokenModelSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+        brokenModelSurface->path = std::filesystem::path(segBrokenModelDir.toStdString());
+        state.setSurface("segmentation", brokenModelSurface, true);
+        panel.startOptimizationAtSeed(
+            &state,
+            &statusBar,
+            SegmentationLasagnaPanel::LasagnaMode::ReOptimize,
+            reoptModelConfigPath,
+            4,
+            5,
+            6);
+        require(statusBar.currentMessage().contains(QStringLiteral("broken symlink")),
+                "Re-optimize should reject a broken local model.pt symlink");
+    } else {
+        std::cerr << "Skipping broken-symlink check: " << symlinkErr.message() << std::endl;
+    }
 
     state.setSurface("segmentation", surface, true);
 
@@ -547,7 +550,11 @@ int main(int argc, char** argv)
     state.setVpkg(vpkg);
     require(panel._atlasCombo->count() == 1,
             "Atlas combo should refresh when the state's volume package changes");
-    require(panel._atlasCombo->currentData().toString().endsWith(QStringLiteral("atlases/fiber_atlas")),
+    const QString selectedAtlasDir = QFileInfo(
+        panel._atlasCombo->currentData().toString()).canonicalFilePath();
+    const QString expectedAtlasDir = QFileInfo(
+        volpkgRoot + QStringLiteral("/atlases/fiber_atlas")).canonicalFilePath();
+    require(selectedAtlasDir == expectedAtlasDir,
             "Atlas combo should select the discovered atlas directory");
     require(panel._compactAtlasCombo->count() == panel._atlasCombo->count(),
             "Compact atlas combo should mirror the full atlas combo");

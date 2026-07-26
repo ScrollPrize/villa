@@ -1,6 +1,7 @@
 SUPPORTED_MODEL_TYPES = (
     "timesformer",
     "resnet3d-50",
+    "resnet3d-152",
     "resnet3d-152-3d-decoder",
 )
 

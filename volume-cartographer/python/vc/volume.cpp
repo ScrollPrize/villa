@@ -475,6 +475,8 @@ NB_MODULE(volume, m)
         .def_prop_ro("is_remote", &Volume::isRemote)
         .def_prop_ro("path", [](const Volume& self) { return self.path().string(); })
         .def_prop_ro("remote_url", [](const Volume& self) { return self.remoteUrl(); })
+        .def_prop_ro("remote_locator", [](const Volume& self) { return self.remoteLocator(); })
+        .def_prop_ro("base_scale_level", &Volume::baseScaleLevel)
         .def_prop_ro("remote_cache_root", [](const Volume& self) { return self.remoteCacheRoot().string(); })
         .def_prop_ro("remote_cache_path", [](const Volume& self) { return self.remotePersistentCachePath().string(); })
         .def_prop_ro("id", &Volume::id)
@@ -493,7 +495,11 @@ NB_MODULE(volume, m)
         .def("chunk_count", &Volume::chunkCount, "level"_a = 0)
         .def("has_scale_level", &Volume::hasScaleLevel, "level"_a)
         .def("present_scale_levels", &Volume::presentScaleLevels)
-        .def("set_cache_budget", &Volume::setCacheBudget, "bytes"_a)
+        .def("set_cache_budget",
+             [](Volume& volume, size_t bytes) {
+                 volume.setCacheBudget(bytes);
+             },
+             "bytes"_a)
         .def("set_io_threads", &Volume::setIOThreads, "count"_a)
         .def("invalidate_cache", &Volume::invalidateCache)
         .def("read_zyx", &readZYX,

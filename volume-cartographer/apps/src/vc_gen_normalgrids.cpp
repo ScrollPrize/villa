@@ -17,10 +17,22 @@
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
-#include <arpa/inet.h>
-#include <sys/mman.h>
+#include <bit>
+
+#include "vc/core/util/MemMap.hpp"
 
 #include <omp.h>
+
+namespace {
+// On-disk GridStore format is big-endian; byte-swap on little-endian hosts
+// (portable replacement for ntohl).
+inline uint32_t be32(uint32_t v) {
+    if constexpr (std::endian::native == std::endian::little) {
+        return std::byteswap(v);
+    }
+    return v;
+}
+}
 
 
 #include "vc/core/types/Volume.hpp"
@@ -124,21 +136,21 @@ struct ThreadScratch {
     ThinningScratch thinning;
 };
 
-// Anonymous-mmap'd buffer. Linux guarantees fresh pages read as zero (the
-// kernel maps a single shared read-only zero page COW until first write),
-// so the buffer is zero-initialised without an eager memset/touch pass.
-// Pages only become resident on first write — for partly-populated slices
-// the unwritten regions never cost a page-fault or a physical page.
+// Anonymous-mapped buffer (mmap MAP_ANONYMOUS / VirtualAlloc). The kernel
+// guarantees fresh pages read as zero, so the buffer is zero-initialised
+// without an eager memset/touch pass. Pages only become resident on first
+// write — for partly-populated slices the unwritten regions never cost a
+// page-fault or a physical page.
 struct AnonMmap {
     AnonMmap() = default;
     explicit AnonMmap(size_t bytes) : bytes_(bytes) {
         if (bytes_ == 0) return;
-        ptr_ = ::mmap(nullptr, bytes_, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (ptr_ == MAP_FAILED) {
+        try {
+            ptr_ = vc::memmap::anonAlloc(bytes_);
+        } catch (...) {
             ptr_ = nullptr;
             bytes_ = 0;
-            throw std::bad_alloc();
+            throw;
         }
     }
     AnonMmap(const AnonMmap&) = delete;
@@ -161,9 +173,7 @@ struct AnonMmap {
     }
     ~AnonMmap() { reset(); }
     void reset() {
-        if (ptr_) {
-            ::munmap(ptr_, bytes_);
-        }
+        vc::memmap::anonFree(ptr_, bytes_);
         ptr_ = nullptr;
         bytes_ = 0;
     }
@@ -1024,8 +1034,8 @@ void run_convert(const po::variables_map& vm) {
             uint32_t magic, version;
             file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
             file.read(reinterpret_cast<char*>(&version), sizeof(version));
-            magic = ntohl(magic);
-            version = ntohl(version);
+            magic = be32(magic);
+            version = be32(version);
 
             if (magic != 0x56434753) { // "VCGS"
                 #pragma omp critical

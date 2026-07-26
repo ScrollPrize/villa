@@ -99,6 +99,60 @@ TEST_CASE("LasagnaDataset wraps manifest and reports missing normal source")
     CHECK_THROWS_AS(dataset.normalSourcePath(), std::runtime_error);
 }
 
+TEST_CASE("LasagnaDataset applies runtime coordinate scale without mutating the manifest file")
+{
+    const auto dir = makeTmpDir("working-scale");
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    {
+        std::ofstream out(manifestPath);
+        out << R"({
+            "version": 2,
+            "source_to_base": 1.0,
+            "base_shape_zyx": [100, 200, 300],
+            "groups": {}
+        })";
+    }
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath, {8.0});
+    CHECK(dataset.manifest().workingToBaseScale == doctest::Approx(8.0));
+    REQUIRE(dataset.manifest().baseShapeZYX.has_value());
+    CHECK(*dataset.manifest().baseShapeZYX ==
+          std::array<std::size_t, 3>{100, 200, 300});
+    CHECK_THROWS(vc::lasagna::LasagnaDataset::open(manifestPath, {0.0}));
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaDataset recognizes a validated remote cache marker")
+{
+    const auto dir = makeTmpDir("remote-marker");
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    {
+        std::ofstream out(manifestPath);
+        out << R"({"version":2,"groups":{}})";
+    }
+    {
+        std::ofstream out(dir / vc::lasagna::kLasagnaRemoteMarker);
+        out << R"({
+          "artifact_url":"https://example.test/lasagna",
+          "manifest_file":"dataset.lasagna.json"
+        })";
+    }
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    CHECK(dataset.manifest().remoteBaseUrl == "https://example.test/lasagna");
+    CHECK(dataset.manifest().remoteCacheRoot == dir);
+
+    {
+        std::ofstream out(dir / vc::lasagna::kLasagnaRemoteMarker);
+        out << R"({
+          "artifact_url":"https://example.test/lasagna",
+          "manifest_file":"different.lasagna.json"
+        })";
+    }
+    CHECK_THROWS(vc::lasagna::LasagnaDataset::open(manifestPath));
+    fs::remove_all(dir);
+}
+
 TEST_CASE("LasagnaDatasetManifest requires grad_mag for normal source")
 {
     auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({

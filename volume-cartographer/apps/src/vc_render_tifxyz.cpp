@@ -48,7 +48,10 @@ static std::thread g_logFlushThread;
 // Log to file if active, otherwise to the given default stream.
 // When logging to a shared file in multi-part mode, each line is prefixed with the part id.
 static void logPrintf(FILE* defaultStream, const char* fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 2, 3)))
+#endif
+    ;
 static void logPrintf(FILE* defaultStream, const char* fmt, ...)
 {
     FILE* out = g_logFile ? g_logFile : defaultStream;
@@ -328,8 +331,13 @@ static cv::Mat accumulate(const std::vector<cv::Mat>& samples, size_t start, siz
 // Unified band rendering
 // ============================================================
 
-// Build the flat offset vector used by readMultiSlice
-static std::vector<float> buildOffsetList(int numSlices, double sliceStep, double dsScale,
+// Build the flat offset vector used by readMultiSlice. Offsets are distances along the
+// unit surface normal, in level-g voxels: base points are already scaled into level-g
+// index space (prepareBaseAndDirs) and dirs are unit length, so a step of sliceStep
+// advances exactly one level-g voxel. (Do NOT scale by ds_scale here — that would make
+// the through-normal spacing the native/level-0 resolution while the in-plane spacing is
+// level-g, yielding an anisotropic stack that mismatches the isotropic .zattrs scale.)
+static std::vector<float> buildOffsetList(int numSlices, double sliceStep,
                                            const std::vector<float>& accumOffsets)
 {
     double center = 0.5 * (std::max(1, numSlices) - 1.0);
@@ -339,21 +347,21 @@ static std::vector<float> buildOffsetList(int numSlices, double sliceStep, doubl
     for (int zi = 0; zi < numSlices; zi++) {
         float base = float((zi - center) * sliceStep);
         if (accumOffsets.empty())
-            out.push_back(base * float(dsScale));
+            out.push_back(base);
         else
             for (float ao : accumOffsets)
-                out.push_back((base + ao) * float(dsScale));
+                out.push_back(base + ao);
     }
     return out;
 }
 
 static std::vector<float> buildCompositeOffsetList(
-    int compositeStart, int compositeEnd, double sliceStep, double dsScale)
+    int compositeStart, int compositeEnd, double sliceStep)
 {
     std::vector<float> out;
     out.reserve(std::max(0, compositeEnd - compositeStart + 1));
     for (int zi = compositeStart; zi <= compositeEnd; zi++)
-        out.push_back(float(double(zi) * sliceStep * dsScale));
+        out.push_back(float(double(zi) * sliceStep));
     return out;
 }
 
@@ -485,8 +493,8 @@ static std::vector<vc::render::ChunkKey> collectPrefetchKeysForRows(
 {
     std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniq;
     std::vector<float> offsets = isComposite
-        ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep, dsScale)
-        : buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
+        ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep)
+        : buildOffsetList(numSlices, sliceStep, accumOffsets);
 
     auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
@@ -602,7 +610,7 @@ static void renderBands(
     const uint32_t numBands = (uint32_t(tgtSize.height) + bandH - 1) / bandH;
 
     // Build offset list for readMultiSlice
-    auto allOffsets = buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
+    auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
 
     auto wallStart = std::chrono::steady_clock::now();
     auto lastPrint = wallStart;
@@ -635,7 +643,7 @@ static void renderBands(
             cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
             if constexpr (std::is_same_v<T, uint8_t>) {
                 readCompositeFast(compOut, cache, level, base, dirs,
-                                  float(sliceStep * dsScale),
+                                  float(sliceStep),
                                   compositeStart, compositeEnd,
                                   compositeParams);
             }
@@ -732,7 +740,7 @@ static void renderTiles(
     surf->validMask();
 
     // Build offset list
-    auto allOffsets = buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
+    auto allOffsets = buildOffsetList(numSlices, sliceStep, accumOffsets);
 
     const bool wantTif = tifWriters && !tifWriters->empty();
     const bool useU16 = (cvType == CV_16UC1);
@@ -844,7 +852,7 @@ static void renderTiles(
                     // and skips non-finite pixels, so size + zero it here.
                     cv::Mat_<uint8_t> compOut(base.rows, base.cols, uint8_t{0});
                     readCompositeFast(compOut, cache, level, base, dirs,
-                                      float(sliceStep * dsScale),
+                                      float(sliceStep),
                                       compositeStart, compositeEnd,
                                       compositeParams);
                     raw.resize(1);
@@ -1327,28 +1335,8 @@ int main(int argc, char *argv[])
         printMat4x4(affineTransform.matrix, "Final composed affine:");
     }
 
-    // Try to read voxelsize from meta.json to set TIFF DPI.
-    // meta.json stores the level-0 voxel size; renders at --group-idx > 0
-    // come from a 2^group_idx-downsampled pyramid, so each output pixel
-    // covers (voxelsize / ds_scale) µm. Account for that so the DPI tag
-    // matches the actual pixel grid.
+    // Resolved below from the same CLI/metadata value used for OME-Zarr.
     float tifDpi = 0.f;
-    {
-        auto metaPath = vol_path / "meta.json";
-        if (std::filesystem::exists(metaPath)) {
-            try {
-                auto meta = Json::parse_file(metaPath);
-                if (meta.contains("voxelsize")) {
-                    const double vs = meta["voxelsize"].get_double();
-                    const double vsLevel = ds_scale > 0
-                                               ? vs / double(ds_scale)
-                                               : vs;
-                    tifDpi = voxelSizeToDpi(vsLevel);
-                }
-            } catch (...) {
-            }
-        }
-    }
 
     // --- Open source volume ---
     const int cacheLevel = group_idx;
@@ -1415,22 +1403,48 @@ int main(int argc, char *argv[])
     // --- Resolve voxel size for OME-Zarr metadata ---
     const std::string voxel_unit = parsed["voxel-unit"].as<std::string>();
     double base_voxel_size = 1.0;
+    bool hasPhysicalVoxelSize = false;
+    bool voxelSizeFromCli = false;
     if (parsed.count("voxel-size")) {
         base_voxel_size = parsed["voxel-size"].as<double>();
         if (!std::isfinite(base_voxel_size) || base_voxel_size <= 0.0) {
             logPrintf(stderr, "Error: --voxel-size must be a positive finite number\n");
             return EXIT_FAILURE;
         }
+        hasPhysicalVoxelSize = true;
+        voxelSizeFromCli = true;
         logPrintf(stdout, "Voxel size (from CLI): %g %s\n", base_voxel_size, voxel_unit.c_str());
     } else if (auto mv = readVolumeVoxelSize(vol_path); mv.has_value()) {
         if (std::isfinite(*mv) && *mv > 0.0) {
             base_voxel_size = *mv;
+            hasPhysicalVoxelSize = true;
             logPrintf(stdout, "Voxel size (from volume metadata): %g %s\n", base_voxel_size, voxel_unit.c_str());
         } else {
             logPrintf(stderr, "Warning: ignoring invalid metadata voxelsize; using default 1.0\n");
         }
     } else {
         logPrintf(stdout, "Voxel size: 1.0 (no metadata found; override with --voxel-size)\n");
+    }
+    if (hasPhysicalVoxelSize) {
+        double voxelSizeUm = base_voxel_size;
+        if (voxelSizeFromCli) {
+            if (voxel_unit == "nanometer" || voxel_unit == "nanometre" || voxel_unit == "nm")
+                voxelSizeUm *= 0.001;
+            else if (voxel_unit == "millimeter" || voxel_unit == "millimetre" || voxel_unit == "mm")
+                voxelSizeUm *= 1000.0;
+            else if (voxel_unit == "meter" || voxel_unit == "metre" || voxel_unit == "m")
+                voxelSizeUm *= 1000000.0;
+            else if (voxel_unit != "micrometer" && voxel_unit != "micrometre" &&
+                     voxel_unit != "um" && voxel_unit != "µm") {
+                logPrintf(stderr, "Error: unsupported --voxel-unit for TIFF resolution: %s\n",
+                          voxel_unit.c_str());
+                return EXIT_FAILURE;
+            }
+        }
+        const double voxelSizeAtRenderLevelUm = ds_scale > 0
+            ? voxelSizeUm / double(ds_scale)
+            : voxelSizeUm;
+        tifDpi = voxelSizeToDpi(voxelSizeAtRenderLevelUm);
     }
 
     int rotQuadGlobal = -1;

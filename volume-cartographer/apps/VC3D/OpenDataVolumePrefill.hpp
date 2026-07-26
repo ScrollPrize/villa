@@ -26,6 +26,7 @@ struct OpenDataVolumePrefillResult {
     std::string volumeId;
     std::filesystem::path cacheDir;
     int level = kOpenDataVolumePrefillLevel;
+    int physicalLevel = kOpenDataVolumePrefillLevel;
     std::size_t totalChunks = 0;
     std::size_t resolvedChunks = 0;
     std::size_t dataChunks = 0;
@@ -39,8 +40,10 @@ using OpenDataVolumePrefillProgressCallback =
 
 struct OpenDataVolumePrefillMarkerInfo {
     std::string remoteUrl;
+    std::string remoteLocator;
     std::string volumeId;
     int level = kOpenDataVolumePrefillLevel;
+    int physicalLevel = kOpenDataVolumePrefillLevel;
     std::array<int, 3> shape{};
     std::array<int, 3> chunkShape{};
     std::array<int, 3> chunkGridShape{};

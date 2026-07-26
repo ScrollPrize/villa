@@ -1,5 +1,6 @@
 ---
 title: "$100,000 Ink Detection (June 14th)"
+sidebar_label: "Kaggle Ink Detection 2023 (closed)"
 hide_table_of_contents: true
 ---
 
@@ -35,6 +36,12 @@ hide_table_of_contents: true
     content="https://scrollprize.org/img/social/opengraph.jpg"
   />
 </head>
+
+:::warning[ARCHIVED]
+
+This page has been archived: the 2023 Kaggle competition it describes has concluded. See [Winners](winners) for the results and [Prizes](prizes) for what is open today.
+
+:::
 
 As you will learn in the [tutorials](/tutorial), one of the big challenges of reading the Herculaneum Papyri is detecting the ink in the 3D X-ray scans.
 

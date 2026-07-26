@@ -38,6 +38,8 @@ private slots:
     void updateSelectedSample();
     void copySelectedVolumeUrl();
     void openSelectedVolumeUrl();
+    void copySelectedRepresentationUrl();
+    void openSelectedRepresentationUrl();
     void downloadSelectedVolumeNormalGrids();
     void copySelectedSegmentUrl();
     void openSelectedSegmentUrl();
@@ -79,8 +81,10 @@ private:
 
     [[nodiscard]] const OpenDataSample* selectedSample() const;
     [[nodiscard]] const OpenDataVolume* selectedVolume() const;
+    [[nodiscard]] const OpenDataArtifact* selectedRepresentationArtifact() const;
     [[nodiscard]] const OpenDataSegment* selectedSegment() const;
     [[nodiscard]] QString selectedVolumeUrl() const;
+    [[nodiscard]] QString selectedRepresentationUrl() const;
     [[nodiscard]] QString selectedSegmentUrl() const;
     [[nodiscard]] std::filesystem::path selectedSegmentCacheDir() const;
     [[nodiscard]] std::filesystem::path cacheRoot() const;
@@ -96,6 +100,7 @@ private:
     QLabel* _overviewPhotoLabel{nullptr};
     QTableWidget* _scansTable{nullptr};
     QTableWidget* _volumesTable{nullptr};
+    QTableWidget* _representationsTable{nullptr};
     QTableWidget* _segmentsTable{nullptr};
     QLabel* _statusLabel{nullptr};
     QPushButton* _refreshButton{nullptr};
@@ -103,6 +108,8 @@ private:
     QPushButton* _copyVolumeUrlButton{nullptr};
     QPushButton* _openVolumeUrlButton{nullptr};
     QPushButton* _downloadNormalGridsButton{nullptr};
+    QPushButton* _copyRepresentationUrlButton{nullptr};
+    QPushButton* _openRepresentationUrlButton{nullptr};
     QPushButton* _copySegmentUrlButton{nullptr};
     QPushButton* _openSegmentUrlButton{nullptr};
     QPushButton* _cacheSegmentButton{nullptr};
@@ -113,6 +120,7 @@ private:
     std::optional<OpenDataManifest> _manifest;
     std::vector<std::size_t> _visibleSampleIndexes;
     QFutureWatcher<ManifestLoadResult>* _fetchWatcher{nullptr};
+    bool _manifestRefreshPending{false};
     QFutureWatcher<PhotoLoadResult>* _photoWatcher{nullptr};
     std::vector<QFutureWatcher<PhotoLoadResult>*> _photoWatchers;
     QString _pendingPhotoSampleId;

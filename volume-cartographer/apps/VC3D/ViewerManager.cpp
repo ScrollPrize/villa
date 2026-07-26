@@ -1,8 +1,11 @@
 #include "ViewerManager.hpp"
+#include "OpenDataSegmentCache.hpp"
 
+#include "AxisAlignedSliceController.hpp"
 #include "VCSettings.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/RawPointsOverlayController.hpp"
@@ -15,8 +18,15 @@
 #include "CState.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/DecodedChunkCacheBudget.hpp"
 
+#include <QApplication>
+#include <QCursor>
+#include <QPointer>
 #include <QMdiArea>
 #include <QTimer>
 #include <QThread>
@@ -29,10 +39,12 @@
 #include <exception>
 #include <iostream>
 #include <optional>
+#include <string_view>
 #include <unordered_set>
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
 
+#include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 Q_LOGGING_CATEGORY(lcViewerManager, "vc.viewer.manager")
@@ -40,6 +52,16 @@ Q_LOGGING_CATEGORY(lcViewerManager, "vc.viewer.manager")
 #define VC3D_DEBUG_QCINFO(category) if (!DebugLoggingEnabled()) {} else qCInfo(category)
 
 namespace {
+
+std::string coordinateSpaceTag(const VolumePkg& pkg, const std::string& volumeId)
+{
+    constexpr std::string_view prefix = "vc-open-data-coordinate-space:";
+    for (const auto& tag : pkg.volumeTags(volumeId)) {
+        if (tag.rfind(prefix, 0) == 0)
+            return tag.substr(prefix.size());
+    }
+    return {};
+}
 
 QString compactViewerLabel(const std::string& surfaceName, const QString& title)
 {
@@ -54,6 +76,102 @@ QString compactViewerLabel(const std::string& surfaceName, const QString& title)
     return {};
 }
 
+bool isChunkedViewer(VolumeViewerBase* viewer)
+{
+    return viewer && qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
+}
+
+bool isAnnotationViewer(VolumeViewerBase* viewer)
+{
+    return viewer &&
+           viewer->asQObject() &&
+           viewer->asQObject()->property("vc_viewer_role").toString() == QStringLiteral("annotation");
+}
+
+void centerViewerOnVolumePointForNavigation(VolumeViewerBase* viewer, const cv::Vec3f& position)
+{
+    if (!viewer) {
+        return;
+    }
+    viewer->centerOnVolumePoint(position, !isChunkedViewer(viewer));
+}
+
+void centerViewerOnSurfacePointForNavigation(VolumeViewerBase* viewer, const cv::Vec2f& position)
+{
+    if (!viewer) {
+        return;
+    }
+    viewer->centerOnSurfacePoint(position, !isChunkedViewer(viewer));
+}
+
+bool finiteVec3(const cv::Vec3f& v)
+{
+    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+}
+
+std::optional<cv::Vec3f> transformPoint(const cv::Vec3f& point, const cv::Matx44d& matrix)
+{
+    cv::Vec3d transformed;
+    if (!vc::core::util::applyAffineTransform(cv::Vec3d(point), matrix, transformed)) {
+        return std::nullopt;
+    }
+    const cv::Vec3f out(static_cast<float>(transformed[0]),
+                        static_cast<float>(transformed[1]),
+                        static_cast<float>(transformed[2]));
+    return finiteVec3(out) ? std::optional<cv::Vec3f>(out) : std::nullopt;
+}
+
+cv::Vec3f clampToVolumeBounds(cv::Vec3f point, const std::shared_ptr<Volume>& volume)
+{
+    if (!volume) {
+        return point;
+    }
+    const auto [w, h, d] = volume->shapeXyz();
+    point[0] = std::clamp(point[0], 0.0f, static_cast<float>(std::max(1, w) - 1));
+    point[1] = std::clamp(point[1], 0.0f, static_cast<float>(std::max(1, h) - 1));
+    point[2] = std::clamp(point[2], 0.0f, static_cast<float>(std::max(1, d) - 1));
+    return point;
+}
+
+// Uniform distance scale of an affine transform, or nullopt when the linear
+// part is too anisotropic for a single scalar to be meaningful.
+std::optional<double> relativeAffineDistanceScale(const cv::Matx44d& matrix)
+{
+    cv::Mat linear(3, 3, CV_64F);
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            linear.at<double>(row, col) = matrix(row, col);
+        }
+    }
+
+    cv::SVD svd(linear, cv::SVD::NO_UV);
+    if (svd.w.rows < 3) {
+        return std::nullopt;
+    }
+    const double s0 = svd.w.at<double>(0, 0);
+    const double s1 = svd.w.at<double>(1, 0);
+    const double s2 = svd.w.at<double>(2, 0);
+    if (!(std::isfinite(s0) && std::isfinite(s1) && std::isfinite(s2)) ||
+        s0 <= 0.0 || s1 <= 0.0 || s2 <= 0.0) {
+        return std::nullopt;
+    }
+
+    const double mean = (s0 + s1 + s2) / 3.0;
+    const double maxDeviation =
+        std::max({std::abs(s0 - mean), std::abs(s1 - mean), std::abs(s2 - mean)});
+    const double relativeDeviation = maxDeviation / mean;
+    if (!std::isfinite(relativeDeviation) || relativeDeviation > 0.02) {
+        return std::nullopt;
+    }
+    return mean;
+}
+
+std::vector<ViewerManager*>& managerRegistry()
+{
+    static std::vector<ViewerManager*> registry;
+    return registry;
+}
+
 }
 
 ViewerManager::ViewerManager(CState* state,
@@ -63,6 +181,7 @@ ViewerManager::ViewerManager(CState* state,
     , _state(state)
     , _points(points)
 {
+    managerRegistry().push_back(this);
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const int savedOpacityPercent = settings.value(viewer::INTERSECTION_OPACITY, viewer::INTERSECTION_OPACITY_DEFAULT).toInt();
@@ -108,6 +227,10 @@ ViewerManager::ViewerManager(CState* state,
 
     if (_state) {
         connect(_state,
+                &CState::volumeChanged,
+                this,
+                &ViewerManager::currentVolumeChanged);
+        connect(_state,
                 &CState::surfaceChanged,
                 this,
                 &ViewerManager::handleSurfaceChanged);
@@ -115,6 +238,10 @@ ViewerManager::ViewerManager(CState* state,
                 &CState::surfaceWillBeDeleted,
                 this,
                 &ViewerManager::handleSurfaceWillBeDeleted);
+        connect(_state,
+                &CState::poiChanged,
+                this,
+                &ViewerManager::handleFocusPoiChanged);
     }
 
     // The single maintenance clock for the whole app: ~60Hz, free-running. Render
@@ -123,6 +250,182 @@ ViewerManager::ViewerManager(CState* state,
     _globalClock->setInterval(16);
     connect(_globalClock, &QTimer::timeout, this, &ViewerManager::onGlobalTick);
     _globalClock->start();
+}
+
+ViewerManager::~ViewerManager()
+{
+    auto& registry = managerRegistry();
+    registry.erase(std::remove(registry.begin(), registry.end(), this), registry.end());
+}
+
+const std::vector<ViewerManager*>& ViewerManager::allManagers()
+{
+    return managerRegistry();
+}
+
+void ViewerManager::applySpiralCacheSettings()
+{
+    using namespace vc3d::settings;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    constexpr std::size_t mib = 1024ULL * 1024ULL;
+    constexpr std::size_t gib = 1024ULL * mib;
+    const auto planeMb = std::max<qlonglong>(
+        0, settings.value(spiral::PLANE_CHUNK_CACHE_MB,
+                          spiral::PLANE_CHUNK_CACHE_MB_DEFAULT).toLongLong());
+    const auto surfaceGb = std::max<qlonglong>(
+        0, settings.value(spiral::SURFACE_CACHE_GB,
+                          spiral::SURFACE_CACHE_GB_DEFAULT).toLongLong());
+    const auto overlayGb = std::max<qlonglong>(
+        0, settings.value(spiral::OVERLAY_SURFACE_CACHE_GB,
+                          spiral::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toLongLong());
+
+    if (_chunkCachePolicy == ChunkCachePolicy::PrivateBounded)
+        setChunkCacheFloorBytes(ChunkCachePool::PlaneViews, std::size_t(planeMb) * mib);
+    else
+        setChunkCachePolicy(ChunkCachePolicy::PrivateBounded, std::size_t(planeMb) * mib);
+    setSurfaceCacheBudgets(std::size_t(surfaceGb) * gib, std::size_t(overlayGb) * gib);
+}
+
+void ViewerManager::setChunkCachePolicy(ChunkCachePolicy policy, std::size_t capacityBytes)
+{
+    const bool policyChanged = _chunkCachePolicy != policy;
+    _chunkCachePolicy = policy;
+    privateChunkPool(ChunkCachePool::PlaneViews).floorBytes = capacityBytes;
+    // The tile filler's pool is not a user setting: it is sized like the plane
+    // pool by default and, like it, raised when one round of concurrent tile
+    // fills cannot fit. Exposing it later is a one-line change.
+    constexpr std::size_t kSurfaceTilePoolFloorBytes = 2ULL * 1024 * 1024 * 1024;
+    privateChunkPool(ChunkCachePool::SurfaceTiles).floorBytes = kSurfaceTilePoolFloorBytes;
+    privateChunkPool(ChunkCachePool::OverlaySurfaceTiles).floorBytes =
+        kSurfaceTilePoolFloorBytes;
+    if (policyChanged) {
+        for (auto& pool : _privateChunkPools) {
+            pool.cache.reset();
+            pool.budget.reset();
+            pool.volume.reset();
+            pool.builtCapacity = 0;
+        }
+    }
+    // Viewers created before the opt-in are already holding a cache from the
+    // previous policy, so make them re-acquire.
+    forEachBaseViewer([](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->refreshChunkSource();
+    });
+}
+
+std::size_t ViewerManager::chunkCacheFloorBytes(ChunkCachePool pool) const
+{
+    return privateChunkPool(pool).floorBytes;
+}
+
+void ViewerManager::setChunkCacheFloorBytes(ChunkCachePool pool, std::size_t bytes)
+{
+    auto& slot = privateChunkPool(pool);
+    if (slot.floorBytes == bytes)
+        return;
+    slot.floorBytes = bytes;
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded)
+        return;
+    forEachBaseViewer([](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->refreshChunkSource();
+    });
+}
+
+std::size_t ViewerManager::effectiveChunkCacheCapacity(ChunkCachePool pool) const
+{
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded)
+        return 0;
+    const auto& slot = privateChunkPool(pool);
+    return std::max(slot.floorBytes, slot.requiredBytes);
+}
+
+void ViewerManager::noteChunkFootprint(ChunkCachePool pool, std::size_t footprintBytes)
+{
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded || footprintBytes == 0)
+        return;
+    // The sampler pins only a small window of chunks at a time and re-reads the
+    // rest through the cache across tiles, so a cap that merely equals one
+    // frame's footprint still thrashes. Two frames' worth is the working
+    // minimum.
+    const std::size_t required = footprintBytes <= std::numeric_limits<std::size_t>::max() / 2
+                                     ? footprintBytes * 2
+                                     : std::numeric_limits<std::size_t>::max();
+    auto& slot = privateChunkPool(pool);
+    // Hard ceiling on how far a *derived* requirement may raise the configured
+    // floor. The point of this policy is a bounded pool; an estimate that comes
+    // back wrong must degrade into thrashing, never into unbounded retention.
+    // The status bar reports the effective capacity either way.
+    const std::size_t ceiling =
+        slot.floorBytes > 0 ? std::min(slot.floorBytes * kChunkCacheDerivedFloorMultiplier,
+                                       kChunkCacheAbsoluteCapBytes)
+                            : kChunkCacheAbsoluteCapBytes;
+    slot.requiredBytes = std::min(std::max(slot.requiredBytes, required), ceiling);
+}
+
+std::shared_ptr<vc::render::ChunkCache> ViewerManager::chunkCacheFor(
+    const std::shared_ptr<Volume>& volume, ChunkCachePool pool)
+{
+    if (!volume)
+        return nullptr;
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded) {
+        // Byte-for-byte the pre-policy behaviour, including Volume's refusal to
+        // drop a warm cache when a second workspace re-applies its budget.
+        return volume->sharedChunkCache();
+    }
+
+    auto& slot = privateChunkPool(pool);
+    const std::size_t wanted = std::max(slot.floorBytes, slot.requiredBytes);
+    // Exact comparison, not >=, so lowering the setting shrinks the pool rather
+    // than silently keeping the larger one until something else rebuilds it.
+    if (slot.cache && slot.volume.lock() == volume && slot.builtCapacity == wanted)
+        return slot.cache;
+
+    // Releasing the previous pool here is what bounds retention: it is dropped
+    // on a volume switch or a capacity growth, and never accumulates with
+    // browsing history. An in-flight render holding the old cache keeps it
+    // alive until that frame finishes.
+    slot.cache.reset();
+    slot.budget.reset();
+    slot.builtCapacity = 0;
+    slot.volume = volume;
+
+    try {
+        vc::render::ChunkCache::Options options;
+        options.decodedByteCapacity = wanted;
+        // A private budget of the same size, rather than the process-wide one:
+        // Volume::createChunkCache substitutes its own budget for a null here,
+        // which would rejoin this pool to the shared ceiling.
+        slot.budget = std::make_shared<vc::render::DecodedChunkCacheBudget>(wanted);
+        options.decodedByteBudget = slot.budget;
+        // maxConcurrentReads is left at the default so this pool shares the
+        // process-wide chunk I/O workers instead of starting its own.
+        slot.cache = volume->createChunkCache(std::move(options));
+        slot.builtCapacity = wanted;
+    } catch (const std::exception& e) {
+        Logger()->warn("spiral private chunk cache unavailable: {}", e.what());
+        slot.cache.reset();
+        slot.budget.reset();
+        slot.volume.reset();
+        slot.builtCapacity = 0;
+    }
+    return slot.cache;
+}
+
+void ViewerManager::setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes)
+{
+    _surfaceCacheEnabled = true;
+    if (_surfaceCacheBudgetBytes == baseBytes &&
+        _overlaySurfaceCacheBudgetBytes == overlayBytes) {
+        return;
+    }
+    _surfaceCacheBudgetBytes = baseBytes;
+    _overlaySurfaceCacheBudgetBytes = overlayBytes;
+    forEachBaseViewer([baseBytes, overlayBytes](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->setSurfaceCacheBudgets(baseBytes, overlayBytes);
+    });
 }
 
 void ViewerManager::onGlobalTick()
@@ -219,6 +522,21 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setSegmentationEditActive(_segmentationEditActive);
     baseViewer->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
 
+    if (role != ViewerRole::Annotation) {
+        connect(chunkedViewer, &CChunkedVolumeViewer::sendVolumeClicked,
+                this, &ViewerManager::handleVolumeClicked);
+    }
+    connect(chunkedViewer, &CChunkedVolumeViewer::sharedCacheStatsChanged,
+            this, &ViewerManager::sharedCacheStatsChanged);
+
+    if (auto* graphicsView = chunkedViewer->graphicsView()) {
+        auto markActiveViewer = [this, baseViewer]() { _activeViewer = baseViewer; };
+        connect(graphicsView, &CVolumeViewerView::sendMousePress, this, markActiveViewer);
+        connect(graphicsView, &CVolumeViewerView::sendMouseDoubleClick, this, markActiveViewer);
+        connect(graphicsView, &CVolumeViewerView::sendZoom, this, markActiveViewer);
+        connect(graphicsView, &CVolumeViewerView::sendCursorMove, this, markActiveViewer);
+    }
+
     _baseViewers.push_back(baseViewer);
 
     // Clean up when viewer is destroyed without an earlier close event.
@@ -237,9 +555,14 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayVolume(_overlayVolume);
     baseViewer->setOverlayOpacity(_overlayOpacity);
     baseViewer->setOverlayColormap(_overlayColormapId);
+    baseViewer->setOverlaySamplingMethod(_overlaySamplingMethod);
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
     baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     baseViewer->setOverlayComposite(_overlayComposite);
+    if (_surfaceCacheEnabled) {
+        baseViewer->setSurfaceCacheBudgets(_surfaceCacheBudgetBytes,
+                                           _overlaySurfaceCacheBudgetBytes);
+    }
 
     if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);
@@ -253,7 +576,6 @@ void ViewerManager::unregisterViewer(VolumeViewerBase* viewer)
     if (!viewer) {
         return;
     }
-
     const auto viewerIt = std::find(_baseViewers.begin(), _baseViewers.end(), viewer);
     const bool knownViewer = viewerIt != _baseViewers.end() ||
                              _resetDefaults.find(viewer) != _resetDefaults.end();
@@ -265,8 +587,486 @@ void ViewerManager::unregisterViewer(VolumeViewerBase* viewer)
     if (_segmentationModule) {
         _segmentationModule->detachViewer(viewer);
     }
+    if (_activeViewer == viewer) {
+        _activeViewer = nullptr;
+    }
     _resetDefaults.erase(viewer);
     _baseViewers.erase(std::remove(_baseViewers.begin(), _baseViewers.end(), viewer), _baseViewers.end());
+}
+
+void ViewerManager::handleFocusPoiChanged(std::string name, POI* poi)
+{
+    if (name != "focus" || !poi) {
+        return;
+    }
+    if (_slices) {
+        _slices->applyOrientation();
+    }
+    if (!poi->suppressViewerRecenter) {
+        const cv::Vec3f focusPosition = poi->p;
+        QTimer::singleShot(0, this, [this, focusPosition]() {
+            recenterPlaneViewersOn(focusPosition);
+        });
+    }
+}
+
+bool ViewerManager::resetFocusForVolumeChange(bool resetToCenter,
+                                              const std::optional<cv::Vec3f>& overridePoint,
+                                              const std::optional<cv::Vec3f>& overrideNormal)
+{
+    if (!_state || !_state->currentVolume()) {
+        return false;
+    }
+
+    const auto [w, h, d] = _state->currentVolume()->shapeXyz();
+    const cv::Vec3f hi(static_cast<float>(std::max(1, w) - 1),
+                       static_cast<float>(std::max(1, h) - 1),
+                       static_cast<float>(std::max(1, d) - 1));
+    const auto clampToBounds = [&hi](cv::Vec3f p) {
+        for (int axis = 0; axis < 3; ++axis) {
+            p[axis] = std::clamp(p[axis], 0.0f, hi[axis]);
+        }
+        return p;
+    };
+
+    POI* poi = _state->poi("focus");
+    const bool createdPoi = (poi == nullptr);
+    if (!poi) {
+        poi = new POI;
+        poi->n = cv::Vec3f(0, 0, 1);
+    }
+
+    if (overridePoint) {
+        poi->p = clampToBounds(*overridePoint);
+        if (overrideNormal) {
+            poi->n = *overrideNormal;
+        }
+    } else if (createdPoi || resetToCenter) {
+        poi->p = hi * 0.5f;
+    } else {
+        poi->p = clampToBounds(poi->p);
+    }
+    poi->surfacePtr.reset();
+
+    _state->setPOI("focus", poi);
+    return true;
+}
+
+bool ViewerManager::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId)
+{
+    if (!_state) {
+        return false;
+    }
+
+    POI* focus = _state->poi("focus");
+    if (!focus) {
+        focus = new POI;
+    }
+
+    focus->p = position;
+    if (cv::norm(normal) > 0.0) {
+        focus->n = normal;
+    }
+    if (!sourceId.empty()) {
+        focus->surfaceId = sourceId;
+    } else if (focus->surfaceId.empty()) {
+        focus->surfaceId = "segmentation";
+    }
+    focus->surfacePtr.reset();
+
+    focus->suppressTransientPlaneIntersections = true;
+    _state->setPOI("focus", focus);
+    recenterSegmentationViewerNear(position);
+
+    // Get surface for orientation - look up by ID
+    Surface* orientationSource = _state->surfaceRaw(focus->surfaceId);
+    if (!orientationSource) {
+        orientationSource = _state->surfaceRaw("segmentation");
+    }
+    if (_slices) {
+        _slices->applyOrientation(orientationSource);
+    }
+
+    emit focusCenteredByUser(position);
+    return true;
+}
+
+bool ViewerManager::centerFocusOnCursor()
+{
+    if (!_state) {
+        return false;
+    }
+
+    const QPoint globalPos = QCursor::pos();
+    auto tryCenterFromViewer = [&](VolumeViewerBase* viewer) -> bool {
+        if (!viewer) {
+            return false;
+        }
+
+        auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject());
+        if (viewerWidget && !viewerWidget->isVisible()) {
+            return false;
+        }
+
+        auto* gv = viewer->graphicsView();
+        auto* viewport = gv ? gv->viewport() : nullptr;
+        if (!viewport) {
+            return false;
+        }
+
+        const QPoint viewportPos = viewport->mapFromGlobal(globalPos);
+        if (!viewport->rect().contains(viewportPos)) {
+            return false;
+        }
+
+        const QPointF scenePos = gv->mapToScene(viewportPos);
+        const cv::Vec3f p = viewer->sceneToVolume(scenePos);
+        if (!finiteVec3(p)) {
+            return false;
+        }
+        cv::Vec3f n(0, 0, 1);
+        if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
+            n = plane->normal(cv::Vec3f(0, 0, 0), {});
+        }
+
+        return centerFocusAt(p, n, viewer->surfName());
+    };
+
+    // Prefer the viewer actually under the mouse cursor: the active
+    // window/subwindow can lag behind the hovered viewer, which would make the
+    // focus jump use the wrong scene transform.
+    if (QWidget* hoveredWidget = QApplication::widgetAt(globalPos)) {
+        for (QWidget* widget = hoveredWidget; widget; widget = widget->parentWidget()) {
+            if (auto* viewer = qobject_cast<CChunkedVolumeViewer*>(widget)) {
+                if (tryCenterFromViewer(viewer)) {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+
+    for (auto* viewer : _baseViewers) {
+        if (tryCenterFromViewer(viewer)) {
+            return true;
+        }
+    }
+
+    // Fall back to the stored cursor POI when the mouse isn't over any viewport.
+    POI* cursor = _state->poi("cursor");
+    if (!cursor) {
+        return false;
+    }
+    return centerFocusAt(cursor->p, cursor->n, cursor->surfaceId);
+}
+
+void ViewerManager::handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surface* surf,
+                                        Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
+{
+    if (_volumeClickInterceptor && _volumeClickInterceptor(volLoc, normal, surf, button, modifiers)) {
+        return;
+    }
+
+    if (modifiers & Qt::ShiftModifier) {
+        // Reserved for point tools.
+        return;
+    }
+    if (modifiers & Qt::ControlModifier) {
+        std::string surfId;
+        if (_state && surf) {
+            surfId = _state->findSurfaceId(surf);
+        }
+        centerFocusAt(volLoc, normal, surfId);
+    }
+}
+
+VolumeViewerBase* ViewerManager::activeViewer() const
+{
+    if (!_activeViewer) {
+        return nullptr;
+    }
+    if (auto* activeObject = _activeViewer->asQObject()) {
+        if (!activeObject->parent()) {
+            return nullptr;
+        }
+    }
+    return _activeViewer;
+}
+
+bool ViewerManager::recenterViewersOnCurrentFocus()
+{
+    if (!_state) {
+        return false;
+    }
+
+    POI* focus = _state->poi("focus");
+    if (!focus) {
+        return false;
+    }
+
+    const cv::Vec3f position = focus->p;
+    forEachBaseViewer([&position](VolumeViewerBase* viewer) {
+        if (viewer && !isAnnotationViewer(viewer)) {
+            centerViewerOnVolumePointForNavigation(viewer, position);
+        }
+    });
+
+    return true;
+}
+
+void ViewerManager::recenterPlaneViewersOn(const cv::Vec3f& position)
+{
+    forEachBaseViewer([&position](VolumeViewerBase* viewer) {
+        if (!viewer || isAnnotationViewer(viewer)) {
+            return;
+        }
+
+        const std::string name = viewer->surfName();
+        if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
+            centerViewerOnVolumePointForNavigation(viewer, position);
+        }
+    });
+}
+
+void ViewerManager::recenterSegmentationViewerNear(const cv::Vec3f& position)
+{
+    static constexpr float kMaxDistanceVoxels = 100.0f;
+
+    auto* viewer = segmentationViewer();
+    if (!viewer) {
+        return;
+    }
+
+    auto activeSurface = _segmentationModule ? _segmentationModule->activeBaseSurfaceShared() : nullptr;
+    if (!activeSurface) {
+        activeSurface = std::dynamic_pointer_cast<QuadSurface>(_state ? _state->surface("segmentation") : nullptr);
+    }
+    if (!activeSurface) {
+        return;
+    }
+
+    auto* patchIndex = surfacePatchIndex();
+    if (!patchIndex || !patchIndex->containsSurface(activeSurface)) {
+        return;
+    }
+
+    SurfacePatchIndex::PointQuery query;
+    query.worldPoint = position;
+    query.tolerance = kMaxDistanceVoxels;
+    query.surfaces.only = activeSurface;
+    auto hit = patchIndex->locate(query);
+    if (hit && hit->distance <= kMaxDistanceVoxels) {
+        const cv::Vec3f loc = activeSurface->loc(hit->ptr);
+        centerViewerOnSurfacePointForNavigation(viewer, {loc[0], loc[1]});
+    }
+}
+
+VolumeViewerBase* ViewerManager::segmentationViewer() const
+{
+    for (auto* viewer : _baseViewers) {
+        if (viewer && viewer->surfName() == "segmentation") {
+            return viewer;
+        }
+    }
+    return nullptr;
+}
+
+void ViewerManager::setShowDirectionHints(bool show)
+{
+    forEachBaseViewer([show](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setShowDirectionHints(show);
+        }
+    });
+}
+
+void ViewerManager::setShowSurfaceNormals(bool show)
+{
+    forEachBaseViewer([show](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setShowSurfaceNormals(show);
+        }
+    });
+}
+
+void ViewerManager::setPlaneIntersectionLinesVisible(bool visible)
+{
+    forEachBaseViewer([visible](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setPlaneIntersectionLinesVisible(visible);
+        }
+    });
+}
+
+void ViewerManager::setSurfaceOverlaysEnabled(bool enabled)
+{
+    forEachBaseViewer([enabled](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setSurfaceOverlayEnabled(enabled);
+        }
+    });
+}
+
+void ViewerManager::setSurfaceOverlapThreshold(float threshold)
+{
+    forEachBaseViewer([threshold](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setSurfaceOverlapThreshold(threshold);
+        }
+    });
+}
+
+void ViewerManager::setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays)
+{
+    forEachBaseViewer([&overlays](VolumeViewerBase* viewer) {
+        if (viewer) {
+            viewer->setSurfaceOverlays(overlays);
+        }
+    });
+}
+
+void ViewerManager::setResetViewOnSurfaceChangeDefault(bool enabled)
+{
+    const bool editingActive = _segmentationModule && _segmentationModule->editingEnabled();
+    forEachBaseViewer([this, enabled, editingActive](VolumeViewerBase* viewer) {
+        if (!viewer) {
+            return;
+        }
+        setResetDefaultFor(viewer, enabled);
+        if (editingActive && viewer->surfName() == "segmentation") {
+            viewer->setResetViewOnSurfaceChange(false);
+            return;
+        }
+        viewer->setResetViewOnSurfaceChange(enabled);
+    });
+}
+
+void ViewerManager::setSegmentationResetViewSuppressed(bool suppressed)
+{
+    forEachBaseViewer([this, suppressed](VolumeViewerBase* viewer) {
+        if (!viewer || viewer->surfName() != "segmentation") {
+            return;
+        }
+        viewer->setResetViewOnSurfaceChange(suppressed ? false : resetDefaultFor(viewer));
+    });
+}
+
+struct ViewerManager::ViewerNavigationSnapshot {
+    struct Entry {
+        QPointer<CChunkedVolumeViewer> viewer;
+        CChunkedVolumeViewer::CameraState camera;
+        cv::Vec3f center{0, 0, 0};
+        bool hasCenter{false};
+    };
+    std::vector<Entry> entries;
+};
+
+std::shared_ptr<ViewerManager::ViewerNavigationSnapshot> ViewerManager::captureNavigation() const
+{
+    auto snapshot = std::make_shared<ViewerNavigationSnapshot>();
+    forEachBaseViewer([&snapshot](VolumeViewerBase* baseViewer) {
+        auto* viewer = dynamic_cast<CChunkedVolumeViewer*>(baseViewer);
+        if (!viewer || !viewer->graphicsView()) {
+            return;
+        }
+        ViewerNavigationSnapshot::Entry captured;
+        captured.viewer = viewer;
+        captured.camera = viewer->cameraState();
+        const QSize viewportSize = viewer->graphicsView()->viewport()->size();
+        const QPointF centerScene(
+            static_cast<qreal>(std::max(1, viewportSize.width())) * 0.5,
+            static_cast<qreal>(std::max(1, viewportSize.height())) * 0.5);
+        if (const auto sample = viewer->sampleSceneVolume(centerScene)) {
+            if (finiteVec3(sample->position)) {
+                captured.center = sample->position;
+                captured.hasCenter = true;
+            }
+        }
+        snapshot->entries.push_back(std::move(captured));
+    });
+    return snapshot;
+}
+
+void ViewerManager::restoreNavigation(const std::shared_ptr<ViewerNavigationSnapshot>& snapshot,
+                                      const cv::Matx44d& transform)
+{
+    if (!snapshot || !_state || !_state->currentVolume()) {
+        return;
+    }
+
+    const auto navigationScale = relativeAffineDistanceScale(transform);
+    for (const auto& captured : snapshot->entries) {
+        CChunkedVolumeViewer* viewer = captured.viewer.data();
+        if (!viewer || viewer->currentVolume() != _state->currentVolume()) {
+            continue;
+        }
+
+        std::optional<cv::Vec3f> transformedCenter;
+        if (captured.hasCenter) {
+            transformedCenter = transformPoint(captured.center, transform);
+        }
+        if (!transformedCenter) {
+            continue;
+        }
+
+        viewer->centerOnVolumePoint(
+            clampToVolumeBounds(*transformedCenter, _state->currentVolume()),
+            false);
+        auto camera = viewer->cameraState();
+        camera.scale = captured.camera.scale;
+        if (navigationScale) {
+            camera.scale = CChunkedVolumeViewer::clampCameraScale(
+                static_cast<float>(static_cast<double>(captured.camera.scale) / *navigationScale));
+        }
+        camera.zOffset = navigationScale
+            ? static_cast<float>(static_cast<double>(captured.camera.zOffset) *
+                                 *navigationScale)
+            : captured.camera.zOffset;
+        camera.zOffsetWorldDir = captured.camera.zOffsetWorldDir;
+        if (cv::norm(captured.camera.zOffsetWorldDir) > 0.0f) {
+            const auto direction = vc::core::util::transformNormal(
+                captured.camera.zOffsetWorldDir, transform);
+            if (finiteVec3(direction)) {
+                camera.zOffsetWorldDir = direction;
+            }
+        }
+        viewer->applyCameraState(camera, false);
+    }
+}
+
+void ViewerManager::switchVolume(std::shared_ptr<Volume> volume,
+                                 const std::optional<cv::Matx44d>& navigationTransform)
+{
+    if (!_state) {
+        return;
+    }
+    const bool hadVolume = static_cast<bool>(_state->currentVolume());
+
+    std::optional<cv::Vec3f> transformedFocusPoint;
+    std::optional<cv::Vec3f> transformedFocusNormal;
+    std::shared_ptr<ViewerNavigationSnapshot> snapshot;
+    if (navigationTransform) {
+        if (POI* focus = _state->poi("focus"); focus && finiteVec3(focus->p)) {
+            transformedFocusPoint = transformPoint(focus->p, *navigationTransform);
+            if (cv::norm(focus->n) > 0.0f) {
+                const cv::Vec3f normal =
+                    vc::core::util::transformNormal(focus->n, *navigationTransform);
+                if (finiteVec3(normal)) {
+                    transformedFocusNormal = normal;
+                }
+            }
+        }
+        snapshot = captureNavigation();
+    }
+
+    // CState handles cache budget and volume ID resolution, and emits volumeChanged
+    _state->setCurrentVolume(std::move(volume));
+
+    resetFocusForVolumeChange(!hadVolume, transformedFocusPoint, transformedFocusNormal);
+
+    if (snapshot && navigationTransform) {
+        restoreNavigation(snapshot, *navigationTransform);
+    }
 }
 
 void ViewerManager::registerOverlay(ViewerOverlayControllerBase* overlay)
@@ -285,6 +1085,30 @@ void ViewerManager::setSegmentationOverlay(SegmentationOverlayController* overla
 {
     _segmentationOverlay = overlay;
     registerOverlay(overlay);
+}
+
+void ViewerManager::scheduleSurfacePatchIndexOverlayRefresh()
+{
+    if (!_segmentationOverlay || _surfacePatchIndexOverlayRefreshPending) {
+        return;
+    }
+
+    // Surface-overlap queries can legitimately run before an asynchronous
+    // index rebuild has installed their target surfaces. In that case the
+    // controller caches an empty result. Retry after every completed index
+    // mutation so that result does not remain empty indefinitely.
+    //
+    // Queue this instead of refreshing synchronously: an index swap can occur
+    // inside SegmentationOverlayController::endIndexRead(), while its previous
+    // overlap result is still being finalized. A direct callback there would
+    // re-enter and overwrite the controller's in-flight request state.
+    _surfacePatchIndexOverlayRefreshPending = true;
+    QTimer::singleShot(0, this, [this]() {
+        _surfacePatchIndexOverlayRefreshPending = false;
+        if (_segmentationOverlay) {
+            _segmentationOverlay->forceRefreshAllOverlays();
+        }
+    });
 }
 
 void ViewerManager::setSegmentationEditActive(bool active)
@@ -379,11 +1203,33 @@ void ViewerManager::setHighlightedSurfaceIds(const std::vector<std::string>& ids
 
 void ViewerManager::setOverlayVolume(std::shared_ptr<Volume> volume, const std::string& volumeId)
 {
+    if (volume && _state && _state->vpkg()) {
+        const auto baseSpace = coordinateSpaceTag(
+            *_state->vpkg(), _state->currentVolumeId());
+        const auto overlaySpace = coordinateSpaceTag(*_state->vpkg(), volumeId);
+        if ((!baseSpace.empty() || !overlaySpace.empty()) &&
+            (baseSpace.empty() || baseSpace != overlaySpace)) {
+            Logger()->warn(
+                "Rejected volume overlay '{}' because its explicit coordinate space does not match '{}'.",
+                volumeId, _state->currentVolumeId());
+            volume.reset();
+        }
+    }
     _overlayVolume = std::move(volume);
-    _overlayVolumeId = volumeId;
+    _overlayVolumeId = _overlayVolume ? volumeId : std::string{};
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayVolume(_overlayVolume); });
 
     emit overlayVolumeAvailabilityChanged(static_cast<bool>(_overlayVolume));
+}
+
+std::shared_ptr<Volume> ViewerManager::currentVolume() const
+{
+    return _state ? _state->currentVolume() : nullptr;
+}
+
+std::string ViewerManager::currentVolumeId() const
+{
+    return _state ? _state->currentVolumeId() : std::string{};
 }
 
 void ViewerManager::setOverlayOpacity(float opacity)
@@ -396,6 +1242,16 @@ void ViewerManager::setOverlayColormap(const std::string& colormapId)
 {
     _overlayColormapId = colormapId;
     forEachBaseViewer([this](VolumeViewerBase* v) { v->setOverlayColormap(_overlayColormapId); });
+}
+
+void ViewerManager::setOverlaySamplingMethod(vc::Sampling method)
+{
+    _overlaySamplingMethod = method == vc::Sampling::Trilinear
+        ? vc::Sampling::Trilinear
+        : vc::Sampling::Nearest;
+    forEachBaseViewer([this](VolumeViewerBase* v) {
+        v->setOverlaySamplingMethod(_overlaySamplingMethod);
+    });
 }
 
 void ViewerManager::setOverlayThreshold(float threshold)
@@ -616,6 +1472,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     if (_surfacePatchIndex.updateSurface(surface)) {
         _indexedSurfaceIds.insert(surfId);
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Rebuilt SurfacePatchIndex entries for surface" << surfId.c_str();
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -658,6 +1515,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Updated SurfacePatchIndex region for" << surfId.c_str()
                                 << "rows" << rowStart << "-" << rowEnd
                                 << "cols" << colStart << "-" << colEnd;
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -686,6 +1544,9 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     std::unordered_set<SurfacePatchIndex::SurfacePtr> seenSurfaces;
     for (const auto& surface : allSurfaces) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surface)) {
+            if (vc3d::opendata::isOpenDataSegmentPlaceholder(quad->path)) {
+                continue;
+            }
             // Skip if we've already seen this surface (shared_ptr hash uses underlying pointer)
             if (seenSurfaces.insert(quad).second) {
                 quadSurfaces.push_back(quad);
@@ -706,6 +1567,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -757,6 +1619,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
                 v->invalidateIntersect();
                 v->renderIntersections("surface index cache hit");
             });
+            scheduleSurfacePatchIndexOverlayRefresh();
             return;
         }
         // Entry went stale (surfaces reloaded, deleted, or stride changed);
@@ -814,6 +1677,7 @@ void ViewerManager::endIndexRead()
         _indexedSurfaceIds.insert(_deferredIndexSwapIds.begin(), _deferredIndexSwapIds.end());
         _deferredIndexSwapIds.clear();
         forEachBaseViewer([](VolumeViewerBase* v) { v->renderIntersections("deferred index swap"); });
+        scheduleSurfacePatchIndexOverlayRefresh();
     }
     // Run any single-surface mutation task that was held while reads were in flight.
     startNextSurfacePatchIndexTask();
@@ -861,6 +1725,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     // require another full rebuild. Apply just those deltas on the worker.
     if (queuedDuringRebuild.empty()) {
         forEachBaseViewer([](VolumeViewerBase* v) { v->renderIntersections(); });
+        scheduleSurfacePatchIndexOverlayRefresh();
     } else {
         forEachBaseViewer([](VolumeViewerBase* v) { v->invalidateIntersect(); });
         for (auto& task : queuedDuringRebuild) {
@@ -948,6 +1813,15 @@ void ViewerManager::handleSurfacePatchIndexTaskFinished()
     }
 
     const auto result = _surfacePatchIndexTaskWatcher->future().result();
+    if (_surfacePatchIndexNeedsRebuild) {
+        // A bulk surface replacement superseded this serialized delta while it
+        // was running. The task mutated only the outgoing live index; rebuild
+        // once from the final state and do not render the transient result.
+        _indexedSurfaceIds.clear();
+        primeSurfacePatchIndicesAsync();
+        return;
+    }
+
     if (result.success) {
         if (result.type == SurfacePatchIndexTaskType::Update) {
             _indexedSurfaceIds.insert(result.id);
@@ -963,6 +1837,7 @@ void ViewerManager::handleSurfacePatchIndexTaskFinished()
                 v->renderIntersections();
             });
         }
+        scheduleSurfacePatchIndexOverlayRefresh();
     } else if (result.type == SurfacePatchIndexTaskType::Update) {
         _indexedSurfaceIds.erase(result.id);
         _surfacePatchIndexNeedsRebuild = true;
@@ -1005,6 +1880,7 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
         const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
         if (flushed) {
             _indexedSurfaceIds.insert(surfId);
+            scheduleSurfacePatchIndexOverlayRefresh();
         }
         _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !flushed;
         return flushed;
@@ -1039,6 +1915,31 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
 
 void ViewerManager::handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate)
 {
+    if (name.empty()) {
+        // Empty-name notifications represent a completed bulk mutation of the
+        // surface catalog. Drop serialized deltas and rebuild once from the
+        // final CState snapshot instead of replaying thousands of updates.
+        _pendingSurfacePatchIndexTasks.clear();
+        _surfacesQueuedDuringRebuild.clear();
+        _pendingSurfacePatchIndexSurfaceIds.clear();
+        _deferredIndexSwap.reset();
+        _deferredIndexSwapIds.clear();
+        _indexedSurfaceIds.clear();
+        _surfacePatchIndexNeedsRebuild = true;
+        forEachBaseViewer([](VolumeViewerBase* v) {
+            v->invalidateIntersect();
+        });
+
+        // A single-surface task mutates the live index. Let it drain before
+        // launching the replacement build; its completion handler will prime.
+        const bool taskRunning =
+            _surfacePatchIndexTaskWatcher && _surfacePatchIndexTaskWatcher->isRunning();
+        if (!taskRunning) {
+            primeSurfacePatchIndicesAsync();
+        }
+        return;
+    }
+
     bool affectsSurfaceIndex = false;
     bool regionUpdated = false;
 

@@ -71,6 +71,7 @@ TEST_CASE("Logger::set_level filters lower-priority messages")
     CHECK(content.find("INFO_SHOULD_NOT_APPEAR_X") == std::string::npos);
     // Reset so other tests aren't affected.
     log->set_level(LogLevel::Info);
+    log->clear_files();
     fs::remove(path);
 }
 
@@ -84,6 +85,7 @@ TEST_CASE("add_file writes to disk")
     CHECK(fs::exists(path));
     auto content = readFile(path);
     CHECK(content.find("INFO_TO_FILE_ZQ") != std::string::npos);
+    log->clear_files();
     fs::remove(path);
 }
 

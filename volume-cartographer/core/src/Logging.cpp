@@ -111,6 +111,11 @@ void MinimalLogger::add_file(const std::filesystem::path& path) {
     }
 }
 
+void MinimalLogger::clear_files() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->file_sinks.clear();
+}
+
 // Global functions
 auto Logger() -> std::shared_ptr<MinimalLogger> {
     static auto logger = std::make_shared<MinimalLogger>();

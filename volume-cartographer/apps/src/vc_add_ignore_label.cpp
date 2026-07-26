@@ -1,5 +1,6 @@
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/BinaryPyramid.hpp"
+#include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/Zarr.hpp"
 #include <utils/zarr.hpp>
 

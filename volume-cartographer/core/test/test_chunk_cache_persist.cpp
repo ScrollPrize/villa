@@ -6,6 +6,7 @@
 
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ChunkFetch.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -65,13 +66,15 @@ fs::path tmpDir(const std::string& tag)
 
 std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
                                        std::optional<fs::path> persist = {},
-                                       bool compress = false)
+                                       bool compress = false,
+                                       std::optional<fs::path> budgetRoot = {})
 {
     std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
     ChunkCache::Options opts;
     opts.maxConcurrentReads = 4;
     opts.detectAllFillChunks = true;
     if (persist) opts.persistentCachePath = *persist;
+    if (budgetRoot) opts.persistentCacheBudgetRoot = *budgetRoot;
     opts.compressPersistentCache = compress;
     return std::make_shared<ChunkCache>(
         std::move(levels),
@@ -79,7 +82,38 @@ std::shared_ptr<ChunkCache> makeCache(std::shared_ptr<CountingFetcher> f,
         0.0, ChunkDtype::UInt8, opts);
 }
 
-std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99})
+std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99});
+ChunkResult waitForResolved(ChunkCache& c, int level, int iz, int iy, int ix,
+                            std::chrono::milliseconds timeout = std::chrono::seconds{2});
+
+TEST_CASE("budget denial skips persistence but downloaded ChunkCache data remains usable")
+{
+    auto root = tmpDir("budget_denied");
+    auto budget = vc::render::PersistentZarrCacheBudget::configure(
+        root, {1, 0}, [](const fs::path&, std::error_code& ec) {
+            ec.clear();
+            return fs::space_info{1024, 1024, 1024};
+        });
+    budget->waitForIdle();
+
+    auto f = std::make_shared<CountingFetcher>();
+    ChunkFetchResult fetched;
+    fetched.status = ChunkFetchStatus::Found;
+    fetched.bytes = makeBytes(64, std::byte{0x2a});
+    f->setCanned({0, 0, 0, 0}, fetched);
+
+    auto cache = makeCache(f, root / "volume", false, root);
+    const auto result = waitForResolved(*cache, 0, 0, 0, 0);
+    REQUIRE(result.status == ChunkStatus::Data);
+    REQUIRE(result.bytes);
+    CHECK((*result.bytes)[0] == std::byte{0x2a});
+    cache->waitForPersistentWrites();
+    CHECK_FALSE(fs::exists(root / "volume" / "level_0" / "0" / "0" / "0.bin"));
+    CHECK(budget->stats().managedBytes == 0);
+    fs::remove_all(root);
+}
+
+std::vector<std::byte> makeBytes(std::size_t n, std::byte v)
 {
     return std::vector<std::byte>(n, v);
 }
@@ -109,7 +143,7 @@ ChunkCache::Stats waitForStats(ChunkCache& c,
 }
 
 ChunkResult waitForResolved(ChunkCache& c, int level, int iz, int iy, int ix,
-                            std::chrono::milliseconds timeout = std::chrono::seconds{2})
+                            std::chrono::milliseconds timeout)
 {
     auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {

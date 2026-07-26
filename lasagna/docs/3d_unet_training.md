@@ -677,10 +677,10 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
 | `--input` | Input zarr array (3D, ZYX layout). Required. |
 | `--output` | Output zarr path. Required. |
 | `--unet-checkpoint` | Path to trained 3D UNet `.pt` checkpoint. Required. |
-| `--tile-size` | Cube tile size for tiled inference (default 256). Must be compatible with the model architecture. |
+| `--tile-size` | Cube tile size for tiled inference. Defaults to the checkpoint's stored `patch_size`. The model architecture is loaded independently and strictly. |
 | `--overlap` | Overlap between adjacent tiles in voxels (default 64). |
 | `--border` | Hard-discard border at tile edges before linear blending (default 16). |
-| `--scaledown` | Output downsample power (default 4). OME-Zarr pyramid level; actual factor = 2^scaledown. |
+| `--scaledown` | Direct output downsampling factor relative to the input array (default 4). |
 | `--crop-xyzwhd` | Process only a sub-region: `x y z w h d` in fullres input coordinates. |
 | `--pred-dt` | Path to a surface prediction zarr. Adds a `pred_dt` distance-to-surface channel to the output. |
 | `--device` | Compute device (default: `cuda` if available, otherwise `cpu`). |

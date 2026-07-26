@@ -2389,6 +2389,8 @@ def main() -> None:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--data-dir", default=None,
                    help="Directory containing .lasagna.json datasets")
+    p.add_argument("--allow-no-data-dir", action="store_true", default=False,
+                   help="Start without datasets for flatten-only jobs")
     p.add_argument("--object-store-dir", default=None,
                    help="Directory for content-addressed VC3D artifacts")
     p.add_argument("--no-gpu-pause", action="store_true", default=False,
@@ -2415,7 +2417,7 @@ def main() -> None:
         _capture_dir = Path(args.capture_dir).resolve()
 
     datasets = _list_datasets()
-    if not datasets:
+    if not datasets and not args.allow_no_data_dir:
         data_dir_msg = _data_dir if _data_dir else "<not set>"
         print(
             f"[fit-service] error: no .lasagna.json datasets found in --data-dir {data_dir_msg}",
@@ -2423,6 +2425,9 @@ def main() -> None:
             flush=True,
         )
         raise SystemExit(2)
+    if not datasets:
+        print("[fit-service] starting without datasets (flatten-only mode)",
+              flush=True)
 
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
     actual_port = server.server_address[1]

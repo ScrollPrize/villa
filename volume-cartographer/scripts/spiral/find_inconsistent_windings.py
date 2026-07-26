@@ -104,8 +104,11 @@ from scipy.optimize import milp, LinearConstraint, Bounds
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 import fit_spiral as fs
-from sample_spiral import get_theta_and_radii
-from tracks import _unwrap_track_shifted_radii
+from sample_spiral import (
+    get_theta_and_radii,
+    get_theta_crossing_step_adjustments,
+    unwrap_shifted_radii,
+)
 # Reuse connect_overlapping_patches' valid-quad graph + path reconstruction so a
 # within-patch strip follows a fringe-avoiding path through valid quads only
 # (never slicing through invalid regions, where theta would jump and the unwrap
@@ -159,6 +162,10 @@ def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z
     field independently of the filtering z-range."""
     cfg = dict(fs.default_config)
     cfg.update(checkpoint['cfg'])
+    # This tool IS the patch graph — a checkpoint trained supervision-free
+    # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
+    # stop the loaders from reading the patches it wants to analyse.
+    cfg['disable_patches'] = False
     fs.cfg = cfg
     fs.verified_patches_path = patches_dir
     # Attachment is over the verified patch set only, so skip the (slow, unrelated)
@@ -205,11 +212,13 @@ def build_transform(checkpoint, model_z_begin, model_z_end):
     model.to(device)
     model.load_state_dict(checkpoint['spiral_and_transform'])
     model.eval()
-    # The high-res flow field is stored "pre-scale": at forward time the hr params
-    # are multiplied by flow_scales[1], which training ramps and which is NOT part
-    # of the state_dict. A fully-fitted checkpoint ends the ramp at its 'final'
-    # value, so pin the scale to that to reproduce the saved transform.
-    model.flow_field.flow_scales[1] = cfg['flow_field_high_res_lr_scale_final']
+    # The high-res flow fields are stored "pre-scale": at forward time the hr params
+    # are multiplied by flow_scales[1], which training ramps (identically for every
+    # stage when num_flow_stages > 1) and which is NOT part of the state_dict. A
+    # fully-fitted checkpoint ends the ramp at its 'final' value, so pin every
+    # stage's scale to that to reproduce the saved transform.
+    for flow_field in model.flow_fields:
+        flow_field.flow_scales[1] = cfg['flow_field_high_res_lr_scale_final']
 
     transform = model.get_slice_to_spiral_transform()
     dr_per_winding = model.get_dr_per_winding()
@@ -326,15 +335,14 @@ def strip_winding_delta(transform, dr, graph, from_ij, to_ij, step_size):
 
     spiral = transform(zyx)
     theta, _, shifted = get_theta_and_radii(spiral[..., 1:], dr)
-    theta_diffs = theta.detach()[1:] - theta.detach()[:-1]
     step_adjustment_windings = (
-        (theta_diffs > np.pi).to(shifted.dtype)
-        - (theta_diffs < -np.pi).to(shifted.dtype)
+        get_theta_crossing_step_adjustments(theta, dr) / dr.detach()
     )
     cumulative_adjustment_windings = step_adjustment_windings.sum()
     delta_windings = int(round(float((-cumulative_adjustment_windings).item())))
 
-    shifted_uw = _unwrap_track_shifted_radii(theta[None], shifted[None], dr)[0]
+    shifted_uw, _ = unwrap_shifted_radii(theta[None], shifted[None], dr)
+    shifted_uw = shifted_uw[0]
     residual_windings = float(((shifted_uw[-1] - shifted_uw[0]) / dr).item())
     return {
         'delta_windings': delta_windings,
@@ -413,7 +421,8 @@ def pcl_edge_unwrap_adjustment_windings(transform, dr, pa, pb):
         spiral = transform(zyx)
         theta, _, _ = get_theta_and_radii(spiral[..., 1:], dr)
         zero_shifted = torch.zeros_like(theta)
-        adjustments = _unwrap_track_shifted_radii(theta[None], zero_shifted[None], dr)[0]
+        _, adjustments = unwrap_shifted_radii(theta[None], zero_shifted[None], dr)
+        adjustments = adjustments[0]
     return int(round(float((adjustments[-1] / dr).item())))
 
 
@@ -918,7 +927,8 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
     print(f'using umbilicus {umbilicus_path}')
 
     print(f'loading checkpoint {checkpoint}')
-    ckpt = torch.load(checkpoint, map_location='cpu')
+    from checkpoint_io import load_checkpoint_cpu
+    ckpt = load_checkpoint_cpu(checkpoint)
     model_z_begin, model_z_end = install_globals(
         ckpt, patches_dir, pcl_paths, filter_z_begin, filter_z_end, umbilicus_path
     )
@@ -934,6 +944,11 @@ def main(checkpoint, patches_dir, umbilicus, patch_id, pcl_paths, z_range, step_
     patches, _unverified, _shell, cross_patch_pcls, _unattached = fs.main(
         load_only_patches_and_point_collections=True
     )
+    if isinstance(cross_patch_pcls, list):
+        # fit_spiral now returns the cross-patch pcls as a list; this tool's
+        # vote/edge builders key their reports by pcl id. Per-file collection
+        # ids collide across json files, so key by list position instead.
+        cross_patch_pcls = dict(enumerate(cross_patch_pcls))
     if patch_id not in patches:
         raise SystemExit(
             f'patch id {patch_id!r} not among {len(patches)} loaded patches (after z-filtering); '

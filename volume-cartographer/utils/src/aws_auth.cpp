@@ -12,6 +12,12 @@
 #include <string>
 #include <vector>
 
+#if defined(_MSC_VER)
+// MSVC spells the POSIX process-pipe API with a leading underscore.
+#define popen _popen
+#define pclose _pclose
+#endif
+
 namespace utils {
 
 AwsAuth AwsAuth::load(const std::string& profile)
@@ -29,7 +35,14 @@ AwsAuth AwsAuth::load(const std::string& profile)
         std::string cmd = "aws configure export-credentials";
         if (!profileArg.empty())
             cmd += " --profile " + profileArg;
+        // Suppress the tool's stderr. On Windows _popen runs the command via
+        // cmd.exe, whose null device is NUL, not /dev/null; an unresolved
+        // /dev/null redirect target there fails the whole command before it runs.
+#if defined(_WIN32)
+        cmd += " 2>NUL";
+#else
         cmd += " 2>/dev/null";
+#endif
         std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
         if (!pipe) return false;
         std::string output;

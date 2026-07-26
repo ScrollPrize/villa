@@ -11,9 +11,11 @@
 
 #include <opencv2/core.hpp>
 
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -26,6 +28,8 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+#ifndef _WIN32
 
 std::string tmpSocketPath()
 {
@@ -96,6 +100,8 @@ std::thread spawnServer(const std::string& path,
     });
 }
 
+#endif
+
 } // namespace
 
 TEST_CASE("Constructor throws when the socket path doesn't exist")
@@ -111,6 +117,8 @@ TEST_CASE("Constructor throws when the socket path is too long")
     auto make = [&]() { NeuralTracerConnection c(huge); (void)c; };
     CHECK_THROWS_AS(make(), std::runtime_error);
 }
+
+#ifndef _WIN32
 
 TEST_CASE("get_next_points returns the candidates the server emits")
 {
@@ -188,3 +196,4 @@ TEST_CASE("get_next_points: NaN sanitization in the response")
     }
     srv.join();
 }
+#endif

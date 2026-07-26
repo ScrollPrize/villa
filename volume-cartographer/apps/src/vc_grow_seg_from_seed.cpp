@@ -126,7 +126,7 @@ bool check_existing_segments(const std::filesystem::path& tgt_dir, const cv::Vec
             continue;
         }
 
-        std::string name = entry.path().filename();
+        std::string name = entry.path().filename().string();
         if (name.compare(0, name_prefix.size(), name_prefix)) {
             continue;
         }
@@ -326,8 +326,12 @@ int main(int argc, char *argv[])
 
     const std::string volume_arg = vol_path.string();
     const bool remote_volume = is_remote_volume_path(volume_arg);
+    const double requested_voxelsize = params.value("voxelsize", 0.0);
+    utils::Json remote_metadata;
+    if (std::isfinite(requested_voxelsize) && requested_voxelsize > 0.0)
+        remote_metadata["voxelsize"] = requested_voxelsize;
     auto volume = remote_volume
-        ? Volume::NewFromUrl(volume_arg)
+        ? Volume::NewFromUrl(volume_arg, {}, {}, remote_metadata)
         : Volume::New(vol_path);
     volume->setCacheBudget(size_t(params.value("cache_size", 1e9)));
     auto* chunk_cache = volume->chunkedCache();
@@ -400,7 +404,7 @@ int main(int argc, char *argv[])
 
         for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
             if (std::filesystem::is_directory(entry)) {
-                std::string name = entry.path().filename();
+                std::string name = entry.path().filename().string();
                 if (name.compare(0, name_prefix.size(), name_prefix))
                     continue;
 
@@ -1404,7 +1408,18 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
-    QuadSurface *surf = tracer(*volume, 1.0, 0, origin, params, cache_root, voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+    QuadSurface *surf = nullptr;
+    try {
+        surf = tracer(*volume, 1.0, 0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+    } catch (const std::exception& e) {
+        // A growth failure (e.g. a remote normal-grid store whose metadata
+        // could not be fetched) must exit as a normal tool failure, not crash
+        // the process with an uncaught exception (SIGABRT). The bridge and the
+        // GUI runner report a non-zero exit + this stderr line cleanly.
+        std::cerr << "ERROR: vc_grow_seg_from_seed: segment growth failed: "
+                  << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
 
     double area_cm2 = surf->meta["area_cm2"].get_double();
     if (area_cm2 < min_area_cm) {
@@ -1413,10 +1428,17 @@ int main(int argc, char *argv[])
         if (std::filesystem::exists(seg_dir)) {
             std::filesystem::remove_all(seg_dir);
         }
+#if defined(_WIN32)
+        // See end of main(): skip CRT teardown, worker threads deadlock it.
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(EXIT_SUCCESS);
+#else
         return EXIT_SUCCESS;
+#endif
     }
 
-    std::cout << "saving " << seg_dir << std::endl;
+    std::cout << "saving " << seg_dir.string() << std::endl;
     surf->save(seg_dir, uuid, true);
     surf->path = seg_dir;
 
@@ -1444,9 +1466,9 @@ int main(int argc, char *argv[])
 
         // Check for additional surfaces in target directory
         for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
-            if (std::filesystem::is_directory(entry) && !surfs.count(entry.path().filename()))
+            if (std::filesystem::is_directory(entry) && !surfs.count(entry.path().filename().string()))
             {
-                std::string name = entry.path().filename();
+                std::string name = entry.path().filename().string();
                 if (name.compare(0, name_prefix.size(), name_prefix))
                     continue;
 
@@ -1485,5 +1507,15 @@ int main(int argc, char *argv[])
         delete sm;
     }
 
+#if defined(_WIN32)
+    // Skip CRT shutdown: live worker threads (ChunkCache IO pool, OpenMP)
+    // deadlock Windows DLL-detach/static-destructor teardown, leaving the
+    // process alive after main() returns — VC3D then never sees the tool
+    // finish. Same approach as VC3D's own main().
+    std::cout.flush();
+    std::cerr.flush();
+    std::_Exit(EXIT_SUCCESS);
+#else
     return EXIT_SUCCESS;
+#endif
 }

@@ -9,10 +9,12 @@
 #include <QCommandLineParser>
 
 #include "CWindow.hpp"
+#include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/Version.hpp"
 #include <QSettings>
 #include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/CrashHandler.hpp"
@@ -20,6 +22,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
+#include <cstdio>
 #include <iostream>
 #include <thread>
 #include <omp.h>
@@ -29,7 +32,15 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #include <sys/resource.h>
 #endif
@@ -37,6 +48,17 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+
+// POSIX setenv with an MSVCRT/UCRT fallback (Windows has no setenv).
+static void vcSetEnv(const char* name, const char* value, int overwrite)
+{
+#if defined(_WIN32)
+    if (!overwrite && std::getenv(name)) return;
+    _putenv_s(name, value);
+#else
+    ::setenv(name, value, overwrite);
+#endif
+}
 
 // Runs before main() AND before all shared-library constructors.
 // .preinit_array is processed by the dynamic linker before any .init_array,
@@ -46,13 +68,13 @@ static void setThreadPoliciesEarly()
     // Force passive wait policy so OpenMP threads sleep instead of
     // spin-waiting with sched_yield.  overwrite=1 is intentional —
     // spin-waiting on 500+ OMP threads kills the machine.
-    setenv("OMP_WAIT_POLICY", "passive", 1);
-    setenv("OMP_NUM_THREADS", "1", 0);       // limit OpenMP parallelism
-    setenv("KMP_BLOCKTIME", "0", 1);         // LLVM/Intel OpenMP: sleep immediately
-    setenv("KMP_AFFINITY", "disabled", 0);   // skip sched_setaffinity per fork/join
-    setenv("OPENBLAS_NUM_THREADS", "1", 0);
-    setenv("GOTO_NUM_THREADS", "1", 0);      // legacy name for OpenBLAS
-    setenv("MKL_NUM_THREADS", "1", 0);       // Intel MKL
+    vcSetEnv("OMP_WAIT_POLICY", "passive", 1);
+    vcSetEnv("OMP_NUM_THREADS", "1", 0);       // limit OpenMP parallelism
+    vcSetEnv("KMP_BLOCKTIME", "0", 1);         // LLVM/Intel OpenMP: sleep immediately
+    vcSetEnv("KMP_AFFINITY", "disabled", 0);   // skip sched_setaffinity per fork/join
+    vcSetEnv("OPENBLAS_NUM_THREADS", "1", 0);
+    vcSetEnv("GOTO_NUM_THREADS", "1", 0);      // legacy name for OpenBLAS
+    vcSetEnv("MKL_NUM_THREADS", "1", 0);       // Intel MKL
 }
 #ifdef __linux__
 __attribute__((section(".preinit_array"), used))
@@ -68,9 +90,21 @@ static bool hasCliFlag(int argc, char* argv[], const char* flag)
     return false;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
 __attribute__((visibility("default")))
+#endif
 auto main(int argc, char* argv[]) -> int
 {
+#ifdef _WIN32
+    // GUI-subsystem exe: stdout/stderr are detached by default. When launched
+    // from a terminal, reattach them so logs and --version/--help output are
+    // visible; double-click launches still get no console window.
+    if (::AttachConsole(ATTACH_PARENT_PROCESS)) {
+        std::freopen("CONOUT$", "w", stdout);
+        std::freopen("CONOUT$", "w", stderr);
+    }
+#endif
+
     vc::crash::install();
 
 #ifndef __linux__
@@ -81,6 +115,12 @@ auto main(int argc, char* argv[]) -> int
 
 #if defined(__GLIBC__) && !defined(VC_HAVE_MIMALLOC)
     // Tune glibc's malloc to give freed pages back to the OS more aggressively.
+    // Bound per-thread arenas before VC3D creates its worker pools. Smaller
+    // volume chunks increasingly use arena allocations rather than independent
+    // mmaps; allowing glibc's default (up to 8 * CPU count) let OpenMP/thread
+    // pool multiplication retain tens of GiB in 128-MiB arena mappings even
+    // after the cache references were released.
+    ::mallopt(M_ARENA_MAX, 4);
     // Lower M_MMAP_THRESHOLD pushes bigger allocations through mmap (returned
     // independently on free), reducing main-heap fragmentation. Lower
     // M_TRIM_THRESHOLD runs sbrk-trim more often. Only takes effect when
@@ -164,6 +204,19 @@ auto main(int argc, char* argv[]) -> int
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
     QApplication::setApplicationVersion(QString::fromStdString(ProjectInfo::VersionString()));
+
+    // Handle this before constructing the main window. QCommandLineParser's
+    // built-in version option normally exits from process(), but keeping the
+    // probe explicit makes the packaged GUI-subsystem executable a reliable
+    // non-interactive smoke test on Windows.
+    if (hasCliFlag(argc, argv, "--version")) {
+        std::cout << QApplication::applicationName().toStdString() << ' '
+                  << QApplication::applicationVersion().toStdString() << std::endl;
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(0);
+    }
+
     std::cout << "VC3D commit: " << ProjectInfo::RepositoryHash() << std::endl;
     std::cout << "creating remote volume cache at "
               << vc3d::remoteCachePath().toStdString() << std::endl;
@@ -191,6 +244,12 @@ auto main(int argc, char* argv[]) -> int
         "Load the named segmentation folder first instead of loading all segmentation folders.",
         "folder");
     parser.addOption(loadFirstOption);
+
+    QCommandLineOption volumePackageOption(
+        "volpkg",
+        "Open a volume package at startup.",
+        "path");
+    parser.addOption(volumePackageOption);
 
     QCommandLineOption debugOption(
         "debug",
@@ -253,6 +312,19 @@ auto main(int argc, char* argv[]) -> int
         "200");
     parser.addOption(replayTimedProfilePeriodOption);
 
+    QCommandLineOption agentBridgeOption(
+        "agent-bridge",
+        "Enable the agent bridge (JSON-RPC over a local socket) on the default "
+        "socket name vc3d-agent-<pid>.");
+    parser.addOption(agentBridgeOption);
+
+    QCommandLineOption agentBridgeNameOption(
+        "agent-bridge-name",
+        "Enable the agent bridge on an explicit QLocalServer name (implies "
+        "--agent-bridge).",
+        "name");
+    parser.addOption(agentBridgeNameOption);
+
     parser.process(app);
 
     if (parser.isSet(debugOption)) {
@@ -304,6 +376,18 @@ auto main(int argc, char* argv[]) -> int
         vc::render::ChunkCache::setPersistentQuantizationDefault(
             settings.value(perf::REMOTE_CACHE_QUANTIZATION,
                            perf::REMOTE_CACHE_QUANTIZATION_DEFAULT).toInt());
+        constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+        vc::render::PersistentZarrCacheBudget::Limits limits;
+        const auto maximumGiB = settings.value(
+            perf::REMOTE_CACHE_MAX_GIB, perf::REMOTE_CACHE_MAX_GIB_DEFAULT).toULongLong();
+        if (maximumGiB > 0)
+            limits.maximumBytes = maximumGiB * gib;
+        limits.minimumFreeBytes = settings.value(
+            perf::REMOTE_CACHE_MIN_FREE_GIB,
+            perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong() * gib;
+        const auto cacheRoot = vc3d::remoteCachePath(
+            settings.value(viewer::REMOTE_CACHE_DIR).toString()).toStdString();
+        vc::render::PersistentZarrCacheBudget::configure(cacheRoot, limits);
     }
     if (parser.isSet(cacheSizeOption)) {
         bool ok = false;
@@ -329,6 +413,48 @@ auto main(int argc, char* argv[]) -> int
     int rc = 0;
     {
         CWindow aWin(cacheSizeGB, benchOptions);
+
+        if (parser.isSet(volumePackageOption)) {
+            QString errorMessage;
+            if (!aWin.openVolumePackage(parser.value(volumePackageOption).trimmed(),
+                                        false,
+                                        &errorMessage)) {
+                std::cerr << "Error: " << errorMessage.toStdString() << std::endl;
+                std::cout.flush();
+                std::cerr.flush();
+                std::_Exit(2);
+            }
+        }
+
+        // Agent bridge (opt-in, off by default). Constructed only when a bridge
+        // flag is present, so normal runs pay zero cost and open no socket.
+        std::unique_ptr<AgentBridgeServer> agentBridge;
+        const bool bridgeRequested =
+            parser.isSet(agentBridgeOption) || parser.isSet(agentBridgeNameOption);
+        if (bridgeRequested) {
+            QString bridgeName = parser.value(agentBridgeNameOption).trimmed();
+            if (bridgeName.isEmpty()) {
+                bridgeName = QStringLiteral("vc3d-agent-%1")
+                                 .arg(QCoreApplication::applicationPid());
+            }
+            agentBridge = std::make_unique<AgentBridgeServer>(&aWin);
+            if (!agentBridge->listen(bridgeName)) {
+                std::cerr << "Error: agent bridge failed to listen on '"
+                          << bridgeName.toStdString() << "'." << std::endl;
+                std::cout.flush();
+                std::cerr.flush();
+                // Exit like the std::_Exit path below rather than returning: a plain
+                // return runs DSO finalizers (gnutls/libtasn1 free through mimalloc
+                // post-teardown) and segfaults in _dl_fini. Nothing has loaded yet.
+                std::_Exit(2);
+            }
+            std::cout << "VC3D-AGENT-BRIDGE: listening name="
+                      << agentBridge->serverName().toStdString()
+                      << " path=" << agentBridge->fullServerName().toStdString()
+                      << std::endl;
+            std::cout.flush();
+        }
+
         aWin.show();
         rc = QApplication::exec();
     }

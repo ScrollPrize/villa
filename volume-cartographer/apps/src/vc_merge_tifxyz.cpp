@@ -16,6 +16,7 @@
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc_merge_tifxyz_grid.hpp"
 
@@ -1153,7 +1154,7 @@ cv::Mat gmDistTransform(const Mat1b& bin)
     cv::Mat src;
     bin.convertTo(src, CV_8U, 255.0);
     cv::Mat dist;
-    cv::distanceTransform(src, dist, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    cv::distanceTransform(src, dist, vc::opencv::distanceL2, cv::DIST_MASK_PRECISE);
     cv::Mat dist64;
     dist.convertTo(dist64, CV_64F);
     return dist64;

@@ -148,6 +148,8 @@ TEST_CASE("createZarrDataset: blosc compressor metadata is numcodecs-compliant")
     CHECK(meta.find("\"blocksize\"") != std::string::npos);
     CHECK(meta.find("\"clevel\": 7") != std::string::npos);
     CHECK(meta.find("\"dimension_separator\": \"/\"") != std::string::npos);
+    f.close();
+    ds.reset();
     fs::remove_all(d);
 }
 

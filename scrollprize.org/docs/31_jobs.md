@@ -44,6 +44,8 @@ Our mission is simple and bold: **read the Herculaneum scrolls**.
 
 We don’t have open roles right now, but we’re always excited to meet exceptional people who can move this mission forward.
 
+Even when we’re not hiring, a great way to catch our attention is to start as a contributor: work on the [open prizes](prizes), win one, and join the community on [Discord](https://discord.gg/V4fJhvtaQn) — many of the people working with us today started exactly that way.
+
 If that’s you, send a brief note with your CV and how you could help to jobs@scrollprize.org
 
 ***

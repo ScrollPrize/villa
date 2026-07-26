@@ -455,6 +455,13 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     atlas.metadata.seedLineIndex = 1;
     atlas.metadata.seedAtlasU = 4.5;
     atlas.metadata.seedAtlasV = 2.0;
+    atlas.metadata.coordinateMetadata = {
+        {"vc_open_data_coordinate_space", "PHerc1451/20260319101107@L2"},
+        {"vc_open_data_source_path", "s3://path/to/the/source/volume"},
+        {"vc_open_data_source_coordinate_level", 2},
+        {"vc_open_data_source_coordinate_scale_factor", 4},
+        {"vc_open_data_source_original_resolution", 2.4},
+    };
     vc::atlas::AtlasLink link;
     link.first.fiberPath = "fibers/1.json";
     link.first.sourceIndex = 0;
@@ -480,6 +487,8 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     const std::string metadata = readText(atlasDir / "metadata.json");
     CHECK(metadata.find("\"version\": 5") != std::string::npos);
     CHECK(metadata.find("\"zero_winding_column\": 3") != std::string::npos);
+    CHECK(metadata.find("\"vc_open_data_source_coordinate_scale_factor\": 4") !=
+          std::string::npos);
     CHECK(metadata.find("idx_rotation_columns") == std::string::npos);
     const std::string mappingJson = readText(atlasDir / "mappings" / "fibers" / "1.json");
     CHECK(mappingJson.find("\"version\": 4") != std::string::npos);
@@ -492,6 +501,12 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     CHECK(loaded.metadata.zeroWindingColumn == 3);
     CHECK(loaded.metadata.seedLineIndex == 1);
     CHECK(loaded.metadata.seedAtlasU == doctest::Approx(4.5));
+    CHECK(loaded.metadata.coordinateMetadata.at(
+              "vc_open_data_coordinate_space").get<std::string>() ==
+          "PHerc1451/20260319101107@L2");
+    CHECK(loaded.metadata.coordinateMetadata.at(
+              "vc_open_data_source_original_resolution").get<double>() ==
+          doctest::Approx(2.4));
     REQUIRE(loaded.links.size() == 1);
     CHECK(loaded.links[0].first.fiberPath == fs::path("fibers/1.json"));
     CHECK(loaded.links[0].first.arclength == doctest::Approx(1.25));

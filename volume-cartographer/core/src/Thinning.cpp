@@ -1,4 +1,5 @@
 #include "vc/core/util/Thinning.hpp"
+#include "vc/core/util/OpenCvCompat.hpp"
 
 #include <algorithm>
 #include <array>
@@ -185,7 +186,8 @@ static void customThinningImpl(
     // size+type, so passing scratch.* as out-params keeps the same
     // backing storage across calls — opencv writes into it instead of
     // mmapping a fresh slice-sized buffer per call.
-    cv::distanceTransform(inputImage, scratch.distTransform, cv::DIST_L1, cv::DIST_MASK_5, CV_8U);
+    cv::distanceTransform(inputImage, scratch.distTransform,
+                          vc::opencv::distanceL1, cv::DIST_MASK_5, CV_8U);
     CV_Assert(scratch.distTransform.type() == CV_8U);
     localStats.distanceTransformSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - dtStart).count();

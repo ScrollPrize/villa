@@ -711,6 +711,37 @@
             </property>
            </widget>
           </item>
+          <item row="4" column="0">
+           <widget class="QLabel" name="labelRemoteCacheMaximum">
+            <property name="text">
+             <string>Remote Zarr cache maximum (GiB)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="4" column="1">
+           <widget class="QSpinBox" name="spinRemoteCacheMaximumGiB">
+            <property name="minimum"><number>0</number></property>
+            <property name="maximum"><number>1048576</number></property>
+            <property name="specialValueText"><string>Unlimited</string></property>
+            <property name="suffix"><string> GiB</string></property>
+            <property name="toolTip"><string>Maximum compressed bytes shared by all remote volume and Lasagna Zarr caches in this cache directory. 0 means unlimited. Applied immediately.</string></property>
+           </widget>
+          </item>
+          <item row="5" column="0">
+           <widget class="QLabel" name="labelRemoteCacheMinimumFree">
+            <property name="text">
+             <string>Minimum free disk space (GiB)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="5" column="1">
+           <widget class="QSpinBox" name="spinRemoteCacheMinimumFreeGiB">
+            <property name="minimum"><number>0</number></property>
+            <property name="maximum"><number>1048576</number></property>
+            <property name="suffix"><string> GiB</string></property>
+            <property name="toolTip"><string>Prevent cache growth when writing would cross this free-space reserve. 0 disables the reserve warning. Applied immediately.</string></property>
+           </widget>
+          </item>
           <item row="6" column="0">
            <widget class="QLabel" name="lblIOThreads">
             <property name="text">
@@ -760,6 +791,93 @@
             </property>
             <property name="toolTip">
              <string>Number of rotating snapshots kept per segment (0 disables). Throttled to at most one snapshot per segment every 2 minutes.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="8" column="0">
+           <widget class="QLabel" name="labelSpiralSurfaceCache">
+            <property name="text">
+             <string>Spiral surface cache (GB)</string>
+            </property>
+            <property name="toolTip">
+             <string>RAM budget for the spiral flattened view's cache of resampled surface space. Independent of the RAM cache size above. 0 disables it and falls back to sampling the volume every frame.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="8" column="1">
+           <widget class="QSpinBox" name="spinSpiralSurfaceCacheGB">
+            <property name="minimum">
+             <number>0</number>
+            </property>
+            <property name="maximum">
+             <number>512</number>
+            </property>
+            <property name="value">
+             <number>4</number>
+            </property>
+            <property name="suffix">
+             <string> GB</string>
+            </property>
+            <property name="toolTip">
+             <string>RAM budget for the spiral flattened view's cache of resampled surface space. 0 disables it. Applies without restart.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="9" column="0">
+           <widget class="QLabel" name="labelSpiralOverlaySurfaceCache">
+            <property name="text">
+             <string>Spiral overlay surface cache (GB)</string>
+            </property>
+            <property name="toolTip">
+             <string>Separate budget for the overlay volume's surface cache in the spiral flattened view. 0 disables it and leaves the overlay on its existing resident-only sampling path.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="9" column="1">
+           <widget class="QSpinBox" name="spinSpiralOverlaySurfaceCacheGB">
+            <property name="minimum">
+             <number>0</number>
+            </property>
+            <property name="maximum">
+             <number>512</number>
+            </property>
+            <property name="value">
+             <number>0</number>
+            </property>
+            <property name="suffix">
+             <string> GB</string>
+            </property>
+            <property name="toolTip">
+             <string>Separate budget for the overlay volume's surface cache in the spiral flattened view. 0 disables it. Applies without restart.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="10" column="0">
+           <widget class="QLabel" name="labelSpiralPlaneChunkCache">
+            <property name="text">
+             <string>Spiral plane chunk cache (MB)</string>
+            </property>
+            <property name="toolTip">
+             <string>Hard cap on decoded chunks retained for the spiral slice panes. Private to the spiral workspace, so it can neither evict the main workspace's cache nor be evicted by it. This is a floor: it is raised automatically if it cannot hold one frame, and the status bar shows the effective value.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="10" column="1">
+           <widget class="QSpinBox" name="spinSpiralPlaneChunkCacheMB">
+            <property name="minimum">
+             <number>64</number>
+            </property>
+            <property name="maximum">
+             <number>524288</number>
+            </property>
+            <property name="value">
+             <number>2048</number>
+            </property>
+            <property name="suffix">
+             <string> MB</string>
+            </property>
+            <property name="toolTip">
+             <string>Hard cap on decoded chunks retained for the spiral slice panes. A floor, raised automatically if it cannot hold one frame.</string>
             </property>
            </widget>
           </item>
