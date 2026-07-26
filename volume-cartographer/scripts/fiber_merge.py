@@ -61,19 +61,60 @@ REOPTIMIZE_TAG = 'needs_reoptimization'
 #   in sync with kNeedsReoptimizationTag in LineAnnotationController.cpp.
 
 
+def _finite_point(p):
+    """Strictly a 3-vector of finite numbers — no bools, no numeric
+    strings. Anything looser either crashes the arithmetic below or writes
+    values the loader throws on."""
+    try:
+        return (len(p) == 3 and
+                all(isinstance(x, (int, float)) and not isinstance(x, bool) and
+                    math.isfinite(x)
+                    for x in p))
+    except TypeError:
+        return False
+
+
 def is_fiber_doc(doc):
-    return (isinstance(doc, dict) and
-            doc.get('type') == 'vc3d_fiber' and
-            isinstance(doc.get('control_points'), list) and
-            isinstance(doc.get('line_points'), list))
+    """Structural AND content validity for every field this module
+    computes over. Malformed (possibly remote-controlled) input must be
+    rejected here so callers degrade to manual resolution instead of
+    crashing mid-merge."""
+    if not (isinstance(doc, dict) and doc.get('type') == 'vc3d_fiber'):
+        return False
+    for key in ('control_points', 'line_points'):
+        points = doc.get(key)
+        if not isinstance(points, list) or not all(_finite_point(p)
+                                                   for p in points):
+            return False
+    tags = doc.get('tags', [])
+    if tags is not None and not (isinstance(tags, list) and
+                                 all(isinstance(tag, str) for tag in tags)):
+        return False
+    generation = doc.get('generation', 1)
+    if generation is not None and (isinstance(generation, bool) or
+                                   not isinstance(generation, (int, float)) or
+                                   not math.isfinite(generation)):
+        return False
+    return True
 
 
 def pos_eq(a, b, tol=POS_TOL):
+    """Port of the loader's pointsApproximatelyEqual: a squared-EUCLIDEAN
+    ball of radius `tol`. A per-axis box would accept positions up to
+    sqrt(3)*tol apart that the loader rejects — the exact class of
+    inconsistency the destructive repair prompt punishes."""
     try:
-        return (len(a) == 3 and len(b) == 3 and
-                all(math.isfinite(x) and math.isfinite(y) and abs(x - y) <= tol
-                    for x, y in zip(a, b)))
-    except TypeError:
+        if len(a) != 3 or len(b) != 3:
+            return False
+        d2 = 0.0
+        for x, y in zip(a, b):
+            fx = float(x)
+            fy = float(y)
+            if not (math.isfinite(fx) and math.isfinite(fy)):
+                return False
+            d2 += (fx - fy) ** 2
+        return d2 <= tol * tol
+    except (TypeError, ValueError):
         return False
 
 
@@ -83,13 +124,6 @@ def _seq_eq(a, b):
 
 def _dist2(a, b):
     return sum((float(x) - float(y)) ** 2 for x, y in zip(a, b))
-
-
-def _finite_point(p):
-    try:
-        return len(p) == 3 and all(math.isfinite(float(x)) for x in p)
-    except (TypeError, ValueError):
-        return False
 
 
 def _normalized(v):
@@ -156,11 +190,29 @@ def endpoint_tangent(line, point):
     return line_tangent_at(line, nearest_line_point_index(line, point))
 
 
+def _snapped_direction(stored, tangent):
+    """The value a stored direction field must hold: exactly +-tangent.
+
+    The loader's checks are sign-agnostic, but the stored sign encodes the
+    link's sense in VC3D, so it is preserved. Writing exactly +-tangent
+    (rather than leave-if-within-tolerance) is what makes reciprocal PAIRS
+    pass the loader's stored-vs-stored comparison: two fields each within
+    tolerance of the true tangent can still be 2x tolerance apart from
+    each other."""
+    negated = [-x for x in tangent]
+    if stored == tangent or stored == negated:
+        return stored
+    normalized = _normalized(stored)
+    if (normalized is not None and
+            sum(x * y for x, y in zip(normalized, tangent)) < 0.0):
+        return negated
+    return tangent
+
+
 def resolve_cp_index(control_points, position):
     """Index of the control point pos_eq-equal to `position` (nearest when
-    several qualify), or None. This is the loader's own position predicate
-    — NOT a tighter Euclidean ball, which would drop links the loader
-    would accept."""
+    several qualify), or None. pos_eq is the loader's own Euclidean
+    predicate, so anything resolvable here is acceptable there."""
     best_index = None
     best_d2 = math.inf
     for i, cp in enumerate(control_points):
@@ -260,21 +312,24 @@ def _branches_of(doc):
     return branches if isinstance(branches, list) else []
 
 
-def _valid_vec3(value):
-    try:
-        return (len(value) == 3 and
-                all(isinstance(x, (int, float)) and math.isfinite(x)
-                    for x in value))
-    except TypeError:
-        return False
+def _branch_target(entry):
+    """Link target normalized the way the loader normalizes it: the bare
+    filename (fs::path(...).filename()). Comparing raw strings would treat
+    a legacy 'fibers/f.json' entry as a different peer than 'f.json' and
+    skip its consistency fixes."""
+    name = entry.get('branch_file')
+    if not isinstance(name, str):
+        return None
+    basename = name.rsplit('/', 1)[-1]
+    return basename or None
 
 
 def _structured_branch(branch):
     """A branch entry this module understands well enough to merge."""
     return (isinstance(branch, dict) and
-            isinstance(branch.get('branch_file'), str) and
-            _valid_vec3(branch.get('control_point_position')) and
-            _valid_vec3(branch.get('branch_control_point_position')))
+            _branch_target(branch) is not None and
+            _finite_point(branch.get('control_point_position')) and
+            _finite_point(branch.get('branch_control_point_position')))
 
 
 def split_branches(doc):
@@ -291,9 +346,10 @@ def split_branches(doc):
 
 
 def links_to(doc, peer_name):
-    """Structured branch entries of `doc` that point at `peer_name`."""
+    """Structured branch entries of `doc` that point at `peer_name`
+    (compared as basenames, like the loader)."""
     return [entry for entry in _branches_of(doc)
-            if _structured_branch(entry) and entry['branch_file'] == peer_name]
+            if _structured_branch(entry) and _branch_target(entry) == peer_name]
 
 
 def links_to_any(doc):
@@ -307,22 +363,30 @@ def _canon_opaque(entries):
 
 def merge_opaque_branches(base_opaque, local_opaque, remote_opaque):
     """Whole-value base-aware merge of uninterpretable branch entries.
-    Returns (merged_entries, conflict_message_or_None)."""
-    if _canon_opaque(local_opaque) == _canon_opaque(remote_opaque):
+    Returns (merged_entries, conflict_message_or_None).
+
+    Note the guarantee is only "the MERGE never drops them": an unmodified
+    VC3D still strips structurally unparseable entries (and rewrites the
+    file) when it next loads it — exactly as it would have without any
+    merge."""
+    canon_base = _canon_opaque(base_opaque)
+    canon_local = _canon_opaque(local_opaque)
+    canon_remote = _canon_opaque(remote_opaque)
+    if canon_local == canon_remote:
         return copy.deepcopy(local_opaque), None
-    if _canon_opaque(local_opaque) == _canon_opaque(base_opaque):
+    if canon_local == canon_base:
         return copy.deepcopy(remote_opaque), None
-    if _canon_opaque(remote_opaque) == _canon_opaque(base_opaque):
+    if canon_remote == canon_base:
         return copy.deepcopy(local_opaque), None
     return [], ("branches: structurally unparseable entries differ between "
                 "local and remote; refusing to merge them")
 
 
 def _same_link(a, b):
-    """Tolerant link identity: same target file and both endpoint positions
-    within POS_TOL — the same geometric predicate used for control-point
-    alignment."""
-    return (a.get('branch_file') == b.get('branch_file') and
+    """Tolerant link identity: same target file (as basenames) and both
+    endpoint positions within POS_TOL — the same geometric predicate used
+    for control-point alignment."""
+    return (_branch_target(a) == _branch_target(b) and
             pos_eq(a.get('control_point_position'),
                    b.get('control_point_position')) and
             pos_eq(a.get('branch_control_point_position'),
@@ -370,6 +434,11 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
     def merge_one_sided(entry, side_name):
         base_entry = base_match(entry)
         if base_entry is None:
+            # Note: a link whose anchor was MOVED on this side (beyond
+            # tolerance) also lands here — its identity no longer matches
+            # the base, so it reads as an addition and survives even if the
+            # other side deleted the original. Kept deliberately: a moved
+            # link is indistinguishable from a re-created one.
             merged.append(copy.deepcopy(entry))
             stats['links_added_%s' % side_name] += 1
             return
@@ -391,14 +460,26 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
             merge_one_sided(local_entry, 'local')
             continue
         used_remote.add(remote_index)
-        base_match(local_entry)  # consume the base entry, if any
+        base_entry = base_match(local_entry)
         remote_entry = remote_entries[remote_index]
         local_pending = bool(local_entry.get('pending', False))
         remote_pending = bool(remote_entry.get('pending', False))
         if local_pending != remote_pending:
-            # Approval (pending -> absent/False) always wins.
-            chosen = remote_entry if local_pending else local_entry
-            stats['links_approved'] += 1
+            if base_entry is not None:
+                # The side that changed the review state relative to the
+                # base wins: approving beats an untouched pending copy, and
+                # deliberately re-flagging beats an untouched approval.
+                base_pending = bool(base_entry.get('pending', False))
+                chosen = (local_entry if local_pending != base_pending
+                          else remote_entry)
+            else:
+                # No base entry to arbitrate: prefer the approved state.
+                chosen = remote_entry if local_pending else local_entry
+            if bool(chosen.get('pending', False)):
+                notes.append(f"link to {_branch_target(chosen) or '?'} "
+                             "re-flagged as pending")
+            else:
+                stats['links_approved'] += 1
         else:
             chosen = local_entry if prefer_local else remote_entry
         merged.append(copy.deepcopy(chosen))
@@ -449,9 +530,10 @@ def _rebind_local_anchors(entries, control_points, line_points):
         if entry['control_point_position'] != snapped:
             entry['control_point_position'] = snapped
         tangent = endpoint_tangent(line_points, snapped)
-        if not directions_compatible(entry.get('control_point_direction'),
-                                     tangent):
-            entry['control_point_direction'] = tangent
+        direction = _snapped_direction(entry.get('control_point_direction'),
+                                       tangent)
+        if entry.get('control_point_direction') != direction:
+            entry['control_point_direction'] = direction
     return entries, None
 
 
@@ -531,7 +613,7 @@ def merge_fibers(base, local, remote):
             return result
 
         owners = {region['owner'] for region in regions} - {'none'}
-        base_line = base.get('line_points', [])
+        base_line = base['line_points']
         local_line_changed = not _seq_eq(local['line_points'], base_line)
         remote_line_changed = not _seq_eq(remote['line_points'], base_line)
 
@@ -607,8 +689,8 @@ def merge_fibers(base, local, remote):
 
     stats['reoptimize'] = reoptimize
     result['peer_files'] = sorted(
-        {entry['branch_file'] for entry in links_to_any(merged)} |
-        {entry['branch_file'] for entry in links_to_any(base)})
+        {_branch_target(entry) for entry in links_to_any(merged)} |
+        {_branch_target(entry) for entry in links_to_any(base)})
     result.update(ok=True, merged=merged, notes=notes, stats=stats)
     return result
 
@@ -644,13 +726,27 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
             entry[key] = value
             out[doc_flag] = True
 
+    # Positions and directions are snapped BYTE-EXACT (to the control
+    # point's value / to +-recomputed tangent), never merely
+    # within-tolerance: the loader also compares stored-A against stored-B
+    # (reciprocity), and two fields each within tolerance of the truth can
+    # be 2x tolerance apart from each other. VC3D-written fields are
+    # already exact, so consistent pairs still see zero changes.
     def snap_position(entry, key, point, doc_flag):
-        if not pos_eq(entry.get(key), point):
-            set_field(entry, key, [float(x) for x in point], doc_flag)
+        set_field(entry, key, [float(x) for x in point], doc_flag)
 
     def snap_direction(entry, key, tangent, doc_flag):
-        if not directions_compatible(entry.get(key), tangent):
-            set_field(entry, key, tangent, doc_flag)
+        set_field(entry, key, _snapped_direction(entry.get(key), tangent),
+                  doc_flag)
+
+    def snap_pending(entry, desired, doc_flag):
+        if bool(entry.get('pending', False)) == desired:
+            return
+        if desired:
+            entry['pending'] = True
+        else:
+            entry.pop('pending', None)
+        out[doc_flag] = True
 
     for entry in a_entries:
         local_index = resolve_cp_index(a_cps, entry['control_point_position'])
@@ -704,6 +800,9 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
                           'b_changed')
             snap_direction(reciprocal, 'branch_control_point_direction', da,
                            'b_changed')
+            # Review state stays in lockstep on both refs, as VC3D keeps it.
+            snap_pending(reciprocal, bool(entry.get('pending', False)),
+                         'b_changed')
 
     # Pairs present in the base but absent from merged A were deleted by
     # the merge: mirror the deletion. Unrelated B->A entries (pairs A never
@@ -716,7 +815,7 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
             removed = 0
             for candidate in _branches_of(b):
                 if (_structured_branch(candidate) and
-                        candidate.get('branch_file') == a_name and
+                        _branch_target(candidate) == a_name and
                         pos_eq(candidate.get('control_point_position'),
                                base_entry.get('branch_control_point_position')) and
                         pos_eq(candidate.get('branch_control_point_position'),

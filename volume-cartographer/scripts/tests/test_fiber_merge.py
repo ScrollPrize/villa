@@ -7,6 +7,7 @@ those checks gets destroyed by an unmodified VC3D, so every clean-merge
 test runs its output through them.
 """
 import copy
+import math
 import os
 import sys
 
@@ -69,42 +70,123 @@ BASE_CPS = [cp(i) for i in range(8)]
 OTHER = [999.0, 999.0, 999.0]
 
 
+# --- independent mini-port of VC3D's load-time validation ----------------
+# Deliberately does NOT reuse fiber_merge's predicates: these are separate
+# implementations of the C++ (LineAnnotationController.cpp,
+# FiberSliceGeometry.cpp, Atlas.cpp) so a fiber_merge primitive that
+# drifts from the loader makes tests FAIL instead of drifting with it.
+
+_REQUIRED_BRANCH_KEYS = (
+    'control_point_index', 'branch_control_point_index',
+    'control_point_direction', 'branch_control_point_direction',
+    'control_point_position', 'branch_control_point_position', 'branch_file')
+
+
+def _l_finite(p):
+    return (isinstance(p, (list, tuple)) and len(p) == 3 and
+            all(isinstance(x, (int, float)) and not isinstance(x, bool) and
+                math.isfinite(x) for x in p))
+
+
+def _l_pos_eq(a, b, tol=1.0e-6):
+    """pointsApproximatelyEqual: EUCLIDEAN ball."""
+    if not _l_finite(a) or not _l_finite(b):
+        return False
+    return sum((x - y) ** 2 for x, y in zip(a, b)) <= tol * tol
+
+
+def _l_finite_direction(v):
+    """finiteDirection: finite and norm > 1e-12."""
+    return _l_finite(v) and math.sqrt(sum(x * x for x in v)) > 1.0e-12
+
+
+def _l_dirs_compatible(a, b, tol=1.0e-5):
+    """branchDirectionsCompatible: sign-agnostic, 1e-5 on |cos|."""
+    if not _l_finite_direction(a) or not _l_finite_direction(b):
+        return False
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    dot = sum((x / na) * (y / nb) for x, y in zip(a, b))
+    return abs(abs(dot) - 1.0) <= tol
+
+
+def _l_tangent(line, point):
+    """nearestLinePointIndex + tangentAtLinePosition."""
+    best, best_d2 = 0, float('inf')
+    for i, p in enumerate(line):
+        if not _l_finite(p):
+            continue
+        d2 = sum((x - y) ** 2 for x, y in zip(p, point))
+        if d2 < best_d2:
+            best_d2, best = d2, i
+    n = len(line)
+    lower = max(0, min(best, n - 1))
+    upper = min(lower + 1, n - 1)
+    if lower == upper and lower > 0:
+        lower -= 1
+    delta = [line[upper][k] - line[lower][k] for k in range(3)]
+    norm = math.sqrt(sum(x * x for x in delta))
+    if not math.isfinite(norm) or norm <= 1.0e-12:
+        return [1.0, 0.0, 0.0]
+    return [x / norm for x in delta]
+
+
+def _l_basename(name):
+    return name.rsplit('/', 1)[-1] if isinstance(name, str) else ''
+
+
 def loader_issues(docs_by_name):
-    """Mini-port of VC3D's load-time fiber validation. Returns a list of
-    issue strings; [] means an unmodified VC3D loads the set cleanly."""
+    """Independent mini-port of VC3D's load-time fiber validation. Returns
+    a list of issue strings; [] means an unmodified VC3D loads the set
+    cleanly and rewrites nothing destructive."""
     issues = []
     for name, doc in docs_by_name.items():
         cps = doc['control_points']
         line = doc['line_points']
+        for label, points in (('control point', cps), ('line point', line)):
+            for k, point in enumerate(points):
+                if not _l_finite(point):
+                    issues.append(f"{name}: non-finite {label} {k} (fatal)")
         # C1: control points must be an ordered subset of line_points
-        # within 1e-8 (validateFiberInputControlPoints) — fatal.
+        # within Euclidean 1e-8 (validateFiberInputControlPoints) — fatal.
         li = 0
         for k, point in enumerate(cps):
-            while li < len(line) and any(abs(line[li][j] - point[j]) > 1e-8
-                                         for j in range(3)):
+            while li < len(line) and not _l_pos_eq(line[li], point, tol=1.0e-8):
                 li += 1
             if li >= len(line):
                 issues.append(f"{name}: control point {k} not on line (fatal)")
                 break
             li += 1
         for entry in doc.get('branches', []):
-            if not isinstance(entry, dict) or 'control_point_index' not in entry:
+            # Parse-time stripping: the loader deletes (and rewrites the
+            # file without) entries it cannot parse — surfaced as issues so
+            # merge output never relies on that destruction.
+            if (not isinstance(entry, dict) or
+                    'link_direction' in entry or
+                    any(key not in entry for key in _REQUIRED_BRANCH_KEYS) or
+                    not _l_basename(entry['branch_file'])):
+                issues.append(f"{name}: branch entry stripped at parse time "
+                              "(file rewritten)")
+                continue
+            if (not _l_finite_direction(entry['control_point_direction']) or
+                    not _l_finite_direction(
+                        entry['branch_control_point_direction'])):
+                issues.append(f"{name}: non-finite branch direction")
                 continue
             i = entry['control_point_index']
-            if not (0 <= i < len(cps)):
+            if not (isinstance(i, int) and 0 <= i < len(cps)):
                 issues.append(f"{name}: local CP index out of range")
                 continue
-            if not fiber_merge.pos_eq(cps[i], entry['control_point_position']):
+            if not _l_pos_eq(cps[i], entry['control_point_position']):
                 issues.append(f"{name}: local CP position mismatch")
                 continue
             if len(line) >= 2:
-                tangent = fiber_merge.endpoint_tangent(
-                    line, entry['control_point_position'])
-                if not fiber_merge.directions_compatible(
-                        entry['control_point_direction'], tangent):
+                tangent = _l_tangent(line, entry['control_point_position'])
+                if not _l_dirs_compatible(entry['control_point_direction'],
+                                          tangent):
                     issues.append(f"{name}: branch endpoint direction mismatch")
                     continue
-            target = docs_by_name.get(entry['branch_file'])
+            target = docs_by_name.get(_l_basename(entry['branch_file']))
             if target is None:
                 issues.append(f"{name}: missing linked fiber "
                               f"{entry['branch_file']}")
@@ -112,35 +194,33 @@ def loader_issues(docs_by_name):
             tcps = target['control_points']
             tline = target['line_points']
             j = entry['branch_control_point_index']
-            if not (0 <= j < len(tcps)):
+            if not (isinstance(j, int) and 0 <= j < len(tcps)):
                 issues.append(f"{name}: linked CP index out of range")
                 continue
-            if not fiber_merge.pos_eq(tcps[j],
-                                      entry['branch_control_point_position']):
+            if not _l_pos_eq(tcps[j], entry['branch_control_point_position']):
                 issues.append(f"{name}: linked CP position mismatch")
                 continue
             if len(tline) >= 2:
-                tangent = fiber_merge.endpoint_tangent(
-                    tline, entry['branch_control_point_position'])
-                if not fiber_merge.directions_compatible(
+                tangent = _l_tangent(tline,
+                                     entry['branch_control_point_position'])
+                if not _l_dirs_compatible(
                         entry['branch_control_point_direction'], tangent):
                     issues.append(f"{name}: linked endpoint direction mismatch")
                     continue
             # C2: index-exact reciprocity, plus positions and directions
+            # compared STORED against STORED.
             reciprocal = any(
-                c.get('branch_file') == name and
+                _l_basename(c.get('branch_file')) == name and
                 c.get('control_point_index') == j and
                 c.get('branch_control_point_index') == i and
-                fiber_merge.pos_eq(c.get('control_point_position'),
-                                   entry['branch_control_point_position']) and
-                fiber_merge.pos_eq(c.get('branch_control_point_position'),
-                                   entry['control_point_position']) and
-                fiber_merge.directions_compatible(
-                    c.get('control_point_direction'),
-                    entry['branch_control_point_direction']) and
-                fiber_merge.directions_compatible(
-                    c.get('branch_control_point_direction'),
-                    entry['control_point_direction'])
+                _l_pos_eq(c.get('control_point_position'),
+                          entry['branch_control_point_position']) and
+                _l_pos_eq(c.get('branch_control_point_position'),
+                          entry['control_point_position']) and
+                _l_dirs_compatible(c.get('control_point_direction'),
+                                   entry['branch_control_point_direction']) and
+                _l_dirs_compatible(c.get('branch_control_point_direction'),
+                                   entry['control_point_direction'])
                 for c in target.get('branches', []) if isinstance(c, dict))
             if not reciprocal:
                 issues.append(f"{name}: missing reciprocal branch in "
@@ -531,20 +611,189 @@ def test_link_identity_is_tolerance_based_not_rounding_based():
     assert branches[0]['pending'] is False  # approval won
 
 
-def test_rebound_link_survives_pos_eq_but_not_euclidean_ball():
-    """Regression for the #1223 review bug: a link whose anchor matches a
-    merged control point per pos_eq (per-axis 1e-6) but not within a
-    Euclidean 1e-6 ball must be re-anchored, not dropped."""
+def test_pos_eq_metric_matches_loader():
+    """pos_eq must be the loader's Euclidean ball, not a per-axis box
+    (the PR #1246 review's M1: a box accepts positions up to sqrt(3)*tol
+    apart that the loader rejects)."""
+    a = [0.0, 0.0, 0.0]
+    box_corner = [8e-7, 8e-7, 8e-7]        # per-axis ok, Euclid 1.386e-6
+    inside = [5e-7, 5e-7, 5e-7]            # Euclid 8.66e-7
+    assert not fiber_merge.pos_eq(a, box_corner)
+    assert fiber_merge.pos_eq(a, inside)
+    assert fiber_merge.pos_eq(a, box_corner) == _l_pos_eq(a, box_corner)
+    assert fiber_merge.pos_eq(a, inside) == _l_pos_eq(a, inside)
+
+
+def test_jitter_beyond_euclidean_tolerance_conflicts_not_drops():
+    """Geometry jittered past the loader's Euclidean tolerance on one side
+    plus a link added on the other: the anchor cannot be resolved, so the
+    whole merge is a manual conflict — the link is neither dropped nor
+    written loader-broken (the #1246 review's M1 repro)."""
     base = make_fiber(BASE_CPS)
     jittered = [[p[0] + 8e-7, p[1] + 8e-7, p[2] + 8e-7] for p in BASE_CPS]
-    local = make_fiber(jittered, generation=2)  # "unchanged" per pos_eq
+    local = make_fiber(jittered, generation=2)
     local['tags'] = ['touched']
     remote = make_fiber(BASE_CPS,
                         branches=[link('kb_a.json', BASE_CPS[2], OTHER, 2)],
                         generation=2)
     result = merge_fibers(base, local, remote)
+    assert not result['ok']
+    assert any('absent from the merged geometry' in c
+               for c in result['conflicts'])
+
+
+def test_jitter_within_euclidean_tolerance_merges_and_snaps():
+    """The incident shape with sub-tolerance jitter on one side: the merge
+    succeeds, and the consistency pass snaps the loser-side link positions
+    BYTE-EXACT to the merged control points so the pair clears the real
+    loader (regression for M1's geometry_same repro)."""
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    base_a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
+
+    def jitter(p):
+        return [p[0] + 5e-7, p[1] + 5e-7, p[2] + 5e-7]  # Euclid 8.66e-7
+
+    local = copy.deepcopy(base_a)
+    local['control_points'] = [jitter(p) for p in local['control_points']]
+    local['line_points'] = [jitter(p) for p in local['line_points']]
+    local['branches'][0]['control_point_position'] = \
+        list(local['control_points'][2])                # VC3D snaps on save
+    local['generation'] = 3
+    remote = copy.deepcopy(base_a)
+    remote['branches'].append(
+        make_pair('a.json', 'b.json', BASE_CPS, b_cps, 4, 2)[0]['branches'][0])
+    remote['generation'] = 2
+
+    result = merge_fibers(base_a, local, remote)
     assert result['ok']
-    assert len(result['merged']['branches']) == 1
+    assert result['peer_files'] == ['b.json']
+    merged = result['merged']
+    # Carrier is the newer (jittered) side; both links survived
+    assert len(merged['branches']) == 2
+
+    out = refresh_pair_links(merged, b, 'a.json', 'b.json', base_doc=base_a)
+    assert out['ok']
+    fixed_a = out['a_doc']
+    for entry in fixed_a['branches']:
+        i = entry['control_point_index']
+        assert entry['control_point_position'] == fixed_a['control_points'][i]
+    assert loader_issues({'a.json': fixed_a, 'b.json': out['b_doc']}) == []
+
+
+def test_pairwise_direction_ratchet_is_closed():
+    """Two stored directions each within tolerance of the true tangent can
+    be 2x tolerance apart from EACH OTHER — which the loader's
+    stored-vs-stored reciprocity check rejects. The refresh must leave the
+    pair byte-identical up to sign, not merely each-within-tolerance
+    (the #1246 review's M2)."""
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
+
+    def rotated(direction, degrees):
+        axis = [0.0, 0.0, 1.0]  # orthogonal to the +x tangents used here
+        u = [axis[1] * direction[2] - axis[2] * direction[1],
+             axis[2] * direction[0] - axis[0] * direction[2],
+             axis[0] * direction[1] - axis[1] * direction[0]]
+        radians = math.radians(degrees)
+        return [math.cos(radians) * d + math.sin(radians) * x
+                for d, x in zip(direction, u)]
+
+    true_db = b['branches'][0]['control_point_direction']
+    plus = rotated(true_db, 0.2)
+    minus = rotated(true_db, -0.2)
+    # Each passes the loader's per-field check individually...
+    assert _l_dirs_compatible(plus, true_db)
+    assert _l_dirs_compatible(minus, true_db)
+    # ...but not against each other.
+    assert not _l_dirs_compatible(plus, minus)
+
+    a['branches'][0]['branch_control_point_direction'] = plus
+    b['branches'][0]['control_point_direction'] = minus
+    assert loader_issues({'a.json': a, 'b.json': b}) != []  # broken pair
+
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok'] and out['a_changed'] and out['b_changed']
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+def test_refresh_preserves_direction_sign():
+    """A stored direction that is exactly the NEGATED tangent is loader-
+    compatible and semantically meaningful; the refresh must not flip it."""
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
+    negated = [-x for x in a['branches'][0]['control_point_direction']]
+    a['branches'][0]['control_point_direction'] = list(negated)
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok'] and not out['a_changed']
+    assert out['a_doc']['branches'][0]['control_point_direction'] == negated
+
+
+def test_refresh_syncs_pending_on_existing_reciprocal():
+    """An approval applied by the merge must reach the peer's existing
+    reciprocal too — VC3D keeps the review state in lockstep on both
+    refs."""
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1, pending=True)
+    a['branches'][0].pop('pending')          # merged A carries the approval
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok'] and out['b_changed']
+    assert not out['b_doc']['branches'][0].get('pending', False)
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+
+
+def test_branch_file_compared_as_basename():
+    """The loader normalizes branch_file to its basename; a legacy
+    'fibers/x.json' entry must be treated as the same peer."""
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
+    a['branches'][0]['branch_file'] = 'fibers/b.json'
+    assert fiber_merge.links_to(a, 'b.json') == a['branches']
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok'] and not out['b_changed']
+    base = make_fiber(BASE_CPS, branches=[copy.deepcopy(a['branches'][0])])
+    local = make_fiber_with_marker(base)
+    remote = copy.deepcopy(base)
+    remote['tags'] = ['other']
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['peer_files'] == ['b.json']
+
+
+def test_reflag_beats_untouched_approval():
+    """Base-aware review-state merge: deliberately re-flagging an approved
+    link on one side beats the untouched approval on the other."""
+    approved = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=False)
+    reflagged = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
+    base = make_fiber(BASE_CPS, branches=[approved])
+    local = make_fiber(BASE_CPS, branches=[reflagged], generation=2)
+    remote = make_fiber(BASE_CPS, branches=[approved], tags=['x'], generation=2)
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['branches'][0]['pending'] is True
+    assert result['stats']['links_approved'] == 0
+
+
+@pytest.mark.parametrize('mutation', [
+    {'generation': 'x'},
+    {'generation': [1]},
+    {'control_points': [['a', 0, 0]]},
+    {'control_points': [[float('nan'), 0.0, 0.0]]},
+    {'tags': [{'k': 1}]},
+    {'tags': 'foo'},
+])
+def test_malformed_docs_are_rejected_not_crashes(mutation):
+    """Remote-controlled malformed input must degrade to a conflict (so
+    vc_sync falls back to manual resolution), never raise (the #1246
+    review's M6 crash inputs)."""
+    doc = make_fiber(BASE_CPS)
+    doc.update(mutation)
+    assert not fiber_merge.is_fiber_doc(doc)
+    good = make_fiber(BASE_CPS, tags=['x'])
+    other = make_fiber(BASE_CPS, tags=['y'])
+    result = merge_fibers(doc, good, other)
+    assert not result['ok']
+    out = refresh_pair_links(doc, good, 'a.json', 'b.json')
+    assert not out['ok']
 
 
 # --- refresh_pair_links: the cross-file consistency pass ------------------

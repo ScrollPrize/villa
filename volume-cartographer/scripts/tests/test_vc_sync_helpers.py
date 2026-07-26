@@ -313,8 +313,7 @@ class TestConflictStash:
         # Tracked md5 differs from current content
         track_row(manager, 'fibers/f.json', info['local_size'], 0.0,
                   10, 'e' * 32, 'a' * 32)
-        manager._stash_divergent_download_targets(
-            ['fibers/f.json'], {'fibers/f.json': info})
+        manager._stash_divergent_download_targets(['fibers/f.json'])
         stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
         stashed = [f for _, _, fs in os.walk(stash_root) for f in fs]
         assert len(stashed) == 1
@@ -324,10 +323,23 @@ class TestConflictStash:
         info = local_info(manager, 'fibers/f.json')
         track_row(manager, 'fibers/f.json', info['local_size'], 0.0,
                   10, 'e' * 32, info['local_md5'])
-        manager._stash_divergent_download_targets(
-            ['fibers/f.json'], {'fibers/f.json': info})
+        manager._stash_divergent_download_targets(['fibers/f.json'])
         assert not os.path.exists(
             os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME))
+
+    def test_edit_after_scan_is_still_stashed(self, manager):
+        """The divergence check hashes at stash time, not scan time: an
+        edit made during the (long) interactive prompt phase must still be
+        preserved before the download overwrites it."""
+        write_local(manager, 'fibers/f.json', '{"v": 1}')
+        info = local_info(manager, 'fibers/f.json')
+        track_row(manager, 'fibers/f.json', info['local_size'], 0.0,
+                  10, 'e' * 32, info['local_md5'])  # clean at scan time
+        write_local(manager, 'fibers/f.json', '{"v": 2}')  # edited afterwards
+        manager._stash_divergent_download_targets(['fibers/f.json'])
+        stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
+        stashed = [f for _, _, fs in os.walk(stash_root) for f in fs]
+        assert len(stashed) == 1
 
 
 class TestAutoMerge:
@@ -755,3 +767,155 @@ class TestLinkConsistency:
         fixed = peer_fixes['fibers/b.json']
         assert fixed['generation'] == 5  # based on the remote doc
         assert fixed['branches'][0]['branch_file'] == 'a.json'
+
+
+class TestAnalyzeDeleteActions:
+    """The tracked delete-vs-download decision — historically the dangerous
+    class in this tool — pinned explicitly."""
+
+    def test_tracked_local_deletion_proposes_remote_delete(self, manager):
+        track_row(manager, 'f.json', 10, 0.0, 10, 'e' * 32)
+        actions = manager.analyze_changes({}, {'f.json': s3_info(10, 'e' * 32)})
+        assert actions['f.json'][0] == SyncAction.DELETE_REMOTE
+
+    def test_untracked_s3_only_file_downloads(self, manager):
+        actions = manager.analyze_changes({}, {'f.json': s3_info(10, 'e' * 32)})
+        assert actions['f.json'][0] == SyncAction.DOWNLOAD
+
+    def test_tracked_s3_deletion_proposes_local_delete(self, manager):
+        write_local(manager, 'f.json', '{"a": 1}')
+        info = local_info(manager, 'f.json')
+        track_row(manager, 'f.json', info['local_size'], info['local_mtime'],
+                  info['local_size'], 'e' * 32, info['local_md5'])
+        actions = manager.analyze_changes({'f.json': info}, {})
+        assert actions['f.json'][0] == SyncAction.DELETE_LOCAL
+
+    def test_untracked_local_only_file_uploads(self, manager):
+        write_local(manager, 'f.json', '{"a": 1}')
+        info = local_info(manager, 'f.json')
+        actions = manager.analyze_changes({'f.json': info}, {})
+        assert actions['f.json'][0] == SyncAction.UPLOAD
+
+    def test_deleted_from_both_skips(self, manager):
+        track_row(manager, 'f.json', 10, 0.0, 10, 'e' * 32)
+        actions = manager.analyze_changes({}, {})
+        assert actions['f.json'][0] == SyncAction.SKIP
+
+
+class TestOldSchemaMigration:
+    def test_rows_survive_with_null_md5(self, tmp_path):
+        """A genuinely old DB (no local_md5 column, legacy idx_path index)
+        must migrate in place: column added, rows intact with NULL md5."""
+        config = {'s3_bucket': 'b', 's3_prefix': 'p', 'aws_profile': None,
+                  'last_updated': 'x'}
+        (tmp_path / '.s3sync.json').write_text(json.dumps(config))
+        db_file = tmp_path / '.s3sync.db'
+        with sqlite3.connect(db_file) as conn:
+            conn.execute('''CREATE TABLE files
+                            (path TEXT PRIMARY KEY, local_size INTEGER,
+                             local_mtime REAL, s3_size INTEGER,
+                             s3_mtime REAL, s3_etag TEXT)''')
+            conn.execute('CREATE INDEX idx_path ON files(path)')
+            conn.execute('INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)',
+                         ('old.json', 5, 1.0, 5, 2.0, 'e' * 32))
+        manager = S3SyncManager(str(tmp_path))
+        with sqlite3.connect(manager.db_file) as conn:
+            cols = {row[1] for row in conn.execute('PRAGMA table_info(files)')}
+            row = conn.execute(
+                'SELECT path, s3_etag, local_md5 FROM files').fetchone()
+        assert 'local_md5' in cols
+        assert row == ('old.json', 'e' * 32, None)
+
+
+class TestStagingPath:
+    def test_staged_files_are_ignored_by_scans(self):
+        """A crash between staging and os.replace must not leave a file the
+        next sync would upload as a new object."""
+        staged = S3SyncManager._staging_path('fibers/proj/f.json')
+        assert S3SyncManager._is_ignored(staged)
+
+
+class TestDemotionFixpoint:
+    """_plan_conflict_resolutions: demotions from link-consistency planning
+    must feed back into the blocked-peer cascade (the #1246 review's M3 —
+    a peer fix must never override a user's manual conflict choice)."""
+
+    CPS = TestLinkConsistency.CPS_A
+
+    def make_plan_for(self, manager, path, peers):
+        doc = TestLinkConsistency.fiber(os.path.basename(path), self.CPS)
+        pending = manager._merge_tmp_path(path, '.merged')
+        with open(pending, 'w') as f:
+            json.dump(doc, f)
+        return {'pending': pending, 'remote_tmp': None, 'summary': 's',
+                'merged_doc': doc,
+                'base_doc': TestLinkConsistency.fiber(os.path.basename(path),
+                                                      self.CPS),
+                'peer_files': peers}
+
+    def test_plan_demotion_cascades_to_dependents(self, manager, monkeypatch):
+        """A merges with peer B; B's own merge demotes (its peer C is
+        missing). B becoming manual must demote A too — no peer fix may be
+        computed for B from stale content."""
+        plans = {
+            'fibers/a.json': self.make_plan_for(manager, 'fibers/a.json',
+                                                ['b.json']),
+            'fibers/b.json': self.make_plan_for(manager, 'fibers/b.json',
+                                                ['c.json']),  # c missing
+        }
+        write_local(manager, 'fibers/a.json', json.dumps(plans['fibers/a.json']['merged_doc']))
+        write_local(manager, 'fibers/b.json', json.dumps(plans['fibers/b.json']['merged_doc']))
+        monkeypatch.setattr(manager, '_attempt_auto_merge',
+                            lambda path, li, si: plans[path])
+        conflicts = [('fibers/a.json', 'both changed'),
+                     ('fibers/b.json', 'both changed')]
+        pending, peer_fixes, manual = manager._plan_conflict_resolutions(
+            conflicts, {}, {}, set(), set(), auto_merge=True)
+        assert pending == []
+        assert peer_fixes == {}
+        assert sorted(p for p, _ in manual) == ['fibers/a.json',
+                                                'fibers/b.json']
+
+    def test_manual_peer_blocks_merge_upfront(self, manager, monkeypatch):
+        plans = {'fibers/a.json': self.make_plan_for(manager, 'fibers/a.json',
+                                                     ['b.json'])}
+        write_local(manager, 'fibers/a.json',
+                    json.dumps(plans['fibers/a.json']['merged_doc']))
+        write_local(manager, 'fibers/b.json', 'not-json')
+
+        def attempt(path, li, si):
+            return plans.get(path)
+
+        monkeypatch.setattr(manager, '_attempt_auto_merge', attempt)
+        conflicts = [('fibers/a.json', 'both changed'),
+                     ('fibers/b.json', 'both changed')]
+        pending, peer_fixes, manual = manager._plan_conflict_resolutions(
+            conflicts, {}, {}, set(), set(), auto_merge=True)
+        assert pending == [] and peer_fixes == {}
+        assert {p for p, _ in manual} == {'fibers/a.json', 'fibers/b.json'}
+
+    def test_partial_peer_failure_rolls_back_fixes(self, manager):
+        """Two peers, second missing: the first peer's tentative fix must
+        not leak into peer_fixes when the merge demotes."""
+        a = TestLinkConsistency.fiber(
+            'a.json', TestLinkConsistency.CPS_A,
+            branches=[TestLinkConsistency.entry(
+                          'b.json', TestLinkConsistency.CPS_A, 1,
+                          TestLinkConsistency.CPS_B, 0),
+                      TestLinkConsistency.entry(
+                          'c.json', TestLinkConsistency.CPS_A, 0,
+                          TestLinkConsistency.CPS_B, 1)])
+        b = TestLinkConsistency.fiber('b.json', TestLinkConsistency.CPS_B)
+        write_local(manager, 'fibers/b.json', json.dumps(b))  # c.json missing
+        pending = manager._merge_tmp_path('fibers/a.json', '.merged')
+        with open(pending, 'w') as f:
+            json.dump(a, f)
+        plan = {'pending': pending, 'remote_tmp': None, 'summary': 's',
+                'merged_doc': a,
+                'base_doc': TestLinkConsistency.fiber(
+                    'a.json', TestLinkConsistency.CPS_A),
+                'peer_files': ['b.json', 'c.json']}
+        peer_fixes, demoted = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert demoted and demoted[0][0] == 'fibers/a.json'
+        assert peer_fixes == {}

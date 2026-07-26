@@ -146,6 +146,11 @@ struct LineAnnotationController::LineAnnotationSession {
     bool suppressFiberSave = false;
     bool suppressGeneratedViews = false;
     bool suppressErrorDialogs = false;
+    // True once the optimizer actually ran in this session (async or the
+    // synchronous save-time finalize). Gates the needs_reoptimization tag
+    // strip on save: a session whose line is still the loaded placeholder
+    // must keep the tag.
+    bool lineWasOptimized = false;
     LineAnnotationController::SessionOptimizationState optimizationState =
         LineAnnotationController::SessionOptimizationState::Unoptimized;
     LineAnnotationController::SessionOptimizationState pendingOptimizationState =
@@ -6789,6 +6794,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
 
     auto* pane = paneForSurface(session.surfaceName);
     session.taskState = LineAnnotationSession::TaskState::Succeeded;
+    session.lineWasOptimized = true;
     session.seedPoint = task.seedPoint;
     session.selectedManifestPath = task.manifestPath;
     session.optimizationReport = task.result.report;
@@ -7886,8 +7892,15 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     if (anyTaggedForReopt && !_reoptimizationPromptPending) {
         _reoptimizationPromptPending = true;
         QTimer::singleShot(0, this, [this]() {
-            _reoptimizationPromptPending = false;
+            // Cleared only AFTER the prompt/work finishes: a fiber reload
+            // during the modal (agent bridge, imports) must not schedule a
+            // second prompt over files whose tag-strip saves are still in
+            // flight.
+            const QPointer<LineAnnotationController> alive(this);
             promptReoptimizationForMergedFibers();
+            if (alive) {
+                _reoptimizationPromptPending = false;
+            }
         });
     }
 }
@@ -7930,9 +7943,10 @@ void LineAnnotationController::promptReoptimizationForMergedFibers()
     auto* reoptimizeButton =
         prompt.addButton(tr("Re-optimize now"), QMessageBox::AcceptRole);
     prompt.addButton(tr("Not now"), QMessageBox::RejectRole);
-    prompt.setDefaultButton(qobject_cast<QPushButton*>(reoptimizeButton));
+    prompt.setDefaultButton(reoptimizeButton);
+    const QPointer<LineAnnotationController> alive(this);
     prompt.exec();
-    if (prompt.clickedButton() != reoptimizeButton) {
+    if (!alive || prompt.clickedButton() != reoptimizeButton) {
         return;
     }
     reoptimizeMergedFibers(tagged);
@@ -7947,6 +7961,16 @@ void LineAnnotationController::reoptimizeMergedFibers(
                    tags.end());
     };
 
+    // One dataset/sampler serves the whole batch; failing to resolve it
+    // (or cancelling the picker) aborts the batch instead of prompting
+    // once per fiber.
+    std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
+    std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
+    fs::path manifestPath;
+    std::string datasetLocation;
+    double workingToBaseScale = 1.0;
+
+    const QPointer<LineAnnotationController> alive(this);
     int reoptimized = 0;
     bool taggedOnlySaves = false;
     for (const uint64_t fiberId : fiberIds) {
@@ -7956,9 +7980,19 @@ void LineAnnotationController::reoptimizeMergedFibers(
         if (it == _fibers.end()) {
             continue;
         }
+        // The ids were collected before a modal prompt, and runtime ids
+        // are densely reassigned on every fiber reload — anything we touch
+        // must still carry the tag, or it is not ours to re-optimize.
+        if (std::find(it->tags.begin(), it->tags.end(),
+                      kNeedsReoptimizationTag) == it->tags.end()) {
+            continue;
+        }
+        // saveSessionAsFiber below can grow _fibers (invalidating `it`).
+        const std::string fileName = it->fileName;
         if (it->controlPoints.size() < 2 || it->linePoints.size() < 2) {
             // No line to fit; just clear the tag.
             stripReoptimizationTag(it->tags);
+            it->needsSave = false;
             scheduleFiberSave(*it);
             taggedOnlySaves = true;
             continue;
@@ -7977,7 +8011,34 @@ void LineAnnotationController::reoptimizeMergedFibers(
         stripReoptimizationTag(session->fiberTags);
         // Arms finalizeSessionOptimizationSynchronously inside the save.
         session->optimizationState = SessionOptimizationState::Unoptimized;
+        if (!dataset) {
+            if (!ensureDatasetForSession(*session) || !alive) {
+                if (alive) {
+                    Logger()->warn("Re-optimization aborted: no usable "
+                                   "Lasagna dataset; the {} tag(s) are kept "
+                                   "for the next load",
+                                   kNeedsReoptimizationTag);
+                }
+                return;
+            }
+            dataset = session->dataset;
+            sampler = session->normalSampler;
+            manifestPath = session->selectedManifestPath;
+            datasetLocation = session->selectedDatasetLocation;
+            workingToBaseScale = session->workingToBaseScale;
+        } else {
+            // Pre-seeded so ensureDatasetForSession (inside the finalize)
+            // reuses it instead of reopening per fiber.
+            session->dataset = dataset;
+            session->normalSampler = sampler;
+            session->selectedManifestPath = manifestPath;
+            session->selectedDatasetLocation = datasetLocation;
+            session->workingToBaseScale = workingToBaseScale;
+        }
         saveSessionAsFiber(*session);
+        if (!alive) {
+            return;
+        }
         if (session->optimizationState == SessionOptimizationState::Optimized) {
             ++reoptimized;
         } else {
@@ -7985,13 +8046,16 @@ void LineAnnotationController::reoptimizeMergedFibers(
             // on disk so the next load offers a retry.
             Logger()->warn("Re-optimization failed for fiber {}; keeping the "
                            "{} tag for a retry on next load",
-                           it->fileName,
+                           fileName,
                            kNeedsReoptimizationTag);
         }
     }
     if (reoptimized > 0) {
         Logger()->info("Re-optimized {} merged fiber(s)", reoptimized);
         waitForFiberSaves();
+        if (!alive) {
+            return;
+        }
     }
     if (taggedOnlySaves) {
         emitFiberSummaries();
@@ -9848,6 +9912,16 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
     try {
         if (!finalizeSessionOptimizationSynchronously(session, false)) {
             return;
+        }
+        if (session.lineWasOptimized) {
+            // The line being saved was produced by the optimizer in this
+            // session, so any sync-applied needs_reoptimization tag is
+            // satisfied. Without this, an ordinary pane save would write
+            // the tag back and re-trigger the load-time prompt forever.
+            session.fiberTags.erase(
+                std::remove(session.fiberTags.begin(), session.fiberTags.end(),
+                            std::string{kNeedsReoptimizationTag}),
+                session.fiberTags.end());
         }
         ensureSessionFiberIdentity(session);
         const BranchMetadataSyncResult branchSync =
