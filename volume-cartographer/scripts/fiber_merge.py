@@ -1,0 +1,762 @@
+"""Three-way merge for VC3D fiber annotation JSON files.
+
+Pure functions over parsed JSON dicts — no I/O, no S3 knowledge. vc_sync
+imports this to auto-resolve conflicts where both machines changed a fiber
+file since their last common synced version (the "base").
+
+Design contract: merge output must load cleanly in an UNMODIFIED VC3D,
+whose loader is strict and destructive (offering to delete inconsistent
+branch links from disk, or dropping whole fibers from the session). The
+invariants, from LineAnnotationController.cpp / Atlas.cpp:
+
+- C1: every control point must appear in line_points, in order, within
+  1e-8 (validateFiberInputControlPoints); violating this makes the whole
+  file unloadable. Consequence: control_points and line_points must always
+  be written as a consistent pair from the same source.
+- C2: cross-fiber link reciprocity is index-exact across files, plus
+  positions (1e-6) and directions.
+- C3: stored link directions must match tangents recomputed from
+  line_points within ~0.26 deg (branchDirectionsCompatible, 1e-5 on
+  |cos theta|).
+
+Merge semantics:
+
+- Same geometry on both sides (the incident case — divergent link edits):
+  geometry and derived fields come wholesale from the newer-generation
+  side; branches merge with set semantics (additions from both sides
+  survive, base-aware deletions, approvals beat both pending and
+  deletion); tags merge base-aware. Loader-safe because every branch
+  entry was written by VC3D against this exact geometry.
+- Geometry changed on ONE side (including line-only re-optimizations):
+  that side's control_points/line_points/hv are taken wholesale (C1 by
+  construction); links from the other side are re-anchored by position.
+- Geometry changed on BOTH sides in disjoint regions: control_points
+  merge via diff3 (position-aligned against the base; overlapping edits
+  conflict). The optimizer cannot run here, so line_points is set to the
+  merged control points verbatim (C1 holds exactly) and the merged fiber
+  is tagged `needs_reoptimization`; VC3D offers to re-fit the line on
+  load.
+- A link whose anchor control point was deleted by the merged geometry
+  makes the whole merge a conflict: links are never silently dropped.
+- After any merge that involves links, the caller must run
+  refresh_pair_links() against each peer file (C2/C3): vc_sync mirrors
+  the merged fiber's link decisions into the peers and uploads them.
+
+A merge either succeeds cleanly or reports conflicts; it never guesses on
+overlapping edits. Callers keep pre-merge copies of every input.
+"""
+
+import copy
+import json
+import math
+
+POS_TOL = 1.0e-6
+
+# Matches finiteDirection's epsilon guard: a vector this short has no
+# usable direction.
+_DIR_EPS = 1.0e-12
+
+REOPTIMIZE_TAG = 'needs_reoptimization'
+# ^ consumed by VC3D's load-time re-optimization prompt; keep the literal
+#   in sync with kNeedsReoptimizationTag in LineAnnotationController.cpp.
+
+
+def is_fiber_doc(doc):
+    return (isinstance(doc, dict) and
+            doc.get('type') == 'vc3d_fiber' and
+            isinstance(doc.get('control_points'), list) and
+            isinstance(doc.get('line_points'), list))
+
+
+def pos_eq(a, b, tol=POS_TOL):
+    try:
+        return (len(a) == 3 and len(b) == 3 and
+                all(math.isfinite(x) and math.isfinite(y) and abs(x - y) <= tol
+                    for x, y in zip(a, b)))
+    except TypeError:
+        return False
+
+
+def _seq_eq(a, b):
+    return len(a) == len(b) and all(pos_eq(x, y) for x, y in zip(a, b))
+
+
+def _dist2(a, b):
+    return sum((float(x) - float(y)) ** 2 for x, y in zip(a, b))
+
+
+def _finite_point(p):
+    try:
+        return len(p) == 3 and all(math.isfinite(float(x)) for x in p)
+    except (TypeError, ValueError):
+        return False
+
+
+def _normalized(v):
+    """Unit vector, or None when the input is non-finite or ~zero
+    (mirrors normalizedOrZero + finiteDirection)."""
+    if not _finite_point(v):
+        return None
+    n = math.sqrt(sum(float(x) * float(x) for x in v))
+    if n <= _DIR_EPS:
+        return None
+    return [float(x) * (1.0 / n) for x in v]
+
+
+def directions_compatible(a, b, tol=1.0e-5):
+    """Port of branchDirectionsCompatible: sign-agnostic, 1e-5 on
+    |cos theta| (~0.26 deg)."""
+    na = _normalized(a)
+    nb = _normalized(b)
+    if na is None or nb is None:
+        return False
+    dot = sum(x * y for x, y in zip(na, nb))
+    return abs(abs(dot) - 1.0) <= tol
+
+
+# --- exact ports of VC3D's endpoint tangent computation -------------------
+# VC3D validates stored link directions against tangents it recomputes from
+# line_points; producing directions with the same algorithm on the same
+# data guarantees agreement well inside the 0.26 deg tolerance.
+
+def nearest_line_point_index(line, point):
+    """Port of fiber_slice::nearestLinePointIndex: first-wins argmin of
+    squared distance, skipping non-finite points."""
+    best_index = 0
+    best_d2 = math.inf
+    for i, p in enumerate(line):
+        if not _finite_point(p):
+            continue
+        d2 = _dist2(p, point)
+        if d2 < best_d2:
+            best_d2 = d2
+            best_index = i
+    return best_index
+
+
+def line_tangent_at(line, index):
+    """Port of tangentAtLinePosition for an integer position: segment
+    tangent at `index`, unit length, with VC3D's {1,0,0} degenerate
+    fallback."""
+    n = len(line)
+    lower = max(0, min(int(index), n - 1))
+    upper = min(lower + 1, n - 1)
+    if lower == upper and lower > 0:
+        lower -= 1
+    tangent = _normalized([float(line[upper][k]) - float(line[lower][k])
+                           for k in range(3)])
+    return tangent if tangent is not None else [1.0, 0.0, 0.0]
+
+
+def endpoint_tangent(line, point):
+    """Port of endpointTangentFromLinePoints: tangent of the line segment
+    nearest to `point`, or None when the line has fewer than 2 points."""
+    if len(line) < 2 or not _finite_point(point):
+        return None
+    return line_tangent_at(line, nearest_line_point_index(line, point))
+
+
+def resolve_cp_index(control_points, position):
+    """Index of the control point pos_eq-equal to `position` (nearest when
+    several qualify), or None. This is the loader's own position predicate
+    — NOT a tighter Euclidean ball, which would drop links the loader
+    would accept."""
+    best_index = None
+    best_d2 = math.inf
+    for i, cp in enumerate(control_points):
+        if pos_eq(cp, position):
+            d2 = _dist2(cp, position)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_index = i
+    return best_index
+
+
+def _lcs_matches(base, side):
+    """Longest common subsequence of positions; returns [(base_i, side_j)]."""
+    n, m = len(base), len(side)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        row = dp[i]
+        below = dp[i + 1]
+        for j in range(m - 1, -1, -1):
+            if pos_eq(base[i], side[j]):
+                row[j] = below[j + 1] + 1
+            else:
+                row[j] = below[j] if below[j] >= row[j + 1] else row[j + 1]
+    matches = []
+    i = j = 0
+    while i < n and j < m:
+        if pos_eq(base[i], side[j]):
+            matches.append((i, j))
+            i += 1
+            j += 1
+        elif dp[i + 1][j] >= dp[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return matches
+
+
+def merge_control_points(base, local, remote):
+    """Diff3 over point sequences.
+
+    Returns (merged, regions, conflicts). regions is one entry per
+    inter-anchor gap: {'owner': none|local|remote|both|conflict,
+    'local': (lo, hi), 'remote': (lo, hi)} with half-open side index
+    ranges (exclusive of the surrounding anchors).
+    """
+    match_local = _lcs_matches(base, local)
+    match_remote = _lcs_matches(base, remote)
+    map_local = dict(match_local)
+    map_remote = dict(match_remote)
+    anchors = [bi for bi, _ in match_local if bi in map_remote]
+
+    bounds = ([(-1, -1, -1)] +
+              [(a, map_local[a], map_remote[a]) for a in anchors] +
+              [(len(base), len(local), len(remote))])
+
+    merged = []
+    regions = []
+    conflicts = []
+    for k in range(len(bounds) - 1):
+        b0, l0, r0 = bounds[k]
+        b1, l1, r1 = bounds[k + 1]
+        base_seg = base[b0 + 1:b1]
+        local_seg = local[l0 + 1:l1]
+        remote_seg = remote[r0 + 1:r1]
+        local_changed = not _seq_eq(local_seg, base_seg)
+        remote_changed = not _seq_eq(remote_seg, base_seg)
+
+        if local_changed and remote_changed:
+            if _seq_eq(local_seg, remote_seg):
+                owner, seg = 'both', local_seg
+            else:
+                owner, seg = 'conflict', base_seg
+                conflicts.append(
+                    "control_points: both sides changed base points "
+                    f"{b0 + 1}..{max(b0 + 1, b1 - 1)} differently "
+                    f"(local {len(local_seg)} pts, remote {len(remote_seg)} pts)")
+        elif local_changed:
+            owner, seg = 'local', local_seg
+        elif remote_changed:
+            owner, seg = 'remote', remote_seg
+        else:
+            owner, seg = 'none', base_seg
+
+        merged.extend(seg)
+        regions.append({'owner': owner,
+                        'local': (l0 + 1, l1),
+                        'remote': (r0 + 1, r1)})
+        if b1 < len(base):
+            # Anchor point itself: all three agree within tolerance.
+            merged.append(local[l1])
+
+    return merged, regions, conflicts
+
+
+def _branches_of(doc):
+    branches = doc.get('branches', [])
+    return branches if isinstance(branches, list) else []
+
+
+def _valid_vec3(value):
+    try:
+        return (len(value) == 3 and
+                all(isinstance(x, (int, float)) and math.isfinite(x)
+                    for x in value))
+    except TypeError:
+        return False
+
+
+def _structured_branch(branch):
+    """A branch entry this module understands well enough to merge."""
+    return (isinstance(branch, dict) and
+            isinstance(branch.get('branch_file'), str) and
+            _valid_vec3(branch.get('control_point_position')) and
+            _valid_vec3(branch.get('branch_control_point_position')))
+
+
+def split_branches(doc):
+    """(structured, opaque) partition of a document's branch entries.
+
+    Opaque entries (non-objects, missing or malformed fields) are data
+    this module cannot interpret; they are preserved as-is and merged
+    only by whole-value comparison — never silently dropped."""
+    structured = []
+    opaque = []
+    for branch in _branches_of(doc):
+        (structured if _structured_branch(branch) else opaque).append(branch)
+    return structured, opaque
+
+
+def links_to(doc, peer_name):
+    """Structured branch entries of `doc` that point at `peer_name`."""
+    return [entry for entry in _branches_of(doc)
+            if _structured_branch(entry) and entry['branch_file'] == peer_name]
+
+
+def links_to_any(doc):
+    """All structured branch entries of a document."""
+    return [entry for entry in _branches_of(doc) if _structured_branch(entry)]
+
+
+def _canon_opaque(entries):
+    return sorted(json.dumps(entry, sort_keys=True) for entry in entries)
+
+
+def merge_opaque_branches(base_opaque, local_opaque, remote_opaque):
+    """Whole-value base-aware merge of uninterpretable branch entries.
+    Returns (merged_entries, conflict_message_or_None)."""
+    if _canon_opaque(local_opaque) == _canon_opaque(remote_opaque):
+        return copy.deepcopy(local_opaque), None
+    if _canon_opaque(local_opaque) == _canon_opaque(base_opaque):
+        return copy.deepcopy(remote_opaque), None
+    if _canon_opaque(remote_opaque) == _canon_opaque(base_opaque):
+        return copy.deepcopy(local_opaque), None
+    return [], ("branches: structurally unparseable entries differ between "
+                "local and remote; refusing to merge them")
+
+
+def _same_link(a, b):
+    """Tolerant link identity: same target file and both endpoint positions
+    within POS_TOL — the same geometric predicate used for control-point
+    alignment."""
+    return (a.get('branch_file') == b.get('branch_file') and
+            pos_eq(a.get('control_point_position'),
+                   b.get('control_point_position')) and
+            pos_eq(a.get('branch_control_point_position'),
+                   b.get('branch_control_point_position')))
+
+
+def _find_link(entries, branch, used):
+    for i, entry in enumerate(entries):
+        if i not in used and _same_link(entry, branch):
+            return i
+    return None
+
+
+def _link_modified(entry, base_entry):
+    """The review state is the meaningful mutable field on a link; indices
+    and directions are derived and re-resolved elsewhere."""
+    return (bool(entry.get('pending', False)) !=
+            bool(base_entry.get('pending', False)))
+
+
+def merge_branches(base_doc, local_doc, remote_doc, prefer_local):
+    """Base-aware set merge of structured link entries. Additions from
+    either side survive; untouched-here-but-gone-there means deletion;
+    approving a link beats deleting it; pending=False wins over
+    pending=True for the same link. Local anchor indices are NOT touched
+    here — the caller re-anchors entries against the merged geometry."""
+    base_entries, _ = split_branches(base_doc)
+    local_entries, _ = split_branches(local_doc)
+    remote_entries, _ = split_branches(remote_doc)
+
+    merged = []
+    notes = []
+    stats = {'links_kept': 0, 'links_added_local': 0, 'links_added_remote': 0,
+             'links_deleted': 0, 'links_approved': 0}
+    used_remote = set()
+    used_base = set()
+
+    def base_match(branch):
+        index = _find_link(base_entries, branch, used_base)
+        if index is None:
+            return None
+        used_base.add(index)
+        return base_entries[index]
+
+    def merge_one_sided(entry, side_name):
+        base_entry = base_match(entry)
+        if base_entry is None:
+            merged.append(copy.deepcopy(entry))
+            stats['links_added_%s' % side_name] += 1
+            return
+        # Present in base, gone from the other side: deletion unless this
+        # side meaningfully modified it (approving a link beats deleting it).
+        if not _link_modified(entry, base_entry):
+            stats['links_deleted'] += 1
+            notes.append(f"link to {entry.get('branch_file', '?')} deleted on "
+                         f"{'remote' if side_name == 'local' else 'local'}")
+            return
+        merged.append(copy.deepcopy(entry))
+        notes.append(f"kept link to {entry.get('branch_file', '?')} modified "
+                     f"on {side_name} but deleted on the other side")
+        stats['links_kept'] += 1
+
+    for local_entry in local_entries:
+        remote_index = _find_link(remote_entries, local_entry, used_remote)
+        if remote_index is None:
+            merge_one_sided(local_entry, 'local')
+            continue
+        used_remote.add(remote_index)
+        base_match(local_entry)  # consume the base entry, if any
+        remote_entry = remote_entries[remote_index]
+        local_pending = bool(local_entry.get('pending', False))
+        remote_pending = bool(remote_entry.get('pending', False))
+        if local_pending != remote_pending:
+            # Approval (pending -> absent/False) always wins.
+            chosen = remote_entry if local_pending else local_entry
+            stats['links_approved'] += 1
+        else:
+            chosen = local_entry if prefer_local else remote_entry
+        merged.append(copy.deepcopy(chosen))
+        stats['links_kept'] += 1
+
+    for i, remote_entry in enumerate(remote_entries):
+        if i not in used_remote:
+            merge_one_sided(remote_entry, 'remote')
+
+    return merged, notes, stats
+
+
+def merge_tags(base_doc, local_doc, remote_doc):
+    base = list(base_doc.get('tags', []) or [])
+    local = list(local_doc.get('tags', []) or [])
+    remote = list(remote_doc.get('tags', []) or [])
+    base_set, local_set, remote_set = set(base), set(local), set(remote)
+
+    def keep(tag):
+        return ((tag in local_set and tag in remote_set) or
+                (tag in local_set and tag not in base_set) or
+                (tag in remote_set and tag not in base_set))
+
+    merged = [t for t in base if keep(t)]
+    merged += [t for t in local if keep(t) and t not in merged]
+    merged += [t for t in remote if keep(t) and t not in merged]
+    return merged
+
+
+def _rebind_local_anchors(entries, control_points, line_points):
+    """Re-anchor link entries against merged geometry: index by position,
+    position snapped to the exact control point, local direction from the
+    line. Returns (entries, conflict_message_or_None). Far-side fields are
+    left alone — refresh_pair_links() fixes them against the peer file."""
+    if entries and len(line_points) < 2:
+        return entries, ("links present but the merged line has fewer than "
+                         "2 points; cannot derive endpoint directions")
+    for entry in entries:
+        index = resolve_cp_index(control_points, entry['control_point_position'])
+        if index is None:
+            # Never silently drop a link: geometry that removed a link's
+            # anchor makes the whole merge a manual conflict.
+            return entries, (f"link to {entry.get('branch_file', '?')} anchors "
+                             "at a control point absent from the merged "
+                             "geometry")
+        entry['control_point_index'] = index
+        snapped = [float(x) for x in control_points[index]]
+        if entry['control_point_position'] != snapped:
+            entry['control_point_position'] = snapped
+        tangent = endpoint_tangent(line_points, snapped)
+        if not directions_compatible(entry.get('control_point_direction'),
+                                     tangent):
+            entry['control_point_direction'] = tangent
+    return entries, None
+
+
+def merge_fibers(base, local, remote):
+    """Three-way merge. Returns
+    {'ok': bool, 'merged': dict|None, 'conflicts': [str], 'notes': [str],
+     'stats': {...}, 'peer_files': [str]}.
+
+    A non-empty peer_files means the caller MUST run refresh_pair_links()
+    for each listed peer and persist both sides together, or the merged
+    file violates VC3D's cross-file reciprocity checks."""
+    result = {'ok': False, 'merged': None, 'conflicts': [], 'notes': [],
+              'stats': {}, 'peer_files': []}
+
+    for name, doc in (('base', base), ('local', local), ('remote', remote)):
+        if not is_fiber_doc(doc):
+            result['conflicts'].append(f"{name} version is not a vc3d_fiber document")
+            return result
+    for field in ('type', 'version', 'filename'):
+        values = {str(doc.get(field)) for doc in (base, local, remote)}
+        if len(values) > 1:
+            result['conflicts'].append(
+                f"'{field}' differs between versions: {sorted(values)}")
+            return result
+
+    # Short circuits: only one side truly changed, or both converged. The
+    # winning content is a file VC3D itself wrote, consistent with its
+    # peers as synced — no peer pass needed.
+    if local == remote or remote == base:
+        result.update(ok=True, merged=copy.deepcopy(local),
+                      notes=(["remote side unchanged; kept local"]
+                             if remote == base and local != remote else
+                             ["both sides identical"]))
+        return result
+    if local == base:
+        result.update(ok=True, merged=copy.deepcopy(remote),
+                      notes=["local side unchanged; took remote"])
+        return result
+
+    # Branch entries this module cannot interpret are preserved by
+    # whole-value comparison; a clean merge must never discard input.
+    _, base_opaque = split_branches(base)
+    _, local_opaque = split_branches(local)
+    _, remote_opaque = split_branches(remote)
+    opaque_branches, opaque_conflict = merge_opaque_branches(
+        base_opaque, local_opaque, remote_opaque)
+    if opaque_conflict:
+        result['conflicts'] = [opaque_conflict]
+        return result
+
+    generation_local = int(local.get('generation', 1) or 1)
+    generation_remote = int(remote.get('generation', 1) or 1)
+    prefer_local = generation_local >= generation_remote
+    newer = local if prefer_local else remote
+
+    merged_branches, branch_notes, branch_stats = merge_branches(
+        base, local, remote, prefer_local)
+
+    geometry_same = (_seq_eq(local['control_points'], remote['control_points'])
+                     and _seq_eq(local['line_points'], remote['line_points']))
+    notes = list(branch_notes)
+    stats = dict(branch_stats)
+    reoptimize = False
+
+    if geometry_same:
+        # The incident case: divergent link/metadata edits over identical
+        # geometry. Every entry was VC3D-written against this geometry, so
+        # no re-anchoring is needed.
+        carrier = newer
+        stats['geometry_merged'] = False
+    else:
+        merged_cps, regions, cp_conflicts = merge_control_points(
+            base['control_points'], local['control_points'],
+            remote['control_points'])
+        if cp_conflicts:
+            result['conflicts'] = cp_conflicts
+            return result
+
+        owners = {region['owner'] for region in regions} - {'none'}
+        base_line = base.get('line_points', [])
+        local_line_changed = not _seq_eq(local['line_points'], base_line)
+        remote_line_changed = not _seq_eq(remote['line_points'], base_line)
+
+        if owners <= {'local', 'both'} or owners <= {'remote', 'both'}:
+            # Geometry effectively changed on one side (or identically on
+            # both): take that side's control_points AND line_points as the
+            # written pair (C1 by construction). With no owned regions at
+            # all, geometry differs only in line_points — pick the side
+            # whose line actually moved.
+            if owners & {'local', 'remote'}:
+                side = 'local' if 'local' in owners else 'remote'
+            elif local_line_changed != remote_line_changed:
+                side = 'local' if local_line_changed else 'remote'
+            else:
+                side = 'local' if prefer_local else 'remote'
+            carrier = local if side == 'local' else remote
+            # The discarded side may have re-optimized its line without
+            # moving control points; that refit cannot be carried, so ask
+            # VC3D to redo it. Never dropped silently.
+            other = remote if side == 'local' else local
+            other_line_changed = (remote_line_changed if side == 'local'
+                                  else local_line_changed)
+            if (other_line_changed and
+                    not _seq_eq(other['line_points'], carrier['line_points'])):
+                reoptimize = True
+                notes.append(f"{'remote' if side == 'local' else 'local'} "
+                             f"re-optimized the line; kept the {side} line "
+                             "and tagged for reoptimization")
+        else:
+            # Disjoint edits on both sides. The real line can only be
+            # produced by VC3D's optimizer (needs the volume), so write the
+            # merged control points AS the line — trivially satisfying the
+            # loader's control-points-on-line invariant — and tag for
+            # re-optimization.
+            merged_cps = [[float(x) for x in p] for p in merged_cps]
+            carrier = {'control_points': merged_cps,
+                       'line_points': copy.deepcopy(merged_cps)}
+            reoptimize = True
+            notes.append("geometry merged from both sides; line set to the "
+                         "control-point polyline pending reoptimization in "
+                         "VC3D")
+
+        merged_branches, anchor_conflict = _rebind_local_anchors(
+            merged_branches, carrier['control_points'], carrier['line_points'])
+        if anchor_conflict:
+            result['conflicts'] = [anchor_conflict]
+            return result
+
+        stats['cp_regions_local'] = sum(1 for r in regions if r['owner'] == 'local')
+        stats['cp_regions_remote'] = sum(1 for r in regions if r['owner'] == 'remote')
+        stats['geometry_merged'] = bool(owners)
+
+    merged = copy.deepcopy(newer)
+    merged['control_points'] = copy.deepcopy(carrier['control_points'])
+    merged['line_points'] = copy.deepcopy(carrier['line_points'])
+    if 'hv_classification' in carrier:
+        merged['hv_classification'] = copy.deepcopy(carrier['hv_classification'])
+    elif not geometry_same and 'hv_classification' in merged:
+        # Synthetic-geometry path: the carried classification is stale for
+        # the merged control points; VC3D recomputes it (one benign rewrite
+        # on load, corrected permanently by the reoptimization save).
+        notes.append("hv_classification is stale for the merged geometry; "
+                     "VC3D recomputes it on load")
+    merged['branches'] = merged_branches + opaque_branches
+    if opaque_branches:
+        noun = 'entry' if len(opaque_branches) == 1 else 'entries'
+        notes.append(f"{len(opaque_branches)} unparseable branch "
+                     f"{noun} carried through unchanged")
+    merged['tags'] = merge_tags(base, local, remote)
+    if reoptimize and REOPTIMIZE_TAG not in merged['tags']:
+        merged['tags'].append(REOPTIMIZE_TAG)
+    merged['generation'] = max(generation_local, generation_remote) + 1
+
+    stats['reoptimize'] = reoptimize
+    result['peer_files'] = sorted(
+        {entry['branch_file'] for entry in links_to_any(merged)} |
+        {entry['branch_file'] for entry in links_to_any(base)})
+    result.update(ok=True, merged=merged, notes=notes, stats=stats)
+    return result
+
+
+def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
+    """Make the A<->B cross-fiber link pair consistent, treating A's
+    entries as the decided truth (A was just auto-merged).
+
+    Pure: returns {'ok', 'a_doc', 'b_doc', 'a_changed', 'b_changed',
+    'notes', 'conflicts'} over deep copies. Fields already satisfying the
+    loader's predicates are left byte-identical, so an in-sync pair yields
+    zero changes (and no re-upload). On any unresolvable anchor the caller
+    must treat A's merge as a manual conflict — nothing is guessed.
+    """
+    a = copy.deepcopy(a_doc)
+    b = copy.deepcopy(b_doc)
+    out = {'ok': False, 'a_doc': a, 'b_doc': b,
+           'a_changed': False, 'b_changed': False, 'notes': [], 'conflicts': []}
+    if not is_fiber_doc(a) or not is_fiber_doc(b):
+        out['conflicts'].append(f"{a_name} or {b_name} is not a vc3d_fiber document")
+        return out
+
+    a_cps, a_line = a['control_points'], a['line_points']
+    b_cps, b_line = b['control_points'], b['line_points']
+    a_entries = links_to(a, b_name)
+    if a_entries and (len(a_line) < 2 or len(b_line) < 2):
+        out['conflicts'].append(
+            f"cannot derive endpoint directions between {a_name} and {b_name}")
+        return out
+
+    def set_field(entry, key, value, doc_flag):
+        if entry.get(key) != value:
+            entry[key] = value
+            out[doc_flag] = True
+
+    def snap_position(entry, key, point, doc_flag):
+        if not pos_eq(entry.get(key), point):
+            set_field(entry, key, [float(x) for x in point], doc_flag)
+
+    def snap_direction(entry, key, tangent, doc_flag):
+        if not directions_compatible(entry.get(key), tangent):
+            set_field(entry, key, tangent, doc_flag)
+
+    for entry in a_entries:
+        local_index = resolve_cp_index(a_cps, entry['control_point_position'])
+        far_index = resolve_cp_index(b_cps, entry['branch_control_point_position'])
+        if local_index is None or far_index is None:
+            out['conflicts'].append(
+                f"link {a_name} -> {b_name}: anchor control point not found in "
+                f"{a_name if local_index is None else b_name}")
+            continue
+        pa = a_cps[local_index]
+        pb = b_cps[far_index]
+        da = endpoint_tangent(a_line, pa)
+        db = endpoint_tangent(b_line, pb)
+
+        set_field(entry, 'control_point_index', local_index, 'a_changed')
+        snap_position(entry, 'control_point_position', pa, 'a_changed')
+        snap_direction(entry, 'control_point_direction', da, 'a_changed')
+        set_field(entry, 'branch_control_point_index', far_index, 'a_changed')
+        snap_position(entry, 'branch_control_point_position', pb, 'a_changed')
+        snap_direction(entry, 'branch_control_point_direction', db, 'a_changed')
+
+        reciprocal = next(
+            (r for r in links_to(b, a_name)
+             if pos_eq(r.get('control_point_position'), pb) and
+             pos_eq(r.get('branch_control_point_position'), pa)),
+            None)
+        if reciprocal is None:
+            reciprocal = {
+                'control_point_index': far_index,
+                # Runtime id; VC3D rebinds it from branch_file at load.
+                'branch_fiber_id': 0,
+                'branch_control_point_index': local_index,
+                'branch_file': a_name,
+                'control_point_direction': db,
+                'branch_control_point_direction': da,
+                'control_point_position': [float(x) for x in pb],
+                'branch_control_point_position': [float(x) for x in pa],
+            }
+            if entry.get('pending', False):
+                reciprocal['pending'] = True
+            b['branches'] = _branches_of(b) + [reciprocal]
+            out['b_changed'] = True
+            out['notes'].append(f"restored reciprocal link {b_name} -> {a_name}")
+        else:
+            set_field(reciprocal, 'control_point_index', far_index, 'b_changed')
+            snap_position(reciprocal, 'control_point_position', pb, 'b_changed')
+            snap_direction(reciprocal, 'control_point_direction', db, 'b_changed')
+            set_field(reciprocal, 'branch_control_point_index', local_index,
+                      'b_changed')
+            snap_position(reciprocal, 'branch_control_point_position', pa,
+                          'b_changed')
+            snap_direction(reciprocal, 'branch_control_point_direction', da,
+                           'b_changed')
+
+    # Pairs present in the base but absent from merged A were deleted by
+    # the merge: mirror the deletion. Unrelated B->A entries (pairs A never
+    # tracked) are left untouched.
+    if base_doc is not None and is_fiber_doc(base_doc):
+        for base_entry in links_to(base_doc, b_name):
+            if any(_same_link(base_entry, entry) for entry in a_entries):
+                continue
+            survivors = []
+            removed = 0
+            for candidate in _branches_of(b):
+                if (_structured_branch(candidate) and
+                        candidate.get('branch_file') == a_name and
+                        pos_eq(candidate.get('control_point_position'),
+                               base_entry.get('branch_control_point_position')) and
+                        pos_eq(candidate.get('branch_control_point_position'),
+                               base_entry.get('control_point_position'))):
+                    removed += 1
+                    continue
+                survivors.append(candidate)
+            if removed:
+                b['branches'] = survivors
+                out['b_changed'] = True
+                out['notes'].append(
+                    f"removed reciprocal of deleted link in {b_name}")
+
+    out['ok'] = not out['conflicts']
+    return out
+
+
+def summarize(result):
+    if not result['ok']:
+        return 'conflict: ' + '; '.join(result['conflicts'])
+    stats = result.get('stats', {})
+    if not stats:
+        return '; '.join(result.get('notes', [])) or 'merged'
+    parts = []
+    if stats.get('cp_regions_local') or stats.get('cp_regions_remote'):
+        parts.append("control points: %d local + %d remote region(s)" %
+                     (stats.get('cp_regions_local', 0),
+                      stats.get('cp_regions_remote', 0)))
+    added = stats.get('links_added_local', 0) + stats.get('links_added_remote', 0)
+    if added:
+        parts.append(f"links +{added}")
+    if stats.get('links_deleted'):
+        parts.append(f"links -{stats['links_deleted']}")
+    if stats.get('links_approved'):
+        parts.append(f"{stats['links_approved']} link approval(s) applied")
+    if stats.get('reoptimize'):
+        parts.append("geometry merged (tagged for reoptimization)")
+    elif stats.get('geometry_merged'):
+        parts.append("geometry merged")
+    if result.get('peer_files'):
+        parts.append("link consistency over %d peer file(s)" %
+                     len(result['peer_files']))
+    return ', '.join(parts) if parts else 'merged (metadata only)'
