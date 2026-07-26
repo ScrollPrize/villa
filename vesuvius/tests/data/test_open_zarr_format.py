@@ -7,12 +7,16 @@ the package builds numcodecs compressors, which zarr 3 rejects on a v3 array.
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 
 import numcodecs
 import pytest
+import zarr
 
 from vesuvius.data.utils import open_zarr
+
+_ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
 
 
 def _stored_format(path: Path) -> int:
@@ -52,8 +56,19 @@ def test_contradictory_overwrite_false_rejected(tmp_path: Path) -> None:
                   chunks=(1, 8, 8), dtype="u1", overwrite=False)
 
 
+@pytest.mark.skipif(not _ZARR_V3, reason="zarr 2.x cannot write the v3 format")
 def test_explicit_zarr_format_3_still_possible(tmp_path: Path) -> None:
     path = tmp_path / "v3.zarr"
     open_zarr(path=str(path), mode="w", shape=(4, 8, 8), chunks=(1, 8, 8),
               dtype="f2", zarr_format=3)
     assert _stored_format(path) == 3
+
+
+def test_zarr_format_default_is_silent(tmp_path: Path) -> None:
+    # zarr 2 has no zarr_format argument and warns once per array created if it
+    # is passed anyway. Inference creates one store per part, so the default
+    # must not make noise on either supported zarr version.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        open_zarr(path=str(tmp_path / "quiet.zarr"), mode="w", shape=(4, 8, 8),
+                  chunks=(1, 8, 8), dtype="f2")

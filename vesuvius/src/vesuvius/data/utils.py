@@ -4,6 +4,8 @@ import zarr
 import os
 from typing import Union, Dict, Any, Optional, Tuple
 
+_ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
+
 # Function to get the maximum value of a dtype
 def get_max_value(dtype: np.dtype) -> Union[float, int]:
     """
@@ -64,7 +66,8 @@ def open_zarr(path: str, mode: str = 'r',
         Zarr format version for arrays created with mode 'w'. Defaults to 2 because
         the numcodecs compressors used throughout this package (and the logits stores
         blend_logits validates) are v2 constructs: zarr 3 raises for `compressor=` on
-        a v3 array. Pass None to accept zarr's own default.
+        a v3 array. Pass None to accept zarr's own default. Ignored when the
+        installed zarr is 2.x, which only writes v2 and does not accept the argument.
     **kwargs : Additional parameters passed to zarr.open
         
     Returns:
@@ -140,7 +143,10 @@ def open_zarr(path: str, mode: str = 'r',
             create_kwargs['fill_value'] = fill_value
         if order is not None:
             create_kwargs['order'] = order
-        if zarr_format is not None:
+        # zarr 2 has no zarr_format argument: it warns "ignoring keyword
+        # argument 'zarr_format'" for every array and writes v2 regardless,
+        # which is already what this default asks for. Only zarr 3 needs telling.
+        if zarr_format is not None and _ZARR_V3:
             create_kwargs['zarr_format'] = zarr_format
 
         # Add any other kwargs
