@@ -24,17 +24,24 @@ side/top strip input loading.
 
 `fiber_trace_3d/model.py`
 
-- Wraps `Vesuvius3dUnetModel` for grouped direction/presence output branches.
-- Each branch has seven sigmoid channels: six Lasagna 3x2 direction channels
-  and one sheet/fiber presence channel.
-- Single-branch legacy configs still use seven output channels. Active
-  multi-direction 3D configs use `model_3d.direction_branch_count: 2` and
-  fourteen output channels.
-- Branch 0 preserves the legacy channel layout (`0:6` direction, `6`
-  presence), so existing first-branch Trace2CP projection paths remain usable.
+- Wraps `Vesuvius3dUnetModel` either as a legacy grouped-output model or as
+  the active direction-conditioned model.
+- In conditioned mode, the shared 3D U-Net emits a configurable latent feature
+  volume (`model_3d.conditioned_latent_channels`, default `64`) independent of
+  the U-Net starting width. A pointwise decoder head receives latent channels
+  plus a six-channel Lasagna 3x2 query and emits seven sigmoid channels: six
+  direction channels and one sheet/fiber presence channel.
+- The conditioned decoder head is only `1x1x1` convolutions/ReLU layers. The
+  all-zero query is reserved as an off-manifold unconditioned token.
+- `forward(volume)` returns the zero-query output for compatibility.
+  `forward_recurrent_grouped(volume, steps=2)` returns branch-shaped grouped
+  outputs: zero-query first, then recurrent outputs conditioned on the previous
+  decoded direction.
+- Legacy configs still use grouped direction/presence output branches. Branch 0
+  preserves the legacy channel layout (`0:6` direction, `6` presence).
 - `direction_outputs(...)` returns `B,K,6,D,H,W` and `presence_outputs(...)`
   returns `B,K,1,D,H,W`; the older `direction_output(...)` and
-  `presence_output(...)` wrappers return branch 0.
+  `presence_output(...)` wrappers return the first seven-channel prediction.
 - Config derives `features_per_stage`, `unet_base_channels`, `unet_depth`,
   `strides`, and `decoder_upsample_mode` the same way as the existing 3D fiber
   model helpers.
@@ -288,26 +295,25 @@ side/top strip input loading.
   and `best.pt`. `training.kept_snapshot_interval` additionally keeps numbered
   snapshots as `snapshots/step_<iteration>.pt` and defaults to `10000`.
 - Logs scalar losses/timings and the full training config JSON to TensorBoard
-  when `training.tensorboard_enabled` is true.
-  Direction reporting includes selected-branch `train/angle_mean_deg` and,
-  when held-out `test_datasets` are configured, `test/angle_mean_deg`. Branch
-  routing diagnostics log branch usage fractions and selected score means.
-- For multi-direction outputs, positive sparse direction/presence supervision
-  chooses one branch per supervised point with
-  `abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence`.
-  Direction loss and positive presence BCE apply only to that selected branch.
-  During training in two-branch configs, routing is grouped by deterministic
-  per-sample-offset `2x2x2` spatial chunks within each patch. If one branch
-  falls below 10% of grouped positive sparse supervision in a batch, the best
-  missing quota for that branch is force-routed to it by grouped detached
-  choice score, then broadcast to every sparse positive point in the chosen
-  chunk. The group offset is keyed by `stream_index`. Test/eval metrics keep
-  raw per-voxel detached argmax routing and never apply grouping or the 10%
-  repair. Dense negative presence supervision applies to every branch at global
-  negative voxels. Presence BCE is normalized per `(patch, branch)` for sparse
-  positives and dense negatives, and the resulting positive/negative terms are
-  summed without an extra global balancing factor. The default 3D loss weights
-  are `direction_weight: 10.0` and `presence_weight: 1.0`.
+  when `training.tensorboard_enabled` is true. Direction reporting includes
+  `train/angle_mean_deg` and, when held-out `test_datasets` are configured,
+  `test/angle_mean_deg`.
+- In conditioned mode, positive sparse supervision decodes two query samples at
+  every supervised point: the zero/unconditioned query and a deterministic
+  query sampled from the plane perpendicular to the GT direction with
+  `training.conditioned_perpendicular_jitter_degrees` jitter. Both queries
+  supervise the same GT direction with weighted MSE on the six Lasagna 3x2
+  channels and positive-presence BCE.
+- Conditioned dense negative supervision decodes zero-query and deterministic
+  random-query outputs over all `presence_mask` voxels, including positive
+  pixels by design. Positive and negative query BCEs are normalized per
+  `(patch, query)` group; the default component weights are both `1.0`, so the
+  dense negative term is weak per voxel but has equal component weight overall.
+- Legacy grouped-output configs still use selected-branch routing by
+  `abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence`, with
+  the deterministic `2x2x2` anti-collapse repair during training and raw
+  per-voxel routing during eval. The default 3D loss weights are
+  `direction_weight: 10.0` and `presence_weight: 1.0`.
 - Passing `--resume /path/to/current.pt` for normal training restores the
   model and optimizer state from that snapshot, continues from the stored step,
   and still creates a fresh timestamped run directory. The TensorBoard config
@@ -338,10 +344,13 @@ side/top strip input loading.
   CP tangent, and a perpendicular/cross slice whose plane normal is the GT CP
   tangent. Each row has nine columns: volume image with projected GT line and
   predicted CP direction overlay where applicable, target/context presence,
-  literal branch-0 presence, literal branch-1 presence, branch presence for the
-  output whose decoded direction is closer to the slice normal, other branch
-  presence, max branch presence, min branch presence, and average branch
-  presence. The GT line overlay draws target-line portions within 2 voxels of
+  first prediction presence, second prediction presence, prediction presence
+  for the output whose decoded direction is closer to the slice normal, other
+  prediction presence, max prediction presence, min prediction presence, and
+  average prediction presence. In conditioned mode the first prediction is the
+  zero-query output and the second is the recurrent output conditioned on the
+  first decoded direction; in legacy mode these columns are branch outputs. The
+  GT line overlay draws target-line portions within 2 voxels of
   the displayed principal slice plane. The two
   oblique rows project/rasterize the carried transformed line segments into
   the oblique slice frame for both the image overlay and target/context panel.
@@ -420,6 +429,11 @@ side/top strip input loading.
   blocks over the requested strip coordinates, projects direction/presence into
   the 2D frame, logs `test/trace2cp_error`, and uses that value for `best.pt`
   selection. Dense 3D test loss remains a diagnostic.
+- Native 3D Trace2CP caches conditioned model inference as grouped recurrent
+  outputs: zero-query output first, then output conditioned on the first decoded
+  direction. That lets the existing branch-aware candidate sampler choose
+  between strongest and recurrent secondary predictions without treating them
+  as free branch heads.
 - 3D prefetch computes a CP-centered selected-level augmentation-envelope bbox
   and asks VC3D for authoritative bbox-to-chunk dependency metadata. This avoids
   materializing representative coordinates or reconstructing chunk paths in

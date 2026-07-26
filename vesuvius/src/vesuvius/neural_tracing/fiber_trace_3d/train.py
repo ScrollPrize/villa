@@ -27,6 +27,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
 )
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
+    encode_lasagna_direction_3x2,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.model import (
     build_fiber_trace_3d_model,
@@ -334,6 +335,144 @@ def _branch_choice_grid_offsets(
     ).to(dtype=torch.long)
 
 
+def _model_uses_conditioned_decoder(model: torch.nn.Module) -> bool:
+    return bool(getattr(model, "conditioned_decoder_enabled", False))
+
+
+def _conditioned_loss_options_from_training(training: dict[str, Any]) -> dict[str, float]:
+    return {
+        "perpendicular_jitter_degrees": float(
+            training.get("conditioned_perpendicular_jitter_degrees", 45.0)
+        ),
+        "positive_query_weight": float(
+            training.get("conditioned_positive_query_weight", 1.0)
+        ),
+        "negative_query_weight": float(
+            training.get("conditioned_negative_query_weight", 1.0)
+        ),
+    }
+
+
+def _deterministic_uniform01_from_keys(
+    keys: torch.Tensor,
+    *,
+    salt: float,
+) -> torch.Tensor:
+    values = keys.to(dtype=torch.float32)
+    coeff = torch.as_tensor(
+        [12.9898, 78.233, 37.719, 15.173, 53.927],
+        dtype=torch.float32,
+        device=values.device,
+    )
+    mixed = torch.sum(values * coeff[: int(values.shape[-1])], dim=-1) + float(salt)
+    hashed = torch.sin(mixed) * 43758.5453123
+    return hashed - torch.floor(hashed)
+
+
+def _deterministic_unit_vectors_xyz_from_keys(
+    keys: torch.Tensor,
+    *,
+    salt: float,
+) -> torch.Tensor:
+    x = _deterministic_uniform01_from_keys(keys, salt=float(salt) + 0.17) * 2.0 - 1.0
+    y = _deterministic_uniform01_from_keys(keys, salt=float(salt) + 11.31) * 2.0 - 1.0
+    z = _deterministic_uniform01_from_keys(keys, salt=float(salt) + 23.79) * 2.0 - 1.0
+    vectors = torch.stack([x, y, z], dim=-1).to(dtype=torch.float32)
+    norm = torch.linalg.vector_norm(vectors, dim=-1, keepdim=True)
+    fallback = torch.zeros_like(vectors)
+    fallback[..., 0] = 1.0
+    return torch.where(norm > 1.0e-6, vectors / norm.clamp_min(1.0e-6), fallback)
+
+
+def _sparse_conditioned_keys(
+    batch: FiberTrace3DBatch,
+    indices_bzyx: torch.Tensor,
+) -> torch.Tensor:
+    indices = indices_bzyx.to(dtype=torch.long)
+    stream_indices = batch.stream_indices.to(device=indices.device, dtype=torch.long)
+    stream = stream_indices[indices[:, 0]]
+    return torch.stack(
+        [stream, indices[:, 1], indices[:, 2], indices[:, 3]],
+        dim=1,
+    )
+
+
+def _perpendicular_basis_xyz(
+    target_axis_xyz: torch.Tensor,
+    seed_axis_xyz: torch.Tensor,
+) -> torch.Tensor:
+    target = F.normalize(target_axis_xyz.to(dtype=torch.float32), p=2.0, dim=-1, eps=1.0e-12)
+    seed = F.normalize(seed_axis_xyz.to(dtype=torch.float32), p=2.0, dim=-1, eps=1.0e-12)
+    perp = seed - torch.sum(seed * target, dim=-1, keepdim=True) * target
+    perp_norm = torch.linalg.vector_norm(perp, dim=-1, keepdim=True)
+    basis = torch.zeros_like(target)
+    least_parallel = torch.argmin(torch.abs(target), dim=-1, keepdim=True)
+    basis.scatter_(-1, least_parallel, 1.0)
+    fallback = basis - torch.sum(basis * target, dim=-1, keepdim=True) * target
+    fallback = F.normalize(fallback, p=2.0, dim=-1, eps=1.0e-12)
+    return torch.where(perp_norm > 1.0e-6, perp / perp_norm.clamp_min(1.0e-6), fallback)
+
+
+def _conditioned_perpendicular_queries(
+    batch: FiberTrace3DBatch,
+    indices_bzyx: torch.Tensor,
+    target_axis_xyz: torch.Tensor,
+    *,
+    jitter_degrees: float,
+) -> torch.Tensor:
+    if int(indices_bzyx.shape[0]) == 0:
+        return torch.zeros(
+            (0, 6),
+            dtype=torch.float32,
+            device=target_axis_xyz.device,
+        )
+    keys = _sparse_conditioned_keys(batch, indices_bzyx).to(device=target_axis_xyz.device)
+    seed_axis = _deterministic_unit_vectors_xyz_from_keys(keys, salt=19.0)
+    perp = _perpendicular_basis_xyz(target_axis_xyz, seed_axis)
+    jitter = float(jitter_degrees)
+    if not math.isfinite(jitter) or jitter < 0.0:
+        raise ValueError("training.conditioned_perpendicular_jitter_degrees must be >= 0")
+    if jitter > 0.0:
+        unit = _deterministic_uniform01_from_keys(keys, salt=41.0) * 2.0 - 1.0
+        angle = unit.to(dtype=perp.dtype) * math.radians(jitter)
+        query_axis = (
+            torch.cos(angle)[:, None] * perp
+            + torch.sin(angle)[:, None] * F.normalize(
+                target_axis_xyz,
+                p=2.0,
+                dim=-1,
+                eps=1.0e-12,
+            )
+        )
+    else:
+        query_axis = perp
+    query_axis = F.normalize(query_axis, p=2.0, dim=-1, eps=1.0e-12)
+    return encode_lasagna_direction_3x2(query_axis).to(dtype=torch.float32)
+
+
+def _conditioned_random_query_b6(
+    batch: FiberTrace3DBatch,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    streams = batch.stream_indices.to(device=device, dtype=torch.long)
+    zeros = torch.zeros_like(streams)
+    keys = torch.stack([streams, zeros, zeros, zeros], dim=1)
+    axis = _deterministic_unit_vectors_xyz_from_keys(keys, salt=83.0)
+    return encode_lasagna_direction_3x2(axis).to(dtype=torch.float32)
+
+
+def _gather_output_at_indices(output: torch.Tensor, indices_bzyx: torch.Tensor) -> torch.Tensor:
+    indices = indices_bzyx.to(dtype=torch.long, device=output.device)
+    return output[
+        indices[:, 0],
+        :,
+        indices[:, 1],
+        indices[:, 2],
+        indices[:, 3],
+    ]
+
+
 def compute_losses(
     output: torch.Tensor,
     batch: FiberTrace3DBatch,
@@ -480,6 +619,182 @@ def compute_losses(
         positive_presence_loss * has_positive
         + negative_presence_loss * has_negative
     )
+    total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss
+    return {
+        "total": total,
+        "direction": direction_loss,
+        "presence": presence_loss,
+        "angle_mean_deg": angle_mean_deg,
+        "branch0_fraction": branch0_fraction,
+        "branch1_fraction": branch1_fraction,
+        "selected_score_mean": selected_score_mean,
+    }
+
+
+def compute_conditioned_losses(
+    model: torch.nn.Module,
+    batch: FiberTrace3DBatch,
+    *,
+    direction_weight: float,
+    presence_weight: float,
+    perpendicular_jitter_degrees: float = 45.0,
+    positive_query_weight: float = 1.0,
+    negative_query_weight: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    require_materialized_targets(batch)
+    assert batch.direction_indices_bzyx is not None
+    assert batch.direction_target_sparse is not None
+    assert batch.direction_weight_sparse is not None
+    assert batch.presence_target is not None
+    assert batch.presence_mask is not None
+    if not _model_uses_conditioned_decoder(model):
+        raise ValueError("compute_conditioned_losses requires conditioned decoder model mode")
+    if float(positive_query_weight) < 0.0 or not math.isfinite(float(positive_query_weight)):
+        raise ValueError("conditioned_positive_query_weight must be finite and non-negative")
+    if float(negative_query_weight) < 0.0 or not math.isfinite(float(negative_query_weight)):
+        raise ValueError("conditioned_negative_query_weight must be finite and non-negative")
+
+    latent = model.encode_volume(batch.volume)
+    batch_size, _latent_channels, depth, height, width = (int(v) for v in latent.shape)
+    zero_query = torch.zeros((batch_size, 6), dtype=latent.dtype, device=latent.device)
+    zero_output = model.decode_conditioned_latent(latent, zero_query)
+    random_query = _conditioned_random_query_b6(batch, device=latent.device).to(dtype=latent.dtype)
+    random_output = model.decode_conditioned_latent(latent, random_query)
+
+    indices = batch.direction_indices_bzyx.to(dtype=torch.long, device=latent.device)
+    positive_query_count = 2
+    if int(indices.shape[0]) > 0:
+        zero_sparse = _gather_output_at_indices(zero_output, indices)
+        target_axis = decode_lasagna_direction_3x2_analytic(
+            batch.direction_target_sparse.to(device=latent.device)
+        )
+        perp_query = _conditioned_perpendicular_queries(
+            batch,
+            indices,
+            target_axis,
+            jitter_degrees=perpendicular_jitter_degrees,
+        ).to(dtype=latent.dtype, device=latent.device)
+        perp_sparse = model.decode_conditioned_points(latent, indices, perp_query)
+        positive_pred = torch.stack([zero_sparse, perp_sparse], dim=1)
+        pred_dirs = positive_pred[:, :, :6]
+        pred_presence = positive_pred[:, :, 6]
+        direction_error = (
+            pred_dirs
+            - batch.direction_target_sparse.to(dtype=pred_dirs.dtype, device=pred_dirs.device)[:, None, :]
+        ) ** 2
+        direction_error = direction_error * batch.direction_weight_sparse.to(
+            dtype=direction_error.dtype,
+            device=direction_error.device,
+        )[:, None, :]
+        direction_loss = direction_error.mean(dim=(0, 2)).mean()
+        pred_axis = decode_lasagna_direction_3x2_analytic(pred_dirs.reshape(-1, 6)).reshape(
+            int(indices.shape[0]),
+            positive_query_count,
+            3,
+        )
+        agreement = torch.abs(torch.sum(pred_axis * target_axis[:, None, :], dim=-1)).clamp(
+            0.0,
+            1.0,
+        )
+        angle_mean_deg = torch.rad2deg(torch.acos(agreement)).mean()
+        positive_presence_mask = batch.presence_mask.to(device=latent.device)[
+            indices[:, 0],
+            0,
+            indices[:, 1],
+            indices[:, 2],
+            indices[:, 3],
+        ]
+        positive_presence_bce = F.binary_cross_entropy(
+            pred_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
+            torch.ones_like(pred_presence),
+            reduction="none",
+        )
+        positive_mask_f = positive_presence_mask[:, None].to(dtype=positive_presence_bce.dtype)
+        group_index = (
+            indices[:, 0, None] * positive_query_count
+            + torch.arange(
+                positive_query_count,
+                dtype=torch.long,
+                device=indices.device,
+            ).view(1, positive_query_count)
+        )
+        positive_group_sum = torch.zeros(
+            (batch_size * positive_query_count,),
+            dtype=positive_presence_bce.dtype,
+            device=positive_presence_bce.device,
+        )
+        positive_group_count = torch.zeros_like(positive_group_sum)
+        positive_group_sum.scatter_add_(
+            0,
+            group_index.reshape(-1),
+            (positive_presence_bce * positive_mask_f).reshape(-1),
+        )
+        positive_group_count.scatter_add_(
+            0,
+            group_index.reshape(-1),
+            positive_mask_f.expand_as(positive_presence_bce).reshape(-1),
+        )
+        positive_presence_loss, positive_presence_group_count = _mean_over_nonempty_groups(
+            positive_group_sum,
+            positive_group_count,
+        )
+        selected_score_mean = (agreement * pred_presence.clamp(0.0, 1.0)).mean()
+        branch0_fraction = torch.full(
+            (),
+            0.5,
+            dtype=pred_presence.dtype,
+            device=pred_presence.device,
+        )
+        branch1_fraction = torch.full_like(branch0_fraction, 0.5)
+    else:
+        direction_loss = zero_output.sum() * 0.0
+        angle_mean_deg = zero_output.sum() * 0.0
+        positive_presence_loss = zero_output.sum() * 0.0
+        positive_presence_group_count = torch.zeros(
+            (),
+            dtype=zero_output.dtype,
+            device=zero_output.device,
+        )
+        selected_score_mean = zero_output.sum() * 0.0
+        branch0_fraction = zero_output.sum() * 0.0
+        branch1_fraction = zero_output.sum() * 0.0
+
+    negative_presence = torch.stack(
+        [zero_output[:, 6:7], random_output[:, 6:7]],
+        dim=1,
+    )
+    expected_spatial = (batch_size, 2, 1, depth, height, width)
+    if tuple(int(v) for v in negative_presence.shape) != expected_spatial:
+        raise ValueError(
+            "conditioned negative presence output shape mismatch: "
+            f"{tuple(int(v) for v in negative_presence.shape)} != {expected_spatial}"
+        )
+    negative_presence_bce = F.binary_cross_entropy(
+        negative_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
+        torch.zeros_like(negative_presence),
+        reduction="none",
+    )
+    negative_mask_f = batch.presence_mask.to(
+        device=negative_presence_bce.device,
+        dtype=negative_presence_bce.dtype,
+    )[:, None].expand_as(negative_presence_bce)
+    negative_group_sum = (negative_presence_bce * negative_mask_f).sum(
+        dim=(2, 3, 4, 5)
+    ).reshape(-1)
+    negative_group_count = negative_mask_f.sum(dim=(2, 3, 4, 5)).reshape(-1)
+    negative_presence_loss, negative_presence_group_count = _mean_over_nonempty_groups(
+        negative_group_sum,
+        negative_group_count,
+    )
+    has_positive = (positive_presence_group_count > 0.0).to(dtype=zero_output.dtype)
+    has_negative = (negative_presence_group_count > 0.0).to(dtype=zero_output.dtype)
+    positive_component = (
+        float(positive_query_weight) * positive_presence_loss * has_positive
+    )
+    negative_component = (
+        float(negative_query_weight) * negative_presence_loss * has_negative
+    )
+    presence_loss = positive_component + negative_component
     total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss
     return {
         "total": total,
@@ -884,6 +1199,7 @@ def evaluate_dense_loss(
     sample_index_limit: int | None = None,
     direction_weight: float,
     presence_weight: float,
+    conditioned_loss_options: dict[str, float] | None = None,
 ) -> dict[str, float]:
     model.eval()
     total_rows: list[dict[str, float]] = []
@@ -904,6 +1220,7 @@ def evaluate_dense_loss(
             batch,
             direction_weight=direction_weight,
             presence_weight=presence_weight,
+            conditioned_loss_options=conditioned_loss_options,
             backward=False,
         )
         total_rows.append(rows)
@@ -1004,18 +1321,28 @@ def _forward_loss(
     *,
     direction_weight: float,
     presence_weight: float,
+    conditioned_loss_options: dict[str, float] | None = None,
     backward: bool,
 ) -> dict[str, float]:
-    output = model(batch.volume)
-    losses = compute_losses(
-        output,
-        batch,
-        direction_weight=direction_weight,
-        presence_weight=presence_weight,
-        branch_selection_mode=(
-            "train_offset_grid_min_fraction" if backward else "eval_voxel"
-        ),
-    )
+    if _model_uses_conditioned_decoder(model):
+        losses = compute_conditioned_losses(
+            model,
+            batch,
+            direction_weight=direction_weight,
+            presence_weight=presence_weight,
+            **dict(conditioned_loss_options or {}),
+        )
+    else:
+        output = model(batch.volume)
+        losses = compute_losses(
+            output,
+            batch,
+            direction_weight=direction_weight,
+            presence_weight=presence_weight,
+            branch_selection_mode=(
+                "train_offset_grid_min_fraction" if backward else "eval_voxel"
+            ),
+        )
     if backward:
         losses["total"].backward()
     return {key: float(value.detach().cpu()) for key, value in losses.items()}
@@ -1096,9 +1423,11 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             "Rows: yx, zx, zy principal slices through the sampled CP, "
             "then GT-tangent and GT-perpendicular oblique slices. "
             "Columns: image with projected GT line and predicted CP direction where applicable, "
-            "target/context presence, branch0 presence, branch1 presence, "
-            "branch presence closer to the slice normal, other branch presence, "
-            "max branch presence, min branch presence, and average branch presence. "
+            "target/context presence, first prediction presence, second prediction presence, "
+            "prediction presence closer to the slice normal, other prediction presence, "
+            "max prediction presence, min prediction presence, and average prediction presence. "
+            "In conditioned mode the first prediction is zero-query output and the second is "
+            "the recurrent output conditioned on the first decoded direction. "
             "Multiple batch samples are concatenated side by side when configured.",
             0,
         )
@@ -1107,9 +1436,11 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             "Rows: yx, zx, zy principal slices through the sampled test CP, "
             "then GT-tangent and GT-perpendicular oblique slices. "
             "Columns: image with projected GT line and predicted CP direction where applicable, "
-            "target/context presence, branch0 presence, branch1 presence, "
-            "branch presence closer to the slice normal, other branch presence, "
-            "max branch presence, min branch presence, and average branch presence. "
+            "target/context presence, first prediction presence, second prediction presence, "
+            "prediction presence closer to the slice normal, other prediction presence, "
+            "max prediction presence, min prediction presence, and average prediction presence. "
+            "In conditioned mode the first prediction is zero-query output and the second is "
+            "the recurrent output conditioned on the first decoded direction. "
             "Multiple batch samples are concatenated side by side when configured.",
             0,
         )
@@ -1154,6 +1485,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     )
     direction_weight = float(training.get("direction_weight", 10.0))
     presence_weight = float(training.get("presence_weight", 1.0))
+    conditioned_loss_options = _conditioned_loss_options_from_training(training)
     loader_workers = _loader_worker_count(raw_config)
     loader_prefetch_factor = _loader_prefetch_factor(raw_config)
     loader_worker_device = _loader_worker_device(raw_config)
@@ -1171,7 +1503,11 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         f"loader_multiprocessing_context={loader_context or 'default'} "
         f"optimizer_lr={effective_optimizer['param_group_lrs']} "
         f"optimizer_weight_decay={effective_optimizer['param_group_weight_decays']} "
-        f"kept_snapshot_interval={kept_snapshot_interval}",
+        f"kept_snapshot_interval={kept_snapshot_interval} "
+        f"conditioned_decoder={_model_uses_conditioned_decoder(model)} "
+        f"conditioned_jitter_deg={conditioned_loss_options['perpendicular_jitter_degrees']} "
+        f"conditioned_pos_w={conditioned_loss_options['positive_query_weight']} "
+        f"conditioned_neg_w={conditioned_loss_options['negative_query_weight']}",
         flush=True,
     )
     if resume:
@@ -1195,6 +1531,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                 sample_mode=test_sample_mode,
                 direction_weight=direction_weight,
                 presence_weight=presence_weight,
+                conditioned_loss_options=conditioned_loss_options,
             )
             metric = float(test_losses["total"])
             metric_name = "test/loss_total"
@@ -1307,6 +1644,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                 batch,
                 direction_weight=direction_weight,
                 presence_weight=presence_weight,
+                conditioned_loss_options=conditioned_loss_options,
                 backward=True,
             )
             optimizer.step()
@@ -2308,7 +2646,13 @@ def _write_3d_sample_sheet(
     model.eval()
     take = min(max(1, int(sample_count)), int(batch.volume.shape[0]))
     with torch.no_grad():
-        vis_output = model(batch.volume[:take])
+        if _model_uses_conditioned_decoder(model) and hasattr(
+            model,
+            "forward_recurrent_grouped",
+        ):
+            vis_output = model.forward_recurrent_grouped(batch.volume[:take], steps=2)
+        else:
+            vis_output = model(batch.volume[:take])
     if was_training:
         model.train()
     writer.add_image(
@@ -2862,6 +3206,7 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
     model.eval()
     direction_weight = float(training.get("direction_weight", 10.0))
     presence_weight = float(training.get("presence_weight", 1.0))
+    conditioned_loss_options = _conditioned_loss_options_from_training(training)
     loader_workers = _loader_worker_count(raw_config)
     loader_prefetch_factor = _loader_prefetch_factor(raw_config)
     loader_worker_device = _loader_worker_device(raw_config)
@@ -2915,6 +3260,7 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
                     batch,
                     direction_weight=direction_weight,
                     presence_weight=presence_weight,
+                    conditioned_loss_options=conditioned_loss_options,
                     backward=False,
                 )
             if device.type == "cuda":

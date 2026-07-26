@@ -86,7 +86,11 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     trace_native_3d_pair,
     trace_native_3d_whole_fiber,
 )
-from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
+from vesuvius.neural_tracing.fiber_trace_3d.train import (
+    _conditioned_perpendicular_queries,
+    compute_conditioned_losses,
+    compute_losses,
+)
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _FiberTrace3DBatchDataset,
     _Trace2Cp3DConfig,
@@ -550,6 +554,15 @@ def test_lasagna_3x2_analytic_decode_round_trips_ambiguous_axes() -> None:
     decoded = decode_lasagna_direction_3x2_analytic(encoded)
     agreement = torch.abs(torch.sum(decoded * axes, dim=1))
     assert torch.all(agreement > 0.999)
+
+
+def test_lasagna_3x2_zero_query_is_reserved_off_manifold_token() -> None:
+    zero_query = torch.zeros((1, 6), dtype=torch.float32)
+    decoded = decode_lasagna_direction_3x2_analytic(zero_query)
+    reencoded = encode_lasagna_direction_3x2(decoded)
+
+    assert torch.isfinite(decoded).all()
+    assert not torch.allclose(reencoded, zero_query)
 
 
 def test_loader_builds_deterministic_cp_centered_3d_batch() -> None:
@@ -1592,6 +1605,191 @@ def test_3d_model_and_losses_smoke() -> None:
     assert torch.isfinite(losses["total"])
     assert losses["angle_mean_deg"].ndim == 0
     assert torch.isfinite(losses["angle_mean_deg"])
+
+
+def test_3d_conditioned_model_shapes_and_pointwise_decoder() -> None:
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            conditioned_decoder_enabled=True,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    assert model.conditioned_latent_channels == 64
+    assert model.direction_branch_count == 1
+    assert model.conditioned_decoder is not None
+    convs = [
+        module
+        for module in model.conditioned_decoder.modules()
+        if isinstance(module, torch.nn.Conv3d)
+    ]
+    assert convs
+    assert all(tuple(conv.kernel_size) == (1, 1, 1) for conv in convs)
+
+    volume = torch.zeros((2, 1, 8, 8, 8), dtype=torch.float32)
+    with torch.no_grad():
+        output = model(volume)
+        grouped = model.forward_recurrent_grouped(volume, steps=2)
+        latent = model.encode_volume(volume)
+        points = model.decode_conditioned_points(
+            latent,
+            torch.tensor([[0, 2, 3, 4], [1, 5, 6, 7]], dtype=torch.long),
+            torch.zeros((2, 6), dtype=torch.float32),
+        )
+
+    assert output.shape == (2, 7, 8, 8, 8)
+    assert grouped.shape == (2, 14, 8, 8, 8)
+    assert latent.shape[1] == 64
+    assert points.shape == (2, 7)
+
+
+def test_3d_conditioned_perpendicular_query_is_deterministic_and_perpendicular() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    indices = batch.direction_indices_bzyx[:8]
+    target = batch.direction_target_sparse[:8]
+    target_axis = decode_lasagna_direction_3x2_analytic(target)
+
+    query_a = _conditioned_perpendicular_queries(
+        batch,
+        indices,
+        target_axis,
+        jitter_degrees=0.0,
+    )
+    query_b = _conditioned_perpendicular_queries(
+        batch,
+        indices,
+        target_axis,
+        jitter_degrees=0.0,
+    )
+    query_axis = decode_lasagna_direction_3x2_analytic(query_a)
+    agreement = torch.abs(torch.sum(query_axis * target_axis, dim=1))
+
+    assert torch.allclose(query_a, query_b)
+    assert torch.max(agreement) < 1.0e-4
+
+
+def test_3d_conditioned_model_and_loss_backprop_smoke() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            conditioned_decoder_enabled=True,
+            conditioned_latent_channels=8,
+            conditioned_decoder_hidden_channels=8,
+            conditioned_decoder_layers=2,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    losses = compute_conditioned_losses(
+        model,
+        batch,
+        direction_weight=1.0,
+        presence_weight=1.0,
+    )
+    losses["total"].backward()
+
+    assert losses["total"].ndim == 0
+    assert torch.isfinite(losses["total"])
+    assert torch.allclose(losses["branch0_fraction"], torch.tensor(0.5))
+    assert torch.allclose(losses["branch1_fraction"], torch.tensor(0.5))
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.net.parameters()
+    )
+    assert model.conditioned_decoder is not None
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.conditioned_decoder.parameters()
+    )
+
+
+def test_3d_conditioned_presence_loss_includes_dense_negatives_at_positive_pixels() -> None:
+    target_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )
+
+    class _FakeConditionedModel(torch.nn.Module):
+        conditioned_decoder_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.zero = torch.zeros((1, 7, 1, 1, 2), dtype=torch.float32)
+            self.zero[0, :6, 0, 0, :] = target_dir.view(6, 1).expand(6, 2)
+            self.zero[0, 6, 0, 0, :] = torch.tensor([0.8, 0.2])
+            self.random = torch.zeros((1, 7, 1, 1, 2), dtype=torch.float32)
+            self.random[0, :6, 0, 0, :] = target_dir.view(6, 1).expand(6, 2)
+            self.random[0, 6, 0, 0, :] = torch.tensor([0.4, 0.3])
+            self.perp = torch.zeros((1, 7), dtype=torch.float32)
+            self.perp[0, :6] = target_dir[0]
+            self.perp[0, 6] = 0.6
+
+        def encode_volume(self, volume: torch.Tensor) -> torch.Tensor:
+            return torch.zeros((1, 1, 1, 1, 2), dtype=volume.dtype, device=volume.device)
+
+        def decode_conditioned_latent(
+            self,
+            latent: torch.Tensor,
+            query: torch.Tensor,
+        ) -> torch.Tensor:
+            del latent
+            if bool(torch.all(query == 0.0)):
+                return self.zero.to(device=query.device)
+            return self.random.to(device=query.device)
+
+        def decode_conditioned_points(
+            self,
+            latent: torch.Tensor,
+            indices_bzyx: torch.Tensor,
+            query_n6: torch.Tensor,
+        ) -> torch.Tensor:
+            del latent, query_n6
+            return self.perp.to(device=indices_bzyx.device).expand(int(indices_bzyx.shape[0]), -1)
+
+    batch = FiberTrace3DBatch(
+        volume=torch.zeros((1, 1, 1, 1, 2), dtype=torch.float32),
+        valid_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
+        cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
+        record_indices=torch.zeros((1,), dtype=torch.long),
+        control_point_indices=torch.zeros((1,), dtype=torch.long),
+        fiber_paths=("synthetic.json",),
+        target_modes=torch.zeros((1,), dtype=torch.long),
+        target_segment_offsets=torch.zeros((1,), dtype=torch.long),
+        target_segment_counts=torch.zeros((1,), dtype=torch.long),
+        target_segment_starts_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_ends_zyx=torch.zeros((0, 3), dtype=torch.float32),
+        target_segment_bbox_lo_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_segment_bbox_hi_zyx=torch.zeros((0, 3), dtype=torch.long),
+        target_tangent_zyx=torch.zeros((1, 3), dtype=torch.float32),
+        direction_indices_bzyx=torch.tensor([[0, 0, 0, 0]], dtype=torch.long),
+        direction_target_sparse=target_dir,
+        direction_weight_sparse=torch.zeros((1, 6), dtype=torch.float32),
+        presence_target=torch.tensor([1.0, 0.0], dtype=torch.float32).view(1, 1, 1, 1, 2),
+        presence_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
+    )
+
+    losses = compute_conditioned_losses(
+        _FakeConditionedModel(),
+        batch,
+        direction_weight=0.0,
+        presence_weight=1.0,
+    )
+
+    positive_expected = -torch.log(torch.tensor([0.8, 0.6])).mean()
+    negative_expected = -torch.log(
+        1.0 - torch.tensor([0.8, 0.2, 0.4, 0.3])
+    ).mean()
+    assert torch.allclose(losses["presence"], positive_expected + negative_expected)
 
 
 def test_3d_model_branch_helpers_preserve_branch_zero_layout() -> None:

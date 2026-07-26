@@ -77,50 +77,57 @@
   `augment_anisotropic_blur_orientation`, and
   `augment_anisotropic_blur_roll_degrees`. It is a value augmentation after
   coordinate sampling, not a geometric transform.
-- The 3D model output layout is grouped by direction branch. Each branch has
-  seven channels: six Lasagna 3x2 ambiguous direction channels followed by one
-  sigmoid sheet/fiber-presence channel. Legacy/single-branch configs use one
-  group (`7` channels); active multi-direction training configs use
-  `model_3d.direction_branch_count: 2` and `14` output channels.
-- Branch 0 preserves the legacy channel positions: channels `0:6` are
-  direction and channel `6` is presence. Branch 1 uses channels `7:13` and
-  channel `13`.
-- Each branch's six direction channels use Lasagna's double-angle projection layout:
+- The active 3D multi-direction experiment uses
+  `model_3d.conditioned_decoder_enabled: true`. A shared spatial 3D U-Net
+  emits a latent feature volume whose width is
+  `model_3d.conditioned_latent_channels` and defaults to `64`, independently
+  of `unet_base_channels`. A separate conditioned decoder receives the latent
+  channels plus a six-channel Lasagna 3x2 query direction at each voxel and
+  emits seven sigmoid channels: six direction channels and one sheet/fiber
+  presence channel.
+- The conditioned decoder head must be pointwise only: `1x1x1` convolutions or
+  equivalent per-voxel linear layers. It must not add spatial 3D kernels after
+  the shared U-Net latent.
+- The all-zero six-channel query is a reserved off-manifold unconditioned
+  token. It must not be decoded or interpreted as a real direction.
+- `FiberTrace3DNet.forward(volume)` remains a zero-query compatibility path
+  returning `B,7,D,H,W`. `forward_recurrent_grouped(volume, steps=2)` returns
+  branch-shaped grouped outputs where the first seven channels are zero-query
+  output and the next seven channels are decoded using the first prediction's
+  encoded direction as the query.
+- Legacy/free-branch configs remain supported when
+  `conditioned_decoder_enabled` is false. In that mode the output layout is
+  grouped by direction branch, each branch has seven channels, and branch 0
+  preserves the legacy channel positions (`0:6` direction, `6` presence).
+- Each seven-channel prediction's six direction channels use Lasagna's double-angle projection layout:
   `dir0_z,dir1_z` for `(tx,ty)`, `dir0_y,dir1_y` for `(tx,tz)`, and
   `dir0_x,dir1_x` for `(ty,tz)`.
 - Direction supervision is computed from the transformed 3D line tangent and is
   masked to positive fiber-neighborhood voxels. Projection-magnitude weighting
   may downweight channels whose projection is nearly degenerate.
-- Positive direction/presence supervision chooses exactly one branch per sparse
-  positive supervision point. The chosen branch is
-  `argmax(abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence)`,
-  using a detached score for the discrete routing decision. Direction loss and
-  positive presence BCE apply only to the selected branch at points included by
-  `presence_mask`. The unselected positive branch is not trained as negative at
-  that positive point.
-- During two-branch 3D training, positive routing includes a batch-local
-  anti-collapse repair over deterministic per-sample-offset `2x2x2` spatial
-  groups within each patch. Training first shifts each sample's group grid by a
-  deterministic integer offset derived from `stream_index`, then averages
-  detached branch choice scores per `(patch, shifted 2x2x2 chunk)`. If either
-  branch receives fewer than 10% of grouped positive supervision, the
-  underrepresented branch takes the missing quota from groups currently
-  assigned to the other branch, sorted by the underrepresented branch's grouped
-  detached choice score. The chosen group branch is broadcast back to all
-  sparse positive points in that group. If both branches already meet the
-  floor, routing is unchanged. Test/eval metrics do not apply this repair, do
-  not group choices, and use the raw per-voxel detached argmax routing.
-- Negative presence supervision remains global: all branches are supervised as
-  negative where the dense presence target is negative inside the valid/reachable
-  patch interior. For CP-only samples, edge voxels that could not contain a CP
-  because of shift augmentation are ignored for presence loss. For NML
-  dense-line samples, presence supervision uses the full valid patch because the
-  centerline can provide positives and negatives in that region.
-- Presence loss is normalized by patch and branch before aggregation. Sparse
-  positive presence BCE is averaged per selected `(patch, branch)` group; dense
-  negative presence BCE is averaged per `(patch, branch)` group. The available
-  positive and negative group-normalized terms are then summed directly, without
-  an additional global positive/negative balancing factor.
+- In conditioned mode, sparse positive supervision evaluates two positive
+  queries per supervised point with equal weight: the zero/unconditioned query,
+  and one deterministic query sampled from the plane perpendicular to the GT
+  direction with configurable jitter
+  (`training.conditioned_perpendicular_jitter_degrees`, default `45.0`). Both
+  positive queries predict positive presence and the same GT direction.
+- Conditioned positive-query randomness is deterministic from `stream_index`
+  and the local sparse point coordinate, not from loader order or global RNG.
+- In conditioned mode, dense negative presence supervision decodes both the
+  zero query and one deterministic random direction query per patch over all
+  `presence_mask` locations, including positive pixels by design. The weak
+  dense negative BCE at positive pixels is intentional; under the configured
+  positive/negative component weights it is equivalent to a softened positive
+  target, not contradictory masked supervision.
+- Conditioned presence BCE is normalized by patch/query group before
+  aggregation. The group-normalized positive and negative components are
+  multiplied by `training.conditioned_positive_query_weight` and
+  `training.conditioned_negative_query_weight`, both defaulting to `1.0`.
+- Legacy/free-branch positive supervision still chooses one branch per sparse
+  positive point by detached
+  `argmax(abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence)`.
+  Legacy two-branch training keeps the deterministic `2x2x2` anti-collapse
+  repair and legacy global-negative branch BCE semantics for old configs.
 - 3D training defaults `training.direction_weight` to `10.0` and
   `training.presence_weight` to `1.0`, so direction loss is 10x stronger than
   presence loss unless the config overrides it.
@@ -131,7 +138,8 @@
   nearest search or by inverting sampled image coordinates. Non-NML fiber
   sources supervise only the sampled CP neighborhood for direction and
   presence.
-- The first 3D model uses branch-routed direction plus presence losses.
+- The first 3D model used branch-routed direction plus presence losses; the
+  active multi-direction experiment uses the conditioned query loss above.
   Contrastive embedding remains unsupported by default in the 3D V0 path.
 - The 3D fiber model defaults to `BatchNorm3d`; configured `batch_size` is the
   actual BatchNorm batch because the trainer has no internal micro-batching.
@@ -144,13 +152,14 @@
   `augment_shift_zyx: [48,48,48]`, and a fixed six-stage U-Net depth
   (`[16,32,64,128,256,512]`) so the deepest feature map remains appropriate
   for 192-voxel patches.
-- `train_s1a_nml_all_64_sd2.json` is a fast experimental S1A NML config for
-  64-voxel patches at `base_volume_scale: 2`. It keeps the same implemented
-  augmentation families enabled at smaller magnitudes appropriate for that
-  patch size: affine shift/rotation/scale/flip, value brightness/contrast/
-  gamma/noise, isotropic blur, smooth displacement, and anisotropic blur.
-  Shear/skew and ringing remain unsupported and must not appear as enabled
-  keys in this config.
+- `train_s1a_nml_all_64_sd2.json` and
+  `train_s1a_nml_all_128_sd2.json` are experimental S1A NML configs at
+  `base_volume_scale: 2` for 64- and 128-voxel patches. They use the active
+  conditioned decoder path and keep the same implemented augmentation families
+  enabled at magnitudes appropriate for their patch sizes: affine
+  shift/rotation/scale/flip, value brightness/contrast/gamma/noise, isotropic
+  blur, smooth displacement, and anisotropic blur. Shear/skew and ringing
+  remain unsupported and must not appear as enabled keys in these configs.
 - 3D training TensorBoard visualization logs CP-centered slice sheets at
   `training.sample_vis_interval`. By default, up to four batch samples are
   shown; `training.sample_vis_count` / `train_sample_vis_count` and
@@ -160,11 +169,14 @@
   perpendicular/cross slice whose plane normal is the GT CP tangent. Each row
   has nine columns: volume image with projected GT line and model-predicted/
   fitted CP direction overlay where applicable, target/context presence,
-  literal branch-0 presence, literal branch-1 presence, branch presence for the
-  output whose decoded direction is closer to the slice normal by
-  `abs(dot(axis, normal))`, the other branch presence, max branch presence, min
-  branch presence, and average branch presence. The target/context presence
-  panel must visualize the carried transformed fiber-line segment
+  first prediction presence, second prediction presence, prediction presence
+  for the output whose decoded direction is closer to the slice normal by
+  `abs(dot(axis, normal))`, the other prediction presence, max prediction
+  presence, min prediction presence, and average prediction presence. In
+  conditioned mode the first prediction is the zero-query output and the second
+  prediction is the recurrent output conditioned on the first decoded
+  direction; in legacy branch mode these are branch outputs. The target/context
+  presence panel must visualize the carried transformed fiber-line segment
   metadata even for JSON/non-NML CP-only samples where loss supervision remains
   CP-only. The two oblique rows must project/rasterize transformed line
   segments into their oblique slice frame for both image overlay and
@@ -180,15 +192,19 @@
 - The 3D target-presence panel in TensorBoard is display-only max-pooled with a
   `3x3x3` kernel before slicing. This must not modify `presence_target` used by
   training or test loss.
-- 3D training/test loss logging reports average selected-branch direction
+- 3D training/test loss logging reports average supervised prediction direction
   angular error in degrees as `train/angle_mean_deg` and
   `test/angle_mean_deg`. The scalar is computed over sparse supervised
   direction samples with Lasagna 3x2 analytic decoding and unoriented
-  `abs(dot)` agreement. Branch routing diagnostics include branch usage
-  fractions and selected score means.
-- 3D presence loss uses equal total class weight when routed positives and
-  global negatives are both present:
-  `0.5 * mean(selected positive BCE) + 0.5 * mean(all-branch negative BCE)`.
+  `abs(dot)` agreement. Legacy branch routing diagnostics include branch usage
+  fractions and selected score means; conditioned mode reports fixed equal
+  query fractions for its two positive query groups and the mean
+  `abs(dot) * presence` over those positive query outputs.
+- Conditioned 3D presence loss uses equal default component weight when
+  positive-query and dense negative-query supervision are both present:
+  `mean(positive-query BCE) + mean(dense negative-query BCE)`, multiplied by
+  the configured conditioned positive/negative component weights. Legacy branch
+  mode keeps its existing selected-positive plus branch-negative BCE contract.
 - When `training.test_interval > 0`, 3D training runs the configured test
   evaluation at step 0 before the first optimizer step and logs the same
   TensorBoard scalars/stdout as interval tests.
@@ -375,6 +391,11 @@
   decodes six Lasagna 3x2 direction channels analytically, treats predicted
   axes as sign-ambiguous, and aligns sampled directions to the current trace
   direction before scoring.
+- For conditioned 3D models, native Trace2CP inferred-block caching must store
+  grouped recurrent outputs: zero-query output first, then output conditioned
+  on the first decoded direction. Existing branch-aware candidate scoring then
+  chooses between strongest and recurrent secondary predictions; these grouped
+  slots are not free branch heads.
 - Native 3D Trace2CP inference uses overlapped axis-aligned model-output
   blocks. Each block has a full input patch and a cropped trusted core; point
   lookups must route to a block whose trusted core contains the queried point.
