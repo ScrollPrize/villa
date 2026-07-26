@@ -170,6 +170,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
     - [HIP/ROCm port of ScrollFiesta's MLS for AMD GPUs](https://github.com/altommo/scrollfiesta-mls-hip) by Alan Thompson (altommo) — clean-room HIP port of the MLS-midpoint kernel, validated on RX 9070 / gfx1201: ~16.8x kernel, ~5.8x multi-cube, topology-equivalent weld-safe mesh. ([upstream PR](https://github.com/Hob3rMallow/scrollfiesta_public/pull/4))
     - [CubeCL port of ScrollFiesta's MLS (portable GPU: AMD/NVIDIA/WGPU)](https://github.com/altommo/scrollfiesta-mls-cubecl) by Alan Thompson (altommo) — Rust/CubeCL reimplementation of the same MLS kernel from a single source; validated on RX 9070 / gfx1201 against the HIP port, passing the 0.25-voxel weld-safety gate and 5-pass strict parity vs clean HIP.
       
+- [Herculaneum Scroll Tools](https://github.com/axiosdevs/herculaneum-scroll-tools) by axiosdevs — CT-consistency QA for the published m7 surface predictions: voxel-exact phantom fractions measured for all 36 samples incl. all 13 grand-prize scrolls (43.3% of positives sit outside the masked CT), with a one-pass `clean` mode ([villa#1114](https://github.com/ScrollPrize/villa/issues/1114)); plus cross-scan registration (2023→2025 rescan, MAD 29 µm), a winding-constraint annotator/verifier in native spiral-input format, and dual-energy high-Z ink-candidate rendering.
+
 ### 📦 Materials
 
 #### 🌟 Highlighted
