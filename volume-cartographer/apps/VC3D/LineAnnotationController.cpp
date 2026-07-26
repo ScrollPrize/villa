@@ -7889,7 +7889,17 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                              fiber.tags.end(),
                              kNeedsReoptimizationTag) != fiber.tags.end();
         });
-    if (anyTaggedForReopt && !_reoptimizationPromptPending) {
+    if (anyTaggedForReopt && _errorDialogsSuppressed) {
+        // Suppression must be checked at SCHEDULE time too: the agent
+        // bridge scopes it per command, so a timer scheduled inside a
+        // suppressed load would fire after the scope is restored and block
+        // the GUI thread on a modal nobody will click. (The fire-time
+        // check below stays as a second gate.)
+        Logger()->warn("Line Annotation (suppressed dialog): fiber(s) tagged "
+                       "{} (merged during sync); skipping the "
+                       "re-optimization prompt",
+                       kNeedsReoptimizationTag);
+    } else if (anyTaggedForReopt && !_reoptimizationPromptPending) {
         _reoptimizationPromptPending = true;
         QTimer::singleShot(0, this, [this]() {
             // Cleared only AFTER the prompt/work finishes: a fiber reload
@@ -7907,11 +7917,14 @@ void LineAnnotationController::loadFibersForCurrentPackage()
 
 void LineAnnotationController::promptReoptimizationForMergedFibers()
 {
-    std::vector<uint64_t> tagged;
+    // Collected by fileName, not runtime id: ids are densely reassigned on
+    // every reload, and a reload can happen while the modal below spins.
+    std::vector<std::string> tagged;
     for (const auto& fiber : _fibers) {
-        if (std::find(fiber.tags.begin(), fiber.tags.end(),
+        if (!fiber.fileName.empty() &&
+            std::find(fiber.tags.begin(), fiber.tags.end(),
                       kNeedsReoptimizationTag) != fiber.tags.end()) {
-            tagged.push_back(fiber.id);
+            tagged.push_back(fiber.fileName);
         }
     }
     if (tagged.empty()) {
@@ -7953,7 +7966,7 @@ void LineAnnotationController::promptReoptimizationForMergedFibers()
 }
 
 void LineAnnotationController::reoptimizeMergedFibers(
-    const std::vector<uint64_t>& fiberIds)
+    const std::vector<std::string>& fiberFileNames)
 {
     auto stripReoptimizationTag = [](std::vector<std::string>& tags) {
         tags.erase(std::remove(tags.begin(), tags.end(),
@@ -7972,17 +7985,18 @@ void LineAnnotationController::reoptimizeMergedFibers(
 
     const QPointer<LineAnnotationController> alive(this);
     int reoptimized = 0;
-    bool taggedOnlySaves = false;
-    for (const uint64_t fiberId : fiberIds) {
+    bool scheduledTagOnlySave = false;
+    for (const std::string& fiberFileName : fiberFileNames) {
         const auto it = std::find_if(
             _fibers.begin(), _fibers.end(),
-            [fiberId](const StoredFiber& fiber) { return fiber.id == fiberId; });
+            [&fiberFileName](const StoredFiber& fiber) {
+                return fiber.fileName == fiberFileName;
+            });
         if (it == _fibers.end()) {
             continue;
         }
-        // The ids were collected before a modal prompt, and runtime ids
-        // are densely reassigned on every fiber reload — anything we touch
-        // must still carry the tag, or it is not ours to re-optimize.
+        // Collected before a modal prompt; a reload during it may have
+        // changed the fiber — only still-tagged files are ours to touch.
         if (std::find(it->tags.begin(), it->tags.end(),
                       kNeedsReoptimizationTag) == it->tags.end()) {
             continue;
@@ -7993,8 +8007,15 @@ void LineAnnotationController::reoptimizeMergedFibers(
             // No line to fit; just clear the tag.
             stripReoptimizationTag(it->tags);
             it->needsSave = false;
-            scheduleFiberSave(*it);
-            taggedOnlySaves = true;
+            try {
+                scheduleFiberSave(*it);
+                scheduledTagOnlySave = true;
+            } catch (const std::exception& ex) {
+                it->needsSave = true;
+                Logger()->warn("Could not save {} after clearing the {} "
+                               "tag: {}",
+                               fileName, kNeedsReoptimizationTag, ex.what());
+            }
             continue;
         }
         // Pane-less session: the surface name is never registered, so no
@@ -8006,7 +8027,7 @@ void LineAnnotationController::reoptimizeMergedFibers(
             *it,
             static_cast<double>(it->linePoints.size() / 2),
             cv::Vec3d{0.0, 0.0, 0.0},
-            "fiber_reoptimization_" + std::to_string(fiberId),
+            "fiber_reoptimization_" + fileName,
             nullptr);
         stripReoptimizationTag(session->fiberTags);
         // Arms finalizeSessionOptimizationSynchronously inside the save.
@@ -8042,22 +8063,32 @@ void LineAnnotationController::reoptimizeMergedFibers(
         if (session->optimizationState == SessionOptimizationState::Optimized) {
             ++reoptimized;
         } else {
-            // saveSessionAsFiber already surfaced the error; the tag stays
-            // on disk so the next load offers a retry.
-            Logger()->warn("Re-optimization failed for fiber {}; keeping the "
-                           "{} tag for a retry on next load",
+            // saveSessionAsFiber already surfaced the error dialog; a
+            // failure here is almost certainly systematic (dataset,
+            // volume), so abort the batch instead of stacking one modal
+            // per remaining fiber. All untouched tags are kept for a
+            // retry on the next load.
+            Logger()->warn("Re-optimization failed for fiber {}; aborting "
+                           "the batch — the {} tag(s) are kept for a retry "
+                           "on next load",
                            fileName,
                            kNeedsReoptimizationTag);
+            break;
         }
     }
-    if (reoptimized > 0) {
-        Logger()->info("Re-optimized {} merged fiber(s)", reoptimized);
+    if (reoptimized > 0 || scheduledTagOnlySave) {
+        if (reoptimized > 0) {
+            Logger()->info("Re-optimized {} merged fiber(s)", reoptimized);
+        }
+        // Wait for ALL scheduled writes (including tag-strip-only saves)
+        // before returning: the caller clears the prompt-dedup flag right
+        // after, and a reload must re-read tag-free files.
         waitForFiberSaves();
         if (!alive) {
             return;
         }
     }
-    if (taggedOnlySaves) {
+    if (scheduledTagOnlySave) {
         emitFiberSummaries();
     }
 }

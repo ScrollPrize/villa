@@ -313,7 +313,7 @@ class TestConflictStash:
         # Tracked md5 differs from current content
         track_row(manager, 'fibers/f.json', info['local_size'], 0.0,
                   10, 'e' * 32, 'a' * 32)
-        manager._stash_divergent_download_targets(['fibers/f.json'])
+        manager._stash_divergent_local_copies(['fibers/f.json'])
         stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
         stashed = [f for _, _, fs in os.walk(stash_root) for f in fs]
         assert len(stashed) == 1
@@ -323,7 +323,7 @@ class TestConflictStash:
         info = local_info(manager, 'fibers/f.json')
         track_row(manager, 'fibers/f.json', info['local_size'], 0.0,
                   10, 'e' * 32, info['local_md5'])
-        manager._stash_divergent_download_targets(['fibers/f.json'])
+        manager._stash_divergent_local_copies(['fibers/f.json'])
         assert not os.path.exists(
             os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME))
 
@@ -336,7 +336,7 @@ class TestConflictStash:
         track_row(manager, 'fibers/f.json', info['local_size'], 0.0,
                   10, 'e' * 32, info['local_md5'])  # clean at scan time
         write_local(manager, 'fibers/f.json', '{"v": 2}')  # edited afterwards
-        manager._stash_divergent_download_targets(['fibers/f.json'])
+        manager._stash_divergent_local_copies(['fibers/f.json'])
         stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
         stashed = [f for _, _, fs in os.walk(stash_root) for f in fs]
         assert len(stashed) == 1
@@ -765,7 +765,8 @@ class TestLinkConsistency:
             [('fibers/a.json', plan)], {'fibers/b.json'})
         assert demoted == []
         fixed = peer_fixes['fibers/b.json']
-        assert fixed['generation'] == 5  # based on the remote doc
+        # Based on the remote doc (gen 5), bumped by the rewrite
+        assert fixed['generation'] == 6
         assert fixed['branches'][0]['branch_file'] == 'a.json'
 
 
@@ -919,3 +920,68 @@ class TestDemotionFixpoint:
             [('fibers/a.json', plan)], set())
         assert demoted and demoted[0][0] == 'fibers/a.json'
         assert peer_fixes == {}
+
+
+class TestDeleteLocalSafety:
+    def test_divergent_local_copy_stashed_before_deletion(self, manager):
+        """Remote deleted the file, local edited it since the last sync —
+        previously the only loss path with no conflict copy."""
+        write_local(manager, 'fibers/f.json', '{"edited": "locally"}')
+        info = local_info(manager, 'fibers/f.json')
+        track_row(manager, 'fibers/f.json', info['local_size'], 0.0,
+                  10, 'e' * 32, 'a' * 32)  # tracked hash differs
+        manager._stash_divergent_local_copies(['fibers/f.json'])
+        stash_root = os.path.join(manager.local_dir, vc_sync.CONFLICT_DIR_NAME)
+        stashed = [f for _, _, fs in os.walk(stash_root) for f in fs]
+        assert len(stashed) == 1
+
+    def test_delete_vs_edit_surfaced_in_reason(self, manager):
+        write_local(manager, 'f.json', '{"edited": true}')
+        info = local_info(manager, 'f.json')
+        track_row(manager, 'f.json', info['local_size'], info['local_mtime'],
+                  10, 'e' * 32, 'a' * 32)  # s3 gone, local hash changed
+        actions = manager.analyze_changes({'f.json': info}, {})
+        action, reason = actions['f.json']
+        assert action == SyncAction.DELETE_LOCAL
+        assert 'unsynced edits' in reason
+
+
+class TestPlannerInputHardening:
+    def test_nul_byte_peer_name_demotes_instead_of_crashing(self, manager):
+        """A remote-crafted branch_file with an embedded NUL must demote
+        the merge, not abort the sync with a ValueError traceback."""
+        doc = TestLinkConsistency.fiber('a.json', TestLinkConsistency.CPS_A)
+        pending = manager._merge_tmp_path('fibers/a.json', '.merged')
+        with open(pending, 'w') as f:
+            json.dump(doc, f)
+        plan = {'pending': pending, 'remote_tmp': None, 'summary': 's',
+                'merged_doc': doc, 'base_doc': doc,
+                'peer_files': ['b\x00.json']}
+        peer_fixes, demoted = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert peer_fixes == {}
+        assert demoted and 'invalid linked fiber name' in demoted[0][1]
+
+    def test_nan_in_merged_doc_demotes(self, manager):
+        """A NaN smuggled through an opaque subtree would serialize as
+        invalid JSON (unloadable by nlohmann); planning demotes it."""
+        a = TestLinkConsistency.fiber(
+            'a.json', TestLinkConsistency.CPS_A,
+            branches=[TestLinkConsistency.entry(
+                'b.json', TestLinkConsistency.CPS_A, 1,
+                TestLinkConsistency.CPS_B, 0)])
+        a['opaque_extra'] = float('nan')
+        b = TestLinkConsistency.fiber('b.json', TestLinkConsistency.CPS_B)
+        write_local(manager, 'fibers/b.json', json.dumps(b))
+        pending = manager._merge_tmp_path('fibers/a.json', '.merged')
+        with open(pending, 'w') as f:
+            f.write('{}')
+        plan = {'pending': pending, 'remote_tmp': None, 'summary': 's',
+                'merged_doc': a,
+                'base_doc': TestLinkConsistency.fiber(
+                    'a.json', TestLinkConsistency.CPS_A),
+                'peer_files': ['b.json']}
+        peer_fixes, demoted = manager._plan_link_consistency(
+            [('fibers/a.json', plan)], set())
+        assert peer_fixes == {}
+        assert demoted and 'refresh against' in demoted[0][1]

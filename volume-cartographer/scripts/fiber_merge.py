@@ -81,15 +81,17 @@ def is_fiber_doc(doc):
     crashing mid-merge."""
     if not (isinstance(doc, dict) and doc.get('type') == 'vc3d_fiber'):
         return False
+    if doc.get('version', 1) != 1:
+        return False  # the loader throws on unsupported versions
     for key in ('control_points', 'line_points'):
         points = doc.get(key)
         if not isinstance(points, list) or not all(_finite_point(p)
                                                    for p in points):
             return False
     tags = doc.get('tags', [])
-    if tags is not None and not (isinstance(tags, list) and
-                                 all(isinstance(tag, str) for tag in tags)):
-        return False
+    if not (isinstance(tags, list) and
+            all(isinstance(tag, str) for tag in tags)):
+        return False  # tags: null is unloadable ("tags must be an array")
     generation = doc.get('generation', 1)
     if generation is not None and (isinstance(generation, bool) or
                                    not isinstance(generation, (int, float)) or
@@ -190,17 +192,29 @@ def endpoint_tangent(line, point):
     return line_tangent_at(line, nearest_line_point_index(line, point))
 
 
+def _nearly(a, b, tol=1.0e-12):
+    try:
+        return (len(a) == 3 and len(b) == 3 and
+                all(abs(float(x) - float(y)) <= tol for x, y in zip(a, b)))
+    except (TypeError, ValueError):
+        return False
+
+
 def _snapped_direction(stored, tangent):
-    """The value a stored direction field must hold: exactly +-tangent.
+    """The value a stored direction field must hold: (+-)tangent.
 
     The loader's checks are sign-agnostic, but the stored sign encodes the
-    link's sense in VC3D, so it is preserved. Writing exactly +-tangent
+    link's sense in VC3D, so it is preserved. Snapping to +-tangent
     (rather than leave-if-within-tolerance) is what makes reciprocal PAIRS
     pass the loader's stored-vs-stored comparison: two fields each within
     tolerance of the true tangent can still be 2x tolerance apart from
-    each other."""
+    each other. The accept window is ~1e-12 per component rather than
+    byte-equality so a VC3D build whose float contraction differs from
+    CPython by an ulp doesn't cause every refresh to rewrite (and
+    re-upload) every direction; pairwise that window is still 7 orders of
+    magnitude inside the loader's 1e-5 tolerance."""
     negated = [-x for x in tangent]
-    if stored == tangent or stored == negated:
+    if _nearly(stored, tangent) or _nearly(stored, negated):
         return stored
     normalized = _normalized(stored)
     if (normalized is not None and
@@ -325,8 +339,13 @@ def _branch_target(entry):
 
 
 def _structured_branch(branch):
-    """A branch entry this module understands well enough to merge."""
+    """A branch entry this module understands well enough to merge.
+
+    Entries carrying the obsolete `link_direction` key are deliberately
+    opaque: the loader strips them at parse time, so treating one as
+    decided truth would cement a reciprocal the loader then tears down."""
     return (isinstance(branch, dict) and
+            'link_direction' not in branch and
             _branch_target(branch) is not None and
             _finite_point(branch.get('control_point_position')) and
             _finite_point(branch.get('branch_control_point_position')))
@@ -526,15 +545,49 @@ def _rebind_local_anchors(entries, control_points, line_points):
                              "at a control point absent from the merged "
                              "geometry")
         entry['control_point_index'] = index
-        snapped = [float(x) for x in control_points[index]]
-        if entry['control_point_position'] != snapped:
-            entry['control_point_position'] = snapped
-        tangent = endpoint_tangent(line_points, snapped)
-        direction = _snapped_direction(entry.get('control_point_direction'),
-                                       tangent)
-        if entry.get('control_point_direction') != direction:
-            entry['control_point_direction'] = direction
+        entry['control_point_position'] = [float(x)
+                                           for x in control_points[index]]
+        tangent = endpoint_tangent(line_points, entry['control_point_position'])
+        entry['control_point_direction'] = _snapped_direction(
+            entry.get('control_point_direction'), tangent)
     return entries, None
+
+
+def _manual_hv_tag(doc):
+    hv = doc.get('hv_classification')
+    return hv.get('manual_tag') if isinstance(hv, dict) else None
+
+
+def _merge_manual_hv_tag(base, local, remote, merged, notes):
+    """Three-way merge of hv_classification.manual_tag — the one field
+    inside hv_classification that is a USER decision, not derived (the
+    loader round-trips it independently of the recomputed scores). The
+    rest of hv_classification stays with the carrier. Returns a conflict
+    message or None."""
+    base_tag = _manual_hv_tag(base)
+    local_tag = _manual_hv_tag(local)
+    remote_tag = _manual_hv_tag(remote)
+    if local_tag == remote_tag:
+        chosen = local_tag
+    elif remote_tag == base_tag:
+        chosen = local_tag
+    elif local_tag == base_tag:
+        chosen = remote_tag
+    else:
+        return (f"hv manual_tag changed differently on both sides "
+                f"({local_tag!r} vs {remote_tag!r})")
+    if chosen == _manual_hv_tag(merged):
+        return None
+    hv = merged.get('hv_classification')
+    if not isinstance(hv, dict):
+        hv = {}
+        merged['hv_classification'] = hv
+    if chosen is None:
+        hv.pop('manual_tag', None)
+    else:
+        hv['manual_tag'] = chosen
+    notes.append(f"kept manual hv tag {chosen!r}")
+    return None
 
 
 def merge_fibers(base, local, remote):
@@ -560,16 +613,25 @@ def merge_fibers(base, local, remote):
             return result
 
     # Short circuits: only one side truly changed, or both converged. The
-    # winning content is a file VC3D itself wrote, consistent with its
-    # peers as synced — no peer pass needed.
+    # winning content is a file VC3D itself wrote — normally consistent
+    # with its peers, since VC3D writes both sides of a link in lockstep.
+    # peer_files is still reported so the caller's consistency pass can
+    # verify (and heal) that invariant; for genuinely consistent pairs the
+    # pass is a no-op with zero rewrites.
+    def short_circuit_peers(doc):
+        return sorted({_branch_target(entry) for entry in links_to_any(doc)} |
+                      {_branch_target(entry) for entry in links_to_any(base)})
+
     if local == remote or remote == base:
         result.update(ok=True, merged=copy.deepcopy(local),
+                      peer_files=short_circuit_peers(local),
                       notes=(["remote side unchanged; kept local"]
                              if remote == base and local != remote else
                              ["both sides identical"]))
         return result
     if local == base:
         result.update(ok=True, merged=copy.deepcopy(remote),
+                      peer_files=short_circuit_peers(remote),
                       notes=["local side unchanged; took remote"])
         return result
 
@@ -605,6 +667,10 @@ def merge_fibers(base, local, remote):
         carrier = newer
         stats['geometry_merged'] = False
     else:
+        # In the one-sided branch below only regions/conflicts are used —
+        # the composite merged_cps mixes floats from all three docs, and a
+        # loader-safe file must take control_points AND line_points from
+        # ONE written pair.
         merged_cps, regions, cp_conflicts = merge_control_points(
             base['control_points'], local['control_points'],
             remote['control_points'])
@@ -686,6 +752,11 @@ def merge_fibers(base, local, remote):
     if reoptimize and REOPTIMIZE_TAG not in merged['tags']:
         merged['tags'].append(REOPTIMIZE_TAG)
     merged['generation'] = max(generation_local, generation_remote) + 1
+    manual_tag_conflict = _merge_manual_hv_tag(base, local, remote, merged,
+                                               notes)
+    if manual_tag_conflict:
+        result['conflicts'] = [manual_tag_conflict]
+        return result
 
     stats['reoptimize'] = reoptimize
     result['peer_files'] = sorted(
@@ -704,6 +775,11 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
     loader's predicates are left byte-identical, so an in-sync pair yields
     zero changes (and no re-upload). On any unresolvable anchor the caller
     must treat A's merge as a manual conflict — nothing is guessed.
+
+    base_doc gates deletion mirroring: without it, a reciprocal of a link
+    A no longer carries is LEFT IN PLACE (e.g. after a moved anchor, the
+    peer keeps the stale entry alongside the new one — loader-visible).
+    Callers that merged A must always pass A's base.
     """
     a = copy.deepcopy(a_doc)
     b = copy.deepcopy(b_doc)
@@ -748,6 +824,7 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
             entry.pop('pending', None)
         out[doc_flag] = True
 
+    used_reciprocals = []
     for entry in a_entries:
         local_index = resolve_cp_index(a_cps, entry['control_point_position'])
         far_index = resolve_cp_index(b_cps, entry['branch_control_point_position'])
@@ -768,11 +845,16 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
         snap_position(entry, 'branch_control_point_position', pb, 'a_changed')
         snap_direction(entry, 'branch_control_point_direction', db, 'a_changed')
 
+        # One reciprocal per entry: two pos_eq-identical A entries must not
+        # both claim the same B entry (leaving B one reciprocal short).
         reciprocal = next(
             (r for r in links_to(b, a_name)
-             if pos_eq(r.get('control_point_position'), pb) and
+             if not any(r is used for used in used_reciprocals) and
+             pos_eq(r.get('control_point_position'), pb) and
              pos_eq(r.get('branch_control_point_position'), pa)),
             None)
+        if reciprocal is not None:
+            used_reciprocals.append(reciprocal)
         if reciprocal is None:
             reciprocal = {
                 'control_point_index': far_index,
@@ -828,6 +910,12 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
                 out['b_changed'] = True
                 out['notes'].append(
                     f"removed reciprocal of deleted link in {b_name}")
+
+    if out['b_changed']:
+        # A rewritten peer is a newer version; keep the generation
+        # monotonic so later 3-way merges pick the right "newer" side
+        # (VC3D bumps on every save too).
+        b['generation'] = int(b.get('generation', 1) or 1) + 1
 
     out['ok'] = not out['conflicts']
     return out

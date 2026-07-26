@@ -496,7 +496,9 @@ private:
     // needs_reoptimization tag; on load VC3D offers to re-fit their lines.
     // Declining keeps the tag so the next load asks again.
     void promptReoptimizationForMergedFibers();
-    void reoptimizeMergedFibers(const std::vector<uint64_t>& fiberIds);
+    // fileNames, not runtime ids: ids are densely reassigned on reloads,
+    // which can happen while the prompt's modal spins.
+    void reoptimizeMergedFibers(const std::vector<std::string>& fiberFileNames);
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
     [[nodiscard]] std::filesystem::path fibersRootDir() const;

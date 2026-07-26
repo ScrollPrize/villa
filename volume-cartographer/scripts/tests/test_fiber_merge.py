@@ -892,3 +892,114 @@ def test_merged_pair_end_to_end_is_loader_safe():
     assert out['ok']
     docs = {'a.json': out['a_doc'], 'b.json': out['b_doc']}
     assert loader_issues(docs) == []
+
+
+# --- round-2 review findings ----------------------------------------------
+
+
+def test_manual_hv_tag_merges_base_aware():
+    """hv_classification.manual_tag is a USER decision: the side that
+    changed it relative to the base wins, regardless of which side carries
+    the geometry/generation."""
+    base = make_fiber(BASE_CPS)
+    base['hv_classification'] = {'manual_tag': 'unknown', 'score': 0.5}
+    local = copy.deepcopy(base)
+    local['hv_classification'] = {'manual_tag': 'horizontal', 'score': 0.5}
+    local['generation'] = 2
+    remote = copy.deepcopy(base)
+    remote['tags'] = ['unrelated']
+    remote['generation'] = 5          # remote is the carrier
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['hv_classification']['manual_tag'] == 'horizontal'
+    assert any('manual hv tag' in n for n in result['notes'])
+
+
+def test_manual_hv_tag_both_changed_conflicts():
+    base = make_fiber(BASE_CPS)
+    base['hv_classification'] = {'manual_tag': 'unknown'}
+    local = copy.deepcopy(base)
+    local['hv_classification'] = {'manual_tag': 'horizontal'}
+    remote = copy.deepcopy(base)
+    remote['hv_classification'] = {'manual_tag': 'vertical'}
+    result = merge_fibers(base, local, remote)
+    assert not result['ok']
+    assert any('manual_tag' in c for c in result['conflicts'])
+
+
+def test_legacy_link_direction_entries_are_opaque():
+    """The loader strips entries carrying the obsolete link_direction key
+    at parse time; the merge must not treat one as decided truth (its
+    reciprocal would be cemented into the peer, then torn down by the
+    loader's destructive repair)."""
+    legacy = link('kb_a.json', BASE_CPS[2], OTHER, 2)
+    legacy['link_direction'] = [1.0, 0.0, 0.0]
+    base = make_fiber(BASE_CPS, branches=[legacy])
+    local = make_fiber(BASE_CPS, branches=[legacy], tags=['x'])
+    remote = make_fiber(BASE_CPS, branches=[legacy], tags=['y'])
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    # Carried as an opaque value, never mirrored into a peer
+    assert result['merged']['branches'] == [legacy]
+    assert result['peer_files'] == []
+
+
+def test_is_fiber_doc_rejects_unloadable_variants():
+    doc = make_fiber(BASE_CPS)
+    doc['version'] = 2                # loader: "Unsupported ... version"
+    assert not fiber_merge.is_fiber_doc(doc)
+    doc = make_fiber(BASE_CPS)
+    doc['tags'] = None                # loader: "tags must be an array"
+    assert not fiber_merge.is_fiber_doc(doc)
+
+
+def test_short_circuit_merges_still_report_peers():
+    """One-side-unchanged merges take the other side wholesale; peer_files
+    is still reported so the (no-op for consistent pairs) consistency pass
+    can verify — a crash mid-VC3D-save breaks the lockstep-write invariant
+    the wholesale adoption relies on."""
+    entry = link('kb_a.json', BASE_CPS[2], OTHER, 2)
+    base = make_fiber(BASE_CPS, branches=[entry])
+    remote = make_fiber(BASE_CPS, branches=[entry], tags=['new'], generation=4)
+    result = merge_fibers(base, copy.deepcopy(base), remote)
+    assert result['ok']
+    assert result['merged'] == remote
+    assert result['peer_files'] == ['kb_a.json']
+
+
+def test_snapped_direction_tolerates_ulp_noise():
+    """A direction differing from the recomputed tangent by an ulp (e.g. a
+    VC3D build with contracted float math) must be accepted as-is, or
+    every refresh would rewrite (and re-upload) every direction."""
+    tangent = [1.0, 0.0, 0.0]
+    ulp_off = [1.0 + 1e-14, 1e-14, 0.0]
+    assert fiber_merge._snapped_direction(ulp_off, tangent) == ulp_off
+    assert fiber_merge._snapped_direction([-1.0 - 1e-14, 0.0, 0.0],
+                                          tangent) == [-1.0 - 1e-14, 0.0, 0.0]
+    rotated = [math.cos(0.001), math.sin(0.001), 0.0]  # well past ulp noise
+    assert fiber_merge._snapped_direction(rotated, tangent) == tangent
+
+
+def test_refresh_bumps_peer_generation_only_when_changed():
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['b_doc']['generation'] == b['generation']  # untouched
+    b_missing = copy.deepcopy(b)
+    b_missing['branches'] = []
+    out = refresh_pair_links(a, b_missing, 'a.json', 'b.json')
+    assert out['b_changed']
+    assert out['b_doc']['generation'] == b['generation'] + 1
+
+
+def test_duplicate_a_entries_claim_distinct_reciprocals():
+    """Two pos_eq-identical A entries must not both snap the same B
+    reciprocal, leaving B one entry short for the loader (GIGO input, but
+    cheap to handle)."""
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1)
+    a['branches'].append(copy.deepcopy(a['branches'][0]))
+    b['branches'].append(copy.deepcopy(b['branches'][0]))
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok']
+    assert len(out['b_doc']['branches']) == 2  # no third entry restored
