@@ -1755,7 +1755,7 @@ def generate_pyramid_levels(
 
         # Create array for this level
         level_chunks = tuple(min(c, s) for c, s in zip(chunks, new_shape))
-        new_arr = root.create_dataset(
+        new_arr = root.create_array(
             str(level),
             shape=new_shape,
             chunks=level_chunks,
@@ -1763,7 +1763,7 @@ def generate_pyramid_levels(
             compressor=compressor,
             fill_value=level0_fill_value,
             overwrite=True,
-            write_empty_chunks=False,
+            config={"write_empty_chunks": False},
         )
 
         # Calculate number of chunks in each dimension
@@ -1933,18 +1933,18 @@ def main() -> None:
     dtype = np.dtype(args.dtype)
 
     # Create root group
-    root = zarr.open_group(str(output_path), mode="w")
+    root = zarr.open_group(str(output_path), mode="w", zarr_format=2)
 
     # Create level 0 array (full resolution)
     level0_path = output_path / "0"
-    zarr_array = root.create_dataset(
+    zarr_array = root.create_array(
         "0",
         shape=(z_dim, y_dim, x_dim),
         chunks=chunks,
         dtype=dtype,
         compressor=compressor,
         fill_value=fill_value,
-        write_empty_chunks=False,
+        config={"write_empty_chunks": False},
     )
     print(f"Created OME-Zarr level 0: shape={zarr_array.shape}, chunks={zarr_array.chunks}, fill_value={fill_value}")
 
