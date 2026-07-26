@@ -72,6 +72,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models. 
 
+- [Region-of-interest inference for `vesuvius.predict`](https://github.com/ScrollPrize/villa/pull/1241): `--bbox "z0:z1,y0:y1,x0:x1"` restricts inference to one region of a volume, in global voxel coordinates, so `blend_logits` and `finalize_outputs` stay aligned. Only the chunks intersecting the region are streamed — on PHerc. Paris 4 a 200³ region reads 27 chunks (56.6 MB) instead of 10,368 (21.7 GB). By TAUIL Abd Elillah
+
 ## Segmentation
 
 ### 🌟 Highlighted
