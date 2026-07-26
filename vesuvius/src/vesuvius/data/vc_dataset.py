@@ -290,12 +290,23 @@ class VCDataset(Dataset):
                     print(f"\nUsing bbox-restricted sliding window (global coords): "
                           f"z=[{roi[0][0]}, {roi[0][1]}), y=[{roi[1][0]}, {roi[1][1]}), "
                           f"x=[{roi[2][0]}, {roi[2][1]})")
-                # Grid over the ROI extent, offset back into the global frame so all
-                # emitted coordinates remain volume-absolute.
+                # Build the grid the whole volume would have used, then keep the
+                # patches that touch the ROI. Anchoring the grid to the ROI origin
+                # instead would place patches the full-volume run never places -
+                # a 256-long ROI yields stride 64 where the volume yields ~96 - so
+                # every voxel gets a different set of overlapping patches and the
+                # blended result no longer matches the corresponding sub-region of
+                # a full run. Selecting from the global grid keeps them identical,
+                # which is the whole point of being able to redo one region.
                 (z0, z1), (y0, y1), (x0, x1) = roi
-                z_positions = [z0 + s for s in compute_steps_for_sliding_window(z1 - z0, pZ, self.step_size)]
-                y_positions = [y0 + s for s in compute_steps_for_sliding_window(y1 - y0, pY, self.step_size)]
-                x_positions = [x0 + s for s in compute_steps_for_sliding_window(x1 - x0, pX, self.step_size)]
+
+                def _overlapping(extent, patch, lo, hi):
+                    return [s for s in compute_steps_for_sliding_window(extent, patch, self.step_size)
+                            if s < hi and s + patch > lo]
+
+                z_positions = _overlapping(image_size[0], pZ, z0, z1)
+                y_positions = _overlapping(image_size[1], pY, y0, y1)
+                x_positions = _overlapping(image_size[2], pX, x0, x1)
             else:
                 # Full-volume sliding window
                 if self.verbose:
