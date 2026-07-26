@@ -180,6 +180,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Herculaneum Scroll Tools](https://github.com/axiosdevs/herculaneum-scroll-tools) by axiosdevs — CT-consistency QA for the published m7 surface predictions: voxel-exact phantom fractions measured for all 36 samples incl. all 13 grand-prize scrolls (43.3% of positives sit outside the masked CT), with a one-pass `clean` mode ([villa#1114](https://github.com/ScrollPrize/villa/issues/1114)); plus cross-scan registration (2023→2025 rescan, MAD 29 µm), a winding-constraint annotator/verifier in native spiral-input format, and dual-energy high-Z ink-candidate rendering.
 
+- [winding-sync](https://github.com/abundantjoe/winding-sync) by Joseph Balmaceda. Generates relative winding constraints directly from CT via structure-tensor lamina orientation, then reconciles contradictions globally as L1 integer synchronization (totally unimodular LP, exact integer solutions). Complements winding-number diffusion over existing surfaces by working from the raw volume before a surface exists. Tolerates 15% gross measurement error before dropping below 95% accuracy, versus 2% for spanning-tree propagation. Absolute winding counts are not yet calibrated; see README.
+
 
 ### 📦 Materials
 
