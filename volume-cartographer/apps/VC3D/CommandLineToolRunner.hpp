@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -10,8 +12,6 @@
 #include "elements/ProgressUtil.hpp"
 #include "ConsoleOutputWidget.hpp"
 
-class CWindow;
-
 /**
  * @brief Class to manage execution of command-line tools
  */
@@ -21,7 +21,10 @@ class CommandLineToolRunner : public QObject
 
 public:
 
-    explicit CommandLineToolRunner(QStatusBar* statusBar, CWindow* mainWindow, QObject* parent = nullptr);
+    explicit CommandLineToolRunner(
+        QStatusBar* statusBar,
+        std::function<QString()> currentVolumePath,
+        QObject* parent = nullptr);
     
     ~CommandLineToolRunner();
 
@@ -37,6 +40,36 @@ public:
         CustomCommand
     };
 
+    enum class Presentation {
+        Interactive,
+        Silent
+    };
+
+    struct ExecutionOptions {
+        constexpr ExecutionOptions(
+            Presentation presentation = Presentation::Interactive,
+            bool showConsole = true)
+            : presentation(presentation)
+            , showConsole(showConsole)
+        {
+        }
+
+        static constexpr ExecutionOptions silent()
+        {
+            return {Presentation::Silent, false};
+        }
+
+        Presentation presentation;
+        bool showConsole;
+    };
+
+    // Output format for Tool::RenderTifXYZ: a per-slice TIFF stack or an
+    // OME-Zarr store. Interactive launches reset this to TifStack.
+    enum class RenderOutputFormat {
+        TifStack,   // --tif-output <pattern>
+        Zarr        // --zarr-output <path.zarr>
+    };
+
     void setVolumePath(const QString& path);
     void setRemoteVolumeUrl(const QString& url);
     void setRemoteVolumeAuth(const QString& accessKey,
@@ -48,11 +81,15 @@ public:
 
     bool executeCustomCommand(const QString& command,
                              const QStringList& args,
-                             const QString& label = QString());
+                             const QString& label = QString(),
+                             ExecutionOptions options = {});
 
     // tool specific params 
     void setRenderParams(float scale, int resolution, int layers);
     void setRenderVoxelSize(double voxelSizeUm, bool enabled);
+    // Selects --tif-output vs --zarr-output for the next RenderTifXYZ run (default
+    // TifStack; interactive re-asserts TifStack to avoid leaking a prior Zarr choice).
+    void setRenderOutputFormat(RenderOutputFormat format);
     void setRenderAdvanced(int cropX, int cropY, int cropWidth, int cropHeight,
                            const QString& affinePath, bool invertAffine,
                            float scaleSegmentation, double rotateDegrees, int flipAxis);
@@ -104,17 +141,25 @@ public:
                              double ransacMadK,
                              int ransacSeed,
                              int anchorCap);
-    bool execute(Tool tool);
+    bool execute(Tool tool, ExecutionOptions options = {});
     void cancel();
     bool isRunning() const;
     
     void showConsoleOutput();
     void hideConsoleOutput();
-    void setAutoShowConsoleOutput(bool autoShow);
     void setIncludeTifs(bool include);
-    void setOmpThreads(int threads);
+    // Applies to the next execute() attempt only.
+    void setNextOmpThreads(int threads);
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
     void setPreserveConsoleOutput(bool preserve);
+
+    // Valid while toolFinished is being delivered for the completed process.
+    bool currentExecutionIsSilent() const
+    {
+        const auto& options =
+            _deliveringCompletion ? _completionOptions : _executionOptions;
+        return options.presentation == Presentation::Silent;
+    }
 
 signals:
     void toolStarted(Tool tool, const QString& message);
@@ -131,14 +176,18 @@ private:
     QStringList buildArguments(Tool tool);
     QString toolName(Tool tool) const;
     QString getOutputPath() const;
+    void closeLog();
+    void finishExecution(bool success,
+                         const QString& message,
+                         const QString& outputPath = {},
+                         bool copyToClipboard = false);
 
-    CWindow* _mainWindow;
+    std::function<QString()> _currentVolumePath;
     ProgressUtil* _progressUtil;
     
     QProcess* _process;
     ConsoleOutputWidget* _consoleOutput;
     QDialog* _consoleDialog;
-    bool _autoShowConsole;
     
     QString _volumePath;
     QString _remoteVolumeUrl;
@@ -162,6 +211,7 @@ private:
     int _layers;
     double _renderVoxelSizeUm{0.0};
     bool _useRenderVoxelSize{false};
+    RenderOutputFormat _renderOutputFormat{RenderOutputFormat::TifStack};
     // Advanced render options
     int _cropX{0};
     int _cropY{0};
@@ -191,8 +241,13 @@ private:
     QFile* _logFile;
     QTextStream* _logStream;
 
-    int _ompThreads{-1};
+    int _nextOmpThreads{-1};
     bool _explicitVolumePath{false};
+    ExecutionOptions _executionOptions;
+    ExecutionOptions _completionOptions;
+    bool _deliveringCompletion{false};
+    bool _terminalReported{true};
+    QString _pendingProcessError;
 
     QString _objOutputDir;
     float _objStretchFactor = 1000.0f;

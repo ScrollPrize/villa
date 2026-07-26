@@ -74,7 +74,7 @@ class OMEU8VectorWriter:
             conf_grp = root.require_group("confidence")
             self.ds_conf = self._require_scale(conf_grp, chunks_zyx, compressor)
 
-    def _require_scale(self, g: zarr.hierarchy.Group, chunks, compressor):
+    def _require_scale(self, g: zarr.Group, chunks, compressor):
         if self.scale_name in g:
             ds = g[self.scale_name]
             if tuple(ds.shape) != self.shape_ds:

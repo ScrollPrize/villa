@@ -43,6 +43,7 @@ void printUsage(const char* argv0)
     std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> "
               << "--src x,y,z [--src x,y,z ...] --sink x,y,z [--sink x,y,z ...] "
               << "[--margin-base-voxels 1000] [--threshold 110] "
+              << "[--working-to-base-scale 1] "
               << "[--run-ecl] [--runs N] [--terminal-flood-depth 10] "
               << "[--terminal-flood-capacity 1024] [--terminal-flood-decay 2] "
               << "[--terminal-region-iterations 0] [--terminal-flood-sweep] "
@@ -1149,6 +1150,10 @@ int main(int argc, char** argv)
                     "margin-base-voxels");
             } else if (arg == "--threshold") {
                 options.threshold = parseThreshold(requireValue("--threshold"));
+            } else if (arg == "--working-to-base-scale") {
+                options.workingToBaseScale = parsePositiveDouble(
+                    requireValue("--working-to-base-scale"),
+                    "working-to-base-scale");
             } else if (arg == "--run-ecl") {
                 runEcl = true;
             } else if (arg == "--runs") {

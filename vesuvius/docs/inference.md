@@ -32,6 +32,7 @@ vesuvius.predict \
 | `--input_format` | Force `zarr`, `tiff`, or `volume` detection. Usually optional.
 | `--tta_type` / `--disable_tta` | Choose `rotation` (default) or `mirroring`, or disable test-time augmentation.
 | `--num_parts` / `--part_id` | Partition inference so multiple machines can process different chunks.
+| `--bbox` | Restrict inference to a region of interest: `"z0:z1,y0:y1,x0:x1"` in global voxel coordinates, half-open. Omit a bound to reach the volume edge (`"1000:1400,:,2000:"`). See [Region-of-interest inference](#region-of-interest-inference).
 | `--overlap` | Fractional patch overlap (0–1, default `0.5`).
 | `--batch_size` | Inference batch size (default `1`).
 | `--patch_size` | Override the model patch size using a comma-separated list (e.g. `192,192,192`).
@@ -58,6 +59,38 @@ vesuvius.predict --model_path ... --num_parts 4 --part_id 1 --device cuda:0
 ```
 
 Each worker writes `logits_part_<id>.zarr` and `coordinates_part_<id>.zarr` into the output directory.
+
+### Region-of-interest inference
+
+`--bbox` restricts the sliding window to one region of the volume, given in **global voxel
+coordinates** as `"z0:z1,y0:y1,x0:x1"`. Ranges are half-open (`z0` included, `z1` excluded),
+and either bound may be omitted to reach the volume edge:
+
+```bash
+vesuvius.predict --model_path hf://scrollprize/surface_recto \
+    --input_dir https://vesuvius-challenge-open-data.s3.amazonaws.com/PHercParis4/volumes/<volume>.zarr \
+    --output_dir /tmp/logits \
+    --bbox "2000:2200,1000:1200,1000:1200"
+
+# open bounds: from z=1000 to the end, all of y, up to x=2000
+vesuvius.predict ... --bbox "1000:,:,:2000"
+```
+
+Patch coordinates stay in the global frame, so `blend_logits` and `finalize_outputs` need no
+extra flags — the merged output lands at the same absolute position it would have had in a
+full-volume run. The requested ROI is recorded in the logits store's `bbox` attribute.
+
+This matters most when streaming a remote volume: only the chunks intersecting the ROI are
+ever fetched, so a small region of a multi-terabyte scroll costs seconds of network instead
+of hours. It is also the practical way to iterate on a model, inspect one column of text, or
+reproduce a result on a laptop.
+
+Notes:
+- `--num_parts`/`--part_id` split the ROI's Z extent (not the whole volume), so distributed
+  runs stay balanced when a bbox is active.
+- An ROI smaller than the model patch size along an axis is grown to the patch size and
+  shifted back inside the volume, so the model always sees a full patch.
+- Bounds are clamped to the volume; a bbox entirely outside it is an error.
 
 ## Stage 2 — `vesuvius.blend_logits`
 

@@ -2,12 +2,14 @@
 
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QFutureWatcher>
 
 #include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -15,12 +17,22 @@
 #include <opencv2/core/mat.hpp>
 
 #include "vc/core/util/Compositing.hpp"
+#include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+
+#include <array>
+
+namespace vc::render {
+class ChunkCache;
+class DecodedChunkCacheBudget;
+}
 
 class QMdiArea;
 class QTimer;
+class AxisAlignedSliceController;
 class CChunkedVolumeViewer;
 class CState;
+struct POI;
 class QWidget;
 class VCCollection;
 class SegmentationOverlayController;
@@ -51,6 +63,11 @@ public:
     ViewerManager(CState* state,
                   VCCollection* points,
                   QObject* parent = nullptr);
+    ~ViewerManager() override;
+
+    // All live managers (one per workspace). Use to apply user preferences
+    // uniformly so viewers behave the same across workspaces.
+    static const std::vector<ViewerManager*>& allManagers();
 
     VolumeViewerBase* createViewer(const std::string& surfaceName,
                                    const QString& title,
@@ -77,6 +94,57 @@ public:
     void setInkDetectionOverlay(InkDetectionOverlayController* overlay);
     InkDetectionOverlayController* inkDetectionOverlay() const { return _inkDetectionOverlay; }
 
+    // --- Chunk-source policy ---
+    //
+    // Where a viewer of this manager samples from. The default returns the
+    // Volume's shared cache, which is what every viewer used before this
+    // existed, so the main workspace is unaffected. PrivateBounded gives this
+    // manager its own hard-capped pools that are not joined to the
+    // process-wide decoded-byte budget: they can neither evict the shared
+    // working set nor be evicted by it, and they die with the workspace.
+    enum class ChunkCachePolicy { SharedVolumeCache, PrivateBounded };
+    // Plane views interleave in time (you use one pane at a time), so one
+    // capped pool beats three. Each surface-tile channel gets its own so plane,
+    // base-tile, and overlay-tile requests can supersede independently.
+    enum class ChunkCachePool { PlaneViews, SurfaceTiles, OverlaySurfaceTiles };
+
+    // Opt this manager into the spiral cache policy and (re-)read all three
+    // spiral cache settings. Called once when the workspace is built and again
+    // whenever the settings dialog applies, so a budget change takes effect
+    // without reopening the workspace.
+    void applySpiralCacheSettings();
+    void setChunkCachePolicy(ChunkCachePolicy policy, std::size_t capacityBytes);
+    ChunkCachePolicy chunkCachePolicy() const { return _chunkCachePolicy; }
+    // The configured value is a *floor*: a setting that cannot hold one frame
+    // would thrash, so the effective LRU cap is raised to fit instead. The
+    // effective value is what the status bar reports as the capacity.
+    std::size_t chunkCacheFloorBytes(ChunkCachePool pool) const;
+    void setChunkCacheFloorBytes(ChunkCachePool pool, std::size_t bytes);
+    std::size_t effectiveChunkCacheCapacity(ChunkCachePool pool) const;
+    // Raise a pool's floor from an observed one-frame (or one-tile-set) chunk
+    // footprint. Doubling it is what keeps a render from re-reading chunks it
+    // just evicted, since the sampler only pins a small window at a time. The
+    // raise is capped (see below) so a bad estimate degrades into thrashing
+    // rather than unbounded retention.
+    void noteChunkFootprint(ChunkCachePool pool, std::size_t footprintBytes);
+    // How far a derived footprint may raise the configured floor, and the
+    // absolute ceiling on a private pool regardless of setting.
+    static constexpr std::size_t kChunkCacheDerivedFloorMultiplier = 8;
+    static constexpr std::size_t kChunkCacheAbsoluteCapBytes =
+        16ULL * 1024 * 1024 * 1024;
+    std::shared_ptr<vc::render::ChunkCache> chunkCacheFor(
+        const std::shared_ptr<Volume>& volume,
+        ChunkCachePool pool = ChunkCachePool::PlaneViews);
+
+    // --- SurfaceCache budgets (spiral's flattened view) ---
+    //
+    // Off unless a workspace opts in, so the main workspace never builds one.
+    // Zero disables a channel and leaves it on the legacy render path.
+    void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes);
+    bool surfaceCacheEnabled() const { return _surfaceCacheEnabled; }
+    std::size_t surfaceCacheBudgetBytes() const { return _surfaceCacheBudgetBytes; }
+    std::size_t overlaySurfaceCacheBudgetBytes() const { return _overlaySurfaceCacheBudgetBytes; }
+
     void setIntersectionOpacity(float opacity);
     float intersectionOpacity() const { return _intersectionOpacity; }
 
@@ -91,6 +159,8 @@ public:
 
     void setOverlayColormap(const std::string& colormapId);
     const std::string& overlayColormap() const { return _overlayColormapId; }
+    void setOverlaySamplingMethod(vc::Sampling method);
+    vc::Sampling overlaySamplingMethod() const { return _overlaySamplingMethod; }
     void setOverlayThreshold(float threshold);
     float overlayThreshold() const { return _overlayWindowLow; }
 
@@ -123,6 +193,73 @@ public:
     bool resetDefaultFor(VolumeViewerBase* viewer) const;
     void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
 
+    // Registered automatically by AxisAlignedSliceController::setViewerManager.
+    void setAxisAlignedSliceController(AxisAlignedSliceController* slices) { _slices = slices; }
+    AxisAlignedSliceController* axisAlignedSliceController() const { return _slices; }
+
+    // --- Focus / navigation policy shared by all workspaces ---
+    // Ensure the "focus" POI exists and lies inside the current volume: a
+    // missing POI (or resetToCenter) is placed at the volume center, an
+    // existing one is clamped to the volume bounds. overridePoint /
+    // overrideNormal (already in the new volume's space) win when provided.
+    // Returns false when no volume is set.
+    bool resetFocusForVolumeChange(bool resetToCenter,
+                                   const std::optional<cv::Vec3f>& overridePoint = std::nullopt,
+                                   const std::optional<cv::Vec3f>& overrideNormal = std::nullopt);
+    // Move the focus POI to a volume position and reorient the slice planes
+    // around it (also nudges the segmentation viewer when the point projects
+    // onto the active surface).
+    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId);
+    // centerFocusAt() at the volume position under the mouse cursor: prefers
+    // the viewer under the cursor, then scans all visible viewer viewports.
+    bool centerFocusOnCursor();
+    bool recenterViewersOnCurrentFocus();
+    void recenterPlaneViewersOn(const cv::Vec3f& position);
+    void recenterSegmentationViewerNear(const cv::Vec3f& position);
+    VolumeViewerBase* segmentationViewer() const;
+
+    // Last viewer the user interacted with (mouse press / zoom / cursor move);
+    // null when none or while it is being torn down.
+    VolumeViewerBase* activeViewer() const;
+
+    // Runs before the default volume-click policy (Shift ignored, Ctrl+click
+    // centers the focus); return true to consume the click.
+    using VolumeClickInterceptor = std::function<bool(const cv::Vec3f& volLoc,
+                                                      const cv::Vec3f& normal,
+                                                      Surface* surf,
+                                                      Qt::MouseButton button,
+                                                      Qt::KeyboardModifiers modifiers)>;
+    void setVolumeClickInterceptor(VolumeClickInterceptor interceptor) { _volumeClickInterceptor = std::move(interceptor); }
+
+    // --- Volume-switch policy shared by all workspaces ---
+    // Snapshot of per-viewer cameras and view centers, retargetable through an
+    // affine coordinate transform after a volume switch.
+    struct ViewerNavigationSnapshot;
+    std::shared_ptr<ViewerNavigationSnapshot> captureNavigation() const;
+    void restoreNavigation(const std::shared_ptr<ViewerNavigationSnapshot>& snapshot,
+                           const cv::Matx44d& transform);
+    // Set the volume on the state, re-derive the focus POI (volume-centered
+    // when new/absent, clamped otherwise, transformed when a coordinate
+    // transform is supplied) and retarget the captured viewer navigation.
+    void switchVolume(std::shared_ptr<Volume> volume,
+                      const std::optional<cv::Matx44d>& navigationTransform = std::nullopt);
+
+    // --- Fleet setters: apply a viewer preference to every viewer ---
+    void setShowDirectionHints(bool show);
+    void setShowSurfaceNormals(bool show);
+    void setPlaneIntersectionLinesVisible(bool visible);
+    void setSurfaceOverlaysEnabled(bool enabled);
+    void setSurfaceOverlapThreshold(float threshold);
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays);
+
+    // --- Reset-view-on-surface-change policy ---
+    // Store the new default on every viewer, keeping the segmentation viewer
+    // suppressed while a segmentation edit session is active.
+    void setResetViewOnSurfaceChangeDefault(bool enabled);
+    // Temporarily force the segmentation viewers off (true) or restore their
+    // stored defaults (false).
+    void setSegmentationResetViewSuppressed(bool suppressed);
+
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroring() const { return _mirrorCursorToSegmentation; }
     void broadcastLinkedCursor(VolumeViewerBase* source,
@@ -150,6 +287,12 @@ public:
 signals:
     void baseViewerCreated(VolumeViewerBase* viewer);
     void baseViewerClosing(VolumeViewerBase* viewer);
+    void currentVolumeChanged();
+    // Emitted whenever the user explicitly places the focus (Ctrl+click,
+    // focus-on-cursor key, point activation, ...).
+    void focusCenteredByUser(const cv::Vec3f& position);
+    // Aggregated per-viewer cache statistics (RAM / disk / network).
+    void sharedCacheStatsChanged(const QStringList& items);
     void overlayWindowChanged(float low, float high);
     void volumeWindowChanged(float low, float high);
     void overlayVolumeAvailabilityChanged(bool hasOverlay);
@@ -158,6 +301,9 @@ signals:
 
 private slots:
     void onGlobalTick();
+    void handleFocusPoiChanged(std::string name, POI* poi);
+    void handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surface* surf,
+                             Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void handleSurfacePatchIndexPrimeFinished();
     void handleSurfacePatchIndexTaskFinished();
     void handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
@@ -189,9 +335,11 @@ private:
     bool updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate);
     void queueSurfacePatchIndexTask(SurfacePatchIndexTask task);
     void startNextSurfacePatchIndexTask();
+    void scheduleSurfacePatchIndexOverlayRefresh();
 
     CState* _state;
     VCCollection* _points;
+    AxisAlignedSliceController* _slices{nullptr};
     SegmentationOverlayController* _segmentationOverlay{nullptr};
     PointsOverlayController* _pointsOverlay{nullptr};
     RawPointsOverlayController* _rawPointsOverlay{nullptr};
@@ -205,6 +353,8 @@ private:
     bool _segmentationEditActive{false};
     SegmentationModule* _segmentationModule{nullptr};
     std::vector<VolumeViewerBase*> _baseViewers;
+    VolumeViewerBase* _activeViewer{nullptr};
+    VolumeClickInterceptor _volumeClickInterceptor;
     // The one maintenance clock for the whole app. Ticks ~60Hz; render requests
     // submit immediately, while deferred intersections/status are serviced here.
     QTimer* _globalClock{nullptr};
@@ -215,6 +365,7 @@ private:
     std::string _overlayVolumeId;
     float _overlayOpacity{0.5f};
     std::string _overlayColormapId;
+    vc::Sampling _overlaySamplingMethod{vc::Sampling::Nearest};
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
     int _overlayMaxDisplayedResolution{0};
@@ -226,6 +377,33 @@ private:
     int _surfacePatchSamplingStride{1};
     std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
+
+    ChunkCachePolicy _chunkCachePolicy{ChunkCachePolicy::SharedVolumeCache};
+    bool _surfaceCacheEnabled{false};
+    std::size_t _surfaceCacheBudgetBytes{0};
+    std::size_t _overlaySurfaceCacheBudgetBytes{0};
+    struct PrivateChunkPool {
+        // Held weakly: a pool exists for the volume the workspace is showing,
+        // and switching volumes releases the previous one rather than
+        // accumulating a pool per volume ever visited.
+        std::weak_ptr<Volume> volume;
+        std::shared_ptr<vc::render::ChunkCache> cache;
+        std::shared_ptr<vc::render::DecodedChunkCacheBudget> budget;
+        // Configured floor, and the floor derived from observed footprints.
+        // The effective cap is the larger of the two.
+        std::size_t floorBytes{0};
+        std::size_t requiredBytes{0};
+        std::size_t builtCapacity{0};
+    };
+    std::array<PrivateChunkPool, 3> _privateChunkPools;
+    PrivateChunkPool& privateChunkPool(ChunkCachePool pool)
+    {
+        return _privateChunkPools[static_cast<std::size_t>(pool)];
+    }
+    const PrivateChunkPool& privateChunkPool(ChunkCachePool pool) const
+    {
+        return _privateChunkPools[static_cast<std::size_t>(pool)];
+    }
 
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
@@ -248,6 +426,7 @@ private:
     std::vector<SurfacePatchIndexTask> _surfacesQueuedDuringRebuild;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
     QFutureWatcher<SurfacePatchIndexTaskResult>* _surfacePatchIndexTaskWatcher{nullptr};
+    bool _surfacePatchIndexOverlayRefreshPending{false};
 
     // Surfaces currently pinned in the LRU as "highlighted/visible".
     // We track them so we can unpin the right set when highlights change.

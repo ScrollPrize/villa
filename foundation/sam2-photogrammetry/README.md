@@ -9,7 +9,7 @@ In particular, we recommend first installing CUDA, then creating a conda environ
 ### Checkpoint Details
 A checkpoint (`checkpoints/photo2_ruler_t_1000.torch`) was obtained by fine-tuning the prompt encoder and the mask decoder of SAM 2.1 on a dataset of scroll/mask image pairs. The fine-tuning was carried out using the `train.py` script located in the main folder of this repository.
 
-Please first execute the script `checkpoints/download_ckpts.sh`, then download [this file](https://dl.ash2txt.org/ml-models/photogrammetry-segmentation/SAM2/photo2_ruler_t_1000.torch) and put it in the `checkpoints` folder. 
+Please first execute the script `checkpoints/download_ckpts.sh`, then download [this file](https://huggingface.co/scrollprize/sam2-photogrammetry/resolve/main/photo2_ruler_t_1000.torch) and put it in the `checkpoints` folder. 
 
 ## Running Segmentation
 To segment the scroll (and optionally the ruler) on new photos, use the `segment.py` script and point it to the folder containing the photos from the photogrammetry session. The folder should be organized as follows:

@@ -157,7 +157,7 @@ GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& vi
                         linePosition,
                         *threshold))
                   : std::nullopt;
-    return makeGeneratedCrossSliceOverlay(
+    GeneratedOverlay overlay = makeGeneratedCrossSliceOverlay(
         views,
         linePosition,
         emphasized,
@@ -167,6 +167,7 @@ GeneratedOverlay makeGeneratedCrossSliceOverlayForPlane(const GeneratedViews& vi
         },
         controlIndex,
         linePositionRadius);
+    return overlay;
 }
 
 GeneratedOverlay makeGeneratedCrossSliceControlOverlayForPlane(
@@ -204,8 +205,11 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     for (const auto& branch : overlay.branchLinePoints) {
         branchPointCount += branch.size();
     }
+    const bool drawDirectBranchLinks = !overlay.useSurfaceCenterLine;
     primitives.reserve(3 + branchPointCount + overlay.controlPoints.size() +
-                       overlay.predSnapPoints.size() * 2);
+                       overlay.predSnapPoints.size() * 2 +
+                       (drawDirectBranchLinks ? overlay.branchLinks.size() * 4 : 0) +
+                       overlay.fiberIntersections.size() * 3);
 
     ViewerOverlayControllerBase::OverlayStyle lineStyle;
     lineStyle.penColor = QColor(0, 220, 255, 190);
@@ -232,8 +236,24 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     branchControlPointStyle.penWidth = 2.0;
     branchControlPointStyle.z = 162.0;
 
+    ViewerOverlayControllerBase::OverlayStyle pendingBranchControlPointStyle = branchControlPointStyle;
+    pendingBranchControlPointStyle.penColor = QColor(80, 150, 255, 245);
+    pendingBranchControlPointStyle.brushColor = QColor(80, 150, 255, 175);
+    pendingBranchControlPointStyle.z = 162.5;
+
+    ViewerOverlayControllerBase::OverlayStyle linkCandidateControlPointStyle = branchControlPointStyle;
+    linkCandidateControlPointStyle.penColor = QColor(60, 235, 120, 245);
+    linkCandidateControlPointStyle.brushColor = QColor(60, 235, 120, 175);
+    linkCandidateControlPointStyle.z = 163.0;
+
     auto controlStyleForMarker = [&](const GeneratedOverlay::ControlPointMarker& control)
         -> const ViewerOverlayControllerBase::OverlayStyle& {
+        if (control.isLinkCandidate) {
+            return linkCandidateControlPointStyle;
+        }
+        if (control.hasPendingLinks) {
+            return pendingBranchControlPointStyle;
+        }
         if (control.hasBranches) {
             return branchControlPointStyle;
         }
@@ -265,6 +285,41 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     predSnapPointStyle.penWidth = 1.0;
     predSnapPointStyle.z = 159.0;
 
+    ViewerOverlayControllerBase::OverlayStyle branchLinkStyle;
+    branchLinkStyle.penColor = QColor(255, 60, 180, 225);
+    branchLinkStyle.brushColor = QColor(255, 60, 180, 165);
+    branchLinkStyle.penWidth = 1.4;
+    branchLinkStyle.z = 164.0;
+
+    ViewerOverlayControllerBase::OverlayStyle estimatedBranchLinkStyle = branchLinkStyle;
+    estimatedBranchLinkStyle.penColor = QColor(255, 150, 210, 185);
+    estimatedBranchLinkStyle.brushColor = QColor(255, 150, 210, 130);
+    estimatedBranchLinkStyle.penStyle = Qt::DashLine;
+
+    ViewerOverlayControllerBase::OverlayStyle fiberIntersectionStyle;
+    fiberIntersectionStyle.penColor = QColor(255, 245, 75, 245);
+    fiberIntersectionStyle.brushColor = Qt::transparent;
+    fiberIntersectionStyle.penWidth = 1.25;
+    fiberIntersectionStyle.penCap = Qt::FlatCap;
+    fiberIntersectionStyle.z = 168.0;
+
+    ViewerOverlayControllerBase::OverlayStyle linkCandidateFiberIntersectionStyle =
+        fiberIntersectionStyle;
+    linkCandidateFiberIntersectionStyle.penColor = QColor(60, 235, 120, 245);
+    linkCandidateFiberIntersectionStyle.penWidth = 1.75;
+    linkCandidateFiberIntersectionStyle.z = 168.5;
+
+    ViewerOverlayControllerBase::OverlayStyle branchLinkFiberIntersectionStyle =
+        fiberIntersectionStyle;
+    branchLinkFiberIntersectionStyle.penColor = QColor(210, 95, 255, 245);
+    branchLinkFiberIntersectionStyle.penWidth = 1.75;
+    branchLinkFiberIntersectionStyle.z = 168.25;
+
+    ViewerOverlayControllerBase::OverlayStyle pendingBranchLinkFiberIntersectionStyle =
+        branchLinkFiberIntersectionStyle;
+    pendingBranchLinkFiberIntersectionStyle.penColor = QColor(80, 150, 255, 245);
+    pendingBranchLinkFiberIntersectionStyle.z = 168.3;
+
     auto addVolumePointMarker = [&](const cv::Vec3f& point,
                                     qreal radius,
                                     const ViewerOverlayControllerBase::OverlayStyle& style) {
@@ -274,6 +329,24 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         primitives.push_back(ViewerOverlayControllerBase::VolumePointPrimitive{
             point,
             radius,
+            style});
+    };
+    auto addFiberIntersectionMarker =
+        [&](const QPointF& scenePoint,
+            const ViewerOverlayControllerBase::OverlayStyle& style) {
+        if (!finiteScenePoint(scenePoint)) {
+            return;
+        }
+        constexpr qreal kIntersectionArm = 7.5;
+        primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+            {scenePoint + QPointF(-kIntersectionArm, -kIntersectionArm),
+             scenePoint + QPointF(kIntersectionArm, kIntersectionArm)},
+            false,
+            style});
+        primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+            {scenePoint + QPointF(-kIntersectionArm, kIntersectionArm),
+             scenePoint + QPointF(kIntersectionArm, -kIntersectionArm)},
+            false,
             style});
     };
 
@@ -428,6 +501,54 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         }
     }
 
+    if (drawDirectBranchLinks) {
+        for (const auto& link : overlay.branchLinks) {
+            const cv::Vec3f visiblePoint = finiteGeneratedPoint(link.planePoint)
+                ? link.planePoint
+                : link.linkedControlPoint;
+            if (!finiteGeneratedPoint(link.localControlPoint) ||
+                !finiteGeneratedPoint(visiblePoint)) {
+                continue;
+            }
+            const QPointF localScene = viewer->volumeToScene(link.localControlPoint);
+            const QPointF visibleScene = viewer->volumeToScene(visiblePoint);
+            if (!finiteScenePoint(localScene) || !finiteScenePoint(visibleScene)) {
+                continue;
+            }
+            const auto& style = link.estimated ? estimatedBranchLinkStyle : branchLinkStyle;
+            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                {localScene, visibleScene},
+                false,
+                style});
+            addFiberIntersectionMarker(visibleScene, fiberIntersectionStyle);
+        }
+    }
+
+    for (const auto& intersection : overlay.fiberIntersections) {
+        if (!finiteGeneratedPoint(intersection.point)) {
+            continue;
+        }
+        const QPointF scenePoint = viewer->volumeToScene(intersection.point);
+        if (intersection.connectorStart &&
+            finiteGeneratedPoint(*intersection.connectorStart)) {
+            const QPointF connectorScene = viewer->volumeToScene(*intersection.connectorStart);
+            if (finiteScenePoint(connectorScene) && finiteScenePoint(scenePoint)) {
+                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                    {connectorScene, scenePoint},
+                    false,
+                    branchLinkStyle});
+            }
+        }
+        addFiberIntersectionMarker(scenePoint,
+                                   intersection.isLinkCandidateFiber
+                                       ? linkCandidateFiberIntersectionStyle
+                                       : (intersection.projectedBranchLink
+                                              ? (intersection.pendingBranchLink
+                                                     ? pendingBranchLinkFiberIntersectionStyle
+                                                     : branchLinkFiberIntersectionStyle)
+                                              : fiberIntersectionStyle));
+    }
+
     if (!overlay.useSurfaceCenterLine) {
         for (const auto& branch : overlay.branchLinePoints) {
             if (branch.size() < 2) {
@@ -559,6 +680,30 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     }
     const auto& selectedControl = options.controlPoints[selectedIndex];
 
+    // Nearest fiber-intersection "X" marker to the click, within a scene-space
+    // threshold matched to the drawn glyph (arm length 7.5 scene units).
+    constexpr double kFiberIntersectionHitThreshold = 12.0;
+    const GeneratedOverlay::FiberIntersectionMarker* nearbyIntersection = nullptr;
+    double bestIntersectionDistanceSq =
+        kFiberIntersectionHitThreshold * kFiberIntersectionHitThreshold;
+    for (const auto& intersection : options.fiberIntersections) {
+        if (intersection.fiberId == 0 ||
+            intersection.projectedBranchLink ||
+            !finiteGeneratedPoint(intersection.point)) {
+            continue;
+        }
+        const QPointF intersectionScene = options.viewer->volumeToScene(intersection.point);
+        if (!finiteScenePoint(intersectionScene)) {
+            continue;
+        }
+        const QPointF delta = intersectionScene - options.scenePoint;
+        const double distanceSq = delta.x() * delta.x() + delta.y() * delta.y();
+        if (distanceSq < bestIntersectionDistanceSq) {
+            bestIntersectionDistanceSq = distanceSq;
+            nearbyIntersection = &intersection;
+        }
+    }
+
     clearGeneratedControlPointContextPreview(options.viewer, options.surfaceName);
     if (finiteScenePoint(options.scenePoint) && finiteScenePoint(targetScene)) {
         ViewerOverlayControllerBase::OverlayStyle previewStyle;
@@ -591,6 +736,14 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     QMenu menu(options.parent);
     QAction* deleteAction = menu.addAction(QWidget::tr("Delete control point"));
     deleteAction->setEnabled(options.controlPoints.size() > 1);
+    QAction* designateLinkCandidateAction = nullptr;
+    if (options.designateLinkCandidate) {
+        designateLinkCandidateAction =
+            menu.addAction(QWidget::tr("Designate as link candidate"));
+        designateLinkCandidateAction->setEnabled(
+            selectedControlIndex != std::numeric_limits<size_t>::max() &&
+            !selectedControl.hasBranches);
+    }
     std::vector<std::pair<QAction*, GeneratedOverlay::ControlPointMarker::BranchLink>> openBranchActions;
     if (!selectedControl.branchLinks.empty()) {
         QMenu* branchMenu = menu.addMenu(QWidget::tr("Go to linked annotation"));
@@ -603,14 +756,97 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             openBranchActions.push_back({action, branch});
         }
     }
-    QAction* newLineAnnotationAction = menu.addAction(
-        options.addBranch
-            ? QWidget::tr("New linked line annotation from control point")
-            : QWidget::tr("New line annotation"));
-    newLineAnnotationAction->setEnabled(
-        (static_cast<bool>(options.addBranch) &&
-         selectedControlIndex != std::numeric_limits<size_t>::max()) ||
-        options.viewer->sampleSceneVolume(options.scenePoint).has_value());
+    std::vector<std::pair<QAction*, GeneratedOverlay::ControlPointMarker::BranchLink>> unlinkActions;
+    if (options.unlinkBranch && !selectedControl.branchLinks.empty()) {
+        if (selectedControl.branchLinks.size() == 1) {
+            const auto& branch = selectedControl.branchLinks.front();
+            QAction* action = menu.addAction(
+                QWidget::tr("Unlink from Fiber %1 / CP %2")
+                    .arg(static_cast<qulonglong>(branch.fiberId))
+                    .arg(branch.controlPointIndex));
+            unlinkActions.push_back({action, branch});
+        } else {
+            QMenu* unlinkMenu = menu.addMenu(QWidget::tr("Unlink"));
+            for (const auto& branch : selectedControl.branchLinks) {
+                QAction* action = unlinkMenu->addAction(
+                    QWidget::tr("Fiber %1 / CP %2")
+                        .arg(static_cast<qulonglong>(branch.fiberId))
+                        .arg(branch.controlPointIndex));
+                unlinkActions.push_back({action, branch});
+            }
+        }
+    }
+    std::vector<std::pair<QAction*, GeneratedOverlay::ControlPointMarker::BranchLink>> approveActions;
+    std::vector<std::pair<QAction*, GeneratedOverlay::ControlPointMarker::BranchLink>> markPendingActions;
+    if (options.setBranchLinkPending && !selectedControl.branchLinks.empty()) {
+        auto addPendingChangeActions =
+            [&menu](std::vector<std::pair<QAction*, GeneratedOverlay::ControlPointMarker::BranchLink>>& actions,
+                    const std::vector<GeneratedOverlay::ControlPointMarker::BranchLink>& links,
+                    const QString& singleFormat,
+                    const QString& submenuTitle) {
+                if (links.empty()) {
+                    return;
+                }
+                if (links.size() == 1) {
+                    const auto& branch = links.front();
+                    QAction* action = menu.addAction(
+                        singleFormat
+                            .arg(static_cast<qulonglong>(branch.fiberId))
+                            .arg(branch.controlPointIndex));
+                    actions.push_back({action, branch});
+                } else {
+                    QMenu* submenu = menu.addMenu(submenuTitle);
+                    for (const auto& branch : links) {
+                        QAction* action = submenu->addAction(
+                            QWidget::tr("Fiber %1 / CP %2")
+                                .arg(static_cast<qulonglong>(branch.fiberId))
+                                .arg(branch.controlPointIndex));
+                        actions.push_back({action, branch});
+                    }
+                }
+            };
+        std::vector<GeneratedOverlay::ControlPointMarker::BranchLink> pendingLinks;
+        std::vector<GeneratedOverlay::ControlPointMarker::BranchLink> approvedLinks;
+        for (const auto& branch : selectedControl.branchLinks) {
+            (branch.pending ? pendingLinks : approvedLinks).push_back(branch);
+        }
+        addPendingChangeActions(approveActions,
+                                pendingLinks,
+                                QWidget::tr("Approve link to Fiber %1 / CP %2"),
+                                QWidget::tr("Approve link"));
+        addPendingChangeActions(markPendingActions,
+                                approvedLinks,
+                                QWidget::tr("Mark link as pending (Fiber %1 / CP %2)"),
+                                QWidget::tr("Mark link as pending"));
+    }
+    const bool canSampleClickedVolume =
+        options.viewer->sampleSceneVolume(options.scenePoint).has_value();
+    QAction* newLineAnnotationAction =
+        menu.addAction(QWidget::tr("New line annotation"));
+    newLineAnnotationAction->setEnabled(canSampleClickedVolume);
+    QAction* newLinkedLineAnnotationAction = nullptr;
+    if (options.addBranch) {
+        newLinkedLineAnnotationAction = menu.addAction(
+            QWidget::tr("New linked line annotation from control point"));
+        newLinkedLineAnnotationAction->setEnabled(
+            selectedControlIndex != std::numeric_limits<size_t>::max() &&
+            canSampleClickedVolume &&
+            !selectedControl.hasBranches);
+    }
+    QAction* linkWithCandidateAction = nullptr;
+    if (options.linkWithCandidate && !options.linkWithCandidateLabel.isEmpty()) {
+        linkWithCandidateAction = menu.addAction(options.linkWithCandidateLabel);
+        linkWithCandidateAction->setEnabled(
+            options.linkWithCandidateEnabled &&
+            selectedControlIndex != std::numeric_limits<size_t>::max() &&
+            !selectedControl.hasBranches);
+    }
+    QAction* openNearbyAnnotationAction = nullptr;
+    if (options.openNearbyAnnotation && nearbyIntersection) {
+        openNearbyAnnotationAction = menu.addAction(
+            QWidget::tr("Go to nearby annotation (Fiber %1)")
+                .arg(static_cast<qulonglong>(nearbyIntersection->fiberId)));
+    }
     QAction* selected = menu.exec(options.globalPos);
     clearGeneratedControlPointContextPreview(options.viewer, options.surfaceName);
 
@@ -626,12 +862,57 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             return GeneratedControlPointContextResult::Handled;
         }
     }
-    if (selected == newLineAnnotationAction && newLineAnnotationAction->isEnabled()) {
-        if (options.addBranch && selectedControlIndex != std::numeric_limits<size_t>::max()) {
-            options.addBranch(selectedControlIndex);
+    for (const auto& [action, branch] : unlinkActions) {
+        if (selected == action) {
+            options.unlinkBranch(selectedControlIndex, branch.fiberId, branch.controlPointIndex);
             return GeneratedControlPointContextResult::Handled;
         }
+    }
+    for (const auto& [action, branch] : approveActions) {
+        if (selected == action) {
+            options.setBranchLinkPending(
+                selectedControlIndex, branch.fiberId, branch.controlPointIndex, false);
+            return GeneratedControlPointContextResult::Handled;
+        }
+    }
+    for (const auto& [action, branch] : markPendingActions) {
+        if (selected == action) {
+            options.setBranchLinkPending(
+                selectedControlIndex, branch.fiberId, branch.controlPointIndex, true);
+            return GeneratedControlPointContextResult::Handled;
+        }
+    }
+    if (selected == newLineAnnotationAction && newLineAnnotationAction->isEnabled()) {
         return GeneratedControlPointContextResult::NewLineAnnotationRequested;
+    }
+    if (newLinkedLineAnnotationAction &&
+        selected == newLinkedLineAnnotationAction &&
+        newLinkedLineAnnotationAction->isEnabled()) {
+        const auto clickedVolumePoint = options.viewer->sampleSceneVolume(options.scenePoint);
+        if (!clickedVolumePoint) {
+            return GeneratedControlPointContextResult::Handled;
+        }
+        options.addBranch(selectedControlIndex,
+                          clickedVolumePoint->position,
+                          false,
+                          options.branchLinkDirection);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (designateLinkCandidateAction &&
+        selected == designateLinkCandidateAction &&
+        designateLinkCandidateAction->isEnabled()) {
+        options.designateLinkCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (linkWithCandidateAction &&
+        selected == linkWithCandidateAction &&
+        linkWithCandidateAction->isEnabled()) {
+        options.linkWithCandidate(selectedControlIndex, selectedControl.point);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (openNearbyAnnotationAction && selected == openNearbyAnnotationAction) {
+        options.openNearbyAnnotation(nearbyIntersection->fiberId, nearbyIntersection->point);
+        return GeneratedControlPointContextResult::Handled;
     }
     return GeneratedControlPointContextResult::Handled;
 }

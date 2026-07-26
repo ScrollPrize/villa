@@ -30,6 +30,13 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.tensorboard import SummaryWriter
 from types import SimpleNamespace
 
+# Prefer this monorepo's model implementation over unrelated packages using
+# the same ``vesuvius`` distribution name on package indexes. setup.py installs
+# the sibling project's declared core and model dependencies.
+_VESUVIUS_SRC = Path(__file__).resolve().parent.parent / "vesuvius" / "src"
+if _VESUVIUS_SRC.is_dir() and str(_VESUVIUS_SRC) not in sys.path:
+    sys.path.insert(0, str(_VESUVIUS_SRC))
+
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
 
@@ -457,6 +464,22 @@ class ScaleSpaceLoss3D(nn.Module):
 # Model construction
 # ---------------------------------------------------------------------------
 
+def infer_model_patch_size(state_dict: dict[str, torch.Tensor]) -> Optional[int]:
+    """Recover the autoconfiguration patch from an old checkpoint's stages."""
+    stage_indices = {
+        int(parts[2])
+        for key in state_dict
+        if (parts := key.split("."))[:2] == ["shared_encoder", "stages"]
+        and len(parts) > 2 and parts[2].isdigit()
+    }
+    if not stage_indices:
+        return None
+    num_stages = max(stage_indices) + 1
+    # get_pool_and_conv_props stops when a feature map is smaller than
+    # 2*4 voxels. This is the canonical power-of-two patch for num_stages.
+    return 4 * (2 ** (num_stages - 1))
+
+
 def build_model(
     patch_size: int,
     device: str,
@@ -465,6 +488,8 @@ def build_model(
     upsample_mode: Optional[str] = None,
     output_sigmoid: Optional[bool] = None,
     batch_size: int = 2,
+    model_patch_size: Optional[int] = None,
+    strict: bool = False,
 ) -> nn.Module:
     """Build 3D UNet via vesuvius NetworkFromConfig.
 
@@ -476,7 +501,10 @@ def build_model(
         output_sigmoid: Whether to apply sigmoid to model output.
             If None and weights is provided, auto-detects from checkpoint metadata.
     """
-    # Auto-detect from checkpoint if not specified
+    # Auto-detect from checkpoint if not specified.  ``patch_size`` is the
+    # inference/training tensor size; ``model_patch_size`` is only an input to
+    # Vesuvius' architecture autoconfiguration.  Older tifxyz checkpoints did
+    # not save the latter, so recover it from the encoder stage count.
     ckpt = None
     if weights is not None:
         ckpt = torch.load(weights, map_location=device, weights_only=False)
@@ -487,6 +515,11 @@ def build_model(
                 upsample_mode = ckpt.get("upsample_mode", "transpconv")
             if output_sigmoid is None:
                 output_sigmoid = ckpt.get("output_sigmoid", True)
+            if model_patch_size is None:
+                model_patch_size = ckpt.get("model_patch_size")
+                if model_patch_size is None:
+                    state_dict = ckpt.get("state_dict", ckpt)
+                    model_patch_size = infer_model_patch_size(state_dict)
     if norm_type is None:
         norm_type = "instance"
     if upsample_mode is None:
@@ -507,7 +540,8 @@ def build_model(
     # activation='none' so we handle output activation ourselves
     # (sigmoid or clamp, configured via output_sigmoid).
     mgr.targets = {"output": {"out_channels": 8, "activation": "none"}}
-    mgr.train_patch_size = (patch_size, patch_size, patch_size)
+    arch_patch = int(model_patch_size) if model_patch_size is not None else int(patch_size)
+    mgr.train_patch_size = (arch_patch, arch_patch, arch_patch)
     mgr.train_batch_size = batch_size
     mgr.in_channels = 1
     mgr.autoconfigure = True
@@ -521,19 +555,26 @@ def build_model(
             state_dict = ckpt["state_dict"]
         else:
             state_dict = ckpt
-        # Filter keys to matching shapes for flexible loading
-        model_state = model.state_dict()
-        filtered = {k: v for k, v in state_dict.items()
-                    if k in model_state and model_state[k].shape == v.shape}
-        missing = [k for k in model_state if k not in filtered]
-        skipped = [k for k in state_dict if k not in filtered]
-        model_state.update(filtered)
-        model.load_state_dict(model_state)
-        print(f"[model] loaded {len(filtered)}/{len(model_state)} params from {weights}")
-        if skipped:
-            print(f"[model] skipped from checkpoint: {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
-        if missing:
-            print(f"[model] randomly initialized: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        if strict:
+            model.load_state_dict(state_dict, strict=True)
+            print(
+                f"[model] loaded all {len(state_dict)} params from {weights} "
+                f"(tile_size={patch_size}, model_patch_size={arch_patch})"
+            )
+        else:
+            # Flexible loading is retained for training/fine-tuning callers.
+            model_state = model.state_dict()
+            filtered = {k: v for k, v in state_dict.items()
+                        if k in model_state and model_state[k].shape == v.shape}
+            missing = [k for k in model_state if k not in filtered]
+            skipped = [k for k in state_dict if k not in filtered]
+            model_state.update(filtered)
+            model.load_state_dict(model_state)
+            print(f"[model] loaded {len(filtered)}/{len(model_state)} params from {weights}")
+            if skipped:
+                print(f"[model] skipped from checkpoint: {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
+            if missing:
+                print(f"[model] randomly initialized: {missing[:5]}{'...' if len(missing) > 5 else ''}")
 
     return model, norm_type, upsample_mode, output_sigmoid
 
