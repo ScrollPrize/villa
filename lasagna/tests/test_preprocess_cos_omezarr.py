@@ -52,7 +52,6 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			self.assertEqual(offset, (channel * 12 + 3) * page)
 			self.assertEqual(length, 4 * page)
 
-	@unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux hole punching")
 	def test_release_memmap_pages_reclaims_only_requested_band(self):
 		page = os.sysconf("SC_PAGE_SIZE")
 		with tempfile.NamedTemporaryFile() as backing:
@@ -62,7 +61,16 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			arr.flush()
 			arr._lasagna_tmp_path = backing.name
 
-			preprocess._release_memmap_pages(arr, 2, 5)
+			class FakeLibc:
+				def madvise(self, *_args):
+					return 0
+
+				def fallocate(self, fd, _mode, offset, length):
+					os.pwrite(fd.value, bytes(length.value), offset.value)
+					return 0
+
+			with mock.patch.object(preprocess, "_get_libc", return_value=FakeLibc()):
+				preprocess._release_memmap_pages(arr, 2, 5)
 			arr.flush()
 			view = np.memmap(backing.name, dtype=np.uint8, mode="r", shape=shape)
 			try:
