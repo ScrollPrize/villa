@@ -90,6 +90,10 @@ Items described in the spec (`lasagna/lasagna_3d.md`) or the 2D model (`lasagna/
 - **OME-Zarr conversion**: `convert_fit_zarr_to_vc3d_omezarr.py` converts the flat
   integrated zarr into per-channel OME-Zarr with multi-level pyramids for the fitting
   pipeline.
+- **3D predict resume**: `predict3d` uses rolling per-channel z-band
+  accumulators, atomic output chunk writes, output-directory temp cleanup, and
+  channel-based completeness (`cos`; or `grad_mag`+`nx`+`ny`). Optional
+  `pred_dt` generation is tracked independently from neural inference.
 
 **Chunk-alignment fix** — tile and slab iteration now aligns to zarr chunk boundaries
 (rounding down the crop start), preventing race conditions where adjacent tiles would
