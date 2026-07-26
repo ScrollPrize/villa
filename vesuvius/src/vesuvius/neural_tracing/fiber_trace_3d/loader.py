@@ -124,7 +124,7 @@ class _SmoothDisplacement3DParams:
 
 @dataclass(frozen=True)
 class _Augment3DParams:
-    sample_index: int
+    stream_index: int
     cp_local_zyx: np.ndarray
     cp_volume_zyx: np.ndarray
     source_to_output_zyx: np.ndarray
@@ -168,7 +168,8 @@ class _PrefetchCounters3D:
 
 @dataclass(frozen=True)
 class FiberTrace3DSample:
-    sample_index: int
+    stream_index: int
+    data_index: int
     record_index: int
     fiber_path: str
     control_point_index: int
@@ -191,7 +192,8 @@ class FiberTrace3DBatch:
     valid_mask: torch.Tensor
     cp_local_zyx: torch.Tensor
     crop_origin_zyx: torch.Tensor
-    sample_indices: torch.Tensor
+    stream_indices: torch.Tensor
+    data_indices: torch.Tensor
     record_indices: torch.Tensor
     control_point_indices: torch.Tensor
     fiber_paths: tuple[str, ...]
@@ -220,7 +222,8 @@ class FiberTrace3DBatch:
             valid_mask=self.valid_mask.to(device),
             cp_local_zyx=self.cp_local_zyx.to(device),
             crop_origin_zyx=self.crop_origin_zyx.to(device),
-            sample_indices=self.sample_indices.to(device),
+            stream_indices=self.stream_indices.to(device),
+            data_indices=self.data_indices.to(device),
             record_indices=self.record_indices.to(device),
             control_point_indices=self.control_point_indices.to(device),
             fiber_paths=self.fiber_paths,
@@ -1404,7 +1407,7 @@ class FiberTrace3DLoader:
         )
 
         return _Augment3DParams(
-            sample_index=int(sample_index),
+            stream_index=int(sample_index),
             cp_local_zyx=cp_local.astype(np.float64),
             cp_volume_zyx=cp_volume.astype(np.float64),
             source_to_output_zyx=source_to_output.astype(np.float64),
@@ -1642,7 +1645,7 @@ class FiberTrace3DLoader:
             out = torch.pow(scaled, float(params.gamma)) * (hi - lo) + lo
         if params.noise_std > 0.0:
             gen = torch.Generator(device=out.device)
-            gen.manual_seed(_stable_seed(self.config.seed, "value_noise", params.sample_index) % (2**63 - 1))
+            gen.manual_seed(_stable_seed(self.config.seed, "value_noise", params.stream_index) % (2**63 - 1))
             out = out + torch.randn(out.shape, generator=gen, device=out.device) * float(params.noise_std)
         if params.blur_sigma > 0.0:
             # Conservative separable 3D blur. Kept simple for the first 3D path.
@@ -1884,20 +1887,21 @@ class FiberTrace3DLoader:
         device: torch.device | str = "cpu",
         profile: bool = False,
     ) -> FiberTrace3DSample:
+        stream_index = int(sample_index)
         total_start = time.perf_counter()
         cpu_total_start = time.process_time()
         timings: dict[str, float] | None = {} if profile else None
         resolved_device = torch.device(device)
         start = time.perf_counter()
-        data_sample_index = _bounded_data_sample_index(sample_index, sample_index_limit)
+        data_index = _bounded_data_sample_index(stream_index, sample_index_limit)
         record, record_index, cp_index = self.descriptor_for_sample_index(
-            data_sample_index,
+            data_index,
             sample_mode=sample_mode,
         )
         if timings is not None:
             timings["descriptor_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
-        params = self._sample_augment_params(record, cp_index, int(sample_index))
+        params = self._sample_augment_params(record, cp_index, stream_index)
         if timings is not None:
             timings["augment_params_ms"] = (time.perf_counter() - start) * 1000.0
         start = time.perf_counter()
@@ -1939,7 +1943,8 @@ class FiberTrace3DLoader:
             timings["sample_total_ms"] = (time.perf_counter() - total_start) * 1000.0
             timings["sample_cpu_ms"] = (time.process_time() - cpu_total_start) * 1000.0
         return FiberTrace3DSample(
-            sample_index=int(data_sample_index),
+            stream_index=stream_index,
+            data_index=int(data_index),
             record_index=int(record_index),
             fiber_path="" if record.fiber.path is None else str(record.fiber.path),
             control_point_index=int(cp_index),
@@ -2049,7 +2054,8 @@ class FiberTrace3DLoader:
             valid_mask=torch.stack([sample.valid_mask for sample in samples], dim=0),
             cp_local_zyx=torch.stack([sample.cp_local_zyx for sample in samples], dim=0),
             crop_origin_zyx=torch.stack([sample.crop_origin_zyx for sample in samples], dim=0),
-            sample_indices=torch.as_tensor([sample.sample_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
+            stream_indices=torch.as_tensor([sample.stream_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
+            data_indices=torch.as_tensor([sample.data_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
             record_indices=torch.as_tensor([sample.record_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
             control_point_indices=torch.as_tensor([sample.control_point_index for sample in samples], dtype=torch.long, device=samples[0].volume.device),
             fiber_paths=tuple(sample.fiber_path for sample in samples),
@@ -2090,9 +2096,10 @@ class FiberTrace3DLoader:
         sample_index_limit: int | None = None,
         sample_mode: str = "random",
     ) -> tuple[int, list[ZarrChunkRequest]]:
-        data_sample_index = _bounded_data_sample_index(sample_index, sample_index_limit)
+        stream_index = int(sample_index)
+        data_index = _bounded_data_sample_index(stream_index, sample_index_limit)
         record, _record_index, cp_index = self.descriptor_for_sample_index(
-            data_sample_index,
+            data_index,
             sample_mode=sample_mode,
         )
         valid_voxels, start_selected, end_selected = self._prefetch_envelope_bbox_selected(

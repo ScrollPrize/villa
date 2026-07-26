@@ -1,13 +1,22 @@
-# VC3D BBox Dependency Metadata For 3D Prefetch
+# 3D Branch Choice Grid Routing Update
 
-Add a VC3D Python binding that returns the same per-chunk dependency metadata
-as `collect_coords_dependencies`, but for a selected-level ZYX bbox directly.
+Change the two-branch 3D positive supervision routing:
 
-The 3D fiber prefetcher should then pass its augmentation-envelope bbox to that
-API instead of materializing representative coordinates or converting bbox
-chunks in Python. Chunk conversion and persistent-cache path/remote metadata
-must remain VC3D-owned.
+- Training should switch the anti-collapse grouped branch-choice grid from the
+  current 4-voxel grid back to a 2-voxel grid.
+- Each sample/patch in a training batch should get a deterministic random grid
+  offset before grouping, so the same physical artifacts are not always aligned
+  to fixed 2-voxel cell boundaries.
+- Test/eval should keep branch choice per voxel/positive point and must not use
+  grouped choice repair or the 10% repair.
+- Rename the ambiguous 3D index fields/API wording:
+  - `stream_index` / `stream_indices`: unbounded deterministic stream position;
+  - `data_index` / `data_indices`: bounded dataset-selection index after any
+    `max_sample_index` wrapping.
+- Use `stream_index` for every random source, augmentation seed, branch-grid
+  offset, and deterministic stream operation.
+- Use `data_index` only for data reading/CP selection and debug reporting.
 
-Because the direct bbox API removes coordinate generation from 3D prefetch, the
-intermediate `prefetch_sampler_device` knob is no longer meaningful and should
-be removed rather than carried as dead configuration.
+Do not change the model output layout, negative presence loss, branch presence
+visualization, or the 10% minimum-branch training quota except for the grid size
+and random offset behavior.

@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-07-26
+
+- Changed 3D two-branch training to route positive supervision through
+  deterministic `stream_index`-seeded per-sample-offset `2x2x2` choice groups
+  with 10% underrepresented-branch repair, while test/eval keeps raw
+  per-voxel branch argmax with no grouped repair. 3D batches now carry explicit
+  `stream_indices` and `data_indices`.
+- Expanded 3D train/test TensorBoard sample sheets to include literal branch-0
+  and branch-1 presence panels in addition to normal-selected and summary
+  branch presence panels.
+
 ## 2026-07-20
 
 - Changed 3D prefetch dependency generation to use a CP-centered configured

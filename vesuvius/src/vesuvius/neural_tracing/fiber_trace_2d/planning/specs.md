@@ -20,15 +20,18 @@
   covers every configured control point once per pass before repeating. Changing
   batch size or step count may truncate/extend the consumed prefix, but must not
   reshuffle earlier samples.
-- 3D training uses the same raw-stream/data-stream split as 2D:
-  `training.max_sample_index` limits CP/data sample selection only, while
-  geometric and value augmentation parameters are seeded by the unbounded raw
-  training sample index. Reusing a bounded CP/data prefix must not replay the
-  same augmentation transforms on each repeat.
-- Public 3D loader calls use `sample_index` as that raw/global deterministic
-  stream index. There is no separate public augmentation-index mode:
-  `sample_index_limit` is the only mechanism that changes bounded CP/data
-  selection, and augmentation seeding remains tied to the raw `sample_index`.
+- 3D training uses a strict stream/data index split. `stream_index` is the
+  unbounded deterministic stream position; `data_index` is the bounded
+  dataset-selection index after applying `training.max_sample_index` /
+  `sample_index_limit`. `training.max_sample_index` limits CP/data sample
+  selection only. Every deterministic random source and augmentation parameter
+  must be keyed by `stream_index`, never `data_index`, so reusing a bounded
+  CP/data prefix cannot replay the same augmentation transforms on each repeat.
+- Public 3D loader compatibility calls may still accept an argument named
+  `sample_index`, but it is semantically `stream_index` and must be normalized
+  to that name internally. Batch/sample data structures must carry explicit
+  `stream_index`/`stream_indices` and `data_index`/`data_indices` fields.
+  `data_index` is only for dataset lookup/CP selection and debug reporting.
 - With `training.max_steps = 0`, 3D training repeats the deterministic training
   stream indefinitely until interrupted. Positive `max_steps` values are
   absolute target training steps, including for resumed runs.
@@ -96,15 +99,17 @@
   `presence_mask`. The unselected positive branch is not trained as negative at
   that positive point.
 - During two-branch 3D training, positive routing includes a batch-local
-  anti-collapse repair over 4-voxel spatial groups within each patch. Training first
-  averages detached branch choice scores per `(patch, 4x4x4 chunk)`. If either
+  anti-collapse repair over deterministic per-sample-offset `2x2x2` spatial
+  groups within each patch. Training first shifts each sample's group grid by a
+  deterministic integer offset derived from `stream_index`, then averages
+  detached branch choice scores per `(patch, shifted 2x2x2 chunk)`. If either
   branch receives fewer than 10% of grouped positive supervision, the
-  underrepresented branch takes the missing quota from groups currently assigned
-  to the other branch, sorted by the underrepresented branch's grouped detached
-  choice score. The chosen group branch is broadcast back to all sparse positive
-  points in that group. If both branches already meet the floor, routing is
-  unchanged. Test/eval metrics do not apply this repair; they use the raw
-  detached argmax routing.
+  underrepresented branch takes the missing quota from groups currently
+  assigned to the other branch, sorted by the underrepresented branch's grouped
+  detached choice score. The chosen group branch is broadcast back to all
+  sparse positive points in that group. If both branches already meet the
+  floor, routing is unchanged. Test/eval metrics do not apply this repair, do
+  not group choices, and use the raw per-voxel detached argmax routing.
 - Negative presence supervision remains global: all branches are supervised as
   negative where the dense presence target is negative inside the valid/reachable
   patch interior. For CP-only samples, edge voxels that could not contain a CP
@@ -153,12 +158,13 @@
   counts. Each sample block has five rows: the `yx`, `zx`, and `zy` principal
   planes, a longitudinal slice containing the GT CP tangent, and a
   perpendicular/cross slice whose plane normal is the GT CP tangent. Each row
-  has seven columns: volume image with projected GT line and model-predicted/
+  has nine columns: volume image with projected GT line and model-predicted/
   fitted CP direction overlay where applicable, target/context presence,
-  branch presence for the output whose decoded direction is closer to the slice
-  normal by `abs(dot(axis, normal))`, the other branch presence, max branch
-  presence, min branch presence, and average branch presence. The target/context
-  presence panel must visualize the carried transformed fiber-line segment
+  literal branch-0 presence, literal branch-1 presence, branch presence for the
+  output whose decoded direction is closer to the slice normal by
+  `abs(dot(axis, normal))`, the other branch presence, max branch presence, min
+  branch presence, and average branch presence. The target/context presence
+  panel must visualize the carried transformed fiber-line segment
   metadata even for JSON/non-NML CP-only samples where loss supervision remains
   CP-only. The two oblique rows must project/rasterize transformed line
   segments into their oblique slice frame for both image overlay and
@@ -898,7 +904,16 @@
 - `train.py --load-only` runs the same 100-batch benchmark loader path and exits without test evaluation, TensorBoard, run-directory creation, snapshots, image/value augmentation, image normalization, supervision building, model forward, backward, or optimizer work. It still performs deterministic sample selection, CP-local source construction, coordinate augmentation, and base-volume sampling so loading bottlenecks can be isolated. When `training.pipeline_enabled` is true, load-only benchmarks use the bounded whole-batch queue so loader parallelism can be measured without model work.
 - Training and training prefetch use the same deterministic pseudo-random CP sample-index sequence: each pass visits all configured CPs once in seeded random order and wraps at dataset end.
 - With `training.max_steps = 0`, training repeats the full training dataset indefinitely.
-- `training.max_sample_index` is an optional positive exclusive deterministic sample-index limit. The default `0` means no limit. When positive, training wraps every global sample position with `sample_index % training.max_sample_index`, so long runs reuse that deterministic CP/data prefix independently of `training.max_steps`. The limit does not bound augmentation seeding: geometric and value/image augmentation draws are keyed by the unbounded training stream index so repeated use of the same bounded CP sample gets fresh deterministic augmentation parameters instead of replaying the same transform.
+- `training.max_sample_index` is an optional positive exclusive deterministic
+  `data_index` limit. The default `0` means no limit. When positive, training
+  maps every unbounded `stream_index` through
+  `stream_index % training.max_sample_index` only for CP/data selection, so
+  long runs reuse that deterministic CP/data prefix independently of
+  `training.max_steps`. The limit does not bound any random source: geometric
+  and value/image augmentation draws, branch-choice grid offsets, jitter, and
+  noise are keyed by the unbounded `stream_index`, so repeated use of the same
+  bounded `data_index` gets fresh deterministic random parameters instead of
+  replaying the same transform.
 - Explicit positive `--prefetch-steps N` overrides `training.max_steps` and prefetches exactly `N * training.control_points_per_step` CP samples from the deterministic random training stream.
 - Explicit `--prefetch-steps 0` overrides `training.max_steps` and prefetches every configured training-dataset CP once, independent of `control_points_per_step`; if `training.max_sample_index` is positive it prefetches that bounded deterministic prefix instead. When `test_datasets` is configured, it also prefetches every held-out test CP once.
 - If `--prefetch-steps` is omitted, prefetch uses `training.max_steps`; if that configured value is `0`, omitted prefetch also means every configured training/test CP once.
@@ -963,7 +978,7 @@
   `control_points_per_step`. Group ordering is deterministic and covers the
   effective CP set by shuffled fiber-local CP groups before repeating.
 - Same-fiber CP patches keep independent geometric augmentation draws through
-  unique raw sample indices. Value/image augmentation draws are synchronized
+  unique stream indices. Value/image augmentation draws are synchronized
   within each same-fiber group so the embedding objective does not treat
   value-only appearance jitter as identity evidence.
 - The contrastive embedding loss uses cosine similarity on each loaded strip

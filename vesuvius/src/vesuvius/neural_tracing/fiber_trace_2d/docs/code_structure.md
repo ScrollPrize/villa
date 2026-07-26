@@ -296,17 +296,18 @@ side/top strip input loading.
   chooses one branch per supervised point with
   `abs(dot(decoded_predicted_axis, target_axis)) * predicted_presence`.
   Direction loss and positive presence BCE apply only to that selected branch.
-  During training in two-branch configs, routing is grouped by 4-voxel spatial
-  chunks within each patch. If one branch falls below 10% of grouped positive
-  sparse supervision in a batch, the best missing quota for that branch is
-  force-routed to it by grouped detached choice score, then broadcast to every
-  sparse positive point in the chosen chunk. Test/eval metrics keep the raw
-  detached argmax routing. Dense negative presence supervision applies to every
-  branch at global negative voxels. Presence BCE is normalized per `(patch,
-  branch)` for sparse positives and dense negatives, and the resulting
-  positive/negative terms are summed without an extra global balancing factor.
-  The default 3D loss weights are `direction_weight: 10.0` and
-  `presence_weight: 1.0`.
+  During training in two-branch configs, routing is grouped by deterministic
+  per-sample-offset `2x2x2` spatial chunks within each patch. If one branch
+  falls below 10% of grouped positive sparse supervision in a batch, the best
+  missing quota for that branch is force-routed to it by grouped detached
+  choice score, then broadcast to every sparse positive point in the chosen
+  chunk. The group offset is keyed by `stream_index`. Test/eval metrics keep
+  raw per-voxel detached argmax routing and never apply grouping or the 10%
+  repair. Dense negative presence supervision applies to every branch at global
+  negative voxels. Presence BCE is normalized per `(patch, branch)` for sparse
+  positives and dense negatives, and the resulting positive/negative terms are
+  summed without an extra global balancing factor. The default 3D loss weights
+  are `direction_weight: 10.0` and `presence_weight: 1.0`.
 - Passing `--resume /path/to/current.pt` for normal training restores the
   model and optimizer state from that snapshot, continues from the stored step,
   and still creates a fresh timestamped run directory. The TensorBoard config
@@ -314,10 +315,15 @@ side/top strip input loading.
 - `training.max_steps: 0` means the deterministic training stream repeats
   indefinitely until interrupted. Positive `max_steps` values remain absolute
   target steps, including when resuming.
+- `stream_index` is the unbounded deterministic stream position. It drives all
+  random sources: geometric/value augmentation, jitter/noise, and branch-choice
+  grid offsets. `data_index` is the bounded dataset-selection position after
+  `training.max_sample_index` / `sample_index_limit` wrapping and is only for
+  data reads/CP selection and debug reporting.
 - `training.max_sample_index` bounds CP/data sample selection to a deterministic
-  prefix. Augmentation parameters are still seeded by the unbounded training
-  stream index, so reused CP/data samples receive fresh deterministic
-  transforms on later repeats.
+  `data_index` prefix. Augmentation parameters and all other random sources are
+  still seeded by `stream_index`, so reused CP/data samples receive fresh
+  deterministic transforms on later repeats.
 - When `test_interval > 0`, configured test evaluation also runs once at step
   0 before the first optimizer step, so initial performance is visible.
 - Logs `train_sample_3d/principal_slices` at `training.sample_vis_interval`.
@@ -326,12 +332,13 @@ side/top strip input loading.
   corresponding dense test sheet count. Each sample block uses five rows: the
   sampled CP's three principal planes, a longitudinal slice containing the GT
   CP tangent, and a perpendicular/cross slice whose plane normal is the GT CP
-  tangent. Each row has seven columns: volume image with projected GT line and
+  tangent. Each row has nine columns: volume image with projected GT line and
   predicted CP direction overlay where applicable, target/context presence,
-  branch presence for the output whose decoded direction is closer to the
-  slice normal, other branch presence, max branch presence, min branch
-  presence, and average branch presence. The GT line overlay draws target-line
-  portions within 2 voxels of the displayed principal slice plane. The two
+  literal branch-0 presence, literal branch-1 presence, branch presence for the
+  output whose decoded direction is closer to the slice normal, other branch
+  presence, max branch presence, min branch presence, and average branch
+  presence. The GT line overlay draws target-line portions within 2 voxels of
+  the displayed principal slice plane. The two
   oblique rows project/rasterize the carried transformed line segments into
   the oblique slice frame for both the image overlay and target/context panel.
   The target/context presence panel is max-pooled for visualization only;
@@ -357,10 +364,11 @@ side/top strip input loading.
   `training.loader_workers > 0`. Each worker lazily constructs its own
   `FiberTrace3DLoader` and VC3D coordinate sampler, and each DataLoader item is
   a complete `FiberTrace3DBatch` keyed by deterministic batch index.
-- Public 3D loader calls interpret `sample_index` as the raw/global
-  deterministic stream index. `sample_index_limit` derives bounded CP/data
-  selection from that raw index; augmentation seeding always remains keyed to
-  the raw index, so bounded-prefix repeats do not replay identical transforms.
+- Public 3D loader calls may still accept `sample_index` for compatibility, but
+  its semantics are `stream_index`. `sample_index_limit` derives bounded
+  `data_index` CP/data selection from that stream index; augmentation seeding
+  and all random-source seeding remain keyed to `stream_index`, so
+  bounded-prefix repeats do not replay identical transforms.
 - For 3D loading, omitted or `null` `volume_cache_memory_mib` resolves in
   Python to a 512 MiB VC3D decoded/hot-cache cap per loader/worker. Explicit
   positive values override this default.
@@ -654,10 +662,9 @@ The important behavior is:
   metadata converts line and control-point coordinates at assembly/export time.
 - Builds one sample as all configured strip-z offsets around one control point.
 - Builds a batch by stacking deterministic samples.
-- Uses the bounded sample index only for CP/data selection; when training wraps
-  a bounded `max_sample_index` prefix, augmentation parameters are seeded by
-  the unbounded raw training stream index so repeated CPs do not replay the
-  same transform.
+- Uses the bounded data index only for CP/data selection; when training wraps a
+  bounded `max_sample_index` prefix, augmentation parameters are seeded by the
+  unbounded stream index so repeated CPs do not replay the same transform.
 - Builds contrastive training batches by selecting deterministic shuffled
   groups of `N` CPs from one fiber, concatenating consecutive same-fiber groups
   to fill the configured training batch, using independent geometric
@@ -1211,12 +1218,12 @@ Training keys:
 - `run_name`: prefix for the run directory.
 - `max_steps`: number of training steps; `0` means indefinite mode, where
   training repeats deterministic pseudo-random full-dataset CP passes.
-- `max_sample_index`: optional exclusive deterministic sample-index limit;
-  `0` means unlimited. Positive values make training wrap global sample
-  positions through that deterministic prefix, so many steps can reuse a
-  prefetched subset. Augmentation seeds still use the unbounded training stream
-  position, so the subset is deterministic but its augmentations keep changing
-  across repeats.
+- `max_sample_index`: optional exclusive deterministic `data_index` limit;
+  `0` means unlimited. Positive values make training wrap global stream
+  positions through that deterministic data prefix, so many steps can reuse a
+  prefetched subset. Augmentation seeds and all other random sources still use
+  the unbounded `stream_index`, so the subset is deterministic but its
+  augmentations and branch-grid offsets keep changing across repeats.
 - `learning_rate`: AdamW learning rate.
 - `scalar_log_interval`: TensorBoard scalar/console interval.
 - `tensorboard_image_interval`: TensorBoard batch-image interval.

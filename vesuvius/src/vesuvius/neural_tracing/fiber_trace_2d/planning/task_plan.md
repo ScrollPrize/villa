@@ -1,152 +1,150 @@
-# VC3D BBox Dependency Metadata For 3D Prefetch Plan
+# 3D Branch Choice Grid Routing Update Plan
 
 ## Current State
 
-- `volume-cartographer/python/vc/volume.cpp` already has:
-  - `collectChunkKeys(volume, offset, shape, level)`, which converts a
-    selected-level ZYX bbox to chunk keys;
-  - `collectCoordsDependencies(...)`, which converts chunk keys to the
-    metadata dictionaries Python prefetch needs.
-- `fiber_trace_3d.loader` now computes a CP-centered augmentation-envelope bbox
-  but still creates representative chunk-center coordinates so it can call the
-  coordinate dependency API.
-- That representative-coordinate layer is unnecessary and leaves chunk-range
-  logic in Python.
+- Positive two-branch routing computes a detached per-positive-point score:
+  `abs(dot(decoded_branch_dir, target_axis)) * branch_presence`.
+- Training calls `compute_losses(..., enforce_branch_min_fraction=True)` through
+  `_forward_loss(..., backward=True)`.
+- Test/eval calls the same loss path with `backward=False`, so it currently
+  skips the 10% repair and chooses the branch independently per positive
+  supervision point/voxel. That per-voxel eval behavior should remain.
+- `FiberTrace3DLoader.load_sample(...)` currently stores the bounded
+  `data_sample_index` in `FiberTrace3DSample.sample_index`; with
+  `max_sample_index`, that stored value repeats even though the raw
+  augmentation sample index passed into `_sample_augment_params(...)` keeps
+  increasing.
+- The current training repair groups scores by `(patch, floor(z/4), floor(y/4),
+  floor(x/4))`, averages detached branch scores per group, enforces the 10%
+  minority floor over groups, and broadcasts the selected branch back to points.
 
 ## Implementation
 
-### VC3D Binding
+### Branch Selection API
 
-- Factor the metadata-emission logic in `collectCoordsDependencies(...)` into a
-  shared helper, for example:
-  - input: `Volume&`, `std::vector<vc::render::ChunkKey>`;
-  - output: `nb::list` with the same dict fields as today:
-    `level`, `iz`, `iy`, `ix`, `key`, `valid`, `remote_chunk_key`,
-    `remote_url`, `cache_path`, `empty_path`, `persistent_extension`,
-    `cache_payload_format`, and `source_payload_matches_cache`.
-- Add a new binding in `volume.cpp`, preferably:
-  - `collect_bbox_dependencies(offset, shape, level=0)`
-  - `offset` and `shape` are selected-level ZYX coordinates, matching existing
-    `prefetch_zyx`, `read_zyx`, and `collectChunkKeys(...)` semantics.
-- The binding should:
-  - validate non-negative `level` and present scale level through the existing
-    `collectChunkKeys(...)` path;
-  - clamp boxes against the selected-level volume shape exactly as
-    `prefetch_zyx` does;
-  - return an empty list for empty/out-of-volume boxes;
-  - release the GIL only around the chunk-key collection if needed, then build
-    Python dicts after reacquiring it;
-  - return the same metadata schema and cache-path authority as
-    `collect_coords_dependencies`.
-- Do not add Python-side cache path reconstruction or remote key generation.
+- Replace the boolean `enforce_branch_min_fraction` plumbing with an explicit
+  branch-selection mode, for example:
+  - `train_offset_grid_min_fraction`
+  - `eval_voxel`
+- Keep direct `compute_losses(...)` compatibility by defaulting to the eval
+  behavior unless training explicitly requests the training mode.
+- `_forward_loss(..., backward=True)` should request
+  `train_offset_grid_min_fraction`.
+- `_forward_loss(..., backward=False)` and `evaluate_dense_loss(...)` should
+  request `eval_voxel`.
 
-### Python Sampler
+### Stream/Data Index Rename
 
-- Add `chunk_requests_for_bbox(start_zyx, end_zyx)` to the coordinate sampler
-  abstraction.
-- For `Vc3dCoordinateSampler`:
-  - convert half-open `start/end` selected-level ZYX bbox to `offset/shape`;
-  - call `volume.collect_bbox_dependencies(offset, shape, level)`;
-  - reuse the same dependency-dict-to-`ZarrChunkRequest` conversion as
-    `chunk_requests_for_coords`;
-  - if the binding is missing, fail clearly with a “rebuild
-    volume-cartographer” message.
-- For `NumpyZarrCoordinateSampler`:
-  - keep local prefetch as a no-op returning `[]`, matching current local-array
-    behavior.
-- Keep `chunk_requests_for_coords(...)` for 2D strip prefetch and other
-  coordinate-surface use cases.
+- Rename the ambiguous public/internal fields and local variables in the 3D
+  loader/trainer:
+  - `stream_index`: unbounded deterministic stream position;
+  - `stream_indices`: batch tensor of unbounded stream positions;
+  - `data_index`: bounded dataset-selection index after applying
+    `sample_index_limit` / `training.max_sample_index`;
+  - `data_indices`: batch tensor of bounded data-selection positions.
+- Avoid new uses of bare `sample_index` where the distinction matters. Keep it
+  only at compatibility CLI/API boundaries if renaming the public argument would
+  be too broad for this task; immediately normalize it to `stream_index`.
+- Update `FiberTrace3DSample` and `FiberTrace3DBatch` to carry both
+  `stream_index/stream_indices` and `data_index/data_indices`.
+- Existing debug/log output may print `data_index` for identifying which CP was
+  read, but must print/use `stream_index` when describing deterministic random
+  state.
+- Replace current legacy bounded-index batch-field usage with the correct new
+  `stream_indices` or `data_indices` field at each call site.
 
-### 3D Prefetch Loader
+### Training Grid
 
-- Replace `_prefetch_envelope_chunk_center_coords_base(...)` with an envelope
-  bbox path:
-  - compute the CP-centered selected-level augmentation-envelope bbox;
-  - clamp it to the selected-level volume shape;
-  - compute `valid_voxels` from the clamped selected-level bbox volume;
-  - call `record.sampler.chunk_requests_for_bbox(start, end)`.
-- Remove Python-side chunk conversion from 3D prefetch:
-  - no representative chunk-center coordinate materialization;
-  - no `record.volume.chunks` / `volume.chunk_shape(...)` dependency in the
-    3D loader;
-  - no `chunk_requests_for_coords(...)` call for 3D prefetch.
-- Remove the intermediate `prefetch_sampler_device` config key and docs/tests,
-  because direct bbox dependency generation does not materialize torch
-  coordinate tensors.
-- Keep:
-  - deterministic sample ordering and `idx` semantics;
-  - augmentation-envelope semantics based on configured extrema;
-  - `prefetch_sampler_workers` for parallel bbox dependency producers;
-  - Python cache-hit / `.empty` / atomic download handling;
-  - no Lasagna-channel prefetch.
-- Update prefetch startup output to keep `mode=augmentation_envelope` but drop
-  sampler-device reporting.
+- Change the grouped repair grid size from `4` to `2` selected/output voxels in
+  each spatial axis. In 3D this means `2x2x2` groups.
+- Add a deterministic per-sample integer grid offset:
+  - offset range per spatial axis: `0..chunk_size-1`;
+  - offset is generated from `stream_indices`, plus fixed per-axis salts;
+  - the offset is looked up by local batch id from `indices_bzyx[:, 0]`;
+  - grouping uses the shifted coordinates, e.g.
+    `floor((coord + offset_for_sample_axis) / chunk_size)`.
+- Keep grouping keyed by the local patch id, so groups never cross samples.
+- Keep the current 10% minimum branch quota over grouped positive supervision.
+- Keep the existing “only repair the underrepresented side” behavior.
+- Keep repair training-only; no grouped repair should run when evaluating.
+
+### Test/Eval Routing
+
+- Keep test/eval branch selection per positive supervision point/voxel:
+  `argmax(score)` independently for each sparse positive voxel.
+- Test/eval must not use grouped branch choice, random offsets, or the 10%
+  quota repair.
+- Branch-fraction scalars remain computed from those per-voxel choices.
+
+### Determinism
+
+- The offset generator must be pure/tensor-based and deterministic from the raw
+  `stream_index`; it must not use mutable Python, NumPy, or torch RNG state
+  inside the loss.
+- Because `stream_index` is unbounded, reused bounded `data_index` samples will
+  still receive different deterministic offsets on later repeats.
+- `data_index` must never seed augmentation, branch-grid offsets, jitter/noise,
+  or other random sources.
 
 ## Spec Update
 
-- Update `planning/specs.md` to say 3D prefetch passes selected-level
-  augmentation-envelope bboxes to VC3D dependency metadata collection.
-- Clarify that VC3D owns bbox-to-chunk conversion for 3D prefetch.
-- Remove the spec text that allows/mentions `prefetch_sampler_device` for 3D
-  dependency generation.
-- Keep the augmentation-sample-independent requirement: configured augmentation
-  extrema define the bbox; one random draw must not decide chunks.
+- Update `planning/specs.md`:
+  - replace the current `4x4x4` grouped repair description with `2x2x2`;
+  - state that training groups are shifted by a deterministic per-sample random
+    offset derived from `stream_index`;
+  - state that test/eval uses raw per-voxel branch argmax and no grouped or 10%
+    repair branch choice.
+  - add canonical naming rules for `stream_index` and `data_index` and require
+    `stream_index` for all random sources/augmentations while limiting
+    `data_index` to dataset lookup/debug.
 
 ## Docs Updates
 
-- Update `planning/local_development.md`:
-  - document that 3D prefetch uses `collect_bbox_dependencies`;
-  - remove `prefetch_sampler_device` from the documented workflow;
-  - keep `prefetch_sampler_workers` and `prefetch_workers` descriptions.
-- Update `docs/code_structure.md` where 3D prefetch internals are described.
-- Add a changelog entry for the VC3D bbox dependency binding and 3D prefetch
-  cleanup.
-- If volume-cartographer has local binding/development notes near the changed
-  code, update only if a relevant doc already exists.
+- Update `docs/code_structure.md` in the 3D training/loss section to describe:
+  - `stream_index` vs `data_index` naming and allowed use;
+  - branch-score routing modes;
+  - training-only offset `2x2x2` grouped min-fraction repair;
+  - test/eval per-voxel branch selection without grouped repair.
+- Add a changelog entry for the branch routing update.
 
 ## Tests
 
-### Vesuvius Python Tests
-
-- Add/adjust tests so 3D prefetch:
-  - calls `chunk_requests_for_bbox(...)`, not `chunk_requests_for_coords(...)`;
-  - does not call `_sample_augment_params(...)`;
-  - returns stable requests for different raw augmentation indices mapping to
-    the same bounded data CP;
-  - expands the bbox when augmentation extrema expand;
-  - treats local `NumpyZarrCoordinateSampler` prefetch as no-op.
-- Remove tests for `prefetch_sampler_device`.
-- Add sampler wrapper tests that fake a VC3D volume exposing
-  `collect_bbox_dependencies(...)` and assert returned metadata converts into
-  `ZarrChunkRequest` correctly.
-
-### Volume-Cartographer Tests
-
-- Add a binding-level test if the existing Python binding test harness supports
-  it. At minimum, add a focused C++/binding smoke that checks:
-  - empty/out-of-bounds bbox returns an empty list;
-  - an in-bounds bbox returns the same metadata keys as coordinate dependency
-    collection for equivalent chunk coverage;
-  - returned dicts include cache and remote metadata fields.
-- If no lightweight binding test harness exists, document that limitation in
-  the task log and cover the wrapper path from Vesuvius with a fake binding.
-
-### Commands
-
-- Run the focused 3D prefetch/dependency tests:
-  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k 'prefetch or dependency'`
-- Run the full 3D fiber test file:
+- Update the existing two-branch positive-supervision tests for `2x2x2`
+  grouping.
+- Add a test that two samples with different `stream_indices` can produce
+  different shifted grouping even for identical local positive coordinates.
+- Add a loader/batch regression test that a limited `max_sample_index` repeat
+  keeps changing `stream_indices` while `data_indices` wraps/repeats.
+- Add a test that augmentation and branch-grid offset helpers consume
+  `stream_indices`, not `data_indices`.
+- Add a test that training repair uses grouped selection with the shifted
+  `2x2x2` grid and still enforces the 10% minority floor.
+- Add a regression test that eval/test keeps independent per-voxel argmax
+  branch choice.
+- Add a regression test that eval/test does not run grouped repair, random
+  offsets, or the 10% floor.
+- Run:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k 'branch or compute_losses'`
+- Run the full 3D test file:
   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-- Rebuild volume-cartographer bindings after the C++ change using the documented
-  local-development command, then run the smallest available VC3D test target
-  that covers the binding/chunk dependency path.
-- Run `python -m py_compile` for touched Python modules and `git diff --check`.
+- Run `python -m py_compile` on `fiber_trace_3d/train.py`.
+- Run `git diff --check`.
 
-## Non-Goals
+## Changelog
 
-- Do not change augmentation semantics or training sample ordering.
-- Do not change 2D prefetch, which still needs coordinate-surface dependency
-  discovery.
-- Do not reconstruct VC3D cache paths in Python.
-- Do not add GPU dependency-generation support for this bbox path; it is no
-  longer relevant once coords are not materialized.
+- Add a 2026-07-26 changelog bullet noting that 3D two-branch training now uses
+  deterministic `stream_index`-seeded per-sample-offset `2x2x2` choice groups,
+  while eval/test keeps per-voxel branch selection with no grouped repair.
+- Include the `stream_index` / `data_index` rename in the changelog bullet.
+
+## Review Notes / Assumptions
+
+- I interpret “2x2” in this 3D loss context as `2x2x2`, because the current
+  code applies the previous scalar `4` to all three spatial axes.
+- Corrected interpretation: test/eval should keep branch choice per
+  voxel/positive point and only avoid grouping/10% repair.
+- `stream_index` and `data_index` are the planned names. `stream_index` is for
+  all operations/random sources/augmentations; `data_index` is only for data
+  read/CP selection and debug.
+- No implementation should change negative presence supervision, per-branch
+  negative normalization, or train/test TensorBoard branch-presence columns.

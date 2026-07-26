@@ -90,6 +90,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _FiberTrace3DBatchDataset,
     _Trace2Cp3DConfig,
+    _branch_choice_grid_offsets,
     _branch_presence_views_from_sampled_output,
     _evaluate_trace2cp_metric_fixed_set_3d,
     _draw_panel_line_aa,
@@ -102,6 +103,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _oblique_line_presence_for_display,
     _resolve_dense_test_selection,
     _resolve_prefetch_sample_count,
+    _select_branch_by_chunked_min_fraction,
     _training_sample_index_limit,
     _write_3d_sample_sheet,
 )
@@ -562,7 +564,8 @@ def test_loader_builds_deterministic_cp_centered_3d_batch() -> None:
     assert batch_a.direction_indices_bzyx.shape[1] == 4
     assert batch_a.direction_target_sparse.shape[1] == 6
     assert batch_a.presence_target.shape == (2, 1, 16, 16, 16)
-    assert torch.equal(batch_a.sample_indices, batch_b.sample_indices)
+    assert torch.equal(batch_a.stream_indices, batch_b.stream_indices)
+    assert torch.equal(batch_a.data_indices, batch_b.data_indices)
     assert torch.allclose(batch_a.volume, batch_b.volume)
     assert int(batch_a.direction_indices_bzyx.shape[0]) > 0
     assert bool((batch_a.presence_target > 0.5).any())
@@ -609,7 +612,8 @@ def test_3d_batch_dataset_preserves_whole_batch_items() -> None:
         expected = materialize_targets(expected, config, profile=True)
         actual = materialize_targets(actual, config, profile=True)
         assert type(actual).__name__ == "FiberTrace3DBatch"
-        assert torch.equal(actual.sample_indices, expected.sample_indices)
+        assert torch.equal(actual.stream_indices, expected.stream_indices)
+        assert torch.equal(actual.data_indices, expected.data_indices)
         assert torch.equal(actual.record_indices, expected.record_indices)
         assert torch.equal(actual.control_point_indices, expected.control_point_indices)
         assert actual.fiber_paths == expected.fiber_paths
@@ -633,8 +637,10 @@ def test_3d_batch_dataset_applies_sample_index_limit_to_data_only() -> None:
     first = dataset[0]
     second = dataset[1]
 
-    assert torch.equal(first.sample_indices, torch.zeros_like(first.sample_indices))
-    assert torch.equal(second.sample_indices, torch.zeros_like(second.sample_indices))
+    assert torch.equal(first.stream_indices, torch.tensor([0, 1], dtype=torch.long))
+    assert torch.equal(second.stream_indices, torch.tensor([2, 3], dtype=torch.long))
+    assert torch.equal(first.data_indices, torch.zeros_like(first.data_indices))
+    assert torch.equal(second.data_indices, torch.zeros_like(second.data_indices))
     assert torch.equal(first.control_point_indices, second.control_point_indices)
     assert not torch.allclose(first.cp_local_zyx, second.cp_local_zyx)
 
@@ -675,11 +681,60 @@ def test_3d_bounded_data_index_reuses_cp_but_not_augmentation() -> None:
         sample_index_limit=1,
     )
 
-    assert torch.equal(batch_a.sample_indices, torch.zeros_like(batch_a.sample_indices))
-    assert torch.equal(batch_b.sample_indices, torch.zeros_like(batch_b.sample_indices))
+    assert torch.equal(batch_a.stream_indices, torch.tensor([0, 1], dtype=torch.long))
+    assert torch.equal(batch_b.stream_indices, torch.tensor([2, 3], dtype=torch.long))
+    assert torch.equal(batch_a.data_indices, torch.zeros_like(batch_a.data_indices))
+    assert torch.equal(batch_b.data_indices, torch.zeros_like(batch_b.data_indices))
     assert torch.equal(batch_a.record_indices, batch_b.record_indices)
     assert torch.equal(batch_a.control_point_indices, batch_b.control_point_indices)
     assert not torch.allclose(batch_a.cp_local_zyx, batch_b.cp_local_zyx)
+
+
+def test_3d_branch_choice_grid_offset_uses_stream_index() -> None:
+    offsets = _branch_choice_grid_offsets(
+        torch.tensor([0, 1], dtype=torch.long),
+        chunk_size=2,
+    )
+    assert offsets.shape == (2, 3)
+    assert bool(torch.all((offsets >= 0) & (offsets <= 1)))
+    assert not torch.equal(offsets[0], offsets[1])
+
+    indices = torch.tensor(
+        [
+            [0, 0, 0, 0],
+            [0, 0, 0, 1],
+            [0, 0, 0, 2],
+            [0, 0, 0, 3],
+        ],
+        dtype=torch.long,
+    )
+    score = torch.tensor(
+        [
+            [2.0, 1.0],
+            [2.0, 0.0],
+            [2.0, 1.0],
+            [2.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    selected_stream0 = _select_branch_by_chunked_min_fraction(
+        score,
+        indices,
+        stream_indices=torch.tensor([0], dtype=torch.long),
+        chunk_size=2,
+        min_fraction=0.10,
+    )
+    selected_stream1 = _select_branch_by_chunked_min_fraction(
+        score,
+        indices,
+        stream_indices=torch.tensor([1], dtype=torch.long),
+        chunk_size=2,
+        min_fraction=0.10,
+    )
+
+    assert torch.equal(selected_stream0, torch.tensor([1, 1, 0, 0], dtype=torch.long))
+    assert torch.equal(selected_stream1, torch.tensor([1, 0, 0, 0], dtype=torch.long))
 
 
 def test_loader_clips_long_label_segments_to_patch_domain() -> None:
@@ -796,7 +851,7 @@ def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
     assert sheet.shape[2] == 3
     assert sheet.dtype == np.uint8
     assert sheet.shape[0] > 16
-    assert sheet.shape[1] == 16 * 7 + 6 * 4
+    assert sheet.shape[1] == 16 * 9 + 8 * 4
     first_image_panel = sheet[:16, :16]
     colored = (
         (first_image_panel[..., 0] != first_image_panel[..., 1])
@@ -815,7 +870,8 @@ def test_train_sample_3d_sheet_maxpools_target_presence_for_display() -> None:
         valid_mask=torch.ones((1, 1, patch, patch, patch), dtype=torch.bool),
         cp_local_zyx=cp,
         crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
-        sample_indices=torch.zeros((1,), dtype=torch.long),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
         record_indices=torch.zeros((1,), dtype=torch.long),
         control_point_indices=torch.zeros((1,), dtype=torch.long),
         fiber_paths=("synthetic.json",),
@@ -1043,7 +1099,7 @@ def test_train_sample_3d_sheet_has_branch_presence_columns_and_line_overlay() ->
 
     patch = int(batch.volume.shape[-1])
     gap = 4
-    assert sheet.shape[1] == patch * 7 + 6 * gap
+    assert sheet.shape[1] == patch * 9 + 8 * gap
     first_image_panel = sheet[:patch, :patch]
     colored = (
         (first_image_panel[..., 0] != first_image_panel[..., 1])
@@ -1065,11 +1121,13 @@ def test_branch_presence_view_selects_output_closer_to_slice_normal() -> None:
     sampled[..., 7:13] = x_dir
     sampled[..., 13] = 0.75
 
-    close, other, max_p, min_p, avg_p = _branch_presence_views_from_sampled_output(
+    branch0, branch1, close, other, max_p, min_p, avg_p = _branch_presence_views_from_sampled_output(
         sampled,
         normal_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
     )
 
+    assert np.allclose(branch0, 0.25)
+    assert np.allclose(branch1, 0.75)
     assert np.allclose(close, 0.25)
     assert np.allclose(other, 0.75)
     assert np.allclose(max_p, 0.75)
@@ -1532,7 +1590,8 @@ def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:
         valid_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
         cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
         crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
-        sample_indices=torch.zeros((1,), dtype=torch.long),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
         record_indices=torch.zeros((1,), dtype=torch.long),
         control_point_indices=torch.zeros((1,), dtype=torch.long),
         fiber_paths=("synthetic.json",),
@@ -1560,7 +1619,7 @@ def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:
         batch,
         direction_weight=1.0,
         presence_weight=1.0,
-        enforce_branch_min_fraction=True,
+        branch_selection_mode="train_offset_grid_min_fraction",
     )
     losses["total"].backward()
 
@@ -1595,7 +1654,8 @@ def test_3d_two_branch_positive_supervision_enforces_minority_floor() -> None:
         valid_mask=torch.ones((1, 1, 1, 1, 12), dtype=torch.bool),
         cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
         crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
-        sample_indices=torch.zeros((1,), dtype=torch.long),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
         record_indices=torch.zeros((1,), dtype=torch.long),
         control_point_indices=torch.zeros((1,), dtype=torch.long),
         fiber_paths=("synthetic.json",),
@@ -1631,17 +1691,22 @@ def test_3d_two_branch_positive_supervision_enforces_minority_floor() -> None:
         batch,
         direction_weight=1.0,
         presence_weight=1.0,
-        enforce_branch_min_fraction=True,
+        branch_selection_mode="train_offset_grid_min_fraction",
     )
     losses["total"].backward()
 
-    assert torch.allclose(losses["branch0_fraction"], torch.tensor(8.0 / 12.0))
-    assert torch.allclose(losses["branch1_fraction"], torch.tensor(4.0 / 12.0))
-    for x in range(4, 8):
+    assert torch.allclose(losses["branch0_fraction"], torch.tensor(10.0 / 12.0))
+    assert torch.allclose(losses["branch1_fraction"], torch.tensor(2.0 / 12.0))
+    for x in range(4, 6):
         assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, x]) > 0
         assert output.grad[0, 13, 0, 0, x] != 0.0
         assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, x]) == 0
         assert output.grad[0, 6, 0, 0, x] == 0.0
+    for x in range(6, 8):
+        assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, x]) == 0
+        assert output.grad[0, 13, 0, 0, x] == 0.0
+        assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, x]) == 0
+        assert output.grad[0, 6, 0, 0, x] != 0.0
     assert torch.count_nonzero(output.grad[0, 7:13, 0, 0, 8]) == 0
     assert output.grad[0, 13, 0, 0, 8] == 0.0
     assert torch.count_nonzero(output.grad[0, 0:6, 0, 0, 8]) == 0
@@ -1663,7 +1728,8 @@ def test_3d_positive_presence_ignores_masked_sparse_points() -> None:
         valid_mask=torch.ones((1, 1, 1, 1, 2), dtype=torch.bool),
         cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
         crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
-        sample_indices=torch.zeros((1,), dtype=torch.long),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
         record_indices=torch.zeros((1,), dtype=torch.long),
         control_point_indices=torch.zeros((1,), dtype=torch.long),
         fiber_paths=("synthetic.json",),
@@ -1741,7 +1807,8 @@ def test_3d_presence_loss_balances_positive_and_negative_regions() -> None:
         valid_mask=torch.ones((1, 1, 1, 1, 4), dtype=torch.bool),
         cp_local_zyx=torch.zeros((1, 3), dtype=torch.float32),
         crop_origin_zyx=torch.zeros((1, 3), dtype=torch.float32),
-        sample_indices=torch.zeros((1,), dtype=torch.long),
+        stream_indices=torch.zeros((1,), dtype=torch.long),
+        data_indices=torch.zeros((1,), dtype=torch.long),
         record_indices=torch.zeros((1,), dtype=torch.long),
         control_point_indices=torch.zeros((1,), dtype=torch.long),
         fiber_paths=("synthetic.json",),
@@ -1787,7 +1854,8 @@ def test_3d_negative_presence_loss_normalizes_per_patch_and_branch() -> None:
         valid_mask=torch.ones((2, 1, 1, 1, 3), dtype=torch.bool),
         cp_local_zyx=torch.zeros((2, 3), dtype=torch.float32),
         crop_origin_zyx=torch.zeros((2, 3), dtype=torch.float32),
-        sample_indices=torch.zeros((2,), dtype=torch.long),
+        stream_indices=torch.zeros((2,), dtype=torch.long),
+        data_indices=torch.zeros((2,), dtype=torch.long),
         record_indices=torch.zeros((2,), dtype=torch.long),
         control_point_indices=torch.zeros((2,), dtype=torch.long),
         fiber_paths=("synthetic0.json", "synthetic1.json"),
