@@ -1,6 +1,6 @@
 ---
-title: "The Data"
-hide_table_of_contents: true
+title: "Data Formats"
+sidebar_label: "Data Formats"
 ---
 
 <head>
@@ -40,16 +40,11 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <JsonLd data={{ "@context":"https://schema.org","@type":"Dataset","name":"Herculaneum Scrolls — X-ray CT Data Portal","description":"Open data portal aggregating synchrotron micro-CT volumes, extracted surface segments, meshes, and ML predictions of the carbonized Herculaneum scrolls and fragments.","url":"https://scrollprize.org/data","creator":{"@type":"Organization","name":"Vesuvius Challenge","url":"https://scrollprize.org/"},"measurementTechnique":"X-ray computed tomography","keywords":["Herculaneum scrolls","papyri","X-ray CT","virtual unwrapping","ink detection","machine learning"],"isAccessibleForFree":true,"license":"https://dl.ash2txt.org/LICENSE.txt","distribution":{"@type":"DataDownload","encodingFormat":"image/tiff","contentUrl":"https://scrollprize.org/data"} }} />
 
-> **Work‑in‑progress 👷‍♀️**
-> We are transitioning data hosting to a new repository. During the transition, some assets may appear in one location before the other. Both repositories follow the same organization structure.
-
 **Quick start:** [example quick data access notebook](https://github.com/ScrollPrize/open-data/blob/main/examples/get-to-know-a-dataset.ipynb)
 
 ## Overview
 
 A vast library of papyrus scrolls in ancient Herculaneum was buried beneath volcanic mud and ash during the 79 AD eruption of Mount Vesuvius. The scrolls were carbonized into a fragile but remarkably preserved state. The Vesuvius Challenge uses synchrotron micro‑CT imaging to study both **intact scrolls** and **detached fragments**.
-
-Our goal is to **virtually unwrap** the scrolls from their 3D X‑ray volumes and recover ink that is invisible to the naked eye. Detached fragments include exposed ink and serve as **ground truth** for improving machine‑learning approaches to ink detection.
 
 ## Multiple datasets
 
@@ -62,14 +57,11 @@ If you are publishing or presenting results, make sure you cite the dataset that
 
 ## Data repositories
 
-We host the dataset in **two repositories** (with the **same folder layout**):
-
-- **Open data bucket:** `s3://vesuvius-challenge-open-data/` usable with any S3‑compatible client (e.g., AWS CLI, boto3, s3fs, etc.). It's also [browsable directly](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html).
-- **(deprecated) Web-browsable samples:** https://data.aws.ash2txt.org/samples/
+We host the dataset in the **open data bucket**: `s3://vesuvius-challenge-open-data/`, usable with any S3‑compatible client (e.g., AWS CLI, boto3, s3fs, etc.). It's also [browsable directly](https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/index.html).
 
 An overview of the dataset can be found in the [Data Browser](data_browser).
 The browser is the unified sample index for both scrolls and fragments.
-For deeper exploration, use [Segments](data_segments) when you want mapped surface data, and [Curated Datasets](data_datasets) for ready-to-use bundles built for specific research tasks.
+For deeper exploration, use [Curated Datasets](data_datasets) for ready-to-use bundles built for specific research tasks.
 
 ## What's included
 
@@ -98,7 +90,7 @@ OME‑Zarr is the primary distribution format because it is cloud‑optimized (c
 
 ## Organization on disk
 
-Both repositories follow the same high‑level structure:
+The repository follows this high‑level structure:
 
 ```text
 {SAMPLE_ID}/
@@ -123,7 +115,7 @@ You will typically browse by **sample ID** (e.g., a specific scroll or fragment)
 - For information on the updated scans (2026), read the [technical pre-print](https://arxiv.org/abs/2606.29085).
 - [Scan at ESRF Draft Info Sheet (2025)](https://docs.google.com/document/d/1CDPgx7XhNsnLJw6uErT8Z5tgY3wnETQdvXpR5Kwu9K4/edit?usp=sharing) draft regarding the 2025 scans.
 - [EduceLab Data Sheet (2023)](https://drive.google.com/file/d/1I6JNrR6A9pMdANbn6uAuXbcDNwjk8qZ2/view?usp=sharing): technical description of the 2023 scans.
-- [EduceLab-Scrolls (2019)](https://arxiv.org/abs/2304.02084): technical paper describing the original dataset work from 2019.
+- [EduceLab-Scrolls (2023)](https://arxiv.org/abs/2304.02084): technical paper describing the original dataset work.
 
 ## How to Cite
 

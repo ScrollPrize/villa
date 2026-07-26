@@ -20,6 +20,11 @@ import cfg from "@site/src/data/atlasDataAccess.json";
 const DA = cfg.dataAccess || {};
 const NEUROGLANCER = "https://neuroglancer-demo.appspot.com/#!";
 
+// The raw s3://->https rewrite rules, exported for buildIndex() (which runs the
+// same s3ToHttp mapping at build time in scripts/genAtlasData.js and at runtime
+// when merging the live metadata.min.json).
+export const rewrites = DA.rewrites || [];
+
 // Apply the configured s3://->https rewrites. Returns the url unchanged if no
 // rule matches (or it is already https).
 export function toHttp(url) {

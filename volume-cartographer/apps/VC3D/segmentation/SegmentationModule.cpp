@@ -1,7 +1,7 @@
 #include "SegmentationModule.hpp"
 
 #include "../OpenDataSegmentCache.hpp"
-#include "../VCSettings.hpp"
+#include "../OpenDataCoordinateIdentity.hpp"
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
@@ -108,8 +108,13 @@ std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* vie
 }
 
 
-bool ensureEditableOpenDataSegmentTarget(CState* state, SegmentationWidget* widget)
+bool ensureEditableOpenDataSegmentTarget(CState* state,
+                                         SegmentationWidget* widget,
+                                         std::string* editableSurfaceId)
 {
+    if (editableSurfaceId) {
+        editableSurfaceId->clear();
+    }
     if (!state || !state->vpkg()) {
         return true;
     }
@@ -120,10 +125,10 @@ bool ensureEditableOpenDataSegmentTarget(CState* state, SegmentationWidget* widg
         return true;
     }
 
-    const QString remoteSuggestion = QString::fromStdString(state->vpkg()->remoteCacheRootOrEmpty());
-    const std::filesystem::path remoteRoot(vc3d::remoteCachePath(remoteSuggestion).toStdString());
+    const std::filesystem::path activeSegmentsRoot = state->vpkg()->outputSegmentsPath();
     const std::filesystem::path defaultPath =
-        vc3d::opendata::defaultEditableCopyPathForCatalogSegment(surface->path, remoteRoot);
+        vc3d::opendata::defaultEditableCopyPathForCatalogSegment(
+            surface->path, activeSegmentsRoot);
 
     QMessageBox prompt(QApplication::activeWindow());
     prompt.setWindowTitle(QObject::tr("Open Data Segment"));
@@ -161,11 +166,8 @@ bool ensureEditableOpenDataSegmentTarget(CState* state, SegmentationWidget* widg
         vc3d::opendata::copyCatalogSegmentToEditableDirectory(surface->path, editablePath);
         const std::filesystem::path editableRoot = editablePath.parent_path();
         auto pkg = state->vpkg();
-        if (!pkg->addSegmentsEntry(editableRoot.string(), {"open-data-editable"})) {
-            pkg->setOutputSegments(editableRoot.string());
-        } else {
-            pkg->setOutputSegments(editableRoot.string());
-        }
+        pkg->addSegmentsEntry(editableRoot.string(), {"open-data-editable"});
+        pkg->setOutputSegments(editableRoot.string());
 
         const std::string segmentId = surface->id.empty()
             ? editablePath.filename().string()
@@ -174,7 +176,13 @@ bool ensureEditableOpenDataSegmentTarget(CState* state, SegmentationWidget* widg
         if (!editableSurface) {
             editableSurface = std::make_shared<QuadSurface>(editablePath);
         }
+        vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
+            *editableSurface, *pkg, state->currentVolumeId());
+        editableSurface->save_meta();
         state->setSurface("segmentation", editableSurface, false, false);
+        if (editableSurfaceId) {
+            *editableSurfaceId = segmentId;
+        }
         return true;
     } catch (const std::exception& e) {
         QMessageBox::warning(
@@ -655,8 +663,16 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_editingEnabled == enabled) {
         return;
     }
-    if (enabled && !ensureEditableOpenDataSegmentTarget(_state, _widget)) {
-        return;
+    std::string editableSurfaceId;
+    if (enabled) {
+        if (!ensureEditableOpenDataSegmentTarget(
+                _state, _widget, &editableSurfaceId)) {
+            return;
+        }
+        if (!editableSurfaceId.empty()) {
+            emit segmentationFolderChanged(
+                QString::fromStdString(editableSurfaceId));
+        }
     }
     _editingEnabled = enabled;
 
@@ -2147,6 +2163,48 @@ bool SegmentationModule::finishManualAdd(bool apply)
     return true;
 }
 
+bool SegmentationModule::setManualAddModeActive(bool active, bool apply)
+{
+    if (active) {
+        return beginManualAdd();
+    }
+    return finishManualAdd(apply);
+}
+
+bool SegmentationModule::undoManualAddConstraint()
+{
+    return undoManualAddPlaneConstraint();
+}
+
+bool SegmentationModule::setCorrectionPointMode(bool active, QString* errorMessage)
+{
+    if (!active) {
+        _correctionDragKeyActive = false;
+        return true;
+    }
+    // Mirror the G-key preconditions (SegmentationModule_Input.cpp handleKeyPress).
+    if (!_editingEnabled) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("editing_disabled");
+        }
+        return false;
+    }
+    if (!_editManager || !_editManager->hasSession()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("no_session");
+        }
+        return false;
+    }
+    if (_growthInProgress) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("growth_in_progress");
+        }
+        return false;
+    }
+    _correctionDragKeyActive = true;
+    return true;
+}
+
 void SegmentationModule::resetManualAddState(bool restorePreview)
 {
     _pendingManualAddTracerMask.release();
@@ -2784,6 +2842,33 @@ void SegmentationModule::stopAllPushPull()
     }
 }
 
+// Programmatic push/pull entry points use distinct names to avoid overload
+// ambiguity in connect().
+bool SegmentationModule::startPushPullMode(int direction, std::optional<bool> alphaOverride)
+{
+    return startPushPull(direction, alphaOverride);
+}
+
+void SegmentationModule::stopPushPullAll()
+{
+    stopAllPushPull();
+}
+
+void SegmentationModule::flushAutosave()
+{
+    // No-op when nothing is pending; marks dirty (follow-up save) when one is in flight.
+    markAutosaveNeeded(true);
+}
+
+SegmentationModule::AutosaveStatus SegmentationModule::autosaveStatus() const
+{
+    AutosaveStatus status;
+    status.pending = _autosaveState.pending();
+    status.saveInProgress = _autosaveState.saveInProgress();
+    status.dirtyAfterSave = _autosaveState.dirtyAfterSave();
+    return status;
+}
+
 bool SegmentationModule::applyPushPullStep()
 {
     return _pushPullTool ? _pushPullTool->applyStep() : false;
@@ -2964,13 +3049,16 @@ void SegmentationModule::performAutosave()
             ? _autosaveState.completeSuccess(autosaveTicket)
             : _autosaveState.completeFailure(autosaveTicket, canRetry);
         if (completion == segmentation::AutosaveState::Completion::Stale) {
+            // A stale ticket still emits terminal completion for observers.
             updateAutosaveState();
+            emit autosaveCompleted(failureMessage.isEmpty());
             return;
         }
 
         if (failureMessage.isEmpty()) {
             _saveSnapshot = savedSnapshot;
             emit statusMessageRequested(tr("Saved"), kStatusShort);
+            emit autosaveCompleted(true);
         } else {
             qCWarning(lcSegModule) << "Autosave failed:" << failureMessage;
             if (!_autosaveState.failureNotified()) {
@@ -2979,6 +3067,7 @@ void SegmentationModule::performAutosave()
                                             kStatusLong);
                 _autosaveState.setFailureNotified(true);
             }
+            emit autosaveCompleted(false);
         }
 
         // If another save was requested while we were saving, start it now

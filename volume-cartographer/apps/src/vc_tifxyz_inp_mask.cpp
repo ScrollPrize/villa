@@ -32,7 +32,7 @@ int main(int argc, char *argv[])
     }
 
     cv::Mat_<cv::Vec3f> *points = surf->rawPointsPtr();
-    cv::Mat_<uint8_t> mask = cv::imread(mask_path, cv::IMREAD_GRAYSCALE);
+    cv::Mat_<uint8_t> mask = cv::imread(mask_path.string(), cv::IMREAD_GRAYSCALE);
     cv::Mat_<uint8_t> mask_points(mask.size(), 0);
 
     for(int j=0;j<points->rows;j++)

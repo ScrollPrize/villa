@@ -1,0 +1,1187 @@
+/* ==========================================================================
+   chrome.css — docs chrome skin (OWNED BY WP2)
+   Loaded AFTER custom.css so it overrides legacy rules without editing them.
+   Skins the standard Docusaurus classes so WP3's structural changes (real
+   navbar, slimmed sidebar, TOC re-enable, dense footer) land already styled.
+
+   SECTION MAP
+   §0  Infima variable bridge (mono font, code bg, toc/table vars, container)
+   §1  Layout grid (navbar height restore, content measure, TOC column)
+   §2  Navbar skin (+ .vc-navbar-cta filled button, hamburger, dropdowns)
+   §3  Mobile drawer (navbar-sidebar)
+   §4  Sidebar skin (category labels, 32px rows, ember active rule)
+   §5  TOC skin (hairline rail, ember active segment; mobile collapsible)
+   §5b Figure system (.vc-fig), Philodemus callout (.vc-callout),
+       TutorialsTop 2×2 phone grid
+   §6  Body-link discipline (docs content only)
+   §7  Admonitions + <details> (the ONE recipe)
+   §8  Tables
+   §9  Code (blocks + inline)
+   §10 Content media (images, figcaption)
+   §11 Doc footer (edit link, last updated) + pagination skin
+   §12 Site footer
+   §13 Heading anchors
+   §14 Focus visibility
+   §15 WP2 component skins (.vc-updates, card link guards)
+   ========================================================================== */
+
+/* ==========================================================================
+   §0 Infima variable bridge
+   ========================================================================== */
+:root {
+  --ifm-font-family-monospace: var(--vc-mono);
+  --ifm-code-background: var(--vc-surface);
+  --ifm-pre-background: var(--vc-code-bg);
+  --ifm-toc-border-color: var(--vc-line);
+  --ifm-table-border-color: var(--vc-line);
+  --ifm-table-stripe-background: transparent; /* no zebra */
+  --ifm-table-head-color: var(--vc-text-faint);
+  /* Docs container: article measure (720) + gutters + TOC (300) — keeps the
+     TOC directly beside the main column instead of floating at the far edge. */
+  --ifm-container-width: 1080px;
+  --ifm-container-width-xl: 1080px;
+}
+
+/* ==========================================================================
+   §1 Layout grid
+   ========================================================================== */
+
+/* Real 56px navbar. WP3 removes the navbar-height-0 hack + restores items in
+   docusaurus.config; these overrides make the skin hold both before and after. */
+:root {
+  --ifm-navbar-height: 56px;
+}
+@media (min-width: 997px) {
+  :root {
+    --ifm-navbar-height: 56px; /* overrides custom.css's 0 hack (later file wins) */
+  }
+  .navbar--fixed-top {
+    display: flex; /* overrides custom.css's display:none */
+  }
+}
+
+/* Retire the legacy 60rem cap on main (custom.css); the .container vars above
+   now govern total width. Landing keeps its own !important unsets. */
+main {
+  max-width: none !important;
+  /* main is a flex item beside the sidebar; without this its intrinsic
+     min-content (e.g. the no-wrap pipeline strip) can push it past the
+     viewport at narrow desktop widths. */
+  min-width: 0;
+}
+
+/* Content measure: 720px (~75ch). Landing and the frozen Data Browser opt out. */
+main .container article {
+  max-width: 720px;
+}
+main .container .pagination-nav {
+  max-width: 720px;
+}
+html.docs-doc-id-landing main .container article,
+html.docs-doc-id-data_browser main .container article {
+  max-width: none;
+}
+
+/* Give the TOC enough room for descriptive headings without sacrificing the
+   720px article measure. Use a slightly narrower value at the compact desktop
+   breakpoint, where the sidebar and TOC are both visible. The adjacent column
+   padding is halved so the content-to-TOC gutter is 16px instead of 32px. */
+@media (min-width: 997px) {
+  :root {
+    --vc-doc-toc-width: 260px;
+  }
+  main .container > .row > .col.col--3 {
+    flex: 0 0 var(--vc-doc-toc-width);
+    max-width: var(--vc-doc-toc-width);
+    padding-left: 8px;
+    padding-right: 0;
+  }
+  main .container > .row:has(> .col.col--3) > .col:not(.col--3) {
+    flex: 1 1 0;
+    max-width: calc(100% - var(--vc-doc-toc-width));
+    min-width: 0;
+    padding-right: 8px;
+  }
+}
+@media (min-width: 1200px) {
+  :root {
+    --vc-doc-toc-width: 300px;
+  }
+}
+
+/* Anchored headings clear the fixed navbar. */
+h1, h2, h3, h4, h5, h6 {
+  scroll-margin-top: 72px;
+}
+
+/* Docusaurus bumps markdown h1/h2/h3 above the :root ramp; pin to spec §2. */
+.markdown h1:first-child {
+  --ifm-h1-font-size: 2.5rem;
+}
+.markdown > h2 {
+  --ifm-h2-font-size: 1.75rem;
+}
+.markdown > h3 {
+  --ifm-h3-font-size: 1.375rem;
+}
+@media (max-width: 480px) {
+  .markdown h1:first-child {
+    --ifm-h1-font-size: 2rem;
+  }
+}
+
+/* Long tokens and math must never widen the page on phones. */
+.markdown {
+  overflow-wrap: break-word;
+}
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* ==========================================================================
+   §2 Navbar skin
+   ========================================================================== */
+.navbar {
+  height: var(--ifm-navbar-height);
+  background: var(--vc-bg); /* fallback */
+  background: color-mix(in srgb, var(--vc-bg) 95%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--vc-line);
+  box-shadow: none;
+  padding-top: 0;
+  padding-bottom: 0;
+  padding-left: max(16px, env(safe-area-inset-left));
+  padding-right: max(16px, env(safe-area-inset-right));
+}
+
+.navbar__brand {
+  opacity: 1; /* custom.css dims it to .5 */
+  color: var(--vc-text);
+  min-height: 44px; /* Gate 8: >=44px-tall hit area within the 56px bar */
+}
+.navbar__brand:hover {
+  color: var(--vc-text);
+}
+.navbar__title {
+  font-weight: 600;
+  color: var(--vc-text);
+}
+
+.navbar__link {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--vc-text-dim);
+  white-space: nowrap; /* multi-word items ("Technical Blogpost") stay on one line */
+}
+/* Just above the 996px hamburger cutoff there isn't room for every item at
+   full padding — tighten instead of letting labels wrap to two lines. */
+@media (min-width: 997px) and (max-width: 1220px) {
+  .navbar__item {
+    padding-left: 0.5rem;
+    padding-right: 0.5rem;
+  }
+}
+.navbar__link:hover {
+  color: var(--vc-text);
+}
+.navbar__link--active,
+.navbar__link--active:hover {
+  color: var(--vc-accent);
+}
+
+/* Dropdown (Community): surface + hairline, flat. */
+.dropdown__menu {
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+  box-shadow: none;
+  padding: 6px;
+}
+.dropdown__link {
+  font-size: 0.875rem;
+  color: var(--vc-text-dim);
+  border-radius: var(--vc-r-btn);
+}
+.dropdown__link:hover {
+  background: var(--vc-raised);
+  color: var(--vc-text);
+}
+.dropdown__link--active,
+.dropdown__link--active:hover {
+  color: var(--vc-accent);
+  background: transparent;
+}
+
+/* THE one filled element site-wide: the navbar "Get Started" item.
+   WP3 adds a navbar item with className "vc-navbar-cta". */
+.navbar .vc-navbar-cta {
+  background: var(--vc-accent);
+  color: #fff;
+  border-radius: var(--vc-r-btn);
+  padding: 8px 14px;
+  font-size: 0.8125rem;
+  font-weight: 650;
+  line-height: 1.2;
+  margin-left: 8px;
+}
+.navbar .vc-navbar-cta:hover,
+.navbar .vc-navbar-cta.navbar__link--active {
+  background: var(--vc-accent);
+  color: #fff;
+  text-decoration: none;
+}
+/* A CTA pointing at the page you're on is noise: hide it on /get_started
+   itself (Docusaurus marks the current page's navbar item as active). */
+.navbar .vc-navbar-cta.navbar__link--active,
+.menu__link.vc-navbar-cta.menu__link--active {
+  display: none;
+}
+/* Same item inside the mobile drawer menu. */
+.menu__link.vc-navbar-cta,
+.menu__link.vc-navbar-cta:hover {
+  background: var(--vc-accent);
+  color: #fff;
+  justify-content: center;
+  font-weight: 650;
+  margin-top: 8px;
+}
+
+/* "Join Discord" navbar button — outline sibling of the filled CTA
+   (the spec's one-filled-element rule stays intact). */
+.navbar .vc-navbar-discord {
+  border: 1px solid var(--vc-line-strong);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text);
+  padding: 7px 14px; /* 1px less than the CTA to offset the border */
+  font-size: 0.8125rem;
+  font-weight: 650;
+  line-height: 1.2;
+  margin-left: 8px;
+}
+.navbar .vc-navbar-discord:hover {
+  background: var(--vc-raised);
+  color: var(--vc-text);
+  text-decoration: none;
+}
+/* Button look: drop the auto external-link icon in the top bar. */
+.navbar .vc-navbar-discord svg {
+  display: none;
+}
+/* Drawer clone: centered outline row above the filled Get Started. */
+.menu__link.vc-navbar-discord,
+.menu__link.vc-navbar-discord:hover {
+  border: 1px solid var(--vc-line-strong);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text);
+  justify-content: center;
+  font-weight: 650;
+  margin-top: 8px;
+}
+
+/* Hamburger: hidden >=997px (Infima default — do NOT force it visible
+   globally, or it shows next to the full desktop navbar); >=44x44 hit area
+   under 997px where the drawer lives (Gate 8; baseline was 30x30). */
+.navbar__toggle {
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text);
+}
+.navbar__toggle:hover {
+  background: var(--vc-raised);
+}
+@media (max-width: 996px) {
+  .navbar__toggle {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+}
+
+/* ==========================================================================
+   §3 Mobile drawer (Docusaurus navbar-sidebar)
+
+   The navbar's backdrop-filter (§2) establishes a containing block for its
+   fixed-position descendants, so the drawer + backdrop (children of .navbar)
+   collapse to the 56px navbar height instead of the viewport — the panel then
+   clips all menu content ("empty transparent drawer"). Viewport-relative
+   heights (dvh) escape the trapped containing block and restore full height.
+   ========================================================================== */
+.navbar-sidebar,
+.navbar-sidebar__backdrop {
+  height: 100vh;
+  height: 100dvh;
+}
+.navbar-sidebar {
+  background: var(--vc-bg);
+  border-right: 1px solid var(--vc-line);
+  padding-left: env(safe-area-inset-left);
+  overflow-y: auto;
+}
+/* Items panel fills below the brand bar and scrolls long doc sidebars. */
+.navbar-sidebar__items {
+  height: calc(100dvh - var(--ifm-navbar-height));
+}
+.navbar-sidebar__item {
+  overflow-y: auto;
+}
+.navbar-sidebar__brand {
+  border-bottom: 1px solid var(--vc-line);
+  box-shadow: none;
+}
+/* "Back to main menu" — custom.css hid this, which stranded users in the
+   secondary (doc-sidebar) panel with no way to reach the primary site nav.
+   Restore it as a quiet hairline row with a >=44px tap target. */
+.navbar-sidebar__back {
+  display: block;
+  background: var(--vc-surface);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text-dim);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  min-height: 44px;
+}
+.navbar-sidebar__back:hover {
+  background: var(--vc-raised);
+  color: var(--vc-text);
+}
+.navbar-sidebar__close {
+  width: 44px;
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+}
+.navbar-sidebar .menu__link {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+}
+.navbar-sidebar .menu__caret {
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ==========================================================================
+   §4 Sidebar skin
+   ========================================================================== */
+.theme-doc-sidebar-container {
+  background: var(--vc-bg);
+  font-size: 0.875rem;
+}
+
+.menu__list-item:not(:first-child) {
+  margin-top: 2px;
+}
+
+/* Items: 14px / 32px rows, dim -> text on hover, NO filled active block. */
+.menu__link {
+  font-size: 0.875rem;
+  font-weight: 400;
+  line-height: 20px;
+  padding: 6px 12px;
+  color: var(--vc-text-dim);
+  border-left: 2px solid transparent; /* reserves space for the active rule */
+  border-radius: 0 var(--vc-r-btn) var(--vc-r-btn) 0;
+}
+.menu__link:hover {
+  color: var(--vc-text);
+  background: var(--vc-surface);
+}
+.menu__link--active:not(.menu__link--sublist) {
+  color: var(--vc-accent);
+  background: transparent;
+  border-left-color: var(--vc-accent);
+}
+.menu__link--active:not(.menu__link--sublist):hover {
+  color: var(--vc-accent);
+  background: var(--vc-surface);
+}
+
+/* Category labels: 12px uppercase faint, +0.08em. */
+.menu__list-item-collapsible .menu__link,
+.menu__link--sublist {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--vc-text-faint);
+}
+.menu__list-item-collapsible .menu__link:hover,
+.menu__link--sublist:hover {
+  color: var(--vc-text-dim);
+  background: transparent;
+}
+.menu__list-item-collapsible {
+  border-radius: var(--vc-r-btn);
+}
+.menu__list-item-collapsible:hover {
+  background: transparent;
+}
+/* Active category row carries no filled block either (matches the item rule). */
+.menu__list-item-collapsible--active,
+.menu__list-item-collapsible .menu__link--active,
+.menu__link--sublist.menu__link--active {
+  background: transparent;
+}
+.menu__caret {
+  border-radius: var(--vc-r-btn);
+}
+.menu__caret:hover {
+  background: var(--vc-raised);
+}
+
+/* ==========================================================================
+   §5 TOC skin
+   Continuous hairline rail on every link; the active segment turns ember.
+   ========================================================================== */
+.table-of-contents {
+  font-size: 13px;
+  padding: 0;
+  margin: 0;
+}
+/* Desktop TOC announces itself: a surface card with an ember header. */
+@media (min-width: 997px) {
+  .theme-doc-toc-desktop {
+    background: var(--vc-surface);
+    border: 1px solid var(--vc-line);
+    border-radius: var(--vc-r-card);
+    padding: 14px 10px 12px;
+  }
+  .theme-doc-toc-desktop::before {
+    content: "On this page";
+    display: block;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--vc-accent);
+    padding: 0 12px 12px;
+  }
+}
+.table-of-contents,
+.table-of-contents ul {
+  list-style: none;
+}
+.table-of-contents ul {
+  padding-left: 0;
+  margin: 0;
+}
+.table-of-contents li {
+  margin: 0;
+}
+.table-of-contents__left-border {
+  border-left: 0; /* the rail lives on the links instead */
+}
+.table-of-contents__link {
+  display: block;
+  padding: 4px 12px;
+  border-left: 1px solid var(--vc-line);
+  color: var(--vc-text-dim);
+  line-height: 1.45;
+}
+.table-of-contents ul .table-of-contents__link {
+  padding-left: 24px; /* nested headings indent inside the rail */
+}
+.table-of-contents__link:hover {
+  color: var(--vc-text);
+}
+.table-of-contents__link--active,
+.table-of-contents__link--active:hover {
+  color: var(--vc-text);
+  border-left-color: var(--vc-accent);
+}
+
+/* Mobile collapsible TOC: card frame + >=44px rows. */
+.theme-doc-toc-mobile {
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+  overflow: hidden;
+}
+.theme-doc-toc-mobile button {
+  padding: 12px 16px;
+  font-size: 0.875rem;
+}
+.theme-doc-toc-mobile .table-of-contents__link {
+  border-left: 0;
+}
+@media (max-width: 996px) {
+  .table-of-contents__link {
+    display: flex;
+    align-items: center;
+    min-height: 44px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+  }
+}
+
+/* KaTeX display equations scroll inside their own box instead of forcing the
+   page wide on phones (e.g. the /unwrapping objectives at 390px). */
+.markdown .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 2px;
+}
+
+/* ==========================================================================
+   §5b Figure system (.vc-fig) — rendered by src/components/Figure.js.
+   Page-agnostic (Open Problems today; tutorials may adopt). One class per
+   variant: --full / --medium / --pair / --stack; modifier --card puts the
+   media on a surface plate. §10's generic .markdown img framing excludes
+   .vc-fig images — their frame is owned here.
+   ========================================================================== */
+.vc-fig {
+  margin: 32px 0;
+}
+/* Medium: a narrower, centered figure for images that don't earn the full
+   measure. The caption still hangs from the figure's (= image's) left edge. */
+.vc-fig--medium {
+  max-width: 560px; /* Figure's maxWidth prop overrides inline */
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Media area: single column, 8px internal gap (stack); pair is a 2-col grid
+   that collapses on phones. */
+.vc-fig__media {
+  display: grid;
+  gap: 8px;
+}
+.vc-fig--pair .vc-fig__media {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+.vc-fig__cell {
+  min-width: 0;
+}
+
+.vc-fig img {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+}
+.vc-fig__enlarge {
+  display: block;
+}
+
+/* Height-capped images (portraits auto-cap at 640px; Figure's maxHeight prop
+   overrides). Figure.js sets a definite pixel `width` (the width at which the
+   image reaches the cap height); we only need to let it shrink and keep ratio.
+   NB: do NOT use width:auto here — an unloaded loading="lazy" image with
+   width:auto collapses to ~2px, which caused ~400px of post-load layout shift
+   and made #anchor links land above their target. */
+.vc-fig img.vc-fig__img--capped {
+  max-width: 100%;
+  height: auto;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Card: the media sits on a surface plate; the plate is the frame, so inner
+   images lose theirs. brightness(.94) settles white diagram backgrounds
+   into the page. */
+.vc-fig--card .vc-fig__media {
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+  padding: 16px;
+}
+.vc-fig--card img {
+  border: 0;
+  border-radius: 4px;
+  filter: brightness(0.94);
+}
+
+/* Captions center under the figure (owner preference; custom.css's legacy
+   negative figcaption margin is neutralized by the explicit margin-top). */
+.vc-fig__caption {
+  margin-top: 8px;
+  margin-left: auto;
+  margin-right: auto;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--vc-text-faint);
+  max-width: 60ch;
+  text-align: center;
+}
+/* Pair micro-captions (e.g. "DLS, 7.91 µm") — metadata labels, not prose. */
+.vc-fig__sub {
+  margin-top: 6px;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  font-style: italic;
+  color: var(--vc-text-faint);
+  text-align: center;
+}
+
+@media (max-width: 767px) {
+  .vc-fig--pair .vc-fig__media {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .vc-fig img {
+    border-radius: 6px;
+  }
+  .vc-fig--card img {
+    border-radius: 4px; /* plate keeps its inner radius */
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Philodemus callout (.vc-callout) — src/components/ChatWidget/ChatCallout.js.
+   The admonition recipe's language (surface, hairline, 2px ember left rule)
+   inviting readers into the chat assistant mid-page.
+   -------------------------------------------------------------------------- */
+.vc-callout {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 16px;
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line);
+  border-left: 2px solid var(--vc-accent);
+  border-radius: var(--vc-r-card);
+  padding: 16px var(--vc-card-pad);
+  margin: 32px 0;
+}
+.vc-callout .vc-callout__avatar {
+  margin-right: 0; /* the flex gap spaces it */
+}
+.vc-callout__text {
+  flex: 1 1 16ch; /* wraps under the avatar before it can overflow at 320px */
+  margin: 0;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  color: var(--vc-text-dim);
+}
+.vc-callout__btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 8px 16px;
+  border: 1px solid var(--vc-accent);
+  border-radius: var(--vc-r-btn);
+  background: var(--vc-accent);
+  color: #fff;
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 650;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.vc-callout__btn:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+
+/* --------------------------------------------------------------------------
+   TutorialsTop pipeline strip, phones: the four thumbs wrapped 3+1 with an
+   orphan below 768px — force a 2×2 grid and drop the arrow separators.
+   (Targets the component's own utility classes; no component edit. The
+   .flex-wrap.sm:flex-nowrap combination exists only in TutorialsTop.)
+   -------------------------------------------------------------------------- */
+@media (max-width: 767px) {
+  .markdown .flex-wrap.sm\:flex-nowrap.items-start {
+    display: grid;
+    /* auto columns hug the fixed-width thumbs; centering the pair reads as
+       one 2×2 unit instead of two distant half-column strays */
+    grid-template-columns: repeat(2, auto);
+    justify-content: center;
+    justify-items: center;
+    gap: 8px 16px;
+  }
+  .markdown .flex-wrap.sm\:flex-nowrap.items-start > .hidden.sm\:flex {
+    display: none;
+  }
+}
+
+/* ==========================================================================
+   §6 Body-link discipline (docs content only)
+   Text-colored links with a soft ember underline; hover goes full ember.
+   Solid-ember text stays reserved for .vc-cta and active nav.
+   Landing (WP1) and the frozen Data Browser are exempt.
+   ========================================================================== */
+html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
+  .markdown
+  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(:has(img, video)) {
+  color: var(--vc-text);
+  text-decoration: underline;
+  text-decoration-color: var(--vc-accent-underline);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
+  .markdown
+  a:not(.vc-card):not(.vc-cta):not(.vc-btn):not(.vc-btn-outline):not(.hash-link):not(.vc-stat):not(:has(img, video)):hover {
+  color: var(--vc-accent);
+  text-decoration-color: var(--vc-accent);
+}
+
+/* Links that wrap media are frames, not prose — no underline artifacts. */
+.markdown a:has(img, video) {
+  text-decoration: none;
+}
+
+/* ==========================================================================
+   §7 Admonitions + <details> — the ONE recipe
+   Surface + hairline + 2px ember left edge; variants differ by label text
+   only. Covers all Docusaurus variants (.theme-admonition, .alert--*) and
+   the <details> collapsibles (Docusaurus renders them as .alert.alert--info).
+   ========================================================================== */
+.alert,
+.theme-admonition {
+  --ifm-alert-background-color: var(--vc-surface);
+  --ifm-alert-background-color-highlight: transparent;
+  --ifm-alert-foreground-color: var(--vc-text);
+  --ifm-alert-border-color: var(--vc-accent);
+  background: var(--vc-surface);
+  color: var(--vc-text);
+  border: 1px solid var(--vc-line);
+  border-left: 2px solid var(--vc-accent);
+  border-radius: var(--vc-r-card);
+  box-shadow: none;
+  padding: var(--vc-card-pad);
+}
+
+/* Label: small caps, faint; icon rendered monochrome (grayscale also mutes
+   the emoji icons used in get_started). */
+.alert [class*="admonitionHeading"],
+.theme-admonition [class*="admonitionHeading"] {
+  font-size: 0.8125rem;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--vc-text-faint);
+  margin-bottom: 8px;
+}
+.alert [class*="admonitionIcon"],
+.theme-admonition [class*="admonitionIcon"] {
+  filter: grayscale(1);
+  opacity: 0.9;
+}
+.alert [class*="admonitionIcon"] svg,
+.theme-admonition [class*="admonitionIcon"] svg {
+  fill: currentColor;
+}
+
+/* "Open problem" variant: each article section's core takeaway. Same family
+   as the help callouts but unmistakably a problem statement — ember label,
+   heavier edge, and a barely-there accent wash (flat, not a gradient). */
+.theme-admonition.vc-problem {
+  border-left-width: 3px;
+  background: color-mix(in srgb, var(--vc-accent) 4%, var(--vc-surface));
+}
+.theme-admonition.vc-problem [class*="admonitionHeading"] {
+  color: var(--vc-accent);
+}
+.theme-admonition.vc-problem [class*="admonitionIcon"] {
+  filter: none;
+  opacity: 1;
+}
+
+/* Links inside admonitions follow body-link discipline (fallback for alerts
+   outside .markdown; inside .markdown §6 wins on specificity anyway). */
+.alert a {
+  color: var(--vc-text);
+  text-decoration-color: var(--vc-accent-underline);
+}
+.alert a:hover {
+  color: var(--vc-accent);
+  text-decoration-color: var(--vc-accent);
+}
+
+/* <details> collapsibles (e.g. prizes "Submission criteria"). Keep the surface
+   + label treatment, but drop the ember left edge — a collapsible is not an
+   accent element, so it reads as a plain hairline card (accent = CTA/active). */
+details.alert {
+  --docusaurus-details-decoration-color: var(--vc-text-faint);
+  border: 1px solid var(--vc-line);
+  border-left: 1px solid var(--vc-line);
+}
+details.alert > summary {
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   §8 Tables
+   Header: small caps faint on surface. Row hairlines only — no verticals,
+   no zebra. Numerals tabular. Scrolls in place on phones.
+   ========================================================================== */
+.markdown table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.markdown table thead,
+.markdown table th {
+  background: var(--vc-surface);
+}
+.markdown table thead tr {
+  border: 0;
+  border-bottom: 1px solid var(--vc-line);
+}
+.markdown table th {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--vc-text-faint);
+  text-align: left;
+  border: 0;
+  padding: 8px 12px;
+}
+.markdown table td {
+  border: 0;
+  border-bottom: 1px solid var(--vc-line);
+  padding: 10px 12px;
+  font-variant-numeric: tabular-nums;
+}
+.markdown table tr {
+  background: transparent;
+  border: 0;
+}
+
+/* ==========================================================================
+   §9 Code
+   ========================================================================== */
+
+/* Blocks: --vc-code-bg + hairline + 8px radius, 13.5px/1.6 mono.
+   !important is required to beat prism-react-renderer's inline theme styles;
+   syntax token colors come from the prism theme (vsDark) and are readable on #131518. */
+.theme-code-block {
+  background: var(--vc-code-bg) !important;
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+  box-shadow: none !important;
+}
+.theme-code-block pre,
+.theme-code-block .prism-code {
+  background: var(--vc-code-bg) !important;
+  font-family: var(--vc-mono);
+  font-size: 13.5px;
+  line-height: 1.6;
+  border-radius: var(--vc-r-card);
+}
+.theme-code-block [class*="codeBlockTitle"] {
+  background: var(--vc-surface) !important;
+  border-bottom: 1px solid var(--vc-line);
+  font-size: 0.8125rem;
+  color: var(--vc-text-faint);
+  border-top-left-radius: var(--vc-r-card);
+  border-top-right-radius: var(--vc-r-card);
+}
+
+/* Inline code: surface pill + hairline, no red tint. */
+.markdown :not(pre) > code {
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-btn);
+  padding: 0.1rem 0.3rem;
+  color: var(--vc-text);
+}
+
+/* ==========================================================================
+   §10 Content media
+   ========================================================================== */
+/* Framed content images. Excludes: landing (WP1's domain), the data browser,
+   component-internal cover images (BeforeAfter layers, TutorialsTop thumbs)
+   which live inside their own frames, and .vc-fig figures (frame owned by
+   §5b). The imageZoom lightbox clones into an overlay outside .markdown, so
+   it is unaffected. */
+html:not(.docs-doc-id-landing):not(.docs-doc-id-data_browser)
+  .markdown
+  img:not([class*="object-cover"]):not([class*="max-w-none"]):not(.vc-fig img) {
+  max-width: 100%;
+  border-radius: var(--vc-r-card);
+  border: 1px solid var(--vc-line);
+}
+/* Pannable full-width strips (e.g. the PHerc 1667 banner on /firstscroll):
+   the image keeps its natural width and scrolls inside its own
+   overflow-x-auto container — forcing max-width:100% distorts it. The frame
+   lives on the outer container, so the image itself stays unframed. */
+.markdown .overflow-x-auto img,
+.markdown img[class*="max-w-none"] {
+  max-width: none;
+  border: 0;
+  border-radius: 0;
+}
+
+/* Typography only — custom.css keeps its legacy negative margin-top, which
+   several docs hand-compensate with utility classes. */
+figcaption {
+  font-size: 0.8125rem;
+  font-style: italic;
+  color: var(--vc-text-faint);
+}
+
+/* ==========================================================================
+   §11 Doc footer + pagination
+   ========================================================================== */
+.theme-doc-footer {
+  border-top: 1px solid var(--vc-line);
+  margin-top: 48px;
+  padding-top: 12px;
+  font-size: 0.8125rem;
+}
+a.theme-edit-this-page {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px; /* Gate 8: was 18px tall */
+  color: var(--vc-text-dim);
+  text-decoration: none;
+}
+a.theme-edit-this-page:hover {
+  color: var(--vc-accent);
+  text-decoration: none;
+}
+.theme-last-updated {
+  font-size: 0.8125rem;
+  font-style: normal;
+  color: var(--vc-text-faint);
+}
+
+/* Pagination is display:none'd in custom.css today; skin is ready if WP3/WP4
+   re-enable it. */
+.pagination-nav__link {
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+  padding: 12px 16px;
+  min-height: 44px;
+}
+.pagination-nav__link:hover {
+  border-color: var(--vc-line-strong);
+  background: var(--vc-raised);
+}
+.pagination-nav__sublabel {
+  font-size: 0.8125rem;
+  color: var(--vc-text-faint);
+}
+.pagination-nav__label {
+  color: var(--vc-text);
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   §12 Site footer — one dense hairline band, >=44px targets
+   (WP3 flattens the config to a single row; this skins both shapes.)
+   ========================================================================== */
+.footer,
+.footer--dark {
+  --ifm-footer-background-color: var(--vc-bg);
+  --ifm-footer-color: var(--vc-text-dim);
+  --ifm-footer-link-color: var(--vc-text-dim);
+  --ifm-footer-title-color: var(--vc-text-faint);
+  background: var(--vc-bg);
+  border-top: 1px solid var(--vc-line);
+  padding: 12px 0 max(12px, env(safe-area-inset-bottom));
+}
+/* Collapse the sitemap shape into a single band. Under 768px it stacks
+   (links row + copyright), both centered and compact. */
+.footer .container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.footer__title {
+  display: none; /* single untitled link group — no column heading */
+}
+.footer__links {
+  margin: 0;
+  width: auto;
+}
+.footer .footer__col {
+  margin: 0;
+  padding: 0;
+}
+.footer__items {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0 4px;
+}
+.footer__item {
+  padding: 0;
+  font-size: 0.875rem;
+}
+.footer__link-item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 44px; /* Gate 8: 𝕏 (28px) / Jobs (31px) reach a >=44px hit area */
+  min-height: 44px; /* baseline links were 29-35 x 32px */
+  padding: 0 12px;
+  color: var(--vc-text-dim);
+}
+.footer__link-item:hover {
+  color: var(--vc-text);
+  text-decoration: none;
+}
+.footer__copyright {
+  font-size: 0.8125rem;
+  color: var(--vc-text-faint);
+  text-align: center;
+}
+
+/* >=768px: one row — copyright left, links inline right. row-reverse puts the
+   links group (first in DOM) on the right and the copyright on the left. */
+@media (min-width: 768px) {
+  .footer .container {
+    flex-direction: row-reverse;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px 24px;
+  }
+  .footer__copyright {
+    text-align: left;
+  }
+}
+
+/* ==========================================================================
+   §13 Heading anchors — visible on hover AND touch/focus, ghost color
+   ========================================================================== */
+.hash-link {
+  color: var(--vc-text-ghost);
+}
+.hash-link:hover,
+.hash-link:focus {
+  color: var(--vc-text-faint);
+  opacity: 1;
+}
+/* custom.css display:none's anchors under 997px — revive them for touch. */
+@media (max-width: 996px) {
+  .markdown .hash-link {
+    display: inline-block;
+  }
+}
+@media (hover: none) {
+  .markdown .hash-link {
+    opacity: 0.5; /* no hover to reveal them — keep a quiet affordance */
+  }
+}
+
+/* ==========================================================================
+   §14 Focus visibility (spec §1)
+   ========================================================================== */
+.navbar a:focus-visible,
+.navbar button:focus-visible,
+.menu__link:focus-visible,
+.menu__caret:focus-visible,
+.table-of-contents__link:focus-visible,
+.footer a:focus-visible,
+.pagination-nav__link:focus-visible,
+a.theme-edit-this-page:focus-visible,
+.hash-link:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+
+/* ==========================================================================
+   §15 WP2 component skins
+   ========================================================================== */
+
+/* Card links (TopCard, PrizeCard) never inherit Infima's red link color. */
+a.vc-card,
+a.vc-card:hover {
+  color: var(--vc-text);
+  text-decoration: none;
+}
+
+/* LatestPosts "Updates" strip: hairline-separated compact rows.
+   The 1px grid gap shows the container's line-tinted background through as
+   the separators — works at every column count. */
+.vc-updates {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--vc-line);
+  background-clip: padding-box;
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-card);
+  overflow: hidden;
+}
+@media (min-width: 1280px) {
+  .vc-updates {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (max-width: 479px) {
+  .vc-updates {
+    grid-template-columns: minmax(0, 1fr); /* single column on phones */
+  }
+  /* Phones read the strip as a ticker: one "Title …… date" line per row. */
+  a.vc-updates__item {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    min-height: 44px;
+    padding: 10px 14px;
+  }
+  .vc-updates__title {
+    min-width: 0; /* long titles wrap instead of overflowing */
+  }
+  .vc-updates__meta {
+    flex: none; /* the date never gets squeezed */
+  }
+}
+a.vc-updates__item {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  min-height: 48px;
+  padding: 8px 14px;
+  background: var(--vc-surface);
+  text-decoration: none;
+}
+a.vc-updates__item:hover {
+  background: var(--vc-raised);
+  text-decoration: none;
+}
+a.vc-updates__item:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: -2px;
+}
+.vc-updates__title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--vc-text);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+/* Desktop rows: one line per title, dates on one baseline across the strip. */
+@media (min-width: 997px) {
+  .vc-updates__title {
+    display: block;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+}
+.vc-updates__meta {
+  font-size: 10px;
+  color: var(--vc-text-faint);
+  font-variant-numeric: tabular-nums;
+}

@@ -128,7 +128,7 @@ class WarpTransform(BasicTransform):
         grid[..., axis] = grid[..., axis] + displacement.to(device).reshape(vshape)
         grid = _convert_my_grid_to_grid_sample_grid(grid, spatial)
         return grid_sample(x[None].float(), grid[None], mode=mode,
-                           padding_mode="border", align_corners=False)[0]
+                           padding_mode="reflection", align_corners=False)[0]
 
     def _apply_to_image(self, img, **p):
         if p['displacement'] is None:

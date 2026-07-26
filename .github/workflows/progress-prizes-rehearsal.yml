@@ -1,0 +1,848 @@
+name: Progress Prize July 20 rehearsal
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Rehearsal segment to execute
+        required: true
+        type: choice
+        default: full-rehearsal
+        options:
+          - full-rehearsal
+          - validate-production
+          - bootstrap-staging-source
+          - prepare-fault-recovery
+          - activation-fault-recovery
+          - cleanup-staging
+      source-cycle:
+        description: Production/staging source cycle
+        required: true
+        type: string
+        default: "2026-07"
+      target-cycle:
+        description: Staging target cycle
+        required: true
+        type: string
+        default: "2026-08"
+      preparation-now:
+        description: Simulated instant inside the seven-day preparation window
+        required: true
+        type: string
+        default: "2026-07-25T12:00:00.000Z"
+      activation-now:
+        description: Simulated instant just after the Pacific July cutoff
+        required: true
+        type: string
+        default: "2026-08-01T07:01:00.000Z"
+
+permissions: {}
+
+concurrency:
+  group: progress-prizes-staging-rehearsal
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate public rehearsal controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Reject invalid trigger context and controls
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          OPERATION: ${{ inputs.operation }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+          PREPARATION_NOW: ${{ inputs['preparation-now'] }}
+          ACTIVATION_NOW: ${{ inputs['activation-now'] }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+
+          assert.equal(process.env.REPOSITORY, 'ScrollPrize/villa');
+          assert.equal(process.env.REPOSITORY_ID, '890972577');
+          assert.equal(process.env.REPOSITORY_OWNER_ID, '121906140');
+          assert.equal(process.env.REF, 'refs/heads/main');
+          assert.match(process.env.HEAD_SHA ?? '', /^[a-f0-9]{40}$/i);
+          assert.equal(process.env.EVENT_NAME, 'workflow_dispatch');
+
+          const allowedOperations = new Set([
+            'full-rehearsal',
+            'validate-production',
+            'bootstrap-staging-source',
+            'prepare-fault-recovery',
+            'activation-fault-recovery',
+            'cleanup-staging',
+          ]);
+          assert.equal(allowedOperations.has(process.env.OPERATION ?? ''), true);
+
+          function parseCycle(value) {
+            const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(value ?? '');
+            assert.ok(match);
+            return { year: Number(match[1]), month: Number(match[2]) };
+          }
+
+          const source = parseCycle(process.env.SOURCE_CYCLE);
+          const target = parseCycle(process.env.TARGET_CYCLE);
+          assert.equal(process.env.SOURCE_CYCLE, '2026-07');
+          assert.equal(process.env.TARGET_CYCLE, '2026-08');
+          const expectedTarget = source.month === 12
+            ? { year: source.year + 1, month: 1 }
+            : { year: source.year, month: source.month + 1 };
+          assert.deepEqual(target, expectedTarget);
+
+          function parseInstant(value) {
+            const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})$/.exec(value ?? '');
+            assert.ok(match);
+            const [, year, month, day, hour, minute, second, fraction = '', zone] = match;
+            const parts = [year, month, day, hour, minute, second].map(Number);
+            const [yearNumber, monthNumber, dayNumber, hourNumber, minuteNumber, secondNumber] = parts;
+            const millisecond = Number(fraction.padEnd(3, '0'));
+            assert.ok(monthNumber >= 1 && monthNumber <= 12);
+            assert.ok(dayNumber >= 1 && dayNumber <= 31);
+            assert.ok(hourNumber <= 23 && minuteNumber <= 59 && secondNumber <= 59);
+            if (zone !== 'Z') {
+              const [offsetHour, offsetMinute] = zone.slice(1).split(':').map(Number);
+              assert.ok(offsetHour <= 23 && offsetMinute <= 59);
+            }
+            const calendar = new Date(Date.UTC(
+              yearNumber,
+              monthNumber - 1,
+              dayNumber,
+              hourNumber,
+              minuteNumber,
+              secondNumber,
+              millisecond,
+            ));
+            assert.deepEqual(
+              [calendar.getUTCFullYear(), calendar.getUTCMonth() + 1, calendar.getUTCDate()],
+              [yearNumber, monthNumber, dayNumber],
+            );
+            assert.ok(Number.isFinite(Date.parse(value)));
+          }
+
+          parseInstant(process.env.PREPARATION_NOW);
+          parseInstant(process.env.ACTIVATION_NOW);
+          NODE
+
+  validate-production:
+    if: >-
+      inputs.operation == 'full-rehearsal' ||
+      inputs.operation == 'validate-production' ||
+      inputs.operation == 'bootstrap-staging-source' ||
+      inputs.operation == 'prepare-fault-recovery' ||
+      inputs.operation == 'activation-fault-recovery'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Validate production Google Form
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: validate
+          environment: production
+          source-cycle: ${{ inputs['source-cycle'] }}
+          branch: main
+          target-branch: main
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  bootstrap-staging:
+    if: >-
+      inputs.operation == 'full-rehearsal' ||
+      inputs.operation == 'bootstrap-staging-source' ||
+      inputs.operation == 'prepare-fault-recovery' ||
+      inputs.operation == 'activation-fault-recovery'
+    needs: validate-production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Bootstrap staging Google Form
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: bootstrap
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ (inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery') && inputs['target-cycle'] || '' }}
+          allow-activation-rewind: ${{ inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery' }}
+          simulated-now: ${{ inputs['preparation-now'] }}
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  inject-copy-fault:
+    if: >-
+      inputs.operation == 'full-rehearsal' ||
+      inputs.operation == 'prepare-fault-recovery' ||
+      inputs.operation == 'activation-fault-recovery'
+    needs: bootstrap-staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Inject staging copy fault
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: prepare
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['preparation-now'] }}
+          fault: after-copy
+          expect-fault: true
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  recover-prepare:
+    if: >-
+      inputs.operation == 'full-rehearsal' ||
+      inputs.operation == 'prepare-fault-recovery' ||
+      inputs.operation == 'activation-fault-recovery'
+    needs: inject-copy-fault
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Recover staging preparation
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: prepare
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['preparation-now'] }}
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  prepare-page:
+    if: >-
+      inputs.operation == 'full-rehearsal' ||
+      inputs.operation == 'prepare-fault-recovery' ||
+      inputs.operation == 'activation-fault-recovery'
+    needs: recover-prepare
+    uses: ./.github/workflows/progress-prizes-page-pr.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      environment: staging
+      source-cycle: ${{ inputs['source-cycle'] }}
+      target-cycle: ${{ inputs['target-cycle'] }}
+      responder-uri: ${{ needs.recover-prepare.outputs['responder-uri'] }}
+      head-branch: codex/progress-prize-smoke-20260720
+      base-branch: codex/progress-prize-smoke-base-20260720
+
+  verify-prepared:
+    if: >-
+      inputs.operation == 'full-rehearsal' ||
+      inputs.operation == 'prepare-fault-recovery' ||
+      inputs.operation == 'activation-fault-recovery'
+    needs: prepare-page
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Verify prepared staging Google Form
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: verify
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['preparation-now'] }}
+          verify-mode: prepared
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          head-sha: ${{ needs.prepare-page.outputs['head-sha'] }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  activation-gate:
+    name: Gate the exact smoke commit
+    if: inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery'
+    needs:
+      - prepare-page
+      - verify-prepared
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
+      statuses: read
+    outputs:
+      head-sha: ${{ steps.gate.outputs['head-sha'] }}
+      base-sha: ${{ steps.gate.outputs['base-sha'] }}
+      pr-number: ${{ steps.gate.outputs['pr-number'] }}
+    steps:
+      - name: Check out trusted gate code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Wait for code checks and Vercel
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+          EXPECTED_SHA: ${{ needs.prepare-page.outputs['head-sha'] }}
+          EXPECTED_BASE_SHA: ${{ needs.prepare-page.outputs['base-sha'] }}
+        run: >-
+          node .github/progress-prizes-github.mjs gate
+          --head codex/progress-prize-smoke-20260720
+          --base codex/progress-prize-smoke-base-20260720
+          --base-sha "$EXPECTED_BASE_SHA"
+          --source-cycle "$SOURCE_CYCLE"
+          --cycle "$TARGET_CYCLE"
+          --sha "$EXPECTED_SHA"
+          --timeout-seconds 1800
+
+  inject-close-fault:
+    if: inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery'
+    needs: activation-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Inject staging close fault
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: activate
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['activation-now'] }}
+          fault: after-close-source
+          expect-fault: true
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          head-sha: ${{ needs.activation-gate.outputs['head-sha'] }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  recover-activate:
+    if: inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery'
+    needs:
+      - activation-gate
+      - inject-close-fault
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Recover staging activation
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: activate
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['activation-now'] }}
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          head-sha: ${{ needs.activation-gate.outputs['head-sha'] }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  verify-active:
+    if: inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery'
+    needs:
+      - activation-gate
+      - recover-activate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Verify active staging Google Form
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: verify
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['activation-now'] }}
+          verify-mode: active
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          head-sha: ${{ needs.activation-gate.outputs['head-sha'] }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  merge-smoke:
+    name: Ready and merge the activated smoke page
+    if: inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery'
+    needs:
+      - activation-gate
+      - verify-active
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      merge-sha: ${{ steps.merge.outputs['merge-sha'] }}
+    steps:
+      - name: Check out trusted merge code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Merge only the gated SHA
+        id: merge
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.activation-gate.outputs['head-sha'] }}
+          BASE_SHA: ${{ needs.activation-gate.outputs['base-sha'] }}
+          PR_NUMBER: ${{ needs.activation-gate.outputs['pr-number'] }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+        run: >-
+          node .github/progress-prizes-github.mjs merge
+          --head codex/progress-prize-smoke-20260720
+          --base codex/progress-prize-smoke-base-20260720
+          --sha "$HEAD_SHA"
+          --base-sha "$BASE_SHA"
+          --pr-number "$PR_NUMBER"
+          --source-cycle "$SOURCE_CYCLE"
+          --cycle "$TARGET_CYCLE"
+
+  verify-post-merge-preview:
+    name: Verify smoke base preview after merge
+    if: inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery'
+    needs: merge-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      contents: read
+      statuses: read
+    steps:
+      - name: Check out trusted gate code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Wait for exact smoke base preview
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ needs.merge-smoke.outputs['merge-sha'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+        run: >-
+          node .github/progress-prizes-github.mjs wait-preview
+          --branch codex/progress-prize-smoke-base-20260720
+          --sha "$MERGE_SHA"
+          --cycle "$TARGET_CYCLE"
+          --timeout-seconds 1800
+
+  prove-activation-idempotency:
+    if: inputs.operation == 'full-rehearsal' || inputs.operation == 'activation-fault-recovery'
+    needs:
+      - activation-gate
+      - verify-post-merge-preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Prove staging activation idempotency
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: activate
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['activation-now'] }}
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          head-sha: ${{ needs.activation-gate.outputs['head-sha'] }}
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  cleanup-full-rehearsal:
+    if: inputs.operation == 'full-rehearsal'
+    needs:
+      - prove-activation-idempotency
+      - verify-post-merge-preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Clean up full staging rehearsal
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: cleanup
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['activation-now'] }}
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  verify-cleaned-full-rehearsal:
+    if: inputs.operation == 'full-rehearsal'
+    needs: cleanup-full-rehearsal
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Verify full staging rehearsal cleanup
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: verify
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['activation-now'] }}
+          verify-mode: cleaned
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  cleanup-standalone:
+    if: inputs.operation == 'cleanup-staging'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Clean up standalone staging rehearsal
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: cleanup
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['activation-now'] }}
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  verify-cleaned-standalone:
+    if: inputs.operation == 'cleanup-staging'
+    needs: cleanup-standalone
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Verify standalone staging rehearsal cleanup
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: verify
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          simulated-now: ${{ inputs['activation-now'] }}
+          verify-mode: cleaned
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}

@@ -1,5 +1,83 @@
 # 2D TIFF layer UNet trainer
 
+## Installation
+
+Lasagna requires [`uv`](https://docs.astral.sh/uv/) and currently targets
+Python 3.14. The recommended installer creates an editable virtual environment,
+selects a driver-compatible official PyTorch build, and installs the fit
+service, downloader, and full 2D/3D preprocessing stack.
+
+```bash
+cd /path/to/villa/lasagna
+python3 scripts/bootstrap_venv.py --venv .venv
+source .venv/bin/activate
+```
+
+The bootstrap uses `nvidia-smi` to select a pinned official PyTorch build for
+CUDA 12.8, CUDA 13.0, or CPU, then installs Lasagna. Override detection with
+`--backend cpu`, `--backend cu128`, or `--backend cu130`, for example:
+
+```bash
+python3 scripts/bootstrap_venv.py --venv .venv --backend cu128
+```
+
+Verify the selected PyTorch build and GPU access:
+
+```bash
+python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+```
+
+The install exposes these commands:
+
+```bash
+lasagna-fit-service --help
+lasagna-download --help
+lasagna-download-list --help
+lasagna-preprocess --help
+lasagna-preprocess integrate --help
+lasagna-preprocess predict3d --help
+```
+
+The bootstrap installs Lasagna with `-e`, so changes in this checkout are
+immediately visible in the environment without reinstalling.
+
+This installation currently expects the `villa` monorepo layout: Lasagna uses
+the sibling `vesuvius/src` model implementation and installs its declared model
+dependencies. It deliberately does not build Volume Cartographer, which is not
+needed for preprocessing. Copying only the `lasagna/` directory is therefore
+not yet a supported standalone installation.
+
+### Batch-download the PHerc scale-0 volumes
+
+Pass a one-S3-URI-per-line list from the directory that should contain the
+scroll directories:
+
+```bash
+cd /path/to/scrolls
+lasagna-download-list /ephemeral/hendrik/las_volumes/pherc_volumes.txt
+```
+
+This processes one volume at a time and uses 512 parallel chunk-transfer
+workers inside each volume. The resulting layout is:
+
+```text
+scrolls/
+  PHerc0125/
+    info.json
+    volumes/
+      20250821151825-9.362um-1.2m-113keV-masked.zarr/
+```
+
+Use `--dry-run` to inspect a run without writing anything:
+
+```bash
+lasagna-download-list /path/to/other-volumes.txt
+lasagna-download-list /ephemeral/hendrik/las_volumes/pherc_volumes.txt --dry-run
+```
+
+CuPy remains an optional acceleration path and is not required for the
+preprocessing commands above.
+
 ## Design decisions
 
 - Minimal dependencies: PyTorch, tifffile, TensorBoard, single in-repo U-Net implementation.

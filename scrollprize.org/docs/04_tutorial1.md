@@ -1,7 +1,6 @@
 ---
 title: "Tutorial: Scanning"
 sidebar_label: "Scanning"
-hide_table_of_contents: true
 ---
 
 <head>
@@ -37,11 +36,16 @@ hide_table_of_contents: true
   />
 </head>
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-<TutorialsTop highlightId={2} />
+
+:::warning[ARCHIVED]
+
+This page has been archived and is no longer maintained. It describes an earlier generation of the Vesuvius Challenge pipeline — tools, data layouts, and results referenced here may have been superseded. See [Open Problems](2026_open_problems) for the current state of the pipeline and [Prizes](prizes) for what is open today.
+
+:::
+
 
 ### Campfire scroll
 
@@ -49,7 +53,9 @@ To get a basic understanding of the kind of data we’re working with, it’s us
 
 <div className="flex flex-wrap items-start">
   <figure className="sm:w-[48.4%]">
-    <img src="/img/tutorials/en-gedi-word-soup.gif"/>
+    <video autoPlay playsInline loop muted className="w-[100%]" poster="/img/tutorials/en-gedi-word-soup-poster.webp">
+      <source src="/img/tutorials/en-gedi-word-soup.webm" type="video/webm"/>
+    </video>
     <figcaption className="mt-0">Word soup in a simulated scroll <a href="https://www.youtube.com/watch?v=tL7rhIFNtQg">(source)</a></figcaption>
   </figure>
   <figure className="sm:w-[50%]">
@@ -81,7 +87,7 @@ Stephen then _carbonized_ the scroll through a process that is similar to that o
     <img className="max-h-[250px]" src="/img/tutorials/campfire-scanning.webp"/>
     <img className="max-h-[250px]" src="/img/tutorials/campfire-scanning2.webp"/>
   </div>
-  <figcaption className="mt-1">Making of the campfire scroll</figcaption>
+  <figcaption className="mt-1">Making of the campfire scroll. © EduceLab/University of Kentucky.</figcaption>
 </figure>
 
 ### Fiji
@@ -232,7 +238,7 @@ Here is a video showing the whole process:
 
 <figure>
   <video controls playsInline muted className="w-[100%] rounded-xl" poster="/img/tutorials/imagej-word-soup2.webp">
-    <source src="/img/tutorials/imagej-word-soup2.webm" type="video/webm"/>
+    <source src="/img/tutorials/imagej-word-soup2-c.webm" type="video/webm"/>
   </video>
 </figure>
 

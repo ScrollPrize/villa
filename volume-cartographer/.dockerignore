@@ -6,6 +6,8 @@
 .zenodo.json
 .idea/
 build
+dist
+*.AppImage
 results
 **/build/
 **/CMakeFiles/

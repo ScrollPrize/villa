@@ -18,6 +18,7 @@ using vc::project::Category;
 using vc::project::isLocationRemote;
 using vc::project::resolveLocalPath;
 using vc::project::validateLocation;
+using vc::project::validateSingleVolumeLocation;
 
 namespace {
 
@@ -95,6 +96,28 @@ TEST_CASE("validateLocation: malformed remote URLs are rejected")
 {
     CHECK_FALSE(validateLocation(Category::Volumes, "s3:").empty());
     CHECK_FALSE(validateLocation(Category::Volumes, "s3://").empty());
+    CHECK_FALSE(validateLocation(
+        Category::Volumes,
+        "https://example.test/volume.zarr#unknown=2").empty());
+}
+
+TEST_CASE("validateSingleVolumeLocation requires exactly one zarr")
+{
+    auto root = tmpDir("single_volume");
+    auto volume = root / "volume";
+    fs::create_directories(volume / "0");
+    { std::ofstream(volume / "meta.json") << "{}"; }
+    { std::ofstream(volume / "0" / ".zarray") << "{}"; }
+
+    CHECK(validateSingleVolumeLocation(volume.string()).empty());
+    CHECK_FALSE(validateSingleVolumeLocation(root.string()).empty());
+    CHECK(validateSingleVolumeLocation(
+        "s3://bucket/volume.zarr#vc-base-scale=2").empty());
+    CHECK_FALSE(validateSingleVolumeLocation(
+        "https://example.test/not-a-zarr").empty());
+    CHECK_FALSE(validateSingleVolumeLocation(
+        "https://example.test/volume.zarr#unknown=2").empty());
+    fs::remove_all(root);
 }
 
 TEST_CASE("validateLocation: nonexistent local path is rejected")
@@ -164,6 +187,46 @@ TEST_CASE("VolumePkg: setName persists in memory")
     CHECK(p->name() == "My Project");
 }
 
+TEST_CASE("VolumePkg::newDetached writes only when explicitly saved")
+{
+    const auto autosave = VolumePkg::autosaveFile();
+    fs::create_directories(autosave.parent_path());
+    {
+        std::ofstream out(autosave);
+        out << "current session";
+    }
+
+    auto d = tmpDir("detached");
+    auto target = d / "created.volpkg.json";
+    vc::project::LoadOptions opts;
+    opts.deferResolution = true;
+    auto p = VolumePkg::newDetached(opts);
+    p->setName("Created");
+    CHECK(p->addVolumeEntry("/volume", {"source:test"}));
+
+    std::ifstream beforeSave(autosave);
+    CHECK(std::string(
+              std::istreambuf_iterator<char>(beforeSave),
+              std::istreambuf_iterator<char>()) == "current session");
+    CHECK_FALSE(fs::exists(target));
+
+    p->save(target);
+    REQUIRE(fs::exists(target));
+    auto loaded = VolumePkg::load(target, opts);
+    CHECK(loaded->name() == "Created");
+    REQUIRE(loaded->volumeEntries().size() == 1);
+    CHECK(loaded->volumeEntries().front().location == "/volume");
+
+    p->setName("Changed later");
+    CHECK(VolumePkg::load(target, opts)->name() == "Created");
+
+    std::ifstream afterSave(autosave);
+    CHECK(std::string(
+              std::istreambuf_iterator<char>(afterSave),
+              std::istreambuf_iterator<char>()) == "current session");
+    fs::remove_all(d);
+}
+
 TEST_CASE("VolumePkg: addVolumeEntry / removeEntry round-trip")
 {
     auto p = VolumePkg::newEmpty();
@@ -192,6 +255,94 @@ TEST_CASE("VolumePkg: addSegmentsEntry sets outputSegments on first add")
     CHECK(p->segmentEntries().size() == 2);
     p->clearOutputSegments();
     CHECK_FALSE(p->addSegmentsEntry(""));
+}
+
+TEST_CASE("VolumePkg: segment entries match normalized local paths")
+{
+    auto d = tmpDir("segment_entry_identity");
+    fs::create_directories(d / "segments");
+
+    auto p = VolumePkg::newEmpty();
+    p->save(d / "project.volpkg.json");
+    REQUIRE(p->addSegmentsEntry("segments", {"source:test"}));
+
+    const auto matching = p->matchingSegmentsEntry((d / "segments").string() + "/");
+    REQUIRE(matching);
+    CHECK(matching->location == "segments");
+    CHECK(matching->tags == std::vector<std::string>{"source:test"});
+    CHECK_FALSE(p->addSegmentsEntry((d / "segments").string()));
+    CHECK(p->segmentEntries().size() == 1);
+
+    std::error_code symlinkError;
+    fs::create_directory_symlink(
+        d / "segments", d / "segments-alias", symlinkError);
+    if (!symlinkError) {
+        CHECK(p->matchingSegmentsEntry((d / "segments-alias").string()));
+        CHECK_FALSE(p->addSegmentsEntry((d / "segments-alias").string()));
+    }
+
+#ifndef _WIN32
+    fs::create_directories(d / "segments\\");
+    CHECK_FALSE(p->matchingSegmentsEntry((d / "segments\\").string()));
+    CHECK(p->addSegmentsEntry((d / "segments\\").string()));
+#endif
+
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: segment directory-name lookup is case-insensitive")
+{
+    auto d = tmpDir("segment_source_name");
+    fs::create_directories(d / "one" / "User-Segments");
+
+    auto p = VolumePkg::newEmpty();
+    p->save(d / "project.volpkg.json");
+    REQUIRE(p->addSegmentsEntry(
+        (d / "one" / "User-Segments").string()));
+
+    const auto matching =
+        p->matchingSegmentsEntryByDirectoryName("user-segments");
+    REQUIRE(matching);
+    CHECK(matching->location ==
+          (d / "one" / "User-Segments").string());
+
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: segment attachment rolls back after a write failure")
+{
+    auto d = tmpDir("segment_attach_rollback");
+    auto makeSegment = [](const fs::path& path, const std::string& id) {
+        fs::create_directories(path);
+        std::ofstream meta(path / "meta.json");
+        meta << R"({"type":"seg","uuid":")" << id
+             << R"(","format":"tifxyz"})";
+    };
+    makeSegment(d / "initial", "initial");
+    makeSegment(d / "new", "new");
+
+    const auto project = d / "project.volpkg.json";
+    auto p = VolumePkg::newEmpty();
+    p->save(project);
+    REQUIRE(p->addSegmentsEntry((d / "initial").string()));
+    fs::remove(project);
+    fs::create_directory(project);
+
+    CHECK_THROWS(p->attachSegmentsEntry(
+        (d / "new").string(), {"source:test"}, true));
+    REQUIRE(p->segmentEntries().size() == 1);
+    CHECK(p->segmentEntries().front().location == (d / "initial").string());
+    CHECK(p->outputSegmentsPath() == d / "initial");
+    CHECK(p->segmentationIDs() == std::vector<std::string>{"initial"});
+
+    vc::project::LoadOptions deferred;
+    deferred.deferResolution = true;
+    auto autosave = VolumePkg::load(VolumePkg::autosaveFile(), deferred);
+    REQUIRE(autosave->segmentEntries().size() == 1);
+    CHECK(autosave->segmentEntries().front().location ==
+          (d / "initial").string());
+
+    fs::remove_all(d);
 }
 
 TEST_CASE("VolumePkg: segment discovery skips transient cache directories")
@@ -247,6 +398,25 @@ TEST_CASE("VolumePkg: save then load round-trips entries")
     CHECK(loaded->volumeEntries()[0].location == "/vol-x");
     CHECK(loaded->segmentEntries().size() == 1);
     CHECK(loaded->normalGridEntries().size() == 1);
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg: saving over an existing project replaces it")
+{
+    auto d = tmpDir("save_overwrite");
+    auto jsonPath = d / "project.json";
+
+    auto p = VolumePkg::newEmpty();
+    p->setName("First");
+    p->save(jsonPath);
+    REQUIRE(fs::exists(jsonPath));
+
+    p->setName("Second");
+    p->save(jsonPath);
+
+    auto loaded = VolumePkg::load(jsonPath);
+    REQUIRE(loaded);
+    CHECK(loaded->name() == "Second");
     fs::remove_all(d);
 }
 
@@ -350,4 +520,89 @@ TEST_CASE("VolumePkg::setLoadFirstSegmentationDirectory: round-trip")
     // Clear it again with empty string
     VolumePkg::setLoadFirstSegmentationDirectory("");
     CHECK(true);
+}
+
+TEST_CASE("VolumePkg reconciles and relocates coordinate-bearing asset entries")
+{
+    auto d = tmpDir("asset_reconcile");
+    const auto oldSegments = (d / "segments-old").string();
+    const auto newSegments = (d / "segments-new").string();
+    const auto grids = (d / "grids").string();
+
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addSegmentsEntry(
+        oldSegments,
+        {"user-tag", "vc-open-data-coordinate-space:sample/source@L0"}));
+    CHECK(pkg->reconcileSegmentsEntryTags(
+        oldSegments,
+        {"vc-open-data-coordinate-space:sample/source@L2",
+         "vc-open-data-source-coordinate-level:2"},
+        {"vc-open-data-coordinate-space:",
+         "vc-open-data-source-coordinate-level:"}));
+    REQUIRE(pkg->segmentEntries().size() == 1);
+    CHECK(std::find(pkg->segmentEntries()[0].tags.begin(),
+                    pkg->segmentEntries()[0].tags.end(),
+                    "user-tag") != pkg->segmentEntries()[0].tags.end());
+    CHECK(std::find(pkg->segmentEntries()[0].tags.begin(),
+                    pkg->segmentEntries()[0].tags.end(),
+                    "vc-open-data-coordinate-space:sample/source@L0") ==
+          pkg->segmentEntries()[0].tags.end());
+    CHECK(pkg->relocateSegmentsEntry(oldSegments, newSegments));
+    CHECK(pkg->segmentEntries()[0].location == newSegments);
+
+    REQUIRE(pkg->addNormalGridEntry(
+        grids, {"vc-open-data-source-coordinate-level:0"}));
+    CHECK(pkg->reconcileNormalGridEntryTags(
+        grids, {"vc-open-data-source-coordinate-level:2"},
+        {"vc-open-data-source-coordinate-level:"}));
+    CHECK(pkg->normalGridEntries()[0].tags.back() ==
+          "vc-open-data-source-coordinate-level:2");
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg persists manifest-backed Lasagna entries independently of normal grids")
+{
+    auto d = tmpDir("lasagna_entries");
+    const auto project = d / "project.json";
+    const auto lasagna = (d / "cache" / "data.lasagna.json").string();
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addLasagnaDatasetEntry(
+        lasagna,
+        {"vc-open-data-lasagna", "vc-open-data-volume-id:vol-a"}));
+    CHECK(pkg->normalGridEntries().empty());
+    pkg->save(project);
+
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    auto loaded = VolumePkg::load(project, options);
+    REQUIRE(loaded);
+    REQUIRE(loaded->lasagnaDatasetEntries().size() == 1);
+    CHECK(loaded->lasagnaDatasetEntries().front().location == lasagna);
+    CHECK(loaded->normalGridEntries().empty());
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit base zero")
+{
+    auto d = tmpDir("remote_selector_identity");
+    const auto jsonPath = d / "project.json";
+    {
+        std::ofstream out(jsonPath);
+        out << R"({"name":"selectors","version":1,"volumes":[{"location":"s3://bucket/source.zarr","tags":[]}]})";
+    }
+    vc::project::LoadOptions opts;
+    opts.deferResolution = true;
+    auto pkg = VolumePkg::load(jsonPath, opts);
+    REQUIRE(pkg);
+    CHECK_FALSE(pkg->addVolumeEntry(
+        "s3://bucket/source.zarr#vc-base-scale=0"));
+    CHECK(pkg->addVolumeEntry(
+        "s3://bucket/source.zarr/#vc-base-scale=02"));
+    CHECK_FALSE(pkg->addVolumeEntry(
+        "https://bucket.s3.us-east-1.amazonaws.com/source.zarr#vc-base-scale=2"));
+    REQUIRE(pkg->volumeEntries().size() == 2);
+    CHECK(pkg->volumeEntries()[0].location == "s3://bucket/source.zarr");
+    CHECK(pkg->volumeEntries()[1].location ==
+          "https://bucket.s3.us-east-1.amazonaws.com/source.zarr#vc-base-scale=2");
+    fs::remove_all(d);
 }

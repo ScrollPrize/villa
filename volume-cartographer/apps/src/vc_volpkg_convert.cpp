@@ -11,6 +11,10 @@ int main(int argc, char** argv)
                   << "  <input>: local volpkg directory or s3://, https:// URL\n";
         return 2;
     }
+    if (std::string(argv[1]).find("#vc-base-scale=") != std::string::npos) {
+        std::cerr << "vc_volpkg_convert does not support rebased remote-volume selectors\n";
+        return 2;
+    }
 
     auto r = vc::convertVolpkg(argv[1], std::filesystem::path(argv[2]));
     if (!r.ok) {

@@ -10,7 +10,7 @@ apt-get install -y --no-install-recommends software-properties-common ca-certifi
 add-apt-repository -y universe
 apt-get update -y
 apt-get install -y --no-install-recommends \
-    build-essential clang lld llvm flang-21 libclang-rt-21-dev mold git cmake ninja-build pkg-config \
+    build-essential clang lld llvm flang-21 libclang-rt-21-dev mold git cmake ninja-build ccache pkg-config \
     qt6-base-dev \
     libboost-system-dev libboost-program-options-dev \
     libceres-dev libsuitesparse-dev \

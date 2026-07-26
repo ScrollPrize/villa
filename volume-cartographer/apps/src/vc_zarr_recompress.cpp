@@ -659,7 +659,13 @@ static std::vector<bool> build_occupancy_mask(
 // ============================================================================
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    // setlinebuf is POSIX-only; unbuffered is the closest Windows can do
+    // (its _IOLBF means fully buffered, not line buffered).
+    setvbuf(stdout, nullptr, _IONBF, 0);
+#else
     setlinebuf(stdout);
+#endif
     if (argc < 3) {
         std::cerr << "Usage: vc_zarr_recompress <input> <output> [options]\n"
                   << "\n"
@@ -694,6 +700,11 @@ int main(int argc, char** argv) {
 
     std::string input_path = argv[1];
     std::string output_path = argv[2];
+    if (input_path.find("#vc-base-scale=") != std::string::npos ||
+        output_path.find("#vc-base-scale=") != std::string::npos) {
+        std::cerr << "Error: vc_zarr_recompress does not support rebased remote-volume selectors\n";
+        return 1;
+    }
     bool verify = false;
     // Outer workers process shards in parallel. Since the per-shard work is
     // now mostly parallel internally (see --inner-jobs), a modest outer count

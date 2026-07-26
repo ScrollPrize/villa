@@ -1,5 +1,6 @@
 #include "LineAnnotationDialog.hpp"
 
+#include "FiberNameDisplay.hpp"
 #include "FiberSliceGeometry.hpp"
 #include "Keybinds.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
@@ -25,11 +26,13 @@
 #include <QMdiSubWindow>
 #include <QPainterPath>
 #include <QPen>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRect>
 #include <QResizeEvent>
 #include <QSettings>
 #include <QShortcut>
+#include <QSizePolicy>
 #include <QSplitter>
 #include <QSpinBox>
 #include <QVariant>
@@ -55,6 +58,12 @@ constexpr char kGeneratedDynamicCurrentCutOverlayKey[] = "line-z-slice-current";
 constexpr float kNominalGeneratedRowWidth = 900.0f;
 constexpr float kNominalGeneratedRowHeight = 260.0f;
 constexpr double kSpanMetricHighlightThresholdDegrees = 45.0;
+constexpr double kNormalOffsetEpsilon = 1.0e-6;
+
+bool normalOffsetActive(double offsetVx)
+{
+    return std::abs(offsetVx) > kNormalOffsetEpsilon;
+}
 
 std::string staticStripOverlayKey(const std::string& surfaceName)
 {
@@ -343,6 +352,32 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
             [this](int) {
                 handleShiftScrollModeChanged();
             });
+    _initialCenterlineLengthSpin = new QSpinBox(buttonRow);
+    _initialCenterlineLengthSpin->setObjectName(
+        QStringLiteral("lineAnnotationInitialCenterlineLengthSpinBox"));
+    _initialCenterlineLengthSpin->setRange(100, 1000000);
+    _initialCenterlineLengthSpin->setSingleStep(100);
+    _initialCenterlineLengthSpin->setPrefix(tr("Length "));
+    _initialCenterlineLengthSpin->setSuffix(tr(" vx"));
+    _initialCenterlineLengthSpin->setToolTip(
+        tr("Total length of a newly generated centerline, split equally around the seed."));
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _initialCenterlineLengthSpin->setValue(
+            settings.value(vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX,
+                           vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT)
+                .toInt());
+    }
+    _initialCenterlineLengthSpin->installEventFilter(this);
+    buttonLayout->addWidget(_initialCenterlineLengthSpin);
+    connect(_initialCenterlineLengthSpin,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            [](int value) {
+                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                settings.setValue(
+                    vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX, value);
+            });
     auto* maxDistanceLabel = new QLabel(tr("Max CP dist"), buttonRow);
     maxDistanceLabel->installEventFilter(this);
     buttonLayout->addWidget(maxDistanceLabel);
@@ -391,6 +426,23 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _optimizationStatusLabel = new QLabel(tr("not optimized"), buttonRow);
     _optimizationStatusLabel->installEventFilter(this);
     buttonLayout->addWidget(_optimizationStatusLabel);
+    _sideStripIntersectionProgress = new QProgressBar(buttonRow);
+    _sideStripIntersectionProgress->setObjectName(QStringLiteral("lineAnnotationSideStripIntersectionProgress"));
+    _sideStripIntersectionProgress->setRange(0, 1);
+    _sideStripIntersectionProgress->setValue(0);
+    _sideStripIntersectionProgress->setTextVisible(true);
+    _sideStripIntersectionProgress->setFormat(tr("strip intersections: 0"));
+    _sideStripIntersectionProgress->setMinimumWidth(260);
+    _sideStripIntersectionProgress->setVisible(false);
+    _sideStripIntersectionProgress->installEventFilter(this);
+    buttonLayout->addWidget(_sideStripIntersectionProgress);
+    _fiberNameLabel = new QLabel(buttonRow);
+    _fiberNameLabel->setObjectName(QStringLiteral("lineAnnotationFiberNameLabel"));
+    _fiberNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    _fiberNameLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _fiberNameLabel->setMinimumWidth(0);
+    _fiberNameLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    _fiberNameLabel->installEventFilter(this);
     _showAsMeshButton = new QPushButton(tr("show as mesh"), buttonRow);
     _showAsMeshButton->setEnabled(false);
     _showAsMeshButton->installEventFilter(this);
@@ -403,7 +455,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _resetViewsButton->setEnabled(false);
     _resetViewsButton->installEventFilter(this);
     buttonLayout->addWidget(_resetViewsButton);
-    buttonLayout->addStretch(1);
+    buttonLayout->addWidget(_fiberNameLabel, 1);
     _layout->addWidget(buttonRow, 0);
     connect(_showAsMeshButton, &QPushButton::clicked, this, [this]() {
         emit showAsMeshRequested();
@@ -453,6 +505,13 @@ LineAnnotationDialog::ReoptimizationMode LineAnnotationDialog::reoptimizationMod
     return static_cast<ReoptimizationMode>(_reoptimizationCombo->currentData().toInt());
 }
 
+int LineAnnotationDialog::initialCenterlineLengthVx() const
+{
+    return _initialCenterlineLengthSpin
+        ? _initialCenterlineLengthSpin->value()
+        : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
+}
+
 LineAnnotationDialog::ShiftScrollMode LineAnnotationDialog::shiftScrollMode() const
 {
     if (!_shiftScrollCombo) {
@@ -469,7 +528,7 @@ int LineAnnotationDialog::maxControlPointDistanceVx() const
 void LineAnnotationDialog::setGeneratedControlPoints(
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.controlPoints = std::move(controlPoints);
@@ -483,17 +542,118 @@ void LineAnnotationDialog::setGeneratedControlPoints(
 void LineAnnotationDialog::setGeneratedBranchLinePoints(
     std::vector<std::vector<cv::Vec3f>> branchLinePoints)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.branchLinePoints = std::move(branchLinePoints);
+    _generatedViews.fiberIntersections.clear();
     rebuildGeneratedOverlays();
+}
+
+void LineAnnotationDialog::setGeneratedBranchLinks(
+    std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks)
+{
+    if (_closing || !_hasGeneratedViews) {
+        return;
+    }
+    _generatedViews.branchLinks = std::move(branchLinks);
+    _generatedViews.fiberIntersections.clear();
+    rebuildGeneratedOverlays();
+}
+
+void LineAnnotationDialog::setGeneratedBranchOverlayData(
+    std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
+    std::vector<std::vector<cv::Vec3f>> branchLinePoints,
+    std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
+    bool requestSideStripIntersections)
+{
+    if (_closing || !_hasGeneratedViews) {
+        return;
+    }
+    _generatedViews.controlPoints = std::move(controlPoints);
+    _generatedViews.branchLinePoints = std::move(branchLinePoints);
+    _generatedViews.branchLinks = std::move(branchLinks);
+    _generatedViews.fiberIntersections.clear();
+    _generatedViews.spanAlignmentMetrics.clear();
+    _generatedControlIndex =
+        vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
+            _generatedViews.controlPoints);
+    rebuildGeneratedOverlays(requestSideStripIntersections);
+}
+
+void LineAnnotationDialog::setGeneratedFiberIntersectionMarkers(
+    std::vector<GeneratedOverlay::FiberIntersectionMarker> markers)
+{
+    if (_closing || !_hasGeneratedViews) {
+        return;
+    }
+    _generatedViews.fiberIntersections = std::move(markers);
+    rebuildGeneratedStaticStripOverlays();
+    rebuildGeneratedDynamicOverlays();
+}
+
+void LineAnnotationDialog::setGeneratedSideStripIntersectionBusy(bool busy)
+{
+    if (_closing || !_sideStripIntersectionProgress) {
+        return;
+    }
+    if (busy) {
+        _sideStripIntersectionProgress->setVisible(true);
+        _sideStripIntersectionProgress->setRange(0, 100);
+        _sideStripIntersectionProgress->setValue(0);
+        _sideStripIntersectionProgress->setFormat(tr("strip intersections: 0%"));
+    } else {
+        _sideStripIntersectionProgress->setRange(0, 100);
+        _sideStripIntersectionProgress->setValue(100);
+    }
+}
+
+void LineAnnotationDialog::setGeneratedSideStripIntersectionProgress(const QString& stage,
+                                                                     size_t completed,
+                                                                     size_t total)
+{
+    if (_closing || !_sideStripIntersectionProgress) {
+        return;
+    }
+    (void)stage;
+    _sideStripIntersectionProgress->setVisible(true);
+    _sideStripIntersectionProgress->setRange(0, 100);
+    int value = total > 0
+        ? static_cast<int>(std::clamp((completed * 100) / total, size_t{0}, size_t{100}))
+        : _sideStripIntersectionProgress->value();
+    value = std::max(value, _sideStripIntersectionProgress->value());
+    _sideStripIntersectionProgress->setValue(value);
+    _sideStripIntersectionProgress->setFormat(
+        tr("strip intersections: %1%").arg(value));
+}
+
+void LineAnnotationDialog::setGeneratedSideStripIntersectionResult(size_t markerCount)
+{
+    if (_closing || !_sideStripIntersectionProgress) {
+        return;
+    }
+    _sideStripIntersectionProgress->setVisible(true);
+    _sideStripIntersectionProgress->setRange(0, 100);
+    _sideStripIntersectionProgress->setValue(100);
+    _sideStripIntersectionProgress->setFormat(
+        tr("strip intersections: %1").arg(markerCount));
+}
+
+void LineAnnotationDialog::setGeneratedSideStripIntersectionError()
+{
+    if (_closing || !_sideStripIntersectionProgress) {
+        return;
+    }
+    _sideStripIntersectionProgress->setVisible(true);
+    _sideStripIntersectionProgress->setRange(0, 100);
+    _sideStripIntersectionProgress->setValue(100);
+    _sideStripIntersectionProgress->setFormat(tr("strip intersections: error"));
 }
 
 void LineAnnotationDialog::setGeneratedPredSnapPoints(
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.predSnapPoints = std::move(predSnapPoints);
@@ -503,7 +663,7 @@ void LineAnnotationDialog::setGeneratedPredSnapPoints(
 void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
     std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics)
 {
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
     _generatedViews.spanAlignmentMetrics = std::move(spanAlignmentMetrics);
@@ -548,6 +708,12 @@ void LineAnnotationDialog::setOptimizationStatus(bool optimized)
     _optimizationStatusLabel->setText(optimized ? tr("optimized") : tr("not optimized"));
 }
 
+void LineAnnotationDialog::setFiberDisplayName(const QString& name)
+{
+    _fiberDisplayName = name;
+    updateFiberNameLabel();
+}
+
 void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)
 {
     _closeAfterFinalizationAllowed = allowed;
@@ -561,6 +727,12 @@ void LineAnnotationDialog::setWorkspaceEmbedded(bool embedded)
 void LineAnnotationDialog::closeEvent(QCloseEvent* event)
 {
     if (_closeAfterFinalizationAllowed) {
+        _closing = true;
+        clearGeneratedOverlayRefreshConnections();
+        cancelControlPointPreviewAnimation();
+        if (_lineUpdateTimer) {
+            _lineUpdateTimer->stop();
+        }
         saveGeneratedViewStateSettings();
         if (!_workspaceEmbedded) {
             saveWindowGeometry();
@@ -645,7 +817,8 @@ bool LineAnnotationDialog::setGeneratedRows(
     _hasGeneratedViews = false;
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
-    _currentCutStraightOffsetActive = false;
+    _currentCutNormalOffsetVx = 0.0;
+    _sideCutNormalOffsetVx = 0.0;
     _generatedControlIndex = {};
     _haveInitialCurrentCutCamera = false;
     _haveInitialSideCutCamera = false;
@@ -732,11 +905,14 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
     }
     _generatedOverlayRefreshConnections.push_back(
         viewer->connectOverlaysUpdated(this, [this]() {
-            if (_generatedOverlayRefreshQueued) {
+            if (_closing || _generatedOverlayRefreshQueued) {
                 return;
             }
             _generatedOverlayRefreshQueued = true;
             QTimer::singleShot(16, this, [this]() {
+                if (_closing) {
+                    return;
+                }
                 _generatedOverlayRefreshQueued = false;
                 rebuildGeneratedOverlays();
             });
@@ -781,7 +957,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 {
     if (!_viewerManager || !_layout || views.linePoints.empty() ||
         views.lineUpVectors.size() != views.linePoints.size() ||
-        !views.currentCutSurface || !views.sideCutSurface) {
+        !views.lineSideSlice || !views.currentCutSurface || !views.sideCutSurface) {
         return false;
     }
 
@@ -865,7 +1041,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             _generatedViews.controlPoints);
     _hasGeneratedViews = true;
     _currentCutFollowsStripMouse = views.initialCurrentCutFollowsStripMouse;
-    _currentCutStraightOffsetActive = false;
+    _currentCutNormalOffsetVx = 0.0;
+    _sideCutNormalOffsetVx = 0.0;
     if (!replacingGeneratedViews) {
         _currentCutManualRotation = cv::Matx33f::eye();
         _currentCutManualRotationActive = false;
@@ -922,7 +1099,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
             (void)modifiers;
             if (shiftScrollMode() == ShiftScrollMode::StraightNormal) {
-                return shiftCurrentCutPlaneStraightByScrollSteps(steps);
+                return shiftCurrentCutPlaneNormalOffsetByScrollSteps(steps);
             }
             return shiftCurrentLinePositionByScrollSteps(steps);
         });
@@ -974,9 +1151,11 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (!haveSideCutCamera && finitePoint(_generatedViews.focusPoint)) {
         sideViewer->centerOnVolumePoint(_generatedViews.focusPoint, false);
     }
+    sideViewer->setProperty("vc_show_custom_normal_offset", true);
+    sideViewer->setProperty("vc_custom_normal_offset_vx", _sideCutNormalOffsetVx);
     sideViewer->setShiftScrollOverride(
         [this](int steps, QPointF, Qt::KeyboardModifiers) {
-            return shiftCurrentLinePositionByScrollSteps(steps);
+            return shiftSideCutPlaneNormalOffsetByScrollSteps(steps);
         });
     bindPaneInteractions(views.sideCutName, sideViewer, false);
     connect(sideViewer,
@@ -1129,10 +1308,12 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 }
 
 LineAnnotationDialog::GeneratedControlPointContextResult
-LineAnnotationDialog::showGeneratedControlPointContextMenu(const std::string& surfaceName,
-                                                           CChunkedVolumeViewer* viewer,
-                                                           const QPointF& scenePoint,
-                                                           const QPoint& globalPos)
+LineAnnotationDialog::showGeneratedControlPointContextMenu(
+    const std::string& surfaceName,
+    CChunkedVolumeViewer* viewer,
+    const QPointF& scenePoint,
+    const QPoint& globalPos,
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState)
 {
     if (!viewer || !_hasGeneratedViews || _generatedViews.controlPoints.empty() ||
         _generatedViews.linePoints.empty()) {
@@ -1170,20 +1351,87 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(const std::string& su
     options.scenePoint = scenePoint;
     options.globalPos = globalPos;
     options.controlPoints = _generatedViews.controlPoints;
+    // On the cut viewers only plane-filtered X markers are drawn; restrict the
+    // hit-test candidates the same way so the menu never targets an invisible
+    // off-plane marker that happens to project near the click.
+    PlaneSurface* cutPlane = nullptr;
+    if (viewer == _currentCutViewer) {
+        cutPlane = _generatedViews.currentCutSurface.get();
+    } else if (viewer == _sideCutViewer) {
+        cutPlane = _generatedViews.sideCutSurface.get();
+    }
+    if (!cutPlane) {
+        options.fiberIntersections = _generatedViews.fiberIntersections;
+    } else if (const std::optional<float> intersectionThreshold =
+                   vc3d::line_annotation::generatedCrossSliceControlPointDistanceThreshold(
+                       viewer)) {
+        for (const auto& intersection : _generatedViews.fiberIntersections) {
+            if (!finitePoint(intersection.point)) {
+                continue;
+            }
+            const float distance = cutPlane->pointDist(intersection.point);
+            if (std::isfinite(distance) && std::abs(distance) <= *intersectionThreshold) {
+                options.fiberIntersections.push_back(intersection);
+            }
+        }
+    }
     options.linePointCount = _generatedViews.linePoints.size();
     options.linePosition = linePosition;
     options.stripViewer = stripViewer;
+    options.linkWithCandidateEnabled = linkCandidateState.enabled;
+    options.linkWithCandidateLabel = linkCandidateState.label;
+    options.branchLinkDirection = branchLinkDirectionForViewer(viewer, linePosition);
     options.deleteControlPoint = [this, surfaceName](double selectedLinePosition,
                                                      cv::Vec3f selectedPoint) {
         emit generatedControlPointDeleteRequested(surfaceName,
                                                   selectedLinePosition,
                                                   selectedPoint);
     };
-    options.addBranch = [this, surfaceName](size_t controlPointIndex) {
-        emit generatedControlPointBranchRequested(surfaceName, controlPointIndex);
+    options.addBranch = [this, surfaceName](size_t controlPointIndex,
+                                            cv::Vec3f linkedControlPoint,
+                                            bool openAfterCreate,
+                                            cv::Vec3f linkDirection) {
+        emit generatedControlPointBranchRequested(surfaceName,
+                                                  controlPointIndex,
+                                                  linkedControlPoint,
+                                                  openAfterCreate,
+                                                  linkDirection);
     };
     options.openBranch = [this](uint64_t branchFiberId, int branchControlPointIndex) {
         emit generatedControlPointBranchOpenRequested(branchFiberId, branchControlPointIndex);
+    };
+    options.designateLinkCandidate = [this, surfaceName](size_t controlPointIndex,
+                                                         cv::Vec3f volumePoint) {
+        emit generatedControlPointLinkCandidateRequested(surfaceName,
+                                                         controlPointIndex,
+                                                         volumePoint);
+    };
+    options.linkWithCandidate = [this, surfaceName](size_t controlPointIndex,
+                                                    cv::Vec3f volumePoint) {
+        emit generatedControlPointLinkWithCandidateRequested(surfaceName,
+                                                             controlPointIndex,
+                                                             volumePoint);
+    };
+    options.openNearbyAnnotation = [this](uint64_t fiberId, cv::Vec3f volumePoint) {
+        emit generatedNearbyAnnotationOpenRequested(fiberId, volumePoint);
+    };
+    options.unlinkBranch = [this, surfaceName](size_t controlPointIndex,
+                                               uint64_t branchFiberId,
+                                               int branchControlPointIndex) {
+        emit generatedControlPointUnlinkRequested(surfaceName,
+                                                  controlPointIndex,
+                                                  branchFiberId,
+                                                  branchControlPointIndex);
+    };
+    options.setBranchLinkPending = [this, surfaceName](size_t controlPointIndex,
+                                                       uint64_t branchFiberId,
+                                                       int branchControlPointIndex,
+                                                       bool pending) {
+        emit generatedControlPointLinkPendingChangeRequested(surfaceName,
+                                                             controlPointIndex,
+                                                             branchFiberId,
+                                                             branchControlPointIndex,
+                                                             pending);
     };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }
@@ -1263,7 +1511,10 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
         return;
     }
     if (currentChanged && _generatedViews.currentCutSurface) {
-        _currentCutStraightOffsetActive = false;
+        _currentCutNormalOffsetVx = 0.0;
+        if (_currentCutViewer) {
+            _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+        }
         _currentLinePosition = position;
         (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
         if (_currentCutViewer) {
@@ -1279,6 +1530,8 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
     }
     if (_generatedViews.sideCutSurface) {
         (void)updateSidePlaneSurface(_generatedViews.sideCutSurface.get(), _currentLinePosition);
+        (void)applyCutPlaneNormalOffset(_generatedViews.sideCutSurface.get(),
+                                        _sideCutNormalOffsetVx);
     }
     if (_sideCutViewer) {
         // Moving the cursor along the strips moves along the line, so keep the current position
@@ -1292,6 +1545,27 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
         }
     }
     rebuildGeneratedDynamicOverlays(updateCurrentCutOverlay, false);
+}
+
+bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
+{
+    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
+        return true;
+    }
+    const int sliceStepSize = _viewerManager
+        ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
+        : 1;
+    const double position = vc3d::line_annotation::shiftedLinePosition(
+        _currentLinePosition,
+        steps,
+        sliceStepSize,
+        static_cast<int>(_generatedViews.linePoints.size()));
+    _currentCutNormalOffsetVx = 0.0;
+    if (_currentCutViewer) {
+        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+    }
+    setCurrentLinePosition(position);
+    return true;
 }
 
 void LineAnnotationDialog::cancelControlPointPreviewAnimation()
@@ -1382,35 +1656,43 @@ void LineAnnotationDialog::previewClosestControlPoint()
     });
 }
 
-bool LineAnnotationDialog::shiftCurrentLinePositionByScrollSteps(int steps)
+bool LineAnnotationDialog::shiftCurrentCutPlaneNormalOffsetByScrollSteps(int steps)
 {
-    if (!_hasGeneratedViews || _generatedViews.linePoints.empty()) {
-        return true;
-    }
-    const int sliceStepSize = _viewerManager
-        ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
-        : 1;
-    const double position = vc3d::line_annotation::shiftedLinePosition(
-        _currentLinePosition,
-        steps,
-        sliceStepSize,
-        static_cast<int>(_generatedViews.linePoints.size()));
-    _currentCutStraightOffsetActive = false;
-    setCurrentLinePosition(position);
-    return true;
+    return shiftCutPlaneNormalOffsetByScrollSteps(_generatedViews.currentCutSurface.get(),
+                                                  _currentCutViewer,
+                                                  steps,
+                                                  _currentCutNormalOffsetVx,
+                                                  "line annotation current cut normal offset");
 }
 
-bool LineAnnotationDialog::shiftCurrentCutPlaneStraightByScrollSteps(int steps)
+bool LineAnnotationDialog::shiftSideCutPlaneNormalOffsetByScrollSteps(int steps)
 {
-    if (!_hasGeneratedViews || !_generatedViews.currentCutSurface) {
+    return shiftCutPlaneNormalOffsetByScrollSteps(_generatedViews.sideCutSurface.get(),
+                                                  _sideCutViewer,
+                                                  steps,
+                                                  _sideCutNormalOffsetVx,
+                                                  "line annotation side cut normal offset");
+}
+
+bool LineAnnotationDialog::shiftCutPlaneNormalOffsetByScrollSteps(PlaneSurface* plane,
+                                                                  CChunkedVolumeViewer* viewer,
+                                                                  int steps,
+                                                                  double& offsetVx,
+                                                                  const char* renderReason)
+{
+    if (!_hasGeneratedViews || !plane || steps == 0) {
         return true;
     }
-    auto* plane = _generatedViews.currentCutSurface.get();
     const int sliceStepSize = _viewerManager
         ? std::max(1, static_cast<int>(std::lround(_viewerManager->zScrollSensitivity())))
         : 1;
     const cv::Vec3f origin = plane->origin();
     const cv::Vec3f normal = plane->normal({0.0f, 0.0f, 0.0f});
+    const float normalNorm = cv::norm(normal);
+    if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
+        !std::isfinite(normal[2]) || normalNorm <= 1.0e-6f) {
+        return true;
+    }
     const cv::Vec3f shiftedOrigin =
         vc3d::line_annotation::shiftedPlaneOriginAlongNormal(origin,
                                                              normal,
@@ -1420,15 +1702,81 @@ bool LineAnnotationDialog::shiftCurrentCutPlaneStraightByScrollSteps(int steps)
         return true;
     }
     plane->setFromNormalAndUp(shiftedOrigin, normal, plane->basisY());
-    if (_currentCutViewer) {
-        _currentCutViewer->markSurfaceGeometryChanged();
+    offsetVx += static_cast<double>(steps) *
+                static_cast<double>(vc3d::line_annotation::shiftScrollLineStepSize(sliceStepSize));
+    if (!normalOffsetActive(offsetVx)) {
+        offsetVx = 0.0;
     }
-    _currentCutStraightOffsetActive = true;
-    if (_currentCutViewer) {
-        _currentCutViewer->renderVisible(true, "line annotation current cut straight shift");
+    if (viewer) {
+        viewer->setProperty("vc_custom_normal_offset_vx", offsetVx);
+        viewer->markSurfaceGeometryChanged();
+        viewer->renderVisible(true, renderReason);
     }
     rebuildGeneratedDynamicOverlays();
     return true;
+}
+
+bool LineAnnotationDialog::applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const
+{
+    if (!plane || !normalOffsetActive(offsetVx)) {
+        return true;
+    }
+    const cv::Vec3f normal = plane->normal({0.0f, 0.0f, 0.0f});
+    const float normalNorm = cv::norm(normal);
+    if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) ||
+        !std::isfinite(normal[2]) || normalNorm <= 1.0e-6f) {
+        return false;
+    }
+    plane->setFromNormalAndUp(plane->origin() +
+                                  normal * (static_cast<float>(offsetVx) / normalNorm),
+                              normal,
+                              plane->basisY());
+    return true;
+}
+
+void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+
+    bool changed = false;
+    const bool currentHadOffset = normalOffsetActive(_currentCutNormalOffsetVx);
+    const bool sideHadOffset = normalOffsetActive(_sideCutNormalOffsetVx);
+    _currentCutNormalOffsetVx = 0.0;
+    _sideCutNormalOffsetVx = 0.0;
+    if (_currentCutViewer) {
+        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+    }
+    if (_sideCutViewer) {
+        _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+    }
+
+    if (currentHadOffset && _generatedViews.currentCutSurface) {
+        if (updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition)) {
+            changed = true;
+            if (_currentCutViewer) {
+                _currentCutViewer->markSurfaceGeometryChanged();
+                if (forceRender) {
+                    _currentCutViewer->renderVisible(true, "line annotation current cut offset reset");
+                }
+            }
+        }
+    }
+    if (sideHadOffset && _generatedViews.sideCutSurface) {
+        if (updateSidePlaneSurface(_generatedViews.sideCutSurface.get(), _currentLinePosition)) {
+            changed = true;
+            if (_sideCutViewer) {
+                _sideCutViewer->markSurfaceGeometryChanged();
+                if (forceRender) {
+                    _sideCutViewer->renderVisible(true, "line annotation side cut offset reset");
+                }
+            }
+        }
+    }
+    if (changed) {
+        rebuildGeneratedDynamicOverlays();
+    }
 }
 
 void LineAnnotationDialog::handleShiftScrollModeChanged()
@@ -1436,14 +1784,21 @@ void LineAnnotationDialog::handleShiftScrollModeChanged()
     if (shiftScrollMode() != ShiftScrollMode::AlongLine) {
         return;
     }
+
+    const bool wasFollowing = _currentCutFollowsStripMouse;
     setCurrentCutFollowsStripMouse(true);
-    if (!_hasGeneratedViews || !_generatedViews.currentCutSurface) {
+    if (!wasFollowing) {
         return;
     }
-    if (!_currentCutStraightOffsetActive) {
+
+    const bool currentHadOffset = normalOffsetActive(_currentCutNormalOffsetVx);
+    _currentCutNormalOffsetVx = 0.0;
+    if (_currentCutViewer) {
+        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+    }
+    if (!currentHadOffset || !_generatedViews.currentCutSurface) {
         return;
     }
-    _currentCutStraightOffsetActive = false;
     if (!updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition)) {
         return;
     }
@@ -1454,9 +1809,53 @@ void LineAnnotationDialog::handleShiftScrollModeChanged()
     rebuildGeneratedDynamicOverlays();
 }
 
+void LineAnnotationDialog::setCutFollowEnabled(bool enabled)
+{
+    // Programmatic twin of the private toggle.
+    setCurrentCutFollowsStripMouse(enabled);
+}
+
 void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
 {
+    const bool wasFollowing = _currentCutFollowsStripMouse;
     _currentCutFollowsStripMouse = follows;
+    if (follows && !wasFollowing) {
+        resetGeneratedCutNormalOffsets(true);
+    }
+}
+
+void LineAnnotationDialog::requestGeneratedSideStripIntersections()
+{
+    if (_closing || !_hasGeneratedViews || !_generatedViews.lineSideSlice) {
+        return;
+    }
+    emit generatedSideStripIntersectionQueryRequested(_generatedViews.lineSideSliceName);
+}
+
+cv::Vec3f LineAnnotationDialog::branchLinkDirectionForViewer(CChunkedVolumeViewer* viewer,
+                                                             double linePosition) const
+{
+    if (!_hasGeneratedViews || !viewer) {
+        return normalizedOrNan({0.0f, 0.0f, 0.0f});
+    }
+    if (viewer == _sideCutViewer && _generatedViews.sideCutSurface) {
+        return normalizedOrNan(
+            _generatedViews.sideCutSurface->normal({0.0f, 0.0f, 0.0f}));
+    }
+    if (viewer == _currentCutViewer && _generatedViews.currentCutSurface) {
+        return normalizedOrNan(
+            _generatedViews.currentCutSurface->normal({0.0f, 0.0f, 0.0f}));
+    }
+    if (std::any_of(_stripViewers.begin(),
+                    _stripViewers.end(),
+                    [viewer](const QPointer<CChunkedVolumeViewer>& candidate) {
+                        return candidate == viewer;
+                    }) &&
+        _generatedViews.sideCutSurface) {
+        return normalizedOrNan(
+            _generatedViews.sideCutSurface->normal({0.0f, 0.0f, 0.0f}));
+    }
+    return normalizedOrNan(interpolatedLineTangent(linePosition));
 }
 
 bool LineAnnotationDialog::controlPointPlacementAllowedAt(double linePosition) const
@@ -1602,17 +2001,22 @@ void LineAnnotationDialog::resetGeneratedViews()
                                       static_cast<double>(_generatedViews.linePoints.size() - 1));
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
-    _currentCutStraightOffsetActive = false;
+    _currentCutNormalOffsetVx = 0.0;
+    _sideCutNormalOffsetVx = 0.0;
     _currentCutFollowsStripMouse = true;
 
     if (_generatedViews.currentCutSurface) {
         (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
         if (_currentCutViewer) {
+            _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
             _currentCutViewer->markSurfaceGeometryChanged();
         }
     }
     if (_generatedViews.sideCutSurface) {
         (void)updateSidePlaneSurface(_generatedViews.sideCutSurface.get(), _currentLinePosition);
+        if (_sideCutViewer) {
+            _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+        }
     }
     restoreInitialGeneratedViewerCameras();
     if (_currentCutViewer) {
@@ -1666,11 +2070,10 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
     if (!kGeneratedLineAnnotationOverlaysEnabled) {
         return;
     }
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
 
-    const GeneratedOverlay strip = staticStripOverlay();
     for (size_t i = 0; i < _stripViewers.size(); ++i) {
         auto* viewer = _stripViewers[i].data();
         if (!viewer) {
@@ -1678,6 +2081,10 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         }
         const std::string key = i == 0 ? _generatedViews.lineSurfaceName
                                        : _generatedViews.lineSideSliceName;
+        GeneratedOverlay strip = staticStripOverlay();
+        if (i == 1) {
+            strip.fiberIntersections = _generatedViews.fiberIntersections;
+        }
         applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
     }
 
@@ -1695,7 +2102,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     if (!kGeneratedLineAnnotationOverlaysEnabled) {
         return;
     }
-    if (!_hasGeneratedViews) {
+    if (_closing || !_hasGeneratedViews) {
         return;
     }
 
@@ -1910,7 +2317,9 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             sideOverlay.pointMarker = currentPoint;
             sideOverlay.emphasizedPointMarker = true;
         }
-        applyOverlayForViewer("line-z-slice-side", _sideCutViewer, sideOverlay);
+        applyOverlayForViewer(dynamicStripOverlayKey(_generatedViews.sideCutName),
+                              _sideCutViewer,
+                              sideOverlay);
     }
 
     if (!updateCurrentCutOverlay || !_currentCutViewer) {
@@ -1921,7 +2330,15 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     if (_fastCurrentCutOverlayItems.viewer != viewer ||
         !_fastCurrentCutOverlayItems.centerPoint ||
         !_fastCurrentCutOverlayItems.controlPoints ||
-        !_fastCurrentCutOverlayItems.seedPoints) {
+        !_fastCurrentCutOverlayItems.seedPoints ||
+        !_fastCurrentCutOverlayItems.linkCandidatePoints ||
+        !_fastCurrentCutOverlayItems.branchControlPoints ||
+        !_fastCurrentCutOverlayItems.pendingBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.fiberIntersections ||
+        !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
+        !_fastCurrentCutOverlayItems.branchLinkFiberIntersections ||
+        !_fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections ||
+        !_fastCurrentCutOverlayItems.fiberIntersectionConnectors) {
         viewer->clearOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey);
         _fastCurrentCutOverlayItems = {};
         _fastCurrentCutOverlayItems.viewer = viewer;
@@ -1948,14 +2365,91 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.seedPoints->setBrush(controlBrush);
         _fastCurrentCutOverlayItems.seedPoints->setZValue(161.0);
 
+        QPen linkCandidatePen(QColor(60, 235, 120, 245));
+        linkCandidatePen.setWidthF(2.0);
+        QBrush linkCandidateBrush(QColor(60, 235, 120, 175));
+        _fastCurrentCutOverlayItems.linkCandidatePoints = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.linkCandidatePoints->setPen(linkCandidatePen);
+        _fastCurrentCutOverlayItems.linkCandidatePoints->setBrush(linkCandidateBrush);
+        _fastCurrentCutOverlayItems.linkCandidatePoints->setZValue(163.0);
+
+        QPen branchControlPen(QColor(210, 95, 255, 245));
+        branchControlPen.setWidthF(2.0);
+        QBrush branchControlBrush(QColor(210, 95, 255, 175));
+        _fastCurrentCutOverlayItems.branchControlPoints = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.branchControlPoints->setPen(branchControlPen);
+        _fastCurrentCutOverlayItems.branchControlPoints->setBrush(branchControlBrush);
+        _fastCurrentCutOverlayItems.branchControlPoints->setZValue(162.0);
+
+        QPen pendingBranchControlPen(QColor(80, 150, 255, 245));
+        pendingBranchControlPen.setWidthF(2.0);
+        QBrush pendingBranchControlBrush(QColor(80, 150, 255, 175));
+        _fastCurrentCutOverlayItems.pendingBranchControlPoints = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.pendingBranchControlPoints->setPen(pendingBranchControlPen);
+        _fastCurrentCutOverlayItems.pendingBranchControlPoints->setBrush(
+            pendingBranchControlBrush);
+        _fastCurrentCutOverlayItems.pendingBranchControlPoints->setZValue(162.5);
+
+        QPen fiberIntersectionPen(QColor(255, 245, 75, 245));
+        fiberIntersectionPen.setWidthF(1.25);
+        fiberIntersectionPen.setCapStyle(Qt::FlatCap);
+        _fastCurrentCutOverlayItems.fiberIntersections = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.fiberIntersections->setPen(fiberIntersectionPen);
+        _fastCurrentCutOverlayItems.fiberIntersections->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.fiberIntersections->setZValue(168.0);
+
+        QPen linkCandidateFiberIntersectionPen(QColor(60, 235, 120, 245));
+        linkCandidateFiberIntersectionPen.setWidthF(1.75);
+        linkCandidateFiberIntersectionPen.setCapStyle(Qt::FlatCap);
+        _fastCurrentCutOverlayItems.linkCandidateFiberIntersections = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.linkCandidateFiberIntersections->setPen(
+            linkCandidateFiberIntersectionPen);
+        _fastCurrentCutOverlayItems.linkCandidateFiberIntersections->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.linkCandidateFiberIntersections->setZValue(168.5);
+
+        QPen branchLinkFiberIntersectionPen(QColor(210, 95, 255, 245));
+        branchLinkFiberIntersectionPen.setWidthF(1.75);
+        branchLinkFiberIntersectionPen.setCapStyle(Qt::FlatCap);
+        _fastCurrentCutOverlayItems.branchLinkFiberIntersections = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setPen(
+            branchLinkFiberIntersectionPen);
+        _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setZValue(168.25);
+
+        QPen pendingBranchLinkFiberIntersectionPen(QColor(80, 150, 255, 245));
+        pendingBranchLinkFiberIntersectionPen.setWidthF(1.75);
+        pendingBranchLinkFiberIntersectionPen.setCapStyle(Qt::FlatCap);
+        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections =
+            new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setPen(
+            pendingBranchLinkFiberIntersectionPen);
+        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setZValue(168.3);
+
+        QPen fiberIntersectionConnectorPen(QColor(255, 60, 180, 225));
+        fiberIntersectionConnectorPen.setWidthF(1.4);
+        _fastCurrentCutOverlayItems.fiberIntersectionConnectors = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setPen(
+            fiberIntersectionConnectorPen);
+        _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setBrush(Qt::NoBrush);
+        _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setZValue(164.0);
+
         viewer->setOverlayGroup(kGeneratedDynamicCurrentCutOverlayKey,
                                 {_fastCurrentCutOverlayItems.centerPoint,
                                  _fastCurrentCutOverlayItems.controlPoints,
-                                 _fastCurrentCutOverlayItems.seedPoints});
+                                 _fastCurrentCutOverlayItems.seedPoints,
+                                 _fastCurrentCutOverlayItems.linkCandidatePoints,
+                                 _fastCurrentCutOverlayItems.branchControlPoints,
+                                 _fastCurrentCutOverlayItems.pendingBranchControlPoints,
+                                 _fastCurrentCutOverlayItems.fiberIntersections,
+                                 _fastCurrentCutOverlayItems.linkCandidateFiberIntersections,
+                                 _fastCurrentCutOverlayItems.branchLinkFiberIntersections,
+                                 _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections,
+                                 _fastCurrentCutOverlayItems.fiberIntersectionConnectors});
     }
 
     QPointF centerScenePoint;
-    if (_currentCutStraightOffsetActive) {
+    if (normalOffsetActive(_currentCutNormalOffsetVx)) {
         centerScenePoint = viewer->volumeToScene(interpolatedLinePoint(_currentLinePosition));
     } else {
         centerScenePoint = viewer->surfaceCoordsToScene(0.0f, 0.0f);
@@ -1968,6 +2462,9 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
 
     QPainterPath controlPath;
     QPainterPath seedPath;
+    QPainterPath linkCandidatePath;
+    QPainterPath branchControlPath;
+    QPainterPath pendingBranchControlPath;
     const double lineRadius =
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
     const double lower = _currentLinePosition - lineRadius;
@@ -2002,7 +2499,14 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
             continue;
         }
-        if (control.isSeed) {
+        if (control.isLinkCandidate) {
+            linkCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
+                                         control.isSeed ? 11.0 : 10.0);
+        } else if (control.hasPendingLinks) {
+            pendingBranchControlPath.addEllipse(scenePoint, 12.0, 12.0);
+        } else if (control.hasBranches) {
+            branchControlPath.addEllipse(scenePoint, 12.0, 12.0);
+        } else if (control.isSeed) {
             seedPath.addEllipse(scenePoint, 11.0, 11.0);
         } else {
             controlPath.addEllipse(scenePoint, 10.0, 10.0);
@@ -2010,6 +2514,64 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     }
     _fastCurrentCutOverlayItems.controlPoints->setPath(controlPath);
     _fastCurrentCutOverlayItems.seedPoints->setPath(seedPath);
+    _fastCurrentCutOverlayItems.linkCandidatePoints->setPath(linkCandidatePath);
+    _fastCurrentCutOverlayItems.branchControlPoints->setPath(branchControlPath);
+    _fastCurrentCutOverlayItems.pendingBranchControlPoints->setPath(pendingBranchControlPath);
+
+    QPainterPath fiberIntersectionPath;
+    QPainterPath linkCandidateFiberIntersectionPath;
+    QPainterPath branchLinkFiberIntersectionPath;
+    QPainterPath pendingBranchLinkFiberIntersectionPath;
+    QPainterPath fiberIntersectionConnectorPath;
+    auto* currentCutPlane = _generatedViews.currentCutSurface.get();
+    const std::optional<float> intersectionThreshold =
+        (currentCutPlane && !_generatedViews.fiberIntersections.empty())
+            ? vc3d::line_annotation::generatedCrossSliceControlPointDistanceThreshold(viewer)
+            : std::nullopt;
+    if (intersectionThreshold) {
+        constexpr qreal kIntersectionArm = 7.5;
+        for (const auto& intersection : _generatedViews.fiberIntersections) {
+            if (!finitePoint(intersection.point)) {
+                continue;
+            }
+            const float distance = currentCutPlane->pointDist(intersection.point);
+            if (!std::isfinite(distance) || std::abs(distance) > *intersectionThreshold) {
+                continue;
+            }
+            const QPointF scenePoint = viewer->volumeToScene(intersection.point);
+            if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
+                continue;
+            }
+            if (intersection.connectorStart && finitePoint(*intersection.connectorStart)) {
+                const QPointF connectorScene =
+                    viewer->volumeToScene(*intersection.connectorStart);
+                if (std::isfinite(connectorScene.x()) && std::isfinite(connectorScene.y())) {
+                    fiberIntersectionConnectorPath.moveTo(connectorScene);
+                    fiberIntersectionConnectorPath.lineTo(scenePoint);
+                }
+            }
+            QPainterPath& path = intersection.isLinkCandidateFiber
+                ? linkCandidateFiberIntersectionPath
+                : (intersection.projectedBranchLink
+                       ? (intersection.pendingBranchLink
+                              ? pendingBranchLinkFiberIntersectionPath
+                              : branchLinkFiberIntersectionPath)
+                       : fiberIntersectionPath);
+            path.moveTo(scenePoint + QPointF(-kIntersectionArm, -kIntersectionArm));
+            path.lineTo(scenePoint + QPointF(kIntersectionArm, kIntersectionArm));
+            path.moveTo(scenePoint + QPointF(-kIntersectionArm, kIntersectionArm));
+            path.lineTo(scenePoint + QPointF(kIntersectionArm, -kIntersectionArm));
+        }
+    }
+    _fastCurrentCutOverlayItems.fiberIntersections->setPath(fiberIntersectionPath);
+    _fastCurrentCutOverlayItems.linkCandidateFiberIntersections->setPath(
+        linkCandidateFiberIntersectionPath);
+    _fastCurrentCutOverlayItems.branchLinkFiberIntersections->setPath(
+        branchLinkFiberIntersectionPath);
+    _fastCurrentCutOverlayItems.pendingBranchLinkFiberIntersections->setPath(
+        pendingBranchLinkFiberIntersectionPath);
+    _fastCurrentCutOverlayItems.fiberIntersectionConnectors->setPath(
+        fiberIntersectionConnectorPath);
 }
 
 void LineAnnotationDialog::rebuildGeneratedDynamicOverlays(bool updateCurrentCutOverlay,
@@ -2018,10 +2580,16 @@ void LineAnnotationDialog::rebuildGeneratedDynamicOverlays(bool updateCurrentCut
     updateGeneratedDynamicOverlaysFast(updateCurrentCutOverlay, updateSpanLabels);
 }
 
-void LineAnnotationDialog::rebuildGeneratedOverlays()
+void LineAnnotationDialog::rebuildGeneratedOverlays(bool requestSideStripIntersections)
 {
+    if (_closing) {
+        return;
+    }
     rebuildGeneratedStaticStripOverlays();
     rebuildGeneratedDynamicOverlays();
+    if (requestSideStripIntersections) {
+        requestGeneratedSideStripIntersections();
+    }
 }
 
 cv::Vec3f LineAnnotationDialog::interpolatedLinePoint(double linePosition) const
@@ -2293,22 +2861,11 @@ void LineAnnotationDialog::resizeEvent(QResizeEvent* event)
 {
     QMainWindow::resizeEvent(event);
     updateOptimizationOverlayGeometry();
+    updateFiberNameLabel();
 }
 
 bool LineAnnotationDialog::toggleCurrentCutFollowFromKeyboard()
 {
-    if (shiftScrollMode() == ShiftScrollMode::StraightNormal &&
-        _currentCutStraightOffsetActive) {
-        _currentCutStraightOffsetActive = false;
-        _currentCutManualRotation = cv::Matx33f::eye();
-        _currentCutManualRotationActive = false;
-        (void)updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition);
-        if (_currentCutViewer) {
-            _currentCutViewer->markSurfaceGeometryChanged();
-            _currentCutViewer->renderVisible(true, "line annotation current cut snap to line");
-        }
-        rebuildGeneratedDynamicOverlays();
-    }
     if (_currentCutFollowsStripMouse) {
         setCurrentLinePosition(snappedControlPointPosition(_currentLinePosition));
         setCurrentCutFollowsStripMouse(false);
@@ -2351,6 +2908,9 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
 
 bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
+    if (watched == _fiberNameLabel && event->type() == QEvent::Resize) {
+        updateFiberNameLabel();
+    }
     if (event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
         if (handleKeyPress(keyEvent)) {
@@ -2369,6 +2929,26 @@ void LineAnnotationDialog::updateOptimizationOverlayGeometry()
     if (_optimizationOverlay->isVisible()) {
         _optimizationOverlay->raise();
     }
+}
+
+void LineAnnotationDialog::updateFiberNameLabel()
+{
+    if (!_fiberNameLabel) {
+        return;
+    }
+
+    const QString fullName = _fiberDisplayName.trimmed();
+    if (fullName.isEmpty()) {
+        _fiberNameLabel->clear();
+        _fiberNameLabel->setToolTip(QString());
+        return;
+    }
+
+    _fiberNameLabel->setText(vc3d::adaptFiberNameToWidth(
+        fullName,
+        _fiberNameLabel->fontMetrics(),
+        _fiberNameLabel->contentsRect().width()));
+    _fiberNameLabel->setToolTip(fullName);
 }
 
 void LineAnnotationDialog::restoreWindowGeometry()

@@ -102,7 +102,7 @@ int main(int argc, char *argv[])
               << ", " << chunk_cache->chunkShape(renderLevel)[1]
               << ", " << chunk_cache->chunkShape(renderLevel)[2] << "]" << std::endl;
 
-    cv::VideoWriter vid(tgt_fn, cv::VideoWriter::fourcc('H','F','Y','U'), 5, tgt_size);
+    cv::VideoWriter vid(tgt_fn.string(), cv::VideoWriter::fourcc('H','F','Y','U'), 5, tgt_size);
 
     for(auto &path : seg_dirs) {
         std::unique_ptr<QuadSurface> surf;

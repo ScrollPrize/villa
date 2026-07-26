@@ -12,6 +12,11 @@
 
 namespace vc::core::util {
 
+    // Marker file inside a normal-grid directory that turns it into a streaming
+    // cache: {"url": "<https prefix>"}. Grid files missing locally are fetched
+    // from the URL on demand and stored alongside the marker.
+    inline constexpr const char* kNormalGridsRemoteMarker = "normal-grids-remote.json";
+
     class NormalGridVolume {
     public:
         struct CacheStats {

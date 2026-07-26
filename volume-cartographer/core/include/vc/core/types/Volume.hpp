@@ -97,6 +97,7 @@ public:
     void writeMetadata(const utils::Json& metadata);
     void updateMetadata(const utils::Json& metadata);
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
+    [[nodiscard]] const std::string& remoteLocator() const noexcept { return remoteLocator_; }
     [[nodiscard]] const vc::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
     [[nodiscard]] std::filesystem::path remoteCacheRoot() const noexcept { return remoteCacheRoot_; }
     [[nodiscard]] std::filesystem::path remotePersistentCachePath() const;
@@ -120,7 +121,11 @@ public:
     [[nodiscard]] double fillValue() const noexcept { return zarrFillValue_; }
 
     [[nodiscard]] size_t numScales() const noexcept;
-    [[nodiscard]] int baseScaleLevel() const noexcept { return 0; }
+    [[nodiscard]] int baseScaleLevel() const noexcept { return baseScaleLevel_; }
+    [[nodiscard]] bool hasExplicitVoxelSizeOverride() const noexcept
+    {
+        return hasExplicitVoxelSizeOverride_;
+    }
     [[nodiscard]] bool hasScaleLevel(int level) const noexcept;
     [[nodiscard]] std::vector<int> presentScaleLevels() const;
     [[nodiscard]] int firstPresentScaleLevel() const;
@@ -140,11 +145,21 @@ public:
     // --- Cache management ---
 
     [[nodiscard]] vc::render::IChunkedArray* chunkedCache();
+    [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> sharedChunkCache();
     [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createChunkCache(
         vc::render::ChunkCache::Options options) const;
 
-    // Set cache budget for the chunked sampling cache.
-    void setCacheBudget(size_t hotBytes);
+    // Set the local safety ceiling and optional process-wide decoded budget
+    // for the single cache shared by volume sampling and viewers.
+    void setCacheBudget(
+        size_t hotBytes,
+        std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget = {});
+
+    // CState clients keep a shared Volume active across workspaces. The final
+    // release invalidates and drops its cache even if the Volume object itself
+    // remains retained by a VolumePkg.
+    void retainCacheClient();
+    void releaseCacheClient();
 
     // Set the number of background IO threads for chunk fetching.
     void setIOThreads(int count);
@@ -273,6 +288,8 @@ protected:
     mutable std::shared_ptr<vc::render::ChunkCache> chunkedCache_;
     mutable std::mutex cacheMutex_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget_;
+    std::size_t cacheClientCount_ = 0;
     int ioThreads_ = 0;  // 0 = use default
 
     // Per-level read-side ZarrArray cache. Avoids reparsing .zarray/zarr.json
@@ -282,12 +299,17 @@ protected:
     mutable std::vector<std::shared_ptr<utils::ZarrArray>> readArrayCache_;
     mutable std::mutex readArrayCacheMutex_;
     std::shared_ptr<utils::ZarrArray> cachedZarrArrayForRead(int level) const;
+    std::shared_ptr<vc::render::ChunkCache> createChunkCacheConfigured(
+        vc::render::ChunkCache::Options options) const;
 
     void loadMetadata();
 
     // Remote volume state
     bool isRemote_ = false;
     std::string remoteUrl_;
+    std::string remoteLocator_;
+    int baseScaleLevel_ = 0;
+    bool hasExplicitVoxelSizeOverride_ = false;
     vc::HttpAuth remoteAuth_;
     std::filesystem::path remoteCacheRoot_;
     size_t remoteNumScales_ = 0;

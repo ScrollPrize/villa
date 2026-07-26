@@ -1,9 +1,11 @@
 #include "MenuActionController.hpp"
 
+#include "VolumeAttachmentController.hpp"
 #include "VCSettings.hpp"
 #include "UnifiedBrowserDialog.hpp"
 #include "OpenDataCatalogWindow.hpp"
 #include "OpenDataSampleProject.hpp"
+#include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
@@ -23,7 +25,6 @@
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/LoadJson.hpp"
-#include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/core/types/Segmentation.hpp"
 
@@ -31,7 +32,6 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QFutureWatcher>
-#include <QUnhandledException>
 #include <QInputDialog>
 #include <QtConcurrent>
 #include <QDateTime>
@@ -78,22 +78,29 @@
 namespace
 {
 constexpr int kMaxStoredRemoteUrls = 10;
-QString extractExceptionMessage(const std::exception& e);
 bool isAuthError(const QString& msg);
 
-struct OpenDataOpenTaskResult {
+} // namespace
+
+// Kept local so the QtConcurrent result type does not leak into the header.
+struct MenuActionController::OpenDataOpenTaskResult {
     std::shared_ptr<VolumePkg> pkg;
     vc3d::opendata::OpenDataSampleProjectResult result;
     QString error;
+    QString sampleId;
+    qint64 tifxyzSegmentCount{0};
 };
-
-} // namespace
 
 MenuActionController::MenuActionController(CWindow* window)
     : QObject(window)
     , _window(window)
 {
     _recentActs.fill(nullptr);
+}
+
+MenuActionController::~MenuActionController()
+{
+    cancelOpenDataVolumePrefills();
 }
 
 void MenuActionController::populateMenus(QMenuBar* menuBar)
@@ -179,6 +186,11 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_mergePatchAct, &QAction::triggered,
             this, &MenuActionController::mergePatchFromMenuRequested);
 
+    _materializeOpenDataFolderAct = new QAction(
+        QObject::tr("Create/Fetch All Segments for Current Folder"), this);
+    connect(_materializeOpenDataFolderAct, &QAction::triggered, this,
+            &MenuActionController::materializeCurrentOpenDataSegmentFolder);
+
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_newProjectAct);
@@ -216,6 +228,8 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     _actionsMenu = new QMenu(QObject::tr("&Actions"), qWindow);
     _actionsMenu->addAction(_drawBBoxAct);
+    _actionsMenu->addSeparator();
+    _actionsMenu->addAction(_materializeOpenDataFolderAct);
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
     _actionsMenu->addAction(_mergePatchAct);
@@ -350,7 +364,6 @@ void MenuActionController::openVolpkg()
         if (!runLegacyVolpkgConvert(file, &converted)) return;
         file = converted;
     }
-    _window->CloseVolume();
     _window->OpenVolume(file);
     _window->UpdateView();
 }
@@ -364,22 +377,24 @@ void MenuActionController::openRecentVolpkg()
     if (auto* action = qobject_cast<QAction*>(sender())) {
         const QString path = action->data().toString();
         if (!path.isEmpty()) {
-            _window->CloseVolume();
             _window->OpenVolume(path);
             _window->UpdateView();
         }
     }
 }
 
-void MenuActionController::openVolpkgAt(const QString& path)
+bool MenuActionController::openVolpkgAt(const QString& path,
+                                        bool interactive,
+                                        QString* errorMessage)
 {
     if (!_window) {
-        return;
+        if (errorMessage) {
+            *errorMessage = QObject::tr("Main window is not available.");
+        }
+        return false;
     }
 
-    _window->CloseVolume();
-    _window->OpenVolume(path);
-    _window->UpdateView();
+    return _window->openVolumePackage(path, interactive, errorMessage);
 }
 
 // --- Remote recents management ---
@@ -476,13 +491,68 @@ bool MenuActionController::isOpenDataCatalogVisible() const
     return _openDataCatalogDialog && _openDataCatalogDialog->isVisible();
 }
 
-bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample)
+bool MenuActionController::openOpenDataSampleById(const QString& sampleId, bool interactive)
 {
-    if (!_window || !_window->_state) {
+    if (!_window || sampleId.isEmpty()) {
         return false;
     }
 
-    if (_window->_state->vpkg()) {
+    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    if (!manifest) {
+        return false;
+    }
+
+    const vc3d::opendata::OpenDataSample* sample =
+        manifest->findSample(sampleId.toStdString());
+    if (!sample) {
+        return false;
+    }
+
+    return openOpenDataSample(*sample, interactive);
+}
+
+bool MenuActionController::openOpenDataSampleById(
+    const QString& sampleId,
+    const OpenDataSampleOpenOptions& options,
+    QString* errorMessage,
+    vc3d::opendata::OpenDataSampleProjectResult* resultOut)
+{
+    if (!_window || sampleId.isEmpty()) {
+        if (errorMessage) *errorMessage = QObject::tr("No sample id provided.");
+        return false;
+    }
+
+    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    if (!manifest) {
+        if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
+        return false;
+    }
+
+    const vc3d::opendata::OpenDataSample* sample =
+        manifest->findSample(sampleId.toStdString());
+    if (!sample) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("Unknown sample id: %1").arg(sampleId);
+        return false;
+    }
+
+    return openOpenDataSample(*sample, options.interactive, &options.selection,
+                              errorMessage, resultOut);
+}
+
+bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
+                                             bool interactive,
+                                             const vc3d::opendata::OpenDataResourceSelection* selection,
+                                             QString* errorMessage,
+                                             vc3d::opendata::OpenDataSampleProjectResult* resultOut)
+{
+    if (!_window || !_window->_state) {
+        if (errorMessage) *errorMessage = QObject::tr("No application window available.");
+        return false;
+    }
+
+    // Only interactive callers ask before replacing the current project.
+    if (interactive && _window->_state->vpkg()) {
         QMessageBox prompt(_window);
         prompt.setWindowTitle(QObject::tr("Open Data Sample"));
         prompt.setText(QObject::tr("Open sample %1").arg(QString::fromStdString(sample.id)));
@@ -498,12 +568,94 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         }
     }
 
+    // Do not interleave CloseVolume/setVpkg from overlapping opens. Only this
+    // interactive wrapper waits through a nested event loop.
+    if (_openDataSampleOpenInFlight) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("An Open Data sample open is already in progress.");
+        return false;
+    }
+
+    OpenDataSampleOpenOutcome outcome;
+    QEventLoop loop;
+    beginOpenDataSampleOpenTask(
+        sample, interactive, selection,
+        [&outcome, &loop](const OpenDataSampleOpenOutcome& o) {
+            outcome = o;
+            loop.quit();
+        },
+        {});
+    loop.exec(QEventLoop::ExcludeUserInputEvents);
+
+    if (errorMessage && !outcome.success) *errorMessage = outcome.error;
+    if (resultOut && outcome.success) *resultOut = outcome.result;
+    return outcome.success;
+}
+
+bool MenuActionController::startOpenDataSampleOpen(
+    const QString& sampleId,
+    const OpenDataSampleOpenOptions& options,
+    std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
+    std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress,
+    QString* errorMessage)
+{
+    if (!_window || !_window->_state) {
+        if (errorMessage) *errorMessage = QObject::tr("No application window available.");
+        return false;
+    }
+    if (sampleId.isEmpty()) {
+        if (errorMessage) *errorMessage = QObject::tr("No sample id provided.");
+        return false;
+    }
+    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    if (!manifest) {
+        if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
+        return false;
+    }
+    const vc3d::opendata::OpenDataSample* sample =
+        manifest->findSample(sampleId.toStdString());
+    if (!sample) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("Unknown sample id: %1").arg(sampleId);
+        return false;
+    }
+    if (_openDataSampleOpenInFlight) {
+        if (errorMessage)
+            *errorMessage = QObject::tr("An Open Data sample open is already in progress.");
+        return false;
+    }
+
+    // This entry point is always non-interactive. Completion is delivered
+    // through onFinished on the GUI thread.
+    beginOpenDataSampleOpenTask(*sample, /*interactive=*/false, &options.selection,
+                                std::move(onFinished), std::move(onProgress));
+    return true;
+}
+
+bool MenuActionController::openDataSampleOpenInFlight() const
+{
+    return _openDataSampleOpenInFlight;
+}
+
+void MenuActionController::beginOpenDataSampleOpenTask(
+    const vc3d::opendata::OpenDataSample& sample,
+    bool interactive,
+    const vc3d::opendata::OpenDataResourceSelection* selection,
+    std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
+    std::function<void(const vc3d::opendata::OpenDataSampleDownloadProgress&)> onProgress)
+{
     const QString cacheDir = vc3d::remoteCachePath();
     const vc3d::opendata::OpenDataSample sampleCopy = sample;
+    // Copy the selection by value so the worker thread never dereferences a
+    // caller-owned pointer; a null selection means attach everything.
+    const bool hasSelection = selection != nullptr;
+    const vc3d::opendata::OpenDataResourceSelection selectionCopy =
+        selection ? *selection : vc3d::opendata::OpenDataResourceSelection{};
+    cancelOpenDataVolumePrefills();
     _window->CloseVolume();
 
     QPointer<QProgressDialog> progressDialog;
-    if (sampleCopy.tifxyzSegmentCount() > 0) {
+    if (interactive && sampleCopy.tifxyzSegmentCount() > 0) {
         auto* dialog = new QProgressDialog(
             QObject::tr("Preparing segment downloads..."),
             QString(),
@@ -520,8 +672,22 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
         progressDialog = dialog;
     }
 
+    // Forward one progress stream to the optional dialog and callback. Both
+    // updates are marshalled to the GUI thread and guarded for object lifetime.
+    QPointer<MenuActionController> self(this);
     auto progressCallback =
-        [progressDialog](const vc3d::opendata::OpenDataSampleDownloadProgress& progress) {
+        [progressDialog, self, onProgress](
+            const vc3d::opendata::OpenDataSampleDownloadProgress& progress) {
+            if (onProgress) {
+                QMetaObject::invokeMethod(
+                    qApp,
+                    [self, onProgress, progress]() {
+                        if (self && onProgress) {
+                            onProgress(progress);
+                        }
+                    },
+                    Qt::QueuedConnection);
+            }
             if (!progressDialog) {
                 return;
             }
@@ -536,7 +702,21 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
                     const QString file = QString::fromStdString(progress.fileName);
                     const QString status = QString::fromStdString(progress.status);
                     const bool transforming = status.startsWith(QStringLiteral("transform-"));
-                    QString label = transforming
+                    const bool preparing = status.startsWith(
+                        QStringLiteral("placeholder"));
+                    const bool resolvingVolumes =
+                        status == QStringLiteral("resolving-volumes");
+                    const bool projectReady =
+                        status == QStringLiteral("project-ready");
+                    QString label = resolvingVolumes
+                        ? QObject::tr("Opening remote volumes in parallel...")
+                        : projectReady
+                        ? QObject::tr("Open-data project is ready.")
+                        : preparing
+                        ? QObject::tr("Preparing segment metadata: %1/%2 representations.")
+                              .arg(progress.completedSegments)
+                              .arg(progress.totalSegments)
+                        : transforming
                         ? QObject::tr("Transforming segments with %1 worker(s): %2/%3 transforms.")
                               .arg(progress.totalWorkers)
                               .arg(totalDone)
@@ -547,39 +727,79 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
                               .arg(progress.totalSegments)
                               .arg(progress.completedFiles)
                               .arg(progress.totalFiles);
-                    if (!segment.isEmpty() && !file.isEmpty()) {
+                    if (!resolvingVolumes && !projectReady &&
+                        !segment.isEmpty() && !file.isEmpty()) {
                         label += transforming
                             ? QObject::tr("\n%1 -> %2").arg(segment, file)
                             : QObject::tr("\n%1: %2").arg(segment, file);
-                    } else if (!segment.isEmpty()) {
+                    } else if (!resolvingVolumes && !projectReady &&
+                               !segment.isEmpty()) {
                         label += QObject::tr("\n%1").arg(segment);
                     }
                     if (progress.failedSegments > 0) {
                         label += QObject::tr("\nFailures: %1").arg(progress.failedSegments);
                     }
-                    progressDialog->setMaximum(std::max(progress.totalFiles, 1));
-                    progressDialog->setValue(std::min(progress.completedFiles,
-                                                      std::max(progress.totalFiles, 1)));
+                    if (resolvingVolumes) {
+                        progressDialog->setRange(0, 0);
+                    } else if (projectReady) {
+                        progressDialog->setRange(0, 1);
+                        progressDialog->setValue(1);
+                    } else if (preparing) {
+                        progressDialog->setRange(
+                            0, std::max(progress.totalSegments, 1));
+                        progressDialog->setValue(std::min(
+                            progress.completedSegments,
+                            std::max(progress.totalSegments, 1)));
+                    } else {
+                        progressDialog->setMaximum(
+                            std::max(progress.totalFiles, 1));
+                        progressDialog->setValue(std::min(
+                            progress.completedFiles,
+                            std::max(progress.totalFiles, 1)));
+                    }
                     progressDialog->setLabelText(label);
                 },
                 Qt::QueuedConnection);
         };
 
-    QFutureWatcher<OpenDataOpenTaskResult> watcher;
-    QEventLoop loop;
-    QObject::connect(&watcher,
-                     &QFutureWatcher<OpenDataOpenTaskResult>::finished,
-                     &loop,
-                     &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run(
-        [sampleCopy, cacheDir, progressCallback]() mutable {
+    // The parented watcher completes on the GUI thread without a nested event
+    // loop. QtConcurrent cannot interrupt this task; destruction simply
+    // disconnects and discards a late result.
+    auto* watcher = new QFutureWatcher<OpenDataOpenTaskResult>(this);
+    connect(watcher,
+            &QFutureWatcher<OpenDataOpenTaskResult>::finished,
+            this,
+            [this, watcher, progressDialog, interactive,
+             onFinished = std::move(onFinished)]() mutable {
+                OpenDataOpenTaskResult task = watcher->result();
+                if (progressDialog) {
+                    progressDialog->close();
+                    progressDialog->deleteLater();
+                }
+                _openDataSampleOpenInFlight = false;
+                watcher->deleteLater();
+
+                OpenDataSampleOpenOutcome outcome;
+                finishOpenDataSampleOpen(std::move(task), interactive, &outcome);
+                if (onFinished) {
+                    onFinished(outcome);
+                }
+            });
+
+    _openDataSampleOpenInFlight = true;
+    watcher->setFuture(QtConcurrent::run(
+        [sampleCopy, cacheDir, progressCallback, hasSelection, selectionCopy]() mutable {
             OpenDataOpenTaskResult taskResult;
+            taskResult.sampleId = QString::fromStdString(sampleCopy.id);
+            taskResult.tifxyzSegmentCount =
+                static_cast<qint64>(sampleCopy.tifxyzSegmentCount());
             try {
                 taskResult.pkg = vc3d::opendata::createOpenDataSampleProject(
                     sampleCopy,
                     cacheDir.toStdString(),
                     &taskResult.result,
-                    progressCallback);
+                    progressCallback,
+                    hasSelection ? &selectionCopy : nullptr);
             } catch (const std::exception& e) {
                 taskResult.error = QString::fromUtf8(e.what());
             } catch (...) {
@@ -587,62 +807,80 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
             }
             return taskResult;
         }));
-    if (!watcher.isFinished()) {
-        loop.exec(QEventLoop::ExcludeUserInputEvents);
-    }
-    OpenDataOpenTaskResult task = watcher.result();
-    if (progressDialog) {
-        progressDialog->close();
-        progressDialog->deleteLater();
-    }
+}
+
+void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
+                                                    bool interactive,
+                                                    OpenDataSampleOpenOutcome* outcomeOut)
+{
+    const QString sampleId = task.sampleId;
 
     if (!task.error.isEmpty()) {
-        QMessageBox::warning(
-            _window,
-            QObject::tr("Open Data Sample"),
-            QObject::tr("Failed to open sample %1:\n\n%2")
-                .arg(QString::fromStdString(sampleCopy.id), task.error));
-        return false;
+        if (interactive) {
+            QMessageBox::warning(
+                _window,
+                QObject::tr("Open Data Sample"),
+                QObject::tr("Failed to open sample %1:\n\n%2")
+                    .arg(sampleId, task.error));
+        }
+        if (outcomeOut) {
+            outcomeOut->success = false;
+            outcomeOut->error = task.error;
+        }
+        return;
     }
 
     vc3d::opendata::OpenDataSampleProjectResult result = std::move(task.result);
 
     auto pkg = std::move(task.pkg);
     if (!pkg) {
-        QMessageBox::warning(
-            _window,
-            QObject::tr("Open Data Sample"),
-            QObject::tr("Failed to create sample project for %1.")
-                .arg(QString::fromStdString(sampleCopy.id)));
-        return false;
+        const QString msg =
+            QObject::tr("Failed to create sample project for %1.").arg(sampleId);
+        if (interactive) {
+            QMessageBox::warning(
+                _window, QObject::tr("Open Data Sample"), msg);
+        }
+        if (outcomeOut) {
+            outcomeOut->success = false;
+            outcomeOut->error = msg;
+        }
+        return;
     }
-    _window->_state->setVpkg(pkg);
+
+    if (_window && _window->_state) {
+        _window->_state->setVpkg(pkg);
+    }
     if (!pkg->path().empty()) {
         updateRecentVolpkgList(QString::fromStdString(pkg->path().string()));
     }
 
-    _window->refreshCurrentVolumePackageUi(
-        QString::fromStdString(result.preferredVolumeId),
-        true);
-    _window->UpdateView();
+    if (_window) {
+        _window->refreshCurrentVolumePackageUi(
+            QString::fromStdString(result.preferredVolumeId),
+            true);
+        _window->UpdateView();
+    }
+    startOpenDataVolumePrefill(
+        _window && _window->_state ? _window->_state->currentVolume() : nullptr);
 
     QString message = QObject::tr("Sample %1: attached %2 of %3 supported volume entries.")
-                          .arg(QString::fromStdString(sampleCopy.id))
+                          .arg(sampleId)
                           .arg(result.attachedVolumeEntries)
                           .arg(result.supportedVolumes);
-    if (sampleCopy.tifxyzSegmentCount() > 0) {
+    if (task.tifxyzSegmentCount > 0) {
         message += QObject::tr(" Cached %1 of %2 tifxyz segments; attached %3 segment source(s).")
                        .arg(result.cachedTifxyzSegments)
                        .arg(result.supportedTifxyzSegments)
                        .arg(result.attachedSegmentEntries);
     }
-    if (_window->statusBar()) {
+    if (_window && _window->statusBar()) {
         _window->showStatusBarMessage(message, 7000);
     }
 
-    if (result.supportedVolumes == 0 ||
-        result.failedVolumes > 0 ||
-        result.failedTifxyzSegments > 0) {
+    if (interactive &&
+        (result.supportedVolumes == 0 ||
+         result.failedVolumes > 0 ||
+         result.failedTifxyzSegments > 0)) {
         QString details;
         for (const auto& item : result.messages) {
             if (!details.isEmpty()) {
@@ -656,166 +894,199 @@ bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSamp
             details.isEmpty() ? message : message + QObject::tr("\n\n%1").arg(details));
     }
 
-    return true;
+    if (outcomeOut) {
+        outcomeOut->success = true;
+        outcomeOut->result = std::move(result);
+    }
 }
 
-bool MenuActionController::tryResolveRemoteAuth(const QString& url,
-                                                vc::HttpAuth* authOut,
-                                                bool allowPrompt,
-                                                QString* errorMessage) const
+void MenuActionController::startOpenDataVolumePrefill(const std::shared_ptr<Volume>& volume)
 {
-    if (!authOut) {
-        return false;
+    const int logicalPrefillLevel = volume
+        ? vc3d::opendata::kOpenDataVolumePrefillLevel - volume->baseScaleLevel()
+        : -1;
+    if (!volume || !volume->isRemote() || logicalPrefillLevel < 0 ||
+        !volume->hasScaleLevel(logicalPrefillLevel)) {
+        return;
+    }
+    if (volume->remotePersistentCachePath().empty()) {
+        return;
+    }
+    if (vc3d::opendata::openDataVolumePrefillMarkerMatches(
+            volume->remotePersistentCachePath(),
+            *volume,
+            logicalPrefillLevel)) {
+        Logger()->info(
+            "Open-data volume {} physical level {} (logical {}) already prefetched",
+            volume->id(),
+            vc3d::opendata::kOpenDataVolumePrefillLevel,
+            logicalPrefillLevel);
+        return;
     }
 
-    *authOut = {};
-    auto resolved = vc::resolveRemoteUrl(url.trimmed().toStdString());
-    if (!resolved.useAwsSigv4) {
-        return true;
+    auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
+    _openDataPrefillCancelFlag = cancelFlag;
+    auto* watcher = new QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>(this);
+    _openDataPrefillWatchers.push_back(watcher);
+    _openDataPrefillCancelFlags.push_back(cancelFlag);
+
+    const QString volumeId = QString::fromStdString(volume->id());
+    if (_window) {
+        _window->showStatusBarMessage(
+            QObject::tr("Caching remote volume %1 physical /%2 (logical /%3) in background...")
+                .arg(volumeId)
+                .arg(vc3d::opendata::kOpenDataVolumePrefillLevel)
+                .arg(logicalPrefillLevel),
+            7000);
     }
 
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    *authOut = vc::loadAwsCredentials();
-    if (authOut->region.empty()) authOut->region = resolved.awsRegion;
+    connect(watcher,
+            &QFutureWatcher<vc3d::opendata::OpenDataVolumePrefillResult>::finished,
+            this,
+            [this, watcher, cancelFlag, volumeId]() {
+                vc3d::opendata::OpenDataVolumePrefillResult result;
+                // A canceled QFuture has no stored result. Check cancellation
+                // before result() when a stale finished signal arrives.
+                if (watcher->isCanceled()) {
+                    result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Cancelled;
+                    result.volumeId = volumeId.toStdString();
+                    result.message = "cancelled before completion";
+                } else {
+                    try {
+                        result = watcher->result();
+                    } catch (const std::exception& e) {
+                        result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                        result.volumeId = volumeId.toStdString();
+                        result.message = e.what();
+                    } catch (...) {
+                        result.status = vc3d::opendata::OpenDataVolumePrefillResult::Status::Failed;
+                        result.volumeId = volumeId.toStdString();
+                        result.message = "unknown error";
+                    }
+                }
 
-    if (authOut->access_key.empty() || authOut->secret_key.empty()) {
-        const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
-        const auto savedSecret = settings.value(vc3d::settings::aws::SECRET_KEY).toString();
-        const auto savedToken = settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
+                _openDataPrefillWatchers.erase(
+                    std::remove(_openDataPrefillWatchers.begin(),
+                                _openDataPrefillWatchers.end(),
+                                watcher),
+                    _openDataPrefillWatchers.end());
+                _openDataPrefillCancelFlags.erase(
+                    std::remove(_openDataPrefillCancelFlags.begin(),
+                                _openDataPrefillCancelFlags.end(),
+                                cancelFlag),
+                    _openDataPrefillCancelFlags.end());
+                if (_openDataPrefillCancelFlag == cancelFlag) {
+                    _openDataPrefillCancelFlag.reset();
+                }
+                watcher->deleteLater();
 
-        if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
-            authOut->access_key = savedAccess.toStdString();
-            authOut->secret_key = savedSecret.toStdString();
-            authOut->session_token = savedToken.toStdString();
-        }
-    }
+                if (!_window) {
+                    return;
+                }
 
-    if (!authOut->access_key.empty() && !authOut->secret_key.empty()) {
-        return true;
-    }
+                using Status = vc3d::opendata::OpenDataVolumePrefillResult::Status;
+                switch (result.status) {
+                case Status::Completed:
+                    _window->showStatusBarMessage(
+                        QObject::tr("Cached remote volume %1 physical /%2 (logical /%3): %4 chunks.")
+                            .arg(QString::fromStdString(result.volumeId))
+                            .arg(result.physicalLevel)
+                            .arg(result.level)
+                            .arg(result.totalChunks),
+                        7000);
+                    Logger()->info(
+                        "Open-data volume prefill completed for {} level {}: {} chunks (data={}, empty={})",
+                        result.volumeId,
+                        result.level,
+                        result.totalChunks,
+                        result.dataChunks,
+                        result.emptyChunks);
+                    break;
+                case Status::Failed:
+                    _window->showStatusBarMessage(
+                        QObject::tr("Remote volume %1 level /%2 cache failed: %3")
+                            .arg(QString::fromStdString(result.volumeId))
+                            .arg(result.level)
+                            .arg(QString::fromStdString(result.message)),
+                        9000);
+                    Logger()->warn(
+                        "Open-data volume prefill failed for {} level {}: {}",
+                        result.volumeId,
+                        result.level,
+                        result.message);
+                    break;
+                case Status::Cancelled:
+                    Logger()->info(
+                        "Open-data volume prefill cancelled for {} level {} after {}/{} chunks",
+                        result.volumeId,
+                        result.level,
+                        result.resolvedChunks,
+                        result.totalChunks);
+                    break;
+                case Status::Skipped:
+                    Logger()->info(
+                        "Open-data volume prefill skipped for {} level {}: {}",
+                        result.volumeId,
+                        result.level,
+                        result.message);
+                    break;
+                }
+            });
 
-    // Public S3 buckets can be read anonymously. Do not block the first
-    // request on credential entry just because the URL is S3-shaped; if the
-    // server returns an auth error, the caller's existing retry path prompts.
-    if (errorMessage) {
-        errorMessage->clear();
-    }
-
-    return true;
+    watcher->setFuture(QtConcurrent::run([volume, cancelFlag, logicalPrefillLevel]() {
+        return vc3d::opendata::prefillOpenDataVolumeLevel(
+            volume,
+            logicalPrefillLevel,
+            cancelFlag.get());
+    }));
 }
 
-QString MenuActionController::suggestedRemoteCacheDirectory() const
+void MenuActionController::cancelOpenDataVolumePrefills()
 {
-    if (_window && _window->_state && _window->_state->vpkg()) {
-        const QString projectDir = QString::fromStdString(_window->_state->vpkg()->getVolpkgDirectory());
-        if (!projectDir.isEmpty()) {
-            // remoteCachePath() will ignore this suggestion if /volpkgs or
-            // /ephemeral is mounted.
-            return vc3d::remoteCachePath(QDir(projectDir).filePath("remote_cache"));
+    if (_openDataPrefillCancelFlag) {
+        _openDataPrefillCancelFlag->store(true, std::memory_order_release);
+    }
+    for (const auto& cancelFlag : _openDataPrefillCancelFlags) {
+        if (cancelFlag) {
+            cancelFlag->store(true, std::memory_order_release);
         }
     }
-
-    return vc3d::remoteCachePath();
-}
-
-QString MenuActionController::configuredRemoteCacheDirectory() const
-{
-    if (_window && _window->_state && _window->_state->vpkg()) {
-        const QString persisted = QString::fromStdString(
-            _window->_state->vpkg()->remoteCacheRootOrEmpty()).trimmed();
-        // Run the persisted value through remoteCachePath() so /volpkgs and
-        // /ephemeral win even if the project JSON points somewhere else.
-        return vc3d::remoteCachePath(persisted);
-    }
-    return {};
-}
-
-QString MenuActionController::remoteCacheDirectory(bool allowPrompt)
-{
-    QString cacheDir = configuredRemoteCacheDirectory();
-    bool shouldPersistCacheRoot = !cacheDir.isEmpty();
-
-    if (cacheDir.isEmpty() && allowPrompt) {
-        bool ok = false;
-        cacheDir = QInputDialog::getText(
-            _window,
-            QObject::tr("Remote Cache Location"),
-            QObject::tr("Choose where this project should store downloaded remote volume chunks."),
-            QLineEdit::Normal,
-            suggestedRemoteCacheDirectory(),
-            &ok).trimmed();
-        if (!ok) {
-            return {};
-        }
-        // Send the prompted value through the resolver too — keeps the host
-        // mount authoritative even if the user typed something else.
-        cacheDir = vc3d::remoteCachePath(cacheDir);
-        shouldPersistCacheRoot = !cacheDir.isEmpty();
-    }
-
-    if (cacheDir.isEmpty()) {
-        // No project- or prompt-supplied path: honor the persisted user
-        // setting (or fall back to ~/.VC3D/remote_cache) — unless host
-        // mounts override.
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        const QString stored =
-            settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR).toString();
-        cacheDir = vc3d::remoteCachePath(stored);
-    }
-
-    if (QDir::isRelativePath(cacheDir)) {
-        cacheDir = QDir::cleanPath(QDir::current().absoluteFilePath(cacheDir));
-    }
-
-    if (shouldPersistCacheRoot && _window && _window->_state && _window->_state->vpkg()) {
-        // VolumePkg::setRemoteCacheRoot persists to the volpkg JSON
-        // automatically via persistProjectState().
-        auto pkg = _window->_state->vpkg();
-        if (!pkg->hasRemoteCacheRoot()) {
-            pkg->setRemoteCacheRoot(cacheDir.toStdString());
+    for (auto* watcher : _openDataPrefillWatchers) {
+        if (watcher) {
+            watcher->cancel();
         }
     }
-
-    QDir().mkpath(cacheDir);
-    return cacheDir;
 }
 
 void MenuActionController::attachRemoteZarrUrl(const QString& url)
 {
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::warning(_window,
-                             QObject::tr("No Volume Package Loaded"),
-                             QObject::tr("Open a volpkg before attaching a remote zarr."));
+    auto* attachment = _window
+        ? _window->_volumeAttachmentController.get()
+        : nullptr;
+    if (!attachment) {
+        QMessageBox::warning(
+            _window,
+            QObject::tr("Attach Remote Zarr"),
+            QObject::tr("Volume attachment is unavailable."));
         return;
     }
 
-    auto resolved = vc::resolveRemoteUrl(url.trimmed().toStdString());
-    std::string trimmed = resolved.httpsUrl;
-    while (!trimmed.empty() && trimmed.back() == '/') {
-        trimmed.pop_back();
-    }
-    const bool looksLikeZarr = trimmed.size() >= 5 && trimmed.substr(trimmed.size() - 5) == ".zarr";
-    if (!looksLikeZarr) {
-        QMessageBox::warning(_window,
-                             QObject::tr("Expected Remote Zarr"),
-                             QObject::tr("Attach Remote Zarr expects a direct .zarr URL, not a scroll root."));
-        return;
-    }
-
-    vc::HttpAuth auth;
-    QString authError;
-    if (!tryResolveRemoteAuth(url, &auth, true, &authError)) {
-        if (!authError.isEmpty() && authError != QObject::tr("AWS credential entry canceled.")) {
-            QMessageBox::warning(_window, QObject::tr("Authentication Error"), authError);
+    VolumeAttachmentRequest request;
+    QString error;
+    if (!attachment->prepare(
+            url,
+            {},
+            VolumeAttachmentPresentation::Interactive,
+            &request,
+            &error)) {
+        if (!error.isEmpty()) {
+            QMessageBox::warning(
+                _window, QObject::tr("Attach Remote Zarr"), error);
         }
         return;
     }
-
-    const QString cacheDir = remoteCacheDirectory(true);
-    if (cacheDir.isEmpty()) {
-        return;
-    }
-    updateRecentRemoteList(url);
+    request.selection = VolumeAttachmentSelection::SelectAttached;
+    const QString persistedLocator = request.location;
     if (_attachRemoteZarrAct) {
         _attachRemoteZarrAct->setEnabled(false);
     }
@@ -823,122 +1094,70 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url)
         _window->showStatusBarMessage(QObject::tr("Attaching remote zarr..."));
     }
 
-    auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
-    connect(watcher, &QFutureWatcher<std::shared_ptr<Volume>>::finished, this,
-            [this, watcher, url]() {
-                watcher->deleteLater();
-                if (_attachRemoteZarrAct) {
-                    _attachRemoteZarrAct->setEnabled(true);
+    QPointer<MenuActionController> self(this);
+    const bool started = attachment->start(
+        std::move(request),
+        [self, persistedLocator](const VolumeAttachmentOutcome& outcome) {
+            if (!self)
+                return;
+            if (self->_attachRemoteZarrAct)
+                self->_attachRemoteZarrAct->setEnabled(true);
+
+            if (outcome.success) {
+                self->updateRecentRemoteList(persistedLocator);
+                if (self->_window && self->_window->statusBar()) {
+                    self->_window->showStatusBarMessage(
+                        outcome.alreadyAttached
+                            ? QObject::tr("Remote zarr is already attached: %1")
+                                  .arg(outcome.volumeId)
+                            : QObject::tr("Attached remote zarr: %1")
+                                  .arg(outcome.volumeId),
+                        5000);
                 }
+                return;
+            }
 
-                auto future = watcher->future();
-                QString errorMsg;
-                bool success = false;
+            if (isAuthError(outcome.error)) {
+                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                settings.remove(vc3d::settings::aws::ACCESS_KEY);
+                settings.remove(vc3d::settings::aws::SECRET_KEY);
+                settings.remove(vc3d::settings::aws::SESSION_TOKEN);
 
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-                if (future.isValid() && !future.isCanceled() && future.isResultReadyAt(0)) {
-#else
-                if (future.isFinished() && !future.isCanceled()) {
-#endif
-                    try {
-                        auto volume = future.result();
-                        if (!_window || !_window->_state || !_window->_state->vpkg()) {
-                            return;
-                        }
-
-                        if (!_window->attachVolumeToCurrentPackage(volume)) {
-                            QMessageBox::warning(
-                                _window,
-                                QObject::tr("Attach Remote Zarr"),
-                                QObject::tr("A volume with id '%1' is already present in this volume package.")
-                                    .arg(QString::fromStdString(volume->id())));
-                            return;
-                        }
-
-                        // VolumePkg::addVolumeEntry persists to the volpkg
-                        // JSON automatically via persistProjectState().
-                        _window->_state->vpkg()->addVolumeEntry(url.trimmed().toStdString());
-
-                        if (_window->statusBar()) {
-                            _window->showStatusBarMessage(
-                                QObject::tr("Attached remote zarr: %1")
-                                    .arg(QString::fromStdString(volume->id())),
-                                5000);
-                        }
-                        success = true;
-                    } catch (const std::exception& e) {
-                        errorMsg = extractExceptionMessage(e);
-                    } catch (...) {
-                        errorMsg = QObject::tr("Unknown error attaching remote zarr");
-                    }
-                } else {
-                    try {
-                        future.waitForFinished();
-                        future.result();
-                    } catch (const std::exception& e) {
-                        errorMsg = extractExceptionMessage(e);
-                    } catch (...) {
-                        errorMsg = QObject::tr("Unknown error attaching remote zarr");
-                    }
-                }
-
-                if (success) return;
-
-                if (isAuthError(errorMsg)) {
-                    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                    settings.remove(vc3d::settings::aws::ACCESS_KEY);
-                    settings.remove(vc3d::settings::aws::SECRET_KEY);
-                    settings.remove(vc3d::settings::aws::SESSION_TOKEN);
-
-                    const auto reply = QMessageBox::warning(
-                        _window,
-                        QObject::tr("Authentication Error"),
-                        QObject::tr("Failed to attach remote zarr:\n%1\n\n"
-                                    "Would you like to enter new AWS credentials and retry?")
-                            .arg(errorMsg),
-                        QMessageBox::Yes | QMessageBox::No);
-                    if (reply == QMessageBox::Yes) {
-                        QTimer::singleShot(0, this, [this, url]() {
-                            attachRemoteZarrUrl(url);
+                const auto reply = QMessageBox::warning(
+                    self->_window,
+                    QObject::tr("Authentication Error"),
+                    QObject::tr("Failed to attach remote zarr:\n%1\n\n"
+                                "Would you like to enter new AWS credentials and retry?")
+                        .arg(outcome.error),
+                    QMessageBox::Yes | QMessageBox::No);
+                if (reply == QMessageBox::Yes) {
+                    QTimer::singleShot(
+                        0, self, [self, persistedLocator]() {
+                            if (self)
+                                self->attachRemoteZarrUrl(persistedLocator);
                         });
-                        return;
-                    }
+                    return;
                 }
+            }
 
-                QMessageBox::critical(
-                    _window,
-                    QObject::tr("Attach Remote Zarr Error"),
-                    QObject::tr("Failed to attach remote zarr:\n%1").arg(errorMsg));
-            });
-
-    auto future = QtConcurrent::run([url, auth, cacheDir]() -> std::shared_ptr<Volume> {
-        return Volume::NewFromUrl(url.toStdString(), cacheDir.toStdString(), auth);
-    });
-    watcher->setFuture(future);
+            QMessageBox::critical(
+                self->_window,
+                QObject::tr("Attach Remote Zarr Error"),
+                QObject::tr("Failed to attach remote zarr:\n%1")
+                    .arg(outcome.error));
+        },
+        &error);
+    if (!started) {
+        if (_attachRemoteZarrAct) {
+            _attachRemoteZarrAct->setEnabled(true);
+        }
+        QMessageBox::warning(
+            _window, QObject::tr("Attach Remote Zarr"), error);
+    }
 }
 
 namespace
 {
-
-// Helper: extract the real error message from a QFuture exception.
-// Qt wraps task exceptions in QUnhandledException whose what() returns
-// "std::exception" — useless. Unwrap to get the original message.
-QString extractExceptionMessage(const std::exception& e)
-{
-    if (auto* unhandled = dynamic_cast<const QUnhandledException*>(&e)) {
-        auto ptr = unhandled->exception();
-        if (ptr) {
-            try {
-                std::rethrow_exception(ptr);
-            } catch (const std::exception& inner) {
-                return QString::fromStdString(inner.what());
-            } catch (...) {
-                return QObject::tr("Unknown error (non-std::exception)");
-            }
-        }
-    }
-    return QString::fromStdString(e.what());
-}
 
 bool isAuthError(const QString& msg)
 {
@@ -1019,6 +1238,15 @@ void MenuActionController::showSettingsDialog()
     _window->onAxisOverlayOpacityChanged(
         settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
                        vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
+
+    // The spiral cache budgets live on the manager, not the window, and only the
+    // spiral workspace opts in -- so walk every live manager and let the ones
+    // that opted in re-read them. Byte capacities are adjustable in place, so
+    // this takes effect without reopening the workspace.
+    for (auto* manager : ViewerManager::allManagers()) {
+        if (manager && manager->surfaceCacheEnabled())
+            manager->applySpiralCacheSettings();
+    }
 
     dialog->deleteLater();
 }
@@ -1327,13 +1555,66 @@ void MenuActionController::beginRotateSurfaceTransform()
     }
 }
 
+void MenuActionController::materializeCurrentOpenDataSegmentFolder()
+{
+    if (!_window || !_window->_surfacePanel) {
+        return;
+    }
+    _window->_surfacePanel->materializeCurrentOpenDataFolder();
+}
+
 void MenuActionController::newProject()
 {
     if (!_window) return;
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    // Default new projects into the per-user .VC3D folder (same root the
+    // autosave uses, so home resolution matches across platforms).
+    QString defaultDir;
+    const auto autosaveFile = VolumePkg::autosaveFile();
+    if (!autosaveFile.empty()) {
+        defaultDir = QString::fromStdString(autosaveFile.parent_path().string());
+        QDir().mkpath(defaultDir);
+    }
+    if (defaultDir.isEmpty()) {
+        defaultDir = settings.value(vc3d::settings::project::DEFAULT_PATH).toString();
+    }
+    const QString defaultBase = QStringLiteral("untitled");
+    const QString defaultName = defaultBase + QStringLiteral(".volpkg.json");
+
+    QFileDialog dlg(_window, QObject::tr("New Project"), defaultDir,
+                    QObject::tr("Project (*.volpkg.json)"));
+    dlg.setAcceptMode(QFileDialog::AcceptSave);
+    dlg.setFileMode(QFileDialog::AnyFile);
+    // The non-native dialog is required to reach the filename line edit below.
+    dlg.setOption(QFileDialog::DontUseNativeDialog, true);
+    dlg.selectFile(defaultName);
+    // Qt pre-selects everything before the last dot ("untitled.volpkg"), so
+    // typing would eat the ".volpkg" part; narrow the selection to the base name.
+    QTimer::singleShot(0, &dlg, [&dlg, &defaultBase] {
+        if (auto* edit = dlg.findChild<QLineEdit*>(QStringLiteral("fileNameEdit"))) {
+            edit->setSelection(0, static_cast<int>(defaultBase.size()));
+        }
+    });
+    if (dlg.exec() != QDialog::Accepted || dlg.selectedFiles().isEmpty()) return;
+    QString file = dlg.selectedFiles().first();
+    if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) file += ".volpkg.json";
+
     auto pkg = VolumePkg::newEmpty();
-    pkg->saveAutosave();
-    _window->_state->setVpkg(pkg);
-    _window->refreshCurrentVolumePackageUi(QString(), true);
+    QString base = QFileInfo(file).fileName();
+    base.chop(QStringLiteral(".volpkg.json").size());
+    // setName before save(): while the package has no path it only touches the
+    // autosave, and save() then writes the full JSON including the name.
+    pkg->setName(base.toStdString());
+    try {
+        pkg->save(std::filesystem::path(file.toStdString()));
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, QObject::tr("New Project failed"), QString::fromUtf8(e.what()));
+        return;
+    }
+    settings.setValue(vc3d::settings::project::DEFAULT_PATH, QFileInfo(file).absolutePath());
+
+    openVolpkgAt(file);
 }
 
 void MenuActionController::saveProjectAs()
@@ -1373,7 +1654,10 @@ QString MenuActionController::promptLocation(const QString& title,
     dlg.setAcceptsFiles(acceptFiles);
     dlg.setAcceptsDirs(acceptDirs);
     dlg.setAuthResolver([this](const QString& url, vc::HttpAuth* out, QString* err) {
-        return tryResolveRemoteAuth(url, out, true, err);
+        auto* attachment = _window
+            ? _window->_volumeAttachmentController.get()
+            : nullptr;
+        return attachment && attachment->resolveRemoteAuth(url, out, err);
     });
     if (dlg.exec() != QDialog::Accepted) return {};
     QString uri = dlg.selectedUri();

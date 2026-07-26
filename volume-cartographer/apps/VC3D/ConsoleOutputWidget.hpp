@@ -17,6 +17,7 @@ public:
 
     void clear();
     void setTitle(const QString& title);
+    void setMaximumBlockCount(int maximum);
 
 public slots:
     void copyToClipboard();
@@ -27,5 +28,4 @@ private:
     QPushButton* _copyButton;
     QLabel* _titleLabel;
 };
-
 

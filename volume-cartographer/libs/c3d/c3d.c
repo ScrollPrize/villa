@@ -15,8 +15,32 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Endianness gate — LE only. */
-#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+/* MSVC lacks the GCC/Clang branch-prediction, prefetch, and alignment builtins
+ * used below. Map them to no-op-equivalent forms (correct results, just without
+ * the optimizer hint). Only defined off the GCC/Clang path. */
+#if !defined(__GNUC__) && !defined(__clang__)
+#  define __builtin_expect(expr, expected)   (expr)
+#  define __builtin_prefetch(...)            ((void)0)
+#  define __builtin_assume_aligned(ptr, ...) (ptr)
+#endif
+
+/* C11 aligned_alloc is missing from the Windows UCRT; _aligned_malloc is the
+ * equivalent but its memory must go through _aligned_free (plain free() is
+ * undefined on it), so the paired frees route through c3d_aligned_free. */
+#if defined(_WIN32)
+#  include <malloc.h>
+#  define c3d_aligned_alloc(align, size) _aligned_malloc((size), (align))
+#  define c3d_aligned_free _aligned_free
+#else
+#  define c3d_aligned_alloc(align, size) aligned_alloc((align), (size))
+#  define c3d_aligned_free free
+#endif
+
+/* Endianness gate — LE only. Windows targets (x86/x64/ARM64) are always
+ * little-endian, but MSVC does not define __BYTE_ORDER__, so exempt _WIN32 from
+ * the predefine-based check rather than tripping the #error. */
+#if !defined(_WIN32) && \
+    (!defined(__BYTE_ORDER__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__)
 #  error "c3d requires a little-endian target"
 #endif
 
@@ -2011,7 +2035,7 @@ struct c3d_decoder {
 c3d_encoder *c3d_encoder_new(void) {
     c3d_encoder *e = malloc(sizeof *e);
     c3d_assert(e);
-    e->coeff_buf    = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK * sizeof(float));
+    e->coeff_buf    = c3d_aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK * sizeof(float));
     e->sub_symbols  = malloc((size_t)128 * 128 * 128);
     e->sub_escapes  = malloc((size_t)128 * 128 * 128 / 4 + 1024);
     e->rans_scratch = malloc((size_t)128 * 128 * 128 * 2 + 1024);
@@ -2038,7 +2062,7 @@ c3d_encoder *c3d_encoder_new(void) {
 }
 void c3d_encoder_free(c3d_encoder *e) {
     if (!e) return;
-    free(e->coeff_buf);   free(e->sub_symbols);
+    c3d_aligned_free(e->coeff_buf); free(e->sub_symbols);
     free(e->sub_escapes); free(e->rans_scratch);
     /* thread_* slot 0 aliased the three above; slots 1..N-1 are independently
      * allocated.  thread_out_scratch[0] was NULL. */
@@ -2049,14 +2073,14 @@ void c3d_encoder_free(c3d_encoder *e) {
     }
     for (unsigned i = 0; i < C3D_OMP_MAX_THREADS; ++i)
         free(e->thread_out_scratch[i]);
-    free(e->in_scratch);
+    c3d_aligned_free(e->in_scratch);
     free(e);
 }
 
 c3d_decoder *c3d_decoder_new(void) {
     c3d_decoder *d = malloc(sizeof *d);
     c3d_assert(d);
-    d->coeff_buf   = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK * sizeof(float));
+    d->coeff_buf   = c3d_aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK * sizeof(float));
     d->sub_symbols = malloc((size_t)128 * 128 * 128);
     c3d_assert(d->coeff_buf && d->sub_symbols);
     memset(d->thread_sub_symbols, 0, sizeof d->thread_sub_symbols);
@@ -2070,7 +2094,7 @@ void c3d_decoder_set_denoise(c3d_decoder *d, bool enabled) {
 }
 void c3d_decoder_free(c3d_decoder *d) {
     if (!d) return;
-    free(d->coeff_buf); free(d->sub_symbols);
+    c3d_aligned_free(d->coeff_buf); free(d->sub_symbols);
     /* Index 0 aliases sub_symbols (already freed).  Free the rest. */
     for (unsigned i = 1; i < C3D_OMP_MAX_THREADS; ++i)
         free(d->thread_sub_symbols[i]);
@@ -3365,7 +3389,7 @@ static void c3d_fill_mask_ignore(const uint8_t *restrict in,
 /* Ensure e->in_scratch is allocated.  Called from the _masked entry points. */
 static void c3d_encoder_ensure_in_scratch(c3d_encoder *e) {
     if (!e->in_scratch) {
-        e->in_scratch = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+        e->in_scratch = c3d_aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
         c3d_assert(e->in_scratch);
     }
 }

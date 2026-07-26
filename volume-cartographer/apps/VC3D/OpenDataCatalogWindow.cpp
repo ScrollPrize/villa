@@ -1,5 +1,6 @@
 #include "OpenDataCatalogWindow.hpp"
 
+#include "OpenDataNormalGrids.hpp"
 #include "OpenDataSegmentCache.hpp"
 #include "VCSettings.hpp"
 
@@ -25,6 +26,8 @@
 #include <QLineEdit>
 #include <QMetaObject>
 #include <QPixmap>
+#include <QPointer>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSaveFile>
@@ -43,8 +46,10 @@
 #include <QtConcurrent>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cmath>
+#include <memory>
 #include <exception>
 #include <limits>
 #include <utility>
@@ -58,6 +63,8 @@ constexpr int kCatalogDefaultWidth = 1520;
 constexpr int kCatalogDefaultHeight = 760;
 constexpr int kSampleTableInitialWidth = 940;
 constexpr int kDetailsInitialWidth = 520;
+constexpr int kRepresentationVolumeIndexRole = Qt::UserRole;
+constexpr int kRepresentationArtifactIndexRole = Qt::UserRole + 1;
 
 class OverviewPhotoLabel : public QLabel {
 public:
@@ -151,6 +158,38 @@ QString yesNo(bool value)
     return value ? QStringLiteral("Yes") : QStringLiteral("No");
 }
 
+QString formatByteSize(std::uint64_t bytes)
+{
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    constexpr double kMiB = 1024.0 * 1024.0;
+    if (bytes >= static_cast<std::uint64_t>(kGiB)) {
+        return QStringLiteral("%1 GB").arg(bytes / kGiB, 0, 'f', 1);
+    }
+    if (bytes >= static_cast<std::uint64_t>(kMiB)) {
+        return QStringLiteral("%1 MB").arg(bytes / kMiB, 0, 'f', 1);
+    }
+    return QStringLiteral("%1 KB").arg(bytes / 1024.0, 0, 'f', 1);
+}
+
+QString normalGridsStatusDisplay(const std::filesystem::path& remoteRoot,
+                                 const std::string& sampleId,
+                                 const OpenDataVolume& volume)
+{
+    const auto state = normalGridsCacheState(remoteRoot, sampleId, volume);
+    if (!state.hasArtifact) {
+        return QStringLiteral("—");
+    }
+    if (state.complete) {
+        return QObject::tr("All (%1)").arg(formatByteSize(state.totalBytes));
+    }
+    if (state.cachedFiles > 0) {
+        return QObject::tr("%1 cached (%2 files)")
+            .arg(formatByteSize(state.cachedBytes))
+            .arg(state.cachedFiles);
+    }
+    return QObject::tr("Not cached");
+}
+
 QString cacheStateDisplay(OpenDataSegmentCacheState state)
 {
     switch (state) {
@@ -166,6 +205,7 @@ QString cacheStateDisplay(OpenDataSegmentCacheState state)
 struct SampleCacheSummary {
     int total = 0;
     int local = 0;
+    std::size_t manual = 0;
     int current = 0;
     int stale = 0;
     int incomplete = 0;
@@ -181,6 +221,7 @@ SampleCacheSummary sampleCacheSummary(const std::filesystem::path& remoteCacheRo
                                       const OpenDataSample& sample)
 {
     SampleCacheSummary summary;
+    summary.manual = manualOpenDataSegmentCount(remoteCacheRoot, sample.id);
     for (const auto& segment : sample.segments) {
         if (!segment.hasTifxyz()) {
             continue;
@@ -272,6 +313,25 @@ QString firstArtifactUrl(const std::vector<OpenDataArtifact>& artifacts, const Q
 QString artifactUrl(const OpenDataArtifact& artifact)
 {
     return qstr(artifact.resolvedUrl.empty() ? artifact.sourcePath : artifact.resolvedUrl);
+}
+
+QString representationCoordinates(const OpenDataArtifact& artifact,
+                                  OpenDataRepresentationKind kind)
+{
+    if (artifact.sourceCoordinateLevel)
+        return QStringLiteral("L%1").arg(*artifact.sourceCoordinateLevel);
+    if (kind == OpenDataRepresentationKind::Lasagna)
+        return QObject::tr("Base L0 (shape matched)");
+    return QObject::tr("Unspecified");
+}
+
+QString representationParameters(const OpenDataArtifact& artifact)
+{
+    nlohmann::json details = artifact.parameters;
+    if (!details.is_object()) details = nlohmann::json::object();
+    if (!artifact.creationInfo.empty())
+        details["creation_info"] = artifact.creationInfo;
+    return details.empty() ? QStringLiteral("—") : qstr(details.dump());
 }
 
 QImage imageFromBytes(const std::vector<std::byte>& bytes)
@@ -384,7 +444,7 @@ void OpenDataCatalogWindow::buildUi()
     _inkOnlyCheck = new QCheckBox(tr("Ink"), this);
     _refreshButton = new QPushButton(tr("Refresh"), this);
     _refreshButton->setToolTip(tr("Refresh the open-data catalog manifest from the remote source."));
-    _refreshButton->setStatusTip(tr("Refreshes the open-data catalog listing, including samples, scans, volumes, and segments."));
+    _refreshButton->setStatusTip(tr("Refreshes the open-data catalog listing, including samples, scans, volumes, representations, and segments."));
     topRow->addWidget(_searchEdit, 1);
     topRow->addWidget(_segmentsOnlyCheck);
     topRow->addWidget(_inkOnlyCheck);
@@ -393,7 +453,7 @@ void OpenDataCatalogWindow::buildUi()
 
     auto* splitter = new QSplitter(Qt::Horizontal, this);
     _sampleTable = new QTableWidget(splitter);
-    _sampleTable->setColumnCount(7);
+    _sampleTable->setColumnCount(8);
     _sampleTable->setHorizontalHeaderLabels({
         tr("Sample ID"),
         tr("Scans"),
@@ -401,6 +461,7 @@ void OpenDataCatalogWindow::buildUi()
         tr("Segments"),
         tr("Ink"),
         tr("Local TIFXYZ"),
+        tr("Manual Segments"),
         tr("Sync Status")
     });
     _sampleTable->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -448,7 +509,7 @@ void OpenDataCatalogWindow::buildUi()
     auto* volumesPage = new QWidget(_tabs);
     auto* volumesLayout = new QVBoxLayout(volumesPage);
     _volumesTable = new QTableWidget(volumesPage);
-    _volumesTable->setColumnCount(8);
+    _volumesTable->setColumnCount(9);
     _volumesTable->setHorizontalHeaderLabels({
         tr("Volume ID"),
         tr("Scan ID"),
@@ -457,6 +518,7 @@ void OpenDataCatalogWindow::buildUi()
         tr("Energy"),
         tr("Detector distance"),
         tr("Format"),
+        tr("Normal grids"),
         tr("Created")
     });
     _volumesTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -465,14 +527,56 @@ void OpenDataCatalogWindow::buildUi()
     _volumesTable->horizontalHeader()->setStretchLastSection(true);
     _volumesTable->verticalHeader()->hide();
     auto* volumeActions = new QHBoxLayout;
+    _downloadNormalGridsButton = new QPushButton(tr("Download Normal Grids"), volumesPage);
+    _downloadNormalGridsButton->setToolTip(
+        tr("Download the volume's full normal-grid store into the remote cache. "
+           "Not required: normal grids stream on demand as they are used."));
     _copyVolumeUrlButton = new QPushButton(tr("Copy URL"), volumesPage);
     _openVolumeUrlButton = new QPushButton(tr("Open URL"), volumesPage);
     volumeActions->addStretch(1);
+    volumeActions->addWidget(_downloadNormalGridsButton);
     volumeActions->addWidget(_copyVolumeUrlButton);
     volumeActions->addWidget(_openVolumeUrlButton);
     volumesLayout->addWidget(_volumesTable, 1);
     volumesLayout->addLayout(volumeActions);
     _tabs->addTab(volumesPage, tr("Volumes"));
+
+    auto* representationsPage = new QWidget(_tabs);
+    auto* representationsLayout = new QVBoxLayout(representationsPage);
+    auto* representationsHelp = new QLabel(
+        tr("Manifest-declared derived data for this sample. Parent volume and "
+           "coordinate metadata are shown explicitly; these rows are not source volumes."),
+        representationsPage);
+    representationsHelp->setWordWrap(true);
+    _representationsTable = new QTableWidget(representationsPage);
+    _representationsTable->setColumnCount(8);
+    _representationsTable->setHorizontalHeaderLabels({
+        tr("Parent volume"),
+        tr("Representation"),
+        tr("Artifact type"),
+        tr("Model"),
+        tr("Coordinates"),
+        tr("Access"),
+        tr("Parameters"),
+        tr("URL")
+    });
+    _representationsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    _representationsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    _representationsTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    _representationsTable->horizontalHeader()->setStretchLastSection(true);
+    _representationsTable->verticalHeader()->hide();
+    auto* representationActions = new QHBoxLayout;
+    _copyRepresentationUrlButton =
+        new QPushButton(tr("Copy URL"), representationsPage);
+    _openRepresentationUrlButton =
+        new QPushButton(tr("Open URL"), representationsPage);
+    representationActions->addStretch(1);
+    representationActions->addWidget(_copyRepresentationUrlButton);
+    representationActions->addWidget(_openRepresentationUrlButton);
+    representationsLayout->addWidget(representationsHelp);
+    representationsLayout->addWidget(_representationsTable, 1);
+    representationsLayout->addLayout(representationActions);
+    _tabs->addTab(representationsPage, tr("Representations"));
 
     auto* segmentsPage = new QWidget(_tabs);
     auto* segmentsLayout = new QVBoxLayout(segmentsPage);
@@ -547,10 +651,31 @@ void OpenDataCatalogWindow::buildUi()
             this, &OpenDataCatalogWindow::updateSelectedSample);
     connect(_volumesTable->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &OpenDataCatalogWindow::updateActionButtons);
+    connect(_representationsTable->selectionModel(),
+            &QItemSelectionModel::selectionChanged,
+            this,
+            &OpenDataCatalogWindow::updateActionButtons);
+    connect(_representationsTable,
+            &QTableWidget::cellDoubleClicked,
+            this,
+            [this](int row, int column) {
+                _representationsTable->setCurrentCell(row, std::max(column, 0));
+                openSelectedRepresentationUrl();
+            });
     connect(_segmentsTable->selectionModel(), &QItemSelectionModel::selectionChanged,
             this, &OpenDataCatalogWindow::updateActionButtons);
     connect(_copyVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::copySelectedVolumeUrl);
     connect(_openVolumeUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedVolumeUrl);
+    connect(_copyRepresentationUrlButton,
+            &QPushButton::clicked,
+            this,
+            &OpenDataCatalogWindow::copySelectedRepresentationUrl);
+    connect(_openRepresentationUrlButton,
+            &QPushButton::clicked,
+            this,
+            &OpenDataCatalogWindow::openSelectedRepresentationUrl);
+    connect(_downloadNormalGridsButton, &QPushButton::clicked,
+            this, &OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids);
     connect(_copySegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::copySelectedSegmentUrl);
     connect(_openSegmentUrlButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::openSelectedSegmentUrl);
     connect(_cacheSegmentButton, &QPushButton::clicked, this, &OpenDataCatalogWindow::cacheSelectedSegment);
@@ -570,10 +695,11 @@ void OpenDataCatalogWindow::buildUi()
 
 void OpenDataCatalogWindow::reloadManifest()
 {
-    if (_fetchWatcher && _fetchWatcher->isRunning()) {
+    if (_manifestRefreshPending) {
         return;
     }
 
+    _manifestRefreshPending = true;
     setLoading(true);
 
     _fetchWatcher = new QFutureWatcher<ManifestLoadResult>(this);
@@ -607,6 +733,7 @@ void OpenDataCatalogWindow::onFetchFinished()
     _fetchWatcher = nullptr;
     const ManifestLoadResult result = watcher->result();
     watcher->deleteLater();
+    _manifestRefreshPending = false;
     setLoading(false);
     if (!result.error.isEmpty()) {
         if (_manifest) {
@@ -658,8 +785,10 @@ void OpenDataCatalogWindow::setLoading(bool loading)
         _refreshButton->setEnabled(!loading);
         _refreshButton->setText(loading ? tr("Refreshing...") : tr("Refresh"));
     }
-    if (loading && !_manifest) {
-        setStatus(tr("Fetching open-data catalog..."));
+    if (loading) {
+        setStatus(_manifest
+            ? tr("Refreshing the live open-data catalog; cached data is preview-only...")
+            : tr("Fetching open-data catalog..."));
     }
     updateActionButtons();
 }
@@ -707,13 +836,16 @@ void OpenDataCatalogWindow::populateSamples()
     }
 
     const QString needle = _searchEdit->text().trimmed();
+    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
     for (std::size_t i = 0; i < _manifest->samples.size(); ++i) {
         const auto& sample = _manifest->samples[i];
         if (!needle.isEmpty() &&
             !qstr(sample.id).contains(needle, Qt::CaseInsensitive)) {
             continue;
         }
-        if (_segmentsOnlyCheck->isChecked() && sample.segmentCount() == 0) {
+        if (_segmentsOnlyCheck->isChecked() &&
+            sample.segmentCount() == 0 &&
+            manualOpenDataSegmentCount(remoteRoot, sample.id) == 0) {
             continue;
         }
         if (_inkOnlyCheck->isChecked() && sample.inkDetectionSegmentCount() == 0) {
@@ -725,7 +857,6 @@ void OpenDataCatalogWindow::populateSamples()
     QSignalBlocker blocker(_sampleTable);
     _sampleTable->setSortingEnabled(false);
     _sampleTable->setRowCount(static_cast<int>(_visibleSampleIndexes.size()));
-    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
     for (int row = 0; row < static_cast<int>(_visibleSampleIndexes.size()); ++row) {
         const auto sampleIndex = _visibleSampleIndexes[static_cast<std::size_t>(row)];
         const auto& sample = _manifest->samples[sampleIndex];
@@ -738,7 +869,8 @@ void OpenDataCatalogWindow::populateSamples()
         _sampleTable->setItem(row, 3, numericItem(sample.segmentCount()));
         _sampleTable->setItem(row, 4, numericItem(sample.inkDetectionSegmentCount()));
         _sampleTable->setItem(row, 5, item(localDataText(cacheSummary)));
-        _sampleTable->setItem(row, 6, item(syncStateText(cacheSummary)));
+        _sampleTable->setItem(row, 6, numericItem(cacheSummary.manual));
+        _sampleTable->setItem(row, 7, item(syncStateText(cacheSummary)));
     }
     _sampleTable->setSortingEnabled(true);
     _sampleTable->resizeColumnsToContents();
@@ -769,19 +901,22 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
 
     const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
     const auto cacheSummary = sampleCacheSummary(remoteRoot, *sample);
+    const auto representations = derivedRepresentations(*sample);
     _overviewLabel->setText(
         tr("<b>%1</b><br>Type: %2<br>Scans: %3<br>Volumes: %4<br>Segments: %5<br>"
-           "TIFXYZ segments: %6<br>Ink detections: %7<br>Photos: %8<br>"
-           "Local TIFXYZ: %9<br>Sync: %10<br><br>%11")
+           "Representations: %6<br>TIFXYZ segments: %7<br>Ink detections: %8<br>Photos: %9<br>"
+           "Local TIFXYZ: %10<br>Manual segments: %11<br>Sync: %12<br><br>%13")
             .arg(qstr(sample->id).toHtmlEscaped())
             .arg(qstr(sample->type).toHtmlEscaped())
             .arg(sample->scanCount())
             .arg(sample->volumeCount())
             .arg(sample->segmentCount())
+            .arg(representations.size())
             .arg(sample->tifxyzSegmentCount())
             .arg(sample->inkDetectionSegmentCount())
             .arg(sample->artifacts.size())
             .arg(localDataText(cacheSummary).toHtmlEscaped())
+            .arg(cacheSummary.manual)
             .arg(syncStateText(cacheSummary).toHtmlEscaped())
             .arg(qstr(sample->description).toHtmlEscaped()));
     loadOverviewPhoto(*sample);
@@ -808,9 +943,47 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
         _volumesTable->setItem(row, 4, item(optionalNumber(volume.energyKeV, 'f', 1)));
         _volumesTable->setItem(row, 5, item(optionalNumber(volume.detectorDistanceMm, 'f', 1)));
         _volumesTable->setItem(row, 6, item(qstr(volume.dataFormat)));
-        _volumesTable->setItem(row, 7, item(qstr(volume.createdAt)));
+        _volumesTable->setItem(row, 7,
+                               item(normalGridsStatusDisplay(remoteRoot, sample->id, volume)));
+        _volumesTable->setItem(row, 8, item(qstr(volume.createdAt)));
     }
     _volumesTable->resizeColumnsToContents();
+
+    _representationsTable->setRowCount(static_cast<int>(representations.size()));
+    for (int row = 0; row < static_cast<int>(representations.size()); ++row) {
+        const auto& ref = representations[static_cast<std::size_t>(row)];
+        const auto& volume = sample->volumes[ref.volumeIndex];
+        const auto& artifact = volume.artifacts[ref.artifactIndex];
+        auto* volumeItem = item(qstr(volume.id));
+        volumeItem->setData(kRepresentationVolumeIndexRole,
+                            static_cast<qulonglong>(ref.volumeIndex));
+        volumeItem->setData(kRepresentationArtifactIndexRole,
+                            static_cast<qulonglong>(ref.artifactIndex));
+        _representationsTable->setItem(row, 0, volumeItem);
+        _representationsTable->setItem(
+            row, 1, item(qstr(std::string(representationKindName(ref.kind)))));
+        _representationsTable->setItem(row, 2, item(qstr(artifact.type)));
+        _representationsTable->setItem(
+            row, 3, item(qstr(artifact.modelId.value_or(std::string{}))));
+        _representationsTable->setItem(
+            row, 4, item(representationCoordinates(artifact, ref.kind)));
+        _representationsTable->setItem(row, 5, item(qstr(artifact.accessUsage)));
+        const QString parameters = representationParameters(artifact);
+        auto* parametersItem = item(parameters);
+        parametersItem->setToolTip(parameters);
+        _representationsTable->setItem(row, 6, parametersItem);
+        const QString url = artifactUrl(artifact);
+        auto* urlItem = item(url);
+        urlItem->setToolTip(url);
+        _representationsTable->setItem(row, 7, urlItem);
+    }
+    _representationsTable->resizeColumnsToContents();
+    _representationsTable->setColumnWidth(
+        2, std::min(_representationsTable->columnWidth(2), 240));
+    _representationsTable->setColumnWidth(
+        6, std::min(_representationsTable->columnWidth(6), 320));
+    _representationsTable->setColumnWidth(
+        7, std::min(_representationsTable->columnWidth(7), 360));
 
     _segmentsTable->setRowCount(static_cast<int>(sample->segments.size()));
     for (int row = 0; row < static_cast<int>(sample->segments.size()); ++row) {
@@ -854,6 +1027,9 @@ void OpenDataCatalogWindow::clearDetails()
     if (_volumesTable) {
         _volumesTable->setRowCount(0);
     }
+    if (_representationsTable) {
+        _representationsTable->setRowCount(0);
+    }
     if (_segmentsTable) {
         _segmentsTable->setRowCount(0);
     }
@@ -876,7 +1052,8 @@ void OpenDataCatalogWindow::refreshSelectedSampleCacheStatus()
         const bool sorting = _sampleTable->isSortingEnabled();
         _sampleTable->setSortingEnabled(false);
         _sampleTable->setItem(row, 5, item(localDataText(cacheSummary)));
-        _sampleTable->setItem(row, 6, item(syncStateText(cacheSummary)));
+        _sampleTable->setItem(row, 6, numericItem(cacheSummary.manual));
+        _sampleTable->setItem(row, 7, item(syncStateText(cacheSummary)));
         _sampleTable->setSortingEnabled(sorting);
     }
     populateDetails(sample);
@@ -1020,6 +1197,27 @@ const OpenDataVolume* OpenDataCatalogWindow::selectedVolume() const
     return &sample->volumes[static_cast<std::size_t>(volumeIndex)];
 }
 
+const OpenDataArtifact* OpenDataCatalogWindow::selectedRepresentationArtifact() const
+{
+    const auto* sample = selectedSample();
+    if (!sample || !_representationsTable ||
+        _representationsTable->currentRow() < 0) {
+        return nullptr;
+    }
+    const auto* rowItem = _representationsTable->item(
+        _representationsTable->currentRow(), 0);
+    if (!rowItem) return nullptr;
+    const auto volumeIndex = static_cast<std::size_t>(
+        rowItem->data(kRepresentationVolumeIndexRole).toULongLong());
+    const auto artifactIndex = static_cast<std::size_t>(
+        rowItem->data(kRepresentationArtifactIndexRole).toULongLong());
+    if (volumeIndex >= sample->volumes.size() ||
+        artifactIndex >= sample->volumes[volumeIndex].artifacts.size()) {
+        return nullptr;
+    }
+    return &sample->volumes[volumeIndex].artifacts[artifactIndex];
+}
+
 const OpenDataSegment* OpenDataCatalogWindow::selectedSegment() const
 {
     const auto* sample = selectedSample();
@@ -1051,6 +1249,12 @@ QString OpenDataCatalogWindow::selectedVolumeUrl() const
     return qstr(artifact->resolvedUrl.empty() ? artifact->sourcePath : artifact->resolvedUrl);
 }
 
+QString OpenDataCatalogWindow::selectedRepresentationUrl() const
+{
+    const auto* artifact = selectedRepresentationArtifact();
+    return artifact ? artifactUrl(*artifact) : QString{};
+}
+
 QString OpenDataCatalogWindow::selectedSegmentUrl() const
 {
     const auto* segment = selectedSegment();
@@ -1071,7 +1275,7 @@ std::filesystem::path OpenDataCatalogWindow::selectedSegmentCacheDir() const
     if (!sample || !segment) {
         return {};
     }
-    return openDataSegmentCacheDirectory(
+    return openDataCanonicalSegmentCacheDirectory(
         std::filesystem::path(vc3d::remoteCachePath().toStdString()),
         *sample,
         *segment);
@@ -1079,11 +1283,13 @@ std::filesystem::path OpenDataCatalogWindow::selectedSegmentCacheDir() const
 
 void OpenDataCatalogWindow::updateActionButtons()
 {
+    const bool manifestReady = !_manifestRefreshPending;
     const bool hasVolumeUrl = !selectedVolumeUrl().isEmpty();
+    const bool hasRepresentationUrl = !selectedRepresentationUrl().isEmpty();
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
     const auto* sample = selectedSample();
     const auto* segment = selectedSegment();
-    const bool canCacheSegment = segment && segment->hasTifxyz();
+    const bool canCacheSegment = manifestReady && segment && segment->hasTifxyz();
     const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
     const auto sampleSummary = sample
         ? sampleCacheSummary(remoteRoot, *sample)
@@ -1092,8 +1298,9 @@ void OpenDataCatalogWindow::updateActionButtons()
     const bool hasCacheDir = !cacheDir.empty() && std::filesystem::is_directory(cacheDir);
     const bool canOpenSample = sample != nullptr &&
                                static_cast<bool>(_openSampleHandler) &&
-                               !(_fetchWatcher && _fetchWatcher->isRunning() && !_manifest);
-    const bool canSyncSample = sample != nullptr && sampleSummary.hasTifxyz();
+                               manifestReady;
+    const bool canSyncSample = manifestReady && sample != nullptr &&
+                               sampleSummary.hasTifxyz();
     if (_openSampleButton) {
         _openSampleButton->setEnabled(canOpenSample);
     }
@@ -1103,11 +1310,34 @@ void OpenDataCatalogWindow::updateActionButtons()
             ? tr("Re-sync Local Data")
             : tr("Sync Local Data"));
     }
+    if (_downloadNormalGridsButton) {
+        const auto* volume = selectedVolume();
+        bool canDownload = false;
+        QString text = tr("Download Normal Grids");
+        if (sample && volume) {
+            const auto gridsState = normalGridsCacheState(remoteRoot, sample->id, *volume);
+            if (gridsState.complete) {
+                text = tr("Normal Grids Downloaded");
+            } else {
+                canDownload = manifestReady && gridsState.hasArtifact;
+            }
+        }
+        _downloadNormalGridsButton->setEnabled(canDownload);
+        _downloadNormalGridsButton->setText(text);
+    }
     if (_copyVolumeUrlButton) {
         _copyVolumeUrlButton->setEnabled(hasVolumeUrl);
     }
     if (_openVolumeUrlButton) {
         _openVolumeUrlButton->setEnabled(hasVolumeUrl);
+    }
+    if (_copyRepresentationUrlButton) {
+        _copyRepresentationUrlButton->setEnabled(
+            manifestReady && hasRepresentationUrl);
+    }
+    if (_openRepresentationUrlButton) {
+        _openRepresentationUrlButton->setEnabled(
+            manifestReady && hasRepresentationUrl);
     }
     if (_cacheSegmentButton) {
         _cacheSegmentButton->setEnabled(canCacheSegment);
@@ -1138,7 +1368,7 @@ void OpenDataCatalogWindow::updateActionButtons()
 void OpenDataCatalogWindow::openSelectedSample()
 {
     const auto* sample = selectedSample();
-    if (!sample || !_openSampleHandler) {
+    if (_manifestRefreshPending || !sample || !_openSampleHandler) {
         return;
     }
     if (_openSampleHandler(*sample)) {
@@ -1161,6 +1391,139 @@ void OpenDataCatalogWindow::openSelectedVolumeUrl()
     if (!url.isEmpty()) {
         QDesktopServices::openUrl(QUrl(url));
     }
+}
+
+void OpenDataCatalogWindow::copySelectedRepresentationUrl()
+{
+    const QString url = selectedRepresentationUrl();
+    if (!url.isEmpty() && QGuiApplication::clipboard()) {
+        QGuiApplication::clipboard()->setText(url);
+        setStatus(tr("Copied representation URL."));
+    }
+}
+
+void OpenDataCatalogWindow::openSelectedRepresentationUrl()
+{
+    const QString url = selectedRepresentationUrl();
+    if (!url.isEmpty()) QDesktopServices::openUrl(QUrl(url));
+}
+
+void OpenDataCatalogWindow::downloadSelectedVolumeNormalGrids()
+{
+    const auto* sample = selectedSample();
+    const auto* volume = selectedVolume();
+    if (!sample || !volume) {
+        return;
+    }
+
+    const auto infos = normalGridsArtifacts(sample->id, *volume);
+    if (infos.empty()) {
+        return;
+    }
+    const std::filesystem::path remoteRoot(vc3d::remoteCachePath().toStdString());
+    const QString volumeLabel = qstr(volume->id);
+    const int volumeRow = _volumesTable ? _volumesTable->currentRow() : -1;
+
+    auto cancelFlag = std::make_shared<std::atomic<bool>>(false);
+    auto* dialog = new QProgressDialog(
+        tr("Listing normal grid files for volume %1...").arg(volumeLabel),
+        tr("Cancel"), 0, 0, this);
+    dialog->setWindowTitle(tr("Downloading Normal Grids"));
+    dialog->setWindowModality(Qt::WindowModal);
+    dialog->setMinimumDuration(0);
+    dialog->setAutoClose(false);
+    dialog->setAutoReset(false);
+    dialog->show();
+    QPointer<QProgressDialog> dialogGuard(dialog);
+    connect(dialog, &QProgressDialog::canceled, this, [cancelFlag]() {
+        cancelFlag->store(true, std::memory_order_release);
+    });
+
+    auto progressCallback =
+        [dialogGuard, volumeLabel](const NormalGridsDownloadProgress& progress) {
+            if (!dialogGuard) {
+                return;
+            }
+            QMetaObject::invokeMethod(
+                dialogGuard.data(),
+                [dialogGuard, volumeLabel, progress]() {
+                    if (!dialogGuard) {
+                        return;
+                    }
+                    if (progress.totalFiles <= 0) {
+                        dialogGuard->setLabelText(
+                            tr("Listing normal grid files for volume %1...").arg(volumeLabel));
+                        return;
+                    }
+                    const int done = progress.completedFiles + progress.failedFiles;
+                    QString label =
+                        tr("Downloading normal grids for volume %1 with %2 worker(s): "
+                           "%3/%4 files (%5 / %6).")
+                            .arg(volumeLabel)
+                            .arg(kNormalGridsDownloadWorkers)
+                            .arg(done)
+                            .arg(progress.totalFiles)
+                            .arg(formatByteSize(progress.completedBytes),
+                                 formatByteSize(progress.totalBytes));
+                    if (progress.failedFiles > 0) {
+                        label += tr("\nFailures: %1").arg(progress.failedFiles);
+                    }
+                    dialogGuard->setMaximum(progress.totalFiles);
+                    dialogGuard->setValue(std::min(done, progress.totalFiles));
+                    dialogGuard->setLabelText(label);
+                },
+                Qt::QueuedConnection);
+        };
+
+    struct DownloadResult {
+        std::vector<std::filesystem::path> dirs;
+        std::string error;
+    };
+
+    QFutureWatcher<DownloadResult> watcher;
+    QEventLoop loop;
+    connect(&watcher, &QFutureWatcher<DownloadResult>::finished, &loop, &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run([infos, remoteRoot, progressCallback, cancelFlag]() {
+        DownloadResult result;
+        for (const auto& info : infos) {
+            std::string error;
+            auto dir = downloadOpenDataNormalGrids(
+                info, remoteRoot, kNormalGridsDownloadWorkers,
+                progressCallback, cancelFlag.get(), &error);
+            if (dir.empty()) {
+                result.error = error;
+                break;
+            }
+            result.dirs.push_back(std::move(dir));
+        }
+        return result;
+    }));
+    if (!watcher.isFinished()) {
+        loop.exec();
+    }
+    const DownloadResult result = watcher.result();
+    if (dialogGuard) {
+        dialogGuard->close();
+        dialogGuard->deleteLater();
+    }
+
+    if (result.dirs.size() != infos.size()) {
+        setStatus(cancelFlag->load(std::memory_order_acquire)
+                      ? tr("Normal grid download for %1 cancelled.").arg(volumeLabel)
+                      : tr("Normal grid download for %1 failed: %2")
+                            .arg(volumeLabel, qstr(result.error)));
+    } else {
+        setStatus(tr("%1 normal-grid artifact(s) for %2 downloaded.")
+                      .arg(result.dirs.size()).arg(volumeLabel));
+    }
+
+    // Refresh the volume's status cell and the button state.
+    if (_volumesTable && volumeRow >= 0 && volumeRow < _volumesTable->rowCount() &&
+        selectedSample() == sample) {
+        _volumesTable->setItem(
+            volumeRow, 7, item(normalGridsStatusDisplay(remoteRoot, sample->id, *volume)));
+    }
+    updateActionButtons();
 }
 
 void OpenDataCatalogWindow::copySelectedSegmentUrl()
@@ -1199,6 +1562,8 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
     oneSegmentSample.type = sample->type;
     oneSegmentSample.description = sample->description;
     oneSegmentSample.properties = sample->properties;
+    oneSegmentSample.volumes = sample->volumes;
+    oneSegmentSample.volumeTransforms = sample->volumeTransforms;
     oneSegmentSample.segments.push_back(*segment);
 
     auto pkg = VolumePkg::newEmpty();
@@ -1226,13 +1591,19 @@ void OpenDataCatalogWindow::cacheSelectedSegment()
             }
         },
         forceRefresh);
+    const auto materialized = materializeOpenDataSegment(
+        openDataCanonicalSegmentCacheDirectory(
+            remoteRoot, oneSegmentSample,
+            oneSegmentSample.segments.front()));
 
     QCoreApplication::processEvents();
     refreshSelectedSampleCacheStatus();
     QString message = tr("Cached %1 of %2 selected tifxyz segment(s).")
-                          .arg(result.cachedTifxyzSegments)
+                          .arg(materialized.success ? 1 : 0)
                           .arg(result.supportedTifxyzSegments);
-    if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
+    if (!materialized.success) {
+        message += tr(" %1").arg(qstr(materialized.message));
+    } else if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
         message += tr(" %1").arg(qstr(result.messages.front()));
     }
     setStatus(message);
@@ -1287,12 +1658,27 @@ void OpenDataCatalogWindow::syncSelectedSampleCache()
         },
         forceRefresh);
 
+    int materializedRepresentations = 0;
+    int failedRepresentations = 0;
+    std::string materializationError;
+    for (const auto& entry : pkg->segmentEntries()) {
+        const auto materialized = materializeOpenDataSegmentFolder(entry.location);
+        materializedRepresentations += materialized.materializedSegments;
+        failedRepresentations += materialized.failedSegments;
+        if (materializationError.empty() && !materialized.message.empty()) {
+            materializationError = materialized.message;
+        }
+    }
+
     QCoreApplication::processEvents();
     refreshSelectedSampleCacheStatus();
-    QString message = tr("Synced %1 of %2 tifxyz segment(s).")
-                          .arg(result.cachedTifxyzSegments)
-                          .arg(result.supportedTifxyzSegments);
-    if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
+    QString message = tr("Created or fetched %1 segment representation(s).")
+                          .arg(materializedRepresentations);
+    if (failedRepresentations > 0) {
+        message += tr(" %1 failed: %2")
+                       .arg(failedRepresentations)
+                       .arg(qstr(materializationError));
+    } else if (result.failedTifxyzSegments > 0 && !result.messages.empty()) {
         message += tr(" %1").arg(qstr(result.messages.front()));
     }
     setStatus(message);

@@ -333,6 +333,7 @@ void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
 {
     if (_scrollPanDisabled) {
         switch (event->key()) {
+        case Qt::Key_Escape:
         case Qt::Key_Left:
         case Qt::Key_Right:
         case Qt::Key_Up:

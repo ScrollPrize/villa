@@ -1,0 +1,110 @@
+[
+  {
+    "name": "Giorgio Angelotti",
+    "role": "Project lead since June 2025; conceived the improved CT scanning protocol; contributed to photogrammetric acquisition, case design, ink segmentation models, mesh parametrization algorithms, and cloud scaling."
+  },
+  {
+    "name": "Stephen Parsons",
+    "role": "Project lead February–June 2025; pioneered ink detection pipelines; contributed to photogrammetry, case design, and scan protocol research."
+  },
+  {
+    "name": "Federica Nicolardi",
+    "role": "Leads papyrological efforts; contributed to photogrammetric acquisition and multispectral imaging."
+  },
+  {
+    "name": "Youssef Nader",
+    "role": "Ink detection models and pseudo-labeling."
+  },
+  {
+    "name": "Sean Johnson",
+    "role": "Developed mesh tracing software; mesh algorithms, ink detection, annotation."
+  },
+  {
+    "name": "David Josey",
+    "role": "Leads annotation efforts since February 2025; contributor since May 2023."
+  },
+  {
+    "name": "Paul Henderson",
+    "role": "Supervises machine learning and geometry research; mesh fitting algorithms."
+  },
+  {
+    "name": "Hendrik Schilling",
+    "role": "Conceived and developed mesh tracing software; mesh algorithms."
+  },
+  {
+    "name": "Johannes Rudolph",
+    "role": "Conceived cloud architecture scaling; data pipelines and optimization."
+  },
+  {
+    "name": "Forrest McDonald",
+    "role": "Mesh tracing software."
+  },
+  {
+    "name": "Elian Rafael Dal Prá",
+    "role": "Fiber and ink detection models, annotation."
+  },
+  {
+    "name": "Paul Tafforeau",
+    "role": "Supervised and implemented CT data acquisition and reconstruction at the ESRF BM18 beamline."
+  },
+  {
+    "name": "Alessandro Mirone",
+    "role": "CT data acquisition and reconstruction at BM18."
+  },
+  {
+    "name": "C. Seth Parker",
+    "role": "Pioneered CT scanning protocols and mesh algorithms; photogrammetry."
+  },
+  {
+    "name": "Jan Paul Posma",
+    "role": "Led the Vesuvius Challenge online contest January 2023–February 2024."
+  },
+  {
+    "name": "Benjamin Kyles",
+    "role": "Led annotation efforts May 2023–February 2025."
+  },
+  {
+    "name": "Claudio Vergara",
+    "role": "Papyrological review and manuscript annotation."
+  },
+  {
+    "name": "Alessia Lavorante",
+    "role": "Papyrological review and manuscript annotation."
+  },
+  {
+    "name": "Rossella Villa",
+    "role": "Papyrological review and manuscript annotation."
+  },
+  {
+    "name": "Maria Chiara Robustelli",
+    "role": "Papyrological review and manuscript annotation."
+  },
+  {
+    "name": "Marzia D'Angelo",
+    "role": "Papyrological review and manuscript annotation."
+  },
+  {
+    "name": "Gianluca Del Mastro",
+    "role": "Papyrological review and manuscript annotation."
+  },
+  {
+    "name": "Kilian Fleischer",
+    "role": "Papyrological review and manuscript annotation."
+  },
+  {
+    "name": "Michael McOsker",
+    "role": "Papyrological review and manuscript annotation."
+  },
+  {
+    "name": "Christy Chapman",
+    "role": "Coordinates institutional relationships, permissions, and conservator interactions."
+  },
+  {
+    "name": "Nat Friedman",
+    "role": "Project conception, resources, open-science strategy."
+  },
+  {
+    "name": "W. Brent Seales",
+    "role": "Initiated and pioneered the project; overall strategic guidance."
+  }
+]

@@ -2,10 +2,15 @@
 // Note: type annotations allow type checking and IDEs autocompletion
 
 const lightCodeTheme = require("prism-react-renderer").themes.github;
-const darkCodeTheme = require("prism-react-renderer").themes.dracula;
+const darkCodeTheme = require("prism-react-renderer").themes.vsDark;
 const rehypeKatex = require("rehype-katex").default; // Extract default export for rehype-katex
 const remarkMath = require("remark-math").default; // Extract default export for remark-math
 const rehypeImageDimensions = require("./plugins/rehype-image-dimensions");
+const { computeAwardedTotal } = require("./plugins/winners-data");
+
+// Total $ awarded, summed from the winners page's money headings at config
+// load — keeps the tagline/meta descriptions in sync with docs/15_winners.md.
+const AWARDED = computeAwardedTotal(__dirname).total.toLocaleString("en-US");
 
 // Sitewide structured data. Injected via headTags (below) so it is present in
 // the server-rendered static HTML — react-helmet (<Head>) drops <script>
@@ -20,7 +25,7 @@ const orgJsonLd = {
   url: SITE_URL,
   logo: SITE_URL + "img/social/opengraph.jpg",
   description:
-    "Vesuvius Challenge is a machine learning, computer vision, and geometry competition reading the carbonized Herculaneum scrolls — papyri buried by the eruption of Mount Vesuvius in 79 AD — using X-ray CT scanning and AI. Over $1,800,500 in prizes has been awarded.",
+    `Vesuvius Challenge is a machine learning, computer vision, and geometry competition reading the carbonized Herculaneum scrolls — papyri buried by the eruption of Mount Vesuvius in 79 AD — using X-ray CT scanning and AI. Over $${AWARDED} in prizes has been awarded.`,
   foundingDate: "2023",
   founder: [
     { "@type": "Person", name: "Nat Friedman" },
@@ -70,13 +75,22 @@ const SITEMAP_LASTMOD = gitLastmodSupported() ? "date" : null;
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: "Vesuvius Challenge",
-  tagline: "A machine learning and computer vision competition with $1,800,500 awarded in prizes",
+  tagline: `A machine learning and computer vision competition with $${AWARDED} awarded in prizes`,
   url: "https://scrollprize.org",
   baseUrl: "/",
   onBrokenAnchors: "throw",
   onBrokenLinks: "throw",
   onBrokenMarkdownLinks: "throw",
   favicon: "img/social/favicon.ico",
+  customFields: {
+    // "Ask the Scrolls" chat endpoint. Same-origin Vercel function in prod;
+    // point CHAT_ENDPOINT at a local dev shim (scripts/devChatServer.mjs) when
+    // testing against `yarn serve`. Empty string disables the widget.
+    chatEndpoint:
+      process.env.CHAT_ENDPOINT !== undefined
+        ? process.env.CHAT_ENDPOINT
+        : "/api/chat",
+  },
   scripts: [
     {
       src: "https://cdn.usefathom.com/script.js",
@@ -112,6 +126,7 @@ const config = {
   clientModules: [
     require.resolve("./src/clientModules/imageZoom.js"),
     require.resolve("./src/clientModules/gtagSafeStub.js"),
+    require.resolve("./src/clientModules/anchorScrollFix.js"),
   ],
   markdown: {
     mermaid: true,
@@ -131,18 +146,22 @@ const config = {
         docs: {
           routeBasePath: "/",
           sidebarPath: require.resolve("./sidebars.js"),
-          sidebarCollapsible: false,
+          sidebarCollapsible: true,
           breadcrumbs: false,
-          editUrl:
-              "https://github.com/ScrollPrize/villa/tree/main/scrollprize.org",
           remarkPlugins: [remarkMath],
           rehypePlugins: [[rehypeKatex, { strict: false }], rehypeImageDimensions],
         },
         blog: false,
         theme: {
           customCss: [
+            require.resolve("./src/css/tokens.css"),
+            require.resolve("./src/css/utilities.css"),
             require.resolve("./src/css/custom.css"),
+            require.resolve("./src/css/chrome.css"),
+            require.resolve("./src/css/landing.css"),
+            require.resolve("./src/css/getstarted.css"),
             require.resolve("./src/css/imageZoom.css"),
+            require.resolve("./src/css/chat.css"),
           ],
         },
         gtag: {
@@ -169,48 +188,101 @@ const config = {
             alt: "Vesuvius Challenge Logo",
             src: "img/social/favicon-64x64.png",
           },
-          items: [],
+          items: [
+            { to: "/prizes", label: "Prizes", position: "left" },
+            { to: "/2026_open_problems", label: "Problems", position: "left" },
+            {
+              type: "dropdown",
+              label: "Tutorials & In-depth",
+              position: "left",
+              items: [
+                {
+                  to: "/tutorial_VC3D",
+                  label: "Virtual Unwrapping",
+                },
+                {
+                  to: "/tutorial_spiral",
+                  label: "Spiral Fitting",
+                },
+                {
+                  to: "/open_problems/winding_annotations",
+                  label: "Winding Constraints",
+                },
+                {
+                  to: "/tutorial5",
+                  label: "Ink Detection",
+                },
+              ],
+            },
+            { to: "/data_browser", label: "Data", position: "left" },
+            { to: "/winners", label: "Milestones", position: "left" },
+            {
+              type: "dropdown",
+              label: "Community",
+              position: "left",
+              items: [
+                { label: "Discord", href: "https://discord.gg/V4fJhvtaQn" },
+                { label: "𝕏", href: "https://x.com/scrollprize" },
+                { label: "Substack", href: "https://scrollprize.substack.com" },
+                { label: "GitHub", href: "https://github.com/ScrollPrize" },
+                {
+                  label: "Hugging Face",
+                  href: "https://huggingface.co/scrollprize",
+                },
+                {
+                  label: "Weights & Biases",
+                  href: "https://wandb.ai/vesuvius-challenge/projects",
+                },
+              ],
+            },
+            {
+              href: "https://donate.stripe.com/aEUg101vt9eN8gM144",
+              label: "Donate",
+              position: "left",
+            },
+            {
+              href: "https://discord.gg/V4fJhvtaQn",
+              label: "Join Discord",
+              position: "right",
+              className: "vc-navbar-discord",
+            },
+            {
+              to: "/get_started",
+              label: "Get Started",
+              position: "right",
+              className: "vc-navbar-cta",
+            },
+          ],
         },
         footer: {
           style: "dark",
           links: [
             {
-              title: "Overview",
-              items: [
-                {
-                  label: "Getting Started",
-                  to: "/get_started",
-                },
-                {
-                  label: "Master Plan",
-                  to: "/master_plan",
-                },
-              ],
-            },
-            {
-              title: "Community",
               items: [
                 {
                   label: "Discord",
                   href: "https://discord.gg/V4fJhvtaQn",
                 },
                 {
-                  label: "Substack",
-                  href: "https://scrollprize.substack.com",
+                  label: "GitHub",
+                  href: "https://github.com/ScrollPrize",
                 },
                 {
-                  label: "GitHub",
-                  href: "https://github.com/ScrollPrize/villa",
+                  label: "Hugging Face",
+                  href: "https://huggingface.co/scrollprize",
+                },
+                {
+                  label: "Weights & Biases",
+                  href: "https://wandb.ai/vesuvius-challenge/projects",
+                },
+                {
+                  label: "Substack",
+                  href: "https://scrollprize.substack.com",
                 },
                 {
                   label: "𝕏",
                   href: "https://x.com/scrollprize",
                 },
-              ],
-            },
-            {
-              title: "More",
-              items: [
                 {
                   label: "Jobs",
                   to: "/jobs",
@@ -218,14 +290,13 @@ const config = {
               ],
             },
           ],
-          copyright: `Copyright © ${new Date().getFullYear()} Vesuvius Challenge.`,
+          copyright: `Copyright © ${new Date().getFullYear()} Vesuvius Challenge · Content licensed CC BY-NC 4.0 unless otherwise specified`,
         },
         image: '/img/social/opengraph.jpg',
         metadata: [
           {
             name: "description",
-            content:
-                "A machine learning and computer vision competition with $1,800,500 awarded in prizes",
+            content: `A machine learning and computer vision competition with $${AWARDED} awarded in prizes`,
           },
           {
             property: "og:type",
@@ -294,6 +365,8 @@ const config = {
     },
     './plugins/fetch-substack-posts',
     './plugins/atlas-data',
+    './plugins/prizes-data',
+    './plugins/winners-data',
     [
       "@docusaurus/plugin-client-redirects",
       {
@@ -313,6 +386,50 @@ const config = {
           {
             to: "https://dl.ash2txt.org/LICENSE.txt",
             from: "/license",
+          },
+          // Orphan docs removed in the "Obsidian Minimal" restyle. Journals and
+          // Discord threads have linked these for years — keep the URLs alive.
+          {
+            to: "/segmentation",
+            from: "/tutorial_thaumato",
+          },
+          {
+            to: "/segmentation",
+            from: "/tutorial4",
+          },
+          {
+            to: "/unwrapping",
+            from: "/open_problem_rep",
+          },
+          // The open_problems/ink_detection page was retired (superseded by
+          // the Ink recovery section of Problems in-depth + the ink
+          // tutorial) — keep the URL alive.
+          {
+            to: "/tutorial5",
+            from: "/open_problems/ink_detection",
+          },
+          // Pages retired in the C6 fix round — keep the URLs alive.
+          {
+            to: "/data",
+            from: "/data_segments",
+          },
+          {
+            to: "/data",
+            from: "/data_fragments",
+          },
+          {
+            to: "/",
+            from: "/background",
+          },
+          // The blogpost briefly lived at /from_ash_to_text and /tech_blogpost
+          // on preview builds.
+          {
+            to: "/2026_open_problems",
+            from: "/from_ash_to_text",
+          },
+          {
+            to: "/2026_open_problems",
+            from: "/tech_blogpost",
           },
         ],
       },

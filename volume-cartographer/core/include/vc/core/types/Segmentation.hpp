@@ -20,6 +20,7 @@ public:
     [[nodiscard]] std::string name() const;
     void setName(const std::string& n);
     [[nodiscard]] std::filesystem::path path() const { return path_; }
+    [[nodiscard]] const utils::Json& metadata() const noexcept { return metadata_; }
     void saveMetadata();
     void ensureScrollSource(const std::string& scrollName, const std::string& volumeUuid);
 

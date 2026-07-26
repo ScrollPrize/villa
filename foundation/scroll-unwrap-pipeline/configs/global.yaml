@@ -1,0 +1,75 @@
+# Global production configuration. Per-group/per-mesh overrides merge over this.
+data:
+  march_dir: "textured_plys/textured_ply_march"
+  may_dir: "textured_plys/textured_ply_may"
+  scrolls_dir: "scroll_meshes-20260610T062158Z-3-001/scroll_meshes"
+  ink_march_dir: "1667 - ink detection"
+  ink_may_dir: "ink det + max comp (may 5th)/predictions_inv"
+
+outputs:
+  root: "outputs"
+  conversions: "outputs/obj"
+  decimated: "outputs/decimated"
+  overlays: "outputs/overlays"
+  anim: "outputs/anim"
+
+conversion:
+  float_format: "%.9g"
+
+decimation:
+  keep_ladder: [0.05, 0.08, 0.12, 0.20, 0.35]
+  qualitythr: 0.5
+  preserveboundary: true
+  boundaryweight: 1.0
+  extratcoordw: 1.0     # raise to 2-3 if UV smears (gate-driven)
+  ssim_production_min: 0.97
+  ssim_closeup_min: 0.95
+  hausdorff_max_mean_edge: 1.0
+
+ink:
+  # bake parameters (see docs/RENDER-STYLE.md; ink is carbon BLACK)
+  # NB: the composites are neutral gray — any warm tint reads as sepia stains. Neutral black.
+  tint_rgb: [16, 16, 16]       # neutral carbon black #101010
+  opacity_lo: 0.42             # raised: keep confident ink, drop diffuse blob halos
+  opacity_hi: 0.78
+  opacity_scale: 0.88
+  glow_sigma_px: 0.0           # no glow for carbon ink
+  glow_strength: 0.0
+
+unwrap:
+  frames: 240
+  fps: 30
+  hold_start: 20
+  hold_end: 25
+  easing: "quintic"
+  substeps: 1            # raise if mid-animation artifacts appear (gate-driven)
+  anchor_strip_frac: 0.02
+  solver_backend: "auto" # resolved from reports/solver_bench.json
+
+render:
+  backend: "pyvista-egl"
+  background: "#101114"
+  framings:
+    horizontal: { width: 3840, height: 2160 }
+    vertical:   { width: 2160, height: 3840 }
+  derivatives:
+    - { name: "1080p", scale: 0.5 }
+  margin_frac: 0.06
+  push_in_frac: 0.025
+  keyframes_per_video: 5
+  # texture sampling orientation: filled by audit (reports/audit.json: tex_orientation)
+
+encode:
+  crf_4k: 19
+  crf_1080: 18
+  preset: "slow"
+  hevc: false
+
+variants:
+  reveal_tail_frames: 90
+  reveal_hold_in: 15
+  reveal_fade: 50
+  reveal_hold_out: 25
+  # post-reveal dwell: after the ink is fully exposed, hold with a slow push-in
+  reveal_zoom_hold: 75
+  reveal_zoom_factor: 1.03

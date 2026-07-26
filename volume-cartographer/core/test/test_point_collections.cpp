@@ -339,6 +339,56 @@ TEST_CASE("loadFromJSON rejects bad input and returns false")
     fs::remove(tmp);
 }
 
+TEST_CASE("top-level coordinate metadata is saved and loaded")
+{
+    const fs::path tmp = fs::temp_directory_path() /
+        ("pc_coordinate_metadata_" + std::to_string(::getpid()) + ".json");
+
+    PointCollections original;
+    original.addPoint("source", {1, 2, 3});
+    utils::Json metadata = utils::Json::object();
+    metadata["vc_open_data_coordinate_space"] = "PHerc1451/20260319101107@L2";
+    metadata["vc_open_data_source_path"] = "s3://path/to/the/source/volume";
+    metadata["vc_open_data_source_coordinate_level"] = 2;
+    metadata["vc_open_data_source_coordinate_scale_factor"] = uint64_t{4};
+    metadata["vc_open_data_source_original_resolution"] = 2.4;
+    original.setFileMetadata(metadata);
+    REQUIRE(original.saveToJSON(tmp.string()));
+
+    const auto saved = utils::Json::parse_file(tmp);
+    CHECK(saved["vc_open_data_coordinate_space"].get_string() ==
+          "PHerc1451/20260319101107@L2");
+    CHECK(saved["vc_open_data_source_coordinate_scale_factor"].get_uint64() == 4);
+
+    PointCollections loaded;
+    REQUIRE(loaded.loadFromJSON(tmp.string()));
+    CHECK(loaded.fileMetadata()["vc_open_data_source_path"].get_string() ==
+          "s3://path/to/the/source/volume");
+    CHECK(loaded.fileMetadata()["vc_open_data_source_original_resolution"].get_double() ==
+          doctest::Approx(2.4));
+    fs::remove(tmp);
+}
+
+TEST_CASE("segment correction files carry top-level coordinate metadata")
+{
+    const fs::path dir = fs::temp_directory_path() /
+        ("pc_segment_coordinate_metadata_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+
+    PointCollections points;
+    points.addPoint("correction", {1, 2, 3});
+    points.setCollectionAnchor2d(points.getCollectionId("correction"), cv::Vec2f(4, 5));
+    utils::Json metadata = utils::Json::object();
+    metadata["vc_open_data_coordinate_space"] = "PHerc1451/20260319101107@L2";
+    points.setFileMetadata(metadata);
+    REQUIRE(points.saveToSegmentPath(dir));
+
+    const auto saved = utils::Json::parse_file(dir / "corrections.json");
+    CHECK(saved["vc_open_data_coordinate_space"].get_string() ==
+          "PHerc1451/20260319101107@L2");
+    fs::remove_all(dir);
+}
+
 TEST_CASE("saveToJSON fails on an unwritable path")
 {
     PointCollections c;

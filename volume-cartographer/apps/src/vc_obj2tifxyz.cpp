@@ -656,9 +656,12 @@ int main(int argc, char *argv[])
     // Source tifxyz (optional): provides the scale that sizes the output grid
     // to the input sampling density, and (if present) the approval mask to
     // resample. Absent -> legacy metric sizing, no approval channel.
+    utils::Json sourceMeta = utils::Json::object();
     if (!tifxyz_source.empty()) {
         try {
             std::unique_ptr<QuadSurface> src(load_quad_from_tifxyz(tifxyz_source));
+            if (src->meta.is_object())
+                sourceMeta = src->meta;
             const cv::Vec2f s = src->scale();
             if (s[0] > 0.f && s[1] > 0.f) {
                 converter.setSrcScale(s);
@@ -694,6 +697,7 @@ int main(int argc, char *argv[])
         std::cerr << "Failed to create quad surface" << std::endl;
         return EXIT_FAILURE;
     }
+    surf->meta = std::move(sourceMeta);
 
     // Attach the resampled approval mask so save() writes approval.tif at the
     // new grid size alongside x/y/z.tif.
