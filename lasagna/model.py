@@ -3106,8 +3106,10 @@ class Model3D(nn.Module):
 		"""Invert a source-vertex UV map onto a regular output grid for export.
 
 		This is intentionally non-differentiable.  Optimization happens on the
-		forward source->UV map; export finds the source quad containing each
-		output UV pixel and bilinearly samples the frozen tifxyz source.
+		forward source->UV map; export finds the fixed-diagonal source triangle
+		containing each output UV pixel and barycentrically samples the frozen
+		tifxyz source. The split matches VC's (p00,p10,p01), (p10,p11,p01)
+		structured-mesh topology.
 		"""
 		if uv_yx.ndim != 3 or int(uv_yx.shape[-1]) != 2:
 			raise ValueError(f"forward flatten UV map must have shape (H,W,2), got {tuple(uv_yx.shape)}")
@@ -3165,10 +3167,21 @@ class Model3D(nn.Module):
 			np.isfinite(xyz01_all).all(axis=-1) &
 			np.isfinite(xyz11_all).all(axis=-1)
 		)
-		e_s = 0.5 * ((q10_all - q00_all) + (q11_all - q01_all))
-		e_t = 0.5 * ((q01_all - q00_all) + (q11_all - q10_all))
-		det_center = e_s[..., 0] * e_t[..., 1] - e_s[..., 1] * e_t[..., 0]
-		valid_cells_2d = cell_valid & finite_uv & finite_xyz & np.isfinite(det_center) & (det_center > 1.0e-10)
+		tri0_s_all = q10_all - q00_all
+		tri0_t_all = q01_all - q00_all
+		tri1_u_all = q11_all - q10_all
+		tri1_v_all = q01_all - q10_all
+		det0 = tri0_s_all[..., 0] * tri0_t_all[..., 1] - tri0_s_all[..., 1] * tri0_t_all[..., 0]
+		det1 = tri1_u_all[..., 0] * tri1_v_all[..., 1] - tri1_u_all[..., 1] * tri1_v_all[..., 0]
+		valid_cells_2d = (
+			cell_valid
+			& finite_uv
+			& finite_xyz
+			& np.isfinite(det0)
+			& np.isfinite(det1)
+			& (det0 > 1.0e-10)
+			& (det1 > 1.0e-10)
+		)
 		if not valid_cells_2d.any():
 			out_map = np.zeros((min_h, min_w, 2), dtype=np.float32)
 			out_xyz = np.zeros((1, min_h, min_w, 3), dtype=np.float32)
@@ -3216,14 +3229,16 @@ class Model3D(nn.Module):
 			if int(centers.shape[0]) * int(out_h) * int(out_w) > 20_000_000:
 				raise RuntimeError("scipy.spatial.cKDTree is required for large forward-flatten export")
 
-		# Vectorized GPU Newton solve.  Only the KDTree candidate search stays on
-		# CPU.  Math is float64 to match the original (float32 breaks near-ties between
-		# overlapping cells differently).
+		# Vectorized triangle barycentric solve. Only the KDTree candidate search
+		# stays on CPU. Float64 keeps shared-edge and overlapping-cell tie behavior
+		# stable across CPU and CUDA.
 		use_cuda = bool(torch.device(device).type == "cuda")
-		es_cell = torch.as_tensor(q10 - q00, dtype=torch.float64, device=device)
-		et_cell = torch.as_tensor(q01 - q00, dtype=torch.float64, device=device)
-		bl_cell = torch.as_tensor(q11 - q10 - q01 + q00, dtype=torch.float64, device=device)
+		tri0_s_cell = torch.as_tensor(q10 - q00, dtype=torch.float64, device=device)
+		tri0_t_cell = torch.as_tensor(q01 - q00, dtype=torch.float64, device=device)
+		tri1_u_cell = torch.as_tensor(q11 - q10, dtype=torch.float64, device=device)
+		tri1_v_cell = torch.as_tensor(q01 - q10, dtype=torch.float64, device=device)
 		q00_c = torch.as_tensor(q00, dtype=torch.float64, device=device)
+		q10_c = torch.as_tensor(q10, dtype=torch.float64, device=device)
 		x00_c = torch.as_tensor(x00, dtype=torch.float64, device=device)
 		x10_c = torch.as_tensor(x10, dtype=torch.float64, device=device)
 		x01_c = torch.as_tensor(x01, dtype=torch.float64, device=device)
@@ -3240,9 +3255,9 @@ class Model3D(nn.Module):
 		total = int(out_h) * int(out_w)
 		chunk = max(1, int(chunk_points))
 		if use_cuda and chunk < (1 << 20):
-			# Peak GPU memory scales with chunk * k: the Newton loop holds ~a dozen
-			# (chunk, k[, 2]) float64 temporaries, roughly 1-2 GB at chunk=1M, k=8.
-			# If k_candidates grows large or OOMs appear, lower this cap.
+			# Peak GPU memory scales with chunk * k through the candidate edge and
+			# barycentric tensors. If k_candidates grows large or OOMs appear,
+			# lower this cap.
 			chunk = 1 << 20
 		for start in range(0, total, chunk):
 			stop = min(total, start + chunk)
@@ -3262,36 +3277,47 @@ class Model3D(nn.Module):
 				cand_t = torch.topk(d2, min(k, int(centers_c.shape[0])), dim=1, largest=False).indices
 
 			pts_t = torch.as_tensor(points, dtype=torch.float64, device=device)
-			rhs = pts_t[:, None, :] - q00_c[cand_t]
-			es = es_cell[cand_t]
-			et = et_cell[cand_t]
-			bl = bl_cell[cand_t]
-			det = es[..., 0] * et[..., 1] - es[..., 1] * et[..., 0]
-			half = torch.full_like(det, 0.5)
-			okdet = det.abs() > 1.0e-12
-			s = torch.where(okdet, (rhs[..., 0] * et[..., 1] - et[..., 0] * rhs[..., 1]) / det, half)
-			t = torch.where(okdet, (es[..., 0] * rhs[..., 1] - rhs[..., 0] * es[..., 1]) / det, half)
-			for _ in range(6):
-				# resid = P - point = s*es + t*et + s*t*bilin - rhs  (all O(1), no absolute coords)
-				resid = (s[..., None] * es + t[..., None] * et + (s * t)[..., None] * bl) - rhs
-				Js = es + t[..., None] * bl
-				Jt = et + s[..., None] * bl
-				jdet = Js[..., 0] * Jt[..., 1] - Js[..., 1] * Jt[..., 0]
-				ok = jdet.abs() > 1.0e-12
-				zero = torch.zeros_like(jdet)
-				ds = torch.where(ok, (resid[..., 0] * Jt[..., 1] - Jt[..., 0] * resid[..., 1]) / jdet, zero)
-				dt = torch.where(ok, (Js[..., 0] * resid[..., 1] - resid[..., 0] * Js[..., 1]) / jdet, zero)
-				s = s - ds
-				t = t - dt
-			resid = (s[..., None] * es + t[..., None] * et + (s * t)[..., None] * bl) - rhs
-			res2 = (resid * resid).sum(dim=-1)
-			inside = (
-				torch.isfinite(res2)
-				& (s >= -1.0e-4) & (s <= 1.0 + 1.0e-4)
-				& (t >= -1.0e-4) & (t <= 1.0 + 1.0e-4)
-				& (res2 <= 1.0e-5)
+
+			# Triangle 0: q00 + s*(q10-q00) + t*(q01-q00).
+			rhs0 = pts_t[:, None, :] - q00_c[cand_t]
+			e0s = tri0_s_cell[cand_t]
+			e0t = tri0_t_cell[cand_t]
+			det0_c = e0s[..., 0] * e0t[..., 1] - e0s[..., 1] * e0t[..., 0]
+			s0 = (rhs0[..., 0] * e0t[..., 1] - e0t[..., 0] * rhs0[..., 1]) / det0_c
+			t0 = (e0s[..., 0] * rhs0[..., 1] - rhs0[..., 0] * e0s[..., 1]) / det0_c
+			resid0 = s0[..., None] * e0s + t0[..., None] * e0t - rhs0
+			res20 = (resid0 * resid0).sum(dim=-1)
+			inside0 = (
+				torch.isfinite(res20)
+				& (s0 >= -1.0e-4)
+				& (t0 >= -1.0e-4)
+				& (s0 + t0 <= 1.0 + 1.0e-4)
+				& (res20 <= 1.0e-5)
 			)
-			score = torch.where(inside, res2, torch.full_like(res2, float("inf")))
+			inf = torch.full_like(res20, float("inf"))
+			score0 = torch.where(inside0, res20, inf)
+			del rhs0, e0s, e0t, det0_c, resid0, res20, inside0
+
+			# Triangle 1: q10 + u*(q11-q10) + v*(q01-q10).
+			rhs1 = pts_t[:, None, :] - q10_c[cand_t]
+			e1u = tri1_u_cell[cand_t]
+			e1v = tri1_v_cell[cand_t]
+			det1_c = e1u[..., 0] * e1v[..., 1] - e1u[..., 1] * e1v[..., 0]
+			u1 = (rhs1[..., 0] * e1v[..., 1] - e1v[..., 0] * rhs1[..., 1]) / det1_c
+			v1 = (e1u[..., 0] * rhs1[..., 1] - rhs1[..., 0] * e1u[..., 1]) / det1_c
+			resid1 = u1[..., None] * e1u + v1[..., None] * e1v - rhs1
+			res21 = (resid1 * resid1).sum(dim=-1)
+			inside1 = (
+				torch.isfinite(res21)
+				& (u1 >= -1.0e-4)
+				& (v1 >= -1.0e-4)
+				& (u1 + v1 <= 1.0 + 1.0e-4)
+				& (res21 <= 1.0e-5)
+			)
+			score1 = torch.where(inside1, res21, inf)
+			del rhs1, e1u, e1v, det1_c, resid1, res21, inside1, inf
+			use_tri1 = score1 < score0
+			score = torch.minimum(score0, score1)
 			# Deterministic argmin matching numpy: lowest candidate position among
 			# minimal scores (torch.min's tie-break is unspecified on CUDA).
 			best_score = score.min(dim=1, keepdim=True).values
@@ -3304,18 +3330,29 @@ class Model3D(nn.Module):
 				continue
 			ar = torch.arange(cand_t.shape[0], device=device)
 			best_cell = cand_t[ar, best_pos][good]
-			best_s = s[ar, best_pos][good].clamp(0.0, 1.0).to(torch.float64)
-			best_t = t[ar, best_pos][good].clamp(0.0, 1.0).to(torch.float64)
+			best_tri1 = use_tri1[ar, best_pos][good]
+			best_s0 = s0[ar, best_pos][good]
+			best_t0 = t0[ar, best_pos][good]
+			best_u1 = u1[ar, best_pos][good]
+			best_v1 = v1[ar, best_pos][good]
+
+			# Clamp tiny shared-edge tolerances, then renormalize barycentric
+			# weights so source coordinates and sampled xyz use the same point.
+			zero = torch.zeros_like(best_s0)
+			w00 = torch.where(best_tri1, zero, 1.0 - best_s0 - best_t0)
+			w10 = torch.where(best_tri1, 1.0 - best_u1 - best_v1, best_s0)
+			w01 = torch.where(best_tri1, best_v1, best_t0)
+			w11 = torch.where(best_tri1, best_u1, zero)
+			weights = torch.stack((w00, w10, w01, w11), dim=-1).clamp_min(0.0)
+			weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
 			flat_out = torch.as_tensor(flat_idx, dtype=torch.long, device=device)[good]
-			src_r = rows_c[best_cell] + best_s
-			src_c = cols_c[best_cell] + best_t
-			S = best_s[:, None]
-			T = best_t[:, None]
+			src_r = rows_c[best_cell] + weights[:, 1] + weights[:, 3]
+			src_c = cols_c[best_cell] + weights[:, 2] + weights[:, 3]
 			sampled = (
-				(1.0 - S) * (1.0 - T) * x00_c[best_cell]
-				+ S * (1.0 - T) * x10_c[best_cell]
-				+ (1.0 - S) * T * x01_c[best_cell]
-				+ S * T * x11_c[best_cell]
+				weights[:, 0, None] * x00_c[best_cell]
+				+ weights[:, 1, None] * x10_c[best_cell]
+				+ weights[:, 2, None] * x01_c[best_cell]
+				+ weights[:, 3, None] * x11_c[best_cell]
 			)
 			out_map_t[flat_out, 0] = src_r.to(torch.float32)
 			out_map_t[flat_out, 1] = src_c.to(torch.float32)

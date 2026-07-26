@@ -187,7 +187,7 @@ class TestCompleteBandDetection:
             normals, torch.tensor([[8.0, 2.0, 2.0]]))
         assert not bool(valid[0])
 
-    def test_dense_and_mmap_normal_gathers_agree(self):
+    def test_dense_and_sparse_normal_gathers_agree(self):
         dense = normal_volume((3, 4, 5), nx=200, ny=90, scale=2.0,
                               z_origin=2)
 
@@ -202,13 +202,13 @@ class TestCompleteBandDetection:
                 return values.to(device), torch.zeros(
                     [len(grad_indices)], dtype=torch.uint8, device=device)
 
-        mmap = {key: value for key, value in dense.items() if key != 'volume'}
-        mmap.update({'backend': 'mmap', 'store': Store(dense['volume'])})
+        sparse = {key: value for key, value in dense.items() if key != 'volume'}
+        sparse.update({'backend': 'sparse_cuda', 'store': Store(dense['volume'])})
         points = torch.tensor([[4.0, 2.0, 4.0], [8.0, 6.0, 8.0]])
         dense_result = sample_lasagna_normals_nearest(dense, points)
-        mmap_result = sample_lasagna_normals_nearest(mmap, points)
-        torch.testing.assert_close(dense_result[0], mmap_result[0])
-        torch.testing.assert_close(dense_result[1], mmap_result[1])
+        sparse_result = sample_lasagna_normals_nearest(sparse, points)
+        torch.testing.assert_close(dense_result[0], sparse_result[0])
+        torch.testing.assert_close(dense_result[1], sparse_result[1])
 
     def test_band_spanning_invalid_interior_is_marked_ambiguous(self):
         volume = sheet_volume(80, [10, 20, 30, 40, 50, 60])

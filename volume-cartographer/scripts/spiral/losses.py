@@ -1240,7 +1240,7 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
         yield 'dense_normals', zero
         return
 
-    backend = lasagna_volume.get('backend', 'dense_cuda')
+    backend = lasagna_volume.get('backend', 'dense_test')
     volume = lasagna_volume.get('volume')  # dense: 3 (nx, ny, grad_mag), z, y, x uint8
     z_size, y_size, x_size = lasagna_volume['shape']
     z_origin = lasagna_volume['z_origin']
@@ -1280,8 +1280,7 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     yi = yi.clamp(0, y_size - 1)
     xi = xi.clamp(0, x_size - 1)
 
-    # Build both sparse requests before touching the mmap backend, so its one
-    # bounded pool can schedule normal and spacing page faults together.
+    # Build both sparse requests before touching the shared CUDA cache.
     if compute_spacing:
         density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale'] * lasagna_scale
         num_steps = int(cfg['spacing_integration_steps'])
@@ -1298,7 +1297,7 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
     else:
         integration_zyx = None
 
-    if backend == 'mmap':
+    if backend == 'sparse_cuda':
         normal_indices = torch.stack([zi, yi, xi], dim=-1)
         if compute_spacing:
             grad_indices = torch.stack([izi, iyi, ixi], dim=-1)
@@ -1309,16 +1308,12 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
         nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
         if compute_spacing:
             grad_mag_u8 = grad_mag_u8.reshape(izi.shape)
-    elif backend == 'dense_cuda_paged':
-        from lasagna_data import gather_paged_u8
-        nx_u8 = gather_paged_u8(lasagna_volume, zi, yi, xi, channel=0)
-        ny_u8 = gather_paged_u8(lasagna_volume, zi, yi, xi, channel=1)
-        grad_mag_u8 = (gather_paged_u8(lasagna_volume, izi, iyi, ixi, channel=2)
-                       if compute_spacing else None)
-    else:
+    elif backend in ('dense', 'dense_test'):
         nx_u8 = volume[0, zi, yi, xi]
         ny_u8 = volume[1, zi, yi, xi]
         grad_mag_u8 = volume[2, izi, iyi, ixi] if compute_spacing else None
+    else:
+        raise ValueError(f'unsupported lasagna backend {backend!r}')
     normal_weight = (((nx_u8 != 0) | (ny_u8 != 0)) & in_bounds).float()
     nx = _decode_uint8_normal_component(nx_u8.float())
     ny = _decode_uint8_normal_component(ny_u8.float())

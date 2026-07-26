@@ -67,7 +67,8 @@ Reference configs:
   - Owns flatten initialization and map integration.
   - `flatten_direction == "inverse"` keeps the old output-to-source map.
   - `flatten_direction == "forward"` uses a source-sized UV map.
-  - `_flatten_invert_forward_uv_map(...)` performs CPU/Numpy export inversion.
+  - `_flatten_invert_forward_uv_map(...)` inverts VC's two fixed-diagonal mesh
+    triangles for export.
 
 - `lasagna/opt_loss_flatten.py`
   - Contains direction-aware flatten losses.
@@ -99,7 +100,14 @@ The forward path also reuses:
   - Keeps the mean UV offset anchored to initialization.
 
 - `flatten_orient`
-  - Penalizes negative or low UV signed area.
+  - Penalizes negative or low signed UV area for both fixed-diagonal triangles
+    in every source cell. This matches the mesh that VC3D consumes and catches
+    triangle folds that a center-only quad determinant misses.
+  - Uses a small positive determinant margin (`flatten_orient_min_det=0.01` by
+    default) so floating-point noise does not leave nearly degenerate triangles.
+  - The supplied flatten configurations use weight `2`; the former center-only
+    determinant used weight `10`, which is unnecessarily stiff for the stricter
+    per-triangle constraint.
   - In forward mode this is masked by valid source cells.
   - In forward mode it also preserves source-row order in output Y and
     source-column/winding order in output X. This prevents distant, locally
@@ -133,11 +141,11 @@ For `flatten_solver: "forward"`:
 2. A regular output canvas is chosen from UV bounds plus
    `flatten_output_margin` padding, but never smaller than the old 20 percent
    larger source-based canvas.
-3. Candidate source quads are found by a KD-tree over UV quad centers when
+3. Candidate source cells are found by a KD-tree over UV cell centers when
    `scipy.spatial.cKDTree` is available.
-4. Each output UV pixel tries bilinear inverse coordinates inside candidate UV
-   quads.
-5. Successful inversions bilinearly sample the original source tifxyz.
+4. Each output UV pixel tries barycentric coordinates in the candidate cell's
+   `(p00,p10,p01)` and `(p10,p11,p01)` triangles.
+5. Successful inversions barycentrically sample the same source mesh triangle.
 6. Failed inversions remain invalid and export as `-1`.
 
 The inversion is intentionally not differentiable. Optimization happens only on
@@ -164,13 +172,13 @@ Additional synthetic smoke:
 
 ## Known Limitations
 
-- Forward export inversion is CPU/Numpy code. It should be acceptable for
-  validation and current runs, but large outputs may need profiling.
+- Forward export uses a CPU KD-tree candidate search and vectorized barycentric
+  triangle solves on the model device. Large outputs may still need profiling.
 - `scipy.spatial.cKDTree` is optional for small exports but required by the
   current implementation for large forward exports.
-- Orientation and source-axis ordering are penalties, not hard constraints.
-  Bad steps can still cross either barrier if weights or step caps are too
-  loose.
+- Triangle orientation and source-axis ordering are penalties, not hard
+  constraints. Bad steps can still cross either barrier if weights or step
+  caps are too loose.
 - The symmetric-Dirichlet forward loss masks invalid, degenerate, or flipped
   UV quads out of the sdir average; `flatten_orient` is the term that should
   push those back.

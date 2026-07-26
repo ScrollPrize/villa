@@ -6,7 +6,7 @@ import model as fit_model
 
 
 _sdir_eps = 1.0e-8
-_orient_min_det = 0.0
+_orient_min_det = 1.0e-2
 _order_margin = 0.05
 _diagnostics_enabled = True
 _last_stats: dict[str, float] = {}
@@ -266,8 +266,12 @@ def _flatten_forward_combined_core(
 	m10 = uv[1:, :-1]
 	m01 = uv[:-1, 1:]
 	m11 = uv[1:, 1:]
-	uy = 0.5 * ((m10 - m00) + (m11 - m01))
-	ux = 0.5 * ((m01 - m00) + (m11 - m10))
+	uy0 = m10 - m00
+	uy1 = m11 - m01
+	ux0 = m01 - m00
+	ux1 = m11 - m10
+	uy = 0.5 * (uy0 + uy1)
+	ux = 0.5 * (ux0 + ux1)
 	c00 = (uy * uy).sum(dim=-1)
 	c01 = (uy * ux).sum(dim=-1)
 	c11 = (ux * ux).sum(dim=-1)
@@ -338,13 +342,28 @@ def _flatten_forward_combined_core(
 	avg_diff = torch.where(avg_weight > 0, avg_diff_candidate, torch.zeros_like(avg_diff_candidate))
 	avg_loss = (avg_diff * avg_diff).sum()
 
+	# The structured surface is a fixed-diagonal triangle mesh. A center-only
+	# quad determinant is the mean of its two triangle determinants, so it can
+	# remain positive while one triangle is flipped. For a bilinear quad their
+	# difference is cross(m10-m01, m11-m10-m01+m00), letting us recover the
+	# smaller triangle determinant with only one extra cross product.
+	bilinear = uy1 - uy0
+	triangle_det_delta = (
+		(m10[..., 0] - m01[..., 0]) * bilinear[..., 1]
+		- (m10[..., 1] - m01[..., 1]) * bilinear[..., 0]
+	)
+	min_triangle_det = det_uv - 0.5 * triangle_det_delta.abs()
 	orient_lm = torch.nan_to_num(
-		torch.relu(orient_min_det - det_uv) ** 2,
+		torch.relu(orient_min_det - min_triangle_det) ** 2,
 		nan=0.0,
 		posinf=1.0e12,
 		neginf=0.0,
 	)
-	orient_active = cell_valid & torch.isfinite(det_uv) & (det_uv < orient_min_det)
+	orient_active = (
+		cell_valid
+		& torch.isfinite(min_triangle_det)
+		& (min_triangle_det < orient_min_det)
+	)
 	orient_loss = (orient_lm * orient_active.to(dtype=uv.dtype)).sum()
 
 	# A positive cell determinant is only a local condition: distant,
@@ -687,9 +706,19 @@ def _flatten_orient_core(
 	m10 = map_yx[1:, :-1]
 	m01 = map_yx[:-1, 1:]
 	m11 = map_yx[1:, 1:]
-	dy = 0.5 * ((m10 - m00) + (m11 - m01))
-	dx = 0.5 * ((m01 - m00) + (m11 - m10))
-	det = dy[..., 0] * dx[..., 1] - dy[..., 1] * dx[..., 0]
+	dy0 = m10 - m00
+	dy1 = m11 - m01
+	dx0 = m01 - m00
+	dx1 = m11 - m10
+	dy = 0.5 * (dy0 + dy1)
+	dx = 0.5 * (dx0 + dx1)
+	center_det = dy[..., 0] * dx[..., 1] - dy[..., 1] * dx[..., 0]
+	bilinear = dy1 - dy0
+	triangle_det_delta = (
+		(m10[..., 0] - m01[..., 0]) * bilinear[..., 1]
+		- (m10[..., 1] - m01[..., 1]) * bilinear[..., 0]
+	)
+	det = center_det - 0.5 * triangle_det_delta.abs()
 	min_det = torch.tensor(min_det_value, device=map_yx.device, dtype=map_yx.dtype)
 	lm = torch.nan_to_num(torch.relu(min_det - det) ** 2, nan=0.0, posinf=1.0e12, neginf=0.0)
 	active = valid_cells & torch.isfinite(det) & (det < min_det)

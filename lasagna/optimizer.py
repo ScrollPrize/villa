@@ -2263,7 +2263,7 @@ def optimize(
 		))
 		opt_loss_flatten.configure(
 			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
-			orient_min_det=float(stage_args.get("flatten_orient_min_det", 0.0)),
+			orient_min_det=float(stage_args.get("flatten_orient_min_det", 1.0e-2)),
 			order_margin=float(stage_args.get("flatten_order_margin", 0.05)),
 			diagnostics=_flatten_diagnostics,
 		)
