@@ -80,6 +80,29 @@ ViewerNormalVisualizationPanel::ViewerNormalVisualizationPanel(const UiRefs& uiR
     setupControls();
 }
 
+void ViewerNormalVisualizationPanel::setViewerManager(ViewerManager* viewerManager)
+{
+    _viewerManager = viewerManager;
+    if (!_viewerManager) {
+        return;
+    }
+    const bool showNormals = _uiRefs.showSurfaceNormals && _uiRefs.showSurfaceNormals->isChecked();
+    const float arrowScale = _uiRefs.normalArrowLengthSlider
+        ? static_cast<float>(_uiRefs.normalArrowLengthSlider->value()) / 100.0f
+        : 1.0f;
+    const int maxArrows = _uiRefs.normalMaxArrowsSlider
+        ? _uiRefs.normalMaxArrowsSlider->value()
+        : 0;
+    _viewerManager->forEachBaseViewer([showNormals, arrowScale, maxArrows](VolumeViewerBase* viewer) {
+        if (!viewer) {
+            return;
+        }
+        viewer->setShowSurfaceNormals(showNormals);
+        viewer->setNormalArrowLengthScale(arrowScale);
+        viewer->setNormalMaxArrows(maxArrows);
+    });
+}
+
 void ViewerNormalVisualizationPanel::setupControls()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
