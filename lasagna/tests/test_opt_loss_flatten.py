@@ -766,6 +766,32 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertLess(stats["flatten_orient_min_det"], 0.0)
 		self.assertEqual(int(masks[0].sum().detach()), 25)
 
+	def test_forward_orient_regularizer_preserves_source_axis_order(self) -> None:
+		opt_loss_flatten.configure(
+			orient_min_det=0.0,
+			order_margin=0.05,
+			reset_history=True,
+		)
+		mdl = _make_flatten_model(
+			_flat_grid(6, 6),
+			mesh_step=1,
+			flatten_direction="forward",
+		)
+		map_yx = -mdl.flatten_map().detach().clone()
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, masks = opt_loss_flatten.flatten_orient_loss(res=res)
+		stats = opt_loss_flatten.last_stats()
+
+		# A 180-degree rotation has positive local area and therefore evades the
+		# determinant-only barrier, but reverses both source-grid axes.
+		self.assertGreater(float(loss.detach()), 60.0)
+		self.assertEqual(stats["flatten_orient_fold_frac"], 0.0)
+		self.assertEqual(stats["flatten_order_row_violation_frac"], 1.0)
+		self.assertEqual(stats["flatten_order_column_violation_frac"], 1.0)
+		self.assertEqual(int(masks[0].sum().detach()), 0)
+
 	def test_flatten_stats_track_validity_transitions(self) -> None:
 		opt_loss_flatten.configure(reset_history=True)
 		mdl = _make_flatten_model(_flat_grid(5, 5), mesh_step=1)

@@ -101,6 +101,11 @@ The forward path also reuses:
 - `flatten_orient`
   - Penalizes negative or low UV signed area.
   - In forward mode this is masked by valid source cells.
+  - In forward mode it also preserves source-row order in output Y and
+    source-column/winding order in output X. This prevents distant, locally
+    oriented regions from overlapping and becoming ambiguous during export.
+  - `flatten_order_margin` controls the positive per-edge order margin and
+    defaults to `0.05` output pixels.
 
 The optimizer is still plain Adam over `map_flatten_ms`; no sparse matrix solve
 or SLIM local/global loop is active in this working path.
@@ -163,8 +168,9 @@ Additional synthetic smoke:
   validation and current runs, but large outputs may need profiling.
 - `scipy.spatial.cKDTree` is optional for small exports but required by the
   current implementation for large forward exports.
-- Orientation is a penalty, not a hard constraint. Bad steps can still create
-  folded UVs if weights or step caps are too loose.
+- Orientation and source-axis ordering are penalties, not hard constraints.
+  Bad steps can still cross either barrier if weights or step caps are too
+  loose.
 - The symmetric-Dirichlet forward loss masks invalid, degenerate, or flipped
   UV quads out of the sdir average; `flatten_orient` is the term that should
   push those back.
