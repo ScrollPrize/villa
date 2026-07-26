@@ -54,6 +54,7 @@
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QPoint>
+#include <QTimer>
 #include <QPointF>
 #include <QPushButton>
 #include <QRadioButton>
@@ -236,6 +237,11 @@ void copyCoordinateIdentityToJson(
 constexpr double kEpsilon = 1.0e-12;
 constexpr double kLineSegmentLength = 32.0;
 constexpr double kControlPointLabelLinePositionTolerance = 1.0e-3;
+
+// Applied by the sync tool's three-way merge (scripts/fiber_merge.py,
+// REOPTIMIZE_TAG) when it had to synthesize line_points it cannot fit to
+// the volume; keep the literal in sync with that module.
+constexpr const char* kNeedsReoptimizationTag = "needs_reoptimization";
 using Clock = std::chrono::steady_clock;
 
 struct InitialLineDiscretization {
@@ -7865,6 +7871,131 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         showError(message);
     }
     emitFiberSummaries();
+
+    // Fibers merged by the sync tool carry a needs_reoptimization tag: the
+    // merge cannot run the line optimizer (it has no volume), so their
+    // line_points are placeholders. Offer to re-fit them. Deferred so the
+    // prompt and the synchronous optimization run outside whatever signal
+    // delivery triggered this load.
+    const bool anyTaggedForReopt = std::any_of(
+        _fibers.begin(), _fibers.end(), [](const StoredFiber& fiber) {
+            return std::find(fiber.tags.begin(),
+                             fiber.tags.end(),
+                             kNeedsReoptimizationTag) != fiber.tags.end();
+        });
+    if (anyTaggedForReopt && !_reoptimizationPromptPending) {
+        _reoptimizationPromptPending = true;
+        QTimer::singleShot(0, this, [this]() {
+            _reoptimizationPromptPending = false;
+            promptReoptimizationForMergedFibers();
+        });
+    }
+}
+
+void LineAnnotationController::promptReoptimizationForMergedFibers()
+{
+    std::vector<uint64_t> tagged;
+    for (const auto& fiber : _fibers) {
+        if (std::find(fiber.tags.begin(), fiber.tags.end(),
+                      kNeedsReoptimizationTag) != fiber.tags.end()) {
+            tagged.push_back(fiber.id);
+        }
+    }
+    if (tagged.empty()) {
+        return;
+    }
+    if (_errorDialogsSuppressed) {
+        // Agent-driven sessions never block on dialogs; the tags persist
+        // and the prompt returns on the next interactive load.
+        Logger()->warn("Line Annotation (suppressed dialog): {} fiber(s) "
+                       "tagged {} (merged during sync); skipping the "
+                       "re-optimization prompt",
+                       tagged.size(),
+                       kNeedsReoptimizationTag);
+        return;
+    }
+
+    QMessageBox prompt(_parentWidget.data());
+    prompt.setIcon(QMessageBox::Question);
+    prompt.setWindowTitle(tr("Merged fibers need re-optimization"));
+    prompt.setText(tr("%1 fiber(s) were merged during sync and need their "
+                      "lines re-optimized against the volume. Re-optimize "
+                      "now?")
+                       .arg(static_cast<int>(tagged.size())));
+    prompt.setInformativeText(
+        tr("Until re-optimized they render as straight segments between "
+           "control points. Choosing \"Not now\" keeps the '%1' tag and "
+           "asks again on the next load.")
+            .arg(QLatin1String(kNeedsReoptimizationTag)));
+    auto* reoptimizeButton =
+        prompt.addButton(tr("Re-optimize now"), QMessageBox::AcceptRole);
+    prompt.addButton(tr("Not now"), QMessageBox::RejectRole);
+    prompt.setDefaultButton(qobject_cast<QPushButton*>(reoptimizeButton));
+    prompt.exec();
+    if (prompt.clickedButton() != reoptimizeButton) {
+        return;
+    }
+    reoptimizeMergedFibers(tagged);
+}
+
+void LineAnnotationController::reoptimizeMergedFibers(
+    const std::vector<uint64_t>& fiberIds)
+{
+    auto stripReoptimizationTag = [](std::vector<std::string>& tags) {
+        tags.erase(std::remove(tags.begin(), tags.end(),
+                               std::string{kNeedsReoptimizationTag}),
+                   tags.end());
+    };
+
+    int reoptimized = 0;
+    bool taggedOnlySaves = false;
+    for (const uint64_t fiberId : fiberIds) {
+        const auto it = std::find_if(
+            _fibers.begin(), _fibers.end(),
+            [fiberId](const StoredFiber& fiber) { return fiber.id == fiberId; });
+        if (it == _fibers.end()) {
+            continue;
+        }
+        if (it->controlPoints.size() < 2 || it->linePoints.size() < 2) {
+            // No line to fit; just clear the tag.
+            stripReoptimizationTag(it->tags);
+            scheduleFiberSave(*it);
+            taggedOnlySaves = true;
+            continue;
+        }
+        // Pane-less session: the surface name is never registered, so no
+        // dialog, pane, or generated view is created. saveSessionAsFiber
+        // finalizes the optimization synchronously, refreshes branch
+        // endpoint metadata on this fiber and its linked peers, bumps the
+        // generation, and schedules the writes.
+        auto session = makeIntersectionLineSession(
+            *it,
+            static_cast<double>(it->linePoints.size() / 2),
+            cv::Vec3d{0.0, 0.0, 0.0},
+            "fiber_reoptimization_" + std::to_string(fiberId),
+            nullptr);
+        stripReoptimizationTag(session->fiberTags);
+        // Arms finalizeSessionOptimizationSynchronously inside the save.
+        session->optimizationState = SessionOptimizationState::Unoptimized;
+        saveSessionAsFiber(*session);
+        if (session->optimizationState == SessionOptimizationState::Optimized) {
+            ++reoptimized;
+        } else {
+            // saveSessionAsFiber already surfaced the error; the tag stays
+            // on disk so the next load offers a retry.
+            Logger()->warn("Re-optimization failed for fiber {}; keeping the "
+                           "{} tag for a retry on next load",
+                           it->fileName,
+                           kNeedsReoptimizationTag);
+        }
+    }
+    if (reoptimized > 0) {
+        Logger()->info("Re-optimized {} merged fiber(s)", reoptimized);
+        waitForFiberSaves();
+    }
+    if (taggedOnlySaves) {
+        emitFiberSummaries();
+    }
 }
 
 void LineAnnotationController::emitFiberSummaries()

@@ -492,6 +492,11 @@ private:
     void loadFibersForCurrentPackage();
     [[nodiscard]] bool validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
                                                 std::vector<std::string>& errors) const;
+    // Fibers merged by the sync tool (scripts/fiber_merge.py) carry a
+    // needs_reoptimization tag; on load VC3D offers to re-fit their lines.
+    // Declining keeps the tag so the next load asks again.
+    void promptReoptimizationForMergedFibers();
+    void reoptimizeMergedFibers(const std::vector<uint64_t>& fiberIds);
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
     [[nodiscard]] std::filesystem::path fibersRootDir() const;
@@ -695,6 +700,9 @@ private:
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
     bool _errorDialogsSuppressed = false;
+    // Deduplicates the deferred re-optimization prompt across reentrant
+    // fiber (re)loads.
+    bool _reoptimizationPromptPending = false;
     mutable QString _lastSuppressedError;
 
     // Transient (in-memory only) staging state for linking two existing control
