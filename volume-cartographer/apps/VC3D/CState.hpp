@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core/mat.hpp>
@@ -16,6 +17,7 @@ class Volume;
 class QuadSurface;
 class Surface;
 class VCCollection;
+namespace vc::render { class DecodedChunkCacheBudget; }
 
 struct POI
 {
@@ -32,7 +34,10 @@ class CState : public QObject
     Q_OBJECT
 
 public:
-    explicit CState(size_t cacheSizeBytes, QObject* parent = nullptr);
+    explicit CState(
+        size_t cacheSizeBytes,
+        QObject* parent = nullptr,
+        std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget = {});
     ~CState();
 
     // --- VolumePkg ---
@@ -61,12 +66,18 @@ public:
 
     // --- Cache budget ---
     size_t cacheSizeBytes() const;
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget() const;
 
     // --- Teardown ---
     void closeAll();
 
     // --- Surfaces (inlined from CSurfaceCollection) ---
     void setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend = false, bool isEditUpdate = false);
+    // Apply catalog-style surface additions/replacements/removals atomically
+    // from observers' perspective. Individual surface signals are suppressed
+    // and one empty-name surfaceChanged signal is emitted after the map is final.
+    void setSurfacesBatch(
+        const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& updates);
     std::shared_ptr<Surface> surface(const std::string& name);
     Surface* surfaceRaw(const std::string& name);
     std::string findSurfaceId(Surface* surf);
@@ -110,9 +121,12 @@ private:
     VCCollection* _pointCollection;
 
     size_t _cacheSizeBytes;
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> _decodedCacheBudget;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;
     std::unordered_map<std::string, std::unique_ptr<POI>> _pois;
     uint64_t _surfacesVersion = 0;
+    int _surfaceBatchDepth = 0;
+    bool _surfaceBatchChanged = false;
 };

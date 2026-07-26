@@ -447,11 +447,17 @@ std::filesystem::path prepareOpenDataLasagna(
 int attachOpenDataLasagna(VolumePkg& pkg,
                           const OpenDataSample& sample,
                           const std::filesystem::path& remoteCacheRoot,
-                          std::vector<std::string>* messages)
+                          std::vector<std::string>* messages,
+                          const OpenDataResourceSelection* selection)
 {
     int attached = 0;
     std::set<std::string> expected;
-    for (const auto& volume : sample.volumes) {
+    for (std::size_t volumeIndex = 0; volumeIndex < sample.volumes.size();
+         ++volumeIndex) {
+        const auto& volume = sample.volumes[volumeIndex];
+        if (selection && !selection->allowsVolume(volume.id)) {
+            continue;
+        }
         const auto infos = lasagnaArtifacts(sample.id, volume);
         if (infos.size() > 1) {
             if (messages) messages->push_back(
@@ -460,6 +466,27 @@ int attachOpenDataLasagna(VolumePkg& pkg,
             continue;
         }
         if (infos.empty()) continue;
+        if (selection) {
+            // Map the representation back to its artifact index before applying
+            // the representation and kind filters.
+            std::optional<std::size_t> artifactIndex;
+            for (std::size_t ai = 0; ai < volume.artifacts.size(); ++ai) {
+                const auto& art = volume.artifacts[ai];
+                if (lowerCopy(art.type) != kLasagnaArtifactType) continue;
+                const auto url = trimSlashes(
+                    art.resolvedUrl.empty() ? art.sourcePath : art.resolvedUrl);
+                if (url == infos.front().artifactUrl) {
+                    artifactIndex = ai;
+                    break;
+                }
+            }
+            if (!artifactIndex ||
+                !selection->allowsRepresentation(
+                    volumeIndex, *artifactIndex,
+                    OpenDataRepresentationKind::Lasagna, volume.id)) {
+                continue;
+            }
+        }
         std::string error;
         const auto manifest = prepareOpenDataLasagna(infos.front(), remoteCacheRoot, &error);
         if (manifest.empty()) {

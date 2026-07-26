@@ -20,6 +20,9 @@ public:
 
     [[nodiscard]] ManualAddTool::Config config() const;
     ManualAddTool::LinePreviewMode cycleLinePreviewMode();
+    // Direct changes emit configChanged through the same path as combo edits.
+    ManualAddTool::LinePreviewMode setLinePreviewMode(ManualAddTool::LinePreviewMode mode);
+    ManualAddTool::InterpolationMode setInterpolationMode(ManualAddTool::InterpolationMode mode);
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool manualAddActive);
 

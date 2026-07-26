@@ -230,6 +230,11 @@ void SpiralConfigProfileEditor::setSessionDefault(const QJsonObject& config)
     emit textChanged();
 }
 
+void SpiralConfigProfileEditor::showSessionDefault()
+{
+    selectProfile(kDefaultId, false);
+}
+
 void SpiralConfigProfileEditor::clearSessionDefault()
 {
     _sessionDefaultText = QStringLiteral("{}");

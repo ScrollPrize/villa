@@ -24,6 +24,17 @@ inline QJsonObject normalizedSpiralReloadRequest(
     for (const QString& key : runConfigKeys) effectiveConfig.remove(key);
     run[QStringLiteral("config")] = effectiveConfig;
     request[QStringLiteral("run")] = run;
+
+    // The service expands preview defaults in its canonical session request,
+    // while older panel requests only sent first_winding. Treat both wire
+    // representations as the same loaded preview configuration.
+    QJsonObject preview =
+        request.value(QStringLiteral("preview")).toObject();
+    if (!preview.contains(QStringLiteral("first_winding")))
+        preview[QStringLiteral("first_winding")] = 10;
+    if (!preview.contains(QStringLiteral("variant")))
+        preview[QStringLiteral("variant")] = QStringLiteral("raw");
+    request[QStringLiteral("preview")] = preview;
     return request;
 }
 

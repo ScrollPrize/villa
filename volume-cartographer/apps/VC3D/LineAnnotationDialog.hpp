@@ -84,6 +84,14 @@ public:
         QGraphicsPathItem* centerPoint = nullptr;
         QGraphicsPathItem* controlPoints = nullptr;
         QGraphicsPathItem* seedPoints = nullptr;
+        QGraphicsPathItem* linkCandidatePoints = nullptr;
+        QGraphicsPathItem* branchControlPoints = nullptr;
+        QGraphicsPathItem* pendingBranchControlPoints = nullptr;
+        QGraphicsPathItem* fiberIntersections = nullptr;
+        QGraphicsPathItem* linkCandidateFiberIntersections = nullptr;
+        QGraphicsPathItem* branchLinkFiberIntersections = nullptr;
+        QGraphicsPathItem* pendingBranchLinkFiberIntersections = nullptr;
+        QGraphicsPathItem* fiberIntersectionConnectors = nullptr;
     };
 
     using GeneratedOverlay = vc3d::line_annotation::GeneratedOverlay;
@@ -109,7 +117,8 @@ public:
         const std::string& surfaceName,
         CChunkedVolumeViewer* viewer,
         const QPointF& scenePoint,
-        const QPoint& globalPos);
+        const QPoint& globalPos,
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {});
     const std::vector<Pane>& panes() const { return _panes; }
     InitialDirectionMode initialDirectionMode() const;
     ReoptimizationMode reoptimizationMode() const;
@@ -141,6 +150,9 @@ public:
     void setCloseAfterFinalizationAllowed(bool allowed);
     void setWorkspaceEmbedded(bool embedded);
     bool workspaceEmbedded() const { return _workspaceEmbedded; }
+    // Programmatic twin of the "current cut follows strip mouse" toggle.
+    void setCutFollowEnabled(bool enabled);
+    bool cutFollowEnabled() const { return _currentCutFollowsStripMouse; }
 
 signals:
     void paneClosed(const std::string& surfaceName);
@@ -158,6 +170,22 @@ signals:
                                               cv::Vec3f linkDirection);
     void generatedControlPointBranchOpenRequested(uint64_t branchFiberId,
                                                    int branchControlPointIndex);
+    void generatedControlPointLinkCandidateRequested(const std::string& surfaceName,
+                                                     size_t controlPointIndex,
+                                                     cv::Vec3f volumePoint);
+    void generatedControlPointLinkWithCandidateRequested(const std::string& surfaceName,
+                                                         size_t controlPointIndex,
+                                                         cv::Vec3f volumePoint);
+    void generatedNearbyAnnotationOpenRequested(uint64_t fiberId, cv::Vec3f volumePoint);
+    void generatedControlPointUnlinkRequested(const std::string& surfaceName,
+                                              size_t controlPointIndex,
+                                              uint64_t branchFiberId,
+                                              int branchControlPointIndex);
+    void generatedControlPointLinkPendingChangeRequested(const std::string& surfaceName,
+                                                         size_t controlPointIndex,
+                                                         uint64_t branchFiberId,
+                                                         int branchControlPointIndex,
+                                                         bool pending);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
