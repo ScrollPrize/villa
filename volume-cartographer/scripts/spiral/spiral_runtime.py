@@ -56,7 +56,6 @@ class InteractiveFitSession:
         self._preview_manifest = None
         self._preview_generation = 0
         self._preview_session_id = uuid.uuid4().hex
-        self._geometry_snapshot_manifest = None
         self._save_checkpoint = None
         self._export_preview = None
         self._incorporate_inputs = None
@@ -82,7 +81,6 @@ class InteractiveFitSession:
                 "warnings": list(self._warnings), "error": self._error,
                 "preview_manifest_path": self._preview_manifest,
                 "preview_generation": self._preview_generation,
-                "geometry_snapshot_manifest_path": self._geometry_snapshot_manifest,
                 "supports_input_incorporation": self._incorporate_inputs is not None,
             }
             if self._run_config is not None:
@@ -124,6 +122,7 @@ class InteractiveFitSession:
             distributed_initialized = True
 
             config = dict(fitter.default_config)
+            checkpoint_profile_config = None
             if self.paths.checkpoint:
                 from checkpoint_io import load_checkpoint_cpu
                 checkpoint_config = load_checkpoint_cpu(self.paths.checkpoint)
@@ -141,6 +140,10 @@ class InteractiveFitSession:
                             and key in config
                         }
                         config.update(durable)
+                        # The session-scoped Default profile must initially
+                        # reproduce the checkpoint, not a second
+                        # z-range/DDP-scaled or input-gated derivative of it.
+                        checkpoint_profile_config = copy.deepcopy(durable)
                 finally:
                     # This first load exists only to resolve configuration.  Do
                     # not retain a complete model + optimiser checkpoint for the
@@ -149,24 +152,31 @@ class InteractiveFitSession:
             unknown = sorted(set(self.run_config.config) - set(config))
             if unknown:
                 raise ValueError(f"Unknown advanced config keys: {unknown}")
-            # Default is a session-scoped baseline, not the final active
-            # configuration.  It follows the selected input availability,
-            # because those switches determine which samplers can actually be
-            # active, but deliberately excludes every other client override.
-            default_advanced_config = copy.deepcopy(config)
-            for key in (
-                    'use_verified_patches', 'use_unverified_patches',
-                    'use_normals', 'use_surf_sdt', 'use_tracks',
-                    'use_gradient_magnitude', 'use_fibers'):
-                if key in self.run_config.config:
-                    default_advanced_config[key] = self.run_config.config[key]
+            if checkpoint_profile_config is not None:
+                default_advanced_config = checkpoint_profile_config
+            else:
+                # Without a checkpoint, Default is the Python baseline adapted
+                # to the inputs selected for this session.
+                default_advanced_config = copy.deepcopy(config)
+                for key in (
+                        'use_verified_patches', 'use_unverified_patches',
+                        'use_normals', 'use_surf_sdt', 'use_tracks',
+                        'use_gradient_magnitude', 'use_fibers'):
+                    if key in self.run_config.config:
+                        default_advanced_config[key] = self.run_config.config[key]
             # Explicit sample-count overrides are literal active counts. This
             # lets VC3D round-trip the host's post-scaling values through a
             # reload without applying the z-range/DDP transforms twice.
+            # Checkpoint cfg values are resolved fitter values too, so give
+            # their counts the same treatment.
             explicit_sampling_counts = {
-                key: value for key, value in self.run_config.config.items()
+                key: value for key, value in (checkpoint_profile_config or {}).items()
                 if key in RUN_MUTABLE_SAMPLING_KEYS
             }
+            explicit_sampling_counts.update({
+                key: value for key, value in self.run_config.config.items()
+                if key in RUN_MUTABLE_SAMPLING_KEYS
+            })
             config.update(self.run_config.config)
             count_keys = (
                 'num_patches_per_step', 'num_patches_per_step_for_dt',
@@ -179,13 +189,19 @@ class InteractiveFitSession:
                 'min_spacing_independent_samples',
                 'regularisation_num_points', 'shell_num_samples',
             )
-            for prepared in (default_advanced_config, config):
+            scale_counts_for_z_range(
+                config, self.run_config.z_begin, self.run_config.z_end,
+                9500, count_keys, floors=SAMPLING_COUNT_FLOORS)
+            split_counts_across_ranks(config, count_keys)
+            if checkpoint_profile_config is None:
                 scale_counts_for_z_range(
-                    prepared, self.run_config.z_begin, self.run_config.z_end,
-                    9500, count_keys, floors=SAMPLING_COUNT_FLOORS)
-                split_counts_across_ranks(prepared, count_keys)
+                    default_advanced_config, self.run_config.z_begin,
+                    self.run_config.z_end, 9500, count_keys,
+                    floors=SAMPLING_COUNT_FLOORS)
+                split_counts_across_ranks(default_advanced_config, count_keys)
             config.update(explicit_sampling_counts)
-            apply_optional_input_selection(default_advanced_config)
+            if checkpoint_profile_config is None:
+                apply_optional_input_selection(default_advanced_config)
             apply_optional_input_selection(config)
             self.requested_config = dict(config)
             with self._condition:
@@ -257,7 +273,7 @@ class InteractiveFitSession:
 
     # Fitter-thread callbacks.
     def on_ready(self, *, completed_iterations, output_path,
-                 save_checkpoint, export_preview, geometry_snapshot_manifest=None,
+                 save_checkpoint, export_preview,
                  incorporate_inputs=None, finish_run=None, configure_run=None):
         with self._condition:
             self._completed = self._target = completed_iterations
@@ -267,7 +283,6 @@ class InteractiveFitSession:
             self._incorporate_inputs = incorporate_inputs
             self._finish_run = finish_run
             self._configure_run = configure_run
-            self._geometry_snapshot_manifest = geometry_snapshot_manifest
         if self.paths.checkpoint and getattr(self, "publishes_outputs", True):
             self._set_state("ExportingPreview", "Exporting restored checkpoint preview")
             self._publish_preview()
@@ -393,6 +408,11 @@ class InteractiveFitSession:
         with self._condition:
             self._preview_generation = generation
             self._preview_manifest = str(manifest["manifest_path"])
+        # Publish while the session is still in ExportingPreview.  The host
+        # service synchronously Lasagna-flattens and packages this generation
+        # from the status callback, so clients cannot start another Run while
+        # the downloadable preview is still being prepared.
+        self._publish_status()
 
     def session_finished(self):
         raise RuntimeError("Interactive optimizer loop ended unexpectedly")
@@ -545,7 +565,7 @@ class DistributedInteractiveFitSession:
             "current_iteration": 0, "target_iteration": 0,
             "session_horizon": None, "latest_metrics": {}, "warnings": [],
             "error": None, "preview_manifest_path": None,
-            "preview_generation": 0, "geometry_snapshot_manifest_path": None,
+            "preview_generation": 0,
             "supports_input_incorporation": False,
         }
         self._acks = {}

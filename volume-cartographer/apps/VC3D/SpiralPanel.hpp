@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QSet>
 #include <QWidget>
+#include <functional>
 
 #include "SpiralServiceProfile.hpp"
 #include "elements/VolumeSelector.hpp"
@@ -33,6 +34,8 @@ public:
     void setVolumes(const QVector<VolumeSelector::VolumeOption>& volumes, const QString& selectedId);
     void setLossMapOptions(const QStringList& names);
     void setLossMapLegend(const QString& text);
+    void setSessionExitGuard(
+        std::function<void(std::function<void()>)> guard) { _sessionExitGuard = std::move(guard); }
 
 signals:
     void volumeSelected(const QString& id);
@@ -41,6 +44,8 @@ signals:
     void lossMapChanged(const QString& name, qreal opacity);
     void windingRangeChanged(int minimum, int maximum);
     void surfaceIntersectionsChanged(bool shown);
+    void surfaceIntersectionStrideChanged(int stride);
+    void surfaceOverlapChanged(bool shown);
     void pythonOutputRequested();
 
 private:
@@ -59,6 +64,8 @@ private:
     bool optionalInputEnabled(const QString& key) const;
     void updateOptionalInputUi();
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
+    void synchronizeSession(const QJsonObject& request,
+                            const QJsonObject& status);
     void applyResolution(const QJsonObject& resolution, bool force);
     void updateStatus(const QJsonObject& status);
     QJsonObject normalizedReloadRequest(QJsonObject request) const;
@@ -75,6 +82,7 @@ private:
     void setRemoteMode(bool remote);
     void connectToSelectedProfile();
     QString formSettingsPrefix() const;
+    void guardSessionExit(std::function<void()> action);
 
     SpiralServiceManager* _service = nullptr;
     QHash<QString, QLineEdit*> _paths;
@@ -143,6 +151,7 @@ private:
     QLabel* _connectionStatus = nullptr;
     QPushButton* _connectButton = nullptr;
     QPushButton* _disconnectButton = nullptr;
+    QToolButton* _restartServiceButton = nullptr;
     QWidget* _endpointRow = nullptr;
     QWidget* _sshRow = nullptr;
     QWidget* _apiKeyRow = nullptr;
@@ -155,7 +164,7 @@ private:
     QLabel* _commitHint = nullptr;
     QJsonArray _lastEphemeral;
     QJsonObject _loadedSessionRequest;
-    QJsonObject _pendingSessionRequest;
+    QJsonObject _attachedAdvancedConfig;
     QJsonObject _defaultAdvancedConfig;
     QSet<QString> _runConfigKeys;
     qint64 _advancedSessionGeneration = -1;
@@ -172,4 +181,6 @@ private:
     bool _connected = false;
     int _ephemeralCount = 0;
     int _uncommittedCount = 0;
+    std::function<void(std::function<void()>)> _sessionExitGuard;
+    bool _runningGuardedExit = false;
 };

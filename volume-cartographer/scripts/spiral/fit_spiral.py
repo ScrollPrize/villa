@@ -122,6 +122,7 @@ pcl_json_paths = [
     f'{dataset_path}/patch-overlap-pcls.json',
     f'{dataset_path}/relative_windings.json',
     f'{dataset_path}/same_windings.json',
+    f'{dataset_path}/drawn_control_points.json',
 ]
 # The interactive session API supplies explicit roles.  The legacy CLI leaves
 # this as None and retains the historical abs_winding.json basename behavior.
@@ -664,6 +665,7 @@ class PatchGpuAtlas:
             self.widths,
             patch_idx_per_sample,
             ijs,
+            heights=self.heights,
         )
 
     def append_patches(self, patches_by_id):
@@ -905,7 +907,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         for patch_id, patch in list(patches.items()):
             # we erode cells this distance from any invalid cell to catch annotation errors
             # which are hard to detect at the edges of patches
-            cells_to_erode = int(cfg['erode_patches'])
+            cells_to_erode = patch.erosion_cells(cfg['erode_patches'])
             if cells_to_erode > 0:
                 if not erode_patch_valid_region(patch, cells_to_erode):
                     del patches[patch_id]
@@ -2268,7 +2270,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     if input_id in verified_patches or input_id in new_patches:
                         raise RuntimeError(f'Patch {input_id!r} is already part of this session')
                     patch = load_tifxyz(path)
-                    cells_to_erode = int(cfg['erode_patches'])
+                    cells_to_erode = patch.erosion_cells(cfg['erode_patches'])
                     if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
                         raise RuntimeError(f'Patch {input_id!r} has no valid quads after erosion')
                     if not patch_intersects_z_roi(patch, z_begin, z_end):
@@ -2474,8 +2476,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             torch.cuda.set_rng_state_all(cuda_states)
 
     if interactive_driver is not None:
-        from geometry_snapshot import write_geometry_snapshot
-
         def configure_interactive_run(config):
             # Only called by the resident driver on the fitter thread at a
             # pause boundary. These settings are read afresh by every step.
@@ -2484,26 +2484,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 configure_prepared_track_sampling(prepared_main_tracks, config)
             cfg.update(config, allow_val_change=True)
 
-        geometry_manifest = None
-        if getattr(interactive_driver, 'publishes_outputs', True):
-            fiber_root = os.path.abspath(fibers_path) if fibers_path else None
-            snapshot_categories = {'fibers': [], 'pcls': [], 'tracks': []}
-            for strip in unattached_pcl_strips:
-                source = os.path.abspath(strip.get('source_file') or '')
-                category = 'fibers' if fiber_root and os.path.commonpath([fiber_root, source]) == fiber_root else 'pcls'
-                snapshot_categories[category].append(strip['zyxs'])
-            if tracks:
-                snapshot_categories['tracks'] = (
-                    tracks if isinstance(tracks, PackedTrackCollection)
-                    else [np.asarray(track, dtype=np.float32)
-                          for track in tracks if len(track)])
-            geometry_path = os.path.join(out_path, '.spiral-geometry', f'generation-{time.time_ns()}')
-            write_geometry_snapshot(geometry_path, snapshot_categories, input_order='ZYX')
-            geometry_manifest = os.path.join(geometry_path, 'manifest.json')
-            del snapshot_categories
         # In the usual zero-exclusion case preview bounds reuse the prepared
         # flat tensor, so the original list of per-track arrays is no longer
-        # needed after the one-time VC3D geometry handoff.
+        # needed after setup.
         if preview_extent_tracks is not tracks:
             tracks = None
         interactive_driver.on_ready(
@@ -2511,7 +2494,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             output_path=out_path,
             save_checkpoint=save_model_to,
             export_preview=export_interactive_preview,
-            geometry_snapshot_manifest=geometry_manifest,
             incorporate_inputs=incorporate_interactive_inputs,
             finish_run=clear_interactive_influence,
             configure_run=configure_interactive_run,

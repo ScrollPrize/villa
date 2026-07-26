@@ -27,6 +27,7 @@ public:
 
     void setCurrentText(const QString& text);
     void setSessionDefault(const QJsonObject& config);
+    void showSessionDefault();
     void clearSessionDefault();
 
 signals:
