@@ -90,6 +90,8 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _FiberTrace3DBatchDataset,
     _Trace2Cp3DConfig,
+    _load_snapshot,
+    _optimizer_hparams_from_training,
     _branch_choice_grid_offsets,
     _branch_presence_views_from_sampled_output,
     _evaluate_trace2cp_metric_fixed_set_3d,
@@ -103,6 +105,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _oblique_line_presence_for_display,
     _resolve_dense_test_selection,
     _resolve_prefetch_sample_count,
+    _save_snapshot,
     _select_branch_by_chunked_min_fraction,
     _training_sample_index_limit,
     _write_3d_sample_sheet,
@@ -1048,6 +1051,63 @@ def test_3d_prefetch_step_count_resolution_matches_2d_sentinels() -> None:
         assert "--prefetch-steps" in str(exc)
     else:
         raise AssertionError("negative prefetch steps should fail")
+
+
+def test_3d_resume_reapplies_current_optimizer_hparams_preserving_state(tmp_path: Path) -> None:
+    torch.manual_seed(5)
+    original_model = torch.nn.Linear(3, 2)
+    original_optimizer = torch.optim.AdamW(
+        original_model.parameters(),
+        lr=1.0e-4,
+        weight_decay=0.125,
+    )
+    original_loss = original_model(torch.ones(4, 3)).square().mean()
+    original_loss.backward()
+    original_optimizer.step()
+    original_state_norms = sorted(
+        float(state["exp_avg"].abs().sum().item())
+        for state in original_optimizer.state.values()
+    )
+    original_state_steps = sorted(
+        float(state["step"].detach().cpu().item())
+        for state in original_optimizer.state.values()
+    )
+    checkpoint = tmp_path / "snapshot.pt"
+    _save_snapshot(
+        checkpoint,
+        model=original_model,
+        optimizer=original_optimizer,
+        step=17,
+        config={},
+        metric=None,
+    )
+
+    resumed_model = torch.nn.Linear(3, 2)
+    current_hparams = _optimizer_hparams_from_training(
+        {"learning_rate": 0.02, "weight_decay": 0.5}
+    )
+    resumed_optimizer = torch.optim.AdamW(resumed_model.parameters(), **current_hparams)
+    loaded_step = _load_snapshot(
+        checkpoint,
+        model=resumed_model,
+        optimizer=resumed_optimizer,
+        optimizer_hparams=current_hparams,
+        map_location="cpu",
+    )
+
+    assert loaded_step == 17
+    assert [group["lr"] for group in resumed_optimizer.param_groups] == [0.02]
+    assert [group["weight_decay"] for group in resumed_optimizer.param_groups] == [0.5]
+    resumed_state_norms = sorted(
+        float(state["exp_avg"].abs().sum().item())
+        for state in resumed_optimizer.state.values()
+    )
+    resumed_state_steps = sorted(
+        float(state["step"].detach().cpu().item())
+        for state in resumed_optimizer.state.values()
+    )
+    assert resumed_state_norms == pytest.approx(original_state_norms)
+    assert resumed_state_steps == pytest.approx(original_state_steps)
 
 
 def test_3d_test_loader_raw_config_disables_augmentation_by_default() -> None:

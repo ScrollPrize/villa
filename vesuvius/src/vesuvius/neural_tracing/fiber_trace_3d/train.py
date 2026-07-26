@@ -515,11 +515,28 @@ def _save_snapshot(
     )
 
 
+def _optimizer_hparams_from_training(training: dict[str, Any]) -> dict[str, float]:
+    return {
+        "lr": float(training.get("learning_rate", 1.0e-3)),
+        "weight_decay": float(training.get("weight_decay", 0.0)),
+    }
+
+
+def _apply_optimizer_hparams(
+    optimizer: torch.optim.Optimizer,
+    hparams: dict[str, float],
+) -> None:
+    for group in optimizer.param_groups:
+        for key, value in hparams.items():
+            group[key] = float(value)
+
+
 def _load_snapshot(
     path: str | Path,
     *,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
+    optimizer_hparams: dict[str, float] | None = None,
     map_location: torch.device | str = "cpu",
 ) -> int:
     payload = torch.load(path, map_location=map_location)
@@ -527,6 +544,8 @@ def _load_snapshot(
     model.load_state_dict(state)
     if optimizer is not None and isinstance(payload, dict) and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
+        if optimizer_hparams is not None:
+            _apply_optimizer_hparams(optimizer, optimizer_hparams)
     return int(payload.get("step", 0)) if isinstance(payload, dict) else 0
 
 
@@ -1028,10 +1047,10 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     )
 
     model = build_fiber_trace_3d_model(raw_config).to(device)
+    optimizer_hparams = _optimizer_hparams_from_training(training)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=float(training.get("learning_rate", 1.0e-3)),
-        weight_decay=float(training.get("weight_decay", 0.0)),
+        **optimizer_hparams,
     )
     resume = (
         str(resume_checkpoint)
@@ -1040,13 +1059,25 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     )
     start_step = 0
     if resume:
-        start_step = _load_snapshot(resume, model=model, optimizer=optimizer, map_location=device)
+        start_step = _load_snapshot(
+            resume,
+            model=model,
+            optimizer=optimizer,
+            optimizer_hparams=optimizer_hparams,
+            map_location=device,
+        )
 
     run_dir, snapshot_dir = _resolve_run_layout(raw_config)
     effective_config = _json_safe(raw_config)
     if resume_checkpoint is not None:
         effective_config.setdefault("training", {})["resume_cli"] = str(resume_checkpoint)
         effective_config.setdefault("training", {})["resume_effective"] = str(resume)
+    effective_optimizer = {
+        "param_group_lrs": [float(group.get("lr", math.nan)) for group in optimizer.param_groups],
+        "param_group_weight_decays": [
+            float(group.get("weight_decay", math.nan)) for group in optimizer.param_groups
+        ],
+    }
     writer = _make_summary_writer(
         run_dir,
         enabled=bool(training.get("tensorboard_enabled", True)),
@@ -1055,6 +1086,11 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         writer.add_text("config/json", json.dumps(effective_config, indent=2, sort_keys=True), 0)
         if resume:
             writer.add_text("config/resume", f"resume={resume}\ncheckpoint_step={start_step}", 0)
+        writer.add_text(
+            "config/optimizer",
+            json.dumps(effective_optimizer, indent=2, sort_keys=True),
+            0,
+        )
         writer.add_text(
             "train_sample_3d/layout",
             "Rows: yx, zx, zy principal slices through the sampled CP, "
@@ -1133,6 +1169,8 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         f"loader_workers={loader_workers} loader_prefetch_factor={loader_prefetch_factor} "
         f"loader_worker_device={loader_worker_device} "
         f"loader_multiprocessing_context={loader_context or 'default'} "
+        f"optimizer_lr={effective_optimizer['param_group_lrs']} "
+        f"optimizer_weight_decay={effective_optimizer['param_group_weight_decays']} "
         f"kept_snapshot_interval={kept_snapshot_interval}",
         flush=True,
     )

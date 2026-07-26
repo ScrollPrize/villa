@@ -1,35 +1,33 @@
-# 3D Branch Choice Grid Routing Update Task Log
+# 3D Resume Optimizer Config Override Task Log
 
 ## Implementation Notes
 
-- Replaced ambiguous 3D batch index storage with explicit
-  `stream_index`/`stream_indices` and `data_index`/`data_indices`.
-- `FiberTrace3DLoader.load_sample(...)` still accepts `sample_index` at the
-  compatibility boundary, but immediately treats it as `stream_index`.
-- Dataset/CP lookup and prefetch dependency lookup apply
-  `sample_index_limit` only to derive `data_index`.
-- Augmentation parameters, smooth displacement, value noise, and branch-grid
-  offsets remain keyed by the unbounded `stream_index`.
-- Replaced the old boolean branch-repair flag with explicit loss routing modes:
-  `eval_voxel` and `train_offset_grid_min_fraction`.
-- Training now groups positive two-branch routing by deterministic
-  per-sample-offset `2x2x2` chunks and keeps the 10% underrepresented-branch
-  repair.
-- Test/eval loss keeps independent per-positive-voxel detached argmax branch
-  selection and does not apply grouping, offsets, or 10% repair.
+- Added `_optimizer_hparams_from_training(...)` and `_apply_optimizer_hparams(...)`
+  in `fiber_trace_3d.train`.
+- Fresh AdamW construction and post-resume optimizer param-group repair now use
+  the same current-config hyperparameter mapping.
+- `_load_snapshot(...)` can receive `optimizer_hparams`; after loading checkpoint
+  optimizer state, it reapplies those values to every param group. AdamW moment
+  buffers and step counters remain loaded from the checkpoint.
+- `run_training(...)` prints effective optimizer LR/weight decay lists in the
+  startup line and writes the same values to TensorBoard `config/optimizer`.
+- Added a regression test that saves a tiny AdamW checkpoint, resumes with new
+  LR/weight decay, and verifies loaded AdamW state is still present.
 
 ## Deviations / Deferred Items
 
-- Public loader methods still use the name `sample_index` for compatibility,
-  as planned. Internally the value is normalized to `stream_index`.
-- No other requirements were simplified or deferred.
+- The independent-agent review step from the local workflow was not performed:
+  the available multi-agent tool requires explicit user authorization for
+  delegation. I performed a local review against the active task plan and spec
+  scope instead.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/loader.py`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k 'branch or compute_losses or sample_index_limit or augmentation_index'`
-  - Result: 14 passed, 97 deselected.
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  - Result: passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k 'optimizer or resume'`
+  - Result: 1 passed, 111 deselected.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  - Result: 111 passed.
+  - Result: 112 passed.
 - `git diff --check`
   - Result: passed.

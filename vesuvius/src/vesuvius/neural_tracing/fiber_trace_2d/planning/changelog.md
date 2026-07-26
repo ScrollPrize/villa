@@ -2,6 +2,9 @@
 
 ## 2026-07-26
 
+- Changed 3D training resume so checkpoint AdamW state is restored first, then
+  current config `training.learning_rate` and `training.weight_decay` are
+  reapplied to optimizer param groups and printed/logged as effective values.
 - Changed 3D two-branch training to route positive supervision through
   deterministic `stream_index`-seeded per-sample-offset `2x2x2` choice groups
   with 10% underrepresented-branch repair, while test/eval keeps raw

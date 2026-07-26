@@ -206,8 +206,12 @@
 - Normal 3D training also supports `--resume <snapshot.pt>`. The CLI path
   overrides config resume keys, restores model and optimizer state, writes a
   fresh timestamped run directory, and records the effective resume path in
-  TensorBoard config text. If finite `training.max_steps` is not greater than
-  the checkpoint step, training must fail clearly.
+  TensorBoard config text. After restoring checkpoint optimizer state, training
+  must reapply the current config optimizer hyperparameters supported by the
+  trainer, currently `training.learning_rate` and `training.weight_decay`, to
+  every optimizer param group while preserving loaded AdamW moment buffers and
+  step counters. If finite `training.max_steps` is not greater than the
+  checkpoint step, training must fail clearly.
 - 3D training and `--benchmark --load-only` runtime loading use
   `torch.utils.data.DataLoader` worker processes when
   `training.loader_workers > 0`. Each DataLoader item is one complete

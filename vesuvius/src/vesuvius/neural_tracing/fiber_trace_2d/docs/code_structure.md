@@ -311,7 +311,11 @@ side/top strip input loading.
 - Passing `--resume /path/to/current.pt` for normal training restores the
   model and optimizer state from that snapshot, continues from the stored step,
   and still creates a fresh timestamped run directory. The TensorBoard config
-  text records the effective CLI resume path.
+  text records the effective CLI resume path. After optimizer state restore,
+  the current config's `training.learning_rate` and `training.weight_decay`
+  are reapplied to every optimizer param group, so AdamW moments/step counters
+  resume from the checkpoint while these supported hyperparameters can be
+  changed in the config.
 - `training.max_steps: 0` means the deterministic training stream repeats
   indefinitely until interrupted. Positive `max_steps` values remain absolute
   target steps, including when resuming.
@@ -1139,7 +1143,10 @@ The important behavior is:
   timestamped run directory from the current config just like normal training,
   and continues from `checkpoint_step + 1`. `training.max_steps` remains the
   absolute target step, so increase it before resuming a completed finite run.
-  The first resumed step is logged and flushed to TensorBoard immediately.
+  The current config's `training.learning_rate` and `training.weight_decay`
+  override checkpoint optimizer param-group values after load, while AdamW
+  moment buffers and step counters are preserved. The first resumed step is
+  logged and flushed to TensorBoard immediately.
 
 `configs/loader_example.json`
 
