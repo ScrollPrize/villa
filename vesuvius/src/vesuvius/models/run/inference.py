@@ -1118,10 +1118,9 @@ def _parse_bbox_arg(value):
     return tuple(bounds)
 
 
-def main():
+def build_parser():
+    """Build the predict CLI parser (separate from main so it can be tested)."""
     import argparse
-    import sys
-    
     parser = argparse.ArgumentParser(description='Run nnUNet inference on Zarr data')
     parser.add_argument('--model_path', type=str, required=True,
                       help='Path to nnUNet model folder, train.py .pth, or external model path (when enabled)')
@@ -1172,7 +1171,10 @@ def main():
 
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
-    parser.add_argument('--model-type', type=str, default='auto',
+    # --model_type is accepted too: every other model/IO option on this parser uses
+    # underscores (--model_path, --model_cache_dir, --input_dir, --patch_size), so the
+    # hyphen here is the odd one out and the underscore spelling is the natural guess.
+    parser.add_argument('--model-type', '--model_type', dest='model_type', type=str, default='auto',
                       choices=['auto', 'nnunet', 'train_py', 'resnet'],
                       help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
     parser.add_argument('--model_cache_dir', type=str, default=DEFAULT_MODEL_CACHE_DIR,
@@ -1194,8 +1196,13 @@ def main():
                            'Patch coordinates stay in the global frame, so blend_logits and '
                            'finalize_outputs need no extra flags. When streaming a remote '
                            'volume only the chunks intersecting the ROI are fetched.')
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+    import sys
+
+    args = build_parser().parse_args()
     
     # Parse optional patch size if provided
     patch_size = None
