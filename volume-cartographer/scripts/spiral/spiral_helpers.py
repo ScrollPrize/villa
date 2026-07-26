@@ -737,7 +737,7 @@ def save_combined_preview(
     *,
     surface_id,
 ):
-    """Write the fast interactive raw preview as one disconnected surface."""
+    """Write the authoritative connected preview used by VC3D and Lasagna."""
     (_, derived_upper), _, _ = compute_winding_range_and_input_extents(
         slice_to_spiral_transform,
         dr_per_winding,
@@ -804,6 +804,7 @@ def save_combined_preview(
         voxel_size_um,
         source='fit_spiral interactive preview',
         first_winding=first_winding,
+        cleanup_erosion_cells=3,
     )
     return manifest
 

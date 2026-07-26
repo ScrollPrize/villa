@@ -18,10 +18,10 @@ class LossMapRecorderTests(unittest.TestCase):
             surface.mkdir()
             Image.fromarray(np.zeros((4, 8), dtype=np.float32)).save(surface / "x.tif")
             manifest = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "spiral_combined_preview",
                 "surface_id": "preview",
-                "components": [[0, 8]],
+                "winding_column_ranges": [[0, 8]],
                 "winding_ids": [10],
             }
             (root / "manifest.json").write_text(json.dumps(manifest))

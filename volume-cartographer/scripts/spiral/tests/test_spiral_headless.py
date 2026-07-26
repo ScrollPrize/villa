@@ -11,7 +11,6 @@ import torch
 
 from fit_session import (PclInputSpec, PclRole, resolve_dataset_root,
                          resolve_logical_dbm, validate_checkpoint_container)
-from geometry_snapshot import validate_geometry_snapshot, write_geometry_snapshot
 from spiral_runtime import DistributedInteractiveFitSession, InteractiveFitSession
 from spiral_helpers import compute_winding_range_and_input_extents
 from spiral_service import ServiceState
@@ -54,7 +53,7 @@ class DatasetResolverTests(unittest.TestCase):
             self.assertEqual(result.resolved["fibers"], str(root / "fibers"))
             self.assertNotIn("unverified_patches", result.resolved)
             self.assertEqual([item["role"] for item in result.pcl_inputs],
-                             ["absolute", "relative"])
+                             ["absolute", "relative", "same_winding"])
             self.assertEqual(resolve_logical_dbm(root / "tracks" / "only.dbm.db"),
                              str(root / "tracks" / "only.dbm"))
 
@@ -72,71 +71,54 @@ class DatasetResolverTests(unittest.TestCase):
 
 
 class HandoffTests(unittest.TestCase):
-    def test_geometry_snapshot_converts_zyx_to_xyz(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "snapshot"
-            write_geometry_snapshot(destination, {
-                "fibers": [np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)]
-            }, input_order="ZYX")
-            validate_geometry_snapshot(destination)
-            points = np.fromfile(destination / "fibers.points.xyz.f32le", dtype="<f4").reshape(-1, 3)
-            np.testing.assert_array_equal(points, [[3, 2, 1], [6, 5, 4]])
-
-    def test_geometry_snapshot_streams_offset_buffer_boundaries(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "snapshot"
-            line = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32)
-            write_geometry_snapshot(destination, {"tracks": [line] * 70_000}, input_order="ZYX")
-            manifest = validate_geometry_snapshot(destination)
-            entry = manifest["categories"]["tracks"]
-            self.assertEqual(entry["polyline_count"], 70_000)
-            self.assertEqual(entry["point_count"], 140_000)
-
-    def test_geometry_snapshot_uses_bulk_packed_protocol(self):
-        class PackedLines:
-            def __iter__(self):
-                raise AssertionError("packed geometry must not iterate polylines")
-
-            def as_packed_polylines(self):
-                return (
-                    np.array([
-                        [1, 2, 3], [4, 5, 6],
-                        [7, 8, 9], [10, 11, 12], [13, 14, 15],
-                    ], dtype=np.float32),
-                    np.array([0, 2, 5], dtype=np.int64),
-                )
-
-        with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "snapshot"
-            manifest = write_geometry_snapshot(
-                destination, {"tracks": PackedLines()}, input_order="ZYX")
-            validate_geometry_snapshot(destination)
-            entry = manifest["categories"]["tracks"]
-            self.assertEqual(entry["polyline_count"], 2)
-            self.assertEqual(entry["point_count"], 5)
-            np.testing.assert_array_equal(
-                np.fromfile(destination / entry["offsets_file"], dtype="<u8"),
-                [0, 2, 5],
-            )
-            np.testing.assert_array_equal(
-                np.fromfile(destination / entry["points_file"], dtype="<f4").reshape(-1, 3),
-                [[3, 2, 1], [6, 5, 4], [9, 8, 7],
-                 [12, 11, 10], [15, 14, 13]],
-            )
-
-    def test_combined_preview_has_separators_and_ordered_components(self):
+    def test_combined_preview_is_connected_with_ordered_winding_ranges(self):
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "generation-1"
             blocks = {winding: np.full((3, 2, 3), winding, dtype=np.float32)
                       for winding in range(10, 13)}
             save_combined_tifxyz(blocks, destination, "preview", 20, 9.6, "test")
             metadata = json.loads((destination / "preview" / "meta.json").read_text())
-            self.assertEqual(metadata["components"], [[0, 2], [3, 5], [6, 8]])
+            manifest = json.loads((destination / "manifest.json").read_text())
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(
+                metadata["winding_column_ranges"], [[0, 2], [2, 4], [4, 6]]
+            )
+            self.assertNotIn("components", metadata)
             self.assertEqual(metadata["component_winding_ids"], [10, 11, 12])
             from PIL import Image
             x = np.asarray(Image.open(destination / "preview" / "x.tif"))
-            self.assertTrue(np.all(x[:, 2] == -1))
-            self.assertTrue(np.all(x[:, 5] == -1))
+            self.assertEqual(x.shape, (3, 6))
+            self.assertTrue(np.all(x[:, 1] == 10))
+            self.assertTrue(np.all(x[:, 2] == 11))
+
+    def test_combined_preview_cleanup_publishes_one_authoritative_component(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "generation-1"
+            block = np.full((18, 32, 3), -1.0, dtype=np.float32)
+            block[1:15, 1:16] = [10.0, 20.0, 30.0]
+            block[5:13, 23:30] = [40.0, 50.0, 60.0]
+            save_combined_tifxyz(
+                {10: block}, destination, "preview", 1, 9.6, "test",
+                cleanup_erosion_cells=3)
+
+            metadata = json.loads(
+                (destination / "preview" / "meta.json").read_text())
+            self.assertNotIn("components", metadata)
+            self.assertEqual(metadata["lasagna_input_cleanup"], {
+                "erosion_cells": 3,
+                "component_connectivity": 4,
+                "components_after_erosion": 2,
+            })
+            from PIL import Image
+            coordinates = [
+                np.asarray(Image.open(destination / "preview" / f"{axis}.tif"))
+                for axis in "xyz"
+            ]
+            valid = np.isfinite(coordinates).all(axis=0) & ~np.all(
+                np.stack(coordinates, axis=-1) == -1.0, axis=-1)
+            self.assertEqual(int(valid.sum()), 72)
+            self.assertTrue(valid[4:12, 4:13].all())
+            self.assertFalse(valid[:, 20:].any())
 
 
 class PreviewRangeTests(unittest.TestCase):
@@ -298,6 +280,34 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertEqual(calls, ["finish", "save", "preview"])
         self.assertEqual(session._state, "Paused")
+
+    def test_preview_is_announced_before_exporting_state_can_pause(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            session = InteractiveFitSession.__new__(InteractiveFitSession)
+            session._condition = threading.Condition()
+            session._preview_generation = 0
+            session._preview_session_id = "test-session"
+            session.paths = type(
+                "Paths", (), {"output_directory": temporary})()
+            states = []
+            session._state = "ExportingPreview"
+            session._export_preview = lambda destination, surface_id: {
+                "manifest_path": str(Path(destination) / "manifest.json"),
+            }
+            session._publish_status = lambda: states.append((
+                session._state,
+                session._preview_generation,
+                session._preview_manifest,
+            ))
+
+            session._publish_preview()
+
+            self.assertEqual(states, [(
+                "ExportingPreview",
+                1,
+                str(Path(temporary) / ".spiral-preview" / "test-session"
+                    / "generation-1" / "manifest.json"),
+            )])
 
     def test_secondary_gpu_rank_pauses_without_publishing_outputs(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
