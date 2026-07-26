@@ -71,6 +71,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [llfio-chunkloader](https://github.com/climbmax123/LLFIOCunkloadingTestingAndBenching): A method to access data in chunks of (x,y,z) that is much faster and more compute-efficient than Zarr. (Written in C++ but it is possible to integrate in Python).
 
 - [preprocessed-data](https://github.com/usc-caisplusplus/scroll-data-preprocessing): Data preprocessing code and a fully processed version of the dataset in .zarr format to allow for faster training of ink detection models. 
+- [scroll-data-audit](https://github.com/Bullo27/scroll-data-audit) by Matteo Bulloni. Integrity auditor for the open-data: reconciles the catalog (`metadata.json`) against the actual Zarr arrays, filenames and scan metadata, and verifies multiscale pyramid value-correctness. Reported a Scroll 5 (PHerc0172) catalog shape error ([#1211](https://github.com/ScrollPrize/villa/issues/1211)) and certified the rest of the open-data consistent.
 
 - [Region-of-interest inference for `vesuvius.predict`](https://github.com/ScrollPrize/villa/pull/1241): `--bbox "z0:z1,y0:y1,x0:x1"` restricts inference to one region of a volume, in global voxel coordinates, so `blend_logits` and `finalize_outputs` stay aligned. Only the chunks intersecting the region are streamed — on PHerc. Paris 4 a 200³ region reads 27 chunks (56.6 MB) instead of 10,368 (21.7 GB). By TAUIL Abd Elillah
 
