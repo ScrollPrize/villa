@@ -191,6 +191,12 @@ Notes:
 Runs tiled UNet inference on an OME-Zarr volume and writes an 8-bit OME-Zarr with
 cos, gradient-magnitude, direction, and validity channels.
 
+The `predict3d` subcommand is the Lasagna cos/normal wrapper around the shared
+3D tiled inference code in `tiled_predict3d.py`. It keeps the existing CLI,
+manifest, rolling z-band accumulation, chunk-resume, and OME-Zarr pyramid
+behavior; product-specific Lasagna logic remains in
+`preprocess_cos_omezarr.py`.
+
 ### Multi-axis processing
 
 The `--axis` flag controls which dimension is sliced through:

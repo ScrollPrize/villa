@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import time
 from pathlib import Path
@@ -9,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 from torch.utils.data import DataLoader
+import zarr
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
@@ -23,6 +25,14 @@ from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     decode_lasagna_direction_3x2_analytic,
     encode_lasagna_direction_2d,
     encode_lasagna_direction_3x2,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
+    FIBER_TRACE_3D_OPTION_CHANNELS,
+    FiberTrace3DOmeZarrOutputAdapter,
+    FiberTrace3DPredictAdapter,
+)
+from vesuvius.neural_tracing.fiber_trace_3d.infer import (
+    run_fiber_trace_3d_inference,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     DEFAULT_VOLUME_CACHE_MEMORY_MIB,
@@ -1953,6 +1963,260 @@ def test_3d_model_branch_helpers_preserve_branch_zero_layout() -> None:
     assert torch.allclose(presence_output(output), presences[:, 0])
     assert torch.allclose(dirs[:, 1], torch.full_like(dirs[:, 1], 0.3))
     assert torch.allclose(presences[:, 1], torch.full_like(presences[:, 1], 0.4))
+
+
+def test_3d_fiber_inference_adapter_schema_preserves_branch_options() -> None:
+    adapter = FiberTrace3DPredictAdapter(
+        {
+            "patch_shape_zyx": [8, 8, 8],
+            "model_3d": {
+                "input_channels": 1,
+                "direction_branch_count": 2,
+                "output_channels": 14,
+                "features_per_stage": [4, 8],
+                "strides": [[1, 1, 1], [2, 2, 2]],
+            },
+        },
+        level=2,
+        scaledown=4,
+        chunk_size=16,
+        output_prefix="fiber",
+    )
+
+    assert adapter.option_count == 2
+    assert [product.name for product in adapter.output_products] == [
+        "fiber_option_000",
+        "fiber_option_001",
+    ]
+    for option_index, product in enumerate(adapter.output_products):
+        assert product.level == 2
+        assert product.scaledown == 4
+        assert product.chunk_size == 16
+        assert product.channel_names == FIBER_TRACE_3D_OPTION_CHANNELS
+        assert [
+            channel.relative_path for channel in product.channels
+        ] == [
+            f"fiber/option_{option_index:03d}/{channel}"
+            for channel in FIBER_TRACE_3D_OPTION_CHANNELS
+        ]
+
+
+def test_3d_fiber_inference_adapter_splits_branch_output_without_collapsing() -> None:
+    adapter = FiberTrace3DPredictAdapter(
+        {
+            "patch_shape_zyx": [8, 8, 8],
+            "model_3d": {
+                "input_channels": 1,
+                "direction_branch_count": 2,
+                "output_channels": 14,
+            },
+        },
+        output_prefix="fiber",
+    )
+    output = torch.zeros((1, 14, 2, 2, 2), dtype=torch.float32)
+    output[:, 0:6] = 0.1
+    output[:, 6:7] = 0.2
+    output[:, 7:13] = 0.7
+    output[:, 13:14] = 0.8
+
+    tensors = adapter.product_tensors_from_output(output)
+    assert torch.allclose(
+        tensors["fiber_option_000"][:, :6],
+        torch.full((1, 6, 2, 2, 2), 0.1),
+    )
+    assert torch.allclose(
+        tensors["fiber_option_000"][:, 6:7],
+        torch.full((1, 1, 2, 2, 2), 0.2),
+    )
+    assert torch.allclose(
+        tensors["fiber_option_001"][:, :6],
+        torch.full((1, 6, 2, 2, 2), 0.7),
+    )
+    assert torch.allclose(
+        tensors["fiber_option_001"][:, 6:7],
+        torch.full((1, 1, 2, 2, 2), 0.8),
+    )
+
+    arrays = adapter.product_channel_arrays_from_output(output)
+    assert arrays["fiber_option_000"]["presence"].dtype == np.uint8
+    assert int(arrays["fiber_option_000"]["presence"][0, 0, 0]) == 51
+    assert int(arrays["fiber_option_001"]["presence"][0, 0, 0]) == 204
+
+
+def test_3d_fiber_inference_adapter_recurrent_conditioned_output_is_grouped() -> None:
+    class _RecurrentModel(torch.nn.Module):
+        conditioned_decoder_enabled = True
+
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("recurrent inference should use forward_recurrent_grouped")
+
+        def forward_recurrent_grouped(
+            self,
+            volume: torch.Tensor,
+            *,
+            steps: int,
+            detach_query: bool = True,
+        ) -> torch.Tensor:
+            del detach_query
+            batch, _channels, depth, height, width = (int(v) for v in volume.shape)
+            output = torch.zeros((batch, int(steps) * 7, depth, height, width))
+            output[:, 6:7] = 0.25
+            output[:, 13:14] = 0.75
+            return output
+
+    adapter = FiberTrace3DPredictAdapter(
+        {
+            "patch_shape_zyx": [8, 8, 8],
+            "model_3d": {
+                "input_channels": 1,
+                "output_channels": 7,
+                "conditioned_decoder_enabled": True,
+            },
+        },
+        recurrent_steps=2,
+        output_prefix="fiber",
+    )
+
+    output = adapter.run_tile_inference(
+        _RecurrentModel(),
+        torch.zeros((1, 1, 2, 2, 2), dtype=torch.float32),
+        device=torch.device("cpu"),
+    )
+    products = adapter.product_tensors_from_output(output)
+    assert list(products) == ["fiber_option_000", "fiber_option_001"]
+    assert torch.allclose(
+        products["fiber_option_000"][:, 6],
+        torch.full((1, 2, 2, 2), 0.25),
+    )
+    assert torch.allclose(
+        products["fiber_option_001"][:, 6],
+        torch.full((1, 2, 2, 2), 0.75),
+    )
+
+
+def test_3d_fiber_output_adapter_requires_all_option_channels(tmp_path: Path) -> None:
+    predict_adapter = FiberTrace3DPredictAdapter(
+        {
+            "patch_shape_zyx": [8, 8, 8],
+            "model_3d": {
+                "input_channels": 1,
+                "direction_branch_count": 1,
+                "output_channels": 7,
+            },
+        },
+        chunk_size=16,
+        output_prefix="fiber",
+    )
+    product = predict_adapter.output_products[0]
+    output_adapter = FiberTrace3DOmeZarrOutputAdapter(
+        output_root=tmp_path,
+        products=predict_adapter.output_products,
+    )
+
+    for channel in product.channels[:-1]:
+        chunk_path = tmp_path / str(channel.relative_path) / "0" / "0.0.0"
+        chunk_path.parent.mkdir(parents=True, exist_ok=True)
+        chunk_path.write_bytes(b"x")
+    assert not output_adapter.product_chunk_complete(
+        product,
+        chunk_origin_zyx=(0, 0, 0),
+    )
+
+    presence_path = tmp_path / str(product.channels[-1].relative_path) / "0" / "0.0.0"
+    presence_path.parent.mkdir(parents=True, exist_ok=True)
+    presence_path.write_bytes(b"x")
+    assert output_adapter.product_chunk_complete(
+        product,
+        chunk_origin_zyx=(0, 0, 0),
+    )
+
+
+def test_3d_fiber_infer_writes_seven_channel_option_bundle(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.zarr"
+    arr = zarr.open(
+        str(input_path),
+        mode="w",
+        shape=(8, 8, 8),
+        chunks=(4, 4, 4),
+        dtype=np.uint8,
+    )
+    arr[:] = np.arange(8 * 8 * 8, dtype=np.uint16).reshape(8, 8, 8) % 251
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "patch_shape_zyx": [8, 8, 8],
+                "image_normalization": "none",
+                "model_3d": {
+                    "input_channels": 1,
+                    "direction_branch_count": 1,
+                    "output_channels": 7,
+                    "features_per_stage": [2, 4],
+                    "strides": [[1, 1, 1], [2, 2, 2]],
+                    "decoder_upsample_mode": "pixelshuffle",
+                    "normalization": "batch",
+                },
+                "training": {"mixed_precision": "off"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "fiber_out"
+
+    run_fiber_trace_3d_inference(
+        config_path=config_path,
+        input_path=str(input_path),
+        output_path=output_path,
+        checkpoint=None,
+        device="cpu",
+        crop_xyzwhd=None,
+        tile_size=8,
+        overlap=0,
+        border=0,
+        scaledown=1,
+        base_ref=str(input_path),
+        base_scale=0,
+        no_download=True,
+        levels=0,
+        ome_chunk=4,
+        output_prefix="fiber",
+    )
+
+    for channel_name in FIBER_TRACE_3D_OPTION_CHANNELS:
+        channel_level = output_path / "fiber" / "option_000" / channel_name / "0"
+        assert (channel_level / ".zarray").is_file()
+        data = zarr.open(str(channel_level), mode="r")
+        assert tuple(int(v) for v in data.shape) == (8, 8, 8)
+        assert tuple(int(v) for v in data.chunks) == (4, 4, 4)
+        assert data.dtype == np.dtype(np.uint8)
+        assert int(np.asarray(data[:]).max()) > 0
+
+    manifest = json.loads(
+        (output_path / "fiber_trace_3d_inference.json").read_text(encoding="utf-8")
+    )
+    assert manifest["schema"] == "vesuvius.fiber_trace_3d.inference"
+    assert manifest["channel_bundle"] == list(FIBER_TRACE_3D_OPTION_CHANNELS)
+    assert manifest["not_lasagna_normal_products"] is True
+    assert manifest["output"]["pyramid"]["policy"] == "data_level_only"
+    assert manifest["output"]["pyramid"]["coarser_fiber_pyramids_built"] is False
+    assert len(manifest["products"]) == 1
+    product = manifest["products"][0]
+    assert product["semantics"] == "fiber_trace_3d_option_bundle"
+    assert product["direction_encoding"] == "lasagna_3x2_ambiguous"
+    assert product["data_level_only"] is True
+    assert [channel["name"] for channel in product["channels"]] == list(
+        FIBER_TRACE_3D_OPTION_CHANNELS
+    )
+    assert {channel["name"] for channel in product["channels"]}.isdisjoint(
+        {"grad_mag", "nx", "ny"}
+    )
+    assert [
+        channel["zarr_path"] for channel in product["channels"]
+    ] == [
+        f"fiber/option_000/{channel_name}"
+        for channel_name in FIBER_TRACE_3D_OPTION_CHANNELS
+    ]
 
 
 def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:

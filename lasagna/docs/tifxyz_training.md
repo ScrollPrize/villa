@@ -663,6 +663,13 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
     --pred-dt pred_surface.zarr
 ```
 
+`predict3d` now runs through the shared tiled 3D inference mechanics in
+`lasagna/tiled_predict3d.py`. The shared layer owns global tile/output-chunk
+lattices, rolling z-band scratch, output-chunk resume, temp cleanup, and
+atomic chunk writes. The Lasagna wrapper still owns the cos/normal products,
+normal estimation, `.lasagna.json` groups, pyramid generation, and all legacy
+CLI defaults.
+
 ### predict3d CLI flags
 
 | Flag | Default | Description |
@@ -704,6 +711,12 @@ Output chunk writes use unique temporary paths followed by atomic rename. Stale
 predict3d temp paths in the output directory are removed on startup/resume and
 after a normal finish; pid-bearing temp paths owned by other live predict3d
 processes are left alone.
+
+These resume rules are product-specific. Missing `pred_dt` chunks do not
+schedule model inference; missing one sibling of the `grad_mag/nx/ny` bundle
+does schedule only that coarse model product. Other users of the shared tiled
+runner, such as fiber 3D inference, define their own product bundles and
+completeness rules through adapters.
 
 ### Lasagna volume format (.lasagna.json)
 

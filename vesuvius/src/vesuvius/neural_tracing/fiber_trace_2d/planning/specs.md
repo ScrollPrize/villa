@@ -1,5 +1,67 @@
 # 2D Fiber Trace Initial Loader Specs
 
+## Shared 3D Tiled Inference
+
+- `lasagna.tiled_predict3d` owns reusable 3D tiled inference mechanics:
+  canonical global tile/output-chunk lattices, crop bounds, S3 auto-download
+  from `_download` metadata, rolling z-band scratch, output-chunk-only resume,
+  temp cleanup, progress formatting, and atomic Zarr chunk writes.
+- Product-specific adapters own model semantics, output channel schema, tile
+  postprocessing, manifest/group metadata, product completeness, and pyramid
+  behavior. The shared runner must not assume Lasagna `cos`,
+  `grad_mag/nx/ny`, or fiber direction/presence semantics.
+- `preprocess_cos_omezarr.py predict3d` remains the compatibility wrapper for
+  Lasagna cos/normal inference. Its CLI, output values, `.lasagna.json`
+  manifest, scale handling, optional `pred_dt`, and OME-Zarr pyramid behavior
+  must remain compatible with the pre-extraction implementation.
+- Resume state is durable output chunks only. Done markers are not allowed.
+  Scratch mmap/temporary files are not resume state and may be deleted on
+  startup/resume or finish.
+- Output products are independently resumable. For Lasagna, missing `pred_dt`
+  chunks schedule only derived distance-transform generation; they must not
+  schedule neural model inference when `cos` and `grad_mag/nx/ny` chunks are
+  complete. Missing one sibling of `grad_mag/nx/ny` makes only the coarse
+  normal bundle incomplete.
+- Output chunks and model tile origins are anchored to a global full-volume
+  lattice. A crop only selects which global output chunks to produce; it must
+  not shift the tile support used for a shared chunk. Overlapping or separate
+  crop runs therefore produce the same bytes for the same complete global
+  output chunk.
+- Every output chunk write uses a unique temporary path on the target
+  filesystem followed by atomic `os.replace`. If any channel in a coherent
+  product is missing, the product is incomplete and the next run rewrites the
+  missing product chunk through the same atomic path.
+- Fiber 3D inference is exposed by
+  `python -m vesuvius.neural_tracing.fiber_trace_3d.infer`. It uses the shared
+  tiled runner with the common arguments `--input`, `--output`,
+  `--checkpoint`, `--tile-size`, `--overlap`, `--border`, `--scaledown`,
+  `--crop`, `--device`, `--no-download`, `--levels`, and `--ome-chunk`.
+  Fiber-specific arguments are the positional training/inference config,
+  `--recurrent-steps`, `--output-prefix`, `--base-ref`, and `--base-scale`.
+- Fiber 3D inference must use the existing 3D fiber model/config/checkpoint
+  stack: `build_fiber_trace_3d_model(...)`, training snapshot loading, the
+  configured tile image normalization, mixed-precision/autocast helpers, and
+  Lasagna 3x2 direction encoding helpers.
+- Fiber inference outputs are not Lasagna normal products. Each emitted option
+  is one coherent seven-channel bundle:
+  `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, and
+  `presence`. The six direction channels use the Lasagna 3x2 ambiguous
+  direction layout. Product completeness for a fiber option requires all seven
+  channel chunks.
+- Multi-branch legacy outputs and conditioned recurrent outputs must be
+  preserved as separate coherent fiber options. Inference must not collapse
+  them to branch 0, min/max, average, or any other summary unless a separate
+  explicit postprocessing mode is added.
+- Fiber inference writes an atomic `fiber_trace_3d_inference.json` manifest at
+  the output root. It records input/output scaledowns, crop and output region,
+  tile parameters, output product paths, the seven-channel bundle schema,
+  `direction_encoding: lasagna_3x2_ambiguous`, and
+  `not_lasagna_normal_products: true`.
+- V0 fiber inference is data-level-only. The manifest must record
+  `pyramid.policy: data_level_only` and
+  `coarser_fiber_pyramids_built: false`; coarser direction/presence pyramid
+  generation remains out of scope until semantics are specified and tested.
+
 ## 3D CP-Centered Fiber Model Variant
 
 - The 3D CP model lives in a sibling package,

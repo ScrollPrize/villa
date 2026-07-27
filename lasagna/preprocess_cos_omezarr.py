@@ -5,15 +5,12 @@ _os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 del _os
 
 import argparse
-import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
 import shutil
-import tempfile
 import threading
 import time
-import uuid
 
 import cv2
 try:
@@ -36,20 +33,108 @@ except ImportError:
 	numba = None
 	_HAS_NUMBA = False
 import torch
-import torch.nn.functional as F
 import zarr
 
 try:
 	from omezarr_pyramid import (
 		build_normal_omezarr_pyramid,
-		build_scalar_omezarr_pyramid,
-		set_pyramid_metadata,
 	)
 except ImportError:
 	from lasagna.omezarr_pyramid import (
 		build_normal_omezarr_pyramid,
-		build_scalar_omezarr_pyramid,
-		set_pyramid_metadata,
+	)
+
+try:
+	from tiled_predict3d import (
+		ModelAdapter,
+		OutputAdapter,
+		OutputChannelSpec,
+		OutputProductSpec,
+		PYRAMID_POLICY_CUSTOM,
+		PYRAMID_POLICY_DIRECTION,
+		PYRAMID_POLICY_NONE,
+		PYRAMID_POLICY_SCALAR,
+		VALID_PYRAMID_POLICIES,
+		_RollingZBand,
+		_atomic_zarr_write,
+		_build_tile_positions,
+		_build_omezarr_pyramid,
+		_canonical_local_tile_positions,
+		_canonical_tile_positions_for_output_region,
+		_cleanup_predict3d_temp_files,
+		_create_omezarr,
+		_downscaled_tile_clip,
+		_find_resume_z,
+		_format_eta,
+		_get_input_meta,
+		_get_libc,
+		_infer_tiled_products_3d,
+		_infer_tiled_3d,
+		_invalidate_pyramid_chunks,
+		_input_has_chunks,
+		_iter_chunk_origins_for_region,
+		_omezarr_chunk_exists,
+		_omezarr_chunk_group_complete,
+		_omezarr_dim_sep,
+		_omezarr_level_shape,
+		_open_or_create_omezarr,
+		_predict3d_finalized_status,
+		_predict3d_overall_eta,
+		_predict3d_progress_line,
+		_predict3d_temp_pid,
+		_pid_is_running,
+		_pyrdown3d,
+		_read_tile_zarr,
+		_release_memmap_pages,
+		_remove_path_quiet,
+		_rolling_band_has_range,
+		_zarr_chunk_path,
+	)
+except ImportError:
+	from lasagna.tiled_predict3d import (
+		ModelAdapter,
+		OutputAdapter,
+		OutputChannelSpec,
+		OutputProductSpec,
+		PYRAMID_POLICY_CUSTOM,
+		PYRAMID_POLICY_DIRECTION,
+		PYRAMID_POLICY_NONE,
+		PYRAMID_POLICY_SCALAR,
+		VALID_PYRAMID_POLICIES,
+		_RollingZBand,
+		_atomic_zarr_write,
+		_build_tile_positions,
+		_build_omezarr_pyramid,
+		_canonical_local_tile_positions,
+		_canonical_tile_positions_for_output_region,
+		_cleanup_predict3d_temp_files,
+		_create_omezarr,
+		_downscaled_tile_clip,
+		_find_resume_z,
+		_format_eta,
+		_get_input_meta,
+		_get_libc,
+		_infer_tiled_products_3d,
+		_infer_tiled_3d,
+		_invalidate_pyramid_chunks,
+		_input_has_chunks,
+		_iter_chunk_origins_for_region,
+		_omezarr_chunk_exists,
+		_omezarr_chunk_group_complete,
+		_omezarr_dim_sep,
+		_omezarr_level_shape,
+		_open_or_create_omezarr,
+		_predict3d_finalized_status,
+		_predict3d_overall_eta,
+		_predict3d_progress_line,
+		_predict3d_temp_pid,
+		_pid_is_running,
+		_pyrdown3d,
+		_read_tile_zarr,
+		_release_memmap_pages,
+		_remove_path_quiet,
+		_rolling_band_has_range,
+		_zarr_chunk_path,
 	)
 
 from common import load_unet, unet_infer_tiled
@@ -83,88 +168,174 @@ def _round_up_to_multiple(v: int, f: int) -> int:
 	return ((max(0, int(v)) + f - 1) // f) * f
 
 
-def _downscaled_tile_clip(local_pos: int, sd: int, tile_down: int, out_size: int):
-	start = int(local_pos) // int(sd)
-	dst0 = max(0, start)
-	dst1 = min(int(out_size), start + int(tile_down))
-	if dst1 <= dst0:
-		return 0, 0, 0, 0
-	src0 = max(0, -start)
-	src1 = src0 + (dst1 - dst0)
-	return dst0, dst1, src0, src1
-
-
-def _build_tile_positions(size: int, tile: int, stride: int) -> list[int]:
-	size = int(size)
-	tile = int(tile)
-	stride = max(1, int(stride))
-	if size <= tile:
-		return [0]
-	positions = list(range(0, size - tile + 1, stride))
-	last = size - tile
-	if positions[-1] != last:
-		positions.append(last)
-	return positions
-
-
-def _canonical_local_tile_positions(
-	*,
-	volume_size: int,
-	crop_start: int,
-	crop_padded_size: int,
-	tile_size: int,
-	stride: int,
-	border: int,
-	scaledown_multiple: int,
-) -> list[int]:
-	"""Return global-lattice tile positions in local padded-crop coordinates."""
-	full_padded_size = _round_up_to_multiple(
-		int(volume_size) + 2 * int(border),
-		max(1, int(scaledown_multiple)),
-	)
-	out: list[int] = []
-	for pos in _build_tile_positions(full_padded_size, int(tile_size), int(stride)):
-		local_pos = int(pos) - int(crop_start)
-		if local_pos < int(crop_padded_size) and local_pos + int(tile_size) > 0:
-			out.append(local_pos)
-	if not out:
-		out.append(0)
-	return out
-
-
-def _canonical_tile_positions_for_output_region(
-	*,
-	volume_size: int,
-	output_start: int,
-	output_end: int,
-	scaledown: int,
-	tile_size: int,
-	stride: int,
-	border: int,
-	scaledown_multiple: int,
-) -> list[int]:
-	"""Return global padded tile positions that contribute to output interval."""
-	sd = max(1, int(scaledown))
-	full_padded_size = _round_up_to_multiple(
-		int(volume_size) + 2 * int(border),
-		max(1, int(scaledown_multiple)),
-	)
-	tile_down = int(tile_size) // sd
-	border_down = int(border) // sd
-	region0 = int(output_start) + border_down
-	region1 = int(output_end) + border_down
-	out: list[int] = []
-	for pos in _build_tile_positions(full_padded_size, int(tile_size), int(stride)):
-		t0 = int(pos) // sd
-		t1 = t0 + tile_down
-		if t0 < region1 and t1 > region0:
-			out.append(int(pos))
-	return out
-
-
 def _grad_mag_factor_from_input_sd(input_sd: int) -> float:
 	"""Scale grad_mag from input-voxel density units to base-voxel density units."""
 	return 1.0 / float(max(1, int(input_sd)))
+
+
+class LasagnaCosPredict3DAdapter:
+	"""Lasagna cos/normal model adapter for shared tiled predict3d mechanics."""
+
+	COS_PRODUCT = "cos"
+	NORMAL_PRODUCT = "lasagna_normal"
+	PRED_DT_PRODUCT = "pred_dt"
+
+	def __init__(
+		self,
+		*,
+		checkpoint: str,
+		tile_size: int,
+		device_name: str,
+		cos_product: OutputProductSpec,
+		normal_product: OutputProductSpec,
+		pred_dt_product: OutputProductSpec | None = None,
+	) -> None:
+		self.checkpoint = str(checkpoint)
+		self.tile_size = int(tile_size)
+		self.device_name = str(device_name)
+		self.cos_product = cos_product
+		self.normal_product = normal_product
+		self.pred_dt_product = pred_dt_product
+		self.norm_type = None
+		self.upsample_mode = None
+		self.output_sigmoid = True
+
+	@property
+	def model_output_products(self) -> tuple[OutputProductSpec, ...]:
+		return (self.cos_product, self.normal_product)
+
+	@property
+	def derived_output_products(self) -> tuple[OutputProductSpec, ...]:
+		return () if self.pred_dt_product is None else (self.pred_dt_product,)
+
+	@property
+	def output_products(self) -> tuple[OutputProductSpec, ...]:
+		return self.model_output_products + self.derived_output_products
+
+	def product_by_name(self, name: str) -> OutputProductSpec:
+		for product in self.output_products:
+			if product.name == name:
+				return product
+		raise KeyError(name)
+
+	def load_model(self, *, device: torch.device):
+		from train_unet_3d import build_model as build_model_3d
+
+		model, self.norm_type, self.upsample_mode, output_sigmoid = build_model_3d(
+			self.tile_size,
+			str(device),
+			weights=self.checkpoint,
+			strict=True,
+		)
+		self.output_sigmoid = bool(output_sigmoid)
+		model.eval()
+		return model
+
+	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
+		_ = device
+		return model(tile)
+
+	def accumulate_tile_output(
+		self,
+		raw_output,
+		*,
+		tile_origin_zyx,
+		tile_weight,
+		accumulators,
+	) -> None:
+		# The current Lasagna rolling loop owns accumulation until the shared
+		# runner is fully generalized; this method satisfies the shared boundary.
+		_ = tile_origin_zyx, tile_weight
+		accumulators["raw_output"] = raw_output
+
+
+class LasagnaOmeZarrOutputAdapter:
+	"""OME-Zarr chunk completeness/write adapter for Lasagna predict3d products."""
+
+	def __init__(self, *, products: tuple[OutputProductSpec, ...], n_levels: int) -> None:
+		self.products = tuple(products)
+		self.n_levels = int(n_levels)
+		self._products_by_name = {product.name: product for product in self.products}
+
+	def product_by_name(self, name: str) -> OutputProductSpec:
+		return self._products_by_name[name]
+
+	@staticmethod
+	def _channel_path(channel: OutputChannelSpec) -> str:
+		if channel.relative_path is None:
+			raise ValueError(f"output channel {channel.name!r} has no OME-Zarr path")
+		return str(channel.relative_path)
+
+	def product_chunk_complete(
+		self,
+		product: OutputProductSpec,
+		*,
+		chunk_origin_zyx,
+	) -> bool:
+		z, y, x = (int(v) for v in chunk_origin_zyx)
+		if product.channel_count == 1:
+			path = self._channel_path(product.channels[0])
+			return _omezarr_chunk_exists(path, product.level, z, y, x, product.chunk_size)
+		paths = tuple(self._channel_path(channel) for channel in product.channels)
+		return _omezarr_chunk_group_complete(paths, product.level, z, y, x, product.chunk_size)
+
+	def channel_chunk_exists(
+		self,
+		product: OutputProductSpec,
+		channel_name: str,
+		*,
+		chunk_origin_zyx,
+	) -> bool:
+		z, y, x = (int(v) for v in chunk_origin_zyx)
+		for channel in product.channels:
+			if channel.name == channel_name:
+				return _omezarr_chunk_exists(
+					self._channel_path(channel),
+					product.level,
+					z,
+					y,
+					x,
+					product.chunk_size,
+				)
+		raise KeyError(channel_name)
+
+	def write_product_chunk(
+		self,
+		product: OutputProductSpec,
+		*,
+		chunk_origin_zyx,
+		data,
+	) -> None:
+		z, y, x = (int(v) for v in chunk_origin_zyx)
+		for channel in product.channels:
+			if channel.name not in data:
+				continue
+			block = np.ascontiguousarray(data[channel.name])
+			if block.ndim != 3:
+				raise ValueError(
+					f"output channel {channel.name!r} chunk must be 3D, got shape={block.shape}"
+				)
+			wz, wy, wx = (int(v) for v in block.shape)
+			if wz <= 0 or wy <= 0 or wx <= 0:
+				continue
+			_atomic_zarr_write(
+				self._channel_path(channel),
+				product.level,
+				z,
+				y,
+				x,
+				z + wz,
+				y + wy,
+				x + wx,
+				block,
+				product.chunk_size,
+				self.n_levels,
+			)
+
+	def update_metadata(self, products) -> None:
+		# Lasagna manifest/pyramid metadata remains in run_preprocess_3d for
+		# compatibility. The adapter boundary is still used for chunk state.
+		_ = products
 
 
 def _pyrdown2d(arr: np.ndarray, *, factor: int) -> np.ndarray:
@@ -179,27 +350,6 @@ def _pyrdown2d(arr: np.ndarray, *, factor: int) -> np.ndarray:
 		out = cv2.pyrDown(out)
 		f //= 2
 	return out
-
-
-def _pyrdown3d(t: torch.Tensor, *, factor: int) -> torch.Tensor:
-	"""Gaussian pyramid downscale for 3D volume tensors.
-	Uses the same [1,4,6,4,1]/16 kernel as cv2.pyrDown, applied separably."""
-	f = int(factor)
-	if f <= 1:
-		return t
-	if (f & (f - 1)) != 0:
-		raise ValueError("downscale factor must be a power of 2 for pyramid scaling")
-	k = torch.tensor([1, 4, 6, 4, 1], dtype=t.dtype, device=t.device) / 16.0
-	while f > 1:
-		C = t.shape[0]
-		for dim, pad_arg in enumerate([(0,0,0,0,2,2), (0,0,2,2,0,0), (2,2,0,0,0,0)]):
-			shape = [1, 1, 1, 1, 1]
-			shape[dim + 2] = 5
-			kd = k.view(*shape).expand(C, 1, *shape[2:])
-			t = F.conv3d(F.pad(t.unsqueeze(0), pad_arg, mode='reflect'), kd, groups=C)[0]
-		t = t[:, ::2, ::2, ::2]
-		f //= 2
-	return t
 
 
 def _decode_dir_angle(dir0: np.ndarray, dir1: np.ndarray) -> np.ndarray:
@@ -574,733 +724,6 @@ def run_preprocess(
 		f"infer_avg={((1000.0 * t_infer_sum) / max(1, proc_count)):.2f}ms "
 		f"write_avg={((1000.0 * t_write_sum) / max(1, proc_count)):.2f}ms"
 	)
-
-
-# ---------------------------------------------------------------------------
-# OME-Zarr helpers
-# ---------------------------------------------------------------------------
-
-_input_meta_cache: dict[str, tuple[tuple[int, ...], str]] = {}
-
-
-def _get_input_meta(zarr_path: str) -> tuple[tuple[int, ...], str]:
-	"""Read chunk sizes and dimension_separator from a zarr array's .zarray."""
-	if zarr_path in _input_meta_cache:
-		return _input_meta_cache[zarr_path]
-	import json as _json
-	zarray_file = os.path.join(zarr_path, ".zarray")
-	with open(zarray_file) as f:
-		meta = _json.load(f)
-	chunks = tuple(meta["chunks"])
-	sep = meta.get("dimension_separator", ".")
-	_input_meta_cache[zarr_path] = (chunks, sep)
-	return chunks, sep
-
-
-def _input_has_chunks(zarr_path: str, z0: int, z1: int, y0: int, y1: int,
-					  x0: int, x1: int) -> bool:
-	"""Check if any chunk files exist in the zarr array for the given region."""
-	chunks, sep = _get_input_meta(zarr_path)
-	cz, cy, cx = chunks[0], chunks[min(1, len(chunks)-1)], chunks[min(2, len(chunks)-1)]
-	for iz in range(max(0, z0 // cz), (z1 + cz - 1) // cz):
-		for iy in range(max(0, y0 // cy), (y1 + cy - 1) // cy):
-			for ix in range(max(0, x0 // cx), (x1 + cx - 1) // cx):
-				path = _zarr_chunk_path(zarr_path, sep, iz, iy, ix)
-				if os.path.isfile(path):
-					return True
-	return False
-
-
-def _invalidate_pyramid_chunks(omezarr_path: str, data_level: int, n_levels: int,
-							   iz: int, iy: int, ix: int) -> None:
-	"""Delete coarser pyramid chunks that depend on data chunk (iz, iy, ix)."""
-	sep = _omezarr_dim_sep(omezarr_path, data_level)
-	for lv in range(data_level + 1, n_levels):
-		iz, iy, ix = iz // 2, iy // 2, ix // 2
-		level_path = os.path.join(omezarr_path, str(lv))
-		path = _zarr_chunk_path(level_path, sep, iz, iy, ix)
-		try:
-			os.unlink(path)
-		except FileNotFoundError:
-			pass
-
-
-def _zarr_chunk_path(level_path: str, sep: str, iz: int, iy: int, ix: int) -> str:
-	"""Filesystem path for a zarr chunk within a level directory."""
-	if sep == "/":
-		return os.path.join(level_path, str(iz), str(iy), str(ix))
-	return os.path.join(level_path, f"{iz}{sep}{iy}{sep}{ix}")
-
-
-def _remove_path_quiet(path: str | Path) -> bool:
-	"""Remove a temp file/dir if it exists. Returns True when anything was removed."""
-	p = Path(path)
-	try:
-		if p.is_dir():
-			shutil.rmtree(p)
-			return True
-		if p.exists():
-			p.unlink()
-			return True
-	except FileNotFoundError:
-		return False
-	except OSError:
-		return False
-	return False
-
-
-def _pid_is_running(pid: int) -> bool:
-	if pid <= 0:
-		return False
-	try:
-		os.kill(int(pid), 0)
-	except ProcessLookupError:
-		return False
-	except PermissionError:
-		return True
-	except OSError:
-		return False
-	return True
-
-
-def _predict3d_temp_pid(name: str) -> int | None:
-	"""Best-effort pid extraction from predict3d temp artifact names."""
-	if name.startswith(".tmp."):
-		marker = ".ome.zarr."
-		pos = name.find(marker)
-		if pos >= 0:
-			tail = name[pos + len(marker):].split(".")
-			if len(tail) >= 3 and tail[1].isdigit():
-				return int(tail[1])
-	if name.startswith(".predict3d_pid"):
-		rest = name[len(".predict3d_pid"):]
-		pid_txt = rest.split("_", 1)[0]
-		if pid_txt.isdigit():
-			return int(pid_txt)
-	return None
-
-
-def _cleanup_predict3d_temp_files(
-	out_dir: str | Path,
-	prefix: str = "",
-	*,
-	remove_current_process: bool = False,
-) -> int:
-	"""Remove stale predict3d temp files/dirs in one predict3d output directory.
-
-	All predict3d temp artifacts in the output directory are considered, not only
-	the current output prefix. Pid-bearing temp paths owned by a live process are
-	left alone so concurrent runs are not damaged; normal finish may remove this
-	process's own leftovers by passing ``remove_current_process=True``.
-	"""
-	root = Path(out_dir)
-	if not root.is_dir():
-		return 0
-	_ = prefix  # kept for old tests/callers; cleanup is directory-wide by design.
-	removed = 0
-	for child in root.iterdir():
-		name = child.name
-		is_tmp_chunk = name.startswith(".tmp.") and ".ome.zarr." in name
-		is_tmp_acc = name.startswith(".predict3d_")
-		if is_tmp_chunk or is_tmp_acc:
-			pid = _predict3d_temp_pid(name)
-			if (
-				pid is not None
-				and _pid_is_running(pid)
-				and not (remove_current_process and pid == os.getpid())
-			):
-				continue
-			removed += int(_remove_path_quiet(child))
-	return removed
-
-
-def _atomic_zarr_write(omezarr_path: str, level: int,
-					   z0: int, y0: int, x0: int,
-					   z1: int, y1: int, x1: int,
-					   data: np.ndarray, chunk_size: int,
-					   n_levels: int = 0) -> None:
-	"""Write data to a temp zarr level, then atomically rename chunks into the real output.
-	If n_levels > 0, also invalidates coarser pyramid chunks that depend on the written data."""
-	sep = _omezarr_dim_sep(omezarr_path, level)
-	level_path = os.path.join(omezarr_path, str(level))
-	# Temp dir outside the OME-Zarr, in the parent output directory
-	out_dir = os.path.dirname(omezarr_path)
-	zarr_name = os.path.basename(omezarr_path)
-	tmp_path = os.path.join(
-		out_dir,
-		f".tmp.{zarr_name}.{level}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}",
-	)
-
-	try:
-		# Ensure temp level has .zarray metadata
-		os.makedirs(tmp_path, exist_ok=True)
-		zarray_src = os.path.join(level_path, ".zarray")
-		zarray_dst = os.path.join(tmp_path, ".zarray")
-		if not os.path.isfile(zarray_dst) and os.path.isfile(zarray_src):
-			shutil.copy2(zarray_src, zarray_dst)
-
-		# Write to temp level
-		tmp_arr = zarr.open(tmp_path, mode="r+")
-		tmp_arr[z0:z1, y0:y1, x0:x1] = data
-
-		# Rename each chunk file atomically into real output
-		for cz in range(z0, z1, chunk_size):
-			for cy in range(y0, y1, chunk_size):
-				for cx in range(x0, x1, chunk_size):
-					iz, iy, ix = cz // chunk_size, cy // chunk_size, cx // chunk_size
-					src = _zarr_chunk_path(tmp_path, sep, iz, iy, ix)
-					dst = _zarr_chunk_path(level_path, sep, iz, iy, ix)
-					if os.path.isfile(src):
-						os.makedirs(os.path.dirname(dst), exist_ok=True)
-						if n_levels > 0:
-							_invalidate_pyramid_chunks(omezarr_path, level, n_levels, iz, iy, ix)
-						os.replace(src, dst)
-	finally:
-		_remove_path_quiet(tmp_path)
-
-
-def _omezarr_dim_sep(omezarr_path: str, level: int) -> str:
-	"""Read dimension_separator from .zarray metadata. Defaults to '.'."""
-	import json as _json
-	zarray_path = os.path.join(omezarr_path, str(level), ".zarray")
-	try:
-		with open(zarray_path) as f:
-			return _json.load(f).get("dimension_separator", ".")
-	except Exception:
-		return "."
-
-
-_dim_sep_cache: dict[tuple[str, int], str] = {}
-
-
-def _omezarr_chunk_exists(omezarr_path: str, level: int, z: int, y: int, x: int, chunk_size: int) -> bool:
-	"""Check if an OME-Zarr chunk file exists on disk."""
-	key = (omezarr_path, level)
-	if key not in _dim_sep_cache:
-		_dim_sep_cache[key] = _omezarr_dim_sep(omezarr_path, level)
-	sep = _dim_sep_cache[key]
-	iz, iy, ix = z // chunk_size, y // chunk_size, x // chunk_size
-	if sep == "/":
-		chunk_path = os.path.join(omezarr_path, str(level), str(iz), str(iy), str(ix))
-	else:
-		chunk_path = os.path.join(omezarr_path, str(level), f"{iz}{sep}{iy}{sep}{ix}")
-	return os.path.isfile(chunk_path)
-
-
-def _omezarr_chunk_group_complete(
-	paths: tuple[str, ...],
-	level: int,
-	z: int,
-	y: int,
-	x: int,
-	chunk_size: int,
-) -> bool:
-	"""A product chunk is complete only when every required channel chunk exists."""
-	return all(_omezarr_chunk_exists(path, level, z, y, x, chunk_size) for path in paths)
-
-
-def _format_eta(seconds: float) -> str:
-	seconds = max(0.0, float(seconds))
-	return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
-
-
-def _eta_from_processed_rate(time_sum: float, processed: int, remaining: int) -> float | None:
-	remaining = max(0, int(remaining))
-	processed = int(processed)
-	if remaining == 0:
-		return 0.0 if processed > 0 else None
-	if processed <= 0:
-		return None
-	return max(0.0, float(time_sum) / float(processed) * float(remaining))
-
-
-def _predict3d_overall_eta(progress: dict | None) -> str:
-	if progress is None:
-		return ""
-	eta = 0.0
-	have_rate = False
-	tile_eta = _eta_from_processed_rate(
-		float(progress.get("tile_time_sum", 0.0)),
-		int(progress.get("tiles_processed", 0)),
-		int(progress.get(
-			"tiles_remaining_est",
-			max(0, int(progress.get("tiles_total", 0)) - int(progress.get("tiles_done", 0))),
-		)),
-	)
-	if tile_eta is not None:
-		eta += tile_eta
-		have_rate = True
-	edt_eta = _eta_from_processed_rate(
-		float(progress.get("edt_time_sum", 0.0)),
-		int(progress.get("edt_processed", 0)),
-		int(progress.get(
-			"edt_remaining_est",
-			max(0, int(progress.get("edt_total_est", 0)) - int(progress.get("edt_done", 0))),
-		)),
-	)
-	if edt_eta is not None:
-		eta += edt_eta
-		have_rate = True
-	if not have_rate:
-		return ""
-	return f" | overall eta {_format_eta(eta)}"
-
-
-def _predict3d_finalized_status(progress: dict | None) -> str:
-	if progress is None or "finalized_base_z" not in progress:
-		return ""
-	final_z = int(progress.get("finalized_base_z", 0))
-	total_z = int(progress.get("finalized_base_z_total", 0))
-	cos_z = int(progress.get("finalized_cos_base_z", final_z))
-	other_z = int(progress.get("finalized_other_base_z", final_z))
-	if total_z <= 0:
-		return f" final_z={final_z}"
-	if cos_z != other_z:
-		return f" final_z={final_z}/{total_z} (cos={cos_z} other={other_z})"
-	return f" final_z={final_z}/{total_z}"
-
-
-def _predict3d_progress_line(progress: dict) -> str:
-	total = max(1, int(progress.get("tiles_total", 0)))
-	done = int(progress.get("tiles_done", 0))
-	processed = int(progress.get("tiles_processed", 0))
-	tile_time_sum = float(progress.get("tile_time_sum", 0.0))
-	tile_eta = _eta_from_processed_rate(
-		tile_time_sum,
-		processed,
-		int(progress.get("tiles_remaining_est", max(0, total - done))),
-	)
-	if tile_eta is None:
-		eta_text = "--:--"
-	else:
-		eta_text = _format_eta(tile_eta)
-	avg = ""
-	if processed > 0:
-		avg = f" avg={1000.0 * tile_time_sum / processed:.0f}ms/tile"
-	bar_w = 30
-	fill = int(round(done / total * bar_w))
-	fill = max(0, min(bar_w, fill))
-	bar = "#" * fill + "-" * (bar_w - fill)
-	return (
-		f"[predict3d] [{bar}] {done}/{total} tiles "
-		f"({100.0 * done / total:.1f}%) "
-		f"eta {eta_text}"
-		f"{avg}"
-		f"{_predict3d_overall_eta(progress)}"
-		f"{_predict3d_finalized_status(progress)}"
-	)
-
-
-def _iter_chunk_origins_for_region(
-	z0: int,
-	z1: int,
-	y0: int,
-	y1: int,
-	x0: int,
-	x1: int,
-	chunk_size: int,
-	shape_zyx: tuple[int, int, int],
-):
-	"""Yield global chunk origins intersecting a half-open region."""
-	zs, ys, xs = (int(v) for v in shape_zyx)
-	z0 = max(0, min(int(z0), zs))
-	y0 = max(0, min(int(y0), ys))
-	x0 = max(0, min(int(x0), xs))
-	z1 = max(z0, min(int(z1), zs))
-	y1 = max(y0, min(int(y1), ys))
-	x1 = max(x0, min(int(x1), xs))
-	if z1 <= z0 or y1 <= y0 or x1 <= x0:
-		return
-	cs = int(chunk_size)
-	for z in range((z0 // cs) * cs, ((z1 + cs - 1) // cs) * cs, cs):
-		for y in range((y0 // cs) * cs, ((y1 + cs - 1) // cs) * cs, cs):
-			for x in range((x0 // cs) * cs, ((x1 + cs - 1) // cs) * cs, cs):
-				yield z, y, x
-
-
-def _rolling_band_has_range(band: object, z0: int, z1: int) -> bool:
-	"""Return True when a rolling band currently contains z=[z0,z1)."""
-	origin = getattr(band, "origin_z", None)
-	if origin is None:
-		return False
-	end_z = getattr(band, "end_z", 0)
-	return int(z0) >= int(origin) and int(z1) <= int(end_z)
-
-
-def _omezarr_level_shape(
-	base_shape: tuple[int, int, int], level: int,
-) -> tuple[int, int, int]:
-	"""Shape at a given pyramid level (halving with ceil, like OME-Zarr)."""
-	z, y, x = (int(v) for v in base_shape)
-	for _ in range(max(0, int(level))):
-		z = max(1, (z + 1) // 2)
-		y = max(1, (y + 1) // 2)
-		x = max(1, (x + 1) // 2)
-	return z, y, x
-
-
-def _create_omezarr(
-	path: str,
-	base_shape_zyx: tuple[int, int, int],
-	first_level: int,
-	n_levels: int,
-	chunk: int,
-	channel_name: str,
-) -> zarr.Group:
-	"""Create an OME-Zarr group with pyramid level arrays.
-
-	Creates levels from ``first_level`` to ``n_levels - 1`` (coarser only).
-	Each level is a 3D (Z, Y, X) uint8 array.
-	"""
-	try:
-		g = zarr.open_group(str(path), mode="w", zarr_format=2)
-	except TypeError:
-		g = zarr.open_group(str(path), mode="w")
-	datasets = []
-	for lv in range(first_level, n_levels):
-		sh = _omezarr_level_shape(base_shape_zyx, lv)
-		chunks = (min(sh[0], chunk), min(sh[1], chunk), min(sh[2], chunk))
-		try:
-			g.create_array(
-				str(lv), shape=sh,
-				chunks=chunks,
-				dtype=np.uint8, fill_value=0, overwrite=True,
-				chunk_key_encoding={"name": "v2", "separator": "/"},
-			)
-		except (AttributeError, TypeError):
-			try:
-				g.create_dataset(
-					str(lv), shape=sh,
-					chunks=chunks,
-					dtype=np.uint8, fill_value=0, overwrite=True,
-					dimension_separator="/",
-				)
-			except TypeError:
-				g.create_dataset(
-					str(lv), shape=sh,
-					chunks=chunks,
-					dtype=np.uint8, fill_value=0, overwrite=True,
-				)
-		datasets.append({
-			"path": str(lv),
-			"coordinateTransformations": [{"type": "scale", "scale": [float(2 ** lv)] * 3}],
-		})
-	g.attrs["multiscales"] = [{
-		"version": "0.4",
-		"name": channel_name,
-		"axes": [
-			{"name": "z", "type": "space", "unit": "pixel"},
-			{"name": "y", "type": "space", "unit": "pixel"},
-			{"name": "x", "type": "space", "unit": "pixel"},
-		],
-		"datasets": datasets,
-	}]
-	set_pyramid_metadata(g, method="mean_pool2x")
-	return g
-
-
-def _open_or_create_omezarr(
-	path: str,
-	base_shape_zyx: tuple[int, int, int],
-	first_level: int,
-	n_levels: int,
-	chunk: int,
-	channel_name: str,
-) -> zarr.Group:
-	"""Open existing OME-Zarr group or create a new one."""
-	if os.path.exists(path):
-		try:
-			g = zarr.open_group(str(path), mode="r+")
-			# Verify the data level exists and has correct shape
-			expected = _omezarr_level_shape(base_shape_zyx, first_level)
-			arr = g[str(first_level)]
-			if tuple(int(v) for v in arr.shape) == expected:
-				# Verify zarr format
-				import json as _json
-				zarray_path = os.path.join(path, str(first_level), ".zarray")
-				if os.path.isfile(zarray_path):
-					with open(zarray_path) as f:
-						meta = _json.load(f)
-					zfmt = meta.get("zarr_format", None)
-					if zfmt != 2:
-						raise ValueError(
-							f"{path} level {first_level} has zarr_format={zfmt}, expected 2. "
-							"Delete and re-create the output."
-						)
-				print(f"[predict3d] reusing existing {os.path.basename(path)} "
-					  f"(level {first_level} shape={expected})", flush=True)
-				return g
-		except (KeyError, ValueError):
-			raise
-		except Exception:
-			pass
-		print(f"[predict3d] {path} shape mismatch, recreating", flush=True)
-	print(f"[predict3d] creating new {os.path.basename(path)} "
-		  f"(levels {first_level}-{n_levels-1})", flush=True)
-	return _create_omezarr(path, base_shape_zyx, first_level, n_levels, chunk, channel_name)
-
-
-def _build_omezarr_pyramid(
-	omezarr_path: str,
-	data_level: int,
-	n_levels: int,
-	chunk: int,
-	workers: int = 0,
-	crop_zyx: tuple[int, int, int, int, int, int] | None = None,
-	label: str = "",
-	zero_overrides: bool = False,
-	scan_existing_source_chunks: bool = False,
-) -> None:
-	"""Build coarser scalar pyramid levels by chunked 2x pooling."""
-	build_scalar_omezarr_pyramid(
-		omezarr_path,
-		data_level,
-		n_levels,
-		chunk,
-		workers=workers,
-		crop_zyx=crop_zyx,
-		label=label,
-		zero_overrides=zero_overrides,
-		scan_existing_source_chunks=scan_existing_source_chunks,
-	)
-
-
-def _find_resume_z(omezarr_path: str, level: int) -> int:
-	"""Find the highest z-index with non-zero data in an OME-Zarr level.
-
-	Returns 0 if no data found or OME-Zarr doesn't exist.
-	Uses binary search on z-slabs for efficiency.
-	"""
-	if not os.path.exists(omezarr_path):
-		return 0
-	try:
-		g = zarr.open_group(str(omezarr_path), mode="r")
-		arr = g[str(level)]
-		z_total = int(arr.shape[0])
-		if z_total == 0:
-			return 0
-		# Binary search: find highest z with any non-zero data
-		lo, hi = 0, z_total
-		# Quick check: is there any data at all?
-		mid_z = z_total // 2
-		sample = np.asarray(arr[mid_z])
-		if not np.any(sample != 0):
-			# Check if there's data in the first half
-			sample = np.asarray(arr[0])
-			if not np.any(sample != 0):
-				return 0
-			hi = mid_z
-		# Binary search for the last z with data
-		while lo < hi - 1:
-			mid = (lo + hi) // 2
-			sample = np.asarray(arr[mid])
-			if np.any(sample != 0):
-				lo = mid
-			else:
-				hi = mid
-		return lo + 1  # return count of written z-slices
-	except Exception:
-		return 0
-
-
-import ctypes
-import ctypes.util
-
-_libc = None
-
-
-def _get_libc():
-	global _libc
-	if _libc is None:
-		_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-	return _libc
-
-
-def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
-	"""Release memmap pages for z-slice range [z0, z1).
-
-	For a 3D per-channel array (Z, Y, X), z is axis 0. For the legacy 4D
-	array (C, Z, Y, X), z is axis 1.
-
-	madvise(DONTNEED) drops resident pages.  On Linux, if the memmap backing file
-	is still linked, fallocate(PUNCH_HOLE|KEEP_SIZE) also releases disk blocks for
-	completed bands on sparse-file-capable filesystems such as btrfs.
-	"""
-	if z1 <= z0 or not hasattr(arr, 'ctypes'):
-		return
-	page = 4096
-	aligned_offset = 0
-	aligned_length = 0
-	try:
-		libc = _get_libc()
-		if arr.ndim == 3:
-			bytes_per_z = int(np.prod(arr.shape[1:])) * arr.itemsize
-			offset = z0 * bytes_per_z
-		elif arr.ndim == 4:
-			# Legacy path only. Channel-major z bands are not physically
-			# contiguous by z across channels, so release per channel.
-			for ch in range(arr.shape[0]):
-				_release_memmap_pages(arr[ch], z0, z1)
-			return
-		else:
-			return
-		length = (z1 - z0) * bytes_per_z
-		aligned_offset = ((offset + page - 1) // page) * page
-		aligned_end = ((offset + length) // page) * page
-		aligned_length = aligned_end - aligned_offset
-		if aligned_length <= 0:
-			return
-		addr = ctypes.c_void_p(arr.ctypes.data + aligned_offset)
-		MADV_DONTNEED = 4
-		libc.madvise(addr, ctypes.c_size_t(aligned_length), ctypes.c_int(MADV_DONTNEED))
-	except Exception:
-		pass  # best effort — non-critical
-	try:
-		path = getattr(arr, "_lasagna_tmp_path", None)
-		if path and aligned_length > 0 and os.path.exists(path):
-			fd = os.open(path, os.O_RDWR)
-			try:
-				libc = _get_libc()
-				FALLOC_FL_KEEP_SIZE = 0x01
-				FALLOC_FL_PUNCH_HOLE = 0x02
-				ret = libc.fallocate(
-					ctypes.c_int(fd),
-					ctypes.c_int(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE),
-					ctypes.c_longlong(aligned_offset),
-					ctypes.c_longlong(aligned_length),
-				)
-				if ret != 0:
-					err = ctypes.get_errno()
-					if err not in (0, 38, 45, 95):  # ENOSYS, EOPNOTSUPP, ENOTSUP
-						print(f"[predict3d] warning: hole punch failed for {path}: errno={err}", flush=True)
-			finally:
-				os.close(fd)
-	except Exception:
-		pass  # best effort — non-critical
-
-
-class _RollingZBand:
-	"""Per-channel sparse mmap-backed z band with fixed logical coordinates."""
-
-	def __init__(
-		self,
-		*,
-		name: str,
-		channel_count: int,
-		z_size: int,
-		y_size: int,
-		x_size: int,
-		tmp_dir: str | None,
-		prefix: str,
-	) -> None:
-		self.name = str(name)
-		self.channel_count = int(channel_count)
-		self.z_size = int(z_size)
-		self.y_size = int(y_size)
-		self.x_size = int(x_size)
-		self.tmp_dir = tmp_dir
-		self.prefix = str(prefix)
-		self.origin_z = 0
-		self._arrays = [self._new_array(ch) for ch in range(self.channel_count)]
-
-	def _new_array(self, ch: int) -> np.memmap:
-		fd, path = tempfile.mkstemp(
-			prefix=f".predict3d_pid{os.getpid()}_{self.prefix}{self.name}_ch{ch}_",
-			suffix=".tmp",
-			dir=self.tmp_dir if self.tmp_dir else None,
-		)
-		try:
-			logical_bytes = (
-				max(0, self.z_size)
-				* max(0, self.y_size)
-				* max(0, self.x_size)
-				* np.dtype(np.float32).itemsize
-			)
-			os.ftruncate(fd, logical_bytes)
-		except Exception:
-			os.close(fd)
-			_remove_path_quiet(path)
-			raise
-		os.close(fd)
-		mm = np.memmap(
-			path,
-			dtype=np.float32,
-			mode="r+",
-			shape=(self.z_size, self.y_size, self.x_size),
-		)
-		mm._lasagna_tmp_path = path
-		atexit.register(lambda p=path: os.path.exists(p) and os.unlink(p))
-		return mm
-
-	@property
-	def end_z(self) -> int:
-		return self.z_size
-
-	def ensure(self, z0: int, z1: int) -> None:
-		z0 = int(z0)
-		z1 = int(z1)
-		if z1 <= z0:
-			return
-		if z0 < self.origin_z:
-			raise ValueError(
-				f"{self.name} rolling band cannot revisit z={z0}; "
-				f"current origin is {self.origin_z}"
-			)
-		if z1 > self.z_size:
-			raise ValueError(
-				f"{self.name} rolling band cannot extend to z={z1}; "
-				f"logical size is {self.z_size}"
-			)
-
-	def add(
-		self,
-		ch: int,
-		z0: int,
-		z1: int,
-		y0: int,
-		y1: int,
-		x0: int,
-		x1: int,
-		data: np.ndarray,
-	) -> None:
-		if z1 <= z0 or y1 <= y0 or x1 <= x0:
-			return
-		self.ensure(z0, z1)
-		self._arrays[int(ch)][int(z0):int(z1), y0:y1, x0:x1] += data
-
-	def view(self, ch: int, z0: int, z1: int) -> np.ndarray:
-		if z1 <= z0:
-			raise ValueError(f"{self.name} rolling band has no data for z=[{z0},{z1})")
-		if z0 < self.origin_z or z1 > self.end_z:
-			raise ValueError(
-				f"{self.name} rolling band missing z=[{z0},{z1}); "
-				f"available=[{self.origin_z},{self.end_z})"
-			)
-		return self._arrays[int(ch)][int(z0):int(z1)]
-
-	def discard_before(self, z_new: int) -> None:
-		z_new = int(z_new)
-		if z_new <= self.origin_z:
-			return
-		z_release = min(z_new, self.z_size)
-		for arr in self._arrays:
-			_release_memmap_pages(arr, self.origin_z, z_release)
-		self.origin_z = z_release
-
-	def _cleanup_array(self, arr: np.ndarray) -> None:
-		path = getattr(arr, "_lasagna_tmp_path", None)
-		try:
-			arr.flush()
-		except Exception:
-			pass
-		if path:
-			_remove_path_quiet(path)
-
-	def cleanup(self) -> None:
-		for arr in self._arrays:
-			self._cleanup_array(arr)
-		self._arrays = []
-		self.origin_z = self.z_size
 
 
 def _edt_reader_proc(pred_path, work_list, overlap, pZ, pY, pX,
@@ -2043,60 +1466,6 @@ def _compute_pred_dt_channel(
 # 3D UNet predict mode
 # ---------------------------------------------------------------------------
 
-def _read_tile_zarr(
-	zarr_arr,
-	volume_shape: tuple[int, int, int],
-	crop_offset: tuple[int, int, int],
-	tz: int, ty: int, tx: int,
-	tile_size: int | None,
-	border: int,
-) -> np.ndarray:
-	"""Read a single tile from zarr, using reflect-padding only at volume boundaries.
-
-	The tile grid is defined in padded-crop space (crop + border on each side).
-	We map tile coords back to zarr coords: zarr_coord = tile_coord + crop_offset - border.
-	Where zarr coords fall outside [0, vol_dim), we reflect-pad.
-	"""
-	Zv, Yv, Xv = volume_shape
-	oz, oy, ox = crop_offset
-
-	# Map tile position in padded space to zarr coordinates
-	src_z0 = tz + oz - border
-	src_y0 = ty + oy - border
-	src_x0 = tx + ox - border
-
-	src_z1 = src_z0 + tile_size
-	src_y1 = src_y0 + tile_size
-	src_x1 = src_x0 + tile_size
-
-	# Clamp to valid zarr range
-	rz0 = max(0, src_z0)
-	ry0 = max(0, src_y0)
-	rx0 = max(0, src_x0)
-	rz1 = min(Zv, src_z1)
-	ry1 = min(Yv, src_y1)
-	rx1 = min(Xv, src_x1)
-
-	if rz1 <= rz0 or ry1 <= ry0 or rx1 <= rx0:
-		return np.zeros((tile_size, tile_size, tile_size), dtype=np.uint8)
-
-	chunk = np.asarray(zarr_arr[rz0:rz1, ry0:ry1, rx0:rx1])
-
-	# Pad if we went out of bounds
-	pad_before = (rz0 - src_z0, ry0 - src_y0, rx0 - src_x0)
-	pad_after = (src_z1 - rz1, src_y1 - ry1, src_x1 - rx1)
-	needs_pad = any(p > 0 for p in pad_before + pad_after)
-	if needs_pad:
-		chunk = np.pad(
-			chunk,
-			[(pad_before[0], pad_after[0]),
-			 (pad_before[1], pad_after[1]),
-			 (pad_before[2], pad_after[2])],
-			mode="reflect",
-		)
-	return chunk
-
-
 def _calibrate_instance_norm(
 	model,
 	zarr_arr,
@@ -2152,370 +1521,6 @@ def _calibrate_instance_norm(
 			model(tile_t)
 	model.eval()
 	print("[calibrate_norm] done")
-
-
-def _infer_tiled_3d(
-	model,
-	zarr_arr,
-	*,
-	crop_slices: tuple[int, int, int, int, int, int],
-	device: torch.device,
-	tile_size: int = 256,
-	overlap: int = 64,
-	border: int = 16,
-	out_channels: int = 8,
-	cos_scaledown: int = 2,
-	other_scaledown: int = 4,
-	tmp_dir: str | None = None,
-	output_sigmoid: bool = True,
-	on_z_complete=None,
-	skip_z_positions: int = 0,
-	progress: dict | None = None,
-	is_tile_done=None,
-	temp_prefix: str = "",
-) -> tuple[np.ndarray, np.ndarray] | None:
-	"""Run 3D UNet inference with dual-resolution accumulators.
-
-	Channel 0 (cos) is accumulated at cos_scaledown resolution.
-	Channels 1..out_channels-1 are accumulated at other_scaledown resolution.
-
-	If *on_z_complete* is provided, it is called after each z-row of tiles
-	with ``(acc_fine, wsum_fine, acc_coarse, wsum_coarse, complete_z_padded,
-	pad0)``.  The callback should normalize, post-process, write output, and
-	release memmap pages for the flushed region.  When a callback is
-	provided the function returns ``None`` (output is consumed by the
-	callback).
-
-	*skip_z_positions* skips the first N z-positions (for resume).
-
-	Returns:
-		(cos_result, other_result) where:
-		  cos_result:   (1, Z_fine, Y_fine, X_fine) float32
-		  other_result: (out_channels-1, Z_coarse, Y_coarse, X_coarse) float32
-	"""
-	z0, z1, y0, y1, x0, x1 = crop_slices
-	nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
-	volume_shape = tuple(int(v) for v in zarr_arr.shape)
-
-	sd_fine = max(1, int(cos_scaledown))
-	sd_coarse = max(1, int(other_scaledown))
-	# Use finest scaledown for tiling alignment
-	sd_min = min(sd_fine, sd_coarse)
-	stride = max(1, tile_size - overlap)
-
-	# Validate alignment
-	for sd_label, sd_val in [("cos_scaledown", sd_fine), ("other_scaledown", sd_coarse)]:
-		if sd_val > 1:
-			for name, val in [("tile_size", tile_size), ("stride", stride), ("border", border)]:
-				if val % sd_val != 0:
-					raise ValueError(f"{name}={val} must be divisible by {sd_label}={sd_val}")
-
-	# Padded crop dimensions (border on each side)
-	pad0 = max(0, int(border))
-	Zp = nz + 2 * pad0
-	Yp = ny + 2 * pad0
-	Xp = nx + 2 * pad0
-
-	# Round up to coarsest scaledown-multiple
-	sd_max = max(sd_fine, sd_coarse)
-	if sd_max > 1:
-		Zp = _round_up_to_multiple(Zp, sd_max)
-		Yp = _round_up_to_multiple(Yp, sd_max)
-		Xp = _round_up_to_multiple(Xp, sd_max)
-
-	# Output dimensions for each accumulator
-	Zo_f, Yo_f, Xo_f = Zp // sd_fine, Yp // sd_fine, Xp // sd_fine
-	Zo_c, Yo_c, Xo_c = Zp // sd_coarse, Yp // sd_coarse, Xp // sd_coarse
-
-	ov_eff = max(0, overlap - 2 * border)
-
-	# Canonical global padded lattice: full-volume tile position p corresponds
-	# to source origin p-border. Local crop padded coordinates start at
-	# source z/y/x = crop_offset-border, so local p = global p - crop_offset.
-	z_positions = _canonical_local_tile_positions(
-		volume_size=volume_shape[0], crop_start=z0, crop_padded_size=Zp,
-		tile_size=tile_size, stride=stride, border=pad0, scaledown_multiple=sd_max,
-	)
-	y_positions = _canonical_local_tile_positions(
-		volume_size=volume_shape[1], crop_start=y0, crop_padded_size=Yp,
-		tile_size=tile_size, stride=stride, border=pad0, scaledown_multiple=sd_max,
-	)
-	x_positions = _canonical_local_tile_positions(
-		volume_size=volume_shape[2], crop_start=x0, crop_padded_size=Xp,
-		tile_size=tile_size, stride=stride, border=pad0, scaledown_multiple=sd_max,
-	)
-
-	def _blend_ramp(length, ov, b):
-		ramp = np.zeros(length, dtype=np.float32)
-		if length <= 0:
-			return ramp
-		core_start = min(b, length)
-		core_end = max(core_start, length - b)
-		core_len = core_end - core_start
-		if core_len <= 0:
-			return ramp
-		core = np.ones(core_len, dtype=np.float32)
-		if ov > 0:
-			ov_core = min(ov, core_len // 2)
-			if ov_core > 0:
-				edges = np.linspace(0.0, 1.0, ov_core + 1, dtype=np.float32)[1:]
-				core[:ov_core] = edges
-				core[-ov_core:] = edges[::-1]
-		ramp[core_start:core_end] = core
-		return ramp
-
-	# Precompute full-tile blend weight on GPU
-	rz_full = _blend_ramp(tile_size, ov_eff, border)
-	ry_full = _blend_ramp(tile_size, ov_eff, border)
-	rx_full = _blend_ramp(tile_size, ov_eff, border)
-	w_full = torch.from_numpy(
-		rz_full[:, None, None] * ry_full[None, :, None] * rx_full[None, None, :]
-	).to(device)  # (tile, tile, tile)
-
-	# Precompute downscaled weights for each accumulator
-	w_fine = (_pyrdown3d(w_full.unsqueeze(0), factor=sd_fine).squeeze(0).cpu().numpy()
-			  if sd_fine > 1 else w_full.cpu().numpy())
-	w_coarse = (_pyrdown3d(w_full.unsqueeze(0), factor=sd_coarse).squeeze(0).cpu().numpy()
-				if sd_coarse > 1 else w_full.cpu().numpy())
-
-	streaming = on_z_complete is not None
-
-	# Memmap accumulators — place next to output to avoid /tmp overflow
-	def _make_memmap(suffix, shape):
-		fd, p = tempfile.mkstemp(
-			prefix=f".predict3d_pid{os.getpid()}_{temp_prefix}{suffix}_",
-			suffix=".tmp",
-			dir=tmp_dir if tmp_dir else None,
-		)
-		os.close(fd)
-		mm = np.memmap(p, dtype=np.float32, mode="w+", shape=shape)
-		mm._lasagna_tmp_path = p
-		atexit.register(lambda path=p: os.path.exists(path) and os.unlink(path))
-		return mm
-
-	def _cleanup_memmap(mm):
-		path = getattr(mm, "_lasagna_tmp_path", None)
-		try:
-			mm.flush()
-		except Exception:
-			pass
-		if path:
-			try:
-				os.unlink(path)
-			except FileNotFoundError:
-				pass
-			except OSError:
-				pass
-
-	n_other = out_channels - 1
-	if streaming:
-		acc_fine = _RollingZBand(
-			name="acc_fine", channel_count=1, z_size=Zo_f, y_size=Yo_f, x_size=Xo_f,
-			tmp_dir=tmp_dir, prefix=temp_prefix,
-		)
-		wsum_fine = _RollingZBand(
-			name="wsum_fine", channel_count=1, z_size=Zo_f, y_size=Yo_f, x_size=Xo_f,
-			tmp_dir=tmp_dir, prefix=temp_prefix,
-		)
-		acc_coarse = _RollingZBand(
-			name="acc_coarse", channel_count=n_other, z_size=Zo_c, y_size=Yo_c, x_size=Xo_c,
-			tmp_dir=tmp_dir, prefix=temp_prefix,
-		)
-		wsum_coarse = _RollingZBand(
-			name="wsum_coarse", channel_count=1, z_size=Zo_c, y_size=Yo_c, x_size=Xo_c,
-			tmp_dir=tmp_dir, prefix=temp_prefix,
-		)
-		print(
-			f"[predict3d] rolling accumulators: fine channels=1 zyx=({Zo_f},{Yo_f},{Xo_f}) sd={sd_fine}; "
-			f"coarse channels={n_other} zyx=({Zo_c},{Yo_c},{Xo_c}) sd={sd_coarse}",
-			flush=True,
-		)
-	else:
-		acc_fine = _make_memmap("acc_fine", (1, Zo_f, Yo_f, Xo_f))
-		wsum_fine = _make_memmap("wsum_fine", (1, Zo_f, Yo_f, Xo_f))
-		acc_coarse = _make_memmap("acc_coarse", (n_other, Zo_c, Yo_c, Xo_c))
-		wsum_coarse = _make_memmap("wsum_coarse", (1, Zo_c, Yo_c, Xo_c))
-
-		fine_bytes = (np.prod(acc_fine.shape) + np.prod(wsum_fine.shape)) * 4
-		coarse_bytes = (np.prod(acc_coarse.shape) + np.prod(wsum_coarse.shape)) * 4
-		print(
-			f"[predict3d] accumulators: fine ({1},{Zo_f},{Yo_f},{Xo_f}) sd={sd_fine} "
-			f"({fine_bytes / (1024**3):.2f} GiB) + "
-			f"coarse ({n_other},{Zo_c},{Yo_c},{Xo_c}) sd={sd_coarse} "
-			f"({coarse_bytes / (1024**3):.2f} GiB)",
-			flush=True,
-		)
-
-	tiles_per_zrow = len(y_positions) * len(x_positions)
-	total_tiles = len(z_positions) * tiles_per_zrow
-	skipped_tiles = skip_z_positions * tiles_per_zrow
-	done = skipped_tiles
-	processed_tiles = 0
-	t0 = time.time()
-	_tile_time_sum = 0.0
-	crop_offset = (z0, y0, x0)
-	if progress is not None:
-		progress["tiles_total"] = total_tiles
-		progress["tiles_done"] = done
-		progress["tiles_skipped"] = skipped_tiles
-		progress["tiles_processed"] = 0
-		progress["tile_time_sum"] = 0.0
-		progress["tiles_remaining_est"] = max(0, total_tiles - done)
-
-	for i_tz, tz in enumerate(z_positions):
-		if i_tz < skip_z_positions:
-			continue  # resume: skip already-processed z-rows
-
-		for ty in y_positions:
-			for tx in x_positions:
-				# Skip tile if all output chunks it contributes to already exist
-				if is_tile_done is not None and is_tile_done(tz, ty, tx):
-					done += 1
-					if progress is not None:
-						progress["tiles_done"] = done
-						progress["tiles_skipped"] = int(progress.get("tiles_skipped", 0)) + 1
-						progress["tiles_remaining_est"] = max(0, total_tiles - done)
-					continue
-
-				_tile_t0 = time.time()
-				# Read tile from zarr (lazy)
-				tile_np = _read_tile_zarr(
-					zarr_arr, volume_shape, crop_offset,
-					tz, ty, tx, tile_size, border,
-				)
-				if tile_np.dtype == np.uint16:
-					tile_np = (tile_np // 257).astype(np.uint8)
-
-				tile_f = tile_np.astype(np.float32) / 255.0
-				tile_t = torch.from_numpy(tile_f).unsqueeze(0).unsqueeze(0).to(device)
-
-				with torch.inference_mode(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-					pred = model(tile_t)
-				if isinstance(pred, dict):
-					pred = pred["output"]
-
-				# Diagnostics
-				raw_nan = torch.isnan(pred).sum().item()
-				if raw_nan > 0 or done == skipped_tiles:
-					print(flush=True)
-					print(
-						f"  tile {done}/{total_tiles} "
-						f"pos=({tz},{ty},{tx}) "
-						f"input: min={tile_f.min():.4f} max={tile_f.max():.4f} "
-						f"raw_out: min={pred.min().item():.4f} max={pred.max().item():.4f} "
-						f"nan={raw_nan}/{pred.numel()} "
-						f"dtype={pred.dtype}",
-						flush=True,
-					)
-
-				# Activate on GPU
-				if output_sigmoid:
-					pred = torch.sigmoid(pred.float())  # (1, C, tz, ty, tx)
-				else:
-					pred = pred.float().clamp(0.0, 1.0)
-
-				# Split channels and accumulate at different resolutions
-				pred_cos = pred[0, 0:1] * w_full    # (1, tz, ty, tx)
-				pred_other = pred[0, 1:] * w_full    # (C-1, tz, ty, tx)
-
-				# Downscale cos channel
-				if sd_fine > 1:
-					pred_cos = _pyrdown3d(pred_cos, factor=sd_fine)
-				cos_np = pred_cos.cpu().numpy()
-				ts_f = tile_size // sd_fine
-				azl_f, azr_f, szl_f, szr_f = _downscaled_tile_clip(tz, sd_fine, ts_f, Zo_f)
-				ayl_f, ayr_f, syl_f, syr_f = _downscaled_tile_clip(ty, sd_fine, ts_f, Yo_f)
-				axl_f, axr_f, sxl_f, sxr_f = _downscaled_tile_clip(tx, sd_fine, ts_f, Xo_f)
-				if azr_f > azl_f and ayr_f > ayl_f and axr_f > axl_f:
-					if streaming:
-						acc_fine.add(0, azl_f, azr_f, ayl_f, ayr_f, axl_f, axr_f,
-									 cos_np[0, szl_f:szr_f, syl_f:syr_f, sxl_f:sxr_f])
-						wsum_fine.add(0, azl_f, azr_f, ayl_f, ayr_f, axl_f, axr_f,
-									  w_fine[szl_f:szr_f, syl_f:syr_f, sxl_f:sxr_f])
-					else:
-						acc_fine[:, azl_f:azr_f, ayl_f:ayr_f, axl_f:axr_f] += cos_np[:, szl_f:szr_f, syl_f:syr_f, sxl_f:sxr_f]
-						wsum_fine[0, azl_f:azr_f, ayl_f:ayr_f, axl_f:axr_f] += w_fine[szl_f:szr_f, syl_f:syr_f, sxl_f:sxr_f]
-
-				# Downscale other channels
-				if sd_coarse > 1:
-					pred_other = _pyrdown3d(pred_other, factor=sd_coarse)
-				other_np = pred_other.cpu().numpy()
-				ts_c = tile_size // sd_coarse
-				azl_c, azr_c, szl_c, szr_c = _downscaled_tile_clip(tz, sd_coarse, ts_c, Zo_c)
-				ayl_c, ayr_c, syl_c, syr_c = _downscaled_tile_clip(ty, sd_coarse, ts_c, Yo_c)
-				axl_c, axr_c, sxl_c, sxr_c = _downscaled_tile_clip(tx, sd_coarse, ts_c, Xo_c)
-				if azr_c > azl_c and ayr_c > ayl_c and axr_c > axl_c:
-					if streaming:
-						for ch in range(n_other):
-							acc_coarse.add(ch, azl_c, azr_c, ayl_c, ayr_c, axl_c, axr_c,
-										   other_np[ch, szl_c:szr_c, syl_c:syr_c, sxl_c:sxr_c])
-						wsum_coarse.add(0, azl_c, azr_c, ayl_c, ayr_c, axl_c, axr_c,
-										w_coarse[szl_c:szr_c, syl_c:syr_c, sxl_c:sxr_c])
-					else:
-						acc_coarse[:, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += other_np[:, szl_c:szr_c, syl_c:syr_c, sxl_c:sxr_c]
-						wsum_coarse[0, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += w_coarse[szl_c:szr_c, syl_c:syr_c, sxl_c:sxr_c]
-
-				tile_elapsed = time.time() - _tile_t0
-				_tile_time_sum += tile_elapsed
-				processed_tiles += 1
-				done += 1
-				if progress is not None:
-					progress["tiles_done"] = done
-					progress["tiles_processed"] = processed_tiles
-					progress["tile_time_sum"] = _tile_time_sum
-					progress["tiles_remaining_est"] = max(0, total_tiles - done)
-				if progress is None:
-					per = _tile_time_sum / max(1, processed_tiles)
-					remaining = total_tiles - done
-					eta = max(0.0, per * remaining)
-					bar_w = 30
-					fill = int(round(done / max(1, total_tiles) * bar_w))
-					fill = max(0, min(bar_w, fill))
-					bar = "#" * fill + "-" * (bar_w - fill)
-					status = (
-						f"[predict3d] [{bar}] {done}/{total_tiles} tiles "
-						f"({100.0 * done / max(1, total_tiles):.1f}%) "
-						f"eta {_format_eta(eta)} "
-						f"avg={1000.0 * per:.0f}ms/tile"
-					)
-				else:
-					status = _predict3d_progress_line(progress)
-				print(f"\r{status}  ", end="", flush=True)
-
-		# --- After all (ty, tx) for this tz: flush completed z-band ---
-		if on_z_complete is not None:
-			next_tz = z_positions[i_tz + 1] if i_tz + 1 < len(z_positions) else Zp
-			on_z_complete(acc_fine, wsum_fine, acc_coarse, wsum_coarse, next_tz, pad0)
-
-	print("", flush=True)
-	print(
-		f"[predict3d] inference done in {time.time() - t0:.1f}s "
-		f"({processed_tiles} processed, {done - processed_tiles} skipped)",
-		flush=True,
-	)
-
-	# If streaming mode (callback), output was consumed incrementally
-	if on_z_complete is not None:
-		acc_fine.cleanup()
-		wsum_fine.cleanup()
-		acc_coarse.cleanup()
-		wsum_coarse.cleanup()
-		del acc_fine, wsum_fine, acc_coarse, wsum_coarse
-		return None
-
-	# Legacy mode: normalize and return full memmap views
-	acc_fine /= np.maximum(wsum_fine, 1e-7)
-	acc_coarse /= np.maximum(wsum_coarse, 1e-7)
-	del wsum_fine, wsum_coarse
-
-	b_f = pad0 // sd_fine
-	b_c = pad0 // sd_coarse
-	nz_f, ny_f, nx_f = nz // sd_fine, ny // sd_fine, nx // sd_fine
-	nz_c, ny_c, nx_c = nz // sd_coarse, ny // sd_coarse, nx // sd_coarse
-
-	result_fine = acc_fine[:, b_f:b_f + nz_f, b_f:b_f + ny_f, b_f:b_f + nx_f]
-	result_coarse = acc_coarse[:, b_c:b_c + nz_c, b_c:b_c + ny_c, b_c:b_c + nx_c]
-	return result_fine, result_coarse
 
 
 def _find_zarr_group_root(path: str) -> Path | None:
@@ -2741,7 +1746,6 @@ def run_preprocess_3d(
 	distance encoding: outside=[80,127], inside=[128,175], no data=0.
 	"""
 	from lasagna_volume import LasagnaVolume, ChannelGroup
-	from train_unet_3d import build_model as build_model_3d
 
 	if tile_size is None:
 		_ckpt_meta = torch.load(unet3d_checkpoint, map_location="cpu", weights_only=False)
@@ -2948,6 +1952,50 @@ def run_preprocess_3d(
 	ny_omezarr_path = os.path.join(out_dir, f"{prefix}ny.ome.zarr")
 	dt_omezarr_path = os.path.join(out_dir, f"{prefix}pred_dt.ome.zarr") if pred_dt_path else None
 
+	predict_adapter = LasagnaCosPredict3DAdapter(
+		checkpoint=unet3d_checkpoint,
+		tile_size=tile_size,
+		device_name=str(torch_device),
+		cos_product=OutputProductSpec(
+			name=LasagnaCosPredict3DAdapter.COS_PRODUCT,
+			level=cos_level,
+			scaledown=effective_cos_sd,
+			channels=(OutputChannelSpec("cos", relative_path=cos_omezarr_path),),
+			chunk_size=oc,
+			pyramid_policy=PYRAMID_POLICY_SCALAR,
+		),
+		normal_product=OutputProductSpec(
+			name=LasagnaCosPredict3DAdapter.NORMAL_PRODUCT,
+			level=other_level,
+			scaledown=effective_other_sd,
+			channels=(
+				OutputChannelSpec("grad_mag", relative_path=gm_omezarr_path),
+				OutputChannelSpec("nx", relative_path=nx_omezarr_path),
+				OutputChannelSpec("ny", relative_path=ny_omezarr_path),
+			),
+			chunk_size=oc,
+			pyramid_policy=PYRAMID_POLICY_CUSTOM,
+		),
+		pred_dt_product=(
+			OutputProductSpec(
+				name=LasagnaCosPredict3DAdapter.PRED_DT_PRODUCT,
+				level=cos_level,
+				scaledown=effective_cos_sd,
+				channels=(OutputChannelSpec("pred_dt", relative_path=dt_omezarr_path),),
+				chunk_size=oc,
+				pyramid_policy=PYRAMID_POLICY_SCALAR,
+			)
+			if dt_omezarr_path is not None
+			else None
+		),
+	)
+	output_adapter = LasagnaOmeZarrOutputAdapter(
+		products=predict_adapter.output_products,
+		n_levels=n_levels,
+	)
+	cos_product = predict_adapter.cos_product
+	normal_product = predict_adapter.normal_product
+
 	cos_grp = _open_or_create_omezarr(cos_omezarr_path, base_shape_zyx, cos_level, n_levels, oc, "cos")
 	gm_grp = _open_or_create_omezarr(gm_omezarr_path, base_shape_zyx, other_level, n_levels, oc, "grad_mag")
 	nx_grp = _open_or_create_omezarr(nx_omezarr_path, base_shape_zyx, other_level, n_levels, oc, "nx")
@@ -3017,9 +2065,8 @@ def run_preprocess_3d(
 		_gpu_ctx.__enter__()
 
 	# --- Build model ---
-	model, _norm_type, _upsample_mode, _output_sigmoid = build_model_3d(
-		tile_size, str(torch_device), weights=str(unet3d_checkpoint), strict=True)
-	model.eval()
+	model = predict_adapter.load_model(device=torch_device)
+	_output_sigmoid = predict_adapter.output_sigmoid
 
 	if calibrate_norm:
 		_calibrate_instance_norm(
@@ -3105,7 +2152,10 @@ def run_preprocess_3d(
 		for z, y, x in _iter_chunk_origins_for_region(
 			fz0, fz1, fy0, fy1, fx0, fx1, oc, (full_cos_z, full_cos_y, full_cos_x),
 		):
-			if not _omezarr_chunk_exists(cos_omezarr_path, cos_level, z, y, x, oc):
+			if not output_adapter.product_chunk_complete(
+				cos_product,
+				chunk_origin_zyx=(z, y, x),
+			):
 				return False
 
 		# Coarse (prediction) output chunks touched by this tile.
@@ -3122,9 +2172,9 @@ def run_preprocess_3d(
 		for z, y, x in _iter_chunk_origins_for_region(
 			cz0, cz1, cy0, cy1, cx0, cx1, oc, (full_other_z, full_other_y, full_other_x),
 		):
-			if not _omezarr_chunk_group_complete(
-				(gm_omezarr_path, nx_omezarr_path, ny_omezarr_path),
-				other_level, z, y, x, oc,
+			if not output_adapter.product_chunk_complete(
+				normal_product,
+				chunk_origin_zyx=(z, y, x),
 			):
 				return False
 		return True
@@ -3197,7 +2247,10 @@ def run_preprocess_3d(
 								cz = oz + dz
 								cy = cos_oy0 + dy
 								cx = cos_ox0 + dx
-								if _omezarr_chunk_exists(cos_omezarr_path, cos_level, cz, cy, cx, oc):
+								if output_adapter.product_chunk_complete(
+									cos_product,
+									chunk_origin_zyx=(cz, cy, cx),
+								):
 									n_skip_cos += 1
 									continue
 								if not _output_chunk_has_input_support(cz, cy, cx, cos_sd):
@@ -3214,9 +2267,11 @@ def run_preprocess_3d(
 								cxe = min(cos_wx, dx + oc)
 								wz = cze - dz; wy = cye - dy; wx = cxe - dx
 								if wz > 0 and wy > 0 and wx > 0:
-									_atomic_zarr_write(cos_omezarr_path, cos_level,
-										cz, cy, cx, cz + wz, cy + wy, cx + wx,
-										cos_slab[dz:cze, dy:cye, dx:cxe], oc, n_levels)
+									output_adapter.write_product_chunk(
+										cos_product,
+										chunk_origin_zyx=(cz, cy, cx),
+										data={"cos": cos_slab[dz:cze, dy:cye, dx:cxe]},
+									)
 								n_write_cos += 1
 
 				# --- pred_dt for this z-band ---
@@ -3301,12 +2356,19 @@ def run_preprocess_3d(
 								cz = oz_c + dz
 								cy = other_oy0 + dy
 								cx = other_ox0 + dx
-								gm_exists = _omezarr_chunk_exists(gm_omezarr_path, other_level, cz, cy, cx, oc)
-								nx_exists = _omezarr_chunk_exists(nx_omezarr_path, other_level, cz, cy, cx, oc)
-								ny_exists = _omezarr_chunk_exists(ny_omezarr_path, other_level, cz, cy, cx, oc)
-								if gm_exists and nx_exists and ny_exists:
+								chunk_origin = (cz, cy, cx)
+								if output_adapter.product_chunk_complete(
+									normal_product,
+									chunk_origin_zyx=chunk_origin,
+								):
 									n_skip_c += 1
 									continue
+								gm_exists = output_adapter.channel_chunk_exists(
+									normal_product, "grad_mag", chunk_origin_zyx=chunk_origin)
+								nx_exists = output_adapter.channel_chunk_exists(
+									normal_product, "nx", chunk_origin_zyx=chunk_origin)
+								ny_exists = output_adapter.channel_chunk_exists(
+									normal_product, "ny", chunk_origin_zyx=chunk_origin)
 								if not _output_chunk_has_input_support(cz, cy, cx, other_sd):
 									n_skip_c += 1
 									continue
@@ -3327,9 +2389,9 @@ def run_preprocess_3d(
 								# grad_mag
 								gm_u8 = np.clip(s[0] * 1000.0, 0.0, 255.0).astype(np.uint8)
 								wz = gm_u8.shape[0]; wy = gm_u8.shape[1]; wx = gm_u8.shape[2]
+								chunk_data = {}
 								if not gm_exists:
-									_atomic_zarr_write(gm_omezarr_path, other_level,
-										cz, cy, cx, cz + wz, cy + wy, cx + wx, gm_u8, oc, n_levels)
+									chunk_data["grad_mag"] = gm_u8
 
 								# Normals
 								if not (nx_exists and ny_exists):
@@ -3339,11 +2401,15 @@ def run_preprocess_3d(
 									nx_u8 = np.clip(np.round(nx_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
 									ny_u8 = np.clip(np.round(ny_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
 									if not nx_exists:
-										_atomic_zarr_write(nx_omezarr_path, other_level,
-											cz, cy, cx, cz + wz, cy + wy, cx + wx, nx_u8, oc, n_levels)
+										chunk_data["nx"] = nx_u8
 									if not ny_exists:
-										_atomic_zarr_write(ny_omezarr_path, other_level,
-											cz, cy, cx, cz + wz, cy + wy, cx + wx, ny_u8, oc, n_levels)
+										chunk_data["ny"] = ny_u8
+								if chunk_data:
+									output_adapter.write_product_chunk(
+										normal_product,
+										chunk_origin_zyx=chunk_origin,
+										data=chunk_data,
+									)
 								n_write_c += 1
 
 			other_final_base_z = (other_oz0 + max(0, flush_to_c - b_c)) * effective_other_sd
@@ -3411,6 +2477,7 @@ def run_preprocess_3d(
 		progress=_progress,
 		is_tile_done=_is_tile_done,
 		temp_prefix=prefix,
+		model_adapter=predict_adapter,
 	)
 	del model
 	torch.cuda.empty_cache()

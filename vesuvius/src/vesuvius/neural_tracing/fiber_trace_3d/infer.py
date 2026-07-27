@@ -1,0 +1,594 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+import time
+from typing import Any
+
+import torch
+import zarr
+
+try:
+    from lasagna.tiled_predict3d import (
+        _auto_download,
+        _cleanup_predict3d_temp_files,
+        _crop_xyzwhd_bounds,
+        _ds_index,
+        _ds_size,
+        _infer_tiled_products_3d,
+        _open_or_create_omezarr,
+    )
+except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
+    from tiled_predict3d import (
+        _auto_download,
+        _cleanup_predict3d_temp_files,
+        _crop_xyzwhd_bounds,
+        _ds_index,
+        _ds_size,
+        _infer_tiled_products_3d,
+        _open_or_create_omezarr,
+    )
+
+from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
+    FIBER_TRACE_3D_OPTION_CHANNELS,
+    FiberTrace3DOmeZarrOutputAdapter,
+    FiberTrace3DPredictAdapter,
+)
+
+try:
+    from lasagna.tiled_predict3d import _resolve_base_shape
+except ImportError:  # pragma: no cover
+    from tiled_predict3d import _resolve_base_shape
+
+
+def _load_config(path: str | Path) -> dict[str, Any]:
+    config_path = Path(path)
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    if not isinstance(config, dict):
+        raise ValueError(f"{config_path} must contain a JSON object")
+    config.setdefault("_config_dir", str(config_path.parent))
+    return config
+
+
+def _tile_size_from_config(config: dict[str, Any], explicit_tile_size: int | None) -> int:
+    if explicit_tile_size is not None:
+        tile_size = int(explicit_tile_size)
+    else:
+        shape = config.get("patch_shape_zyx", config.get("crop_size"))
+        if shape is None:
+            raise ValueError("pass --tile-size or set patch_shape_zyx in the config")
+        shape_tuple = tuple(int(v) for v in shape)
+        if len(shape_tuple) != 3 or len(set(shape_tuple)) != 1:
+            raise ValueError(
+                "fiber tiled inference currently requires cubic tiles; "
+                f"pass --tile-size explicitly for patch_shape_zyx={shape_tuple}"
+            )
+        tile_size = shape_tuple[0]
+    if tile_size <= 0:
+        raise ValueError("tile_size must be > 0")
+    return tile_size
+
+
+def _level_from_scaledown(scaledown: int) -> int:
+    sd = max(1, int(scaledown))
+    return round(math.log2(sd)) if sd > 1 else 0
+
+
+def _select_and_expand_crop(
+    *,
+    input_shape_zyx: tuple[int, int, int],
+    crop_xyzwhd_base: tuple[int, int, int, int, int, int] | None,
+    input_scaledown_from_base: int,
+    output_scaledown_from_input: int,
+    ome_chunk: int,
+) -> tuple[
+    tuple[int, int, int, int, int, int],
+    tuple[int, int, int, int, int, int],
+    tuple[int, int, int],
+]:
+    if crop_xyzwhd_base is None:
+        crop_input = None
+    else:
+        bx, by, bz, bw, bh, bd = (int(v) for v in crop_xyzwhd_base)
+        input_sd = max(1, int(input_scaledown_from_base))
+        crop_input = (
+            bx // input_sd,
+            by // input_sd,
+            bz // input_sd,
+            max(1, bw // input_sd),
+            max(1, bh // input_sd),
+            max(1, bd // input_sd),
+        )
+
+    z0, z1, y0, y1, x0, x1 = _crop_xyzwhd_bounds(
+        shape_zyx=input_shape_zyx,
+        crop_xyzwhd=crop_input,
+    )
+    nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
+    if nz <= 0 or ny <= 0 or nx <= 0:
+        raise ValueError(
+            f"empty crop: x=[{x0},{x1}) y=[{y0},{y1}) z=[{z0},{z1}) "
+            f"in shape={input_shape_zyx}"
+        )
+
+    sd = max(1, int(output_scaledown_from_input))
+    oc = max(1, int(ome_chunk))
+    full_out_shape = (
+        _ds_size(input_shape_zyx[0], sd),
+        _ds_size(input_shape_zyx[1], sd),
+        _ds_size(input_shape_zyx[2], sd),
+    )
+
+    oz0 = (_ds_index(z0, sd) // oc) * oc
+    oy0 = (_ds_index(y0, sd) // oc) * oc
+    ox0 = (_ds_index(x0, sd) // oc) * oc
+    oz1 = min(
+        full_out_shape[0],
+        ((_ds_index(z0, sd) + _ds_size(nz, sd) + oc - 1) // oc) * oc,
+    )
+    oy1 = min(
+        full_out_shape[1],
+        ((_ds_index(y0, sd) + _ds_size(ny, sd) + oc - 1) // oc) * oc,
+    )
+    ox1 = min(
+        full_out_shape[2],
+        ((_ds_index(x0, sd) + _ds_size(nx, sd) + oc - 1) // oc) * oc,
+    )
+
+    z0 = max(0, min(z0, oz0 * sd))
+    y0 = max(0, min(y0, oy0 * sd))
+    x0 = max(0, min(x0, ox0 * sd))
+    z1 = max(z1, min(input_shape_zyx[0], oz1 * sd))
+    y1 = max(y1, min(input_shape_zyx[1], oy1 * sd))
+    x1 = max(x1, min(input_shape_zyx[2], ox1 * sd))
+
+    nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
+    oz0 = (_ds_index(z0, sd) // oc) * oc
+    oy0 = (_ds_index(y0, sd) // oc) * oc
+    ox0 = (_ds_index(x0, sd) // oc) * oc
+    oz1 = min(
+        full_out_shape[0],
+        ((_ds_index(z0, sd) + _ds_size(nz, sd) + oc - 1) // oc) * oc,
+    )
+    oy1 = min(
+        full_out_shape[1],
+        ((_ds_index(y0, sd) + _ds_size(ny, sd) + oc - 1) // oc) * oc,
+    )
+    ox1 = min(
+        full_out_shape[2],
+        ((_ds_index(x0, sd) + _ds_size(nx, sd) + oc - 1) // oc) * oc,
+    )
+
+    return (
+        (z0, z1, y0, y1, x0, x1),
+        (oz0, oy0, ox0, oz1, oy1, ox1),
+        full_out_shape,
+    )
+
+
+def _create_fiber_output_groups(
+    *,
+    output_adapter: FiberTrace3DOmeZarrOutputAdapter,
+    base_shape_zyx: tuple[int, int, int],
+    n_levels: int,
+    ome_chunk: int,
+) -> None:
+    for product in output_adapter.products:
+        for channel in product.channels:
+            _open_or_create_omezarr(
+                output_adapter.channel_path(product, channel),
+                base_shape_zyx,
+                int(product.level),
+                n_levels,
+                int(ome_chunk),
+                channel.name,
+            )
+
+
+def _manifest_relative_path(root: Path, path: str | Path) -> str:
+    root_abs = root.resolve()
+    path_abs = Path(path).resolve()
+    try:
+        return path_abs.relative_to(root_abs).as_posix()
+    except ValueError:
+        return path_abs.as_posix()
+
+
+def _interval_dict_zyx(
+    region: tuple[int, int, int, int, int, int],
+) -> dict[str, list[int]]:
+    z0, z1, y0, y1, x0, x1 = (int(v) for v in region)
+    return {
+        "z": [z0, z1],
+        "y": [y0, y1],
+        "x": [x0, x1],
+    }
+
+
+def _output_region_dict_zyx(
+    region: tuple[int, int, int, int, int, int],
+) -> dict[str, list[int]]:
+    oz0, oy0, ox0, oz1, oy1, ox1 = (int(v) for v in region)
+    return {
+        "z": [oz0, oz1],
+        "y": [oy0, oy1],
+        "x": [ox0, ox1],
+    }
+
+
+def _atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(
+        f".tmp.{path.name}.{os.getpid()}.{time.time_ns()}"
+    )
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _write_fiber_inference_manifest(
+    *,
+    manifest_path: Path,
+    config_path: str | Path,
+    input_path: str,
+    output_root: Path,
+    checkpoint: str | Path | None,
+    output_adapter: FiberTrace3DOmeZarrOutputAdapter,
+    input_shape_zyx: tuple[int, int, int],
+    base_shape_zyx: tuple[int, int, int],
+    input_scaledown_base: int,
+    output_scaledown_base: int,
+    output_scaledown_input: int,
+    data_level: int,
+    n_levels: int,
+    ome_chunk: int,
+    crop_xyzwhd_base: tuple[int, int, int, int, int, int] | None,
+    input_crop_zyx: tuple[int, int, int, int, int, int],
+    output_region_zyx: tuple[int, int, int, int, int, int],
+    tile_size: int,
+    overlap: int,
+    border: int,
+    recurrent_steps: int,
+    output_prefix: str,
+) -> None:
+    products: list[dict[str, Any]] = []
+    for product in output_adapter.products:
+        channels = [
+            {
+                "name": channel.name,
+                "zarr_path": _manifest_relative_path(
+                    output_root,
+                    output_adapter.channel_path(product, channel),
+                ),
+            }
+            for channel in product.channels
+        ]
+        products.append(
+            {
+                "name": product.name,
+                "semantics": "fiber_trace_3d_option_bundle",
+                "direction_encoding": "lasagna_3x2_ambiguous",
+                "channel_count": len(product.channels),
+                "channels": channels,
+                "level": int(product.level),
+                "scaledown_base": int(product.scaledown),
+                "chunk_size": int(product.chunk_size),
+                "dtype": str(product.dtype),
+                "pyramid_policy": str(product.pyramid_policy),
+                "data_level_only": True,
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "schema": "vesuvius.fiber_trace_3d.inference",
+        "schema_version": 1,
+        "created_at_unix": time.time(),
+        "producer": "vesuvius.neural_tracing.fiber_trace_3d.infer",
+        "config_path": str(config_path),
+        "checkpoint_path": None if checkpoint is None else str(checkpoint),
+        "input": {
+            "path": str(input_path),
+            "shape_zyx": list(input_shape_zyx),
+            "base_shape_zyx": list(base_shape_zyx),
+            "input_scaledown_base": int(input_scaledown_base),
+        },
+        "output": {
+            "path": str(output_root),
+            "output_prefix": str(output_prefix),
+            "data_level": int(data_level),
+            "levels_created": int(n_levels),
+            "ome_chunk": int(ome_chunk),
+            "output_scaledown_input": int(output_scaledown_input),
+            "output_scaledown_base": int(output_scaledown_base),
+            "pyramid": {
+                "policy": "data_level_only",
+                "coarser_fiber_pyramids_built": False,
+                "reason": (
+                    "fiber direction/presence pyramid semantics are not "
+                    "defined for this V0 writer"
+                ),
+            },
+        },
+        "crop": {
+            "requested_xyzwhd_base": (
+                None if crop_xyzwhd_base is None else list(crop_xyzwhd_base)
+            ),
+            "input_crop_zyx": _interval_dict_zyx(input_crop_zyx),
+            "output_region_zyx": _output_region_dict_zyx(output_region_zyx),
+        },
+        "inference": {
+            "tile_size": int(tile_size),
+            "overlap": int(overlap),
+            "border": int(border),
+            "recurrent_steps": int(recurrent_steps),
+        },
+        "products": products,
+        "channel_bundle": list(FIBER_TRACE_3D_OPTION_CHANNELS),
+        "not_lasagna_normal_products": True,
+    }
+    _atomic_json_write(manifest_path, payload)
+
+
+def run_fiber_trace_3d_inference(
+    *,
+    config_path: str | Path,
+    input_path: str,
+    output_path: str | Path,
+    checkpoint: str | Path | None,
+    device: str | None = None,
+    crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
+    tile_size: int | None = None,
+    overlap: int = 16,
+    border: int = 16,
+    scaledown: int = 1,
+    base_ref: str | None = None,
+    base_scale: int | None = None,
+    no_download: bool = False,
+    levels: int = 0,
+    ome_chunk: int = 32,
+    recurrent_steps: int | None = None,
+    output_prefix: str = "fiber",
+) -> None:
+    config = _load_config(config_path)
+    tile_size_i = _tile_size_from_config(config, tile_size)
+
+    if not no_download:
+        _auto_download(input_path, crop_xyzwhd)
+
+    a_in = zarr.open(str(input_path), mode="r")
+    if not hasattr(a_in, "shape"):
+        raise ValueError(f"input must point to a zarr array, got: {input_path}")
+    input_shape = tuple(int(v) for v in a_in.shape)
+    if len(input_shape) != 3:
+        raise ValueError(f"input array must be (Z,Y,X), got shape {input_shape}")
+
+    base_shape_zyx = _resolve_base_shape(input_path, base_ref, base_scale)
+    if base_shape_zyx is None:
+        raise ValueError(
+            "cannot determine base_shape_zyx. Pass --base-ref or use an input "
+            "inside an OME-Zarr group with level 0 metadata."
+        )
+    input_sd = max(1, round(int(base_shape_zyx[0]) / int(input_shape[0])))
+    output_sd_input = max(1, int(scaledown))
+    effective_output_sd = input_sd * output_sd_input
+    output_level = _level_from_scaledown(effective_output_sd)
+    n_levels = max(int(levels), output_level + 1)
+
+    crop_slices, output_region, full_output_shape = _select_and_expand_crop(
+        input_shape_zyx=input_shape,
+        crop_xyzwhd_base=crop_xyzwhd,
+        input_scaledown_from_base=input_sd,
+        output_scaledown_from_input=output_sd_input,
+        ome_chunk=ome_chunk,
+    )
+    z0, z1, y0, y1, x0, x1 = crop_slices
+    oz0, oy0, ox0, oz1, oy1, ox1 = output_region
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_device = torch.device(device)
+
+    output_root = Path(output_path)
+    output_root.mkdir(parents=True, exist_ok=True)
+    removed = _cleanup_predict3d_temp_files(output_root, output_prefix)
+    if removed > 0:
+        print(
+            f"[fiber_trace_3d:infer] removed {removed} stale temp path(s) from {output_root}",
+            flush=True,
+        )
+
+    predict_adapter = FiberTrace3DPredictAdapter(
+        config,
+        checkpoint=checkpoint,
+        level=output_level,
+        scaledown=effective_output_sd,
+        chunk_size=int(ome_chunk),
+        output_prefix=output_prefix,
+        recurrent_steps=recurrent_steps,
+    )
+    output_adapter = FiberTrace3DOmeZarrOutputAdapter(
+        output_root=output_root,
+        products=predict_adapter.output_products,
+        n_levels=n_levels,
+    )
+    _create_fiber_output_groups(
+        output_adapter=output_adapter,
+        base_shape_zyx=base_shape_zyx,
+        n_levels=n_levels,
+        ome_chunk=int(ome_chunk),
+    )
+
+    print(
+        f"[fiber_trace_3d:infer] input={input_path} shape={input_shape} "
+        f"input_sd={input_sd} base_shape={base_shape_zyx}",
+        flush=True,
+    )
+    print(
+        f"[fiber_trace_3d:infer] crop_zyx=({z0},{z1},{y0},{y1},{x0},{x1}) "
+        f"output_region_zyx=({oz0},{oy0},{ox0},{oz1},{oy1},{ox1}) "
+        f"scaledown={output_sd_input} effective_sd={effective_output_sd} "
+        f"level={output_level} products={len(predict_adapter.output_products)} "
+        f"device={torch_device}",
+        flush=True,
+    )
+
+    t0 = time.time()
+    model = predict_adapter.load_model(device=torch_device)
+    progress = {
+        "t0": time.time(),
+        "finalized_base_z": int(oz0 * effective_output_sd),
+        "finalized_base_z_total": int(oz1 * effective_output_sd),
+    }
+    _infer_tiled_products_3d(
+        model,
+        a_in,
+        crop_slices=crop_slices,
+        device=torch_device,
+        model_adapter=predict_adapter,
+        output_adapter=output_adapter,
+        products=predict_adapter.output_products,
+        output_region_zyx=output_region,
+        full_output_shape_zyx=full_output_shape,
+        input_zarr_path=str(input_path),
+        output_scaledown_base=effective_output_sd,
+        tile_size=tile_size_i,
+        overlap=int(overlap),
+        border=int(border),
+        scaledown=output_sd_input,
+        tmp_dir=str(output_root),
+        progress=progress,
+        temp_prefix=f"{output_prefix}_",
+    )
+    del model
+    if torch_device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    _write_fiber_inference_manifest(
+        manifest_path=output_root / "fiber_trace_3d_inference.json",
+        config_path=config_path,
+        input_path=input_path,
+        output_root=output_root,
+        checkpoint=checkpoint,
+        output_adapter=output_adapter,
+        input_shape_zyx=input_shape,
+        base_shape_zyx=base_shape_zyx,
+        input_scaledown_base=input_sd,
+        output_scaledown_base=effective_output_sd,
+        output_scaledown_input=output_sd_input,
+        data_level=output_level,
+        n_levels=n_levels,
+        ome_chunk=int(ome_chunk),
+        crop_xyzwhd_base=crop_xyzwhd,
+        input_crop_zyx=crop_slices,
+        output_region_zyx=output_region,
+        tile_size=tile_size_i,
+        overlap=int(overlap),
+        border=int(border),
+        recurrent_steps=predict_adapter.recurrent_steps,
+        output_prefix=output_prefix,
+    )
+    removed_finish = _cleanup_predict3d_temp_files(
+        output_root,
+        output_prefix,
+        remove_current_process=True,
+    )
+    if removed_finish > 0:
+        print(
+            f"[fiber_trace_3d:infer] removed {removed_finish} temp path(s) on finish",
+            flush=True,
+        )
+    print(
+        f"[fiber_trace_3d:infer] done output={output_root} "
+        f"elapsed={time.time() - t0:.1f}s",
+        flush=True,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run shared tiled 3D inference for fiber trace models.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("config", help="Fiber trace 3D training/inference config JSON.")
+    parser.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
+    parser.add_argument("--output", required=True, help="Output directory for fiber OME-Zarr channel groups.")
+    parser.add_argument("--checkpoint", required=True, help="Fiber trace 3D model checkpoint (.pt).")
+    parser.add_argument("--tile-size", type=int, default=None, help="Inference tile cube size.")
+    parser.add_argument("--overlap", type=int, default=16, help="Tile overlap in input voxels.")
+    parser.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
+    parser.add_argument("--scaledown", type=int, default=1, help="Output downsample factor relative to input.")
+    parser.add_argument(
+        "--crop",
+        "--crop-xyzwhd",
+        dest="crop_xyzwhd",
+        type=int,
+        nargs=6,
+        default=None,
+        metavar=("X", "Y", "Z", "W", "H", "D"),
+        help="Crop in base coordinates: x y z w h d.",
+    )
+    parser.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu".')
+    parser.add_argument(
+        "--base-ref",
+        default=None,
+        help="Reference zarr for base shape. With --base-scale N, base = ref_shape * 2^N.",
+    )
+    parser.add_argument("--base-scale", type=int, default=None, help="Downsample exponent for --base-ref.")
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        default=False,
+        help="Skip automatic S3 download from _download zarr metadata.",
+    )
+    parser.add_argument(
+        "--levels",
+        type=int,
+        default=0,
+        help="Number of OME-Zarr levels to create. 0 means data level only.",
+    )
+    parser.add_argument("--ome-chunk", type=int, default=32, help="Output OME-Zarr chunk size.")
+    parser.add_argument(
+        "--recurrent-steps",
+        type=int,
+        default=None,
+        help="Conditioned recurrent inference steps; each step is stored as one option.",
+    )
+    parser.add_argument("--output-prefix", default="fiber", help="Output product/channel prefix.")
+    args = parser.parse_args(argv)
+
+    run_fiber_trace_3d_inference(
+        config_path=args.config,
+        input_path=str(args.input),
+        output_path=args.output,
+        checkpoint=args.checkpoint,
+        device=args.device,
+        crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
+        tile_size=args.tile_size,
+        overlap=int(args.overlap),
+        border=int(args.border),
+        scaledown=int(args.scaledown),
+        base_ref=args.base_ref,
+        base_scale=args.base_scale,
+        no_download=bool(args.no_download),
+        levels=int(args.levels),
+        ome_chunk=int(args.ome_chunk),
+        recurrent_steps=args.recurrent_steps,
+        output_prefix=str(args.output_prefix),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

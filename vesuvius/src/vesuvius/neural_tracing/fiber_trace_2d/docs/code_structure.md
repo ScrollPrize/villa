@@ -50,6 +50,46 @@ side/top strip input loading.
   used for BatchNorm statistics. Set `model_3d.normalization: "none"` to disable
   normalization explicitly.
 
+`fiber_trace_3d/inference_adapter.py`
+
+- Adapts trained 3D fiber models to the shared tiled 3D inference layer in
+  `lasagna.tiled_predict3d`.
+- Loads models through `build_fiber_trace_3d_model(...)`, restores snapshots
+  with the same training helper used by `train.py`, applies the configured
+  fiber image normalization per tile, and uses the training mixed-precision
+  autocast settings when available.
+- Keeps each model option as a coherent seven-channel output product:
+  `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, and `presence`.
+  The six direction channels are Lasagna 3x2 ambiguous direction channels, not
+  Lasagna `grad_mag/nx/ny` normal products.
+- Legacy grouped outputs become one option bundle per branch. Conditioned
+  recurrent inference can emit one option bundle per recurrent step. Resume
+  completeness for an option requires all seven channel chunks to exist.
+
+`fiber_trace_3d/infer.py`
+
+- Provides tiled OME-Zarr inference for trained 3D fiber models:
+
+  ```bash
+  PYTHONPATH=lasagna:vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.infer <config.json> --input <volume.zarr/level> --output <out_dir> --checkpoint <snapshot.pt>
+  ```
+
+- Reuses the shared predict3d mechanics for crop handling, canonical tile and
+  output-chunk lattices, automatic S3 download from `_download` metadata,
+  rolling product accumulation, output-chunk-only resume, temp cleanup, and
+  atomic chunk writes.
+- Common tiled arguments are `--input`, `--output`, `--checkpoint`,
+  `--tile-size`, `--overlap`, `--border`, `--scaledown`, `--crop`,
+  `--device`, `--no-download`, `--levels`, and `--ome-chunk`.
+  Fiber-specific arguments are the positional config, `--recurrent-steps`,
+  `--output-prefix`, `--base-ref`, and `--base-scale`.
+- Writes one OME-Zarr group per channel under each option, for example
+  `fiber/option_000/dir0_z/.../presence`, plus an atomic
+  `fiber_trace_3d_inference.json` manifest. The manifest records the input
+  and output scales, crop/output region, tile settings, product paths, and the
+  data-level-only pyramid policy. Coarser fiber pyramids are not generated in
+  this V0 writer.
+
 `fiber_trace_3d/loader.py`
 
 - Parses Vesuvius-style JSON configs into `FiberTrace3DConfig`.
@@ -472,6 +512,7 @@ PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --resume /path/to/current.pt
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --trace2cp-vis --checkpoint /path/to/best.pt --sample-index 13 --export-dir /tmp/fiber_trace_3d_trace2cp
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --checkpoint /path/to/best.pt --sample-index 13 --export-dir /tmp/fiber_trace_3d_native_trace2cp
+PYTHONPATH=lasagna:vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.infer vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --input /path/to/volume.zarr/0 --output /tmp/fiber_trace_3d_infer --checkpoint /path/to/best.pt
 ```
 
 The important behavior is:

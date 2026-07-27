@@ -56,6 +56,9 @@
 - [ ] currently need significant margin (20) for artifact free processing (from patch size 64!)
 - [x] for cp start: lets actually _not_ use the cp dir but the sampled dir that most closely aligns with the cp dir. The do apply smoothness and dir supervision directly as applicable
 - [ ] conditioned decoder: add also from-dir conditioning (makes this closer to neural tracer decoder!) - can we maybe even unify this into a single dir condition?
+- [ ] fiber inference - how do we store and signal validity?
+- [ ] inference size - test larger inference size quality for the pretrained model (then update defaults)
+- [ ] fiber_trace_3d_inference.json ->should change the name similar to lasagna - or even use lasagna naming just with additional information?
     
 # beam-search
 - [ ] beamsearch

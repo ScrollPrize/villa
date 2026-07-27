@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-07-27
+
+- Extracted shared tiled 3D inference mechanics from Lasagna `predict3d` into
+  `lasagna.tiled_predict3d` and added adapter boundaries for model-specific
+  products, output chunk completeness, rolling accumulation, crop-composable
+  resume, temp cleanup, and atomic writes.
+- Kept `preprocess_cos_omezarr.py predict3d` as the Lasagna compatibility
+  wrapper while routing cos/normal product inference and chunk writes through
+  shared adapter interfaces. The legacy CLI and `.lasagna.json` semantics are
+  preserved.
+- Added `vesuvius.neural_tracing.fiber_trace_3d.infer`, a shared-runner-based
+  3D fiber inference CLI that writes coherent seven-channel option bundles
+  (`dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, `presence`)
+  plus `fiber_trace_3d_inference.json` manifest metadata. Fiber outputs are
+  data-level-only in V0 and are explicitly marked as not Lasagna normal
+  products.
+
 ## 2026-07-26
 
 - Added `training.mixed_precision` support to 3D fiber training with BF16/FP16
