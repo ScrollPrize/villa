@@ -1,4 +1,5 @@
 import json
+import io
 import unittest
 import os
 import sys
@@ -8,6 +9,7 @@ import types
 from unittest import mock
 
 import numpy as np
+import torch
 import zarr
 
 
@@ -28,7 +30,9 @@ from preprocess_cos_omezarr import (
 	_cleanup_predict3d_temp_files,
 	_create_omezarr,
 	_grad_mag_factor_from_input_sd,
+	_infer_tiled_3d,
 	_omezarr_chunk_group_complete,
+	_predict3d_overall_eta,
 	run_preprocess_3d,
 )
 
@@ -63,6 +67,18 @@ def _write_predict3d_manifest(path: Path, groups: dict) -> None:
 	)
 
 
+class _ConstantPredict3dModel:
+	def eval(self):
+		return self
+
+	def __call__(self, tile_t: torch.Tensor) -> torch.Tensor:
+		return torch.zeros(
+			(tile_t.shape[0], 8, tile_t.shape[2], tile_t.shape[3], tile_t.shape[4]),
+			dtype=torch.float32,
+			device=tile_t.device,
+		)
+
+
 class PreprocessCosOmezarrTests(unittest.TestCase):
 	def _run_predict3d_until_model_build(
 		self,
@@ -94,6 +110,103 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 						n_levels=3,
 						ome_chunk=4,
 					)
+
+	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
+		progress = {
+			"tiles_total": 100,
+			"tiles_done": 90,
+			"tiles_processed": 10,
+			"tile_time_sum": 20.0,
+			"edt_total_est": 100,
+			"edt_done": 50,
+			"edt_processed": 10,
+			"edt_time_sum": 30.0,
+		}
+
+		self.assertEqual(_predict3d_overall_eta(progress), " | overall eta 02:50")
+
+	def test_predict3d_tile_eta_uses_processed_tiles_not_runtime_skips(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = _write_zarr_array(root / "input.zarr", (8, 8, 8))
+			arr = zarr.open(str(input_path), mode="r")
+			progress = {
+				"finalized_base_z": 0,
+				"finalized_cos_base_z": 0,
+				"finalized_other_base_z": 0,
+				"finalized_base_z_total": 8,
+			}
+			skip_state = {"calls": 0}
+
+			def _is_tile_done(*_args):
+				skip_state["calls"] += 1
+				return skip_state["calls"] <= 3
+
+			times = iter([0, 10, 14, 20, 24, 30, 34, 40, 44, 50, 54, 60])
+			stdout = io.StringIO()
+			with mock.patch("preprocess_cos_omezarr.time.time", side_effect=lambda: next(times)):
+				with mock.patch("sys.stdout", stdout):
+					_infer_tiled_3d(
+						_ConstantPredict3dModel(),
+						arr,
+						crop_slices=(0, 8, 0, 8, 0, 8),
+						device=torch.device("cpu"),
+						tile_size=4,
+						overlap=0,
+						border=0,
+						cos_scaledown=1,
+						other_scaledown=1,
+						tmp_dir=str(root),
+						output_sigmoid=False,
+						on_z_complete=lambda *_args: None,
+						progress=progress,
+						is_tile_done=_is_tile_done,
+					)
+
+			out = stdout.getvalue()
+			self.assertIn("4/8 tiles", out)
+			self.assertIn("eta 00:16 avg=4000ms/tile", out)
+			self.assertIn("final_z=0/8", out)
+
+	def test_predict3d_status_reports_finalized_z_after_band_flush(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = _write_zarr_array(root / "input.zarr", (8, 4, 4))
+			output_path = root / "vol.lasagna.json"
+			gpu_pause_stub = types.ModuleType("gpu_pause")
+			gpu_pause_stub.gpu_pause_context = lambda: None
+			stdout = io.StringIO()
+
+			with mock.patch.dict(sys.modules, {"gpu_pause": gpu_pause_stub}):
+				with mock.patch.object(
+					train_stub,
+					"build_model",
+					return_value=(_ConstantPredict3dModel(), None, None, False),
+				):
+					with mock.patch("preprocess_cos_omezarr._build_omezarr_pyramid"):
+						with mock.patch("preprocess_cos_omezarr.build_normal_omezarr_pyramid"):
+							with mock.patch("sys.stdout", stdout):
+								run_preprocess_3d(
+									input_path=str(input_path),
+									output_path=str(output_path),
+									unet3d_checkpoint=str(root / "missing_model.pt"),
+									device="cpu",
+									crop_xyzwhd=None,
+									tile_size=4,
+									overlap=0,
+									border=0,
+									cos_scaledown=1,
+									scaledown=1,
+									source_to_base=1.0,
+									base_ref=str(input_path),
+									n_levels=2,
+									ome_chunk=4,
+								)
+
+			out = stdout.getvalue()
+			self.assertIn("final_z=4/8", out)
+			self.assertIn("final_z=8/8", out)
+			self.assertNotIn("\n[predict3d] final_z=", out)
 
 	def test_grad_mag_factor_uses_input_scale_not_output_level(self):
 		self.assertEqual(_grad_mag_factor_from_input_sd(1), 1.0)

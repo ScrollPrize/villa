@@ -799,6 +799,98 @@ def _omezarr_chunk_group_complete(
 	return all(_omezarr_chunk_exists(path, level, z, y, x, chunk_size) for path in paths)
 
 
+def _format_eta(seconds: float) -> str:
+	seconds = max(0.0, float(seconds))
+	return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+
+
+def _eta_from_processed_rate(time_sum: float, processed: int, remaining: int) -> float | None:
+	remaining = max(0, int(remaining))
+	processed = int(processed)
+	if remaining == 0:
+		return 0.0 if processed > 0 else None
+	if processed <= 0:
+		return None
+	return max(0.0, float(time_sum) / float(processed) * float(remaining))
+
+
+def _predict3d_overall_eta(progress: dict | None) -> str:
+	if progress is None:
+		return ""
+	eta = 0.0
+	have_rate = False
+	tile_eta = _eta_from_processed_rate(
+		float(progress.get("tile_time_sum", 0.0)),
+		int(progress.get("tiles_processed", 0)),
+		int(progress.get(
+			"tiles_remaining_est",
+			max(0, int(progress.get("tiles_total", 0)) - int(progress.get("tiles_done", 0))),
+		)),
+	)
+	if tile_eta is not None:
+		eta += tile_eta
+		have_rate = True
+	edt_eta = _eta_from_processed_rate(
+		float(progress.get("edt_time_sum", 0.0)),
+		int(progress.get("edt_processed", 0)),
+		int(progress.get(
+			"edt_remaining_est",
+			max(0, int(progress.get("edt_total_est", 0)) - int(progress.get("edt_done", 0))),
+		)),
+	)
+	if edt_eta is not None:
+		eta += edt_eta
+		have_rate = True
+	if not have_rate:
+		return ""
+	return f" | overall eta {_format_eta(eta)}"
+
+
+def _predict3d_finalized_status(progress: dict | None) -> str:
+	if progress is None or "finalized_base_z" not in progress:
+		return ""
+	final_z = int(progress.get("finalized_base_z", 0))
+	total_z = int(progress.get("finalized_base_z_total", 0))
+	cos_z = int(progress.get("finalized_cos_base_z", final_z))
+	other_z = int(progress.get("finalized_other_base_z", final_z))
+	if total_z <= 0:
+		return f" final_z={final_z}"
+	if cos_z != other_z:
+		return f" final_z={final_z}/{total_z} (cos={cos_z} other={other_z})"
+	return f" final_z={final_z}/{total_z}"
+
+
+def _predict3d_progress_line(progress: dict) -> str:
+	total = max(1, int(progress.get("tiles_total", 0)))
+	done = int(progress.get("tiles_done", 0))
+	processed = int(progress.get("tiles_processed", 0))
+	tile_time_sum = float(progress.get("tile_time_sum", 0.0))
+	tile_eta = _eta_from_processed_rate(
+		tile_time_sum,
+		processed,
+		int(progress.get("tiles_remaining_est", max(0, total - done))),
+	)
+	if tile_eta is None:
+		eta_text = "--:--"
+	else:
+		eta_text = _format_eta(tile_eta)
+	avg = ""
+	if processed > 0:
+		avg = f" avg={1000.0 * tile_time_sum / processed:.0f}ms/tile"
+	bar_w = 30
+	fill = int(round(done / total * bar_w))
+	fill = max(0, min(bar_w, fill))
+	bar = "#" * fill + "-" * (bar_w - fill)
+	return (
+		f"[predict3d] [{bar}] {done}/{total} tiles "
+		f"({100.0 * done / total:.1f}%) "
+		f"eta {eta_text}"
+		f"{avg}"
+		f"{_predict3d_overall_eta(progress)}"
+		f"{_predict3d_finalized_status(progress)}"
+	)
+
+
 def _iter_chunk_origins_for_region(
 	z0: int,
 	z1: int,
@@ -1535,6 +1627,13 @@ def _compute_pred_dt_slab(
 				work.append((cz0, cz1, cy0, cy1, cx0, cx1))
 
 	n_chunks = len(work)
+	if progress is not None:
+		done_before = int(progress.get("edt_done", 0))
+		total_est = max(int(progress.get("edt_total_est", 0)), done_before + skipped + n_chunks)
+		progress["edt_total_est"] = total_est
+		progress["edt_done"] = done_before + skipped
+		progress["edt_skipped"] = int(progress.get("edt_skipped", 0)) + skipped
+		progress["edt_remaining_est"] = max(0, total_est - int(progress["edt_done"]))
 	if skipped > 0:
 		print(f"[pred_dt] skipped {skipped} already-processed chunks", flush=True)
 	if n_chunks == 0:
@@ -1689,32 +1788,31 @@ def _compute_pred_dt_slab(
 		_t_d2h_sum += _td2h - _tedt
 
 		if progress is not None:
-			progress["edt_done"] = progress.get("edt_done", 0) + 1
+			progress["edt_done"] = int(progress.get("edt_done", 0)) + B
+			progress["edt_processed"] = int(progress.get("edt_processed", 0)) + B
+			progress["edt_time_sum"] = float(progress.get("edt_time_sum", 0.0)) + (_td2h - _tw0)
+			progress["edt_remaining_est"] = max(
+				0,
+				int(progress.get("edt_total_est", 0)) - int(progress.get("edt_done", 0)),
+			)
 		if gpu_done == 0:
 			continue
 		elapsed = max(1e-6, time.time() - t0)
 		eta = elapsed / gpu_done * (n_chunks - gpu_done)
-		overall = ""
-		if progress is not None:
-			oe = max(1e-6, time.time() - progress["t0"])
-			frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
-			edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
-			overall_frac = 0.18 * frac + 0.67 * edt_frac
-			if overall_frac > 0.01:
-				overall_eta = oe / overall_frac * (1.0 - overall_frac)
-				overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
+		overall = _predict3d_overall_eta(progress)
+		finalized = _predict3d_finalized_status(progress)
 		vox_per_chunk = edt_chunk ** 3
 		mvox_s = gpu_done * vox_per_chunk / elapsed / 1e6
 		print(f"\r[pred_dt] gpu {gpu_done}/{n_chunks} "
 			  f"({100.0 * gpu_done / n_chunks:.0f}%) "
-			  f"eta {int(eta // 60):02d}:{int(eta % 60):02d} "
+			  f"eta {_format_eta(eta)} "
 			  f"{mvox_s:.0f}Mvox/s "
 			  f"wait={1000*_t_wait_sum/gpu_done:.0f} "
 			  f"h2d={1000*_t_h2d_sum/gpu_done:.0f} "
 			  f"edt={1000*_t_edt_sum/gpu_done:.0f} "
 			  f"d2h={1000*_t_d2h_sum/gpu_done:.0f}ms "
 			  f"B={B}"
-			  f"{overall}  ",
+			  f"{overall}{finalized}  ",
 			  end="", flush=True)
 
 	# Signal writers to stop
@@ -2261,12 +2359,17 @@ def _infer_tiled_3d(
 	total_tiles = len(z_positions) * tiles_per_zrow
 	skipped_tiles = skip_z_positions * tiles_per_zrow
 	done = skipped_tiles
+	processed_tiles = 0
 	t0 = time.time()
 	_tile_time_sum = 0.0
 	crop_offset = (z0, y0, x0)
 	if progress is not None:
 		progress["tiles_total"] = total_tiles
 		progress["tiles_done"] = done
+		progress["tiles_skipped"] = skipped_tiles
+		progress["tiles_processed"] = 0
+		progress["tile_time_sum"] = 0.0
+		progress["tiles_remaining_est"] = max(0, total_tiles - done)
 
 	for i_tz, tz in enumerate(z_positions):
 		if i_tz < skip_z_positions:
@@ -2279,6 +2382,8 @@ def _infer_tiled_3d(
 					done += 1
 					if progress is not None:
 						progress["tiles_done"] = done
+						progress["tiles_skipped"] = int(progress.get("tiles_skipped", 0)) + 1
+						progress["tiles_remaining_est"] = max(0, total_tiles - done)
 					continue
 
 				_tile_t0 = time.time()
@@ -2359,34 +2464,32 @@ def _infer_tiled_3d(
 						acc_coarse[:, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += other_np[:, szl_c:szr_c, syl_c:syr_c, sxl_c:sxr_c]
 						wsum_coarse[0, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += w_coarse[szl_c:szr_c, syl_c:syr_c, sxl_c:sxr_c]
 
-				_tile_time_sum += time.time() - _tile_t0
+				tile_elapsed = time.time() - _tile_t0
+				_tile_time_sum += tile_elapsed
+				processed_tiles += 1
 				done += 1
 				if progress is not None:
 					progress["tiles_done"] = done
-				elapsed = max(1e-6, time.time() - t0)
-				actual_done = done - skipped_tiles
-				per = _tile_time_sum / max(1, actual_done)
-				remaining = total_tiles - done
-				eta = max(0.0, per * remaining)
-				overall = ""
-				if progress is not None:
-					oe = max(1e-6, time.time() - progress["t0"])
-					frac = done / max(1, total_tiles)
-					overall_frac = 0.18 * frac  # tiles ~18% of total work
-					if overall_frac > 0.01:
-						overall_eta = oe / overall_frac * (1.0 - overall_frac)
-						overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
-				bar_w = 30
-				fill = int(round(done / max(1, total_tiles) * bar_w))
-				bar = "#" * fill + "-" * (bar_w - fill)
-				print(
-					f"\r[predict3d] [{bar}] {done}/{total_tiles} tiles "
-					f"({100.0 * done / max(1, total_tiles):.1f}%) "
-					f"eta {int(eta // 60):02d}:{int(eta % 60):02d} "
-					f"avg={1000.0 * per:.0f}ms/tile"
-					f"{overall}",
-					end="", flush=True,
-				)
+					progress["tiles_processed"] = processed_tiles
+					progress["tile_time_sum"] = _tile_time_sum
+					progress["tiles_remaining_est"] = max(0, total_tiles - done)
+				if progress is None:
+					per = _tile_time_sum / max(1, processed_tiles)
+					remaining = total_tiles - done
+					eta = max(0.0, per * remaining)
+					bar_w = 30
+					fill = int(round(done / max(1, total_tiles) * bar_w))
+					fill = max(0, min(bar_w, fill))
+					bar = "#" * fill + "-" * (bar_w - fill)
+					status = (
+						f"[predict3d] [{bar}] {done}/{total_tiles} tiles "
+						f"({100.0 * done / max(1, total_tiles):.1f}%) "
+						f"eta {_format_eta(eta)} "
+						f"avg={1000.0 * per:.0f}ms/tile"
+					)
+				else:
+					status = _predict3d_progress_line(progress)
+				print(f"\r{status}  ", end="", flush=True)
 
 		# --- After all (ty, tx) for this tz: flush completed z-band ---
 		if on_z_complete is not None:
@@ -2394,7 +2497,11 @@ def _infer_tiled_3d(
 			on_z_complete(acc_fine, wsum_fine, acc_coarse, wsum_coarse, next_tz, pad0)
 
 	print("", flush=True)
-	print(f"[predict3d] inference done in {time.time() - t0:.1f}s ({done - skipped_tiles} tiles)", flush=True)
+	print(
+		f"[predict3d] inference done in {time.time() - t0:.1f}s "
+		f"({processed_tiles} processed, {done - processed_tiles} skipped)",
+		flush=True,
+	)
 
 	# If streaming mode (callback), output was consumed incrementally
 	if on_z_complete is not None:
@@ -3031,6 +3138,28 @@ def run_preprocess_3d(
 				return False
 		return True
 
+	def _update_finalized_z(
+		*,
+		cos_base_z: int | None = None,
+		other_base_z: int | None = None,
+	) -> None:
+		prev_cos = int(_progress.get("finalized_cos_base_z", _finalized_start_base_z))
+		prev_other = int(_progress.get("finalized_other_base_z", _finalized_start_base_z))
+		changed = False
+		if cos_base_z is not None:
+			next_cos = min(int(base_shape_zyx[0]), max(prev_cos, int(cos_base_z)))
+			_progress["finalized_cos_base_z"] = next_cos
+			changed = changed or next_cos != prev_cos
+		if other_base_z is not None:
+			next_other = min(int(base_shape_zyx[0]), max(prev_other, int(other_base_z)))
+			_progress["finalized_other_base_z"] = next_other
+			changed = changed or next_other != prev_other
+		cos_done = int(_progress.get("finalized_cos_base_z", _finalized_start_base_z))
+		other_done = int(_progress.get("finalized_other_base_z", _finalized_start_base_z))
+		_progress["finalized_base_z"] = min(cos_done, other_done)
+		if changed and int(_progress.get("tiles_total", 0)) > 0:
+			print(f"\r{_predict3d_progress_line(_progress)}  ", end="", flush=True)
+
 	def _on_z_complete(acc_fine, wsum_fine, acc_coarse, wsum_coarse,
 					   complete_z_padded, pad0_inner):
 		"""Flush completed z-bands to OME-Zarr, compute pred_dt, release pages."""
@@ -3137,6 +3266,8 @@ def run_preprocess_3d(
 					)
 					_t_edt_total[0] += time.time() - _t_edt0
 
+			fine_final_base_z = (cos_oz0 + max(0, flush_to_f - b_f)) * effective_cos_sd
+			_update_finalized_z(cos_base_z=fine_final_base_z)
 			acc_fine.discard_before(flush_to_f)
 			wsum_fine.discard_before(flush_to_f)
 
@@ -3224,6 +3355,8 @@ def run_preprocess_3d(
 											cz, cy, cx, cz + wz, cy + wy, cx + wx, ny_u8, oc, n_levels)
 								n_write_c += 1
 
+			other_final_base_z = (other_oz0 + max(0, flush_to_c - b_c)) * effective_other_sd
+			_update_finalized_z(other_base_z=other_final_base_z)
 			acc_coarse.discard_before(flush_to_c)
 			wsum_coarse.discard_before(flush_to_c)
 
@@ -3233,14 +3366,35 @@ def run_preprocess_3d(
 	# --- Streaming inference + flush ---
 	# Shared progress tracker for unified ETA across tiles + EDT
 	_t_edt_total = [0.0]  # accumulated wall time in EDT calls
+	_finalized_start_base_z = min(
+		cos_oz0 * effective_cos_sd,
+		other_oz0 * effective_other_sd,
+	)
+	_finalized_end_base_z = min(
+		int(base_shape_zyx[0]),
+		cos_oz1 * effective_cos_sd,
+		other_oz1 * effective_other_sd,
+	)
 	_progress = {
 		"t0": time.time(),
 		"tiles_done": 0,
 		"tiles_total": 0,  # set by _infer_tiled_3d
+		"tiles_skipped": 0,
+		"tiles_processed": 0,
+		"tile_time_sum": 0.0,
+		"tiles_remaining_est": 0,
 		"edt_done": 0,
-		"edt_total_est": 1,  # updated below
+		"edt_skipped": 0,
+		"edt_processed": 0,
+		"edt_time_sum": 0.0,
+		"edt_total_est": 0,  # updated below
+		"edt_remaining_est": 0,
+		"finalized_base_z": int(_finalized_start_base_z),
+		"finalized_cos_base_z": int(_finalized_start_base_z),
+		"finalized_other_base_z": int(_finalized_start_base_z),
+		"finalized_base_z_total": int(_finalized_end_base_z),
 	}
-	# Estimate total EDT chunks (for overall ETA weighting)
+	# Initial EDT estimate; each slab tightens this with its actual skip/work list.
 	if pred_dt_zarr is not None:
 		_psh = tuple(int(v) for v in pred_dt_zarr.shape)
 		import math as _m2
@@ -3248,6 +3402,7 @@ def run_preprocess_3d(
 		_edt_ny = max(1, _m2.ceil((_psh[1]) / 448))
 		_edt_nx = max(1, _m2.ceil((_psh[2]) / 448))
 		_progress["edt_total_est"] = _edt_nz * _edt_ny * _edt_nx
+		_progress["edt_remaining_est"] = _progress["edt_total_est"]
 
 	_infer_tiled_3d(
 		model, a_in,
