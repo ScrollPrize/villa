@@ -225,36 +225,44 @@
   `GradScaler` and snapshots include scaler state when present. Dense test
   loss, benchmark forward loss, TensorBoard sample-sheet inference, and
   Trace2CP metric/visual inference use the same configured autocast mode.
-- The active S1A conditioned 3D configs use `training.mixed_precision: "bf16"`
-  to reduce activation memory while preserving the configured BatchNorm batch.
+- The active S1A 3D configs use `training.mixed_precision: "bf16"` to reduce
+  activation memory while preserving the configured BatchNorm batch.
 - The S1A NML 3D training config uses `patch_shape_zyx: [192,192,192]`,
   `augment_shift_zyx: [48,48,48]`, and a fixed six-stage U-Net depth
   (`[16,32,64,128,256,512]`) so the deepest feature map remains appropriate
   for 192-voxel patches.
 - `train_s1a_nml_all_64_sd2.json` and
   `train_s1a_nml_all_128_sd2.json` are experimental S1A NML configs at
-  `base_volume_scale: 2` for 64- and 128-voxel patches. They use the active
-  conditioned decoder path and keep the same implemented augmentation families
-  enabled at magnitudes appropriate for their patch sizes: affine
-  shift/rotation/scale/flip, value brightness/contrast/gamma/noise, isotropic
-  blur, smooth displacement, and anisotropic blur. Shear/skew and ringing
-  remain unsupported and must not appear as enabled keys in these configs.
+  `base_volume_scale: 2` for 64- and 128-voxel patches. The 64 sd2 config uses
+  the active conditioned decoder path. The 128 sd2 config is currently a
+  regular single-output legacy config with one seven-channel branch
+  (`direction_branch_count: 1`, `output_channels: 7`) for direct comparison
+  against the conditioned experiment. Both keep the same implemented
+  augmentation families enabled at magnitudes appropriate for their patch
+  sizes: affine shift/rotation/scale/flip, value
+  brightness/contrast/gamma/noise, isotropic blur, smooth displacement, and
+  anisotropic blur. Shear/skew and ringing remain unsupported and must not
+  appear as enabled keys in these configs.
 - 3D training TensorBoard visualization logs CP-centered slice sheets at
   `training.sample_vis_interval`. By default, up to four batch samples are
   shown; `training.sample_vis_count` / `train_sample_vis_count` and
   `training.test_sample_vis_count` control the side-by-side train/test sample
   counts. Each sample block has five rows: the `yx`, `zx`, and `zy` principal
   planes, a longitudinal slice containing the GT CP tangent, and a
-  perpendicular/cross slice whose plane normal is the GT CP tangent. Each row
-  has nine columns: volume image with projected GT line and model-predicted/
-  fitted CP direction overlay where applicable, target/context presence,
-  first prediction presence, second prediction presence, prediction presence
-  for the output whose decoded direction is closer to the slice normal by
-  `abs(dot(axis, normal))`, the other prediction presence, max prediction
-  presence, min prediction presence, and average prediction presence. In
-  conditioned mode the first prediction is the zero-query output and the second
-  prediction is the recurrent output conditioned on the first decoded
-  direction; in legacy branch mode these are branch outputs. The target/context
+  perpendicular/cross slice whose plane normal is the GT CP tangent.
+  Single-output rows have five columns: volume image with projected GT line and
+  model-predicted/fitted CP direction overlay where applicable,
+  target/context presence, raw predicted presence, predicted presence weighted
+  by `abs(dot(pred_axis, slice_normal))`, and predicted presence weighted by
+  `abs(dot(pred_axis, GT_tangent))`. Multi-output rows keep the branch summary
+  layout: image, target/context presence, first prediction presence, second
+  prediction presence, prediction presence for the output whose decoded
+  direction is closer to the slice normal by `abs(dot(axis, normal))`, the other
+  prediction presence, max prediction presence, min prediction presence, and
+  average prediction presence. In conditioned mode the first prediction is the
+  zero-query output and the second prediction is the recurrent output
+  conditioned on the first decoded direction; in legacy branch mode these are
+  branch outputs. The target/context
   presence panel must visualize the carried transformed fiber-line segment
   metadata even for JSON/non-NML CP-only samples where loss supervision remains
   CP-only. The two oblique rows must project/rasterize transformed line
@@ -298,6 +306,24 @@
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
   entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
   `--prefetch`.
+- Multi-process 3D training is enabled only by the standard `torchrun`
+  environment (`WORLD_SIZE > 1` with `RANK` and `LOCAL_RANK`); no DDP config
+  keys are required. A typical launch is
+  `torchrun --standalone --nproc_per_node=N -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>`.
+  `--benchmark`, `--prefetch`, and `--trace2cp-vis` are single-process-only
+  modes and must fail clearly when launched with `WORLD_SIZE > 1`.
+- In DDP training, configured `batch_size` remains the per-rank local batch size.
+  The effective global optimizer-step batch is `batch_size * WORLD_SIZE`.
+  Training samples are partitioned by rank as disjoint deterministic stream
+  batches, and `training.max_steps` remains the number of optimizer steps.
+- CUDA DDP training must convert `BatchNorm3d` modules to `SyncBatchNorm`
+  before DDP wrapping so BatchNorm statistics are computed across ranks.
+  Ordinary single-process training keeps literal `BatchNorm3d` modules.
+  Checkpoints are saved by rank 0 from the unwrapped model so snapshot keys do
+  not receive a DDP `module.` prefix.
+- DDP side effects are rank-0-only: TensorBoard, stdout progress, checkpoints,
+  dense test evaluation, Trace2CP metrics, and train/test visualization. Scalar
+  training losses are averaged across ranks before rank-0 logging.
 - Normal 3D training also supports `--resume <snapshot.pt>`. The CLI path
   overrides config resume keys, restores model and optimizer state, writes a
   fresh timestamped run directory, and records the effective resume path in
@@ -350,8 +376,9 @@
   samples supervise presence over the full valid patch. Lasagna 3x2 direction
   encoding uses the shared NumPy/torch-compatible helper semantics.
 - `training.loader_workers` controls 3D DataLoader worker process count.
-  `0` is the explicit serial/debug path. `training.loader_prefetch_factor`
-  maps directly to PyTorch DataLoader prefetch factor for worker processes.
+  Under DDP this count is per rank. `0` is the explicit serial/debug path.
+  `training.loader_prefetch_factor` maps directly to PyTorch DataLoader prefetch
+  factor for worker processes.
   `training.loader_worker_device` defaults to `"cpu"`. CPU worker processes
   use a guarded `forkserver` multiprocessing context where available, falling
   back to `fork` only when needed; CUDA worker devices select `spawn`.

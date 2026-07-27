@@ -109,11 +109,13 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _FiberTrace3DBatchDataset,
+    _DistributedConfig,
     _Trace2Cp3DConfig,
     _load_snapshot,
     _optimizer_hparams_from_training,
     _branch_choice_grid_offsets,
     _branch_presence_views_from_sampled_output,
+    _single_output_presence_views_from_sampled_output,
     _evaluate_trace2cp_metric_fixed_set_3d,
     _draw_panel_line_aa,
     _draw_projected_cp_direction,
@@ -124,8 +126,13 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _make_train_sample_3d_sheet,
     _mixed_precision_config_from_training,
     _oblique_line_presence_for_display,
+    _distributed_config_from_env,
+    _distributed_should_use_sync_batchnorm,
+    _distributed_training_batch_index,
+    _distributed_training_sample_index,
     _resolve_dense_test_selection,
     _resolve_prefetch_sample_count,
+    _require_single_process_cli_mode,
     _save_snapshot,
     _select_branch_by_chunked_min_fraction,
     _training_sample_index_limit,
@@ -678,6 +685,118 @@ def test_3d_batch_dataset_applies_sample_index_limit_to_data_only() -> None:
     assert not torch.allclose(first.cp_local_zyx, second.cp_local_zyx)
 
 
+def test_3d_batch_dataset_strides_batch_indices_for_distributed_ranks() -> None:
+    config = _loader(augment_enabled=False).config
+    dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=1,
+        batch_index_stride=3,
+        batch_count=2,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+
+    first = dataset[0]
+    second = dataset[1]
+
+    assert torch.equal(first.stream_indices, torch.tensor([2, 3], dtype=torch.long))
+    assert torch.equal(second.stream_indices, torch.tensor([8, 9], dtype=torch.long))
+
+
+def test_3d_distributed_config_defaults_to_single_process() -> None:
+    config = _distributed_config_from_env(torch.device("cpu"), env={})
+
+    assert not config.enabled
+    assert config.rank == 0
+    assert config.local_rank == 0
+    assert config.world_size == 1
+    assert config.is_main
+    assert config.backend == ""
+    assert config.device == torch.device("cpu")
+
+
+def test_3d_distributed_config_parses_torchrun_cpu_env() -> None:
+    config = _distributed_config_from_env(
+        torch.device("cpu"),
+        env={"WORLD_SIZE": "4", "RANK": "2", "LOCAL_RANK": "1"},
+    )
+
+    assert config.enabled
+    assert config.rank == 2
+    assert config.local_rank == 1
+    assert config.world_size == 4
+    assert not config.is_main
+    assert config.backend == "gloo"
+    assert config.device == torch.device("cpu")
+
+
+def test_3d_distributed_config_requires_complete_torchrun_env() -> None:
+    with pytest.raises(ValueError, match="WORLD_SIZE, RANK, and LOCAL_RANK"):
+        _distributed_config_from_env(
+            torch.device("cpu"),
+            env={"WORLD_SIZE": "2", "RANK": "0"},
+        )
+
+
+def test_3d_distributed_training_sample_indices_partition_by_rank() -> None:
+    config = _DistributedConfig(
+        enabled=True,
+        rank=1,
+        local_rank=1,
+        world_size=4,
+        is_main=False,
+        backend="gloo",
+        device=torch.device("cpu"),
+    )
+
+    assert _distributed_training_batch_index(1, config) == 1
+    assert _distributed_training_batch_index(2, config) == 5
+    assert _distributed_training_sample_index(2, batch_size=8, config=config) == 40
+    with pytest.raises(ValueError, match="positive"):
+        _distributed_training_batch_index(0, config)
+
+
+def test_3d_sync_batchnorm_is_only_automatic_for_cuda_ddp() -> None:
+    cpu_ddp = _DistributedConfig(
+        enabled=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        is_main=True,
+        backend="gloo",
+        device=torch.device("cpu"),
+    )
+    cuda_ddp = _DistributedConfig(
+        enabled=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        is_main=True,
+        backend="nccl",
+        device=torch.device("cuda", 0),
+    )
+    single = _DistributedConfig(
+        enabled=False,
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        is_main=True,
+        backend="",
+        device=torch.device("cuda", 0),
+    )
+
+    assert not _distributed_should_use_sync_batchnorm(cpu_ddp)
+    assert _distributed_should_use_sync_batchnorm(cuda_ddp)
+    assert not _distributed_should_use_sync_batchnorm(single)
+
+
+def test_3d_torchrun_rejects_single_process_only_subcommands(monkeypatch) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    with pytest.raises(SystemExit, match="single-process only"):
+        _require_single_process_cli_mode("--benchmark")
+
+
 def test_loader_augmented_batch_is_finite() -> None:
     loader = _loader(augment_enabled=True)
     batch = _load_materialized_batch(loader, 1)
@@ -884,7 +1003,7 @@ def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
     assert sheet.shape[2] == 3
     assert sheet.dtype == np.uint8
     assert sheet.shape[0] > 16
-    assert sheet.shape[1] == 16 * 9 + 8 * 4
+    assert sheet.shape[1] == 16 * 5 + 4 * 4
     first_image_panel = sheet[:16, :16]
     colored = (
         (first_image_panel[..., 0] != first_image_panel[..., 1])
@@ -1140,6 +1259,25 @@ def test_3d_resume_reapplies_current_optimizer_hparams_preserving_state(tmp_path
     assert resumed_state_steps == pytest.approx(original_state_steps)
 
 
+def test_3d_save_snapshot_unwraps_parallel_model_state(tmp_path: Path) -> None:
+    model = torch.nn.Linear(3, 2)
+    wrapped = torch.nn.DataParallel(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    checkpoint = tmp_path / "wrapped.pt"
+
+    _save_snapshot(
+        checkpoint,
+        model=wrapped,
+        optimizer=optimizer,
+        step=3,
+        config={},
+        metric=1.25,
+    )
+
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert sorted(payload["model"].keys()) == ["bias", "weight"]
+
+
 def test_3d_mixed_precision_config_parsing_cpu() -> None:
     cpu = torch.device("cpu")
 
@@ -1301,7 +1439,7 @@ def test_3d_dense_test_control_points_zero_uses_random_full_set() -> None:
     ) == (5, 9, "random")
 
 
-def test_train_sample_3d_sheet_has_branch_presence_columns_and_line_overlay() -> None:
+def test_train_sample_3d_sheet_has_single_output_presence_columns_and_line_overlay() -> None:
     loader = _loader(augment_enabled=False)
     batch = _load_materialized_batch(loader, 0)
     output = torch.zeros(
@@ -1316,7 +1454,7 @@ def test_train_sample_3d_sheet_has_branch_presence_columns_and_line_overlay() ->
 
     patch = int(batch.volume.shape[-1])
     gap = 4
-    assert sheet.shape[1] == patch * 9 + 8 * gap
+    assert sheet.shape[1] == patch * 5 + 4 * gap
     first_image_panel = sheet[:patch, :patch]
     colored = (
         (first_image_panel[..., 0] != first_image_panel[..., 1])
@@ -1350,6 +1488,25 @@ def test_branch_presence_view_selects_output_closer_to_slice_normal() -> None:
     assert np.allclose(max_p, 0.75)
     assert np.allclose(min_p, 0.25)
     assert np.allclose(avg_p, 0.5)
+
+
+def test_single_output_presence_views_include_normal_and_tangent_modulation() -> None:
+    x_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    sampled = torch.zeros((2, 3, 7), dtype=torch.float32)
+    sampled[..., 0:6] = x_dir
+    sampled[..., 6] = 0.6
+
+    raw_p, normal_p, tangent_p = _single_output_presence_views_from_sampled_output(
+        sampled,
+        normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        tangent_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert np.allclose(raw_p, 0.6)
+    assert np.allclose(normal_p, 0.6, atol=1.0e-5)
+    assert np.allclose(tangent_p, 0.0, atol=1.0e-5)
 
 
 def test_oblique_line_presence_uses_slice_frame_axes() -> None:
@@ -1896,6 +2053,45 @@ def test_3d_conditioned_presence_loss_includes_dense_negatives_at_positive_pixel
         ) -> torch.Tensor:
             del latent, query_n6
             return self.perp.to(device=indices_bzyx.device).expand(int(indices_bzyx.shape[0]), -1)
+
+        def forward(
+            self,
+            volume: torch.Tensor,
+            *,
+            conditioned_random_query: torch.Tensor | None = None,
+            conditioned_point_indices_bzyx: torch.Tensor | None = None,
+            conditioned_point_query_n6: torch.Tensor | None = None,
+            return_conditioned_components: bool = False,
+        ) -> dict[str, torch.Tensor | None] | torch.Tensor:
+            latent = self.encode_volume(volume)
+            zero = self.decode_conditioned_latent(
+                latent,
+                torch.zeros((1, 6), dtype=volume.dtype, device=volume.device),
+            )
+            if not return_conditioned_components:
+                return zero
+            assert conditioned_random_query is not None
+            random = self.decode_conditioned_latent(latent, conditioned_random_query)
+            point_query = (
+                torch.empty(
+                    (int(conditioned_point_indices_bzyx.shape[0]), 6),
+                    dtype=volume.dtype,
+                    device=volume.device,
+                )
+                if conditioned_point_query_n6 is None
+                and conditioned_point_indices_bzyx is not None
+                else conditioned_point_query_n6
+            )
+            point = (
+                None
+                if conditioned_point_indices_bzyx is None
+                else self.decode_conditioned_points(
+                    latent,
+                    conditioned_point_indices_bzyx,
+                    point_query,
+                )
+            )
+            return {"zero_output": zero, "random_output": random, "point_output": point}
 
     batch = FiberTrace3DBatch(
         volume=torch.zeros((1, 1, 1, 1, 2), dtype=torch.float32),

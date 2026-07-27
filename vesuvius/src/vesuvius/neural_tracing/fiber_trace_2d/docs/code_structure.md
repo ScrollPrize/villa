@@ -342,6 +342,23 @@ loading.
 
 - Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, `--load-only`,
   `--resume`, and `--trace2cp-vis`.
+- Multi-GPU training uses the standard `torchrun` launch environment and does
+  not require config changes:
+
+  ```bash
+  torchrun --standalone --nproc_per_node=2 -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>
+  ```
+
+  The configured `batch_size` is local to each rank, so the effective
+  optimizer-step batch is `batch_size * WORLD_SIZE`. Each rank receives a
+  disjoint deterministic training-stream slice, and `training.loader_workers`
+  is also per rank. CUDA DDP converts
+  `BatchNorm3d` modules to `SyncBatchNorm` automatically; single-process
+  training keeps regular `BatchNorm3d`. TensorBoard, stdout progress,
+  checkpoints, dense tests, Trace2CP metrics, and sample sheets are written
+  only by rank 0, and snapshots are saved without DDP `module.` key prefixes.
+  `--prefetch`, `--benchmark`, and `--trace2cp-vis` remain single-process
+  modes and reject `WORLD_SIZE > 1`.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
   and `best.pt`. `training.kept_snapshot_interval` additionally keeps numbered
   snapshots as `snapshots/step_<iteration>.pt` and defaults to `10000`.
@@ -399,14 +416,17 @@ loading.
   corresponding dense test sheet count. Each sample block uses five rows: the
   sampled CP's three principal planes, a longitudinal slice containing the GT
   CP tangent, and a perpendicular/cross slice whose plane normal is the GT CP
-  tangent. Each row has nine columns: volume image with projected GT line and
-  predicted CP direction overlay where applicable, target/context presence,
-  first prediction presence, second prediction presence, prediction presence
-  for the output whose decoded direction is closer to the slice normal, other
-  prediction presence, max prediction presence, min prediction presence, and
-  average prediction presence. In conditioned mode the first prediction is the
-  zero-query output and the second is the recurrent output conditioned on the
-  first decoded direction; in legacy mode these columns are branch outputs. The
+  tangent. Single-output rows have five columns: volume image with projected GT
+  line and predicted CP direction overlay where applicable, target/context
+  presence, raw predicted presence, predicted presence weighted by the cosine
+  to the slice normal, and predicted presence weighted by the cosine to the GT
+  tangent. Multi-output rows keep the branch summary columns: first prediction
+  presence, second prediction presence, prediction presence closer to the slice
+  normal, other prediction presence, max prediction presence, min prediction
+  presence, and average prediction presence. In conditioned mode the first
+  prediction is the zero-query output and the second is the recurrent output
+  conditioned on the first decoded direction; in legacy multi-branch mode these
+  columns are branch outputs. The
   GT line overlay draws target-line portions within 2 voxels of
   the displayed principal slice plane. The two
   oblique rows project/rasterize the carried transformed line segments into
