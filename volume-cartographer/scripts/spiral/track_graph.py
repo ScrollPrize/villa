@@ -1,6 +1,9 @@
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
+import os
 import numpy as np
 from scipy.sparse import csr_array
 from scipy.sparse.csgraph import breadth_first_order, connected_components, maximum_flow
@@ -8,10 +11,10 @@ import vc.track_store as track_store
 import vc.compression.vcz1_numcodecs  # Registers the VCZ1 codec with numcodecs.
 import zarr
 import fsspec
-import napari
 import dask.array as da
 from huggingface_hub import sync_bucket as _sync_bucket
 from tifxyz import save_tifxyz
+from tqdm.auto import tqdm
 
 family_names = {
   -1: "unknown",
@@ -97,27 +100,43 @@ class Track:
         self,
         min_arclength=0.0,
         min_spacing=0.0,
+        max_spacing=None,
         min_shared_z_extent=0.0,
     ):
         """Return crossing tracks ordered from this track's first endpoint.
 
         ``min_arclength`` filters the crossing tracks, while ``min_spacing``
         is the minimum arclength along this track between selected crossings.
+        When ``max_spacing`` is supplied, all eligible crossings are retained
+        and an empty result is returned if any adjacent pair is farther apart
+        than that value. ``min_spacing`` and ``max_spacing`` are mutually
+        exclusive.
         ``min_shared_z_extent`` requires every returned track to cover a
         common z interval of at least that size.
-        The result contains as many tracks as possible and, among that number,
-        chooses crossings that are as close as possible to uniform spacing.
+        In minimum-spacing mode, the result contains as many tracks as possible
+        and, among that number, chooses crossings that are as close as possible
+        to uniform spacing.
         Results are ordered by increasing arclength along this track, starting
         at the endpoint represented by ``points_zyx[0]``.
-        All three arguments use the same coordinate units as ``arclength``.
+        All spacing and extent arguments use the coordinate units of
+        ``arclength``.
         """
         min_arclength = float(min_arclength)
         min_spacing = float(min_spacing)
+        if max_spacing is not None:
+            max_spacing = float(max_spacing)
         min_shared_z_extent = float(min_shared_z_extent)
         if not np.isfinite(min_arclength) or min_arclength < 0:
             raise ValueError("min_arclength must be finite and non-negative")
         if not np.isfinite(min_spacing) or min_spacing < 0:
             raise ValueError("min_spacing must be finite and non-negative")
+        if max_spacing is not None:
+            if not np.isfinite(max_spacing) or max_spacing <= 0:
+                raise ValueError("max_spacing must be finite and positive")
+            if min_spacing != 0:
+                raise ValueError(
+                    "min_spacing and max_spacing are mutually exclusive"
+                )
         if (
             not np.isfinite(min_shared_z_extent)
             or min_shared_z_extent < 0
@@ -176,6 +195,14 @@ class Track:
         position_order = np.argsort(positions, kind="stable")
         neighbor_rows = neighbor_rows[position_order]
         positions = positions[position_order]
+
+        if max_spacing is not None:
+            if (
+                neighbor_rows.size < 2
+                or np.any(np.diff(positions) > max_spacing)
+            ):
+                return []
+            return [self.collection[int(row)] for row in neighbor_rows]
 
         if min_spacing == 0 or neighbor_rows.size == 1:
             return [self.collection[int(row)] for row in neighbor_rows]
@@ -439,7 +466,7 @@ def write_2d_grid_as_tifxyz(
         raise ValueError("grid_zyx must contain only finite coordinates")
 
     if surface_uuid is None:
-        surface_uuid = datetime.now().strftime("%y%m%d%H%S")
+        surface_uuid = datetime.now().strftime("%y%m%d%H%M%S%f")
     else:
         surface_uuid = str(surface_uuid)
 
@@ -552,8 +579,246 @@ def load_tracks(local_tracks_path):
         crossing_positions=crossing_positions,
     )
 
+def select_random_horizontal_seeds(
+    tracks,
+    count,
+    *,
+    rng,
+    crossing_min_arclength,
+    crossing_max_spacing,
+    crossing_min_shared_z_extent,
+    on_selected=None,
+):
+    """Choose usable long horizontal seeds with randomized spatial diversity."""
+    count = int(count)
+    if count < 1:
+        raise ValueError("count must be positive")
+
+    horizontal_rows = np.flatnonzero(tracks.family_codes == 0)
+    finite = np.isfinite(tracks.arclengths[horizontal_rows])
+    horizontal_rows = horizontal_rows[finite]
+    if not horizontal_rows.size:
+        raise ValueError("the collection contains no horizontal tracks")
+
+    cutoff = np.percentile(tracks.arclengths[horizontal_rows], 75.0)
+    candidate_rows = horizontal_rows[
+        tracks.arclengths[horizontal_rows] >= cutoff
+    ]
+    candidate_rows = np.asarray(candidate_rows, dtype=np.int64)
+    rng.shuffle(candidate_rows)
+
+    # A representative point lets the greedy sampler favor seeds in different
+    # parts of the volume without loading whole tracks into a second graph.
+    representative_points = np.empty((len(candidate_rows), 3), dtype=np.float64)
+    for index, row in enumerate(
+        tqdm(
+            candidate_rows,
+            desc="Indexing seed candidates",
+            unit="track",
+        )
+    ):
+        points = tracks[int(row)].points_zyx
+        representative_points[index] = points[len(points) // 2]
+
+    available = np.ones(len(candidate_rows), dtype=bool)
+    min_distances = np.full(len(candidate_rows), np.inf)
+    selected = []
+    selected_crossings = []
+
+    with tqdm(
+        total=count,
+        desc="Selecting random seeds",
+        unit="seed",
+    ) as progress:
+        attempted = 0
+        progress.set_postfix(tried=attempted)
+        while len(selected) < count and np.any(available):
+            available_indices = np.flatnonzero(available)
+            if selected:
+                distances = min_distances[available_indices]
+                threshold = np.percentile(distances, 75.0)
+                diverse_indices = available_indices[distances >= threshold]
+                candidate_index = int(rng.choice(diverse_indices))
+            else:
+                candidate_index = int(rng.choice(available_indices))
+            available[candidate_index] = False
+
+            track = tracks[int(candidate_rows[candidate_index])]
+            crossing_tracks = track.spaced_crossing_tracks(
+                min_arclength=crossing_min_arclength,
+                max_spacing=crossing_max_spacing,
+                min_shared_z_extent=crossing_min_shared_z_extent,
+            )
+            attempted += 1
+            progress.set_postfix(tried=attempted)
+            if len(crossing_tracks) < 2:
+                continue
+
+            selected.append(track)
+            selected_crossings.append(crossing_tracks)
+            if on_selected is not None:
+                on_selected(track, crossing_tracks)
+            progress.update()
+            distances = np.linalg.norm(
+                representative_points
+                - representative_points[candidate_index],
+                axis=1,
+            )
+            min_distances = np.minimum(min_distances, distances)
+
+    if len(selected) < count:
+        raise RuntimeError(
+            f"only {len(selected)} usable seeds were found among "
+            f"{len(candidate_rows)} horizontals in the top arclength quartile"
+        )
+    return list(zip(selected, selected_crossings))
+
+def write_random_seed_grid(
+    seed_track,
+    crossing_tracks,
+    *,
+    output_directory,
+    grid_spacing,
+    voxel_size_um,
+    surface_uuid,
+):
+    """Build and write one random-seed grid; safe to run in a worker thread."""
+    shared_z_extent, crossing_points = crop_tracks_to_shared_z_extent(
+        crossing_tracks
+    )
+    grid = tracks_to_2d_grid(
+        crossing_points,
+        row_spacing=grid_spacing,
+        column_spacing=grid_spacing,
+    )
+    output_path = write_2d_grid_as_tifxyz(
+        grid,
+        output_directory,
+        spacing=grid_spacing,
+        voxel_size_um=voxel_size_um,
+        source=(
+            "random horizontal seed "
+            f"track_row={seed_track.row}, source_id={seed_track.source_id}"
+        ),
+        surface_uuid=surface_uuid,
+    )
+    return {
+        "seed_row": seed_track.row,
+        "source_id": seed_track.source_id,
+        "crossing_count": len(crossing_tracks),
+        "shared_z_extent": shared_z_extent,
+        "grid_shape": grid.shape,
+        "output_path": output_path,
+    }
+
+def create_random_seed_grids(
+    tracks,
+    count,
+    *,
+    output_directory,
+    crossing_min_arclength=500.0,
+    crossing_max_spacing=40.0,
+    crossing_min_shared_z_extent=500.0,
+    grid_spacing=20.0,
+    voxel_size_um=4.0,
+    workers=None,
+    rng_seed=None,
+):
+    """Select random horizontal seeds and create their TIFXYZ grids."""
+    count = int(count)
+    if count < 1:
+        raise ValueError("count must be positive")
+    rng = np.random.default_rng(rng_seed)
+    if workers is None:
+        workers = min(count, os.cpu_count() or 1)
+    workers = max(1, min(int(workers), count))
+
+    # Preallocate a batch prefix so concurrent writers can never choose the
+    # same timestamp. Microseconds protect separate invocations from collision.
+    batch_id = datetime.now().strftime("%y%m%d%H%M%S%f")
+    results = []
+    with (
+        ThreadPoolExecutor(max_workers=workers) as executor,
+        tqdm(
+            total=count,
+            desc="Writing TIFXYZ grids",
+            unit="grid",
+            position=1,
+        ) as write_progress,
+    ):
+        futures = []
+
+        def submit_grid(seed, crossings):
+            surface_uuid = f"{batch_id}{len(futures):04d}"
+            future = executor.submit(
+                write_random_seed_grid,
+                seed,
+                crossings,
+                output_directory=output_directory,
+                grid_spacing=grid_spacing,
+                voxel_size_um=voxel_size_um,
+                surface_uuid=surface_uuid,
+            )
+            future.add_done_callback(lambda _: write_progress.update())
+            futures.append(future)
+
+        select_random_horizontal_seeds(
+            tracks,
+            count,
+            rng=rng,
+            crossing_min_arclength=crossing_min_arclength,
+            crossing_max_spacing=crossing_max_spacing,
+            crossing_min_shared_z_extent=crossing_min_shared_z_extent,
+            on_selected=submit_grid,
+        )
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            tqdm.write(
+                f"Wrote random seed row={result['seed_row']}, "
+                f"crossings={result['crossing_count']}, "
+                f"grid_shape={result['grid_shape']}, "
+                f"tifxyz={result['output_path']}"
+            )
+    return sorted(results, key=lambda result: result["seed_row"])
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Create track grids and optionally inspect one in Napari."
+    )
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=("display", "random_seed"),
+        default="display",
+    )
+    parser.add_argument(
+        "--num-random-seeds",
+        type=int,
+        help="number of TIFXYZ grids to create in random_seed mode",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="shared-graph worker threads (default: up to the CPU count)",
+    )
+    parser.add_argument(
+        "--rng-seed",
+        type=int,
+        default=None,
+        help="optional reproducible random selection seed",
+    )
+    args = parser.parse_args()
+    if args.mode == "random_seed":
+        if args.num_random_seeds is None or args.num_random_seeds < 1:
+            parser.error(
+                "random_seed requires --num-random-seeds with a positive value"
+            )
+    elif args.num_random_seeds is not None:
+        parser.error("--num-random-seeds is only valid in random_seed mode")
+
     local_tracks_path = Path(
         "/home/sean/Desktop/spiral_dataset/to_hf/tracks/"
         "2um_ds2_ps256_surf_v2.dbm.vctracks"
@@ -567,9 +832,9 @@ if __name__ == "__main__":
     #     "s3://vesuvius-challenge-open-data/PHercParis4/volumes/"
     #     "20260411134726-2.400um-0.2m-78keV-masked.zarr"
     # )
-    crossing_min_arclength = 500.0
-    crossing_min_shared_z_extent = 500.0
-    crossing_min_spacing = 20.0
+    crossing_min_arclength = 750.0
+    crossing_min_shared_z_extent = 750.0
+    crossing_max_spacing = 40.0
     grid_spacing = 20.0
     track_voxel_size_um = 4.0
     tifxyz_output_directory = Path(
@@ -578,12 +843,36 @@ if __name__ == "__main__":
     using_s3_ct = ct_vol_path.startswith("s3://")
 
     tracks = load_tracks(local_tracks_path)
+    if args.mode == "random_seed":
+        results = create_random_seed_grids(
+            tracks,
+            args.num_random_seeds,
+            output_directory=tifxyz_output_directory,
+            crossing_min_arclength=crossing_min_arclength,
+            crossing_max_spacing=crossing_max_spacing,
+            crossing_min_shared_z_extent=crossing_min_shared_z_extent,
+            grid_spacing=grid_spacing,
+            voxel_size_um=track_voxel_size_um,
+            workers=args.workers,
+            rng_seed=args.rng_seed,
+        )
+        print(
+            f"Created {len(results)} random-seed TIFXYZ grids in "
+            f"{tifxyz_output_directory}"
+        )
+        raise SystemExit(0)
+
     longest_track = tracks[int(np.nanargmax(tracks.arclengths))]
     crossing_tracks = longest_track.spaced_crossing_tracks(
         min_arclength=crossing_min_arclength,
-        min_spacing=crossing_min_spacing,
+        max_spacing=crossing_max_spacing,
         min_shared_z_extent=crossing_min_shared_z_extent,
     )
+    if len(crossing_tracks) < 2:
+        raise RuntimeError(
+            "the longest track does not have at least two eligible crossings "
+            f"with adjacent spacing <= {crossing_max_spacing:g}"
+        )
     shared_crossing_z_extent, crossing_points_zyx = (
         crop_tracks_to_shared_z_extent(crossing_tracks)
     )
@@ -657,6 +946,8 @@ if __name__ == "__main__":
         ct_image_kwargs = {"multiscale": True}
         ct_description = f"CT multiscale ({len(ct_image)} levels)"
     points_zyx = full_points_zyx[::10]
+
+    import napari
 
     viewer = napari.Viewer(ndisplay=2)
     viewer.add_image(
