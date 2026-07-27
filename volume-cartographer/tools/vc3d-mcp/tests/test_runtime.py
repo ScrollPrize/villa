@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -202,7 +203,7 @@ class AutoLaunchTest(unittest.TestCase):
     def test_windows_launch_uses_its_registry_record_when_stdout_closes(self) -> None:
         class WindowsGuiProcess:
             pid = 4242
-            stdout: list[str] = []
+            stdout = io.StringIO()
             returncode = None
 
             def poll(self):
@@ -242,6 +243,7 @@ class AutoLaunchTest(unittest.TestCase):
 
         self.assertEqual(endpoint, r"\\.\pipe\vc3d-agent-4242")
         self.assertIs(server_module._launched_process, process)
+        self.assertTrue(process.stdout.closed)
 
 
 class NewTailLinesTest(unittest.TestCase):

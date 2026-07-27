@@ -177,19 +177,20 @@ def launch_vc3d(
 
     def _drain() -> None:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            stripped = line.rstrip("\n")
-            tail.append(stripped)
-            if not found.is_set():
-                parsed = BridgeClient.socket_path_from_handshake(line)
-                if parsed is not None:
-                    handshake["path"] = parsed[1]
-                    found.set()
-                    continue
-            try:
-                print(stripped, file=sys.stderr)
-            except Exception:  # noqa: BLE001 - stderr sink gone; keep draining
-                pass
+        with proc.stdout:
+            for line in proc.stdout:
+                stripped = line.rstrip("\n")
+                tail.append(stripped)
+                if not found.is_set():
+                    parsed = BridgeClient.socket_path_from_handshake(line)
+                    if parsed is not None:
+                        handshake["path"] = parsed[1]
+                        found.set()
+                        continue
+                try:
+                    print(stripped, file=sys.stderr)
+                except Exception:  # noqa: BLE001 - stderr sink gone; keep draining
+                    pass
         output_closed.set()
 
     threading.Thread(target=_drain, name="vc3d-stdout-drain", daemon=True).start()
