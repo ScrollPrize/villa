@@ -201,7 +201,7 @@ class SpiralRunConfig:
     voxel_size_um: float = 9.6
     lasagna_group: str = "4"
     lasagna_scale: int = 4
-    storage_backend: str = "auto"
+    storage_backend: str = "sparse_cuda"
     legacy_checkpoint_step: int = 0
     run_tag: str = ""
     render_volume_scale: int = 16
@@ -217,7 +217,7 @@ class SpiralRunConfig:
             voxel_size_um=float(value.get("voxel_size_um", 9.6)),
             lasagna_group=str(value.get("lasagna_group", "4")),
             lasagna_scale=int(value.get("lasagna_scale", 4)),
-            storage_backend=str(value.get("storage_backend", "auto")).lower(),
+            storage_backend=str(value.get("storage_backend", "sparse_cuda")).lower(),
             legacy_checkpoint_step=int(value.get("legacy_checkpoint_step", 0)),
             run_tag=str(value.get("run_tag", "")),
             render_volume_scale=int(value.get("render_volume_scale", 16)),
@@ -512,8 +512,11 @@ def validate_session_request(
         errors.append({"field": "outward_sense", "message": "Must be CW or ACW"})
     if run.lasagna_scale <= 0:
         errors.append({"field": "lasagna_scale", "message": "Must be positive"})
-    if run.storage_backend not in {"auto", "mmap", "dense_cuda"}:
-        errors.append({"field": "storage_backend", "message": "Must be auto, mmap, or dense_cuda"})
+    if run.storage_backend != "sparse_cuda":
+        errors.append({
+            "field": "storage_backend",
+            "message": "Only sparse_cuda is supported",
+        })
 
     if not paths.output_directory:
         errors.append({"field": "output_directory", "message": "Output directory is required"})
