@@ -35,6 +35,7 @@ from preprocess_cos_omezarr import (
 	_predict3d_overall_eta,
 	run_preprocess_3d,
 )
+from omezarr_pyramid import _make_downsample_work
 
 
 class _StopAfterManifest(Exception):
@@ -242,6 +243,58 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			arr = zarr.open(str(Path(path) / "0"), mode="r")
 			self.assertEqual(int(np.asarray(arr[0, 0, 0])), 7)
 			self.assertEqual([p.name for p in Path(td).iterdir() if p.name.startswith(".tmp.")], [])
+
+	def test_atomic_zarr_write_invalidates_before_replacing_chunk(self):
+		with tempfile.TemporaryDirectory() as td:
+			path = str(Path(td) / "cos.ome.zarr")
+			_create_omezarr(path, (16, 16, 16), 0, 2, 16, "cos")
+			block = np.full((16, 16, 16), 7, dtype=np.uint8)
+			events: list[str] = []
+			real_replace = os.replace
+			live_level = str(Path(path) / "0")
+
+			def _replace(src, dst):
+				if str(dst).startswith(live_level):
+					events.append("replace")
+				return real_replace(src, dst)
+
+			def _invalidate(*_args, **_kwargs):
+				events.append("invalidate")
+
+			with mock.patch("preprocess_cos_omezarr.os.replace", side_effect=_replace):
+				with mock.patch("preprocess_cos_omezarr._invalidate_pyramid_chunks", side_effect=_invalidate):
+					_atomic_zarr_write(path, 0, 0, 0, 0, 16, 16, 16, block, 16, n_levels=2)
+
+			self.assertEqual(events[:2], ["invalidate", "replace"])
+
+	def test_pyramid_full_source_scan_schedules_missing_chunk_outside_crop(self):
+		with tempfile.TemporaryDirectory() as td:
+			path = str(Path(td) / "cos.ome.zarr")
+			_create_omezarr(path, (16, 16, 16), 0, 3, 4, "cos")
+			arr = zarr.open(str(Path(path) / "0"), mode="r+")
+			arr[8:12, 0:4, 0:4] = np.full((4, 4, 4), 9, dtype=np.uint8)
+
+			crop_work, _ = _make_downsample_work(
+				omezarr_path=path,
+				src_level=0,
+				dst_level=1,
+				chunk=4,
+				crop_zyx=(0, 0, 0, 4, 4, 4),
+				skip_existing=True,
+				require_source_chunks=True,
+			)
+			full_work, _ = _make_downsample_work(
+				omezarr_path=path,
+				src_level=0,
+				dst_level=1,
+				chunk=4,
+				crop_zyx=None,
+				skip_existing=True,
+				require_source_chunks=True,
+			)
+
+			self.assertEqual(crop_work, [])
+			self.assertTrue(any((z0, y0, x0) == (8, 0, 0) for *_prefix, z0, _z1, y0, _y1, x0, _x1, _zero in full_work))
 
 	def test_predict3d_temp_cleanup_is_output_directory_wide(self):
 		with tempfile.TemporaryDirectory() as td:

@@ -74,6 +74,32 @@ def omezarr_chunk_exists(
 	return zarr_chunk_path(Path(omezarr_path) / str(level), sep, iz, iy, ix).is_file()
 
 
+def omezarr_region_has_chunks(
+	omezarr_path: str | Path,
+	level: int,
+	z0: int,
+	z1: int,
+	y0: int,
+	y1: int,
+	x0: int,
+	x1: int,
+	chunk_size: int | tuple[int, int, int],
+) -> bool:
+	cz, cy, cx = _normalize_chunk_zyx(chunk_size)
+	for z in range((max(0, int(z0)) // cz) * cz, max(0, int(z1) + cz - 1), cz):
+		if z >= int(z1):
+			break
+		for y in range((max(0, int(y0)) // cy) * cy, max(0, int(y1) + cy - 1), cy):
+			if y >= int(y1):
+				break
+			for x in range((max(0, int(x0)) // cx) * cx, max(0, int(x1) + cx - 1), cx):
+				if x >= int(x1):
+					break
+				if omezarr_chunk_exists(omezarr_path, level, z, y, x, chunk_size):
+					return True
+	return False
+
+
 def set_pyramid_metadata(group: zarr.Group, *, method: str) -> None:
 	group.attrs["lasagna_pyramid_downsample"] = method
 
@@ -257,9 +283,11 @@ def _make_downsample_work(
 	crop_zyx: tuple[int, int, int, int, int, int] | None,
 	skip_existing: bool,
 	zero_overrides: bool = False,
+	require_source_chunks: bool = False,
 ) -> tuple[list[tuple], int]:
 	g = zarr.open_group(str(omezarr_path), mode="r+")
 	src_shape = tuple(int(v) for v in g[str(src_level)].shape)
+	src_chunk_zyx = _level_chunks_zyx(g, src_level)
 	chunk_zyx = _level_chunks_zyx(g, dst_level) if chunk is None else _normalize_chunk_zyx(chunk)
 	cz2, cy2, cx2 = (2 * v for v in chunk_zyx)
 	if crop_zyx is not None:
@@ -286,6 +314,11 @@ def _make_downsample_work(
 			for x0 in range(sx0, sx1, cx2):
 				x1 = min(sx1, x0 + cx2)
 				if skip_existing and omezarr_chunk_exists(omezarr_path, dst_level, z0 // 2, y0 // 2, x0 // 2, chunk_zyx):
+					skipped += 1
+					continue
+				if require_source_chunks and not omezarr_region_has_chunks(
+					omezarr_path, src_level, z0, z1, y0, y1, x0, x1, src_chunk_zyx,
+				):
 					skipped += 1
 					continue
 				work.append((str(omezarr_path), int(src_level), int(dst_level), z0, z1, y0, y1, x0, x1, bool(zero_overrides)))
@@ -349,6 +382,7 @@ def build_scalar_omezarr_pyramid(
 	label: str = "",
 	force: bool = False,
 	zero_overrides: bool = False,
+	scan_existing_source_chunks: bool = False,
 ) -> None:
 	if workers <= 0:
 		workers = max(1, multiprocessing.cpu_count())
@@ -357,7 +391,7 @@ def build_scalar_omezarr_pyramid(
 		clear_coarser_levels(omezarr_path, data_level, n_levels)
 	for lv in range(int(data_level) + 1, int(n_levels)):
 		src_lv = lv - 1
-		src_crop = _scaled_crop_for_source_level(crop_zyx, src_lv - int(data_level))
+		src_crop = None if scan_existing_source_chunks else _scaled_crop_for_source_level(crop_zyx, src_lv - int(data_level))
 		work, skipped = _make_downsample_work(
 			omezarr_path=omezarr_path,
 			src_level=src_lv,
@@ -366,6 +400,7 @@ def build_scalar_omezarr_pyramid(
 			crop_zyx=src_crop,
 			skip_existing=not force,
 			zero_overrides=zero_overrides,
+			require_source_chunks=scan_existing_source_chunks,
 		)
 		tag = f"[pyramid {label} L{lv}]" if label else f"[pyramid L{lv}]"
 		if skipped > 0:
@@ -385,6 +420,7 @@ def build_normal_omezarr_pyramid(
 	crop_zyx: tuple[int, int, int, int, int, int] | None = None,
 	label: str = "normal",
 	force: bool = False,
+	scan_existing_source_chunks: bool = False,
 ) -> None:
 	if workers <= 0:
 		workers = max(1, multiprocessing.cpu_count())
@@ -395,19 +431,34 @@ def build_normal_omezarr_pyramid(
 		clear_coarser_levels(ny_omezarr_path, data_level, n_levels)
 	for lv in range(int(data_level) + 1, int(n_levels)):
 		src_lv = lv - 1
-		src_crop = _scaled_crop_for_source_level(crop_zyx, src_lv - int(data_level))
+		src_crop = None if scan_existing_source_chunks else _scaled_crop_for_source_level(crop_zyx, src_lv - int(data_level))
 		work_base, skipped = _make_downsample_work(
 			omezarr_path=nx_omezarr_path,
 			src_level=src_lv,
 			dst_level=lv,
 			chunk=chunk,
 			crop_zyx=src_crop,
-			skip_existing=not force,
+			skip_existing=False,
+			require_source_chunks=scan_existing_source_chunks,
 		)
-		work = [
-			(str(nx_omezarr_path), str(ny_omezarr_path), src_lv, lv, z0, z1, y0, y1, x0, x1)
-			for _path, _src, _dst, z0, z1, y0, y1, x0, x1, *_rest in work_base
-		]
+		work = []
+		dst_chunk_zyx = _level_chunks_zyx(nx_g, lv) if chunk is None else _normalize_chunk_zyx(chunk)
+		ny_src_chunk_zyx = _level_chunks_zyx(ny_g, src_lv)
+		for _path, _src, _dst, z0, z1, y0, y1, x0, x1, *_rest in work_base:
+			dst_z, dst_y, dst_x = int(z0) // 2, int(y0) // 2, int(x0) // 2
+			if (
+				not force
+				and omezarr_chunk_exists(nx_omezarr_path, lv, dst_z, dst_y, dst_x, dst_chunk_zyx)
+				and omezarr_chunk_exists(ny_omezarr_path, lv, dst_z, dst_y, dst_x, dst_chunk_zyx)
+			):
+				skipped += 1
+				continue
+			if scan_existing_source_chunks and not omezarr_region_has_chunks(
+				ny_omezarr_path, src_lv, z0, z1, y0, y1, x0, x1, ny_src_chunk_zyx,
+			):
+				skipped += 1
+				continue
+			work.append((str(nx_omezarr_path), str(ny_omezarr_path), src_lv, lv, z0, z1, y0, y1, x0, x1))
 		tag = f"[pyramid {label} L{lv}]"
 		if skipped > 0:
 			print(f"{tag} skipped {skipped} existing chunks", flush=True)

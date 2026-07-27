@@ -752,9 +752,9 @@ def _atomic_zarr_write(omezarr_path: str, level: int,
 					dst = _zarr_chunk_path(level_path, sep, iz, iy, ix)
 					if os.path.isfile(src):
 						os.makedirs(os.path.dirname(dst), exist_ok=True)
-						os.replace(src, dst)
 						if n_levels > 0:
 							_invalidate_pyramid_chunks(omezarr_path, level, n_levels, iz, iy, ix)
+						os.replace(src, dst)
 	finally:
 		_remove_path_quiet(tmp_path)
 
@@ -1049,6 +1049,7 @@ def _build_omezarr_pyramid(
 	crop_zyx: tuple[int, int, int, int, int, int] | None = None,
 	label: str = "",
 	zero_overrides: bool = False,
+	scan_existing_source_chunks: bool = False,
 ) -> None:
 	"""Build coarser scalar pyramid levels by chunked 2x pooling."""
 	build_scalar_omezarr_pyramid(
@@ -1060,6 +1061,7 @@ def _build_omezarr_pyramid(
 		crop_zyx=crop_zyx,
 		label=label,
 		zero_overrides=zero_overrides,
+		scan_existing_source_chunks=scan_existing_source_chunks,
 	)
 
 
@@ -3434,7 +3436,16 @@ def run_preprocess_3d(
 		(cos_omezarr_path, cos_level, "cos", cos_crop_zyx),
 		(gm_omezarr_path, other_level, "grad_mag", other_crop_zyx),
 	]:
-		_build_omezarr_pyramid(path, data_lv, n_levels, oc, crop_zyx=crop, label=name, zero_overrides=(name == "grad_mag"))
+		_build_omezarr_pyramid(
+			path,
+			data_lv,
+			n_levels,
+			oc,
+			crop_zyx=crop,
+			label=name,
+			zero_overrides=(name == "grad_mag"),
+			scan_existing_source_chunks=True,
+		)
 	build_normal_omezarr_pyramid(
 		nx_omezarr_path,
 		ny_omezarr_path,
@@ -3443,9 +3454,18 @@ def run_preprocess_3d(
 		oc,
 		crop_zyx=other_crop_zyx,
 		label="normal",
+		scan_existing_source_chunks=True,
 	)
 	if dt_omezarr_path:
-		_build_omezarr_pyramid(dt_omezarr_path, cos_level, n_levels, oc, crop_zyx=cos_crop_zyx, label="pred_dt")
+		_build_omezarr_pyramid(
+			dt_omezarr_path,
+			cos_level,
+			n_levels,
+			oc,
+			crop_zyx=cos_crop_zyx,
+			label="pred_dt",
+			scan_existing_source_chunks=True,
+		)
 
 	# --- Resume training ---
 	if _gpu_ctx is not None:
