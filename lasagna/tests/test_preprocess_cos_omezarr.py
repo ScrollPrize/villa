@@ -1,9 +1,11 @@
+import json
 import unittest
 import os
 import sys
 import tempfile
 from pathlib import Path
 import types
+from unittest import mock
 
 import numpy as np
 import zarr
@@ -27,10 +29,72 @@ from preprocess_cos_omezarr import (
 	_create_omezarr,
 	_grad_mag_factor_from_input_sd,
 	_omezarr_chunk_group_complete,
+	run_preprocess_3d,
 )
 
 
+class _StopAfterManifest(Exception):
+	pass
+
+
+def _write_zarr_array(path: Path, shape: tuple[int, int, int], value: int = 1) -> Path:
+	arr = zarr.open(str(path), mode="w", shape=shape, chunks=(4, 4, 4), dtype="uint8")
+	arr[:] = np.full(shape, value, dtype=np.uint8)
+	return path
+
+
+def _write_predict3d_manifest(path: Path, groups: dict) -> None:
+	path.write_text(
+		json.dumps(
+			{
+				"version": 2,
+				"source_to_base": 2.5,
+				"base_shape_zyx": [8, 8, 8],
+				"grad_mag_encode_scale": 1000.0,
+				"grad_mag_factor": 9.0,
+				"umbilicus_json": "umbilicus.json",
+				"init_shell_dir": "init_shells",
+				"crops": [[1, 2, 3, 4, 5, 6]],
+				"groups": groups,
+			}
+		)
+		+ "\n",
+		encoding="utf-8",
+	)
+
+
 class PreprocessCosOmezarrTests(unittest.TestCase):
+	def _run_predict3d_until_model_build(
+		self,
+		*,
+		input_path: Path,
+		output_path: Path,
+		pred_dt_path: Path | None = None,
+		crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
+	) -> None:
+		gpu_pause_stub = types.ModuleType("gpu_pause")
+		gpu_pause_stub.gpu_pause_context = lambda: None
+		with mock.patch.dict(sys.modules, {"gpu_pause": gpu_pause_stub}):
+			with mock.patch.object(train_stub, "build_model", side_effect=_StopAfterManifest):
+				with self.assertRaises(_StopAfterManifest):
+					run_preprocess_3d(
+						input_path=str(input_path),
+						output_path=str(output_path),
+						unet3d_checkpoint=str(output_path.parent / "missing_model.pt"),
+						device="cpu",
+						crop_xyzwhd=crop_xyzwhd,
+						tile_size=8,
+						overlap=0,
+						border=0,
+						cos_scaledown=1,
+						scaledown=2,
+						source_to_base=8.0,
+						pred_dt_path=str(pred_dt_path) if pred_dt_path is not None else None,
+						base_ref=str(input_path),
+						n_levels=3,
+						ome_chunk=4,
+					)
+
 	def test_grad_mag_factor_uses_input_scale_not_output_level(self):
 		self.assertEqual(_grad_mag_factor_from_input_sd(1), 1.0)
 		self.assertEqual(_grad_mag_factor_from_input_sd(4), 0.25)
@@ -127,6 +191,72 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		)
 		self.assertEqual(a, b)
 		self.assertIn(96, a)
+
+	def test_predict3d_early_manifest_removes_stale_pred_dt_and_preserves_metadata(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = _write_zarr_array(root / "input.zarr", (8, 8, 8))
+			output_path = root / "vol.lasagna.json"
+			pred_dt_output = root / "vol_pred_dt.ome.zarr"
+			pred_dt_output.mkdir()
+			(pred_dt_output / "sentinel").write_text("keep\n", encoding="utf-8")
+			_write_predict3d_manifest(
+				output_path,
+				{
+					"cos": {"zarr": "old_cos.ome.zarr/0", "scaledown": 0, "channels": ["cos"]},
+					"pred_dt": {"zarr": "vol_pred_dt.ome.zarr/0", "scaledown": 0, "channels": ["pred_dt"]},
+					"obsolete": {"zarr": "obsolete.ome.zarr/0", "scaledown": 0, "channels": ["obsolete"]},
+				},
+			)
+
+			self._run_predict3d_until_model_build(
+				input_path=input_path,
+				output_path=output_path,
+				crop_xyzwhd=(0, 0, 0, 8, 8, 8),
+			)
+
+			raw = json.loads(output_path.read_text(encoding="utf-8"))
+			self.assertEqual(list(raw["groups"]), ["cos", "grad_mag", "nx", "ny"])
+			self.assertEqual(raw["umbilicus_json"], "umbilicus.json")
+			self.assertEqual(raw["init_shell_dir"], "init_shells")
+			self.assertEqual(raw["source_to_base"], 2.5)
+			self.assertIn([1, 2, 3, 4, 5, 6], raw["crops"])
+			self.assertIn([0, 0, 0, 8, 8, 8], raw["crops"])
+			self.assertTrue((pred_dt_output / "sentinel").exists())
+			backups = sorted(root.glob("vol_old.*.lasagna.json"))
+			self.assertEqual(len(backups), 1)
+			old_raw = json.loads(backups[0].read_text(encoding="utf-8"))
+			self.assertIn("pred_dt", old_raw["groups"])
+
+	def test_predict3d_later_pred_dt_run_readds_manifest_group_and_reuses_output(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = _write_zarr_array(root / "input.zarr", (8, 8, 8))
+			pred_dt_source = _write_zarr_array(root / "pred_source.zarr", (8, 8, 8))
+			output_path = root / "vol.lasagna.json"
+			_write_predict3d_manifest(
+				output_path,
+				{
+					"cos": {"zarr": "vol_cos.ome.zarr/0", "scaledown": 0, "channels": ["cos"]},
+					"grad_mag": {"zarr": "vol_grad_mag.ome.zarr/1", "scaledown": 1, "channels": ["grad_mag"]},
+					"nx": {"zarr": "vol_nx.ome.zarr/1", "scaledown": 1, "channels": ["nx"]},
+					"ny": {"zarr": "vol_ny.ome.zarr/1", "scaledown": 1, "channels": ["ny"]},
+				},
+			)
+			_create_omezarr(str(root / "vol_pred_dt.ome.zarr"), (8, 8, 8), 0, 3, 4, "pred_dt")
+			dt_arr = zarr.open(str(root / "vol_pred_dt.ome.zarr" / "0"), mode="r+")
+			dt_arr[0:4, 0:4, 0:4] = np.full((4, 4, 4), 13, dtype=np.uint8)
+
+			self._run_predict3d_until_model_build(
+				input_path=input_path,
+				output_path=output_path,
+				pred_dt_path=pred_dt_source,
+			)
+
+			raw = json.loads(output_path.read_text(encoding="utf-8"))
+			self.assertIn("pred_dt", raw["groups"])
+			self.assertEqual(raw["groups"]["pred_dt"]["zarr"], "vol_pred_dt.ome.zarr/0")
+			self.assertEqual(int(np.asarray(dt_arr[0, 0, 0])), 13)
 
 
 if __name__ == "__main__":

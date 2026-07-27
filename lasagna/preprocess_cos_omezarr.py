@@ -2792,7 +2792,8 @@ def run_preprocess_3d(
 
 	# Load or create the .lasagna.json manifest
 	json_path = Path(output_path)
-	if json_path.exists():
+	json_path_preexisting = json_path.exists()
+	if json_path_preexisting:
 		vol = LasagnaVolume.load(json_path)
 		print(f"[predict3d] loaded existing manifest: {output_path}", flush=True)
 		vol.base_shape_zyx = base_shape_zyx
@@ -2861,6 +2862,40 @@ def run_preprocess_3d(
 	nx_lv_arr = nx_grp[str(other_level)]
 	ny_lv_arr = ny_grp[str(other_level)]
 	dt_lv_arr = dt_grp[str(cos_level)] if dt_grp else None
+
+	desired_groups = {
+		"cos": ChannelGroup(
+			zarr_path=f"{prefix}cos.ome.zarr/{cos_level}",
+			scaledown=cos_level,
+			channels=["cos"],
+		),
+		"grad_mag": ChannelGroup(
+			zarr_path=f"{prefix}grad_mag.ome.zarr/{other_level}",
+			scaledown=other_level,
+			channels=["grad_mag"],
+		),
+		"nx": ChannelGroup(
+			zarr_path=f"{prefix}nx.ome.zarr/{other_level}",
+			scaledown=other_level,
+			channels=["nx"],
+		),
+		"ny": ChannelGroup(
+			zarr_path=f"{prefix}ny.ome.zarr/{other_level}",
+			scaledown=other_level,
+			channels=["ny"],
+		),
+	}
+	if pred_dt_path:
+		desired_groups["pred_dt"] = ChannelGroup(
+			zarr_path=f"{prefix}pred_dt.ome.zarr/{cos_level}",
+			scaledown=cos_level,
+			channels=["pred_dt"],
+		)
+	vol.groups = desired_groups
+	vol.save(
+		backup_existing=json_path_preexisting,
+		backup_suffix=time.strftime("%Y%m%d_%H%M%S"),
+	)
 
 	# Resume is handled per-chunk: _is_tile_done skips tiles whose output
 	# chunks exist, and the flush skips writing existing chunks.
@@ -3257,24 +3292,10 @@ def run_preprocess_3d(
 	if dt_omezarr_path:
 		_build_omezarr_pyramid(dt_omezarr_path, cos_level, n_levels, oc, crop_zyx=cos_crop_zyx, label="pred_dt")
 
-	# --- Update manifest ---
-	vol.update_group("cos", ChannelGroup(
-		zarr_path=f"{prefix}cos.ome.zarr/{cos_level}", scaledown=cos_level, channels=["cos"]))
-	vol.update_group("grad_mag", ChannelGroup(
-		zarr_path=f"{prefix}grad_mag.ome.zarr/{other_level}", scaledown=other_level, channels=["grad_mag"]))
-	vol.update_group("nx", ChannelGroup(
-		zarr_path=f"{prefix}nx.ome.zarr/{other_level}", scaledown=other_level, channels=["nx"]))
-	vol.update_group("ny", ChannelGroup(
-		zarr_path=f"{prefix}ny.ome.zarr/{other_level}", scaledown=other_level, channels=["ny"]))
-	if pred_dt_path:
-		vol.update_group("pred_dt", ChannelGroup(
-			zarr_path=f"{prefix}pred_dt.ome.zarr/{cos_level}", scaledown=cos_level, channels=["pred_dt"]))
-
 	# --- Resume training ---
 	if _gpu_ctx is not None:
 		_gpu_ctx.__exit__(None, None, None)
 
-	vol.save()
 	_removed_tmp_finish = _cleanup_predict3d_temp_files(
 		out_dir, prefix, remove_current_process=True,
 	)
