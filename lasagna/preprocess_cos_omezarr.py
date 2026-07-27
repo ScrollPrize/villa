@@ -1145,8 +1145,8 @@ def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
 		else:
 			return
 		length = (z1 - z0) * bytes_per_z
-		aligned_offset = (offset // page) * page
-		aligned_end = ((offset + length + page - 1) // page) * page
+		aligned_offset = ((offset + page - 1) // page) * page
+		aligned_end = ((offset + length) // page) * page
 		aligned_length = aligned_end - aligned_offset
 		if aligned_length <= 0:
 			return
@@ -1180,13 +1180,14 @@ def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
 
 
 class _RollingZBand:
-	"""Per-channel mmap-backed z band that grows and discards monotonically."""
+	"""Per-channel sparse mmap-backed z band with fixed logical coordinates."""
 
 	def __init__(
 		self,
 		*,
 		name: str,
 		channel_count: int,
+		z_size: int,
 		y_size: int,
 		x_size: int,
 		tmp_dir: str | None,
@@ -1194,25 +1195,38 @@ class _RollingZBand:
 	) -> None:
 		self.name = str(name)
 		self.channel_count = int(channel_count)
+		self.z_size = int(z_size)
 		self.y_size = int(y_size)
 		self.x_size = int(x_size)
 		self.tmp_dir = tmp_dir
 		self.prefix = str(prefix)
-		self.origin_z: int | None = None
-		self._arrays: list[np.memmap] = []
+		self.origin_z = 0
+		self._arrays = [self._new_array(ch) for ch in range(self.channel_count)]
 
-	def _new_array(self, ch: int, z_size: int) -> np.memmap:
+	def _new_array(self, ch: int) -> np.memmap:
 		fd, path = tempfile.mkstemp(
 			prefix=f".predict3d_pid{os.getpid()}_{self.prefix}{self.name}_ch{ch}_",
 			suffix=".tmp",
 			dir=self.tmp_dir if self.tmp_dir else None,
 		)
+		try:
+			logical_bytes = (
+				max(0, self.z_size)
+				* max(0, self.y_size)
+				* max(0, self.x_size)
+				* np.dtype(np.float32).itemsize
+			)
+			os.ftruncate(fd, logical_bytes)
+		except Exception:
+			os.close(fd)
+			_remove_path_quiet(path)
+			raise
 		os.close(fd)
 		mm = np.memmap(
 			path,
 			dtype=np.float32,
-			mode="w+",
-			shape=(max(0, int(z_size)), self.y_size, self.x_size),
+			mode="r+",
+			shape=(self.z_size, self.y_size, self.x_size),
 		)
 		mm._lasagna_tmp_path = path
 		atexit.register(lambda p=path: os.path.exists(p) and os.unlink(p))
@@ -1220,35 +1234,23 @@ class _RollingZBand:
 
 	@property
 	def end_z(self) -> int:
-		if self.origin_z is None or not self._arrays:
-			return 0
-		return self.origin_z + int(self._arrays[0].shape[0])
+		return self.z_size
 
 	def ensure(self, z0: int, z1: int) -> None:
 		z0 = int(z0)
 		z1 = int(z1)
 		if z1 <= z0:
 			return
-		if self.origin_z is None:
-			self.origin_z = z0
-			self._arrays = [self._new_array(ch, z1 - z0) for ch in range(self.channel_count)]
-			return
 		if z0 < self.origin_z:
 			raise ValueError(
 				f"{self.name} rolling band cannot revisit z={z0}; "
 				f"current origin is {self.origin_z}"
 			)
-		if z1 <= self.end_z:
-			return
-		old_arrays = self._arrays
-		old_z = 0 if not old_arrays else int(old_arrays[0].shape[0])
-		new_z = z1 - self.origin_z
-		new_arrays = [self._new_array(ch, new_z) for ch in range(self.channel_count)]
-		for old, new in zip(old_arrays, new_arrays):
-			if old_z > 0:
-				new[:old_z] = old[:old_z]
-			self._cleanup_array(old)
-		self._arrays = new_arrays
+		if z1 > self.z_size:
+			raise ValueError(
+				f"{self.name} rolling band cannot extend to z={z1}; "
+				f"logical size is {self.z_size}"
+			)
 
 	def add(
 		self,
@@ -1264,39 +1266,26 @@ class _RollingZBand:
 		if z1 <= z0 or y1 <= y0 or x1 <= x0:
 			return
 		self.ensure(z0, z1)
-		assert self.origin_z is not None
-		lz0 = z0 - self.origin_z
-		lz1 = z1 - self.origin_z
-		self._arrays[int(ch)][lz0:lz1, y0:y1, x0:x1] += data
+		self._arrays[int(ch)][int(z0):int(z1), y0:y1, x0:x1] += data
 
 	def view(self, ch: int, z0: int, z1: int) -> np.ndarray:
-		if self.origin_z is None or z1 <= z0:
+		if z1 <= z0:
 			raise ValueError(f"{self.name} rolling band has no data for z=[{z0},{z1})")
 		if z0 < self.origin_z or z1 > self.end_z:
 			raise ValueError(
 				f"{self.name} rolling band missing z=[{z0},{z1}); "
 				f"available=[{self.origin_z},{self.end_z})"
 			)
-		lz0 = int(z0) - self.origin_z
-		lz1 = int(z1) - self.origin_z
-		return self._arrays[int(ch)][lz0:lz1]
+		return self._arrays[int(ch)][int(z0):int(z1)]
 
 	def discard_before(self, z_new: int) -> None:
 		z_new = int(z_new)
-		if self.origin_z is None or z_new <= self.origin_z:
+		if z_new <= self.origin_z:
 			return
-		if z_new >= self.end_z:
-			self.cleanup()
-			return
-		keep0 = z_new - self.origin_z
-		keep_z = self.end_z - z_new
-		old_arrays = self._arrays
-		new_arrays = [self._new_array(ch, keep_z) for ch in range(self.channel_count)]
-		for old, new in zip(old_arrays, new_arrays):
-			new[:] = old[keep0:]
-			self._cleanup_array(old)
-		self.origin_z = z_new
-		self._arrays = new_arrays
+		z_release = min(z_new, self.z_size)
+		for arr in self._arrays:
+			_release_memmap_pages(arr, self.origin_z, z_release)
+		self.origin_z = z_release
 
 	def _cleanup_array(self, arr: np.ndarray) -> None:
 		path = getattr(arr, "_lasagna_tmp_path", None)
@@ -1311,7 +1300,7 @@ class _RollingZBand:
 		for arr in self._arrays:
 			self._cleanup_array(arr)
 		self._arrays = []
-		self.origin_z = None
+		self.origin_z = self.z_size
 
 
 def _edt_reader_proc(pred_path, work_list, overlap, pZ, pY, pX,
@@ -2321,19 +2310,19 @@ def _infer_tiled_3d(
 	n_other = out_channels - 1
 	if streaming:
 		acc_fine = _RollingZBand(
-			name="acc_fine", channel_count=1, y_size=Yo_f, x_size=Xo_f,
+			name="acc_fine", channel_count=1, z_size=Zo_f, y_size=Yo_f, x_size=Xo_f,
 			tmp_dir=tmp_dir, prefix=temp_prefix,
 		)
 		wsum_fine = _RollingZBand(
-			name="wsum_fine", channel_count=1, y_size=Yo_f, x_size=Xo_f,
+			name="wsum_fine", channel_count=1, z_size=Zo_f, y_size=Yo_f, x_size=Xo_f,
 			tmp_dir=tmp_dir, prefix=temp_prefix,
 		)
 		acc_coarse = _RollingZBand(
-			name="acc_coarse", channel_count=n_other, y_size=Yo_c, x_size=Xo_c,
+			name="acc_coarse", channel_count=n_other, z_size=Zo_c, y_size=Yo_c, x_size=Xo_c,
 			tmp_dir=tmp_dir, prefix=temp_prefix,
 		)
 		wsum_coarse = _RollingZBand(
-			name="wsum_coarse", channel_count=1, y_size=Yo_c, x_size=Xo_c,
+			name="wsum_coarse", channel_count=1, z_size=Zo_c, y_size=Yo_c, x_size=Xo_c,
 			tmp_dir=tmp_dir, prefix=temp_prefix,
 		)
 		print(

@@ -31,6 +31,7 @@ from preprocess_cos_omezarr import (
 	_create_omezarr,
 	_grad_mag_factor_from_input_sd,
 	_infer_tiled_3d,
+	_omezarr_chunk_exists,
 	_omezarr_chunk_group_complete,
 	_predict3d_overall_eta,
 	run_preprocess_3d,
@@ -81,6 +82,18 @@ class _ConstantPredict3dModel:
 
 	def __call__(self, tile_t: torch.Tensor) -> torch.Tensor:
 		return torch.zeros(
+			(tile_t.shape[0], 8, tile_t.shape[2], tile_t.shape[3], tile_t.shape[4]),
+			dtype=torch.float32,
+			device=tile_t.device,
+		)
+
+
+class _OnesPredict3dModel:
+	def eval(self):
+		return self
+
+	def __call__(self, tile_t: torch.Tensor) -> torch.Tensor:
+		return torch.ones(
 			(tile_t.shape[0], 8, tile_t.shape[2], tile_t.shape[3], tile_t.shape[4]),
 			dtype=torch.float32,
 			device=tile_t.device,
@@ -456,7 +469,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 	def test_rolling_z_band_discards_without_cross_channel_release(self):
 		with tempfile.TemporaryDirectory() as td:
 			band = _RollingZBand(
-				name="test", channel_count=2, y_size=2, x_size=2,
+				name="test", channel_count=2, z_size=4, y_size=2, x_size=2,
 				tmp_dir=td, prefix="unit_",
 			)
 			band.add(0, 0, 4, 0, 2, 0, 2, np.ones((4, 2, 2), dtype=np.float32))
@@ -466,6 +479,110 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			np.testing.assert_array_equal(band.view(1, 2, 4), np.full((2, 2, 2), 5, dtype=np.float32))
 			band.cleanup()
 			self.assertEqual([p for p in Path(td).iterdir() if p.name.startswith(".predict3d_")], [])
+
+	def test_rolling_z_band_sparse_ranges_read_as_zero(self):
+		with tempfile.TemporaryDirectory() as td:
+			band = _RollingZBand(
+				name="test", channel_count=1, z_size=6, y_size=2, x_size=2,
+				tmp_dir=td, prefix="unit_",
+			)
+			np.testing.assert_array_equal(
+				band.view(0, 0, 6),
+				np.zeros((6, 2, 2), dtype=np.float32),
+			)
+
+			band.add(0, 2, 4, 0, 2, 0, 2, np.full((2, 2, 2), 7, dtype=np.float32))
+			np.testing.assert_array_equal(
+				band.view(0, 0, 2),
+				np.zeros((2, 2, 2), dtype=np.float32),
+			)
+			np.testing.assert_array_equal(
+				band.view(0, 2, 4),
+				np.full((2, 2, 2), 7, dtype=np.float32),
+			)
+
+			band.add(0, 5, 6, 0, 2, 0, 2, np.full((1, 2, 2), 3, dtype=np.float32))
+			np.testing.assert_array_equal(
+				band.view(0, 4, 5),
+				np.zeros((1, 2, 2), dtype=np.float32),
+			)
+			np.testing.assert_array_equal(
+				band.view(0, 5, 6),
+				np.full((1, 2, 2), 3, dtype=np.float32),
+			)
+			band.cleanup()
+
+	def test_rolling_z_band_discard_releases_and_rejects_revisit(self):
+		with tempfile.TemporaryDirectory() as td:
+			band = _RollingZBand(
+				name="test", channel_count=1, z_size=6, y_size=2, x_size=2,
+				tmp_dir=td, prefix="unit_",
+			)
+			band.add(0, 4, 6, 0, 2, 0, 2, np.full((2, 2, 2), 9, dtype=np.float32))
+			with mock.patch("preprocess_cos_omezarr._release_memmap_pages") as release:
+				band.discard_before(4)
+			release.assert_called_once()
+			self.assertEqual((release.call_args.args[1], release.call_args.args[2]), (0, 4))
+			self.assertEqual(band.origin_z, 4)
+			np.testing.assert_array_equal(
+				band.view(0, 4, 6),
+				np.full((2, 2, 2), 9, dtype=np.float32),
+			)
+			with self.assertRaises(ValueError):
+				band.view(0, 3, 4)
+			with self.assertRaises(ValueError):
+				band.add(0, 3, 4, 0, 2, 0, 2, np.ones((1, 2, 2), dtype=np.float32))
+			band.cleanup()
+
+	def test_predict3d_sparse_skipped_z_prefix_flushes_later_suffix(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = root / "input.zarr"
+			arr = zarr.open(str(input_path), mode="w", shape=(8, 4, 4), chunks=(4, 4, 4), dtype="uint8")
+			arr[4:8, :, :] = np.full((4, 4, 4), 1, dtype=np.uint8)
+			output_path = root / "vol.lasagna.json"
+			gpu_pause_stub = types.ModuleType("gpu_pause")
+			gpu_pause_stub.gpu_pause_context = lambda: None
+			stdout = io.StringIO()
+
+			with mock.patch.dict(sys.modules, {"gpu_pause": gpu_pause_stub}):
+				with mock.patch.object(
+					train_stub,
+					"build_model",
+					return_value=(_OnesPredict3dModel(), None, None, False),
+				):
+					with mock.patch("preprocess_cos_omezarr._build_omezarr_pyramid"):
+						with mock.patch("preprocess_cos_omezarr.build_normal_omezarr_pyramid"):
+							with mock.patch("sys.stdout", stdout):
+								run_preprocess_3d(
+									input_path=str(input_path),
+									output_path=str(output_path),
+									unet3d_checkpoint=str(root / "missing_model.pt"),
+									device="cpu",
+									crop_xyzwhd=None,
+									tile_size=4,
+									overlap=0,
+									border=0,
+									cos_scaledown=1,
+									scaledown=1,
+									source_to_base=1.0,
+									base_ref=str(input_path),
+									n_levels=2,
+									ome_chunk=4,
+								)
+
+			cos_path = str(root / "vol_cos.ome.zarr")
+			gm_path = str(root / "vol_grad_mag.ome.zarr")
+			nx_path = str(root / "vol_nx.ome.zarr")
+			ny_path = str(root / "vol_ny.ome.zarr")
+			self.assertFalse(_omezarr_chunk_exists(cos_path, 0, 0, 0, 0, 4))
+			self.assertTrue(_omezarr_chunk_exists(cos_path, 0, 4, 0, 0, 4))
+			for path in (gm_path, nx_path, ny_path):
+				self.assertFalse(_omezarr_chunk_exists(path, 0, 0, 0, 0, 4))
+				self.assertTrue(_omezarr_chunk_exists(path, 0, 4, 0, 0, 4))
+			out = stdout.getvalue()
+			self.assertIn("final_z=4/8", out)
+			self.assertIn("final_z=8/8", out)
 
 	def test_canonical_tile_positions_do_not_shift_with_crop_origin(self):
 		kwargs = {
