@@ -91,6 +91,19 @@ jobs:
       - name: Build
         run: ninja -C build/ci-windows-mingw
 
+      - name: Smoke test build-tree VC3D
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
+          $env:QT_PLUGIN_PATH = "C:\msys64\ucrt64\share\qt6\plugins"
+          $binary = Get-Item `
+            "${{ github.workspace }}\volume-cartographer\build\ci-windows-mingw\bin\VC3D.exe"
+          Write-Host "VC3D.exe size: $($binary.Length) bytes"
+          & "C:\msys64\ucrt64\bin\objdump.exe" -f $binary.FullName
+          & $binary.FullName --version
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
