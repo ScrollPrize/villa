@@ -293,14 +293,6 @@ endif()
 
 add_executable(VC3D ${srcs} resources.qrc)
 
-if(MINGW)
-    # A PE image cannot be loaded once it reaches 2 GiB. Keep line tables for
-    # release backtraces without embedding full type information in VC3D.exe.
-    target_compile_options(VC3D PRIVATE
-        "$<$<CONFIG:Release>:-g1>"
-        "$<$<CONFIG:Release>:-feliminate-unused-debug-types>")
-endif()
-
 if(WIN32)
     # GUI subsystem so double-click launch doesn't open a console window.
     set_target_properties(VC3D PROPERTIES WIN32_EXECUTABLE ON)
