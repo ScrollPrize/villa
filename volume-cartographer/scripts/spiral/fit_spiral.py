@@ -1836,7 +1836,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         temporary = f'{destination}.tmp-{os.getpid()}-{time.time_ns()}'
         try:
             torch.save(checkpoint_payload(completed_iterations), temporary)
-            with open(temporary, 'rb') as stream:
+            # 'rb+' not 'rb': fsync on Windows (_commit) requires a writable descriptor.
+            with open(temporary, 'rb+') as stream:
                 os.fsync(stream.fileno())
             os.replace(temporary, destination)
             try:
