@@ -120,6 +120,7 @@ jobs:
           $env:PYTHON = $python
           $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
           $env:QT_PLUGIN_PATH = "C:\msys64\ucrt64\share\qt6\plugins"
+          $env:QT_QPA_PLATFORM = "offscreen"
           & $python -m pip install -e .
           & $python -m pip check
           & $python -m unittest -v `
