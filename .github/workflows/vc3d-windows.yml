@@ -101,6 +101,9 @@ jobs:
           $binary = Get-Item `
             "${{ github.workspace }}\volume-cartographer\build\ci-windows-mingw\bin\VC3D.exe"
           Write-Host "VC3D.exe size: $($binary.Length) bytes"
+          if ($binary.Length -ge 2GB) {
+            throw "VC3D.exe exceeds the Windows 2 GiB image limit"
+          }
           & "C:\msys64\ucrt64\bin\objdump.exe" -f $binary.FullName
           & $binary.FullName --version
 
