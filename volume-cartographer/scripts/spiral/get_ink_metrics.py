@@ -174,14 +174,34 @@ def run_worker(argv):
 # structure at the wrong scale (e.g. beautifully periodic 100 px "columns")
 # scores near zero.
 # ===========================================================================
-COL_WIDTH_PX = 850.0         # expected column width in strip pixels
 COL_WIDTH_TOL = 0.15         # fractional width variation that still scores 1.0
-LINE_PITCH_PX = (80.0, 120.0)  # expected text-line pitch band in strip pixels
 LINE_WIN_PX = 512            # x-window for line detection (~half a column)
 LINE_STEP_PX = 256
 LINE_MIN_WINDOW_INK = 0.01   # mean ink probability for a window to count
 LINE_MIN_GAPS = 10           # below this many observed gaps, scale the score down
 PROFILE_DS = 4               # downsampling of the density profile kept in metrics.json
+
+# The column-width and line-pitch priors are expressed in *physical* length units
+# (millimetres on the scroll surface), NOT strip pixels. A strip's pixels-per-mm depends
+# on the flattener (flatboi is ~isometric; the lasagna whole-scroll flattener is ~35%
+# coarser, and its meta.json `scale` does not match the geometry) AND on the volume's voxel
+# size, so a pixel prior silently means different physical sizes on different strips. At
+# scoring time run_main converts mm -> px with the strip's own measured um/px, itself the
+# product of the flat mesh's vertex spacing (voxels/px, mesh_surface_scale) and the volume
+# voxel size (um/voxel, mesh_voxel_size_um). Values are the historical px priors expressed
+# physically (on this S1 volume ~8.1 vox/px, ~9.6 um/vox: 850 px ~= 65 mm, 80-120 px ~=
+# 6.2-9.3 mm), with the column width rounded to 65 mm.
+COL_WIDTH_MM = 65.0              # expected text column width, millimetres
+LINE_PITCH_MM = (6.22, 9.33)     # expected text-line pitch band, millimetres
+# Fallbacks used only when a factor can't be read from the mesh (legacy per-winding strips,
+# --no-measured-scale, or missing area metadata). Converting the mm priors through both
+# recovers the historical 850 px / 80-120 px behaviour.
+REF_VOX_PER_PX = 8.1             # flatboi strips' surface-voxels per pixel
+REF_UM_PER_VOX = 9.6             # S1 volume voxel size (um) if mesh area metadata is absent
+# Pixel-space defaults for score_columns/score_lines: only used if they are called without
+# an explicit prior (run_main always passes the physically-derived value).
+COL_WIDTH_PX = COL_WIDTH_MM * 1000.0 / (REF_VOX_PER_PX * REF_UM_PER_VOX)
+LINE_PITCH_PX = tuple(p * 1000.0 / (REF_VOX_PER_PX * REF_UM_PER_VOX) for p in LINE_PITCH_MM)
 
 
 def band_score(value, lo, hi, log_sigma=0.22):
@@ -358,6 +378,58 @@ def load_concat_strip(paths):
     return np.concatenate(padded, axis=1)
 
 
+def mesh_surface_scale(mesh_dir, strip_w_px, strip_h_px):
+    """Measure the flat mesh's physical scale as surface-voxels per rendered pixel,
+    separately for the horizontal (column-width) and vertical (line-pitch) axes.
+
+    The flattener's meta.json `scale` is nominal and (for the lasagna forward
+    flattener) does not match the delivered geometry, so we measure it directly: the
+    median 3D distance between adjacent grid vertices is voxels-per-grid-cell, and the
+    rendered strip's px / grid-cell count is px-per-grid-cell; their ratio is
+    voxels-per-pixel. Returns (vox_per_px_x, vox_per_px_y), or None if the mesh can't
+    be read (e.g. legacy per-winding strips with no whole-scroll flat mesh) so the
+    caller can fall back to the raw px priors."""
+    try:
+        from tifxyz import load_tifxyz
+        z = load_tifxyz(mesh_dir).zyxs.cpu().numpy()   # (H, W, 3) voxel coords, -1 == invalid
+    except Exception as e:
+        print(f'  [scale] could not read flat mesh {mesh_dir}: {e}')
+        return None
+    H, W, _ = z.shape
+    valid = z[..., 0] >= 0
+    mc = valid[:, 1:] & valid[:, :-1]     # adjacent-column pairs both valid
+    mr = valid[1:, :] & valid[:-1, :]     # adjacent-row pairs both valid
+    if mc.sum() < 100 or mr.sum() < 100:
+        print(f'  [scale] too few valid grid adjacencies in {mesh_dir}')
+        return None
+    col_vox = float(np.median(np.linalg.norm((z[:, 1:] - z[:, :-1])[mc], axis=1)))
+    row_vox = float(np.median(np.linalg.norm((z[1:, :] - z[:-1, :])[mr], axis=1)))
+    px_per_gridcol = strip_w_px / W
+    px_per_gridrow = strip_h_px / H
+    if px_per_gridcol <= 0 or px_per_gridrow <= 0:
+        return None
+    return col_vox / px_per_gridcol, row_vox / px_per_gridrow
+
+
+def mesh_voxel_size_um(mesh_dir):
+    """Micrometres per voxel edge for the volume this mesh lives in, from its area
+    metadata: um/vox = sqrt(area_cm2 / area_vx2 * 1e8). The lasagna flat mesh omits
+    area_cm2, so fall back to the raw concat mesh (mesh_dir minus the '_flat' suffix),
+    which carries it. Returns None if neither is available."""
+    cands = [mesh_dir]
+    if mesh_dir.endswith('_flat'):
+        cands.insert(0, mesh_dir[:-len('_flat')])   # raw concat mesh (has area_cm2)
+    for cand in cands:
+        try:
+            with open(os.path.join(cand, 'meta.json')) as f:
+                meta = json.load(f)
+            if meta.get('area_cm2') and meta.get('area_vx2'):
+                return (meta['area_cm2'] / meta['area_vx2'] * 1e8) ** 0.5
+        except Exception:
+            continue
+    return None
+
+
 def detect_folds(model_dir):
     folds = []
     for name in sorted(os.listdir(model_dir)):
@@ -467,12 +539,17 @@ def run_main(argv):
                     help='ensemble foreground-probability threshold for the mask '
                          '(0.5 == argmax; lower = more permissive)')
     ap.add_argument('--step', type=float, default=0.5, help='nnU-Net tile_step_size')
-    ap.add_argument('--col-width-px', type=float, default=COL_WIDTH_PX,
-                    help='expected text column width in strip pixels (layout prior)')
+    ap.add_argument('--col-width-mm', type=float, default=COL_WIDTH_MM,
+                    help='expected text column width in millimetres (physical layout '
+                         "prior); converted to strip pixels with the strip's measured um/px")
     ap.add_argument('--col-width-tol', type=float, default=COL_WIDTH_TOL,
                     help='fractional column-width variation that still scores 1.0')
-    ap.add_argument('--line-pitch-px', default=f'{LINE_PITCH_PX[0]:g},{LINE_PITCH_PX[1]:g}',
-                    help='expected text-line pitch band in strip pixels, as "min,max"')
+    ap.add_argument('--line-pitch-mm', default=f'{LINE_PITCH_MM[0]:g},{LINE_PITCH_MM[1]:g}',
+                    help='expected text-line pitch band in millimetres, as "min,max"; '
+                         "converted to strip pixels with the strip's measured um/px")
+    ap.add_argument('--no-measured-scale', action='store_true',
+                    help='skip measuring the flat mesh; convert the mm priors with the fixed '
+                         'reference scale (REF_VOX_PER_PX, REF_UM_PER_VOX) instead')
     ap.add_argument('--no-tta', action='store_true',
                     help='disable mirroring test-time augmentation (~faster, slightly worse)')
     ap.add_argument('--procs', type=int, default=8,
@@ -567,16 +644,41 @@ def run_main(argv):
     px_area_cm2 = None
     if args.pixel_size_um:
         px_area_cm2 = (args.pixel_size_um * 1e-4) ** 2  # (um -> cm)^2 per pixel
-    line_band = tuple(float(x) for x in args.line_pitch_px.split(','))
-    if len(line_band) != 2 or line_band[0] >= line_band[1]:
-        ap.error(f'--line-pitch-px must be "min,max", got {args.line_pitch_px!r}')
+    line_pitch_mm = tuple(float(x) for x in args.line_pitch_mm.split(','))
+    if len(line_pitch_mm) != 2 or line_pitch_mm[0] >= line_pitch_mm[1]:
+        ap.error(f'--line-pitch-mm must be "min,max", got {args.line_pitch_mm!r}')
 
     probs = [load_fold_prob(os.path.join(fold_out[f], f'{name}.npz')) for f in folds]
     avg = np.mean(probs, axis=0)          # (num_classes, H, W)
     fg_prob = avg[1]                       # class 1 == ink
     mask = fg_prob >= args.fg_threshold
-    col_metrics, col_detail = score_columns(fg_prob, args.col_width_px, args.col_width_tol)
-    line_metrics = score_lines(fg_prob, line_band)
+
+    # Convert the physical (mm) layout priors to strip pixels using this strip's own
+    # micrometres-per-pixel, so the column-width and line-pitch priors track real geometry
+    # regardless of the flattener's pixels-per-mm or the volume's voxel size. um/px is the
+    # product of the flat mesh's vertex spacing (voxels/px) and the volume voxel size
+    # (um/voxel). Only the whole-scroll `_flat` mesh has geometry matching the scored strip;
+    # legacy per-winding strips (and --no-measured-scale, or missing metadata) fall back to
+    # the fixed reference scale, which recovers the historical px priors.
+    mesh_dir = os.path.join(os.path.dirname(ink_dir), 'concat', name)
+    scale = None
+    if not args.no_measured_scale and name.endswith('_flat'):
+        scale = mesh_surface_scale(mesh_dir, fg_prob.shape[1], fg_prob.shape[0])
+    um_per_vox = mesh_voxel_size_um(mesh_dir) or REF_UM_PER_VOX
+    vpx, vpy = scale if scale is not None else (REF_VOX_PER_PX, REF_VOX_PER_PX)
+    um_per_px_x, um_per_px_y = vpx * um_per_vox, vpy * um_per_vox
+    eff_col_width = args.col_width_mm * 1000.0 / um_per_px_x
+    eff_line_band = (line_pitch_mm[0] * 1000.0 / um_per_px_y,
+                     line_pitch_mm[1] * 1000.0 / um_per_px_y)
+    src = 'measured' if scale is not None else 'reference'
+    print(f'  [scale] {src} scale, {um_per_vox:.2f} um/vox  ->  '
+          f'{um_per_px_x:.1f} um/px (x), {um_per_px_y:.1f} um/px (y)  ->  '
+          f'col_width {args.col_width_mm:g}mm={eff_col_width:.0f}px, '
+          f'line_pitch {line_pitch_mm[0]:g}-{line_pitch_mm[1]:g}mm='
+          f'{eff_line_band[0]:.0f}-{eff_line_band[1]:.0f}px')
+
+    col_metrics, col_detail = score_columns(fg_prob, eff_col_width, args.col_width_tol)
+    line_metrics = score_lines(fg_prob, eff_line_band)
     # Guard against any resampling size drift between prob map and source strip.
     if mask.shape != gray.shape:
         gray = np.asarray(Image.fromarray(gray).resize(
@@ -604,8 +706,8 @@ def run_main(argv):
     row['columns'] = col_detail
     # Per-slice breakdown (scored independently) for the report's granular table and
     # its display rows; json-only, kept out of the flat metrics.csv.
-    row['slices'] = slice_metrics(fg_prob, mask, args.col_width_px,
-                                  args.col_width_tol, line_band)
+    row['slices'] = slice_metrics(fg_prob, mask, eff_col_width,
+                                  args.col_width_tol, eff_line_band)
     print(f'  {name}  {mask.shape[1]:,}x{mask.shape[0]} '
           f'ink={fg:,}px  ({row["fg_fraction"]*100:.2f}%)  '
           f'lines={row["line_score"]:.2f}@{row["line_median_pitch_px"]}px  '
@@ -620,9 +722,14 @@ def run_main(argv):
         'checkpoint': args.checkpoint,
         'folds': folds,
         'fg_threshold': args.fg_threshold,
-        'col_width_px': args.col_width_px,
+        'col_width_mm': args.col_width_mm,
+        'col_width_px': eff_col_width,
         'col_width_tol': args.col_width_tol,
-        'line_pitch_px': list(line_band),
+        'line_pitch_mm': list(line_pitch_mm),
+        'line_pitch_px': list(eff_line_band),
+        'surface_scale_vox_per_px': (list(scale) if scale is not None else None),
+        'voxel_size_um': um_per_vox,
+        'scale_source': src,
         'total_fg_pixels': fg,
         'total_pixels': n,
         'overall_fg_fraction': row['fg_fraction'],
@@ -654,9 +761,9 @@ def run_main(argv):
     print(f'total strip area       : {n:,} px')
     print(f'overall ink fraction   : {summary["overall_fg_fraction"]*100:.3f} %')
     print(f'overall line-ness      : {summary["overall_line_score"]:.3f}   '
-          f'(1 = all line pitches in {line_band[0]:g}-{line_band[1]:g} px band)')
+          f'(1 = all line pitches in {eff_line_band[0]:g}-{eff_line_band[1]:g} px band)')
     print(f'overall column-ness    : {summary["overall_column_score"]:.3f}   '
-          f'(1 = clean columns of ~{args.col_width_px:g} px +/- {args.col_width_tol*100:g}%)')
+          f'(1 = clean columns of ~{eff_col_width:g} px +/- {args.col_width_tol*100:g}%)')
     if px_area_cm2 is not None:
         print(f'TOTAL ink area         : {summary["total_fg_area_cm2"]:.3f} cm^2')
     print(f'predictions            : {pred_dir}')
