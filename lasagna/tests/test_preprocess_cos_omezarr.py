@@ -37,6 +37,7 @@ from preprocess_cos_omezarr import (
 )
 from omezarr_pyramid import (
 	_make_downsample_work,
+	_write_level_block,
 	build_normal_omezarr_pyramid,
 	build_scalar_omezarr_pyramid,
 	downsample_normal_pair_chunk_worker,
@@ -301,6 +302,46 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 			self.assertEqual(crop_work, [])
 			self.assertTrue(any((z0, y0, x0) == (8, 0, 0) for *_prefix, z0, _z1, y0, _y1, x0, _x1, _zero in full_work))
+
+	def test_pyramid_level_write_is_atomic_and_cleans_temp_dir(self):
+		with tempfile.TemporaryDirectory() as td:
+			path = str(Path(td) / "cos.ome.zarr")
+			_create_omezarr(path, (16, 16, 16), 0, 3, 4, "cos")
+			block = np.full((4, 4, 4), 11, dtype=np.uint8)
+
+			_write_level_block(
+				omezarr_path=path,
+				level=1,
+				z0=0,
+				y0=0,
+				x0=0,
+				data=block,
+				n_levels=3,
+			)
+
+			arr1 = zarr.open(str(Path(path) / "1"), mode="r")
+			self.assertEqual(int(np.asarray(arr1[0, 0, 0])), 11)
+			self.assertEqual([p.name for p in Path(td).iterdir() if p.name.startswith(".tmp.")], [])
+
+	def test_pyramid_level_atomic_write_invalidates_coarser_chunk(self):
+		with tempfile.TemporaryDirectory() as td:
+			path = str(Path(td) / "cos.ome.zarr")
+			_create_omezarr(path, (16, 16, 16), 0, 3, 4, "cos")
+			arr2 = zarr.open(str(Path(path) / "2"), mode="r+")
+			arr2[0:4, 0:4, 0:4] = np.full((4, 4, 4), 5, dtype=np.uint8)
+			self.assertTrue(Path(path, "2", "0", "0", "0").is_file())
+
+			_write_level_block(
+				omezarr_path=path,
+				level=1,
+				z0=0,
+				y0=0,
+				x0=0,
+				data=np.full((4, 4, 4), 9, dtype=np.uint8),
+				n_levels=3,
+			)
+
+			self.assertFalse(Path(path, "2", "0", "0", "0").exists())
 
 	def test_pyramid_full_source_stream_writes_missing_chunk_outside_crop(self):
 		with tempfile.TemporaryDirectory() as td:

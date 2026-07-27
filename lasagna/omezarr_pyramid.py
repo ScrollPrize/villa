@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 import shutil
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -227,6 +229,7 @@ def _write_level_block(
 	y0: int,
 	x0: int,
 	data: np.ndarray,
+	n_levels: int = 0,
 ) -> None:
 	g = zarr.open_group(str(omezarr_path), mode="r+")
 	dst = g[str(level)]
@@ -235,7 +238,95 @@ def _write_level_block(
 	x1 = min(int(dst.shape[2]), int(x0) + int(data.shape[2]))
 	wz, wy, wx = z1 - int(z0), y1 - int(y0), x1 - int(x0)
 	if wz > 0 and wy > 0 and wx > 0:
-		dst[int(z0):z1, int(y0):y1, int(x0):x1] = data[:wz, :wy, :wx]
+		_atomic_write_level_block(
+			omezarr_path=str(omezarr_path),
+			level=int(level),
+			z0=int(z0),
+			y0=int(y0),
+			x0=int(x0),
+			z1=z1,
+			y1=y1,
+			x1=x1,
+			data=data[:wz, :wy, :wx],
+			chunk_zyx=tuple(int(v) for v in dst.chunks[-3:]),
+			n_levels=int(n_levels),
+		)
+
+
+def _remove_path_quiet(path: str | Path) -> None:
+	p = Path(path)
+	try:
+		if p.is_dir():
+			shutil.rmtree(p)
+		else:
+			p.unlink()
+	except FileNotFoundError:
+		pass
+
+
+def _invalidate_coarser_chunks(
+	omezarr_path: str | Path,
+	level: int,
+	n_levels: int,
+	iz: int,
+	iy: int,
+	ix: int,
+) -> None:
+	for lv in range(int(level) + 1, int(n_levels)):
+		iz, iy, ix = int(iz) // 2, int(iy) // 2, int(ix) // 2
+		sep = omezarr_dim_sep(omezarr_path, lv)
+		path = zarr_chunk_path(Path(omezarr_path) / str(lv), sep, iz, iy, ix)
+		try:
+			path.unlink()
+		except FileNotFoundError:
+			pass
+
+
+def _atomic_write_level_block(
+	*,
+	omezarr_path: str,
+	level: int,
+	z0: int,
+	y0: int,
+	x0: int,
+	z1: int,
+	y1: int,
+	x1: int,
+	data: np.ndarray,
+	chunk_zyx: tuple[int, int, int],
+	n_levels: int = 0,
+) -> None:
+	"""Write through a temp zarr and atomically replace completed chunk files."""
+	sep = omezarr_dim_sep(omezarr_path, level)
+	level_path = Path(omezarr_path) / str(level)
+	tmp_path = (
+		Path(omezarr_path).parent
+		/ f".tmp.{Path(omezarr_path).name}.{level}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+	)
+	cz, cy, cx = _normalize_chunk_zyx(chunk_zyx)
+	try:
+		tmp_path.mkdir(parents=True, exist_ok=True)
+		zarray_src = level_path / ".zarray"
+		zarray_dst = tmp_path / ".zarray"
+		if zarray_src.is_file() and not zarray_dst.is_file():
+			shutil.copy2(zarray_src, zarray_dst)
+
+		tmp_arr = zarr.open(str(tmp_path), mode="r+")
+		tmp_arr[int(z0):int(z1), int(y0):int(y1), int(x0):int(x1)] = data
+
+		for cz0 in range((int(z0) // cz) * cz, int(z1), cz):
+			for cy0 in range((int(y0) // cy) * cy, int(y1), cy):
+				for cx0 in range((int(x0) // cx) * cx, int(x1), cx):
+					iz, iy, ix = cz0 // cz, cy0 // cy, cx0 // cx
+					src = zarr_chunk_path(tmp_path, sep, iz, iy, ix)
+					dst = zarr_chunk_path(level_path, sep, iz, iy, ix)
+					if src.is_file():
+						dst.parent.mkdir(parents=True, exist_ok=True)
+						if int(n_levels) > 0:
+							_invalidate_coarser_chunks(omezarr_path, level, n_levels, iz, iy, ix)
+						src.replace(dst)
+	finally:
+		_remove_path_quiet(tmp_path)
 
 
 def downsample_scalar_chunk_worker(args_tuple) -> None:
@@ -246,16 +337,24 @@ def downsample_scalar_chunk_worker(args_tuple) -> None:
 		require_source_chunks = False
 		dst_chunk_zyx = None
 		src_chunk_zyx = None
+		n_levels = 0
 	elif len(args_tuple) == 10:
 		(out_path_str, src_level, dst_level, z0, z1, y0, y1, x0, x1, zero_overrides) = args_tuple
 		skip_existing = False
 		require_source_chunks = False
 		dst_chunk_zyx = None
 		src_chunk_zyx = None
-	else:
+		n_levels = 0
+	elif len(args_tuple) == 14:
 		(
 			out_path_str, src_level, dst_level, z0, z1, y0, y1, x0, x1,
 			zero_overrides, skip_existing, require_source_chunks, dst_chunk_zyx, src_chunk_zyx,
+		) = args_tuple
+		n_levels = 0
+	else:
+		(
+			out_path_str, src_level, dst_level, z0, z1, y0, y1, x0, x1,
+			zero_overrides, skip_existing, require_source_chunks, dst_chunk_zyx, src_chunk_zyx, n_levels,
 		) = args_tuple
 	if skip_existing and omezarr_chunk_exists(
 		out_path_str, dst_level, int(z0) // 2, int(y0) // 2, int(x0) // 2, dst_chunk_zyx,
@@ -278,6 +377,7 @@ def downsample_scalar_chunk_worker(args_tuple) -> None:
 		y0=int(y0) // 2,
 		x0=int(x0) // 2,
 		data=down,
+		n_levels=int(n_levels),
 	)
 	return "written"
 
@@ -290,10 +390,17 @@ def downsample_normal_pair_chunk_worker(args_tuple) -> None:
 		dst_chunk_zyx = None
 		nx_src_chunk_zyx = None
 		ny_src_chunk_zyx = None
-	else:
+		n_levels = 0
+	elif len(args_tuple) == 15:
 		(
 			nx_path_str, ny_path_str, src_level, dst_level, z0, z1, y0, y1, x0, x1,
 			skip_existing, require_source_chunks, dst_chunk_zyx, nx_src_chunk_zyx, ny_src_chunk_zyx,
+		) = args_tuple
+		n_levels = 0
+	else:
+		(
+			nx_path_str, ny_path_str, src_level, dst_level, z0, z1, y0, y1, x0, x1,
+			skip_existing, require_source_chunks, dst_chunk_zyx, nx_src_chunk_zyx, ny_src_chunk_zyx, n_levels,
 		) = args_tuple
 	dst_z, dst_y, dst_x = int(z0) // 2, int(y0) // 2, int(x0) // 2
 	if (
@@ -319,8 +426,14 @@ def downsample_normal_pair_chunk_worker(args_tuple) -> None:
 		return "skipped_empty_slice"
 	nx_down, ny_down = _moment_pool2x_normals(nx_slab, ny_slab)
 	dz0, dy0, dx0 = int(z0) // 2, int(y0) // 2, int(x0) // 2
-	_write_level_block(omezarr_path=str(nx_path_str), level=int(dst_level), z0=dz0, y0=dy0, x0=dx0, data=nx_down)
-	_write_level_block(omezarr_path=str(ny_path_str), level=int(dst_level), z0=dz0, y0=dy0, x0=dx0, data=ny_down)
+	_write_level_block(
+		omezarr_path=str(nx_path_str), level=int(dst_level), z0=dz0, y0=dy0, x0=dx0,
+		data=nx_down, n_levels=int(n_levels),
+	)
+	_write_level_block(
+		omezarr_path=str(ny_path_str), level=int(dst_level), z0=dz0, y0=dy0, x0=dx0,
+		data=ny_down, n_levels=int(n_levels),
+	)
 	return "written"
 
 
@@ -414,6 +527,7 @@ def _make_scalar_downsample_stream(
 	skip_existing: bool,
 	zero_overrides: bool = False,
 	require_source_chunks: bool = False,
+	n_levels: int = 0,
 ):
 	g = zarr.open_group(str(omezarr_path), mode="r+")
 	src_shape = tuple(int(v) for v in g[str(src_level)].shape)
@@ -435,7 +549,7 @@ def _make_scalar_downsample_stream(
 			yield (
 				str(omezarr_path), int(src_level), int(dst_level), z0, z1, y0, y1, x0, x1,
 				bool(zero_overrides), bool(skip_existing), bool(require_source_chunks),
-				chunk_zyx, src_chunk_zyx,
+				chunk_zyx, src_chunk_zyx, int(n_levels),
 			)
 
 	return _iter(), total
@@ -451,6 +565,7 @@ def _make_normal_downsample_stream(
 	crop_zyx: tuple[int, int, int, int, int, int] | None,
 	skip_existing: bool,
 	require_source_chunks: bool = False,
+	n_levels: int = 0,
 ):
 	nx_g = zarr.open_group(str(nx_omezarr_path), mode="r+")
 	ny_g = zarr.open_group(str(ny_omezarr_path), mode="r+")
@@ -475,6 +590,7 @@ def _make_normal_downsample_stream(
 				str(nx_omezarr_path), str(ny_omezarr_path), int(src_level), int(dst_level),
 				z0, z1, y0, y1, x0, x1,
 				bool(skip_existing), bool(require_source_chunks), chunk_zyx, nx_src_chunk_zyx, ny_src_chunk_zyx,
+				int(n_levels),
 			)
 
 	return _iter(), total
@@ -581,6 +697,7 @@ def build_scalar_omezarr_pyramid(
 			skip_existing=not force,
 			zero_overrides=zero_overrides,
 			require_source_chunks=scan_existing_source_chunks,
+			n_levels=n_levels,
 		)
 		tag = f"[pyramid {label} L{lv}]" if label else f"[pyramid L{lv}]"
 		_run_pool(work, downsample_scalar_chunk_worker, workers=workers, tag=tag, total=total)
@@ -619,6 +736,7 @@ def build_normal_omezarr_pyramid(
 			crop_zyx=src_crop,
 			skip_existing=not force,
 			require_source_chunks=scan_existing_source_chunks,
+			n_levels=n_levels,
 		)
 		tag = f"[pyramid {label} L{lv}]"
 		_run_pool(work, downsample_normal_pair_chunk_worker, workers=workers, tag=tag, total=total)
