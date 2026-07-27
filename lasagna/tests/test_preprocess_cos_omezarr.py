@@ -204,6 +204,11 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 								)
 
 			out = stdout.getvalue()
+			self.assertIn(
+				"rolling accumulators: fine channels=1 zyx=(8,4,4) sd=1; "
+				"coarse channels=7 zyx=(8,4,4) sd=1",
+				out,
+			)
 			self.assertIn("final_z=4/8", out)
 			self.assertIn("final_z=8/8", out)
 			self.assertNotIn("\n[predict3d] final_z=", out)

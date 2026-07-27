@@ -2335,8 +2335,8 @@ def _infer_tiled_3d(
 			tmp_dir=tmp_dir, prefix=temp_prefix,
 		)
 		print(
-			f"[predict3d] rolling accumulators: fine channels=1 yx=({Yo_f},{Xo_f}) sd={sd_fine}; "
-			f"coarse channels={n_other} yx=({Yo_c},{Xo_c}) sd={sd_coarse}",
+			f"[predict3d] rolling accumulators: fine channels=1 zyx=({Zo_f},{Yo_f},{Xo_f}) sd={sd_fine}; "
+			f"coarse channels={n_other} zyx=({Zo_c},{Yo_c},{Xo_c}) sd={sd_coarse}",
 			flush=True,
 		)
 	else:
