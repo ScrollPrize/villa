@@ -179,7 +179,15 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           cd build/ci-windows-mingw
-          cpack -V
+          # cpack only reports that makensis failed and points at a log file
+          # inside the build tree, which the job never uploads — so a packaging
+          # break is undiagnosable from the run output alone. Dump the log here.
+          if ! cpack -V; then
+            echo "::group::NSISOutput.log"
+            cat _CPack_Packages/win64/NSIS/NSISOutput.log || echo "(no NSISOutput.log)"
+            echo "::endgroup::"
+            exit 1
+          fi
           ls -la *.exe *.zip
 
       - name: Upload installer artifact

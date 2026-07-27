@@ -278,6 +278,19 @@ else()
     elseif(WIN32)
         # binutils PE linker: --gc-sections works, mold/lld are not options.
         set(_link -Wl,--gc-sections -Wl,--as-needed)
+        # MinGW links DWARF straight into the PE, and on Windows nothing reads
+        # it: vc::crash::install() is a no-op off Linux (core/src/CrashHandler.cpp)
+        # and Windows debuggers consume PDB, not DWARF. Emitting it added ~1.5GB
+        # across the 43 packaged binaries — enough to push the NSIS payload past
+        # its data limit and fail packaging outright. Keep the codegen flags and
+        # drop the debug-info ones (-fno-eliminate-unused-debug-types only
+        # amplifies -g, so it goes too); configure with -DVC_WINDOWS_DEBUG_INFO=ON
+        # for a local gdb/lldb session under MSYS2.
+        option(VC_WINDOWS_DEBUG_INFO "Emit DWARF in MinGW builds (gdb/lldb)" OFF)
+        set(_dbg -fno-omit-frame-pointer -fasynchronous-unwind-tables)
+        if(VC_WINDOWS_DEBUG_INFO)
+            list(APPEND _dbg -g3 -fno-eliminate-unused-debug-types)
+        endif()
     else()
         find_program(VC_MOLD_BINARY mold)
         if(VC_MOLD_BINARY)
