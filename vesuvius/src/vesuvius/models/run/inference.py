@@ -28,6 +28,7 @@ from vesuvius.models.run.external_models.load_resnet import try_load_external_re
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
 from vesuvius.utils.k8s import get_tqdm_kwargs
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 def _tuple_if_sequence(value):
@@ -1121,7 +1122,7 @@ def _parse_bbox_arg(value):
 def build_parser():
     """Build the predict CLI parser (separate from main so it can be tested)."""
     import argparse
-    parser = argparse.ArgumentParser(description='Run nnUNet inference on Zarr data')
+    parser = HyphenUnderscoreParser(description='Run nnUNet inference on Zarr data')
     parser.add_argument('--model_path', type=str, required=True,
                       help='Path to nnUNet model folder, train.py .pth, or external model path (when enabled)')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to the input Zarr volume')
@@ -1171,10 +1172,7 @@ def build_parser():
 
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
-    # --model_type is accepted too: every other model/IO option on this parser uses
-    # underscores (--model_path, --model_cache_dir, --input_dir, --patch_size), so the
-    # hyphen here is the odd one out and the underscore spelling is the natural guess.
-    parser.add_argument('--model-type', '--model_type', dest='model_type', type=str, default='auto',
+    parser.add_argument('--model-type', dest='model_type', type=str, default='auto',
                       choices=['auto', 'nnunet', 'train_py', 'resnet'],
                       help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
     parser.add_argument('--model_cache_dir', type=str, default=DEFAULT_MODEL_CACHE_DIR,

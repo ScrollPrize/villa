@@ -17,6 +17,7 @@ from tqdm.auto import tqdm
 from vesuvius.data.utils import open_zarr
 from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 class SpatialPatchGrid:
@@ -959,7 +960,7 @@ def main():
     import argparse
     import sys
 
-    parser = argparse.ArgumentParser(description='Merge partial inference outputs with Gaussian blending using fsspec.')
+    parser = HyphenUnderscoreParser(description='Merge partial inference outputs with Gaussian blending using fsspec.')
     parser.add_argument('parent_dir', type=str,
                         help='Directory containing the partial inference results (logits_part_X.zarr, coordinates_part_X.zarr)')
     parser.add_argument('output_path', type=str,
@@ -1018,7 +1019,7 @@ def blend_and_finalize_main():
     import argparse
     import sys
 
-    parser = argparse.ArgumentParser(
+    parser = HyphenUnderscoreParser(
         description='Blend partial inference outputs and finalize (softmax + uint8) in a single pass.')
     parser.add_argument('parent_dir', type=str,
                         help='Directory containing the partial inference results (logits_part_X.zarr, coordinates_part_X.zarr)')

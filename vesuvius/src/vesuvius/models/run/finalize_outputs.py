@@ -14,6 +14,7 @@ from functools import partial
 from vesuvius.data.utils import open_zarr
 from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 @dataclass
@@ -555,7 +556,7 @@ def resolve_threshold(parser, args):
 # --- Command Line Interface ---
 def build_parser() -> argparse.ArgumentParser:
     """Build the finalize_outputs CLI parser (separate from main so it can be tested)."""
-    parser = argparse.ArgumentParser(description='Process merged logits to produce final outputs.')
+    parser = HyphenUnderscoreParser(description='Process merged logits to produce final outputs.')
     parser.add_argument('input_path', type=str,
                       help='Path to the merged logits Zarr store')
     parser.add_argument('output_path', type=str,
@@ -565,12 +566,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_threshold_arguments(parser)
     parser.add_argument('--delete-intermediates', dest='delete_intermediates', action='store_true',
                       help='Delete intermediate logits after processing')
-    # Also accept the underscore spellings: blend_logits calls these same two options
-    # --chunk_size and --num_workers, so running the documented three-stage pipeline
-    # otherwise means switching convention between stage 2 and stage 3 for one parameter.
-    parser.add_argument('--chunk-size', '--chunk_size', dest='chunk_size', type=str, default=None,
+    parser.add_argument('--chunk-size', dest='chunk_size', type=str, default=None,
                       help='Spatial chunk size (Z,Y,X) for output Zarr. Comma-separated. If not specified, input chunks will be used.')
-    parser.add_argument('--num-workers', '--num_workers', dest='num_workers', type=int, default=None,
+    parser.add_argument('--num-workers', dest='num_workers', type=int, default=None,
                       help='Number of worker processes for parallel processing. Default: CPU_COUNT // 2')
     parser.add_argument('--quiet', dest='quiet', action='store_true',
                       help='Suppress verbose output')
