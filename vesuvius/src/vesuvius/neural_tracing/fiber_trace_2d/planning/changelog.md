@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-27
+
+- Switched `train_s1a_nml_all_128_sd2.json` back to regular single-output
+  legacy 3D supervision (`direction_branch_count: 1`, `output_channels: 7`,
+  conditioned decoder disabled) while keeping BF16 enabled for the 128 sd2 run.
+
 ## 2026-07-26
 
 - Added `training.mixed_precision` support to 3D fiber training with BF16/FP16

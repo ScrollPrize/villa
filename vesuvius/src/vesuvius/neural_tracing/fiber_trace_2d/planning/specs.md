@@ -154,20 +154,24 @@
   `GradScaler` and snapshots include scaler state when present. Dense test
   loss, benchmark forward loss, TensorBoard sample-sheet inference, and
   Trace2CP metric/visual inference use the same configured autocast mode.
-- The active S1A conditioned 3D configs use `training.mixed_precision: "bf16"`
-  to reduce activation memory while preserving the configured BatchNorm batch.
+- The active S1A 3D configs use `training.mixed_precision: "bf16"` to reduce
+  activation memory while preserving the configured BatchNorm batch.
 - The S1A NML 3D training config uses `patch_shape_zyx: [192,192,192]`,
   `augment_shift_zyx: [48,48,48]`, and a fixed six-stage U-Net depth
   (`[16,32,64,128,256,512]`) so the deepest feature map remains appropriate
   for 192-voxel patches.
 - `train_s1a_nml_all_64_sd2.json` and
   `train_s1a_nml_all_128_sd2.json` are experimental S1A NML configs at
-  `base_volume_scale: 2` for 64- and 128-voxel patches. They use the active
-  conditioned decoder path and keep the same implemented augmentation families
-  enabled at magnitudes appropriate for their patch sizes: affine
-  shift/rotation/scale/flip, value brightness/contrast/gamma/noise, isotropic
-  blur, smooth displacement, and anisotropic blur. Shear/skew and ringing
-  remain unsupported and must not appear as enabled keys in these configs.
+  `base_volume_scale: 2` for 64- and 128-voxel patches. The 64 sd2 config uses
+  the active conditioned decoder path. The 128 sd2 config is currently a
+  regular single-output legacy config with one seven-channel branch
+  (`direction_branch_count: 1`, `output_channels: 7`) for direct comparison
+  against the conditioned experiment. Both keep the same implemented
+  augmentation families enabled at magnitudes appropriate for their patch
+  sizes: affine shift/rotation/scale/flip, value
+  brightness/contrast/gamma/noise, isotropic blur, smooth displacement, and
+  anisotropic blur. Shear/skew and ringing remain unsupported and must not
+  appear as enabled keys in these configs.
 - 3D training TensorBoard visualization logs CP-centered slice sheets at
   `training.sample_vis_interval`. By default, up to four batch samples are
   shown; `training.sample_vis_count` / `train_sample_vis_count` and
