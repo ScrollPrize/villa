@@ -7,6 +7,7 @@ import multiprocessing as mp
 import os
 import re
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +74,15 @@ class _Trace2Cp3DMetricEvalResult:
     first_skip_reason: str
 
 
+@dataclass(frozen=True)
+class _MixedPrecisionConfig:
+    mode: str
+    enabled: bool
+    device_type: str
+    dtype: torch.dtype | None
+    use_grad_scaler: bool
+
+
 def _load_raw_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
@@ -131,6 +141,112 @@ def _device_from_training(training: dict[str, Any]) -> torch.device:
     if raw == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(raw)
+
+
+def _mixed_precision_config_from_training(
+    training: dict[str, Any],
+    device: torch.device,
+) -> _MixedPrecisionConfig:
+    raw = training.get("mixed_precision", "off")
+    if isinstance(raw, bool):
+        mode = "bf16" if raw else "off"
+    else:
+        mode = str(raw).strip().lower().replace("-", "_")
+    aliases = {
+        "none": "off",
+        "false": "off",
+        "0": "off",
+        "no": "off",
+        "float32": "off",
+        "fp32": "off",
+        "true": "bf16",
+        "1": "bf16",
+        "yes": "bf16",
+        "bfloat16": "bf16",
+        "amp_bf16": "bf16",
+        "float16": "fp16",
+        "half": "fp16",
+        "amp_fp16": "fp16",
+    }
+    mode = aliases.get(mode, mode)
+    valid_modes = {"off", "bf16", "fp16", "auto"}
+    if mode not in valid_modes:
+        raise ValueError(
+            "training.mixed_precision must be one of off, bf16, fp16, auto; "
+            f"got {raw!r}"
+        )
+    device_type = str(device.type)
+    if mode == "auto":
+        if device_type == "cuda":
+            supports_bf16 = bool(
+                getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+            )
+            mode = "bf16" if supports_bf16 else "fp16"
+        else:
+            mode = "off"
+    if mode == "off":
+        return _MixedPrecisionConfig(
+            mode="off",
+            enabled=False,
+            device_type=device_type,
+            dtype=None,
+            use_grad_scaler=False,
+        )
+    if mode == "bf16":
+        if device_type not in {"cuda", "cpu"}:
+            raise ValueError(
+                "training.mixed_precision='bf16' is supported only on cuda or cpu devices, "
+                f"got {device_type!r}"
+            )
+        if device_type == "cuda":
+            supports_bf16 = bool(
+                getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+            )
+            if not supports_bf16:
+                raise ValueError(
+                    "training.mixed_precision='bf16' requested, but CUDA BF16 is not supported "
+                    "on this device. Use 'fp16', 'auto', or 'off'."
+                )
+        return _MixedPrecisionConfig(
+            mode="bf16",
+            enabled=True,
+            device_type=device_type,
+            dtype=torch.bfloat16,
+            use_grad_scaler=False,
+        )
+    if device_type != "cuda":
+        raise ValueError(
+            "training.mixed_precision='fp16' requires a CUDA device; "
+            f"got {device_type!r}"
+        )
+    return _MixedPrecisionConfig(
+        mode="fp16",
+        enabled=True,
+        device_type=device_type,
+        dtype=torch.float16,
+        use_grad_scaler=True,
+    )
+
+
+def _autocast_context(precision: _MixedPrecisionConfig | None):
+    if precision is None or not precision.enabled:
+        return nullcontext()
+    assert precision.dtype is not None
+    return torch.autocast(
+        device_type=precision.device_type,
+        dtype=precision.dtype,
+        enabled=True,
+    )
+
+
+def _make_grad_scaler(precision: _MixedPrecisionConfig) -> torch.amp.GradScaler | None:
+    if not precision.use_grad_scaler:
+        return None
+    return torch.amp.GradScaler("cuda", enabled=True)
+
+
+def _grad_scaler_enabled(grad_scaler: torch.amp.GradScaler | None) -> bool:
+    return bool(grad_scaler is not None and grad_scaler.is_enabled())
 
 
 def _training_sample_index_limit(training: dict[str, Any], sample_count: int) -> int:
@@ -200,6 +316,32 @@ def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask_f = mask.to(dtype=value.dtype)
     denom = mask_f.sum().clamp_min(1.0)
     return (value * mask_f).sum() / denom
+
+
+def _safe_probability_bce(
+    input_prob: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    reduction: str,
+) -> torch.Tensor:
+    """Compute BCE on sigmoid probabilities outside autocast.
+
+    PyTorch marks probability-space BCE unsafe under autocast. The model
+    currently emits sigmoid probabilities, so keep that contract and run the BCE
+    kernel in float32 instead of switching this path to logits.
+    """
+    device_type = str(input_prob.device.type)
+    context = (
+        torch.autocast(device_type=device_type, enabled=False)
+        if device_type in {"cpu", "cuda"}
+        else nullcontext()
+    )
+    with context:
+        return F.binary_cross_entropy(
+            input_prob.float(),
+            target.to(device=input_prob.device, dtype=torch.float32),
+            reduction=reduction,
+        )
 
 
 def _mean_over_nonempty_groups(
@@ -552,7 +694,7 @@ def compute_losses(
             indices[:, 2],
             indices[:, 3],
         ]
-        positive_presence_bce = F.binary_cross_entropy(
+        positive_presence_bce = _safe_probability_bce(
             selected_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
             torch.ones_like(selected_presence),
             reduction="none",
@@ -599,7 +741,7 @@ def compute_losses(
     presence_target = batch.presence_target.unsqueeze(1).expand_as(pred_presences)
     presence_mask = batch.presence_mask.unsqueeze(1).expand_as(pred_presences)
     negative_mask = (presence_target <= 0.5) & presence_mask
-    negative_presence_bce = F.binary_cross_entropy(
+    negative_presence_bce = _safe_probability_bce(
         pred_presences.clamp(1.0e-6, 1.0 - 1.0e-6),
         torch.zeros_like(pred_presences),
         reduction="none",
@@ -704,7 +846,7 @@ def compute_conditioned_losses(
             indices[:, 2],
             indices[:, 3],
         ]
-        positive_presence_bce = F.binary_cross_entropy(
+        positive_presence_bce = _safe_probability_bce(
             pred_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
             torch.ones_like(pred_presence),
             reduction="none",
@@ -769,7 +911,7 @@ def compute_conditioned_losses(
             "conditioned negative presence output shape mismatch: "
             f"{tuple(int(v) for v in negative_presence.shape)} != {expected_spatial}"
         )
-    negative_presence_bce = F.binary_cross_entropy(
+    negative_presence_bce = _safe_probability_bce(
         negative_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
         torch.zeros_like(negative_presence),
         reduction="none",
@@ -812,22 +954,23 @@ def _save_snapshot(
     *,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    grad_scaler: torch.amp.GradScaler | None = None,
     step: int,
     config: dict[str, Any],
     metric: float | None,
     metric_name: str | None = None,
 ) -> None:
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "step": int(step),
-            "config": _json_safe(config),
-            "metric": metric,
-            "metric_name": metric_name,
-        },
-        path,
-    )
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": int(step),
+        "config": _json_safe(config),
+        "metric": metric,
+        "metric_name": metric_name,
+    }
+    if _grad_scaler_enabled(grad_scaler):
+        payload["grad_scaler"] = grad_scaler.state_dict()
+    torch.save(payload, path)
 
 
 def _optimizer_hparams_from_training(training: dict[str, Any]) -> dict[str, float]:
@@ -852,6 +995,7 @@ def _load_snapshot(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
     optimizer_hparams: dict[str, float] | None = None,
+    grad_scaler: torch.amp.GradScaler | None = None,
     map_location: torch.device | str = "cpu",
 ) -> int:
     payload = torch.load(path, map_location=map_location)
@@ -861,6 +1005,12 @@ def _load_snapshot(
         optimizer.load_state_dict(payload["optimizer"])
         if optimizer_hparams is not None:
             _apply_optimizer_hparams(optimizer, optimizer_hparams)
+    if (
+        _grad_scaler_enabled(grad_scaler)
+        and isinstance(payload, dict)
+        and "grad_scaler" in payload
+    ):
+        grad_scaler.load_state_dict(payload["grad_scaler"])
     return int(payload.get("step", 0)) if isinstance(payload, dict) else 0
 
 
@@ -1066,6 +1216,7 @@ def _infer_trace2cp_fields_3d(
     image_normalization: str,
     cfg: _Trace2Cp3DConfig,
     device: torch.device,
+    mixed_precision: _MixedPrecisionConfig | None = None,
 ) -> Trace2Cp3DProjectedFields:
     coords_xyz = source.grid.coords_xyz.detach().cpu().numpy().astype(np.float32, copy=False)
     valid_mask = source.grid.valid_mask.detach().cpu().numpy().astype(bool, copy=False)
@@ -1100,7 +1251,9 @@ def _infer_trace2cp_fields_3d(
             block_t = torch.as_tensor(block, dtype=torch.float32, device=device)
             block_valid = _valid_block_mask(tuple(block.shape), start, volume_shape).to(device)
             block_t = _normalize_image(block_t, block_valid, image_normalization)
-            output = model(block_t.view(1, 1, *block.shape))[0]
+            with _autocast_context(mixed_precision):
+                output = model(block_t.view(1, 1, *block.shape))[0]
+            output = output.float()
             fields = project_3d_output_to_trace2cp_fields(
                 output,
                 tile_coords - start.reshape(1, 1, 3).astype(np.float32),
@@ -1128,6 +1281,7 @@ def _evaluate_trace2cp_metric_fixed_set_3d(
     image_normalization: str,
     cfg: _Trace2Cp3DConfig,
     device: torch.device,
+    mixed_precision: _MixedPrecisionConfig | None = None,
 ) -> _Trace2Cp3DMetricEvalResult:
     if int(cfg.control_points) == 0:
         sample_count = int(geometry_loader.sample_count)
@@ -1157,6 +1311,7 @@ def _evaluate_trace2cp_metric_fixed_set_3d(
                 image_normalization=image_normalization,
                 cfg=cfg,
                 device=device,
+                mixed_precision=mixed_precision,
             )
             score = score_trace2cp_projected_fields(
                 fields,
@@ -1200,6 +1355,7 @@ def evaluate_dense_loss(
     direction_weight: float,
     presence_weight: float,
     conditioned_loss_options: dict[str, float] | None = None,
+    mixed_precision: _MixedPrecisionConfig | None = None,
 ) -> dict[str, float]:
     model.eval()
     total_rows: list[dict[str, float]] = []
@@ -1215,14 +1371,15 @@ def evaluate_dense_loss(
         take = min(int(batch.volume.shape[0]), sample_count - consumed)
         if take < int(batch.volume.shape[0]):
             batch = _slice_batch(batch, 0, take)
-        rows = _forward_loss(
-            model,
-            batch,
-            direction_weight=direction_weight,
-            presence_weight=presence_weight,
-            conditioned_loss_options=conditioned_loss_options,
-            backward=False,
-        )
+        with _autocast_context(mixed_precision):
+            rows = _forward_loss(
+                model,
+                batch,
+                direction_weight=direction_weight,
+                presence_weight=presence_weight,
+                conditioned_loss_options=conditioned_loss_options,
+                backward=False,
+            )
         total_rows.append(rows)
         consumed += take
     model.train()
@@ -1315,6 +1472,39 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
     )
 
 
+def _forward_loss_tensors(
+    model: torch.nn.Module,
+    batch: FiberTrace3DBatch,
+    *,
+    direction_weight: float,
+    presence_weight: float,
+    conditioned_loss_options: dict[str, float] | None = None,
+    training_loss: bool,
+) -> dict[str, torch.Tensor]:
+    if _model_uses_conditioned_decoder(model):
+        return compute_conditioned_losses(
+            model,
+            batch,
+            direction_weight=direction_weight,
+            presence_weight=presence_weight,
+            **dict(conditioned_loss_options or {}),
+        )
+    output = model(batch.volume)
+    return compute_losses(
+        output,
+        batch,
+        direction_weight=direction_weight,
+        presence_weight=presence_weight,
+        branch_selection_mode=(
+            "train_offset_grid_min_fraction" if training_loss else "eval_voxel"
+        ),
+    )
+
+
+def _losses_to_float_dict(losses: dict[str, torch.Tensor]) -> dict[str, float]:
+    return {key: float(value.detach().cpu()) for key, value in losses.items()}
+
+
 def _forward_loss(
     model: torch.nn.Module,
     batch: FiberTrace3DBatch,
@@ -1324,28 +1514,17 @@ def _forward_loss(
     conditioned_loss_options: dict[str, float] | None = None,
     backward: bool,
 ) -> dict[str, float]:
-    if _model_uses_conditioned_decoder(model):
-        losses = compute_conditioned_losses(
-            model,
-            batch,
-            direction_weight=direction_weight,
-            presence_weight=presence_weight,
-            **dict(conditioned_loss_options or {}),
-        )
-    else:
-        output = model(batch.volume)
-        losses = compute_losses(
-            output,
-            batch,
-            direction_weight=direction_weight,
-            presence_weight=presence_weight,
-            branch_selection_mode=(
-                "train_offset_grid_min_fraction" if backward else "eval_voxel"
-            ),
-        )
+    losses = _forward_loss_tensors(
+        model,
+        batch,
+        direction_weight=direction_weight,
+        presence_weight=presence_weight,
+        conditioned_loss_options=conditioned_loss_options,
+        training_loss=backward,
+    )
     if backward:
         losses["total"].backward()
-    return {key: float(value.detach().cpu()) for key, value in losses.items()}
+    return _losses_to_float_dict(losses)
 
 
 def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | None = None) -> None:
@@ -1374,6 +1553,8 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     )
 
     model = build_fiber_trace_3d_model(raw_config).to(device)
+    mixed_precision = _mixed_precision_config_from_training(training, device)
+    grad_scaler = _make_grad_scaler(mixed_precision)
     optimizer_hparams = _optimizer_hparams_from_training(training)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1391,6 +1572,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             model=model,
             optimizer=optimizer,
             optimizer_hparams=optimizer_hparams,
+            grad_scaler=grad_scaler,
             map_location=device,
         )
 
@@ -1405,6 +1587,13 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             float(group.get("weight_decay", math.nan)) for group in optimizer.param_groups
         ],
     }
+    effective_precision = {
+        "mode": mixed_precision.mode,
+        "enabled": mixed_precision.enabled,
+        "device_type": mixed_precision.device_type,
+        "dtype": None if mixed_precision.dtype is None else str(mixed_precision.dtype),
+        "grad_scaler": _grad_scaler_enabled(grad_scaler),
+    }
     writer = _make_summary_writer(
         run_dir,
         enabled=bool(training.get("tensorboard_enabled", True)),
@@ -1416,6 +1605,11 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         writer.add_text(
             "config/optimizer",
             json.dumps(effective_optimizer, indent=2, sort_keys=True),
+            0,
+        )
+        writer.add_text(
+            "config/mixed_precision",
+            json.dumps(effective_precision, indent=2, sort_keys=True),
             0,
         )
         writer.add_text(
@@ -1503,6 +1697,9 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         f"loader_multiprocessing_context={loader_context or 'default'} "
         f"optimizer_lr={effective_optimizer['param_group_lrs']} "
         f"optimizer_weight_decay={effective_optimizer['param_group_weight_decays']} "
+        f"mixed_precision={effective_precision['mode']} "
+        f"autocast_enabled={effective_precision['enabled']} "
+        f"amp_grad_scaler={effective_precision['grad_scaler']} "
         f"kept_snapshot_interval={kept_snapshot_interval} "
         f"conditioned_decoder={_model_uses_conditioned_decoder(model)} "
         f"conditioned_jitter_deg={conditioned_loss_options['perpendicular_jitter_degrees']} "
@@ -1532,6 +1729,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                 direction_weight=direction_weight,
                 presence_weight=presence_weight,
                 conditioned_loss_options=conditioned_loss_options,
+                mixed_precision=mixed_precision,
             )
             metric = float(test_losses["total"])
             metric_name = "test/loss_total"
@@ -1567,6 +1765,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                         vis_batch,
                         step,
                         sample_count=test_sample_vis_count,
+                        mixed_precision=mixed_precision,
                     )
         if trace2cp_loader is not None and test_interval > 0:
             trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
@@ -1575,6 +1774,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                 image_normalization=loader.config.image_normalization,
                 cfg=trace2cp_cfg,
                 device=device,
+                mixed_precision=mixed_precision,
             )
             metric = float(trace2cp_metric.error_mean)
             metric_name = "test/trace2cp_error"
@@ -1612,6 +1812,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             config=raw_config,
             metric=best_metric,
             metric_name=initial_metric_name,
+            grad_scaler=grad_scaler,
         )
 
     remaining_steps = None if max_steps is None else max(0, int(max_steps) - int(start_step))
@@ -1639,15 +1840,24 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             )
             optimizer.zero_grad(set_to_none=True)
             fw_start = time.perf_counter()
-            losses = _forward_loss(
-                model,
-                batch,
-                direction_weight=direction_weight,
-                presence_weight=presence_weight,
-                conditioned_loss_options=conditioned_loss_options,
-                backward=True,
-            )
-            optimizer.step()
+            with _autocast_context(mixed_precision):
+                loss_tensors = _forward_loss_tensors(
+                    model,
+                    batch,
+                    direction_weight=direction_weight,
+                    presence_weight=presence_weight,
+                    conditioned_loss_options=conditioned_loss_options,
+                    training_loss=True,
+                )
+            if _grad_scaler_enabled(grad_scaler):
+                assert grad_scaler is not None
+                grad_scaler.scale(loss_tensors["total"]).backward()
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                loss_tensors["total"].backward()
+                optimizer.step()
+            losses = _losses_to_float_dict(loss_tensors)
             step_ms = (time.perf_counter() - fw_start) * 1000.0
 
             if step <= 100 or step % scalar_interval == 0:
@@ -1688,6 +1898,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                     batch,
                     step,
                     sample_count=sample_vis_count,
+                    mixed_precision=mixed_precision,
                 )
 
             metric = losses["total"]
@@ -1707,6 +1918,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                     config=raw_config,
                     metric=metric,
                     metric_name=metric_name,
+                    grad_scaler=grad_scaler,
                 )
             if kept_snapshot_interval > 0 and step % kept_snapshot_interval == 0:
                 _save_snapshot(
@@ -1717,6 +1929,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                     config=raw_config,
                     metric=metric,
                     metric_name=metric_name,
+                    grad_scaler=grad_scaler,
                 )
             if metric < best_metric:
                 best_metric = float(metric)
@@ -1728,6 +1941,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                     config=raw_config,
                     metric=best_metric,
                     metric_name=metric_name,
+                    grad_scaler=grad_scaler,
                 )
     finally:
         if train_dataloader is not None:
@@ -2641,18 +2855,21 @@ def _write_3d_sample_sheet(
     step: int,
     *,
     sample_count: int = 1,
+    mixed_precision: _MixedPrecisionConfig | None = None,
 ) -> None:
     was_training = bool(model.training)
     model.eval()
     take = min(max(1, int(sample_count)), int(batch.volume.shape[0]))
     with torch.no_grad():
-        if _model_uses_conditioned_decoder(model) and hasattr(
-            model,
-            "forward_recurrent_grouped",
-        ):
-            vis_output = model.forward_recurrent_grouped(batch.volume[:take], steps=2)
-        else:
-            vis_output = model(batch.volume[:take])
+        with _autocast_context(mixed_precision):
+            if _model_uses_conditioned_decoder(model) and hasattr(
+                model,
+                "forward_recurrent_grouped",
+            ):
+                vis_output = model.forward_recurrent_grouped(batch.volume[:take], steps=2)
+            else:
+                vis_output = model(batch.volume[:take])
+        vis_output = vis_output.float()
     if was_training:
         model.train()
     writer.add_image(
@@ -2798,6 +3015,7 @@ def run_trace2cp_vis(
     )
     training = dict(raw_config.get("training", {}))
     device = _device_from_training(training)
+    mixed_precision = _mixed_precision_config_from_training(training, device)
     model = build_fiber_trace_3d_model(raw_config).to(device)
     _load_snapshot(checkpoint, model=model, optimizer=None, map_location=device)
     out_dir = Path(export_dir)
@@ -2829,6 +3047,7 @@ def run_trace2cp_vis(
                 image_normalization=loader_config.image_normalization,
                 cfg=trace_cfg,
                 device=device,
+                mixed_precision=mixed_precision,
             )
             score = score_trace2cp_projected_fields(
                 fields,
@@ -3202,6 +3421,7 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
     loader = FiberTrace3DLoader(load_config(config_path))
     training = dict(raw_config.get("training", {}))
     device = _device_from_training(training)
+    mixed_precision = _mixed_precision_config_from_training(training, device)
     model = build_fiber_trace_3d_model(raw_config).to(device)
     model.eval()
     direction_weight = float(training.get("direction_weight", 10.0))
@@ -3228,7 +3448,8 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
         f"loader_workers={loader_workers} loader_prefetch_factor={loader_prefetch_factor} "
         f"loader_worker_device={loader_worker_device} "
         f"loader_multiprocessing_context={loader_context or 'default'} "
-        f"device={device} load_only={bool(load_only)}",
+        f"device={device} load_only={bool(load_only)} "
+        f"mixed_precision={mixed_precision.mode} autocast_enabled={mixed_precision.enabled}",
         flush=True,
     )
     print(
@@ -3255,14 +3476,15 @@ def run_benchmark(config_path: str | Path, *, load_only: bool, batches: int) -> 
         if not load_only:
             fw_start = time.perf_counter()
             with torch.no_grad():
-                _forward_loss(
-                    model,
-                    batch,
-                    direction_weight=direction_weight,
-                    presence_weight=presence_weight,
-                    conditioned_loss_options=conditioned_loss_options,
-                    backward=False,
-                )
+                with _autocast_context(mixed_precision):
+                    _forward_loss(
+                        model,
+                        batch,
+                        direction_weight=direction_weight,
+                        presence_weight=presence_weight,
+                        conditioned_loss_options=conditioned_loss_options,
+                        backward=False,
+                    )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             fw_ms = (time.perf_counter() - fw_start) * 1000.0

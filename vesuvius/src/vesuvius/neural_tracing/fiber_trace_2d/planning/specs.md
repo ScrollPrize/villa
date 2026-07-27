@@ -148,6 +148,14 @@
   forward/backward call. The 3D trainer does not support internal
   micro-batching; any BatchNorm statistics must come from the real configured
   batch.
+- `training.mixed_precision` controls trainer autocast only and must not
+  introduce internal micro-batching. Supported modes are `off`, `bf16`, `fp16`,
+  and `auto`. BF16 uses autocast without a scaler; FP16 uses AMP with
+  `GradScaler` and snapshots include scaler state when present. Dense test
+  loss, benchmark forward loss, TensorBoard sample-sheet inference, and
+  Trace2CP metric/visual inference use the same configured autocast mode.
+- The active S1A conditioned 3D configs use `training.mixed_precision: "bf16"`
+  to reduce activation memory while preserving the configured BatchNorm batch.
 - The S1A NML 3D training config uses `patch_shape_zyx: [192,192,192]`,
   `augment_shift_zyx: [48,48,48]`, and a fixed six-stage U-Net depth
   (`[16,32,64,128,256,512]`) so the deepest feature map remains appropriate

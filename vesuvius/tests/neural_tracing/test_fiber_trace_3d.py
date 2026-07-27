@@ -87,7 +87,9 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     trace_native_3d_whole_fiber,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
+    _autocast_context,
     _conditioned_perpendicular_queries,
+    _safe_probability_bce,
     compute_conditioned_losses,
     compute_losses,
 )
@@ -106,6 +108,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _make_test_loader_raw_config,
     _make_train_sample_3d_contact_sheet,
     _make_train_sample_3d_sheet,
+    _mixed_precision_config_from_training,
     _oblique_line_presence_for_display,
     _resolve_dense_test_selection,
     _resolve_prefetch_sample_count,
@@ -1121,6 +1124,133 @@ def test_3d_resume_reapplies_current_optimizer_hparams_preserving_state(tmp_path
     )
     assert resumed_state_norms == pytest.approx(original_state_norms)
     assert resumed_state_steps == pytest.approx(original_state_steps)
+
+
+def test_3d_mixed_precision_config_parsing_cpu() -> None:
+    cpu = torch.device("cpu")
+
+    off = _mixed_precision_config_from_training({}, cpu)
+    assert off.mode == "off"
+    assert not off.enabled
+    assert off.dtype is None
+
+    bf16 = _mixed_precision_config_from_training({"mixed_precision": "bf16"}, cpu)
+    assert bf16.mode == "bf16"
+    assert bf16.enabled
+    assert bf16.dtype == torch.bfloat16
+    assert not bf16.use_grad_scaler
+
+    bool_enabled = _mixed_precision_config_from_training({"mixed_precision": True}, cpu)
+    assert bool_enabled.mode == "bf16"
+
+    auto_cpu = _mixed_precision_config_from_training({"mixed_precision": "auto"}, cpu)
+    assert auto_cpu.mode == "off"
+    assert not auto_cpu.enabled
+
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        _mixed_precision_config_from_training({"mixed_precision": "fp16"}, cpu)
+    with pytest.raises(ValueError, match="mixed_precision"):
+        _mixed_precision_config_from_training({"mixed_precision": "tf32"}, cpu)
+
+
+def test_3d_mixed_precision_autocast_context_cpu_bf16() -> None:
+    precision = _mixed_precision_config_from_training(
+        {"mixed_precision": "bf16"},
+        torch.device("cpu"),
+    )
+    x = torch.ones((4, 4), dtype=torch.float32)
+
+    with _autocast_context(precision):
+        y = x @ x
+
+    assert y.shape == (4, 4)
+    assert y.dtype == torch.bfloat16
+
+
+def test_3d_conditioned_loss_runs_under_cpu_bf16_autocast() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0)
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            conditioned_decoder_enabled=True,
+            conditioned_latent_channels=8,
+            conditioned_decoder_hidden_channels=8,
+            conditioned_decoder_layers=2,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    )
+    precision = _mixed_precision_config_from_training(
+        {"mixed_precision": "bf16"},
+        torch.device("cpu"),
+    )
+
+    with _autocast_context(precision):
+        losses = compute_conditioned_losses(
+            model,
+            batch,
+            direction_weight=1.0,
+            presence_weight=1.0,
+        )
+    losses["total"].backward()
+
+    assert losses["total"].ndim == 0
+    assert torch.isfinite(losses["total"])
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.parameters()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_3d_probability_bce_is_safe_under_cuda_bf16_autocast() -> None:
+    values = torch.tensor([0.2, 0.8], dtype=torch.float32, device="cuda", requires_grad=True)
+    target = torch.ones_like(values)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss = _safe_probability_bce(values, target, reduction="mean")
+    loss.backward()
+
+    assert loss.dtype == torch.float32
+    assert values.grad is not None
+    assert torch.isfinite(values.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_3d_conditioned_loss_runs_under_cuda_bf16_autocast() -> None:
+    loader = _loader(augment_enabled=False)
+    batch = _load_materialized_batch(loader, 0).to("cuda")
+    model = FiberTrace3DNet(
+        FiberTrace3DModelConfig(
+            input_channels=1,
+            output_channels=7,
+            conditioned_decoder_enabled=True,
+            conditioned_latent_channels=8,
+            conditioned_decoder_hidden_channels=8,
+            conditioned_decoder_layers=2,
+            features_per_stage=(4, 8),
+            strides=((1, 1, 1), (2, 2, 2)),
+            decoder_upsample_mode="pixelshuffle",
+        )
+    ).to("cuda")
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        losses = compute_conditioned_losses(
+            model,
+            batch,
+            direction_weight=1.0,
+            presence_weight=1.0,
+        )
+    losses["total"].backward()
+
+    assert torch.isfinite(losses["total"])
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad).item() > 0
+        for parameter in model.parameters()
+    )
 
 
 def test_3d_test_loader_raw_config_disables_augmentation_by_default() -> None:

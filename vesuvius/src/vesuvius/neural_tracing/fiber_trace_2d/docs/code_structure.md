@@ -294,6 +294,12 @@ side/top strip input loading.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
   and `best.pt`. `training.kept_snapshot_interval` additionally keeps numbered
   snapshots as `snapshots/step_<iteration>.pt` and defaults to `10000`.
+- `training.mixed_precision` accepts `off`, `bf16`, `fp16`, and `auto`.
+  Autocast wraps training loss, dense test loss, benchmark forward loss,
+  TensorBoard sample-sheet inference, and Trace2CP metric/visual inference.
+  BF16 uses no scaler; FP16 uses `torch.amp.GradScaler`, whose state is saved
+  in snapshots when enabled. This is not gradient accumulation: the configured
+  `batch_size` remains the real `BatchNorm3d` batch.
 - Logs scalar losses/timings and the full training config JSON to TensorBoard
   when `training.tensorboard_enabled` is true. Direction reporting includes
   `train/angle_mean_deg` and, when held-out `test_datasets` are configured,
