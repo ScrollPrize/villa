@@ -314,9 +314,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _lasagnaScale->setRange(1, 1024);
     _lasagnaScale->setValue(4);
     _storageBackend = new QComboBox(lasagnaContents);
-    _storageBackend->addItem(tr("Auto"), QStringLiteral("auto"));
-    _storageBackend->addItem(tr("Memory mapped"), QStringLiteral("mmap"));
-    _storageBackend->addItem(tr("Dense CUDA (legacy)"), QStringLiteral("dense_cuda"));
+    _storageBackend->addItem(tr("Sparse CUDA LRU"), QStringLiteral("sparse_cuda"));
     addPathRow(lasagnaForm, "cache_directory", tr("Cache directory"), true);
     lasagnaForm->addRow(tr("Zarr group"), _lasagnaGroup);
     lasagnaForm->addRow(tr("Coordinate scale"), _lasagnaScale);
@@ -1828,7 +1826,8 @@ void SpiralPanel::restore()
     _voxelSize->setValue(settings.value(valuePrefix + "voxel_size_um", 9.6).toDouble());
     _lasagnaGroup->setText(settings.value(valuePrefix + "lasagna_group", "4").toString());
     _lasagnaScale->setValue(settings.value(valuePrefix + "lasagna_scale", 4).toInt());
-    const int backend = _storageBackend->findData(settings.value(valuePrefix + "storage_backend", "auto").toString());
+    const int backend = _storageBackend->findData(
+        settings.value(valuePrefix + "storage_backend", "sparse_cuda").toString());
     if (backend >= 0) _storageBackend->setCurrentIndex(backend);
     _legacyCheckpointStep->setValue(settings.value(valuePrefix + "legacy_checkpoint_step", 0).toInt());
     _runTag->setText(settings.value(valuePrefix + "run_tag").toString());
