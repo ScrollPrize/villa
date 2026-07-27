@@ -167,14 +167,16 @@ def sample_sdt_trilinear(sdt_volume, points_working_zyx):
     in_bounds = ((corners >= 0) & (corners < shape)).all(dim=-1)
     clamped = torch.minimum(corners.clamp(min=0), shape - 1)
 
-    if sdt_volume['backend'] == 'sparse_cuda':
+    if sdt_volume['backend'] == 'mmap':
         values_u8 = sdt_volume['store'].gather(
             clamped.reshape(-1, 3), device).reshape(clamped.shape[:2])
-    elif sdt_volume['backend'] in ('dense', 'dense_test'):
+    elif sdt_volume['backend'] == 'dense_cuda_paged':
+        from lasagna_data import gather_paged_u8
+        values_u8 = gather_paged_u8(
+            sdt_volume, clamped[..., 0], clamped[..., 1], clamped[..., 2])
+    else:  # dense torch uint8 tensor (tests / tiny ROIs)
         volume = sdt_volume['volume']
         values_u8 = volume[clamped[..., 0], clamped[..., 1], clamped[..., 2]]
-    else:
-        raise ValueError(f"unsupported SDT backend {sdt_volume['backend']!r}")
 
     corner_valid = in_bounds & (values_u8 != 0)
     corner_frac = torch.where(
@@ -462,19 +464,20 @@ def sample_lasagna_normals_nearest(lasagna_volume, points_working_zyx):
     zi = zi.clamp(0, z_size - 1)
     yi = yi.clamp(0, y_size - 1)
     xi = xi.clamp(0, x_size - 1)
-    if lasagna_volume['backend'] == 'sparse_cuda':
+    if lasagna_volume['backend'] == 'mmap':
         normal_indices = torch.stack([zi, yi, xi], dim=-1)
         empty = torch.zeros([0, 3], dtype=torch.long, device=device)
         normal_u8, _ = lasagna_volume['store'].gather_pair(
             normal_indices, empty, device)
         nx_u8, ny_u8 = normal_u8.unbind(dim=-1)
-    elif lasagna_volume['backend'] in ('dense', 'dense_test'):
+    elif lasagna_volume['backend'] == 'dense_cuda_paged':
+        from lasagna_data import gather_paged_u8
+        nx_u8 = gather_paged_u8(lasagna_volume, zi, yi, xi, channel=0)
+        ny_u8 = gather_paged_u8(lasagna_volume, zi, yi, xi, channel=1)
+    else:
         volume = lasagna_volume['volume']
         nx_u8 = volume[0, zi, yi, xi]
         ny_u8 = volume[1, zi, yi, xi]
-    else:
-        raise ValueError(
-            f"unsupported normal backend {lasagna_volume['backend']!r}")
     valid = in_bounds & ((nx_u8 != 0) | (ny_u8 != 0))
     nx = (nx_u8.to(torch.float32) - 128.0) / 127.0
     ny = (ny_u8.to(torch.float32) - 128.0) / 127.0

@@ -82,11 +82,11 @@ def main():
             dataset / 'lasagna_inputs/las_008_grad_mag.ome.zarr'),
         normal_zarr_group=lasagna_group,
         z_begin=args.z_begin, z_end=args.z_end, lasagna_scale=lasagna_scale,
-        storage_backend='sparse_cuda', cache_directory=args.cache)
+        storage_backend='auto', cache_directory=args.cache)
     sdt = prepare_surf_sdt_volume(
         str(dataset / 'lasagna_inputs/las_008_surf_sdt.ome.zarr'), '1',
         z_begin=args.z_begin, z_end=args.z_end,
-        cache_directory=args.cache, storage_backend='sparse_cuda')
+        cache_directory=args.cache, storage_backend='auto')
 
     weights = phase_bundle_component_weights(cfg, attachment_ramp=1.0)
     records = {}
@@ -164,7 +164,8 @@ def main():
             print(f'pass {p + 1}/{args.passes} done')
     finally:
         for volume in (normals, sdt):
-            volume['store'].close()
+            if volume['backend'] == 'mmap':
+                volume['store'].close()
 
     summary = {}
     for name, rows in records.items():

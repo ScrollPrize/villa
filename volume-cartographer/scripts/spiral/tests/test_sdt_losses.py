@@ -3,7 +3,9 @@
 implementable without machine-local data)."""
 
 import math
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -32,6 +34,21 @@ def spiral_shifted_radius(points):
     radius = torch.sqrt(y * y + x * x + 1e-12)
     theta = torch.arctan2(y, x) % TWO_PI
     return radius - theta / TWO_PI * DR_PER_WINDING
+
+
+class ArrayFixture:
+    """Minimal zarr-array stand-in accepted by prepare_scalar_mmap."""
+
+    def __init__(self, array):
+        self.array = array
+        self.shape = array.shape
+        self.chunks = (2, 2, 2)
+        self.dtype = array.dtype
+        self.path = '1'
+        self.store = None
+
+    def __getitem__(self, item):
+        return self.array[item]
 
 
 def make_volume(array_u8, *, scale=1.0, z_origin=0, unit=1.0, offset=128,
@@ -584,13 +601,72 @@ class AttachmentLossTests(unittest.TestCase):
         self.assertEqual(fitted_winding_domain(130), (1, 129))
 
 
+class ScalarMmapStoreTests(unittest.TestCase):
+    def test_gather_matches_dense_and_dedupes(self):
+        from lasagna_mmap import prepare_scalar_mmap
+
+        rng = np.random.default_rng(0)
+        data = rng.integers(0, 256, size=(6, 5, 4), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'store'
+            source.mkdir()
+            store = prepare_scalar_mmap(
+                array=ArrayFixture(data), source_path=str(source), group='1',
+                z_lo=1, z_hi=5, coordinate_scale=[2.0, 2.0, 2.0],
+                cache_directory=str(Path(temporary) / 'cache'), kind='surf_sdt')
+            try:
+                indices = torch.tensor(
+                    [[0, 0, 0], [3, 4, 3], [2, 2, 2], [0, 0, 0], [1, 3, 1]],
+                    dtype=torch.int64)
+                values = store.gather(indices, 'cpu')
+                expected = data[1:5][indices[:, 0], indices[:, 1], indices[:, 2]]
+                np.testing.assert_array_equal(values.numpy(), expected)
+                self.assertLess(store.last_timings['unique_fraction'], 1.0)
+
+                # Reopen from the cache and verify probe validation passes.
+                store_again = prepare_scalar_mmap(
+                    array=ArrayFixture(data), source_path=str(source), group='1',
+                    z_lo=1, z_hi=5, coordinate_scale=[2.0, 2.0, 2.0],
+                    cache_directory=str(Path(temporary) / 'cache'), kind='surf_sdt')
+                self.assertEqual(store_again.directory, store.directory)
+                store_again.close()
+            finally:
+                store.close()
+
+    def test_dense_and_mmap_sampling_agree(self):
+        from lasagna_mmap import prepare_scalar_mmap
+
+        x = np.arange(32, dtype=np.float32)
+        sd = np.abs(x - 12.0) - 2.0
+        encoded = (np.clip(np.rint(sd), -127, 127) + 128).astype(np.uint8)
+        data = np.broadcast_to(encoded, (6, 6, 32)).copy()
+        dense = make_volume(data)
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'store'
+            source.mkdir()
+            store = prepare_scalar_mmap(
+                array=ArrayFixture(data), source_path=str(source), group='1',
+                z_lo=0, z_hi=6, coordinate_scale=[1.0] * 3,
+                cache_directory=str(Path(temporary) / 'cache'), kind='surf_sdt')
+            try:
+                mmap_volume = dict(dense)
+                mmap_volume.update(backend='mmap', store=store, volume=None)
+                points = torch.rand([64, 3]) * torch.tensor([4.0, 4.0, 30.0]) + 0.5
+                dense_value, dense_valid, _ = sample_sdt_trilinear(dense, points)
+                mmap_value, mmap_valid, _ = sample_sdt_trilinear(mmap_volume, points)
+                torch.testing.assert_close(dense_value, mmap_value)
+                torch.testing.assert_close(dense_valid, mmap_valid)
+            finally:
+                store.close()
+
+
 SHIPPED_STORE = '/home/sean/Desktop/spiral_dataset/to_hf/lasagna_inputs/las_008_surf_sdt.ome.zarr'
 
 
 @unittest.skipUnless(
     __import__('os').environ.get('SPIRAL_SDT_INTEGRATION'),
     'machine-local integration test; set SPIRAL_SDT_INTEGRATION=1 to run '
-    '(requires the shipped threshold-150 store and CUDA)')
+    '(builds a ~1 GB mmap cache from the shipped threshold-150 store)')
 class ShippedStoreIntegrationTests(unittest.TestCase):
     def test_primary_diagnostic_point(self):
         # Doc test 15: the primary diagnostic point (working xyz 4375, 2176,

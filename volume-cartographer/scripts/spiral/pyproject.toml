@@ -23,7 +23,6 @@ dependencies = [
     "s3fs>=2026.6.0",
     "scipy>=1.18.0",
     "tifffile>=2026.6.1",
-    "tensorstore>=0.1.80",
     "torchdiffeq>=0.2.5",
     "tqdm>=4.68.3",
     "trimesh>=4.12.2",

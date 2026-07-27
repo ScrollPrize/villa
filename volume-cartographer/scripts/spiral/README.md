@@ -40,21 +40,6 @@ uv sync            # creates .venv from pyproject.toml
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e scripts/spiral`.
 
-### Sparse CUDA field cache
-
-Normals, gradient magnitude, and surf-SDT samples use a bounded 32³-chunk
-CUDA LRU backed directly by the source Zarr arrays. The default pool limits
-are 6 GiB for normals, 2 GiB for gradient magnitude, and 16 GiB for SDT;
-each is also capped to a fraction of currently free device memory. Override
-them with `FIT_SPIRAL_SPARSE_NORMAL_CACHE_GB`,
-`FIT_SPIRAL_SPARSE_GRAD_CACHE_GB`, and
-`FIT_SPIRAL_SPARSE_SDT_CACHE_GB`. `FIT_SPIRAL_TENSORSTORE_CACHE_GB`
-controls the host TensorStore cache (2 GiB per field by default).
-
-A single gather's distinct chunks must fit its field pool. If it does not,
-the fitter reports the required working-set size and the corresponding
-environment variable instead of growing the cache or risking a CUDA OOM.
-
 ### Internet flow (SSH attach)
 
 Start a persistent loopback service on the GPU host with its dataset. Give
