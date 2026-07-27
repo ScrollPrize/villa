@@ -860,12 +860,25 @@ def _load_umbilicus_lookup(
 	return points, lookup, float(z0), float(z_step)
 
 
+def _maybe_load_umbilicus_lookup(
+	vol: LasagnaVolume,
+	*,
+	device: torch.device,
+	require_umbilicus: bool,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, float, float]:
+	"""Load umbilicus metadata when present, or when explicitly required."""
+	if vol.umbilicus_json or require_umbilicus:
+		return _load_umbilicus_lookup(vol, device=device)
+	return None, None, 0.0, 1000.0
+
+
 def load_3d_for_model(
 	*, path: str, device: torch.device, model: object,
 	blur_sigma: float = 0.0,
 	erode_valid_mask: int = 0,
 	cuda_gridsample: bool = True,
 	skip_channels: set[str] | None = None,
+	require_umbilicus: bool = False,
 ) -> FitData3D:
 	"""Load 3D data auto-cropped around model mesh bbox. Optionally blurs."""
 	with torch.no_grad():
@@ -880,7 +893,7 @@ def load_3d_for_model(
 	print(f"[fit_data] auto-crop: x={crop[0]} y={crop[1]} z={crop[2]} "
 		  f"w={crop[3]} h={crop[4]} d={crop[5]}", flush=True)
 	data = load_3d(path=path, device=device, crop=crop, cuda_gridsample=cuda_gridsample,
-				  skip_channels=skip_channels)
+				  skip_channels=skip_channels, require_umbilicus=require_umbilicus)
 	if blur_sigma > 0:
 		blur_3d(data, sigma=blur_sigma)
 		print(f"[fit_data] blurred data sigma={blur_sigma}", flush=True)
@@ -1085,18 +1098,23 @@ def load_3d(
 	crop: tuple[int, int, int, int, int, int] | None = None,
 	cuda_gridsample: bool = True,
 	skip_channels: set[str] | None = None,
+	require_umbilicus: bool = False,
 ) -> FitData3D:
 	"""Load 3D sub-volume from .lasagna.json manifest.
 
 	crop: (x0, y0, z0, w, h, d) in base-coord voxels, or None for full volume.
 	skip_channels: channel names to skip (set to None instead of loading).
 	"""
-	vol = LasagnaVolume.load(path)
+	vol = LasagnaVolume.load(path, require_umbilicus=require_umbilicus)
 	# Effective decode scale: encode_scale / factor
 	# Higher factor → larger decoded grad_mag values
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
 	s2b = vol.source_to_base
-	umb_pts, umb_lookup, umb_z0, umb_z_step = _load_umbilicus_lookup(vol, device=device)
+	umb_pts, umb_lookup, umb_z0, umb_z_step = _maybe_load_umbilicus_lookup(
+		vol,
+		device=device,
+		require_umbilicus=require_umbilicus,
+	)
 	_skip = skip_channels or set()
 
 	# Resolve which channels are available
@@ -1225,6 +1243,7 @@ def load_3d_streaming(
 	device: torch.device,
 	skip_channels: set[str] | None = None,
 	sparse_prefetch_backend: str = "tensorstore",
+	require_umbilicus: bool = False,
 ) -> FitData3D:
 	"""Load .lasagna.json as sparse streaming cache — no upfront data load.
 
@@ -1233,10 +1252,14 @@ def load_3d_streaming(
 	"""
 	from sparse_cache import SparseChunkGroupCache
 
-	vol = LasagnaVolume.load(path)
+	vol = LasagnaVolume.load(path, require_umbilicus=require_umbilicus)
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
 	s2b = vol.source_to_base
-	umb_pts, umb_lookup, umb_z0, umb_z_step = _load_umbilicus_lookup(vol, device=device)
+	umb_pts, umb_lookup, umb_z0, umb_z_step = _maybe_load_umbilicus_lookup(
+		vol,
+		device=device,
+		require_umbilicus=require_umbilicus,
+	)
 	_skip = skip_channels or set()
 	_backend = str(sparse_prefetch_backend)
 	if _backend not in {"tensorstore", "python-zarr"}:

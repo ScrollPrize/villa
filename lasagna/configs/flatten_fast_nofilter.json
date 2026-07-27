@@ -10,7 +10,7 @@
 		"flatten_sdir": 1.0,
 		"flatten_map_step": 0.1,
 		"flatten_avg_offset": 1.0,
-		"flatten_orient": 10.0
+		"flatten_orient": 2.0
 	},
 	"stages": [
 		{
@@ -26,7 +26,7 @@
 				"fused_flatten_adam_clamp": true,
 				"flatten_support": true,
 				"flatten_support_radius": 1,
-				"flatten_orient_min_det": 0.0,
+				"flatten_orient_min_det": 0.01,
 				"flatten_filter_source_angles": false,
 				"flatten_max_update": 0.1,
 				"flatten_sdir_eps": 1e-8,
@@ -49,7 +49,7 @@
 				"fused_flatten_adam_clamp": true,
 				"flatten_support": true,
 				"flatten_support_radius": 1,
-				"flatten_orient_min_det": 0.0,
+				"flatten_orient_min_det": 0.01,
 				"flatten_filter_source_angles": false,
 				"flatten_max_update": 0.1,
 				"flatten_sdir_eps": 1e-8,
@@ -72,7 +72,7 @@
 				"fused_flatten_adam_clamp": true,
 				"flatten_support": true,
 				"flatten_support_radius": 1,
-				"flatten_orient_min_det": 0.0,
+				"flatten_orient_min_det": 0.01,
 				"flatten_filter_source_angles": false,
 				"flatten_max_update": 0.1,
 				"flatten_sdir_eps": 1e-8,

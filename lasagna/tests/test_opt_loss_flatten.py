@@ -151,6 +151,62 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertAlmostEqual(float(map_yx[mask, 1].min()), 0.0, places=5)
 		self.assertAlmostEqual(float(map_yx[mask, 1].max()), 2.0, places=5)
 
+	def test_forward_inversion_uses_fixed_diagonal_triangles_for_concave_cell(self) -> None:
+		# Both VC triangles have positive signed area, but this concave quad has
+		# a negative bilinear corner Jacobian. Forward export must preserve the
+		# fixed-diagonal mesh instead of trying to invert it as a bilinear patch.
+		xyz = torch.tensor(
+			[
+				[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+				[[1.0, 0.0, 0.0], [1.0, 1.0, 10.0]],
+			],
+			dtype=torch.float32,
+		)
+		uv = torch.tensor(
+			[
+				[[0.0, 0.0], [0.0, 2.0]],
+				[[1.0, 1.0], [3.0, 1.0]],
+			],
+			dtype=torch.float32,
+		)
+
+		map_yx, sampled, mask = fit_model.Model3D._flatten_invert_forward_uv_map(
+			xyz,
+			torch.ones(1, 1, dtype=torch.bool),
+			uv,
+			output_margin=0.0,
+			min_shape=(2, 2),
+			k_candidates=1,
+			chunk_points=8,
+		)
+
+		self.assertEqual(tuple(mask.shape), (4, 3))
+		self.assertTrue(bool(mask[2, 1]))
+		self.assertTrue(torch.allclose(map_yx[2, 1], torch.tensor([1.0, 0.5])))
+		self.assertTrue(torch.allclose(sampled[0, 2, 1], torch.tensor([1.0, 0.5, 5.0])))
+
+	def test_forward_inversion_rejects_cell_with_one_flipped_mesh_triangle(self) -> None:
+		xyz = _flat_grid(2, 2)
+		uv = torch.tensor(
+			[
+				[[0.0, 0.0], [-1.5, 1.0]],
+				[[1.0, -3.0], [1.5, 0.5]],
+			],
+			dtype=torch.float32,
+		)
+
+		_map_yx, _sampled, mask = fit_model.Model3D._flatten_invert_forward_uv_map(
+			xyz,
+			torch.ones(1, 1, dtype=torch.bool),
+			uv,
+			output_margin=0.0,
+			min_shape=(2, 2),
+			k_candidates=1,
+			chunk_points=8,
+		)
+
+		self.assertFalse(bool(mask.any()))
+
 	def test_flatten_stage_defaults_disable_volume_losses(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"args": {"model-init": "flatten"},
@@ -733,6 +789,40 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertEqual(stats["flatten_orient_lowdet_frac"], 0.0)
 		self.assertGreater(stats["flatten_orient_min_det"], 0.0)
 
+	def test_orient_regularizer_rejects_triangle_fold_with_positive_center_determinant(self) -> None:
+		# All source-row edges increase output Y and all source-column edges
+		# increase output X, but the strong cross-axis shear flips one of the
+		# fixed-diagonal mesh triangles. Its center determinant remains positive,
+		# so the former center-only test accepted it.
+		map_yx = torch.tensor(
+			[
+				[[0.0, 0.0], [-1.5, 1.0]],
+				[[1.0, -3.0], [1.5, 0.5]],
+			],
+			dtype=torch.float32,
+		)
+		dy = 0.5 * ((map_yx[1, 0] - map_yx[0, 0]) + (map_yx[1, 1] - map_yx[0, 1]))
+		dx = 0.5 * ((map_yx[0, 1] - map_yx[0, 0]) + (map_yx[1, 1] - map_yx[1, 0]))
+		center_det = dy[0] * dx[1] - dy[1] * dx[0]
+		self.assertGreater(float(center_det), 0.0)
+		self.assertTrue(bool((map_yx[1:, :, 0] - map_yx[:-1, :, 0] > 0.05).all()))
+		self.assertTrue(bool((map_yx[:, 1:, 1] - map_yx[:, :-1, 1] > 0.05).all()))
+
+		valid_cells = torch.ones((1, 1), dtype=torch.bool)
+		valid_vertices = torch.ones((2, 2), dtype=torch.bool)
+		loss, _lm, mask, min_triangle_det = opt_loss_flatten._flatten_orient_core(
+			map_yx,
+			valid_cells,
+			0.0,
+			valid_vertices,
+			0.05,
+			1.0,
+		)
+
+		self.assertAlmostEqual(float(min_triangle_det), -3.5)
+		self.assertAlmostEqual(float(loss), 12.25)
+		self.assertEqual(int(mask.sum()), 1)
+
 	def test_orient_regularizer_rejects_negative_area_fold(self) -> None:
 		opt_loss_flatten.configure(orient_min_det=0.0, reset_history=True)
 		mdl = _make_flatten_model(_flat_grid(6, 6), mesh_step=1)
@@ -765,6 +855,32 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertEqual(stats["flatten_orient_lowdet_frac"], 1.0)
 		self.assertLess(stats["flatten_orient_min_det"], 0.0)
 		self.assertEqual(int(masks[0].sum().detach()), 25)
+
+	def test_forward_orient_regularizer_preserves_source_axis_order(self) -> None:
+		opt_loss_flatten.configure(
+			orient_min_det=0.0,
+			order_margin=0.05,
+			reset_history=True,
+		)
+		mdl = _make_flatten_model(
+			_flat_grid(6, 6),
+			mesh_step=1,
+			flatten_direction="forward",
+		)
+		map_yx = -mdl.flatten_map().detach().clone()
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, masks = opt_loss_flatten.flatten_orient_loss(res=res)
+		stats = opt_loss_flatten.last_stats()
+
+		# A 180-degree rotation has positive local area and therefore evades the
+		# determinant-only barrier, but reverses both source-grid axes.
+		self.assertGreater(float(loss.detach()), 60.0)
+		self.assertEqual(stats["flatten_orient_fold_frac"], 0.0)
+		self.assertEqual(stats["flatten_order_row_violation_frac"], 1.0)
+		self.assertEqual(stats["flatten_order_column_violation_frac"], 1.0)
+		self.assertEqual(int(masks[0].sum().detach()), 0)
 
 	def test_flatten_stats_track_validity_transitions(self) -> None:
 		opt_loss_flatten.configure(reset_history=True)

@@ -518,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
 			device=device,
 			sparse_prefetch_backend=prefetch_backend,
 			skip_channels=_streaming_skip_channels(needed_channels),
+			require_umbilicus=True,
 		)
 		_set_model_volume_extent(mdl, d)
 		return d
@@ -536,6 +537,7 @@ def main(argv: list[str] | None = None) -> int:
 		device=device,
 		sparse_prefetch_backend=prefetch_backend,
 		skip_channels=_streaming_skip_channels(set()),
+		require_umbilicus=True,
 	)
 
 	if args.z_range is None:

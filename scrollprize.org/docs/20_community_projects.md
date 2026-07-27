@@ -83,8 +83,6 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 ### 🛠️ Tools
 
-- [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/999) by pscamillo. GPU-native augmentations for the segmentation training pipeline, addressing #201: Squeeze (compression, [#997](https://github.com/ScrollPrize/villa/pull/997)), Decohesion (beam-scatter blur) and Warp (coherent warping), plus CT-reconstruction artifacts — Ring ([#1020](https://github.com/ScrollPrize/villa/pull/1020)) and Streak ([#1021](https://github.com/ScrollPrize/villa/pull/1021)). Each models a real scroll/CT distortion rather than generic noise, and is validated with a controlled ablation and a speed benchmark to improve segmentation robustness in degraded regions.
-
 - [Volume Cartographer](https://github.com/educelab/volume-cartographer): the OG virtual unwrapping toolkit. Includes a graphical interface to annotate scroll segments. First built by [EduceLab](https://educelab.engr.uky.edu/); an [active fork](https://github.com/spacegaier/volume-cartographer) by Philip Allgaier contains many community contributions and is currently used by the segmentation team.
   
 - [Thaumato Anakalyptor](https://github.com/schillij95/ThaumatoAnakalyptor/tree/main) is an automatic tool that combines classical methods such as threshold gradient operator based edge detectors and Deep Learning based instance segmentation of point clouds to detect, merge and render segments. It was built by Julian Schilliger (part of Grand Prize winning submission).
@@ -168,12 +166,20 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
     - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput.
-    - [HIP/ROCm port of ScrollFiesta's MLS for AMD GPUs](https://github.com/altommo/scrollfiesta-mls-hip) by Alan Thompson (altommo) — clean-room HIP port of the MLS-midpoint kernel, validated on RX 9070 / gfx1201: ~16.8x kernel, ~5.8x multi-cube, topology-equivalent weld-safe mesh. ([upstream PR](https://github.com/Hob3rMallow/scrollfiesta_public/pull/4))
-    - [CubeCL port of ScrollFiesta's MLS (portable GPU: AMD/NVIDIA/WGPU)](https://github.com/altommo/scrollfiesta-mls-cubecl) by Alan Thompson (altommo) — Rust/CubeCL reimplementation of the same MLS kernel from a single source; validated on RX 9070 / gfx1201 against the HIP port, passing the 0.25-voxel weld-safety gate and 5-pass strict parity vs clean HIP.
+
+
+- [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/997) by pscamillo. GPU-native training augmentations modeling real scroll/CT distortions: Squeeze ([#997](https://github.com/ScrollPrize/villa/pull/997)), Decohesion + Warp ([#999](https://github.com/ScrollPrize/villa/pull/999)), Ring ([#1020](https://github.com/ScrollPrize/villa/pull/1020)), Streak ([#1021](https://github.com/ScrollPrize/villa/pull/1021)), Warp edge-padding fix ([#1025](https://github.com/ScrollPrize/villa/pull/1025)) (#201), each validated with ablation + benchmark.
+
+- [winding-ruler](https://github.com/pscamillo/winding-ruler) by pscamillo. Measures winding evidence for the spiral fit: where human annotations matter, why generation fails at the published resolution, and a collection-wide winding-pitch atlas (36 scrolls). Includes [qa_holescan](https://github.com/pscamillo/winding-ruler/blob/main/concordance/qa_holescan.py), a content-level detector for silent z-slice loss in predict3d output ([#1183](https://github.com/ScrollPrize/villa/issues/1183)).
+       
+
+- [HIP/ROCm port of ScrollFiesta's MLS for AMD GPUs](https://github.com/altommo/scrollfiesta-mls-hip) by Alan Thompson (altommo) — clean-room HIP port of the MLS-midpoint kernel, validated on RX 9070 / gfx1201: ~16.8x kernel, ~5.8x multi-cube, topology-equivalent weld-safe mesh. ([upstream PR](https://github.com/Hob3rMallow/scrollfiesta_public/pull/4))
+- [CubeCL port of ScrollFiesta's MLS (portable GPU: AMD/NVIDIA/WGPU)](https://github.com/altommo/scrollfiesta-mls-cubecl) by Alan Thompson (altommo) — Rust/CubeCL reimplementation of the same MLS kernel from a single source; validated on RX 9070 / gfx1201 against the HIP port, passing the 0.25-voxel weld-safety gate and 5-pass strict parity vs clean HIP.
 
 - [vesuvius-automesh](https://github.com/spencerdavis-tx/vesuvius-automesh) by spencerdavis-tx. Fully automated, QC-gated surface harvest: masks the public surface predictions against the CT, seed-sweeps the villa tracer, and accepts output per 25 mm window under a two-part quality gate plus an independent topology check - 279 cm2 of verified Scroll 3 surface with zero manual annotation, CPU only. Ships per-window QC records for all 157 windows (passes and failures) as a labeled set of tracer failure modes.
 
 - [Herculaneum Scroll Tools](https://github.com/axiosdevs/herculaneum-scroll-tools) by axiosdevs — CT-consistency QA for the published m7 surface predictions: voxel-exact phantom fractions measured for all 36 samples incl. all 13 grand-prize scrolls (43.3% of positives sit outside the masked CT), with a one-pass `clean` mode ([villa#1114](https://github.com/ScrollPrize/villa/issues/1114)); plus cross-scan registration (2023→2025 rescan, MAD 29 µm), a winding-constraint annotator/verifier in native spiral-input format, and dual-energy high-Z ink-candidate rendering.
+
 
 ### 📦 Materials
 
