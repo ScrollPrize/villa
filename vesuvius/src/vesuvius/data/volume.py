@@ -467,15 +467,19 @@ class Volume:
             print(f"  Global Mean: {self.global_mean}, Global Std: {self.global_std}")
         print(f"Return Type: {self.return_as_type}")
         print(f"Return as Tensor: {self.return_as_tensor}")
-        print(f"Number of Resolution Levels: {len(self.data)}")
         if isinstance(self.data, zarr.Array):
+            # A single array is one resolution level; zarr.Array has no len().
+            print(f"Number of Resolution Levels: 1")
             print(f"  Level 0 Shape: {self.data.shape}, Dtype: {self.data.dtype}")
         elif isinstance(self.data, zarr.Group):
-            for key in sorted(self.data.keys(), key=lambda x: int(x) if x.isdigit() else x):
+            levels = [key for key in sorted(self.data.keys(), key=lambda x: int(x) if x.isdigit() else x)
+                      if isinstance(self.data[key], zarr.Array)]
+            print(f"Number of Resolution Levels: {len(levels)}")
+            for key in levels:
                 arr = self.data[key]
-                if isinstance(arr, zarr.Array):
-                    print(f"  Level {key} Shape: {arr.shape}, Dtype: {arr.dtype}")
+                print(f"  Level {key} Shape: {arr.shape}, Dtype: {arr.dtype}")
         else:
+            print(f"Number of Resolution Levels: {len(self.data)}")
             for idx, store in enumerate(self.data):
                 print(f"  Level {idx} Shape: {store.shape}, Dtype: {store.dtype}")
         if self.inklabel is not None:
