@@ -26,8 +26,8 @@ sys.modules.setdefault("train_unet_3d", train_stub)
 
 from preprocess_cos_omezarr import (
 	LasagnaCosPredict3DAdapter,
-	LasagnaOmeZarrOutputAdapter,
 	ModelAdapter,
+	OmeZarrOutputAdapter,
 	OutputAdapter,
 	OutputChannelSpec,
 	OutputProductSpec,
@@ -136,6 +136,12 @@ class _FakeModelAdapter:
 	def accumulate_tile_output(self, raw_output, *, tile_origin_zyx, tile_weight, accumulators):
 		accumulators["called"] = True
 
+	def product_tensors_from_output(self, raw_output):
+		return {self.output_products[0].name: raw_output}
+
+	def finalize_product_slab(self, product, raw_slab):
+		return {channel.name: raw_slab[index] for index, channel in enumerate(product.channels)}
+
 
 class _FakeOutputAdapter:
 	def product_chunk_complete(self, product: OutputProductSpec, *, chunk_origin_zyx):
@@ -189,6 +195,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 	def test_predict3d_shared_helpers_are_reexported_for_compatibility(self):
 		self.assertIs(preprocess_wrapper.OutputProductSpec, shared_predict3d.OutputProductSpec)
 		self.assertIs(preprocess_wrapper.OutputChannelSpec, shared_predict3d.OutputChannelSpec)
+		self.assertIs(preprocess_wrapper.OmeZarrOutputAdapter, shared_predict3d.OmeZarrOutputAdapter)
 		self.assertIs(preprocess_wrapper.ModelAdapter, shared_predict3d.ModelAdapter)
 		self.assertIs(preprocess_wrapper.OutputAdapter, shared_predict3d.OutputAdapter)
 		self.assertIs(
@@ -326,7 +333,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				),
 				chunk_size=16,
 			)
-			adapter = LasagnaOmeZarrOutputAdapter(products=(product,), n_levels=1)
+			adapter = OmeZarrOutputAdapter(products=(product,), n_levels=1)
 			block = np.ones((16, 16, 16), dtype=np.uint8)
 
 			self.assertIsInstance(adapter, OutputAdapter)
@@ -539,25 +546,24 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					"build_model",
 					return_value=(_ConstantPredict3dModel(), None, None, False),
 				):
-					with mock.patch("preprocess_cos_omezarr._build_omezarr_pyramid"):
-						with mock.patch("preprocess_cos_omezarr.build_normal_omezarr_pyramid"):
-							with mock.patch("sys.stdout", stdout):
-								run_preprocess_3d(
-									input_path=str(input_path),
-									output_path=str(output_path),
-									unet3d_checkpoint=str(root / "missing_model.pt"),
-									device="cpu",
-									crop_xyzwhd=None,
-									tile_size=4,
-									overlap=0,
-									border=0,
-									cos_scaledown=1,
-									scaledown=1,
-									source_to_base=1.0,
-									base_ref=str(input_path),
-									n_levels=2,
-									ome_chunk=4,
-								)
+					with mock.patch("preprocess_cos_omezarr.build_product_omezarr_pyramids"):
+						with mock.patch("sys.stdout", stdout):
+							run_preprocess_3d(
+								input_path=str(input_path),
+								output_path=str(output_path),
+								unet3d_checkpoint=str(root / "missing_model.pt"),
+								device="cpu",
+								crop_xyzwhd=None,
+								tile_size=4,
+								overlap=0,
+								border=0,
+								cos_scaledown=1,
+								scaledown=1,
+								source_to_base=1.0,
+								base_ref=str(input_path),
+								n_levels=2,
+								ome_chunk=4,
+							)
 
 			out = stdout.getvalue()
 			self.assertIn(
@@ -886,25 +892,24 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					"build_model",
 					return_value=(_OnesPredict3dModel(), None, None, False),
 				):
-					with mock.patch("preprocess_cos_omezarr._build_omezarr_pyramid"):
-						with mock.patch("preprocess_cos_omezarr.build_normal_omezarr_pyramid"):
-							with mock.patch("sys.stdout", stdout):
-								run_preprocess_3d(
-									input_path=str(input_path),
-									output_path=str(output_path),
-									unet3d_checkpoint=str(root / "missing_model.pt"),
-									device="cpu",
-									crop_xyzwhd=None,
-									tile_size=4,
-									overlap=0,
-									border=0,
-									cos_scaledown=1,
-									scaledown=1,
-									source_to_base=1.0,
-									base_ref=str(input_path),
-									n_levels=2,
-									ome_chunk=4,
-								)
+					with mock.patch("preprocess_cos_omezarr.build_product_omezarr_pyramids"):
+						with mock.patch("sys.stdout", stdout):
+							run_preprocess_3d(
+								input_path=str(input_path),
+								output_path=str(output_path),
+								unet3d_checkpoint=str(root / "missing_model.pt"),
+								device="cpu",
+								crop_xyzwhd=None,
+								tile_size=4,
+								overlap=0,
+								border=0,
+								cos_scaledown=1,
+								scaledown=1,
+								source_to_base=1.0,
+								base_ref=str(input_path),
+								n_levels=2,
+								ome_chunk=4,
+							)
 
 			cos_path = str(root / "vol_cos.ome.zarr")
 			gm_path = str(root / "vol_grad_mag.ome.zarr")
@@ -988,7 +993,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				if not channel_path.exists():
 					_create_omezarr(str(channel_path), (16, 16, 16), 0, 1, 4, "value")
 				model_adapter = adapter_cls(product)
-				output_adapter = LasagnaOmeZarrOutputAdapter(products=(product,), n_levels=1)
+				output_adapter = OmeZarrOutputAdapter(products=(product,), n_levels=1)
 				_infer_tiled_products_3d(
 					model_adapter.load_model(device=torch.device("cpu")),
 					zarr.open(str(input_path), mode="r"),

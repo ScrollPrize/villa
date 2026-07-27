@@ -6,10 +6,11 @@
   canonical global tile/output-chunk lattices, crop bounds, S3 auto-download
   from `_download` metadata, rolling z-band scratch, output-chunk-only resume,
   temp cleanup, progress formatting, and atomic Zarr chunk writes.
-- Product-specific adapters own model semantics, output channel schema, tile
-  postprocessing, manifest/group metadata, product completeness, and pyramid
-  behavior. The shared runner must not assume Lasagna `cos`,
-  `grad_mag/nx/ny`, or fiber direction/presence semantics.
+- Product-specific adapters own model semantics, raw output splitting, output
+  channel schema, tile preprocessing, raw-to-persisted finalization, and
+  completeness semantics. Shared predict3d helpers own OME-Zarr group
+  creation, Lasagna manifest writing, standard scalar/normal pyramid building,
+  and chunk writing/resume mechanics.
 - `preprocess_cos_omezarr.py predict3d` remains the compatibility wrapper for
   Lasagna cos/normal inference. Its CLI, output values, `.lasagna.json`
   manifest, scale handling, optional `pred_dt`, and OME-Zarr pyramid behavior
@@ -36,31 +37,39 @@
   tiled runner with the common arguments `--input`, `--output`,
   `--checkpoint`, `--tile-size`, `--overlap`, `--border`, `--scaledown`,
   `--crop`, `--device`, `--no-download`, `--levels`, and `--ome-chunk`.
+  It also accepts `--pyramid-workers` to pass worker count to the shared
+  pyramid builders.
   Fiber-specific arguments are the positional training/inference config,
-  `--recurrent-steps`, `--output-prefix`, `--base-ref`, and `--base-scale`.
+  `--recurrent-steps`, `--base-ref`, and `--base-scale`.
+- Fiber 3D inference `--output` is a `.lasagna.json` manifest path. The
+  manifest is the authoritative output description and points to per-channel
+  OME-Zarr groups derived from the manifest stem.
 - Fiber 3D inference must use the existing 3D fiber model/config/checkpoint
   stack: `build_fiber_trace_3d_model(...)`, training snapshot loading, the
   configured tile image normalization, mixed-precision/autocast helpers, and
   Lasagna 3x2 direction encoding helpers.
-- Fiber inference outputs are not Lasagna normal products. Each emitted option
-  is one coherent seven-channel bundle:
+- Fiber model output has seven raw channels per option internally:
   `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, and
-  `presence`. The six direction channels use the Lasagna 3x2 ambiguous
-  direction layout. Product completeness for a fiber option requires all seven
-  channel chunks.
+  `presence`. These raw channels are accumulated in the shared rolling z-band
+  and are never persisted as output channels.
+- Fiber persisted output is only `presence`, `nx`, and `ny` per option.
+  Presence is fixed-point uint8 with `0 == 0.0` and `255 == 1.0`. `nx/ny` use
+  Lasagna's compact ambiguous hemisphere encoding: estimate the 3D axis from
+  raw 3x2 direction channels, flip the equivalent sign to `z >= 0`, then write
+  `round(component * 127 + 128)` clipped to uint8.
+- Product completeness for a fiber option requires all three persisted sibling
+  chunks: `presence`, `nx`, and `ny`.
 - Multi-branch legacy outputs and conditioned recurrent outputs must be
   preserved as separate coherent fiber options. Inference must not collapse
   them to branch 0, min/max, average, or any other summary unless a separate
   explicit postprocessing mode is added.
-- Fiber inference writes an atomic `fiber_trace_3d_inference.json` manifest at
-  the output root. It records input/output scaledowns, crop and output region,
-  tile parameters, output product paths, the seven-channel bundle schema,
-  `direction_encoding: lasagna_3x2_ambiguous`, and
-  `not_lasagna_normal_products: true`.
-- V0 fiber inference is data-level-only. The manifest must record
-  `pyramid.policy: data_level_only` and
-  `coarser_fiber_pyramids_built: false`; coarser direction/presence pyramid
-  generation remains out of scope until semantics are specified and tested.
+- Fiber inference must build coarser OME-Zarr pyramids: scalar mean-pool
+  pyramids for `presence` and paired normal pyramids for `nx/ny`, using the
+  existing Lasagna pyramid helpers.
+- Fiber inference must not keep legacy V0 output compatibility shims: no
+  `fiber_trace_3d_inference.json`, no raw seven-channel persisted bundle, no
+  directory-style `--output`, no duplicate fiber output adapter, and no public
+  exports for removed V0 symbols.
 
 ## 3D CP-Centered Fiber Model Variant
 

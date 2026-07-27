@@ -1,12 +1,13 @@
 # 2D Fiber Trace Loader Code Structure
 
-This package implements a loader/debug runner and a V0 training path for 2D
-fiber side-strip patches around VC3D fiber control points.
+This package implements a loader/debug runner and training path for 2D fiber
+side-strip patches around VC3D fiber control points.
 
-The sibling package `vesuvius.neural_tracing.fiber_trace_3d` implements the V0
-CP-centered 3D model path. It shares fiber JSON/NML parsing conventions and
-Lasagna-manifest dataset semantics with this package, but it does not use 2D
-side/top strip input loading.
+The sibling package `vesuvius.neural_tracing.fiber_trace_3d` implements the
+CP-centered 3D model path. It shares fiber JSON/NML parsing conventions,
+Lasagna-manifest dataset semantics, and the shared Lasagna tiled inference
+machinery with this package, but it does not use 2D side/top strip input
+loading.
 
 ## 3D CP Model Package
 
@@ -58,20 +59,24 @@ side/top strip input loading.
   with the same training helper used by `train.py`, applies the configured
   fiber image normalization per tile, and uses the training mixed-precision
   autocast settings when available.
-- Keeps each model option as a coherent seven-channel output product:
+- Keeps each model option as a coherent raw seven-channel accumulator product:
   `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, and `presence`.
-  The six direction channels are Lasagna 3x2 ambiguous direction channels, not
-  Lasagna `grad_mag/nx/ny` normal products.
-- Legacy grouped outputs become one option bundle per branch. Conditioned
-  recurrent inference can emit one option bundle per recurrent step. Resume
-  completeness for an option requires all seven channel chunks to exist.
+  Those raw channels are internal only.
+- Finalizes each raw option slab into persisted Lasagna-style
+  `presence`, `nx`, and `ny` OME-Zarr channels. The six direction channels are
+  decoded through the same Lasagna 3x2 normal-estimation path before compact
+  `nx/ny` encoding.
+- Legacy grouped outputs become one option product per branch. Conditioned
+  recurrent inference can emit one option product per recurrent step. Resume
+  completeness for an option requires the persisted `presence/nx/ny` sibling
+  chunks to exist.
 
 `fiber_trace_3d/infer.py`
 
 - Provides tiled OME-Zarr inference for trained 3D fiber models:
 
   ```bash
-  PYTHONPATH=lasagna:vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.infer <config.json> --input <volume.zarr/level> --output <out_dir> --checkpoint <snapshot.pt>
+  PYTHONPATH=lasagna:vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.infer <config.json> --input <volume.zarr/level> --output <fiber_out.lasagna.json> --checkpoint <snapshot.pt>
   ```
 
 - Reuses the shared predict3d mechanics for crop handling, canonical tile and
@@ -80,15 +85,21 @@ side/top strip input loading.
   atomic chunk writes.
 - Common tiled arguments are `--input`, `--output`, `--checkpoint`,
   `--tile-size`, `--overlap`, `--border`, `--scaledown`, `--crop`,
-  `--device`, `--no-download`, `--levels`, and `--ome-chunk`.
+  `--device`, `--no-download`, `--levels`, `--ome-chunk`, and
+  `--pyramid-workers`.
   Fiber-specific arguments are the positional config, `--recurrent-steps`,
-  `--output-prefix`, `--base-ref`, and `--base-scale`.
-- Writes one OME-Zarr group per channel under each option, for example
-  `fiber/option_000/dir0_z/.../presence`, plus an atomic
-  `fiber_trace_3d_inference.json` manifest. The manifest records the input
-  and output scales, crop/output region, tile settings, product paths, and the
-  data-level-only pyramid policy. Coarser fiber pyramids are not generated in
-  this V0 writer.
+  `--base-ref`, and `--base-scale`.
+- Writes a Lasagna-style `.lasagna.json` manifest plus OME-Zarr groups derived
+  from the manifest stem. A single-option run writes
+  `<stem>_presence.ome.zarr`, `<stem>_nx.ome.zarr`, and
+  `<stem>_ny.ome.zarr`; multi-option runs prefix channel names with
+  `option_000_`, `option_001_`, etc.
+- The fiber model's raw seven-channel option output is internal only. The
+  shared rolling accumulator stores raw `dir0_z/dir1_z/dir0_y/dir1_y/dir0_x/
+  dir1_x/presence`, and the fiber adapter finalizes those raw slabs to
+  persisted `presence/nx/ny` chunks using Lasagna's compact hemisphere
+  encoding. Coarser presence and normal pyramids are built with the existing
+  Lasagna pyramid helpers.
 
 `fiber_trace_3d/loader.py`
 

@@ -11,11 +11,11 @@
   shared adapter interfaces. The legacy CLI and `.lasagna.json` semantics are
   preserved.
 - Added `vesuvius.neural_tracing.fiber_trace_3d.infer`, a shared-runner-based
-  3D fiber inference CLI that writes coherent seven-channel option bundles
-  (`dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, `presence`)
-  plus `fiber_trace_3d_inference.json` manifest metadata. Fiber outputs are
-  data-level-only in V0 and are explicitly marked as not Lasagna normal
-  products.
+  3D fiber inference CLI that follows the Lasagna output contract. It writes a
+  `.lasagna.json` manifest plus persisted `presence/nx/ny` OME-Zarr groups,
+  accumulates the raw seven model channels only internally, builds presence
+  and normal pyramids with Lasagna helpers, and does not keep the intermediate
+  raw-bundle/custom-manifest writer surface.
 
 ## 2026-07-26
 

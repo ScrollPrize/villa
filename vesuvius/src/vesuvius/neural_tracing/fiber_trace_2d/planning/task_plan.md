@@ -1,187 +1,257 @@
-# Correct Fiber 3D Tiled Inference Output Plan
+# Thin Lasagna Port For Fiber 3D Inference Plan
 
-## Scope
+## Goal
 
-Targets:
+Make `vesuvius.neural_tracing.fiber_trace_3d.infer` a thin Lasagna-style
+`predict3d` port. Remove the intermediate V0 fiber inference output layer
+instead of preserving aliases or compatibility shims for it.
 
-- `vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/inference_adapter.py`
-- `vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/infer.py`
-- shared helpers in `lasagna/tiled_predict3d.py` only where the generic
-  adapter boundary is missing pyramid/manifest hooks
-- tests in `vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-- docs/specs under `vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/`
+Fiber-specific code may only define:
 
-Do not change Lasagna `preprocess_cos_omezarr.py predict3d` behavior except
-for reusable helper exports required by fiber inference.
+- fiber model loading;
+- raw fiber model output splitting;
+- conversion from raw accumulated fiber channels to persisted channels;
+- product completeness in terms of the persisted fiber channels.
 
-## Current Code Facts
+Everything else must be shared with Lasagna `predict3d` or moved into a shared
+Lasagna inference helper.
 
-- Current Lasagna `predict3d` stores normals as separate `grad_mag`, `nx`, and
-  `ny` OME-Zarr groups and records them in `.lasagna.json`.
-- Current Lasagna `predict3d` encodes the hemisphere vector by flipping the
-  estimated vector when `z < 0`, then writing:
-  `nx_u8 = round(nx * 127 + 128)` and
-  `ny_u8 = round(ny * 127 + 128)`, clipped to `uint8`.
-- Current Lasagna `predict3d` builds scalar OME-Zarr pyramids for scalar
-  channels and uses `build_normal_omezarr_pyramid(nx_path, ny_path, ...)` for
-  the paired normal/angle channels.
-- Current fiber inference adapter writes one raw seven-channel product per
-  option:
-  `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, `presence`.
-  That is useful internally but is not the desired persisted output format.
+## Reference Behavior
 
-## Design
+Use `lasagna/preprocess_cos_omezarr.py predict3d` as the behavior reference:
 
-- Keep the model-facing schema unchanged: the 3D fiber model still emits six
-  Lasagna 3x2 ambiguous direction channels plus one presence channel per
-  option.
-- Change the persisted fiber product schema to Lasagna-style channels:
-  `presence`, `nx`, and `ny` per output option.
-- Convert each option's six direction channels to one ambiguous 3D axis with
-  `decode_lasagna_direction_3x2_analytic(...)`, resolve the sign by `z >= 0`,
-  and encode `nx/ny` exactly like Lasagna predict3d.
-- Encode presence as `round(clamp(presence, 0, 1) * 255)` uint8.
-- Treat each option's `presence/nx/ny` triplet as one coherent product. This
-  is only an adapter schema change: the existing shared tiled runner must keep
-  doing resume/skipping/writing exactly as it already does for Lasagna.
-- Write each channel as an OME-Zarr group with levels from the data level to
-  `--levels - 1`, just like Lasagna `_open_or_create_omezarr(...)`.
-- Build coarser pyramids after data-level inference:
-  - scalar mean-pool pyramid for `presence`;
-  - paired normal pyramid for `nx/ny`.
-- Write a `.lasagna.json` manifest using `LasagnaVolume` and `ChannelGroup`.
-  For single-option output, use group names `presence`, `nx`, `ny`.
-  For multi-option output, use stable option-prefixed group/channel names such
-  as `option_000_presence`, `option_000_nx`, `option_000_ny`.
-- Keep a small fiber-specific metadata JSON only if needed for non-Lasagna
-  fields such as model checkpoint/config/options. The authoritative spatial
-  data manifest must be `.lasagna.json`.
+- output is a `.lasagna.json` manifest plus per-channel OME-Zarr groups;
+- output groups are created with `_open_or_create_omezarr(...)`;
+- raw model channels are accumulated in rolling z-band accumulators;
+- persisted chunks are encoded only at product chunk finalization;
+- scalar pyramids use `_build_omezarr_pyramid(...)`;
+- paired normal pyramids use `build_normal_omezarr_pyramid(...)`;
+- resume is based only on durable output chunk existence;
+- temp cleanup and atomic chunk writes are handled by the shared predict3d
+  code path.
+
+Lasagna `nx/ny` encoding is the exact reference:
+
+- estimate the 3D ambiguous axis from raw 3x2 direction channels;
+- flip equivalent sign so `z >= 0`;
+- persist `round(component * 127 + 128)` clipped to `uint8`.
+
+## Current Leftovers To Remove
+
+The current tree still contains V0/intermediate fiber inference artifacts. They
+must be removed, not aliased:
+
+- `FiberTrace3DOmeZarrOutputAdapter` in
+  `fiber_trace_3d/inference_adapter.py`: duplicate output writer/completeness
+  adapter. Replace all use with the shared Lasagna/OME-Zarr output adapter,
+  then delete the class and its exports/imports/tests.
+- `FIBER_TRACE_3D_OPTION_CHANNELS` as a persisted-output constant:
+  currently names the raw seven-channel bundle. Replace with explicit names:
+  `FIBER_TRACE_3D_INTERNAL_CHANNELS` for raw model/accumulator channels and
+  `FIBER_TRACE_3D_PERSISTED_CHANNELS = ("presence", "nx", "ny")`.
+- `product_channel_arrays_from_output(...)` if it remains a direct
+  raw-output-to-seven-uint8-bundle conversion. Replace with a finalizer that
+  accepts the averaged raw accumulator slab and returns only
+  `presence/nx/ny`.
+- `fiber_trace_3d/infer.py` custom manifest functions:
+  `_atomic_json_write(...)`, `_write_fiber_inference_manifest(...)`,
+  `_manifest_relative_path(...)`, `_interval_dict_zyx(...)`, and
+  `_output_region_dict_zyx(...)`. Delete them.
+- `fiber_trace_3d_inference.json`: stop writing it. No optional provenance
+  sidecar in this task.
+- Fiber output layout under `fiber/option_000/<raw-channel>`: remove.
+- CLI behavior where `--output` is an output directory: remove. Match Lasagna:
+  `--output` must be a `.lasagna.json` path. The zarr group names derive from
+  the manifest stem, as in Lasagna.
+- V0 docs/spec/tests that mention raw seven persisted channels,
+  `data_level_only`, `not_lasagna_normal_products`, or the custom manifest:
+  update or delete.
+- `fiber_trace_3d/__init__.py` exports for removed V0 symbols: delete, not
+  alias.
+
+## Shared Boundary
+
+Shared code should own mechanics:
+
+- tile iteration;
+- crop handling and output chunk lattice;
+- S3/input download handling;
+- rolling z-band accumulation;
+- output chunk skip/resume;
+- temp cleanup;
+- atomic chunk writes;
+- OME-Zarr group creation;
+- pyramid generation;
+- `.lasagna.json` manifest writing.
+
+Fiber code should own product semantics:
+
+- load configured fiber checkpoint/model;
+- normalize/preprocess tiles in the same way training expects;
+- split model output into raw option tensors;
+- state the raw accumulator channel count;
+- finalize averaged raw option slabs to persisted `presence/nx/ny`;
+- define completeness as all three persisted chunks existing.
+
+If the existing shared runner lacks this boundary, add the minimum generic hook
+to `lasagna/tiled_predict3d.py`:
+
+- `OutputProductSpec` can have an accumulator channel count that differs from
+  persisted channel count;
+- model adapters can finalize an averaged raw product slab into a
+  `dict[channel_name, np.ndarray]`;
+- default finalization remains current direct `clamp(x * 255)` behavior.
+
+Do not create another fiber-specific runner, output adapter, skip policy,
+manifest writer, or pyramid writer.
+
+## Fiber Product Mapping
+
+For each output option:
+
+- raw accumulated channels:
+  `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, `presence`;
+- persisted channels:
+  `presence`, `nx`, `ny`;
+- persisted channel paths:
+  - single option: `<manifest_stem>_presence.ome.zarr`,
+    `<manifest_stem>_nx.ome.zarr`, `<manifest_stem>_ny.ome.zarr`;
+  - multi-option: `<manifest_stem>_option_000_presence.ome.zarr`,
+    `<manifest_stem>_option_000_nx.ome.zarr`,
+    `<manifest_stem>_option_000_ny.ome.zarr`, etc.
+
+Finalization:
+
+- `presence_u8 = round(clamp(raw_presence, 0, 1) * 255)`;
+- use the established Lasagna analytic 3x2 direction implementation; do not
+  add a grid search or a new decoder;
+- sign-fold by `z >= 0`;
+- encode `nx/ny` with the Lasagna formula above.
+
+Do not collapse branch/recurrent options. Each option remains its own
+`presence/nx/ny` product triplet.
 
 ## Implementation Steps
 
-1. **Add Lasagna-style fiber product schema**
-   - Replace the persisted `FIBER_TRACE_3D_OPTION_CHANNELS` product layout in
-     the inference adapter with `presence`, `nx`, and `ny` output channels per
-     option.
-   - Keep the model-output splitting as seven internal channels.
-   - Add explicit internal-to-output conversion helpers:
-     `fiber_option_to_presence_nx_ny_uint8(...)`.
+1. **Make the shared runner support raw-finalize-persist products**
+   - Add the accumulator-channel-count/finalizer hook in
+     `lasagna/tiled_predict3d.py`.
+   - Keep default behavior byte-compatible for existing direct products.
+   - Do not change Lasagna `predict3d` numeric behavior.
 
-2. **Implement direction conversion**
-   - Decode six-channel model direction output with
-     `decode_lasagna_direction_3x2_analytic(...)`.
-   - Flip sign where decoded `z < 0`.
-   - Encode `nx/ny` using the current Lasagna formula:
-     `clip(round(component * 127.0 + 128.0), 0, 255).astype(uint8)`.
-   - Add tests for both equivalent signs and edge cases near horizontal axes.
+2. **Move generic OME-Zarr output adapter to shared code**
+   - Promote the Lasagna OME-Zarr output adapter behavior to the shared
+     predict3d module, or expose an equivalent shared helper there.
+   - Update Lasagna `preprocess_cos_omezarr.py` to use the shared adapter if
+     needed.
+   - Delete `FiberTrace3DOmeZarrOutputAdapter`; do not keep an alias.
 
-3. **Create OME-Zarr groups for fiber channels**
-   - Reuse `_open_or_create_omezarr(...)` from `lasagna.tiled_predict3d` or
-     promote it to the public shared helper set if needed.
-   - Ensure `--scaledown` and input zarr level determine the data level exactly
-     as today: `effective_output_sd = input_scaledown * scaledown`;
-     `data_level = log2(effective_output_sd)`.
-   - The data-level shape must be the OME-Zarr shape for that effective
-     scaledown. Coarser pyramid levels are derived from the data level.
+3. **Replace fiber adapter output schema**
+   - Rename constants to distinguish raw internal vs persisted output channels.
+   - Product specs expose only persisted `presence/nx/ny`.
+   - Product specs set raw accumulator channel count to seven.
+   - Product specs use scalar pyramid policy for `presence` and custom/normal
+     policy for `nx/ny` as required by shared pyramid dispatch.
 
-4. **Add fiber `.lasagna.json` manifest writing**
-   - Use `LasagnaVolume` with the resolved `source_to_base` and
-     `base_shape_zyx`.
-   - Add configured crop metadata when `--crop` is used.
-   - Record channel groups pointing at the data-level arrays for every
-     option/channel.
-   - Use backup behavior compatible with existing Lasagna manifest writes.
+4. **Implement fiber finalizer**
+   - Accept the averaged raw seven-channel slab.
+   - Return only `presence`, `nx`, `ny` arrays.
+   - Match Lasagna's 3x2 normal estimation/sign fold/uint8 encoding.
+   - Remove any old helper that writes raw seven output channels.
 
-5. **Wire pyramid construction**
-   - After tiled inference, call scalar pyramid builder for each presence
-     group.
-   - Call `build_normal_omezarr_pyramid(nx_path, ny_path, data_level, ...)`
-     for each option's `nx/ny` pair.
-   - Use the same crop-aware pyramid rebuild policy as `predict3d`, including
-     `scan_existing_source_chunks=True`.
+5. **Rewrite fiber inference output setup around `.lasagna.json`**
+   - Require `--output` to end in `.lasagna.json`.
+   - Derive output directory and zarr name prefix from the manifest path,
+     matching Lasagna.
+   - Create OME-Zarr groups with `_open_or_create_omezarr(...)`.
+   - Write `LasagnaVolume`/`ChannelGroup` as the authoritative manifest.
+   - Delete the custom `fiber_trace_3d_inference.json` writer.
 
-6. **Use the existing shared runner resume path unchanged**
-   - Do not implement a new fiber resume loop, skip loop, atomic writer, done
-     marker, or resume policy.
-   - The only fiber-specific change is the adapter product schema:
-     `product_chunk_complete(...)` for a fiber option checks the three
-     persisted sibling chunks `presence`, `nx`, and `ny`.
-   - Once that schema is set, the shared tiled runner must handle chunk
-     skipping, recomputation of incomplete chunks, and atomic writes through
-     the same code path already used by Lasagna.
+6. **Build pyramids through existing Lasagna helpers**
+   - Build scalar pyramids for every `presence` group.
+   - Build paired normal pyramids for each `nx/ny` pair.
+   - Use crop-aware `scan_existing_source_chunks=True`.
+   - Remove any V0 `data_level_only` behavior.
 
-7. **Update CLI and metadata wording**
-   - Keep existing fiber CLI arguments compatible where possible.
-   - Rename or document `--output-prefix` as the Lasagna channel-name prefix,
-     not a raw seven-channel bundle prefix.
-   - Remove/replace `data_level_only` manifest wording.
-   - Update startup output to report data level and pyramid levels.
+7. **Update imports and public surface**
+   - Remove V0 exports from `fiber_trace_3d/__init__.py`.
+   - Update tests and internal imports to use new names.
+   - Do not leave compatibility aliases for removed V0 names.
 
-8. **Tests**
-   - Update existing fiber adapter tests from seven persisted channels to
-     three persisted channels per option.
-   - Add conversion tests proving:
-     - six-channel direction outputs are decoded and encoded as Lasagna
-       `nx/ny`;
-     - `v` and `-v` persist identically after the `z >= 0` sign fold;
-     - presence fixed-point encoding maps `0.0 -> 0`, `1.0 -> 255`.
-   - Add end-to-end CPU inference test verifying:
-     - `.lasagna.json` exists;
-     - expected OME-Zarr groups/levels exist;
-     - presence, nx, ny data-level chunks are written;
-     - coarser pyramid metadata/arrays exist when `--levels > data_level + 1`.
-   - Add resume test where one of `presence/nx/ny` is missing and the option
-     product is treated incomplete.
+8. **Update docs/specs/tests**
+   - Replace V0 raw bundle docs and specs.
+   - Delete or rewrite tests that assert V0 behavior.
+   - Add tests for raw internal split, persisted schema, finalization,
+     completeness, `.lasagna.json`, and pyramids.
 
 ## Spec Update
 
 Update `planning/specs.md`:
 
-- Replace the fiber V0 seven-channel persisted output spec with:
-  model-internal seven channels, persisted Lasagna-style
-  `presence/nx/ny` channels.
-- State that fiber inference writes `.lasagna.json` and OME-Zarr scale-space
-  pyramids like Lasagna `predict3d`.
-- Document presence fixed-point encoding.
-- Document the `nx/ny` sign fold and uint8 formula.
-- Reclassify existence-based resume and cubic tiled inference as required
-  behavior, not limitations. State explicitly that fiber inference must reuse
-  the shared runner resume path rather than reimplementing it.
-- Clarify output resolution:
-  the data level is the configured inference output resolution; pyramid levels
-  are derived from it.
+- Fiber 3D inference is a thin Lasagna `predict3d` port.
+- The authoritative output is `.lasagna.json`; no custom primary manifest.
+- `--output` is a `.lasagna.json` path.
+- Raw seven-channel fiber model output is internal only.
+- Persisted fiber output is only `presence`, `nx`, `ny`.
+- Raw channels are accumulated before final encoding.
+- Presence is uint8 fixed point with `0 == 0.0`, `255 == 1.0`.
+- `nx/ny` use Lasagna's compact ambiguous hemisphere encoding.
+- Coarser pyramids are required.
+- Shared predict3d owns resume/temp/atomic/chunk/pyramid mechanics.
+- No legacy V0 aliases or output compatibility shims should remain.
 
 ## Docs Updates
 
-- Update `fiber_trace_2d/docs/code_structure.md` for the new persisted fiber
-  inference output layout.
-- Update Lasagna/shared inference docs only where they describe adapter
-  behavior shared by both products.
-- Add a CLI example that points users to the `.lasagna.json` output.
-- Update `planning/changelog.md` when implementation lands.
+Update `fiber_trace_2d/docs/code_structure.md`:
 
-## Validation Commands
+- Replace the V0 fiber inference description.
+- Document the thin Lasagna port and shared ownership boundary.
+- Show a CLI example writing a `.lasagna.json` output.
+- Document the resulting output groups.
 
+Update `planning/changelog.md` after implementation.
+
+## Tests
+
+Update or add focused tests:
+
+- fiber adapter product schema persists only `presence/nx/ny`;
+- raw seven channels still split correctly per option internally;
+- finalizer maps presence `0.0 -> 0` and `1.0 -> 255`;
+- finalizer maps equivalent `v` and `-v` directions to identical `nx/ny`;
+- product completeness requires all three persisted chunks;
+- V0 symbols/classes are absent from the public fiber package;
+- end-to-end CPU inference writes:
+  - `.lasagna.json`;
+  - OME-Zarr groups for `presence`, `nx`, `ny`;
+  - data-level chunks;
+  - coarser pyramid levels;
+- Lasagna `predict3d` tests still pass.
+
+Validation commands:
+
+- `python -m py_compile lasagna/tiled_predict3d.py lasagna/preprocess_cos_omezarr.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/infer.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/inference_adapter.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/__init__.py`
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "fiber_infer or fiber_inference_adapter or fiber_output_adapter"`
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=lasagna:vesuvius/src:. pytest -q lasagna/tests/test_preprocess_cos_omezarr.py`
-- `python -m py_compile lasagna/tiled_predict3d.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/infer.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/inference_adapter.py`
 
 ## Non-Goals
 
-- Do not add fiber tracing or Trace2CP inference output.
-- Do not change fiber training output/loss semantics.
-- Do not change Lasagna cos/normal `predict3d` numeric behavior.
-- Do not add non-cubic tiles.
-- Do not add any fiber-specific resume implementation, done markers, or
-  config-hash resume gating.
-- Do not collapse multi-option model outputs unless an explicit later
-  postprocessing mode is specified.
+- No fiber tracing output.
+- No Trace2CP output.
+- No done markers.
+- No fiber-specific pyramid implementation.
+- No encoded `nx/ny` accumulation.
+- No change to Lasagna `predict3d` outputs or numerics.
+- No branch collapse or option averaging.
+- No compatibility shim for the V0 raw-bundle output.
 
 ## Review Checklist
 
-- Fiber output can be opened through `.lasagna.json`.
-- Fiber persisted output is only presence plus compact `nx/ny` angle channels.
-- Presence and `nx/ny` have OME-Zarr pyramids.
-- Existing Lasagna `predict3d` commands still work.
-- Resume remains chunk-existence based.
-- Output data level is exactly the configured inference resolution.
+- No `FiberTrace3DOmeZarrOutputAdapter` class or export remains.
+- No custom `fiber_trace_3d_inference.json` writer remains.
+- No persisted raw seven-channel fiber output remains.
+- No `data_level_only` fiber inference wording remains.
+- Fiber output opens through `.lasagna.json`.
+- Existing Lasagna `predict3d` remains compatible.
+- Any remaining fiber-specific code is tied to model loading, raw channel
+  interpretation, finalization, or product completeness.

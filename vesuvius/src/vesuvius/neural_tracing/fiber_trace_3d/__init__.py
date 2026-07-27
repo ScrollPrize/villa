@@ -15,8 +15,8 @@ from .model import (
     presence_outputs,
 )
 from .inference_adapter import (
-    FIBER_TRACE_3D_OPTION_CHANNELS,
-    FiberTrace3DOmeZarrOutputAdapter,
+    FIBER_TRACE_3D_INTERNAL_CHANNELS,
+    FIBER_TRACE_3D_PERSISTED_CHANNELS,
     FiberTrace3DPredictAdapter,
 )
 
@@ -27,8 +27,8 @@ __all__ = [
     "direction_outputs",
     "presence_output",
     "presence_outputs",
-    "FIBER_TRACE_3D_OPTION_CHANNELS",
-    "FiberTrace3DOmeZarrOutputAdapter",
+    "FIBER_TRACE_3D_INTERNAL_CHANNELS",
+    "FIBER_TRACE_3D_PERSISTED_CHANNELS",
     "FiberTrace3DPredictAdapter",
     "decode_lasagna_direction_3x2_analytic",
     "decode_lasagna_direction_2d",

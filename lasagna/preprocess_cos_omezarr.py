@@ -36,17 +36,9 @@ import torch
 import zarr
 
 try:
-	from omezarr_pyramid import (
-		build_normal_omezarr_pyramid,
-	)
-except ImportError:
-	from lasagna.omezarr_pyramid import (
-		build_normal_omezarr_pyramid,
-	)
-
-try:
 	from tiled_predict3d import (
 		ModelAdapter,
+		OmeZarrOutputAdapter,
 		OutputAdapter,
 		OutputChannelSpec,
 		OutputProductSpec,
@@ -57,11 +49,13 @@ try:
 		VALID_PYRAMID_POLICIES,
 		_RollingZBand,
 		_atomic_zarr_write,
+		build_product_omezarr_pyramids,
 		_build_tile_positions,
 		_build_omezarr_pyramid,
 		_canonical_local_tile_positions,
 		_canonical_tile_positions_for_output_region,
 		_cleanup_predict3d_temp_files,
+		create_product_omezarr_groups,
 		_create_omezarr,
 		_downscaled_tile_clip,
 		_find_resume_z,
@@ -89,10 +83,12 @@ try:
 		_remove_path_quiet,
 		_rolling_band_has_range,
 		_zarr_chunk_path,
+		write_lasagna_product_manifest,
 	)
 except ImportError:
 	from lasagna.tiled_predict3d import (
 		ModelAdapter,
+		OmeZarrOutputAdapter,
 		OutputAdapter,
 		OutputChannelSpec,
 		OutputProductSpec,
@@ -103,11 +99,13 @@ except ImportError:
 		VALID_PYRAMID_POLICIES,
 		_RollingZBand,
 		_atomic_zarr_write,
+		build_product_omezarr_pyramids,
 		_build_tile_positions,
 		_build_omezarr_pyramid,
 		_canonical_local_tile_positions,
 		_canonical_tile_positions_for_output_region,
 		_cleanup_predict3d_temp_files,
+		create_product_omezarr_groups,
 		_create_omezarr,
 		_downscaled_tile_clip,
 		_find_resume_z,
@@ -135,6 +133,7 @@ except ImportError:
 		_remove_path_quiet,
 		_rolling_band_has_range,
 		_zarr_chunk_path,
+		write_lasagna_product_manifest,
 	)
 
 from common import load_unet, unet_infer_tiled
@@ -248,94 +247,59 @@ class LasagnaCosPredict3DAdapter:
 		_ = tile_origin_zyx, tile_weight
 		accumulators["raw_output"] = raw_output
 
-
-class LasagnaOmeZarrOutputAdapter:
-	"""OME-Zarr chunk completeness/write adapter for Lasagna predict3d products."""
-
-	def __init__(self, *, products: tuple[OutputProductSpec, ...], n_levels: int) -> None:
-		self.products = tuple(products)
-		self.n_levels = int(n_levels)
-		self._products_by_name = {product.name: product for product in self.products}
-
-	def product_by_name(self, name: str) -> OutputProductSpec:
-		return self._products_by_name[name]
-
-	@staticmethod
-	def _channel_path(channel: OutputChannelSpec) -> str:
-		if channel.relative_path is None:
-			raise ValueError(f"output channel {channel.name!r} has no OME-Zarr path")
-		return str(channel.relative_path)
-
-	def product_chunk_complete(
-		self,
-		product: OutputProductSpec,
-		*,
-		chunk_origin_zyx,
-	) -> bool:
-		z, y, x = (int(v) for v in chunk_origin_zyx)
-		if product.channel_count == 1:
-			path = self._channel_path(product.channels[0])
-			return _omezarr_chunk_exists(path, product.level, z, y, x, product.chunk_size)
-		paths = tuple(self._channel_path(channel) for channel in product.channels)
-		return _omezarr_chunk_group_complete(paths, product.level, z, y, x, product.chunk_size)
-
-	def channel_chunk_exists(
-		self,
-		product: OutputProductSpec,
-		channel_name: str,
-		*,
-		chunk_origin_zyx,
-	) -> bool:
-		z, y, x = (int(v) for v in chunk_origin_zyx)
-		for channel in product.channels:
-			if channel.name == channel_name:
-				return _omezarr_chunk_exists(
-					self._channel_path(channel),
-					product.level,
-					z,
-					y,
-					x,
-					product.chunk_size,
-				)
-		raise KeyError(channel_name)
-
-	def write_product_chunk(
-		self,
-		product: OutputProductSpec,
-		*,
-		chunk_origin_zyx,
-		data,
-	) -> None:
-		z, y, x = (int(v) for v in chunk_origin_zyx)
-		for channel in product.channels:
-			if channel.name not in data:
-				continue
-			block = np.ascontiguousarray(data[channel.name])
-			if block.ndim != 3:
-				raise ValueError(
-					f"output channel {channel.name!r} chunk must be 3D, got shape={block.shape}"
-				)
-			wz, wy, wx = (int(v) for v in block.shape)
-			if wz <= 0 or wy <= 0 or wx <= 0:
-				continue
-			_atomic_zarr_write(
-				self._channel_path(channel),
-				product.level,
-				z,
-				y,
-				x,
-				z + wz,
-				y + wy,
-				x + wx,
-				block,
-				product.chunk_size,
-				self.n_levels,
+	def product_tensors_from_output(self, raw_output) -> dict[str, torch.Tensor]:
+		output = raw_output.to(dtype=torch.float32)
+		if output.ndim != 5:
+			raise ValueError("Lasagna predict3d model output must have shape B,C,D,H,W")
+		if int(output.shape[1]) < 8:
+			raise ValueError(
+				"Lasagna predict3d model output must contain at least 8 channels: "
+				"cos, grad_mag, and six direction channels"
 			)
+		return {
+			self.cos_product.name: output[:, 0:1],
+			self.normal_product.name: output[:, 1:8],
+		}
 
-	def update_metadata(self, products) -> None:
-		# Lasagna manifest/pyramid metadata remains in run_preprocess_3d for
-		# compatibility. The adapter boundary is still used for chunk state.
-		_ = products
+	def finalize_product_slab(
+		self,
+		product: OutputProductSpec,
+		raw_slab: np.ndarray,
+	) -> dict[str, np.ndarray]:
+		slab = np.asarray(raw_slab, dtype=np.float32)
+		if product.name == self.cos_product.name:
+			if slab.ndim != 4 or int(slab.shape[0]) != 1:
+				raise ValueError(f"cos slab must have shape 1,D,H,W; got {slab.shape}")
+			return {
+				"cos": np.clip(slab[0] * 255.0, 0.0, 255.0).astype(np.uint8),
+			}
+		if product.name == self.normal_product.name:
+			if slab.ndim != 4 or int(slab.shape[0]) != 7:
+				raise ValueError(
+					f"normal slab must have shape 7,D,H,W; got {slab.shape}"
+				)
+			gm_u8 = np.clip(slab[0] * 1000.0, 0.0, 255.0).astype(np.uint8)
+			_, _, _, nx_n, ny_n, nz_n = _estimate_normal(
+				slab[1],
+				slab[2],
+				slab[3],
+				slab[4],
+				slab[5],
+				slab[6],
+			)
+			flip = np.where(nz_n < 0.0, -1.0, 1.0)
+			nx_u8 = np.clip(
+				np.round(nx_n * flip * 127.0 + 128.0),
+				0.0,
+				255.0,
+			).astype(np.uint8)
+			ny_u8 = np.clip(
+				np.round(ny_n * flip * 127.0 + 128.0),
+				0.0,
+				255.0,
+			).astype(np.uint8)
+			return {"grad_mag": gm_u8, "nx": nx_u8, "ny": ny_u8}
+		raise KeyError(product.name)
 
 
 def _pyrdown2d(arr: np.ndarray, *, factor: int) -> np.ndarray:
@@ -1745,8 +1709,6 @@ def run_preprocess_3d(
 	pred_dt (if provided) is stored at cos_scaledown resolution with signed
 	distance encoding: outside=[80,127], inside=[128,175], no data=0.
 	"""
-	from lasagna_volume import LasagnaVolume, ChannelGroup
-
 	if tile_size is None:
 		_ckpt_meta = torch.load(unet3d_checkpoint, map_location="cpu", weights_only=False)
 		if not isinstance(_ckpt_meta, dict) or _ckpt_meta.get("patch_size") is None:
@@ -1892,26 +1854,6 @@ def run_preprocess_3d(
 	print(f"[predict3d] input_sd={input_sd} cos_level={cos_level} other_level={other_level} "
 		  f"n_levels={n_levels}", flush=True)
 
-	# Load or create the .lasagna.json manifest
-	json_path = Path(output_path)
-	json_path_preexisting = json_path.exists()
-	if json_path_preexisting:
-		vol = LasagnaVolume.load(json_path)
-		print(f"[predict3d] loaded existing manifest: {output_path}", flush=True)
-		vol.base_shape_zyx = base_shape_zyx
-	else:
-		vol = LasagnaVolume(
-			path=json_path.resolve(),
-			source_to_base=source_to_base,
-			base_shape_zyx=base_shape_zyx,
-		)
-	# grad_mag values stay in input-voxel density units; the OME pyramid level only
-	# changes coordinate spacing because downsampling averages the values.
-	vol.grad_mag_factor = _grad_mag_factor_from_input_sd(input_sd)
-	# Record this crop in base coordinates (appends if new, deduplicates)
-	if crop_xyzwhd is not None:
-		vol.add_crop(tuple(int(v) for v in crop_xyzwhd))
-
 	# Validate pred-dt source and determine its scale relative to base
 	pred_dt_zarr = None
 	pred_sd = 1       # pred zarr scaledown from base (1 = full res)
@@ -1989,59 +1931,34 @@ def run_preprocess_3d(
 			else None
 		),
 	)
-	output_adapter = LasagnaOmeZarrOutputAdapter(
+	output_adapter = OmeZarrOutputAdapter(
 		products=predict_adapter.output_products,
 		n_levels=n_levels,
 	)
 	cos_product = predict_adapter.cos_product
 	normal_product = predict_adapter.normal_product
 
-	cos_grp = _open_or_create_omezarr(cos_omezarr_path, base_shape_zyx, cos_level, n_levels, oc, "cos")
-	gm_grp = _open_or_create_omezarr(gm_omezarr_path, base_shape_zyx, other_level, n_levels, oc, "grad_mag")
-	nx_grp = _open_or_create_omezarr(nx_omezarr_path, base_shape_zyx, other_level, n_levels, oc, "nx")
-	ny_grp = _open_or_create_omezarr(ny_omezarr_path, base_shape_zyx, other_level, n_levels, oc, "ny")
-	dt_grp = _open_or_create_omezarr(dt_omezarr_path, base_shape_zyx, cos_level, n_levels, oc, "pred_dt") if dt_omezarr_path else None
+	output_groups = create_product_omezarr_groups(
+		products=predict_adapter.output_products,
+		base_shape_zyx=base_shape_zyx,
+		n_levels=n_levels,
+		ome_chunk=oc,
+	)
+	write_lasagna_product_manifest(
+		output_path=output_path,
+		products=predict_adapter.output_products,
+		base_shape_zyx=base_shape_zyx,
+		crop_xyzwhd_base=crop_xyzwhd,
+		source_to_base=source_to_base,
+		grad_mag_factor=_grad_mag_factor_from_input_sd(input_sd),
+	)
 
 	# Level arrays (3D) for writing
-	cos_lv_arr = cos_grp[str(cos_level)]
-	gm_lv_arr = gm_grp[str(other_level)]
-	nx_lv_arr = nx_grp[str(other_level)]
-	ny_lv_arr = ny_grp[str(other_level)]
-	dt_lv_arr = dt_grp[str(cos_level)] if dt_grp else None
-
-	desired_groups = {
-		"cos": ChannelGroup(
-			zarr_path=f"{prefix}cos.ome.zarr/{cos_level}",
-			scaledown=cos_level,
-			channels=["cos"],
-		),
-		"grad_mag": ChannelGroup(
-			zarr_path=f"{prefix}grad_mag.ome.zarr/{other_level}",
-			scaledown=other_level,
-			channels=["grad_mag"],
-		),
-		"nx": ChannelGroup(
-			zarr_path=f"{prefix}nx.ome.zarr/{other_level}",
-			scaledown=other_level,
-			channels=["nx"],
-		),
-		"ny": ChannelGroup(
-			zarr_path=f"{prefix}ny.ome.zarr/{other_level}",
-			scaledown=other_level,
-			channels=["ny"],
-		),
-	}
-	if pred_dt_path:
-		desired_groups["pred_dt"] = ChannelGroup(
-			zarr_path=f"{prefix}pred_dt.ome.zarr/{cos_level}",
-			scaledown=cos_level,
-			channels=["pred_dt"],
-		)
-	vol.groups = desired_groups
-	vol.save(
-		backup_existing=json_path_preexisting,
-		backup_suffix=time.strftime("%Y%m%d_%H%M%S"),
-	)
+	cos_lv_arr = output_groups["cos"][str(cos_level)]
+	gm_lv_arr = output_groups["grad_mag"][str(other_level)]
+	nx_lv_arr = output_groups["nx"][str(other_level)]
+	ny_lv_arr = output_groups["ny"][str(other_level)]
+	dt_lv_arr = output_groups["pred_dt"][str(cos_level)] if dt_omezarr_path else None
 
 	# Resume is handled per-chunk: _is_tile_done skips tiles whose output
 	# chunks exist, and the flush skips writing existing chunks.
@@ -2488,40 +2405,18 @@ def run_preprocess_3d(
 	print("[predict3d] building OME-Zarr pyramids ...", flush=True)
 	cos_crop_zyx = (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1)
 	other_crop_zyx = (other_oz0, other_oy0, other_ox0, other_oz1, other_oy1, other_ox1)
-	for path, data_lv, name, crop in [
-		(cos_omezarr_path, cos_level, "cos", cos_crop_zyx),
-		(gm_omezarr_path, other_level, "grad_mag", other_crop_zyx),
-	]:
-		_build_omezarr_pyramid(
-			path,
-			data_lv,
-			n_levels,
-			oc,
-			crop_zyx=crop,
-			label=name,
-			zero_overrides=(name == "grad_mag"),
-			scan_existing_source_chunks=True,
-		)
-	build_normal_omezarr_pyramid(
-		nx_omezarr_path,
-		ny_omezarr_path,
-		other_level,
-		n_levels,
-		oc,
-		crop_zyx=other_crop_zyx,
-		label="normal",
-		scan_existing_source_chunks=True,
+	crop_by_product = {
+		cos_product.name: cos_crop_zyx,
+		normal_product.name: other_crop_zyx,
+	}
+	if predict_adapter.pred_dt_product is not None:
+		crop_by_product[predict_adapter.pred_dt_product.name] = cos_crop_zyx
+	build_product_omezarr_pyramids(
+		products=predict_adapter.output_products,
+		n_levels=n_levels,
+		ome_chunk=oc,
+		crop_zyx_by_product=crop_by_product,
 	)
-	if dt_omezarr_path:
-		_build_omezarr_pyramid(
-			dt_omezarr_path,
-			cos_level,
-			n_levels,
-			oc,
-			crop_zyx=cos_crop_zyx,
-			label="pred_dt",
-			scan_existing_source_chunks=True,
-		)
 
 	# --- Resume training ---
 	if _gpu_ctx is not None:

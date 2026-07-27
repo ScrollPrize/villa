@@ -12,34 +12,38 @@ try:
         OutputChannelSpec,
         OutputProductSpec,
         ProductTileOutput,
-        PYRAMID_POLICY_NONE,
-        _atomic_zarr_write,
-        _omezarr_chunk_group_complete,
+        PYRAMID_POLICY_CUSTOM,
     )
 except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
     from tiled_predict3d import (
         OutputChannelSpec,
         OutputProductSpec,
         ProductTileOutput,
-        PYRAMID_POLICY_NONE,
-        _atomic_zarr_write,
-        _omezarr_chunk_group_complete,
+        PYRAMID_POLICY_CUSTOM,
     )
+
+try:
+    from lasagna.preprocess_cos_omezarr import _estimate_normal
+except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
+    from preprocess_cos_omezarr import _estimate_normal
 
 from vesuvius.neural_tracing.fiber_trace_3d.direction import LASAGNA_3X2_CHANNELS
 from vesuvius.neural_tracing.fiber_trace_3d.model import build_fiber_trace_3d_model
 
 
-FIBER_TRACE_3D_OPTION_CHANNELS: tuple[str, ...] = (
+FIBER_TRACE_3D_INTERNAL_CHANNELS: tuple[str, ...] = (
     *LASAGNA_3X2_CHANNELS,
     "presence",
 )
+FIBER_TRACE_3D_PERSISTED_CHANNELS: tuple[str, ...] = ("presence", "nx", "ny")
 
 
-def _sanitize_output_prefix(value: str) -> str:
-    prefix = str(value).strip().strip("/")
+def _sanitize_product_prefix(value: str) -> str:
+    prefix = str(value).strip()
     if not prefix:
-        raise ValueError("output_prefix must be non-empty")
+        raise ValueError("product_prefix must be non-empty")
+    if "/" in prefix or "\\" in prefix:
+        raise ValueError("product_prefix must be a simple product-name prefix")
     return prefix
 
 
@@ -103,8 +107,8 @@ def _option_count_from_config(
 class FiberTrace3DPredictAdapter:
     """Model adapter for 3D fiber inference.
 
-    Each emitted option is a coherent seven-channel product:
-    Lasagna 3x2 direction channels followed by scalar fiber presence.
+    Each emitted option accumulates seven raw model channels internally and
+    persists a Lasagna-style ``presence/nx/ny`` product.
     """
 
     def __init__(
@@ -115,7 +119,8 @@ class FiberTrace3DPredictAdapter:
         level: int = 0,
         scaledown: int = 1,
         chunk_size: int = 64,
-        output_prefix: str = "fiber",
+        product_prefix: str = "fiber",
+        zarr_path_prefix: str | Path | None = None,
         recurrent_steps: int | None = None,
     ) -> None:
         self.config = dict(config)
@@ -128,7 +133,12 @@ class FiberTrace3DPredictAdapter:
             self.config,
             recurrent_steps=self.recurrent_steps,
         )
-        self.output_prefix = _sanitize_output_prefix(output_prefix)
+        self.product_prefix = _sanitize_product_prefix(product_prefix)
+        self.zarr_path_prefix = (
+            self.product_prefix
+            if zarr_path_prefix is None
+            else str(zarr_path_prefix)
+        )
         self._products = tuple(
             self._make_option_product(
                 option_index,
@@ -186,21 +196,29 @@ class FiberTrace3DPredictAdapter:
         chunk_size: int,
     ) -> OutputProductSpec:
         option_name = f"option_{int(option_index):03d}"
+        if self.option_count == 1:
+            persisted_names = FIBER_TRACE_3D_PERSISTED_CHANNELS
+        else:
+            persisted_names = tuple(
+                f"{option_name}_{channel}"
+                for channel in FIBER_TRACE_3D_PERSISTED_CHANNELS
+            )
         return OutputProductSpec(
-            name=f"{self.output_prefix}_{option_name}",
+            name=f"{self.product_prefix}_{option_name}",
             level=level,
             scaledown=scaledown,
             channels=tuple(
                 OutputChannelSpec(
                     channel,
-                    relative_path=f"{self.output_prefix}/{option_name}/{channel}",
+                    relative_path=f"{self.zarr_path_prefix}_{channel}.ome.zarr",
                 )
-                for channel in FIBER_TRACE_3D_OPTION_CHANNELS
+                for channel in persisted_names
             ),
             chunk_size=chunk_size,
             dtype=np.uint8,
             value_range=(0.0, 255.0),
-            pyramid_policy=PYRAMID_POLICY_NONE,
+            pyramid_policy=PYRAMID_POLICY_CUSTOM,
+            accumulator_channel_count=len(FIBER_TRACE_3D_INTERNAL_CHANNELS),
         )
 
     def load_model(self, *, device: torch.device) -> torch.nn.Module:
@@ -276,30 +294,52 @@ class FiberTrace3DPredictAdapter:
             for option_index, product in enumerate(self.output_products)
         }
 
-    def product_channel_arrays_from_output(
+    def finalize_product_slab(
         self,
-        raw_output: torch.Tensor,
-        *,
-        batch_index: int = 0,
-    ) -> dict[str, dict[str, np.ndarray]]:
-        products = self.product_tensors_from_output(raw_output)
-        out: dict[str, dict[str, np.ndarray]] = {}
-        for product in self.output_products:
-            tensor = products[product.name]
-            batch = int(batch_index)
-            if batch < 0 or batch >= int(tensor.shape[0]):
-                raise IndexError(
-                    f"batch_index={batch} is outside output batch size {int(tensor.shape[0])}"
-                )
-            bundle = tensor[batch].detach().cpu().clamp(0.0, 1.0)
-            channels: dict[str, np.ndarray] = {}
-            for channel_index, channel in enumerate(product.channels):
-                channels[channel.name] = (
-                    torch.round(bundle[channel_index] * 255.0)
-                    .to(dtype=torch.uint8)
-                    .numpy()
-                )
-            out[product.name] = channels
+        product: OutputProductSpec,
+        raw_slab: np.ndarray,
+    ) -> ProductTileOutput:
+        slab = np.asarray(raw_slab, dtype=np.float32)
+        if slab.ndim != 4 or int(slab.shape[0]) != len(FIBER_TRACE_3D_INTERNAL_CHANNELS):
+            raise ValueError(
+                "fiber raw product slab must have shape 7,D,H,W; "
+                f"got {slab.shape}"
+            )
+        presence_u8 = np.clip(
+            np.round(np.clip(slab[6], 0.0, 1.0) * 255.0),
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+        _, _, _, nx_n, ny_n, nz_n = _estimate_normal(
+            slab[0],
+            slab[1],
+            slab[2],
+            slab[3],
+            slab[4],
+            slab[5],
+        )
+        flip = np.where(nz_n < 0.0, -1.0, 1.0)
+        nx_u8 = np.clip(
+            np.round(nx_n * flip * 127.0 + 128.0),
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+        ny_u8 = np.clip(
+            np.round(ny_n * flip * 127.0 + 128.0),
+            0.0,
+            255.0,
+        ).astype(np.uint8)
+        arrays_by_base = {
+            "presence": presence_u8,
+            "nx": nx_u8,
+            "ny": ny_u8,
+        }
+        out: dict[str, np.ndarray] = {}
+        for channel in product.channels:
+            for base_name, array in arrays_by_base.items():
+                if channel.name == base_name or channel.name.endswith(f"_{base_name}"):
+                    out[channel.name] = array
+                    break
         return out
 
     def accumulate_tile_output(
@@ -334,97 +374,8 @@ class FiberTrace3DPredictAdapter:
                 )
 
 
-class FiberTrace3DOmeZarrOutputAdapter:
-    """Chunk completeness and atomic write adapter for fiber option bundles."""
-
-    def __init__(
-        self,
-        *,
-        output_root: str | Path,
-        products: Sequence[OutputProductSpec],
-        n_levels: int = 0,
-    ) -> None:
-        self.output_root = Path(output_root)
-        self.products = tuple(products)
-        self.n_levels = int(n_levels)
-
-    def _channel_path(
-        self,
-        product: OutputProductSpec,
-        channel: OutputChannelSpec,
-    ) -> str:
-        rel = channel.relative_path or channel.name
-        path = Path(rel)
-        return str(path if path.is_absolute() else self.output_root / path)
-
-    def channel_path(
-        self,
-        product: OutputProductSpec,
-        channel: OutputChannelSpec,
-    ) -> str:
-        return self._channel_path(product, channel)
-
-    def _channel_paths(self, product: OutputProductSpec) -> tuple[str, ...]:
-        return tuple(self._channel_path(product, channel) for channel in product.channels)
-
-    def product_chunk_complete(
-        self,
-        product: OutputProductSpec,
-        *,
-        chunk_origin_zyx: tuple[int, int, int],
-    ) -> bool:
-        z, y, x = (int(v) for v in chunk_origin_zyx)
-        return _omezarr_chunk_group_complete(
-            self._channel_paths(product),
-            int(product.level),
-            z,
-            y,
-            x,
-            int(product.chunk_size),
-        )
-
-    def write_product_chunk(
-        self,
-        product: OutputProductSpec,
-        *,
-        chunk_origin_zyx: tuple[int, int, int],
-        data: ProductTileOutput,
-    ) -> None:
-        missing = [channel.name for channel in product.channels if channel.name not in data]
-        if missing:
-            raise ValueError(
-                f"product {product.name!r} write is missing channels: {missing}"
-            )
-        z0, y0, x0 = (int(v) for v in chunk_origin_zyx)
-        for channel in product.channels:
-            chunk = np.asarray(data[channel.name])
-            if chunk.ndim != 3:
-                raise ValueError(
-                    f"fiber output channel {channel.name!r} chunk must be 3D"
-                )
-            z1 = z0 + int(chunk.shape[0])
-            y1 = y0 + int(chunk.shape[1])
-            x1 = x0 + int(chunk.shape[2])
-            _atomic_zarr_write(
-                self._channel_path(product, channel),
-                int(product.level),
-                z0,
-                y0,
-                x0,
-                z1,
-                y1,
-                x1,
-                chunk.astype(product.dtype, copy=False),
-                int(product.chunk_size),
-                n_levels=self.n_levels,
-            )
-
-    def update_metadata(self, products: Sequence[OutputProductSpec]) -> None:
-        del products
-
-
 __all__ = [
-    "FIBER_TRACE_3D_OPTION_CHANNELS",
+    "FIBER_TRACE_3D_INTERNAL_CHANNELS",
+    "FIBER_TRACE_3D_PERSISTED_CHANNELS",
     "FiberTrace3DPredictAdapter",
-    "FiberTrace3DOmeZarrOutputAdapter",
 ]

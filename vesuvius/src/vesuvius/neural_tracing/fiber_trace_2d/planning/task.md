@@ -1,49 +1,34 @@
-# Correct Fiber 3D Tiled Inference Output Format
+# Thin Lasagna Port For Fiber 3D Inference
 
-The previous shared tiled inference task left fiber 3D inference in an
-incomplete V0 format: raw seven-channel option bundles, no useful scale-space
-pyramid, and a custom manifest. Correct this so fiber inference is a normal
-Lasagna-style prediction product.
+The current fiber 3D inference plan and partial implementation drifted too far
+from Lasagna `preprocess_cos_omezarr.py predict3d`. Correct the plan before
+implementation: fiber inference must be a minimal Lasagna-style port.
 
-Requirements:
+Requirement:
 
-- Fiber inference must create the same OME-Zarr scale-space pyramid behavior
-  as regular Lasagna `preprocess_cos_omezarr.py predict3d`.
-- Fiber inference must write a `.lasagna.json` manifest, not only a custom
-  `fiber_trace_3d_inference.json` side manifest.
-- Fiber direction output must be stored in Lasagna's compact ambiguous
-  hemisphere encoding:
-  - decode the model's six Lasagna 3x2 ambiguous direction channels into one
-    ambiguous 3D axis;
-  - choose the equivalent sign with non-negative z component;
-  - write `nx = round(axis_x * 127 + 128)` and
-    `ny = round(axis_y * 127 + 128)` as `uint8`, matching current Lasagna
-    normal output encoding;
-  - downstream decode reconstructs `nz = sqrt(1 - nx^2 - ny^2) >= 0`.
-- Fiber presence is the scalar confidence output:
-  - store as `uint8` fixed point with `0 == 0.0` and `255 == 1.0`;
-  - `0` is also the invalid/no-data encoding.
-- Fiber inference output is only direction angles plus presence. It must not
-  perform or write any fiber tracing result.
-- Preserve crop-composable output and chunk-existence resume semantics from
-  the shared tiled runner. This must be reuse of the existing shared runner
-  resume path, not a fiber-specific reimplementation.
-- Preserve the configured inference resolution:
-  `--scaledown` selects the output resolution relative to the input zarr level,
-  and the written data-level OME-Zarr resolution must be exactly that inferred
-  output resolution. Coarser pyramid levels are derived from it.
-- Keep existing Lasagna `predict3d` compatibility intact.
-
-Clarifications:
-
-- Existence-based resume is not a limitation; it is the intended durable
-  resume state and matches Lasagna `predict3d`: chunks on disk are complete,
-  missing chunks are recomputed, and no done markers are needed. Fiber only
-  changes the adapter product-completeness definition to `presence/nx/ny`.
-- Cubic tiled inference is not a limitation; it is the required current shared
-  inference shape contract. Do not change it unless a separate future spec asks
-  for non-cubic tiles.
-- Single written data resolution for fiber is not a limitation if the output
-  data level is exactly the configured inference resolution. The pyramid levels
-  must still be written above that data level, matching Lasagna OME-Zarr
-  behavior.
+- Everything about tiled inference, output chunking, resume, temp cleanup,
+  atomic writes, OME-Zarr group creation, scale-space pyramid generation, and
+  `.lasagna.json` writing must be shared with or directly ported from Lasagna
+  `predict3d`.
+- Fiber-specific code may only specialize:
+  - which model is loaded;
+  - how raw model output channels are interpreted;
+  - which persisted output channels are written;
+  - how product completeness is defined for those persisted channels.
+- Remove or collapse superfluous fiber-specific reimplementations that duplicate
+  Lasagna behavior.
+- Remove intermediate compatibility leftovers. Do not keep legacy aliases,
+  duplicate output adapters, old raw-bundle constants, old manifests, or old
+  tests/docs around merely so old fiber V0 imports keep working.
+- Fiber inference output remains only:
+  - `presence`, stored as uint8 fixed point where `0 == 0.0` and `255 == 1.0`;
+  - `nx` and `ny`, stored with Lasagna's compact ambiguous hemisphere encoding.
+- Fiber must not persist raw seven-channel option bundles.
+- Fiber must not invent a custom primary manifest. The authoritative output is
+  the `.lasagna.json` manifest.
+- The fiber CLI should follow the Lasagna contract: output is a
+  `.lasagna.json` path, not a directory containing a custom sidecar manifest.
+- Fiber must not accumulate encoded `nx/ny`. Match Lasagna: accumulate raw
+  model channels, then encode persisted channels only at product chunk
+  finalization.
+- Lasagna `predict3d` behavior and compatibility must remain unchanged.

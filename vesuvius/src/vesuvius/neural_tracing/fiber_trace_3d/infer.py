@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import os
+import json
 from pathlib import Path
 import time
 from typing import Any
@@ -14,27 +13,31 @@ import zarr
 try:
     from lasagna.tiled_predict3d import (
         _auto_download,
+        build_product_omezarr_pyramids,
+        create_product_omezarr_groups,
         _cleanup_predict3d_temp_files,
         _crop_xyzwhd_bounds,
         _ds_index,
         _ds_size,
         _infer_tiled_products_3d,
-        _open_or_create_omezarr,
+        OmeZarrOutputAdapter,
+        write_lasagna_product_manifest,
     )
 except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
     from tiled_predict3d import (
         _auto_download,
+        build_product_omezarr_pyramids,
+        create_product_omezarr_groups,
         _cleanup_predict3d_temp_files,
         _crop_xyzwhd_bounds,
         _ds_index,
         _ds_size,
         _infer_tiled_products_3d,
-        _open_or_create_omezarr,
+        OmeZarrOutputAdapter,
+        write_lasagna_product_manifest,
     )
 
 from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
-    FIBER_TRACE_3D_OPTION_CHANNELS,
-    FiberTrace3DOmeZarrOutputAdapter,
     FiberTrace3DPredictAdapter,
 )
 
@@ -170,177 +173,6 @@ def _select_and_expand_crop(
     )
 
 
-def _create_fiber_output_groups(
-    *,
-    output_adapter: FiberTrace3DOmeZarrOutputAdapter,
-    base_shape_zyx: tuple[int, int, int],
-    n_levels: int,
-    ome_chunk: int,
-) -> None:
-    for product in output_adapter.products:
-        for channel in product.channels:
-            _open_or_create_omezarr(
-                output_adapter.channel_path(product, channel),
-                base_shape_zyx,
-                int(product.level),
-                n_levels,
-                int(ome_chunk),
-                channel.name,
-            )
-
-
-def _manifest_relative_path(root: Path, path: str | Path) -> str:
-    root_abs = root.resolve()
-    path_abs = Path(path).resolve()
-    try:
-        return path_abs.relative_to(root_abs).as_posix()
-    except ValueError:
-        return path_abs.as_posix()
-
-
-def _interval_dict_zyx(
-    region: tuple[int, int, int, int, int, int],
-) -> dict[str, list[int]]:
-    z0, z1, y0, y1, x0, x1 = (int(v) for v in region)
-    return {
-        "z": [z0, z1],
-        "y": [y0, y1],
-        "x": [x0, x1],
-    }
-
-
-def _output_region_dict_zyx(
-    region: tuple[int, int, int, int, int, int],
-) -> dict[str, list[int]]:
-    oz0, oy0, ox0, oz1, oy1, ox1 = (int(v) for v in region)
-    return {
-        "z": [oz0, oz1],
-        "y": [oy0, oy1],
-        "x": [ox0, ox1],
-    }
-
-
-def _atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(
-        f".tmp.{path.name}.{os.getpid()}.{time.time_ns()}"
-    )
-    try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-
-
-def _write_fiber_inference_manifest(
-    *,
-    manifest_path: Path,
-    config_path: str | Path,
-    input_path: str,
-    output_root: Path,
-    checkpoint: str | Path | None,
-    output_adapter: FiberTrace3DOmeZarrOutputAdapter,
-    input_shape_zyx: tuple[int, int, int],
-    base_shape_zyx: tuple[int, int, int],
-    input_scaledown_base: int,
-    output_scaledown_base: int,
-    output_scaledown_input: int,
-    data_level: int,
-    n_levels: int,
-    ome_chunk: int,
-    crop_xyzwhd_base: tuple[int, int, int, int, int, int] | None,
-    input_crop_zyx: tuple[int, int, int, int, int, int],
-    output_region_zyx: tuple[int, int, int, int, int, int],
-    tile_size: int,
-    overlap: int,
-    border: int,
-    recurrent_steps: int,
-    output_prefix: str,
-) -> None:
-    products: list[dict[str, Any]] = []
-    for product in output_adapter.products:
-        channels = [
-            {
-                "name": channel.name,
-                "zarr_path": _manifest_relative_path(
-                    output_root,
-                    output_adapter.channel_path(product, channel),
-                ),
-            }
-            for channel in product.channels
-        ]
-        products.append(
-            {
-                "name": product.name,
-                "semantics": "fiber_trace_3d_option_bundle",
-                "direction_encoding": "lasagna_3x2_ambiguous",
-                "channel_count": len(product.channels),
-                "channels": channels,
-                "level": int(product.level),
-                "scaledown_base": int(product.scaledown),
-                "chunk_size": int(product.chunk_size),
-                "dtype": str(product.dtype),
-                "pyramid_policy": str(product.pyramid_policy),
-                "data_level_only": True,
-            }
-        )
-
-    payload: dict[str, Any] = {
-        "schema": "vesuvius.fiber_trace_3d.inference",
-        "schema_version": 1,
-        "created_at_unix": time.time(),
-        "producer": "vesuvius.neural_tracing.fiber_trace_3d.infer",
-        "config_path": str(config_path),
-        "checkpoint_path": None if checkpoint is None else str(checkpoint),
-        "input": {
-            "path": str(input_path),
-            "shape_zyx": list(input_shape_zyx),
-            "base_shape_zyx": list(base_shape_zyx),
-            "input_scaledown_base": int(input_scaledown_base),
-        },
-        "output": {
-            "path": str(output_root),
-            "output_prefix": str(output_prefix),
-            "data_level": int(data_level),
-            "levels_created": int(n_levels),
-            "ome_chunk": int(ome_chunk),
-            "output_scaledown_input": int(output_scaledown_input),
-            "output_scaledown_base": int(output_scaledown_base),
-            "pyramid": {
-                "policy": "data_level_only",
-                "coarser_fiber_pyramids_built": False,
-                "reason": (
-                    "fiber direction/presence pyramid semantics are not "
-                    "defined for this V0 writer"
-                ),
-            },
-        },
-        "crop": {
-            "requested_xyzwhd_base": (
-                None if crop_xyzwhd_base is None else list(crop_xyzwhd_base)
-            ),
-            "input_crop_zyx": _interval_dict_zyx(input_crop_zyx),
-            "output_region_zyx": _output_region_dict_zyx(output_region_zyx),
-        },
-        "inference": {
-            "tile_size": int(tile_size),
-            "overlap": int(overlap),
-            "border": int(border),
-            "recurrent_steps": int(recurrent_steps),
-        },
-        "products": products,
-        "channel_bundle": list(FIBER_TRACE_3D_OPTION_CHANNELS),
-        "not_lasagna_normal_products": True,
-    }
-    _atomic_json_write(manifest_path, payload)
-
-
 def run_fiber_trace_3d_inference(
     *,
     config_path: str | Path,
@@ -356,13 +188,20 @@ def run_fiber_trace_3d_inference(
     base_ref: str | None = None,
     base_scale: int | None = None,
     no_download: bool = False,
-    levels: int = 0,
+    levels: int = 5,
     ome_chunk: int = 32,
+    pyramid_workers: int = 0,
     recurrent_steps: int | None = None,
-    output_prefix: str = "fiber",
 ) -> None:
     config = _load_config(config_path)
     tile_size_i = _tile_size_from_config(config, tile_size)
+    output_manifest = Path(output_path)
+    if not output_manifest.name.endswith(".lasagna.json"):
+        raise ValueError(f"output must be .lasagna.json, got: {output_path}")
+    output_dir = output_manifest.parent
+    json_stem = output_manifest.name.removesuffix(".lasagna.json")
+    if not json_stem:
+        raise ValueError("output .lasagna.json path must have a non-empty stem")
 
     if not no_download:
         _auto_download(input_path, crop_xyzwhd)
@@ -384,7 +223,7 @@ def run_fiber_trace_3d_inference(
     output_sd_input = max(1, int(scaledown))
     effective_output_sd = input_sd * output_sd_input
     output_level = _level_from_scaledown(effective_output_sd)
-    n_levels = max(int(levels), output_level + 1)
+    n_levels = max(int(levels), output_level + 2)
 
     crop_slices, output_region, full_output_shape = _select_and_expand_crop(
         input_shape_zyx=input_shape,
@@ -400,12 +239,11 @@ def run_fiber_trace_3d_inference(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_device = torch.device(device)
 
-    output_root = Path(output_path)
-    output_root.mkdir(parents=True, exist_ok=True)
-    removed = _cleanup_predict3d_temp_files(output_root, output_prefix)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    removed = _cleanup_predict3d_temp_files(output_dir, f"{json_stem}_")
     if removed > 0:
         print(
-            f"[fiber_trace_3d:infer] removed {removed} stale temp path(s) from {output_root}",
+            f"[fiber_trace_3d:infer] removed {removed} stale temp path(s) from {output_dir}",
             flush=True,
         )
 
@@ -415,19 +253,25 @@ def run_fiber_trace_3d_inference(
         level=output_level,
         scaledown=effective_output_sd,
         chunk_size=int(ome_chunk),
-        output_prefix=output_prefix,
+        product_prefix=json_stem,
+        zarr_path_prefix=output_dir / json_stem,
         recurrent_steps=recurrent_steps,
     )
-    output_adapter = FiberTrace3DOmeZarrOutputAdapter(
-        output_root=output_root,
+    output_adapter = OmeZarrOutputAdapter(
         products=predict_adapter.output_products,
         n_levels=n_levels,
     )
-    _create_fiber_output_groups(
-        output_adapter=output_adapter,
+    create_product_omezarr_groups(
+        products=predict_adapter.output_products,
         base_shape_zyx=base_shape_zyx,
         n_levels=n_levels,
         ome_chunk=int(ome_chunk),
+    )
+    write_lasagna_product_manifest(
+        output_path=output_manifest,
+        products=predict_adapter.output_products,
+        base_shape_zyx=base_shape_zyx,
+        crop_xyzwhd_base=crop_xyzwhd,
     )
 
     print(
@@ -467,41 +311,24 @@ def run_fiber_trace_3d_inference(
         overlap=int(overlap),
         border=int(border),
         scaledown=output_sd_input,
-        tmp_dir=str(output_root),
+        tmp_dir=str(output_dir),
         progress=progress,
-        temp_prefix=f"{output_prefix}_",
+        temp_prefix=f"{json_stem}_",
     )
     del model
     if torch_device.type == "cuda":
         torch.cuda.empty_cache()
 
-    _write_fiber_inference_manifest(
-        manifest_path=output_root / "fiber_trace_3d_inference.json",
-        config_path=config_path,
-        input_path=input_path,
-        output_root=output_root,
-        checkpoint=checkpoint,
-        output_adapter=output_adapter,
-        input_shape_zyx=input_shape,
-        base_shape_zyx=base_shape_zyx,
-        input_scaledown_base=input_sd,
-        output_scaledown_base=effective_output_sd,
-        output_scaledown_input=output_sd_input,
-        data_level=output_level,
+    build_product_omezarr_pyramids(
+        products=predict_adapter.output_products,
         n_levels=n_levels,
         ome_chunk=int(ome_chunk),
-        crop_xyzwhd_base=crop_xyzwhd,
-        input_crop_zyx=crop_slices,
-        output_region_zyx=output_region,
-        tile_size=tile_size_i,
-        overlap=int(overlap),
-        border=int(border),
-        recurrent_steps=predict_adapter.recurrent_steps,
-        output_prefix=output_prefix,
+        crop_zyx=output_region,
+        workers=int(pyramid_workers),
     )
     removed_finish = _cleanup_predict3d_temp_files(
-        output_root,
-        output_prefix,
+        output_dir,
+        f"{json_stem}_",
         remove_current_process=True,
     )
     if removed_finish > 0:
@@ -510,7 +337,7 @@ def run_fiber_trace_3d_inference(
             flush=True,
         )
     print(
-        f"[fiber_trace_3d:infer] done output={output_root} "
+        f"[fiber_trace_3d:infer] done output={output_manifest} "
         f"elapsed={time.time() - t0:.1f}s",
         flush=True,
     )
@@ -523,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("config", help="Fiber trace 3D training/inference config JSON.")
     parser.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
-    parser.add_argument("--output", required=True, help="Output directory for fiber OME-Zarr channel groups.")
+    parser.add_argument("--output", required=True, help="Output .lasagna.json manifest path.")
     parser.add_argument("--checkpoint", required=True, help="Fiber trace 3D model checkpoint (.pt).")
     parser.add_argument("--tile-size", type=int, default=None, help="Inference tile cube size.")
     parser.add_argument("--overlap", type=int, default=16, help="Tile overlap in input voxels.")
@@ -555,17 +382,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--levels",
         type=int,
-        default=0,
-        help="Number of OME-Zarr levels to create. 0 means data level only.",
+        default=5,
+        help="Number of OME-Zarr levels to create.",
     )
     parser.add_argument("--ome-chunk", type=int, default=32, help="Output OME-Zarr chunk size.")
+    parser.add_argument(
+        "--pyramid-workers",
+        type=int,
+        default=0,
+        help="Workers for OME-Zarr pyramid construction. 0 uses the helper default.",
+    )
     parser.add_argument(
         "--recurrent-steps",
         type=int,
         default=None,
         help="Conditioned recurrent inference steps; each step is stored as one option.",
     )
-    parser.add_argument("--output-prefix", default="fiber", help="Output product/channel prefix.")
     args = parser.parse_args(argv)
 
     run_fiber_trace_3d_inference(
@@ -584,8 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         no_download=bool(args.no_download),
         levels=int(args.levels),
         ome_chunk=int(args.ome_chunk),
+        pyramid_workers=int(args.pyramid_workers),
         recurrent_steps=args.recurrent_steps,
-        output_prefix=str(args.output_prefix),
     )
     return 0
 

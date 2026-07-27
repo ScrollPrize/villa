@@ -58,7 +58,7 @@
 - [ ] conditioned decoder: add also from-dir conditioning (makes this closer to neural tracer decoder!) - can we maybe even unify this into a single dir condition?
 - [ ] fiber inference - how do we store and signal validity?
 - [ ] inference size - test larger inference size quality for the pretrained model (then update defaults)
-- [ ] fiber_trace_3d_inference.json ->should change the name similar to lasagna - or even use lasagna naming just with additional information?
+- [x] fiber inference output should use `.lasagna.json` as the authoritative manifest, not `fiber_trace_3d_inference.json`
     
 # beam-search
 - [ ] beamsearch

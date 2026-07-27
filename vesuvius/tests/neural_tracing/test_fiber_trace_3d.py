@@ -27,13 +27,17 @@ from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     encode_lasagna_direction_3x2,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
-    FIBER_TRACE_3D_OPTION_CHANNELS,
-    FiberTrace3DOmeZarrOutputAdapter,
+    FIBER_TRACE_3D_INTERNAL_CHANNELS,
+    FIBER_TRACE_3D_PERSISTED_CHANNELS,
     FiberTrace3DPredictAdapter,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.infer import (
     run_fiber_trace_3d_inference,
 )
+try:
+    from lasagna.tiled_predict3d import OmeZarrOutputAdapter
+except ImportError:  # pragma: no cover
+    from tiled_predict3d import OmeZarrOutputAdapter
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     DEFAULT_VOLUME_CACHE_MEMORY_MIB,
     FiberTrace3DBatch,
@@ -1980,7 +1984,7 @@ def test_3d_fiber_inference_adapter_schema_preserves_branch_options() -> None:
         level=2,
         scaledown=4,
         chunk_size=16,
-        output_prefix="fiber",
+        product_prefix="fiber",
     )
 
     assert adapter.option_count == 2
@@ -1992,12 +1996,16 @@ def test_3d_fiber_inference_adapter_schema_preserves_branch_options() -> None:
         assert product.level == 2
         assert product.scaledown == 4
         assert product.chunk_size == 16
-        assert product.channel_names == FIBER_TRACE_3D_OPTION_CHANNELS
+        assert product.raw_channel_count == len(FIBER_TRACE_3D_INTERNAL_CHANNELS)
+        assert product.channel_names == tuple(
+            f"option_{option_index:03d}_{channel}"
+            for channel in FIBER_TRACE_3D_PERSISTED_CHANNELS
+        )
         assert [
             channel.relative_path for channel in product.channels
         ] == [
-            f"fiber/option_{option_index:03d}/{channel}"
-            for channel in FIBER_TRACE_3D_OPTION_CHANNELS
+            f"fiber_option_{option_index:03d}_{channel}.ome.zarr"
+            for channel in FIBER_TRACE_3D_PERSISTED_CHANNELS
         ]
 
 
@@ -2011,7 +2019,7 @@ def test_3d_fiber_inference_adapter_splits_branch_output_without_collapsing() ->
                 "output_channels": 14,
             },
         },
-        output_prefix="fiber",
+        product_prefix="fiber",
     )
     output = torch.zeros((1, 14, 2, 2, 2), dtype=torch.float32)
     output[:, 0:6] = 0.1
@@ -2037,10 +2045,53 @@ def test_3d_fiber_inference_adapter_splits_branch_output_without_collapsing() ->
         torch.full((1, 1, 2, 2, 2), 0.8),
     )
 
-    arrays = adapter.product_channel_arrays_from_output(output)
-    assert arrays["fiber_option_000"]["presence"].dtype == np.uint8
-    assert int(arrays["fiber_option_000"]["presence"][0, 0, 0]) == 51
-    assert int(arrays["fiber_option_001"]["presence"][0, 0, 0]) == 204
+    tensors = adapter.product_tensors_from_output(output)
+    arrays0 = adapter.finalize_product_slab(
+        adapter.product_by_name("fiber_option_000"),
+        tensors["fiber_option_000"][0].detach().cpu().numpy(),
+    )
+    arrays1 = adapter.finalize_product_slab(
+        adapter.product_by_name("fiber_option_001"),
+        tensors["fiber_option_001"][0].detach().cpu().numpy(),
+    )
+    assert arrays0["option_000_presence"].dtype == np.uint8
+    assert int(arrays0["option_000_presence"][0, 0, 0]) == 51
+    assert int(arrays1["option_001_presence"][0, 0, 0]) == 204
+    assert set(arrays0) == {"option_000_presence", "option_000_nx", "option_000_ny"}
+
+
+def test_3d_fiber_finalizer_sign_folds_lasagna_direction_encoding() -> None:
+    adapter = FiberTrace3DPredictAdapter(
+        {
+            "patch_shape_zyx": [4, 4, 4],
+            "model_3d": {
+                "input_channels": 1,
+                "direction_branch_count": 1,
+                "output_channels": 7,
+            },
+        },
+        product_prefix="fiber",
+    )
+    product = adapter.output_products[0]
+    direction = encode_lasagna_direction_3x2(
+        torch.tensor([[0.2, 0.3, 0.9]], dtype=torch.float32)
+    )[0].numpy()
+    flipped = encode_lasagna_direction_3x2(
+        torch.tensor([[-0.2, -0.3, -0.9]], dtype=torch.float32)
+    )[0].numpy()
+    slab = np.zeros((7, 1, 1, 2), dtype=np.float32)
+    slab[:6, 0, 0, 0] = direction
+    slab[:6, 0, 0, 1] = flipped
+    slab[6, 0, 0, 0] = 0.0
+    slab[6, 0, 0, 1] = 1.0
+
+    arrays = adapter.finalize_product_slab(product, slab)
+
+    assert set(arrays) == set(FIBER_TRACE_3D_PERSISTED_CHANNELS)
+    assert int(arrays["presence"][0, 0, 0]) == 0
+    assert int(arrays["presence"][0, 0, 1]) == 255
+    assert int(arrays["nx"][0, 0, 0]) == int(arrays["nx"][0, 0, 1])
+    assert int(arrays["ny"][0, 0, 0]) == int(arrays["ny"][0, 0, 1])
 
 
 def test_3d_fiber_inference_adapter_recurrent_conditioned_output_is_grouped() -> None:
@@ -2074,7 +2125,7 @@ def test_3d_fiber_inference_adapter_recurrent_conditioned_output_is_grouped() ->
             },
         },
         recurrent_steps=2,
-        output_prefix="fiber",
+        product_prefix="fiber",
     )
 
     output = adapter.run_tile_inference(
@@ -2105,16 +2156,17 @@ def test_3d_fiber_output_adapter_requires_all_option_channels(tmp_path: Path) ->
             },
         },
         chunk_size=16,
-        output_prefix="fiber",
+        product_prefix="fiber",
+        zarr_path_prefix=tmp_path / "fiber",
     )
     product = predict_adapter.output_products[0]
-    output_adapter = FiberTrace3DOmeZarrOutputAdapter(
-        output_root=tmp_path,
+    output_adapter = OmeZarrOutputAdapter(
         products=predict_adapter.output_products,
+        n_levels=0,
     )
 
     for channel in product.channels[:-1]:
-        chunk_path = tmp_path / str(channel.relative_path) / "0" / "0.0.0"
+        chunk_path = Path(str(channel.relative_path)) / "0" / "0.0.0"
         chunk_path.parent.mkdir(parents=True, exist_ok=True)
         chunk_path.write_bytes(b"x")
     assert not output_adapter.product_chunk_complete(
@@ -2122,7 +2174,7 @@ def test_3d_fiber_output_adapter_requires_all_option_channels(tmp_path: Path) ->
         chunk_origin_zyx=(0, 0, 0),
     )
 
-    presence_path = tmp_path / str(product.channels[-1].relative_path) / "0" / "0.0.0"
+    presence_path = Path(str(product.channels[-1].relative_path)) / "0" / "0.0.0"
     presence_path.parent.mkdir(parents=True, exist_ok=True)
     presence_path.write_bytes(b"x")
     assert output_adapter.product_chunk_complete(
@@ -2131,7 +2183,7 @@ def test_3d_fiber_output_adapter_requires_all_option_channels(tmp_path: Path) ->
     )
 
 
-def test_3d_fiber_infer_writes_seven_channel_option_bundle(tmp_path: Path) -> None:
+def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) -> None:
     input_path = tmp_path / "input.zarr"
     arr = zarr.open(
         str(input_path),
@@ -2162,7 +2214,7 @@ def test_3d_fiber_infer_writes_seven_channel_option_bundle(tmp_path: Path) -> No
         ),
         encoding="utf-8",
     )
-    output_path = tmp_path / "fiber_out"
+    output_path = tmp_path / "fiber_out.lasagna.json"
 
     run_fiber_trace_3d_inference(
         config_path=config_path,
@@ -2178,45 +2230,32 @@ def test_3d_fiber_infer_writes_seven_channel_option_bundle(tmp_path: Path) -> No
         base_ref=str(input_path),
         base_scale=0,
         no_download=True,
-        levels=0,
+        levels=2,
         ome_chunk=4,
-        output_prefix="fiber",
+        pyramid_workers=1,
     )
 
-    for channel_name in FIBER_TRACE_3D_OPTION_CHANNELS:
-        channel_level = output_path / "fiber" / "option_000" / channel_name / "0"
+    for channel_name in FIBER_TRACE_3D_PERSISTED_CHANNELS:
+        channel_level = tmp_path / f"fiber_out_{channel_name}.ome.zarr" / "0"
         assert (channel_level / ".zarray").is_file()
         data = zarr.open(str(channel_level), mode="r")
         assert tuple(int(v) for v in data.shape) == (8, 8, 8)
         assert tuple(int(v) for v in data.chunks) == (4, 4, 4)
         assert data.dtype == np.dtype(np.uint8)
         assert int(np.asarray(data[:]).max()) > 0
+        assert (tmp_path / f"fiber_out_{channel_name}.ome.zarr" / "1" / ".zarray").is_file()
 
-    manifest = json.loads(
-        (output_path / "fiber_trace_3d_inference.json").read_text(encoding="utf-8")
-    )
-    assert manifest["schema"] == "vesuvius.fiber_trace_3d.inference"
-    assert manifest["channel_bundle"] == list(FIBER_TRACE_3D_OPTION_CHANNELS)
-    assert manifest["not_lasagna_normal_products"] is True
-    assert manifest["output"]["pyramid"]["policy"] == "data_level_only"
-    assert manifest["output"]["pyramid"]["coarser_fiber_pyramids_built"] is False
-    assert len(manifest["products"]) == 1
-    product = manifest["products"][0]
-    assert product["semantics"] == "fiber_trace_3d_option_bundle"
-    assert product["direction_encoding"] == "lasagna_3x2_ambiguous"
-    assert product["data_level_only"] is True
-    assert [channel["name"] for channel in product["channels"]] == list(
-        FIBER_TRACE_3D_OPTION_CHANNELS
-    )
-    assert {channel["name"] for channel in product["channels"]}.isdisjoint(
-        {"grad_mag", "nx", "ny"}
-    )
-    assert [
-        channel["zarr_path"] for channel in product["channels"]
-    ] == [
-        f"fiber/option_000/{channel_name}"
-        for channel_name in FIBER_TRACE_3D_OPTION_CHANNELS
-    ]
+    manifest = json.loads(output_path.read_text(encoding="utf-8"))
+    assert set(manifest["groups"]) == set(FIBER_TRACE_3D_PERSISTED_CHANNELS)
+    assert manifest["base_shape_zyx"] == [8, 8, 8]
+    for channel_name in FIBER_TRACE_3D_PERSISTED_CHANNELS:
+        group = manifest["groups"][channel_name]
+        assert group["channels"] == [channel_name]
+        assert group["scaledown"] == 0
+        assert group["zarr"] == f"fiber_out_{channel_name}.ome.zarr/0"
+    assert not (tmp_path / "fiber_trace_3d_inference.json").exists()
+    for raw_channel in FIBER_TRACE_3D_INTERNAL_CHANNELS:
+        assert not (tmp_path / "fiber" / "option_000" / raw_channel).exists()
 
 
 def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:

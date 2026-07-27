@@ -20,9 +20,17 @@ import torch.nn.functional as F
 import zarr
 
 try:
-	from omezarr_pyramid import build_scalar_omezarr_pyramid, set_pyramid_metadata
+	from omezarr_pyramid import (
+		build_normal_omezarr_pyramid,
+		build_scalar_omezarr_pyramid,
+		set_pyramid_metadata,
+	)
 except ImportError:
-	from lasagna.omezarr_pyramid import build_scalar_omezarr_pyramid, set_pyramid_metadata
+	from lasagna.omezarr_pyramid import (
+		build_normal_omezarr_pyramid,
+		build_scalar_omezarr_pyramid,
+		set_pyramid_metadata,
+	)
 
 
 ChunkOriginZYX = tuple[int, int, int]
@@ -73,6 +81,7 @@ class OutputProductSpec:
 	dtype: Any = np.uint8
 	value_range: tuple[float, float] | None = (0.0, 255.0)
 	pyramid_policy: str = PYRAMID_POLICY_NONE
+	accumulator_channel_count: int | None = None
 
 	def __post_init__(self) -> None:
 		name = str(self.name).strip()
@@ -81,6 +90,11 @@ class OutputProductSpec:
 		level = int(self.level)
 		scaledown = int(self.scaledown)
 		chunk_size = int(self.chunk_size)
+		accumulator_channel_count = (
+			None
+			if self.accumulator_channel_count is None
+			else int(self.accumulator_channel_count)
+		)
 		if level < 0:
 			raise ValueError(f"output product {name!r} level must be >= 0")
 		if scaledown <= 0:
@@ -98,6 +112,10 @@ class OutputProductSpec:
 		channel_names = [ch.name for ch in channels]
 		if len(set(channel_names)) != len(channel_names):
 			raise ValueError(f"output product {name!r} channel names must be unique")
+		if accumulator_channel_count is not None and accumulator_channel_count <= 0:
+			raise ValueError(
+				f"output product {name!r} accumulator_channel_count must be > 0"
+			)
 		dtype = np.dtype(self.dtype)
 		value_range = self.value_range
 		if value_range is not None:
@@ -119,10 +137,23 @@ class OutputProductSpec:
 		object.__setattr__(self, "dtype", dtype)
 		object.__setattr__(self, "value_range", value_range)
 		object.__setattr__(self, "pyramid_policy", pyramid_policy)
+		object.__setattr__(
+			self,
+			"accumulator_channel_count",
+			accumulator_channel_count,
+		)
 
 	@property
 	def channel_count(self) -> int:
 		return len(self.channels)
+
+	@property
+	def raw_channel_count(self) -> int:
+		return (
+			len(self.channels)
+			if self.accumulator_channel_count is None
+			else int(self.accumulator_channel_count)
+		)
 
 	@property
 	def channel_names(self) -> tuple[str, ...]:
@@ -155,6 +186,18 @@ class ModelAdapter(Protocol):
 		accumulators: Mapping[str, Any],
 	) -> None:
 		"""Convert raw tile output into logical product accumulators."""
+		...
+
+	def product_tensors_from_output(self, raw_output: Any) -> Mapping[str, torch.Tensor]:
+		"""Split one raw model output into per-product raw tensors."""
+		...
+
+	def finalize_product_slab(
+		self,
+		product: OutputProductSpec,
+		raw_slab: np.ndarray,
+	) -> ProductTileOutput:
+		"""Convert an averaged raw product slab to persisted channel arrays."""
 		...
 
 
@@ -678,6 +721,93 @@ def _omezarr_chunk_group_complete(
 	return all(_omezarr_chunk_exists(path, level, z, y, x, chunk_size) for path in paths)
 
 
+class OmeZarrOutputAdapter:
+	"""Generic OME-Zarr chunk completeness/write adapter for predict3d products."""
+
+	def __init__(self, *, products: Sequence[OutputProductSpec], n_levels: int) -> None:
+		self.products = tuple(products)
+		self.n_levels = int(n_levels)
+		self._products_by_name = {product.name: product for product in self.products}
+
+	def product_by_name(self, name: str) -> OutputProductSpec:
+		return self._products_by_name[name]
+
+	@staticmethod
+	def channel_path(channel: OutputChannelSpec) -> str:
+		if channel.relative_path is None:
+			raise ValueError(f"output channel {channel.name!r} has no OME-Zarr path")
+		return str(channel.relative_path)
+
+	def product_chunk_complete(
+		self,
+		product: OutputProductSpec,
+		*,
+		chunk_origin_zyx: ChunkOriginZYX,
+	) -> bool:
+		z, y, x = (int(v) for v in chunk_origin_zyx)
+		if product.channel_count == 1:
+			path = self.channel_path(product.channels[0])
+			return _omezarr_chunk_exists(path, product.level, z, y, x, product.chunk_size)
+		paths = tuple(self.channel_path(channel) for channel in product.channels)
+		return _omezarr_chunk_group_complete(paths, product.level, z, y, x, product.chunk_size)
+
+	def channel_chunk_exists(
+		self,
+		product: OutputProductSpec,
+		channel_name: str,
+		*,
+		chunk_origin_zyx: ChunkOriginZYX,
+	) -> bool:
+		z, y, x = (int(v) for v in chunk_origin_zyx)
+		for channel in product.channels:
+			if channel.name == channel_name:
+				return _omezarr_chunk_exists(
+					self.channel_path(channel),
+					product.level,
+					z,
+					y,
+					x,
+					product.chunk_size,
+				)
+		raise KeyError(channel_name)
+
+	def write_product_chunk(
+		self,
+		product: OutputProductSpec,
+		*,
+		chunk_origin_zyx: ChunkOriginZYX,
+		data: ProductTileOutput,
+	) -> None:
+		z, y, x = (int(v) for v in chunk_origin_zyx)
+		for channel in product.channels:
+			if channel.name not in data:
+				continue
+			block = np.ascontiguousarray(data[channel.name])
+			if block.ndim != 3:
+				raise ValueError(
+					f"output channel {channel.name!r} chunk must be 3D, got shape={block.shape}"
+				)
+			wz, wy, wx = (int(v) for v in block.shape)
+			if wz <= 0 or wy <= 0 or wx <= 0:
+				continue
+			_atomic_zarr_write(
+				self.channel_path(channel),
+				product.level,
+				z,
+				y,
+				x,
+				z + wz,
+				y + wy,
+				x + wx,
+				block.astype(product.dtype, copy=False),
+				product.chunk_size,
+				self.n_levels,
+			)
+
+	def update_metadata(self, products: Sequence[OutputProductSpec]) -> None:
+		_ = products
+
+
 def _format_eta(seconds: float) -> str:
 	seconds = max(0.0, float(seconds))
 	return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
@@ -913,6 +1043,88 @@ def _open_or_create_omezarr(
 	return _create_omezarr(path, base_shape_zyx, first_level, n_levels, chunk, channel_name)
 
 
+def create_product_omezarr_groups(
+	*,
+	products: Sequence[OutputProductSpec],
+	base_shape_zyx: tuple[int, int, int],
+	n_levels: int,
+	ome_chunk: int,
+) -> dict[str, zarr.Group]:
+	"""Create or open per-channel OME-Zarr groups for product specs."""
+	groups: dict[str, zarr.Group] = {}
+	for product in products:
+		for channel in product.channels:
+			path = OmeZarrOutputAdapter.channel_path(channel)
+			groups[channel.name] = _open_or_create_omezarr(
+				path,
+				base_shape_zyx,
+				int(product.level),
+				int(n_levels),
+				int(ome_chunk),
+				channel.name,
+			)
+	return groups
+
+
+def _manifest_zarr_path(manifest_path: Path, path: str | Path, level: int) -> str:
+	root_abs = manifest_path.parent.resolve()
+	path_abs = Path(path).resolve()
+	try:
+		rel = path_abs.relative_to(root_abs).as_posix()
+	except ValueError:
+		rel = path_abs.as_posix()
+	return f"{rel}/{int(level)}"
+
+
+def write_lasagna_product_manifest(
+	*,
+	output_path: str | Path,
+	products: Sequence[OutputProductSpec],
+	base_shape_zyx: tuple[int, int, int],
+	crop_xyzwhd_base: tuple[int, int, int, int, int, int] | None = None,
+	source_to_base: float = 1.0,
+	grad_mag_factor: float | None = None,
+) -> None:
+	"""Write a Lasagna manifest whose groups come directly from product specs."""
+	try:
+		from lasagna_volume import ChannelGroup, LasagnaVolume
+	except ImportError:  # pragma: no cover - package import mode.
+		from lasagna.lasagna_volume import ChannelGroup, LasagnaVolume
+
+	manifest_path = Path(output_path)
+	preexisting = manifest_path.exists()
+	if preexisting:
+		vol = LasagnaVolume.load(manifest_path)
+		vol.base_shape_zyx = tuple(int(v) for v in base_shape_zyx)
+	else:
+		vol = LasagnaVolume(
+			path=manifest_path.resolve(),
+			source_to_base=float(source_to_base),
+			base_shape_zyx=tuple(int(v) for v in base_shape_zyx),
+		)
+	if grad_mag_factor is not None:
+		vol.grad_mag_factor = float(grad_mag_factor)
+	if crop_xyzwhd_base is not None:
+		vol.add_crop(tuple(int(v) for v in crop_xyzwhd_base))
+	groups: dict[str, ChannelGroup] = {}
+	for product in products:
+		for channel in product.channels:
+			groups[channel.name] = ChannelGroup(
+				zarr_path=_manifest_zarr_path(
+					manifest_path,
+					OmeZarrOutputAdapter.channel_path(channel),
+					int(product.level),
+				),
+				scaledown=int(product.level),
+				channels=[channel.name],
+			)
+	vol.groups = groups
+	vol.save(
+		backup_existing=preexisting,
+		backup_suffix=time.strftime("%Y%m%d_%H%M%S"),
+	)
+
+
 def _build_omezarr_pyramid(
 	omezarr_path: str,
 	data_level: int,
@@ -936,6 +1148,65 @@ def _build_omezarr_pyramid(
 		zero_overrides=zero_overrides,
 		scan_existing_source_chunks=scan_existing_source_chunks,
 	)
+
+
+def _product_channel_kind(channel_name: str) -> str:
+	name = str(channel_name)
+	for kind in ("presence", "grad_mag", "pred_dt", "cos", "nx", "ny"):
+		if name == kind or name.endswith(f"_{kind}"):
+			return kind
+	return name
+
+
+def build_product_omezarr_pyramids(
+	*,
+	products: Sequence[OutputProductSpec],
+	n_levels: int,
+	ome_chunk: int,
+	crop_zyx: tuple[int, int, int, int, int, int] | None = None,
+	crop_zyx_by_product: Mapping[str, tuple[int, int, int, int, int, int]] | None = None,
+	workers: int = 0,
+) -> None:
+	"""Build standard scalar and normal-pair pyramids for product channels."""
+	for product in products:
+		if product.pyramid_policy == PYRAMID_POLICY_NONE:
+			continue
+		product_crop = (
+			crop_zyx_by_product.get(product.name)
+			if crop_zyx_by_product is not None and product.name in crop_zyx_by_product
+			else crop_zyx
+		)
+		paths_by_kind: dict[str, str] = {
+			_product_channel_kind(channel.name): OmeZarrOutputAdapter.channel_path(channel)
+			for channel in product.channels
+		}
+		for channel in product.channels:
+			kind = _product_channel_kind(channel.name)
+			if kind in {"nx", "ny"}:
+				continue
+			_build_omezarr_pyramid(
+				OmeZarrOutputAdapter.channel_path(channel),
+				int(product.level),
+				int(n_levels),
+				int(ome_chunk),
+				workers=int(workers),
+				crop_zyx=product_crop,
+				label=channel.name,
+				zero_overrides=(kind == "grad_mag"),
+				scan_existing_source_chunks=True,
+			)
+		if "nx" in paths_by_kind and "ny" in paths_by_kind:
+			build_normal_omezarr_pyramid(
+				paths_by_kind["nx"],
+				paths_by_kind["ny"],
+				int(product.level),
+				int(n_levels),
+				int(ome_chunk),
+				workers=int(workers),
+				crop_zyx=product_crop,
+				label=product.name,
+				scan_existing_source_chunks=True,
+			)
 
 
 def _find_resume_z(omezarr_path: str, level: int) -> int:
@@ -1321,7 +1592,7 @@ def _infer_tiled_products_3d(
 	for product in products:
 		accumulators[product.name] = _RollingZBand(
 			name=f"acc_{product.name}",
-			channel_count=int(product.channel_count),
+			channel_count=int(product.raw_channel_count),
 			z_size=Zo,
 			y_size=Yo,
 			x_size=Xo,
@@ -1466,12 +1737,12 @@ def _infer_tiled_products_3d(
 					continue
 				acc_bands = [
 					acc.view(ch, flush_from, flush_to)
-					for ch in range(int(product.channel_count))
+					for ch in range(int(product.raw_channel_count))
 				]
 				ws_band = wsum.view(0, flush_from, flush_to)
 				for acc_band in acc_bands:
 					acc_band /= np.maximum(ws_band, 1.0e-7)
-				slab = None
+				persisted_slab = None
 				oz = out_oz0 + out_zs
 				local_from = 0
 				local_to = flush_to - flush_from
@@ -1491,8 +1762,8 @@ def _infer_tiled_products_3d(
 								continue
 							if not _output_chunk_has_input_support(cz, cy, cx):
 								continue
-							if slab is None:
-								slab = np.ascontiguousarray(np.stack([
+							if persisted_slab is None:
+								raw_slab = np.ascontiguousarray(np.stack([
 									acc_band[
 										local_from:local_to,
 										y_base:y_base + out_wy,
@@ -1500,13 +1771,38 @@ def _infer_tiled_products_3d(
 									]
 									for acc_band in acc_bands
 								], axis=0))
-								slab = np.clip(slab * 255.0, 0.0, 255.0).astype(np.uint8)
+								finalize_product_slab = getattr(
+									model_adapter,
+									"finalize_product_slab",
+									None,
+								)
+								if finalize_product_slab is None:
+									persisted_slab = {
+										channel.name: np.clip(
+											raw_slab[channel_index] * 255.0,
+											0.0,
+											255.0,
+										).astype(product.dtype, copy=False)
+										for channel_index, channel in enumerate(product.channels)
+									}
+								else:
+									persisted_slab = finalize_product_slab(product, raw_slab)
+								missing_channels = [
+									channel.name
+									for channel in product.channels
+									if channel.name not in persisted_slab
+								]
+								if missing_channels:
+									raise ValueError(
+										f"product {product.name!r} finalizer missing channels: "
+										f"{missing_channels}"
+									)
 							cze = min(out_ze - out_zs, dz + oc)
 							cye = min(out_wy, dy + oc)
 							cxe = min(out_wx, dx + oc)
 							chunk_data = {
-								channel.name: slab[channel_index, dz:cze, dy:cye, dx:cxe]
-								for channel_index, channel in enumerate(product.channels)
+								channel.name: persisted_slab[channel.name][dz:cze, dy:cye, dx:cxe]
+								for channel in product.channels
 							}
 							output_adapter.write_product_chunk(
 								product,
@@ -1566,6 +1862,12 @@ def _infer_tiled_products_3d(
 						if sd > 1:
 							tensor = _pyrdown3d(tensor, factor=sd)
 						product_np = tensor.detach().cpu().numpy()
+						if int(product_np.shape[0]) != int(product.raw_channel_count):
+							raise ValueError(
+								f"product {product.name!r} raw tensor has "
+								f"{int(product_np.shape[0])} channels, expected "
+								f"{int(product.raw_channel_count)}"
+							)
 						ts_out = int(tile_size) // sd
 						az0, az1, sz0, sz1 = _downscaled_tile_clip(tz, sd, ts_out, Zo)
 						ay0, ay1, sy0, sy1 = _downscaled_tile_clip(ty, sd, ts_out, Yo)
@@ -1573,7 +1875,7 @@ def _infer_tiled_products_3d(
 						if az1 > az0 and ay1 > ay0 and ax1 > ax0:
 							acc = accumulators[product.name]
 							wsum = wsums[product.name]
-							for ch in range(int(product.channel_count)):
+							for ch in range(int(product.raw_channel_count)):
 								acc.add(
 									ch,
 									az0,
