@@ -101,10 +101,15 @@ jobs:
         env:
           VC3D_MCP_TEST_BINARY: ${{ github.workspace }}\volume-cartographer\build\ci-windows-mingw\bin\VC3D.exe
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $python = (Get-Command python.exe).Source
+          $env:PYTHON = $python
           $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
           $env:QT_PLUGIN_PATH = "C:\msys64\ucrt64\share\qt6\plugins"
-          python -m pip install -e .
-          python -m unittest -v `
+          & $python -m pip install -e .
+          & $python -m pip check
+          & $python -m unittest -v `
             tests.test_contract `
             tests.test_real_bridge `
             tests.test_windows_pipe `
@@ -128,7 +133,7 @@ jobs:
           $stdout = Join-Path $env:RUNNER_TEMP "vc3d-mcp-launcher.stdout"
           $stderr = Join-Path $env:RUNNER_TEMP "vc3d-mcp-launcher.stderr"
           Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction SilentlyContinue
-          python -m venv $venv
+          & $python -m venv $venv
           $powershell = (Get-Command powershell.exe).Source
           $launcher = Start-Process `
             -FilePath $powershell `
