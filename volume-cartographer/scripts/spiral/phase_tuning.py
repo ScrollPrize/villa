@@ -171,7 +171,7 @@ def main():
         z_begin=args.z_begin,
         z_end=args.z_end,
         lasagna_scale=lasagna_scale,
-        storage_backend='mmap',
+        storage_backend='sparse_cuda',
         cache_directory=str(args.cache),
     )
     normal_prepare_seconds = time.perf_counter() - normal_started
@@ -183,7 +183,7 @@ def main():
         z_begin=args.z_begin,
         z_end=args.z_end,
         cache_directory=str(args.cache),
-        storage_backend='mmap',
+        storage_backend='sparse_cuda',
     )
     sdt_prepare_seconds = time.perf_counter() - sdt_started
 
@@ -234,8 +234,7 @@ def main():
             0x6A09E667)
     finally:
         for volume in (normals, sdt):
-            if volume['backend'] == 'mmap':
-                volume['store'].close()
+            volume['store'].close()
 
     summary = _aggregate(pass_metrics)
     report = {
