@@ -4,9 +4,12 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <numeric>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -74,6 +77,29 @@ struct PairEdge {
     double first_position;
     double second_position;
     double clearance;
+};
+
+struct WalkIndex {
+    std::vector<int64_t> offsets;
+    std::vector<int32_t> partners;
+    std::vector<int32_t> self_local;
+    std::vector<int32_t> partner_local;
+    std::vector<int32_t> reciprocal;
+    std::vector<int32_t> component;
+    std::vector<uint8_t> eligible;
+    std::vector<int32_t> track_lengths;
+    bool loop_consistency = false;
+    uint64_t cyclic_components = 0;
+
+    size_t track_count() const { return track_lengths.size(); }
+    size_t crossing_count() const { return partners.size(); }
+    size_t memory_bytes() const {
+        return offsets.capacity() * sizeof(int64_t)
+            + (partners.capacity() + self_local.capacity()
+               + partner_local.capacity() + component.capacity()
+               + reciprocal.capacity() + track_lengths.capacity()) * sizeof(int32_t)
+            + eligible.capacity() * sizeof(uint8_t);
+    }
 };
 
 template <typename T>
@@ -884,7 +910,8 @@ nb::dict resample_tracks(
     FloatCoordinates coordinates, Int64Vector offsets,
     Int32Matrix crossing_partners, Int32Matrix crossing_self_local,
     Int32Matrix crossing_partner_local, double minimum_spacing,
-    double maximum_spacing, int workers, const nb::object& progress)
+    double maximum_spacing, int workers, const nb::object& progress,
+    const WalkIndex* walk_index)
 {
     workers = effective_workers(workers);
     if (!(minimum_spacing > 0.0) || !(maximum_spacing > 0.0)
@@ -914,6 +941,9 @@ nb::dict resample_tracks(
         || crossing_self_local.shape(1) != width
         || crossing_partner_local.shape(1) != width)
         throw std::runtime_error("crossing tables must have equal shapes");
+    if (walk_index != nullptr && walk_index->track_count() != track_count)
+        throw std::runtime_error(
+            "walk index track count does not match resampling offsets");
 
     const float* coordinate_data = coordinates.data();
     const int64_t* offset_data = offsets.data();
@@ -924,7 +954,18 @@ nb::dict resample_tracks(
     // Build a compact CSR of every local index that must survive resampling.
     // Entries may repeat, but sorting each row lets lookups remain allocation-free.
     std::vector<uint32_t> anchor_counts(track_count, 0);
-    if (width > 0) {
+    if (walk_index != nullptr) {
+        for (size_t track = 0; track < track_count; ++track) {
+            const int64_t count = walk_index->offsets[track + 1]
+                - walk_index->offsets[track];
+            if (count < 0
+                || static_cast<uint64_t>(count)
+                    > std::numeric_limits<uint32_t>::max())
+                throw std::runtime_error(
+                    "walk anchor count exceeds the native row limit");
+            anchor_counts[track] = static_cast<uint32_t>(count);
+        }
+    } else if (width > 0) {
         nb::gil_scoped_release release;
 #pragma omp parallel for schedule(static) num_threads(workers)
         for (int64_t track = 0; track < static_cast<int64_t>(track_count); ++track) {
@@ -948,7 +989,25 @@ nb::dict resample_tracks(
     std::vector<int32_t> anchors(static_cast<size_t>(anchor_offsets.back()));
     std::vector<int64_t> anchor_cursor(
         anchor_offsets.begin(), anchor_offsets.end() - 1);
-    if (width > 0) {
+    if (walk_index != nullptr) {
+        {
+            nb::gil_scoped_release release;
+#pragma omp parallel for schedule(dynamic, 4096) num_threads(workers)
+            for (int64_t track = 0;
+                 track < static_cast<int64_t>(track_count); ++track) {
+                const int64_t source_begin = walk_index->offsets[track];
+                const int64_t source_end = walk_index->offsets[track + 1];
+                const int64_t destination = anchor_offsets[track];
+                std::copy(
+                    walk_index->self_local.begin() + source_begin,
+                    walk_index->self_local.begin() + source_end,
+                    anchors.begin() + destination);
+                std::sort(
+                    anchors.begin() + destination,
+                    anchors.begin() + anchor_offsets[track + 1]);
+            }
+        }
+    } else if (width > 0) {
         nb::gil_scoped_release release;
 #pragma omp parallel for schedule(static) num_threads(workers)
         for (int64_t track = 0; track < static_cast<int64_t>(track_count); ++track) {
@@ -1147,6 +1206,28 @@ nb::dict resample_tracks(
             }
         }
     }
+    std::vector<int32_t> walk_record_sample;
+    if (walk_index != nullptr) {
+        walk_record_sample.resize(walk_index->crossing_count(), -1);
+        nb::gil_scoped_release release;
+#pragma omp parallel for schedule(dynamic, 4096) num_threads(workers)
+        for (int64_t track = 0;
+             track < static_cast<int64_t>(track_count); ++track) {
+            const int64_t anchor_begin = anchor_offsets[track];
+            const int64_t anchor_end = anchor_offsets[track + 1];
+            for (int64_t record = walk_index->offsets[track];
+                 record < walk_index->offsets[track + 1]; ++record) {
+                const int32_t local = walk_index->self_local[record];
+                const int32_t* found = std::lower_bound(
+                    anchors.data() + anchor_begin,
+                    anchors.data() + anchor_end, local);
+                if (found != anchors.data() + anchor_end && *found == local) {
+                    walk_record_sample[record] = anchor_samples[
+                        static_cast<size_t>(found - anchors.data())];
+                }
+            }
+        }
+    }
 
     nb::dict result;
     result["coordinates"] = own_2d(
@@ -1158,9 +1239,437 @@ nb::dict resample_tracks(
         std::move(crossing_self_sample), track_count, width);
     result["crossing_partner_sample"] = own_2d(
         std::move(crossing_partner_sample), track_count, width);
+    if (walk_index != nullptr)
+        result["walk_record_sample"] = own_1d(
+            std::move(walk_record_sample));
     result["minimum_observed_spacing"] = minimum_observed;
     result["maximum_observed_spacing"] = maximum_observed;
     result["undersized_anchor_gaps"] = undersized_gaps;
+    return result;
+}
+
+struct CrossingKey {
+    int32_t a, b, a_local, b_local;
+    bool operator==(const CrossingKey&) const = default;
+};
+
+struct CrossingKeyHash {
+    size_t operator()(const CrossingKey& key) const noexcept {
+        size_t value = static_cast<uint32_t>(key.a);
+        value = value * 1000003u + static_cast<uint32_t>(key.b);
+        value = value * 1000003u + static_cast<uint32_t>(key.a_local);
+        return value * 1000003u + static_cast<uint32_t>(key.b_local);
+    }
+};
+
+CrossingKey canonical_crossing(
+    int32_t track, int32_t partner, int32_t local, int32_t partner_local)
+{
+    if (track < partner)
+        return {track, partner, local, partner_local};
+    return {partner, track, partner_local, local};
+}
+
+WalkIndex* prepare_walk_index(
+    Int64Vector offsets, Int32Vector partners, Int32Vector self_local,
+    Int32Vector partner_local, Int32Vector track_lengths,
+    bool require_loop_consistency)
+{
+    const size_t tracks = track_lengths.shape(0);
+    if (offsets.shape(0) != tracks + 1 || offsets(0) != 0)
+        throw std::runtime_error("walk crossing offsets have an invalid shape");
+    const int64_t records64 = offsets(tracks);
+    if (records64 < 0 || partners.shape(0) != static_cast<size_t>(records64)
+        || self_local.shape(0) != static_cast<size_t>(records64)
+        || partner_local.shape(0) != static_cast<size_t>(records64))
+        throw std::runtime_error("walk crossing arrays are not parallel");
+    const size_t records = static_cast<size_t>(records64);
+
+    auto index = std::make_unique<WalkIndex>();
+    index->offsets.assign(offsets.data(), offsets.data() + tracks + 1);
+    index->partners.assign(partners.data(), partners.data() + records);
+    index->self_local.assign(self_local.data(), self_local.data() + records);
+    index->partner_local.assign(
+        partner_local.data(), partner_local.data() + records);
+    index->track_lengths.assign(
+        track_lengths.data(), track_lengths.data() + tracks);
+    index->reciprocal.assign(records, -1);
+    index->component.assign(records, -1);
+    index->eligible.assign(records, require_loop_consistency ? 0 : 1);
+    index->loop_consistency = require_loop_consistency;
+
+    std::unordered_map<CrossingKey, int32_t, CrossingKeyHash> vertex_by_key;
+    vertex_by_key.reserve(records / 2 + 1);
+    std::vector<int32_t> record_vertex(records, -1);
+    std::vector<std::vector<int32_t>> vertex_records;
+    for (size_t track = 0; track < tracks; ++track) {
+        for (int64_t record = index->offsets[track];
+             record < index->offsets[track + 1]; ++record) {
+            const int32_t partner = index->partners[record];
+            if (partner < 0 || static_cast<size_t>(partner) >= tracks)
+                throw std::runtime_error("walk crossing partner is out of range");
+            const CrossingKey key = canonical_crossing(
+                static_cast<int32_t>(track), partner,
+                index->self_local[record], index->partner_local[record]);
+            auto [found, inserted] = vertex_by_key.emplace(
+                key, static_cast<int32_t>(vertex_records.size()));
+            if (inserted)
+                vertex_records.emplace_back();
+            const int32_t vertex = found->second;
+            record_vertex[record] = vertex;
+            vertex_records[vertex].push_back(static_cast<int32_t>(record));
+        }
+    }
+    for (const auto& members : vertex_records) {
+        if (members.size() != 2)
+            throw std::runtime_error(
+                "walk index requires reciprocal directed crossing records");
+        index->reciprocal[members[0]] = members[1];
+        index->reciprocal[members[1]] = members[0];
+    }
+
+    if (!require_loop_consistency)
+        return index.release();
+
+    struct RailHalf { int32_t to, edge; };
+    std::vector<std::vector<RailHalf>> graph(vertex_records.size());
+    int32_t edge_count = 0;
+    std::vector<int32_t> ordered;
+    for (size_t track = 0; track < tracks; ++track) {
+        ordered.clear();
+        for (int64_t record = index->offsets[track];
+             record < index->offsets[track + 1]; ++record)
+            ordered.push_back(static_cast<int32_t>(record));
+        std::sort(ordered.begin(), ordered.end(), [&](int32_t a, int32_t b) {
+            return std::tie(index->self_local[a], index->partners[a])
+                 < std::tie(index->self_local[b], index->partners[b]);
+        });
+        for (size_t slot = 1; slot < ordered.size(); ++slot) {
+            const int32_t a = record_vertex[ordered[slot - 1]];
+            const int32_t b = record_vertex[ordered[slot]];
+            if (a == b)
+                continue;
+            graph[a].push_back({b, edge_count});
+            graph[b].push_back({a, edge_count});
+            ++edge_count;
+        }
+    }
+
+    // Iterative Tarjan traversal: this avoids one native stack frame per
+    // crossing on the very large production cache.
+    const int32_t vertices = static_cast<int32_t>(graph.size());
+    std::vector<int32_t> discovery(vertices, -1), low(vertices), parent(vertices, -1);
+    std::vector<int32_t> parent_edge(vertices, -1), cursor(vertices, 0);
+    std::vector<uint8_t> bridge(static_cast<size_t>(edge_count), 0);
+    std::vector<int32_t> stack;
+    int32_t clock = 0;
+    for (int32_t root = 0; root < vertices; ++root) {
+        if (discovery[root] >= 0)
+            continue;
+        discovery[root] = low[root] = clock++;
+        stack.push_back(root);
+        while (!stack.empty()) {
+            const int32_t vertex = stack.back();
+            if (cursor[vertex] < static_cast<int32_t>(graph[vertex].size())) {
+                const RailHalf half = graph[vertex][cursor[vertex]++];
+                if (half.edge == parent_edge[vertex])
+                    continue;
+                if (discovery[half.to] < 0) {
+                    parent[half.to] = vertex;
+                    parent_edge[half.to] = half.edge;
+                    discovery[half.to] = low[half.to] = clock++;
+                    stack.push_back(half.to);
+                } else {
+                    low[vertex] = std::min(low[vertex], discovery[half.to]);
+                }
+                continue;
+            }
+            stack.pop_back();
+            if (parent[vertex] >= 0) {
+                const int32_t up = parent[vertex];
+                low[up] = std::min(low[up], low[vertex]);
+                if (low[vertex] > discovery[up])
+                    bridge[parent_edge[vertex]] = 1;
+            }
+        }
+    }
+
+    std::vector<int32_t> vertex_component(vertices, -1);
+    std::vector<uint8_t> cyclic;
+    for (int32_t root = 0; root < vertices; ++root) {
+        if (vertex_component[root] >= 0)
+            continue;
+        const int32_t component = static_cast<int32_t>(cyclic.size());
+        int64_t component_vertices = 0;
+        int64_t half_edges = 0;
+        vertex_component[root] = component;
+        stack.push_back(root);
+        while (!stack.empty()) {
+            const int32_t vertex = stack.back();
+            stack.pop_back();
+            ++component_vertices;
+            for (const RailHalf half : graph[vertex]) {
+                if (bridge[half.edge])
+                    continue;
+                ++half_edges;
+                if (vertex_component[half.to] < 0) {
+                    vertex_component[half.to] = component;
+                    stack.push_back(half.to);
+                }
+            }
+        }
+        cyclic.push_back(
+            component_vertices > 1 && half_edges / 2 >= component_vertices);
+    }
+    index->cyclic_components = std::accumulate(
+        cyclic.begin(), cyclic.end(), uint64_t{0});
+    for (size_t record = 0; record < records; ++record) {
+        const int32_t component = vertex_component[record_vertex[record]];
+        index->component[record] = component;
+        index->eligible[record] = cyclic[component];
+    }
+    return index.release();
+}
+
+nb::dict walk_index_stats(const WalkIndex& index)
+{
+    uint64_t eligible_records = std::accumulate(
+        index.eligible.begin(), index.eligible.end(), uint64_t{0});
+    uint64_t eligible_tracks = 0;
+    for (size_t track = 0; track < index.track_count(); ++track) {
+        bool any = false;
+        for (int64_t record = index.offsets[track];
+             record < index.offsets[track + 1]; ++record)
+            any = any || index.eligible[record];
+        eligible_tracks += any;
+    }
+    nb::dict result;
+    result["tracks"] = index.track_count();
+    result["directed_crossings"] = index.crossing_count();
+    result["eligible_tracks"] = eligible_tracks;
+    result["eligible_directed_crossings"] = eligible_records;
+    result["cyclic_components"] = index.cyclic_components;
+    result["memory_bytes"] = index.memory_bytes();
+    result["loop_consistency"] = index.loop_consistency;
+    return result;
+}
+
+WalkIndex* prepare_cached_walk_index(
+    UInt64Vector cached_source_ids, Int64Vector cached_offsets,
+    Int32Vector cached_partners, Int32Vector cached_self_local,
+    Int32Vector cached_partner_local, UInt64Vector selected_source_ids,
+    Int32Vector track_lengths, bool require_loop_consistency)
+{
+    const size_t cached_tracks = cached_source_ids.shape(0);
+    const size_t selected_tracks = selected_source_ids.shape(0);
+    if (track_lengths.shape(0) != selected_tracks
+        || cached_offsets.shape(0) != cached_tracks + 1
+        || cached_offsets(0) != 0)
+        throw std::runtime_error("cached walk index arrays have invalid shapes");
+    const int64_t cached_records = cached_offsets(cached_tracks);
+    if (cached_records < 0
+        || cached_partners.shape(0) != static_cast<size_t>(cached_records)
+        || cached_self_local.shape(0) != static_cast<size_t>(cached_records)
+        || cached_partner_local.shape(0) != static_cast<size_t>(cached_records))
+        throw std::runtime_error("cached walk crossing arrays are not parallel");
+
+    std::vector<int32_t> selected_rows(selected_tracks);
+    std::vector<int32_t> global_to_local(cached_tracks, -1);
+    for (size_t local = 0; local < selected_tracks; ++local) {
+        const uint64_t source = selected_source_ids(local);
+        const uint64_t* found = std::lower_bound(
+            cached_source_ids.data(), cached_source_ids.data() + cached_tracks,
+            source);
+        if (found == cached_source_ids.data() + cached_tracks || *found != source)
+            throw std::runtime_error(
+                "crossing cache does not contain every selected track");
+        const size_t row = static_cast<size_t>(found - cached_source_ids.data());
+        selected_rows[local] = static_cast<int32_t>(row);
+        global_to_local[row] = static_cast<int32_t>(local);
+    }
+    std::vector<int64_t> offsets(selected_tracks + 1, 0);
+    std::vector<int32_t> partners, self_local, partner_local;
+    for (size_t local = 0; local < selected_tracks; ++local) {
+        const int32_t row = selected_rows[local];
+        for (int64_t record = cached_offsets(row);
+             record < cached_offsets(row + 1); ++record) {
+            const int32_t global_partner = cached_partners(record);
+            if (global_partner < 0
+                || static_cast<size_t>(global_partner) >= cached_tracks)
+                continue;
+            const int32_t partner = global_to_local[global_partner];
+            if (partner < 0)
+                continue;
+            partners.push_back(partner);
+            self_local.push_back(cached_self_local(record));
+            partner_local.push_back(cached_partner_local(record));
+        }
+        offsets[local + 1] = static_cast<int64_t>(partners.size());
+    }
+    Int64Vector offset_view(offsets.data(), {offsets.size()});
+    Int32Vector partner_view(partners.data(), {partners.size()});
+    Int32Vector self_view(self_local.data(), {self_local.size()});
+    Int32Vector partner_local_view(
+        partner_local.data(), {partner_local.size()});
+    return prepare_walk_index(
+        offset_view, partner_view, self_view, partner_local_view,
+        track_lengths, require_loop_consistency);
+}
+
+nb::dict walk_index_crossings(const WalkIndex& index)
+{
+    nb::dict result;
+    result["offsets"] = own_1d(
+        std::vector<int64_t>(index.offsets.begin(), index.offsets.end()));
+    result["partners"] = own_1d(
+        std::vector<int32_t>(index.partners.begin(), index.partners.end()));
+    result["self_local"] = own_1d(
+        std::vector<int32_t>(index.self_local.begin(), index.self_local.end()));
+    result["partner_local"] = own_1d(std::vector<int32_t>(
+        index.partner_local.begin(), index.partner_local.end()));
+    return result;
+}
+
+bool draw_walk(
+    const WalkIndex& index, int32_t primary, int target_points, int hops,
+    int minimum_steps, int maximum_steps, uint64_t seed,
+    int32_t* output_tracks, int32_t* output_records)
+{
+    if (primary < 0 || static_cast<size_t>(primary) >= index.track_count())
+        return false;
+    std::mt19937_64 random(seed);
+    std::vector<int32_t> visited;
+    visited.reserve(static_cast<size_t>(hops) + 1);
+    visited.push_back(primary);
+    output_tracks[0] = primary;
+    int32_t current = primary;
+    int32_t current_local = -1;
+    int32_t starting_component = -1;
+
+    for (int hop = 0; hop < hops; ++hop) {
+        std::vector<int32_t> candidates;
+        const int64_t begin = index.offsets[current];
+        const int64_t end = index.offsets[current + 1];
+        if (hop == 0) {
+            const int points = std::max(1, target_points);
+            std::uniform_int_distribution<int> target_draw(0, points - 1);
+            const int target_slot = target_draw(random);
+            const int32_t target = points == 1 ? 0 : static_cast<int32_t>(
+                std::llround(static_cast<double>(target_slot)
+                    * (index.track_lengths[current] - 1) / (points - 1)));
+            int32_t best = -1;
+            int64_t best_distance = std::numeric_limits<int64_t>::max();
+            for (int64_t record = begin; record < end; ++record) {
+                if (!index.eligible[record])
+                    continue;
+                const int64_t distance = std::abs(
+                    static_cast<int64_t>(index.self_local[record]) - target);
+                if (distance < best_distance) {
+                    best = static_cast<int32_t>(record);
+                    best_distance = distance;
+                }
+            }
+            if (best < 0)
+                return false;
+            candidates.push_back(best);
+        } else {
+            std::vector<int32_t> by_direction[2];
+            for (int64_t record = begin; record < end; ++record) {
+                if (!index.eligible[record])
+                    continue;
+                if (index.loop_consistency
+                    && index.component[record] != starting_component)
+                    continue;
+                const int delta = index.self_local[record] - current_local;
+                const int distance = std::abs(delta);
+                if (distance >= minimum_steps && distance <= maximum_steps)
+                    by_direction[delta > 0].push_back(
+                        static_cast<int32_t>(record));
+            }
+            std::vector<int> directions;
+            if (!by_direction[0].empty()) directions.push_back(0);
+            if (!by_direction[1].empty()) directions.push_back(1);
+            if (directions.empty())
+                return false;
+            std::uniform_int_distribution<size_t> direction_draw(
+                0, directions.size() - 1);
+            const int direction = directions[direction_draw(random)];
+            const int endpoint_distance = direction
+                ? index.track_lengths[current] - 1 - current_local
+                : current_local;
+            const int upper = std::min(maximum_steps, endpoint_distance);
+            if (upper < minimum_steps)
+                return false;
+            std::uniform_int_distribution<int> distance_draw(
+                minimum_steps, upper);
+            const int desired = distance_draw(random);
+            int32_t best = -1;
+            int best_error = std::numeric_limits<int>::max();
+            for (int32_t record : by_direction[direction]) {
+                const int distance = std::abs(
+                    index.self_local[record] - current_local);
+                const int error = std::abs(distance - desired);
+                if (error < best_error) {
+                    best = record;
+                    best_error = error;
+                }
+            }
+            if (best < 0)
+                return false;
+            candidates.push_back(best);
+        }
+
+        const int32_t record = candidates.front();
+        const int32_t next = index.partners[record];
+        if (std::find(visited.begin(), visited.end(), next) != visited.end())
+            return false;
+        if (hop == 0)
+            starting_component = index.component[record];
+        output_records[2 * hop] = record;
+        output_records[2 * hop + 1] = index.reciprocal[record];
+        output_tracks[hop + 1] = next;
+        visited.push_back(next);
+        current = next;
+        current_local = index.partner_local[record];
+    }
+    return true;
+}
+
+nb::dict sample_walks(
+    const WalkIndex& index, Int32Vector primary_candidates,
+    UInt64Vector seeds, int groups, int target_points, int hops,
+    int minimum_steps, int maximum_steps)
+{
+    if (groups < 0 || target_points < 1 || hops < 1
+        || minimum_steps < 1 || maximum_steps < minimum_steps)
+        throw std::runtime_error("invalid track-walk sampling parameters");
+    if (seeds.shape(0) != primary_candidates.shape(0))
+        throw std::runtime_error("walk candidates and seeds must be parallel");
+    std::vector<int32_t> tracks(static_cast<size_t>(groups) * (hops + 1), -1);
+    std::vector<int32_t> records(static_cast<size_t>(groups) * hops * 2, -1);
+    int produced = 0;
+    uint64_t rejected = 0;
+    for (size_t attempt = 0;
+         attempt < primary_candidates.shape(0) && produced < groups; ++attempt) {
+        if (draw_walk(
+                index, primary_candidates(attempt), target_points, hops,
+                minimum_steps, maximum_steps, seeds(attempt),
+                tracks.data() + static_cast<size_t>(produced) * (hops + 1),
+                records.data() + static_cast<size_t>(produced) * hops * 2))
+            ++produced;
+        else
+            ++rejected;
+    }
+    tracks.resize(static_cast<size_t>(produced) * (hops + 1));
+    records.resize(static_cast<size_t>(produced) * hops * 2);
+    nb::dict result;
+    result["tracks"] = own_2d(
+        std::move(tracks), static_cast<size_t>(produced), hops + 1);
+    result["records"] = own_2d(
+        std::move(records), static_cast<size_t>(produced), hops * 2);
+    result["produced"] = produced;
+    result["rejected_candidates"] = rejected;
+    result["attempted_candidates"] = primary_candidates.shape(0);
     return result;
 }
 
@@ -1172,6 +1681,10 @@ NB_MODULE(track_crossings, module)
     nb::class_<EventBuffer>(module, "EventBuffer")
         .def_prop_ro("event_count", &EventBuffer::size)
         .def_prop_ro("memory_bytes", &EventBuffer::memory_bytes);
+    nb::class_<WalkIndex>(module, "WalkIndex")
+        .def_prop_ro("track_count", &WalkIndex::track_count)
+        .def_prop_ro("crossing_count", &WalkIndex::crossing_count)
+        .def_prop_ro("memory_bytes", &WalkIndex::memory_bytes);
     module.def(
         "parallel_argsort", &parallel_argsort,
         nb::arg("packed"), nb::arg("workers") = 1,
@@ -1200,5 +1713,28 @@ NB_MODULE(track_crossings, module)
         nb::arg("crossing_partners"), nb::arg("crossing_self_local"),
         nb::arg("crossing_partner_local"),
         nb::arg("minimum_spacing"), nb::arg("maximum_spacing"),
-        nb::arg("workers") = 1, nb::arg("progress") = nb::none());
+        nb::arg("workers") = 1, nb::arg("progress") = nb::none(),
+        nb::arg("walk_index") = nullptr);
+    module.def(
+        "prepare_walk_index", &prepare_walk_index,
+        nb::rv_policy::take_ownership,
+        nb::arg("offsets"), nb::arg("partners"), nb::arg("self_local"),
+        nb::arg("partner_local"), nb::arg("track_lengths"),
+        nb::arg("require_loop_consistency") = false);
+    module.def("walk_index_stats", &walk_index_stats, nb::arg("index"));
+    module.def(
+        "prepare_cached_walk_index", &prepare_cached_walk_index,
+        nb::rv_policy::take_ownership,
+        nb::arg("cached_source_ids"), nb::arg("cached_offsets"),
+        nb::arg("cached_partners"), nb::arg("cached_self_local"),
+        nb::arg("cached_partner_local"), nb::arg("selected_source_ids"),
+        nb::arg("track_lengths"),
+        nb::arg("require_loop_consistency") = false);
+    module.def(
+        "walk_index_crossings", &walk_index_crossings, nb::arg("index"));
+    module.def(
+        "sample_walks", &sample_walks,
+        nb::arg("index"), nb::arg("primary_candidates"), nb::arg("seeds"),
+        nb::arg("groups"), nb::arg("target_points"), nb::arg("hops"),
+        nb::arg("minimum_steps"), nb::arg("maximum_steps"));
 }

@@ -18,9 +18,8 @@ import zipfile
 
 
 
-# Version 11 makes preview artifacts host-published Lasagna flatten results
-# with correspondence-mapped winding, loss-map, and run-diff metadata.
-API_VERSION = 11
+# Version 12 expands Run configuration with native track-walk hop controls.
+API_VERSION = 12
 
 
 # Counts which describe how many training objects/points are sampled per
@@ -61,6 +60,9 @@ RUN_MUTABLE_TRACK_POLICY_KEYS = frozenset({
     "max_track_crossing_per_step",
     "track_min_sample_spacing",
     "track_max_sample_spacing",
+    "min_walk_steps_per_track",
+    "max_walk_steps_per_track",
+    "n_walks_per_track",
 })
 
 
