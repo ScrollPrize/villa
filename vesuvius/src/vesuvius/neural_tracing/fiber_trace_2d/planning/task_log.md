@@ -1,41 +1,38 @@
-# 3D Fiber Training Mixed Precision Task Log
+# Shared 3D Tiled Inference Task Log
 
-## Implementation Notes
+## Planning Notes
 
-- Added trainer-local mixed precision parsing in `fiber_trace_3d.train` with
-  `training.mixed_precision` values `off`, `bf16`, `fp16`, and `auto`.
-  Boolean values map to `bf16`/`off`.
-- Added autocast wrapping for training forward/loss, dense test loss,
-  benchmark forward loss, TensorBoard sample-sheet inference, and 3D Trace2CP
-  metric/visual inference.
-- Refactored loss execution so training backward runs outside the autocast
-  context. FP16 uses `torch.amp.GradScaler`; BF16 uses autocast without a
-  scaler.
-- Added optional GradScaler snapshot save/load support. Old snapshots without
-  scaler state remain valid.
-- Added precision stdout and TensorBoard config logging.
-- Enabled `training.mixed_precision: "bf16"` in
-  `train_s1a_nml_all_64_sd2.json` and `train_s1a_nml_all_128_sd2.json`.
-- Added CPU-safe regression coverage for precision config parsing, autocast,
-  and conditioned loss under CPU BF16 autocast.
+- Re-read the backed-up rolling-accumulator task files after the main merge.
+- Checked the current `lasagna/preprocess_cos_omezarr.py` implementation.
+  The rolling z-band accumulator, per-channel mmap scratch files, startup and
+  finish temp cleanup, atomic chunk writes, canonical tile helpers,
+  per-channel completeness checks, independent `pred_dt` handling, and pyramid
+  generation are already present in the current code.
+- Checked `lasagna/tests/test_preprocess_cos_omezarr.py`. It already covers
+  several current predict3d invariants, including rolling-band behavior,
+  canonical tile positions, grouped chunk completeness, temp cleanup, and
+  `pred_dt` manifest behavior.
+- Checked current `vesuvius.neural_tracing.fiber_trace_3d` source. It now has
+  real model, direction, loader, target, training, Trace2CP bridge, and native
+  Trace2CP tool modules. The old backup-plan statement that this package has
+  only configs/pycache is stale.
+- Rewrote the backed-up task and task plan so the next work item is shared
+  tiled inference extraction plus a fiber inference adapter/CLI, not another
+  implementation of the rolling accumulator.
+- Promoted the updated backed-up task, task plan, status, and task log into
+  the regular active planning files at the user's request.
 
 ## Deviations / Deferred Items
 
-- The independent-agent review step from the local workflow has not been
-  performed because delegation requires explicit user authorization with the
-  available tools. I performed a local plan/spec consistency review before
-  implementation instead.
-- Gradient accumulation, activation checkpointing, and decoder-loss chunking
-  are intentionally deferred. This task only adds BF16/FP16 autocast support.
+- No production code was changed in this pass. This was a planning/doc update
+  only.
+- The completed mixed-precision task content in the regular planning files was
+  replaced because `planning/task_log.md` is supposed to contain only the
+  current active task.
+- The actual spec/docs/changelog updates are planned but not applied in this
+  pass.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/train.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k 'mixed_precision or conditioned'`
-  passed: 7 passed, 113 deselected.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: 120 passed.
-- `PYTHONPATH=vesuvius/src:. python -c "<build both active configs and print their effective mixed precision>"`
-  passed and printed BF16 enabled for both active configs.
-- `git diff --check` passed.
+- Read-only code inspection plus planning-file edits only.
+- No tests were run because no runtime code changed.
