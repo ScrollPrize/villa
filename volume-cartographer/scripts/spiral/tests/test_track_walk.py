@@ -82,6 +82,23 @@ class NativeTrackWalkTests(unittest.TestCase):
         np.testing.assert_array_equal(first["tracks"], second["tracks"])
         np.testing.assert_array_equal(first["records"], second["records"])
 
+    def test_adaptive_sampling_is_deterministic_and_stops_when_full(self):
+        index = self._chain()
+        kwargs = dict(
+            primary_probabilities=np.asarray(
+                [1., 0., 0., 0., 0., 0.], dtype=np.float64),
+            seed=91, groups=4, target_points=24, hops=4,
+            minimum_steps=24, maximum_steps=40,
+            maximum_attempts=256)
+        first = self.native.sample_walks_adaptive(index, **kwargs)
+        second = self.native.sample_walks_adaptive(index, **kwargs)
+        self.assertEqual(int(first["produced"]), 4)
+        self.assertEqual(int(first["attempted_candidates"]), 4)
+        np.testing.assert_array_equal(first["tracks"], second["tracks"])
+        np.testing.assert_array_equal(first["records"], second["records"])
+        np.testing.assert_array_equal(
+            np.asarray(first["tracks"])[:, 0], np.zeros(4, dtype=np.int32))
+
     def test_cached_preparation_compacts_to_selected_tracks(self):
         arrays = _csr(6, [
             (0, 50, 1, 10),
@@ -208,6 +225,21 @@ class TrackWalkConfigurationTests(unittest.TestCase):
         # and row 3 likewise inherits the full preceding-chain offset.
         torch.testing.assert_close(
             alignment, torch.tensor([0.0, 8.0, 12.0, 16.0]))
+
+    def test_chain_alignment_vectorizes_independent_groups(self):
+        radii = torch.tensor([
+            10.0, 2.0, 5.0, 1.0,
+            20.0, 19.0, 30.0, 27.0,
+        ])
+        alignment = _crossing_row_alignments(
+            radii,
+            torch.tensor([0, 2, 4, 6]),
+            torch.tensor([1, 3, 5, 7]),
+            torch.tensor([1, 2, 4, 5]),
+            row_count=6,
+            chain=True)
+        torch.testing.assert_close(
+            alignment, torch.tensor([0.0, 8.0, 12.0, 0.0, 1.0, 4.0]))
 
 
 if __name__ == "__main__":

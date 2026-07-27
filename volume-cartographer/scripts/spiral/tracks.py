@@ -44,20 +44,17 @@ def _load_native_track_crossings():
     if os.environ.get('VC_DISABLE_NATIVE_TRACK_CROSSINGS') == '1':
         return None
     try:
+        # Editable VC installs may point ``vc`` at site-packages even while a
+        # newer extension exists in this checkout's build tree. Prefer that
+        # developer build so repo scripts use the matching native kernel
+        # immediately after ``ninja -C build vc_track_crossings``.
+        import vc
+        build_package = Path(__file__).resolve().parents[2] / 'build/python/vc'
+        if build_package.is_dir() and str(build_package) not in vc.__path__:
+            vc.__path__.insert(0, str(build_package))
         return importlib.import_module('vc.track_crossings')
     except ImportError:
-        # Editable VC installs may point ``vc`` at site-packages even while a
-        # newer extension exists in this checkout's build tree. Make that
-        # developer build discoverable so repo scripts use the matching native
-        # kernel immediately after ``ninja -C build vc_track_crossings``.
-        try:
-            import vc
-            build_package = Path(__file__).resolve().parents[2] / 'build/python/vc'
-            if build_package.is_dir() and str(build_package) not in vc.__path__:
-                vc.__path__.append(str(build_package))
-            return importlib.import_module('vc.track_crossings')
-        except ImportError:
-            return None
+        return None
 
 
 def _load_native_track_store():
@@ -797,11 +794,15 @@ def configure_prepared_track_sampling(prepared_tracks, config):
         weights = policy['length_bin_weights']
         if weights is None:
             prepared_tracks.pop('sampling_probabilities', None)
+            prepared_tracks.pop('sampling_probabilities_cpu', None)
             prepared_tracks['length_bin_weights'] = None
         else:
-            prepared_tracks['sampling_probabilities'] = _length_bin_probabilities(
+            probabilities = _length_bin_probabilities(
                 prepared_tracks['arclengths_cpu'], weights,
                 prepared_tracks['device'])
+            prepared_tracks['sampling_probabilities'] = probabilities
+            prepared_tracks['sampling_probabilities_cpu'] = np.asarray(
+                probabilities.detach().cpu(), dtype=np.float64)
             prepared_tracks['length_bin_weights'] = weights.tolist()
 
     maximum = policy['max_crossings']
@@ -2761,23 +2762,23 @@ def _draw_track_walk_sample(
     attempts = max(1024, k * 64)
     probabilities = prepared_tracks.get('sampling_probabilities')
     if probabilities is None:
-        primary_candidates = torch.randint(
-            int(prepared_tracks['lengths'].numel()), (attempts,),
-            device=device, generator=generator)
+        probabilities_cpu = np.empty(0, dtype=np.float64)
     else:
-        primary_candidates = torch.multinomial(
-            probabilities, attempts, replacement=True, generator=generator)
-    seeds = torch.randint(
-        0, (1 << 63) - 1, (attempts,), dtype=torch.int64,
-        device=device, generator=generator)
+        probabilities_cpu = prepared_tracks.get('sampling_probabilities_cpu')
+        if probabilities_cpu is None:
+            probabilities_cpu = np.asarray(
+                probabilities.detach().cpu(), dtype=np.float64)
+            prepared_tracks['sampling_probabilities_cpu'] = probabilities_cpu
+    seed = int(torch.randint(
+        0, (1 << 63) - 1, (1,), dtype=torch.int64,
+        device=device, generator=generator).item())
     hops = int(prepared_tracks['n_walks_per_track'])
-    result = native.sample_walks(
-        prepared_tracks['walk_index'],
-        np.asarray(primary_candidates.cpu(), dtype=np.int32),
-        np.asarray(seeds.cpu(), dtype=np.uint64),
+    result = native.sample_walks_adaptive(
+        prepared_tracks['walk_index'], probabilities_cpu, seed=seed,
         groups=k, target_points=target_points, hops=hops,
         minimum_steps=int(prepared_tracks['min_walk_steps_per_track']),
         maximum_steps=int(prepared_tracks['max_walk_steps_per_track']),
+        maximum_attempts=attempts,
     )
     produced = int(result['produced'])
     if produced != k:
@@ -3031,14 +3032,18 @@ def _crossing_row_alignments(
     row_alignment = torch.zeros(
         row_count, device=shifted_radii.device, dtype=shifted_radii.dtype)
     if chain:
-        for source_cross, partner_cross, partner_row in zip(
-                primary_cross_flat, partner_cross_flat, partner_rows):
-            source_row = partner_row - 1
-            row_alignment[partner_row] = (
-                shifted_radii[source_cross]
-                + row_alignment[source_row]
-                - shifted_radii[partner_cross]
-            ).detach()
+        edge_count = primary_cross_flat.numel()
+        group_count = row_count - edge_count
+        if edge_count == 0:
+            return row_alignment
+        if group_count <= 0 or edge_count % group_count:
+            raise ValueError("track-walk rows do not form fixed-width groups")
+        hops = edge_count // group_count
+        hop_deltas = (
+            shifted_radii[primary_cross_flat]
+            - shifted_radii[partner_cross_flat]
+        ).reshape(group_count, hops)
+        row_alignment[partner_rows] = hop_deltas.cumsum(dim=1).reshape(-1).detach()
     else:
         row_alignment[partner_rows] = (
             shifted_radii[primary_cross_flat]

@@ -1673,6 +1673,82 @@ nb::dict sample_walks(
     return result;
 }
 
+nb::dict sample_walks_adaptive(
+    const WalkIndex& index, Float64Vector primary_probabilities,
+    uint64_t seed, int groups, int target_points, int hops,
+    int minimum_steps, int maximum_steps, int maximum_attempts)
+{
+    if (groups < 0 || target_points < 1 || hops < 1
+        || minimum_steps < 1 || maximum_steps < minimum_steps
+        || maximum_attempts < groups)
+        throw std::runtime_error("invalid adaptive track-walk sampling parameters");
+    if (index.track_count() == 0 && groups > 0)
+        throw std::runtime_error("cannot sample walks from an empty index");
+    if (primary_probabilities.shape(0) != 0
+        && primary_probabilities.shape(0) != index.track_count())
+        throw std::runtime_error(
+            "primary probabilities must be empty or match the track count");
+
+    std::vector<double> weights;
+    if (primary_probabilities.shape(0) != 0) {
+        weights.assign(
+            primary_probabilities.data(),
+            primary_probabilities.data() + primary_probabilities.shape(0));
+        double total = 0.0;
+        for (double weight : weights) {
+            if (!std::isfinite(weight) || weight < 0.0)
+                throw std::runtime_error(
+                    "primary probabilities must be finite and non-negative");
+            total += weight;
+        }
+        if (!(total > 0.0))
+            throw std::runtime_error(
+                "primary probabilities must have positive total mass");
+    }
+
+    std::vector<int32_t> tracks(
+        static_cast<size_t>(groups) * (hops + 1), -1);
+    std::vector<int32_t> records(
+        static_cast<size_t>(groups) * hops * 2, -1);
+    int produced = 0;
+    int attempted = 0;
+    {
+        nb::gil_scoped_release release;
+        std::mt19937_64 random(seed);
+        std::uniform_int_distribution<int32_t> uniform_primary(
+            0, std::max(
+                int32_t{0},
+                static_cast<int32_t>(index.track_count()) - int32_t{1}));
+        std::discrete_distribution<int32_t> weighted_primary(
+            weights.begin(), weights.end());
+        while (attempted < maximum_attempts && produced < groups) {
+            const int32_t primary = weights.empty()
+                ? uniform_primary(random) : weighted_primary(random);
+            const uint64_t walk_seed = random();
+            ++attempted;
+            if (draw_walk(
+                    index, primary, target_points, hops,
+                    minimum_steps, maximum_steps, walk_seed,
+                    tracks.data()
+                        + static_cast<size_t>(produced) * (hops + 1),
+                    records.data()
+                        + static_cast<size_t>(produced) * hops * 2))
+                ++produced;
+        }
+    }
+    tracks.resize(static_cast<size_t>(produced) * (hops + 1));
+    records.resize(static_cast<size_t>(produced) * hops * 2);
+    nb::dict result;
+    result["tracks"] = own_2d(
+        std::move(tracks), static_cast<size_t>(produced), hops + 1);
+    result["records"] = own_2d(
+        std::move(records), static_cast<size_t>(produced), hops * 2);
+    result["produced"] = produced;
+    result["rejected_candidates"] = attempted - produced;
+    result["attempted_candidates"] = attempted;
+    return result;
+}
+
 } // namespace
 
 NB_MODULE(track_crossings, module)
@@ -1737,4 +1813,10 @@ NB_MODULE(track_crossings, module)
         nb::arg("index"), nb::arg("primary_candidates"), nb::arg("seeds"),
         nb::arg("groups"), nb::arg("target_points"), nb::arg("hops"),
         nb::arg("minimum_steps"), nb::arg("maximum_steps"));
+    module.def(
+        "sample_walks_adaptive", &sample_walks_adaptive,
+        nb::arg("index"), nb::arg("primary_probabilities"), nb::arg("seed"),
+        nb::arg("groups"), nb::arg("target_points"), nb::arg("hops"),
+        nb::arg("minimum_steps"), nb::arg("maximum_steps"),
+        nb::arg("maximum_attempts"));
 }
