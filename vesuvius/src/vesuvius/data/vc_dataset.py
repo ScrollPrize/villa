@@ -29,6 +29,7 @@ class VCDataset(Dataset):
             mode: str = 'infer', # Currently only 'infer' logic is fully implemented
             num_parts: int = 1,
             part_id: int = 0,
+            bbox: Optional[Tuple[int, int, int, int, int, int]] = None,
             targets = None,  # Added targets parameter with None default
             # --- Volume Class Pass-through Parameters ---
             scroll_id: Optional[Union[int, str]] = None,
@@ -44,6 +45,7 @@ class VCDataset(Dataset):
             domain: Optional[str] = None,
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
             anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
+            read_retries: int = 4,  # Attempts per read, forwarded to Volume
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -62,6 +64,13 @@ class VCDataset(Dataset):
             mode: 'infer' (default). 'train' mode logic is not implemented here.
             num_parts: Number of parts to split the dataset into along Z-axis.
             part_id: Which part of the split dataset to use (0-indexed).
+            bbox: Optional region of interest as (z_min, z_max, y_min, y_max, x_min, x_max)
+                  in *global* voxel coordinates, half-open ([min, max)). When given, the
+                  sliding-window grid covers only this region, but patch coordinates stay
+                  in the global volume frame so downstream blending/finalization remain
+                  aligned. Bounds are clamped to the volume; an ROI smaller than the patch
+                  size along an axis is grown to the patch size (shifted back inside the
+                  volume when possible).
 
             scroll_id: Scroll ID for Volume (if input_path isn't a specific scroll/segment).
             energy: Energy value for Volume.
@@ -75,6 +84,9 @@ class VCDataset(Dataset):
                              (e.g., 'np.float16', 'np.float32'). Default is 'np.float32'.
             domain: Data source domain for Volume ('dl.ash2txt', 'local'). Auto-detected if None.
             anon: Use anonymous requests for input S3 reads.
+            read_retries: Attempts per read, forwarded to Volume (default 4). Transient
+                remote failures are retried with exponential backoff so one dropped
+                connection does not abort a long streaming run. Pass 1 to disable.
         """
         self.input_path = input_path
         self.input_format = input_format # Keep for informational purposes
@@ -97,6 +109,21 @@ class VCDataset(Dataset):
             raise ValueError(f"part_id must be between 0 and {num_parts-1}, got {part_id}")
         self.num_parts = num_parts
         self.part_id = part_id
+
+        if bbox is not None:
+            if len(bbox) != 6:
+                raise ValueError(
+                    f"bbox must be (z_min, z_max, y_min, y_max, x_min, x_max), got {bbox}"
+                )
+            for axis, (lo, hi) in enumerate(zip(bbox[0::2], bbox[1::2])):
+                if lo is not None and lo < 0:
+                    raise ValueError(f"bbox axis {axis} min {lo} is negative")
+                if lo is not None and hi is not None and hi <= lo:
+                    raise ValueError(
+                        f"bbox axis {axis} range [{lo}, {hi}) is empty; "
+                        f"bounds are half-open and must satisfy min < max"
+                    )
+        self.bbox = tuple(int(v) if v is not None else None for v in bbox) if bbox is not None else None
 
         if self.mode != 'infer':
             print(f"Warning: VCDataset mode is '{self.mode}'. Only 'infer' mode logic (sliding window) is fully implemented.")
@@ -205,6 +232,7 @@ class VCDataset(Dataset):
                 domain=domain,
                 path=use_path,
                 anon=self.anon,
+                read_retries=read_retries,
             )
 
             # Get shape and dtype from the primary resolution level (0)
@@ -258,14 +286,30 @@ class VCDataset(Dataset):
             else:
                 raise ValueError(f"Unsupported input shape dimension from Volume: {self.input_shape}")
 
-            # Full-volume sliding window
-            if self.verbose:
-                print("\nUsing full volume sliding window")
+            roi = None
+            if self.bbox is not None:
+                roi = self._clamp_bbox_to_image(self.bbox, image_size, self.patch_size)
 
-            # Generate all potential coordinates
-            z_positions = compute_steps_for_sliding_window(image_size[0], pZ, self.step_size)
-            y_positions = compute_steps_for_sliding_window(image_size[1], pY, self.step_size)
-            x_positions = compute_steps_for_sliding_window(image_size[2], pX, self.step_size)
+            if roi is not None:
+                if self.verbose:
+                    print(f"\nUsing bbox-restricted sliding window (global coords): "
+                          f"z=[{roi[0][0]}, {roi[0][1]}), y=[{roi[1][0]}, {roi[1][1]}), "
+                          f"x=[{roi[2][0]}, {roi[2][1]})")
+                # Grid over the ROI extent, offset back into the global frame so all
+                # emitted coordinates remain volume-absolute.
+                (z0, z1), (y0, y1), (x0, x1) = roi
+                z_positions = [z0 + s for s in compute_steps_for_sliding_window(z1 - z0, pZ, self.step_size)]
+                y_positions = [y0 + s for s in compute_steps_for_sliding_window(y1 - y0, pY, self.step_size)]
+                x_positions = [x0 + s for s in compute_steps_for_sliding_window(x1 - x0, pX, self.step_size)]
+            else:
+                # Full-volume sliding window
+                if self.verbose:
+                    print("\nUsing full volume sliding window")
+
+                # Generate all potential coordinates
+                z_positions = compute_steps_for_sliding_window(image_size[0], pZ, self.step_size)
+                y_positions = compute_steps_for_sliding_window(image_size[1], pY, self.step_size)
+                x_positions = compute_steps_for_sliding_window(image_size[2], pX, self.step_size)
 
             if self.verbose:
                 print(f"  Image Size (Z, Y, X): {image_size}")
@@ -284,23 +328,29 @@ class VCDataset(Dataset):
 
             # Optional coverage diagnostics in verbose mode
             if self.verbose and self.all_positions:
+                # Coverage is judged against the tiled extent: the ROI when a bbox is
+                # active, the whole volume otherwise.
+                (tz0, tz1), (ty0, ty1), (tx0, tx1) = roi if roi is not None else (
+                    (0, image_size[0]), (0, image_size[1]), (0, image_size[2]))
                 max_start_z = max(pos[0] for pos in self.all_positions)
                 max_start_y = max(pos[1] for pos in self.all_positions)
                 max_start_x = max(pos[2] for pos in self.all_positions)
-                cov_z = (max_start_z + pZ == image_size[0]) if image_size[0] >= pZ else (max_start_z == 0)
-                cov_y = (max_start_y + pY == image_size[1]) if image_size[1] >= pY else (max_start_y == 0)
-                cov_x = (max_start_x + pX == image_size[2]) if image_size[2] >= pX else (max_start_x == 0)
+                cov_z = (max_start_z + pZ == tz1) if (tz1 - tz0) >= pZ else (max_start_z == tz0)
+                cov_y = (max_start_y + pY == ty1) if (ty1 - ty0) >= pY else (max_start_y == ty0)
+                cov_x = (max_start_x + pX == tx1) if (tx1 - tx0) >= pX else (max_start_x == tx0)
                 print("\nTiling coverage check:")
-                print(f"  Z axis: start in [0..{max_start_z}], patch {pZ}, size {image_size[0]} -> covers end: {cov_z}")
-                print(f"  Y axis: start in [0..{max_start_y}], patch {pY}, size {image_size[1]} -> covers end: {cov_y}")
-                print(f"  X axis: start in [0..{max_start_x}], patch {pX}, size {image_size[2]} -> covers end: {cov_x}")
+                print(f"  Z axis: start in [{tz0}..{max_start_z}], patch {pZ}, extent [{tz0}, {tz1}) -> covers end: {cov_z}")
+                print(f"  Y axis: start in [{ty0}..{max_start_y}], patch {pY}, extent [{ty0}, {ty1}) -> covers end: {cov_y}")
+                print(f"  X axis: start in [{tx0}..{max_start_x}], patch {pX}, extent [{tx0}, {tx1}) -> covers end: {cov_x}")
 
             # Apply Z-axis partitioning if num_parts > 1
             if self.num_parts > 1:
-                max_z = image_size[0]
-                z_per_part = max_z / self.num_parts
-                z_start = int(z_per_part * self.part_id)
-                z_end = int(z_per_part * (self.part_id + 1)) if self.part_id < self.num_parts - 1 else max_z
+                # Partition the tiled Z extent: with a bbox active, splitting the full
+                # volume range would leave most parts empty, so split the ROI instead.
+                part_z0, part_z1 = (roi[0] if roi is not None else (0, image_size[0]))
+                z_per_part = (part_z1 - part_z0) / self.num_parts
+                z_start = part_z0 + int(z_per_part * self.part_id)
+                z_end = part_z0 + int(z_per_part * (self.part_id + 1)) if self.part_id < self.num_parts - 1 else part_z1
 
                 if self.verbose:
                     print(f"\nApplying Z-axis partitioning:")
@@ -327,6 +377,34 @@ class VCDataset(Dataset):
             # today's lazy min/max-based detection untouched.
             self.non_empty_mask = self._build_non_empty_mask_from_chunks(use_path)
 
+
+    @staticmethod
+    def _clamp_bbox_to_image(bbox, image_size, patch_size):
+        """Clamp a global-coordinate bbox to the volume and grow it to patch size.
+
+        Returns ((z0, z1), (y0, y1), (x0, x1)), half-open. Raises if the bbox lies
+        entirely outside the volume. An ROI shorter than the patch along an axis is
+        grown to the patch size, shifted back inside the volume when it would
+        overhang (matching the sliding window's guarantee that starts stay >= 0).
+        """
+        roi = []
+        for axis in range(3):
+            lo, hi = bbox[2 * axis], bbox[2 * axis + 1]
+            dim = image_size[axis]
+            patch = patch_size[axis]
+            lo = 0 if lo is None else lo
+            hi = dim if hi is None else hi
+            lo_c, hi_c = min(lo, dim), min(hi, dim)
+            if hi_c <= lo_c:
+                raise ValueError(
+                    f"bbox axis {axis} range [{lo}, {hi}) lies outside the volume "
+                    f"(size {dim} along this axis)"
+                )
+            if hi_c - lo_c < patch:
+                hi_c = min(lo_c + patch, dim)
+                lo_c = max(0, hi_c - patch)
+            roi.append((lo_c, hi_c))
+        return tuple(roi)
 
     def _build_non_empty_mask_from_chunks(self, use_path):
         if not self.skip_empty_patches or not self.all_positions:

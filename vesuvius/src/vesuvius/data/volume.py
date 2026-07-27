@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import time
 import yaml
 import json
 from numpy.typing import NDArray
@@ -13,6 +14,49 @@ from io import BytesIO
 from pathlib import Path
 from vesuvius.install.accept_terms import get_installation_path
 import zarr
+
+# Substrings that mark a read as worth retrying. Matching on the message keeps
+# this independent of which stack (aiohttp, botocore, urllib3, ssl) raised:
+# zarr and fsspec wrap those differently across versions and backends.
+_TRANSIENT_READ_MARKERS = (
+    'payload is not completed',
+    'not enough data to satisfy content length',
+    'contentlengtherror',
+    'connection reset',
+    'connection aborted',
+    'connection closed',
+    'server disconnected',
+    'record layer failure',
+    'ssl',
+    'timed out',
+    'timeout',
+    'temporarily unavailable',
+    'slowdown',
+    'throttl',
+    'too many requests',
+    'internal error',
+    'service unavailable',
+    'bad gateway',
+    'gateway timeout',
+    ' 429',
+    ' 500',
+    ' 502',
+    ' 503',
+    ' 504',
+)
+
+
+def _is_transient_read_error(exc: BaseException) -> bool:
+    """True when a read failure looks like a network hiccup rather than a bug."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        text = f"{type(exc).__name__}: {exc}".lower()
+        if any(marker in text for marker in _TRANSIENT_READ_MARKERS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
 
 # Define the functions needed here to avoid circular imports
 def list_files():
@@ -116,6 +160,7 @@ class Volume:
                  path: Optional[str] = None,
                  download_only: bool = False,
                  anon: bool = False,
+                 read_retries: int = 4,
                  ):
 
         """
@@ -157,6 +202,11 @@ class Volume:
         anon : bool, default = False
             If True, use anonymous (unsigned) requests for S3 access.
             Required for public S3 buckets when no AWS credentials are configured.
+        read_retries : int, default = 4
+            Attempts per read in __getitem__. Transient remote failures — dropped
+            connections, truncated payloads, 429/5xx — are retried with exponential
+            backoff so one hiccup does not abort a long streaming job. Deterministic
+            errors are re-raised immediately. Pass 1 to disable retrying.
         """
 
         # Initialize basic attributes
@@ -170,6 +220,7 @@ class Volume:
         self.path = path
         self.verbose = verbose
         self.anon = anon
+        self.read_retries = max(1, int(read_retries))
         self.inklabel = None  # Initialize inklabel
 
         # --- Input Validation ---
@@ -716,6 +767,30 @@ class Volume:
             else:
                 self.inklabel = np.zeros((1, 1), dtype=np.uint8)  # Fallback if data not loaded
 
+    def _read_with_retry(self, store, coord_idx):
+        """Read a slice from a store, retrying transient remote failures.
+
+        Remote object stores drop connections routinely — truncated payloads,
+        SSL record errors, 5xx, throttling. A caller streaming a whole volume
+        issues one read per patch, so without this a single hiccup propagates
+        out and aborts the job, discarding everything computed so far.
+
+        Deterministic failures (bad coordinates, missing array, auth) are not
+        retried; they re-raise on the first attempt.
+        """
+        delay = 0.5
+        for attempt in range(self.read_retries):
+            try:
+                return store[coord_idx]
+            except Exception as e:
+                if attempt == self.read_retries - 1 or not _is_transient_read_error(e):
+                    raise
+                if self.verbose:
+                    print(f"  transient read error ({type(e).__name__}), retry "
+                          f"{attempt + 1}/{self.read_retries - 1} in {delay:.1f}s: {e}")
+                time.sleep(delay)
+                delay = min(delay * 2, 8.0)
+
     def __getitem__(self, idx: Union[Tuple[Union[int, slice], ...], int]) -> Union[NDArray, torch.Tensor]:
         """
         Gets a sub-volume or slice, applying specified normalization and type conversion.
@@ -808,11 +883,13 @@ class Volume:
         try:
             # Handle the case when self.data is a zarr array directly (from _init_from_zarr_path)
             if isinstance(self.data, zarr.Array):
-                data_slice = self.data[coord_idx]
+                store = self.data
             else:
-                data_slice = self.data[subvolume_idx][coord_idx]
+                store = self.data[subvolume_idx]
 
-            original_dtype = data_slice.dtype  
+            data_slice = self._read_with_retry(store, coord_idx)
+
+            original_dtype = data_slice.dtype
 
             if self.verbose:
                 print(f"  Read slice shape: {data_slice.shape}, dtype: {data_slice.dtype}")

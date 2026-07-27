@@ -2,7 +2,12 @@ import torch
 import numpy as np
 import zarr
 import os
-import fcntl
+import errno
+try:
+    import fcntl  # POSIX-only; used to serialize model-cache downloads
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+    import msvcrt
 import hashlib
 import multiprocessing
 import subprocess
@@ -156,13 +161,34 @@ class _InferenceDeepSupervisionWrapper(torch.nn.Module):
 DEFAULT_MODEL_CACHE_DIR = os.environ.get('VESUVIUS_MODEL_CACHE_DIR', '/tmp/vesuvius-models')
 
 
+def _lock_file_exclusive(fh):
+    """Take an exclusive advisory lock on an open file, on POSIX or Windows.
+
+    Released when the handle closes, matching the previous fcntl.flock usage.
+    """
+    if fcntl is not None:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    else:
+        # msvcrt locks a byte range; one byte suffices for a lockfile. LK_LOCK
+        # retries for ~10 s and then raises, so loop to mirror LOCK_EX's
+        # blocking. Only contention is worth retrying: anything else (a bad
+        # descriptor, a full disk) would spin here forever, so re-raise it.
+        while True:
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EDEADLK):
+                    raise
+
+
 def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) -> str:
     """Resolve a model_path, downloading from S3 to a local cache if needed.
 
     For s3:// URLs, runs `aws s3 sync` into `<cache_dir>/<sha256(url)>/` and
     returns the local directory path. A `.done` sentinel marks successful
     completion so re-runs reuse the cache. Concurrent downloads of the same
-    model are serialized with fcntl.flock on a per-model lockfile.
+    model are serialized with an exclusive lock on a per-model lockfile.
 
     For non-S3 paths, returns the input unchanged.
     """
@@ -181,7 +207,7 @@ def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) 
         return target
 
     with open(lock_path, 'w') as lock_fh:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        _lock_file_exclusive(lock_fh)
         # Re-check after acquiring the lock in case another process completed.
         if os.path.exists(done):
             if verbose:
@@ -238,8 +264,10 @@ class Inferer():
                  hf_token: str = None,
                  model_type: str = 'auto',
                  input_anon: bool = False,
+                 read_retries: int = 4,
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
+                 bbox: [list, tuple] = None,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -273,8 +301,10 @@ class Inferer():
         self.hf_token = hf_token
         self.model_type = model_type
         self.input_anon = input_anon
+        self.read_retries = read_retries
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
+        self.bbox = tuple(bbox) if bbox is not None else None
         self.model_patch_size = None
         self.num_classes = None
 
@@ -705,6 +735,8 @@ class Inferer():
             energy=self.energy,
             resolution=self.resolution,
             anon=self.input_anon,
+            bbox=self.bbox,
+            read_retries=self.read_retries,
         )
 
         expected_attr_name = 'all_positions'
@@ -861,6 +893,10 @@ class Inferer():
             self.output_store.attrs['overlap'] = self.overlap
             self.output_store.attrs['part_id'] = self.part_id
             self.output_store.attrs['num_parts'] = self.num_parts
+            if self.bbox is not None:
+                # Record the requested ROI (global voxel coords, half-open) so the
+                # output is self-describing about which region was processed.
+                self.output_store.attrs['bbox'] = list(self.bbox)
             
             # Store multi-task metadata if applicable
             if self.is_multi_task and self.target_info:
@@ -1052,6 +1088,36 @@ class Inferer():
             traceback.print_exc() 
 
 
+def _parse_bbox_arg(value):
+    """Parse "z0:z1,y0:y1,x0:x1" (half-open, global voxel coords) into a 6-tuple.
+
+    An omitted bound becomes None and is resolved to the volume edge once the
+    dataset opens the volume, so "1000:1400,:,2000:" is valid.
+    """
+    parts = value.split(',')
+    if len(parts) != 3:
+        raise ValueError(
+            f"--bbox expects three comma-separated ranges 'z0:z1,y0:y1,x0:x1', got '{value}'"
+        )
+    bounds = []
+    for axis_label, part in zip('zyx', parts):
+        piece = part.strip()
+        if ':' not in piece:
+            raise ValueError(
+                f"--bbox {axis_label}-range '{piece}' must contain ':' "
+                f"(use ':' alone for the full axis)"
+            )
+        lo_s, hi_s = piece.split(':', 1)
+        try:
+            bounds.append(int(lo_s) if lo_s.strip() else None)
+            bounds.append(int(hi_s) if hi_s.strip() else None)
+        except ValueError:
+            raise ValueError(
+                f"--bbox {axis_label}-range '{piece}' has a non-integer bound"
+            ) from None
+    return tuple(bounds)
+
+
 def main():
     import argparse
     import sys
@@ -1113,10 +1179,22 @@ def main():
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
+    parser.add_argument('--read-retries', dest='read_retries', type=int, default=4,
+                      help='Attempts per patch read (default 4). Transient remote failures '
+                           '(dropped connections, truncated payloads, 429/5xx) are retried '
+                           'with exponential backoff so one hiccup does not abort a long '
+                           'streaming run. Set to 1 to disable.')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')
-    
+    parser.add_argument('--bbox', type=str, default=None,
+                      help='Restrict inference to a region of interest given as '
+                           '"z0:z1,y0:y1,x0:x1" in global voxel coordinates (half-open). '
+                           'Omit a bound to reach the volume edge, e.g. "1000:1400,:,2000:". '
+                           'Patch coordinates stay in the global frame, so blend_logits and '
+                           'finalize_outputs need no extra flags. When streaming a remote '
+                           'volume only the chunks intersecting the ROI are fetched.')
+
     args = parser.parse_args()
     
     # Parse optional patch size if provided
@@ -1130,6 +1208,14 @@ def main():
             print("Expected format: comma-separated integers, e.g. '192,192,192'")
             print("Using model's default patch size instead.")
     
+    bbox = None
+    if args.bbox:
+        try:
+            bbox = _parse_bbox_arg(args.bbox)
+        except ValueError as e:
+            parser.error(str(e))
+        print(f"Restricting inference to bbox (z0,z1,y0,y1,x0,x1): {bbox}")
+
     # Convert scroll_id and segment_id if needed
     scroll_id = args.scroll_id
     segment_id = args.segment_id
@@ -1172,8 +1258,10 @@ def main():
         hf_token=args.hf_token,
         model_type=args.model_type,
         input_anon=args.input_anon,
+        read_retries=args.read_retries,
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
+        bbox=bbox,
     )
 
     try:
