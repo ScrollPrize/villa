@@ -101,16 +101,32 @@ jobs:
         env:
           VC3D_MCP_TEST_BINARY: ${{ github.workspace }}\volume-cartographer\build\ci-windows-mingw\bin\VC3D.exe
         run: |
+          # Pin the interpreter to the one actions/setup-python installed, and
+          # resolve it before MSYS2 goes on PATH: C:\msys64\ucrt64\bin ships its
+          # own python.exe with no pip, which otherwise shadows this one. That
+          # made `pip install -e .` a silent no-op and left every mcp-importing
+          # test erroring on ModuleNotFoundError. MSYS2 still leads PATH so
+          # VC3D.exe resolves its DLLs.
+          $py = if ($env:pythonLocation) {
+            Join-Path $env:pythonLocation "python.exe"
+          } else {
+            (Get-Command python).Source
+          }
+          Write-Host "python: $py"
           $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
           $env:QT_PLUGIN_PATH = "C:\msys64\ucrt64\share\qt6\plugins"
-          python -m pip install -e .
-          python -m unittest -v `
+          & $py -m pip install -e .
+          if ($LASTEXITCODE -ne 0) { throw "pip install -e . failed ($LASTEXITCODE)" }
+          # pwsh only propagates the *last* native exit code to the step, and
+          # several commands follow, so check this one explicitly.
+          & $py -m unittest -v `
             tests.test_contract `
             tests.test_real_bridge `
             tests.test_windows_pipe `
             tests.test_runtime.RegistryDiscoveryTest `
             tests.test_runtime.RegistryResolutionTest `
             tests.test_runtime.AutoLaunchTest
+          if ($LASTEXITCODE -ne 0) { throw "MCP unittest run failed ($LASTEXITCODE)" }
 
           $tokens = $null
           $errors = $null
