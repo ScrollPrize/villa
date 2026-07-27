@@ -270,8 +270,9 @@ default_config = {
     # every track regardless of tortuosity; crossing supplements are opt-in.
     'track_length_bin_weights': None,  # [short, medium, long], using eligible-track arclength tertiles
     'track_max_tortuosity': None,  # whole-track arclength / endpoint chord; None disables filtering
-    # Crossing discovery is session-scoped; the active per-step count can then
-    # change freely up to this prepared ceiling at a Run boundary.
+    # The complete eligible crossing CSR is retained for the session. The active
+    # per-step random sample can change freely up to this safety ceiling at a
+    # Run boundary. The legacy setting name is kept for profile compatibility.
     'track_crossing_precompute_max': 8,
     # Opposite-family partners joined to each primary track's shared winding
     # target. Zero disables crossing-connected sampling.

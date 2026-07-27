@@ -64,6 +64,23 @@ struct EventBuffer {
     size_t memory_bytes() const { return events.capacity() * sizeof(Event); }
 };
 
+struct CrossingIndex {
+    std::vector<int64_t> offsets;
+    std::vector<int32_t> partners;
+    std::vector<int32_t> self_local;
+    std::vector<int32_t> partner_local;
+    std::vector<int32_t> track_lengths;
+
+    size_t track_count() const { return track_lengths.size(); }
+    size_t crossing_count() const { return partners.size(); }
+    size_t memory_bytes() const {
+        return offsets.capacity() * sizeof(int64_t)
+            + (partners.capacity() + self_local.capacity()
+               + partner_local.capacity() + track_lengths.capacity())
+                * sizeof(int32_t);
+    }
+};
+
 struct PairRange {
     size_t begin;
     size_t end;
@@ -911,7 +928,7 @@ nb::dict resample_tracks(
     Int32Matrix crossing_partners, Int32Matrix crossing_self_local,
     Int32Matrix crossing_partner_local, double minimum_spacing,
     double maximum_spacing, int workers, const nb::object& progress,
-    const WalkIndex* walk_index)
+    const WalkIndex* walk_index, const CrossingIndex* crossing_index)
 {
     workers = effective_workers(workers);
     if (!(minimum_spacing > 0.0) || !(maximum_spacing > 0.0)
@@ -941,9 +958,15 @@ nb::dict resample_tracks(
         || crossing_self_local.shape(1) != width
         || crossing_partner_local.shape(1) != width)
         throw std::runtime_error("crossing tables must have equal shapes");
+    if (walk_index != nullptr && crossing_index != nullptr)
+        throw std::runtime_error(
+            "resampling accepts either a walk index or crossing index, not both");
     if (walk_index != nullptr && walk_index->track_count() != track_count)
         throw std::runtime_error(
             "walk index track count does not match resampling offsets");
+    if (crossing_index != nullptr && crossing_index->track_count() != track_count)
+        throw std::runtime_error(
+            "crossing index track count does not match resampling offsets");
 
     const float* coordinate_data = coordinates.data();
     const int64_t* offset_data = offsets.data();
@@ -963,6 +986,17 @@ nb::dict resample_tracks(
                     > std::numeric_limits<uint32_t>::max())
                 throw std::runtime_error(
                     "walk anchor count exceeds the native row limit");
+            anchor_counts[track] = static_cast<uint32_t>(count);
+        }
+    } else if (crossing_index != nullptr) {
+        for (size_t track = 0; track < track_count; ++track) {
+            const int64_t count = crossing_index->offsets[track + 1]
+                - crossing_index->offsets[track];
+            if (count < 0
+                || static_cast<uint64_t>(count)
+                    > std::numeric_limits<uint32_t>::max())
+                throw std::runtime_error(
+                    "crossing anchor count exceeds the native row limit");
             anchor_counts[track] = static_cast<uint32_t>(count);
         }
     } else if (width > 0) {
@@ -1001,6 +1035,24 @@ nb::dict resample_tracks(
                 std::copy(
                     walk_index->self_local.begin() + source_begin,
                     walk_index->self_local.begin() + source_end,
+                    anchors.begin() + destination);
+                std::sort(
+                    anchors.begin() + destination,
+                    anchors.begin() + anchor_offsets[track + 1]);
+            }
+        }
+    } else if (crossing_index != nullptr) {
+        {
+            nb::gil_scoped_release release;
+#pragma omp parallel for schedule(dynamic, 4096) num_threads(workers)
+            for (int64_t track = 0;
+                 track < static_cast<int64_t>(track_count); ++track) {
+                const int64_t source_begin = crossing_index->offsets[track];
+                const int64_t source_end = crossing_index->offsets[track + 1];
+                const int64_t destination = anchor_offsets[track];
+                std::copy(
+                    crossing_index->self_local.begin() + source_begin,
+                    crossing_index->self_local.begin() + source_end,
                     anchors.begin() + destination);
                 std::sort(
                     anchors.begin() + destination,
@@ -1206,23 +1258,31 @@ nb::dict resample_tracks(
             }
         }
     }
-    std::vector<int32_t> walk_record_sample;
-    if (walk_index != nullptr) {
-        walk_record_sample.resize(walk_index->crossing_count(), -1);
+    std::vector<int32_t> crossing_record_sample;
+    const auto record_count = walk_index != nullptr
+        ? walk_index->crossing_count()
+        : (crossing_index != nullptr ? crossing_index->crossing_count() : 0);
+    if (record_count > 0) {
+        crossing_record_sample.resize(record_count, -1);
         nb::gil_scoped_release release;
 #pragma omp parallel for schedule(dynamic, 4096) num_threads(workers)
         for (int64_t track = 0;
-             track < static_cast<int64_t>(track_count); ++track) {
+                 track < static_cast<int64_t>(track_count); ++track) {
             const int64_t anchor_begin = anchor_offsets[track];
             const int64_t anchor_end = anchor_offsets[track + 1];
-            for (int64_t record = walk_index->offsets[track];
-                 record < walk_index->offsets[track + 1]; ++record) {
-                const int32_t local = walk_index->self_local[record];
+            const int64_t record_begin = walk_index != nullptr
+                ? walk_index->offsets[track] : crossing_index->offsets[track];
+            const int64_t record_end = walk_index != nullptr
+                ? walk_index->offsets[track + 1] : crossing_index->offsets[track + 1];
+            for (int64_t record = record_begin; record < record_end; ++record) {
+                const int32_t local = walk_index != nullptr
+                    ? walk_index->self_local[record]
+                    : crossing_index->self_local[record];
                 const int32_t* found = std::lower_bound(
                     anchors.data() + anchor_begin,
                     anchors.data() + anchor_end, local);
                 if (found != anchors.data() + anchor_end && *found == local) {
-                    walk_record_sample[record] = anchor_samples[
+                    crossing_record_sample[record] = anchor_samples[
                         static_cast<size_t>(found - anchors.data())];
                 }
             }
@@ -1239,12 +1299,223 @@ nb::dict resample_tracks(
         std::move(crossing_self_sample), track_count, width);
     result["crossing_partner_sample"] = own_2d(
         std::move(crossing_partner_sample), track_count, width);
-    if (walk_index != nullptr)
-        result["walk_record_sample"] = own_1d(
-            std::move(walk_record_sample));
+    if (!crossing_record_sample.empty()) {
+        auto samples = own_1d(std::move(crossing_record_sample));
+        result["crossing_record_sample"] = samples;
+        if (walk_index != nullptr)
+            result["walk_record_sample"] = samples;
+    }
     result["minimum_observed_spacing"] = minimum_observed;
     result["maximum_observed_spacing"] = maximum_observed;
     result["undersized_anchor_gaps"] = undersized_gaps;
+    return result;
+}
+
+CrossingIndex* prepare_crossing_index(
+    Int64Vector offsets, Int32Vector partners, Int32Vector self_local,
+    Int32Vector partner_local, Int32Vector track_lengths)
+{
+    const size_t tracks = track_lengths.shape(0);
+    if (offsets.shape(0) != tracks + 1 || offsets(0) != 0)
+        throw std::runtime_error("crossing index offsets have an invalid shape");
+    const int64_t records64 = offsets(tracks);
+    if (records64 < 0 || partners.shape(0) != static_cast<size_t>(records64)
+        || self_local.shape(0) != static_cast<size_t>(records64)
+        || partner_local.shape(0) != static_cast<size_t>(records64))
+        throw std::runtime_error("crossing index arrays are not parallel");
+    const size_t records = static_cast<size_t>(records64);
+    if (records > static_cast<size_t>(std::numeric_limits<int32_t>::max()))
+        throw std::runtime_error(
+            "crossing index exceeds the native record id range");
+
+    auto index = std::make_unique<CrossingIndex>();
+    index->offsets.assign(offsets.data(), offsets.data() + tracks + 1);
+    index->partners.assign(partners.data(), partners.data() + records);
+    index->self_local.assign(self_local.data(), self_local.data() + records);
+    index->partner_local.assign(
+        partner_local.data(), partner_local.data() + records);
+    index->track_lengths.assign(
+        track_lengths.data(), track_lengths.data() + tracks);
+    for (size_t track = 0; track < tracks; ++track) {
+        if (index->offsets[track + 1] < index->offsets[track])
+            throw std::runtime_error("crossing index offsets must be monotonic");
+        for (int64_t record = index->offsets[track];
+             record < index->offsets[track + 1]; ++record) {
+            const int32_t partner = index->partners[record];
+            if (partner < 0 || static_cast<size_t>(partner) >= tracks)
+                throw std::runtime_error(
+                    "crossing index partner is out of range");
+            if (index->self_local[record] < 0
+                || index->self_local[record] >= index->track_lengths[track]
+                || index->partner_local[record] < 0
+                || index->partner_local[record]
+                    >= index->track_lengths[static_cast<size_t>(partner)])
+                throw std::runtime_error(
+                    "crossing index local point is out of range");
+        }
+    }
+    return index.release();
+}
+
+CrossingIndex* prepare_cached_crossing_index(
+    UInt64Vector cached_source_ids, Int64Vector cached_offsets,
+    Int32Vector cached_partners, Int32Vector cached_self_local,
+    Int32Vector cached_partner_local, UInt64Vector selected_source_ids,
+    Int32Vector track_lengths)
+{
+    const size_t cached_tracks = cached_source_ids.shape(0);
+    const size_t selected_tracks = selected_source_ids.shape(0);
+    if (track_lengths.shape(0) != selected_tracks
+        || cached_offsets.shape(0) != cached_tracks + 1
+        || cached_offsets(0) != 0)
+        throw std::runtime_error("cached crossing index arrays have invalid shapes");
+    const int64_t cached_records = cached_offsets(cached_tracks);
+    if (cached_records < 0
+        || cached_partners.shape(0) != static_cast<size_t>(cached_records)
+        || cached_self_local.shape(0) != static_cast<size_t>(cached_records)
+        || cached_partner_local.shape(0) != static_cast<size_t>(cached_records))
+        throw std::runtime_error("cached crossing arrays are not parallel");
+
+    std::vector<int32_t> selected_rows(selected_tracks);
+    std::vector<int32_t> global_to_local(cached_tracks, -1);
+    for (size_t local = 0; local < selected_tracks; ++local) {
+        const uint64_t source = selected_source_ids(local);
+        const uint64_t* found = std::lower_bound(
+            cached_source_ids.data(), cached_source_ids.data() + cached_tracks,
+            source);
+        if (found == cached_source_ids.data() + cached_tracks || *found != source)
+            throw std::runtime_error(
+                "crossing cache does not contain every selected track");
+        const size_t row = static_cast<size_t>(
+            found - cached_source_ids.data());
+        selected_rows[local] = static_cast<int32_t>(row);
+        global_to_local[row] = static_cast<int32_t>(local);
+    }
+
+    std::vector<int64_t> offsets(selected_tracks + 1, 0);
+    std::vector<int32_t> partners, self_local, partner_local;
+    for (size_t local = 0; local < selected_tracks; ++local) {
+        const int32_t row = selected_rows[local];
+        for (int64_t record = cached_offsets(row);
+             record < cached_offsets(row + 1); ++record) {
+            const int32_t global_partner = cached_partners(record);
+            if (global_partner < 0
+                || static_cast<size_t>(global_partner) >= cached_tracks)
+                continue;
+            const int32_t partner = global_to_local[global_partner];
+            if (partner < 0)
+                continue;
+            partners.push_back(partner);
+            self_local.push_back(cached_self_local(record));
+            partner_local.push_back(cached_partner_local(record));
+        }
+        offsets[local + 1] = static_cast<int64_t>(partners.size());
+    }
+    Int64Vector offset_view(offsets.data(), {offsets.size()});
+    Int32Vector partner_view(partners.data(), {partners.size()});
+    Int32Vector self_view(self_local.data(), {self_local.size()});
+    Int32Vector partner_local_view(
+        partner_local.data(), {partner_local.size()});
+    return prepare_crossing_index(
+        offset_view, partner_view, self_view, partner_local_view, track_lengths);
+}
+
+nb::dict crossing_index_stats(const CrossingIndex& index)
+{
+    uint64_t connected_tracks = 0;
+    uint64_t maximum_degree = 0;
+    for (size_t track = 0; track < index.track_count(); ++track) {
+        const uint64_t degree = static_cast<uint64_t>(
+            index.offsets[track + 1] - index.offsets[track]);
+        connected_tracks += degree > 0;
+        maximum_degree = std::max(maximum_degree, degree);
+    }
+    nb::dict result;
+    result["tracks"] = index.track_count();
+    result["directed_crossings"] = index.crossing_count();
+    result["connected_tracks"] = connected_tracks;
+    result["maximum_degree"] = maximum_degree;
+    result["memory_bytes"] = index.memory_bytes();
+    return result;
+}
+
+nb::dict sample_crossing_partners(
+    const CrossingIndex& index, Int32Vector primaries, int maximum,
+    uint64_t seed)
+{
+    if (maximum < 0)
+        throw std::runtime_error("maximum must be non-negative");
+    const size_t rows = primaries.shape(0);
+    const size_t width = static_cast<size_t>(maximum);
+    if (width != 0 && rows > std::numeric_limits<size_t>::max() / width)
+        throw std::runtime_error("sampled crossing table dimensions overflow");
+    const size_t output_count = rows * width;
+    std::vector<int32_t> partners(output_count, -1);
+    std::vector<int32_t> records(output_count, -1);
+    std::vector<int32_t> partner_records(output_count, -1);
+    std::atomic<uint64_t> selected_slots{0};
+    std::atomic<uint64_t> missing_reciprocals{0};
+
+    {
+        nb::gil_scoped_release release;
+#pragma omp parallel for schedule(dynamic, 1024)
+        for (int64_t row = 0; row < static_cast<int64_t>(rows); ++row) {
+            const int32_t primary = primaries(static_cast<size_t>(row));
+            if (primary < 0
+                || static_cast<size_t>(primary) >= index.track_count())
+                continue;
+            const int64_t begin = index.offsets[static_cast<size_t>(primary)];
+            const int64_t end = index.offsets[static_cast<size_t>(primary) + 1];
+            const size_t degree = static_cast<size_t>(end - begin);
+            const size_t count = std::min(width, degree);
+            if (count == 0)
+                continue;
+
+            std::vector<int32_t> candidates(degree);
+            std::iota(candidates.begin(), candidates.end(),
+                      static_cast<int32_t>(begin));
+            std::mt19937_64 random(
+                seed + 0x9e3779b97f4a7c15ULL
+                    * (static_cast<uint64_t>(row) + 1));
+            for (size_t slot = 0; slot < count; ++slot) {
+                std::uniform_int_distribution<size_t> draw(slot, degree - 1);
+                const size_t choice = draw(random);
+                std::swap(candidates[slot], candidates[choice]);
+                const int32_t record = candidates[slot];
+                const int32_t partner = index.partners[record];
+                int32_t reciprocal = -1;
+                for (int64_t candidate = index.offsets[partner];
+                     candidate < index.offsets[static_cast<size_t>(partner) + 1];
+                     ++candidate) {
+                    if (index.partners[candidate] == primary
+                        && index.self_local[candidate]
+                            == index.partner_local[record]
+                        && index.partner_local[candidate]
+                            == index.self_local[record]) {
+                        reciprocal = static_cast<int32_t>(candidate);
+                        break;
+                    }
+                }
+                const size_t output = static_cast<size_t>(row) * width + slot;
+                partners[output] = partner;
+                records[output] = record;
+                partner_records[output] = reciprocal;
+                missing_reciprocals.fetch_add(
+                    reciprocal < 0, std::memory_order_relaxed);
+            }
+            selected_slots.fetch_add(count, std::memory_order_relaxed);
+        }
+    }
+    if (missing_reciprocals.load(std::memory_order_relaxed) != 0)
+        throw std::runtime_error(
+            "crossing index requires reciprocal directed records");
+
+    nb::dict result;
+    result["partners"] = own_2d(std::move(partners), rows, width);
+    result["records"] = own_2d(std::move(records), rows, width);
+    result["partner_records"] = own_2d(
+        std::move(partner_records), rows, width);
+    result["selected_slots"] = selected_slots.load(std::memory_order_relaxed);
     return result;
 }
 
@@ -1757,6 +2028,10 @@ NB_MODULE(track_crossings, module)
     nb::class_<EventBuffer>(module, "EventBuffer")
         .def_prop_ro("event_count", &EventBuffer::size)
         .def_prop_ro("memory_bytes", &EventBuffer::memory_bytes);
+    nb::class_<CrossingIndex>(module, "CrossingIndex")
+        .def_prop_ro("track_count", &CrossingIndex::track_count)
+        .def_prop_ro("crossing_count", &CrossingIndex::crossing_count)
+        .def_prop_ro("memory_bytes", &CrossingIndex::memory_bytes);
     nb::class_<WalkIndex>(module, "WalkIndex")
         .def_prop_ro("track_count", &WalkIndex::track_count)
         .def_prop_ro("crossing_count", &WalkIndex::crossing_count)
@@ -1790,7 +2065,26 @@ NB_MODULE(track_crossings, module)
         nb::arg("crossing_partner_local"),
         nb::arg("minimum_spacing"), nb::arg("maximum_spacing"),
         nb::arg("workers") = 1, nb::arg("progress") = nb::none(),
-        nb::arg("walk_index") = nullptr);
+        nb::arg("walk_index") = nullptr,
+        nb::arg("crossing_index") = nullptr);
+    module.def(
+        "prepare_crossing_index", &prepare_crossing_index,
+        nb::rv_policy::take_ownership,
+        nb::arg("offsets"), nb::arg("partners"), nb::arg("self_local"),
+        nb::arg("partner_local"), nb::arg("track_lengths"));
+    module.def(
+        "prepare_cached_crossing_index", &prepare_cached_crossing_index,
+        nb::rv_policy::take_ownership,
+        nb::arg("cached_source_ids"), nb::arg("cached_offsets"),
+        nb::arg("cached_partners"), nb::arg("cached_self_local"),
+        nb::arg("cached_partner_local"), nb::arg("selected_source_ids"),
+        nb::arg("track_lengths"));
+    module.def(
+        "crossing_index_stats", &crossing_index_stats, nb::arg("index"));
+    module.def(
+        "sample_crossing_partners", &sample_crossing_partners,
+        nb::arg("index"), nb::arg("primaries"), nb::arg("maximum"),
+        nb::arg("seed"));
     module.def(
         "prepare_walk_index", &prepare_walk_index,
         nb::rv_policy::take_ownership,

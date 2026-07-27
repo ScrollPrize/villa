@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 import numpy as np
+import torch
 
 from build_track_crossings import build_cache
 from tracks import (
@@ -18,6 +19,7 @@ from tracks import (
     load_track_crossing_cache,
     load_tracks_from_dbm,
     prepare_main_phase_tracks,
+    _sample_prepared_track_points,
     track_crossing_cache_path,
     write_packed_track_store,
 )
@@ -80,14 +82,17 @@ class TrackCrossingCacheTests(unittest.TestCase):
 
             horizontal = families.index('horizontal')
             vertical = families.index('vertical')
+            self.assertIn('crossing_index', prepared)
             self.assertEqual(
-                int(prepared['crossing_partners'][horizontal, 0]), vertical)
-            self.assertEqual(
-                int(prepared['crossing_partners'][vertical, 0]), horizontal)
-            self.assertEqual(
-                int(prepared['crossing_self_local'][horizontal, 0]), 10)
-            self.assertEqual(
-                int(prepared['crossing_partner_local'][horizontal, 0]), 10)
+                int(prepared['crossing_index_stats']['directed_crossings']), 2)
+            probabilities = np.zeros(len(families), dtype=np.float32)
+            probabilities[horizontal] = 1
+            prepared['sampling_probabilities'] = torch.from_numpy(probabilities)
+            sample = _sample_prepared_track_points(prepared, 1, 4)
+            self.assertEqual(sample['track_idx'].tolist(), [horizontal, vertical])
+            np.testing.assert_array_equal(
+                sample['sampled_scroll'][sample['primary_cross_flat'][0]].numpy(),
+                sample['sampled_scroll'][sample['partner_cross_flat'][0]].numpy())
 
     def test_packed_store_loads_and_prepares_without_track_objects(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -120,7 +125,9 @@ class TrackCrossingCacheTests(unittest.TestCase):
                 crossing_cache=cache,
             )
             self.assertEqual(prepared['lengths'].tolist(), [21, 21])
-            self.assertEqual(prepared['crossing_partners'].tolist(), [[1], [0]])
+            self.assertIn('crossing_index', prepared)
+            self.assertEqual(
+                int(prepared['crossing_index_stats']['directed_crossings']), 2)
 
     def test_builder_limits_cache_to_half_open_z_range(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -151,8 +158,8 @@ class TrackCrossingCacheTests(unittest.TestCase):
                 track_source_ids=source_ids,
                 crossing_cache=cache,
             )
-            self.assertTrue(np.all(
-                prepared['crossing_partners'].numpy() >= 0))
+            self.assertEqual(
+                int(prepared['crossing_index_stats']['connected_tracks']), 2)
 
     def test_hybrid_builder_uses_first_local_index_for_repeated_voxel(self):
         with tempfile.TemporaryDirectory() as temporary:
