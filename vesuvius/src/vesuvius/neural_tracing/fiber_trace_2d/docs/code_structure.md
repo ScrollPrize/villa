@@ -291,6 +291,23 @@ side/top strip input loading.
 
 - Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, `--load-only`,
   `--resume`, and `--trace2cp-vis`.
+- Multi-GPU training uses the standard `torchrun` launch environment and does
+  not require config changes:
+
+  ```bash
+  torchrun --standalone --nproc_per_node=2 -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>
+  ```
+
+  The configured `batch_size` is local to each rank, so the effective
+  optimizer-step batch is `batch_size * WORLD_SIZE`. Each rank receives a
+  disjoint deterministic training-stream slice, and `training.loader_workers`
+  is also per rank. CUDA DDP converts
+  `BatchNorm3d` modules to `SyncBatchNorm` automatically; single-process
+  training keeps regular `BatchNorm3d`. TensorBoard, stdout progress,
+  checkpoints, dense tests, Trace2CP metrics, and sample sheets are written
+  only by rank 0, and snapshots are saved without DDP `module.` key prefixes.
+  `--prefetch`, `--benchmark`, and `--trace2cp-vis` remain single-process
+  modes and reject `WORLD_SIZE > 1`.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
   and `best.pt`. `training.kept_snapshot_interval` additionally keeps numbered
   snapshots as `snapshots/step_<iteration>.pt` and defaults to `10000`.

@@ -2,6 +2,9 @@
 
 ## 2026-07-27
 
+- Added `torchrun`-driven DDP support to 3D fiber training with rank-partitioned
+  deterministic batches, rank-0-only side effects, distributed loss logging,
+  unwrapped checkpoint saving, and automatic CUDA SyncBatchNorm conversion.
 - Switched `train_s1a_nml_all_128_sd2.json` back to regular single-output
   legacy 3D supervision (`direction_branch_count: 1`, `output_channels: 7`,
   conditioned decoder disabled) while keeping BF16 enabled for the 128 sd2 run.

@@ -231,6 +231,24 @@
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.train` is the 3D training
   entrypoint. It supports normal training, `--benchmark`, `--load-only`, and
   `--prefetch`.
+- Multi-process 3D training is enabled only by the standard `torchrun`
+  environment (`WORLD_SIZE > 1` with `RANK` and `LOCAL_RANK`); no DDP config
+  keys are required. A typical launch is
+  `torchrun --standalone --nproc_per_node=N -m vesuvius.neural_tracing.fiber_trace_3d.train <config.json>`.
+  `--benchmark`, `--prefetch`, and `--trace2cp-vis` are single-process-only
+  modes and must fail clearly when launched with `WORLD_SIZE > 1`.
+- In DDP training, configured `batch_size` remains the per-rank local batch size.
+  The effective global optimizer-step batch is `batch_size * WORLD_SIZE`.
+  Training samples are partitioned by rank as disjoint deterministic stream
+  batches, and `training.max_steps` remains the number of optimizer steps.
+- CUDA DDP training must convert `BatchNorm3d` modules to `SyncBatchNorm`
+  before DDP wrapping so BatchNorm statistics are computed across ranks.
+  Ordinary single-process training keeps literal `BatchNorm3d` modules.
+  Checkpoints are saved by rank 0 from the unwrapped model so snapshot keys do
+  not receive a DDP `module.` prefix.
+- DDP side effects are rank-0-only: TensorBoard, stdout progress, checkpoints,
+  dense test evaluation, Trace2CP metrics, and train/test visualization. Scalar
+  training losses are averaged across ranks before rank-0 logging.
 - Normal 3D training also supports `--resume <snapshot.pt>`. The CLI path
   overrides config resume keys, restores model and optimizer state, writes a
   fresh timestamped run directory, and records the effective resume path in
@@ -283,8 +301,9 @@
   samples supervise presence over the full valid patch. Lasagna 3x2 direction
   encoding uses the shared NumPy/torch-compatible helper semantics.
 - `training.loader_workers` controls 3D DataLoader worker process count.
-  `0` is the explicit serial/debug path. `training.loader_prefetch_factor`
-  maps directly to PyTorch DataLoader prefetch factor for worker processes.
+  Under DDP this count is per rank. `0` is the explicit serial/debug path.
+  `training.loader_prefetch_factor` maps directly to PyTorch DataLoader prefetch
+  factor for worker processes.
   `training.loader_worker_device` defaults to `"cpu"`. CPU worker processes
   use a guarded `forkserver` multiprocessing context where available, falling
   back to `fork` only when needed; CUDA worker devices select `spawn`.

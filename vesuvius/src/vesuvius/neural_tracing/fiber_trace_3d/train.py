@@ -15,7 +15,9 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
@@ -83,6 +85,17 @@ class _MixedPrecisionConfig:
     use_grad_scaler: bool
 
 
+@dataclass(frozen=True)
+class _DistributedConfig:
+    enabled: bool
+    rank: int
+    local_rank: int
+    world_size: int
+    is_main: bool
+    backend: str
+    device: torch.device
+
+
 def _load_raw_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
@@ -111,11 +124,19 @@ def _sanitize_run_name(value: Any) -> str:
     return name.strip("._-") or "fiber_trace_3d"
 
 
-def _resolve_run_layout(config: dict[str, Any]) -> tuple[Path, Path]:
+def _resolve_run_layout(
+    config: dict[str, Any],
+    *,
+    date_str_override: str | None = None,
+) -> tuple[Path, Path]:
     training = dict(config.get("training", {}))
     run_path = Path(str(training.get("run_path", config.get("run_path", "runs/fiber_trace_3d"))))
     run_name = _sanitize_run_name(training.get("run_name", config.get("run_name", "fiber_trace_3d")))
-    date_str = str(training.get("run_datestr") or datetime.now().strftime("%Y%m%d_%H%M%S"))
+    date_str = str(
+        date_str_override
+        if date_str_override is not None
+        else training.get("run_datestr") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
     run_dir = run_path / f"{run_name}_{date_str}"
     snapshot_dir = run_dir / "snapshots"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +162,151 @@ def _device_from_training(training: dict[str, Any]) -> torch.device:
     if raw == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(raw)
+
+
+def _env_int(env: dict[str, str], key: str) -> int | None:
+    raw = env.get(key)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be an integer, got {raw!r}") from exc
+
+
+def _distributed_config_from_env(
+    base_device: torch.device,
+    *,
+    env: dict[str, str] | None = None,
+) -> _DistributedConfig:
+    env_map = os.environ if env is None else env
+    world_size = _env_int(env_map, "WORLD_SIZE")
+    if world_size is None:
+        return _DistributedConfig(
+            enabled=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            is_main=True,
+            backend="",
+            device=base_device,
+        )
+    if int(world_size) <= 0:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if int(world_size) == 1:
+        return _DistributedConfig(
+            enabled=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            is_main=True,
+            backend="",
+            device=base_device,
+        )
+    rank = _env_int(env_map, "RANK")
+    local_rank = _env_int(env_map, "LOCAL_RANK")
+    if rank is None or local_rank is None:
+        raise ValueError(
+            "DDP launch requires WORLD_SIZE, RANK, and LOCAL_RANK. "
+            "Use torchrun for multi-process training."
+        )
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is not available in this PyTorch build")
+    if int(rank) < 0 or int(rank) >= int(world_size):
+        raise ValueError(f"RANK must be in [0, WORLD_SIZE), got rank={rank} world_size={world_size}")
+    if int(local_rank) < 0:
+        raise ValueError(f"LOCAL_RANK must be non-negative, got {local_rank}")
+
+    if base_device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP CUDA launch requested but CUDA is not available")
+        device_count = int(torch.cuda.device_count())
+        if device_count > 0 and int(local_rank) >= device_count:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} exceeds visible CUDA device count {device_count}"
+            )
+        device = torch.device("cuda", int(local_rank))
+        backend = "nccl"
+    elif base_device.type == "cpu":
+        device = torch.device("cpu")
+        backend = "gloo"
+    else:
+        raise ValueError(f"DDP supports only cpu/cuda training devices, got {base_device}")
+    return _DistributedConfig(
+        enabled=True,
+        rank=int(rank),
+        local_rank=int(local_rank),
+        world_size=int(world_size),
+        is_main=int(rank) == 0,
+        backend=backend,
+        device=device,
+    )
+
+
+def _torchrun_world_size_from_env(env: dict[str, str] | None = None) -> int:
+    env_map = os.environ if env is None else env
+    world_size = _env_int(env_map, "WORLD_SIZE")
+    return 1 if world_size is None else int(world_size)
+
+
+def _require_single_process_cli_mode(mode_name: str) -> None:
+    if _torchrun_world_size_from_env() > 1:
+        raise SystemExit(
+            f"{mode_name} is single-process only. Run normal training under torchrun, "
+            "or run this subcommand without torchrun/WORLD_SIZE>1."
+        )
+
+
+def _distributed_init(config: _DistributedConfig) -> None:
+    if not config.enabled:
+        return
+    if config.device.type == "cuda":
+        torch.cuda.set_device(config.local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend=config.backend)
+
+
+def _distributed_barrier(config: _DistributedConfig) -> None:
+    if config.enabled and dist.is_initialized():
+        dist.barrier()
+
+
+def _distributed_cleanup(config: _DistributedConfig) -> None:
+    if config.enabled and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _distributed_broadcast_object(value: Any, config: _DistributedConfig, *, src: int = 0) -> Any:
+    if not config.enabled:
+        return value
+    objects = [value]
+    dist.broadcast_object_list(objects, src=src)
+    return objects[0]
+
+
+def _distributed_should_use_sync_batchnorm(config: _DistributedConfig) -> bool:
+    return bool(config.enabled and config.device.type == "cuda")
+
+
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    if isinstance(model, (DistributedDataParallel, torch.nn.DataParallel)):
+        return model.module
+    return model
+
+
+def _wrap_distributed_model(
+    model: torch.nn.Module,
+    config: _DistributedConfig,
+) -> torch.nn.Module:
+    if not config.enabled:
+        return model
+    if config.device.type == "cuda":
+        return DistributedDataParallel(
+            model,
+            device_ids=[config.local_rank],
+            output_device=config.local_rank,
+        )
+    return DistributedDataParallel(model)
 
 
 def _mixed_precision_config_from_training(
@@ -478,7 +644,7 @@ def _branch_choice_grid_offsets(
 
 
 def _model_uses_conditioned_decoder(model: torch.nn.Module) -> bool:
-    return bool(getattr(model, "conditioned_decoder_enabled", False))
+    return bool(getattr(_unwrap_model(model), "conditioned_decoder_enabled", False))
 
 
 def _conditioned_loss_options_from_training(training: dict[str, Any]) -> dict[str, float]:
@@ -796,27 +962,45 @@ def compute_conditioned_losses(
     if float(negative_query_weight) < 0.0 or not math.isfinite(float(negative_query_weight)):
         raise ValueError("conditioned_negative_query_weight must be finite and non-negative")
 
-    latent = model.encode_volume(batch.volume)
-    batch_size, _latent_channels, depth, height, width = (int(v) for v in latent.shape)
-    zero_query = torch.zeros((batch_size, 6), dtype=latent.dtype, device=latent.device)
-    zero_output = model.decode_conditioned_latent(latent, zero_query)
-    random_query = _conditioned_random_query_b6(batch, device=latent.device).to(dtype=latent.dtype)
-    random_output = model.decode_conditioned_latent(latent, random_query)
-
-    indices = batch.direction_indices_bzyx.to(dtype=torch.long, device=latent.device)
-    positive_query_count = 2
-    if int(indices.shape[0]) > 0:
-        zero_sparse = _gather_output_at_indices(zero_output, indices)
-        target_axis = decode_lasagna_direction_3x2_analytic(
-            batch.direction_target_sparse.to(device=latent.device)
-        )
-        perp_query = _conditioned_perpendicular_queries(
+    forward_device = batch.volume.device
+    indices = batch.direction_indices_bzyx.to(dtype=torch.long, device=forward_device)
+    target_axis = decode_lasagna_direction_3x2_analytic(
+        batch.direction_target_sparse.to(device=forward_device)
+    )
+    random_query = _conditioned_random_query_b6(batch, device=forward_device).to(
+        dtype=batch.volume.dtype
+    )
+    perp_query = (
+        _conditioned_perpendicular_queries(
             batch,
             indices,
             target_axis,
             jitter_degrees=perpendicular_jitter_degrees,
-        ).to(dtype=latent.dtype, device=latent.device)
-        perp_sparse = model.decode_conditioned_points(latent, indices, perp_query)
+        ).to(dtype=batch.volume.dtype, device=forward_device)
+        if int(indices.shape[0]) > 0
+        else None
+    )
+    components = model(
+        batch.volume,
+        conditioned_random_query=random_query,
+        conditioned_point_indices_bzyx=indices if int(indices.shape[0]) > 0 else None,
+        conditioned_point_query_n6=perp_query,
+        return_conditioned_components=True,
+    )
+    if not isinstance(components, dict):
+        raise RuntimeError("conditioned model forward did not return component outputs")
+    zero_output = components["zero_output"]
+    random_output = components["random_output"]
+    perp_sparse = components["point_output"]
+    if zero_output is None or random_output is None:
+        raise RuntimeError("conditioned model forward did not return dense outputs")
+    batch_size, _channels, depth, height, width = (int(v) for v in zero_output.shape)
+
+    positive_query_count = 2
+    if int(indices.shape[0]) > 0:
+        zero_sparse = _gather_output_at_indices(zero_output, indices)
+        if perp_sparse is None:
+            raise RuntimeError("conditioned model forward did not return sparse point output")
         positive_pred = torch.stack([zero_sparse, perp_sparse], dim=1)
         pred_dirs = positive_pred[:, :, :6]
         pred_presence = positive_pred[:, :, 6]
@@ -839,7 +1023,7 @@ def compute_conditioned_losses(
             1.0,
         )
         angle_mean_deg = torch.rad2deg(torch.acos(agreement)).mean()
-        positive_presence_mask = batch.presence_mask.to(device=latent.device)[
+        positive_presence_mask = batch.presence_mask.to(device=zero_output.device)[
             indices[:, 0],
             0,
             indices[:, 1],
@@ -960,8 +1144,9 @@ def _save_snapshot(
     metric: float | None,
     metric_name: str | None = None,
 ) -> None:
+    snapshot_model = _unwrap_model(model)
     payload = {
-        "model": model.state_dict(),
+        "model": snapshot_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": int(step),
         "config": _json_safe(config),
@@ -1505,6 +1690,41 @@ def _losses_to_float_dict(losses: dict[str, torch.Tensor]) -> dict[str, float]:
     return {key: float(value.detach().cpu()) for key, value in losses.items()}
 
 
+def _distributed_mean_loss_tensors(
+    losses: dict[str, torch.Tensor],
+    config: _DistributedConfig,
+) -> dict[str, torch.Tensor]:
+    if not config.enabled:
+        return losses
+    keys = list(losses.keys())
+    values = [
+        losses[key].detach().to(dtype=torch.float32).reshape(())
+        for key in keys
+    ]
+    packed = torch.stack(values)
+    dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    packed = packed / float(config.world_size)
+    return {
+        key: packed[index].to(device=losses[key].device, dtype=losses[key].dtype)
+        for index, key in enumerate(keys)
+    }
+
+
+def _distributed_training_batch_index(step: int, config: _DistributedConfig) -> int:
+    if int(step) <= 0:
+        raise ValueError("training step must be positive")
+    return (int(step) - 1) * int(config.world_size) + int(config.rank)
+
+
+def _distributed_training_sample_index(
+    step: int,
+    *,
+    batch_size: int,
+    config: _DistributedConfig,
+) -> int:
+    return _distributed_training_batch_index(step, config) * int(batch_size)
+
+
 def _forward_loss(
     model: torch.nn.Module,
     batch: FiberTrace3DBatch,
@@ -1531,10 +1751,16 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     raw_config = _load_raw_config(config_path)
     loader_config = load_config(config_path)
     training = dict(raw_config.get("training", {}))
-    device = _device_from_training(training)
+    base_device = _device_from_training(training)
+    distributed = _distributed_config_from_env(base_device)
+    _distributed_init(distributed)
+    device = distributed.device
+    writer = None
+    train_dataloader = None
+    train_iterator = None
     loader = FiberTrace3DLoader(loader_config)
     test_loader = None
-    if raw_config.get("test_datasets"):
+    if distributed.is_main and raw_config.get("test_datasets"):
         test_raw = _make_test_loader_raw_config(raw_config, training)
         tmp_path = Path("/tmp") / f"fiber_trace_3d_test_{int(time.time() * 1000)}.json"
         tmp_path.write_text(json.dumps(_json_safe(test_raw)), encoding="utf-8")
@@ -1548,16 +1774,19 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     trace2cp_cfg = _trace2cp_3d_config(raw_config)
     trace2cp_loader = (
         _make_trace2cp_geometry_loader(raw_config, trace2cp_cfg)
-        if trace2cp_cfg.enabled
+        if distributed.is_main and trace2cp_cfg.enabled
         else None
     )
 
-    model = build_fiber_trace_3d_model(raw_config).to(device)
+    raw_model = build_fiber_trace_3d_model(raw_config)
+    if _distributed_should_use_sync_batchnorm(distributed):
+        raw_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(raw_model)
+    raw_model = raw_model.to(device)
     mixed_precision = _mixed_precision_config_from_training(training, device)
     grad_scaler = _make_grad_scaler(mixed_precision)
     optimizer_hparams = _optimizer_hparams_from_training(training)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        raw_model.parameters(),
         **optimizer_hparams,
     )
     resume = (
@@ -1569,14 +1798,26 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     if resume:
         start_step = _load_snapshot(
             resume,
-            model=model,
+            model=raw_model,
             optimizer=optimizer,
             optimizer_hparams=optimizer_hparams,
             grad_scaler=grad_scaler,
             map_location=device,
         )
 
-    run_dir, snapshot_dir = _resolve_run_layout(raw_config)
+    train_model = _wrap_distributed_model(raw_model, distributed)
+    run_datestr = str(
+        training.get("run_datestr") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
+    run_datestr = _distributed_broadcast_object(
+        run_datestr if distributed.is_main else None,
+        distributed,
+    )
+    run_dir, snapshot_dir = _resolve_run_layout(
+        raw_config,
+        date_str_override=str(run_datestr),
+    )
+    _distributed_barrier(distributed)
     effective_config = _json_safe(raw_config)
     if resume_checkpoint is not None:
         effective_config.setdefault("training", {})["resume_cli"] = str(resume_checkpoint)
@@ -1596,7 +1837,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     }
     writer = _make_summary_writer(
         run_dir,
-        enabled=bool(training.get("tensorboard_enabled", True)),
+        enabled=distributed.is_main and bool(training.get("tensorboard_enabled", True)),
     )
     if writer is not None:
         writer.add_text("config/json", json.dumps(effective_config, indent=2, sort_keys=True), 0)
@@ -1686,28 +1927,33 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     loader_context = _loader_multiprocessing_context(raw_config)
     best_metric = math.inf
 
-    print(
-        "fiber_trace_3d train: "
-        f"samples={loader.sample_count} batch_size={loader.config.batch_size} "
-        f"max_sample_index={sample_index_limit} "
-        f"patch_shape_zyx={loader.config.patch_shape_zyx} device={device} run_dir={run_dir} "
-        f"trace2cp_enabled={bool(trace2cp_loader is not None)} "
-        f"loader_workers={loader_workers} loader_prefetch_factor={loader_prefetch_factor} "
-        f"loader_worker_device={loader_worker_device} "
-        f"loader_multiprocessing_context={loader_context or 'default'} "
-        f"optimizer_lr={effective_optimizer['param_group_lrs']} "
-        f"optimizer_weight_decay={effective_optimizer['param_group_weight_decays']} "
-        f"mixed_precision={effective_precision['mode']} "
-        f"autocast_enabled={effective_precision['enabled']} "
-        f"amp_grad_scaler={effective_precision['grad_scaler']} "
-        f"kept_snapshot_interval={kept_snapshot_interval} "
-        f"conditioned_decoder={_model_uses_conditioned_decoder(model)} "
-        f"conditioned_jitter_deg={conditioned_loss_options['perpendicular_jitter_degrees']} "
-        f"conditioned_pos_w={conditioned_loss_options['positive_query_weight']} "
-        f"conditioned_neg_w={conditioned_loss_options['negative_query_weight']}",
-        flush=True,
-    )
-    if resume:
+    if distributed.is_main:
+        print(
+            "fiber_trace_3d train: "
+            f"samples={loader.sample_count} batch_size={loader.config.batch_size} "
+            f"global_batch_size={loader.config.batch_size * distributed.world_size} "
+            f"max_sample_index={sample_index_limit} "
+            f"patch_shape_zyx={loader.config.patch_shape_zyx} device={device} run_dir={run_dir} "
+            f"ddp_enabled={distributed.enabled} ddp_world_size={distributed.world_size} "
+            f"ddp_backend={distributed.backend or 'none'} "
+            f"sync_batchnorm={_distributed_should_use_sync_batchnorm(distributed)} "
+            f"trace2cp_enabled={bool(trace2cp_loader is not None)} "
+            f"loader_workers={loader_workers} loader_prefetch_factor={loader_prefetch_factor} "
+            f"loader_worker_device={loader_worker_device} "
+            f"loader_multiprocessing_context={loader_context or 'default'} "
+            f"optimizer_lr={effective_optimizer['param_group_lrs']} "
+            f"optimizer_weight_decay={effective_optimizer['param_group_weight_decays']} "
+            f"mixed_precision={effective_precision['mode']} "
+            f"autocast_enabled={effective_precision['enabled']} "
+            f"amp_grad_scaler={effective_precision['grad_scaler']} "
+            f"kept_snapshot_interval={kept_snapshot_interval} "
+            f"conditioned_decoder={_model_uses_conditioned_decoder(raw_model)} "
+            f"conditioned_jitter_deg={conditioned_loss_options['perpendicular_jitter_degrees']} "
+            f"conditioned_pos_w={conditioned_loss_options['positive_query_weight']} "
+            f"conditioned_neg_w={conditioned_loss_options['negative_query_weight']}",
+            flush=True,
+        )
+    if distributed.is_main and resume:
         print(
             "fiber_trace_3d resume: "
             f"checkpoint={resume} checkpoint_step={start_step} next_step={start_step + 1} "
@@ -1720,7 +1966,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         metric_name: str | None = None
         if test_loader is not None and test_interval > 0:
             test_losses = evaluate_dense_loss(
-                model,
+                raw_model,
                 test_loader,
                 device=device,
                 start_sample_index=test_start_sample_index,
@@ -1761,7 +2007,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                     _write_3d_sample_sheet(
                         writer,
                         "test_sample_3d/principal_slices",
-                        model,
+                        raw_model,
                         vis_batch,
                         step,
                         sample_count=test_sample_vis_count,
@@ -1769,7 +2015,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                     )
         if trace2cp_loader is not None and test_interval > 0:
             trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
-                model,
+                raw_model,
                 trace2cp_loader,
                 image_normalization=loader.config.image_normalization,
                 cfg=trace2cp_cfg,
@@ -1801,25 +2047,32 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             writer.flush()
         return metric, metric_name
 
-    initial_metric, initial_metric_name = run_configured_tests(start_step)
+    initial_metric, initial_metric_name = (
+        run_configured_tests(start_step) if distributed.is_main else (None, None)
+    )
+    initial_metric = _distributed_broadcast_object(initial_metric, distributed)
+    initial_metric_name = _distributed_broadcast_object(initial_metric_name, distributed)
     if initial_metric is not None and initial_metric_name is not None:
         best_metric = float(initial_metric)
-        _save_snapshot(
-            snapshot_dir / "best.pt",
-            model=model,
-            optimizer=optimizer,
-            step=start_step,
-            config=raw_config,
-            metric=best_metric,
-            metric_name=initial_metric_name,
-            grad_scaler=grad_scaler,
-        )
+        if distributed.is_main:
+            _save_snapshot(
+                snapshot_dir / "best.pt",
+                model=raw_model,
+                optimizer=optimizer,
+                step=start_step,
+                config=raw_config,
+                metric=best_metric,
+                metric_name=initial_metric_name,
+                grad_scaler=grad_scaler,
+            )
+    _distributed_barrier(distributed)
 
     remaining_steps = None if max_steps is None else max(0, int(max_steps) - int(start_step))
     train_dataloader = _make_batch_dataloader(
         config_path,
         raw_config=raw_config,
-        start_batch_index=start_step,
+        start_batch_index=start_step * distributed.world_size + distributed.rank,
+        batch_index_stride=distributed.world_size,
         batch_count=remaining_steps,
         sample_index_limit=sample_index_limit,
         sample_mode="random",
@@ -1829,7 +2082,11 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         step = int(start_step)
         while max_steps is None or step < max_steps:
             step += 1
-            sample_index = (step - 1) * loader.config.batch_size
+            sample_index = _distributed_training_sample_index(
+                step,
+                batch_size=loader.config.batch_size,
+                config=distributed,
+            )
             batch, load_ms, wait_ms, to_device_ms, target_ms = _next_training_batch(
                 iterator=train_iterator,
                 loader=loader,
@@ -1842,7 +2099,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             fw_start = time.perf_counter()
             with _autocast_context(mixed_precision):
                 loss_tensors = _forward_loss_tensors(
-                    model,
+                    train_model,
                     batch,
                     direction_weight=direction_weight,
                     presence_weight=presence_weight,
@@ -1857,10 +2114,11 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             else:
                 loss_tensors["total"].backward()
                 optimizer.step()
-            losses = _losses_to_float_dict(loss_tensors)
+            reduced_loss_tensors = _distributed_mean_loss_tensors(loss_tensors, distributed)
+            losses = _losses_to_float_dict(reduced_loss_tensors)
             step_ms = (time.perf_counter() - fw_start) * 1000.0
 
-            if step <= 100 or step % scalar_interval == 0:
+            if distributed.is_main and (step <= 100 or step % scalar_interval == 0):
                 print(
                     f"step={step} loss_total={losses['total']:.6f} "
                     f"loss_direction={losses['direction']:.6f} "
@@ -1888,68 +2146,82 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                 writer.add_scalar("timing/batch_to_device_ms", to_device_ms, step)
                 writer.add_scalar("timing/target_ms", target_ms, step)
                 writer.add_scalar("timing/fw_bw_step_ms", step_ms, step)
-            if writer is not None and sample_vis_interval > 0 and (
+            train_vis_due = sample_vis_interval > 0 and (
                 step == 1 or step % sample_vis_interval == 0
-            ):
+            )
+            if writer is not None and train_vis_due:
                 _write_3d_sample_sheet(
                     writer,
                     "train_sample_3d/principal_slices",
-                    model,
+                    raw_model,
                     batch,
                     step,
                     sample_count=sample_vis_count,
                     mixed_precision=mixed_precision,
                 )
+            if train_vis_due:
+                _distributed_barrier(distributed)
 
             metric = losses["total"]
             metric_name = "train/loss_total"
             if test_interval > 0 and step % test_interval == 0:
-                test_metric, test_metric_name = run_configured_tests(step)
+                test_metric, test_metric_name = (
+                    run_configured_tests(step) if distributed.is_main else (None, None)
+                )
+                test_metric = _distributed_broadcast_object(test_metric, distributed)
+                test_metric_name = _distributed_broadcast_object(test_metric_name, distributed)
                 if test_metric is not None and test_metric_name is not None:
                     metric = test_metric
                     metric_name = test_metric_name
 
             if step % checkpoint_interval == 0 or (max_steps is not None and step == max_steps):
-                _save_snapshot(
-                    snapshot_dir / "current.pt",
-                    model=model,
-                    optimizer=optimizer,
-                    step=step,
-                    config=raw_config,
-                    metric=metric,
-                    metric_name=metric_name,
-                    grad_scaler=grad_scaler,
-                )
+                if distributed.is_main:
+                    _save_snapshot(
+                        snapshot_dir / "current.pt",
+                        model=raw_model,
+                        optimizer=optimizer,
+                        step=step,
+                        config=raw_config,
+                        metric=metric,
+                        metric_name=metric_name,
+                        grad_scaler=grad_scaler,
+                    )
+                _distributed_barrier(distributed)
             if kept_snapshot_interval > 0 and step % kept_snapshot_interval == 0:
-                _save_snapshot(
-                    snapshot_dir / f"step_{step:08d}.pt",
-                    model=model,
-                    optimizer=optimizer,
-                    step=step,
-                    config=raw_config,
-                    metric=metric,
-                    metric_name=metric_name,
-                    grad_scaler=grad_scaler,
-                )
+                if distributed.is_main:
+                    _save_snapshot(
+                        snapshot_dir / f"step_{step:08d}.pt",
+                        model=raw_model,
+                        optimizer=optimizer,
+                        step=step,
+                        config=raw_config,
+                        metric=metric,
+                        metric_name=metric_name,
+                        grad_scaler=grad_scaler,
+                    )
+                _distributed_barrier(distributed)
             if metric < best_metric:
                 best_metric = float(metric)
-                _save_snapshot(
-                    snapshot_dir / "best.pt",
-                    model=model,
-                    optimizer=optimizer,
-                    step=step,
-                    config=raw_config,
-                    metric=best_metric,
-                    metric_name=metric_name,
-                    grad_scaler=grad_scaler,
-                )
+                if distributed.is_main:
+                    _save_snapshot(
+                        snapshot_dir / "best.pt",
+                        model=raw_model,
+                        optimizer=optimizer,
+                        step=step,
+                        config=raw_config,
+                        metric=best_metric,
+                        metric_name=metric_name,
+                        grad_scaler=grad_scaler,
+                    )
+                _distributed_barrier(distributed)
     finally:
         if train_dataloader is not None:
             train_iterator = None
             train_dataloader = None
-    if writer is not None:
-        writer.flush()
-        writer.close()
+        if writer is not None:
+            writer.flush()
+            writer.close()
+        _distributed_cleanup(distributed)
 
 
 def _image_to_u8(image: np.ndarray, valid: np.ndarray) -> np.ndarray:
@@ -3132,6 +3404,7 @@ class _FiberTrace3DBatchDataset(Dataset):
         *,
         start_batch_index: int,
         batch_count: int | None,
+        batch_index_stride: int = 1,
         sample_index_limit: int | None = None,
         sample_mode: str,
         worker_device: str | torch.device = "cpu",
@@ -3139,6 +3412,9 @@ class _FiberTrace3DBatchDataset(Dataset):
     ) -> None:
         self.config_source = config_source
         self.start_batch_index = int(start_batch_index)
+        self.batch_index_stride = int(batch_index_stride)
+        if self.batch_index_stride <= 0:
+            raise ValueError("batch_index_stride must be > 0")
         self.batch_count = None if batch_count is None else int(batch_count)
         self.sample_index_limit = 0 if sample_index_limit is None else int(sample_index_limit)
         if self.sample_index_limit < 0:
@@ -3171,7 +3447,7 @@ class _FiberTrace3DBatchDataset(Dataset):
         item_start_ns = time.time_ns()
         item_cpu_start = time.process_time()
         loader = self._get_loader()
-        batch_index = self.start_batch_index + int(index)
+        batch_index = self.start_batch_index + int(index) * self.batch_index_stride
         sample_index = batch_index * int(loader.config.batch_size)
         worker_device = torch.device(self.worker_device)
         batch = loader.load_batch(
@@ -3259,6 +3535,7 @@ def _make_batch_dataloader(
     raw_config: dict[str, Any],
     start_batch_index: int,
     batch_count: int | None,
+    batch_index_stride: int = 1,
     sample_index_limit: int | None = None,
     sample_mode: str,
     profile: bool = False,
@@ -3269,6 +3546,7 @@ def _make_batch_dataloader(
     dataset = _FiberTrace3DBatchDataset(
         config_source,
         start_batch_index=int(start_batch_index),
+        batch_index_stride=int(batch_index_stride),
         batch_count=None if batch_count is None else int(batch_count),
         sample_index_limit=sample_index_limit,
         sample_mode=sample_mode,
@@ -3609,12 +3887,14 @@ def main() -> None:
     parser.add_argument("--resume", type=Path, default=None)
     args = parser.parse_args()
     if args.prefetch:
+        _require_single_process_cli_mode("--prefetch")
         run_prefetch(
             args.config,
             prefetch_steps=args.prefetch_steps,
             workers=args.prefetch_workers,
         )
     elif args.trace2cp_vis:
+        _require_single_process_cli_mode("--trace2cp-vis")
         if args.checkpoint is None:
             raise SystemExit("--trace2cp-vis requires --checkpoint")
         if args.export_dir is None:
@@ -3629,6 +3909,7 @@ def main() -> None:
             rf_margin_px=args.trace2cp_rf_margin_px,
         )
     elif args.benchmark:
+        _require_single_process_cli_mode("--benchmark")
         run_benchmark(
             args.config,
             load_only=bool(args.load_only),

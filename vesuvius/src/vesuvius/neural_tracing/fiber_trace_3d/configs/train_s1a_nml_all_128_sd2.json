@@ -1,5 +1,5 @@
 {
-  "batch_size": 16,
+  "batch_size": 8,
   "patch_shape_zyx": [128, 128, 128],
   "seed": 0,
   "cp_margin_voxels": 4,

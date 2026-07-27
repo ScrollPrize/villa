@@ -116,7 +116,15 @@ class FiberTrace3DNet(nn.Module):
         layers.append(nn.Conv3d(in_channels, 7, kernel_size=1))
         return nn.Sequential(*layers)
 
-    def forward(self, volume: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        volume: torch.Tensor,
+        *,
+        conditioned_random_query: torch.Tensor | None = None,
+        conditioned_point_indices_bzyx: torch.Tensor | None = None,
+        conditioned_point_query_n6: torch.Tensor | None = None,
+        return_conditioned_components: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor | None]:
         if volume.ndim != 5:
             raise ValueError("volume must have shape B,C,D,H,W")
         if self.conditioned_decoder_enabled:
@@ -132,7 +140,38 @@ class FiberTrace3DNet(nn.Module):
                 dtype=latent.dtype,
                 device=latent.device,
             )
-            return self.decode_conditioned_latent(latent, query)
+            zero_output = self.decode_conditioned_latent(latent, query)
+            if not return_conditioned_components:
+                return zero_output
+            random_output = (
+                None
+                if conditioned_random_query is None
+                else self.decode_conditioned_latent(latent, conditioned_random_query)
+            )
+            point_output = (
+                None
+                if conditioned_point_indices_bzyx is None
+                or conditioned_point_query_n6 is None
+                else self.decode_conditioned_points(
+                    latent,
+                    conditioned_point_indices_bzyx,
+                    conditioned_point_query_n6,
+                )
+            )
+            return {
+                "zero_output": zero_output,
+                "random_output": random_output,
+                "point_output": point_output,
+            }
+        if (
+            return_conditioned_components
+            or conditioned_random_query is not None
+            or conditioned_point_indices_bzyx is not None
+            or conditioned_point_query_n6 is not None
+        ):
+            raise RuntimeError(
+                "conditioned forward arguments require conditioned decoder mode"
+            )
         raw = self.net(volume)
         return torch.sigmoid(raw)
 
