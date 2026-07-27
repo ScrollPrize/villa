@@ -365,14 +365,17 @@ side/top strip input loading.
   corresponding dense test sheet count. Each sample block uses five rows: the
   sampled CP's three principal planes, a longitudinal slice containing the GT
   CP tangent, and a perpendicular/cross slice whose plane normal is the GT CP
-  tangent. Each row has nine columns: volume image with projected GT line and
-  predicted CP direction overlay where applicable, target/context presence,
-  first prediction presence, second prediction presence, prediction presence
-  for the output whose decoded direction is closer to the slice normal, other
-  prediction presence, max prediction presence, min prediction presence, and
-  average prediction presence. In conditioned mode the first prediction is the
-  zero-query output and the second is the recurrent output conditioned on the
-  first decoded direction; in legacy mode these columns are branch outputs. The
+  tangent. Single-output rows have five columns: volume image with projected GT
+  line and predicted CP direction overlay where applicable, target/context
+  presence, raw predicted presence, predicted presence weighted by the cosine
+  to the slice normal, and predicted presence weighted by the cosine to the GT
+  tangent. Multi-output rows keep the branch summary columns: first prediction
+  presence, second prediction presence, prediction presence closer to the slice
+  normal, other prediction presence, max prediction presence, min prediction
+  presence, and average prediction presence. In conditioned mode the first
+  prediction is the zero-query output and the second is the recurrent output
+  conditioned on the first decoded direction; in legacy multi-branch mode these
+  columns are branch outputs. The
   GT line overlay draws target-line portions within 2 voxels of
   the displayed principal slice plane. The two
   oblique rows project/rasterize the carried transformed line segments into

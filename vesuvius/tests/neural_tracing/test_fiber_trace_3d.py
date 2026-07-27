@@ -101,6 +101,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _optimizer_hparams_from_training,
     _branch_choice_grid_offsets,
     _branch_presence_views_from_sampled_output,
+    _single_output_presence_views_from_sampled_output,
     _evaluate_trace2cp_metric_fixed_set_3d,
     _draw_panel_line_aa,
     _draw_projected_cp_direction,
@@ -988,7 +989,7 @@ def test_train_sample_3d_sheet_contains_principal_slice_panels() -> None:
     assert sheet.shape[2] == 3
     assert sheet.dtype == np.uint8
     assert sheet.shape[0] > 16
-    assert sheet.shape[1] == 16 * 9 + 8 * 4
+    assert sheet.shape[1] == 16 * 5 + 4 * 4
     first_image_panel = sheet[:16, :16]
     colored = (
         (first_image_panel[..., 0] != first_image_panel[..., 1])
@@ -1424,7 +1425,7 @@ def test_3d_dense_test_control_points_zero_uses_random_full_set() -> None:
     ) == (5, 9, "random")
 
 
-def test_train_sample_3d_sheet_has_branch_presence_columns_and_line_overlay() -> None:
+def test_train_sample_3d_sheet_has_single_output_presence_columns_and_line_overlay() -> None:
     loader = _loader(augment_enabled=False)
     batch = _load_materialized_batch(loader, 0)
     output = torch.zeros(
@@ -1439,7 +1440,7 @@ def test_train_sample_3d_sheet_has_branch_presence_columns_and_line_overlay() ->
 
     patch = int(batch.volume.shape[-1])
     gap = 4
-    assert sheet.shape[1] == patch * 9 + 8 * gap
+    assert sheet.shape[1] == patch * 5 + 4 * gap
     first_image_panel = sheet[:patch, :patch]
     colored = (
         (first_image_panel[..., 0] != first_image_panel[..., 1])
@@ -1473,6 +1474,25 @@ def test_branch_presence_view_selects_output_closer_to_slice_normal() -> None:
     assert np.allclose(max_p, 0.75)
     assert np.allclose(min_p, 0.25)
     assert np.allclose(avg_p, 0.5)
+
+
+def test_single_output_presence_views_include_normal_and_tangent_modulation() -> None:
+    x_dir = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+    sampled = torch.zeros((2, 3, 7), dtype=torch.float32)
+    sampled[..., 0:6] = x_dir
+    sampled[..., 6] = 0.6
+
+    raw_p, normal_p, tangent_p = _single_output_presence_views_from_sampled_output(
+        sampled,
+        normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        tangent_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert np.allclose(raw_p, 0.6)
+    assert np.allclose(normal_p, 0.6, atol=1.0e-5)
+    assert np.allclose(tangent_p, 0.0, atol=1.0e-5)
 
 
 def test_oblique_line_presence_uses_slice_frame_axes() -> None:

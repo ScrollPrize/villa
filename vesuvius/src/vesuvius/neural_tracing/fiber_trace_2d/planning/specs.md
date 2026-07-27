@@ -178,16 +178,20 @@
   `training.test_sample_vis_count` control the side-by-side train/test sample
   counts. Each sample block has five rows: the `yx`, `zx`, and `zy` principal
   planes, a longitudinal slice containing the GT CP tangent, and a
-  perpendicular/cross slice whose plane normal is the GT CP tangent. Each row
-  has nine columns: volume image with projected GT line and model-predicted/
-  fitted CP direction overlay where applicable, target/context presence,
-  first prediction presence, second prediction presence, prediction presence
-  for the output whose decoded direction is closer to the slice normal by
-  `abs(dot(axis, normal))`, the other prediction presence, max prediction
-  presence, min prediction presence, and average prediction presence. In
-  conditioned mode the first prediction is the zero-query output and the second
-  prediction is the recurrent output conditioned on the first decoded
-  direction; in legacy branch mode these are branch outputs. The target/context
+  perpendicular/cross slice whose plane normal is the GT CP tangent.
+  Single-output rows have five columns: volume image with projected GT line and
+  model-predicted/fitted CP direction overlay where applicable,
+  target/context presence, raw predicted presence, predicted presence weighted
+  by `abs(dot(pred_axis, slice_normal))`, and predicted presence weighted by
+  `abs(dot(pred_axis, GT_tangent))`. Multi-output rows keep the branch summary
+  layout: image, target/context presence, first prediction presence, second
+  prediction presence, prediction presence for the output whose decoded
+  direction is closer to the slice normal by `abs(dot(axis, normal))`, the other
+  prediction presence, max prediction presence, min prediction presence, and
+  average prediction presence. In conditioned mode the first prediction is the
+  zero-query output and the second prediction is the recurrent output
+  conditioned on the first decoded direction; in legacy branch mode these are
+  branch outputs. The target/context
   presence panel must visualize the carried transformed fiber-line segment
   metadata even for JSON/non-NML CP-only samples where loss supervision remains
   CP-only. The two oblique rows must project/rasterize transformed line

@@ -2,6 +2,9 @@
 
 ## 2026-07-27
 
+- Simplified single-output 3D train/test sample-sheet presence visualization to
+  raw presence plus slice-normal- and GT-tangent-weighted presence panels,
+  while keeping multi-output branch summaries unchanged.
 - Added `torchrun`-driven DDP support to 3D fiber training with rank-partitioned
   deterministic batches, rank-0-only side effects, distributed loss logging,
   unwrapped checkpoint saving, and automatic CUDA SyncBatchNorm conversion.

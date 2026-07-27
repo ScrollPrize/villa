@@ -1857,10 +1857,11 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             "train_sample_3d/layout",
             "Rows: yx, zx, zy principal slices through the sampled CP, "
             "then GT-tangent and GT-perpendicular oblique slices. "
-            "Columns: image with projected GT line and predicted CP direction where applicable, "
-            "target/context presence, first prediction presence, second prediction presence, "
-            "prediction presence closer to the slice normal, other prediction presence, "
-            "max prediction presence, min prediction presence, and average prediction presence. "
+            "Single-output columns: image with projected GT line and predicted CP direction "
+            "where applicable, target/context presence, raw prediction presence, "
+            "prediction presence times abs dot with the slice normal, and prediction presence "
+            "times abs dot with the GT tangent. Multi-output columns instead show first, "
+            "second, normal-closest, other, max, min, and average prediction presence. "
             "In conditioned mode the first prediction is zero-query output and the second is "
             "the recurrent output conditioned on the first decoded direction. "
             "Multiple batch samples are concatenated side by side when configured.",
@@ -1870,10 +1871,11 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             "test_sample_3d/layout",
             "Rows: yx, zx, zy principal slices through the sampled test CP, "
             "then GT-tangent and GT-perpendicular oblique slices. "
-            "Columns: image with projected GT line and predicted CP direction where applicable, "
-            "target/context presence, first prediction presence, second prediction presence, "
-            "prediction presence closer to the slice normal, other prediction presence, "
-            "max prediction presence, min prediction presence, and average prediction presence. "
+            "Single-output columns: image with projected GT line and predicted CP direction "
+            "where applicable, target/context presence, raw prediction presence, "
+            "prediction presence times abs dot with the slice normal, and prediction presence "
+            "times abs dot with the GT tangent. Multi-output columns instead show first, "
+            "second, normal-closest, other, max, min, and average prediction presence. "
             "In conditioned mode the first prediction is zero-query output and the second is "
             "the recurrent output conditioned on the first decoded direction. "
             "Multiple batch samples are concatenated side by side when configured.",
@@ -2754,6 +2756,47 @@ def _branch_presence_views_from_sampled_output(
     return _branch_presence_views(axes, presence, normal_zyx=normal_zyx)
 
 
+def _single_output_presence_views_from_sampled_output(
+    sampled_hwc: torch.Tensor,
+    *,
+    normal_zyx: np.ndarray,
+    tangent_zyx: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    values = sampled_hwc.to(dtype=torch.float32)
+    channels = int(values.shape[-1])
+    if channels != 7:
+        raise ValueError("single-output presence views require exactly 7 channels")
+    axes = decode_lasagna_direction_3x2_analytic(values[..., 0:6]).detach().cpu().numpy()
+    presence = values[..., 6].detach().cpu().numpy().astype(np.float32, copy=False)
+    normal_xyz = _zyx_to_xyz_np(_unit_np(normal_zyx, fallback=(0.0, 0.0, 1.0)))
+    tangent_xyz = _zyx_to_xyz_np(_unit_np(tangent_zyx, fallback=(0.0, 0.0, 1.0)))
+    normal_cos = np.abs(np.sum(axes * normal_xyz.reshape(1, 1, 3), axis=-1))
+    tangent_cos = np.abs(np.sum(axes * tangent_xyz.reshape(1, 1, 3), axis=-1))
+    return (
+        presence,
+        (presence * normal_cos).astype(np.float32, copy=False),
+        (presence * tangent_cos).astype(np.float32, copy=False),
+    )
+
+
+def _sample_sheet_presence_views_from_sampled_output(
+    sampled_hwc: torch.Tensor,
+    *,
+    normal_zyx: np.ndarray,
+    tangent_zyx: np.ndarray,
+) -> tuple[np.ndarray, ...]:
+    if int(sampled_hwc.shape[-1]) == 7:
+        return _single_output_presence_views_from_sampled_output(
+            sampled_hwc,
+            normal_zyx=normal_zyx,
+            tangent_zyx=tangent_zyx,
+        )
+    return _branch_presence_views_from_sampled_output(
+        sampled_hwc,
+        normal_zyx=normal_zyx,
+    )
+
+
 def _pad_panels_to_height(panels: list[np.ndarray]) -> list[np.ndarray]:
     height = max(int(panel.shape[0]) for panel in panels)
     padded_panels = []
@@ -2787,6 +2830,7 @@ def _make_oblique_sample_row(
     row_axis_zyx: np.ndarray,
     col_axis_zyx: np.ndarray,
     normal_zyx: np.ndarray,
+    tangent_zyx: np.ndarray,
     height: int,
     width: int,
     gap: int,
@@ -2821,19 +2865,14 @@ def _make_oblique_sample_row(
     if not bool(np.any(target_p > 0.0)) and target_czyx is not None:
         target_p = _sample_czyx_at_coords(target_czyx, coords)[..., 0].detach().cpu().numpy()
     sampled_output = _sample_czyx_at_coords(output_czyx, coords)
-    branch0_p, branch1_p, close_p, other_p, max_p, min_p, avg_p = _branch_presence_views_from_sampled_output(
+    presence_views = _sample_sheet_presence_views_from_sampled_output(
         sampled_output,
         normal_zyx=normal_zyx,
+        tangent_zyx=tangent_zyx,
     )
     image_rgb = np.repeat(_image_to_u8(image, image_valid)[..., None], 3, axis=2)
     target_rgb = _gray_to_rgb(target_p, mask=image_valid)
-    branch0_rgb = _gray_to_rgb(branch0_p, mask=image_valid)
-    branch1_rgb = _gray_to_rgb(branch1_p, mask=image_valid)
-    close_rgb = _gray_to_rgb(close_p, mask=image_valid)
-    other_rgb = _gray_to_rgb(other_p, mask=image_valid)
-    max_rgb = _gray_to_rgb(max_p, mask=image_valid)
-    min_rgb = _gray_to_rgb(min_p, mask=image_valid)
-    avg_rgb = _gray_to_rgb(avg_p, mask=image_valid)
+    presence_rgbs = [_gray_to_rgb(view, mask=image_valid) for view in presence_views]
     cp_row = int(round(float(height - 1) * 0.5))
     cp_col = int(round(float(width - 1) * 0.5))
     _draw_projected_oblique_gt_line(
@@ -2846,29 +2885,13 @@ def _make_oblique_sample_row(
         normal_zyx=normal_zyx,
         threshold_voxels=2.0,
     )
-    for panel in (
-        image_rgb,
-        target_rgb,
-        branch0_rgb,
-        branch1_rgb,
-        close_rgb,
-        other_rgb,
-        max_rgb,
-        min_rgb,
-        avg_rgb,
-    ):
+    for panel in (image_rgb, target_rgb, *presence_rgbs):
         _mark_slice_cp(panel, cp_row, cp_col)
     return _make_sample_sheet_row(
         [
             image_rgb,
             target_rgb,
-            branch0_rgb,
-            branch1_rgb,
-            close_rgb,
-            other_rgb,
-            max_rgb,
-            min_rgb,
-            avg_rgb,
+            *presence_rgbs,
         ],
         gap=gap,
     )
@@ -2904,6 +2927,7 @@ def _make_train_sample_3d_sheet(
     segment_slice = slice(segment_offset, segment_offset + segment_count)
     segments_start_zyx = batch.target_segment_starts_zyx[segment_slice].detach().cpu().numpy()
     segments_end_zyx = batch.target_segment_ends_zyx[segment_slice].detach().cpu().numpy()
+    tangent_zyx = batch.target_tangent_zyx[0].detach().cpu().numpy().astype(np.float32, copy=False)
     line_presence = _line_presence_for_display(
         tuple(int(v) for v in volume.shape),
         segments_start_zyx,
@@ -2972,19 +2996,14 @@ def _make_train_sample_3d_sheet(
         cp_row,
         cp_col,
     ) in slice_specs:
-        branch0_p, branch1_p, close_p, other_p, max_p, min_p, avg_p = _branch_presence_views_from_sampled_output(
+        presence_views = _sample_sheet_presence_views_from_sampled_output(
             sampled_output,
             normal_zyx=normal_zyx,
+            tangent_zyx=tangent_zyx,
         )
         image_rgb = np.repeat(_image_to_u8(image, image_valid)[..., None], 3, axis=2)
         target_rgb = _gray_to_rgb(target_p, mask=image_valid)
-        branch0_rgb = _gray_to_rgb(branch0_p, mask=image_valid)
-        branch1_rgb = _gray_to_rgb(branch1_p, mask=image_valid)
-        close_rgb = _gray_to_rgb(close_p, mask=image_valid)
-        other_rgb = _gray_to_rgb(other_p, mask=image_valid)
-        max_rgb = _gray_to_rgb(max_p, mask=image_valid)
-        min_rgb = _gray_to_rgb(min_p, mask=image_valid)
-        avg_rgb = _gray_to_rgb(avg_p, mask=image_valid)
+        presence_rgbs = [_gray_to_rgb(view, mask=image_valid) for view in presence_views]
         _draw_projected_gt_line(
             image_rgb,
             segments_start_zyx,
@@ -3005,31 +3024,19 @@ def _make_train_sample_3d_sheet(
         )
         _mark_slice_cp(image_rgb, cp_row, cp_col)
         _mark_slice_cp(target_rgb, cp_row, cp_col)
-        _mark_slice_cp(branch0_rgb, cp_row, cp_col)
-        _mark_slice_cp(branch1_rgb, cp_row, cp_col)
-        _mark_slice_cp(close_rgb, cp_row, cp_col)
-        _mark_slice_cp(other_rgb, cp_row, cp_col)
-        _mark_slice_cp(max_rgb, cp_row, cp_col)
-        _mark_slice_cp(min_rgb, cp_row, cp_col)
-        _mark_slice_cp(avg_rgb, cp_row, cp_col)
+        for panel in presence_rgbs:
+            _mark_slice_cp(panel, cp_row, cp_col)
         rows.append(
             _make_sample_sheet_row(
                 [
                     image_rgb,
                     target_rgb,
-                    branch0_rgb,
-                    branch1_rgb,
-                    close_rgb,
-                    other_rgb,
-                    max_rgb,
-                    min_rgb,
-                    avg_rgb,
+                    *presence_rgbs,
                 ],
                 gap=gap,
             )
         )
 
-    tangent_zyx = batch.target_tangent_zyx[0].detach().cpu().numpy().astype(np.float32, copy=False)
     tangent_row_axis, tangent_col_axis, tangent_normal = _tangent_slice_frame_zyx(tangent_zyx)
     cross_row_axis, cross_col_axis = _basis_for_normal_zyx(tangent_zyx)
     oblique_height = int(volume.shape[1])
@@ -3051,6 +3058,7 @@ def _make_train_sample_3d_sheet(
             row_axis_zyx=tangent_row_axis,
             col_axis_zyx=tangent_col_axis,
             normal_zyx=tangent_normal,
+            tangent_zyx=tangent_zyx,
             height=oblique_height,
             width=oblique_width,
             gap=gap,
@@ -3068,6 +3076,7 @@ def _make_train_sample_3d_sheet(
             row_axis_zyx=cross_row_axis,
             col_axis_zyx=cross_col_axis,
             normal_zyx=_unit_np(tangent_zyx, fallback=(0.0, 0.0, 1.0)),
+            tangent_zyx=tangent_zyx,
             height=oblique_height,
             width=oblique_width,
             gap=gap,
