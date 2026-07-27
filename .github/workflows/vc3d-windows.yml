@@ -39,7 +39,7 @@ concurrency:
 
 jobs:
   build-windows:
-    name: ${{ github.event_name == 'pull_request' && 'Compile' || 'Build + package' }} (MSYS2 UCRT64)
+    name: Build + package (MSYS2 UCRT64)
     runs-on: windows-latest
     timeout-minutes: 150
     env:
@@ -165,19 +165,29 @@ jobs:
         run: '"${SCCACHE_PATH}" --show-stats'
 
       - name: Package (NSIS installer + ZIP)
-        if: github.event_name != 'pull_request'
         run: |
+          set +e
           cd build/ci-windows-mingw
-          # cpack only reports that makensis failed and points at a log file
-          # inside the build tree, which the job never uploads — so a packaging
-          # break is undiagnosable from the run output alone. Dump the log here.
-          if ! cpack -V; then
-            echo "::group::NSISOutput.log"
-            cat _CPack_Packages/win64/NSIS/NSISOutput.log || echo "(no NSISOutput.log)"
-            echo "::endgroup::"
-            exit 1
+          cpack -V
+          package_rc=$?
+          if (( package_rc != 0 )); then
+            while IFS= read -r log; do
+              echo "::group::$log"
+              cat "$log"
+              echo "::endgroup::"
+            done < <(find _CPack_Packages -name NSISOutput.log -type f)
+            exit "$package_rc"
           fi
           ls -la *.exe *.zip
+
+      - name: Upload packaging diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-windows-packaging-diagnostics
+          path: volume-cartographer/build/ci-windows-mingw/_CPack_Packages/**/NSISOutput.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload installer artifact
         if: github.event_name != 'pull_request'
@@ -193,7 +203,6 @@ jobs:
       # from plain PowerShell (no MSYS2 on PATH), so any DLL missing from the
       # bundle fails loudly here instead of on a user's machine.
       - name: Smoke test packaged tree
-        if: github.event_name != 'pull_request'
         shell: pwsh
         timeout-minutes: 10
         working-directory: volume-cartographer/build/ci-windows-mingw
