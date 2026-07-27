@@ -34,8 +34,10 @@
   "volume_cache_memory_mib": null,
   "model_3d": {
     "input_channels": 1,
-    "direction_branch_count": 2,
-    "output_channels": 14,
+    "conditioned_decoder_enabled": true,
+    "conditioned_latent_channels": 64,
+    "conditioned_decoder_hidden_channels": 64,
+    "conditioned_decoder_layers": 3,
     "unet_base_channels": 16,
     "unet_depth": 5,
     "decoder_upsample_mode": "pixelshuffle",
@@ -44,7 +46,7 @@
   },
   "training": {
     "run_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber_trace_3d_runs",
-    "run_name": "cont_s1a_128_2_2x2r",
+    "run_name": "s1a_128_2_conditioned",
     "max_steps": 1000000,
     "learning_rate": 0.001,
     "scalar_log_interval": 100,
@@ -66,12 +68,16 @@
     "test_trace2cp_tile_shape_hw": [128, 128],
     "test_trace2cp_block_context_voxels": 4,
     "device": "auto",
+    "mixed_precision": "bf16",
     "loader_workers": 8,
     "loader_prefetch_factor": 2,
     "loader_worker_device": "cpu",
     "tensorboard_enabled": true,
     "direction_weight": 10.0,
-    "presence_weight": 1.0
+    "presence_weight": 1.0,
+    "conditioned_perpendicular_jitter_degrees": 45.0,
+    "conditioned_positive_query_weight": 1.0,
+    "conditioned_negative_query_weight": 1.0
   },
   "datasets": [
     {

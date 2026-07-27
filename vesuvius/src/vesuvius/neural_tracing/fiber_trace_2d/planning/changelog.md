@@ -2,6 +2,15 @@
 
 ## 2026-07-26
 
+- Added `training.mixed_precision` support to 3D fiber training with BF16/FP16
+  autocast, FP16 GradScaler snapshot resume, precision logging, and BF16
+  enabled in the active S1A conditioned 64/128 configs.
+- Added an opt-in 3D direction-conditioned decoder mode: shared U-Net latent
+  features plus a pointwise query decoder, conditioned positive query
+  supervision, dense zero/random-query negative presence supervision, recurrent
+  grouped visualization/native-trace outputs, and updated the active
+  `train_s1a_nml_all_64_sd2.json` and `train_s1a_nml_all_128_sd2.json`
+  configs to use it.
 - Changed 3D training resume so checkpoint AdamW state is restored first, then
   current config `training.learning_rate` and `training.weight_decay` are
   reapplied to optimizer param groups and printed/logged as effective values.

@@ -781,9 +781,16 @@ class NativeTraceFieldCache:
         image = _normalize_image(raw_t, valid, self.image_normalization)
         was_training = bool(self.model.training)
         self.model.eval()
+        model_input = image.view(1, 1, *self.patch_shape_zyx)
+        if bool(getattr(self.model, "conditioned_decoder_enabled", False)) and hasattr(
+            self.model,
+            "forward_recurrent_grouped",
+        ):
+            model_output = self.model.forward_recurrent_grouped(model_input, steps=2)[0]
+        else:
+            model_output = self.model(model_input)[0]
         output = (
-            self.model(image.view(1, 1, *self.patch_shape_zyx))[0]
-            .detach()
+            model_output.detach()
             .to(device=torch.device("cpu"), dtype=torch.float32)
             .contiguous()
         )
