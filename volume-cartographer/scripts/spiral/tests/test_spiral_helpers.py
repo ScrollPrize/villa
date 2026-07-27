@@ -6,7 +6,10 @@ import unittest
 import numpy as np
 from PIL import Image
 
-from spiral_helpers import load_fiber_point_collection
+from spiral_helpers import (
+    ensure_patches_survive_z_roi,
+    load_fiber_point_collection,
+)
 from tifxyz import load_tifxyz
 
 
@@ -68,6 +71,28 @@ class TifxyzMetadataTests(unittest.TestCase):
             patch = load_tifxyz(root)
 
             self.assertEqual(patch.erosion_cells(7), 7)
+
+
+class EnsurePatchesSurviveZRoiTests(unittest.TestCase):
+    def test_window_missing_all_patches_raises(self):
+        with self.assertRaises(RuntimeError) as raised:
+            ensure_patches_survive_z_roi(
+                {}, {}, True, 17600, 18400,
+                loaded_verified=25, loaded_unverified=0)
+        message = str(raised.exception)
+        self.assertIn("z 17600-18400", message)
+        self.assertIn("25 verified", message)
+        self.assertIn("disable_patches", message)
+
+    def test_intentionally_patch_free_fit_is_exempt(self):
+        ensure_patches_survive_z_roi(
+            {}, {}, False, 17600, 18400,
+            loaded_verified=0, loaded_unverified=0)
+
+    def test_surviving_patches_pass(self):
+        ensure_patches_survive_z_roi(
+            {1: object()}, {}, True, 17600, 18400,
+            loaded_verified=25, loaded_unverified=0)
 
 
 if __name__ == "__main__":

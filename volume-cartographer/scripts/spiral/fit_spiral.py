@@ -82,6 +82,7 @@ from sdt_losses import (
 )
 from spiral_helpers import (
     SAMPLING_COUNT_FLOORS,
+    ensure_patches_survive_z_roi,
     erode_patch_valid_region,
     load_patches,
     load_fiber_point_collection,
@@ -891,6 +892,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
     print(f" loaded {len(verified_patches)} patches")
     print(f" loaded {len(unverified_patches)} unverified patches")
+    loaded_verified, loaded_unverified = len(verified_patches), len(unverified_patches)
 
     for patches in (verified_patches, unverified_patches):
         for patch_id, patch in list(patches.items()):
@@ -910,6 +912,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             # Training retains the base grid and masks, so regenerate this view
             # lazily only for a later exporter that actually requests it.
             patch.release_derived_caches()
+
+    ensure_patches_survive_z_roi(
+        verified_patches, unverified_patches,
+        use_verified_patches or use_unverified_patches,
+        z_begin, z_end, loaded_verified, loaded_unverified)
 
     # ==========================================================================
     # Point collection loading

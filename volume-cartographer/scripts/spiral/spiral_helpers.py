@@ -25,6 +25,25 @@ def patch_intersects_z_roi(patch, z_begin, z_end):
     return bool(((zs >= z_begin) & (zs < z_end)).any().item())
 
 
+def ensure_patches_survive_z_roi(verified_patches, unverified_patches,
+                                 patches_requested, z_begin, z_end,
+                                 loaded_verified, loaded_unverified):
+    """Fail loudly when the z-ROI filter drops every loaded patch.
+
+    The 'No patches could be loaded' guard runs before the z-ROI filter,
+    so a window falling in a pack coverage gap used to fit zero patches
+    to a clean exit 0 (#1237). Intentionally patch-free fits pass
+    patches_requested=False and stay exempt.
+    """
+    if patches_requested and not verified_patches and not unverified_patches:
+        raise RuntimeError(
+            f'No patches intersect the fit window z {z_begin}-{z_end}: '
+            f'{loaded_verified} verified + {loaded_unverified} unverified '
+            'patches were loaded, but the z-ROI filter (and erosion) dropped '
+            'them all. Adjust z_begin/z_end to patch coverage, or set '
+            'disable_patches=True to fit without patches intentionally.')
+
+
 def scale_counts_for_z_range(
     config,
     z_begin,
