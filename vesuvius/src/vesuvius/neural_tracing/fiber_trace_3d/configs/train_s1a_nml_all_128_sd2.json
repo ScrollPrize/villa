@@ -1,6 +1,6 @@
 {
   "batch_size": 4,
-  "patch_shape_zyx": [112, 112, 112],
+  "patch_shape_zyx": [128, 128, 128],
   "seed": 0,
   "cp_margin_voxels": 4,
   "presence_radius_voxels": 2.0,
