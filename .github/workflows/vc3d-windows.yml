@@ -178,6 +178,41 @@ jobs:
           }
           Remove-Item -LiteralPath $venv -Recurse -Force
 
+      - name: Diagnose VC3D startup
+        if: failure()
+        shell: pwsh
+        env:
+          VC3D_MCP_TEST_BINARY: ${{ github.workspace }}\volume-cartographer\build\ci-windows-mingw\bin\VC3D.exe
+        run: |
+          $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
+          $env:QT_PLUGIN_PATH = "C:\msys64\ucrt64\share\qt6\plugins"
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $env:QT_WIN_DEBUG_CONSOLE = "attach"
+          $env:QT_DEBUG_PLUGINS = "1"
+          $python = (Get-Command python.exe).Source
+          @'
+          import os
+          import subprocess
+
+          binary = os.environ["VC3D_MCP_TEST_BINARY"]
+          for arguments in (["--version"], ["--agent-bridge"]):
+              print(f"python subprocess probe: {arguments}")
+              process = subprocess.Popen(
+                  [binary, *arguments],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              try:
+                  output, _ = process.communicate(timeout=5)
+              except subprocess.TimeoutExpired:
+                  process.kill()
+                  output, _ = process.communicate()
+                  print("process stayed alive for five seconds")
+              print(f"exit code: {process.returncode}")
+              print(output)
+          '@ | & $python -
+
       - name: Report compiler cache statistics
         if: always()
         run: '"${SCCACHE_PATH}" --show-stats'
