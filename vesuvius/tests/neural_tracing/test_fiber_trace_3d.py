@@ -449,6 +449,44 @@ def test_3d_config_preserves_explicit_volume_cache_budget() -> None:
     assert config.volume_cache_memory_bytes == 128 * 1024 * 1024
 
 
+def test_3d_dataset_manifest_is_optional_at_scale_zero() -> None:
+    volume = np.zeros((17, 19, 23), dtype=np.float32)
+    config = config_from_mapping(
+        {"datasets": [{"base_volume_path": "synthetic", "base_volume_scale": 0}]}
+    )
+    base_shape = loader3d_module._validate_dataset_manifest(
+        {"base_volume_path": "synthetic", "base_volume_scale": 0},
+        config,
+        volume=volume,
+        volume_path="synthetic",
+    )
+    assert base_shape == volume.shape
+
+
+def test_3d_dataset_manifest_is_optional_for_selected_scale(monkeypatch) -> None:
+    selected = np.zeros((8, 10, 12), dtype=np.float32)
+    base0 = np.zeros((32, 40, 48), dtype=np.float32)
+    calls: list[int] = []
+
+    def fake_open_zarr(*args, **kwargs):
+        del args
+        calls.append(int(kwargs["scale"]))
+        return base0
+
+    monkeypatch.setattr(loader3d_module, "open_zarr", fake_open_zarr)
+    config = config_from_mapping(
+        {"datasets": [{"base_volume_path": "synthetic", "base_volume_scale": 2}]}
+    )
+    base_shape = loader3d_module._validate_dataset_manifest(
+        {"base_volume_path": "synthetic", "base_volume_scale": 2},
+        config,
+        volume=selected,
+        volume_path="synthetic",
+    )
+    assert base_shape == base0.shape
+    assert calls == [0]
+
+
 def test_3d_prefetch_dependency_uses_augmentation_envelope_not_sampled_params(
     monkeypatch,
 ) -> None:

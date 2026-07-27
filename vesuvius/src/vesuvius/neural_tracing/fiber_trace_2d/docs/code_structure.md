@@ -106,8 +106,10 @@ loading.
 - Parses Vesuvius-style JSON configs into `FiberTrace3DConfig`.
 - Uses `fiber_trace_2d.fiber_json.load_fiber_file`, so VC3D JSON, NML, and
   dataset-level XYZ affine transforms follow the same rules as the 2D loader.
-- Requires Lasagna manifests for normal dataset entries and validates the base
-  volume shape against the manifest.
+- Accepts optional Lasagna manifests for shape cross-checking. When a 3D
+  training dataset omits `lasagna_manifest_path`, the loader derives
+  `base_shape_zyx` from the raw OME-Zarr volume and validates the selected
+  Zarr level against `base_volume_scale`.
 - Samples ordinary CP-centered 3D ZYX patches from the selected Zarr level
   through explicit coordinates and the VC3D blocking coordinate sampler. It
   does not create fiber-aligned strips or slices for 3D input, and normal

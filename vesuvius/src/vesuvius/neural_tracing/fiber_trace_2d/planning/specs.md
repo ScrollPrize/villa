@@ -79,9 +79,11 @@
 - 3D training samples ordinary CP-centered ZYX volume blocks from the selected
   base-volume Zarr level. It must not build fiber-aligned 3D strips or slices
   for input loading.
-- Dataset entries use the same Lasagna-manifest-first convention as 2D:
-  `base_volume_path`, `base_volume_scale`, required
-  `lasagna_manifest_path`, and `fiber_paths`/`fiber_glob`.
+- Dataset entries use `base_volume_path`, `base_volume_scale`, and
+  `fiber_paths`/`fiber_glob`. `lasagna_manifest_path` is optional for 3D
+  training; when omitted, the loader derives `base_shape_zyx` from the raw
+  OME-Zarr volume and validates the selected scale against the configured
+  `base_volume_scale`.
 - JSON and NML fiber parsing, control-point exactness, and optional
   dataset-level XYZ affine transforms follow the existing
   `fiber_trace_2d.fiber_json` semantics.
@@ -947,7 +949,9 @@
 - Augment contact sheets draw the transformed fiber-line coordinates at 50 percent opacity with fixed drawing thickness.
 - Augment contact sheets draw a final visualization-only thin vertical marker at the transformed control-point coordinate for each patch, leaving a small gap around the CP pixel itself.
 - Augment contact-sheet cells include a top label band naming the shown augmentation; labels must not overlay image pixels.
-- Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`, `base_volume_scale`, and required `lasagna_manifest_path`.
+- Dataset entries include `fiber_paths` or `fiber_glob`, `base_volume_path`,
+  and `base_volume_scale`; `lasagna_manifest_path` is required for 2D strip
+  training/Trace2CP normals but optional for 3D CP-volume training.
 - Dataset entries may define a fiber-coordinate affine transform using one of
   `fiber_transform_json` / `fiber_transform_json_path` for Vesuvius
   registration `transform.json`, inline `fiber_transform`, or Lasagna-compatible

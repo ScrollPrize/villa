@@ -480,11 +480,27 @@ def _validate_dataset_manifest(
     volume_path: str,
 ) -> tuple[int, int, int]:
     manifest_path = dataset_config.get("lasagna_manifest_path")
-    if not manifest_path:
-        if dataset_config.get("_array_records"):
-            return tuple(int(v) for v in volume.shape)
-        raise ValueError("dataset entry missing lasagna_manifest_path")
     common_config = _common_zarr_config(config)
+    volume_scale = int(dataset_config.get("base_volume_scale", dataset_config.get("volume_scale", 0)))
+    if not manifest_path:
+        if dataset_config.get("_array_records") or volume_scale == 0:
+            base_shape_zyx = _volume_shape_zyx(volume, label="base volume selected level")
+        else:
+            base0 = open_zarr(
+                volume_path,
+                scale=0,
+                auth_json_path=dataset_config.get("base_volume_auth_json", dataset_config.get("volume_auth_json")),
+                config=common_config,
+            )
+            base_shape_zyx = _volume_shape_zyx(base0, label="base volume level 0")
+        _validate_shape(
+            _volume_shape_zyx(volume, label="base volume selected level"),
+            _omezarr_level_shape(tuple(base_shape_zyx), volume_scale),
+            label="base volume selected level",
+            context=f"base_shape_zyx={base_shape_zyx} base_volume_scale={volume_scale}",
+        )
+        return tuple(int(v) for v in base_shape_zyx)
+
     resolved_manifest = _resolve_config_relative_path(manifest_path, common_config)
     lasagna_volume = _load_lasagna_volume(resolved_manifest, common_config)
     if lasagna_volume.base_shape_zyx is None:
@@ -501,7 +517,6 @@ def _validate_dataset_manifest(
         label="base volume level 0",
         context=f"Lasagna manifest {resolved_manifest}",
     )
-    volume_scale = int(dataset_config.get("base_volume_scale", dataset_config.get("volume_scale", 0)))
     _validate_shape(
         _volume_shape_zyx(volume, label="base volume selected level"),
         _omezarr_level_shape(tuple(lasagna_volume.base_shape_zyx), volume_scale),
