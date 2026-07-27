@@ -35,7 +35,13 @@ from preprocess_cos_omezarr import (
 	_predict3d_overall_eta,
 	run_preprocess_3d,
 )
-from omezarr_pyramid import _make_downsample_work
+from omezarr_pyramid import (
+	_make_downsample_work,
+	build_normal_omezarr_pyramid,
+	build_scalar_omezarr_pyramid,
+	downsample_normal_pair_chunk_worker,
+	downsample_scalar_chunk_worker,
+)
 
 
 class _StopAfterManifest(Exception):
@@ -295,6 +301,98 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 			self.assertEqual(crop_work, [])
 			self.assertTrue(any((z0, y0, x0) == (8, 0, 0) for *_prefix, z0, _z1, y0, _y1, x0, _x1, _zero in full_work))
+
+	def test_pyramid_full_source_stream_writes_missing_chunk_outside_crop(self):
+		with tempfile.TemporaryDirectory() as td:
+			path = str(Path(td) / "cos.ome.zarr")
+			_create_omezarr(path, (16, 16, 16), 0, 3, 4, "cos")
+			arr0 = zarr.open(str(Path(path) / "0"), mode="r+")
+			arr0[8:12, 0:4, 0:4] = np.full((4, 4, 4), 8, dtype=np.uint8)
+			stdout = io.StringIO()
+
+			with mock.patch("sys.stdout", stdout):
+				build_scalar_omezarr_pyramid(
+					path,
+					0,
+					2,
+					4,
+					workers=1,
+					crop_zyx=(0, 0, 0, 4, 4, 4),
+					label="cos",
+					scan_existing_source_chunks=True,
+				)
+
+			arr1 = zarr.open(str(Path(path) / "1"), mode="r")
+			self.assertEqual(int(np.asarray(arr1[4, 0, 0])), 8)
+			out = stdout.getvalue()
+			self.assertIn("[pyramid cos L1]", out)
+			self.assertIn("write=", out)
+			self.assertIn("skip_empty=", out)
+
+	def test_scalar_pyramid_worker_reports_skip_and_write_statuses(self):
+		with tempfile.TemporaryDirectory() as td:
+			path = str(Path(td) / "cos.ome.zarr")
+			_create_omezarr(path, (16, 16, 16), 0, 2, 4, "cos")
+			args = (
+				path, 0, 1, 0, 8, 0, 8, 0, 8,
+				False, True, True, (4, 4, 4), (4, 4, 4),
+			)
+			self.assertEqual(downsample_scalar_chunk_worker(args), "skipped_empty_source")
+
+			arr0 = zarr.open(str(Path(path) / "0"), mode="r+")
+			arr0[0:4, 0:4, 0:4] = np.full((4, 4, 4), 12, dtype=np.uint8)
+			self.assertEqual(downsample_scalar_chunk_worker(args), "written")
+			arr1 = zarr.open(str(Path(path) / "1"), mode="r")
+			self.assertEqual(int(np.asarray(arr1[0, 0, 0])), 12)
+			self.assertEqual(downsample_scalar_chunk_worker(args), "skipped_existing")
+
+	def test_normal_pyramid_worker_requires_both_source_channels(self):
+		with tempfile.TemporaryDirectory() as td:
+			nx_path = str(Path(td) / "nx.ome.zarr")
+			ny_path = str(Path(td) / "ny.ome.zarr")
+			_create_omezarr(nx_path, (16, 16, 16), 0, 2, 4, "nx")
+			_create_omezarr(ny_path, (16, 16, 16), 0, 2, 4, "ny")
+			args = (
+				nx_path, ny_path, 0, 1, 0, 8, 0, 8, 0, 8,
+				True, True, (4, 4, 4), (4, 4, 4), (4, 4, 4),
+			)
+			nx0 = zarr.open(str(Path(nx_path) / "0"), mode="r+")
+			nx0[0:4, 0:4, 0:4] = np.full((4, 4, 4), 128, dtype=np.uint8)
+			self.assertEqual(downsample_normal_pair_chunk_worker(args), "skipped_empty_source")
+
+			ny0 = zarr.open(str(Path(ny_path) / "0"), mode="r+")
+			ny0[0:4, 0:4, 0:4] = np.full((4, 4, 4), 128, dtype=np.uint8)
+			self.assertEqual(downsample_normal_pair_chunk_worker(args), "written")
+			self.assertEqual(downsample_normal_pair_chunk_worker(args), "skipped_existing")
+
+	def test_normal_pyramid_full_source_stream_writes_outside_crop(self):
+		with tempfile.TemporaryDirectory() as td:
+			nx_path = str(Path(td) / "nx.ome.zarr")
+			ny_path = str(Path(td) / "ny.ome.zarr")
+			_create_omezarr(nx_path, (16, 16, 16), 0, 2, 4, "nx")
+			_create_omezarr(ny_path, (16, 16, 16), 0, 2, 4, "ny")
+			for path in (nx_path, ny_path):
+				arr0 = zarr.open(str(Path(path) / "0"), mode="r+")
+				arr0[8:12, 0:4, 0:4] = np.full((4, 4, 4), 128, dtype=np.uint8)
+
+			with mock.patch("sys.stdout", io.StringIO()):
+				build_normal_omezarr_pyramid(
+					nx_path,
+					ny_path,
+					0,
+					2,
+					4,
+					workers=1,
+					crop_zyx=(0, 0, 0, 4, 4, 4),
+					scan_existing_source_chunks=True,
+				)
+
+			nx1 = zarr.open(str(Path(nx_path) / "1"), mode="r")
+			ny1 = zarr.open(str(Path(ny_path) / "1"), mode="r")
+			self.assertTrue(Path(nx_path, "1", "1", "0", "0").is_file())
+			self.assertTrue(Path(ny_path, "1", "1", "0", "0").is_file())
+			self.assertEqual(int(np.asarray(nx1[4, 0, 0])), 128)
+			self.assertEqual(int(np.asarray(ny1[4, 0, 0])), 128)
 
 	def test_predict3d_temp_cleanup_is_output_directory_wide(self):
 		with tempfile.TemporaryDirectory() as td:
