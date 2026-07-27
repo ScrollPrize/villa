@@ -985,3 +985,110 @@ class TestPlannerInputHardening:
             [('fibers/a.json', plan)], set())
         assert peer_fixes == {}
         assert demoted and 'refresh against' in demoted[0][1]
+
+
+class TestClassifyFibers:
+    """hfsync publishes outward, so classify_fibers is a gate: what it puts
+    in `tagged` is uploaded to a Hugging Face bucket, and what it puts in
+    `untagged` is deleted from one."""
+
+    @staticmethod
+    def fiber(tags, **extra):
+        doc = {'type': 'vc3d_fiber', 'version': 1, 'filename': 'f.json',
+               'control_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+               'line_points': [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+               'generation': 1, 'branches': [], 'tags': tags}
+        doc.update(extra)
+        return doc
+
+    @staticmethod
+    def write(tmp_path, name, doc):
+        path = tmp_path / name
+        path.write_text(doc if isinstance(doc, str) else json.dumps(doc))
+        return path
+
+    def test_tagged_fiber_publishes(self, tmp_path):
+        self.write(tmp_path, 'a.json', self.fiber(['reviewed']))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), 'reviewed')
+        assert (tagged, untagged, invalid, deferred) == (['a.json'], [], [], [])
+
+    def test_untagged_fiber_is_removable(self, tmp_path):
+        self.write(tmp_path, 'a.json', self.fiber(['draft']))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), 'reviewed')
+        assert (tagged, untagged, deferred) == ([], ['a.json'], [])
+
+    def test_needs_reoptimization_is_held_back(self, tmp_path):
+        """A sync-merged fiber's line is a straight-segment placeholder until
+        VC3D re-fits it; publishing it presents unfitted geometry as
+        reviewed."""
+        self.write(tmp_path, 'a.json',
+                   self.fiber(['reviewed', vc_sync.REOPTIMIZE_TAG]))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), 'reviewed')
+        assert tagged == []
+        # NOT untagged: a held-back local file must not delete the good copy
+        # already published.
+        assert untagged == []
+        assert invalid == []
+        assert [name for name, _ in deferred] == ['a.json']
+        assert vc_sync.REOPTIMIZE_TAG in deferred[0][1]
+
+    def test_untagged_and_unfitted_is_still_removable(self, tmp_path):
+        """Holding back applies only to fibers claiming the publish tag."""
+        self.write(tmp_path, 'a.json', self.fiber([vc_sync.REOPTIMIZE_TAG]))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), 'reviewed')
+        assert (tagged, untagged, deferred) == ([], ['a.json'], [])
+
+    def test_string_tags_do_not_substring_match(self, tmp_path):
+        """`tag in tags` over a string publishes 'unreviewed' as 'reviewed'."""
+        self.write(tmp_path, 'a.json', self.fiber('unreviewed'))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), 'reviewed')
+        assert tagged == []
+        assert [name for name, _ in invalid] == ['a.json']
+
+    def test_null_tags_does_not_crash(self, tmp_path):
+        """`tags: null` used to raise TypeError and abort the whole run."""
+        self.write(tmp_path, 'a.json', self.fiber(None))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), 'reviewed')
+        assert [name for name, _ in invalid] == ['a.json']
+
+    def test_non_object_root_does_not_crash(self, tmp_path):
+        """A JSON root that isn't an object used to raise AttributeError."""
+        self.write(tmp_path, 'a.json', '[1, 2, 3]')
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), 'reviewed')
+        assert [name for name, _ in invalid] == ['a.json']
+
+    def test_unloadable_fiber_is_invalid_not_untagged(self, tmp_path):
+        """An unloadable doc is quarantined, not treated as a deletion
+        request for its published namesake."""
+        self.write(tmp_path, 'a.json', self.fiber(['reviewed'], version=2))
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), 'reviewed')
+        assert (tagged, untagged) == ([], [])
+        assert [name for name, _ in invalid] == ['a.json']
+
+    def test_existing_skips_still_apply(self, tmp_path):
+        (tmp_path / 'empty.json').write_text('')
+        (tmp_path / 'bad.json').write_text('{not json')
+        (tmp_path / '.hidden.json').write_text(json.dumps(self.fiber(['reviewed'])))
+        (tmp_path / 'notes.txt').write_text('x')
+        (tmp_path / 'sub.json').mkdir()
+        tagged, untagged, invalid, deferred = vc_sync.classify_fibers(
+            str(tmp_path), 'reviewed')
+        assert tagged == []
+        assert sorted(name for name, _ in invalid) == ['bad.json', 'empty.json']
+
+    def test_unpublishable_reason_without_fiber_merge(self, monkeypatch):
+        """The fallback path (fiber_merge import failed) must still refuse the
+        shapes that crash the run or mis-tag a fiber."""
+        monkeypatch.setattr(vc_sync, 'fiber_merge', None)
+        assert vc_sync.unpublishable_reason({'tags': ['reviewed']}) is None
+        assert vc_sync.unpublishable_reason({'tags': None})
+        assert vc_sync.unpublishable_reason({'tags': 'unreviewed'})
+        assert vc_sync.unpublishable_reason([1, 2, 3])
