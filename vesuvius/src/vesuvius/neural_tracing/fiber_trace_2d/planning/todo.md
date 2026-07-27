@@ -56,9 +56,13 @@
 - [ ] currently need significant margin (20) for artifact free processing (from patch size 64!)
 - [x] for cp start: lets actually _not_ use the cp dir but the sampled dir that most closely aligns with the cp dir. The do apply smoothness and dir supervision directly as applicable
 - [ ] conditioned decoder: add also from-dir conditioning (makes this closer to neural tracer decoder!) - can we maybe even unify this into a single dir condition?
-- [ ] fiber inference - how do we store and signal validity?
+- [x] fiber inference - how do we store and signal validity?
 - [ ] inference size - test larger inference size quality for the pretrained model (then update defaults)
-- [x] fiber inference output should use `.lasagna.json` as the authoritative manifest, not `fiber_trace_3d_inference.json`
+- [ ] fiber_trace_3d_inference.json ->should change the name similar to lasagna - or even use lasagna naming just with additional information?
+- [ ] switch to wand from tb
+- [ ] training should include the full json config used and the current git commit hash + diff to that commit of the running/current code
+    - [ ] and the command run
+    - [ ] same for inferences
     
 # beam-search
 - [ ] beamsearch
