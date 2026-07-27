@@ -897,6 +897,13 @@ class Inferer():
             self.output_store.attrs['overlap'] = self.overlap
             self.output_store.attrs['part_id'] = self.part_id
             self.output_store.attrs['num_parts'] = self.num_parts
+            # Record whether test-time augmentation was used. Patch size and overlap are
+            # already here, but TTA is the setting that changes the output most and it
+            # leaves no trace otherwise, so a stored prediction cannot be reproduced from
+            # itself without guessing it.
+            self.output_store.attrs['tta'] = bool(self.do_tta)
+            if self.do_tta:
+                self.output_store.attrs['tta_type'] = self.tta_type
             if self.bbox is not None:
                 # Record the requested ROI (global voxel coords, half-open) so the
                 # output is self-describing about which region was processed.
