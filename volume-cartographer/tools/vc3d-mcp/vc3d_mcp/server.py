@@ -145,23 +145,21 @@ def launch_vc3d(
 ) -> str:
     """Spawn VC3D with the agent bridge enabled and return its local endpoint.
 
-    A daemon thread drains the child's stdout for the whole process lifetime
-    (with stderr merged in): it detects the ``VC3D-AGENT-BRIDGE: listening ...``
-    handshake line (parsed by ``BridgeClient.socket_path_from_handshake``),
-    signals a ``threading.Event`` with the authoritative ``path=`` value, and
-    keeps reading so VC3D's stdout pipe keeps draining and never blocks VC3D.
+    A daemon thread drains the child's stdout for the whole process lifetime.
+    Unix builds publish the endpoint in a handshake line. Windows GUI
+    executables can detach redirected standard handles while Qt starts, so the
+    launcher instead waits for the matching per-process discovery record.
     Non-handshake lines are forwarded to this process's STDERR only (stdout is
-    reserved for MCP stdio); a bounded tail of recent lines is also retained
-    for error reporting.
+    reserved for MCP stdio); a bounded tail is retained for error reporting.
 
-    Waits up to ``timeout`` seconds for the handshake. A silent-but-live child
-    times out at the deadline; a child that exits before the handshake fails
-    immediately with its captured log tail. Raises ``BridgeConnectionError`` in
-    both failure cases. The process is retained (module global) so it keeps
+    Waits up to ``timeout`` seconds for the endpoint. A silent-but-live child
+    times out at the deadline; a child that exits first fails immediately with
+    its captured log tail. The process is retained (module global) so it keeps
     running for the MCP session and is terminated (escalating) on our exit.
     """
     global _launched_process
 
+    launched_at_ms = int(time.time() * 1000)
     proc = subprocess.Popen(
         _launch_command(binary, volpkg),
         stdout=subprocess.PIPE,
@@ -174,6 +172,7 @@ def launch_vc3d(
 
     handshake: dict[str, str] = {}
     found = threading.Event()
+    output_closed = threading.Event()
     tail: deque[str] = deque(maxlen=200)
 
     def _drain() -> None:
@@ -191,29 +190,44 @@ def launch_vc3d(
                 print(stripped, file=sys.stderr)
             except Exception:  # noqa: BLE001 - stderr sink gone; keep draining
                 pass
-        found.set()  # EOF: unblock the waiter even if no handshake arrived
+        output_closed.set()
 
     threading.Thread(target=_drain, name="vc3d-stdout-drain", daemon=True).start()
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if found.wait(timeout=0.1):
-            if "path" in handshake:
-                return handshake["path"]
-            break  # EOF set the event with no handshake
+            return handshake["path"]
         if proc.poll() is not None:
             break
+        if os.name == "nt":
+            endpoint = next(
+                (
+                    entry.endpoint
+                    for entry in discover_registry_entries()
+                    if (
+                        entry.pid == proc.pid
+                        and entry.started_at >= launched_at_ms
+                    )
+                ),
+                None,
+            )
+            if endpoint is not None:
+                return endpoint
+        elif output_closed.is_set():
+            break
 
+    exit_code = proc.poll()
     _terminate_launched_process()
     detail = "\n".join(tail)
-    if proc.returncode is not None:
+    if exit_code is not None:
         raise BridgeConnectionError(
-            f"VC3D ({binary!r}) exited with code {proc.returncode} before printing the "
-            f"agent-bridge handshake line. Last output:\n{detail}"
+            f"VC3D ({binary!r}) exited with code {exit_code} before publishing the "
+            f"agent-bridge endpoint. Last output:\n{detail}"
         )
     raise BridgeConnectionError(
-        f"timed out after {timeout:g}s waiting for VC3D ({binary!r}) to print its "
-        f"agent-bridge handshake line. Last output:\n{detail}"
+        f"timed out after {timeout:g}s waiting for VC3D ({binary!r}) to publish "
+        f"its agent-bridge endpoint. Last output:\n{detail}"
     )
 
 

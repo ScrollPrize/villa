@@ -30,6 +30,7 @@ class RegistryEntry:
     endpoint: str
     file_path: str
     started_at: float
+    pid: int | None = None
 
 
 def discover_registry_entries(registry_dir: str = REGISTRY_DIR) -> list[RegistryEntry]:
@@ -72,7 +73,18 @@ def discover_registry_entries(registry_dir: str = REGISTRY_DIR) -> list[Registry
             except OSError:
                 started_at = 0.0
 
-        entries.append(RegistryEntry(path, file_path, started_at))
+        pid_value = obj.get("pid")
+        pid = (
+            int(pid_value)
+            if (
+                isinstance(pid_value, (int, float))
+                and not isinstance(pid_value, bool)
+                and pid_value > 0
+                and int(pid_value) == pid_value
+            )
+            else None
+        )
+        entries.append(RegistryEntry(path, file_path, started_at, pid))
 
     return sorted(entries, key=lambda entry: entry.started_at, reverse=True)
 

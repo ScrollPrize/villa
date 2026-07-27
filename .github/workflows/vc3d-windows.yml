@@ -117,6 +117,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           $python = (Get-Command python.exe).Source
+          Write-Host "python: $python"
           $env:PYTHON = $python
           $env:PATH = "C:\msys64\ucrt64\bin;$env:PATH"
           $env:QT_PLUGIN_PATH = "C:\msys64\ucrt64\share\qt6\plugins"
