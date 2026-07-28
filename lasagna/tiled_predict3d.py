@@ -1637,6 +1637,12 @@ def _infer_tiled_products_3d(
 		progress["tiles_processed"] = 0
 		progress["tile_time_sum"] = 0.0
 		progress["tiles_remaining_est"] = total_tiles
+		initial_status = _predict3d_progress_line(progress)
+	else:
+		initial_status = (
+			f"[predict3d] [{'-' * 30}] 0/{total_tiles} tiles (0.0%) eta --:--"
+		)
+	print(initial_status, flush=True)
 
 	def _output_chunk_has_input_support(cz: int, cy: int, cx: int) -> bool:
 		z_end = min(full_out_shape[0], int(cz) + oc)

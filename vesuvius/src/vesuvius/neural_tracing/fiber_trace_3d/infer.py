@@ -81,6 +81,13 @@ def _level_from_scaledown(scaledown: int) -> int:
     return round(math.log2(sd)) if sd > 1 else 0
 
 
+def _resolve_inference_device(device: str | None) -> torch.device:
+    requested = "auto" if device is None else str(device).strip().lower()
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    return torch.device(requested)
+
+
 def _select_and_expand_crop(
     *,
     input_shape_zyx: tuple[int, int, int],
@@ -179,7 +186,7 @@ def run_fiber_trace_3d_inference(
     input_path: str,
     output_path: str | Path,
     checkpoint: str | Path | None,
-    device: str | None = None,
+    device: str | None = "auto",
     crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
     tile_size: int | None = None,
     overlap: int = 16,
@@ -235,9 +242,7 @@ def run_fiber_trace_3d_inference(
     z0, z1, y0, y1, x0, x1 = crop_slices
     oz0, oy0, ox0, oz1, oy1, ox1 = output_region
 
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_device = torch.device(device)
+    torch_device = _resolve_inference_device(device)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     removed = _cleanup_predict3d_temp_files(output_dir, f"{json_stem}_")
@@ -289,7 +294,12 @@ def run_fiber_trace_3d_inference(
     )
 
     t0 = time.time()
+    print(
+        f"[fiber_trace_3d:infer] loading checkpoint={checkpoint} device={torch_device}",
+        flush=True,
+    )
     model = predict_adapter.load_model(device=torch_device)
+    print("[fiber_trace_3d:infer] model loaded; starting tiled inference", flush=True)
     progress = {
         "t0": time.time(),
         "finalized_base_z": int(oz0 * effective_output_sd),
@@ -366,7 +376,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar=("X", "Y", "Z", "W", "H", "D"),
         help="Crop in base coordinates: x y z w h d.",
     )
-    parser.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu".')
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help='Device: "auto" selects CUDA when available, otherwise CPU.',
+    )
     parser.add_argument(
         "--base-ref",
         default=None,

@@ -35,6 +35,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
     FiberTrace3DPredictAdapter,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.infer import (
+    _resolve_inference_device,
     run_fiber_trace_3d_inference,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.prediction import (
@@ -177,6 +178,17 @@ def test_snapshot_intervals_must_align_with_evaluation() -> None:
             kept_snapshot_interval=0,
             test_interval=0,
         )
+
+
+def test_inference_device_defaults_to_available_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert _resolve_inference_device(None) == torch.device("cuda")
+    assert _resolve_inference_device("auto") == torch.device("cuda")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert _resolve_inference_device(None) == torch.device("cpu")
+    assert _resolve_inference_device("auto") == torch.device("cpu")
+    assert _resolve_inference_device("cpu") == torch.device("cpu")
 
 
 class _NativeTraceTestPredictionAdapter:
