@@ -51,10 +51,12 @@ Verify the active import:
 python -c "import vc.volume, zarr, numcodecs; print(vc.volume.__file__); print(zarr.__version__); print(numcodecs.__version__); help(vc.volume.Volume.sample_coords)"
 ```
 
-For the current blocking coordinate sampler, the help output must include:
+For the current blocking coordinate sampler and native 3D block sampler, the
+help output must include:
 
 ```text
 sample_coords(..., tile_size: int = 32, blocking: bool = True) -> tuple
+sample_zyx_block(..., blocking: bool = True) -> tuple
 ```
 
 ## Optional Build-Tree Rebuild

@@ -549,14 +549,21 @@
   core plus the one-voxel upper interpolation halo needed to preserve
   trilinear point sampling inside the trusted core; full margin outputs must
   not remain in the resident CPU cache after block inference.
-- Native 3D Trace2CP inference blocks are sampled through the configured
-  `CoordinateSampler` using the same selected-level to base-coordinate
-  conversion as 3D training: selected-level block grids are multiplied by
-  `record.volume_spacing_base`, validated against `record.base_shape_zyx`, and
-  passed to blocking `sample_coord_batch(...)`. Real configured volumes must
-  not be read by direct zarr/raw block slicing in the native tool. These
-  native block samples must use the strict requested-level VC3D blocking
-  semantics above and reject reported fallback or chunk-error stats.
+- Native 3D Trace2CP inference blocks are regular axis-aligned selected-level
+  regions and must be sampled through `CoordinateSampler.sample_block_zyx(...)`.
+  This path is backed by VC3D requested-level chunk-cache reads and must not
+  materialize dense `[D,H,W,3]` coordinate grids or call generic
+  `sample_coord_batch(...)` for these blocks. Real configured volumes must not
+  be read by direct zarr/raw block slicing in Python. The block sampler must use
+  strict requested-level VC3D blocking semantics, report
+  `requested_level_only=true` and `fallback_levels=0`, reject chunk errors, and
+  mark out-of-volume voxels invalid/zero. Known-missing requested-level chunks
+  follow the existing strict VC3D rendering semantics: black covered pixels and
+  a non-zero `missing_chunks` stat.
+- Generic `CoordinateSampler.sample_coords(...)` and
+  `sample_coord_batch(...)` remain the correct boundary for arbitrary
+  coordinate surfaces such as side/top strips, TTA surfaces, and strip
+  visualization.
 - Native 3D Trace2CP applies the configured 3D model-input normalization before
   inference. Exported native strip volume panels must display that same
   normalized input domain so the visualization shows what inference sees. For
@@ -569,10 +576,14 @@
   VC3D sampler results that do not report strict requested-level blocking
   semantics. Scale fallback, unresolved requested chunks, or chunk errors must
   fail loudly for debugging renders instead of being shown as valid strips.
-- Native 3D Trace2CP defaults to `--inference-patch-shape-zyx 64 64 64`,
-  matching the current fast 3D training/debug patch size, and
-  `--core-margin-voxels 20` to crop away block-edge inference artifacts.
-  Larger patch shapes remain explicit CLI overrides.
+- Native 3D Trace2CP defaults to `--inference-patch-shape-zyx 128 128 128`
+  and `--core-margin-voxels 48`, matching the current trained checkpoint setup
+  and the observed artifact margin. Other patch shapes remain explicit CLI
+  overrides.
+- Native 3D Trace2CP may batch missing axis-aligned inference blocks before
+  model forwarding. `--inference-block-batch-size` controls the maximum number
+  of newly materialized blocks in one forward and defaults to `2` to limit
+  transient 128-cube GPU memory.
 - Native 3D Trace2CP ordinary single-sample CLI mode defaults to sample index
   13 when no explicit `--sample-index` is provided. Bare `--fiber-json`
   without sample/CP selectors remains whole-fiber mode and must not be turned

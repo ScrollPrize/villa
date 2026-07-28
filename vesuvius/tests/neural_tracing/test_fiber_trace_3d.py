@@ -2039,6 +2039,67 @@ def test_vc3d_bbox_dependency_reports_missing_binding() -> None:
         )
 
 
+def test_vc3d_coordinate_sampler_direct_block_read_uses_binding() -> None:
+    class _FakeVolume:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[int, int, int], tuple[int, int, int], int, bool]] = []
+
+        def sample_zyx_block(
+            self,
+            offset: tuple[int, int, int],
+            shape: tuple[int, int, int],
+            level: int,
+            blocking: bool,
+        ):
+            self.calls.append((tuple(offset), tuple(shape), int(level), bool(blocking)))
+            image = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape)
+            valid = np.ones(shape, dtype=np.uint8)
+            stats = {
+                "requested_level_only": True,
+                "fallback_levels": 0,
+                "error_chunks": 0,
+                "missing_chunks": 0,
+                "requested_chunks": 1,
+            }
+            return image, valid, stats
+
+    fake = _FakeVolume()
+    sampler = Vc3dCoordinateSampler.__new__(Vc3dCoordinateSampler)
+    sampler.volume = fake
+    sampler.level = 2
+    sampler.sampling = "trilinear"
+    sampler.blocking = True
+
+    result = sampler.sample_block_zyx(np.asarray([1, 2, 3], dtype=np.int64), (4, 5, 6))
+
+    assert fake.calls == [((1, 2, 3), (4, 5, 6), 2, True)]
+    assert result.image.shape == (4, 5, 6)
+    assert result.valid_mask.shape == (4, 5, 6)
+    assert result.valid_mask.all()
+    assert result.stats["sample_block_zyx"] == 1
+
+
+def test_numpy_coordinate_sampler_direct_block_read_masks_out_of_bounds() -> None:
+    array = np.arange(4 * 5 * 6, dtype=np.float32).reshape(4, 5, 6)
+    sampler = NumpyZarrCoordinateSampler(array, level_spacing_base=2.0)
+
+    result = sampler.sample_block_zyx(
+        np.asarray([-1, 2, 3], dtype=np.int64),
+        (3, 2, 4),
+    )
+
+    assert result.image.shape == (3, 2, 4)
+    assert result.valid_mask.shape == (3, 2, 4)
+    assert not bool(result.valid_mask[0].any())
+    assert bool(result.valid_mask[1:, :, :3].all())
+    assert not bool(result.valid_mask[1:, :, 3].any())
+    assert np.allclose(result.image[1, 0, 0], array[0, 2, 3])
+    assert np.allclose(result.image[2, 1, 2], array[1, 3, 5])
+    assert result.image[2, 1, 3] == 0.0
+    assert not bool(result.valid_mask[2, 1, 3])
+    assert result.stats["requested_level_only"] is True
+
+
 def test_3d_model_and_losses_smoke() -> None:
     loader = _loader(augment_enabled=False)
     batch = _load_materialized_batch(loader, 0)
@@ -3180,7 +3241,7 @@ def test_native_3d_trace2cp_torch_candidate_generation_matches_numpy() -> None:
 
 
 def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
-    assert NativeTrace2CpConfig().inference_patch_shape_zyx == (64, 64, 64)
+    assert NativeTrace2CpConfig().inference_patch_shape_zyx == (128, 128, 128)
     assert NativeTrace2CpConfig().cone_grid_size == 25
     assert NativeTrace2CpConfig().cone_angle_step_degrees == 5.0
     assert NativeTrace2CpConfig().beam_width == 8
@@ -3196,7 +3257,8 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().cumulative_smoothness_steps == 4
     assert NativeTrace2CpConfig().cumulative_smoothness_tangent_weight == 2.0
     assert NativeTrace2CpConfig().all_pairs_direction_product is True
-    assert NativeTrace2CpConfig().core_margin_voxels == 20
+    assert NativeTrace2CpConfig().core_margin_voxels == 48
+    assert NativeTrace2CpConfig().inference_block_batch_size == 2
     assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 10.0
     assert NativeTrace2CpConfig().max_cached_inference_gib == pytest.approx(8.0)
 
@@ -3221,7 +3283,8 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.beam_lookahead_steps == 1
     assert args.smoothness_normal_weight == 0.1
     assert args.smoothness_tangent_weight == 10.0
-    assert args.core_margin_voxels == 20
+    assert args.core_margin_voxels == 48
+    assert args.inference_block_batch_size == 2
     assert args.max_cached_inference_gib == pytest.approx(8.0)
     assert args.vis is False
 
@@ -4193,7 +4256,7 @@ def test_native_3d_trace2cp_field_cache_evicts_lru_blocks() -> None:
     assert cache.evicted_inferred_blocks == 2
 
 
-def test_native_3d_trace2cp_field_cache_uses_sampler_and_base_scale() -> None:
+def test_native_3d_trace2cp_field_cache_uses_block_sampler() -> None:
     class UnsliceableVolume:
         def __getitem__(self, _key):
             raise AssertionError("native trace field cache must not slice volume directly")
@@ -4202,20 +4265,39 @@ def test_native_3d_trace2cp_field_cache_uses_sampler_and_base_scale() -> None:
         blocking = True
 
         def __init__(self) -> None:
-            self.calls: list[tuple[np.ndarray, np.ndarray]] = []
+            self.calls: list[tuple[np.ndarray, tuple[int, int, int]]] = []
 
         def sample_coord_batch(
             self,
             coords_zyx_base: np.ndarray,
             valid_mask: np.ndarray,
         ) -> CoordinateSampleResult:
-            coords = np.asarray(coords_zyx_base, dtype=np.float32)
-            valid = np.asarray(valid_mask, dtype=bool)
-            self.calls.append((coords.copy(), valid.copy()))
+            del coords_zyx_base, valid_mask
+            raise AssertionError("native trace field cache must use sample_block_zyx")
+
+        def sample_block_zyx(
+            self,
+            start_zyx: np.ndarray,
+            shape_zyx: tuple[int, int, int],
+        ) -> CoordinateSampleResult:
+            start = np.asarray(start_zyx, dtype=np.int64)
+            shape = tuple(int(v) for v in shape_zyx)
+            self.calls.append((start.copy(), shape))
+            zz = (
+                np.arange(shape[0], dtype=np.float32)[:, None, None]
+                + np.float32(start[0])
+            )
+            image = np.broadcast_to(zz, shape).astype(np.float32, copy=True)
+            valid = np.ones(shape, dtype=bool)
             return CoordinateSampleResult(
-                image=coords[..., 0].astype(np.float32, copy=False),
+                image=image,
                 valid_mask=valid,
-                stats={"sample_coord_batch": 1},
+                stats={
+                    "sample_block_zyx": 1,
+                    "requested_level_only": True,
+                    "fallback_levels": 0,
+                    "error_chunks": 0,
+                },
             )
 
     class RecordingModel(torch.nn.Module):
@@ -4254,14 +4336,11 @@ def test_native_3d_trace2cp_field_cache_uses_sampler_and_base_scale() -> None:
     assert block.output_czyx.device.type == "cpu"
     assert block.valid_mask_zyx.device.type == "cpu"
     assert len(sampler.calls) == 1
-    coords, valid = sampler.calls[0]
-    assert coords.shape == (4, 4, 4, 3)
-    assert valid.shape == (4, 4, 4)
-    assert bool(valid.all())
-    assert np.allclose(coords[0, 0, 0], [4.0, 8.0, 12.0])
-    assert np.allclose(coords[0, 0, 1], [4.0, 8.0, 16.0])
+    start, shape = sampler.calls[0]
+    assert np.allclose(start, [1, 2, 3])
+    assert shape == (4, 4, 4)
     assert model.input_volume is not None
-    assert float(model.input_volume[0, 0, 0, 0, 0]) == 4.0
+    assert float(model.input_volume[0, 0, 0, 0, 0]) == 1.0
 
 
 def test_native_3d_trace2cp_candidate_score_maximizes_dot_product_presence() -> None:

@@ -1,5 +1,8 @@
 # 2026-07-28
 
+- Native 3D Trace2CP inference blocks now use a shared VC3D-backed
+  requested-level axis-aligned block-read API and batch missing block forwards,
+  avoiding dense coordinate-grid sampling for regular inference cubes.
 - Native 3D Trace2CP live inference now uses the shared fiber 3D inference
   adapter plus shared Lasagna normal encoding and raw fiber prediction decode
   helpers.

@@ -1,32 +1,60 @@
-# Task Log: Metric-Only 3D Trace2CP Config
+# Task Log: Native 3D Trace2CP Hot-Path Acceleration
 
-## Implementation Notes
+## Implemented
 
-- Replaced `metric_sd2_s1.json`, which was a full training config clone, with a
-  compact native 3D Trace2CP metric config.
-- Kept a single `datasets` entry only as a volume/scale/manifest template.
-- Removed the config-local JSON fiber glob because this metric config expects
-  the concrete fiber to be supplied through `--fiber-json`.
-- Removed the NML training glob, affine transform, transform inversion,
-  `test_datasets`, augmentations, prefetch settings, training-loop settings,
-  loss weights, TensorBoard settings, and run/checkpoint settings.
-- Kept `lasagna_manifest_path` because the Trace2CP geometry path still uses
-  Lasagna normals for strip geometry; this is not NML-specific.
-- Kept `training.mixed_precision` because native 3D model inference reads it.
-- Added a spec note that dedicated native 3D Trace2CP metric configs may be
-  `--fiber-json` only and should not carry unrelated full training config
-  fields or config-local fiber sources.
+- Added `Volume.sample_zyx_block(...)` to the VC3D Python binding for strict
+  requested-level axis-aligned ZYX block reads through the VC3D chunk cache.
+- Added `CoordinateSampler.sample_block_zyx(...)` and implemented it for the
+  production VC3D sampler and local NumPy test sampler.
+- Switched native 3D Trace2CP inference-block loading from dense
+  `[D,H,W,3]` coordinate grids plus `sample_coord_batch(...)` to direct
+  selected-level block reads.
+- Added missing-block materialization batching in `NativeTraceFieldCache` and
+  batched model forwards controlled by `--inference-block-batch-size`
+  (default `2`).
+- Updated native 3D Trace2CP defaults to the trained/in-use path:
+  `--inference-patch-shape-zyx 128 128 128` and `--core-margin-voxels 48`.
+- Updated `FiberTrace3DPredictAdapter.preprocess_tile(...)` to accept batched
+  tiles while preserving the existing per-tile normalization semantics.
+- Updated tests for the direct block sampler, native field-cache block routing,
+  and new native 3D Trace2CP defaults.
+- Rebuilt and reinstalled the local editable VC3D Python binding so the active
+  user-site `vc.volume.Volume` exposes `sample_zyx_block`.
+
+## Audit Notes
+
+- Candidate scoring was already torch-vectorized for flattened candidate sets;
+  this task kept that math unchanged.
+- Lasagna normals are already sampled once per flattened candidate batch in the
+  current native tracer path. I did not add a spatial normal cache in this task
+  because that would change cache behavior without a fresh profile showing it
+  dominates after block-read removal.
+- Point lookup still groups by inferred block and transfers each resident CPU
+  block needed by the lookup call to CUDA. The change now materializes misses
+  before that loop, but it does not add a packed global GPU texture/cache.
 
 ## Deviations / Deferred Items
 
-- None.
+- No fiber-only zarr/raw reader was added; all production reads stay behind the
+  shared VC3D-backed sampler boundary.
+- No scoring, metric, restart, fusion, normalization, or checkpoint-selection
+  semantics were changed.
+- I did not run a full native Trace2CP metric benchmark in this pass. The code
+  and targeted tests are validated; a full before/after wall-time comparison
+  still needs the exact long-running metric command/dataset run.
 
 ## Validation
 
-- `python -m json.tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/metric_sd2_s1.json`
+- `cmake --build volume-cartographer/build/python-bindings --target vc_volume -j 8`
   passed.
-- `PYTHONPATH=vesuvius/src:lasagna:. python -c "from vesuvius.neural_tracing.fiber_trace_3d.loader import load_config; cfg=load_config('vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/metric_sd2_s1.json'); print(len(cfg.datasets), sorted(cfg.datasets[0]))"`
-  passed and printed only `base_volume_path`, `base_volume_scale`, and
-  `lasagna_manifest_path` in the dataset template.
-- `PYTHONPATH=vesuvius/src:lasagna:. python -c "from pathlib import Path; from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import _load_raw_config, _tool_raw_config; raw=_load_raw_config('vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/metric_sd2_s1.json'); patched=_tool_raw_config(raw, fiber_json=Path('/tmp/example.json')); print(patched['datasets'][0]['fiber_paths'])"`
-  passed and confirmed the CLI fiber path is injected as `fiber_paths`.
+- `python -m pip install -e volume-cartographer --no-deps --break-system-packages`
+  passed.
+- `python -c "import vc.volume; print(vc.volume.__file__); print(hasattr(vc.volume.Volume, 'sample_zyx_block'))"`
+  printed the user-site VC3D extension path and `True`.
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/inference_adapter.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/sampling.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "native_3d or whole_fiber_trace"`
+  passed: `60 passed, 89 deselected`.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "vc3d_coordinate_sampler_direct_block_read_uses_binding or numpy_coordinate_sampler_direct_block_read_masks_out_of_bounds"`
+  passed: `2 passed, 147 deselected`.
+- `git diff --check` passed.

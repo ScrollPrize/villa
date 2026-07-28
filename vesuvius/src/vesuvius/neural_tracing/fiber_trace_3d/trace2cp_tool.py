@@ -210,8 +210,9 @@ class NativeTrace2CpConfig:
     max_step_factor: float = 3.0
     max_steps: int | None = None
     trace_step_limit: int | None = None
-    inference_patch_shape_zyx: tuple[int, int, int] = (64, 64, 64)
-    core_margin_voxels: int = 20
+    inference_patch_shape_zyx: tuple[int, int, int] = (128, 128, 128)
+    core_margin_voxels: int = 48
+    inference_block_batch_size: int = 2
     whole_fiber_error_threshold_voxels: float = 10.0
     max_cached_inference_gib: float = 8.0
 
@@ -763,6 +764,7 @@ class NativeTraceFieldCache:
         core_margin_voxels: int,
         device: torch.device,
         max_cached_bytes: int | None = 8 * 1024**3,
+        inference_block_batch_size: int = 1,
         profiler: _NativeTraceProfiler | None = None,
     ) -> None:
         self.record = record
@@ -781,6 +783,7 @@ class NativeTraceFieldCache:
         if max_cached_bytes is not None and int(max_cached_bytes) < 0:
             raise ValueError("max_cached_bytes must be >= 0 or None")
         self.max_cached_bytes = None if max_cached_bytes is None else int(max_cached_bytes)
+        self.inference_block_batch_size = max(1, int(inference_block_batch_size))
         self.profiler = profiler
         self._blocks: OrderedDict[tuple[int, int, int], _InferredBlock] = OrderedDict()
         self.total_inferred_blocks = 0
@@ -818,43 +821,19 @@ class NativeTraceFieldCache:
         origin *= np.asarray(self.core_shape_zyx, dtype=np.int64)[None, :]
         return origin.astype(np.int64, copy=False)
 
-    def _block_coords_base_and_valid(
-        self, origin_zyx: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        shape = np.asarray(self.patch_shape_zyx, dtype=np.int64)
-        zz, yy, xx = np.meshgrid(
-            np.arange(int(shape[0]), dtype=np.float32) + np.float32(origin_zyx[0]),
-            np.arange(int(shape[1]), dtype=np.float32) + np.float32(origin_zyx[1]),
-            np.arange(int(shape[2]), dtype=np.float32) + np.float32(origin_zyx[2]),
-            indexing="ij",
-        )
-        coords_selected = np.stack([zz, yy, xx], axis=-1).astype(np.float32, copy=False)
-        spacing = np.float32(getattr(self.record, "volume_spacing_base", 1.0))
-        coords_base = np.ascontiguousarray(coords_selected * spacing)
-        base_shape = np.asarray(getattr(self.record, "base_shape_zyx"), dtype=np.float32)
-        if base_shape.shape != (3,):
-            raise ValueError("native 3D Trace2CP record.base_shape_zyx must have length 3")
-        valid = (
-            np.isfinite(coords_base).all(axis=-1)
-            & (coords_base[..., 0] >= 0.0)
-            & (coords_base[..., 0] <= float(base_shape[0] - 1.0))
-            & (coords_base[..., 1] >= 0.0)
-            & (coords_base[..., 1] <= float(base_shape[1] - 1.0))
-            & (coords_base[..., 2] >= 0.0)
-            & (coords_base[..., 2] <= float(base_shape[2] - 1.0))
-        )
-        return coords_base, np.ascontiguousarray(valid)
-
     def _sample_block_volume(self, origin_zyx: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         sampler = getattr(self.record, "sampler", None)
         if sampler is None:
             raise ValueError("native 3D Trace2CP record must provide a coordinate sampler")
         if hasattr(sampler, "blocking") and not bool(getattr(sampler, "blocking")):
             raise ValueError("native 3D Trace2CP requires blocking coordinate sampling")
-        with self._measure("src_coords"):
-            coords_base, valid = self._block_coords_base_and_valid(origin_zyx)
-        with self._measure("src_read"):
-            result = sampler.sample_coord_batch(coords_base, valid)
+        if not hasattr(sampler, "sample_block_zyx"):
+            raise ValueError(
+                "native 3D Trace2CP requires a sampler with sample_block_zyx support"
+            )
+        origin = np.asarray(origin_zyx, dtype=np.int64)
+        with self._measure("src_read_block"):
+            result = sampler.sample_block_zyx(origin, self.patch_shape_zyx)
         with self._measure("src_validate"):
             stats = dict(getattr(result, "stats", {}) or {})
             error_chunks = int(stats.get("error_chunks", 0) or 0)
@@ -875,7 +854,7 @@ class NativeTraceFieldCache:
                     f"stats={stats}"
                 )
             sampled_np = np.asarray(result.image, dtype=np.float32)
-            sampled_valid_np = np.asarray(result.valid_mask, dtype=bool) & valid
+            sampled_valid_np = np.asarray(result.valid_mask, dtype=bool)
             expected_shape = self.patch_shape_zyx
             if sampled_np.shape != expected_shape:
                 raise ValueError(
@@ -905,73 +884,41 @@ class NativeTraceFieldCache:
         slices = tuple(slice(lo, int(axis_hi)) for axis_hi in crop_hi)
         return slices, np.asarray([lo, lo, lo], dtype=np.int64)
 
-    @torch.no_grad()
-    def _infer_block(self, origin_zyx: np.ndarray) -> _InferredBlock:
-        origin = np.asarray(origin_zyx, dtype=np.int64)
-        key = tuple(int(v) for v in origin)
-        block = self._blocks.get(key)
-        if block is not None:
-            with self._measure("inference_cache_hit"):
-                self._blocks.move_to_end(key)
-            return block
-        raw_t, valid = self._sample_block_volume(origin)
-        with self._measure("inference_preprocess", sync=True):
-            model_input = raw_t.view(1, 1, *self.patch_shape_zyx)
-            valid_input = valid.view(1, 1, *self.patch_shape_zyx)
-            model_input = self.prediction_adapter.preprocess_tile(model_input, valid_input)
-        with self._measure("inference_forward", sync=True):
-            model_output = self.prediction_adapter.run_tile_inference(
-                self.model,
-                model_input,
-                device=self.device,
-            )
-        with self._measure("inference_decode_cache", sync=True):
-            products = self.prediction_adapter.product_tensors_from_output(model_output)
-            option_tensors = []
-            for product in self.prediction_adapter.output_products:
-                tensor = products.get(product.name)
-                if tensor is None:
-                    raise ValueError(
-                        f"fiber 3D prediction adapter did not return product {product.name!r}"
-                    )
-                if tensor.ndim != 5 or int(tensor.shape[0]) != 1 or int(tensor.shape[1]) != 7:
-                    raise ValueError(
-                        "fiber 3D prediction adapter product tensors must have shape "
-                        f"1,7,D,H,W; got {tuple(int(v) for v in tensor.shape)}"
-                    )
-                option_tensors.append(tensor[0])
-            output = torch.cat(option_tensors, dim=0).detach().to(
-                device=torch.device("cpu"),
-                dtype=torch.float32,
-            ).contiguous()
-            valid_cpu = valid.detach().to(device=torch.device("cpu")).contiguous()
-            core_lo = origin + int(self.core_margin)
-            core_hi = (
-                origin
-                + np.asarray(self.patch_shape_zyx, dtype=np.int64)
-                - int(self.core_margin)
-            )
-            crop_slices, crop_lo = self._cached_output_slices()
-            output_crop = output[
-                :,
-                crop_slices[0],
-                crop_slices[1],
-                crop_slices[2],
-            ].contiguous()
-            valid_crop = valid_cpu[crop_slices[0], crop_slices[1], crop_slices[2]].contiguous()
-            cache_nbytes = int(output_crop.numel() * output_crop.element_size())
-            cache_nbytes += int(valid_crop.numel() * valid_crop.element_size())
-            block = _InferredBlock(
-                origin_zyx=origin.astype(np.int64),
-                sample_origin_zyx=(origin + crop_lo).astype(np.int64),
-                shape_zyx=tuple(int(v) for v in valid_crop.shape),
-                core_lo_zyx=core_lo.astype(np.float32),
-                core_hi_zyx=core_hi.astype(np.float32),
-                output_czyx=output_crop,
-                valid_mask_zyx=valid_crop,
-                cache_nbytes=cache_nbytes,
-            )
-        self.total_inferred_blocks += 1
+    def _store_inferred_block(
+        self,
+        *,
+        origin: np.ndarray,
+        output: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> _InferredBlock:
+        origin_i64 = np.asarray(origin, dtype=np.int64)
+        core_lo = origin_i64 + int(self.core_margin)
+        core_hi = (
+            origin_i64
+            + np.asarray(self.patch_shape_zyx, dtype=np.int64)
+            - int(self.core_margin)
+        )
+        crop_slices, crop_lo = self._cached_output_slices()
+        output_crop = output[
+            :,
+            crop_slices[0],
+            crop_slices[1],
+            crop_slices[2],
+        ].contiguous()
+        valid_crop = valid[crop_slices[0], crop_slices[1], crop_slices[2]].contiguous()
+        cache_nbytes = int(output_crop.numel() * output_crop.element_size())
+        cache_nbytes += int(valid_crop.numel() * valid_crop.element_size())
+        block = _InferredBlock(
+            origin_zyx=origin_i64.astype(np.int64),
+            sample_origin_zyx=(origin_i64 + crop_lo).astype(np.int64),
+            shape_zyx=tuple(int(v) for v in valid_crop.shape),
+            core_lo_zyx=core_lo.astype(np.float32),
+            core_hi_zyx=core_hi.astype(np.float32),
+            output_czyx=output_crop,
+            valid_mask_zyx=valid_crop,
+            cache_nbytes=cache_nbytes,
+        )
+        key = tuple(int(v) for v in origin_i64)
         with self._measure("inference_cache_store"):
             if self.max_cached_bytes is None or self.max_cached_bytes > 0:
                 self._blocks[key] = block
@@ -986,6 +933,96 @@ class NativeTraceFieldCache:
                         self.resident_inferred_block_bytes -= int(evicted.cache_nbytes)
                         self.evicted_inferred_blocks += 1
         return block
+
+    @torch.no_grad()
+    def _infer_blocks(
+        self,
+        origins_zyx: np.ndarray,
+    ) -> dict[tuple[int, int, int], _InferredBlock]:
+        origins = np.asarray(origins_zyx, dtype=np.int64).reshape(-1, 3)
+        blocks_by_key: dict[tuple[int, int, int], _InferredBlock] = {}
+        missing: list[np.ndarray] = []
+        for origin in origins:
+            key = tuple(int(v) for v in origin)
+            block = self._blocks.get(key)
+            if block is not None:
+                with self._measure("inference_cache_hit"):
+                    self._blocks.move_to_end(key)
+                blocks_by_key[key] = block
+            else:
+                missing.append(origin.astype(np.int64, copy=True))
+        if not missing:
+            return blocks_by_key
+
+        batch_size = max(1, int(self.inference_block_batch_size))
+        for start in range(0, len(missing), batch_size):
+            batch_origins = missing[start : start + batch_size]
+            raw_blocks: list[torch.Tensor] = []
+            valid_blocks: list[torch.Tensor] = []
+            for origin in batch_origins:
+                raw_t, valid_t = self._sample_block_volume(origin)
+                raw_blocks.append(raw_t)
+                valid_blocks.append(valid_t)
+            with self._measure("inference_preprocess", sync=True):
+                raw_batch = torch.stack(raw_blocks, dim=0).view(
+                    len(batch_origins),
+                    1,
+                    *self.patch_shape_zyx,
+                )
+                valid_batch = torch.stack(valid_blocks, dim=0).view(
+                    len(batch_origins),
+                    1,
+                    *self.patch_shape_zyx,
+                )
+                model_input = self.prediction_adapter.preprocess_tile(raw_batch, valid_batch)
+            with self._measure("inference_forward", sync=True):
+                model_output = self.prediction_adapter.run_tile_inference(
+                    self.model,
+                    model_input,
+                    device=self.device,
+                )
+            with self._measure("inference_decode_cache", sync=True):
+                products = self.prediction_adapter.product_tensors_from_output(model_output)
+                product_tensors: list[torch.Tensor] = []
+                for product in self.prediction_adapter.output_products:
+                    tensor = products.get(product.name)
+                    if tensor is None:
+                        raise ValueError(
+                            f"fiber 3D prediction adapter did not return product {product.name!r}"
+                        )
+                    if (
+                        tensor.ndim != 5
+                        or int(tensor.shape[0]) != len(batch_origins)
+                        or int(tensor.shape[1]) != 7
+                    ):
+                        raise ValueError(
+                            "fiber 3D prediction adapter product tensors must have shape "
+                            f"B,7,D,H,W; got {tuple(int(v) for v in tensor.shape)}"
+                        )
+                    product_tensors.append(tensor)
+                valid_cpu = valid_batch.detach().to(device=torch.device("cpu")).contiguous()
+                for batch_index, origin in enumerate(batch_origins):
+                    output = torch.cat(
+                        [tensor[batch_index] for tensor in product_tensors],
+                        dim=0,
+                    ).detach().to(
+                        device=torch.device("cpu"),
+                        dtype=torch.float32,
+                    ).contiguous()
+                    block = self._store_inferred_block(
+                        origin=origin,
+                        output=output,
+                        valid=valid_cpu[batch_index, 0],
+                    )
+                    blocks_by_key[tuple(int(v) for v in origin)] = block
+                self.total_inferred_blocks += len(batch_origins)
+        return blocks_by_key
+
+    @torch.no_grad()
+    def _infer_block(self, origin_zyx: np.ndarray) -> _InferredBlock:
+        origin = np.asarray(origin_zyx, dtype=np.int64)
+        key = tuple(int(v) for v in origin)
+        return self._infer_blocks(origin.reshape(1, 3))[key]
 
     def block_for_point(self, point_zyx: np.ndarray) -> _InferredBlock:
         point = np.asarray(point_zyx, dtype=np.float32)
@@ -1052,18 +1089,21 @@ class NativeTraceFieldCache:
             )
 
         emit_progress(0, force=True)
+        unique_keys = [
+            tuple(int(v) for v in np.asarray(origin, dtype=np.int64))
+            for origin in unique_origins
+        ]
+        cached_before = {key for key in unique_keys if key in self._blocks}
+        blocks_by_key = self._infer_blocks(unique_origins)
+        cached_blocks = len(cached_before)
+        new_blocks = len(unique_keys) - cached_blocks
         for unique_index, origin in enumerate(unique_origins):
             indices = np.flatnonzero(inverse == int(unique_index))
             if indices.size == 0:
                 emit_progress(int(unique_index) + 1)
                 continue
-            key = tuple(int(v) for v in np.asarray(origin, dtype=np.int64))
-            was_cached = key in self._blocks
-            block = self._infer_block(origin)
-            if was_cached:
-                cached_blocks += 1
-            else:
-                new_blocks += 1
+            key = unique_keys[int(unique_index)]
+            block = blocks_by_key[key]
             group_points = points[indices]
             shape = np.asarray(block.shape_zyx, dtype=np.float32)
             local = group_points - block.sample_origin_zyx.astype(np.float32)
@@ -5441,6 +5481,7 @@ def run_native_trace2cp(
         core_margin_voxels=cfg.core_margin_voxels,
         device=device,
         max_cached_bytes=_cache_bytes_from_gib(float(cfg.max_cached_inference_gib)),
+        inference_block_batch_size=int(cfg.inference_block_batch_size),
         profiler=profiler,
     )
     normal_sampler = _NativeLasagnaNormalSampler(
@@ -5592,6 +5633,7 @@ def run_native_trace2cp(
             **_native_trace_smoothness_summary(cfg),
             "max_steps": None if cfg.max_steps is None else int(cfg.max_steps),
             "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
+            "inference_block_batch_size": int(cfg.inference_block_batch_size),
             "inferred_blocks": int(cache.total_inferred_blocks),
             "resident_inferred_blocks": int(len(cache._blocks)),
             "evicted_inferred_blocks": int(cache.evicted_inferred_blocks),
@@ -5762,6 +5804,7 @@ def run_native_trace2cp(
         **_native_trace_smoothness_summary(cfg),
         "max_steps": None if cfg.max_steps is None else int(cfg.max_steps),
         "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
+        "inference_block_batch_size": int(cfg.inference_block_batch_size),
         "visualization_enabled": bool(render_visualization),
         "visualization_cross_strip_height_px": visualization_cross_strip_height_px,
         "visualization_max_cross_strip_height_px": visualization_max_cross_strip_height_px,
@@ -5871,7 +5914,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--trace-step-limit", type=int, default=None)
     parser.add_argument("--inference-patch-shape-zyx", nargs=3, type=int, default=None)
-    parser.add_argument("--core-margin-voxels", type=int, default=20)
+    parser.add_argument("--core-margin-voxels", type=int, default=48)
+    parser.add_argument(
+        "--inference-block-batch-size",
+        type=int,
+        default=2,
+        help="Maximum number of missing native 3D inference blocks to forward in one batch.",
+    )
     parser.add_argument(
         "--max-cached-inference-gib",
         type=float,
@@ -5888,7 +5937,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     patch_shape = (
-        (64, 64, 64)
+        (128, 128, 128)
         if args.inference_patch_shape_zyx is None
         else _as_zyx3(args.inference_patch_shape_zyx, key="--inference-patch-shape-zyx")
     )
@@ -5919,6 +5968,7 @@ def main() -> None:
         trace_step_limit=None if args.trace_step_limit is None else int(args.trace_step_limit),
         inference_patch_shape_zyx=patch_shape,
         core_margin_voxels=int(args.core_margin_voxels),
+        inference_block_batch_size=int(args.inference_block_batch_size),
         whole_fiber_error_threshold_voxels=float(args.whole_fiber_error_threshold_voxels),
         max_cached_inference_gib=float(args.max_cached_inference_gib),
     )

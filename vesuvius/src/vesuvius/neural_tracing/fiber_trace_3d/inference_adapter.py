@@ -232,11 +232,15 @@ class FiberTrace3DPredictAdapter:
         from vesuvius.neural_tracing.fiber_trace_3d.loader import _normalize_image
 
         normalization = str(self.config.get("image_normalization", "zscore"))
-        if tile.ndim != 5 or int(tile.shape[0]) != 1 or int(tile.shape[1]) != 1:
-            raise ValueError("fiber inference tile must have shape 1,1,D,H,W")
-        image = tile[0, 0]
-        valid = valid_mask[0, 0].to(dtype=torch.bool)
-        return _normalize_image(image, valid, normalization).view_as(tile)
+        if tile.ndim != 5 or int(tile.shape[1]) != 1:
+            raise ValueError("fiber inference tile must have shape B,1,D,H,W")
+        if valid_mask.shape != tile.shape:
+            raise ValueError("fiber inference valid_mask must match tile shape")
+        normalized = [
+            _normalize_image(tile[index, 0], valid_mask[index, 0].to(dtype=torch.bool), normalization)
+            for index in range(int(tile.shape[0]))
+        ]
+        return torch.stack(normalized, dim=0).view_as(tile)
 
     def product_by_name(self, name: str) -> OutputProductSpec:
         for product in self._products:

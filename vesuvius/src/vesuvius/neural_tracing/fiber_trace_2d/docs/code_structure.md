@@ -543,9 +543,11 @@ loading.
   selection. Dense 3D test loss remains a diagnostic.
 - Native 3D Trace2CP uses a field-provider boundary. The current provider is
   `NativeTraceFieldCache`, a sparse live checkpoint-backed block cache. It
-  samples requested-level volume blocks with VC3D blocking sampling, calls
-  `FiberTrace3DPredictAdapter` for tile normalization, recurrent/conditioned
-  inference, mixed precision, and raw option splitting, then exposes
+  samples regular requested-level volume blocks through
+  `CoordinateSampler.sample_block_zyx(...)`, batches missing blocks for model
+  forwarding where memory permits, calls `FiberTrace3DPredictAdapter` for
+  per-tile normalization, recurrent/conditioned inference, mixed precision, and
+  raw option splitting, then exposes
   branch-aware point sampling to the tracer. Precomputed fiber prediction
   outputs are not wired yet, but should use the same field-provider contract
   when added.
@@ -654,12 +656,18 @@ The important behavior is:
   and returns `[patches,H,W]` image and valid-mask arrays. The default
   implementation flattens `[patches,H,W,3]` into one larger coordinate image,
   calls ordinary `sample_coords` once, and reshapes back.
+- `CoordinateSampler.sample_block_zyx` loads a regular axis-aligned
+  selected-level `[D,H,W]` block and returns the same image/valid/stats
+  contract. Native 3D Trace2CP uses this for inference blocks so it does not
+  build dense coordinate grids for ordinary cubes.
 - `Vc3dCoordinateSampler` is the production sampler:
   - opens local paths with `vc.volume.Volume.open`;
   - converts `s3://bucket/key` to the matching public HTTPS URL;
   - opens remote paths with `Volume.open_url`;
   - calls `Volume.sample_coords(..., blocking=True)` so requested-level chunks
     are fetched/decoded and pinned before sampling starts;
+  - calls `Volume.sample_zyx_block(..., blocking=True)` for regular
+    axis-aligned block reads used by native 3D Trace2CP;
   - rejects blocking results that do not report strict requested-level sampling
     (`requested_level_only=true`, `fallback_levels=0`);
   - uses `Volume.collect_coords_dependencies(...)` for prefetch dependency
