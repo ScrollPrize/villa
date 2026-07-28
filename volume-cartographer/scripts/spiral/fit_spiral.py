@@ -2236,7 +2236,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
                 reprepare_tracks = bool(changed & {
                     'track_max_tortuosity',
-                    'track_walk_require_loop_consistency',
                     'track_exclusion_radius',
                 })
                 if reprepare_tracks and rebuilt_tracks is None and tracks:
@@ -2257,8 +2256,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                      'track_max_track_crossing_per_step',
                      'track_min_walk_steps_per_track',
                      'track_max_walk_steps_per_track',
-                     'track_n_walks_per_track',
-                     'track_walk_require_loop_consistency'}
+                     'track_min_walks_per_track',
+                     'track_max_walks_per_track',
+                     'track_walk_minimum_cycle_travel'}
                         & changed):
                     configure_prepared_track_sampling(target_tracks, config)
 

@@ -60,15 +60,16 @@ class FakeSession:
             "track_max_sample_spacing": 60.0,
             "track_min_walk_steps_per_track": 24,
             "track_max_walk_steps_per_track": 256,
-            "track_n_walks_per_track": 4,
+            "track_min_walks_per_track": 2,
+            "track_max_walks_per_track": 4,
         }
         self.default_advanced_config = {
             "optimizer_learning_rate": 3e-5,
             "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "track_crossing_precompute_max": 8,
-            "track_crossing_mode": "count",
-            "track_walk_require_loop_consistency": False,
+            "track_crossing_mode": "track_walk",
+            "track_walk_minimum_cycle_travel": 20.0,
         }
         self.saved = []
         self.closed = False
@@ -834,7 +835,7 @@ class UploadTests(unittest.TestCase):
             "track_max_sample_spacing": 32.0,
             "track_min_walk_steps_per_track": 18,
             "track_max_walk_steps_per_track": 96,
-            "track_n_walks_per_track": 5,
+            "track_max_walks_per_track": 5,
         }
 
         response = _planned_run(self.state, {"iterations": 10, "run_config": config})

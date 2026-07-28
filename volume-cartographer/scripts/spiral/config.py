@@ -216,11 +216,12 @@ class Config:
         self.track_max_tortuosity = None
         self.track_crossing_precompute_max = 8
         self.track_max_track_crossing_per_step = 1
-        self.track_crossing_mode = "count"
+        self.track_crossing_mode = "track_walk"
         self.track_min_walk_steps_per_track = 24
         self.track_max_walk_steps_per_track = 256
-        self.track_n_walks_per_track = 4
-        self.track_walk_require_loop_consistency = False
+        self.track_min_walks_per_track = 2
+        self.track_max_walks_per_track = 4
+        self.track_walk_minimum_cycle_travel = 20.0
         self.track_exclusion_radius = 16.0
         self.track_radius_target = "mean"
         self.track_radius_loss_margin = 0.025

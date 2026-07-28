@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 
 from track_graph import TrackGraph
+from tracks import _load_native_track_crossings
 
 
 DEFAULT_TRACK_ROOT = Path(
@@ -89,6 +90,73 @@ class RealTrackGraphTests(unittest.TestCase):
                 walk[step],
                 visited=walk[:step],
             ))
+
+    def test_native_production_walk_uses_root_return_gate(self):
+        native = _load_native_track_crossings()
+        if native is None:
+            self.skipTest("native track-crossing module is unavailable")
+        root = self.graph.node_for_source_id(KNOWN_CYCLE_SOURCE_ID)
+        produced = None
+        chosen_csr = None
+        for cycle in self.graph.short_cycles_through(root, limit=100):
+            selected = self.graph.source_ids[np.asarray(cycle)]
+            csr = self.graph.restricted_csr(selected)
+            lengths = np.maximum.reduceat(
+                csr["self_local"], csr["offsets"][:-1]).astype(
+                    np.int32) + 1
+            index = native.prepare_walk_index(
+                csr["offsets"], csr["partners"], csr["self_local"],
+                csr["partner_local"], csr["positions"], lengths)
+            result = native.sample_walks(
+                index,
+                np.zeros(128, dtype=np.int32),
+                np.arange(128, dtype=np.uint64),
+                groups=1,
+                target_points=24,
+                minimum_hops=2,
+                maximum_hops=8,
+                minimum_steps=1,
+                maximum_steps=int(lengths.max()),
+                minimum_candidate_travel=20.0,
+            )
+            if int(result["produced"]) == 1:
+                produced = result
+                chosen_csr = csr
+                break
+        self.assertIsNotNone(
+            produced, "no real short cycle produced a gated native walk")
+        walk_hops = int(np.asarray(produced["walk_hops"])[0])
+        self.assertGreaterEqual(walk_hops, 2)
+        self.assertLessEqual(walk_hops, 3)
+        self.assertLess(walk_hops, 8)
+        walked = np.asarray(produced["tracks"])[0][:walk_hops + 1]
+        self.assertEqual(len(set(walked.tolist())), len(walked))
+
+        records = np.asarray(produced["records"])[0][:2 * walk_hops]
+        for step in range(1, walk_hops):
+            entry_record = int(records[2 * (step - 1) + 1])
+            exit_record = int(records[2 * step])
+            self.assertGreaterEqual(
+                abs(
+                    float(chosen_csr["positions"][exit_record])
+                    - float(chosen_csr["positions"][entry_record])
+                ),
+                20.0,
+            )
+        final_entry = int(records[-1])
+        final_track = int(walked[-1])
+        final_begin = int(chosen_csr["offsets"][final_track])
+        final_end = int(chosen_csr["offsets"][final_track + 1])
+        valid_closures = [
+            record
+            for record in range(final_begin, final_end)
+            if int(chosen_csr["partners"][record]) == int(walked[0])
+            and abs(
+                float(chosen_csr["positions"][record])
+                - float(chosen_csr["positions"][final_entry])
+            ) >= 20.0
+        ]
+        self.assertTrue(valid_closures)
 
 
 if __name__ == "__main__":
