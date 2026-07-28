@@ -1,100 +1,97 @@
-# Task Log: Fail-Fast Native 3D Trace2CP Acceleration Comparison
+# Task Log: Native 3D Trace2CP GPU-Centric Beam Acceleration
 
-## Implementation Notes
+## Plan
 
-- Added `--debug-compare-normal-sampler[=sparse-corner-principal]` to the
-  native 3D Trace2CP CLI.
-- The comparison mode wraps the restored production geometry-loader normal
-  sampler. The tracer still receives and scores with production normals.
-- Added `_SparseCornerLasagnaNormalSampler` for sparse Lasagna
-  sampling. It samples compact `nx/ny` only at the eight channel-grid corners,
-  reconstructs the tensor/hint on those values, and decodes with the existing
-  `_principal_tensor_axes` helper.
-- Removed the invalid raw compact-normal path after confirming it reproduced
-  the mismatch. Native 3D Trace2CP now has no debug or production path that
-  interpolates raw compact `nx/ny` and then reads `FitData3D.normal_3d`.
-- Added `_FailFastNormalComparisonSampler`, which raises immediately on
-  valid-mask mismatch or on angular difference above
-  `--debug-normal-angle-threshold-degrees`.
-- Inverted the comparison wrapper return path so normal-aware smoothness now
-  receives sparse corner/tensor normals after they pass comparison against the
-  baseline sampler.
-- Made `sparse-corner-principal` the default native 3D Trace2CP normal sampler
-  via `--normal-sampler`; `baseline` remains an explicit fallback.
-- The failure message includes sampler label, call number, point index,
-  selected-level ZYX coordinate, valid flags, normals, and angle/threshold where
-  applicable.
-- Fixed the debug-only Lasagna streaming import path so `fit_data.py` can resolve
-  its script-style `lasagna_volume` import without changing normal tracer runs.
-
-## Debug Run Results
-
-- Removed historical raw `normal_3d` debug path result: it failed fast on the
-  first candidate-normal call, confirming why it must not exist. First
-  mismatch:
-  `point_index=2`, `angle_degrees=1.050298`,
-  `point_zyx_selected=[4545.16796875, 5062.00439453125, 3406.501708984375]`,
-  baseline normal `[0.30029154, 0.87094468, 0.38894793]`, accelerated normal
-  `[0.31770453, 0.86614174, 0.38582677]`.
-- `--debug-compare-normal-sampler=sparse-corner-principal --debug-normal-angle-threshold-degrees 1.0`:
-  completed the whole 87-segment fiber without any normal mismatch above
-  1 degree. This shows sparse chunk reads with baseline-style corner/tensor
-  reconstruction can match the geometry-loader sampler at this threshold.
-- Re-ran after removing the bad raw mode from the CLI/code:
-  `err/kvx=0.7`, `restarts=11`, `segments=87`, `err/m=72.0 (12.7mm)`,
-  `trace_wall_s=129.556`, no debug comparison failure.
-- Next run target: same command, but now the trace is driven by the sparse
-  corner/tensor normals instead of only comparing them.
-- Accelerated-primary run with `--beam-lookahead-steps 1` completed without
-  comparison failure but produced 11 restarts. This was the wrong comparison
-  command for the 3-restart reference.
-- Accelerated-primary run with the reference command's
-  `--beam-lookahead-steps 2` completed without comparison failure and recovered
-  the expected quality: `err/kvx=0.2`, `restarts=3`, `segments=87`,
-  `err/m=19.6 (38.2mm)`, `trace_wall_s=679.960`.
-- User-provided no-debug command showed no acceleration because it still used
-  `debug_compare_normal_sampler=off` and the old baseline normal sampler:
-  `trace_wall_s=472.279`, `trace_candidate_normals=291.478`,
-  `lasagna_normal_sample=290.463`.
-- Updated the no-debug path so the same command now uses
-  `normal_sampler=sparse-corner-principal`.
-- No-debug sparse run before moving tensor decode to torch:
-  `err/kvx=0.2`, `restarts=3`, `segments=87`, `err/m=19.6 (38.2mm)`,
-  `trace_wall_s=374.490`. The remaining normal cost was outside zarr sampling:
-  `trace_candidate_normals=191.216` while
-  `sparse_normal_prefetch+sparse_normal_sample=5.716`.
-- Ported sparse corner/tensor reconstruction and principal-axis power
-  iteration to torch to remove the per-call NumPy conversion/decode path.
-- No-debug sparse run after torch normal decode:
-  `err/kvx=0.2`, `restarts=3`, `segments=87`, `err/m=19.6 (38.2mm)`,
-  `trace_wall_s=200.708`. This is 2.35x faster than the user's
-  baseline-normal no-debug run (`472.279s`) with the same restart count.
-  Remaining top stages: `trace_candidate_score=146.309`,
-  `inference_forward=38.637`, `field_sample_lookup=35.018`,
-  `trace_candidate_normals=19.312`.
-- Removed a progress-only GPU-to-CPU sync from point lookup and one root-mask
-  sync from beam tracing. Rerun was effectively unchanged:
-  `trace_wall_s=202.279`, `restarts=3`, so this was not the main remaining
-  bottleneck.
+- Reuse the approved whole-fiber Trace2CP benchmark command after each change.
+- Preserve current metric quality: the reference run should remain at 3
+  restarts on the benchmark fiber unless a change is explicitly rejected.
+- First target the measured hot path in point-field lookup: fewer GPU calls,
+  one valid/output sampling pass, and one decode pass per query batch.
+- Then reduce Python beam rebuild/synchronization overhead.
+- Then move cached resident block routing off NumPy where practical.
 
 ## Deviations / Deferred Items
 
-- The accelerated sparse corner/tensor sampler is now the default native 3D
-  Trace2CP normal sampler. Baseline remains selectable with
-  `--normal-sampler baseline`.
-- No long traces or JSON diff reports are written; the user requested fail-fast
-  behavior instead.
+- Rejected experiments are listed below with measurements and were removed from
+  the code path. No intentionally slower or quality-changing acceleration path
+  remains enabled.
 
 ## Validation
 
-- `python -m py_compile lasagna/normal_encoding.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`: passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "normal_comparison or lasagna_normal_sampler or normal_aware_smoothness or cumulative_tangent_smoothness or trace_paths_sample_candidate_normals"`: 11 passed, 149 deselected.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py` after final cleanup: 158 passed, 2 skipped.
-- `PYTHONPATH=vesuvius/src:lasagna:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool --help | rg -n "debug-compare-normal-sampler|debug-normal-angle"`: passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "normal_comparison or lasagna_normal_sampler"` after the import fix: 4 passed, 156 deselected.
-- Same focused test after removing the bad raw mode: 4 passed, 156 deselected.
-- Same focused test after inverting the comparison wrapper to return the
-  accelerated normals: 4 passed, 156 deselected.
-- Focused tests after torch principal-axis decode:
-  6 passed, 155 deselected.
-- `git diff --check`: passed.
+- Baseline command:
+  `PYTHONPATH=/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/volume-cartographer/build/python-bindings/python:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src:/home/hendrik/business/aiconsulting/vesuviuschallenge/villa3 python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool /home/hendrik/business/aiconsulting/vesuviuschallenge/villa3/vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/metric_sd2_s1_single.json --checkpoint /home/hendrik/business/aiconsulting/vesuviuschallenge/data/fiber/snapshots/s1a_128_2_single_8x8_20260727_161616/best_25_9k.pt --export-dir /tmp/trace2cp_sparse_default --fiber-json /home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_test_paul_4/kb_20260605T150824406_000001.json --beam-lookahead-steps 2 --beam-width 8 --smoothness-normal-weight 0.1 --smoothness-tangent-weight 10.0 --core-margin-voxels 48 --inference-patch-shape-zyx 128 128 128 --inference-scaledown-power 2`
+- Baseline result on current checkout:
+  `restarts=3`, `err/kvx=0.2`, `err/m=19.6 (38.2mm)`,
+  `trace_wall_s=202.528`, `trace_cpu_s=741.915`.
+- Baseline top profile rows:
+  `trace_candidate_score=148.877s`, `inference_forward=38.632s`,
+  `field_sample_lookup=33.868s`, `trace_candidate_normals=19.253s`,
+  `trace_current_sample=18.283s`.
+- Batched field lookup result:
+  `restarts=3`, `err/kvx=0.2`, `err/m=19.6 (38.2mm)`,
+  `trace_wall_s=188.519`, `trace_cpu_s=725.442`.
+  `field_sample_lookup` dropped to `23.484s` and `trace_current_sample`
+  dropped to `14.502s`; new measured route component was
+  `field_lookup_route=10.187s`.
+- Carried endpoint-current beam state result:
+  `restarts=3`, `err/kvx=0.2`, `err/m=19.6 (38.2mm)`,
+  `trace_wall_s=178.775`, `trace_cpu_s=713.605`.
+  `trace_current_sample` collapsed to `0.143s`, proving the duplicate
+  current-point lookup was removed. `field_sample_lookup=12.470s` and
+  `field_lookup_route=9.569s`.
+- GPU resident block-bank route experiment:
+  - First exact 3-vector match version: `trace_wall_s=181.388`.
+  - Exact linear-key version: `trace_wall_s=181.033`.
+  - Both kept `restarts=3`, but both were slower than the carried-state run.
+    The extra resident prechecks and pointwise block-bank sampling outweighed
+    the saved CPU route, so this path was removed rather than kept as dead or
+    slower code.
+- Parent-routed candidate lookup experiment:
+  - Result: `restarts=3`, `trace_wall_s=244.104`.
+  - Rejected and removed. It routed fewer CPU points, but duplicated block
+    tensors per beam state; `field_sample_lookup` jumped to `139.970s`.
+- GPU block-origin/group routing result:
+  - Result: `restarts=3`, `err/kvx=0.2`, `err/m=19.6 (38.2mm)`,
+    `trace_wall_s=105.795`, `trace_cpu_s=610.183`.
+  - This keeps candidate points on torch tensors, computes block origins with
+    torch, transfers only unique block origins to CPU for block inference, and
+    performs per-block grouping with tensors. `field_lookup_route` dropped to
+    `0.506s`; `field_lookup_origin=1.558s`; `field_sample_lookup=13.466s`.
+- Reference-line model-block prefetch experiment:
+  - Rejected and removed. It prefetched `763` blocks from `2336` densified
+    reference-line points before tracing, but changed quality immediately
+    (`restart` at segment 3 instead of segment 31). This indicates model block
+    inference is not safe to reorder/batch differently for this checkpoint, so
+    explicit broad prefetch is not kept.
+- Torch-only beam prune selection:
+  - Result: `restarts=3`, `err/kvx=0.2`, `err/m=19.6 (38.2mm)`,
+    `trace_wall_s=104.255`, `trace_cpu_s=608.720`.
+  - `trace_beam_prune` dropped from `3.345s` to `2.594s`; overall gain was
+    small but positive, and behavior remained unchanged.
+- Batched 3x3 eigensolve normal reconstruction:
+  - Result: `restarts=3`, `err/kvx=0.2`, `err/m=19.6 (38.2mm)`,
+    `trace_wall_s=101.806`, `trace_cpu_s=604.198`.
+  - Kept by user direction. This does not interpolate raw compact `nx/ny`; it
+    recovers the principal axis from the already-built sign-invariant local
+    tensor and replaces the previous fixed power iteration.
+- Cached inferred-block metadata tensors:
+  - Result with the retained eigensolve normal path: `restarts=3`,
+    `trace_wall_s=102.048`.
+  - `field_sample_lookup` dropped from `13.300s` to `12.935s`, but total time
+    was within noise. Kept provisionally because it is a direct field-lookup
+    cleanup and does not change numerical semantics.
+- Focused validation after the final code/test cleanup:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+  passed with `159 passed, 2 skipped in 5.73s`.
+- Syntax and whitespace validation:
+  `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py`
+  passed.
+  `git diff --check -- ...` passed for the touched Trace2CP, test, and planning
+  files.
+- Test cleanup:
+  - The principal-axis torch test now compares against the exact dominant
+    eigenvector with the same hint sign handling, matching the current spec.
+  - Fallback test caches without `sample_point_choices_torch` no longer carry
+    endpoint samples from `sample_points_torch`; they resample current-point
+    validity through the fallback path. Production multi-choice caches keep the
+    carried endpoint-state optimization.

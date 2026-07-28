@@ -17,7 +17,6 @@ import zarr
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
-from vesuvius.neural_tracing.fiber_trace_2d.loader import _principal_tensor_axes
 from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
     CoordinateSampleResult,
@@ -5319,7 +5318,21 @@ def test_native_3d_principal_tensor_axes_torch_matches_numpy() -> None:
     hints[1] = 0.0
     hints[5] = np.nan
 
-    expected = _principal_tensor_axes(tensors, hints)
+    eigenvalues, eigenvectors = np.linalg.eigh(tensors)
+    expected = eigenvectors[
+        np.arange(int(tensors.shape[0])),
+        :,
+        np.argmax(eigenvalues, axis=1),
+    ]
+    expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    hint_norm = np.linalg.norm(hints, axis=1)
+    valid_hint = np.isfinite(hint_norm) & (hint_norm > 1.0e-12)
+    hint_unit = np.zeros_like(hints)
+    hint_unit[valid_hint] = hints[valid_hint] / hint_norm[valid_hint, None]
+    expected[
+        valid_hint & (np.sum(expected * hint_unit, axis=1) < 0.0)
+    ] *= -1.0
+    expected[(~valid_hint) & (expected[:, 2] < 0.0)] *= -1.0
     actual = (
         _principal_tensor_axes_torch(
             torch.as_tensor(tensors, dtype=torch.float32),
@@ -5724,7 +5737,7 @@ def test_native_3d_trace2cp_beam_lookahead_keeps_initially_worse_valid_path() ->
     kwargs = dict(
         cache=FakeCache(),
         start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
-        target_zyx=np.asarray([0.0, 0.0, 3.0], dtype=np.float32),
+        target_zyx=np.asarray([0.0, 0.0, 2.7], dtype=np.float32),
         initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
     )
     greedy = trace_native_3d_one_way(

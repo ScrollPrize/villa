@@ -1,5 +1,11 @@
 # 2026-07-28
 
+- Accelerated native 3D whole-fiber Trace2CP hot-path lookup/scoring while
+  preserving the reference benchmark metric: point lookup now routes candidate
+  batches with torch block-origin/grouping, duplicate current-point field
+  sampling is carried in beam state, beam pruning avoids per-selection syncs,
+  sparse normal tensor principal axes use batched symmetric eigensolve, and
+  inferred block coordinate metadata is cached on device.
 - Restored native 3D Trace2CP candidate Lasagna normals to the
   pre-acceleration geometry-loader sampler and restored vector-normal
   smoothness scoring.

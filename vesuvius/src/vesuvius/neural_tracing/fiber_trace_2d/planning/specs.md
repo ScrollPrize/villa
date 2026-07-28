@@ -572,6 +572,17 @@
   for each lookup. Long whole-fiber traces still must not retain every
   historical block until process exit; `--max-cached-inference-gib` bounds the
   resident inferred field cache and eviction may cause re-inference.
+- Native 3D Trace2CP field lookup must keep query points, block-origin
+  calculation, per-block grouping, trusted-core masks, and sampled field
+  tensors on `cache.device` for resident lookups. CPU transfer is limited to
+  the unique missing/resident block origins required by the VC3D/model-output
+  block cache. The lookup must not convert every candidate point batch to
+  NumPy for `np.unique`/`flatnonzero` routing.
+- Broad reference-line or corridor model-block prefetch must not be enabled by
+  default. It may only be added when it is proven metric-equivalent to the
+  incremental inference order, because changing model-block materialization
+  order/batching has been observed to alter native Trace2CP decisions for the
+  current checkpoint.
 - Native 3D Trace2CP supports `--inference-scaledown-power N` for opt-in
   lower-resolution tracing over the raw model-output field. The scaledown
   factor is `2 ** N`: `0` is the default no-op, `1` samples a half-resolution
@@ -674,9 +685,8 @@
   inference block, sampled with batched `grid_sample`, decoded with the
   analytic Lasagna 3x2 torch decoder, and scored as tensors. The bounded
   inferred-block cache keeps sampled model-output tensors on `cache.device`;
-  cache-miss source-block construction may still involve CPU/VC3D reads, and
-  the current implementation may still use CPU trusted-core block grouping
-  before sampling those resident tensors.
+  cache-miss source-block construction may still involve CPU/VC3D reads, but
+  resident candidate point routing and trusted-core grouping stay tensorized.
   For multi-branch outputs, every candidate evaluates every branch at the
   candidate point and uses the branch with the best score. Candidate selection
   minimizes a cost. By default, the direction score uses all-pairs product
@@ -704,8 +714,11 @@
   available as `--normal-sampler baseline` and as the fail-fast comparison
   reference. Compact `nx`/`ny` normals must not be interpolated directly, and the
   tracer must not call `FitData3D.normal_3d` on interpolated compact normals,
-  perform grid search, use a generic eigensolver fallback, or interpolate
-  normals by reference-line progress. With a valid candidate normal axis,
+  perform grid search, or interpolate normals by reference-line progress.
+  Once the sign-invariant local tensor is built from decoded compact-normal
+  corners, the principal axis may be recovered with a batched symmetric
+  eigensolve or another measured tensor principal-axis method. With a valid
+  candidate normal axis,
   smoothness is split into tangent-plane turn and normal-tilt turn using the
   vector-normal projection equations from the pre-acceleration tracer:
   tangent-plane turn is the angle between previous and candidate step
