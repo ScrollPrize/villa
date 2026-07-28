@@ -2135,8 +2135,29 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
     track_np = np.ascontiguousarray(track_np, dtype=np.float32)
     if threshold <= 0 or anchor_tree is None:
         return np.ones(track_np.shape[0], dtype=bool)
-    dist, _ = anchor_tree.query(track_np, k=1, distance_upper_bound=float(threshold), workers=-1)
-    return np.isinf(dist)
+    # A full production store can contain close to a billion points.  Passing
+    # that array to scipy in one call makes query allocate point-count-sized
+    # distance and index arrays (16 bytes/point) in addition to its internal
+    # workspace.  Keep only the final one-byte mask resident and bound every
+    # query allocation.
+    chunk_size = max(
+        1, int(os.environ.get('FIT_SPIRAL_TRACK_EXCLUSION_CHUNK', '4000000')))
+    keep = np.empty(track_np.shape[0], dtype=bool)
+    progress = tqdm(
+        total=track_np.shape[0], desc='excluding track points',
+        unit='point', unit_scale=True,
+    )
+    try:
+        for begin in range(0, track_np.shape[0], chunk_size):
+            end = min(begin + chunk_size, track_np.shape[0])
+            dist, _ = anchor_tree.query(
+                track_np[begin:end], k=1,
+                distance_upper_bound=float(threshold), workers=-1)
+            keep[begin:end] = np.isinf(dist)
+            progress.update(end - begin)
+    finally:
+        progress.close()
+    return keep
 
 
 def prepare_main_phase_tracks(
@@ -2436,10 +2457,9 @@ def prepare_main_phase_tracks(
             flat_zyx_np, lengths_new, surviving, surviving_tracks)
 
     if packed_input:
-        flat_materialized, packed_offsets = working_tracks.materialize()
+        flat_zyx_np, packed_offsets = working_tracks.materialize()
+        flat_zyx_np = np.asarray(flat_zyx_np, dtype=np.float32)
         input_offsets = np.asarray(packed_offsets, dtype=np.int64)
-        working_tracks = _MemmapTrackCollection(
-            flat_materialized, packed_offsets)
     else:
         input_lengths = np.fromiter(
             (len(track) for track in working_tracks),
@@ -2447,54 +2467,54 @@ def prepare_main_phase_tracks(
         input_offsets = np.empty(len(input_lengths) + 1, dtype=np.int64)
         input_offsets[0] = 0
         np.cumsum(input_lengths, out=input_offsets[1:])
-
-    flat_zyx_np = np.concatenate([t.astype(np.float32) for t in working_tracks], axis=0)
-    track_id_np = np.concatenate([
-        np.full(len(t), i, dtype=np.int64) for i, t in enumerate(working_tracks)
-    ])
+        flat_zyx_np = np.concatenate(
+            [t.astype(np.float32) for t in working_tracks], axis=0)
     keep_np = _track_points_far_from_anchors_mask(flat_zyx_np, anchor_tree, exclusion_radius)
-    original_keep_np = keep_np
-    flat_zyx_np = flat_zyx_np[keep_np]
-    track_id_np = track_id_np[keep_np]
     num_tracks_orig = len(working_tracks)
-    new_lengths = np.bincount(track_id_np, minlength=num_tracks_orig)
+    # Points are already grouped by track.  Segment reduction replaces the old
+    # int64 track-id-per-point array (7.3 GiB for the 2um store).
+    new_lengths = np.add.reduceat(
+        keep_np, input_offsets[:-1], dtype=np.int64)
     surviving = np.where(new_lengths >= 2)[0]
     print(f'kept {len(surviving)} / {len(working_tracks)} tracks')
     if len(surviving) == 0:
         return None
-    old_to_new = -np.ones(num_tracks_orig, dtype=np.int64)
-    old_to_new[surviving] = np.arange(len(surviving))
-    new_id = old_to_new[track_id_np]
-    keep2 = new_id >= 0
-    flat_zyx_np = flat_zyx_np[keep2]
-    new_id = new_id[keep2]
-    sort_idx = np.argsort(new_id, kind='stable')
-    flat_zyx_np = flat_zyx_np[sort_idx]
+    # Drop the residual 0/1-point tracks without constructing IDs or sorting:
+    # stable boolean compaction preserves both track and local-point order.
+    surviving_points = np.repeat(
+        new_lengths >= 2, np.diff(input_offsets))
+    keep_np &= surviving_points
+    del surviving_points
     lengths_new = new_lengths[surviving].astype(np.int64)
+    compact_zyx_np = flat_zyx_np[keep_np]
     crossing_csr_override = None
     if track_graph is not None:
-        retained_old_points = np.flatnonzero(original_keep_np)[keep2][sort_idx]
-        old_point_to_new = np.full(
-            len(original_keep_np), -1, dtype=np.int32)
-        old_point_to_new[retained_old_points] = np.arange(
-            len(retained_old_points), dtype=np.int32)
+        if int(keep_np.sum()) >= np.iinfo(np.int32).max:
+            raise ValueError(
+                'point-clipped track output exceeds the int32 crossing limit')
+        old_point_to_new = np.cumsum(
+            keep_np, dtype=np.int32) - np.int32(1)
+        old_point_to_new[~keep_np] = -1
         output_offsets = np.empty(len(lengths_new) + 1, dtype=np.int64)
         output_offsets[0] = 0
         np.cumsum(lengths_new, out=output_offsets[1:])
         crossing_csr_override = track_graph.clipped_csr(
             working_source_ids, input_offsets, surviving,
             old_point_to_new, output_offsets)
-        del old_point_to_new, retained_old_points
+        del old_point_to_new
         print(
             f'track crossings: remapped TrackGraph after point exclusion '
             f'({len(crossing_csr_override["partners"])} directed crossings)')
-    prepared_track_list = list(np.split(flat_zyx_np, np.cumsum(lengths_new)[:-1]))
+    del keep_np, flat_zyx_np
+    prepared_track_list = _MemmapTrackCollection(
+        compact_zyx_np,
+        np.r_[np.int64(0), np.cumsum(lengths_new, dtype=np.int64)])
     print(
         f'track radius loss: {len(surviving)}/{num_tracks_orig} tracks survive exclusion '
         f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
     )
     return finish_prepared(
-        flat_zyx_np, lengths_new, surviving, prepared_track_list,
+        compact_zyx_np, lengths_new, surviving, prepared_track_list,
         crossing_csr_override=crossing_csr_override)
 
 

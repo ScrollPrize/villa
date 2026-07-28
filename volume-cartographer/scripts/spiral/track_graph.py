@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import time
 
 import numpy as np
@@ -102,6 +103,253 @@ class TrackGraph:
     @property
     def edge_count(self):
         return self.graph.num_edges()
+
+    def node_for_source_id(self, source_id):
+        """Return the graph node for one stable track source ID."""
+        source_id = np.uint64(source_id)
+        node = int(np.searchsorted(self.source_ids, source_id))
+        if node >= len(self.source_ids) or self.source_ids[node] != source_id:
+            raise KeyError(int(source_id))
+        return node
+
+    def crossing_record(self, track, partner):
+        """Return the directed CSR record for track -> partner."""
+        track = int(track)
+        partner = int(partner)
+        if not self.graph.has_node(track):
+            raise IndexError(f"track graph has no node {track}")
+        begin = int(self.offsets[track])
+        end = int(self.offsets[track + 1])
+        local_partners = self.partners[begin:end]
+        slot = int(np.searchsorted(local_partners, partner))
+        if slot >= len(local_partners) or local_partners[slot] != partner:
+            raise KeyError((track, partner))
+        return begin + slot
+
+    def _bounded_path_to_root(
+            self, current, root, remaining_new_tracks, forbidden):
+        """Return one simple path suffix to root, or None."""
+        for neighbor in self.graph.neighbors(current):
+            neighbor = int(neighbor)
+            if neighbor == root:
+                return (current, root)
+            if remaining_new_tracks <= 0 or neighbor in forbidden:
+                continue
+            forbidden.add(neighbor)
+            suffix = self._bounded_path_to_root(
+                neighbor, root, remaining_new_tracks - 1, forbidden)
+            forbidden.remove(neighbor)
+            if suffix is not None:
+                return (current, *suffix)
+        return None
+
+    def transition_return_cycle_witness(
+            self, original, current, candidate, *, visited=None,
+            minimum_candidate_travel=20.0, max_cycle_tracks=4):
+        """Return a witness proving a candidate could close to original.
+
+        ``visited`` is the current simple walk path from ``original`` through
+        ``current``. The witness contains that prefix, ``candidate``, and a
+        simple non-backtracking suffix back to ``original``. Only the first
+        exit on ``candidate`` is subject to ``minimum_candidate_travel``.
+        """
+        original = int(original)
+        current = int(current)
+        candidate = int(candidate)
+        max_cycle_tracks = int(max_cycle_tracks)
+        minimum_candidate_travel = float(minimum_candidate_travel)
+        if (not np.isfinite(minimum_candidate_travel)
+                or minimum_candidate_travel < 0):
+            raise ValueError(
+                "minimum candidate travel must be finite and non-negative")
+        if max_cycle_tracks < 3:
+            return None
+        if visited is None:
+            if current != original:
+                raise ValueError(
+                    "visited is required when current is not original")
+            visited = (original,)
+        else:
+            visited = tuple(map(int, visited))
+        if (not visited or visited[0] != original
+                or visited[-1] != current):
+            raise ValueError(
+                "visited must run from original through current")
+        if len(set(visited)) != len(visited):
+            raise ValueError("visited must not repeat tracks")
+        if candidate in visited:
+            return None
+        if len(visited) + 1 > max_cycle_tracks:
+            return None
+
+        try:
+            entry_record = self.crossing_record(candidate, current)
+        except KeyError:
+            return None
+        entry_position = float(self.positions[entry_record])
+        forbidden = set(visited)
+        forbidden.add(candidate)
+        remaining_after_candidate = (
+            max_cycle_tracks - len(visited) - 1)
+        begin = int(self.offsets[candidate])
+        end = int(self.offsets[candidate + 1])
+        for exit_record in range(begin, end):
+            exit_partner = int(self.partners[exit_record])
+            if exit_partner == current:
+                continue
+            if abs(float(self.positions[exit_record]) - entry_position) \
+                    < minimum_candidate_travel:
+                continue
+            if exit_partner == original:
+                return (*visited, candidate, original)
+            if (remaining_after_candidate <= 0
+                    or exit_partner in forbidden):
+                continue
+            suffix_forbidden = set(forbidden)
+            suffix_forbidden.add(exit_partner)
+            suffix = self._bounded_path_to_root(
+                exit_partner,
+                original,
+                remaining_after_candidate - 1,
+                suffix_forbidden,
+            )
+            if suffix is not None:
+                return (*visited, candidate, *suffix)
+        return None
+
+    def transition_has_return_cycle(
+            self, original, current, candidate, *, visited=None,
+            minimum_candidate_travel=20.0, max_cycle_tracks=4):
+        """Whether candidate passes the root-return quality gate."""
+        return self.transition_return_cycle_witness(
+            original,
+            current,
+            candidate,
+            visited=visited,
+            minimum_candidate_travel=minimum_candidate_travel,
+            max_cycle_tracks=max_cycle_tracks,
+        ) is not None
+
+    def gated_random_walk(
+            self, original, steps, *, rng=None,
+            minimum_candidate_travel=20.0, max_cycle_tracks=4):
+        """Randomly extend a simple walk using the root-return quality gate."""
+        original = int(original)
+        steps = int(steps)
+        if steps < 0:
+            raise ValueError("walk steps must be non-negative")
+        if not self.graph.has_node(original):
+            raise IndexError(f"track graph has no node {original}")
+        rng = np.random.default_rng() if rng is None else rng
+        visited = [original]
+        for _ in range(steps):
+            current = visited[-1]
+            eligible = [
+                int(candidate)
+                for candidate in self.graph.neighbors(current)
+                if self.transition_has_return_cycle(
+                    original,
+                    current,
+                    int(candidate),
+                    visited=visited,
+                    minimum_candidate_travel=minimum_candidate_travel,
+                    max_cycle_tracks=max_cycle_tracks,
+                )
+            ]
+            if not eligible:
+                break
+            visited.append(int(rng.choice(eligible)))
+        return tuple(visited)
+
+    def _short_cycle_neighbors(self, node, max_tracks):
+        node = int(node)
+        max_tracks = int(max_tracks)
+        if max_tracks < 3:
+            return node, max_tracks, [], {}
+        if max_tracks > 4:
+            raise ValueError(
+                "short-cycle queries support at most four tracks")
+        if not self.graph.has_node(node):
+            raise IndexError(f"track graph has no node {node}")
+        root_neighbors = sorted(set(self.graph.neighbors(node)))
+        neighbor_sets = {
+            neighbor: set(self.graph.neighbors(neighbor))
+            for neighbor in root_neighbors
+        }
+        return node, max_tracks, root_neighbors, neighbor_sets
+
+    def iter_short_cycles_through(
+            self, node, *, max_tracks=4, return_source_ids=False):
+        """Yield unique simple cycles through one known starting track.
+
+        The start node is present once in each returned tuple and the closing
+        edge back to it is implicit. Cycles are simple (no repeated vertices),
+        and choosing the smaller of the start node's two cycle-neighbors first
+        removes the reverse-orientation duplicate.
+        """
+        node, max_tracks, root_neighbors, neighbor_sets = \
+            self._short_cycle_neighbors(node, max_tracks)
+        root_neighbor_set = set(root_neighbors)
+
+        # node -> left -> right -> node
+        for left in root_neighbors:
+            for right in sorted(
+                    root_neighbor_set.intersection(neighbor_sets[left])):
+                if left < right:
+                    cycle = (node, left, right)
+                    yield (
+                        tuple(int(self.source_ids[index]) for index in cycle)
+                        if return_source_ids else cycle)
+
+        if max_tracks == 4:
+            # node -> left -> middle -> right -> node. Iterating unordered
+            # pairs of root neighbors gives each reversed cycle only once.
+            for left, right in itertools.combinations(root_neighbors, 2):
+                middles = (
+                    neighbor_sets[left].intersection(neighbor_sets[right])
+                    - {node}
+                )
+                for middle in sorted(middles):
+                    cycle = (node, left, middle, right)
+                    yield (
+                        tuple(int(self.source_ids[index]) for index in cycle)
+                        if return_source_ids else cycle)
+
+    def short_cycles_through(
+            self, node, *, max_tracks=4, return_source_ids=False,
+            limit=None):
+        """Return cycles through one start track, optionally capped by limit."""
+        cycles = self.iter_short_cycles_through(
+            node, max_tracks=max_tracks,
+            return_source_ids=return_source_ids)
+        if limit is None:
+            return list(cycles)
+        limit = int(limit)
+        if limit < 0:
+            raise ValueError("cycle limit must be non-negative")
+        return list(itertools.islice(cycles, limit))
+
+    def count_short_cycles_through(self, node, *, max_tracks=4):
+        """Count short cycles through one start without materializing them."""
+        node, max_tracks, root_neighbors, neighbor_sets = \
+            self._short_cycle_neighbors(node, max_tracks)
+        root_neighbor_set = set(root_neighbors)
+        triangle_count = sum(
+            sum(left < right for right in (
+                root_neighbor_set.intersection(neighbor_sets[left])))
+            for left in root_neighbors
+        )
+        four_track_count = 0
+        if max_tracks == 4:
+            for left, right in itertools.combinations(root_neighbors, 2):
+                four_track_count += len(
+                    neighbor_sets[left].intersection(neighbor_sets[right])
+                    - {node})
+        return {
+            3: triangle_count,
+            4: four_track_count,
+            "total": triangle_count + four_track_count,
+        }
 
     def _selected_records(self, selected_source_ids):
         """Return selected-row records with partners remapped locally."""
