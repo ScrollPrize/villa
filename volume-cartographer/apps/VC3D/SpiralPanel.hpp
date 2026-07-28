@@ -167,6 +167,7 @@ private:
     QJsonObject _attachedAdvancedConfig;
     QJsonObject _defaultAdvancedConfig;
     QSet<QString> _runConfigKeys;
+    QSet<QString> _runMutablePaths;
     qint64 _advancedSessionGeneration = -1;
 
     QString _currentProfileId;

@@ -148,23 +148,23 @@ class TrackWalkConfigurationTests(unittest.TestCase):
     def test_defaults_preserve_count_mode(self):
         policy = validate_track_sampling_config({})
         self.assertEqual(policy["crossing_mode"], "count")
-        self.assertEqual(policy["min_walk_steps_per_track"], 24)
-        self.assertEqual(policy["max_walk_steps_per_track"], 256)
-        self.assertEqual(policy["n_walks_per_track"], 4)
+        self.assertEqual(policy["track_min_walk_steps_per_track"], 24)
+        self.assertEqual(policy["track_max_walk_steps_per_track"], 256)
+        self.assertEqual(policy["track_n_walks_per_track"], 4)
         self.assertFalse(policy["walk_require_loop_consistency"])
 
     def test_validation(self):
         with self.assertRaisesRegex(ValueError, "track_crossing_mode"):
             validate_track_sampling_config({"track_crossing_mode": "bad"})
-        for key in ("min_walk_steps_per_track", "max_walk_steps_per_track",
-                    "n_walks_per_track"):
+        for key in ("track_min_walk_steps_per_track", "track_max_walk_steps_per_track",
+                    "track_n_walks_per_track"):
             with self.subTest(key=key), self.assertRaisesRegex(
                     ValueError, "positive integer"):
                 validate_track_sampling_config({key: 0})
         with self.assertRaisesRegex(ValueError, "must be <="):
             validate_track_sampling_config({
-                "min_walk_steps_per_track": 10,
-                "max_walk_steps_per_track": 9,
+                "track_min_walk_steps_per_track": 10,
+                "track_max_walk_steps_per_track": 9,
             })
         with self.assertRaisesRegex(ValueError, "must be boolean"):
             validate_track_sampling_config({
@@ -192,9 +192,9 @@ class TrackWalkConfigurationTests(unittest.TestCase):
         config = validate_track_sampling_config({
             "track_crossing_mode": "track_walk",
             "track_crossing_precompute_max": 0,
-            "min_walk_steps_per_track": 30,
-            "max_walk_steps_per_track": 30,
-            "n_walks_per_track": 4,
+            "track_min_walk_steps_per_track": 30,
+            "track_max_walk_steps_per_track": 30,
+            "track_n_walks_per_track": 4,
         })
         prepared = prepare_main_phase_tracks(
             tracks, None, 0.0, torch.device("cpu"),

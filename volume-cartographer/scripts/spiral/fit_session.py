@@ -16,73 +16,17 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 import zipfile
 
+from config import Config
 
 
-# Version 12 expands Run configuration with native track-walk hop controls.
-API_VERSION = 12
-
-
-# Counts which describe how many training objects/points are sampled per
-# optimizer step. The service exposes the post-scaling values actually used by
-# the resident fitter, and Run-scoped edits set those active values directly.
-RUN_MUTABLE_SAMPLING_KEYS = frozenset({
-    "num_patches_per_step",
-    "num_patches_per_step_for_dt",
-    "num_points_per_patch",
-    "unverified_num_patches_per_step",
-    "unverified_num_patches_per_step_for_dt",
-    "unverified_num_points_per_patch",
-    "rel_winding_num_pcls",
-    "rel_winding_num_patch_pairs_per_pcl",
-    "abs_winding_num_pcls",
-    "abs_winding_num_points_per_pcl",
-    "unattached_pcl_num_per_step",
-    "unattached_pcl_num_points_per_step",
-    "track_num_per_step",
-    "track_num_points_per_step",
-    "dense_normals_num_points",
-    "dense_spacing_num_pairs",
-    "dense_spacing_density_extra_pairs",
-    "dense_attachment_num_points",
-    "min_spacing_independent_samples",
-    "regularisation_num_points",
-    "shell_num_samples",
-})
-
-
-RUN_MUTABLE_BOOLEAN_KEYS = frozenset({
-    "save_png_visualizations",
-})
-
-
-RUN_MUTABLE_TRACK_POLICY_KEYS = frozenset({
-    "track_length_bin_weights",
-    "max_track_crossing_per_step",
-    "track_min_sample_spacing",
-    "track_max_sample_spacing",
-    "min_walk_steps_per_track",
-    "max_walk_steps_per_track",
-    "n_walks_per_track",
-})
-
-
-def is_run_mutable_config_key(key: str) -> bool:
-    """Return whether an advanced setting may change at a Run boundary."""
-    return (
-        key in RUN_MUTABLE_SAMPLING_KEYS
-        or key in RUN_MUTABLE_BOOLEAN_KEYS
-        or key in RUN_MUTABLE_TRACK_POLICY_KEYS
-        or (key.startswith("loss_weight_") and key != "loss_weight_anchor")
-        or key.startswith("loss_start_")
-    )
+# Version 14 adds shell-only reloads and advertised mutable input paths.
+API_VERSION = 14
 
 
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Select the Run-scoped editor fields from a complete fitter config."""
-    return {
-        key: value for key, value in config.items()
-        if is_run_mutable_config_key(key)
-    }
+    fields = Config.catalog()["schema"]["fields"]
+    return {key: value for key, value in config.items()
+            if fields[key]["runtime_impact"] in {"run_boundary", "shell_reload"}}
 
 
 def apply_optional_input_selection(config: dict[str, Any]) -> dict[str, Any]:
@@ -91,39 +35,39 @@ def apply_optional_input_selection(config: dict[str, Any]) -> dict[str, Any]:
         for key in keys:
             config[key] = 0
 
-    if not bool(config.get("use_verified_patches", True)):
+    if not bool(config.get("input_use_verified_patches", True)):
         zero("loss_weight_patch_radius", "loss_weight_patch_dt",
              "loss_weight_umbilicus", "loss_weight_shell_patch_radius",
-             "num_patches_per_step", "num_patches_per_step_for_dt",
-             "num_points_per_patch")
-    if not bool(config.get("use_unverified_patches", True)):
+             "sample_count_patches_per_step", "sample_count_patches_per_step_for_dt",
+             "sample_count_points_per_patch")
+    if not bool(config.get("input_use_unverified_patches", True)):
         zero("loss_weight_unverified_patch_radius",
              "loss_weight_unverified_patch_dt",
-             "unverified_num_patches_per_step",
-             "unverified_num_patches_per_step_for_dt",
-             "unverified_num_points_per_patch")
-    normals = bool(config.get("use_normals", True))
-    sdt = bool(config.get("use_surf_sdt", True))
+             "sample_count_unverified_patches_per_step",
+             "sample_count_unverified_patches_per_step_for_dt",
+             "sample_count_unverified_points_per_patch")
+    normals = bool(config.get("input_use_normals", True))
+    sdt = bool(config.get("input_use_surf_sdt", True))
     if not normals:
-        zero("loss_weight_dense_normals", "dense_normals_num_points")
-    if not bool(config.get("use_tracks", True)):
+        zero("loss_weight_dense_normals", "sample_count_dense_normal_points")
+    if not bool(config.get("input_use_tracks", True)):
         zero("loss_weight_track_radius", "loss_weight_track_dt",
-             "track_num_per_step", "track_num_points_per_step")
-    if not bool(config.get("use_fibers", True)):
+             "sample_count_tracks_per_step", "sample_count_track_points_per_step")
+    if not bool(config.get("input_use_fibers", True)):
         zero("loss_weight_unattached_pcl_radius", "loss_weight_unattached_pcl_dt",
-             "unattached_pcl_num_per_step", "unattached_pcl_num_points_per_step")
+             "sample_count_unattached_pcls_per_step", "sample_count_unattached_pcl_points_per_step")
 
     spacing_mode = str(config.get("dense_spacing_mode", "phase"))
     if not sdt or not normals:
         zero("loss_weight_dense_spacing_count",
              "loss_weight_dense_spacing_density",
-             "loss_weight_dense_attachment", "dense_spacing_count_extra_pairs",
-             "dense_spacing_density_extra_pairs", "dense_attachment_num_points")
+             "loss_weight_dense_attachment", "sample_count_dense_spacing_count_extra_pairs",
+             "sample_count_dense_spacing_density_extra_pairs", "sample_count_dense_attachment_points")
         if spacing_mode == "phase":
-            zero("loss_weight_dense_spacing", "dense_spacing_num_pairs")
-    if (not bool(config.get("use_gradient_magnitude", True))
+            zero("loss_weight_dense_spacing", "sample_count_dense_spacing_pairs")
+    if (not bool(config.get("input_use_gradient_magnitude", True))
             and spacing_mode == "grad_mag"):
-        zero("loss_weight_dense_spacing", "dense_spacing_num_pairs")
+        zero("loss_weight_dense_spacing", "sample_count_dense_spacing_pairs")
     return config
 
 
@@ -446,13 +390,13 @@ def validate_session_request(
             errors.append({"field": field_name, "message": "Directory is not readable"})
 
     require_file(paths.umbilicus, "umbilicus", json_file=True)
-    disable_patches = bool(run.config.get("disable_patches", False))
-    use_verified = bool(run.config.get("use_verified_patches", True)) and not disable_patches
-    use_unverified = bool(run.config.get("use_unverified_patches", True)) and not disable_patches
+    disable_patches = bool(run.config.get("input_disable_patches", False))
+    use_verified = bool(run.config.get("input_use_verified_patches", True)) and not disable_patches
+    use_unverified = bool(run.config.get("input_use_unverified_patches", True)) and not disable_patches
     optional_dir(paths.verified_patches, "verified_patches", required=use_verified)
     if use_unverified:
         optional_dir(paths.unverified_patches, "unverified_patches")
-    if bool(run.config.get("use_fibers", True)):
+    if bool(run.config.get("input_use_fibers", True)):
         optional_dir(paths.fibers, "fibers")
 
     shell_enabled = (
@@ -461,7 +405,7 @@ def validate_session_request(
     )
     optional_dir(paths.outer_shell, "outer_shell", required=shell_enabled)
 
-    if (bool(run.config.get("use_tracks", True)) and paths.tracks_dbm
+    if (bool(run.config.get("input_use_tracks", True)) and paths.tracks_dbm
             and not resolve_logical_dbm(paths.tracks_dbm)):
         errors.append({"field": "tracks_dbm", "message": "DBM logical base or backing file was not found"})
 
@@ -484,9 +428,9 @@ def validate_session_request(
                        "message": "Must be phase or grad_mag"})
         spacing_mode = None
 
-    normals_selected = bool(run.config.get("use_normals", True))
-    sdt_selected = bool(run.config.get("use_surf_sdt", True))
-    grad_mag_selected = bool(run.config.get("use_gradient_magnitude", True))
+    normals_selected = bool(run.config.get("input_use_normals", True))
+    sdt_selected = bool(run.config.get("input_use_surf_sdt", True))
+    grad_mag_selected = bool(run.config.get("input_use_gradient_magnitude", True))
     use_normals = (normals_selected
                    and float(run.config.get("loss_weight_dense_normals", 100.0)) > 0)
     spacing_enabled = float(run.config.get("loss_weight_dense_spacing", 12.0)) > 0

@@ -34,16 +34,16 @@ def _build_model(checkpoint, dataset, cfg, outward_sense):
     umbilicus_zyx = torch.from_numpy(np.concatenate([
         all_z[:, None], umbilicus_fn(all_z),
     ], axis=-1).astype(np.float32)).to(device)
-    radius = int(cfg['flow_bounds_radius'])
+    radius = int(cfg['model_flow_bounds_radius'])
     flow_min = torch.tensor([
-        model_z_begin - int(cfg['flow_bounds_z_margin']), -radius, -radius,
+        model_z_begin - int(cfg['model_flow_bounds_z_margin']), -radius, -radius,
     ], dtype=torch.int64, device=device)
     flow_max = torch.tensor([
-        model_z_end + int(cfg['flow_bounds_z_margin']), radius, radius,
+        model_z_end + int(cfg['model_flow_bounds_z_margin']), radius, radius,
     ], dtype=torch.int64, device=device)
     model = fs.SpiralAndTransform(
-        flow_integration_steps=int(cfg['num_flow_integration_steps']),
-        flow_integration_solver=cfg['flow_integration_solver'],
+        flow_integration_steps=int(cfg['model_num_flow_integration_steps']),
+        flow_integration_solver=cfg['model_flow_integration_solver'],
         flow_min_corner_zyx=flow_min,
         flow_max_corner_zyx=flow_max,
         umbilicus_zyx=umbilicus_zyx,
@@ -53,7 +53,7 @@ def _build_model(checkpoint, dataset, cfg, outward_sense):
     model.load_state_dict(checkpoint['spiral_and_transform'])
     model.eval()
     model.flow_field.flow_scales[1] = cfg[
-        'flow_field_high_res_lr_scale_final']
+        'model_flow_field_high_res_lr_scale_final']
     return model
 
 
@@ -125,14 +125,14 @@ def main():
         args.checkpoint.resolve() if args.checkpoint
         else dataset / 'checkpoint_fitted.ckpt')
     checkpoint = load_checkpoint_cpu(str(checkpoint_path))
-    cfg = dict(fs.default_config)
+    cfg = fs.Config().as_dict()
     cfg.update({
         key: value for key, value in checkpoint.get('cfg', {}).items()
         if key in cfg
     })
     cfg.update({
         'dense_spacing_mode': 'phase',
-        'dense_spacing_num_pairs': int(args.pairs),
+        'sample_count_dense_spacing_pairs': int(args.pairs),
         # Measure phase registration and count only; the barrier gradient is
         # probed separately and attachment is not part of this measurement.
         'loss_weight_min_spacing': 0.0,
@@ -268,8 +268,8 @@ def main():
                 'dense_spacing_phase_top2_margin',
                 'dense_spacing_phase_min_matched_windings',
                 'dense_spacing_phase_min_matched_mass',
-                'min_spacing_d_min_wv',
-                'min_spacing_independent_samples',
+                'dense_min_spacing_d_min_wv',
+                'sample_count_minimum_spacing_independent_samples',
             )
         },
         'summary': summary,

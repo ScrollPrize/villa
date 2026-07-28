@@ -85,12 +85,12 @@ class PerfectSpiralToX:
 
 def spacing_cfg(**overrides):
     cfg = {
-        'dense_spacing_num_pairs': 256,
+        'sample_count_dense_spacing_pairs': 256,
         'dense_spacing_pair_m_short': (1, 1),
         'dense_spacing_pair_m_long': (1, 1),
         'dense_spacing_pair_long_fraction': 0.0,
         'dense_spacing_count_temperature_wv': 0.5,
-        'dense_spacing_count_extra_pairs': 0,
+        'sample_count_dense_spacing_count_extra_pairs': 0,
         'dense_spacing_target_step_wv': 1.0,
         'dense_spacing_max_step_wv': 2.0,
         'dense_spacing_max_steps': 64,
@@ -119,9 +119,9 @@ def spacing_cfg(**overrides):
         'loss_weight_dense_spacing_count': 8.0,
         'loss_weight_min_spacing': 0.0,
         'loss_weight_dense_attachment': 0.0,
-        'min_spacing_d_min_wv': 6.0,
-        'min_spacing_independent_samples': 64,
-        'dense_attachment_num_points': 512,
+        'dense_min_spacing_d_min_wv': 6.0,
+        'sample_count_minimum_spacing_independent_samples': 64,
+        'sample_count_dense_attachment_points': 512,
         'dense_attachment_scale': 8.0,
     }
     cfg.update(overrides)
@@ -473,7 +473,7 @@ class SpacingLossTests(unittest.TestCase):
         # compute_pair_counts implementation under identical (k, m, theta, z)
         # samples, including gradients through the transform.
         volume = sheet_volume(96, [10, 20, 30, 40, 50, 60])
-        cfg = spacing_cfg(dense_spacing_num_pairs=64)
+        cfg = spacing_cfg(sample_count_dense_spacing_pairs=64)
         seed = 11
 
         offset_bundle = torch.tensor(1.5, requires_grad=True)

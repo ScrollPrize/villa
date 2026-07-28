@@ -211,7 +211,7 @@ class ProtocolTests(unittest.TestCase):
         session._incorporate_inputs = lambda *_: None
         session._idle_actions = []
         pending = [{"id": "new-patch"}]
-        influence = {"interactive_influence_theta_frac": 0.25}
+        influence = {"influence_theta_frac": 0.25}
 
         session.run(20, pending_inputs=pending, influence_config=influence)
 
@@ -248,13 +248,13 @@ class ProtocolTests(unittest.TestCase):
         session._configure_run = lambda config: setattr(session, "applied", config)
 
         session._run_configuration({
-            "num_patches_per_step": 101,
+            "sample_count_patches_per_step": 101,
             "loss_weight_patch_radius": 3.5,
             "loss_start_patch_dt": 123,
         })
 
         self.assertEqual(session.applied, {
-            "num_patches_per_step": 101,
+            "sample_count_patches_per_step": 101,
             "loss_weight_patch_radius": 3.5,
             "loss_start_patch_dt": 123,
         })

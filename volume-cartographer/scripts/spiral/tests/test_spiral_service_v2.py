@@ -41,6 +41,7 @@ from spiral_service import (ApiError, ArtifactRegistry, ExclusiveFileLock,
                             load_or_create_api_key, parse_gpu_ids,
                             parse_session_name)
 from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
+from config import Config
 
 
 class FakeSession:
@@ -48,22 +49,22 @@ class FakeSession:
         self.state = "Paused"
         self.run_calls = []
         self.run_config = {
-            "num_patches_per_step": 360,
+            "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "loss_start_patch_dt": 25_000,
             "loss_start_track_dt": 10_000,
-            "save_png_visualizations": False,
+            "output_save_png_visualizations": False,
             "track_length_bin_weights": None,
-            "max_track_crossing_per_step": 0,
+            "track_max_track_crossing_per_step": 0,
             "track_min_sample_spacing": 20.0,
             "track_max_sample_spacing": 60.0,
-            "min_walk_steps_per_track": 24,
-            "max_walk_steps_per_track": 256,
-            "n_walks_per_track": 4,
+            "track_min_walk_steps_per_track": 24,
+            "track_max_walk_steps_per_track": 256,
+            "track_n_walks_per_track": 4,
         }
         self.default_advanced_config = {
-            "learning_rate": 3e-5,
-            "num_patches_per_step": 360,
+            "optimizer_learning_rate": 3e-5,
+            "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "track_crossing_precompute_max": 8,
             "track_crossing_mode": "count",
@@ -71,6 +72,7 @@ class FakeSession:
         }
         self.saved = []
         self.closed = False
+        self.path_change_calls = []
 
     def status(self):
         return {
@@ -79,14 +81,15 @@ class FakeSession:
             "error": None, "preview_manifest_path": None, "preview_generation": 0,
             "supports_input_incorporation": True,
             "run_config": dict(self.run_config),
-            "run_config_limits": {"max_track_crossing_per_step": 8},
+            "run_config_limits": {"track_max_track_crossing_per_step": 8},
             "default_advanced_config": dict(self.default_advanced_config),
         }
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None):
+            influence_config=None, run_config=None, path_changes=None):
         self.run_calls.append((count, list(pending_inputs or []), mark_incorporated,
                                dict(influence_config or {}), dict(run_config or {})))
+        self.path_change_calls.append(dict(path_changes or {}))
         self.run_config.update(run_config or {})
         return 5 + count
 
@@ -110,7 +113,24 @@ def _attach_fake_session(state, output_directory, dataset_root=""):
         "verified_patches": str(Path(dataset_root) / "verified_patches") if dataset_root else "",
         "fibers": str(Path(dataset_root) / "fibers") if dataset_root else "",
     })
+    state.session_request = {
+        "paths": state.session_paths.manifest(),
+        "run": {"config": Config().as_dict()},
+    }
+    state.session_revision += 1
     return state.session
+
+
+def _planned_run(state, request):
+    request = dict(request)
+    configuration = Config(request.pop("run_config", {})).as_dict()
+    plan = state.plan_run({
+        "configuration": configuration,
+        "iterations": request.pop("iterations"),
+        "influence": request.pop("influence_config", {}),
+        "expected_session_revision": state.session_revision,
+    })
+    return state.run({"plan_token": plan["plan_token"]})
 
 
 def _digest(data):
@@ -553,13 +573,13 @@ class DatasetOwnershipTests(unittest.TestCase):
 
     def test_dataset_request_omits_disabled_optional_inputs(self):
         config = {
-            "use_verified_patches": False,
-            "use_unverified_patches": False,
-            "use_normals": False,
-            "use_surf_sdt": False,
-            "use_tracks": False,
-            "use_gradient_magnitude": False,
-            "use_fibers": False,
+            "input_use_verified_patches": False,
+            "input_use_unverified_patches": False,
+            "input_use_normals": False,
+            "input_use_surf_sdt": False,
+            "input_use_tracks": False,
+            "input_use_gradient_magnitude": False,
+            "input_use_fibers": False,
         }
         request = self.state._dataset_session_request({
             "run": {"z_begin": 0, "z_end": 10, "config": config},
@@ -571,13 +591,13 @@ class DatasetOwnershipTests(unittest.TestCase):
 
     def test_status_advertises_canonical_active_session_request(self):
         config = {
-            "use_verified_patches": True,
-            "use_unverified_patches": False,
-            "use_normals": False,
-            "use_surf_sdt": False,
-            "use_tracks": False,
-            "use_gradient_magnitude": False,
-            "use_fibers": False,
+            "input_use_verified_patches": True,
+            "input_use_unverified_patches": False,
+            "input_use_normals": False,
+            "input_use_surf_sdt": False,
+            "input_use_tracks": False,
+            "input_use_gradient_magnitude": False,
+            "input_use_fibers": False,
             "loss_weight_shell_outer": 0,
             "loss_weight_shell_patch_radius": 0,
             "loss_weight_patch_radius": 7.5,
@@ -617,13 +637,13 @@ class DatasetOwnershipTests(unittest.TestCase):
                 "z_begin": 0,
                 "z_end": 10,
                 "config": {
-                    "use_verified_patches": False,
-                    "use_unverified_patches": False,
-                    "use_normals": False,
-                    "use_surf_sdt": False,
-                    "use_tracks": False,
-                    "use_gradient_magnitude": False,
-                    "use_fibers": False,
+                    "input_use_verified_patches": False,
+                    "input_use_unverified_patches": False,
+                    "input_use_normals": False,
+                    "input_use_surf_sdt": False,
+                    "input_use_tracks": False,
+                    "input_use_gradient_magnitude": False,
+                    "input_use_fibers": False,
                     "loss_weight_shell_outer": 0,
                     "loss_weight_shell_patch_radius": 0,
                 },
@@ -695,7 +715,7 @@ class UploadTests(unittest.TestCase):
         self.assertIn(".spiral-ephemeral", str(published))
         status = self.state.status()
         self.assertEqual(status["ephemeral_inputs"][0]["id"], "patch-1")
-        self.assertEqual(status["default_advanced_config"]["learning_rate"], 3e-5)
+        self.assertEqual(status["default_advanced_config"]["optimizer_learning_rate"], 3e-5)
         self.assertNotEqual(status["default_advanced_config"], status["run_config"])
         # Finalize is idempotent.
         self.assertEqual(self.state.finalize_upload(upload_id)["input"]["id"],
@@ -746,7 +766,7 @@ class UploadTests(unittest.TestCase):
         upload_id = _upload_input(self.state, "pcl", "drawn-1", PCL_FILES,
                                   role="drawn_control_points")
         self.state.finalize_upload(upload_id)
-        self.state.run({"iterations": 2})
+        _planned_run(self.state, {"iterations": 2})
         _, pending, _, _, _ = session.run_calls[-1]
         self.assertEqual([(record["id"], record["role"]) for record in pending],
                          [("drawn-1", "drawn_control_points")])
@@ -781,7 +801,7 @@ class UploadTests(unittest.TestCase):
         session = self._session()
         upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
         self.state.finalize_upload(upload_id)
-        self.state.run({"iterations": 10})
+        _planned_run(self.state, {"iterations": 10})
         count, pending, mark, influence, _ = session.run_calls[-1]
         self.assertEqual(count, 10)
         self.assertEqual([record["id"] for record in pending], ["fiber-1"])
@@ -790,108 +810,121 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(self.state.status()["ephemeral_inputs"][0]["state"],
                          "incorporated")
         # A later run does not re-incorporate.
-        self.state.run({"iterations": 5})
+        _planned_run(self.state, {"iterations": 5})
         self.assertEqual(session.run_calls[-1][1], [])
 
     def test_run_passes_and_validates_transient_influence_config(self):
         session = self._session()
         influence = {
-            "interactive_influence_enabled": True,
-            "interactive_influence_z": 1200,
-            "interactive_influence_windings": 2.5,
-            "interactive_influence_theta_frac": 0.2,
-            "interactive_influence_disable_dt_frac": 0.4,
-            "interactive_influence_sigma": 0.25,
-            "interactive_influence_footprint_points": 512,
-            "interactive_influence_anchor_lattice_points": 2000,
-            "interactive_influence_anchor_geometry_points": 1000,
-            "interactive_influence_anchor_samples_per_step": 128,
-            "interactive_influence_anchor_ramp_power": 3.0,
+            "influence_enabled": True,
+            "influence_z": 1200,
+            "influence_windings": 2.5,
+            "influence_theta_frac": 0.2,
+            "influence_disable_dt_frac": 0.4,
+            "influence_sigma": 0.25,
+            "sample_count_influence_footprint_points": 512,
+            "sample_count_influence_anchor_lattice_points": 2000,
+            "sample_count_influence_anchor_geometry_points": 1000,
+            "sample_count_influence_anchor_samples_per_step": 128,
+            "influence_anchor_ramp_power": 3.0,
             "loss_weight_anchor": 15.0,
         }
-        self.state.run({"iterations": 10, "influence_config": influence})
+        _planned_run(self.state, {"iterations": 10, "influence_config": influence})
         self.assertEqual(session.run_calls[-1][3], influence)
 
         with self.assertRaises(ApiError) as caught:
-            self.state.run({"iterations": 10, "influence_config": {
-                "interactive_influence_theta_frac": 1.5,
+            _planned_run(self.state, {"iterations": 10, "influence_config": {
+                "influence_theta_frac": 1.5,
             }})
         self.assertEqual(caught.exception.status, 400)
 
     def test_run_passes_and_validates_mutable_training_config(self):
         session = self._session()
         config = {
-            "num_patches_per_step": 240,
+            "sample_count_patches_per_step": 240,
             "loss_weight_patch_radius": 3.5,
             "loss_start_track_dt": None,
-            "save_png_visualizations": True,
+            "output_save_png_visualizations": True,
             "track_length_bin_weights": [0.2, 0.3, 0.5],
-            "max_track_crossing_per_step": 3,
+            "track_max_track_crossing_per_step": 3,
             "track_min_sample_spacing": 12.0,
             "track_max_sample_spacing": 32.0,
-            "min_walk_steps_per_track": 18,
-            "max_walk_steps_per_track": 96,
-            "n_walks_per_track": 5,
+            "track_min_walk_steps_per_track": 18,
+            "track_max_walk_steps_per_track": 96,
+            "track_n_walks_per_track": 5,
         }
 
-        response = self.state.run({"iterations": 10, "run_config": config})
+        response = _planned_run(self.state, {"iterations": 10, "run_config": config})
 
         self.assertEqual(session.run_calls[-1][4], config)
-        self.assertEqual(response["run_config"]["num_patches_per_step"], 240)
+        self.assertEqual(response["run_config"]["sample_count_patches_per_step"], 240)
 
-        with self.assertRaisesRegex(ApiError, "non-mutable"):
-            self.state.run({"iterations": 10, "run_config": {
-                "learning_rate": 1e-4,
+        with self.assertRaisesRegex(ApiError, "Start New Fit"):
+            _planned_run(self.state, {"iterations": 10, "run_config": {
+                "model_num_flow_stages": 2,
             }})
-        with self.assertRaisesRegex(ApiError, "at least 1"):
-            self.state.run({"iterations": 10, "run_config": {
-                "num_patches_per_step": 0,
+        with self.assertRaisesRegex(ValueError, "Invalid value"):
+            _planned_run(self.state, {"iterations": 10, "run_config": {
+                "output_save_png_visualizations": 1,
             }})
-        with self.assertRaisesRegex(ApiError, "must be boolean"):
-            self.state.run({"iterations": 10, "run_config": {
-                "save_png_visualizations": 1,
-            }})
-        with self.assertRaisesRegex(ApiError, "three finite non-negative"):
-            self.state.run({"iterations": 10, "run_config": {
+        with self.assertRaisesRegex(ValueError, "vector length"):
+            _planned_run(self.state, {"iterations": 10, "run_config": {
                 "track_length_bin_weights": [1, 2],
-            }})
-        with self.assertRaisesRegex(ApiError, "prepared limit"):
-            self.state.run({"iterations": 10, "run_config": {
-                "max_track_crossing_per_step": 9,
-            }})
-        with self.assertRaisesRegex(ApiError, "finite positive"):
-            self.state.run({"iterations": 10, "run_config": {
-                "track_min_sample_spacing": 0,
-            }})
-        with self.assertRaisesRegex(ApiError, "must be <="):
-            self.state.run({"iterations": 10, "run_config": {
-                "track_min_sample_spacing": 33,
-            }})
-        with self.assertRaisesRegex(ApiError, "positive integer"):
-            self.state.run({"iterations": 10, "run_config": {
-                "n_walks_per_track": 0,
-            }})
-        with self.assertRaisesRegex(ApiError, "must be <="):
-            self.state.run({"iterations": 10, "run_config": {
-                "min_walk_steps_per_track": 97,
-            }})
-        with self.assertRaisesRegex(ApiError, "non-mutable"):
-            self.state.run({"iterations": 10, "run_config": {
-                "track_crossing_mode": "track_walk",
             }})
 
     def test_run_accepts_advertised_zero_count_for_disabled_input(self):
         session = self._session()
-        session.run_config["dense_attachment_num_points"] = 0
+        session.run_config["sample_count_dense_attachment_points"] = 0
 
-        response = self.state.run({"iterations": 10, "run_config": {
-            "dense_attachment_num_points": 0,
+        response = _planned_run(self.state, {"iterations": 10, "run_config": {
+            "sample_count_dense_attachment_points": 0,
         }})
 
         self.assertEqual(session.run_calls[-1][4], {
-            "dense_attachment_num_points": 0,
+            "sample_count_dense_attachment_points": 0,
         })
-        self.assertEqual(response["run_config"]["dense_attachment_num_points"], 0)
+        self.assertEqual(response["run_config"]["sample_count_dense_attachment_points"], 0)
+
+    def test_outer_shell_path_is_a_shell_only_run_change(self):
+        session = self._session()
+        shell = self.dataset / "outer_shell_v2"
+        shell.mkdir()
+        inputs = self.state.session_paths.manifest()
+        inputs["outer_shell"] = str(shell)
+        plan = self.state.plan_run({
+            "configuration": Config().as_dict(),
+            "iterations": 3,
+            "inputs": inputs,
+            "expected_session_revision": self.state.session_revision,
+        })
+
+        self.assertFalse(plan["session_reload_required"])
+        self.assertEqual(plan["affected_prepared_inputs"], ["shell"])
+        self.assertEqual(plan["input_changes"][0]["runtime_impact"],
+                         "shell_reload")
+        self.state.run({"plan_token": plan["plan_token"]})
+        self.assertEqual(session.path_change_calls[-1], {
+            "outer_shell": str(shell),
+        })
+
+    def test_non_shell_path_and_patch_erosion_still_require_reload(self):
+        self._session()
+        inputs = self.state.session_paths.manifest()
+        inputs["verified_patches"] = str(self.dataset / "other-patches")
+        configuration = Config({
+            "patch_erode_patches": (
+                Config().patch_erode_patches + 1),
+        }).as_dict()
+        plan = self.state.plan_run({
+            "configuration": configuration,
+            "iterations": 3,
+            "inputs": inputs,
+            "expected_session_revision": self.state.session_revision,
+        })
+
+        self.assertTrue(plan["session_reload_required"])
+        with self.assertRaisesRegex(ApiError, "reloading fit inputs"):
+            self.state.run({"plan_token": plan["plan_token"]})
 
     def test_new_session_does_not_see_previous_ephemeral_inputs(self):
         self._session()
@@ -1304,7 +1337,7 @@ class CommitTests(unittest.TestCase):
         self.assertTrue(staged.exists())
         with self.assertRaisesRegex(ApiError, "already committed"):
             self.state.commit_inputs()
-        self.state.run({"iterations": 3})
+        _planned_run(self.state, {"iterations": 3})
         _, pending, mark, _, _ = self.session.run_calls[-1]
         self.assertEqual([entry["id"] for entry in pending], ["patch-9"])
         # Once incorporated, a committed record is done and leaves the list.
@@ -1318,12 +1351,12 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(response["removed"], "fiber-9")
         self.assertEqual(self.state.status()["ephemeral_inputs"], [])
         self.assertFalse(staged.exists())
-        self.state.run({"iterations": 1})
+        _planned_run(self.state, {"iterations": 1})
         self.assertEqual(self.session.run_calls[-1][1], [])
 
     def test_remove_incorporated_input_is_rejected(self):
         self._finalize("patch", "patch-9", PATCH_FILES)
-        self.state.run({"iterations": 1})
+        _planned_run(self.state, {"iterations": 1})
         _, pending, mark, _, _ = self.session.run_calls[-1]
         mark(pending)
         with self.assertRaises(ApiError) as caught:

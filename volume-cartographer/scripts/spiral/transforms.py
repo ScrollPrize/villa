@@ -31,7 +31,7 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         self.truncate_at_step = truncate_at_step
         self._event_dim = event_dim
         self._flow_range_zyx = self.flow_max_corner_zyx - self.flow_min_corner_zyx
-        self.num_flow_timesteps = getattr(flow_field, 'num_flow_timesteps', 1)
+        self.num_flow_timesteps = getattr(flow_field, 'model_num_flow_timesteps', 1)
         # Cached sampler/integrator closure at t=0 for the num_flow_timesteps==1 fast path.
         # Built once per diffeomorphism instance (one per training iteration), shared across
         # forward and inverse calls so per-iteration setup (e.g. trilinear LR->HR upsampling)
@@ -455,16 +455,16 @@ class SpiralAndTransform(nn.Module):
         self.linear_logits_scale = 40.  # larger value increases effective learning rate
 
         self.umbilicus_transform = UmbilicusTransform(umbilicus_zyx)
-        self.dr_per_winding_logit = nn.Parameter(torch.tensor(config['initial_dr_per_winding'] / self.dr_per_winding_scale, dtype=torch.float32))
+        self.dr_per_winding_logit = nn.Parameter(torch.tensor(config['model_initial_dr_per_winding'] / self.dr_per_winding_scale, dtype=torch.float32))
 
-        flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['flow_voxel_resolution']
-        flow_field_cls = CylindricalFlowField if config['flow_field_type'] == 'cylindrical' else CartesianFlowField
+        flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['model_flow_voxel_resolution']
+        flow_field_cls = CylindricalFlowField if config['model_flow_field_type'] == 'cylindrical' else CartesianFlowField
 
         def make_flow_field():
             return flow_field_cls(
                 flow_resolution,
-                lr_scale_factor=config['flow_field_high_res_lr_scale_initial'],
-                num_flow_timesteps=config['num_flow_timesteps'],
+                lr_scale_factor=config['model_flow_field_high_res_lr_scale_initial'],
+                num_flow_timesteps=config['model_num_flow_timesteps'],
             )
 
         # num_flow_stages: number of independent stationary flow fields whose integrated
@@ -472,19 +472,19 @@ class SpiralAndTransform(nn.Module):
         # spiral->slice direction; the inverse applies the stage inverses in reverse order via
         # ComposeTransform.inv). num_flow_stages == 1 is exactly the original single-field
         # behaviour: `flow_field` keeps its name/state_dict keys and `extra_flow_fields` is empty.
-        self.num_flow_stages = int(config.get('num_flow_stages', 1) or 1)
+        self.num_flow_stages = int(config.get('model_num_flow_stages', 1) or 1)
         assert self.num_flow_stages >= 1
         self.flow_field = make_flow_field()
         self.extra_flow_fields = nn.ModuleList([make_flow_field() for _ in range(self.num_flow_stages - 1)])
 
-        self.linear_logits = nn.Parameter(torch.zeros([int(flow_max_corner_zyx[0] - flow_min_corner_zyx[0]) // config['linear_z_resolution'], 2, 2], dtype=torch.float32))
+        self.linear_logits = nn.Parameter(torch.zeros([int(flow_max_corner_zyx[0] - flow_min_corner_zyx[0]) // config['model_linear_z_resolution'], 2, 2], dtype=torch.float32))
 
         self.gap_expander_params = GapExpanderParams(
-            resolution=config['gap_expander_logit_resolution'],
+            resolution=config['model_gap_expander_logit_resolution'],
             min_z=flow_min_corner_zyx[0],
             max_z=flow_max_corner_zyx[0],
-            num_windings=config['gap_expander_num_windings'],
-            dr_per_winding=config['initial_dr_per_winding'],  # this is a nominal (fixed) winding spacing which we only use to calculate the number of logits
+            num_windings=config['model_gap_expander_num_windings'],
+            dr_per_winding=config['model_initial_dr_per_winding'],  # this is a nominal (fixed) winding spacing which we only use to calculate the number of logits
         )
 
     @property
@@ -507,7 +507,7 @@ class SpiralAndTransform(nn.Module):
             self.get_dr_per_winding(),
             self.flow_min_corner_zyx[0],
             self.flow_max_corner_zyx[0],
-            self.cfg['gap_expander_lr_scale'],
+            self.cfg['model_gap_expander_lr_scale'],
             truncate_frac,
         )
         if self.spiral_outward_sense == 'CW':

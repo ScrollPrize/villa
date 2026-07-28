@@ -169,7 +169,7 @@ class CpuTrackStorageTests(unittest.TestCase):
             sampling_config={
                 'track_length_bin_weights': None,
                 'track_max_tortuosity': None,
-                'max_track_crossing_per_step': 0,
+                'track_max_track_crossing_per_step': 0,
             },
         )
 
@@ -238,7 +238,7 @@ class CpuTrackStorageTests(unittest.TestCase):
             sampling_config={
                 'track_length_bin_weights': [0.15, 0.25, 0.60],
                 'track_max_tortuosity': None,
-                'max_track_crossing_per_step': 0,
+                'track_max_track_crossing_per_step': 0,
             },
         )
 
@@ -314,7 +314,7 @@ class CpuTrackStorageTests(unittest.TestCase):
                 'track_length_bin_weights': None,
                 'track_max_tortuosity': None,
                 'track_crossing_precompute_max': 2,
-                'max_track_crossing_per_step': 2,
+                'track_max_track_crossing_per_step': 2,
             },
             track_families=['horizontal', 'vertical', 'vertical', 'vertical', 'vertical'],
         )
@@ -324,7 +324,7 @@ class CpuTrackStorageTests(unittest.TestCase):
             int(prepared['crossing_index_stats']['directed_crossings']), 6)
 
         configure_prepared_track_sampling(prepared, {
-            'max_track_crossing_per_step': 1,
+            'track_max_track_crossing_per_step': 1,
         })
 
         # Force primary track zero so the first draw uses the Run-scoped limit.
@@ -343,7 +343,7 @@ class CpuTrackStorageTests(unittest.TestCase):
         self.assertEqual(sample['group_width'], 2)
 
         configure_prepared_track_sampling(prepared, {
-            'max_track_crossing_per_step': 2,
+            'track_max_track_crossing_per_step': 2,
         })
         sample = _sample_prepared_track_points(prepared, 1, 4)
         self.assertEqual(sample['track_idx'][0], 0)
@@ -358,7 +358,7 @@ class CpuTrackStorageTests(unittest.TestCase):
             )
 
         configure_prepared_track_sampling(prepared, {
-            'max_track_crossing_per_step': 1,
+            'track_max_track_crossing_per_step': 1,
         })
         observed = set()
         for seed in range(32):
@@ -388,7 +388,7 @@ class CpuTrackStorageTests(unittest.TestCase):
             [horizontal, vertical, same_family], None, 0.0, 'cpu',
             sampling_config={
                 'track_crossing_precompute_max': 1,
-                'max_track_crossing_per_step': 1,
+                'track_max_track_crossing_per_step': 1,
             },
             track_families=['horizontal', 'vertical', 'vertical'],
         )
@@ -450,7 +450,7 @@ class CpuTrackStorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '>= 1'):
             validate_track_sampling_config({'track_max_tortuosity': 0.9})
         with self.assertRaisesRegex(ValueError, 'non-negative integer'):
-            validate_track_sampling_config({'max_track_crossing_per_step': 1.5})
+            validate_track_sampling_config({'track_max_track_crossing_per_step': 1.5})
         with self.assertRaisesRegex(ValueError, 'non-negative integer'):
             validate_track_sampling_config({
                 'track_crossing_precompute_max': -1,
@@ -484,8 +484,8 @@ class CpuTrackStorageTests(unittest.TestCase):
         ]
         prepared = prepare_main_phase_tracks(tracks, None, 0.0, 'cpu')
         config = {
-            'track_num_per_step': 2,
-            'track_num_points_per_step': 4,
+            'sample_count_tracks_per_step': 2,
+            'sample_count_track_points_per_step': 4,
             'track_radius_loss_margin': 0.025,
             'track_radius_target': 'mean',
             'track_radius_within_norm_p': 3.0,

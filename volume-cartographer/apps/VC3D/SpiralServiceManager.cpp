@@ -5,6 +5,7 @@
 #include "VCSettings.hpp"
 
 #include <QCoreApplication>
+#include <QApplication>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
@@ -16,7 +17,9 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QMessageBox>
 #include <QProcessEnvironment>
+#include <QPushButton>
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QSettings>
@@ -39,7 +42,7 @@ constexpr int kRemoteLogPollMs = 500;
 constexpr int kRestartProbeMs = 500;
 constexpr int kRestartTimeoutMs = 60000;
 constexpr int kMutationRetries = 2;
-constexpr int kSupportedApiVersion = 12;
+constexpr int kSupportedApiVersion = 14;
 constexpr int kPreviewCacheKept = 3;
 
 QString stateName(SpiralServiceManager::ConnectionState state)
@@ -356,6 +359,12 @@ void SpiralServiceManager::handleHealth(const QJsonObject& health)
         _remoteLogPoll->stop();
     }
     if (_serviceOwnsDataset) fetchAdvertisedDataset();
+    get(QStringLiteral("/configuration"), Timeout::Quick,
+        [this](const QJsonObject& catalog) {
+            _configurationDefaults =
+                catalog.value(QStringLiteral("defaults")).toObject();
+            emit configurationCatalogChanged(catalog);
+        });
     pollStatus();
 }
 
@@ -706,14 +715,66 @@ void SpiralServiceManager::uploadCheckpointForResume(
 
 void SpiralServiceManager::runIterations(int iterations,
                                          const QJsonObject& influenceConfig,
-                                         const QJsonObject& runConfig)
+                                         const QJsonObject& runConfig,
+                                         const QJsonObject& inputs)
 {
-    postWithRetry(QStringLiteral("/session/run"),
-                  {{QStringLiteral("command_id"), commandId()},
-                   {QStringLiteral("iterations"), iterations},
-                   {QStringLiteral("influence_config"), influenceConfig},
-                   {QStringLiteral("run_config"), runConfig}},
-                  Timeout::Command, kMutationRetries, {});
+    QJsonObject configuration = _configurationDefaults;
+    for (auto it = _appliedConfiguration.begin();
+         it != _appliedConfiguration.end(); ++it)
+        configuration[it.key()] = it.value();
+    for (auto it = runConfig.begin(); it != runConfig.end(); ++it)
+        configuration[it.key()] = it.value();
+    post(QStringLiteral("/session/run/plan"),
+         {{QStringLiteral("configuration"), configuration},
+          {QStringLiteral("iterations"), iterations},
+          {QStringLiteral("influence"), influenceConfig},
+          {QStringLiteral("inputs"), inputs},
+          {QStringLiteral("expected_session_revision"), _sessionRevision}},
+         Timeout::Command,
+         [this](const QJsonObject& plan) {
+             if (plan.value(QStringLiteral("new_fit_required")).toBool()) {
+                 QMessageBox::information(
+                     QApplication::activeWindow(), tr("Start New Fit required"),
+                     tr("These changes are incompatible with the resident model. "
+                        "Use New Fit to apply them."));
+                 emit configurationReviewRequested();
+                 return;
+             }
+             if (plan.value(QStringLiteral("session_reload_required")).toBool()) {
+                 QMessageBox::information(
+                     QApplication::activeWindow(), tr("Reload fit inputs required"),
+                     tr("These changes require reloading the resident fit inputs. "
+                        "Use New Fit to apply them."));
+                 emit configurationReviewRequested();
+                 return;
+             }
+             const bool changed =
+                 !plan.value(QStringLiteral("changes")).toArray().isEmpty()
+                 || plan.value(QStringLiteral("input_changed")).toBool();
+             if (changed) {
+                 QMessageBox box(QMessageBox::Question,
+                                 tr("Spiral configuration changed"),
+                                 tr("Configuration changed since last run: continue?"),
+                                 QMessageBox::Cancel,
+                                 QApplication::activeWindow());
+                 auto* proceed = box.addButton(tr("Continue Run"),
+                                               QMessageBox::AcceptRole);
+                 auto* review = box.addButton(tr("Review"),
+                                              QMessageBox::ActionRole);
+                 box.exec();
+                 if (box.clickedButton() == review) {
+                     emit configurationReviewRequested();
+                     return;
+                 }
+                 if (box.clickedButton() != proceed) return;
+             }
+             postWithRetry(
+                 QStringLiteral("/session/run"),
+                 {{QStringLiteral("command_id"), commandId()},
+                  {QStringLiteral("plan_token"),
+                   plan.value(QStringLiteral("plan_token"))}},
+                 Timeout::Command, kMutationRetries, {});
+         });
 }
 
 void SpiralServiceManager::stopAfterIteration()
@@ -1127,6 +1188,11 @@ void SpiralServiceManager::handleStatus(const QJsonObject& status)
     const qint64 generation = status.value(QStringLiteral("generation")).toInteger(-1);
     if (generation < _lastStatusGeneration) return;
     _lastStatusGeneration = generation;
+    _sessionRevision =
+        status.value(QStringLiteral("session_revision")).toInteger();
+    const QJsonObject applied =
+        status.value(QStringLiteral("applied_config")).toObject();
+    if (!applied.isEmpty()) _appliedConfiguration = applied;
     const QString sessionId =
         status.value(QStringLiteral("session_id")).toString();
     const bool active = !sessionId.isEmpty()

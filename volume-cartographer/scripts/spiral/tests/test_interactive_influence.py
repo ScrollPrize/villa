@@ -16,31 +16,31 @@ from transforms import GapExpanderParams, GapExpandingTransform, SpiralAndTransf
 
 
 TINY_CONFIG = {
-    'initial_dr_per_winding': 16.,
-    'flow_voxel_resolution': 8,  # 24^3 high-res lattice, 4^3 low-res: both have interior points
-    'flow_field_type': 'cartesian',
-    'flow_field_high_res_lr_scale_initial': 2.0e-1,
-    'num_flow_timesteps': 1,
-    'linear_z_resolution': 48,
-    'gap_expander_logit_resolution': 24,
-    'gap_expander_num_windings': 6,
-    'gap_expander_lr_scale': 0.3,
+    'model_initial_dr_per_winding': 16.,
+    'model_flow_voxel_resolution': 8,  # 24^3 high-res lattice, 4^3 low-res: both have interior points
+    'model_flow_field_type': 'cartesian',
+    'model_flow_field_high_res_lr_scale_initial': 2.0e-1,
+    'model_num_flow_timesteps': 1,
+    'model_linear_z_resolution': 48,
+    'model_gap_expander_logit_resolution': 24,
+    'model_gap_expander_num_windings': 6,
+    'model_gap_expander_lr_scale': 0.3,
     'output_first_winding': 1,
 }
 
 INFLUENCE_CONFIG = {
-    'random_seed': 1,
-    'interactive_influence_enabled': True,
-    'interactive_influence_z': 48.0,
-    'interactive_influence_windings': 1.5,
-    'interactive_influence_theta_frac': 0.25,
-    'interactive_influence_sigma': 0.3333,
-    'interactive_influence_footprint_points': 256,
+    'optimizer_random_seed': 1,
+    'influence_enabled': True,
+    'influence_z': 48.0,
+    'influence_windings': 1.5,
+    'influence_theta_frac': 0.25,
+    'influence_sigma': 0.3333,
+    'sample_count_influence_footprint_points': 256,
     'loss_weight_anchor': 20.0,
-    'interactive_influence_anchor_lattice_points': 200,
-    'interactive_influence_anchor_geometry_points': 200,
-    'interactive_influence_anchor_samples_per_step': 64,
-    'interactive_influence_anchor_ramp_power': 2.0,
+    'sample_count_influence_anchor_lattice_points': 200,
+    'sample_count_influence_anchor_geometry_points': 200,
+    'sample_count_influence_anchor_samples_per_step': 64,
+    'influence_anchor_ramp_power': 2.0,
     'shell_outer_winding_idx': 5,
 }
 
@@ -154,7 +154,7 @@ class GapCoordinateTests(unittest.TestCase):
 
         def radii():
             transform = GapExpandingTransform(
-                gap_params, torch.tensor(16.), min_z, max_z, TINY_CONFIG['gap_expander_lr_scale'])
+                gap_params, torch.tensor(16.), min_z, max_z, TINY_CONFIG['model_gap_expander_lr_scale'])
             with torch.no_grad():
                 return transform.get_transformed_winding_radii(theta_probe, z_probe)
 
@@ -187,7 +187,7 @@ class GapCoordinateTests(unittest.TestCase):
 
         def radii():
             transform = GapExpandingTransform(
-                gap_params, torch.tensor(16.), min_z, max_z, TINY_CONFIG['gap_expander_lr_scale'])
+                gap_params, torch.tensor(16.), min_z, max_z, TINY_CONFIG['model_gap_expander_lr_scale'])
             with torch.no_grad():
                 return transform.get_transformed_winding_radii(theta_probe, z_rows.clone())
 
@@ -232,7 +232,7 @@ class FlowLatticeMappingTests(unittest.TestCase):
         torch.testing.assert_close(round_trip, points, atol=0.5, rtol=0.)
 
     def test_two_stage_flow_round_trip(self):
-        model = make_tiny_model(num_flow_stages=2)
+        model = make_tiny_model(model_num_flow_stages=2)
         self.assertEqual(len(model.flow_fields), 2)
         with torch.no_grad():
             for flow_field in model.flow_fields:
@@ -326,7 +326,7 @@ class FreezeInvariantTests(unittest.TestCase):
         self.assertLess(float(moved_masked), float(moved_free))
 
     def test_flow_masks_apply_to_every_stage(self):
-        model = make_tiny_model(num_flow_stages=2)
+        model = make_tiny_model(model_num_flow_stages=2)
         state = make_influence_state(INFLUENCE_CONFIG, torch.device('cpu'))
         state._allocate_masks(model)
         state.masks['flow_lr'].zero_()

@@ -578,7 +578,7 @@ def validate_track_sampling_config(config):
             raise ValueError('track_max_tortuosity must be null or a finite number >= 1')
         max_tortuosity = float(max_tortuosity)
 
-    max_crossings = config.get('max_track_crossing_per_step', 0)
+    max_crossings = config.get('track_max_track_crossing_per_step', 0)
     if (isinstance(max_crossings, bool) or not isinstance(max_crossings, (int, float))
             or not math.isfinite(float(max_crossings))
             or not float(max_crossings).is_integer() or int(max_crossings) < 0):
@@ -603,17 +603,17 @@ def validate_track_sampling_config(config):
             "track_crossing_mode must be 'count' or 'track_walk'")
     walk_values = {}
     for key, default in (
-            ('min_walk_steps_per_track', 24),
-            ('max_walk_steps_per_track', 256),
-            ('n_walks_per_track', 4)):
+            ('track_min_walk_steps_per_track', 24),
+            ('track_max_walk_steps_per_track', 256),
+            ('track_n_walks_per_track', 4)):
         value = config.get(key, default)
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(float(value))
                 or not float(value).is_integer() or int(value) <= 0):
             raise ValueError(f'{key} must be a positive integer')
         walk_values[key] = int(value)
-    if (walk_values['min_walk_steps_per_track']
-            > walk_values['max_walk_steps_per_track']):
+    if (walk_values['track_min_walk_steps_per_track']
+            > walk_values['track_max_walk_steps_per_track']):
         raise ValueError(
             'min_walk_steps_per_track must be <= max_walk_steps_per_track')
     require_loop = config.get(
@@ -771,16 +771,16 @@ def configure_prepared_track_sampling(prepared_tracks, config):
         return
     current = {
         'track_length_bin_weights': prepared_tracks.get('length_bin_weights'),
-        'max_track_crossing_per_step': prepared_tracks.get('active_max_crossings', 0),
+        'track_max_track_crossing_per_step': prepared_tracks.get('active_max_crossings', 0),
         'track_crossing_precompute_max': prepared_tracks.get(
             'crossing_precompute_max', 0),
         'track_crossing_mode': prepared_tracks.get(
             'track_crossing_mode', 'count'),
-        'min_walk_steps_per_track': prepared_tracks.get(
-            'min_walk_steps_per_track', 24),
-        'max_walk_steps_per_track': prepared_tracks.get(
-            'max_walk_steps_per_track', 256),
-        'n_walks_per_track': prepared_tracks.get('n_walks_per_track', 4),
+        'track_min_walk_steps_per_track': prepared_tracks.get(
+            'track_min_walk_steps_per_track', 24),
+        'track_max_walk_steps_per_track': prepared_tracks.get(
+            'track_max_walk_steps_per_track', 256),
+        'track_n_walks_per_track': prepared_tracks.get('track_n_walks_per_track', 4),
         'track_walk_require_loop_consistency': prepared_tracks.get(
             'track_walk_require_loop_consistency', False),
     }
@@ -813,9 +813,11 @@ def configure_prepared_track_sampling(prepared_tracks, config):
             f'prepared crossing ceiling ({prepared_maximum}); reload with a larger '
             'track_crossing_precompute_max')
     prepared_tracks['active_max_crossings'] = maximum
-    for key in ('min_walk_steps_per_track', 'max_walk_steps_per_track',
-                'n_walks_per_track'):
+    for key in ('track_min_walk_steps_per_track', 'track_max_walk_steps_per_track',
+                'track_n_walks_per_track'):
         prepared_tracks[key] = policy[key]
+    prepared_tracks['track_walk_require_loop_consistency'] = \
+        policy['walk_require_loop_consistency']
 
 
 def _track_tangent(track, raw_index, radius_voxels=12.0):
@@ -2222,9 +2224,9 @@ def prepare_main_phase_tracks(
                 else 0),
             'track_crossing_mode': crossing_mode,
             'track_walk_require_loop_consistency': require_walk_loop,
-            'min_walk_steps_per_track': policy['min_walk_steps_per_track'],
-            'max_walk_steps_per_track': policy['max_walk_steps_per_track'],
-            'n_walks_per_track': policy['n_walks_per_track'],
+            'track_min_walk_steps_per_track': policy['track_min_walk_steps_per_track'],
+            'track_max_walk_steps_per_track': policy['track_max_walk_steps_per_track'],
+            'track_n_walks_per_track': policy['track_n_walks_per_track'],
         }
         if ((crossing_mode == 'count' and crossing_precompute_max > 0)
                 or crossing_mode == 'track_walk'):
@@ -2365,10 +2367,10 @@ def prepare_main_phase_tracks(
         configure_prepared_track_sampling(prepared, {
             'track_length_bin_weights': (
                 None if weights is None else weights.tolist()),
-            'max_track_crossing_per_step': max_crossings,
-            'min_walk_steps_per_track': policy['min_walk_steps_per_track'],
-            'max_walk_steps_per_track': policy['max_walk_steps_per_track'],
-            'n_walks_per_track': policy['n_walks_per_track'],
+            'track_max_track_crossing_per_step': max_crossings,
+            'track_min_walk_steps_per_track': policy['track_min_walk_steps_per_track'],
+            'track_max_walk_steps_per_track': policy['track_max_walk_steps_per_track'],
+            'track_n_walks_per_track': policy['track_n_walks_per_track'],
         })
         return prepared
 
@@ -2463,9 +2465,9 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
     if prepared_tracks.get('track_crossing_mode', 'count') == 'track_walk':
         cache_key = (
             min_spacing, max_spacing, 'track_walk',
-            prepared_tracks.get('min_walk_steps_per_track', 24),
-            prepared_tracks.get('max_walk_steps_per_track', 256),
-            prepared_tracks.get('n_walks_per_track', 4),
+            prepared_tracks.get('track_min_walk_steps_per_track', 24),
+            prepared_tracks.get('track_max_walk_steps_per_track', 256),
+            prepared_tracks.get('track_n_walks_per_track', 4),
             prepared_tracks.get(
                 'track_walk_require_loop_consistency', False),
         )
@@ -2928,12 +2930,12 @@ def _draw_track_walk_sample(
     seed = int(torch.randint(
         0, (1 << 63) - 1, (1,), dtype=torch.int64,
         device=device, generator=generator).item())
-    hops = int(prepared_tracks['n_walks_per_track'])
+    hops = int(prepared_tracks['track_n_walks_per_track'])
     result = native.sample_walks_adaptive(
         prepared_tracks['walk_index'], probabilities_cpu, seed=seed,
         groups=k, target_points=target_points, hops=hops,
-        minimum_steps=int(prepared_tracks['min_walk_steps_per_track']),
-        maximum_steps=int(prepared_tracks['max_walk_steps_per_track']),
+        minimum_steps=int(prepared_tracks['track_min_walk_steps_per_track']),
+        maximum_steps=int(prepared_tracks['track_max_walk_steps_per_track']),
         maximum_attempts=attempts,
     )
     produced = int(result['produced'])
@@ -2945,8 +2947,8 @@ def _draw_track_walk_sample(
             f'policy-compatible primary draws; '
             f'{stats.get("eligible_tracks", "unknown")} eligible tracks, '
             f'{hops} hops, raw-index bounds '
-            f'[{prepared_tracks["min_walk_steps_per_track"]}, '
-            f'{prepared_tracks["max_walk_steps_per_track"]}])')
+            f'[{prepared_tracks["track_min_walk_steps_per_track"]}, '
+            f'{prepared_tracks["track_max_walk_steps_per_track"]}])')
 
     width = hops + 1
     track_matrix = torch.from_numpy(
@@ -3049,9 +3051,9 @@ def _sample_prepared_track_points(
             walk_key = (
                 'track_walk', k, num_points_per_track,
                 float(min_sample_spacing), float(max_sample_spacing),
-                int(prepared_tracks['min_walk_steps_per_track']),
-                int(prepared_tracks['max_walk_steps_per_track']),
-                int(prepared_tracks['n_walks_per_track']),
+                int(prepared_tracks['track_min_walk_steps_per_track']),
+                int(prepared_tracks['track_max_walk_steps_per_track']),
+                int(prepared_tracks['track_n_walks_per_track']),
                 bool(prepared_tracks[
                     'track_walk_require_loop_consistency']),
             )
@@ -3223,11 +3225,11 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
         return
     sample = _sample_prepared_track_points(
         prepared_tracks,
-        cfg['track_num_per_step'],
-        cfg['track_num_points_per_step'],
+        cfg['sample_count_tracks_per_step'],
+        cfg['sample_count_track_points_per_step'],
         cfg.get('track_min_sample_spacing', 20.0),
         cfg.get('track_max_sample_spacing', 60.0),
-        cfg.get('max_track_crossing_per_step', 0),
+        cfg.get('track_max_track_crossing_per_step', 0),
     )
     if sample is None:
         yield 'track_radius', zero

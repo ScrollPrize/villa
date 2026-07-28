@@ -50,8 +50,8 @@ def scale_counts_for_z_range(
 
 
 SAMPLING_COUNT_FLOORS = {
-    'dense_spacing_num_pairs': 8_000,
-    'dense_spacing_density_extra_pairs': 16_000,
+    'sample_count_dense_spacing_pairs': 8_000,
+    'sample_count_dense_spacing_density_extra_pairs': 16_000,
 }
 
 
@@ -110,7 +110,7 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
             'fiber_tags': data.get('tags', []),
             'hv_classification': data.get('hv_classification', {}),
             'input_coordinate_scale': coordinate_scale,
-            'fiber_min_point_spacing': min_point_spacing,
+            'pcl_fiber_min_point_spacing': min_point_spacing,
             'fiber_original_num_points': original_num_points,
         },
         'color': color,
@@ -390,7 +390,7 @@ def _warn_if_inputs_exceed_flow_bounds(
     flow_field_radius,
     cfg,
 ):
-    gap_expander_num_windings = cfg['gap_expander_num_windings']
+    gap_expander_num_windings = cfg['model_gap_expander_num_windings']
 
     over_radius_patches = []
     over_winding_patches = []
@@ -661,7 +661,7 @@ def save_mesh(
         max_winding_idx = min(max_winding_idx, cfg['shell_outer_winding_idx'])
     print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
     grid_spacing = cfg['output_step_size']
-    z_margin = cfg['flow_bounds_z_margin']
+    z_margin = cfg['model_flow_bounds_z_margin']
     spiral_yxs_by_winding = get_spiral_yxs(max_winding_idx, dr_per_winding, grid_spacing, group_by_winding=True)
     num_thetas_by_winding = [len(yxs_for_winding) for yxs_for_winding in spiral_yxs_by_winding]
     spiral_yxs = torch.cat(spiral_yxs_by_winding, dim=0)
@@ -763,7 +763,7 @@ def save_combined_preview(
         )
 
     grid_spacing = int(cfg['output_step_size'])
-    z_margin = int(cfg['flow_bounds_z_margin'])
+    z_margin = int(cfg['model_flow_bounds_z_margin'])
     spiral_yxs_by_winding = get_spiral_yxs(
         last_winding + 1,
         dr_per_winding,

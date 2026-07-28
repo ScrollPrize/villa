@@ -3,6 +3,8 @@
 #include "VCSettings.hpp"
 
 #include <QComboBox>
+#include <QCheckBox>
+#include <QDoubleSpinBox>
 #include <QDialog>
 #include <QEvent>
 #include <QFile>
@@ -19,6 +21,9 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QSpinBox>
+#include <QTabWidget>
+#include <QTreeWidget>
 #include <QUuid>
 #include <QVBoxLayout>
 
@@ -26,6 +31,7 @@
 
 namespace {
 const QString kDefaultId = QStringLiteral("default");
+const QString kDefaultsId = QStringLiteral("catalog-defaults");
 const QString kCustomId = QStringLiteral("custom");
 
 QString profileStorePath()
@@ -103,6 +109,16 @@ QString formatted(const QJsonObject& object)
 {
     return QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Indented)).trimmed();
 }
+
+QString impactLabel(const QString& impact)
+{
+    if (impact == QStringLiteral("run_boundary")) return QObject::tr("Next Run");
+    if (impact == QStringLiteral("shell_reload")) return QObject::tr("Reload shell");
+    if (impact == QStringLiteral("prepared_input_rebuild"))
+        return QObject::tr("Reload fit inputs");
+    if (impact == QStringLiteral("new_fit")) return QObject::tr("Start New Fit");
+    return impact;
+}
 }
 
 SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
@@ -170,6 +186,22 @@ SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
     _dialog->resize(720, 620);
     _dialog->setLayout(new QVBoxLayout);
     _dialog->installEventFilter(this);
+    root->removeWidget(_editorContents);
+    _inlinePopInButton->setText(tr("Open Spiral Configuration…"));
+    _inlinePopInButton->show();
+    auto* tabs = new QTabWidget(_dialog);
+    _controlsPage = new QWidget(tabs);
+    auto* controlsLayout = new QVBoxLayout(_controlsPage);
+    _search = new QLineEdit(_controlsPage);
+    _search->setPlaceholderText(tr("Search controls…"));
+    controlsLayout->addWidget(_search);
+    _controls = new QTreeWidget(_controlsPage);
+    _controls->setHeaderLabels({tr("Control"), tr("Value"), tr("Impact")});
+    controlsLayout->addWidget(_controls);
+    tabs->addTab(_controlsPage, tr("Controls"));
+    tabs->addTab(_editorContents, tr("Expert JSON"));
+    _dialog->layout()->addWidget(tabs);
+    _poppedOut = true;
 
     connect(_profileCombo, qOverload<int>(&QComboBox::currentIndexChanged),
             this, [this](int index) {
@@ -184,11 +216,23 @@ SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
             this, &SpiralConfigProfileEditor::renameCurrent);
     connect(_deleteButton, &QPushButton::clicked,
             this, &SpiralConfigProfileEditor::deleteCurrent);
-    connect(_popButton, &QPushButton::clicked, this, [this]() {
-        _poppedOut ? popIn() : popOut();
-    });
+    _popButton->hide();
     connect(_inlinePopInButton, &QPushButton::clicked,
-            this, &SpiralConfigProfileEditor::popIn);
+            this, &SpiralConfigProfileEditor::showWindow);
+    connect(_search, &QLineEdit::textChanged, this, [this](const QString& text) {
+        for (int i = 0; i < _controls->topLevelItemCount(); ++i) {
+            auto* section = _controls->topLevelItem(i);
+            bool any = false;
+            for (int j = 0; j < section->childCount(); ++j) {
+                auto* field = section->child(j);
+                const bool visible = text.isEmpty()
+                    || field->text(0).contains(text, Qt::CaseInsensitive);
+                field->setHidden(!visible);
+                any |= visible;
+            }
+            section->setHidden(!any);
+        }
+    });
 
     loadProfiles();
     rebuildCombo();
@@ -226,6 +270,7 @@ void SpiralConfigProfileEditor::setSessionDefault(const QJsonObject& config)
     _cleanText = _sessionDefaultText;
     _dirty = false;
     validateCurrentText();
+    jsonToControls();
     updateUi();
     emit textChanged();
 }
@@ -237,17 +282,197 @@ void SpiralConfigProfileEditor::showSessionDefault()
 
 void SpiralConfigProfileEditor::clearSessionDefault()
 {
-    _sessionDefaultText = QStringLiteral("{}");
-    if (isDefaultProfile()) setSessionDefault(QJsonObject{});
+    const QJsonObject defaults =
+        _catalog.value(QStringLiteral("defaults")).toObject();
+    _sessionDefaultText = formatted(defaults);
+    if (isDefaultProfile()) setSessionDefault(defaults);
+}
+
+void SpiralConfigProfileEditor::setCatalog(const QJsonObject& catalog)
+{
+    _catalog = catalog;
+    if (_sessionDefaultText.trimmed() == QStringLiteral("{}"))
+        _sessionDefaultText =
+            formatted(_catalog.value(QStringLiteral("defaults")).toObject());
+    rebuildCombo();
+    rebuildControls();
+    if (isDefaultProfile())
+        applyCurrentProfileText();
+    else
+        jsonToControls();
+}
+
+void SpiralConfigProfileEditor::rebuildControls()
+{
+    _controls->clear();
+    _fieldEditors.clear();
+    const QJsonObject schema = _catalog.value(QStringLiteral("schema")).toObject();
+    const QJsonObject fields = schema.value(QStringLiteral("fields")).toObject();
+    QHash<QString, QTreeWidgetItem*> sections;
+    for (auto it = fields.begin(); it != fields.end(); ++it) {
+        const QString sectionName = it.key().section('_', 0, 0).toUpper();
+        auto* section = sections.value(sectionName);
+        if (!section) {
+            section = new QTreeWidgetItem(_controls, {sectionName, {}});
+            section->setExpanded(true);
+            sections.insert(sectionName, section);
+        }
+        const QJsonObject spec = it.value().toObject();
+        auto* item = new QTreeWidgetItem(section, {
+            spec.value(QStringLiteral("label")).toString(),
+            {}, impactLabel(
+                spec.value(QStringLiteral("runtime_impact")).toString())
+        });
+        item->setToolTip(0, it.key());
+        const QString type = spec.value(QStringLiteral("type")).toString();
+        QWidget* editor = nullptr;
+        if (type == QStringLiteral("boolean")) {
+            auto* value = new QCheckBox(_controls);
+            connect(value, &QCheckBox::toggled,
+                    this, &SpiralConfigProfileEditor::controlsToJson);
+            editor = value;
+        } else if (type == QStringLiteral("integer")) {
+            auto* value = new QSpinBox(_controls);
+            value->setRange(spec.value(QStringLiteral("minimum")).toInt(),
+                            spec.value(QStringLiteral("maximum")).toInt());
+            connect(value, qOverload<int>(&QSpinBox::valueChanged),
+                    this, [this] { controlsToJson(); });
+            editor = value;
+        } else if (type == QStringLiteral("number")) {
+            auto* value = new QDoubleSpinBox(_controls);
+            value->setRange(spec.value(QStringLiteral("minimum")).toDouble(),
+                            spec.value(QStringLiteral("maximum")).toDouble());
+            value->setDecimals(spec.value(QStringLiteral("precision")).toInt(6));
+            value->setSingleStep(spec.value(QStringLiteral("step")).toDouble(.01));
+            connect(value, qOverload<double>(&QDoubleSpinBox::valueChanged),
+                    this, [this] { controlsToJson(); });
+            editor = value;
+        } else if (type == QStringLiteral("enum")) {
+            auto* value = new QComboBox(_controls);
+            for (const QJsonValue& option :
+                 spec.value(QStringLiteral("values")).toArray())
+                value->addItem(option.toString());
+            connect(value, qOverload<int>(&QComboBox::currentIndexChanged),
+                    this, [this] { controlsToJson(); });
+            editor = value;
+        } else {
+            auto* value = new QLineEdit(_controls);
+            value->setPlaceholderText(
+                type == QStringLiteral("dictionary")
+                    ? tr("{ key: value }") : tr("[ values ]"));
+            connect(value, &QLineEdit::editingFinished,
+                    this, &SpiralConfigProfileEditor::controlsToJson);
+            editor = value;
+        }
+        editor->setProperty("spiralConfigKey", it.key());
+        QWidget* displayed = editor;
+        if (spec.value(QStringLiteral("nullable")).toBool()) {
+            displayed = new QWidget(_controls);
+            auto* row = new QHBoxLayout(displayed);
+            row->setContentsMargins(0, 0, 0, 0);
+            auto* enabled = new QCheckBox(tr("Enabled"), displayed);
+            editor->setProperty("nullableToggle",
+                                QVariant::fromValue<QObject*>(enabled));
+            row->addWidget(enabled);
+            row->addWidget(editor, 1);
+            connect(enabled, &QCheckBox::toggled, editor,
+                    [this, editor](bool on) {
+                        editor->setEnabled(on);
+                        controlsToJson();
+                    });
+        }
+        _fieldEditors.insert(it.key(), editor);
+        _controls->setItemWidget(item, 1, displayed);
+    }
+    for (int column = 0; column < _controls->columnCount(); ++column)
+        _controls->resizeColumnToContents(column);
+}
+
+void SpiralConfigProfileEditor::controlsToJson()
+{
+    if (_programmatic) return;
+    QJsonObject values;
+    for (auto it = _fieldEditors.begin(); it != _fieldEditors.end(); ++it) {
+        QWidget* editor = it.value();
+        QJsonValue value;
+        auto* nullable = qobject_cast<QCheckBox*>(
+            editor->property("nullableToggle").value<QObject*>());
+        if (nullable && !nullable->isChecked())
+            value = QJsonValue::Null;
+        else if (auto* widget = qobject_cast<QCheckBox*>(editor))
+            value = widget->isChecked();
+        else if (auto* widget = qobject_cast<QSpinBox*>(editor))
+            value = widget->value();
+        else if (auto* widget = qobject_cast<QDoubleSpinBox*>(editor))
+            value = widget->value();
+        else if (auto* widget = qobject_cast<QComboBox*>(editor))
+            value = widget->currentText();
+        else {
+            const QByteArray text =
+                qobject_cast<QLineEdit*>(editor)->text().toUtf8();
+            QJsonParseError error;
+            const QJsonDocument document = QJsonDocument::fromJson(text, &error);
+            if (error.error != QJsonParseError::NoError) return;
+            value = document.isArray() ? QJsonValue(document.array())
+                                       : QJsonValue(document.object());
+        }
+        values[it.key()] = value;
+    }
+    setCurrentText(formatted(values));
+}
+
+void SpiralConfigProfileEditor::jsonToControls()
+{
+    const QJsonDocument document = QJsonDocument::fromJson(currentText().toUtf8());
+    if (!document.isObject()) return;
+    const bool previous = _programmatic;
+    _programmatic = true;
+    QJsonObject values = _catalog.value(QStringLiteral("defaults")).toObject();
+    const QJsonObject overrides = document.object();
+    for (auto it = overrides.begin(); it != overrides.end(); ++it)
+        values.insert(it.key(), it.value());
+    for (auto it = _fieldEditors.begin(); it != _fieldEditors.end(); ++it) {
+        const QJsonValue value = values.value(it.key());
+        auto* nullable = qobject_cast<QCheckBox*>(
+            it.value()->property("nullableToggle").value<QObject*>());
+        if (nullable) {
+            nullable->setChecked(!value.isNull());
+            it.value()->setEnabled(!value.isNull());
+            if (value.isNull()) continue;
+        }
+        if (auto* widget = qobject_cast<QCheckBox*>(it.value()))
+            widget->setChecked(value.toBool());
+        else if (auto* widget = qobject_cast<QSpinBox*>(it.value()))
+            widget->setValue(value.toInt());
+        else if (auto* widget = qobject_cast<QDoubleSpinBox*>(it.value()))
+            widget->setValue(value.toDouble());
+        else if (auto* widget = qobject_cast<QComboBox*>(it.value()))
+            widget->setCurrentText(value.toString());
+        else {
+            const QJsonDocument encoded = value.isArray()
+                ? QJsonDocument(value.toArray())
+                : QJsonDocument(value.toObject());
+            qobject_cast<QLineEdit*>(it.value())->setText(
+                QString::fromUtf8(encoded.toJson(QJsonDocument::Compact)));
+        }
+    }
+    _programmatic = previous;
 }
 
 bool SpiralConfigProfileEditor::eventFilter(QObject* watched, QEvent* event)
 {
     if (watched == _dialog && event->type() == QEvent::Close) {
-        popIn();
+        _dialog->hide();
         return true;
     }
     return QWidget::eventFilter(watched, event);
+}
+
+void SpiralConfigProfileEditor::showWindow()
+{
+    _dialog->show();
+    _dialog->raise();
+    _dialog->activateWindow();
 }
 
 void SpiralConfigProfileEditor::loadProfiles()
@@ -296,7 +521,11 @@ void SpiralConfigProfileEditor::rebuildCombo()
     _programmatic = true;
     const QSignalBlocker blocker(_profileCombo);
     _profileCombo->clear();
-    _profileCombo->addItem(tr("Default"), kDefaultId);
+    _profileCombo->addItem(tr("Current Session"), kDefaultId);
+    _profileCombo->addItem(tr("Defaults"), kDefaultsId);
+    const QJsonObject presets = _catalog.value(QStringLiteral("presets")).toObject();
+    for (auto it = presets.begin(); it != presets.end(); ++it)
+        _profileCombo->addItem(it.key(), QStringLiteral("preset:") + it.key());
     _profileCombo->addItem(tr("Custom"), kCustomId);
     for (const StoredProfile& profile : _profiles)
         _profileCombo->addItem(profile.name, profile.id);
@@ -326,6 +555,11 @@ void SpiralConfigProfileEditor::applyCurrentProfileText()
 {
     QString text;
     if (_currentProfileId == kDefaultId) text = _sessionDefaultText;
+    else if (_currentProfileId == kDefaultsId)
+        text = formatted(_catalog.value(QStringLiteral("defaults")).toObject());
+    else if (_currentProfileId.startsWith(QStringLiteral("preset:")))
+        text = formatted(_catalog.value(QStringLiteral("presets")).toObject()
+                             .value(_currentProfileId.mid(7)).toObject());
     else if (_currentProfileId == kCustomId) text = _customText;
     else if (const StoredProfile* profile = findStored(_currentProfileId)) text = profile->jsonText;
     else {
@@ -338,6 +572,7 @@ void SpiralConfigProfileEditor::applyCurrentProfileText()
     _cleanText = text;
     _dirty = false;
     validateCurrentText();
+    jsonToControls();
     updateUi();
 }
 
@@ -356,6 +591,7 @@ void SpiralConfigProfileEditor::handleTextEdited()
     }
     _dirty = text != _cleanText;
     validateCurrentText();
+    jsonToControls();
     updateUi();
     emit textChanged();
 }

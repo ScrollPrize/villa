@@ -43,11 +43,10 @@ import numpy as np
 from PIL import Image
 import scipy.ndimage
 
-from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_BOOLEAN_KEYS,
-                         RUN_MUTABLE_SAMPLING_KEYS,
-                         parse_session_request,
+from fit_session import (API_VERSION, PclRole, parse_session_request,
                          resolve_dataset_root, validate_checkpoint_container,
                          validate_session_request)
+from config import Config
 
 
 SERVICE_VERSION = "6.0.0"
@@ -203,17 +202,17 @@ def _validate_run_influence_config(value):
         raise ApiError(HTTPStatus.BAD_REQUEST,
                        "influence_config must be a JSON object")
     allowed = {
-        "interactive_influence_enabled",
-        "interactive_influence_z",
-        "interactive_influence_windings",
-        "interactive_influence_theta_frac",
-        "interactive_influence_disable_dt_frac",
-        "interactive_influence_sigma",
-        "interactive_influence_footprint_points",
-        "interactive_influence_anchor_lattice_points",
-        "interactive_influence_anchor_geometry_points",
-        "interactive_influence_anchor_samples_per_step",
-        "interactive_influence_anchor_ramp_power",
+        "influence_enabled",
+        "influence_z",
+        "influence_windings",
+        "influence_theta_frac",
+        "influence_disable_dt_frac",
+        "influence_sigma",
+        "sample_count_influence_footprint_points",
+        "sample_count_influence_anchor_lattice_points",
+        "sample_count_influence_anchor_geometry_points",
+        "sample_count_influence_anchor_samples_per_step",
+        "influence_anchor_ramp_power",
         "loss_weight_anchor",
     }
     unknown = sorted(set(value) - allowed)
@@ -221,23 +220,23 @@ def _validate_run_influence_config(value):
         raise ApiError(HTTPStatus.BAD_REQUEST,
                        f"Unknown influence configuration keys: {unknown}")
     result = {}
-    if "interactive_influence_enabled" in value:
-        enabled = value["interactive_influence_enabled"]
+    if "influence_enabled" in value:
+        enabled = value["influence_enabled"]
         if not isinstance(enabled, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "interactive_influence_enabled must be boolean")
-        result["interactive_influence_enabled"] = enabled
+        result["influence_enabled"] = enabled
     ranges = {
-        "interactive_influence_z": (1.0, 1_000_000.0),
-        "interactive_influence_windings": (0.1, 100.0),
-        "interactive_influence_theta_frac": (0.01, 1.0),
-        "interactive_influence_disable_dt_frac": (0.0, 1.0),
-        "interactive_influence_sigma": (0.000001, 10.0),
-        "interactive_influence_footprint_points": (1.0, 1_000_000.0),
-        "interactive_influence_anchor_lattice_points": (1.0, 1_000_000.0),
-        "interactive_influence_anchor_geometry_points": (1.0, 100_000.0),
-        "interactive_influence_anchor_samples_per_step": (1.0, 1_000_000.0),
-        "interactive_influence_anchor_ramp_power": (0.000001, 100.0),
+        "influence_z": (1.0, 1_000_000.0),
+        "influence_windings": (0.1, 100.0),
+        "influence_theta_frac": (0.01, 1.0),
+        "influence_disable_dt_frac": (0.0, 1.0),
+        "influence_sigma": (0.000001, 10.0),
+        "sample_count_influence_footprint_points": (1.0, 1_000_000.0),
+        "sample_count_influence_anchor_lattice_points": (1.0, 1_000_000.0),
+        "sample_count_influence_anchor_geometry_points": (1.0, 100_000.0),
+        "sample_count_influence_anchor_samples_per_step": (1.0, 1_000_000.0),
+        "influence_anchor_ramp_power": (0.000001, 100.0),
         "loss_weight_anchor": (0.0, 10_000.0),
     }
     for key, (minimum, maximum) in ranges.items():
@@ -252,143 +251,15 @@ def _validate_run_influence_config(value):
                            f"{key} must be between {minimum} and {maximum}")
         result[key] = number
     integer_keys = {
-        "interactive_influence_footprint_points",
-        "interactive_influence_anchor_lattice_points",
-        "interactive_influence_anchor_geometry_points",
-        "interactive_influence_anchor_samples_per_step",
+        "sample_count_influence_footprint_points",
+        "sample_count_influence_anchor_lattice_points",
+        "sample_count_influence_anchor_geometry_points",
+        "sample_count_influence_anchor_samples_per_step",
     }
     for key in integer_keys & result.keys():
         if not result[key].is_integer():
             raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be an integer")
         result[key] = int(result[key])
-    return result
-
-
-def _validate_run_config(value, current, limits=None):
-    """Validate settings which the resident fitter can change between Runs."""
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "run_config must be a JSON object")
-    current = current if isinstance(current, dict) else {}
-    limits = limits if isinstance(limits, dict) else {}
-    unknown = sorted(set(value) - set(current))
-    if unknown:
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       f"Unknown or non-mutable Run configuration keys: {unknown}")
-
-    result = {}
-    for key, item in value.items():
-        if key == "track_length_bin_weights":
-            if item is None:
-                result[key] = None
-                continue
-            if (not isinstance(item, list) or len(item) != 3
-                    or any(isinstance(weight, bool)
-                           or not isinstance(weight, (int, float))
-                           or not math.isfinite(float(weight))
-                           or float(weight) < 0 for weight in item)
-                    or sum(float(weight) for weight in item) <= 0):
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    f"{key} must be null or three finite non-negative weights "
-                    "with a positive sum")
-            result[key] = [float(weight) for weight in item]
-            continue
-        if key == "max_track_crossing_per_step":
-            if (isinstance(item, bool) or not isinstance(item, (int, float))
-                    or not math.isfinite(float(item))
-                    or not float(item).is_integer() or int(item) < 0):
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               f"{key} must be a non-negative integer")
-            maximum = limits.get(key)
-            if (not isinstance(maximum, bool)
-                    and isinstance(maximum, (int, float))
-                    and int(item) > int(maximum)):
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    f"{key} cannot exceed this session's prepared limit ({int(maximum)})")
-            result[key] = int(item)
-            continue
-        if key in ("track_min_sample_spacing", "track_max_sample_spacing"):
-            if (isinstance(item, bool) or not isinstance(item, (int, float))
-                    or not math.isfinite(float(item)) or float(item) <= 0):
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               f"{key} must be a finite positive number")
-            result[key] = float(item)
-            continue
-        if key in ("min_walk_steps_per_track", "max_walk_steps_per_track",
-                   "n_walks_per_track"):
-            if (isinstance(item, bool) or not isinstance(item, (int, float))
-                    or not math.isfinite(float(item))
-                    or not float(item).is_integer() or int(item) <= 0):
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    f"{key} must be a positive integer")
-            result[key] = int(item)
-            continue
-        if key in RUN_MUTABLE_BOOLEAN_KEYS:
-            if not isinstance(item, bool):
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               f"{key} must be boolean")
-            result[key] = item
-            continue
-        if key.startswith("loss_start_") and item is None:
-            if key == "loss_start_patch_dt":
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "loss_start_patch_dt cannot be null")
-            result[key] = None
-            continue
-        if isinstance(item, bool) or not isinstance(item, (int, float)):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"{key} must be numeric")
-        number = float(item)
-        if not math.isfinite(number) or number < 0:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"{key} must be a finite non-negative number")
-        if key in RUN_MUTABLE_SAMPLING_KEYS or key.startswith("loss_start_"):
-            if not number.is_integer():
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               f"{key} must be an integer")
-            number = int(number)
-            if key in RUN_MUTABLE_SAMPLING_KEYS and number < 1:
-                # Disabled optional inputs have their loss weights and sample
-                # counts forced to zero when the session is loaded.  VC3D
-                # round-trips those advertised active values on every Run.
-                # Permit that unchanged disabled value, while still rejecting
-                # attempts to turn an active sampler off by setting its count
-                # to zero at a Run boundary.
-                current_value = current.get(key)
-                current_is_zero = (
-                    not isinstance(current_value, bool)
-                    and isinstance(current_value, (int, float))
-                    and float(current_value) == 0.0
-                )
-                if number != 0 or not current_is_zero:
-                    raise ApiError(HTTPStatus.BAD_REQUEST,
-                                   f"{key} must be at least 1")
-        result[key] = number
-    effective = dict(current)
-    effective.update(result)
-    minimum = effective.get("track_min_sample_spacing")
-    maximum = effective.get("track_max_sample_spacing")
-    if (not isinstance(minimum, bool) and isinstance(minimum, (int, float))
-            and not isinstance(maximum, bool) and isinstance(maximum, (int, float))
-            and float(minimum) > float(maximum)):
-        raise ApiError(
-            HTTPStatus.BAD_REQUEST,
-            "track_min_sample_spacing must be <= track_max_sample_spacing")
-    walk_minimum = effective.get("min_walk_steps_per_track")
-    walk_maximum = effective.get("max_walk_steps_per_track")
-    if (not isinstance(walk_minimum, bool)
-            and isinstance(walk_minimum, (int, float))
-            and not isinstance(walk_maximum, bool)
-            and isinstance(walk_maximum, (int, float))
-            and int(walk_minimum) > int(walk_maximum)):
-        raise ApiError(
-            HTTPStatus.BAD_REQUEST,
-            "min_walk_steps_per_track must be <= max_walk_steps_per_track")
     return result
 
 
@@ -1206,6 +1077,10 @@ class ServiceState:
         self._preview_publish_error = None
         self._preview_process = None
         self._previous_raw_preview_manifest = None
+        self.config_catalog = Config.catalog()
+        self.session_revision = 0
+        self.run_plans = {}
+        self.pending_revision_target = None
 
     # ------------------------------------------------------------------
     # Status and health
@@ -1220,6 +1095,7 @@ class ServiceState:
             "session_id": self.session_id,
             "service_generation": self.service_generation,
             "session_generation": self.session_generation,
+            "session_revision": self.session_revision,
             "command_generation": self.command_generation,
             "generation": self.status_generation,
             "session_replacement_in_progress": self.replacing,
@@ -1285,6 +1161,9 @@ class ServiceState:
             "cuda_ready": None if not self.session else self.session.status()["state"] != "Error",
         })
         return response
+
+    def configuration_catalog(self):
+        return {**self._base(), **self.config_catalog}
 
     def dataset(self):
         if self.dataset_resolution is None:
@@ -1363,13 +1242,13 @@ class ServiceState:
         # not loaded.
         config = (request.get("run") or {}).get("config") or {}
         selected_paths = {
-            "use_verified_patches": ("verified_patches",),
-            "use_unverified_patches": ("unverified_patches",),
-            "use_normals": ("normal_x", "normal_y"),
-            "use_surf_sdt": ("surf_sdt",),
-            "use_tracks": ("tracks_dbm",),
-            "use_gradient_magnitude": ("gradient_magnitude",),
-            "use_fibers": ("fibers",),
+            "input_use_verified_patches": ("verified_patches",),
+            "input_use_unverified_patches": ("unverified_patches",),
+            "input_use_normals": ("normal_x", "normal_y"),
+            "input_use_surf_sdt": ("surf_sdt",),
+            "input_use_tracks": ("tracks_dbm",),
+            "input_use_gradient_magnitude": ("gradient_magnitude",),
+            "input_use_fibers": ("fibers",),
         }
         for flag, field_names in selected_paths.items():
             if not bool(config.get(flag, True)):
@@ -1423,6 +1302,8 @@ class ServiceState:
                     "run": run.manifest(),
                     "preview": preview.manifest(),
                 }
+                self.session_revision += 1
+                self.run_plans.clear()
                 self._reset_session_scope()
                 try:
                     self.session = create_session(
@@ -1465,6 +1346,21 @@ class ServiceState:
             print(f"SPIRAL_ARTIFACT_ERROR {type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)
         with self.lock:
+            applied_manifest = status.get("input_manifest")
+            if (self.session_paths is not None
+                    and isinstance(applied_manifest, dict)
+                    and applied_manifest != self.session_paths.manifest()):
+                self.session_paths = SpiralInputPaths.from_mapping(
+                    applied_manifest)
+                if self.session_request is not None:
+                    self.session_request["paths"] = \
+                        self.session_paths.manifest()
+            if (self.pending_revision_target is not None
+                    and status.get("state") in {"Ready", "Paused"}
+                    and int(status.get("current_iteration") or 0)
+                    >= self.pending_revision_target):
+                self.session_revision += 1
+                self.pending_revision_target = None
             self.status_generation += 1
 
     def _maybe_register_artifacts(self, status):
@@ -1531,14 +1427,26 @@ class ServiceState:
             current["generation"] = generation
             self._preview_publish = current
             self.status_generation += 1
+
     def run(self, request):
+        token = request.get("plan_token")
+        with self.lock:
+            plan = self.run_plans.pop(token, None)
+        if not plan or plan["expires"] < time.monotonic():
+            raise ApiError(HTTPStatus.CONFLICT, "Run plan is missing or expired")
+        if plan["revision"] != self.session_revision:
+            raise ApiError(HTTPStatus.CONFLICT, "Run plan is stale")
+        if plan["new_fit_required"]:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "This plan requires Start New Fit")
+        if plan["session_reload_required"]:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "This plan requires reloading fit inputs")
         session = self._require_session()
         status = session.status()
         influence_config = _validate_run_influence_config(
-            request.get("influence_config"))
-        run_config = _validate_run_config(
-            request.get("run_config"), status.get("run_config"),
-            status.get("run_config_limits"))
+            plan["influence"])
+        run_config = plan["configuration_changes"]
         with self.lock:
             pending = [record for record in self.ephemeral_records
                        if record["state"] == "pending"]
@@ -1559,14 +1467,136 @@ class ServiceState:
                                     and record["state"] == "incorporated")]
                     self.status_generation += 1
 
-        target = session.run(int(request.get("iterations", 0)),
-                             pending_inputs=pending,
-                             mark_incorporated=mark_incorporated,
-                             influence_config=influence_config,
-                             run_config=run_config)
         with self.lock:
+            self.pending_revision_target = (
+                int(status.get("current_iteration") or 0) + plan["iterations"])
+        try:
+            run_arguments = {
+                "pending_inputs": pending,
+                "mark_incorporated": mark_incorporated,
+                "influence_config": influence_config,
+                "run_config": run_config,
+            }
+            if plan["path_changes"]:
+                run_arguments["path_changes"] = plan["path_changes"]
+            target = session.run(plan["iterations"], **run_arguments)
+        except BaseException:
+            with self.lock:
+                self.pending_revision_target = None
+            raise
+        with self.lock:
+            self.run_plans.clear()
             self.status_generation += 1
         return {**self.status(), "accepted": True, "target_iteration": target}
+
+    def plan_run(self, request):
+        session = self._require_session()
+        if session.status().get("state") not in {"Ready", "Paused"}:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "Run planning requires a paused session")
+        expected = request.get("expected_session_revision")
+        if expected != self.session_revision:
+            raise ApiError(HTTPStatus.CONFLICT, "Session revision is stale")
+        configuration = request.get("configuration")
+        if not isinstance(configuration, dict) or \
+                set(configuration) != set(self.config_catalog["defaults"]):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Run planning requires a complete configuration")
+        try:
+            configuration = Config(configuration).as_dict()
+        except ValueError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        iterations = int(request.get("iterations", 0))
+        if iterations < 1:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "iterations must be at least 1")
+        current = session.status().get("applied_config")
+        if current is None:
+            current = Config(
+                (self.session_request.get("run") or {}).get("config") or {}
+            ).as_dict()
+        changes = {
+            key: value for key, value in configuration.items()
+            if current.get(key) != value
+        }
+        fields = self.config_catalog["schema"]["fields"]
+        impacts = {fields[key]["runtime_impact"] for key in changes}
+        dependencies = sorted({
+            dependency for key in changes
+            for dependency in fields[key]["dependencies"]
+        })
+        current_manifest = self.session_paths.manifest()
+        input_manifest = request.get("inputs")
+        if input_manifest is None:
+            input_manifest = current_manifest
+        if not isinstance(input_manifest, dict):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "inputs must be a path manifest object")
+        path_changes = {
+            key: input_manifest.get(key)
+            for key in set(current_manifest) | set(input_manifest)
+            if input_manifest.get(key) != current_manifest.get(key)
+        }
+        path_specs = self.config_catalog["schema"].get("paths", {})
+        input_changes = []
+        for key, value in sorted(path_changes.items()):
+            spec = path_specs.get(key)
+            impact = (
+                spec["runtime_impact"] if spec is not None
+                else "prepared_input_rebuild")
+            impacts.add(impact)
+            dependencies.extend(
+                spec.get("dependencies", []) if spec is not None else [
+                    "dense_stores", "patch_pcl", "tracks", "shell",
+                    "preview_output",
+                ])
+            input_changes.append({
+                "key": key,
+                "before": current_manifest.get(key),
+                "after": value,
+                "runtime_impact": impact,
+            })
+        if "outer_shell" in path_changes:
+            outer_shell = str(path_changes["outer_shell"] or "").strip()
+            if not outer_shell or not Path(outer_shell).is_dir():
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Outer shell path is not a readable directory",
+                    [{"field": "outer_shell",
+                      "message": "Path is not a directory"}])
+        dependencies = sorted(set(dependencies))
+        token = secrets.token_urlsafe(24)
+        new_fit = "new_fit" in impacts
+        session_reload_required = "prepared_input_rebuild" in impacts
+        plan = {
+            "revision": self.session_revision,
+            "expires": time.monotonic() + 60.0,
+            "iterations": iterations,
+            "influence": request.get("influence") or {},
+            "configuration_changes": changes,
+            "path_changes": path_changes,
+            "changes": [
+                {"key": key, "before": current.get(key), "after": value,
+                 "runtime_impact": fields[key]["runtime_impact"]}
+                for key, value in changes.items()
+            ],
+            "affected_prepared_inputs": dependencies,
+            "model_state_preserved": not new_fit,
+            "optimizer_state_preserved": not new_fit,
+            "new_fit_required": new_fit,
+            "session_reload_required": session_reload_required,
+            "input_changed": bool(path_changes),
+            "input_changes": input_changes,
+        }
+        with self.lock:
+            self.run_plans[token] = plan
+        return {
+            **self._base(), "plan_token": token,
+            "expires_in_seconds": 60,
+            **{key: value for key, value in plan.items()
+               if key not in {"expires", "configuration_changes", "path_changes",
+                              "iterations", "influence", "revision"}},
+        }
 
     def stop(self):
         self._require_session().stop()
@@ -2569,6 +2599,8 @@ class SpiralHandler(BaseHTTPRequestHandler):
         if self.command == "GET":
             if path == "/health":
                 return state.health()
+            if path == "/configuration":
+                return state.configuration_catalog()
             if path == "/session/status":
                 return state.status()
             if path == "/logs":
@@ -2633,6 +2665,8 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 return state.begin_upload(body)
             if path == "/session/load":
                 return state.deduplicated(command_id, lambda: state.load(body))
+            if path == "/session/run/plan":
+                return state.plan_run(body)
             if path == "/session/run":
                 return state.deduplicated(command_id, lambda: state.run(body))
             if path == "/session/stop":

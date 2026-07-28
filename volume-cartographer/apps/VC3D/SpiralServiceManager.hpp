@@ -61,7 +61,8 @@ public:
     void resolveDataset(const QString& root);
     void loadSession(QJsonObject request);
     void runIterations(int iterations, const QJsonObject& influenceConfig,
-                       const QJsonObject& runConfig);
+                       const QJsonObject& runConfig,
+                       const QJsonObject& inputs = {});
     void stopAfterIteration();
     // Save on service: writes to a service-host path.
     void saveCheckpoint(const QString& path);
@@ -86,6 +87,8 @@ signals:
                                 const QString& message);
     void serviceStateChanged(const QString& state);
     void datasetResolved(const QJsonObject& resolution);
+    void configurationCatalogChanged(const QJsonObject& catalog);
+    void configurationReviewRequested();
     // Emitted once when this connection first observes a resident session,
     // whether VC3D loaded it or attached after another client did.
     void sessionSynchronized(const QJsonObject& sessionRequest,
@@ -171,6 +174,9 @@ private:
     int _remoteLogFailures = 0;
     qint64 _lastRemoteLogSequence = 0;
     QJsonObject _advertisedDataset;
+    QJsonObject _configurationDefaults;
+    QJsonObject _appliedConfiguration;
+    qint64 _sessionRevision = 0;
     quint64 _commandCounter = 0;
     qint64 _lastStatusGeneration = -1;
     QString _installedPreviewArtifact;

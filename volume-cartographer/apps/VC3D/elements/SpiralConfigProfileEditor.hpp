@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QHash>
 #include <QVector>
 #include <QWidget>
 
@@ -29,6 +30,8 @@ public:
     void setSessionDefault(const QJsonObject& config);
     void showSessionDefault();
     void clearSessionDefault();
+    void setCatalog(const QJsonObject& catalog);
+    void showWindow();
 
 signals:
     void textChanged();
@@ -65,6 +68,9 @@ private:
 
     void popOut();
     void popIn();
+    void rebuildControls();
+    void controlsToJson();
+    void jsonToControls();
 
     QWidget* _editorContents = nullptr;
     QComboBox* _profileCombo = nullptr;
@@ -77,6 +83,11 @@ private:
     QPlainTextEdit* _textEdit = nullptr;
     QLabel* _statusLabel = nullptr;
     QDialog* _dialog = nullptr;
+    QJsonObject _catalog;
+    QWidget* _controlsPage = nullptr;
+    class QTreeWidget* _controls = nullptr;
+    class QLineEdit* _search = nullptr;
+    QHash<QString, QWidget*> _fieldEditors;
 
     QVector<StoredProfile> _profiles;
     QString _currentProfileId = QStringLiteral("default");

@@ -17,10 +17,10 @@ import traceback
 from typing import Mapping
 import uuid
 
-from fit_session import (RUN_MUTABLE_SAMPLING_KEYS, SpiralInputPaths,
-                         SpiralPreviewConfig, SpiralRunConfig,
+from fit_session import (SpiralInputPaths, SpiralPreviewConfig, SpiralRunConfig,
                          apply_optional_input_selection,
                          run_mutable_config)
+from config import Config
 
 
 class _SessionShutdown(BaseException):
@@ -36,6 +36,7 @@ class InteractiveFitSession:
         self.preview_config = preview
         self.input_manifest = paths.manifest()
         self.requested_config = dict(run.config)
+        self._applied_config = None
         self._run_config = None
         self._run_config_limits = None
         self._default_advanced_config = None
@@ -82,6 +83,7 @@ class InteractiveFitSession:
                 "preview_manifest_path": self._preview_manifest,
                 "preview_generation": self._preview_generation,
                 "supports_input_incorporation": self._incorporate_inputs is not None,
+                "input_manifest": copy.deepcopy(self.input_manifest),
             }
             if self._run_config is not None:
                 result["run_config"] = copy.deepcopy(self._run_config)
@@ -91,6 +93,8 @@ class InteractiveFitSession:
             if self._default_advanced_config is not None:
                 result["default_advanced_config"] = copy.deepcopy(
                     self._default_advanced_config)
+            if getattr(self, "_applied_config", None) is not None:
+                result["applied_config"] = copy.deepcopy(self._applied_config)
             return result
 
     def _publish_status(self):
@@ -121,29 +125,24 @@ class InteractiveFitSession:
             maybe_init_distributed()
             distributed_initialized = True
 
-            config = dict(fitter.default_config)
+            config = Config().as_dict()
             checkpoint_profile_config = None
             if self.paths.checkpoint:
                 from checkpoint_io import load_checkpoint_cpu
                 checkpoint_config = load_checkpoint_cpu(self.paths.checkpoint)
                 try:
-                    if isinstance(checkpoint_config, dict) and isinstance(checkpoint_config.get('cfg'), Mapping):
-                        # Influence settings describe one interactive Run, not
-                        # durable model configuration. Ignore them even when
-                        # opening checkpoints written by older services.
-                        # Keys the current fitter no longer defines are
-                        # dropped; old configurations are not supported.
-                        durable = {
-                            key: value for key, value in checkpoint_config['cfg'].items()
-                            if not key.startswith('interactive_influence_')
-                            and key != 'loss_weight_anchor'
-                            and key in config
-                        }
-                        config.update(durable)
-                        # The session-scoped Default profile must initially
-                        # reproduce the checkpoint, not a second
-                        # z-range/DDP-scaled or input-gated derivative of it.
-                        checkpoint_profile_config = copy.deepcopy(durable)
+                    if not isinstance(checkpoint_config, dict) or not isinstance(
+                            checkpoint_config.get('cfg'), Mapping):
+                        raise ValueError("Checkpoint has no current Spiral configuration")
+                    durable = dict(checkpoint_config['cfg'])
+                    if set(durable) != set(config):
+                        raise ValueError(
+                            "Checkpoint configuration does not match the current schema")
+                    durable = Config(durable).as_dict()
+                    config.update(durable)
+                    # The session-scoped profile initially reproduces the
+                    # checkpoint without applying scaling twice.
+                    checkpoint_profile_config = copy.deepcopy(durable)
                 finally:
                     # This first load exists only to resolve configuration.  Do
                     # not retain a complete model + optimiser checkpoint for the
@@ -159,9 +158,9 @@ class InteractiveFitSession:
                 # to the inputs selected for this session.
                 default_advanced_config = copy.deepcopy(config)
                 for key in (
-                        'use_verified_patches', 'use_unverified_patches',
-                        'use_normals', 'use_surf_sdt', 'use_tracks',
-                        'use_gradient_magnitude', 'use_fibers'):
+                        'input_use_verified_patches', 'input_use_unverified_patches',
+                        'input_use_normals', 'input_use_surf_sdt', 'input_use_tracks',
+                        'input_use_gradient_magnitude', 'input_use_fibers'):
                     if key in self.run_config.config:
                         default_advanced_config[key] = self.run_config.config[key]
             # Explicit sample-count overrides are literal active counts. This
@@ -171,24 +170,16 @@ class InteractiveFitSession:
             # their counts the same treatment.
             explicit_sampling_counts = {
                 key: value for key, value in (checkpoint_profile_config or {}).items()
-                if key in RUN_MUTABLE_SAMPLING_KEYS
+                if key.startswith("sample_count_")
             }
             explicit_sampling_counts.update({
                 key: value for key, value in self.run_config.config.items()
-                if key in RUN_MUTABLE_SAMPLING_KEYS
+                if key.startswith("sample_count_")
             })
             config.update(self.run_config.config)
-            count_keys = (
-                'num_patches_per_step', 'num_patches_per_step_for_dt',
-                'unverified_num_patches_per_step', 'unverified_num_patches_per_step_for_dt',
-                'rel_winding_num_pcls', 'abs_winding_num_pcls',
-                'unattached_pcl_num_per_step', 'track_num_per_step',
-                'dense_normals_num_points', 'dense_spacing_num_pairs',
-                'dense_spacing_density_extra_pairs',
-                'dense_attachment_num_points',
-                'min_spacing_independent_samples',
-                'regularisation_num_points', 'shell_num_samples',
-            )
+            fields = Config.catalog()["schema"]["fields"]
+            count_keys = tuple(
+                key for key, spec in fields.items() if spec.get("scale_with_z"))
             scale_counts_for_z_range(
                 config, self.run_config.z_begin, self.run_config.z_end,
                 9500, count_keys, floors=SAMPLING_COUNT_FLOORS)
@@ -205,11 +196,12 @@ class InteractiveFitSession:
             apply_optional_input_selection(config)
             self.requested_config = dict(config)
             with self._condition:
+                self._applied_config = copy.deepcopy(config)
                 self._run_config = run_mutable_config(config)
                 self._run_config_limits = {
-                    'max_track_crossing_per_step': max(
+                    'track_max_track_crossing_per_step': max(
                         int(config.get('track_crossing_precompute_max', 0)),
-                        int(config.get('max_track_crossing_per_step', 0))),
+                        int(config.get('track_max_track_crossing_per_step', 0))),
                 }
                 self._default_advanced_config = default_advanced_config
             self._publish_status()
@@ -306,7 +298,7 @@ class InteractiveFitSession:
                 self._run_incorporation(records, mark_incorporated, influence_config)
                 continue
             if action[0] == "configure":
-                self._run_configuration(action[1])
+                self._run_configuration(action[1], action[2], action[3])
                 continue
             kind, path, done, result = action
             try:
@@ -352,13 +344,18 @@ class InteractiveFitSession:
                     self._phase = "Optimizing"
             self._publish_status()
 
-    def _run_configuration(self, config):
+    def _run_configuration(
+            self, config, path_changes=None, previous_run_config=None):
         """Apply validated Run-scoped settings on the fitter thread."""
         try:
             if self._configure_run is None:
                 raise RuntimeError(
                     "The resident fitter does not support Run configuration changes")
-            self._configure_run(dict(config))
+            path_changes = dict(path_changes or {})
+            if path_changes:
+                self._configure_run(dict(config), dict(path_changes))
+            else:
+                self._configure_run(dict(config))
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             with self._condition:
@@ -370,9 +367,18 @@ class InteractiveFitSession:
                     if action[0] != "incorporate"
                 ]
                 self._warnings.append(f"Run configuration failed: {error}")
+                if previous_run_config is not None:
+                    self._run_config.update(previous_run_config)
                 self._state, self._phase = "Paused", "Paused"
                 self._condition.notify_all()
             self._publish_status()
+        else:
+            if getattr(self, "_applied_config", None) is not None:
+                with self._condition:
+                    self._applied_config.update(config)
+                    self._run_config.update(config)
+                    self.requested_config.update(config)
+                    self.input_manifest.update(path_changes)
 
     def iteration_completed(self, *, completed_iterations, total_loss, losses, learning_rate, metrics=None):
         with self._condition:
@@ -419,24 +425,32 @@ class InteractiveFitSession:
 
     # Coordinator-thread commands.
     def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None):
+            influence_config=None, run_config=None, path_changes=None):
         if count < 1:
             raise ValueError("iterations must be at least 1")
         with self._condition:
             if self._state not in {"Ready", "Paused"}:
                 raise RuntimeError(f"Run is not allowed while session state is {self._state}")
             run_config = dict(run_config or {})
-            if run_config:
+            path_changes = dict(path_changes or {})
+            if run_config or path_changes:
                 if self._configure_run is None:
                     raise RuntimeError(
                         "The resident fitter does not support Run configuration changes")
-                self.requested_config.update(run_config)
-                apply_optional_input_selection(self.requested_config)
+                requested_config = dict(self.requested_config)
+                requested_config.update(run_config)
+                apply_optional_input_selection(requested_config)
                 run_config = {
-                    key: self.requested_config[key]
+                    key: requested_config[key]
                     for key in run_config
                 }
-                self._idle_actions.append(("configure", run_config))
+                previous_run_config = {
+                    key: self._run_config.get(key)
+                    for key in run_config
+                }
+                self._idle_actions.append(
+                    ("configure", run_config, path_changes,
+                     previous_run_config))
                 self._run_config.update(run_config)
             if pending_inputs:
                 if self._incorporate_inputs is None:
@@ -523,6 +537,7 @@ def _distributed_session_worker(rank, world_size, gpu_id, master_port,
                         mark_incorporated=mark_incorporated,
                         influence_config=arguments.get("influence_config"),
                         run_config=arguments.get("run_config"),
+                        path_changes=arguments.get("path_changes"),
                     )
                 elif name == "stop":
                     result = session.stop()
@@ -730,7 +745,7 @@ class DistributedInteractiveFitSession:
             return responses[ranks[0]][1]
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None):
+            influence_config=None, run_config=None, path_changes=None):
         state = self.status()["state"]
         if state not in {"Ready", "Paused"}:
             raise RuntimeError(f"Run is not allowed while session state is {state}")
@@ -739,6 +754,7 @@ class DistributedInteractiveFitSession:
             "pending_inputs": list(pending_inputs or []),
             "influence_config": dict(influence_config or {}),
             "run_config": dict(run_config or {}),
+            "path_changes": dict(path_changes or {}),
         }
         return self._call("run", arguments, timeout=30.0,
                           incorporation_callback=mark_incorporated)
