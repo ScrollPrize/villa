@@ -861,9 +861,9 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # crossings along the whole strip (the corner only introduces a ~sqrt(2)-quad ij
     # jump). We then pool all 4 L-strips per annotated point into one set of sample
     # points and take a single all-pairs diff between p1's and p2's pooled sets,
-    # regressing it onto winding_diff * dr_per_winding. If the selected PCL
-    # points (adjacent mode) or the PCL chain between them (non-adjacent mode)
-    # crosses theta=0, adjust the expected delta by that branch-cut jump.
+    # regressing it onto winding_diff * dr_per_winding. If the PCL chain between
+    # the selected points crosses theta=0, adjust the expected delta by that
+    # branch-cut jump.
 
     num_points_per_strip = cfg['num_points_per_patch'] // 2
     num_strips_per_pcl = 4
@@ -884,13 +884,13 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     selected_pcls = [point_collections[i] for i in selected_idxs]
 
     for pcl in selected_pcls:
-        sorted_pcl_points = None
-        sorted_pcl_point_idx = None
-        if not cfg['rel_winding_adjacent_patches_only']:
-            sorted_pcl_points = [
-                point for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
-            ]
-            sorted_pcl_point_idx = {id(point): idx for idx, point in enumerate(sorted_pcl_points)}
+        # Uniform chain interface (attach_sequence_chain_fns): id-sorted order
+        # for ordinary pcls, the fiber-graph route (hopping fibers at junctions)
+        # for merged fiber-link components -- whose id-sorted order is NOT
+        # chain-valid across members. The full chain is used even in
+        # adjacent-patches mode, since adjacent patches may sit far apart along
+        # the pcl (or on different fibers).
+        chain_fn = pcl['chain_zyxs_between']
 
         # Pair patches either only with their immediate neighbour in the pcl's
         # patch ordering (first-seen order; built in main()),
@@ -917,15 +917,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             i1, j1 = int(p1['on_patch']['ij'][0]), int(p1['on_patch']['ij'][1])
             i2, j2 = int(p2['on_patch']['ij'][0]), int(p2['on_patch']['ij'][1])
 
-            if cfg['rel_winding_adjacent_patches_only']:
-                pcl_chain = [p1, p2]
-            else:
-                idx1, idx2 = sorted_pcl_point_idx[id(p1)], sorted_pcl_point_idx[id(p2)]
-                if idx1 <= idx2:
-                    pcl_chain = sorted_pcl_points[idx1:idx2 + 1]
-                else:
-                    pcl_chain = list(reversed(sorted_pcl_points[idx2:idx1 + 1]))
-            pcl_chain_zyxs = np.stack([point['zyx'] for point in pcl_chain], axis=0).astype(np.float32)
+            pcl_chain_zyxs = chain_fn(p1, p2)
             pair_requests.append((
                 (pid1, i1, j1), (pid2, i2, j2),
                 pid1, pid2, winding_diff, pcl_chain_zyxs,
@@ -1365,10 +1357,53 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
 
 
 
+def _sample_component_walk(members, edges, strip_lengths, branch_probability):
+    """Sample a chain walk through a link component.
+
+    members are the component's strip indices; edges its junctions as
+    (strip_a, pos_a, strip_b, pos_b); strip_lengths maps strip index -> point
+    count. Starting from a random member end, walk along the strip; at each
+    junction passed, hop onto the linked strip (at its junction position, in a
+    random direction) with branch_probability, never revisiting a strip.
+    Returns ordered segments [(strip, pos_from, pos_to)] (inclusive, pos_from >
+    pos_to when walking backwards); consecutive segments meet at a junction,
+    whose two nearly-coincident endpoints appear as consecutive walk points, so
+    the sequential theta=0 unwrap treats the hop like any other step."""
+    junctions = {s: [] for s in members}
+    for strip_a, pos_a, strip_b, pos_b in edges:
+        junctions[strip_a].append((pos_a, strip_b, pos_b))
+        junctions[strip_b].append((pos_b, strip_a, pos_a))
+    strip = members[np.random.randint(len(members))]
+    direction = 1 if np.random.rand() < 0.5 else -1
+    pos = 0 if direction == 1 else strip_lengths[strip] - 1
+    visited = {strip}
+    segments = []
+    while True:
+        ahead = [(p, other, other_pos) for p, other, other_pos in junctions[strip]
+                 if other not in visited
+                 and (p >= pos if direction == 1 else p <= pos)]
+        ahead.sort(key=lambda t: t[0], reverse=direction == -1)
+        hopped = False
+        for p, other, other_pos in ahead:
+            if np.random.rand() < branch_probability:
+                segments.append((strip, pos, p))
+                visited.add(other)
+                strip, pos = other, other_pos
+                direction = 1 if np.random.rand() < 0.5 else -1
+                hopped = True
+                break
+        if not hopped:
+            end = strip_lengths[strip] - 1 if direction == 1 else 0
+            segments.append((strip, pos, end))
+            return segments
+
+
 def get_unattached_pcl_strip_losses(
     slice_to_spiral_transform,
     dr_per_winding,
     pcl_strips,
+    component_strip_lists,
+    component_edges,
     sampling_strata,
     get_or_build_unattached_pcl_flat,
     num_pcls_per_step,
@@ -1387,6 +1422,21 @@ def get_unattached_pcl_strip_losses(
     # when dt_target_cache is given, the cached whole-strip quantile target from
     # dt_targets.py, transferred into this sample's unwrap frame through the cached
     # point nearest a sampled point by within-strip index).
+    #
+    # Graph awareness (cross-fiber links): sampling_strata indexes *components* --
+    # groups of strips joined by same-winding links (component_strip_lists gives
+    # each component's member strip indices, component_edges its junctions as
+    # (strip_a, pos_a, strip_b, pos_b)). Each chosen component contributes one row
+    # sampled along a chain *walk* through its strips (_sample_component_walk):
+    # along a strip, hopping to the linked strip at a junction with
+    # cfg['fiber_link_branch_probability'], so a junction hop is an ordinary
+    # |dtheta| < pi step and the sequential unwrap stitches theta=0 crossings
+    # through it like any other. The constant-shifted-radius target (1) along the
+    # walk then pulls points on either side of every traversed junction onto one
+    # shared winding; over steps, random walks cover all of a component's
+    # junctions. Rows mix strips, so the DT snap (2) passes per-point strip
+    # indices to the cache lookup. A singleton component reduces exactly to the
+    # legacy per-strip row.
     device = dr_per_winding.device
     zero = torch.zeros([], device=device)
     if not pcl_strips:
@@ -1395,21 +1445,43 @@ def get_unattached_pcl_strip_losses(
     num_to_sample = min(num_pcls_per_step, len(sampling_strata['all']))
     if num_to_sample <= 0:
         return zero, zero
-    chosen = _choose_pcl_indices(sampling_strata, num_to_sample)
+    chosen_comps = _choose_pcl_indices(sampling_strata, num_to_sample)
 
     flat = get_or_build_unattached_pcl_flat(pcl_strips, device)
     if flat is None or flat['total'] == 0:
         return zero, zero
 
+    branch_probability = cfg.get('fiber_link_branch_probability', 0.5)
+    num_rows = len(chosen_comps)
     starts_cpu = flat['starts_cpu'].numpy()
-    sampled_local_indices = np.empty([num_to_sample, num_points_per_pcl], dtype=np.int64)
-    sampled_flat_indices = np.empty([num_to_sample, num_points_per_pcl], dtype=np.int64)
-    for k, pcl_idx in enumerate(chosen):
-        strip = pcl_strips[pcl_idx]
-        N = len(strip['zyxs'])
-        coords = np.sort(np.random.choice(N, num_points_per_pcl, replace=num_points_per_pcl > N))
-        sampled_local_indices[k] = coords
-        sampled_flat_indices[k] = starts_cpu[pcl_idx] + coords
+    sampled_strip_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
+    sampled_local_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
+    sampled_flat_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
+    for k, comp_idx in enumerate(chosen_comps):
+        members = component_strip_lists[comp_idx]
+        edges = component_edges[comp_idx] if component_edges is not None else []
+        if len(members) == 1 or not edges:
+            strip_idx = members[np.random.randint(len(members))]
+            segments = [(strip_idx, 0, len(pcl_strips[strip_idx]['zyxs']) - 1)]
+        else:
+            segments = _sample_component_walk(
+                members, edges,
+                {s: len(pcl_strips[s]['zyxs']) for s in members},
+                branch_probability,
+            )
+        walk_strips = np.concatenate([
+            np.full(abs(pos_to - pos_from) + 1, strip_idx, dtype=np.int64)
+            for strip_idx, pos_from, pos_to in segments])
+        walk_locals = np.concatenate([
+            np.arange(pos_from, pos_to + 1, dtype=np.int64) if pos_from <= pos_to
+            else np.arange(pos_from, pos_to - 1, -1, dtype=np.int64)
+            for strip_idx, pos_from, pos_to in segments])
+        walk_len = len(walk_locals)
+        picks = np.sort(np.random.choice(
+            walk_len, num_points_per_pcl, replace=num_points_per_pcl > walk_len))
+        sampled_strip_indices[k] = walk_strips[picks]
+        sampled_local_indices[k] = walk_locals[picks]
+        sampled_flat_indices[k] = starts_cpu[sampled_strip_indices[k]] + sampled_local_indices[k]
 
     sampled_flat_indices_t = torch.from_numpy(sampled_flat_indices).to(device=device)
     zyxs_t = flat['zyxs'][sampled_flat_indices_t]
@@ -1451,9 +1523,13 @@ def get_unattached_pcl_strip_losses(
     if not compute_dt:
         return radius_loss, zero
 
+    # Per-point strip indices: a walk row can span several strips, each with its
+    # own cache entry; the snap anchors the row on its best valid (point, cache)
+    # pair and takes that strip's cached target (the component is same-winding, so
+    # any member's target names the same winding).
     target_normalised = strip_dt_target_in_sample_frame(
         normalised_radii, sampled_local_indices, theta, crossing_adjustments,
-        dr_per_winding, dt_target_cache, chosen,
+        dr_per_winding, dt_target_cache, sampled_strip_indices,
     )
     target_shifted = target_normalised + winding_t * dr_per_winding
     target_radii = radius_from_unwrapped_shifted(

@@ -179,36 +179,43 @@ def snap_strip_dt_target(
 
     sample_local_idx (K, P) are the sampled points' within-strip indices,
     sample_theta / sample_adjustments (K, P) the loss sample's wrapped theta and
-    cumulative crossing adjustments (radius units), cache_idx (K,) the strip rows.
+    cumulative crossing adjustments (radius units), cache_idx the strip rows --
+    (K,) when a row samples a single strip, or (K, P) per-point when a row mixes
+    strips (a chain walk through a fiber-link component); the anchor is then the
+    row's best valid (point, cache) pair and the target comes from the anchor
+    point's strip.
     Returns (target (K, 1), valid (K,)); valid is False where the cache holds no
-    usable entry for the strip (strip_dt_target_in_sample_frame then falls back to the
-    snapped sample median).
+    usable entry for any of the row's strips (strip_dt_target_in_sample_frame then
+    falls back to the snapped sample median).
     """
-    valid = cache['valid'][cache_idx]
+    if cache_idx.dim() == 1:
+        cache_idx = cache_idx[:, None].expand_as(sample_local_idx)
+    point_valid = cache['valid'][cache_idx]  # (K, P)
+    valid = point_valid.any(dim=-1)
     keys = cache['keys']
     if keys.numel() == 0:
-        target = torch.zeros(*cache_idx.shape, 1, device=cache_idx.device, dtype=sample_theta.dtype)
+        target = torch.zeros(cache_idx.shape[0], 1, device=cache_idx.device, dtype=sample_theta.dtype)
         return target, torch.zeros_like(valid)
     # Composite keys (strip * key_scale + local index) are globally sorted, so the
     # nearest cached point of the right strip brackets each sample key's insertion
     # position; at least one bracket lies in the strip's own segment whenever the
     # strip has any cached points.
-    sample_keys = cache_idx[:, None] * cache['key_scale'] + sample_local_idx
+    sample_keys = cache_idx * cache['key_scale'] + sample_local_idx
     positions = torch.searchsorted(keys, sample_keys)
     candidates = torch.stack(
         [(positions - 1).clamp(min=0), positions.clamp(max=keys.numel() - 1)], dim=-1,
     )  # (K, P, 2)
     candidate_keys = keys[candidates]
-    same_strip = torch.div(candidate_keys, cache['key_scale'], rounding_mode='floor') == cache_idx[:, None, None]
+    same_strip = torch.div(candidate_keys, cache['key_scale'], rounding_mode='floor') == cache_idx[..., None]
     gaps = (candidate_keys - sample_keys[..., None]).abs()
-    gaps = gaps.masked_fill(~same_strip, torch.iinfo(torch.int64).max)
-    best = gaps.flatten(start_dim=1).argmin(dim=-1)  # closest sample/cache pair per strip
+    gaps = gaps.masked_fill(~same_strip | ~point_valid[..., None], torch.iinfo(torch.int64).max)
+    best = gaps.flatten(start_dim=1).argmin(dim=-1)  # closest sample/cache pair per row
     rows = torch.arange(best.shape[0], device=best.device)
     sample_anchor_idx = torch.div(best, 2, rounding_mode='floor')
     cache_anchor_idx = candidates.flatten(start_dim=1)[rows, best]
 
     target_winding = _transfer_target_through_anchor(
-        cache['target_relative'][cache_idx],
+        cache['target_relative'][cache_idx[rows, sample_anchor_idx]],
         sample_theta.detach()[rows, sample_anchor_idx],
         sample_adjustments[rows, sample_anchor_idx] / dr_per_winding.detach(),
         cache['theta'][cache_anchor_idx],
