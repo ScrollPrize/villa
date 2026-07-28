@@ -41,14 +41,14 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     dataclass_replace,
 )
 from vesuvius.neural_tracing.fiber_trace_2d.loader import _Trace2CpSegmentSource
-from vesuvius.neural_tracing.fiber_trace_2d.loader import _principal_tensor_axes
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_line_index
 
 
 _EPS = 1.0e-12
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 _GIB = 1024**3
-_DEBUG_NORMAL_CHANNELS = frozenset({"grad_mag", "nx", "ny"})
+_SPARSE_NORMAL_CHANNELS = frozenset({"grad_mag", "nx", "ny"})
+_NATIVE_NORMAL_SAMPLER_MODES = ("sparse-corner-principal", "baseline")
 _NORMAL_CORNER_BITS_XYZ = (
     (0.0, 0.0, 0.0),
     (1.0, 0.0, 0.0),
@@ -1382,7 +1382,8 @@ class NativeTraceFieldCache:
                     (valid_values[:, None] > 0.5)
                     & decoded_valid
                 )
-                valid_done += int(torch.count_nonzero(group_valid.any(dim=1)).detach().cpu())
+                if progress_label is not None:
+                    valid_done += int(torch.count_nonzero(group_valid.any(dim=1)).detach().cpu())
                 index_t = torch.as_tensor(usable_indices, dtype=torch.long, device=self.device)
                 assert directions is not None
                 assert presence is not None
@@ -1481,6 +1482,56 @@ def _align_axes_torch(axes: torch.Tensor, references: torch.Tensor) -> torch.Ten
     return axes_n * sign
 
 
+def _principal_tensor_axes_torch(tensors: torch.Tensor, hints: torch.Tensor) -> torch.Tensor:
+    tensors_t = tensors.to(dtype=torch.float32)
+    hints_t = hints.to(device=tensors_t.device, dtype=torch.float32)
+    if tensors_t.ndim != 3 or tuple(int(v) for v in tensors_t.shape[1:]) != (3, 3):
+        raise ValueError("tensors must have shape [N,3,3]")
+    if tuple(int(v) for v in hints_t.shape) != (int(tensors_t.shape[0]), 3):
+        raise ValueError("hints must have shape [N,3]")
+    count = int(tensors_t.shape[0])
+    axes = hints_t.clone()
+    hint_norm = torch.linalg.norm(axes, dim=1)
+    valid_hint = torch.isfinite(hint_norm) & (hint_norm > float(_EPS))
+    diag = torch.stack(
+        [tensors_t[:, 0, 0], tensors_t[:, 1, 1], tensors_t[:, 2, 2]],
+        dim=1,
+    )
+    fallback_axis = torch.zeros((count, 3), dtype=torch.float32, device=tensors_t.device)
+    fallback_axis[
+        torch.arange(count, device=tensors_t.device),
+        torch.argmax(diag, dim=1),
+    ] = 1.0
+    axes = torch.where(
+        valid_hint[:, None],
+        axes / hint_norm.clamp_min(float(_EPS))[:, None],
+        fallback_axis,
+    )
+    for _ in range(16):
+        next_axes = torch.bmm(tensors_t, axes[:, :, None]).squeeze(2)
+        norms = torch.linalg.norm(next_axes, dim=1)
+        valid = torch.isfinite(norms) & (norms > float(_EPS))
+        next_axes = next_axes / norms.clamp_min(float(_EPS))[:, None]
+        axes = torch.where(valid[:, None], next_axes, axes)
+    norms = torch.linalg.norm(axes, dim=1)
+    valid_axes = torch.isfinite(norms) & (norms > float(_EPS))
+    axes = torch.where(
+        valid_axes[:, None],
+        axes / norms.clamp_min(float(_EPS))[:, None],
+        torch.zeros_like(axes),
+    )
+    hint_unit = torch.where(
+        valid_hint[:, None],
+        hints_t / hint_norm.clamp_min(float(_EPS))[:, None],
+        torch.zeros_like(hints_t),
+    )
+    flip = valid_hint & (torch.sum(axes * hint_unit, dim=1) < 0.0)
+    axes = torch.where(flip[:, None], -axes, axes)
+    no_hint_flip = (~valid_hint) & (axes[:, 2] < 0.0)
+    axes = torch.where(no_hint_flip[:, None], -axes, axes)
+    return axes
+
+
 def _points_to_numpy(points_zyx: torch.Tensor | np.ndarray) -> np.ndarray:
     if isinstance(points_zyx, torch.Tensor):
         return (
@@ -1577,17 +1628,14 @@ def _native_trace_manifest_path_for_record(
 
 
 @dataclass
-class _DebugSparseLasagnaNormalSampler:
+class _SparseCornerLasagnaNormalSampler:
     trace_record: Any
     data: Any
     device: torch.device
-    mode: str
     profiler: _NativeTraceProfiler | None = None
 
     def __post_init__(self) -> None:
         self.device = torch.device(self.device)
-        if self.mode != "sparse-corner-principal":
-            raise ValueError(f"unsupported debug sparse normal sampler mode: {self.mode!r}")
 
     def _measure(
         self,
@@ -1681,12 +1729,12 @@ class _DebugSparseLasagnaNormalSampler:
             + corner_index_xyz.to(dtype=torch.float32) * normal_spacing.view(1, 1, 3)
         ).reshape(1, 1, count * 8, 3).contiguous()
         point_query = points_fullres_xyz.reshape(1, 1, count, 3).contiguous()
-        with self._measure("debug_sparse_corner_prefetch", sync=True):
+        with self._measure("sparse_normal_prefetch", sync=True):
             self._prefetch_sparse_points(
                 torch.cat([point_query, corner_points_fullres_xyz], dim=2),
-                channels=set(_DEBUG_NORMAL_CHANNELS),
+                channels=set(_SPARSE_NORMAL_CHANNELS),
             )
-        with self._measure("debug_sparse_corner_sample", sync=True):
+        with self._measure("sparse_normal_sample", sync=True):
             grad_sampled = self.data.grid_sample_fullres(
                 point_query,
                 channels={"grad_mag"},
@@ -1700,57 +1748,39 @@ class _DebugSparseLasagnaNormalSampler:
                 or normal_sampled.nx is None
                 or normal_sampled.ny is None
             ):
-                raise ValueError("debug sparse-corner normal sampler did not return grad_mag/nx/ny")
-            grad = grad_sampled.grad_mag.reshape(count).detach().cpu().numpy()
-            nx = normal_sampled.nx.reshape(count, 8).detach().cpu().numpy().astype(np.float64)
-            ny = normal_sampled.ny.reshape(count, 8).detach().cpu().numpy().astype(np.float64)
-        nz = np.sqrt(np.maximum(0.0, 1.0 - nx * nx - ny * ny))
-        decoded = np.stack([nx, ny, nz], axis=2)
-        norm = np.linalg.norm(decoded, axis=2)
-        decoded = np.divide(
-            decoded,
-            np.maximum(norm, 1.0e-12)[:, :, None],
-            out=np.zeros_like(decoded),
-            where=norm[:, :, None] > 1.0e-12,
+                raise ValueError("sparse-corner normal sampler did not return grad_mag/nx/ny")
+            grad = grad_sampled.grad_mag.reshape(count).to(device=self.device, dtype=torch.float32)
+            nx = normal_sampled.nx.reshape(count, 8).to(device=self.device, dtype=torch.float32)
+            ny = normal_sampled.ny.reshape(count, 8).to(device=self.device, dtype=torch.float32)
+        nz = torch.sqrt(torch.clamp(1.0 - nx * nx - ny * ny, min=0.0))
+        decoded = torch.stack([nx, ny, nz], dim=2)
+        norm = torch.linalg.norm(decoded, dim=2)
+        corner_valid = torch.isfinite(norm) & (norm > float(_EPS))
+        decoded = decoded / norm.clamp_min(float(_EPS))[:, :, None]
+        decoded = torch.where(corner_valid[:, :, None], decoded, torch.zeros_like(decoded))
+        corner_weights = torch.where(
+            corner_bits[None, :, :] > 0.5,
+            frac_xyz[:, None, :],
+            1.0 - frac_xyz[:, None, :],
         )
-        corner_valid = np.isfinite(norm) & (norm > 1.0e-12)
-        frac = frac_xyz.detach().cpu().numpy()
-        fz = frac[:, 2]
-        fy = frac[:, 1]
-        fx = frac[:, 0]
-        # The sampled corner array is ordered by xyz corner bits. The baseline
-        # tensor blend is axis-order invariant as long as weights match corners.
-        wx = np.stack([1.0 - fx, fx], axis=1)
-        wy = np.stack([1.0 - fy, fy], axis=1)
-        wz = np.stack([1.0 - fz, fz], axis=1)
-        weights = np.empty((count, 8), dtype=np.float64)
-        for corner_index, (bx, by, bz) in enumerate(_NORMAL_CORNER_BITS_XYZ):
-            weights[:, corner_index] = (
-                wx[:, int(bx)] * wy[:, int(by)] * wz[:, int(bz)]
-            )
-        weights = np.where(corner_valid, weights, 0.0)
-        hint = np.sum(decoded * weights[:, :, None], axis=1)
-        tensor = np.einsum("nc,nci,ncj->nij", weights, decoded, decoded, optimize=True)
-        total_weight = np.sum(weights, axis=1)
-        valid_np = (
-            in_bounds.detach().cpu().numpy()
-            & np.isfinite(grad)
+        weights = torch.prod(corner_weights, dim=2)
+        weights = torch.where(corner_valid, weights, torch.zeros_like(weights))
+        hint = torch.sum(decoded * weights[:, :, None], dim=1)
+        tensor = torch.einsum("nc,nci,ncj->nij", weights, decoded, decoded)
+        total_weight = torch.sum(weights, dim=1)
+        valid_t = (
+            in_bounds
+            & torch.isfinite(grad)
             & (grad > 0.0)
-            & np.isfinite(total_weight)
-            & (total_weight > 1.0e-12)
+            & torch.isfinite(total_weight)
+            & (total_weight > float(_EPS))
         )
-        normals_xyz = np.zeros((count, 3), dtype=np.float32)
-        if bool(np.any(valid_np)):
-            valid_indices = np.flatnonzero(valid_np)
-            axes = _principal_tensor_axes(tensor[valid_np], hint[valid_np])
-            axis_norm = np.linalg.norm(axes, axis=1)
-            axis_valid = np.isfinite(axis_norm) & (axis_norm > 1.0e-12)
-            good_indices = valid_indices[axis_valid]
-            normals_xyz[good_indices] = axes[axis_valid].astype(np.float32, copy=False)
-            valid_np[valid_indices[~axis_valid]] = False
-        normals_zyx = normals_xyz[:, [2, 1, 0]].copy()
-        normals_t = torch.as_tensor(normals_zyx, dtype=torch.float32, device=self.device)
-        valid_t = torch.as_tensor(valid_np, dtype=torch.bool, device=self.device)
+        axes = _principal_tensor_axes_torch(tensor, hint)
+        axis_norm = torch.linalg.norm(axes, dim=1)
+        axis_valid = torch.isfinite(axis_norm) & (axis_norm > float(_EPS))
+        valid_t = valid_t & axis_valid
+        axes = torch.where(valid_t[:, None], axes, torch.zeros_like(axes))
+        normals_t = axes[:, [2, 1, 0]].contiguous()
         return normals_t, valid_t
 
     def __call__(
@@ -1766,9 +1796,48 @@ class _DebugSparseLasagnaNormalSampler:
                 torch.zeros((0,), dtype=torch.bool, device=self.device),
             )
         points_fullres_xyz = self._selected_zyx_to_fullres_xyz(points)
-        if self.mode == "sparse-corner-principal":
-            return self._corner_principal_normals(points_fullres_xyz)
-        raise ValueError(f"unsupported debug sparse normal sampler mode: {self.mode!r}")
+        return self._corner_principal_normals(points_fullres_xyz)
+
+
+def _make_sparse_corner_normal_sampler(
+    *,
+    trace_record: Any,
+    raw_config: dict[str, Any],
+    device: torch.device,
+    profiler: _NativeTraceProfiler | None,
+) -> NativeTraceNormalSampler:
+    manifest_path = _native_trace_manifest_path_for_record(trace_record, raw_config=raw_config)
+    if manifest_path is None:
+        raise ValueError(
+            "native 3D Trace2CP sparse normal sampling requires dataset lasagna_manifest_path"
+        )
+    fit_data = _import_lasagna_fit_data()
+    volume = fit_data.LasagnaVolume.load(str(manifest_path))
+    channels = set(volume.all_channels())
+    missing = _SPARSE_NORMAL_CHANNELS - channels
+    if missing:
+        raise ValueError(
+            "native 3D Trace2CP sparse normal sampling requires Lasagna "
+            f"channels {sorted(_SPARSE_NORMAL_CHANNELS)}; missing {sorted(missing)} "
+            f"in manifest {manifest_path}"
+        )
+    skip_channels = {channel for channel in channels if channel not in _SPARSE_NORMAL_CHANNELS}
+    data = fit_data.load_3d_streaming(
+        path=str(manifest_path),
+        device=torch.device(device),
+        skip_channels=skip_channels,
+        sparse_prefetch_backend="tensorstore",
+    )
+    if not getattr(data, "sparse_caches", None):
+        raise ValueError(
+            "native 3D Trace2CP sparse normal sampling requires Lasagna sparse caches"
+        )
+    return _SparseCornerLasagnaNormalSampler(
+        trace_record=trace_record,
+        data=data,
+        device=device,
+        profiler=profiler,
+    )
 
 
 @dataclass
@@ -1948,45 +2017,16 @@ def _make_debug_normal_comparison_sampler(
         or float(angle_threshold_degrees) < 0.0
     ):
         raise ValueError("debug normal angle threshold must be finite and non-negative")
-    manifest_path = _native_trace_manifest_path_for_record(trace_record, raw_config=raw_config)
-    if manifest_path is None:
-        raise ValueError(
-            "native 3D Trace2CP normal comparison requires dataset lasagna_manifest_path"
-        )
-    fit_data = _import_lasagna_fit_data()
-    volume = fit_data.LasagnaVolume.load(str(manifest_path))
-    channels = set(volume.all_channels())
-    missing = _DEBUG_NORMAL_CHANNELS - channels
-    if missing:
-        raise ValueError(
-            "native 3D Trace2CP normal comparison requires Lasagna "
-            f"channels {sorted(_DEBUG_NORMAL_CHANNELS)}; missing {sorted(missing)} "
-            f"in manifest {manifest_path}"
-        )
-    skip_channels = {channel for channel in channels if channel not in _DEBUG_NORMAL_CHANNELS}
-    data = fit_data.load_3d_streaming(
-        path=str(manifest_path),
-        device=torch.device(device),
-        skip_channels=skip_channels,
-        sparse_prefetch_backend="tensorstore",
-    )
-    if not getattr(data, "sparse_caches", None):
-        raise ValueError(
-            "native 3D Trace2CP normal comparison requires Lasagna sparse caches"
-        )
-    modes = (("sparse-corner-principal", "sparse-corner-principal"),)
-    alternates = tuple(
+    alternates = (
         (
-            label,
-            _DebugSparseLasagnaNormalSampler(
+            "sparse-corner-principal",
+            _make_sparse_corner_normal_sampler(
                 trace_record=trace_record,
-                data=data,
                 device=device,
-                mode=sampler_mode,
+                raw_config=raw_config,
                 profiler=profiler,
             ),
-        )
-        for label, sampler_mode in modes
+        ),
     )
     return _FailFastNormalComparisonSampler(
         primary=primary,
@@ -3635,14 +3675,16 @@ def _trace_native_3d_one_way_beam(
                     )
                 )
                 root_mask = frontier_gen.depth == 0
-                if bool(torch.any(root_mask).detach().cpu()):
-                    current_directions = current_directions.clone()
-                    state_valid = state_valid.clone()
-                    current_directions[root_mask] = initial_direction_t.expand(
-                        int(current_directions.shape[0]),
-                        3,
-                    )[root_mask]
-                    state_valid[root_mask] = True
+                current_directions = torch.where(
+                    root_mask[:, None],
+                    initial_direction_t.expand(int(current_directions.shape[0]), 3),
+                    current_directions,
+                )
+                state_valid = torch.where(
+                    root_mask,
+                    torch.ones_like(state_valid),
+                    state_valid,
+                )
             valid_state_indices = torch.nonzero(state_valid, as_tuple=False).flatten()
             if int(valid_state_indices.numel()) == 0:
                 break
@@ -6109,6 +6151,7 @@ def run_native_trace2cp(
     sample_mode: str | None = None,
     native_cfg: NativeTrace2CpConfig | None = None,
     render_visualization: bool = False,
+    normal_sampler_mode: str = "sparse-corner-principal",
     debug_compare_normal_sampler: str | None = None,
     debug_normal_angle_threshold_degrees: float = 1.0,
 ) -> NativeTracePairResult | NativeWholeFiberResult:
@@ -6180,6 +6223,11 @@ def run_native_trace2cp(
     prediction_adapter = FiberTrace3DPredictAdapter(raw_config, checkpoint=checkpoint)
     model = prediction_adapter.load_model(device=device)
     profiler = _NativeTraceProfiler()
+    normal_sampler_mode = str(normal_sampler_mode)
+    if normal_sampler_mode not in _NATIVE_NORMAL_SAMPLER_MODES:
+        raise ValueError(
+            f"unsupported native 3D Trace2CP normal sampler mode: {normal_sampler_mode!r}"
+        )
     cache = NativeTraceFieldCache(
         record=record,
         prediction_adapter=prediction_adapter,
@@ -6193,15 +6241,18 @@ def run_native_trace2cp(
         inference_block_batch_size=int(cfg.inference_block_batch_size),
         profiler=profiler,
     )
-    baseline_normal_sampler = _NativeLasagnaNormalSampler(
-        geometry_loader=geometry_loader,
-        trace_record=record,
-        normal_record=_native_trace_geometry_normal_record(geometry_loader, record),
-        profiler=profiler,
-    )
-    normal_sampler: NativeTraceNormalSampler = baseline_normal_sampler
+    baseline_normal_sampler: NativeTraceNormalSampler | None = None
+    if normal_sampler_mode == "baseline" or debug_compare_normal_sampler is not None:
+        baseline_normal_sampler = _NativeLasagnaNormalSampler(
+            geometry_loader=geometry_loader,
+            trace_record=record,
+            normal_record=_native_trace_geometry_normal_record(geometry_loader, record),
+            profiler=profiler,
+        )
     if debug_compare_normal_sampler is not None:
-        normal_sampler = _make_debug_normal_comparison_sampler(
+        if baseline_normal_sampler is None:
+            raise RuntimeError("debug normal comparison requires a baseline sampler")
+        normal_sampler: NativeTraceNormalSampler = _make_debug_normal_comparison_sampler(
             primary=baseline_normal_sampler,
             trace_record=record,
             raw_config=raw_config,
@@ -6210,6 +6261,24 @@ def run_native_trace2cp(
             angle_threshold_degrees=float(debug_normal_angle_threshold_degrees),
             profiler=profiler,
         )
+    elif normal_sampler_mode == "sparse-corner-principal":
+        normal_sampler: NativeTraceNormalSampler = _make_sparse_corner_normal_sampler(
+            trace_record=record,
+            raw_config=raw_config,
+            device=device,
+            profiler=profiler,
+        )
+    elif baseline_normal_sampler is not None:
+        normal_sampler = baseline_normal_sampler
+    else:  # pragma: no cover - guarded by mode validation above.
+        raise ValueError(
+            f"unsupported native 3D Trace2CP normal sampler mode: {normal_sampler_mode!r}"
+        )
+    effective_normal_sampler = (
+        "sparse-corner-principal+baseline-compare"
+        if debug_compare_normal_sampler is not None
+        else normal_sampler_mode
+    )
     cfg = _native_trace_cfg_with_effective_smoothness(cfg, normal_sampler=normal_sampler)
     print(
         "native_trace2cp_3d input "
@@ -6219,6 +6288,7 @@ def run_native_trace2cp(
         f"inference_scaledown_power={int(cfg.inference_scaledown_power)} "
         f"inference_scaledown_factor={int(cache.inference_scaledown_factor)} "
         f"inference_blur_sigma_voxels={float(cfg.inference_blur_sigma_voxels):.3f} "
+        f"normal_sampler={effective_normal_sampler} "
         f"debug_compare_normal_sampler={debug_compare_normal_sampler or 'off'} "
         f"debug_normal_angle_threshold_degrees={float(debug_normal_angle_threshold_degrees):.6g} "
         f"sampler={type(getattr(record, 'sampler', None)).__name__} "
@@ -6693,6 +6763,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--normal-sampler",
+        choices=_NATIVE_NORMAL_SAMPLER_MODES,
+        default="sparse-corner-principal",
+        help=(
+            "Lasagna normal sampler for native 3D tracing. sparse-corner-principal "
+            "uses sparse chunk reads and baseline-style tensor reconstruction; "
+            "baseline uses the geometry-loader sampler."
+        ),
+    )
+    parser.add_argument(
         "--debug-compare-normal-sampler",
         nargs="?",
         const="sparse-corner-principal",
@@ -6767,6 +6847,7 @@ def main() -> None:
         sample_mode=args.sample_mode,
         native_cfg=native_cfg,
         render_visualization=bool(args.vis),
+        normal_sampler_mode=str(args.normal_sampler),
         debug_compare_normal_sampler=args.debug_compare_normal_sampler,
         debug_normal_angle_threshold_degrees=float(args.debug_normal_angle_threshold_degrees),
     )

@@ -695,11 +695,14 @@
   two-dot scoring is enabled. A multi-substep candidate is valid only when
   every substep has at least one valid branch. Search smoothness defaults to
   normal-aware split smoothness in the native 3D CLI. Candidate Lasagna normals
-  are sampled directly at the candidate trace coordinates through the
-  established `fiber_trace_2d` geometry-loader path
-  `_lasagna_normals_at_zyx_batch`. That path must remain the behavior source of
-  truth unless a future replacement is proven metric-equivalent before becoming
-  default. Compact `nx`/`ny` normals must not be interpolated directly, and the
+  default to sparse Lasagna corner/tensor sampling through
+  `--normal-sampler sparse-corner-principal`: sample `grad_mag` at candidate
+  points, sample compact `nx/ny` only at the eight channel-grid corners, decode
+  corners, blend the sign-invariant tensor/hint, and recover the axis with the
+  same principal-axis helper as the baseline path. The established
+  `fiber_trace_2d` geometry-loader path `_lasagna_normals_at_zyx_batch` remains
+  available as `--normal-sampler baseline` and as the fail-fast comparison
+  reference. Compact `nx`/`ny` normals must not be interpolated directly, and the
   tracer must not call `FitData3D.normal_3d` on interpolated compact normals,
   perform grid search, use a generic eigensolver fallback, or interpolate
   normals by reference-line progress. With a valid candidate normal axis,

@@ -6,9 +6,12 @@ sampler at the same candidate points.
 
 Requirements:
 
-- The normal comparison path must remain opt-in from the CLI.
-- When the comparison path is enabled, tracing must use the accelerated
-  sparse corner/tensor normal outputs after they pass comparison.
+- The no-debug native 3D Trace2CP command must use the accelerated
+  sparse corner/tensor normal sampler by default.
+- The baseline geometry-loader normal sampler must remain available as an
+  explicit fallback.
+- The normal comparison path must remain opt-in from the CLI and must still
+  trace with sparse corner/tensor normals after they pass comparison.
 - The comparison must fail fast on significant differences instead of recording
   long traces.
 - Failures must identify the compared path, call number, point coordinate,

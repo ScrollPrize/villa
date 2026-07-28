@@ -6,7 +6,7 @@
   native 3D Trace2CP CLI.
 - The comparison mode wraps the restored production geometry-loader normal
   sampler. The tracer still receives and scores with production normals.
-- Added `_DebugSparseLasagnaNormalSampler` for debug-only sparse Lasagna
+- Added `_SparseCornerLasagnaNormalSampler` for sparse Lasagna
   sampling. It samples compact `nx/ny` only at the eight channel-grid corners,
   reconstructs the tensor/hint on those values, and decodes with the existing
   `_principal_tensor_axes` helper.
@@ -19,6 +19,8 @@
 - Inverted the comparison wrapper return path so normal-aware smoothness now
   receives sparse corner/tensor normals after they pass comparison against the
   baseline sampler.
+- Made `sparse-corner-principal` the default native 3D Trace2CP normal sampler
+  via `--normal-sampler`; `baseline` remains an explicit fallback.
 - The failure message includes sampler label, call number, point index,
   selected-level ZYX coordinate, valid flags, normals, and angle/threshold where
   applicable.
@@ -50,12 +52,36 @@
   `--beam-lookahead-steps 2` completed without comparison failure and recovered
   the expected quality: `err/kvx=0.2`, `restarts=3`, `segments=87`,
   `err/m=19.6 (38.2mm)`, `trace_wall_s=679.960`.
+- User-provided no-debug command showed no acceleration because it still used
+  `debug_compare_normal_sampler=off` and the old baseline normal sampler:
+  `trace_wall_s=472.279`, `trace_candidate_normals=291.478`,
+  `lasagna_normal_sample=290.463`.
+- Updated the no-debug path so the same command now uses
+  `normal_sampler=sparse-corner-principal`.
+- No-debug sparse run before moving tensor decode to torch:
+  `err/kvx=0.2`, `restarts=3`, `segments=87`, `err/m=19.6 (38.2mm)`,
+  `trace_wall_s=374.490`. The remaining normal cost was outside zarr sampling:
+  `trace_candidate_normals=191.216` while
+  `sparse_normal_prefetch+sparse_normal_sample=5.716`.
+- Ported sparse corner/tensor reconstruction and principal-axis power
+  iteration to torch to remove the per-call NumPy conversion/decode path.
+- No-debug sparse run after torch normal decode:
+  `err/kvx=0.2`, `restarts=3`, `segments=87`, `err/m=19.6 (38.2mm)`,
+  `trace_wall_s=200.708`. This is 2.35x faster than the user's
+  baseline-normal no-debug run (`472.279s`) with the same restart count.
+  Remaining top stages: `trace_candidate_score=146.309`,
+  `inference_forward=38.637`, `field_sample_lookup=35.018`,
+  `trace_candidate_normals=19.312`.
+- Removed a progress-only GPU-to-CPU sync from point lookup and one root-mask
+  sync from beam tracing. Rerun was effectively unchanged:
+  `trace_wall_s=202.279`, `restarts=3`, so this was not the main remaining
+  bottleneck.
 
 ## Deviations / Deferred Items
 
-- The accelerated sparse corner/tensor sampler is still only selected by the
-  debug comparison flag, but when selected it now drives tracing after passing
-  fail-fast comparison.
+- The accelerated sparse corner/tensor sampler is now the default native 3D
+  Trace2CP normal sampler. Baseline remains selectable with
+  `--normal-sampler baseline`.
 - No long traces or JSON diff reports are written; the user requested fail-fast
   behavior instead.
 
@@ -69,4 +95,6 @@
 - Same focused test after removing the bad raw mode: 4 passed, 156 deselected.
 - Same focused test after inverting the comparison wrapper to return the
   accelerated normals: 4 passed, 156 deselected.
+- Focused tests after torch principal-axis decode:
+  6 passed, 155 deselected.
 - `git diff --check`: passed.

@@ -9,6 +9,9 @@
 - Added a debug-only native 3D Trace2CP normal comparison mode that runs sparse
   Lasagna normal sampling beside the production geometry-loader sampler and
   fails fast on significant differences.
+- Native 3D Trace2CP now defaults to the sparse corner/tensor Lasagna normal
+  sampler, with the geometry-loader sampler retained as `--normal-sampler
+  baseline` and as the debug comparison reference.
 - Native 3D Trace2CP inference blocks now use a shared VC3D-backed
   requested-level axis-aligned block-read API and batch missing block forwards,
   avoiding dense coordinate-grid sampling for regular inference cubes.

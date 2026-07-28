@@ -2,8 +2,8 @@
 
 ## Implementation
 
-1. Reintroduce the accelerated Lasagna-normal sampler as debug-only code.
-   - Load Lasagna streaming data only when the comparison flag is set.
+1. Reintroduce the accelerated Lasagna-normal sampler as selectable production code.
+   - Load Lasagna streaming data when sparse normal sampling is selected.
    - Use sparse `FitData3D.grid_sample_fullres(...)` only to read `grad_mag` at
      candidate points and compact `nx`/`ny` at the eight channel-grid corners.
    - Decode each compact corner, blend the sign-invariant tensor/hint, and
@@ -20,6 +20,8 @@
      above the configured threshold.
 
 3. Add CLI controls.
+   - `--normal-sampler` selects `sparse-corner-principal` or `baseline`.
+   - Default `--normal-sampler` to `sparse-corner-principal`.
    - `--debug-compare-normal-sampler[=sparse-corner-principal]` enables the
      parallel comparison.
    - `--debug-normal-angle-threshold-degrees` controls angular fail threshold.
@@ -34,7 +36,8 @@
 
 - Add a debug-only native 3D Trace2CP comparison mode that is explicitly
   fail-fast but can drive tracing with the accelerated sampler.
-- Reaffirm that default scoring uses the restored geometry-loader sampler.
+- Make default native 3D Trace2CP scoring use sparse corner/tensor normals.
+- Keep the restored geometry-loader sampler as `--normal-sampler baseline`.
 
 ## Docs Updates
 

@@ -17,6 +17,7 @@ import zarr
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
+from vesuvius.neural_tracing.fiber_trace_2d.loader import _principal_tensor_axes
 from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
     CoordinateSampleResult,
@@ -97,6 +98,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _format_trace2cp_kvx_rate,
     _format_trace2cp_meter_rate,
     _project_trace_to_initial_strip,
+    _principal_tensor_axes_torch,
     _resolve_native_trace2cp_selection,
     _sample_presence_on_strip,
     _sample_point_choices_for_points_torch,
@@ -3336,6 +3338,7 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.inference_blur_sigma_voxels == pytest.approx(0.0)
     assert args.inference_block_batch_size == 2
     assert args.max_cached_inference_gib == pytest.approx(8.0)
+    assert args.normal_sampler == "sparse-corner-principal"
     assert args.vis is False
 
 
@@ -3357,6 +3360,8 @@ def test_native_3d_trace2cp_help_shows_defaults(
     assert "[0] Power-of-two Gaussian pyramid scaledown applied" in option_text
     assert "--inference-blur-sigma-voxels" in option_text
     assert "[0.0] 3D Gaussian sigma applied" in option_text
+    assert "--normal-sampler" in option_text
+    assert "[sparse-corner-principal]" in option_text
     assert "--core-margin-voxels" in option_text
     assert "[48]" in option_text
     assert "STEP_VOXELS" not in option_text
@@ -5303,6 +5308,29 @@ def test_native_3d_trace2cp_lasagna_normal_sampler_uses_geometry_record() -> Non
     assert np.allclose(geometry_loader.points_base, [[4.0, 8.0, 12.0]])
     assert valid.tolist() == [True]
     assert torch.allclose(normals_zyx, torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32))
+
+
+def test_native_3d_principal_tensor_axes_torch_matches_numpy() -> None:
+    rng = np.random.default_rng(7)
+    vectors = rng.normal(size=(9, 3, 3)).astype(np.float64)
+    weights = rng.uniform(0.1, 1.0, size=(9, 3)).astype(np.float64)
+    tensors = np.einsum("nk,nki,nkj->nij", weights, vectors, vectors, optimize=True)
+    hints = rng.normal(size=(9, 3)).astype(np.float64)
+    hints[1] = 0.0
+    hints[5] = np.nan
+
+    expected = _principal_tensor_axes(tensors, hints)
+    actual = (
+        _principal_tensor_axes_torch(
+            torch.as_tensor(tensors, dtype=torch.float32),
+            torch.as_tensor(hints, dtype=torch.float32),
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    assert np.allclose(actual, expected, atol=2.0e-5)
 
 
 def test_native_3d_trace2cp_normal_comparison_returns_alternate_below_threshold() -> None:

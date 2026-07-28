@@ -1,11 +1,13 @@
-# Status: Fail-Fast Native 3D Trace2CP Acceleration Comparison
+# Status: Native 3D Trace2CP Accelerated Normal Default
 
 - [x] Read project AGENTS workflow.
-- [x] Define debug comparison task.
-- [x] Create implementation plan.
-- [x] Add debug-only accelerated sampler.
-- [x] Add fail-fast comparison wrapper.
-- [x] Add CLI controls.
+- [x] Identify why no-debug Trace2CP command still used baseline normals.
+- [x] Make sparse corner/tensor normals the default no-debug sampler.
+- [x] Keep baseline sampler selectable with `--normal-sampler baseline`.
+- [x] Keep fail-fast baseline comparison available.
 - [x] Update specs/changelog/task log.
-- [x] Add focused tests.
-- [x] Run validation.
+- [x] Run focused unit tests.
+- [x] Run no-debug full-fiber benchmark command.
+- [x] Run no-debug full-fiber benchmark after torch normal decode.
+- [x] Run sync-removal follow-up benchmark.
+- [x] Run final validation checks.
