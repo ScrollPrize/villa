@@ -4,10 +4,12 @@
 
 1. Reintroduce the accelerated Lasagna-normal sampler as debug-only code.
    - Load Lasagna streaming data only when the comparison flag is set.
-   - Use sparse `FitData3D.grid_sample_fullres(...)` for `grad_mag`, `nx`, and
-     `ny` at the exact candidate points.
-   - Provide at least a direct sparse-normal variant so we can reproduce and
-     localize the suspected divergent path.
+   - Use sparse `FitData3D.grid_sample_fullres(...)` only to read `grad_mag` at
+     candidate points and compact `nx`/`ny` at the eight channel-grid corners.
+   - Decode each compact corner, blend the sign-invariant tensor/hint, and
+     recover the axis with the same principal-axis helper as the baseline path.
+   - Do not provide or keep any path that interpolates raw compact `nx`/`ny`
+     and then reads `FitData3D.normal_3d`.
 
 2. Add a fail-fast comparison wrapper.
    - Wrap the restored `_NativeLasagnaNormalSampler` as the primary sampler.
@@ -17,7 +19,8 @@
      above the configured threshold.
 
 3. Add CLI controls.
-   - `--debug-compare-normal-sampler` enables the parallel comparison.
+   - `--debug-compare-normal-sampler[=sparse-corner-principal]` enables the
+     parallel comparison.
    - `--debug-normal-angle-threshold-degrees` controls angular fail threshold.
 
 4. Keep diagnostics compact.

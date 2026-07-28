@@ -1586,7 +1586,7 @@ class _DebugSparseLasagnaNormalSampler:
 
     def __post_init__(self) -> None:
         self.device = torch.device(self.device)
-        if self.mode not in {"sparse-direct", "sparse-corner-principal"}:
+        if self.mode != "sparse-corner-principal":
             raise ValueError(f"unsupported debug sparse normal sampler mode: {self.mode!r}")
 
     def _measure(
@@ -1638,39 +1638,6 @@ class _DebugSparseLasagnaNormalSampler:
         for cache in sparse_caches.values():
             if set(getattr(cache, "channels", ())) & channels:
                 cache.sync()
-
-    def _direct_normals(
-        self,
-        points_fullres_xyz: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        count = int(points_fullres_xyz.shape[0])
-        query = points_fullres_xyz.reshape(1, 1, count, 3).contiguous()
-        with self._measure("debug_sparse_direct_prefetch", sync=True):
-            self._prefetch_sparse_points(query, channels=set(_DEBUG_NORMAL_CHANNELS))
-        with self._measure("debug_sparse_direct_sample", sync=True):
-            sampled = self.data.grid_sample_fullres(
-                query,
-                channels=set(_DEBUG_NORMAL_CHANNELS),
-            )
-            if sampled.grad_mag is None or sampled.normal_3d is None:
-                raise ValueError("debug sparse-direct normal sampler did not return grad_mag/normal_3d")
-            grad = sampled.grad_mag.reshape(count)
-            normals_xyz = sampled.normal_3d.reshape(count, 3)
-            normals_zyx = normals_xyz[:, [2, 1, 0]]
-            norms = torch.linalg.norm(normals_zyx, dim=1)
-            valid = (
-                torch.isfinite(grad)
-                & (grad > 0.0)
-                & torch.isfinite(normals_zyx).all(dim=1)
-                & torch.isfinite(norms)
-                & (norms > float(_EPS))
-            )
-            normals_zyx = torch.where(
-                valid[:, None],
-                normals_zyx / norms.clamp_min(float(_EPS))[:, None],
-                torch.zeros_like(normals_zyx),
-            )
-        return normals_zyx, valid
 
     def _corner_principal_normals(
         self,
@@ -1799,8 +1766,6 @@ class _DebugSparseLasagnaNormalSampler:
                 torch.zeros((0,), dtype=torch.bool, device=self.device),
             )
         points_fullres_xyz = self._selected_zyx_to_fullres_xyz(points)
-        if self.mode == "sparse-direct":
-            return self._direct_normals(points_fullres_xyz)
         if self.mode == "sparse-corner-principal":
             return self._corner_principal_normals(points_fullres_xyz)
         raise ValueError(f"unsupported debug sparse normal sampler mode: {self.mode!r}")
@@ -1971,7 +1936,7 @@ def _make_debug_normal_comparison_sampler(
     angle_threshold_degrees: float,
     profiler: _NativeTraceProfiler | None,
 ) -> NativeTraceNormalSampler:
-    if mode not in {"all", "sparse-direct", "sparse-corner-principal"}:
+    if mode != "sparse-corner-principal":
         raise ValueError(f"unsupported debug normal comparison mode: {mode!r}")
     if (
         not math.isfinite(float(angle_threshold_degrees))
@@ -2004,10 +1969,7 @@ def _make_debug_normal_comparison_sampler(
         raise ValueError(
             "native 3D Trace2CP normal comparison requires Lasagna sparse caches"
         )
-    modes = (
-        ("sparse-corner-principal", "sparse-corner-principal"),
-        ("sparse-direct", "sparse-direct"),
-    ) if mode == "all" else ((mode, mode),)
+    modes = (("sparse-corner-principal", "sparse-corner-principal"),)
     alternates = tuple(
         (
             label,
@@ -6728,13 +6690,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--debug-compare-normal-sampler",
         nargs="?",
-        const="all",
-        choices=("all", "sparse-direct", "sparse-corner-principal"),
+        const="sparse-corner-principal",
+        choices=("sparse-corner-principal",),
         default=None,
         help=(
-            "Debug-only: run accelerated Lasagna normal sampling in parallel with "
-            "the baseline sampler and fail fast on differences. The tracer still "
-            "uses baseline normals."
+            "Debug-only: run sparse corner/tensor Lasagna normal sampling in "
+            "parallel with the baseline sampler and fail fast on differences. "
+            "The tracer still uses baseline normals."
         ),
     )
     parser.add_argument(
