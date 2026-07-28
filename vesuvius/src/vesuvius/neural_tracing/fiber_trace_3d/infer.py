@@ -19,7 +19,7 @@ try:
         _crop_xyzwhd_bounds,
         _ds_index,
         _ds_size,
-        _infer_tiled_products_3d,
+        run_tiled_inference_3d,
         OmeZarrOutputAdapter,
         write_lasagna_product_manifest,
     )
@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs
         _crop_xyzwhd_bounds,
         _ds_index,
         _ds_size,
-        _infer_tiled_products_3d,
+        run_tiled_inference_3d,
         OmeZarrOutputAdapter,
         write_lasagna_product_manifest,
     )
@@ -79,6 +79,13 @@ def _tile_size_from_config(config: dict[str, Any], explicit_tile_size: int | Non
 def _level_from_scaledown(scaledown: int) -> int:
     sd = max(1, int(scaledown))
     return round(math.log2(sd)) if sd > 1 else 0
+
+
+def _resolve_inference_device(device: str | None) -> torch.device:
+    requested = "auto" if device is None else str(device).strip().lower()
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    return torch.device(requested)
 
 
 def _select_and_expand_crop(
@@ -179,7 +186,7 @@ def run_fiber_trace_3d_inference(
     input_path: str,
     output_path: str | Path,
     checkpoint: str | Path | None,
-    device: str | None = None,
+    device: str | None = "auto",
     crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
     tile_size: int | None = None,
     overlap: int = 16,
@@ -235,9 +242,7 @@ def run_fiber_trace_3d_inference(
     z0, z1, y0, y1, x0, x1 = crop_slices
     oz0, oy0, ox0, oz1, oy1, ox1 = output_region
 
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_device = torch.device(device)
+    torch_device = _resolve_inference_device(device)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     removed = _cleanup_predict3d_temp_files(output_dir, f"{json_stem}_")
@@ -252,6 +257,7 @@ def run_fiber_trace_3d_inference(
         checkpoint=checkpoint,
         level=output_level,
         scaledown=effective_output_sd,
+        inference_scaledown=output_sd_input,
         chunk_size=int(ome_chunk),
         product_prefix=json_stem,
         zarr_path_prefix=output_dir / json_stem,
@@ -289,13 +295,18 @@ def run_fiber_trace_3d_inference(
     )
 
     t0 = time.time()
+    print(
+        f"[fiber_trace_3d:infer] loading checkpoint={checkpoint} device={torch_device}",
+        flush=True,
+    )
     model = predict_adapter.load_model(device=torch_device)
+    print("[fiber_trace_3d:infer] model loaded; starting tiled inference", flush=True)
     progress = {
         "t0": time.time(),
         "finalized_base_z": int(oz0 * effective_output_sd),
         "finalized_base_z_total": int(oz1 * effective_output_sd),
     }
-    _infer_tiled_products_3d(
+    run_tiled_inference_3d(
         model,
         a_in,
         crop_slices=crop_slices,
@@ -303,14 +314,13 @@ def run_fiber_trace_3d_inference(
         model_adapter=predict_adapter,
         output_adapter=output_adapter,
         products=predict_adapter.output_products,
-        output_region_zyx=output_region,
-        full_output_shape_zyx=full_output_shape,
+		output_regions_zyx={p.name: output_region for p in predict_adapter.output_products},
+		full_output_shapes_zyx={p.name: full_output_shape for p in predict_adapter.output_products},
         input_zarr_path=str(input_path),
-        output_scaledown_base=effective_output_sd,
+		output_scaledown_base={p.name: effective_output_sd for p in predict_adapter.output_products},
         tile_size=tile_size_i,
         overlap=int(overlap),
         border=int(border),
-        scaledown=output_sd_input,
         tmp_dir=str(output_dir),
         progress=progress,
         temp_prefix=f"{json_stem}_",
@@ -366,7 +376,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar=("X", "Y", "Z", "W", "H", "D"),
         help="Crop in base coordinates: x y z w h d.",
     )
-    parser.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu".')
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help='Device: "auto" selects CUDA when available, otherwise CPU.',
+    )
     parser.add_argument(
         "--base-ref",
         default=None,

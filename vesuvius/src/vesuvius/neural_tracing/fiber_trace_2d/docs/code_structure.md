@@ -95,12 +95,56 @@ loading.
 
 - Reuses the shared predict3d mechanics for crop handling, canonical tile and
   output-chunk lattices, automatic S3 download from `_download` metadata,
-  rolling product accumulation, output-chunk-only resume, temp cleanup, and
+  fixed-depth circular product accumulation, output-chunk-only resume, temp cleanup, and
   atomic chunk writes.
 - Common tiled arguments are `--input`, `--output`, `--checkpoint`,
   `--tile-size`, `--overlap`, `--border`, `--scaledown`, `--crop`,
   `--device`, `--no-download`, `--levels`, `--ome-chunk`, and
   `--pyramid-workers`.
+
+### Shared 3D tiled runner
+
+Both entry points terminate in `lasagna.tiled_predict3d.run_tiled_inference_3d`:
+
+```text
+Lasagna CLI -> LasagnaCosPredict3DAdapter --+
+                                               +-> run_tiled_inference_3d
+Fiber CLI   -> FiberTrace3DPredictAdapter ---+       |
+                                                       +-> per-scale circular mmap rings
+                                                       +-> chunk atomic output writes
+```
+
+The runner traverses the globally anchored model-tile lattice once. Model
+adapters provide preprocessing, model execution, raw product splitting, and
+raw-to-persisted conversion; they do not own traversal, accumulation, resume,
+or flushing. `OutputProductSpec.inference_scaledown` describes a product's
+scale relative to the selected input array, while `scaledown` remains the
+base-relative manifest scale.
+
+Each distinct inference scale has separate raw-product float32 mmap rings and
+one shared geometric weight ring. A logical Z plane maps to
+`physical_z = logical_z % ring_depth`; generation checks prevent an unflushed
+plane from being overwritten. Ring depth is planned from actual canonical tile
+positions and chunk-aligned flush frontiers, so backing size is
+`(raw_channels + 1) * ring_depth * working_y * working_x * 4` bytes and does
+not depend on full volume depth. Flushes visit Zarr chunks in Z/Y/X order,
+normalize with chunk-sized denominator scratch, atomically write coherent
+channel bundles, clear that chunk region, and only then release its logical Z
+generation. Wrapped reads copy at most one output chunk.
+
+Lasagna's optional `pred_dt` is an external-source stage after neural
+inference. It is independently resumable and never schedules model tiles.
+
+Ownership changed as follows:
+
+| Concern | Before | Current owner |
+| --- | --- | --- |
+| Lasagna traversal/flush | `_infer_tiled_3d` plus `_on_z_complete` | `run_tiled_inference_3d` |
+| Fiber traversal/flush | `_infer_tiled_products_3d` | `run_tiled_inference_3d` |
+| Model preprocessing/autocast/output split | partly embedded in each loop | model adapter |
+| Tile lattice, resume, blend, rings, progress | duplicated/divergent | shared runner |
+| Coherent atomic channel writes | output adapter | output adapter |
+| Lasagna prediction EDT | Lasagna flush callback | independent Lasagna post-stage |
   Fiber-specific arguments are the positional config, `--recurrent-steps`,
   `--base-ref`, and `--base-scale`.
 - Writes a Lasagna-style `.lasagna.json` manifest plus OME-Zarr groups derived
@@ -109,7 +153,7 @@ loading.
   `<stem>_ny.ome.zarr`; multi-option runs prefix channel names with
   `option_000_`, `option_001_`, etc.
 - The fiber model's raw seven-channel option output is internal only. The
-  shared rolling accumulator stores raw `dir0_z/dir1_z/dir0_y/dir1_y/dir0_x/
+  shared circular accumulator stores raw `dir0_z/dir1_z/dir0_y/dir1_y/dir0_x/
   dir1_x/presence`, and the fiber adapter finalizes those raw slabs to
   persisted `presence/nx/ny` chunks using Lasagna's compact hemisphere
   encoding. Coarser presence and normal pyramids are built with the existing
@@ -397,6 +441,11 @@ loading.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
   and `best.pt`. `training.kept_snapshot_interval` additionally keeps numbered
   snapshots as `snapshots/step_<iteration>.pt` and defaults to `10000`.
+  Fiber3d snapshots are written only after dense test evaluation:
+  `checkpoint_interval` must be a positive multiple of `test_interval`, and
+  `kept_snapshot_interval` must be `0` or a multiple of `test_interval`.
+  `best.pt` tracks the lowest dense `test/loss_total`; training and Trace2CP
+  metrics cannot select it.
 - `training.mixed_precision` accepts `off`, `bf16`, `fp16`, and `auto`.
   Autocast wraps training loss, dense test loss, benchmark forward loss,
   TensorBoard sample-sheet inference, and Trace2CP metric/visual inference.
@@ -539,8 +588,8 @@ loading.
 - When `training.test_trace2cp_enabled` is true, test evaluation builds
   Trace2CP side-strip geometry with the 2D loader, runs tiled dense 3D inference
   blocks over the requested strip coordinates, projects direction/presence into
-  the 2D frame, logs `test/trace2cp_error`, and uses that value for `best.pt`
-  selection. Dense 3D test loss remains a diagnostic.
+  the 2D frame, and logs `test/trace2cp_error` as a diagnostic. Dense
+  `test/loss_total` remains the sole metric used for fiber3d snapshot selection.
 - Native 3D Trace2CP uses a field-provider boundary. The current provider is
   `NativeTraceFieldCache`, a sparse live checkpoint-backed block cache. It
   samples regular requested-level volume blocks through
@@ -1277,7 +1326,9 @@ The important behavior is:
   set at `training.test_interval` using either the configured fixed-size
   random window or all held-out CPs when `test_control_points` is `0`; it also
   evaluates Trace2CP on each selected held-out CP using the segment to the next
-  CP, and uses the averaged `test/trace2cp_error` for current/best snapshots.
+  CP. Fiber3d current/retained snapshots are written only on aligned test
+  steps, and `best.pt` uses the lowest dense `test/loss_total`; Trace2CP is
+  diagnostic only.
 - `--resume <snapshot.pt>` restores model and optimizer state, creates a fresh
   timestamped run directory from the current config just like normal training,
   and continues from `checkpoint_step + 1`. `training.max_steps` remains the

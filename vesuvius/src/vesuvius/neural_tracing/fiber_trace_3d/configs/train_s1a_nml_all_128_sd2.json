@@ -50,7 +50,7 @@
     "learning_rate": 0.001,
     "scalar_log_interval": 100,
     "sample_vis_interval": 500,
-    "checkpoint_interval": 100,
+    "checkpoint_interval": 500,
     "kept_snapshot_interval": 10000,
     "test_interval": 500,
     "test_control_points": 0,

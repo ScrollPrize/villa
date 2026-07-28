@@ -35,6 +35,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
     FiberTrace3DPredictAdapter,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.infer import (
+    _resolve_inference_device,
     run_fiber_trace_3d_inference,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.prediction import (
@@ -147,8 +148,49 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _save_snapshot,
     _select_branch_by_chunked_min_fraction,
     _training_sample_index_limit,
+    _validate_snapshot_intervals,
     _write_3d_sample_sheet,
 )
+
+
+def test_snapshot_intervals_must_align_with_evaluation() -> None:
+    _validate_snapshot_intervals(
+        checkpoint_interval=500,
+        kept_snapshot_interval=10_000,
+        test_interval=500,
+    )
+
+    with pytest.raises(ValueError, match="checkpoint_interval must be a multiple"):
+        _validate_snapshot_intervals(
+            checkpoint_interval=100,
+            kept_snapshot_interval=10_000,
+            test_interval=500,
+        )
+
+    with pytest.raises(ValueError, match="kept_snapshot_interval must be 0 or a multiple"):
+        _validate_snapshot_intervals(
+            checkpoint_interval=500,
+            kept_snapshot_interval=750,
+            test_interval=500,
+        )
+
+    with pytest.raises(ValueError, match="test_interval must be > 0"):
+        _validate_snapshot_intervals(
+            checkpoint_interval=100,
+            kept_snapshot_interval=0,
+            test_interval=0,
+        )
+
+
+def test_inference_device_defaults_to_available_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert _resolve_inference_device(None) == torch.device("cuda")
+    assert _resolve_inference_device("auto") == torch.device("cuda")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert _resolve_inference_device(None) == torch.device("cpu")
+    assert _resolve_inference_device("auto") == torch.device("cpu")
+    assert _resolve_inference_device("cpu") == torch.device("cpu")
 
 
 class _NativeTraceTestPredictionAdapter:

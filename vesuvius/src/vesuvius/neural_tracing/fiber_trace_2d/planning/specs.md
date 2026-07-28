@@ -2,9 +2,10 @@
 
 ## Shared 3D Tiled Inference
 
-- `lasagna.tiled_predict3d` owns reusable 3D tiled inference mechanics:
+- `lasagna.tiled_predict3d.run_tiled_inference_3d` is the sole neural tiled
+  inference runner used by both Lasagna predict3d and Fiber 3D inference. It owns:
   canonical global tile/output-chunk lattices, crop bounds, S3 auto-download
-  from `_download` metadata, rolling z-band scratch, output-chunk-only resume,
+  from `_download` metadata, circular Z scratch, output-chunk-only resume,
   temp cleanup, progress formatting, and atomic Zarr chunk writes.
 - Product-specific adapters own model semantics, raw output splitting, output
   channel schema, tile preprocessing, raw-to-persisted finalization, and
@@ -18,6 +19,24 @@
 - Resume state is durable output chunks only. Done markers are not allowed.
   Scratch mmap/temporary files are not resume state and may be deleted on
   startup/resume or finish.
+- Neural accumulation uses a fixed-depth circular float32 mmap per raw product
+  and one geometric weight mmap per distinct source-relative inference scale.
+  Ring depth is derived from the actual canonical Z tile positions, nonzero
+  tile support, flush opportunities, and output chunk alignment. Mmap shape and
+  logical file size must be independent of full output Z.
+- Completed output is normalized, finalized, written, and cleared one globally
+  anchored output chunk at a time. Denominator and wrap scratch are bounded by
+  one output chunk; no full-XY or full-band normalization/finalization
+  temporary is allowed. Circular slots may be reused only after every live raw
+  product region sharing their geometric weight has finished.
+- Resume masks suppress accumulation for already complete product chunks.
+  Weight contributions are accumulated once over the union of incomplete
+  product regions at a scale, never once per product. Each scheduled global
+  model tile is inferred at most once even when it feeds several scales or
+  products.
+- `OutputProductSpec.scaledown` is base-relative output metadata;
+  `inference_scaledown` is the explicit factor relative to the selected input
+  array used for tile downsampling and ring geometry.
 - Output products are independently resumable. For Lasagna, missing `pred_dt`
   chunks schedule only derived distance-transform generation; they must not
   schedule neural model inference when `cos` and `grad_mag/nx/ny` chunks are
@@ -62,7 +81,7 @@
   `preprocess_cos_omezarr.py`.
 - Fiber model output has seven raw channels per option internally:
   `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, and
-  `presence`. These raw channels are accumulated in the shared rolling z-band
+  `presence`. These raw channels are accumulated in the shared circular Z ring
   and are never persisted as output channels.
 - Fiber persisted output is only `presence`, `nx`, and `ny` per option.
   Presence is fixed-point uint8 with `0 == 0.0` and `255 == 1.0`. `nx/ny` use
@@ -309,6 +328,15 @@
 - When `training.test_interval > 0`, 3D training runs the configured test
   evaluation at step 0 before the first optimizer step and logs the same
   TensorBoard scalars/stdout as interval tests.
+- 3D snapshots are evaluation-only. `training.checkpoint_interval` must be a
+  positive multiple of `training.test_interval`, and
+  `training.kept_snapshot_interval` must be `0` or a multiple of
+  `training.test_interval`. `current.pt` and retained numbered snapshots are
+  written only on aligned evaluation steps; an otherwise unscheduled final
+  training step must not write a snapshot.
+- The 3D `best.pt` snapshot is selected exclusively by the lowest observed
+  dense `test/loss_total`. Training loss must never be compared with the test
+  metric or trigger a best snapshot.
 - Dense 3D test loaders do not inherit train augmentations by default.
   `training.test_augment_enabled: true` is the explicit opt-in for augmented
   dense tests.
@@ -476,8 +504,9 @@
   interval dense 3D test loss run for the fast 64-scale training setup.
 - When `training.test_trace2cp_enabled` is true, 3D training logs
   `test/trace2cp_error`, raw y-error, valid segment count, and skipped segment
-  count. `best.pt` and `current.pt` store `metric_name`; best-checkpoint
-  selection uses `test/trace2cp_error` when it is available.
+  count. Trace2CP metrics are diagnostic and must not replace dense
+  `test/loss_total` as the snapshot metric. `best.pt`, `current.pt`, and
+  retained numbered snapshots store `metric_name: test/loss_total`.
 - `training.test_trace2cp_control_points: 0` means the full held-out Trace2CP
   CP set in flat order. Positive values use the deterministic random held-out
   range beginning at `training.test_trace2cp_start_sample_index` or, when that
@@ -493,8 +522,8 @@
   exports `trace2cp_3d_vis.jpg`.
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool` is a
   separate native 3D Trace2CP inspection tool. It must not replace the
-  projected `test/trace2cp_error` training metric or best-checkpoint selection
-  unless that migration is explicitly requested.
+  projected `test/trace2cp_error` diagnostic or affect best-checkpoint
+  selection, which is based only on dense `test/loss_total`.
 - Native 3D Trace2CP is metric-only by default. It always prints native metric
   lines and writes `trace2cp_native_3d_summary.json`; JPG visualization and
   partial image updates are opt-in and run only when `--vis` is supplied.
