@@ -6,7 +6,10 @@
 #endif
 
 #include <qapplication.h>
+#include <QAbstractSpinBox>
 #include <QCommandLineParser>
+#include <QComboBox>
+#include <QEvent>
 
 #include "CWindow.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
@@ -89,6 +92,37 @@ static bool hasCliFlag(int argc, char* argv[], const char* flag)
     }
     return false;
 }
+
+class WheelFocusFilter final : public QObject
+{
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() != QEvent::Wheel)
+            return QObject::eventFilter(watched, event);
+
+        auto* widget = qobject_cast<QWidget*>(watched);
+        while (widget) {
+            if (auto* spinBox = qobject_cast<QAbstractSpinBox*>(widget)) {
+                if (!spinBox->hasFocus()) {
+                    event->ignore();
+                    return true;
+                }
+                break;
+            }
+            if (auto* comboBox = qobject_cast<QComboBox*>(widget)) {
+                if (!comboBox->hasFocus()) {
+                    event->ignore();
+                    return true;
+                }
+                break;
+            }
+            widget = widget->parentWidget();
+        }
+
+        return QObject::eventFilter(watched, event);
+    }
+};
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((visibility("default")))
@@ -200,6 +234,8 @@ auto main(int argc, char* argv[]) -> int
     }
 
     QApplication app(argc, argv);
+    WheelFocusFilter wheelFocusFilter;
+    app.installEventFilter(&wheelFocusFilter);
     QApplication::setOrganizationName("Vesuvius Challenge");
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
