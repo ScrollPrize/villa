@@ -59,7 +59,7 @@ bool resId_t::operator==(const resId_t& o) const
     return true;
 }
 
-size_t resId_hash::operator()(resId_t id)
+size_t resId_hash::operator()(const resId_t& id) const
 {
     size_t hash1 = std::hash<int>{}(id._type);
     size_t hash2 = std::hash<void*>{}(id._sm);
@@ -74,7 +74,7 @@ size_t resId_hash::operator()(resId_t id)
     return hash;
 }
 
-size_t SurfPoint_hash::operator()(SurfPoint p)
+size_t SurfPoint_hash::operator()(const SurfPoint& p) const
 {
     size_t hash1 = std::hash<void*>{}(p.first);
     size_t hash2 = std::hash<int>{}(p.second[0]);
