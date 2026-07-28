@@ -27,6 +27,9 @@ class CoordinateSampler:
     def sample_coords(self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray) -> CoordinateSampleResult:
         raise NotImplementedError
 
+    def sample_block_zyx(self, start_zyx: np.ndarray, shape_zyx: tuple[int, int, int]) -> CoordinateSampleResult:
+        raise NotImplementedError
+
     def sample_coord_batch(
         self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
     ) -> CoordinateSampleResult:
@@ -186,6 +189,70 @@ class Vc3dCoordinateSampler(CoordinateSampler):
             stats=stats_dict,
         )
 
+    def sample_block_zyx(
+        self,
+        start_zyx: np.ndarray,
+        shape_zyx: tuple[int, int, int],
+    ) -> CoordinateSampleResult:
+        if hasattr(self, "blocking") and not bool(getattr(self, "blocking")):
+            raise ValueError("VC3D block sampling requires blocking=True")
+        sample_block = getattr(self.volume, "sample_zyx_block", None)
+        if sample_block is None:
+            raise RuntimeError(
+                "VC3D volume binding does not expose sample_zyx_block; rebuild "
+                "volume-cartographer so native 3D Trace2CP can use strict "
+                "requested-level axis-aligned block reads"
+            )
+        start = np.asarray(start_zyx, dtype=np.int64)
+        shape = np.asarray(shape_zyx, dtype=np.int64)
+        if start.shape != (3,) or shape.shape != (3,):
+            raise ValueError("start_zyx and shape_zyx must each have shape (3,)")
+        if not bool(np.all(shape > 0)):
+            raise ValueError("shape_zyx values must be positive")
+        image, sampled_valid, stats = sample_block(
+            tuple(int(v) for v in start),
+            tuple(int(v) for v in shape),
+            self.level,
+            self.blocking,
+        )
+        image_arr = np.asarray(image, dtype=np.float32)
+        valid_arr = np.asarray(sampled_valid, dtype=np.uint8)
+        stats_dict = dict(stats)
+        if self.blocking:
+            if "requested_level_only" not in stats_dict:
+                raise RuntimeError(
+                    "VC3D block sampling did not report requested_level_only; "
+                    "rebuild volume-cartographer so native 3D Trace2CP can use "
+                    "strict requested-level block reads"
+                )
+            if not bool(stats_dict.get("requested_level_only")):
+                raise RuntimeError(
+                    "VC3D block sampling did not use requested-level-only mode: "
+                    f"stats={stats_dict}"
+                )
+            fallback_levels = int(stats_dict.get("fallback_levels", 0) or 0)
+            if fallback_levels != 0:
+                raise RuntimeError(
+                    f"VC3D block sampling reported scale fallback: stats={stats_dict}"
+                )
+        expected_shape = tuple(int(v) for v in shape)
+        if image_arr.shape != expected_shape:
+            raise ValueError(
+                "VC3D block sampler returned incompatible image shape: "
+                f"shape={image_arr.shape} expected={expected_shape}"
+            )
+        if valid_arr.shape != expected_shape:
+            raise ValueError(
+                "VC3D block sampler returned incompatible valid-mask shape: "
+                f"shape={valid_arr.shape} expected={expected_shape}"
+            )
+        stats_dict.setdefault("sample_block_zyx", 1)
+        return CoordinateSampleResult(
+            image=image_arr.astype(np.float32, copy=False),
+            valid_mask=valid_arr.astype(bool, copy=False),
+            stats=stats_dict,
+        )
+
     def chunk_requests_for_coords(
         self, coords_zyx_base: np.ndarray, valid_mask: np.ndarray
     ) -> list[ZarrChunkRequest]:
@@ -302,6 +369,43 @@ class NumpyZarrCoordinateSampler(CoordinateSampler):
             image=image,
             valid_mask=np.asarray(valid_mask, dtype=bool),
             stats={"covered_pixels": int(np.count_nonzero(valid_mask)), "requested_chunks": 0, "error_chunks": 0},
+        )
+
+    def sample_block_zyx(
+        self,
+        start_zyx: np.ndarray,
+        shape_zyx: tuple[int, int, int],
+    ) -> CoordinateSampleResult:
+        start = np.asarray(start_zyx, dtype=np.int64)
+        shape = np.asarray(shape_zyx, dtype=np.int64)
+        if start.shape != (3,) or shape.shape != (3,):
+            raise ValueError("start_zyx and shape_zyx must each have shape (3,)")
+        if not bool(np.all(shape > 0)):
+            raise ValueError("shape_zyx values must be positive")
+        array_shape = np.asarray(self.array.shape[:3], dtype=np.int64)
+        out = np.zeros(tuple(int(v) for v in shape), dtype=np.float32)
+        valid = np.zeros(tuple(int(v) for v in shape), dtype=bool)
+        read_lo = np.maximum(start, 0)
+        read_hi = np.minimum(start + shape, array_shape)
+        if bool(np.all(read_hi > read_lo)):
+            dst_lo = read_lo - start
+            dst_hi = dst_lo + (read_hi - read_lo)
+            src_slices = tuple(slice(int(lo), int(hi)) for lo, hi in zip(read_lo, read_hi, strict=True))
+            dst_slices = tuple(slice(int(lo), int(hi)) for lo, hi in zip(dst_lo, dst_hi, strict=True))
+            out[dst_slices] = np.asarray(self.array[src_slices], dtype=np.float32)
+            valid[dst_slices] = True
+        return CoordinateSampleResult(
+            image=out,
+            valid_mask=valid,
+            stats={
+                "covered_pixels": int(np.count_nonzero(valid)),
+                "requested_chunks": 0,
+                "error_chunks": 0,
+                "missing_chunks": 0,
+                "fallback_levels": 0,
+                "requested_level_only": True,
+                "sample_block_zyx": 1,
+            },
         )
 
     def chunk_requests_for_coords(

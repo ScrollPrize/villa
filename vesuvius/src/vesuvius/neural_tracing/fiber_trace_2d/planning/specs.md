@@ -48,6 +48,18 @@
   stack: `build_fiber_trace_3d_model(...)`, training snapshot loading, the
   configured tile image normalization, mixed-precision/autocast helpers, and
   Lasagna 3x2 direction encoding helpers.
+- When a 3D fiber inference/tracing checkpoint contains a saved training
+  `config`, that checkpoint config is authoritative for model construction,
+  option count, and tile preprocessing. Runtime configs still provide the
+  dataset/CLI context, but must not silently build a different architecture
+  than the snapshot. Older checkpoints without embedded config may infer a
+  minimal legacy free-branch model layout from
+  `net.decoder.final_seg_layer.weight` when possible.
+- Lasagna 3x2 normal estimation and compact `nx/ny` byte encoding live in the
+  package-safe shared `lasagna.normal_encoding` module. Lasagna predict3d,
+  fiber whole-volume inference, and live fiber prediction paths must import
+  that helper directly, not private functions from
+  `preprocess_cos_omezarr.py`.
 - Fiber model output has seven raw channels per option internally:
   `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, and
   `presence`. These raw channels are accumulated in the shared rolling z-band
@@ -493,6 +505,17 @@
   separate native 3D Trace2CP inspection tool. It must not replace the
   projected `test/trace2cp_error` diagnostic or affect best-checkpoint
   selection, which is based only on dense `test/loss_total`.
+- Native 3D Trace2CP is metric-only by default. It always prints native metric
+  lines and writes `trace2cp_native_3d_summary.json`; JPG visualization and
+  partial image updates are opt-in and run only when `--vis` is supplied.
+- Dedicated native 3D Trace2CP metric configs may require the JSON fiber to be
+  supplied by `--fiber-json`. In that mode the config `datasets` entry is only
+  a volume/scale/manifest template and must not carry a config-local
+  `fiber_glob` or `fiber_paths` list. It should contain only metric/runtime
+  fields and must not carry unrelated NML training datasets, affine transforms,
+  train/test duplicate dataset blocks, augmentation settings, prefetch
+  settings, loss weights, TensorBoard settings, or training-loop/run/checkpoint
+  settings.
 - Native 3D Trace2CP selection supports both the existing
   `--sample-index`/`--target-offset` mode and explicit fiber segment mode:
   `--fiber-json <path> --start-cp-index A --target-cp-index B`. Explicit CP
@@ -536,14 +559,21 @@
   core plus the one-voxel upper interpolation halo needed to preserve
   trilinear point sampling inside the trusted core; full margin outputs must
   not remain in the resident CPU cache after block inference.
-- Native 3D Trace2CP inference blocks are sampled through the configured
-  `CoordinateSampler` using the same selected-level to base-coordinate
-  conversion as 3D training: selected-level block grids are multiplied by
-  `record.volume_spacing_base`, validated against `record.base_shape_zyx`, and
-  passed to blocking `sample_coord_batch(...)`. Real configured volumes must
-  not be read by direct zarr/raw block slicing in the native tool. These
-  native block samples must use the strict requested-level VC3D blocking
-  semantics above and reject reported fallback or chunk-error stats.
+- Native 3D Trace2CP inference blocks are regular axis-aligned selected-level
+  regions and must be sampled through `CoordinateSampler.sample_block_zyx(...)`.
+  This path is backed by VC3D requested-level chunk-cache reads and must not
+  materialize dense `[D,H,W,3]` coordinate grids or call generic
+  `sample_coord_batch(...)` for these blocks. Real configured volumes must not
+  be read by direct zarr/raw block slicing in Python. The block sampler must use
+  strict requested-level VC3D blocking semantics, report
+  `requested_level_only=true` and `fallback_levels=0`, reject chunk errors, and
+  mark out-of-volume voxels invalid/zero. Known-missing requested-level chunks
+  follow the existing strict VC3D rendering semantics: black covered pixels and
+  a non-zero `missing_chunks` stat.
+- Generic `CoordinateSampler.sample_coords(...)` and
+  `sample_coord_batch(...)` remain the correct boundary for arbitrary
+  coordinate surfaces such as side/top strips, TTA surfaces, and strip
+  visualization.
 - Native 3D Trace2CP applies the configured 3D model-input normalization before
   inference. Exported native strip volume panels must display that same
   normalized input domain so the visualization shows what inference sees. For
@@ -556,10 +586,14 @@
   VC3D sampler results that do not report strict requested-level blocking
   semantics. Scale fallback, unresolved requested chunks, or chunk errors must
   fail loudly for debugging renders instead of being shown as valid strips.
-- Native 3D Trace2CP defaults to `--inference-patch-shape-zyx 64 64 64`,
-  matching the current fast 3D training/debug patch size, and
-  `--core-margin-voxels 20` to crop away block-edge inference artifacts.
-  Larger patch shapes remain explicit CLI overrides.
+- Native 3D Trace2CP defaults to `--inference-patch-shape-zyx 128 128 128`
+  and `--core-margin-voxels 48`, matching the current trained checkpoint setup
+  and the observed artifact margin. Other patch shapes remain explicit CLI
+  overrides.
+- Native 3D Trace2CP may batch missing axis-aligned inference blocks before
+  model forwarding. `--inference-block-batch-size` controls the maximum number
+  of newly materialized blocks in one forward and defaults to `2` to limit
+  transient 128-cube GPU memory.
 - Native 3D Trace2CP ordinary single-sample CLI mode defaults to sample index
   13 when no explicit `--sample-index` is provided. Bare `--fiber-json`
   without sample/CP selectors remains whole-fiber mode and must not be turned
@@ -664,13 +698,15 @@
 - The native 3D CLI prints live progress bars for forward and backward tracing.
   Progress is measured by signed target-plane progress along the initial
   CP-to-CP direction. It includes step count, ETA, and inferred-block count.
-- Native 3D strip visualization prints live progress for rendering stages and
+- When `--vis` is supplied, native 3D strip visualization prints live progress
+  for rendering stages and
   for side/top presence-strip sampling. Presence progress must report
   processed inference blocks, total unique inference blocks, sampled strip
   points, valid output points, newly inferred blocks, cached blocks, and total
   cache block count. Regular trace candidate sampling remains quiet unless a
   caller explicitly supplies a progress label.
-- Native 3D strip visualization progressively overwrites the regular
+- When `--vis` is supplied, native 3D strip visualization progressively
+  overwrites the regular
   `trace2cp_native_3d_vis.jpg` output at render start, stage start/end, and as
   panels are rendered and added to the sheet. Before the first panel is
   available, the file must contain a status canvas rather than being absent.
@@ -715,11 +751,33 @@
   selected diagnostic progress, raw gap, considered pair score, and center
   penalty. For pairwise traced-arc fusion the center penalty is fixed to `1.0`.
   These are not the public 2D `trace2cp_error`.
-- Native 3D whole-fiber mode reports its tool-local metric on a single line as
-  `native_trace2cp_fiber_restart_rate=... restarts=... segments=...`, where
-  the restart rate is `restart_count / segment_count`. Its JSON summary stores
-  per-segment status, reason, reached-plane flag, in-plane error, step count,
-  restart point, and reference arc distance at the last successful CP plane.
+- Native 3D whole-fiber mode reports its tool-local human stdout metric as
+  compact error-rate fields: `err/kvx=...` and, when physical units are
+  available, `err/m=...`. Human stdout/progress should use three digits after
+  the decimal for these rates and must not include physical unit or reference
+  length fields. Live whole-fiber progress must update one terminal line with
+  carriage returns; it must not print a fresh line for every segment. It should
+  emit a newline only when the progress reaches the terminal state.
+  The metric is `restart_count / (reference_length_voxels / 1000)`, where
+  `reference_length_voxels` is measured along the original loaded fiber line
+  between CP0 and the final CP in selected-level voxels. Physical units are
+  reported only when the VC3D sampler exposes
+  `record.sampler.volume.metadata["voxelsize"]` as a finite positive value in
+  micrometers. In that case the tool converts it with `voxelsize * 1e-6`.
+  If that exact VC3D metadata path is unavailable or invalid, the per-meter
+  field is omitted from stdout and null in JSON. The
+  VC3D remote volume loader must normalize public Vesuvius
+  `scan/tomo/acquisition/detector/samplePixelSize` metadata into
+  `metadata["voxelsize"]` whenever no explicit positive `voxelsize` exists,
+  independent of the remote volume base-scale mode. The
+  fiber code must not parse Zarr/OME JSON directly, inspect dataset config or
+  record metadata for physical units, accept alternate keys, or infer voxel
+  size from filenames. The JSON summary stores per-segment status, reason,
+  reached-plane flag, in-plane error, step count, restart point, reference arc
+  distance at the last successful CP plane, full-precision reference lengths,
+  full-precision `native_trace2cp_fiber_restarts_per_kvx` and optional
+  `native_trace2cp_fiber_restarts_per_meter`, and the old segment-normalized
+  fraction only as `restart_fraction_per_segment`.
 - Native 3D single-pair visualization first builds the initial side/top strip
   source from the existing 2D Trace2CP geometry loader for the input CP pair.
   In single-pair mode, the configured cross-strip height is a maximum cap: the

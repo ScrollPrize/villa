@@ -196,6 +196,103 @@ void copyChunkIntersection(std::vector<T>& out,
 }
 
 template <typename T>
+void sampleBlockChunkIntersection(std::vector<T>& out,
+                                  std::vector<uint8_t>& valid,
+                                  const std::array<size_t, 3>& outShape,
+                                  const std::array<int, 3>& requestOffset,
+                                  const std::array<int, 3>& chunkShape,
+                                  int level,
+                                  int cz,
+                                  int cy,
+                                  int cx,
+                                  vc::render::IChunkedArray& cache,
+                                  bool blocking,
+                                  T fill,
+                                  vc::render::ChunkedPlaneSampler::Stats& stats)
+{
+    const int chunkBaseZ = cz * chunkShape[0];
+    const int chunkBaseY = cy * chunkShape[1];
+    const int chunkBaseX = cx * chunkShape[2];
+
+    const int64_t reqZ0 = requestOffset[0];
+    const int64_t reqY0 = requestOffset[1];
+    const int64_t reqX0 = requestOffset[2];
+    const int64_t reqZ1 = reqZ0 + static_cast<int64_t>(outShape[0]);
+    const int64_t reqY1 = reqY0 + static_cast<int64_t>(outShape[1]);
+    const int64_t reqX1 = reqX0 + static_cast<int64_t>(outShape[2]);
+
+    const int z0 = static_cast<int>(std::max<int64_t>(reqZ0, chunkBaseZ));
+    const int y0 = static_cast<int>(std::max<int64_t>(reqY0, chunkBaseY));
+    const int x0 = static_cast<int>(std::max<int64_t>(reqX0, chunkBaseX));
+    const int z1 = static_cast<int>(std::min<int64_t>(reqZ1, chunkBaseZ + chunkShape[0]));
+    const int y1 = static_cast<int>(std::min<int64_t>(reqY1, chunkBaseY + chunkShape[1]));
+    const int x1 = static_cast<int>(std::min<int64_t>(reqX1, chunkBaseX + chunkShape[2]));
+    if (z0 >= z1 || y0 >= y1 || x0 >= x1)
+        return;
+
+    auto result = blocking
+        ? cache.getChunkBlocking(level, cz, cy, cx)
+        : cache.tryGetChunk(level, cz, cy, cx);
+    if (result.status == vc::render::ChunkStatus::Error) {
+        ++stats.errorChunks;
+        throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
+    }
+    if (blocking && result.status == vc::render::ChunkStatus::MissQueued) {
+        ++stats.errorChunks;
+        throw std::runtime_error(
+            "blocking requested-level block sampling received unresolved chunk after getChunkBlocking");
+    }
+    if (result.status == vc::render::ChunkStatus::MissQueued)
+        return;
+    if (result.status == vc::render::ChunkStatus::Missing)
+        ++stats.missingChunks;
+
+    const size_t copyCount = static_cast<size_t>(x1 - x0);
+    const size_t dstStrideY = outShape[2];
+    const size_t dstStrideZ = outShape[1] * dstStrideY;
+
+    const bool fillOnly = result.status == vc::render::ChunkStatus::AllFill ||
+                          result.status == vc::render::ChunkStatus::Missing;
+    const T fillValue = result.status == vc::render::ChunkStatus::Missing ? T{} : fill;
+    const T* srcData = nullptr;
+    size_t srcStrideY = 0;
+    size_t srcStrideZ = 0;
+    if (!fillOnly) {
+        if (!result.bytes)
+            throw std::runtime_error("chunk payload is missing for data chunk");
+        const size_t expectedBytes = static_cast<size_t>(chunkShape[0]) *
+                                     static_cast<size_t>(chunkShape[1]) *
+                                     static_cast<size_t>(chunkShape[2]) *
+                                     sizeof(T);
+        if (result.bytes->size() < expectedBytes)
+            throw std::runtime_error("chunk payload is smaller than expected");
+        srcData = reinterpret_cast<const T*>(result.bytes->data());
+        srcStrideY = static_cast<size_t>(chunkShape[2]);
+        srcStrideZ = static_cast<size_t>(chunkShape[1]) * srcStrideY;
+    }
+
+    for (int z = z0; z < z1; ++z) {
+        const size_t srcZ = static_cast<size_t>(z - chunkBaseZ);
+        const size_t dstZ = static_cast<size_t>(z - requestOffset[0]);
+        for (int y = y0; y < y1; ++y) {
+            const size_t srcY = static_cast<size_t>(y - chunkBaseY);
+            const size_t srcX = static_cast<size_t>(x0 - chunkBaseX);
+            const size_t dstY = static_cast<size_t>(y - requestOffset[1]);
+            const size_t dstX = static_cast<size_t>(x0 - requestOffset[2]);
+            const size_t dst = dstZ * dstStrideZ + dstY * dstStrideY + dstX;
+            if (fillOnly) {
+                std::fill_n(out.data() + dst, copyCount, fillValue);
+            } else {
+                const size_t src = srcZ * srcStrideZ + srcY * srcStrideY + srcX;
+                std::memcpy(out.data() + dst, srcData + src, copyCount * sizeof(T));
+            }
+            std::fill_n(valid.data() + dst, copyCount, uint8_t{1});
+            stats.coveredPixels += static_cast<int>(copyCount);
+        }
+    }
+}
+
+template <typename T>
 nb::object readZYXTypedSlow(Volume& volume,
                             const std::array<int, 3>& offset,
                             const std::array<size_t, 3>& shape,
@@ -304,6 +401,87 @@ nb::object readXYZ(Volume& volume,
     if (volume.dtype() == vc::render::ChunkDtype::UInt8)
         return readXYZTyped<uint8_t>(volume, offset, shape, level, missingPolicy);
     return readXYZTyped<uint16_t>(volume, offset, shape, level, missingPolicy);
+}
+
+std::vector<vc::render::ChunkKey> collectChunkKeys(Volume& volume,
+                                                   const std::array<int, 3>& offset,
+                                                   const std::array<size_t, 3>& shape,
+                                                   int level);
+
+nb::dict statsToDict(const vc::render::ChunkedPlaneSampler::Stats& stats);
+
+template <typename T>
+nb::tuple sampleZYXBlockTyped(Volume& volume,
+                              const std::array<int, 3>& offset,
+                              const std::array<size_t, 3>& shape,
+                              int level,
+                              bool blocking)
+{
+    if (level < 0)
+        throw std::out_of_range("level must be non-negative");
+    if (!volume.hasScaleLevel(level))
+        throw std::out_of_range("requested missing zarr scale level " + std::to_string(level));
+
+    vc::render::ChunkedPlaneSampler::Stats stats;
+    stats.requestedLevelOnly = true;
+    stats.fallbackLevels = 0;
+
+    std::vector<T> out(shape[0] * shape[1] * shape[2], T{});
+    std::vector<uint8_t> valid(out.size(), uint8_t{0});
+
+    const auto keys = collectChunkKeys(volume, offset, shape, level);
+    stats.requestedChunks = static_cast<int>(keys.size());
+    if (keys.empty()) {
+        nb::dict statsDict = statsToDict(stats);
+        statsDict["blocking_prefetch_chunks"] = 0;
+        return nb::make_tuple(
+            makeNumpyArray(std::move(out), shape),
+            makeNumpyArray(std::move(valid), shape),
+            statsDict);
+    }
+
+    {
+        nb::gil_scoped_release release;
+        auto* cache = volume.chunkedCache();
+        if (blocking)
+            cache->prefetchChunks(keys, false);
+        const auto chunkShape = cache->chunkShape(level);
+        const T fill = typedFill<T>(cache->fillValue());
+        for (const auto& key : keys) {
+            sampleBlockChunkIntersection(
+                out,
+                valid,
+                shape,
+                offset,
+                chunkShape,
+                level,
+                key.iz,
+                key.iy,
+                key.ix,
+                *cache,
+                blocking,
+                fill,
+                stats);
+        }
+    }
+
+    nb::dict statsDict = statsToDict(stats);
+    statsDict["blocking_prefetch_chunks"] = blocking ? stats.requestedChunks : 0;
+    return nb::make_tuple(
+        makeNumpyArray(std::move(out), shape),
+        makeNumpyArray(std::move(valid), shape),
+        statsDict);
+}
+
+nb::tuple sampleZYXBlock(Volume& volume,
+                         const std::array<int, 3>& offset,
+                         const std::array<size_t, 3>& shape,
+                         int level,
+                         bool blocking)
+{
+    if (volume.dtype() == vc::render::ChunkDtype::UInt8)
+        return sampleZYXBlockTyped<uint8_t>(volume, offset, shape, level, blocking);
+    return sampleZYXBlockTyped<uint16_t>(volume, offset, shape, level, blocking);
 }
 
 std::array<size_t, 3> checkedSizeArray(const std::array<int, 3>& value, const char* name)
@@ -712,6 +890,11 @@ NB_MODULE(volume, m)
             "shape"_a,
             "level"_a = 0,
             "missing_policy"_a = "error")
+        .def("sample_zyx_block", &sampleZYXBlock,
+            "offset"_a,
+            "shape"_a,
+            "level"_a = 0,
+            "blocking"_a = true)
         .def("read_xyz", &readXYZ,
             "offset"_a,
             "shape"_a,

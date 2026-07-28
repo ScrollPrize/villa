@@ -59,17 +59,31 @@ loading.
   with the same training helper used by `train.py`, applies the configured
   fiber image normalization per tile, and uses the training mixed-precision
   autocast settings when available.
+- If the checkpoint contains the training `config`, the adapter uses that
+  snapshot config for model construction, output option count, and tile
+  preprocessing. This prevents a current CLI/config file from accidentally
+  constructing a conditioned-decoder model for an older free-branch checkpoint.
+  Older checkpoints without embedded config can infer the minimal legacy branch
+  layout from the final U-Net layer shape.
 - Keeps each model option as a coherent raw seven-channel accumulator product:
   `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, and `presence`.
   Those raw channels are internal only.
 - Finalizes each raw option slab into persisted Lasagna-style
   `presence`, `nx`, and `ny` OME-Zarr channels. The six direction channels are
-  decoded through the same Lasagna 3x2 normal-estimation path before compact
-  `nx/ny` encoding.
+  decoded through the package-safe `lasagna.normal_encoding` helpers before
+  compact `nx/ny` encoding.
 - Legacy grouped outputs become one option product per branch. Conditioned
   recurrent inference can emit one option product per recurrent step. Resume
   completeness for an option requires the persisted `presence/nx/ny` sibling
   chunks to exist.
+
+`fiber_trace_3d/prediction.py`
+
+- Decodes raw fiber model samples shared by tiled inference and native
+  Trace2CP: either six direction-only Lasagna 3x2 channels or grouped
+  seven-channel options (`dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`,
+  `dir1_x`, `presence`). It returns ZYX directions, presence, and validity
+  masks while reusing the analytic Lasagna 3x2 decoder.
 
 `fiber_trace_3d/infer.py`
 
@@ -162,6 +176,12 @@ loading.
   python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool <config.json> --checkpoint <snapshot.pt> --sample-index 13 --export-dir <dir>
   ```
 
+- The native 3D CLI is metric-only by default: it traces, prints
+  `native_trace2cp_plane_error` / `native_trace2cp_closest_target_error`
+  or `native_trace2cp_fiber_restarts_per_kvx`, and writes
+  `trace2cp_native_3d_summary.json`. Add `--vis` to render
+  `trace2cp_native_3d_vis.jpg` and enable partial image updates during long
+  renders.
 - `--fiber-json <path>` without sample or CP selectors runs native whole-fiber
   tracing over all consecutive CP pairs from that fiber. Supplying
   `--fiber-json <path> --sample-index N` keeps deterministic flat
@@ -268,21 +288,21 @@ loading.
   `--trace-step-limit` intentionally produces partial traces for debugging.
   Forward/backward progress bars report signed target-plane progress along the
   initial CP-to-CP direction, ETA, step count, and inferred-block count.
-- Native strip rendering prints coarse stage progress for side/top volume
-  rendering, coordinate extraction, side/top presence sampling, trace overlay
-  projection, and image composition. Presence sampling also prints block-level
-  progress with sampled points, valid outputs, newly inferred blocks, cached
-  blocks, and total cache blocks.
+- When `--vis` is enabled, native strip rendering prints coarse stage progress
+  for side/top volume rendering, coordinate extraction, side/top presence
+  sampling, trace overlay projection, and image composition. Presence sampling
+  also prints block-level progress with sampled points, valid outputs, newly
+  inferred blocks, cached blocks, and total cache blocks.
 - Inferred block outputs are cached on CPU. The tool moves one cached block at
   a time back to the active device for point sampling, so long traces and
   presence-strip renders do not retain all block outputs on the GPU.
-- During visualization, the regular `trace2cp_native_3d_vis.jpg` path is
-  overwritten at render start, each stage start/end, and after each panel is
-  added to the sheet. Before the first panel exists, the file contains a small
-  status canvas, so there is always one current status/partial/final image to
-  inspect during long renders.
-- In whole-fiber mode, `trace2cp_native_3d_vis.jpg` is also overwritten after
-  every completed CP segment. The whole-fiber sheet has eight stitched rows:
+- With `--vis`, the regular `trace2cp_native_3d_vis.jpg` path is overwritten at
+  render start, each stage start/end, and after each panel is added to the
+  sheet. Before the first panel exists, the file contains a small status
+  canvas, so there is always one current status/partial/final image to inspect
+  during long renders.
+- In whole-fiber `--vis` mode, `trace2cp_native_3d_vis.jpg` is also overwritten
+  after every completed CP segment. The whole-fiber sheet has eight stitched rows:
   initial side volume, initial side 3D presence, initial top volume, initial top
   3D presence, regenerated side volume, regenerated side 3D presence,
   regenerated top volume, and regenerated top 3D presence. Those rows are
@@ -300,10 +320,23 @@ loading.
   succeeds when it reaches the next CP plane within the segment budget and its
   in-plane selected-voxel error to the target CP is below
   `--whole-fiber-error-threshold-voxels` (default `10`). Failures count one
-  restart and resume from the failed target CP. Stdout prints the whole-fiber
-  metric as `native_trace2cp_fiber_restart_rate=... restarts=... segments=...`;
-  the JSON summary includes per-segment status, errors, step counts, restart
-  points, and the last successful reference arc distance.
+  restart and resume from the failed target CP. Human stdout/progress prints
+  compact error rates as `err/kvx=...` and, when physical units are available,
+  `err/m=...`, rounded to three decimals. Reference lengths and
+  `physical_unit=m` are omitted from human progress output. Live progress uses
+  carriage-return updates on one terminal line and prints a newline only at
+  completion. Physical per-meter output is optional and comes only from the
+  VC3D sampler's
+  `record.sampler.volume.metadata["voxelsize"]` value, interpreted as
+  micrometers and converted to meters. If VC3D does not expose a finite
+  positive `voxelsize`, stdout/progress omit physical units and JSON stores
+  null for the per-meter fields. The fiber code does not parse Zarr/OME JSON,
+  dataset config, record metadata, alternate keys, or filenames for physical
+  units. The JSON summary includes per-segment status, errors, step counts,
+  restart points, the last successful reference arc distance, reference
+  lengths, full-precision `native_trace2cp_fiber_restarts_per_kvx`, optional
+  full-precision `native_trace2cp_fiber_restarts_per_meter`, and the old
+  segment fraction only as `restart_fraction_per_segment`.
 - Fuses forward and reverse traces in selected-level 3D ZYX coordinates by
   preserving traced order and selecting a pairwise traced-arc meeting, not a
   straight-axis overlap progress. The score is
@@ -513,11 +546,16 @@ loading.
   blocks over the requested strip coordinates, projects direction/presence into
   the 2D frame, and logs `test/trace2cp_error` as a diagnostic. Dense
   `test/loss_total` remains the sole metric used for fiber3d snapshot selection.
-- Native 3D Trace2CP caches conditioned model inference as grouped recurrent
-  outputs: zero-query output first, then output conditioned on the first decoded
-  direction. That lets the existing branch-aware candidate sampler choose
-  between strongest and recurrent secondary predictions without treating them
-  as free branch heads.
+- Native 3D Trace2CP uses a field-provider boundary. The current provider is
+  `NativeTraceFieldCache`, a sparse live checkpoint-backed block cache. It
+  samples regular requested-level volume blocks through
+  `CoordinateSampler.sample_block_zyx(...)`, batches missing blocks for model
+  forwarding where memory permits, calls `FiberTrace3DPredictAdapter` for
+  per-tile normalization, recurrent/conditioned inference, mixed precision, and
+  raw option splitting, then exposes
+  branch-aware point sampling to the tracer. Precomputed fiber prediction
+  outputs are not wired yet, but should use the same field-provider contract
+  when added.
 - 3D prefetch computes a CP-centered selected-level augmentation-envelope bbox
   and asks VC3D for authoritative bbox-to-chunk dependency metadata. This avoids
   materializing representative coordinates or reconstructing chunk paths in
@@ -550,6 +588,7 @@ PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --resume /path/to/current.pt
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --trace2cp-vis --checkpoint /path/to/best.pt --sample-index 13 --export-dir /tmp/fiber_trace_3d_trace2cp
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --checkpoint /path/to/best.pt --sample-index 13 --export-dir /tmp/fiber_trace_3d_native_trace2cp
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --checkpoint /path/to/best.pt --sample-index 13 --export-dir /tmp/fiber_trace_3d_native_trace2cp --vis
 PYTHONPATH=lasagna:vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.infer vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --input /path/to/volume.zarr/0 --output /tmp/fiber_trace_3d_infer --checkpoint /path/to/best.pt
 ```
 
@@ -622,12 +661,18 @@ The important behavior is:
   and returns `[patches,H,W]` image and valid-mask arrays. The default
   implementation flattens `[patches,H,W,3]` into one larger coordinate image,
   calls ordinary `sample_coords` once, and reshapes back.
+- `CoordinateSampler.sample_block_zyx` loads a regular axis-aligned
+  selected-level `[D,H,W]` block and returns the same image/valid/stats
+  contract. Native 3D Trace2CP uses this for inference blocks so it does not
+  build dense coordinate grids for ordinary cubes.
 - `Vc3dCoordinateSampler` is the production sampler:
   - opens local paths with `vc.volume.Volume.open`;
   - converts `s3://bucket/key` to the matching public HTTPS URL;
   - opens remote paths with `Volume.open_url`;
   - calls `Volume.sample_coords(..., blocking=True)` so requested-level chunks
     are fetched/decoded and pinned before sampling starts;
+  - calls `Volume.sample_zyx_block(..., blocking=True)` for regular
+    axis-aligned block reads used by native 3D Trace2CP;
   - rejects blocking results that do not report strict requested-level sampling
     (`requested_level_only=true`, `fallback_levels=0`);
   - uses `Volume.collect_coords_dependencies(...)` for prefetch dependency
