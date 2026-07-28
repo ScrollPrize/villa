@@ -48,6 +48,18 @@
   stack: `build_fiber_trace_3d_model(...)`, training snapshot loading, the
   configured tile image normalization, mixed-precision/autocast helpers, and
   Lasagna 3x2 direction encoding helpers.
+- When a 3D fiber inference/tracing checkpoint contains a saved training
+  `config`, that checkpoint config is authoritative for model construction,
+  option count, and tile preprocessing. Runtime configs still provide the
+  dataset/CLI context, but must not silently build a different architecture
+  than the snapshot. Older checkpoints without embedded config may infer a
+  minimal legacy free-branch model layout from
+  `net.decoder.final_seg_layer.weight` when possible.
+- Lasagna 3x2 normal estimation and compact `nx/ny` byte encoding live in the
+  package-safe shared `lasagna.normal_encoding` module. Lasagna predict3d,
+  fiber whole-volume inference, and live fiber prediction paths must import
+  that helper directly, not private functions from
+  `preprocess_cos_omezarr.py`.
 - Fiber model output has seven raw channels per option internally:
   `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, and
   `presence`. These raw channels are accumulated in the shared rolling z-band

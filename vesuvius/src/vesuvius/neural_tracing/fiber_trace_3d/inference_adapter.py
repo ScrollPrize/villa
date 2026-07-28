@@ -23,9 +23,9 @@ except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs
     )
 
 try:
-    from lasagna.preprocess_cos_omezarr import _estimate_normal
+    from lasagna.normal_encoding import encode_normal_nxny_u8
 except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
-    from preprocess_cos_omezarr import _estimate_normal
+    from normal_encoding import encode_normal_nxny_u8
 
 from vesuvius.neural_tracing.fiber_trace_3d.direction import LASAGNA_3X2_CHANNELS
 from vesuvius.neural_tracing.fiber_trace_3d.model import build_fiber_trace_3d_model
@@ -49,6 +49,63 @@ def _sanitize_product_prefix(value: str) -> str:
 
 def _model_cfg_from_raw(config: Mapping[str, Any]) -> dict[str, Any]:
     return dict(config.get("model_3d", config.get("model", {})))
+
+
+def _checkpoint_payload(path: str | Path) -> Any:
+    return torch.load(path, map_location="cpu")
+
+
+def _checkpoint_state(payload: Any) -> Mapping[str, Any] | None:
+    state = payload.get("model", payload) if isinstance(payload, Mapping) else payload
+    return state if isinstance(state, Mapping) else None
+
+
+def _checkpoint_config(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, Mapping) and isinstance(payload.get("config"), Mapping):
+        return dict(payload["config"])
+    return None
+
+
+def _config_from_checkpoint(
+    runtime_config: Mapping[str, Any],
+    checkpoint: str | Path | None,
+) -> dict[str, Any]:
+    config = dict(runtime_config)
+    if checkpoint is None:
+        return config
+    payload = _checkpoint_payload(checkpoint)
+    checkpoint_config = _checkpoint_config(payload)
+    if checkpoint_config is not None:
+        effective = dict(config)
+        effective.update(checkpoint_config)
+        effective.setdefault("_config_dir", config.get("_config_dir"))
+        if not _conditioned_decoder_enabled(effective):
+            inference_cfg = dict(effective.get("inference", {}))
+            inference_cfg["recurrent_steps"] = 1
+            effective["inference"] = inference_cfg
+        return effective
+    state = _checkpoint_state(payload)
+    if state is None:
+        return config
+    weight = state.get("net.decoder.final_seg_layer.weight")
+    if not isinstance(weight, torch.Tensor):
+        return config
+    output_channels = int(weight.shape[0])
+    if output_channels <= 0 or output_channels % 7 != 0:
+        return config
+    has_conditioned_decoder = any(str(key).startswith("conditioned_decoder.") for key in state)
+    if has_conditioned_decoder:
+        return config
+    effective = dict(config)
+    model_cfg = _model_cfg_from_raw(effective)
+    model_cfg["conditioned_decoder_enabled"] = False
+    model_cfg["output_channels"] = output_channels
+    model_cfg["direction_branch_count"] = output_channels // 7
+    effective["model_3d"] = model_cfg
+    inference_cfg = dict(effective.get("inference", {}))
+    inference_cfg["recurrent_steps"] = 1
+    effective["inference"] = inference_cfg
+    return effective
 
 
 def _conditioned_decoder_enabled(config: Mapping[str, Any]) -> bool:
@@ -123,8 +180,8 @@ class FiberTrace3DPredictAdapter:
         zarr_path_prefix: str | Path | None = None,
         recurrent_steps: int | None = None,
     ) -> None:
-        self.config = dict(config)
         self.checkpoint = None if checkpoint is None else Path(checkpoint)
+        self.config = _config_from_checkpoint(config, self.checkpoint)
         self.recurrent_steps = _recurrent_steps_from_config(
             self.config,
             recurrent_steps,
@@ -310,7 +367,7 @@ class FiberTrace3DPredictAdapter:
             0.0,
             255.0,
         ).astype(np.uint8)
-        _, _, _, nx_n, ny_n, nz_n = _estimate_normal(
+        nx_u8, ny_u8 = encode_normal_nxny_u8(
             slab[0],
             slab[1],
             slab[2],
@@ -318,17 +375,6 @@ class FiberTrace3DPredictAdapter:
             slab[4],
             slab[5],
         )
-        flip = np.where(nz_n < 0.0, -1.0, 1.0)
-        nx_u8 = np.clip(
-            np.round(nx_n * flip * 127.0 + 128.0),
-            0.0,
-            255.0,
-        ).astype(np.uint8)
-        ny_u8 = np.clip(
-            np.round(ny_n * flip * 127.0 + 128.0),
-            0.0,
-            255.0,
-        ).astype(np.uint8)
         arrays_by_base = {
             "presence": presence_u8,
             "nx": nx_u8,

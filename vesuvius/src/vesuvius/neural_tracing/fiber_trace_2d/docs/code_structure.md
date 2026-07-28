@@ -59,17 +59,31 @@ loading.
   with the same training helper used by `train.py`, applies the configured
   fiber image normalization per tile, and uses the training mixed-precision
   autocast settings when available.
+- If the checkpoint contains the training `config`, the adapter uses that
+  snapshot config for model construction, output option count, and tile
+  preprocessing. This prevents a current CLI/config file from accidentally
+  constructing a conditioned-decoder model for an older free-branch checkpoint.
+  Older checkpoints without embedded config can infer the minimal legacy branch
+  layout from the final U-Net layer shape.
 - Keeps each model option as a coherent raw seven-channel accumulator product:
   `dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`, `dir1_x`, and `presence`.
   Those raw channels are internal only.
 - Finalizes each raw option slab into persisted Lasagna-style
   `presence`, `nx`, and `ny` OME-Zarr channels. The six direction channels are
-  decoded through the same Lasagna 3x2 normal-estimation path before compact
-  `nx/ny` encoding.
+  decoded through the package-safe `lasagna.normal_encoding` helpers before
+  compact `nx/ny` encoding.
 - Legacy grouped outputs become one option product per branch. Conditioned
   recurrent inference can emit one option product per recurrent step. Resume
   completeness for an option requires the persisted `presence/nx/ny` sibling
   chunks to exist.
+
+`fiber_trace_3d/prediction.py`
+
+- Decodes raw fiber model samples shared by tiled inference and native
+  Trace2CP: either six direction-only Lasagna 3x2 channels or grouped
+  seven-channel options (`dir0_z`, `dir1_z`, `dir0_y`, `dir1_y`, `dir0_x`,
+  `dir1_x`, `presence`). It returns ZYX directions, presence, and validity
+  masks while reusing the analytic Lasagna 3x2 decoder.
 
 `fiber_trace_3d/infer.py`
 
@@ -508,11 +522,14 @@ loading.
   blocks over the requested strip coordinates, projects direction/presence into
   the 2D frame, logs `test/trace2cp_error`, and uses that value for `best.pt`
   selection. Dense 3D test loss remains a diagnostic.
-- Native 3D Trace2CP caches conditioned model inference as grouped recurrent
-  outputs: zero-query output first, then output conditioned on the first decoded
-  direction. That lets the existing branch-aware candidate sampler choose
-  between strongest and recurrent secondary predictions without treating them
-  as free branch heads.
+- Native 3D Trace2CP uses a field-provider boundary. The current provider is
+  `NativeTraceFieldCache`, a sparse live checkpoint-backed block cache. It
+  samples requested-level volume blocks with VC3D blocking sampling, calls
+  `FiberTrace3DPredictAdapter` for tile normalization, recurrent/conditioned
+  inference, mixed precision, and raw option splitting, then exposes
+  branch-aware point sampling to the tracer. Precomputed fiber prediction
+  outputs are not wired yet, but should use the same field-provider contract
+  when added.
 - 3D prefetch computes a CP-centered selected-level augmentation-envelope bbox
   and asks VC3D for authoritative bbox-to-chunk dependency metadata. This avoids
   materializing representative coordinates or reconstructing chunk paths in

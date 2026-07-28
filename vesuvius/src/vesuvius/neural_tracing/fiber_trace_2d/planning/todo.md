@@ -63,6 +63,8 @@
 - [ ] training should include the full json config used and the current git commit hash + diff to that commit of the running/current code
     - [ ] and the command run
     - [ ] same for inferences
+- [ ] augment_anisotropic_blur_orientation "fiber"  - that does not sound correct ...
+- [ ] dir result dependent presencec supervision? supervise with dot between gt and estimated dir?
     
 # beam-search
 - [ ] beamsearch

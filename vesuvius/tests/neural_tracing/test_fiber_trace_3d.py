@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,10 +37,15 @@ from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
 from vesuvius.neural_tracing.fiber_trace_3d.infer import (
     run_fiber_trace_3d_inference,
 )
+from vesuvius.neural_tracing.fiber_trace_3d.prediction import (
+    decode_grouped_direction_presence,
+    direction_branch_count_from_channels,
+)
 try:
     from lasagna.tiled_predict3d import OmeZarrOutputAdapter
 except ImportError:  # pragma: no cover
     from tiled_predict3d import OmeZarrOutputAdapter
+from lasagna.normal_encoding import encode_normal_nxny_u8, estimate_normal
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     DEFAULT_VOLUME_CACHE_MEMORY_MIB,
     FiberTrace3DBatch,
@@ -51,6 +59,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
 from vesuvius.neural_tracing.fiber_trace_3d.model import (
     FiberTrace3DModelConfig,
     FiberTrace3DNet,
+    build_fiber_trace_3d_model,
     direction_output,
     direction_outputs,
     presence_output,
@@ -138,6 +147,31 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _training_sample_index_limit,
     _write_3d_sample_sheet,
 )
+
+
+class _NativeTraceTestPredictionAdapter:
+    output_products = (SimpleNamespace(name="test_option"),)
+
+    def preprocess_tile(
+        self,
+        tile: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        del valid_mask
+        return tile
+
+    def run_tile_inference(
+        self,
+        model: torch.nn.Module,
+        tile: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del device
+        return model(tile)
+
+    def product_tensors_from_output(self, raw_output: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"test_option": raw_output}
 
 
 def _straight_fiber() -> Vc3dFiber:
@@ -599,6 +633,46 @@ def test_lasagna_3x2_encoding_matches_projection_formula() -> None:
     assert np.allclose(encoded_3d[4:], [0.5, 0.5])
 
 
+def test_fiber_trace_3d_imports_with_package_style_lasagna_path() -> None:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "vesuvius/src:."
+    code = "\n".join(
+        [
+            "import vesuvius.neural_tracing.fiber_trace_3d",
+            "import vesuvius.neural_tracing.fiber_trace_3d.infer",
+            "import vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool",
+        ]
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[3],
+        env=env,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_lasagna_compact_normal_encoding_is_shared() -> None:
+    axis = np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+    encoded = encode_lasagna_direction_3x2(axis)[0]
+    channels = [np.asarray([float(value)], dtype=np.float32) for value in encoded]
+
+    _wz, _wy, _wx, nx_n, ny_n, nz_n = estimate_normal(*channels)
+    nx_u8, ny_u8 = encode_normal_nxny_u8(*channels)
+
+    flip = np.where(nz_n < 0.0, -1.0, 1.0)
+    expected_nx = np.clip(np.round(nx_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(
+        np.uint8
+    )
+    expected_ny = np.clip(np.round(ny_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(
+        np.uint8
+    )
+    assert np.array_equal(nx_u8, expected_nx)
+    assert np.array_equal(ny_u8, expected_ny)
+
+
 def test_lasagna_3x2_analytic_decode_round_trips_ambiguous_axes() -> None:
     axes = torch.tensor(
         [
@@ -616,6 +690,47 @@ def test_lasagna_3x2_analytic_decode_round_trips_ambiguous_axes() -> None:
     decoded = decode_lasagna_direction_3x2_analytic(encoded)
     agreement = torch.abs(torch.sum(decoded * axes, dim=1))
     assert torch.all(agreement > 0.999)
+
+
+def test_fiber_prediction_decodes_direction_only_output() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )
+
+    directions, presence, valid = decode_grouped_direction_presence(encoded)
+
+    assert direction_branch_count_from_channels(6) == 1
+    assert directions.shape == (1, 1, 3)
+    assert presence.shape == (1, 1)
+    assert valid.shape == (1, 1)
+    assert bool(valid[0, 0])
+    assert torch.allclose(presence, torch.ones_like(presence))
+    assert torch.allclose(torch.abs(directions[0, 0, 2]), torch.tensor(1.0), atol=1.0e-5)
+
+
+def test_fiber_prediction_decodes_multi_branch_output() -> None:
+    encoded_a = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )
+    encoded_b = encode_lasagna_direction_3x2(
+        torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32)
+    )
+    raw = torch.cat(
+        [
+            encoded_a,
+            torch.tensor([[0.25]], dtype=torch.float32),
+            encoded_b,
+            torch.tensor([[0.75]], dtype=torch.float32),
+        ],
+        dim=1,
+    )
+
+    directions, presence, valid = decode_grouped_direction_presence(raw)
+
+    assert direction_branch_count_from_channels(14) == 2
+    assert directions.shape == (1, 2, 3)
+    assert torch.allclose(presence, torch.tensor([[0.25, 0.75]], dtype=torch.float32))
+    assert torch.equal(valid, torch.ones((1, 2), dtype=torch.bool))
 
 
 def test_lasagna_3x2_zero_query_is_reserved_off_manifold_token() -> None:
@@ -2294,6 +2409,61 @@ def test_3d_fiber_inference_adapter_splits_branch_output_without_collapsing() ->
     assert set(arrays0) == {"option_000_presence", "option_000_nx", "option_000_ny"}
 
 
+def test_3d_fiber_inference_adapter_uses_checkpoint_config_for_model(
+    tmp_path: Path,
+) -> None:
+    checkpoint_config = {
+        "patch_shape_zyx": [8, 8, 8],
+        "model_3d": {
+            "input_channels": 1,
+            "direction_branch_count": 2,
+            "output_channels": 14,
+            "features_per_stage": [4, 8],
+            "strides": [[1, 1, 1], [2, 2, 2]],
+            "conditioned_decoder_enabled": False,
+        },
+        "image_normalization": "none",
+    }
+    checkpoint_model = build_fiber_trace_3d_model(checkpoint_config)
+    checkpoint_path = tmp_path / "legacy_branch_checkpoint.pt"
+    torch.save(
+        {
+            "model": checkpoint_model.state_dict(),
+            "config": checkpoint_config,
+            "step": 123,
+        },
+        checkpoint_path,
+    )
+    runtime_conditioned_config = {
+        "patch_shape_zyx": [8, 8, 8],
+        "model_3d": {
+            "input_channels": 1,
+            "output_channels": 7,
+            "features_per_stage": [4, 8],
+            "strides": [[1, 1, 1], [2, 2, 2]],
+            "conditioned_decoder_enabled": True,
+            "conditioned_latent_channels": 64,
+        },
+        "inference": {"recurrent_steps": 2},
+        "image_normalization": "zscore",
+    }
+
+    adapter = FiberTrace3DPredictAdapter(
+        runtime_conditioned_config,
+        checkpoint=checkpoint_path,
+        product_prefix="fiber",
+    )
+    model = adapter.load_model(device=torch.device("cpu"))
+
+    assert adapter.option_count == 2
+    assert not model.conditioned_decoder_enabled
+    assert model.output_channels == 14
+    assert [product.name for product in adapter.output_products] == [
+        "fiber_option_000",
+        "fiber_option_001",
+    ]
+
+
 def test_3d_fiber_finalizer_sign_folds_lasagna_direction_encoding() -> None:
     adapter = FiberTrace3DPredictAdapter(
         {
@@ -3846,9 +4016,8 @@ def test_native_3d_trace2cp_block_router_uses_trusted_core() -> None:
     record = _native_trace_record(np.ones((32, 32, 32), dtype=np.float32))
     cache = NativeTraceFieldCache(
         record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
         model=ConstantNativeModel(),
-        config=_loader(augment_enabled=False).config,
-        image_normalization="none",
         patch_shape_zyx=(16, 16, 16),
         core_margin_voxels=4,
         device=torch.device("cpu"),
@@ -3877,9 +4046,8 @@ def test_native_3d_trace2cp_field_cache_evicts_lru_blocks() -> None:
     record = _native_trace_record(np.ones((64, 32, 32), dtype=np.float32))
     cache = NativeTraceFieldCache(
         record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
         model=CountingNativeModel(),
-        config=_loader(augment_enabled=False).config,
-        image_normalization="none",
         patch_shape_zyx=(16, 16, 16),
         core_margin_voxels=4,
         device=torch.device("cpu"),
@@ -3945,9 +4113,8 @@ def test_native_3d_trace2cp_field_cache_uses_sampler_and_base_scale() -> None:
     )
     cache = NativeTraceFieldCache(
         record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
         model=model,
-        config=_loader(augment_enabled=False).config,
-        image_normalization="none",
         patch_shape_zyx=(4, 4, 4),
         core_margin_voxels=1,
         device=torch.device("cpu"),
@@ -5047,9 +5214,8 @@ def test_native_3d_trace2cp_field_cache_rejects_nonblocking_sampler() -> None:
     )
     cache = NativeTraceFieldCache(
         record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
         model=torch.nn.Identity(),
-        config=_loader(augment_enabled=False).config,
-        image_normalization="none",
         patch_shape_zyx=(4, 4, 4),
         core_margin_voxels=1,
         device=torch.device("cpu"),
@@ -5075,9 +5241,8 @@ def test_native_3d_trace2cp_constant_field_reaches_target_plane() -> None:
     record = _native_trace_record(np.ones((32, 32, 32), dtype=np.float32))
     cache = NativeTraceFieldCache(
         record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
         model=ConstantNativeModel(),
-        config=_loader(augment_enabled=False).config,
-        image_normalization="none",
         patch_shape_zyx=(16, 16, 16),
         core_margin_voxels=2,
         device=torch.device("cpu"),
@@ -5121,9 +5286,8 @@ def test_native_3d_trace2cp_trace_step_limit_stops_partial_trace() -> None:
     record = _native_trace_record(np.ones((32, 32, 32), dtype=np.float32))
     cache = NativeTraceFieldCache(
         record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
         model=ConstantNativeModel(),
-        config=_loader(augment_enabled=False).config,
-        image_normalization="none",
         patch_shape_zyx=(16, 16, 16),
         core_margin_voxels=2,
         device=torch.device("cpu"),
@@ -5171,9 +5335,8 @@ def test_native_3d_trace2cp_max_step_factor_limits_trace() -> None:
     record = _native_trace_record(np.ones((32, 32, 32), dtype=np.float32))
     cache = NativeTraceFieldCache(
         record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
         model=ConstantNativeModel(),
-        config=_loader(augment_enabled=False).config,
-        image_normalization="none",
         patch_shape_zyx=(16, 16, 16),
         core_margin_voxels=2,
         device=torch.device("cpu"),

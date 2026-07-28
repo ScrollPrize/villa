@@ -7,14 +7,14 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.fiber_trace_3d.direction import (
-    decode_lasagna_direction_3x2_analytic,
+from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
+    FiberTrace3DPredictAdapter,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DConfig,
@@ -22,13 +22,13 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     _normalize_image,
     load_config,
 )
-from vesuvius.neural_tracing.fiber_trace_3d.model import (
-    build_fiber_trace_3d_model,
+from vesuvius.neural_tracing.fiber_trace_3d.prediction import (
+    decode_grouped_direction_presence,
+    direction_branch_count_from_channels,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _device_from_training,
     _load_raw_config,
-    _load_snapshot,
     _make_trace2cp_geometry_loader,
     _trace2cp_3d_config,
     dataclass_replace,
@@ -155,6 +155,20 @@ class _InferredBlock:
     output_czyx: torch.Tensor
     valid_mask_zyx: torch.Tensor
     cache_nbytes: int
+
+
+class NativeTracePredictionField(Protocol):
+    total_inferred_blocks: int
+    evicted_inferred_blocks: int
+    resident_inferred_block_bytes: int
+
+    def sample_point_choices_torch(
+        self,
+        points_zyx: np.ndarray,
+        *,
+        progress_label: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ...
 
 
 @dataclass(frozen=True)
@@ -585,52 +599,6 @@ def _grid_sample_channels_at_points(
     return sampled[0, :, :, 0, 0].transpose(0, 1).contiguous()
 
 
-def _direction_branch_count_from_channels(channels: int) -> int:
-    channels_i = int(channels)
-    if channels_i < 6:
-        raise ValueError("native 3D Trace2CP model output has fewer than six channels")
-    if channels_i == 6:
-        return 1
-    if channels_i < 7 or channels_i % 7 != 0:
-        raise ValueError(
-            "native 3D Trace2CP model output channels must be 6 or a positive "
-            f"multiple of 7; got {channels_i}"
-        )
-    return channels_i // 7
-
-
-def _decode_grouped_direction_presence(
-    sampled_nchannels: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if sampled_nchannels.ndim != 2:
-        raise ValueError("sampled_nchannels must have shape N,C")
-    channels = int(sampled_nchannels.shape[1])
-    branch_count = _direction_branch_count_from_channels(channels)
-    directions: list[torch.Tensor] = []
-    presences: list[torch.Tensor] = []
-    for branch in range(branch_count):
-        start = 0 if channels == 6 else branch * 7
-        axis_xyz = decode_lasagna_direction_3x2_analytic(
-            sampled_nchannels[:, start : start + 6]
-        )
-        axis_zyx = axis_xyz[:, [2, 1, 0]].to(dtype=torch.float32)
-        axis_zyx = F.normalize(axis_zyx, p=2.0, dim=1, eps=float(_EPS))
-        directions.append(axis_zyx)
-        if channels == 6:
-            presences.append(
-                torch.ones(
-                    (int(sampled_nchannels.shape[0]),),
-                    dtype=torch.float32,
-                    device=sampled_nchannels.device,
-                )
-            )
-        else:
-            presences.append(
-                sampled_nchannels[:, start + 6].to(dtype=torch.float32).clamp(0.0, 1.0)
-            )
-    return torch.stack(directions, dim=1), torch.stack(presences, dim=1)
-
-
 class NativeTraceFieldCache:
     """Lazy overlapped 3D model-output cache with trusted-core point routing."""
 
@@ -638,18 +606,16 @@ class NativeTraceFieldCache:
         self,
         *,
         record: Any,
+        prediction_adapter: Any,
         model: torch.nn.Module,
-        config: FiberTrace3DConfig,
-        image_normalization: str,
         patch_shape_zyx: tuple[int, int, int],
         core_margin_voxels: int,
         device: torch.device,
         max_cached_bytes: int | None = 8 * 1024**3,
     ) -> None:
         self.record = record
+        self.prediction_adapter = prediction_adapter
         self.model = model
-        self.config = config
-        self.image_normalization = str(image_normalization)
         self.patch_shape_zyx = tuple(int(v) for v in patch_shape_zyx)
         self.core_margin = int(core_margin_voxels)
         if self.core_margin < 0:
@@ -778,25 +744,33 @@ class NativeTraceFieldCache:
             self._blocks.move_to_end(key)
             return block
         raw_t, valid = self._sample_block_volume(origin)
-        image = _normalize_image(raw_t, valid, self.image_normalization)
-        was_training = bool(self.model.training)
-        self.model.eval()
-        model_input = image.view(1, 1, *self.patch_shape_zyx)
-        if bool(getattr(self.model, "conditioned_decoder_enabled", False)) and hasattr(
+        model_input = raw_t.view(1, 1, *self.patch_shape_zyx)
+        valid_input = valid.view(1, 1, *self.patch_shape_zyx)
+        model_input = self.prediction_adapter.preprocess_tile(model_input, valid_input)
+        model_output = self.prediction_adapter.run_tile_inference(
             self.model,
-            "forward_recurrent_grouped",
-        ):
-            model_output = self.model.forward_recurrent_grouped(model_input, steps=2)[0]
-        else:
-            model_output = self.model(model_input)[0]
-        output = (
-            model_output.detach()
-            .to(device=torch.device("cpu"), dtype=torch.float32)
-            .contiguous()
+            model_input,
+            device=self.device,
         )
+        products = self.prediction_adapter.product_tensors_from_output(model_output)
+        option_tensors = []
+        for product in self.prediction_adapter.output_products:
+            tensor = products.get(product.name)
+            if tensor is None:
+                raise ValueError(
+                    f"fiber 3D prediction adapter did not return product {product.name!r}"
+                )
+            if tensor.ndim != 5 or int(tensor.shape[0]) != 1 or int(tensor.shape[1]) != 7:
+                raise ValueError(
+                    "fiber 3D prediction adapter product tensors must have shape "
+                    f"1,7,D,H,W; got {tuple(int(v) for v in tensor.shape)}"
+                )
+            option_tensors.append(tensor[0])
+        output = torch.cat(option_tensors, dim=0).detach().to(
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ).contiguous()
         valid_cpu = valid.detach().to(device=torch.device("cpu")).contiguous()
-        if was_training:
-            self.model.train()
         core_lo = origin + int(self.core_margin)
         core_hi = origin + np.asarray(self.patch_shape_zyx, dtype=np.int64) - int(self.core_margin)
         crop_slices, crop_lo = self._cached_output_slices()
@@ -931,7 +905,7 @@ class NativeTraceFieldCache:
                 usable_points,
                 origin_zyx=block.sample_origin_zyx,
             )
-            sampled_branch_count = _direction_branch_count_from_channels(int(sampled.shape[1]))
+            sampled_branch_count = direction_branch_count_from_channels(int(sampled.shape[1]))
             if branch_count is None:
                 branch_count = sampled_branch_count
                 directions = torch.zeros(
@@ -964,11 +938,10 @@ class NativeTraceFieldCache:
                 usable_points,
                 origin_zyx=block.sample_origin_zyx,
             )[:, 0]
-            axis_choices_zyx, group_presence = _decode_grouped_direction_presence(sampled)
+            axis_choices_zyx, group_presence, decoded_valid = decode_grouped_direction_presence(sampled)
             group_valid = (
                 (valid_values[:, None] > 0.5)
-                & torch.isfinite(axis_choices_zyx).all(dim=2)
-                & torch.isfinite(group_presence)
+                & decoded_valid
             )
             valid_done += int(torch.count_nonzero(group_valid.any(dim=1)).detach().cpu())
             index_t = torch.as_tensor(usable_indices, dtype=torch.long, device=self.device)
@@ -5111,14 +5084,12 @@ def run_native_trace2cp(
         )
     training = dict(raw_config.get("training", {}))
     device = _device_from_training(training)
-    model = build_fiber_trace_3d_model(raw_config).to(device)
-    _load_snapshot(checkpoint, model=model, optimizer=None, map_location=device)
-    model.eval()
+    prediction_adapter = FiberTrace3DPredictAdapter(raw_config, checkpoint=checkpoint)
+    model = prediction_adapter.load_model(device=device)
     cache = NativeTraceFieldCache(
         record=record,
+        prediction_adapter=prediction_adapter,
         model=model,
-        config=loader_config,
-        image_normalization=loader_config.image_normalization,
         patch_shape_zyx=cfg.inference_patch_shape_zyx,
         core_margin_voxels=cfg.core_margin_voxels,
         device=device,
