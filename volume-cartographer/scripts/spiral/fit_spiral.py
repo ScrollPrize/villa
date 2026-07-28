@@ -267,12 +267,20 @@ default_config = {
     # every track regardless of tortuosity; crossing supplements are opt-in.
     'track_length_bin_weights': [0.0, 0.15, 0.85],  # [short, medium, long], using eligible-track arclength tertiles
     'track_max_tortuosity': None,  # whole-track arclength / endpoint chord; None disables filtering
-    # Crossing discovery is session-scoped; the active per-step count can then
-    # change freely up to this prepared ceiling at a Run boundary.
+    # The complete eligible crossing CSR is retained for the session. The active
+    # per-step random sample can change freely up to this safety ceiling at a
+    # Run boundary. The legacy setting name is kept for profile compatibility.
     'track_crossing_precompute_max': 8,
     # Opposite-family partners joined to each primary track's shared winding
     # target. Zero disables crossing-connected sampling.
     'max_track_crossing_per_step': 1,
+    # Native crossing-chain sampling. "count" preserves the historical
+    # fixed-width primary/partner sampler exactly.
+    'track_crossing_mode': 'count',
+    'min_walk_steps_per_track': 24,
+    'max_walk_steps_per_track': 256,
+    'n_walks_per_track': 4,
+    'track_walk_require_loop_consistency': False,
     'track_exclusion_radius': 16.0,
     'track_radius_target': 'mean',
     'track_radius_loss_margin': 0.025,
@@ -1280,7 +1288,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     track_crossing_cache = None
     if tracks_dbm_path is not None and cfg.get('use_tracks', True):
         print(f'loading tracks from {tracks_dbm_path}')
-        if track_sampling_config['crossing_precompute_max'] > 0:
+        if (track_sampling_config['crossing_precompute_max'] > 0
+                or track_sampling_config['crossing_mode'] == 'track_walk'):
             track_crossing_cache = load_track_crossing_cache(tracks_dbm_path)
             tracks, track_families, track_source_ids = load_tracks_from_dbm(
                 tracks_dbm_path, z_begin, z_end, return_families=True,
@@ -1833,7 +1842,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         temporary = f'{destination}.tmp-{os.getpid()}-{time.time_ns()}'
         try:
             torch.save(checkpoint_payload(completed_iterations), temporary)
-            with open(temporary, 'rb') as stream:
+            # 'rb+' not 'rb': fsync on Windows (_commit) requires a writable descriptor.
+            with open(temporary, 'rb+') as stream:
                 os.fsync(stream.fileno())
             os.replace(temporary, destination)
             try:
@@ -2425,7 +2435,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         def configure_interactive_run(config):
             # Only called by the resident driver on the fitter thread at a
             # pause boundary. These settings are read afresh by every step.
-            if ({'track_length_bin_weights', 'max_track_crossing_per_step'}
+            if ({'track_length_bin_weights', 'max_track_crossing_per_step',
+                 'min_walk_steps_per_track', 'max_walk_steps_per_track',
+                 'n_walks_per_track'}
                     & set(config)):
                 configure_prepared_track_sampling(prepared_main_tracks, config)
             cfg.update(config, allow_val_change=True)
