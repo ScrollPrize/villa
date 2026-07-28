@@ -42,8 +42,8 @@ vesuvius.predict \
 | `--normalization` | Runtime normalization (`instance_zscore`, `global_zscore`, `instance_minmax`, `ct`, `none`).
 | `--intensity-properties-json` | nnU-Net style JSON with intensity stats for CT normalization.
 | `--device` | Device string such as `cuda`, `cuda:1`, or `cpu`.
-| `--skip-empty-patches` / `--no-skip-empty-patches` | Toggle automatic removal of homogeneous patches.
-| `--zarr-compressor` / `--zarr-compression-level` | Configure output compression (`zstd` with level `3` by default).
+| `--skip_empty_patches` / `--no_skip_empty_patches` | Toggle automatic removal of homogeneous patches.
+| `--zarr_compressor` / `--zarr_compression_level` | Configure output compression (`zstd` with level `3` by default).
 | `--scroll_id`, `--segment_id`, `--energy`, `--resolution` | Metadata when reading remote scrolls via the `Volume` helper.
 | `--hf_token` | Hugging Face token for private repositories.
 | `--config-yaml` | Training YAML to resolve model architecture when the checkpoint lacks embedded metadata.
@@ -123,11 +123,11 @@ Finalize logits into probabilities or masks and optionally build a multiscale py
 ```bash
 vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
   --mode binary \
-  --threshold --threshold-value 0.3 \
-  --delete-intermediates
+  --threshold --threshold_value 0.3 \
+  --delete_intermediates
 ```
 
-`--threshold` toggles binarization on (default cutoff `0.5`). `--threshold-value T` overrides the cutoff with any value in `(0, 1)` and requires `--threshold`. The right cutoff is model-dependent and should come from validation — `0.3` above is illustrative, not a recommendation.
+`--threshold` toggles binarization on (default cutoff `0.5`). `--threshold_value T` overrides the cutoff with any value in `(0, 1)` and requires `--threshold`. The right cutoff is model-dependent and should come from validation — `0.3` above is illustrative, not a recommendation.
 
 ### Options
 
@@ -136,11 +136,11 @@ vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
 | `input_path` | Path to the blended logits Zarr (level `0` is the logits array).
 | `output_path` | Destination multiscale Zarr root.
 | `--mode` | `binary` (default), `multiclass`, or `surface_frame` (keeps 9-channel frame outputs; no thresholding).
-| `--threshold` | Binarize the probability map. In `binary` mode cuts at the probability given by `--threshold-value` (default `0.5`). In `multiclass` mode emits the argmax channel. Ignored in `surface_frame` mode.
-| `--threshold-value T` | Override the `--threshold` cutoff with `T` in `(0, 1)`. Requires `--threshold`. Binary mode only — rejected in `multiclass` since argmax ignores the cutoff.
-| `--delete-intermediates` | Remove the source logits after a successful run.
-| `--chunk-size` | Spatial chunk size for the output store (`Z,Y,X`). Defaults to the logits chunking.
-| `--num-workers` | Worker processes for finalization (defaults to half of CPU cores).
+| `--threshold` | Binarize the probability map. In `binary` mode cuts at the probability given by `--threshold_value` (default `0.5`). In `multiclass` mode emits the argmax channel. Ignored in `surface_frame` mode.
+| `--threshold_value T` | Override the `--threshold` cutoff with `T` in `(0, 1)`. Requires `--threshold`. Binary mode only — rejected in `multiclass` since argmax ignores the cutoff.
+| `--delete_intermediates` | Remove the source logits after a successful run.
+| `--chunk_size` | Spatial chunk size for the output store (`Z,Y,X`). Defaults to the logits chunking.
+| `--num_workers` | Worker processes for finalization (defaults to half of CPU cores).
 | `--quiet` | Suppress verbose logging.
 
 Without `--threshold`, binary mode outputs a single softmax foreground channel; multiclass mode writes one channel per class plus an argmax channel. `surface_frame` mode bypasses thresholding entirely and stores orthonormal 9-channel frames in float32.
@@ -155,9 +155,9 @@ vesuvius.predict --model_path hf://scrollprize/surface_recto \
     --num_parts 4 \
     --part_id 0 \
     --device cuda:0 \
-    --zarr-compressor zstd \
-    --zarr-compression-level 3 \
-    --skip-empty-patches
+    --zarr_compressor zstd \
+    --zarr_compression_level 3 \
+    --skip_empty_patches
 
 # ...repeat for part_id 1,2,3 on other hosts...
 
@@ -166,11 +166,11 @@ vesuvius.blend_logits s3://vesuvius/tmp/logits s3://vesuvius/tmp/merged_logits.z
     --num_workers 32 \
     --chunk_size 256,256,256
 
-# 3. Finalize outputs (bare --threshold cuts at 0.5; add --threshold-value 0.3 for a different cutoff)
+# 3. Finalize outputs (bare --threshold cuts at 0.5; add --threshold_value 0.3 for a different cutoff)
 vesuvius.finalize_outputs s3://vesuvius/tmp/merged_logits.zarr s3://vesuvius/output/final.zarr \
     --mode binary \
     --threshold \
-    --delete-intermediates
+    --delete_intermediates
 ```
 
 After finalization the destination Zarr contains a multiscale hierarchy (`0/`, `1/`, …) and a `metadata.json` file describing the inference run. Rechunk the output if you plan to serve it through a viewer that expects different chunk sizes.

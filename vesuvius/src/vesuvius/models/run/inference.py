@@ -28,6 +28,7 @@ from vesuvius.models.run.external_models.load_resnet import try_load_external_re
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
 from vesuvius.utils.k8s import get_tqdm_kwargs
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 def _tuple_if_sequence(value):
@@ -434,7 +435,7 @@ class Inferer():
                         raise
                     raise ValueError(
                         f"{e}. If this is an external ResNet checkpoint (ink_model.py + .pth), "
-                        "rerun with --model-type resnet."
+                        "rerun with --model_type resnet."
                     ) from e
             else:
                 # Auto mode: fallback to nnUNet loader
@@ -1138,11 +1139,10 @@ def _parse_bbox_arg(value):
     return tuple(bounds)
 
 
-def main():
+def build_parser():
+    """Build the predict CLI parser (separate from main so it can be tested)."""
     import argparse
-    import sys
-    
-    parser = argparse.ArgumentParser(description='Run nnUNet inference on Zarr data')
+    parser = HyphenUnderscoreParser(description='Run nnUNet inference on Zarr data')
     parser.add_argument('--model_path', type=str, required=True,
                       help='Path to nnUNet model folder, train.py .pth, or external model path (when enabled)')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to the input Zarr volume')
@@ -1171,17 +1171,17 @@ def main():
                       help='Number of threads used to write patches to the output zarr. '
                            'Default: min(16, cpu_count). Increase for S3 outputs to push more parallelism.')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true',
+    parser.add_argument('--skip_empty_patches', action='store_true',
                       help='Skip patches that are empty (all values the same). Default: True')
-    parser.add_argument('--no-skip-empty-patches', dest='skip_empty_patches', action='store_false',
+    parser.add_argument('--no_skip_empty_patches', dest='skip_empty_patches', action='store_false',
                       help='Process all patches, even if they appear empty')
     parser.set_defaults(skip_empty_patches=True)
     
     # Add arguments for Zarr compression
-    parser.add_argument('--zarr-compressor', type=str, default='zstd',
+    parser.add_argument('--zarr_compressor', type=str, default='zstd',
                       choices=['zstd', 'lz4', 'zlib', 'none'],
                       help='Zarr compression algorithm')
-    parser.add_argument('--zarr-compression-level', type=int, default=3,
+    parser.add_argument('--zarr_compression_level', type=int, default=3,
                       help='Compression level (1-9, higher = better compression but slower)')
     
     # Add arguments for the updated Volume class
@@ -1192,14 +1192,14 @@ def main():
 
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
-    parser.add_argument('--model-type', type=str, default='auto',
+    parser.add_argument('--model_type', type=str, default='auto',
                       choices=['auto', 'nnunet', 'train_py', 'resnet'],
                       help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
     parser.add_argument('--model_cache_dir', type=str, default=DEFAULT_MODEL_CACHE_DIR,
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
-    parser.add_argument('--read-retries', dest='read_retries', type=int, default=4,
+    parser.add_argument('--read_retries', type=int, default=4,
                       help='Attempts per patch read (default 4). Transient remote failures '
                            '(dropped connections, truncated payloads, 429/5xx) are retried '
                            'with exponential backoff so one hiccup does not abort a long '
@@ -1214,8 +1214,13 @@ def main():
                            'Patch coordinates stay in the global frame, so blend_logits and '
                            'finalize_outputs need no extra flags. When streaming a remote '
                            'volume only the chunks intersecting the ROI are fetched.')
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+    import sys
+
+    args = build_parser().parse_args()
     
     # Parse optional patch size if provided
     patch_size = None
