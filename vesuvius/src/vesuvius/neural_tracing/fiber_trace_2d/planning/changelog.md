@@ -1,11 +1,14 @@
 # 2026-07-28
 
-- Native 3D Trace2CP candidate normal sampling now uses Lasagna streaming
-  sparse GPU sampling for `grad_mag`, `nx`, and `ny` on CUDA, converts compact
-  normals to Lasagna-style second-moment tensors before interpolation,
-  reconstructs the local ambiguous normal axis through Lasagna's closed-form
-  tensor-to-encoding/`estimate_normal` path, and keeps live inferred blocks
+- Restored native 3D Trace2CP candidate Lasagna normals to the
+  pre-acceleration geometry-loader sampler and restored vector-normal
+  smoothness scoring.
+- Removed the intermediate sparse-normal Trace2CP scoring path and its torch
+  closed-form normal helpers; live inferred prediction blocks still stay
   device-resident under the existing LRU cache budget for point lookup.
+- Added a debug-only native 3D Trace2CP normal comparison mode that runs sparse
+  Lasagna normal sampling beside the production geometry-loader sampler and
+  fails fast on significant differences.
 - Native 3D Trace2CP inference blocks now use a shared VC3D-backed
   requested-level axis-aligned block-read API and batch missing block forwards,
   avoiding dense coordinate-grid sampling for regular inference cubes.

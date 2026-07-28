@@ -1,72 +1,56 @@
-# Task Log: Native 3D Trace2CP GPU Sparse Sampling
+# Task Log: Fail-Fast Native 3D Trace2CP Acceleration Comparison
 
-## Planning
+## Implementation Notes
 
-- Read `fiber_trace_2d/AGENTS.md`.
-- Checked current `planning/specs.md` and `planning/plan.md`.
-- Inspected existing Lasagna sparse-cache code:
-  - `lasagna.fit_data.load_3d_streaming(...)`
-  - `FitData3D.grid_sample_fullres(...)`
-  - `SparseChunkGroupCache`
-  - `TensorStoreSparseChunkGroupCache`
-- Confirmed Lasagna already has the right zarr-backed GPU sparse sampling path
-  for `grad_mag`, `nx`, and `ny`; the tracer should use that for candidate
-  normals instead of the current CPU geometry callback.
-- Wrote the task and detailed implementation plan.
+- Added `--debug-compare-normal-sampler[=MODE]` to the native 3D Trace2CP CLI.
+  Supported modes are `all`, `sparse-direct`, and `sparse-corner-principal`.
+- The comparison mode wraps the restored production geometry-loader normal
+  sampler. The tracer still receives and scores with production normals.
+- Added `_DebugSparseLasagnaNormalSampler` for debug-only sparse Lasagna
+  sampling:
+  - `sparse-direct` samples `grad_mag/nx/ny` at candidate points and reads
+    `FitData3D.normal_3d`, matching the kind of direct sparse path that caused
+    problems.
+  - `sparse-corner-principal` samples `nx/ny` at the eight channel-grid corners,
+    reconstructs the tensor/hint on those values, and decodes with the existing
+    `_principal_tensor_axes` helper. This isolates sparse read/coordinate
+    differences from direct compact-normal interpolation differences.
+- Added `_FailFastNormalComparisonSampler`, which raises immediately on
+  valid-mask mismatch or on angular difference above
+  `--debug-normal-angle-threshold-degrees`.
+- The failure message includes sampler label, call number, point index,
+  selected-level ZYX coordinate, valid flags, normals, and angle/threshold where
+  applicable.
+- Fixed the debug-only Lasagna streaming import path so `fit_data.py` can resolve
+  its script-style `lasagna_volume` import without changing normal tracer runs.
+
+## Debug Run Results
+
+- `--debug-compare-normal-sampler=sparse-direct --debug-normal-angle-threshold-degrees 1.0`:
+  failed fast on the first candidate-normal call. First mismatch:
+  `point_index=2`, `angle_degrees=1.050298`,
+  `point_zyx_selected=[4545.16796875, 5062.00439453125, 3406.501708984375]`,
+  baseline normal `[0.30029154, 0.87094468, 0.38894793]`, accelerated normal
+  `[0.31770453, 0.86614174, 0.38582677]`.
+- `--debug-compare-normal-sampler=sparse-corner-principal --debug-normal-angle-threshold-degrees 1.0`:
+  completed the whole 87-segment fiber without any normal mismatch above
+  1 degree. This isolates the first confirmed divergence to the direct sparse
+  `normal_3d` style decode, not to sparse chunk reads in general at this
+  threshold.
 
 ## Deviations / Deferred Items
 
-- Full Python-free beam object storage/reconstruction is explicitly deferred in
-  the plan because current profiles show it is not the dominant bottleneck.
-- The shared sparse inferred-field cache from the plan is not complete in this
-  implementation. The existing Lasagna sparse cache/sampler is uint8
-  zarr-chunk oriented and uses a dense pointer table over a known volume grid,
-  which fits `grad_mag`/`nx`/`ny` normals but does not directly fit live
-  float32 checkpoint outputs with overlapping trusted cores. Implementing that
-  correctly requires a shared typed float32 sparse sampler/table extension in
-  Lasagna, not a tracer-local duplicate table.
-- As an intermediate step, native Trace2CP inferred blocks now stay
-  device-resident under the existing LRU byte budget and candidate lookup no
-  longer copies resident block outputs from CPU back to GPU for each sampled
-  block. Point-to-block routing still uses CPU grouping by trusted-core block.
-
-## Implementation
-
-- Added `_NativeSparseLasagnaNormalSampler`, backed by Lasagna streaming
-  `FitData3D.grid_sample_fullres(...)`, restricted to `grad_mag`, `nx`, and
-  `ny`.
-- The sparse normal sampler converts selected-level ZYX trace points to
-  base/fullres XYZ tensors, prefetches/syncs the Lasagna sparse caches once per
-  batched call, samples `grad_mag` and the eight requested-channel `nx`/`ny`
-  corner values via `grid_sample_fullres`, decodes only the corner compact
-  normals, converts them to Lasagna-style second-moment tensors, and
-  trilinearly blends those tensors.
-- Corrected the previous sparse-normal implementation mistake: it must not call
-  `FitData3D.normal_3d` on interpolated compact `nx`/`ny`, interpolate raw
-  compact normals, or use grid-search/power/eigen fallback decoding. The
-  blended tensor is re-encoded with Lasagna `encode_from_tensor(...)` and
-  decoded through Lasagna's closed-form `estimate_normal(...)` path to produce
-  one local ambiguous normal axis for smoothness.
-- Native Trace2CP chooses the sparse normal sampler for CUDA runs when the
-  configured dataset record has a `lasagna_manifest_path`; the existing
-  geometry-loader normal sampler remains the fallback for non-CUDA/test paths.
-- Updated point-choice lookup helpers so torch-capable caches receive torch
-  tensors directly.
-- Updated `NativeTraceFieldCache` to store decoded inferred output tensors and
-  valid masks on `cache.device` instead of CPU.
+- The accelerated samplers are debug-only and are not used for production
+  scoring. This is intentional so the restored baseline metric stays unchanged
+  while we localize acceleration differences.
+- No long traces or JSON diff reports are written; the user requested fail-fast
+  behavior instead.
 
 ## Validation
 
-- `python -m py_compile lasagna/normal_encoding.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "lasagna_estimate_normal_torch or sparse_lasagna_normal_sampler or normal_aware_smoothness or cumulative_tangent_smoothness or candidate_smoothness_can_reject_branch_switch or trace_paths_sample_candidate_normals"`
-  passed: 10 passed, 149 deselected.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: 157 passed, 2 skipped.
-- `PYTHONPATH=vesuvius/src:. python -c "from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import _import_lasagna_fit_data; m=_import_lasagna_fit_data(); print(m.__name__)"`
-  passed and printed `fit_data`, matching the script-style Lasagna import path
-  used by this checkout.
-- `git diff --check` passed.
-- Full user-dataset before/after metric profiling was not run in this shell
-  because `$SRC` and `$VES` are unset; running a rewritten command would not be
-  a directly comparable validation command.
+- `python -m py_compile lasagna/normal_encoding.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`: passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "normal_comparison or lasagna_normal_sampler or normal_aware_smoothness or cumulative_tangent_smoothness or trace_paths_sample_candidate_normals"`: 11 passed, 149 deselected.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`: 158 passed, 2 skipped.
+- `PYTHONPATH=vesuvius/src:lasagna:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool --help | rg -n "debug-compare-normal-sampler|debug-normal-angle"`: passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "normal_comparison or lasagna_normal_sampler"` after the import fix: 4 passed, 156 deselected.
+- `git diff --check`: passed.

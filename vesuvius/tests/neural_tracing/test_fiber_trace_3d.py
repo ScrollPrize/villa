@@ -46,7 +46,7 @@ try:
     from lasagna.tiled_predict3d import OmeZarrOutputAdapter
 except ImportError:  # pragma: no cover
     from tiled_predict3d import OmeZarrOutputAdapter
-from lasagna.normal_encoding import encode_normal_nxny_u8, estimate_normal, estimate_normal_torch
+from lasagna.normal_encoding import encode_normal_nxny_u8, estimate_normal
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     DEFAULT_VOLUME_CACHE_MEMORY_MIB,
     FiberTrace3DBatch,
@@ -83,10 +83,10 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _build_native_whole_fiber_span_source,
     _compose_whole_fiber_panel_blocks,
     _fiber_line_tangent_zyx_toward_target,
+    _FailFastNormalComparisonSampler,
     _image_to_u8,
     _interpolate_plane_crossing,
     _NativeLasagnaNormalSampler,
-    _NativeSparseLasagnaNormalSampler,
     _native_cumulative_tangent_smoothness_loss_torch,
     _native_trace2cp_whole_fiber_mode,
     _native_whole_fiber_visual_spans,
@@ -717,31 +717,6 @@ def test_lasagna_compact_normal_encoding_is_shared() -> None:
     )
     assert np.array_equal(nx_u8, expected_nx)
     assert np.array_equal(ny_u8, expected_ny)
-
-
-def test_lasagna_estimate_normal_torch_matches_numpy() -> None:
-    axes = torch.tensor(
-        [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 2.0, 3.0],
-            [-0.2, 0.4, 0.9],
-            [1.0e-4, 1.0, 2.0e-4],
-        ],
-        dtype=torch.float32,
-    )
-    axes = axes / torch.linalg.vector_norm(axes, dim=1, keepdim=True)
-    encoded = encode_lasagna_direction_3x2(axes)
-    numpy_outputs = estimate_normal(
-        *(encoded[:, channel].detach().cpu().numpy() for channel in range(6))
-    )
-    torch_outputs = estimate_normal_torch(
-        *(encoded[:, channel] for channel in range(6))
-    )
-
-    for expected, actual in zip(numpy_outputs, torch_outputs):
-        assert np.allclose(expected, actual.detach().cpu().numpy(), atol=1.0e-5)
 
 
 def test_lasagna_3x2_analytic_decode_round_trips_ambiguous_axes() -> None:
@@ -5330,108 +5305,64 @@ def test_native_3d_trace2cp_lasagna_normal_sampler_uses_geometry_record() -> Non
     assert torch.allclose(normals_zyx, torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32))
 
 
-def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_lasagna_tensor_moment_decode() -> None:
-    class FakeSparseCache:
-        channels = ["grad_mag", "nx", "ny"]
-        vol_shape_zyx = (4, 4, 4)
+def test_native_3d_trace2cp_normal_comparison_returns_baseline_below_threshold() -> None:
+    points = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+    baseline_normals = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32)
+    baseline_valid = torch.tensor([True])
+    alternate_normals = torch.tensor([[0.0, 0.01, 1.0]], dtype=torch.float32)
+    alternate_normals = torch.nn.functional.normalize(alternate_normals, p=2.0, dim=1)
+    alternate_valid = torch.tensor([True])
 
-        def __init__(self) -> None:
-            self.prefetch_calls = 0
-            self.sync_calls = 0
-            self.prefetch_xyz = None
+    def baseline(_points):
+        return baseline_normals.clone(), baseline_valid.clone()
 
-        def prefetch(self, xyz_fullres, origin, spacing):
-            self.prefetch_calls += 1
-            self.prefetch_xyz = xyz_fullres.detach().clone()
-            assert origin == (0.0, 0.0, 0.0)
-            assert spacing == (16.0, 16.0, 16.0)
+    def alternate(_points):
+        return alternate_normals.clone(), alternate_valid.clone()
 
-        def sync(self):
-            self.sync_calls += 1
+    sampler = _FailFastNormalComparisonSampler(
+        primary=baseline,
+        alternates=(("alt", alternate),),
+        angle_threshold_degrees=2.0,
+    )
+    normals, valid = sampler(points)
 
-    class FakeSampled:
-        def __init__(
-            self,
-            *,
-            grad_mag: torch.Tensor | None = None,
-            nx: torch.Tensor | None = None,
-            ny: torch.Tensor | None = None,
-        ) -> None:
-            self.grad_mag = grad_mag
-            self.nx = nx
-            self.ny = ny
+    assert sampler.call_count == 1
+    assert torch.equal(normals, baseline_normals)
+    assert torch.equal(valid, baseline_valid)
 
-        @property
-        def normal_3d(self):
-            raise AssertionError("sparse normal sampler must not interpolate normal_3d")
 
-    class FakeFitData:
-        origin_fullres = (0.0, 0.0, 0.0)
+def test_native_3d_trace2cp_normal_comparison_raises_on_valid_mismatch() -> None:
+    def baseline(_points):
+        return torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32), torch.tensor([True])
 
-        def __init__(self) -> None:
-            self.cache = FakeSparseCache()
-            self.sparse_caches = {"normal": self.cache}
-            self.sample_calls: list[tuple[frozenset[str], torch.Tensor]] = []
+    def alternate(_points):
+        return torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32), torch.tensor([False])
 
-        def _spacing_for(self, _channel: str):
-            return (16.0, 16.0, 16.0)
-
-        def _size_of(self, _tensor):
-            return (4, 4, 4)
-
-        def grid_sample_fullres(self, xyz_fullres, *, channels):
-            channels_frozen = frozenset(channels)
-            self.sample_calls.append((channels_frozen, xyz_fullres.detach().clone()))
-            count = int(xyz_fullres.shape[2])
-            if channels_frozen == frozenset({"grad_mag"}):
-                assert tuple(xyz_fullres.shape) == (1, 1, 2, 3)
-                return FakeSampled(
-                    grad_mag=torch.ones((1, 1, 1, 1, count), dtype=torch.float32)
-                )
-            if channels_frozen == frozenset({"nx", "ny"}):
-                assert tuple(xyz_fullres.shape) == (1, 1, 16, 3)
-                # Two sample points, eight corners each. The signs alternate
-                # around an X-facing axis. Interpolating nx directly at the
-                # middle would cancel to 0 and incorrectly decode a Z normal;
-                # the Lasagna convention interpolates the sign-invariant
-                # second-moment tensor.
-                signs = torch.tensor(
-                    [1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0],
-                    dtype=torch.float32,
-                ).repeat(2)
-                return FakeSampled(
-                    nx=signs.view(1, 1, 1, 1, count),
-                    ny=torch.zeros((1, 1, 1, 1, count), dtype=torch.float32),
-                )
-            raise AssertionError(f"unexpected channels: {channels}")
-
-    data = FakeFitData()
-    sampler = _NativeSparseLasagnaNormalSampler(
-        trace_record=SimpleNamespace(volume_spacing_base=4.0),
-        data=data,
-        device=torch.device("cpu"),
+    sampler = _FailFastNormalComparisonSampler(
+        primary=baseline,
+        alternates=(("alt", alternate),),
+        angle_threshold_degrees=1.0,
     )
 
-    points = torch.tensor([[2.0, 2.0, 2.0], [6.0, 6.0, 6.0]], dtype=torch.float32)
-    normals_zyx, valid = sampler(points)
+    with pytest.raises(ValueError, match="valid_mismatch"):
+        sampler(torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32))
 
-    expected_xyz = torch.tensor(
-        [[8.0, 8.0, 8.0], [24.0, 24.0, 24.0]],
-        dtype=torch.float32,
-    ).view(1, 1, 2, 3)
-    assert data.cache.prefetch_calls == 1
-    assert data.cache.sync_calls == 1
-    assert len(data.sample_calls) == 2
-    assert data.sample_calls[0][0] == frozenset({"grad_mag"})
-    assert data.sample_calls[1][0] == frozenset({"nx", "ny"})
-    assert tuple(data.cache.prefetch_xyz.shape) == (1, 1, 18, 3)
-    assert torch.allclose(data.cache.prefetch_xyz[:, :, :2], expected_xyz)
-    assert torch.allclose(data.sample_calls[0][1], expected_xyz)
-    assert valid.tolist() == [True, True]
-    assert torch.allclose(
-        normals_zyx,
-        torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=torch.float32),
+
+def test_native_3d_trace2cp_normal_comparison_raises_on_angle_mismatch() -> None:
+    def baseline(_points):
+        return torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32), torch.tensor([True])
+
+    def alternate(_points):
+        return torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float32), torch.tensor([True])
+
+    sampler = _FailFastNormalComparisonSampler(
+        primary=baseline,
+        alternates=(("alt", alternate),),
+        angle_threshold_degrees=5.0,
     )
+
+    with pytest.raises(ValueError, match="angle_mismatch"):
+        sampler(torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32))
 
 
 def test_native_3d_trace2cp_point_choice_helper_keeps_torch_points() -> None:

@@ -693,27 +693,22 @@
   substep, takes the best branch score per substep, averages those substep
   scores, and then applies the current-point direction gate when legacy
   two-dot scoring is enabled. A multi-substep candidate is valid only when
-  every substep has at least one valid branch. Search smoothness defaults to normal-aware split
-  smoothness in the native 3D CLI. Candidate Lasagna normals are sampled
-  directly at the candidate trace coordinates. In CUDA mode with a configured
-  Lasagna manifest, this must use Lasagna streaming
-  `FitData3D.grid_sample_fullres(...)` over the sparse GPU chunk cache for
-  `grad_mag`, `nx`, and `ny`. Compact `nx`/`ny` normals must be decoded at the
-  eight requested-channel voxel corners, converted to Lasagna's sign-invariant
-  second-moment tensor representation (`n*n^T`, the same six-component
-  convention used by `lasagna.tifxyz_labels.encode_from_tensor`), and
-  trilinearly blended as tensors. The blended tensor must then be passed
-  through Lasagna's established closed-form tensor-to-encoding and
-  `estimate_normal` reconstruction path to produce one local ambiguous normal
-  axis for smoothness. The tracer must not interpolate compact normal vectors,
-  call `FitData3D.normal_3d` on an interpolated `nx`/`ny` sample, perform
-  grid-search/eigen/power fallback decoding in the hot path, call a
-  per-candidate CPU geometry callback, or interpolate normals by reference-line
-  progress. With a valid candidate normal axis, smoothness is split into
-  tangent-plane turn and normal-tilt turn: tangent-plane turn is the angle
-  between previous and candidate step directions after projection by
-  `I - n*n^T`, while normal-tilt turn uses the tensor-projected elevation
-  magnitudes. Both components use
+  every substep has at least one valid branch. Search smoothness defaults to
+  normal-aware split smoothness in the native 3D CLI. Candidate Lasagna normals
+  are sampled directly at the candidate trace coordinates through the
+  established `fiber_trace_2d` geometry-loader path
+  `_lasagna_normals_at_zyx_batch`. That path must remain the behavior source of
+  truth unless a future replacement is proven metric-equivalent before becoming
+  default. Compact `nx`/`ny` normals must not be interpolated directly, and the
+  tracer must not call `FitData3D.normal_3d` on interpolated compact normals,
+  perform grid search, use a generic eigensolver fallback, or interpolate
+  normals by reference-line progress. With a valid candidate normal axis,
+  smoothness is split into tangent-plane turn and normal-tilt turn using the
+  vector-normal projection equations from the pre-acceleration tracer:
+  tangent-plane turn is the angle between previous and candidate step
+  directions after subtracting their signed normal-axis components, while
+  normal-tilt turn compares their signed `asin(dot(direction, normal))`
+  elevations. Both components use
   `max(0, angle - smoothness_free_angle)^2`, in radians, and the native 3D
   CLI default for `smoothness_free_angle` is `0` degrees so all measured
   turns are penalized unless explicitly overridden. The Lasagna normal
@@ -734,6 +729,12 @@
   normal/elevation change. If candidate normal sampling is unavailable,
   invalid, or tangent projection is degenerate, the cumulative term is zero for
   that candidate.
+  The optional `--debug-compare-normal-sampler` mode is diagnostic only. It
+  wraps the production geometry-loader sampler, runs one or more accelerated
+  sparse Lasagna samplers on the same candidate points, returns the production
+  normals to the tracer, and raises immediately on valid-mask mismatch or an
+  angular difference above `--debug-normal-angle-threshold-degrees`. This mode
+  must not be used as production scoring.
   The native 3D tool does not expose additive direction/presence
   candidate-selection weights.
 - The native 3D Trace2CP start direction is sampled from the model at the

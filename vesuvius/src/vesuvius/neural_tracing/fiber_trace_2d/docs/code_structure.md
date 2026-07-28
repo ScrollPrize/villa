@@ -279,13 +279,12 @@ Ownership changed as follows:
   dot products, then multiplies that direction product by candidate presence.
   `--no-all-pairs-direction-product` restores the older
   `dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * presence` score.
-  Smoothness uses Lasagna normals sampled directly at candidate trace points.
-  In CUDA mode with a configured Lasagna manifest, normal sampling uses
-  Lasagna streaming `FitData3D.grid_sample_fullres(...)` over the sparse GPU
-  chunk cache for `grad_mag`, `nx`, and `ny`, then reads `FitData3D.normal_3d`
-  for the established ambiguous normal decode. The scorer does not call a
-  per-candidate CPU geometry callback, interpolate reference-line normals, or
-  reimplement normal decoding.
+  Smoothness uses Lasagna normals sampled directly at candidate trace points
+  through the established `fiber_trace_2d` geometry-loader sampler. That path
+  remains the production behavior source of truth. The debug-only
+  `--debug-compare-normal-sampler` option can run sparse Lasagna sampling in
+  parallel and fail fast on valid-mask or angular differences, while the tracer
+  still scores with the baseline geometry-loader normals.
   With a valid candidate normal, `--smoothness-tangent-weight` penalizes turns
   within the tangent plane perpendicular to the normal and
   `--smoothness-normal-weight` penalizes elevation change into/out of the
