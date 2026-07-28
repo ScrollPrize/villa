@@ -7,4 +7,7 @@
   enables JPG rendering and partial image updates.
 - Native 3D whole-fiber Trace2CP now reports restarts per 1000 reference
   voxels, with optional restarts per meter in summaries and progress output
-  when explicit voxel-size metadata is available.
+  when VC3D `volume.metadata["voxelsize"]` is available.
+- VC3D remote volume metadata normalization now always discovers public
+  `scan/tomo/acquisition/detector/samplePixelSize` as `voxelsize` when no
+  explicit positive `voxelsize` exists.

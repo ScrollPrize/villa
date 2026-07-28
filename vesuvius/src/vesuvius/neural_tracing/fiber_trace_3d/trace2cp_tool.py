@@ -1592,11 +1592,12 @@ def _emit_native_progress(
     filled = int(math.floor(width * progress))
     bar = "#" * filled + "-" * (width - filled)
     suffix = "" if not detail else f" {detail}"
-    print(
+    message = (
         f"native {label} [{bar}] {current_i}/{total_i} "
-        f"elapsed={_format_eta(elapsed)} eta={_format_eta(eta)}{suffix}",
-        flush=True,
+        f"elapsed={_format_eta(elapsed)} eta={_format_eta(eta)}{suffix}"
     )
+    complete = current_i >= total_i
+    print(f"\r{message}", end="\n" if complete else "", flush=True)
 
 
 def _score_candidate_loss_tensors(
@@ -3390,253 +3391,23 @@ def _control_point_reference_arc_voxels(record: Any) -> np.ndarray:
     return np.asarray(arcs, dtype=np.float64)
 
 
-def _unit_to_meter_factor(unit: Any) -> float | None:
-    text = str(unit).strip().lower().replace("µ", "u")
-    text = text.replace("meters", "meter").replace("micrometers", "micrometer")
-    text = text.replace("nanometers", "nanometer").replace("millimeters", "millimeter")
-    if text in {"m", "meter"}:
-        return 1.0
-    if text in {"mm", "millimeter"}:
-        return 1.0e-3
-    if text in {"um", "micron", "micrometer"}:
-        return 1.0e-6
-    if text in {"nm", "nanometer"}:
-        return 1.0e-9
-    return None
-
-
-def _coerce_voxel_size_triplet(value: Any, *, order: str) -> np.ndarray | None:
+def _vc3d_voxel_size_m(record: Any) -> float | None:
+    sampler = getattr(record, "sampler", None)
+    volume = getattr(sampler, "volume", None)
+    metadata = getattr(volume, "metadata", None)
+    if metadata is None:
+        return None
     try:
-        arr = np.asarray(value, dtype=np.float64)
+        voxelsize_um = metadata["voxelsize"]
+    except (KeyError, TypeError, AttributeError):
+        return None
+    try:
+        voxelsize_um = float(voxelsize_um)
     except (TypeError, ValueError):
         return None
-    if arr.ndim == 0:
-        arr = np.repeat(arr.reshape(1), 3)
-    arr = arr.reshape(-1)
-    if int(arr.size) != 3 or not bool(np.isfinite(arr).all()) or bool(np.any(arr <= 0.0)):
+    if not math.isfinite(voxelsize_um) or voxelsize_um <= 0.0:
         return None
-    order_normalized = str(order).lower()
-    if order_normalized == "xyz":
-        return arr.astype(np.float64, copy=False)
-    if order_normalized == "zyx":
-        return arr[[2, 1, 0]].astype(np.float64, copy=False)
-    raise ValueError(f"unsupported voxel-size axis order {order!r}")
-
-
-def _voxel_size_from_mapping(
-    mapping: Any,
-    *,
-    selected_spacing_base: float,
-) -> np.ndarray | None:
-    if not isinstance(mapping, dict):
-        return None
-
-    def parse_key(key: str, *, unit: str, order: str, selected: bool) -> np.ndarray | None:
-        if key not in mapping:
-            return None
-        factor = _unit_to_meter_factor(unit)
-        if factor is None:
-            return None
-        values = _coerce_voxel_size_triplet(mapping[key], order=order)
-        if values is None:
-            return None
-        out = values * float(factor)
-        return out if selected else out * float(selected_spacing_base)
-
-    specs = (
-        ("selected_voxel_size_xyz_m", "m", "xyz", True),
-        ("selected_voxel_size_zyx_m", "m", "zyx", True),
-        ("selected_voxel_size_m", "m", "xyz", True),
-        ("selected_voxel_size_xyz_um", "um", "xyz", True),
-        ("selected_voxel_size_zyx_um", "um", "zyx", True),
-        ("selected_voxel_size_um", "um", "xyz", True),
-        ("level_voxel_size_xyz_m", "m", "xyz", True),
-        ("level_voxel_size_zyx_m", "m", "zyx", True),
-        ("level_voxel_size_m", "m", "xyz", True),
-        ("level_voxel_size_xyz_um", "um", "xyz", True),
-        ("level_voxel_size_zyx_um", "um", "zyx", True),
-        ("level_voxel_size_um", "um", "xyz", True),
-        ("base_voxel_size_xyz_m", "m", "xyz", False),
-        ("base_voxel_size_zyx_m", "m", "zyx", False),
-        ("base_voxel_size_m", "m", "xyz", False),
-        ("base_voxel_size_xyz_um", "um", "xyz", False),
-        ("base_voxel_size_zyx_um", "um", "zyx", False),
-        ("base_voxel_size_um", "um", "xyz", False),
-        ("base_voxel_size_xyz_nm", "nm", "xyz", False),
-        ("base_voxel_size_zyx_nm", "nm", "zyx", False),
-        ("base_voxel_size_nm", "nm", "xyz", False),
-        ("voxel_size_xyz_m", "m", "xyz", False),
-        ("voxel_size_zyx_m", "m", "zyx", False),
-        ("voxel_size_m", "m", "xyz", False),
-        ("voxel_size_xyz_um", "um", "xyz", False),
-        ("voxel_size_zyx_um", "um", "zyx", False),
-        ("voxel_size_um", "um", "xyz", False),
-        ("voxel_size_xyz_nm", "nm", "xyz", False),
-        ("voxel_size_zyx_nm", "nm", "zyx", False),
-        ("voxel_size_nm", "nm", "xyz", False),
-    )
-    for key, unit, order, selected in specs:
-        parsed = parse_key(key, unit=unit, order=order, selected=selected)
-        if parsed is not None:
-            return parsed
-
-    for key, order, selected in (
-        ("selected_voxel_size_xyz", "xyz", True),
-        ("selected_voxel_size_zyx", "zyx", True),
-        ("selected_voxel_size", "xyz", True),
-        ("level_voxel_size_xyz", "xyz", True),
-        ("level_voxel_size_zyx", "zyx", True),
-        ("level_voxel_size", "xyz", True),
-        ("base_voxel_size_xyz", "xyz", False),
-        ("base_voxel_size_zyx", "zyx", False),
-        ("base_voxel_size", "xyz", False),
-        ("voxel_size_xyz", "xyz", False),
-        ("voxel_size_zyx", "zyx", False),
-        ("voxel_size", "xyz", False),
-    ):
-        if key not in mapping:
-            continue
-        unit = (
-            mapping.get(f"{key}_unit")
-            or mapping.get("voxel_size_unit")
-            or mapping.get("physical_unit")
-            or mapping.get("unit")
-        )
-        factor = _unit_to_meter_factor(unit)
-        if factor is None:
-            continue
-        values = _coerce_voxel_size_triplet(mapping[key], order=order)
-        if values is None:
-            continue
-        out = values * float(factor)
-        return out if selected else out * float(selected_spacing_base)
-
-    return None
-
-
-def _ome_axis_unit_scale(axis: dict[str, Any]) -> float | None:
-    unit = axis.get("unit")
-    if unit is None:
-        return None
-    return _unit_to_meter_factor(unit)
-
-
-def _voxel_size_from_ome_multiscales(
-    attrs: dict[str, Any],
-    *,
-    volume_scale: int,
-) -> np.ndarray | None:
-    multiscales = attrs.get("multiscales")
-    if not isinstance(multiscales, list) or not multiscales:
-        return None
-    for multiscale in multiscales:
-        if not isinstance(multiscale, dict):
-            continue
-        axes_raw = multiscale.get("axes")
-        datasets = multiscale.get("datasets")
-        if not isinstance(axes_raw, list) or not isinstance(datasets, list):
-            continue
-        axes: list[tuple[str, float]] = []
-        for axis in axes_raw:
-            if not isinstance(axis, dict):
-                continue
-            axis_type = str(axis.get("type", "space")).lower()
-            if axis_type != "space":
-                continue
-            factor = _ome_axis_unit_scale(axis)
-            if factor is None:
-                axes = []
-                break
-            axes.append((str(axis.get("name", "")).lower(), float(factor)))
-        if len(axes) != 3:
-            continue
-        selected_dataset = None
-        for dataset in datasets:
-            if not isinstance(dataset, dict):
-                continue
-            if str(dataset.get("path", "")) == str(int(volume_scale)):
-                selected_dataset = dataset
-                break
-        if selected_dataset is None and 0 <= int(volume_scale) < len(datasets):
-            selected_dataset = datasets[int(volume_scale)]
-        if not isinstance(selected_dataset, dict):
-            continue
-        transforms = selected_dataset.get("coordinateTransformations", [])
-        if not isinstance(transforms, list):
-            continue
-        scale_values = None
-        for transform in transforms:
-            if isinstance(transform, dict) and str(transform.get("type", "")).lower() == "scale":
-                raw_scale = transform.get("scale")
-                if isinstance(raw_scale, list) and len(raw_scale) >= len(axes):
-                    scale_values = [float(v) for v in raw_scale[: len(axes)]]
-                    break
-        if scale_values is None:
-            continue
-        by_name: dict[str, float] = {}
-        for (name, factor), scale_value in zip(axes, scale_values):
-            by_name[name] = float(scale_value) * float(factor)
-        if all(name in by_name for name in ("x", "y", "z")):
-            out = np.asarray([by_name["x"], by_name["y"], by_name["z"]], dtype=np.float64)
-            if bool(np.isfinite(out).all()) and bool(np.all(out > 0.0)):
-                return out
-    return None
-
-
-def _attrs_to_dict(attrs: Any) -> dict[str, Any] | None:
-    if attrs is None:
-        return None
-    if hasattr(attrs, "asdict"):
-        try:
-            value = attrs.asdict()
-        except Exception:
-            return None
-        return value if isinstance(value, dict) else None
-    if isinstance(attrs, dict):
-        return dict(attrs)
-    try:
-        return dict(attrs)
-    except Exception:
-        return None
-
-
-def _selected_voxel_size_xyz_m(record: Any) -> np.ndarray | None:
-    spacing = float(getattr(record, "volume_spacing_base", 1.0))
-    if not math.isfinite(spacing) or spacing <= 0.0:
-        return None
-    for mapping in (
-        getattr(record, "dataset_config", None),
-        getattr(record, "metadata", None),
-    ):
-        parsed = _voxel_size_from_mapping(mapping, selected_spacing_base=spacing)
-        if parsed is not None:
-            return parsed
-    for key, selected in (
-        ("selected_voxel_size_xyz_m", True),
-        ("base_voxel_size_xyz_m", False),
-        ("voxel_size_xyz_m", False),
-        ("selected_voxel_size_m", True),
-        ("base_voxel_size_m", False),
-        ("voxel_size_m", False),
-    ):
-        if not hasattr(record, key):
-            continue
-        values = _coerce_voxel_size_triplet(getattr(record, key), order="xyz")
-        if values is not None:
-            return values if selected else values * spacing
-    volume = getattr(record, "volume", None)
-    attrs = _attrs_to_dict(getattr(volume, "attrs", None))
-    if attrs is not None:
-        parsed = _voxel_size_from_mapping(attrs, selected_spacing_base=spacing)
-        if parsed is not None:
-            return parsed
-        parsed = _voxel_size_from_ome_multiscales(
-            attrs,
-            volume_scale=int(getattr(record, "volume_scale", 0)),
-        )
-        if parsed is not None:
-            return parsed
-    return None
+    return voxelsize_um * 1.0e-6
 
 
 def _reference_line_length_meters_between_cps(
@@ -3645,11 +3416,8 @@ def _reference_line_length_meters_between_cps(
     start_cp_index: int,
     end_cp_index: int,
 ) -> float | None:
-    selected_voxel_size_xyz = _selected_voxel_size_xyz_m(record)
-    if selected_voxel_size_xyz is None:
-        return None
-    spacing = float(getattr(record, "volume_spacing_base", 1.0))
-    if not math.isfinite(spacing) or spacing <= 0.0:
+    voxel_size_m = _vc3d_voxel_size_m(record)
+    if voxel_size_m is None:
         return None
     line_xyz = np.asarray(record.fiber.line_points_xyz, dtype=np.float64)
     if line_xyz.ndim != 2 or line_xyz.shape[1] != 3:
@@ -3660,10 +3428,8 @@ def _reference_line_length_meters_between_cps(
     hi = max(int(start_line), int(end_line))
     if hi <= lo:
         return 0.0
-    selected_xyz = line_xyz[lo : hi + 1] / float(spacing)
-    diffs = np.diff(selected_xyz, axis=0)
-    physical_diffs = diffs * selected_voxel_size_xyz.reshape(1, 3)
-    length = float(np.linalg.norm(physical_diffs, axis=1).sum())
+    diffs = np.diff(line_xyz[lo : hi + 1], axis=0)
+    length = float(np.linalg.norm(diffs, axis=1).sum()) * float(voxel_size_m)
     return length if math.isfinite(length) and length >= 0.0 else None
 
 
@@ -3749,9 +3515,7 @@ def trace_native_3d_whole_fiber(
         physical_detail = ""
         if restarts_per_meter is not None and reference_length_meters is not None:
             physical_detail = (
-                f"restarts_per_meter={restarts_per_meter:.6f} "
-                f"reference_length_meters={reference_length_meters:.9g} "
-                "physical_unit=m "
+                f"err/m={restarts_per_meter:.3f} "
             )
         _emit_native_progress(
             "whole fiber",
@@ -3761,7 +3525,7 @@ def trace_native_3d_whole_fiber(
             detail=(
                 f"segment={min(done + 1, segment_count)}/{segment_count} "
                 f"status={status} restarts={restart_count} "
-                f"restarts_per_kvx={restarts_per_kvx:.6f} "
+                f"err/kvx={restarts_per_kvx:.3f} "
                 f"{physical_detail}"
                 f"eta={_format_eta(eta)} blocks={len(cache._blocks)}"
             ),
@@ -5502,8 +5266,7 @@ def run_native_trace2cp(
                 and partial.reference_length_meters is not None
             ):
                 physical_status = (
-                    f" restarts_per_meter={partial.restarts_per_meter:.6f}"
-                    " physical_unit=m"
+                    f" err/m={partial.restarts_per_meter:.3f}"
                 )
             _compose_whole_fiber_panel_blocks(
                 [panels],
@@ -5511,7 +5274,7 @@ def run_native_trace2cp(
                 status_text=(
                     f"segments={len(partial.segments) if partial is not None else 0} "
                     f"spans={closed_span_count + 1} restarts={restarts} "
-                    f"restarts_per_kvx={restarts_per_kvx:.6f}"
+                    f"err/kvx={restarts_per_kvx:.3f}"
                     f"{physical_status}"
                 ),
             ).convert("RGB").save(image_path, quality=90)
@@ -5612,17 +5375,15 @@ def run_native_trace2cp(
         summary_path = out_dir / "trace2cp_native_3d_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
         print(
-            "native_trace2cp_fiber_restarts_per_kvx="
-            f"{whole.restarts_per_kvx:.8f} restarts={whole.restart_count} "
-            f"reference_length_voxels={whole.reference_length_voxels:.3f} "
+            "native_trace2cp_fiber "
+            f"err/kvx={whole.restarts_per_kvx:.3f} restarts={whole.restart_count} "
             f"segments={whole.segment_count}",
             flush=True,
         )
         if whole.restarts_per_meter is not None and whole.reference_length_meters is not None:
             print(
-                "native_trace2cp_fiber_restarts_per_meter="
-                f"{whole.restarts_per_meter:.8f} "
-                f"reference_length_meters={whole.reference_length_meters:.9g}",
+                "native_trace2cp_fiber "
+                f"err/m={whole.restarts_per_meter:.3f}",
                 flush=True,
             )
         print(

@@ -320,17 +320,23 @@ loading.
   succeeds when it reaches the next CP plane within the segment budget and its
   in-plane selected-voxel error to the target CP is below
   `--whole-fiber-error-threshold-voxels` (default `10`). Failures count one
-  restart and resume from the failed target CP. Stdout prints
-  `native_trace2cp_fiber_restarts_per_kvx`, measured as restarts per 1000
-  selected-level voxels along the original loaded fiber line. If explicit
-  physical voxel-size metadata is available, stdout also prints
-  `native_trace2cp_fiber_restarts_per_meter`, and live whole-fiber progress
-  includes the same per-meter metric plus the current reference length in
-  meters with `physical_unit=m`. The tool does not infer this from filenames.
-  The JSON summary includes per-segment status, errors, step counts, restart
-  points, the last successful reference arc distance, reference lengths,
-  optional per-meter normalization, and the old segment fraction only as
-  `restart_fraction_per_segment`.
+  restart and resume from the failed target CP. Human stdout/progress prints
+  compact error rates as `err/kvx=...` and, when physical units are available,
+  `err/m=...`, rounded to three decimals. Reference lengths and
+  `physical_unit=m` are omitted from human progress output. Live progress uses
+  carriage-return updates on one terminal line and prints a newline only at
+  completion. Physical per-meter output is optional and comes only from the
+  VC3D sampler's
+  `record.sampler.volume.metadata["voxelsize"]` value, interpreted as
+  micrometers and converted to meters. If VC3D does not expose a finite
+  positive `voxelsize`, stdout/progress omit physical units and JSON stores
+  null for the per-meter fields. The fiber code does not parse Zarr/OME JSON,
+  dataset config, record metadata, alternate keys, or filenames for physical
+  units. The JSON summary includes per-segment status, errors, step counts,
+  restart points, the last successful reference arc distance, reference
+  lengths, full-precision `native_trace2cp_fiber_restarts_per_kvx`, optional
+  full-precision `native_trace2cp_fiber_restarts_per_meter`, and the old
+  segment fraction only as `restart_fraction_per_segment`.
 - Fuses forward and reverse traces in selected-level 3D ZYX coordinates by
   preserving traced order and selecting a pairwise traced-arc meeting, not a
   straight-axis overlap progress. The score is

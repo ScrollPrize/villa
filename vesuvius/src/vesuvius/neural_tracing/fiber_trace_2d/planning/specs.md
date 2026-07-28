@@ -722,23 +722,33 @@
   selected diagnostic progress, raw gap, considered pair score, and center
   penalty. For pairwise traced-arc fusion the center penalty is fixed to `1.0`.
   These are not the public 2D `trace2cp_error`.
-- Native 3D whole-fiber mode reports its tool-local metric on a single line as
-  `native_trace2cp_fiber_restarts_per_kvx=... restarts=... reference_length_voxels=... segments=...`.
+- Native 3D whole-fiber mode reports its tool-local human stdout metric as
+  compact error-rate fields: `err/kvx=...` and, when physical units are
+  available, `err/m=...`. Human stdout/progress should use three digits after
+  the decimal for these rates and must not include physical unit or reference
+  length fields. Live whole-fiber progress must update one terminal line with
+  carriage returns; it must not print a fresh line for every segment. It should
+  emit a newline only when the progress reaches the terminal state.
   The metric is `restart_count / (reference_length_voxels / 1000)`, where
   `reference_length_voxels` is measured along the original loaded fiber line
-  between CP0 and the final CP in selected-level voxels. If explicit physical
-  voxel-size metadata is available from the dataset config, record metadata, or
-  OME multiscales with spatial units, the tool also prints and stores
-  `native_trace2cp_fiber_restarts_per_meter=...`; otherwise the per-meter
-  field is omitted from stdout and null in JSON. Live whole-fiber progress
-  output uses the same units and includes `restarts_per_meter` plus
-  `reference_length_meters` plus `physical_unit=m` when available. The tool
-  must not infer voxel size from the volume filename. The JSON summary stores
-  per-segment status,
-  reason, reached-plane flag, in-plane error, step count, restart point,
-  reference arc distance at the last successful CP plane, reference lengths,
-  and the old segment-normalized fraction only as
-  `restart_fraction_per_segment`.
+  between CP0 and the final CP in selected-level voxels. Physical units are
+  reported only when the VC3D sampler exposes
+  `record.sampler.volume.metadata["voxelsize"]` as a finite positive value in
+  micrometers. In that case the tool converts it with `voxelsize * 1e-6`.
+  If that exact VC3D metadata path is unavailable or invalid, the per-meter
+  field is omitted from stdout and null in JSON. The
+  VC3D remote volume loader must normalize public Vesuvius
+  `scan/tomo/acquisition/detector/samplePixelSize` metadata into
+  `metadata["voxelsize"]` whenever no explicit positive `voxelsize` exists,
+  independent of the remote volume base-scale mode. The
+  fiber code must not parse Zarr/OME JSON directly, inspect dataset config or
+  record metadata for physical units, accept alternate keys, or infer voxel
+  size from filenames. The JSON summary stores per-segment status, reason,
+  reached-plane flag, in-plane error, step count, restart point, reference arc
+  distance at the last successful CP plane, full-precision reference lengths,
+  full-precision `native_trace2cp_fiber_restarts_per_kvx` and optional
+  `native_trace2cp_fiber_restarts_per_meter`, and the old segment-normalized
+  fraction only as `restart_fraction_per_segment`.
 - Native 3D single-pair visualization first builds the initial side/top strip
   source from the existing 2D Trace2CP geometry loader for the input CP pair.
   In single-pair mode, the configured cross-strip height is a maximum cap: the

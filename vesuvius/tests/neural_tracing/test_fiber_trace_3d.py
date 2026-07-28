@@ -3711,7 +3711,9 @@ def test_native_3d_whole_fiber_trace_restarts_after_plane_miss() -> None:
 
 def test_native_3d_whole_fiber_trace_reports_restarts_per_meter_when_voxel_size_known() -> None:
     record = _whole_native_trace_record()
-    record.dataset_config = {"base_voxel_size_um": 2.0}
+    record.sampler = SimpleNamespace(
+        volume=SimpleNamespace(metadata={"voxelsize": 2.0})
+    )
     cache = SimpleNamespace(_blocks={})
     calls = 0
 
@@ -3752,9 +3754,11 @@ def test_native_3d_whole_fiber_trace_reports_restarts_per_meter_when_voxel_size_
     assert result.restarts_per_meter == pytest.approx(25_000.0)
 
 
-def test_native_3d_whole_fiber_progress_reports_physical_unit_when_known(capsys) -> None:
+def test_native_3d_whole_fiber_progress_reports_compact_error_units_when_known(capsys) -> None:
     record = _whole_native_trace_record()
-    record.dataset_config = {"base_voxel_size_um": 2.0}
+    record.sampler = SimpleNamespace(
+        volume=SimpleNamespace(metadata={"voxelsize": 2.0})
+    )
     cache = SimpleNamespace(_blocks={})
     calls = 0
 
@@ -3792,10 +3796,39 @@ def test_native_3d_whole_fiber_progress_reports_physical_unit_when_known(capsys)
     )
 
     output = capsys.readouterr().out
-    assert "restarts_per_kvx=" in output
-    assert "restarts_per_meter=" in output
-    assert "reference_length_meters=" in output
-    assert "physical_unit=m" in output
+    assert "err/kvx=" in output
+    assert "err/m=" in output
+    assert "\r" in output
+    assert output.count("\n") == 1
+    assert "restarts_per_kvx=" not in output
+    assert "restarts_per_meter=" not in output
+    assert "reference_length_meters=" not in output
+    assert "physical_unit=m" not in output
+
+
+def test_native_3d_whole_fiber_ignores_non_vc3d_voxel_size_metadata() -> None:
+    record = _whole_native_trace_record()
+    record.dataset_config = {"base_voxel_size_um": 2.0}
+    cache = SimpleNamespace(_blocks={})
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_voxels=1.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.reference_length_meters is None
+    assert result.restarts_per_meter is None
 
 
 def test_native_3d_whole_fiber_trace_restarts_after_large_in_plane_error() -> None:

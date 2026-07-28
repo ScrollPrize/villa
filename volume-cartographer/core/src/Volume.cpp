@@ -72,8 +72,7 @@ std::string deriveRemoteVolumeName(const std::string& url)
 }
 
 std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl,
-                                                    const vc::HttpAuth& auth,
-                                                    bool discoverPublicSamplePixelSize)
+                                                    const vc::HttpAuth& auth)
 {
     const auto numberFromObject = [](const utils::Json& obj,
                                      std::initializer_list<const char*> keys) -> std::optional<double> {
@@ -141,7 +140,7 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl
                 hasVoxelSize = true;
             }
         }
-        if (!hasVoxelSize && discoverPublicSamplePixelSize) {
+        if (!hasVoxelSize) {
             const utils::Json* current = &json;
             for (const char* key : {"scan", "tomo", "acquisition", "detector"}) {
                 if (!current->is_object() || !current->contains(key)) {
@@ -1396,8 +1395,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
 
     std::optional<double> nativeRemoteVoxelSize;
     try {
-        if (auto remoteMeta = loadRemoteVolumeMetadata(
-                remoteUrl, auth, spec.baseScaleLevel > 0)) {
+        if (auto remoteMeta = loadRemoteVolumeMetadata(remoteUrl, auth)) {
             if (remoteMeta->contains("voxelsize") &&
                 (*remoteMeta)["voxelsize"].is_number()) {
                 const double value = (*remoteMeta)["voxelsize"].get_double();
