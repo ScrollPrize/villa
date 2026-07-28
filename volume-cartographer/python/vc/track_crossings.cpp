@@ -1299,7 +1299,7 @@ nb::dict resample_tracks(
         std::move(crossing_self_sample), track_count, width);
     result["crossing_partner_sample"] = own_2d(
         std::move(crossing_partner_sample), track_count, width);
-    if (!crossing_record_sample.empty()) {
+    if (crossing_index != nullptr || walk_index != nullptr) {
         auto samples = own_1d(std::move(crossing_record_sample));
         result["crossing_record_sample"] = samples;
         if (walk_index != nullptr)

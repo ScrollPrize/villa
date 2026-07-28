@@ -302,6 +302,36 @@ class TrackCrossingCacheTests(unittest.TestCase):
         for name in expected:
             np.testing.assert_array_equal(actual[name], expected[name])
 
+    def test_native_resampler_returns_empty_crossing_record_map(self):
+        native = _load_native_track_crossings()
+        if native is None:
+            self.skipTest('VC native crossing extension is not built')
+        tracks = [
+            line_track(2, z=10, y=10),
+            line_track(2, z=20, y=20),
+        ]
+        crossing_index = native.prepare_crossing_index(
+            np.zeros(3, dtype=np.int64),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.int32),
+            np.asarray([len(track) for track in tracks], dtype=np.int32),
+        )
+        empty_table = np.empty((len(tracks), 0), dtype=np.int32)
+        result = native.resample_tracks(
+            np.concatenate(tracks).astype(np.float32),
+            np.asarray([0, len(tracks[0]), sum(map(len, tracks))],
+                       dtype=np.int64),
+            empty_table, empty_table, empty_table,
+            minimum_spacing=1.0, maximum_spacing=2.0,
+            crossing_index=crossing_index,
+        )
+
+        self.assertIn('crossing_record_sample', result)
+        np.testing.assert_array_equal(
+            result['crossing_record_sample'],
+            np.empty(0, dtype=np.int32))
+
     def test_native_radix_argsort_is_stable(self):
         native = _load_native_track_crossings()
         if native is None:
