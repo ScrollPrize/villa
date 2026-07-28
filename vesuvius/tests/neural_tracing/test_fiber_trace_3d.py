@@ -3335,6 +3335,28 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.vis is False
 
 
+def test_native_3d_trace2cp_help_shows_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("sys.argv", ["trace2cp_tool", "--help"])
+
+    with pytest.raises(SystemExit) as exc:
+        _parse_args()
+
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    option_text = help_text.split("options:", 1)[1]
+    assert "--step-voxels" in option_text
+    assert "[4.0]" in option_text
+    assert "--inference-scaledown-power" in option_text
+    assert "[0] Power-of-two box scaledown applied" in option_text
+    assert "--core-margin-voxels" in option_text
+    assert "[48]" in option_text
+    assert "STEP_VOXELS" not in option_text
+    assert "(default:" not in help_text
+
+
 def test_native_3d_trace2cp_mode_routes_only_unselected_fiber_json_to_whole_fiber() -> None:
     assert _native_trace2cp_whole_fiber_mode(
         fiber_json=Path("fiber.json"),

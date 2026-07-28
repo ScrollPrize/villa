@@ -190,6 +190,40 @@ class _NativeTraceProfiler:
             )
 
 
+class _ArgumentDefaultsHelpFormatter(argparse.HelpFormatter):
+    def __init__(self, prog: str) -> None:
+        super().__init__(prog, max_help_position=56, width=140)
+
+    def _format_action_invocation(self, action: argparse.Action) -> str:
+        if not action.option_strings:
+            return super()._format_action_invocation(action)
+        return ", ".join(action.option_strings)
+
+    def _get_help_string(self, action: argparse.Action) -> str:
+        help_text = "" if action.help is None else str(action.help)
+        if (
+            action.default is argparse.SUPPRESS
+            or bool(action.required)
+            or not action.option_strings
+        ):
+            return help_text
+        if "%(default)" in help_text:
+            return help_text
+        prefix = "[%(default)s]"
+        return prefix if not help_text else f"{prefix} {help_text}"
+
+
+def _fill_missing_argparse_default_help(parser: argparse.ArgumentParser) -> None:
+    for action in parser._actions:
+        if (
+            action.help is None
+            and action.option_strings
+            and action.default is not argparse.SUPPRESS
+            and not bool(action.required)
+        ):
+            action.help = "[%(default)s]"
+
+
 @dataclass(frozen=True)
 class NativeTrace2CpConfig:
     step_voxels: float = 4.0
@@ -6033,7 +6067,10 @@ def run_native_trace2cp(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Native 3D Trace2CP cone tracer")
+    parser = argparse.ArgumentParser(
+        description="Native 3D Trace2CP cone tracer",
+        formatter_class=_ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("config", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--export-dir", type=Path, required=True)
@@ -6097,6 +6134,7 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--whole-fiber-error-threshold-voxels", type=float, default=10.0)
+    _fill_missing_argparse_default_help(parser)
     return parser.parse_args()
 
 

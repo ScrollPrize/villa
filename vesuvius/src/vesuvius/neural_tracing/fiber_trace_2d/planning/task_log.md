@@ -13,6 +13,10 @@
   sample spacing, so point lookups keep selected-level voxel coordinates while
   sampling the scaled field.
 - Startup output and JSON summaries include the scaledown power and factor.
+- Follow-up: native 3D Trace2CP `--help` now shows defaults for optional
+  arguments, including options that previously had no explicit help string.
+- Follow-up: native 3D Trace2CP `--help` now uses compact defaults in the
+  option detail column, formatted as `[value] explanation` or just `[value]`.
 
 ## Deviations / Deferred Items
 
@@ -26,6 +30,10 @@
   - Result: `9 passed, 145 deselected`.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "native_3d or whole_fiber_trace"`
   - Result: `63 passed, 91 deselected`.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "cli_defaults or help_shows_defaults or scaled_inference"`
+  - Result: `4 passed, 151 deselected`.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "cli_defaults or help_shows_defaults"`
+  - Result: `2 passed, 153 deselected`.
 - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
   - Result: passed.
 - `git diff --check`
