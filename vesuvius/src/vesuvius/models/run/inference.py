@@ -737,6 +737,14 @@ class Inferer():
             anon=self.input_anon,
             bbox=self.bbox,
             read_retries=self.read_retries,
+            # The float16 default suits the CUDA autocast path. CPU convolutions
+            # have no float16 kernels, so half patches meet float32 weights and
+            # raise "Input type (c10::Half) and bias type (float) should be the
+            # same". Ask for the dtype the CPU model can actually consume.
+            return_as_type=(
+                "np.float32" if self.device.type == "cpu"
+                else "np.float16"
+            ),
         )
 
         expected_attr_name = 'all_positions'
@@ -1018,8 +1026,9 @@ class Inferer():
                     # Only perform inference if there are non-empty patches
                     if non_empty_indices:
                         non_empty_input = input_batch[non_empty_indices]
-                        
-                        with torch.inference_mode(), torch.amp.autocast('cuda'):
+
+                        with torch.inference_mode(), torch.amp.autocast(
+                                self.device.type, enabled=(self.device.type == 'cuda')):
                             if self.do_tta:
                                 non_empty_output = infer_with_tta(
                                     self.model,
