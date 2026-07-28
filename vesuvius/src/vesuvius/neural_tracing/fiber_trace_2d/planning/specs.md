@@ -698,17 +698,20 @@
   directly at the candidate trace coordinates. In CUDA mode with a configured
   Lasagna manifest, this must use Lasagna streaming
   `FitData3D.grid_sample_fullres(...)` over the sparse GPU chunk cache for
-  `grad_mag`, `nx`, and `ny`. Compact `nx`/`ny` normals must be converted to
-  Lasagna's sign-invariant second-moment tensor representation (`n*n^T`, the
-  same six-component convention used by `lasagna.tifxyz_labels.encode_from_tensor`)
-  before interpolation or averaging. The scorer must carry those tensor
-  moments directly for tangent/normal projections; it must not interpolate
-  compact normal vectors, call `FitData3D.normal_3d` on an interpolated
-  `nx`/`ny` sample, perform grid-search/eigen fallback decoding in the hot
-  path, call a per-candidate CPU geometry callback, or interpolate normals by
-  reference-line progress. With a valid candidate normal tensor, smoothness is
-  split into tangent-plane turn and normal-tilt turn: tangent-plane turn is the
-  angle between previous and candidate step directions after projection by
+  `grad_mag`, `nx`, and `ny`. Compact `nx`/`ny` normals must be decoded at the
+  eight requested-channel voxel corners, converted to Lasagna's sign-invariant
+  second-moment tensor representation (`n*n^T`, the same six-component
+  convention used by `lasagna.tifxyz_labels.encode_from_tensor`), and
+  trilinearly blended as tensors. The blended tensor must then be passed
+  through Lasagna's established closed-form tensor-to-encoding and
+  `estimate_normal` reconstruction path to produce one local ambiguous normal
+  axis for smoothness. The tracer must not interpolate compact normal vectors,
+  call `FitData3D.normal_3d` on an interpolated `nx`/`ny` sample, perform
+  grid-search/eigen/power fallback decoding in the hot path, call a
+  per-candidate CPU geometry callback, or interpolate normals by reference-line
+  progress. With a valid candidate normal axis, smoothness is split into
+  tangent-plane turn and normal-tilt turn: tangent-plane turn is the angle
+  between previous and candidate step directions after projection by
   `I - n*n^T`, while normal-tilt turn uses the tensor-projected elevation
   magnitudes. Both components use
   `max(0, angle - smoothness_free_angle)^2`, in radians, and the native 3D

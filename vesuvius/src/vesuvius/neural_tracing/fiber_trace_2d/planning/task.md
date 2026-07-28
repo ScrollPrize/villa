@@ -20,10 +20,13 @@ Requirements:
   lookahead states, and substeps. No per-candidate Python callback path.
 - Lasagna normal sampling must use the existing sparse GPU chunk cache path for
   `grad_mag`, `nx`, and `ny`, via streaming `FitData3D` where possible.
-  Compact `nx`/`ny` samples must follow Lasagna's sign-ambiguous
-  second-moment tensor convention before interpolation; interpolating decoded
-  normals or using `FitData3D.normal_3d` on interpolated `nx`/`ny` is not
-  allowed for candidate smoothness.
+  Compact `nx`/`ny` samples must be decoded only at the requested-channel voxel
+  corners, converted to Lasagna's sign-ambiguous second-moment tensor
+  convention before interpolation, and then reconstructed with Lasagna's
+  existing closed-form tensor-to-encoding plus `estimate_normal` path to get
+  one local ambiguous normal axis for candidate smoothness. Raw `nx`/`ny`
+  interpolation, `FitData3D.normal_3d` on interpolated `nx`/`ny`, grid search,
+  and power/eigen fallback decoding are not allowed in the tracer.
 - Inferred fiber prediction fields should remain GPU-resident for sampling.
   Reuse/extend Lasagna sparse-cache/sparse-sampling code for this rather than
   maintaining tracer-local CPU block lookup and per-block GPU copies.

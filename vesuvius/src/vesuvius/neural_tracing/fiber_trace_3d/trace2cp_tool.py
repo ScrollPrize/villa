@@ -17,8 +17,12 @@ import torch.nn.functional as F
 
 try:
     from lasagna.tiled_predict3d import _pyrdown3d
+    from lasagna.tifxyz_labels import encode_from_tensor as _lasagna_encode_from_tensor
+    from lasagna.normal_encoding import estimate_normal_torch as _lasagna_estimate_normal_torch
 except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
     from tiled_predict3d import _pyrdown3d
+    from tifxyz_labels import encode_from_tensor as _lasagna_encode_from_tensor
+    from normal_encoding import estimate_normal_torch as _lasagna_estimate_normal_torch
 
 from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
     FiberTrace3DPredictAdapter,
@@ -1566,6 +1570,44 @@ def _coerce_normal_tensor6_torch(
     raise ValueError("candidate normals must have 3 vector channels or 6 tensor channels")
 
 
+def _lasagna_axis_zyx_from_normal_tensor6_torch(
+    tensor6: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tensors, tensor_valid = _normalize_normal_tensor6_torch(tensor6)
+    flat = tensors.reshape(-1, 6)
+    if int(flat.shape[0]) == 0:
+        return (
+            torch.zeros((*tensors.shape[:-1], 3), dtype=torch.float32, device=tensors.device),
+            tensor_valid,
+        )
+    encoded = _lasagna_encode_from_tensor(flat.T).T.contiguous()
+    _w_z, _w_y, _w_x, nx, ny, nz = _lasagna_estimate_normal_torch(
+        encoded[:, 0],
+        encoded[:, 1],
+        encoded[:, 2],
+        encoded[:, 3],
+        encoded[:, 4],
+        encoded[:, 5],
+    )
+    axes_xyz = torch.stack([nx, ny, nz], dim=1)
+    axes_xyz = torch.where(
+        axes_xyz[:, 2:3] < 0.0,
+        -axes_xyz,
+        axes_xyz,
+    )
+    axis_norm = torch.linalg.norm(axes_xyz, dim=1)
+    axis_valid = torch.isfinite(axes_xyz).all(dim=1) & torch.isfinite(axis_norm) & (
+        axis_norm > float(_EPS)
+    )
+    axes_xyz = torch.where(
+        axis_valid[:, None],
+        axes_xyz / axis_norm.clamp_min(float(_EPS))[:, None],
+        torch.zeros_like(axes_xyz),
+    )
+    axes_zyx = axes_xyz[:, [2, 1, 0]].reshape(*tensors.shape[:-1], 3).contiguous()
+    return axes_zyx, tensor_valid & axis_valid.reshape(tensor_valid.shape)
+
+
 def _normal_tensor6_quadratic_form_zyx(
     tensor6: torch.Tensor,
     a_zyx: torch.Tensor,
@@ -1766,7 +1808,7 @@ class _NativeSparseLasagnaNormalSampler:
         count = int(points.shape[0])
         if count == 0:
             return (
-                torch.zeros((0, 6), dtype=torch.float32, device=self.device),
+                torch.zeros((0, 3), dtype=torch.float32, device=self.device),
                 torch.zeros((0,), dtype=torch.bool, device=self.device),
             )
         spacing = float(getattr(self.trace_record, "volume_spacing_base", 1.0))
@@ -1867,20 +1909,24 @@ class _NativeSparseLasagnaNormalSampler:
                 tensor6 = torch.sum(tensor6_corners * weights[:, :, None], dim=1)
                 total_weight = torch.sum(weights, dim=1)
                 tensor6, tensor_valid = _normalize_normal_tensor6_torch(tensor6)
+                normals_zyx, axis_valid = _lasagna_axis_zyx_from_normal_tensor6_torch(
+                    tensor6
+                )
                 valid = (
                     normal_in_bounds
                     & (grad_sampled.grad_mag.reshape(count) > 0.0)
                     & torch.isfinite(total_weight)
                     & (total_weight > float(_EPS))
                     & tensor_valid
-                    & torch.isfinite(tensor6).all(dim=1)
+                    & axis_valid
+                    & torch.isfinite(normals_zyx).all(dim=1)
                 )
-                tensor6 = torch.where(
+                normals_zyx = torch.where(
                     valid[:, None],
-                    tensor6,
-                    torch.zeros_like(tensor6),
+                    normals_zyx,
+                    torch.zeros_like(normals_zyx),
                 )
-        return tensor6, valid
+        return normals_zyx, valid
 
 
 def _native_trace_manifest_path_for_record(

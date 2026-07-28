@@ -46,7 +46,7 @@ try:
     from lasagna.tiled_predict3d import OmeZarrOutputAdapter
 except ImportError:  # pragma: no cover
     from tiled_predict3d import OmeZarrOutputAdapter
-from lasagna.normal_encoding import encode_normal_nxny_u8, estimate_normal
+from lasagna.normal_encoding import encode_normal_nxny_u8, estimate_normal, estimate_normal_torch
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     DEFAULT_VOLUME_CACHE_MEMORY_MIB,
     FiberTrace3DBatch,
@@ -717,6 +717,31 @@ def test_lasagna_compact_normal_encoding_is_shared() -> None:
     )
     assert np.array_equal(nx_u8, expected_nx)
     assert np.array_equal(ny_u8, expected_ny)
+
+
+def test_lasagna_estimate_normal_torch_matches_numpy() -> None:
+    axes = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 2.0, 3.0],
+            [-0.2, 0.4, 0.9],
+            [1.0e-4, 1.0, 2.0e-4],
+        ],
+        dtype=torch.float32,
+    )
+    axes = axes / torch.linalg.vector_norm(axes, dim=1, keepdim=True)
+    encoded = encode_lasagna_direction_3x2(axes)
+    numpy_outputs = estimate_normal(
+        *(encoded[:, channel].detach().cpu().numpy() for channel in range(6))
+    )
+    torch_outputs = estimate_normal_torch(
+        *(encoded[:, channel] for channel in range(6))
+    )
+
+    for expected, actual in zip(numpy_outputs, torch_outputs):
+        assert np.allclose(expected, actual.detach().cpu().numpy(), atol=1.0e-5)
 
 
 def test_lasagna_3x2_analytic_decode_round_trips_ambiguous_axes() -> None:
@@ -5305,7 +5330,7 @@ def test_native_3d_trace2cp_lasagna_normal_sampler_uses_geometry_record() -> Non
     assert torch.allclose(normals_zyx, torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32))
 
 
-def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_tensor_moment_sampling() -> None:
+def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_lasagna_tensor_moment_decode() -> None:
     class FakeSparseCache:
         channels = ["grad_mag", "nx", "ny"]
         vol_shape_zyx = (4, 4, 4)
@@ -5388,7 +5413,7 @@ def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_tensor_moment_sam
     )
 
     points = torch.tensor([[2.0, 2.0, 2.0], [6.0, 6.0, 6.0]], dtype=torch.float32)
-    normal_tensor6, valid = sampler(points)
+    normals_zyx, valid = sampler(points)
 
     expected_xyz = torch.tensor(
         [[8.0, 8.0, 8.0], [24.0, 24.0, 24.0]],
@@ -5404,11 +5429,8 @@ def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_tensor_moment_sam
     assert torch.allclose(data.sample_calls[0][1], expected_xyz)
     assert valid.tolist() == [True, True]
     assert torch.allclose(
-        normal_tensor6,
-        torch.tensor(
-            [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
-            dtype=torch.float32,
-        ),
+        normals_zyx,
+        torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]], dtype=torch.float32),
     )
 
 

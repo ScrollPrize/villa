@@ -38,13 +38,15 @@
 - The sparse normal sampler converts selected-level ZYX trace points to
   base/fullres XYZ tensors, prefetches/syncs the Lasagna sparse caches once per
   batched call, samples `grad_mag` and the eight requested-channel `nx`/`ny`
-  corner values via `grid_sample_fullres`, converts compact normals to
-  Lasagna-style second-moment tensors before interpolation, and returns those
-  tensors to the scorer.
+  corner values via `grid_sample_fullres`, decodes only the corner compact
+  normals, converts them to Lasagna-style second-moment tensors, and
+  trilinearly blends those tensors.
 - Corrected the previous sparse-normal implementation mistake: it must not call
-  `FitData3D.normal_3d` on interpolated compact `nx`/`ny`, and it must not
-  recover a principal axis for smoothness scoring. Smoothness now projects
-  directions with the blended `n*n^T` tensor directly.
+  `FitData3D.normal_3d` on interpolated compact `nx`/`ny`, interpolate raw
+  compact normals, or use grid-search/power/eigen fallback decoding. The
+  blended tensor is re-encoded with Lasagna `encode_from_tensor(...)` and
+  decoded through Lasagna's closed-form `estimate_normal(...)` path to produce
+  one local ambiguous normal axis for smoothness.
 - Native Trace2CP chooses the sparse normal sampler for CUDA runs when the
   configured dataset record has a `lasagna_manifest_path`; the existing
   geometry-loader normal sampler remains the fallback for non-CUDA/test paths.
@@ -55,14 +57,12 @@
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+- `python -m py_compile lasagna/normal_encoding.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
   passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "sparse_lasagna_normal_sampler or normal_aware_smoothness or cumulative_tangent_smoothness or candidate_smoothness_can_reject_branch_switch or trace_paths_sample_candidate_normals"`
-  passed: 9 passed, 149 deselected.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "native_3d or whole_fiber_trace"`
-  passed: 67 passed, 91 deselected.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "lasagna_estimate_normal_torch or sparse_lasagna_normal_sampler or normal_aware_smoothness or cumulative_tangent_smoothness or candidate_smoothness_can_reject_branch_switch or trace_paths_sample_candidate_normals"`
+  passed: 10 passed, 149 deselected.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: 156 passed, 2 skipped.
+  passed: 157 passed, 2 skipped.
 - `PYTHONPATH=vesuvius/src:. python -c "from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import _import_lasagna_fit_data; m=_import_lasagna_fit_data(); print(m.__name__)"`
   passed and printed `fit_data`, matching the script-style Lasagna import path
   used by this checkout.
