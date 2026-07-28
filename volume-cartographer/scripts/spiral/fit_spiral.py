@@ -119,17 +119,14 @@ surf_sdt_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_surf_sdt.ome.zarr'
 surf_sdt_zarr_group = '1'
 pcl_json_paths = [
     f'{dataset_path}/abs_winding.json',
-    f'{dataset_path}/patch-overlap-pcls.json',
     f'{dataset_path}/relative_windings.json',
-    f'{dataset_path}/same_windings.json',
-    f'{dataset_path}/drawn_control_points.json',
 ]
 # The interactive session API supplies explicit roles.  The legacy CLI leaves
 # this as None and retains the historical abs_winding.json basename behavior.
 pcl_input_specs = None
 fibers_path = f'{dataset_path}/fibers'
 verified_patches_path = f'{dataset_path}/verified_patches'
-unverified_patches_path = f'{dataset_path}/unverified_patches'
+unverified_patches_path = None
 run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
 shell_path = f'{dataset_path}/outer_shell'
 tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'  # or: m7_ds2_z3000_18000_surf.dbm
@@ -260,7 +257,7 @@ default_config = {
     'unattached_pcl_num_points_per_step': 32,
     'unattached_pcl_min_point_spacing': 16.,
     'track_num_per_step': 48000,
-    'track_num_points_per_step': 24,
+    'track_num_points_per_step': 96,
     # Resample each complete track in full-resolution polyline arclength.
     # track_num_points_per_step selects target-estimation points; the spacing
     # bounds control how many points contribute to the complete-track loss.
@@ -268,7 +265,7 @@ default_config = {
     'track_max_sample_spacing': 60.0,
     # Optional track-pool policies. None preserves uniform sampling and keeps
     # every track regardless of tortuosity; crossing supplements are opt-in.
-    'track_length_bin_weights': None,  # [short, medium, long], using eligible-track arclength tertiles
+    'track_length_bin_weights': [0.0, 0.15, 0.85],  # [short, medium, long], using eligible-track arclength tertiles
     'track_max_tortuosity': None,  # whole-track arclength / endpoint chord; None disables filtering
     # The complete eligible crossing CSR is retained for the session. The active
     # per-step random sample can change freely up to this safety ceiling at a
@@ -276,7 +273,7 @@ default_config = {
     'track_crossing_precompute_max': 8,
     # Opposite-family partners joined to each primary track's shared winding
     # target. Zero disables crossing-connected sampling.
-    'max_track_crossing_per_step': 0,
+    'max_track_crossing_per_step': 1,
     # Native crossing-chain sampling. "count" preserves the historical
     # fixed-width primary/partner sampler exactly.
     'track_crossing_mode': 'count',
@@ -300,7 +297,7 @@ default_config = {
     # soft-sequence phase registration, crossing count, native minimum
     # spacing, and SDT attachment, each with its own weight) and 'grad_mag'
     # (the legacy density integral and default inherited from origin/main).
-    'dense_spacing_mode': 'grad_mag',
+    'dense_spacing_mode': 'phase',
     'dense_spacing_num_pairs': 12_000,
     # m is a two-range mixture biased short: longer baselines average out
     # per-gap counting noise (std ~ 0.5 * sqrt(m)) and let rays straddle wide
@@ -357,7 +354,7 @@ default_config = {
     'dense_spacing_phase_min_matched_mass': 1.0,
     # Native pre-expansion anti-collapse barrier. This is asset-independent
     # and can run in either dense-spacing mode.
-    'loss_weight_min_spacing': 0.0,
+    'loss_weight_min_spacing': 2.0,
     # Crossing count: per-step it is gradient-starved on coarse fits and its
     # support gate self-confirms, but its integer-topology pressure compounds
     # - at 2000-step held-out probes (2026-07-17, wrap-aware scorer) count 8
@@ -379,7 +376,7 @@ default_config = {
     # r<1000, under-reads ~12% at r>1000 (detection recall - partial
     # crossings), and is blind below ~12 wv detected spacing (SDT resolution
     # floor) - hence the min-gap abstention below.
-    'loss_weight_dense_spacing_density': 0.0,
+    'loss_weight_dense_spacing_density': 12.0,
     # Sub-resolution abstention: below ~12 wv detected spacing the store
     # under-reads winding density ~30% (measured), so steps bracketed by a
     # gap under min_gap_wv can abstain (contribute nothing, target-corrected
