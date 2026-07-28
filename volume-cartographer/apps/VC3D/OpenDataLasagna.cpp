@@ -174,6 +174,11 @@ void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest
 void validatePrepared(const OpenDataLasagnaInfo& info,
                       const std::filesystem::path& manifestPath)
 {
+    if (!info.levelWasExplicit ||
+        info.sourceCoordinateLevel < 0 ||
+        info.sourceCoordinateLevel > 5)
+        throw std::runtime_error(
+            "Lasagna artifact has missing or invalid parameters.level");
     if (!info.lasagnaVersionPresent || !info.lasagnaVersion)
         throw std::runtime_error(
             "Lasagna artifact has missing or invalid creation_info.lasagna_version");
@@ -221,8 +226,10 @@ std::vector<std::string> entryTags(const OpenDataLasagnaInfo& info)
         std::string(kOpenDataLasagnaEntryTag),
         std::string(kOpenDataSampleIdTagPrefix) + info.sampleId,
         "vc-open-data-volume-id:" + info.volumeId,
-        "vc-open-data-source-coordinate-level:0",
-        "vc-open-data-coordinate-space:" + info.sampleId + "/" + info.volumeId + "@L0",
+        "vc-open-data-source-coordinate-level:" +
+            std::to_string(info.sourceCoordinateLevel),
+        "vc-open-data-coordinate-space:" + info.sampleId + "/" + info.volumeId +
+            "@L" + std::to_string(info.sourceCoordinateLevel),
         std::string(kOpenDataLasagnaArtifactTagPrefix) + info.artifactUrl,
     };
     if (!info.modelId.empty())
@@ -268,48 +275,82 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
     const auto volumeId = tagValue(volumeTags, "vc-open-data-volume-id:");
     const auto levelText = tagValue(volumeTags, "vc-open-data-source-coordinate-level:");
     if (!sampleId.empty() && !volumeId.empty()) {
-        std::optional<int> declaredLevel;
+        std::optional<int> activeLevel;
         if (!levelText.empty()) {
-            std::size_t consumed = 0;
-            const int level = std::stoi(levelText, &consumed);
-            if (consumed != levelText.size() || level < 0 || level > 5)
+            try {
+                std::size_t consumed = 0;
+                const int level = std::stoi(levelText, &consumed);
+                if (consumed != levelText.size() || level < 0 || level > 5)
+                    throw std::runtime_error("invalid");
+                activeLevel = level;
+            } catch (...) {
                 throw std::runtime_error(
                     "Active catalog volume has an invalid coordinate level");
-            declaredLevel = level;
+            }
         }
-        std::vector<const vc::project::Entry*> matches;
+        std::vector<const vc::project::Entry*> parentMatches;
         for (const auto& entry : pkg.lasagnaDatasetEntries()) {
             if (!hasTag(entry.tags, kOpenDataLasagnaEntryTag)) continue;
             if (tagValue(entry.tags, kOpenDataSampleIdTagPrefix) == sampleId &&
                 tagValue(entry.tags, "vc-open-data-volume-id:") == volumeId)
-                matches.push_back(&entry);
+                parentMatches.push_back(&entry);
         }
-        if (matches.size() > 1)
-            throw std::runtime_error(
-                "Multiple Lasagna datasets match the active catalog volume");
-        if (matches.size() == 1) {
-            const auto path = vc::project::resolveLocalPath(
-                matches.front()->location, pkg.path().parent_path());
-            int level = declaredLevel.value_or(0);
+
+        if (!parentMatches.empty()) {
+            const auto shapeManifestPath = vc::project::resolveLocalPath(
+                parentMatches.front()->location, pkg.path().parent_path());
             if (workingShape) {
-                const auto dataset = vc::lasagna::LasagnaDataset::open(path);
+                const auto dataset =
+                    vc::lasagna::LasagnaDataset::open(shapeManifestPath);
                 if (!dataset.manifest().baseShapeZYX)
                     throw std::runtime_error(
                         "Lasagna manifest has no base_shape_zyx for coordinate pairing");
-                level = dyadicLevelForShapes(
+                const int shapeLevel = dyadicLevelForShapes(
                     *dataset.manifest().baseShapeZYX, *workingShape);
-                if (declaredLevel && *declaredLevel != level)
+                if (activeLevel && *activeLevel != shapeLevel)
                     throw std::runtime_error(
                         "Active volume shape disagrees with its catalog coordinate level");
-            } else if (!declaredLevel) {
+                activeLevel = shapeLevel;
+            } else if (!activeLevel) {
                 throw std::runtime_error(
                     "Catalog coordinate tags have no level and no volume shape was supplied");
             }
+
+            std::vector<const vc::project::Entry*> compatibleMatches;
+            for (const auto* entry : parentMatches) {
+                const auto artifactLevelText = tagValue(
+                    entry->tags, "vc-open-data-source-coordinate-level:");
+                int artifactLevel = -1;
+                try {
+                    std::size_t consumed = 0;
+                    artifactLevel = std::stoi(
+                        artifactLevelText, &consumed);
+                    if (consumed != artifactLevelText.size() ||
+                        artifactLevel < 0 || artifactLevel > 5)
+                        throw std::runtime_error("invalid");
+                } catch (...) {
+                    throw std::runtime_error(
+                        "Cached Lasagna entry has an invalid coordinate level");
+                }
+                if (*activeLevel == 0 || *activeLevel == artifactLevel)
+                    compatibleMatches.push_back(entry);
+            }
+            if (compatibleMatches.size() > 1)
+                throw std::runtime_error(
+                    "Multiple Lasagna datasets match the active catalog coordinate space");
+            if (compatibleMatches.empty())
+                throw std::runtime_error(
+                    "No Lasagna dataset is published for the active catalog coordinate level");
+
+            const auto* match = compatibleMatches.front();
+            const auto path = vc::project::resolveLocalPath(
+                match->location, pkg.path().parent_path());
             return ResolvedOpenDataLasagna{
                 path,
-                static_cast<double>(std::uint64_t{1} << level),
-                sampleId + "/" + volumeId + "@L" + std::to_string(level),
-                tagValue(matches.front()->tags, kOpenDataLasagnaArtifactTagPrefix),
+                static_cast<double>(std::uint64_t{1} << *activeLevel),
+                sampleId + "/" + volumeId + "@L" +
+                    std::to_string(*activeLevel),
+                tagValue(match->tags, kOpenDataLasagnaArtifactTagPrefix),
                 true};
         }
         if (!tagValue(volumeTags, kOpenDataLasagnaArtifactTagPrefix).empty()) {
@@ -341,13 +382,19 @@ std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
         info.volumeId = volume.id;
         info.artifactUrl = url;
         info.modelId = artifact.modelId.value_or(std::string{});
+        if (!artifact.levelParameterPresent || !artifact.sourceCoordinateLevel)
+            continue;
+        info.sourceCoordinateLevel = *artifact.sourceCoordinateLevel;
+        info.levelWasExplicit = true;
         info.lasagnaVersionPresent = artifact.lasagnaVersionPresent;
         info.lasagnaVersion = artifact.lasagnaVersion;
         info.sourceToBasePresent = artifact.sourceToBasePresent;
         info.sourceToBase = artifact.sourceToBase;
         info.baseShapeZYX = volume.shapeZYX;
         const auto duplicate = std::find_if(result.begin(), result.end(), [&](const auto& item) {
-            return item.artifactUrl == info.artifactUrl && item.modelId == info.modelId;
+            return item.artifactUrl == info.artifactUrl &&
+                   item.modelId == info.modelId &&
+                   item.sourceCoordinateLevel == info.sourceCoordinateLevel;
         });
         if (duplicate == result.end()) result.push_back(std::move(info));
     }
@@ -382,7 +429,7 @@ std::filesystem::path prepareOpenDataLasagna(
         const auto finalDir = lasagnaCacheDir(remoteCacheRoot, info);
         const auto markerPath = finalDir / vc::lasagna::kLasagnaRemoteMarker;
         if (std::filesystem::is_regular_file(markerPath)) {
-            const auto marker = nlohmann::json::parse(std::ifstream(markerPath));
+            auto marker = nlohmann::json::parse(std::ifstream(markerPath));
             if (marker.value("artifact_url", std::string{}) == info.artifactUrl &&
                 marker.value("sample_id", std::string{}) == info.sampleId &&
                 marker.value("volume_id", std::string{}) == info.volumeId &&
@@ -391,6 +438,12 @@ std::filesystem::path prepareOpenDataLasagna(
                     marker.value("manifest_file", std::string{});
                 if (std::filesystem::is_regular_file(manifest)) {
                     validatePrepared(info, manifest);
+                    if (marker.value("source_coordinate_level", -1) !=
+                        info.sourceCoordinateLevel) {
+                        marker["source_coordinate_level"] =
+                            info.sourceCoordinateLevel;
+                        writeText(markerPath, marker.dump(2));
+                    }
                     return manifest;
                 }
             }
@@ -419,6 +472,7 @@ std::filesystem::path prepareOpenDataLasagna(
             {"sample_id", info.sampleId},
             {"volume_id", info.volumeId},
             {"model_id", info.modelId},
+            {"source_coordinate_level", info.sourceCoordinateLevel},
             {"manifest_file", relativeName},
         };
         if (info.lasagnaVersion)
@@ -459,6 +513,16 @@ int attachOpenDataLasagna(VolumePkg& pkg,
             continue;
         }
         const auto infos = lasagnaArtifacts(sample.id, volume);
+        const bool hasLasagnaArtifact = std::any_of(
+            volume.artifacts.begin(), volume.artifacts.end(), [](const auto& artifact) {
+                return lowerCopy(artifact.type) == kLasagnaArtifactType;
+            });
+        if (infos.empty() && hasLasagnaArtifact) {
+            if (messages) messages->push_back(
+                "Skipped Lasagna for " + volume.id +
+                ": parameters.level is missing or invalid.");
+            continue;
+        }
         if (infos.size() > 1) {
             if (messages) messages->push_back(
                 "Skipped Lasagna for " + volume.id +
