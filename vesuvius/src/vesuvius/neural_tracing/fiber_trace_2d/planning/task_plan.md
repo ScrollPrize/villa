@@ -27,8 +27,13 @@ block table implementation.
      coordinates once per batched candidate call, on GPU.
    - Prefetch/sync the sparse caches once per whole candidate batch, not once
      per candidate.
-   - Decode `normal_3d` using the existing `FitData3D.normal_3d` property and
-     validate with `grad_mag > 0`.
+   - Sample `nx`/`ny` at the eight requested-channel voxel corners, convert
+     each compact normal to Lasagna's sign-invariant six-component
+     second-moment tensor (`nx^2`, `ny^2`, `nz^2`, `nx*ny`, `nx*nz`,
+     `ny*nz`), and trilinearly blend those tensors.
+   - Validate with `grad_mag > 0`; do not call `FitData3D.normal_3d` on
+     interpolated compact `nx`/`ny`, and do not recover a principal axis for
+     smoothness scoring.
    - Replace `_NativeLasagnaNormalSampler` in the 3D tracer with this sparse
      sampler when a Lasagna manifest is available.
    - Keep a loud error if normal-aware smoothness is requested but no Lasagna
@@ -37,8 +42,8 @@ block table implementation.
 3. Make candidate normal sampling shape-preserving and tensor-native.
    - Accept `B x K x 3` and `B x K x S x 3` candidate point tensors.
    - Flatten only as a tensor view for sparse sampling.
-   - Return normals and valid masks reshaped to the original candidate tensor
-     shape.
+   - Return normal tensors and valid masks reshaped to the original candidate
+     tensor shape.
    - Remove the current tensor-to-NumPy conversion from the candidate normal
      path.
 
@@ -93,8 +98,12 @@ block table implementation.
 Add native 3D Trace2CP tracer specs:
 
 - Candidate normal sampling must use Lasagna streaming `FitData3D` sparse GPU
-  chunk sampling for `grad_mag`, `nx`, and `ny`; per-candidate CPU geometry
-  callbacks are not allowed in the hot path.
+  chunk sampling for `grad_mag`, `nx`, and `ny`. It must follow Lasagna's
+  sign-ambiguous second-moment tensor convention before interpolation, and the
+  scorer must consume those tensors directly for projection/smoothness. Calling
+  `FitData3D.normal_3d` on interpolated compact normals, doing a grid-search
+  decode, or recovering a principal axis in the hot path is not allowed.
+  Per-candidate CPU geometry callbacks are not allowed in the hot path.
 - Native 3D Trace2CP inferred prediction fields must be sampled through shared
   Lasagna sparse GPU field/cache infrastructure. The tracer must not own a
   duplicate sparse block-table implementation.
@@ -117,7 +126,9 @@ Update the relevant fiber 3D tracing documentation to describe:
 Add focused tests for:
 
 1. Sparse normal sampler uses `FitData3D.grid_sample_fullres(...)` once per
-   batched candidate tensor and preserves candidate shape.
+   batched candidate tensor, preserves candidate shape, and returns
+   sign-invariant normal tensors rather than interpolated compact-normal
+   vectors.
 2. Candidate normal sampling no longer converts each candidate through a Python
    callback.
 3. Inferred-field sparse cache lookup returns the same directions/presence as

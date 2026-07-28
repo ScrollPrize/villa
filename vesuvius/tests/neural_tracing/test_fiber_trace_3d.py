@@ -5305,9 +5305,10 @@ def test_native_3d_trace2cp_lasagna_normal_sampler_uses_geometry_record() -> Non
     assert torch.allclose(normals_zyx, torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32))
 
 
-def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_fit_data_grid_sample() -> None:
+def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_tensor_moment_sampling() -> None:
     class FakeSparseCache:
         channels = ["grad_mag", "nx", "ny"]
+        vol_shape_zyx = (4, 4, 4)
 
         def __init__(self) -> None:
             self.prefetch_calls = 0
@@ -5324,14 +5325,20 @@ def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_fit_data_grid_sam
             self.sync_calls += 1
 
     class FakeSampled:
-        def __init__(self, count: int) -> None:
-            self.grad_mag = torch.ones((1, 1, 1, 1, count), dtype=torch.float32)
-            normal = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32)
-            self._normal = normal.view(1, 1, 1, 3).expand(1, 1, count, 3)
+        def __init__(
+            self,
+            *,
+            grad_mag: torch.Tensor | None = None,
+            nx: torch.Tensor | None = None,
+            ny: torch.Tensor | None = None,
+        ) -> None:
+            self.grad_mag = grad_mag
+            self.nx = nx
+            self.ny = ny
 
         @property
         def normal_3d(self):
-            return self._normal
+            raise AssertionError("sparse normal sampler must not interpolate normal_3d")
 
     class FakeFitData:
         origin_fullres = (0.0, 0.0, 0.0)
@@ -5339,18 +5346,39 @@ def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_fit_data_grid_sam
         def __init__(self) -> None:
             self.cache = FakeSparseCache()
             self.sparse_caches = {"normal": self.cache}
-            self.sample_calls = 0
-            self.sample_xyz = None
+            self.sample_calls: list[tuple[frozenset[str], torch.Tensor]] = []
 
         def _spacing_for(self, _channel: str):
             return (16.0, 16.0, 16.0)
 
+        def _size_of(self, _tensor):
+            return (4, 4, 4)
+
         def grid_sample_fullres(self, xyz_fullres, *, channels):
-            self.sample_calls += 1
-            self.sample_xyz = xyz_fullres.detach().clone()
-            assert channels == {"grad_mag", "nx", "ny"}
-            assert tuple(xyz_fullres.shape) == (1, 1, 2, 3)
-            return FakeSampled(int(xyz_fullres.shape[2]))
+            channels_frozen = frozenset(channels)
+            self.sample_calls.append((channels_frozen, xyz_fullres.detach().clone()))
+            count = int(xyz_fullres.shape[2])
+            if channels_frozen == frozenset({"grad_mag"}):
+                assert tuple(xyz_fullres.shape) == (1, 1, 2, 3)
+                return FakeSampled(
+                    grad_mag=torch.ones((1, 1, 1, 1, count), dtype=torch.float32)
+                )
+            if channels_frozen == frozenset({"nx", "ny"}):
+                assert tuple(xyz_fullres.shape) == (1, 1, 16, 3)
+                # Two sample points, eight corners each. The signs alternate
+                # around an X-facing axis. Interpolating nx directly at the
+                # middle would cancel to 0 and incorrectly decode a Z normal;
+                # the Lasagna convention interpolates the sign-invariant
+                # second-moment tensor.
+                signs = torch.tensor(
+                    [1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0],
+                    dtype=torch.float32,
+                ).repeat(2)
+                return FakeSampled(
+                    nx=signs.view(1, 1, 1, 1, count),
+                    ny=torch.zeros((1, 1, 1, 1, count), dtype=torch.float32),
+                )
+            raise AssertionError(f"unexpected channels: {channels}")
 
     data = FakeFitData()
     sampler = _NativeSparseLasagnaNormalSampler(
@@ -5359,20 +5387,29 @@ def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_fit_data_grid_sam
         device=torch.device("cpu"),
     )
 
-    points = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32)
-    normals_zyx, valid = sampler(points)
+    points = torch.tensor([[2.0, 2.0, 2.0], [6.0, 6.0, 6.0]], dtype=torch.float32)
+    normal_tensor6, valid = sampler(points)
 
     expected_xyz = torch.tensor(
-        [[12.0, 8.0, 4.0], [24.0, 20.0, 16.0]],
+        [[8.0, 8.0, 8.0], [24.0, 24.0, 24.0]],
         dtype=torch.float32,
     ).view(1, 1, 2, 3)
     assert data.cache.prefetch_calls == 1
     assert data.cache.sync_calls == 1
-    assert data.sample_calls == 1
-    assert torch.allclose(data.cache.prefetch_xyz, expected_xyz)
-    assert torch.allclose(data.sample_xyz, expected_xyz)
+    assert len(data.sample_calls) == 2
+    assert data.sample_calls[0][0] == frozenset({"grad_mag"})
+    assert data.sample_calls[1][0] == frozenset({"nx", "ny"})
+    assert tuple(data.cache.prefetch_xyz.shape) == (1, 1, 18, 3)
+    assert torch.allclose(data.cache.prefetch_xyz[:, :, :2], expected_xyz)
+    assert torch.allclose(data.sample_calls[0][1], expected_xyz)
     assert valid.tolist() == [True, True]
-    assert torch.allclose(normals_zyx, torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]))
+    assert torch.allclose(
+        normal_tensor6,
+        torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+            dtype=torch.float32,
+        ),
+    )
 
 
 def test_native_3d_trace2cp_point_choice_helper_keeps_torch_points() -> None:

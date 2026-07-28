@@ -49,6 +49,16 @@ _EPS = 1.0e-12
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 _GIB = 1024**3
 _NORMAL_CHANNELS = frozenset({"grad_mag", "nx", "ny"})
+_NORMAL_CORNER_BITS_XYZ = (
+    (0.0, 0.0, 0.0),
+    (1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+    (1.0, 1.0, 0.0),
+    (0.0, 0.0, 1.0),
+    (1.0, 0.0, 1.0),
+    (0.0, 1.0, 1.0),
+    (1.0, 1.0, 1.0),
+)
 
 
 def _ensure_lasagna_module_path() -> None:
@@ -1502,6 +1512,86 @@ def _points_to_numpy(points_zyx: torch.Tensor | np.ndarray) -> np.ndarray:
     return np.asarray(points_zyx, dtype=np.float32)
 
 
+def _normal_tensor6_from_vectors_xyz_torch(vectors_xyz: torch.Tensor) -> torch.Tensor:
+    vectors = F.normalize(
+        vectors_xyz.to(dtype=torch.float32),
+        p=2.0,
+        dim=-1,
+        eps=float(_EPS),
+    )
+    nx = vectors[..., 0]
+    ny = vectors[..., 1]
+    nz = vectors[..., 2]
+    return torch.stack(
+        [nx * nx, ny * ny, nz * nz, nx * ny, nx * nz, ny * nz],
+        dim=-1,
+    )
+
+
+def _normal_tensor6_from_vectors_zyx_torch(vectors_zyx: torch.Tensor) -> torch.Tensor:
+    return _normal_tensor6_from_vectors_xyz_torch(vectors_zyx[..., [2, 1, 0]])
+
+
+def _normalize_normal_tensor6_torch(tensor6: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    tensor = tensor6.to(dtype=torch.float32)
+    if int(tensor.shape[-1]) != 6:
+        raise ValueError("normal tensor must have 6 channels")
+    trace = tensor[..., 0] + tensor[..., 1] + tensor[..., 2]
+    valid = torch.isfinite(tensor).all(dim=-1) & torch.isfinite(trace) & (
+        trace > float(_EPS)
+    )
+    normalized = torch.where(
+        valid[..., None],
+        tensor / trace.clamp_min(float(_EPS))[..., None],
+        torch.zeros_like(tensor),
+    )
+    return normalized, valid
+
+
+def _coerce_normal_tensor6_torch(
+    normals_or_tensors: torch.Tensor,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    values = normals_or_tensors.to(device=device, dtype=torch.float32)
+    if int(values.shape[-1]) == 6:
+        return _normalize_normal_tensor6_torch(values)
+    if int(values.shape[-1]) == 3:
+        norms = torch.linalg.norm(values, dim=-1)
+        valid = torch.isfinite(values).all(dim=-1) & torch.isfinite(norms) & (
+            norms > float(_EPS)
+        )
+        tensor = _normal_tensor6_from_vectors_zyx_torch(values)
+        return torch.where(valid[..., None], tensor, torch.zeros_like(tensor)), valid
+    raise ValueError("candidate normals must have 3 vector channels or 6 tensor channels")
+
+
+def _normal_tensor6_quadratic_form_zyx(
+    tensor6: torch.Tensor,
+    a_zyx: torch.Tensor,
+    b_zyx: torch.Tensor,
+) -> torch.Tensor:
+    tensors = tensor6.to(dtype=torch.float32)
+    a = F.normalize(a_zyx.to(dtype=torch.float32), p=2.0, dim=-1, eps=float(_EPS))
+    b = F.normalize(b_zyx.to(dtype=torch.float32), p=2.0, dim=-1, eps=float(_EPS))
+    ax = a[..., 2]
+    ay = a[..., 1]
+    az = a[..., 0]
+    bx = b[..., 2]
+    by = b[..., 1]
+    bz = b[..., 0]
+    nx2, ny2, nz2, nxny, nxnz, nynz = torch.unbind(tensors, dim=-1)
+    value = (
+        nx2 * ax * bx
+        + ny2 * ay * by
+        + nz2 * az * bz
+        + nxny * (ax * by + ay * bx)
+        + nxnz * (ax * bz + az * bx)
+        + nynz * (ay * bz + az * by)
+    )
+    return torch.where(torch.isfinite(tensors).all(dim=-1), value, torch.zeros_like(value))
+
+
 @dataclass(frozen=True)
 class _NativeLasagnaNormalSampler:
     geometry_loader: Any
@@ -1611,6 +1701,61 @@ class _NativeSparseLasagnaNormalSampler:
             sync_device=self.device if bool(sync) else None,
         )
 
+    def _channel_shape_xyz_tensor(self, channel: str) -> torch.Tensor:
+        shape_zyx: tuple[int, int, int] | None = None
+        for cache in getattr(self.data, "sparse_caches", {}).values():
+            if channel in set(getattr(cache, "channels", ())):
+                shape_zyx = tuple(int(v) for v in getattr(cache, "vol_shape_zyx"))
+                break
+        if shape_zyx is None:
+            tensor = getattr(self.data, channel, None)
+            shape_zyx = tuple(int(v) for v in self.data._size_of(tensor))
+        z, y, x = shape_zyx
+        return torch.tensor([x, y, z], dtype=torch.float32, device=self.device)
+
+    def _prefetch_sparse_points(
+        self,
+        *,
+        grad_points_fullres_xyz: torch.Tensor,
+        normal_corner_points_fullres_xyz: torch.Tensor,
+    ) -> None:
+        sparse_caches = getattr(self.data, "sparse_caches", None) or {}
+        for cache in sparse_caches.values():
+            cache_channels = set(getattr(cache, "channels", ()))
+            query_parts: list[torch.Tensor] = []
+            if "grad_mag" in cache_channels:
+                query_parts.append(grad_points_fullres_xyz)
+            if bool({"nx", "ny"} & cache_channels):
+                query_parts.append(normal_corner_points_fullres_xyz)
+            if not query_parts:
+                continue
+            query = (
+                query_parts[0]
+                if len(query_parts) == 1
+                else torch.cat(query_parts, dim=2).contiguous()
+            )
+            cache.prefetch(
+                query,
+                self.data.origin_fullres,
+                self.data._spacing_for(cache.channels[0]),
+            )
+        for cache in sparse_caches.values():
+            if _NORMAL_CHANNELS & set(getattr(cache, "channels", ())):
+                cache.sync()
+
+    @staticmethod
+    def _decode_sampled_nxny_to_normals_xyz(
+        nx: torch.Tensor,
+        ny: torch.Tensor,
+    ) -> torch.Tensor:
+        nz = torch.sqrt(torch.clamp(1.0 - nx * nx - ny * ny, min=0.0))
+        normals = torch.stack([nx, ny, nz], dim=-1)
+        return F.normalize(normals, p=2.0, dim=-1, eps=float(_EPS))
+
+    @staticmethod
+    def _normal_tensor6_from_decoded_normals_xyz(normals_xyz: torch.Tensor) -> torch.Tensor:
+        return _normal_tensor6_from_vectors_xyz_torch(normals_xyz)
+
     def __call__(
         self,
         points_zyx_selected: torch.Tensor | np.ndarray,
@@ -1621,7 +1766,7 @@ class _NativeSparseLasagnaNormalSampler:
         count = int(points.shape[0])
         if count == 0:
             return (
-                torch.zeros((0, 3), dtype=torch.float32, device=self.device),
+                torch.zeros((0, 6), dtype=torch.float32, device=self.device),
                 torch.zeros((0,), dtype=torch.bool, device=self.device),
             )
         spacing = float(getattr(self.trace_record, "volume_spacing_base", 1.0))
@@ -1633,45 +1778,109 @@ class _NativeSparseLasagnaNormalSampler:
             points_fullres_xyz = torch.stack(
                 [points_base_zyx[:, 2], points_base_zyx[:, 1], points_base_zyx[:, 0]],
                 dim=1,
-            ).reshape(1, 1, count, 3).contiguous()
-            with self._measure("normal_sparse_prefetch_sync", sync=True):
-                for cache in self.data.sparse_caches.values():
-                    if not (_NORMAL_CHANNELS & set(cache.channels)):
-                        continue
-                    cache.prefetch(
-                        points_fullres_xyz,
-                        self.data.origin_fullres,
-                        self.data._spacing_for(cache.channels[0]),
-                    )
-                for cache in self.data.sparse_caches.values():
-                    if _NORMAL_CHANNELS & set(cache.channels):
-                        cache.sync()
-            with self._measure("normal_sparse_grid_sample", sync=True):
-                sampled = self.data.grid_sample_fullres(
-                    points_fullres_xyz,
-                    channels=set(_NORMAL_CHANNELS),
+            )
+            points_query = points_fullres_xyz.reshape(1, 1, count, 3).contiguous()
+
+            nx_spacing = tuple(float(v) for v in self.data._spacing_for("nx"))
+            ny_spacing = tuple(float(v) for v in self.data._spacing_for("ny"))
+            if any(abs(a - b) > 1.0e-6 for a, b in zip(nx_spacing, ny_spacing)):
+                raise ValueError(
+                    f"Lasagna sparse nx and ny spacing mismatch: nx={nx_spacing} ny={ny_spacing}"
                 )
-                normals_xyz = sampled.normal_3d
-                if normals_xyz is None or sampled.grad_mag is None:
+            origin = torch.tensor(
+                self.data.origin_fullres,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            normal_spacing = torch.tensor(nx_spacing, dtype=torch.float32, device=self.device)
+            normal_shape_xyz = self._channel_shape_xyz_tensor("nx")
+            local_xyz = (points_fullres_xyz - origin) / normal_spacing
+            normal_in_bounds = (
+                torch.isfinite(local_xyz).all(dim=1)
+                & torch.all(local_xyz >= 0.0, dim=1)
+                & torch.all(local_xyz <= (normal_shape_xyz - 1.0), dim=1)
+            )
+            base_xyz = torch.floor(local_xyz).to(dtype=torch.long)
+            frac_xyz = local_xyz - base_xyz.to(dtype=torch.float32)
+            max_index_xyz = (normal_shape_xyz.to(dtype=torch.long) - 1).clamp_min(0)
+            corner_bits = torch.tensor(
+                _NORMAL_CORNER_BITS_XYZ,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            corner_index_xyz = (
+                base_xyz[:, None, :]
+                + corner_bits.to(dtype=torch.long)[None, :, :]
+            ).clamp(min=0)
+            corner_index_xyz = torch.minimum(
+                corner_index_xyz,
+                max_index_xyz.view(1, 1, 3),
+            )
+            corner_points_fullres_xyz = (
+                origin.view(1, 1, 3)
+                + corner_index_xyz.to(dtype=torch.float32) * normal_spacing.view(1, 1, 3)
+            ).reshape(1, 1, count * 8, 3).contiguous()
+
+            with self._measure("normal_sparse_prefetch_sync", sync=True):
+                self._prefetch_sparse_points(
+                    grad_points_fullres_xyz=points_query,
+                    normal_corner_points_fullres_xyz=corner_points_fullres_xyz,
+                )
+            with self._measure("normal_sparse_grid_sample", sync=True):
+                grad_sampled = self.data.grid_sample_fullres(
+                    points_query,
+                    channels={"grad_mag"},
+                )
+                normal_sampled = self.data.grid_sample_fullres(
+                    corner_points_fullres_xyz,
+                    channels={"nx", "ny"},
+                )
+                if (
+                    grad_sampled.grad_mag is None
+                    or normal_sampled.nx is None
+                    or normal_sampled.ny is None
+                ):
                     raise ValueError(
                         "native 3D Trace2CP sparse normal sampling did not return "
                         "grad_mag/nx/ny"
                     )
-                normal_flat_xyz = normals_xyz.reshape(count, 3)
-                normals_zyx = normal_flat_xyz[:, [2, 1, 0]].contiguous()
-                norms = torch.linalg.norm(normals_zyx, dim=1)
+                nx = normal_sampled.nx.reshape(count, 8)
+                ny = normal_sampled.ny.reshape(count, 8)
+                decoded_xyz = self._decode_sampled_nxny_to_normals_xyz(nx, ny)
+                tensor6_corners = self._normal_tensor6_from_decoded_normals_xyz(decoded_xyz)
+                corner_norm = torch.linalg.norm(decoded_xyz, dim=-1)
+                corner_valid = torch.isfinite(corner_norm) & (corner_norm > float(_EPS))
+                weights = torch.prod(
+                    torch.where(
+                        corner_bits.view(1, 8, 3) > 0.5,
+                        frac_xyz[:, None, :],
+                        1.0 - frac_xyz[:, None, :],
+                    ),
+                    dim=2,
+                )
+                weights = torch.where(corner_valid, weights, torch.zeros_like(weights))
+                weights = torch.where(
+                    normal_in_bounds[:, None],
+                    weights,
+                    torch.zeros_like(weights),
+                )
+                tensor6 = torch.sum(tensor6_corners * weights[:, :, None], dim=1)
+                total_weight = torch.sum(weights, dim=1)
+                tensor6, tensor_valid = _normalize_normal_tensor6_torch(tensor6)
                 valid = (
-                    (sampled.grad_mag.reshape(count) > 0.0)
-                    & torch.isfinite(normals_zyx).all(dim=1)
-                    & torch.isfinite(norms)
-                    & (norms > float(_EPS))
+                    normal_in_bounds
+                    & (grad_sampled.grad_mag.reshape(count) > 0.0)
+                    & torch.isfinite(total_weight)
+                    & (total_weight > float(_EPS))
+                    & tensor_valid
+                    & torch.isfinite(tensor6).all(dim=1)
                 )
-                normals_zyx = torch.where(
+                tensor6 = torch.where(
                     valid[:, None],
-                    normals_zyx / norms.clamp_min(float(_EPS))[:, None],
-                    torch.zeros_like(normals_zyx),
+                    tensor6,
+                    torch.zeros_like(tensor6),
                 )
-        return normals_zyx, valid
+        return tensor6, valid
 
 
 def _native_trace_manifest_path_for_record(
@@ -1961,7 +2170,7 @@ def _optional_nonnegative_float(value: float | None, *, name: str) -> float | No
     return out
 
 
-def _sample_candidate_normals_torch(
+def _sample_candidate_normal_tensors_torch(
     normal_sampler: NativeTraceNormalSampler | None,
     points_zyx: torch.Tensor | np.ndarray,
     *,
@@ -1975,15 +2184,49 @@ def _sample_candidate_normals_torch(
     if int(points_zyx.shape[-1]) != 3:
         raise ValueError("candidate normal points must have shape [...,3]")
     flat_points = points_zyx.reshape(-1, 3)
-    normals, valid = normal_sampler(flat_points)
-    normals_t = torch.as_tensor(normals, dtype=torch.float32, device=device)
+    normals_or_tensors, valid = normal_sampler(flat_points)
+    values_t = torch.as_tensor(normals_or_tensors, dtype=torch.float32, device=device)
     valid_t = torch.as_tensor(valid, dtype=torch.bool, device=device)
     expected_count = int(flat_points.shape[0])
-    if normals_t.shape != (expected_count, 3):
-        raise ValueError("candidate normal sampler must return normals with shape [N,3]")
+    if values_t.ndim != 2 or int(values_t.shape[0]) != expected_count:
+        raise ValueError(
+            "candidate normal sampler must return normals/tensors with shape [N,3] or [N,6]"
+        )
+    normal_tensors, tensor_valid = _coerce_normal_tensor6_torch(values_t, device=device)
+    valid_t = valid_t & tensor_valid
     if valid_t.shape != (expected_count,):
         raise ValueError("candidate normal sampler must return valid mask with shape [N]")
-    return normals_t.reshape(*point_shape, 3), valid_t.reshape(*point_shape)
+    return normal_tensors.reshape(*point_shape, 6), valid_t.reshape(*point_shape)
+
+
+def _candidate_normal_tensors_for_smoothness(
+    candidate_normals: torch.Tensor,
+    candidate_normals_valid: torch.Tensor | None,
+    *,
+    candidates: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    normal_tensors, tensor_valid = _coerce_normal_tensor6_torch(
+        candidate_normals,
+        device=candidates.device,
+    )
+    valid = tensor_valid
+    if candidate_normals_valid is not None:
+        valid = valid & candidate_normals_valid.to(device=candidates.device, dtype=torch.bool)
+    if normal_tensors.ndim == 4:
+        tensors = normal_tensors[:, :, -1, :]
+        tensors_valid = valid[:, :, -1] if valid.ndim == 3 else valid
+    else:
+        tensors = normal_tensors
+        tensors_valid = valid
+    expected_shape = (*candidates.shape[:2], 6)
+    if tensors.shape != expected_shape:
+        raise ValueError(
+            "candidate_normals must have shape [N,M,3], [N,M,6], "
+            "[N,M,S,3], or [N,M,S,6]"
+        )
+    if tensors_valid.shape != candidates.shape[:2]:
+        raise ValueError("candidate_normals_valid must have shape [N,M] or [N,M,S]")
+    return tensors, tensors_valid
 
 
 def _native_smoothness_loss_torch(
@@ -2024,48 +2267,46 @@ def _native_smoothness_loss_torch(
         return isotropic
     if candidate_normals is None:
         return isotropic
-    if candidate_normals.ndim == 4:
-        normals = candidate_normals[:, :, -1, :]
-        if candidate_normals_valid is None:
-            normals_valid = None
-        elif candidate_normals_valid.ndim == 3:
-            normals_valid = candidate_normals_valid[:, :, -1]
-        else:
-            normals_valid = candidate_normals_valid
-    else:
-        normals = candidate_normals
-        normals_valid = candidate_normals_valid
-    normals = normals.to(device=candidates.device, dtype=torch.float32)
-    if normals_valid is not None:
-        normals_valid = normals_valid.to(device=candidates.device, dtype=torch.bool)
-    if normals.shape != candidates.shape:
-        raise ValueError("candidate_normals must have shape [N,M,3] or [N,M,S,3]")
-    if normals_valid is not None and normals_valid.shape != candidates.shape[:2]:
-        raise ValueError("candidate_normals_valid must have shape [N,M] or [N,M,S]")
+    normal_tensors, finite_normal = _candidate_normal_tensors_for_smoothness(
+        candidate_normals,
+        candidate_normals_valid,
+        candidates=candidates,
+    )
 
     tangent_w = float(smoothness_weight) if tangent_weight is None else float(tangent_weight)
     normal_w = float(smoothness_weight) if normal_weight is None else float(normal_weight)
-    normal_norm = torch.linalg.norm(normals.to(dtype=torch.float32), dim=2)
-    finite_normal = torch.isfinite(normals).all(dim=2) & torch.isfinite(normal_norm)
-    finite_normal = finite_normal & (normal_norm > float(_EPS))
-    if normals_valid is not None:
-        finite_normal = finite_normal & normals_valid.to(device=normals.device, dtype=torch.bool)
-    unit_normal = F.normalize(normals, p=2.0, dim=2, eps=float(_EPS))
     previous_expand = previous[:, None, :].expand_as(candidates)
-    previous_dot_n = torch.sum(previous_expand * unit_normal, dim=2).clamp(-1.0, 1.0)
-    candidate_dot_n = torch.sum(candidates * unit_normal, dim=2).clamp(-1.0, 1.0)
-    previous_tangent = previous_expand - previous_dot_n[:, :, None] * unit_normal
-    candidate_tangent = candidates - candidate_dot_n[:, :, None] * unit_normal
-    previous_tangent_norm = torch.linalg.norm(previous_tangent, dim=2)
-    candidate_tangent_norm = torch.linalg.norm(candidate_tangent, dim=2)
-    tangent_ok = (previous_tangent_norm > float(_EPS)) & (candidate_tangent_norm > float(_EPS))
-    previous_tangent = F.normalize(previous_tangent, p=2.0, dim=2, eps=float(_EPS))
-    candidate_tangent = F.normalize(candidate_tangent, p=2.0, dim=2, eps=float(_EPS))
-    tangent_dot = torch.sum(previous_tangent * candidate_tangent, dim=2).clamp(-1.0, 1.0)
+    previous_normal_sq = _normal_tensor6_quadratic_form_zyx(
+        normal_tensors,
+        previous_expand,
+        previous_expand,
+    ).clamp(0.0, 1.0)
+    candidate_normal_sq = _normal_tensor6_quadratic_form_zyx(
+        normal_tensors,
+        candidates,
+        candidates,
+    ).clamp(0.0, 1.0)
+    normal_cross = _normal_tensor6_quadratic_form_zyx(
+        normal_tensors,
+        previous_expand,
+        candidates,
+    )
+    tangent_prev_sq = (1.0 - previous_normal_sq).clamp_min(0.0)
+    tangent_cand_sq = (1.0 - candidate_normal_sq).clamp_min(0.0)
+    tangent_denom = torch.sqrt(
+        tangent_prev_sq.clamp_min(float(_EPS))
+        * tangent_cand_sq.clamp_min(float(_EPS))
+    )
+    tangent_dot_raw = (smooth_dot - normal_cross) / tangent_denom
+    tangent_ok = (tangent_prev_sq > float(_EPS)) & (tangent_cand_sq > float(_EPS))
+    tangent_dot = torch.where(tangent_ok, tangent_dot_raw, smooth_dot).clamp(-1.0, 1.0)
     tangent_angle = torch.acos(tangent_dot)
     isotropic_angle = torch.acos(smooth_dot)
     tangent_angle = torch.where(tangent_ok, tangent_angle, isotropic_angle)
-    normal_angle = torch.abs(torch.asin(candidate_dot_n) - torch.asin(previous_dot_n))
+    normal_angle = torch.abs(
+        torch.asin(torch.sqrt(candidate_normal_sq).clamp(0.0, 1.0))
+        - torch.asin(torch.sqrt(previous_normal_sq).clamp(0.0, 1.0))
+    )
     split = (
         torch.clamp(tangent_angle - float(free_angle), min=0.0).square() * tangent_w
         + torch.clamp(normal_angle - float(free_angle), min=0.0).square() * normal_w
@@ -2098,47 +2339,45 @@ def _native_cumulative_tangent_smoothness_loss_torch(
     if weight <= 0.0 or candidate_normals is None:
         return torch.zeros(candidates.shape[:2], dtype=torch.float32, device=candidates.device)
 
-    if candidate_normals.ndim == 4:
-        normals = candidate_normals[:, :, -1, :]
-        if candidate_normals_valid is None:
-            normals_valid = None
-        elif candidate_normals_valid.ndim == 3:
-            normals_valid = candidate_normals_valid[:, :, -1]
-        else:
-            normals_valid = candidate_normals_valid
-    else:
-        normals = candidate_normals
-        normals_valid = candidate_normals_valid
-    normals = normals.to(device=candidates.device, dtype=torch.float32)
-    if normals_valid is not None:
-        normals_valid = normals_valid.to(device=candidates.device, dtype=torch.bool)
-    if normals.shape != candidates.shape:
-        raise ValueError("candidate_normals must have shape [N,M,3] or [N,M,S,3]")
-    if normals_valid is not None and normals_valid.shape != candidates.shape[:2]:
-        raise ValueError("candidate_normals_valid must have shape [N,M] or [N,M,S]")
+    normal_tensors, finite_normal = _candidate_normal_tensors_for_smoothness(
+        candidate_normals,
+        candidate_normals_valid,
+        candidates=candidates,
+    )
 
-    normal_norm = torch.linalg.norm(normals, dim=2)
-    finite_normal = torch.isfinite(normals).all(dim=2) & torch.isfinite(normal_norm)
-    finite_normal = finite_normal & (normal_norm > float(_EPS))
-    if normals_valid is not None:
-        finite_normal = finite_normal & normals_valid
-    unit_normal = F.normalize(normals, p=2.0, dim=2, eps=float(_EPS))
     history_expand = F.normalize(
         history.to(device=candidates.device, dtype=torch.float32),
         p=2.0,
         dim=1,
         eps=float(_EPS),
     )[:, None, :].expand_as(candidates)
-    history_dot_n = torch.sum(history_expand * unit_normal, dim=2).clamp(-1.0, 1.0)
-    candidate_dot_n = torch.sum(candidates * unit_normal, dim=2).clamp(-1.0, 1.0)
-    history_tangent = history_expand - history_dot_n[:, :, None] * unit_normal
-    candidate_tangent = candidates - candidate_dot_n[:, :, None] * unit_normal
-    history_norm = torch.linalg.norm(history_tangent, dim=2)
-    candidate_norm = torch.linalg.norm(candidate_tangent, dim=2)
-    tangent_ok = (history_norm > float(_EPS)) & (candidate_norm > float(_EPS))
-    history_tangent = F.normalize(history_tangent, p=2.0, dim=2, eps=float(_EPS))
-    candidate_tangent = F.normalize(candidate_tangent, p=2.0, dim=2, eps=float(_EPS))
-    tangent_dot = torch.sum(history_tangent * candidate_tangent, dim=2).clamp(-1.0, 1.0)
+    history_normal_sq = _normal_tensor6_quadratic_form_zyx(
+        normal_tensors,
+        history_expand,
+        history_expand,
+    ).clamp(0.0, 1.0)
+    candidate_normal_sq = _normal_tensor6_quadratic_form_zyx(
+        normal_tensors,
+        candidates,
+        candidates,
+    ).clamp(0.0, 1.0)
+    normal_cross = _normal_tensor6_quadratic_form_zyx(
+        normal_tensors,
+        history_expand,
+        candidates,
+    )
+    history_tangent_sq = (1.0 - history_normal_sq).clamp_min(0.0)
+    candidate_tangent_sq = (1.0 - candidate_normal_sq).clamp_min(0.0)
+    tangent_denom = torch.sqrt(
+        history_tangent_sq.clamp_min(float(_EPS))
+        * candidate_tangent_sq.clamp_min(float(_EPS))
+    )
+    isotropic_dot = torch.sum(history_expand * candidates, dim=2).clamp(-1.0, 1.0)
+    tangent_dot = ((isotropic_dot - normal_cross) / tangent_denom).clamp(-1.0, 1.0)
+    tangent_ok = (history_tangent_sq > float(_EPS)) & (
+        candidate_tangent_sq > float(_EPS)
+    )
+    tangent_dot = torch.where(tangent_ok, tangent_dot, isotropic_dot)
     tangent_angle = torch.acos(tangent_dot)
     free_angle = math.radians(float(smoothness_free_angle_degrees))
     loss = torch.clamp(tangent_angle - float(free_angle), min=0.0).square() * weight
@@ -2635,9 +2874,18 @@ def _score_candidate_batch(
     if candidate_normals is None:
         candidate_normals_batched = None
     elif isinstance(candidate_normals, torch.Tensor):
-        candidate_normals_batched = candidate_normals.reshape(1, -1, 3)
+        candidate_normals_batched = candidate_normals.reshape(
+            1,
+            -1,
+            int(candidate_normals.shape[-1]),
+        )
     else:
-        candidate_normals_batched = np.asarray(candidate_normals, dtype=np.float32).reshape(1, -1, 3)
+        candidate_normals_np = np.asarray(candidate_normals, dtype=np.float32)
+        candidate_normals_batched = candidate_normals_np.reshape(
+            1,
+            -1,
+            int(candidate_normals_np.shape[-1]),
+        )
     if candidate_normals_valid is None:
         candidate_normals_valid_batched = None
     elif isinstance(candidate_normals_valid, torch.Tensor):
@@ -2916,7 +3164,7 @@ def _trace_native_3d_one_way_greedy(
             candidates_unit = _trace_candidate_directions(current_direction, cfg)
             next_points = current[None, :] + candidates_unit * np.float32(cfg.step_voxels)
         with _profile_span_for_cache(cache, "trace_candidate_normals"):
-            sampled_normals = _sample_candidate_normals_torch(
+            sampled_normals = _sample_candidate_normal_tensors_torch(
                 normal_sampler,
                 next_points,
                 device=_cache_device(cache),
@@ -3381,7 +3629,7 @@ def _trace_native_3d_one_way_beam(
                     current_points_v[:, None, :] + candidate_dirs * float(cfg.step_voxels)
                 )
             with _profile_span_for_cache(cache, "trace_candidate_normals"):
-                sampled_normals = _sample_candidate_normals_torch(
+                sampled_normals = _sample_candidate_normal_tensors_torch(
                     normal_sampler,
                     next_points,
                     device=device,

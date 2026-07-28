@@ -698,15 +698,19 @@
   directly at the candidate trace coordinates. In CUDA mode with a configured
   Lasagna manifest, this must use Lasagna streaming
   `FitData3D.grid_sample_fullres(...)` over the sparse GPU chunk cache for
-  `grad_mag`, `nx`, and `ny`, then use `FitData3D.normal_3d` for the
-  established ambiguous normal decode. The candidate scorer must not call a
-  per-candidate CPU geometry callback, interpolate normals by reference-line
-  progress, or reimplement Lasagna normal decoding. With a
-  valid candidate normal, smoothness is split into tangent-plane turn and
-  normal-tilt turn: tangent-plane turn is the angle between previous and
-  candidate step directions after projection into the plane perpendicular to
-  the Lasagna normal, while normal-tilt turn is the absolute elevation change
-  against that normal. Both components use
+  `grad_mag`, `nx`, and `ny`. Compact `nx`/`ny` normals must be converted to
+  Lasagna's sign-invariant second-moment tensor representation (`n*n^T`, the
+  same six-component convention used by `lasagna.tifxyz_labels.encode_from_tensor`)
+  before interpolation or averaging. The scorer must carry those tensor
+  moments directly for tangent/normal projections; it must not interpolate
+  compact normal vectors, call `FitData3D.normal_3d` on an interpolated
+  `nx`/`ny` sample, perform grid-search/eigen fallback decoding in the hot
+  path, call a per-candidate CPU geometry callback, or interpolate normals by
+  reference-line progress. With a valid candidate normal tensor, smoothness is
+  split into tangent-plane turn and normal-tilt turn: tangent-plane turn is the
+  angle between previous and candidate step directions after projection by
+  `I - n*n^T`, while normal-tilt turn uses the tensor-projected elevation
+  magnitudes. Both components use
   `max(0, angle - smoothness_free_angle)^2`, in radians, and the native 3D
   CLI default for `smoothness_free_angle` is `0` degrees so all measured
   turns are penalized unless explicitly overridden. The Lasagna normal
