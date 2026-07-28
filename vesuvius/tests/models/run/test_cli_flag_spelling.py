@@ -1,14 +1,16 @@
 """Long options should answer to both --foo-bar and --foo_bar, everywhere.
 
 The three stages of the documented pipeline did not agree with each other. blend_logits
-takes --chunk_size and --num_workers; finalize_outputs took --chunk-size and --num-workers
+took --chunk_size and --num_workers; finalize_outputs took --chunk-size and --num-workers
 for the same two parameters, so running the pipeline end to end meant switching convention
-between stage 2 and stage 3. predict has the same split internally: --model_path,
---model_cache_dir, --input_dir and --patch_size use underscores while --model-type uses a
+between stage 2 and stage 3. predict had the same split internally: --model_path,
+--model_cache_dir, --input_dir and --patch_size used underscores while --model-type used a
 hyphen.
 
-The alternate spelling is derived automatically rather than hand-written per flag, so a
-flag added later needs no thought.
+The declarations are now uniformly underscored (test_declarations_are_underscored keeps
+them that way), and the alternate spelling is derived automatically rather than written
+per flag, so existing hyphenated invocations keep working and a flag added later needs no
+thought.
 """
 
 from __future__ import annotations
@@ -113,3 +115,65 @@ def test_defaults_unchanged():
     args = build_parser().parse_args(["in", "out"])
     assert args.chunk_size is None and args.num_workers is None
     assert args.input_path == "in" and args.output_path == "out"
+
+
+# --- the convention ----------------------------------------------------------------
+
+def _run_parsers():
+    """The four parsers under models/run, built fresh."""
+    from vesuvius.models.run import blending, finalize_outputs, inference
+    return {
+        "predict": inference.build_parser(),
+        "blend_logits": blending.build_parser(),
+        "blend_and_finalize": blending.build_blend_and_finalize_parser(),
+        "finalize_outputs": finalize_outputs.build_parser(),
+    }
+
+
+def _declared_long_options(parser):
+    """Long options as written in add_argument, excluding the auto-derived aliases."""
+    for action in parser._actions:
+        auto = getattr(action, "_auto_aliases", ())
+        for option in action.option_strings:
+            if option.startswith("--") and option not in auto:
+                yield option
+
+
+@pytest.mark.parametrize(
+    "name", ["predict", "blend_logits", "blend_and_finalize", "finalize_outputs"]
+)
+def test_declarations_are_underscored(name):
+    """Underscores are the declared convention; hyphens survive only as derived aliases.
+
+    Both spellings parse either way, so this is about what --help shows and what the next
+    flag copies. Without it the two conventions drift apart again.
+    """
+    parser = _run_parsers()[name]
+    hyphenated = [o for o in _declared_long_options(parser) if "-" in o[2:]]
+    assert hyphenated == [], f"{name} declares hyphenated flags: {hyphenated}"
+
+
+@pytest.mark.parametrize(
+    "flag, dest, value",
+    [
+        ("--zarr-compressor", "zarr_compressor", "lz4"),
+        ("--zarr-compression-level", "zarr_compression_level", 5),
+        ("--read-retries", "read_retries", 9),
+    ],
+)
+def test_predict_still_accepts_the_old_hyphenated_spellings(flag, dest, value):
+    """Renaming the declarations must not break invocations already in people's scripts."""
+    from vesuvius.models.run.inference import build_parser
+    args = build_parser().parse_args(
+        ["--model_path", "m", "--input_dir", "i", "--output_dir", "o", flag, str(value)]
+    )
+    assert getattr(args, dest) == value
+
+
+@pytest.mark.parametrize("flag", ["--delete-intermediates", "--delete_intermediates"])
+def test_finalize_still_accepts_the_old_hyphenated_spellings(flag):
+    from vesuvius.models.run.finalize_outputs import build_parser
+    args = build_parser().parse_args(
+        ["in", "out", flag, "--threshold", "--threshold-value", "0.3"]
+    )
+    assert args.delete_intermediates is True and args.threshold_value == 0.3

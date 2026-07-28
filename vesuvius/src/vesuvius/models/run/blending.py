@@ -955,11 +955,8 @@ def merge_inference_outputs(
 
 
 # --- Command Line Interface ---
-def main():
-    """Entry point for the vesuvius.blend command line tool."""
-    import argparse
-    import sys
-
+def build_parser():
+    """Build the blend_logits CLI parser (separate from main so it can be tested)."""
     parser = HyphenUnderscoreParser(description='Merge partial inference outputs with Gaussian blending using fsspec.')
     parser.add_argument('parent_dir', type=str,
                         help='Directory containing the partial inference results (logits_part_X.zarr, coordinates_part_X.zarr)')
@@ -979,7 +976,12 @@ def main():
                         help='Number of parts to split the blending process into. Default: 1')
     parser.add_argument('--part_id', type=int, default=0,
                         help='Part ID for this process (0-indexed). Default: 0')
+    return parser
 
+
+def main():
+    """Entry point for the vesuvius.blend command line tool."""
+    parser = build_parser()
     args = parser.parse_args()
 
     # Validate partitioning arguments
@@ -1014,11 +1016,8 @@ def main():
         traceback.print_exc()
         return 1
 
-def blend_and_finalize_main():
-    """Entry point for vesuvius.blend_and_finalize — fused blend + finalize in one pass."""
-    import argparse
-    import sys
-
+def build_blend_and_finalize_parser():
+    """Build the blend_and_finalize CLI parser (separate from main so it can be tested)."""
     parser = HyphenUnderscoreParser(
         description='Blend partial inference outputs and finalize (softmax + uint8) in a single pass.')
     parser.add_argument('parent_dir', type=str,
@@ -1043,9 +1042,16 @@ def blend_and_finalize_main():
     # Finalization args
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                         help='Finalization mode. Default: binary')
-    from vesuvius.models.run.finalize_outputs import add_threshold_arguments, resolve_threshold
+    from vesuvius.models.run.finalize_outputs import add_threshold_arguments
     add_threshold_arguments(parser)
+    return parser
 
+
+def blend_and_finalize_main():
+    """Entry point for vesuvius.blend_and_finalize — fused blend + finalize in one pass."""
+    from vesuvius.models.run.finalize_outputs import resolve_threshold
+
+    parser = build_blend_and_finalize_parser()
     args = parser.parse_args()
 
     if args.part_id < 0 or args.part_id >= args.num_parts:

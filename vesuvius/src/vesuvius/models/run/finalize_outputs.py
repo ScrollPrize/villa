@@ -312,7 +312,7 @@ def finalize_logits(
             if verbose:
                 print(f"Using input chunk size: {output_chunks}")
         except:
-            raise ValueError("Cannot determine input chunk size. Please specify --chunk-size.")
+            raise ValueError("Cannot determine input chunk size. Please specify --chunk_size.")
     else:
         output_chunks = chunk_size
         if verbose:
@@ -523,31 +523,31 @@ def finalize_logits(
 
 # --- Shared CLI helpers ---
 def add_threshold_arguments(parser):
-    """Register the shared `--threshold` / `--threshold-value` arguments on an argparse parser.
+    """Register the shared `--threshold` / `--threshold_value` arguments on an argparse parser.
 
     - `--threshold` toggles thresholding on (default cutoff = 0.5).
-    - `--threshold-value T` overrides the cutoff (must be in (0, 1)); requires --threshold.
+    - `--threshold_value T` overrides the cutoff (must be in (0, 1)); requires --threshold.
     """
     parser.add_argument('--threshold', dest='threshold', action='store_true',
                         help='Binarize the probability map (default cutoff 0.5). '
                              'In multiclass mode this emits the argmax channel.')
-    parser.add_argument('--threshold-value', dest='threshold_value', type=float, default=None,
+    parser.add_argument('--threshold_value', type=float, default=None,
                         help='Override the probability cutoff used by --threshold '
                              '(float in (0, 1)). Binary mode only.')
 
 
 def resolve_threshold(parser, args):
-    """Validate --threshold / --threshold-value and return the effective Optional[float] cutoff.
+    """Validate --threshold / --threshold_value and return the effective Optional[float] cutoff.
 
     Returns None if thresholding is disabled, else a float in (0, 1) (0.5 if no override).
     Calls parser.error on invalid combinations.
     """
     if args.threshold_value is not None and not args.threshold:
-        parser.error("--threshold-value requires --threshold")
+        parser.error("--threshold_value requires --threshold")
     if args.threshold_value is not None and not (0.0 < args.threshold_value < 1.0):
-        parser.error(f"--threshold-value must be in (0, 1), got {args.threshold_value}")
+        parser.error(f"--threshold_value must be in (0, 1), got {args.threshold_value}")
     if args.mode == 'multiclass' and args.threshold_value is not None:
-        parser.error("--threshold-value is not applicable in multiclass mode (argmax ignores the cutoff)")
+        parser.error("--threshold_value is not applicable in multiclass mode (argmax ignores the cutoff)")
     if not args.threshold:
         return None
     return args.threshold_value if args.threshold_value is not None else 0.5
@@ -564,11 +564,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                       help='Processing mode. "binary" for 2-class segmentation, "multiclass" for >2 classes. Default: binary')
     add_threshold_arguments(parser)
-    parser.add_argument('--delete-intermediates', dest='delete_intermediates', action='store_true',
+    parser.add_argument('--delete_intermediates', action='store_true',
                       help='Delete intermediate logits after processing')
-    parser.add_argument('--chunk-size', dest='chunk_size', type=str, default=None,
+    parser.add_argument('--chunk_size', type=str, default=None,
                       help='Spatial chunk size (Z,Y,X) for output Zarr. Comma-separated. If not specified, input chunks will be used.')
-    parser.add_argument('--num-workers', dest='num_workers', type=int, default=None,
+    parser.add_argument('--num_workers', type=int, default=None,
                       help='Number of worker processes for parallel processing. Default: CPU_COUNT // 2')
     parser.add_argument('--quiet', dest='quiet', action='store_true',
                       help='Suppress verbose output')

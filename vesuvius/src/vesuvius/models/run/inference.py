@@ -435,7 +435,7 @@ class Inferer():
                         raise
                     raise ValueError(
                         f"{e}. If this is an external ResNet checkpoint (ink_model.py + .pth), "
-                        "rerun with --model-type resnet."
+                        "rerun with --model_type resnet."
                     ) from e
             else:
                 # Auto mode: fallback to nnUNet loader
@@ -1151,17 +1151,17 @@ def build_parser():
                       help='Number of threads used to write patches to the output zarr. '
                            'Default: min(16, cpu_count). Increase for S3 outputs to push more parallelism.')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true',
+    parser.add_argument('--skip_empty_patches', action='store_true',
                       help='Skip patches that are empty (all values the same). Default: True')
-    parser.add_argument('--no-skip-empty-patches', dest='skip_empty_patches', action='store_false',
+    parser.add_argument('--no_skip_empty_patches', dest='skip_empty_patches', action='store_false',
                       help='Process all patches, even if they appear empty')
     parser.set_defaults(skip_empty_patches=True)
     
     # Add arguments for Zarr compression
-    parser.add_argument('--zarr-compressor', type=str, default='zstd',
+    parser.add_argument('--zarr_compressor', type=str, default='zstd',
                       choices=['zstd', 'lz4', 'zlib', 'none'],
                       help='Zarr compression algorithm')
-    parser.add_argument('--zarr-compression-level', type=int, default=3,
+    parser.add_argument('--zarr_compression_level', type=int, default=3,
                       help='Compression level (1-9, higher = better compression but slower)')
     
     # Add arguments for the updated Volume class
@@ -1172,14 +1172,14 @@ def build_parser():
 
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
-    parser.add_argument('--model-type', dest='model_type', type=str, default='auto',
+    parser.add_argument('--model_type', type=str, default='auto',
                       choices=['auto', 'nnunet', 'train_py', 'resnet'],
                       help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
     parser.add_argument('--model_cache_dir', type=str, default=DEFAULT_MODEL_CACHE_DIR,
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
-    parser.add_argument('--read-retries', dest='read_retries', type=int, default=4,
+    parser.add_argument('--read_retries', type=int, default=4,
                       help='Attempts per patch read (default 4). Transient remote failures '
                            '(dropped connections, truncated payloads, 429/5xx) are retried '
                            'with exponential backoff so one hiccup does not abort a long '

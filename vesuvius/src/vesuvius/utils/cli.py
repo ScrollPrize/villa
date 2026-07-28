@@ -1,16 +1,18 @@
 """An ArgumentParser that accepts --foo-bar and --foo_bar interchangeably.
 
-The CLIs in this repo use both conventions, and the split runs between stages of the same
-pipeline: blend_logits takes --chunk_size and --num_workers, while finalize_outputs takes
---chunk-size and --num-workers for the same two parameters. predict is mixed internally
-too. Whichever a user types first, half the time they get "unrecognized arguments".
+The CLIs in this repo used both conventions, and the split ran between stages of the same
+pipeline: blend_logits took --chunk_size and --num_workers, while finalize_outputs took
+--chunk-size and --num-workers for the same two parameters. predict was mixed internally
+too. Whichever a user typed first, half the time they got "unrecognized arguments".
 
-Rather than hand-maintaining an alias on every affected flag, this derives the alternate
-spelling automatically: any long option containing '-' also answers to '_', and vice
-versa. Adding a flag later needs no thought.
+The declarations in models/run are now uniformly underscored, so this class is what keeps
+the hyphenated spellings people already have in scripts and docs working, and what stops
+the two conventions drifting apart again. Rather than hand-maintaining an alias on every
+affected flag, it derives the alternate spelling automatically: any long option containing
+'-' also answers to '_', and vice versa. Adding a flag later needs no thought.
 
     parser = HyphenUnderscoreParser(description=...)
-    parser.add_argument('--chunk-size', ...)   # --chunk_size works too
+    parser.add_argument('--chunk_size', ...)   # --chunk-size works too
 
 The auto-derived spellings are hidden from --help, so the help text still shows one
 canonical name per flag rather than doubling in width.
