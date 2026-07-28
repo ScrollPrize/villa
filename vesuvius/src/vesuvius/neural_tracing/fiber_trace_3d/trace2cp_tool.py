@@ -212,6 +212,7 @@ class NativeTrace2CpConfig:
     trace_step_limit: int | None = None
     inference_patch_shape_zyx: tuple[int, int, int] = (128, 128, 128)
     core_margin_voxels: int = 48
+    inference_scaledown_power: int = 0
     inference_block_batch_size: int = 2
     whole_fiber_error_threshold_voxels: float = 10.0
     max_cached_inference_gib: float = 8.0
@@ -301,6 +302,7 @@ class _NativeWholeFiberVisualSpan:
 class _InferredBlock:
     origin_zyx: np.ndarray
     sample_origin_zyx: np.ndarray
+    sample_spacing_zyx: np.ndarray
     shape_zyx: tuple[int, int, int]
     core_lo_zyx: np.ndarray
     core_hi_zyx: np.ndarray
@@ -709,11 +711,64 @@ def _trace_candidate_directions(
     )
 
 
+def _scaledown_factor_from_power(power: int) -> int:
+    exponent = int(power)
+    if exponent < 0:
+        raise ValueError("inference_scaledown_power must be >= 0")
+    return int(1 << exponent)
+
+
+def _validate_inference_scaledown(
+    *,
+    patch_shape_zyx: tuple[int, int, int],
+    core_margin_voxels: int,
+    inference_scaledown_power: int,
+) -> tuple[int, tuple[int, int, int], int]:
+    factor = _scaledown_factor_from_power(int(inference_scaledown_power))
+    patch_shape = tuple(int(v) for v in patch_shape_zyx)
+    if any(v <= 0 for v in patch_shape):
+        raise ValueError("inference_patch_shape_zyx axes must be > 0")
+    margin = int(core_margin_voxels)
+    if margin < 0:
+        raise ValueError("core_margin_voxels must be >= 0")
+    if any(v <= 2 * margin for v in patch_shape):
+        raise ValueError(
+            "inference_patch_shape_zyx must be larger than 2 * core_margin_voxels"
+        )
+    if any(v % factor != 0 for v in patch_shape):
+        raise ValueError(
+            "inference_patch_shape_zyx axes must be evenly divisible by "
+            f"the inference scaledown factor {factor}"
+        )
+    if margin % factor != 0:
+        raise ValueError(
+            "core_margin_voxels must be evenly divisible by "
+            f"the inference scaledown factor {factor}"
+        )
+    scaled_shape = tuple(int(v // factor) for v in patch_shape)
+    scaled_margin = int(margin // factor)
+    if any(v <= 2 * scaled_margin for v in scaled_shape):
+        raise ValueError(
+            "scaled inference field must be larger than 2 * scaled core margin"
+        )
+    return factor, scaled_shape, scaled_margin
+
+
+def _box_downsample_3d(tensor: torch.Tensor, factor: int) -> torch.Tensor:
+    factor_i = int(factor)
+    if factor_i <= 1:
+        return tensor
+    if tensor.ndim != 5:
+        raise ValueError("box downsample expects tensor shape B,C,D,H,W")
+    return F.avg_pool3d(tensor, kernel_size=factor_i, stride=factor_i)
+
+
 def _grid_sample_channels_at_points(
     values_czyx: torch.Tensor,
     points_zyx: np.ndarray,
     *,
     origin_zyx: np.ndarray,
+    spacing_zyx: np.ndarray | float | int = 1.0,
 ) -> torch.Tensor:
     if values_czyx.ndim != 4:
         raise ValueError("values_czyx must have shape C,Z,Y,X")
@@ -728,6 +783,16 @@ def _grid_sample_channels_at_points(
         dtype=torch.float32,
         device=values_czyx.device,
     )
+    spacing_np = np.asarray(spacing_zyx, dtype=np.float32)
+    if spacing_np.ndim == 0:
+        spacing_np = np.full((3,), float(spacing_np), dtype=np.float32)
+    spacing_np = spacing_np.reshape(-1)
+    if int(spacing_np.size) != 3:
+        raise ValueError("spacing_zyx must be a scalar or length-3 vector")
+    if not bool(np.all(spacing_np > 0.0)):
+        raise ValueError("spacing_zyx values must be > 0")
+    spacing = torch.as_tensor(spacing_np, dtype=torch.float32, device=values_czyx.device)
+    local = local / spacing.view(1, 3)
     if depth > 1:
         gz = local[:, 0] * (2.0 / float(depth - 1)) - 1.0
     else:
@@ -762,6 +827,7 @@ class NativeTraceFieldCache:
         model: torch.nn.Module,
         patch_shape_zyx: tuple[int, int, int],
         core_margin_voxels: int,
+        inference_scaledown_power: int = 0,
         device: torch.device,
         max_cached_bytes: int | None = 8 * 1024**3,
         inference_block_batch_size: int = 1,
@@ -772,12 +838,16 @@ class NativeTraceFieldCache:
         self.model = model
         self.patch_shape_zyx = tuple(int(v) for v in patch_shape_zyx)
         self.core_margin = int(core_margin_voxels)
-        if self.core_margin < 0:
-            raise ValueError("core_margin_voxels must be >= 0")
-        if any(v <= 2 * self.core_margin for v in self.patch_shape_zyx):
-            raise ValueError(
-                "inference_patch_shape_zyx must be larger than 2 * core_margin_voxels"
-            )
+        (
+            self.inference_scaledown_factor,
+            self.inference_field_shape_zyx,
+            self.scaled_core_margin,
+        ) = _validate_inference_scaledown(
+            patch_shape_zyx=self.patch_shape_zyx,
+            core_margin_voxels=self.core_margin,
+            inference_scaledown_power=int(inference_scaledown_power),
+        )
+        self.inference_scaledown_power = int(inference_scaledown_power)
         self.core_shape_zyx = tuple(v - 2 * self.core_margin for v in self.patch_shape_zyx)
         self.device = torch.device(device)
         if max_cached_bytes is not None and int(max_cached_bytes) < 0:
@@ -873,12 +943,15 @@ class NativeTraceFieldCache:
         return sampled, sampled_valid
 
     def _cached_output_slices(self) -> tuple[tuple[slice, slice, slice], np.ndarray]:
-        lo = int(self.core_margin)
-        hi = np.asarray(self.patch_shape_zyx, dtype=np.int64) - int(self.core_margin)
+        lo = int(self.scaled_core_margin)
+        hi = (
+            np.asarray(self.inference_field_shape_zyx, dtype=np.int64)
+            - int(self.scaled_core_margin)
+        )
         # Keep a one-voxel upper halo so trilinear samples inside the trusted
         # core can read the same interpolation corners as the full output.
         crop_hi = np.minimum(
-            np.asarray(self.patch_shape_zyx, dtype=np.int64),
+            np.asarray(self.inference_field_shape_zyx, dtype=np.int64),
             hi + np.asarray([1, 1, 1], dtype=np.int64),
         )
         slices = tuple(slice(lo, int(axis_hi)) for axis_hi in crop_hi)
@@ -892,6 +965,7 @@ class NativeTraceFieldCache:
         valid: torch.Tensor,
     ) -> _InferredBlock:
         origin_i64 = np.asarray(origin, dtype=np.int64)
+        factor = int(self.inference_scaledown_factor)
         core_lo = origin_i64 + int(self.core_margin)
         core_hi = (
             origin_i64
@@ -899,6 +973,17 @@ class NativeTraceFieldCache:
             - int(self.core_margin)
         )
         crop_slices, crop_lo = self._cached_output_slices()
+        expected_shape = tuple(int(v) for v in self.inference_field_shape_zyx)
+        if tuple(int(v) for v in output.shape[-3:]) != expected_shape:
+            raise ValueError(
+                "native 3D Trace2CP model output has incompatible scaled shape: "
+                f"shape={tuple(int(v) for v in output.shape[-3:])} expected={expected_shape}"
+            )
+        if tuple(int(v) for v in valid.shape[-3:]) != expected_shape:
+            raise ValueError(
+                "native 3D Trace2CP valid mask has incompatible scaled shape: "
+                f"shape={tuple(int(v) for v in valid.shape[-3:])} expected={expected_shape}"
+            )
         output_crop = output[
             :,
             crop_slices[0],
@@ -910,7 +995,8 @@ class NativeTraceFieldCache:
         cache_nbytes += int(valid_crop.numel() * valid_crop.element_size())
         block = _InferredBlock(
             origin_zyx=origin_i64.astype(np.int64),
-            sample_origin_zyx=(origin_i64 + crop_lo).astype(np.int64),
+            sample_origin_zyx=(origin_i64 + crop_lo * factor).astype(np.float32),
+            sample_spacing_zyx=np.asarray([factor, factor, factor], dtype=np.float32),
             shape_zyx=tuple(int(v) for v in valid_crop.shape),
             core_lo_zyx=core_lo.astype(np.float32),
             core_hi_zyx=core_hi.astype(np.float32),
@@ -1000,7 +1086,19 @@ class NativeTraceFieldCache:
                             f"B,7,D,H,W; got {tuple(int(v) for v in tensor.shape)}"
                         )
                     product_tensors.append(tensor)
-                valid_cpu = valid_batch.detach().to(device=torch.device("cpu")).contiguous()
+                if int(self.inference_scaledown_factor) > 1:
+                    factor = int(self.inference_scaledown_factor)
+                    product_tensors = [
+                        _box_downsample_3d(tensor, factor)
+                        for tensor in product_tensors
+                    ]
+                    valid_for_cache = (
+                        _box_downsample_3d(valid_batch.to(dtype=torch.float32), factor)
+                        >= 1.0
+                    )
+                else:
+                    valid_for_cache = valid_batch
+                valid_cpu = valid_for_cache.detach().to(device=torch.device("cpu")).contiguous()
                 for batch_index, origin in enumerate(batch_origins):
                     output = torch.cat(
                         [tensor[batch_index] for tensor in product_tensors],
@@ -1106,7 +1204,9 @@ class NativeTraceFieldCache:
             block = blocks_by_key[key]
             group_points = points[indices]
             shape = np.asarray(block.shape_zyx, dtype=np.float32)
-            local = group_points - block.sample_origin_zyx.astype(np.float32)
+            local = (
+                group_points - block.sample_origin_zyx.astype(np.float32)
+            ) / block.sample_spacing_zyx.astype(np.float32)
             inside_core = np.all(group_points >= block.core_lo_zyx, axis=1) & np.all(
                 group_points < block.core_hi_zyx,
                 axis=1,
@@ -1127,6 +1227,7 @@ class NativeTraceFieldCache:
                     block_output,
                     usable_points,
                     origin_zyx=block.sample_origin_zyx,
+                    spacing_zyx=block.sample_spacing_zyx,
                 )
                 sampled_branch_count = direction_branch_count_from_channels(int(sampled.shape[1]))
                 if branch_count is None:
@@ -1160,6 +1261,7 @@ class NativeTraceFieldCache:
                     block_valid.view(1, *block.shape_zyx),
                     usable_points,
                     origin_zyx=block.sample_origin_zyx,
+                    spacing_zyx=block.sample_spacing_zyx,
                 )[:, 0]
                 axis_choices_zyx, group_presence, decoded_valid = (
                     decode_grouped_direction_presence(sampled)
@@ -5518,6 +5620,7 @@ def run_native_trace2cp(
         model=model,
         patch_shape_zyx=cfg.inference_patch_shape_zyx,
         core_margin_voxels=cfg.core_margin_voxels,
+        inference_scaledown_power=int(cfg.inference_scaledown_power),
         device=device,
         max_cached_bytes=_cache_bytes_from_gib(float(cfg.max_cached_inference_gib)),
         inference_block_batch_size=int(cfg.inference_block_batch_size),
@@ -5535,6 +5638,8 @@ def run_native_trace2cp(
         f"base_volume_scale={getattr(record, 'volume_scale', 'unknown')} "
         f"volume_spacing_base={float(getattr(record, 'volume_spacing_base', 1.0)):.6g} "
         f"image_normalization={loader_config.image_normalization} "
+        f"inference_scaledown_power={int(cfg.inference_scaledown_power)} "
+        f"inference_scaledown_factor={int(cache.inference_scaledown_factor)} "
         f"sampler={type(getattr(record, 'sampler', None)).__name__} "
         f"blocking={getattr(getattr(record, 'sampler', None), 'blocking', 'n/a')}",
         flush=True,
@@ -5677,6 +5782,8 @@ def run_native_trace2cp(
             **_native_trace_smoothness_summary(cfg),
             "max_steps": None if cfg.max_steps is None else int(cfg.max_steps),
             "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
+            "inference_scaledown_power": int(cfg.inference_scaledown_power),
+            "inference_scaledown_factor": int(cache.inference_scaledown_factor),
             "inference_block_batch_size": int(cfg.inference_block_batch_size),
             "inferred_blocks": int(cache.total_inferred_blocks),
             "resident_inferred_blocks": int(len(cache._blocks)),
@@ -5852,6 +5959,8 @@ def run_native_trace2cp(
         **_native_trace_smoothness_summary(cfg),
         "max_steps": None if cfg.max_steps is None else int(cfg.max_steps),
         "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
+        "inference_scaledown_power": int(cfg.inference_scaledown_power),
+        "inference_scaledown_factor": int(cache.inference_scaledown_factor),
         "inference_block_batch_size": int(cfg.inference_block_batch_size),
         "visualization_enabled": bool(render_visualization),
         "visualization_cross_strip_height_px": visualization_cross_strip_height_px,
@@ -5964,6 +6073,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--inference-patch-shape-zyx", nargs=3, type=int, default=None)
     parser.add_argument("--core-margin-voxels", type=int, default=48)
     parser.add_argument(
+        "--inference-scaledown-power",
+        type=int,
+        default=0,
+        help=(
+            "Power-of-two box scaledown applied to raw native 3D inference outputs "
+            "before tracing samples them: 0=1x, 1=0.5x, 2=0.25x."
+        ),
+    )
+    parser.add_argument(
         "--inference-block-batch-size",
         type=int,
         default=2,
@@ -6016,6 +6134,7 @@ def main() -> None:
         trace_step_limit=None if args.trace_step_limit is None else int(args.trace_step_limit),
         inference_patch_shape_zyx=patch_shape,
         core_margin_voxels=int(args.core_margin_voxels),
+        inference_scaledown_power=int(args.inference_scaledown_power),
         inference_block_batch_size=int(args.inference_block_batch_size),
         whole_fiber_error_threshold_voxels=float(args.whole_fiber_error_threshold_voxels),
         max_cached_inference_gib=float(args.max_cached_inference_gib),

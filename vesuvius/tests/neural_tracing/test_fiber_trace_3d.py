@@ -3302,6 +3302,7 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().cumulative_smoothness_tangent_weight == 2.0
     assert NativeTrace2CpConfig().all_pairs_direction_product is True
     assert NativeTrace2CpConfig().core_margin_voxels == 48
+    assert NativeTrace2CpConfig().inference_scaledown_power == 0
     assert NativeTrace2CpConfig().inference_block_batch_size == 2
     assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 10.0
     assert NativeTrace2CpConfig().max_cached_inference_gib == pytest.approx(8.0)
@@ -3328,6 +3329,7 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.smoothness_normal_weight == 0.1
     assert args.smoothness_tangent_weight == 10.0
     assert args.core_margin_voxels == 48
+    assert args.inference_scaledown_power == 0
     assert args.inference_block_batch_size == 2
     assert args.max_cached_inference_gib == pytest.approx(8.0)
     assert args.vis is False
@@ -4399,6 +4401,112 @@ def test_native_3d_trace2cp_field_cache_uses_block_sampler() -> None:
     assert shape == (4, 4, 4)
     assert model.input_volume is not None
     assert float(model.input_volume[0, 0, 0, 0, 0]) == 1.0
+
+
+def test_native_3d_trace2cp_scaled_inference_downsamples_cached_field() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ZRampSampler:
+        blocking = True
+
+        def sample_block_zyx(
+            self,
+            start_zyx: np.ndarray,
+            shape_zyx: tuple[int, int, int],
+        ) -> CoordinateSampleResult:
+            start = np.asarray(start_zyx, dtype=np.int64)
+            shape = tuple(int(v) for v in shape_zyx)
+            zz = np.arange(shape[0], dtype=np.float32)[:, None, None] + np.float32(start[0])
+            return CoordinateSampleResult(
+                image=np.broadcast_to(zz, shape).astype(np.float32, copy=True),
+                valid_mask=np.ones(shape, dtype=bool),
+                stats={
+                    "sample_block_zyx": 1,
+                    "requested_level_only": True,
+                    "fallback_levels": 0,
+                    "error_chunks": 0,
+                },
+            )
+
+    class PresenceRampModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6:7] = volume / 10.0
+            return out
+
+    record = _native_trace_record(
+        np.zeros((16, 16, 16), dtype=np.float32),
+        sampler=ZRampSampler(),
+    )
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=PresenceRampModel(),
+        patch_shape_zyx=(8, 8, 8),
+        core_margin_voxels=2,
+        inference_scaledown_power=1,
+        device=torch.device("cpu"),
+    )
+
+    block = cache._infer_block(np.asarray([0, 0, 0], dtype=np.int64))
+
+    assert cache.inference_scaledown_factor == 2
+    assert cache.inference_field_shape_zyx == (4, 4, 4)
+    assert cache.scaled_core_margin == 1
+    assert block.output_czyx.shape == (7, 3, 3, 3)
+    assert block.valid_mask_zyx.shape == (3, 3, 3)
+    assert np.allclose(block.sample_origin_zyx, [2.0, 2.0, 2.0])
+    assert np.allclose(block.sample_spacing_zyx, [2.0, 2.0, 2.0])
+    assert float(block.output_czyx[6, 0, 0, 0]) == pytest.approx(0.25)
+    assert float(block.output_czyx[6, 1, 0, 0]) == pytest.approx(0.45)
+
+    _directions, presence, valid = cache.sample_points_torch(
+        np.asarray([[4.0, 2.0, 2.0]], dtype=np.float32)
+    )
+
+    assert bool(valid[0].item())
+    assert float(presence[0].item()) == pytest.approx(0.45)
+
+
+def test_native_3d_trace2cp_scaled_inference_rejects_indivisible_shapes() -> None:
+    record = _native_trace_record(np.zeros((16, 16, 16), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="inference_patch_shape_zyx.*divisible"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(7, 8, 8),
+            core_margin_voxels=2,
+            inference_scaledown_power=1,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(ValueError, match="core_margin_voxels.*divisible"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(8, 8, 8),
+            core_margin_voxels=3,
+            inference_scaledown_power=1,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(ValueError, match="inference_scaledown_power"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(8, 8, 8),
+            core_margin_voxels=2,
+            inference_scaledown_power=-1,
+            device=torch.device("cpu"),
+        )
 
 
 def test_native_3d_trace2cp_candidate_score_maximizes_dot_product_presence() -> None:

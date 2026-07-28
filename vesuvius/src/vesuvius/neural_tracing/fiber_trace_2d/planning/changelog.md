@@ -14,6 +14,8 @@
 - Native 3D whole-fiber Trace2CP human metric output now uses one decimal
   place and includes mean successful run length in millimeters beside `err/m`
   when physical units are available.
+- Native 3D Trace2CP can now box-downsample raw inferred fields with
+  `--inference-scaledown-power` before direction/presence sampling.
 - VC3D remote volume metadata normalization now always discovers public
   `scan/tomo/acquisition/detector/samplePixelSize` as `voxelsize` when no
   explicit positive `voxelsize` exists.

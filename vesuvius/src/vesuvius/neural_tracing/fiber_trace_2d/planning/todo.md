@@ -65,6 +65,7 @@
     - [ ] same for inferences
 - [ ] augment_anisotropic_blur_orientation "fiber"  - that does not sound correct ...
 - [ ] dir result dependent presencec supervision? supervise with dot between gt and estimated dir?
+- [ ] when we try embedding again (or other alignement ways) - focus on the left/right positioning on the fiber - that seems to be the biggest hurdle right now
     
 # beam-search
 - [ ] beamsearch

@@ -569,6 +569,18 @@
 - Native 3D Trace2CP cached inferred blocks must be CPU-resident. CUDA is used
   for model inference and transient block sampling, but the cache must not keep
   all inferred block output tensors on GPU across a long trace or strip render.
+- Native 3D Trace2CP supports `--inference-scaledown-power N` for opt-in
+  lower-resolution tracing over the raw model-output field. The scaledown
+  factor is `2 ** N`: `0` is the default no-op, `1` samples a half-resolution
+  field, and `2` samples a quarter-resolution field. The model input patch is
+  unchanged; after inference, every raw product tensor is box-filtered with
+  kernel/stride equal to the factor before the CPU field cache stores it. The
+  valid mask is box-filtered with the same factor and a scaled output voxel is
+  valid only if all source voxels in the box were valid. The inference patch
+  shape and `--core-margin-voxels` must be evenly divisible by the factor, and
+  invalid combinations must fail before tracing starts. The trusted core is
+  still defined in selected-level voxel coordinates, while cached output
+  lookups convert points to the scaled field with the same factor.
 - Native 3D Trace2CP inferred blocks must also be bounded on the CPU by default.
   The native CLI uses an LRU byte budget exposed as
   `--max-cached-inference-gib`, defaults to 8 GiB, and reports total inferred,
