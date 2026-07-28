@@ -723,10 +723,22 @@
   penalty. For pairwise traced-arc fusion the center penalty is fixed to `1.0`.
   These are not the public 2D `trace2cp_error`.
 - Native 3D whole-fiber mode reports its tool-local metric on a single line as
-  `native_trace2cp_fiber_restart_rate=... restarts=... segments=...`, where
-  the restart rate is `restart_count / segment_count`. Its JSON summary stores
-  per-segment status, reason, reached-plane flag, in-plane error, step count,
-  restart point, and reference arc distance at the last successful CP plane.
+  `native_trace2cp_fiber_restarts_per_kvx=... restarts=... reference_length_voxels=... segments=...`.
+  The metric is `restart_count / (reference_length_voxels / 1000)`, where
+  `reference_length_voxels` is measured along the original loaded fiber line
+  between CP0 and the final CP in selected-level voxels. If explicit physical
+  voxel-size metadata is available from the dataset config, record metadata, or
+  OME multiscales with spatial units, the tool also prints and stores
+  `native_trace2cp_fiber_restarts_per_meter=...`; otherwise the per-meter
+  field is omitted from stdout and null in JSON. Live whole-fiber progress
+  output uses the same units and includes `restarts_per_meter` plus
+  `reference_length_meters` plus `physical_unit=m` when available. The tool
+  must not infer voxel size from the volume filename. The JSON summary stores
+  per-segment status,
+  reason, reached-plane flag, in-plane error, step count, restart point,
+  reference arc distance at the last successful CP plane, reference lengths,
+  and the old segment-normalized fraction only as
+  `restart_fraction_per_segment`.
 - Native 3D single-pair visualization first builds the initial side/top strip
   source from the existing 2D Trace2CP geometry loader for the input CP pair.
   In single-pair mode, the configured cross-strip height is a maximum cap: the

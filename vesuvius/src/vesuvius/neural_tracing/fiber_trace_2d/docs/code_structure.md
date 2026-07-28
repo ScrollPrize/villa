@@ -178,7 +178,7 @@ loading.
 
 - The native 3D CLI is metric-only by default: it traces, prints
   `native_trace2cp_plane_error` / `native_trace2cp_closest_target_error`
-  or `native_trace2cp_fiber_restart_rate`, and writes
+  or `native_trace2cp_fiber_restarts_per_kvx`, and writes
   `trace2cp_native_3d_summary.json`. Add `--vis` to render
   `trace2cp_native_3d_vis.jpg` and enable partial image updates during long
   renders.
@@ -320,10 +320,17 @@ loading.
   succeeds when it reaches the next CP plane within the segment budget and its
   in-plane selected-voxel error to the target CP is below
   `--whole-fiber-error-threshold-voxels` (default `10`). Failures count one
-  restart and resume from the failed target CP. Stdout prints the whole-fiber
-  metric as `native_trace2cp_fiber_restart_rate=... restarts=... segments=...`;
-  the JSON summary includes per-segment status, errors, step counts, restart
-  points, and the last successful reference arc distance.
+  restart and resume from the failed target CP. Stdout prints
+  `native_trace2cp_fiber_restarts_per_kvx`, measured as restarts per 1000
+  selected-level voxels along the original loaded fiber line. If explicit
+  physical voxel-size metadata is available, stdout also prints
+  `native_trace2cp_fiber_restarts_per_meter`, and live whole-fiber progress
+  includes the same per-meter metric plus the current reference length in
+  meters with `physical_unit=m`. The tool does not infer this from filenames.
+  The JSON summary includes per-segment status, errors, step counts, restart
+  points, the last successful reference arc distance, reference lengths,
+  optional per-meter normalization, and the old segment fraction only as
+  `restart_fraction_per_segment`.
 - Fuses forward and reverse traces in selected-level 3D ZYX coordinates by
   preserving traced order and selecting a pairwise traced-arc meeting, not a
   straight-axis overlap progress. The score is

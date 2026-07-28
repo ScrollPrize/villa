@@ -5,3 +5,6 @@
   helpers.
 - Native 3D Trace2CP now defaults to metric-only output; `--vis` explicitly
   enables JPG rendering and partial image updates.
+- Native 3D whole-fiber Trace2CP now reports restarts per 1000 reference
+  voxels, with optional restarts per meter in summaries and progress output
+  when explicit voxel-size metadata is available.
