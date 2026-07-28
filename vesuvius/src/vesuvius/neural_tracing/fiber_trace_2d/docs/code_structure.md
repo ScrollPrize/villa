@@ -364,6 +364,11 @@ loading.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
   and `best.pt`. `training.kept_snapshot_interval` additionally keeps numbered
   snapshots as `snapshots/step_<iteration>.pt` and defaults to `10000`.
+  Fiber3d snapshots are written only after dense test evaluation:
+  `checkpoint_interval` must be a positive multiple of `test_interval`, and
+  `kept_snapshot_interval` must be `0` or a multiple of `test_interval`.
+  `best.pt` tracks the lowest dense `test/loss_total`; training and Trace2CP
+  metrics cannot select it.
 - `training.mixed_precision` accepts `off`, `bf16`, `fp16`, and `auto`.
   Autocast wraps training loss, dense test loss, benchmark forward loss,
   TensorBoard sample-sheet inference, and Trace2CP metric/visual inference.
@@ -506,8 +511,8 @@ loading.
 - When `training.test_trace2cp_enabled` is true, test evaluation builds
   Trace2CP side-strip geometry with the 2D loader, runs tiled dense 3D inference
   blocks over the requested strip coordinates, projects direction/presence into
-  the 2D frame, logs `test/trace2cp_error`, and uses that value for `best.pt`
-  selection. Dense 3D test loss remains a diagnostic.
+  the 2D frame, and logs `test/trace2cp_error` as a diagnostic. Dense
+  `test/loss_total` remains the sole metric used for fiber3d snapshot selection.
 - Native 3D Trace2CP caches conditioned model inference as grouped recurrent
   outputs: zero-query output first, then output conditioned on the first decoded
   direction. That lets the existing branch-aware candidate sampler choose
@@ -1232,7 +1237,9 @@ The important behavior is:
   set at `training.test_interval` using either the configured fixed-size
   random window or all held-out CPs when `test_control_points` is `0`; it also
   evaluates Trace2CP on each selected held-out CP using the segment to the next
-  CP, and uses the averaged `test/trace2cp_error` for current/best snapshots.
+  CP. Fiber3d current/retained snapshots are written only on aligned test
+  steps, and `best.pt` uses the lowest dense `test/loss_total`; Trace2CP is
+  diagnostic only.
 - `--resume <snapshot.pt>` restores model and optimizer state, creates a fresh
   timestamped run directory from the current config just like normal training,
   and continues from `checkpoint_step + 1`. `training.max_steps` remains the

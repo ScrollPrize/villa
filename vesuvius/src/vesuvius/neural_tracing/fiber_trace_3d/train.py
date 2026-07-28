@@ -466,6 +466,29 @@ def _resolve_prefetch_sample_count(
     return min(explicit * int(batch_size), bounded_count)
 
 
+def _validate_snapshot_intervals(
+    *,
+    checkpoint_interval: int,
+    kept_snapshot_interval: int,
+    test_interval: int,
+) -> None:
+    if checkpoint_interval <= 0:
+        raise ValueError("training.checkpoint_interval must be > 0")
+    if kept_snapshot_interval < 0:
+        raise ValueError("training.kept_snapshot_interval must be >= 0")
+    if test_interval <= 0:
+        raise ValueError("training.test_interval must be > 0 when snapshots are enabled")
+    if checkpoint_interval % test_interval != 0:
+        raise ValueError(
+            "training.checkpoint_interval must be a multiple of training.test_interval"
+        )
+    if kept_snapshot_interval > 0 and kept_snapshot_interval % test_interval != 0:
+        raise ValueError(
+            "training.kept_snapshot_interval must be 0 or a multiple of "
+            "training.test_interval"
+        )
+
+
 def _resolve_dense_test_selection(
     training: dict[str, Any],
     *,
@@ -1895,9 +1918,12 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     scalar_interval = int(training.get("scalar_log_interval", 100))
     checkpoint_interval = int(training.get("checkpoint_interval", 100))
     kept_snapshot_interval = int(training.get("kept_snapshot_interval", 10000))
-    if kept_snapshot_interval < 0:
-        raise ValueError("training.kept_snapshot_interval must be >= 0")
     test_interval = int(training.get("test_interval", 0))
+    _validate_snapshot_intervals(
+        checkpoint_interval=checkpoint_interval,
+        kept_snapshot_interval=kept_snapshot_interval,
+        test_interval=test_interval,
+    )
     sample_vis_interval = int(
         training.get("sample_vis_interval", training.get("train_sample_vis_interval", 1000))
     )
@@ -2024,8 +2050,6 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                 device=device,
                 mixed_precision=mixed_precision,
             )
-            metric = float(trace2cp_metric.error_mean)
-            metric_name = "test/trace2cp_error"
             print(
                 f"test_trace2cp step={step} trace2cp_error={trace2cp_metric.error_mean:.6f} "
                 f"raw_y_error_mean_px={trace2cp_metric.raw_y_error_mean_px:.3f} "
@@ -2164,19 +2188,16 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             if train_vis_due:
                 _distributed_barrier(distributed)
 
-            metric = losses["total"]
-            metric_name = "train/loss_total"
+            test_metric = None
+            test_metric_name = None
             if test_interval > 0 and step % test_interval == 0:
                 test_metric, test_metric_name = (
                     run_configured_tests(step) if distributed.is_main else (None, None)
                 )
                 test_metric = _distributed_broadcast_object(test_metric, distributed)
                 test_metric_name = _distributed_broadcast_object(test_metric_name, distributed)
-                if test_metric is not None and test_metric_name is not None:
-                    metric = test_metric
-                    metric_name = test_metric_name
 
-            if step % checkpoint_interval == 0 or (max_steps is not None and step == max_steps):
+            if test_metric is not None and step % checkpoint_interval == 0:
                 if distributed.is_main:
                     _save_snapshot(
                         snapshot_dir / "current.pt",
@@ -2184,12 +2205,16 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                         optimizer=optimizer,
                         step=step,
                         config=raw_config,
-                        metric=metric,
-                        metric_name=metric_name,
+                        metric=test_metric,
+                        metric_name=test_metric_name,
                         grad_scaler=grad_scaler,
                     )
                 _distributed_barrier(distributed)
-            if kept_snapshot_interval > 0 and step % kept_snapshot_interval == 0:
+            if (
+                test_metric is not None
+                and kept_snapshot_interval > 0
+                and step % kept_snapshot_interval == 0
+            ):
                 if distributed.is_main:
                     _save_snapshot(
                         snapshot_dir / f"step_{step:08d}.pt",
@@ -2197,13 +2222,13 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                         optimizer=optimizer,
                         step=step,
                         config=raw_config,
-                        metric=metric,
-                        metric_name=metric_name,
+                        metric=test_metric,
+                        metric_name=test_metric_name,
                         grad_scaler=grad_scaler,
                     )
                 _distributed_barrier(distributed)
-            if metric < best_metric:
-                best_metric = float(metric)
+            if test_metric is not None and test_metric < best_metric:
+                best_metric = float(test_metric)
                 if distributed.is_main:
                     _save_snapshot(
                         snapshot_dir / "best.pt",
@@ -2212,7 +2237,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                         step=step,
                         config=raw_config,
                         metric=best_metric,
-                        metric_name=metric_name,
+                        metric_name=test_metric_name,
                         grad_scaler=grad_scaler,
                     )
                 _distributed_barrier(distributed)

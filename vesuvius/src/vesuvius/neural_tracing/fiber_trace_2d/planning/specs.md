@@ -297,6 +297,15 @@
 - When `training.test_interval > 0`, 3D training runs the configured test
   evaluation at step 0 before the first optimizer step and logs the same
   TensorBoard scalars/stdout as interval tests.
+- 3D snapshots are evaluation-only. `training.checkpoint_interval` must be a
+  positive multiple of `training.test_interval`, and
+  `training.kept_snapshot_interval` must be `0` or a multiple of
+  `training.test_interval`. `current.pt` and retained numbered snapshots are
+  written only on aligned evaluation steps; an otherwise unscheduled final
+  training step must not write a snapshot.
+- The 3D `best.pt` snapshot is selected exclusively by the lowest observed
+  dense `test/loss_total`. Training loss must never be compared with the test
+  metric or trigger a best snapshot.
 - Dense 3D test loaders do not inherit train augmentations by default.
   `training.test_augment_enabled: true` is the explicit opt-in for augmented
   dense tests.
@@ -464,8 +473,9 @@
   interval dense 3D test loss run for the fast 64-scale training setup.
 - When `training.test_trace2cp_enabled` is true, 3D training logs
   `test/trace2cp_error`, raw y-error, valid segment count, and skipped segment
-  count. `best.pt` and `current.pt` store `metric_name`; best-checkpoint
-  selection uses `test/trace2cp_error` when it is available.
+  count. Trace2CP metrics are diagnostic and must not replace dense
+  `test/loss_total` as the snapshot metric. `best.pt`, `current.pt`, and
+  retained numbered snapshots store `metric_name: test/loss_total`.
 - `training.test_trace2cp_control_points: 0` means the full held-out Trace2CP
   CP set in flat order. Positive values use the deterministic random held-out
   range beginning at `training.test_trace2cp_start_sample_index` or, when that
@@ -481,8 +491,8 @@
   exports `trace2cp_3d_vis.jpg`.
 - `python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool` is a
   separate native 3D Trace2CP inspection tool. It must not replace the
-  projected `test/trace2cp_error` training metric or best-checkpoint selection
-  unless that migration is explicitly requested.
+  projected `test/trace2cp_error` diagnostic or affect best-checkpoint
+  selection, which is based only on dense `test/loss_total`.
 - Native 3D Trace2CP selection supports both the existing
   `--sample-index`/`--target-offset` mode and explicit fiber segment mode:
   `--fiber-json <path> --start-cp-index A --target-cp-index B`. Explicit CP
