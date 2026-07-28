@@ -42,6 +42,154 @@ _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 _GIB = 1024**3
 
 
+@dataclass
+class _NativeTraceProfileStat:
+    count: int = 0
+    wall_seconds: float = 0.0
+    cpu_seconds: float = 0.0
+
+
+class _NullNativeTraceProfileSpan:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> bool:
+        return False
+
+
+class _NativeTraceProfileSpan:
+    def __init__(
+        self,
+        profiler: "_NativeTraceProfiler",
+        name: str,
+        *,
+        sync_device: torch.device | None = None,
+    ) -> None:
+        self.profiler = profiler
+        self.name = str(name)
+        self.sync_device = None if sync_device is None else torch.device(sync_device)
+        self.wall_start = 0.0
+        self.cpu_start = 0.0
+
+    def __enter__(self):
+        self.profiler.sync(self.sync_device)
+        self.wall_start = time.perf_counter()
+        self.cpu_start = time.process_time()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> bool:
+        self.profiler.sync(self.sync_device)
+        self.profiler.add(
+            self.name,
+            wall_seconds=time.perf_counter() - self.wall_start,
+            cpu_seconds=time.process_time() - self.cpu_start,
+        )
+        return False
+
+
+class _NativeTraceProfiler:
+    def __init__(self) -> None:
+        self._stats: OrderedDict[str, _NativeTraceProfileStat] = OrderedDict()
+        self._total_wall_start = time.perf_counter()
+        self._total_cpu_start = time.process_time()
+        self.total_wall_seconds: float | None = None
+        self.total_cpu_seconds: float | None = None
+
+    @staticmethod
+    def sync(device: torch.device | None) -> None:
+        if device is None:
+            return
+        device = torch.device(device)
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+    def measure(
+        self,
+        name: str,
+        *,
+        sync_device: torch.device | None = None,
+    ) -> _NativeTraceProfileSpan:
+        return _NativeTraceProfileSpan(self, name, sync_device=sync_device)
+
+    def add(self, name: str, *, wall_seconds: float, cpu_seconds: float) -> None:
+        key = str(name)
+        stat = self._stats.get(key)
+        if stat is None:
+            stat = _NativeTraceProfileStat()
+            self._stats[key] = stat
+        stat.count += 1
+        stat.wall_seconds += float(wall_seconds)
+        stat.cpu_seconds += float(cpu_seconds)
+
+    def finish_total(self) -> None:
+        if self.total_wall_seconds is None:
+            self.total_wall_seconds = time.perf_counter() - self._total_wall_start
+            self.total_cpu_seconds = time.process_time() - self._total_cpu_start
+
+    def restart_total(self) -> None:
+        self._total_wall_start = time.perf_counter()
+        self._total_cpu_start = time.process_time()
+        self.total_wall_seconds = None
+        self.total_cpu_seconds = None
+
+    def total_wall(self) -> float:
+        if self.total_wall_seconds is None:
+            return time.perf_counter() - self._total_wall_start
+        return float(self.total_wall_seconds)
+
+    def total_cpu(self) -> float:
+        if self.total_cpu_seconds is None:
+            return time.process_time() - self._total_cpu_start
+        return float(self.total_cpu_seconds)
+
+    def summary(self) -> dict[str, Any]:
+        self.finish_total()
+        total_wall = max(float(self.total_wall_seconds or 0.0), _EPS)
+        return {
+            "total_wall_seconds": float(self.total_wall_seconds or 0.0),
+            "total_cpu_seconds": float(self.total_cpu_seconds or 0.0),
+            "stages": {
+                name: {
+                    "count": int(stat.count),
+                    "wall_seconds": float(stat.wall_seconds),
+                    "cpu_seconds": float(stat.cpu_seconds),
+                    "wall_percent": float(stat.wall_seconds * 100.0 / total_wall),
+                }
+                for name, stat in self._stats.items()
+            },
+        }
+
+    def print_table(self) -> None:
+        self.finish_total()
+        total_wall = max(float(self.total_wall_seconds or 0.0), _EPS)
+        print(
+            "native_trace2cp_profile columns: "
+            "stage=profiled stage n=events wall_s=wall seconds cpu_s=process CPU seconds "
+            "wall_pct=percent of measured Trace2CP wall runtime",
+            flush=True,
+        )
+        print(f"{'stage':32s} {'n':>6s} {'wall_s':>10s} {'cpu_s':>10s} {'wall_pct':>9s}", flush=True)
+        print(
+            f"{'total':32s} {1:6d} "
+            f"{float(self.total_wall_seconds or 0.0):10.3f} "
+            f"{float(self.total_cpu_seconds or 0.0):10.3f} "
+            f"{100.0:9.2f}",
+            flush=True,
+        )
+        for name, stat in sorted(
+            self._stats.items(),
+            key=lambda item: float(item[1].wall_seconds),
+            reverse=True,
+        ):
+            print(
+                f"{name[:32]:32s} {int(stat.count):6d} "
+                f"{float(stat.wall_seconds):10.3f} "
+                f"{float(stat.cpu_seconds):10.3f} "
+                f"{float(stat.wall_seconds) * 100.0 / total_wall:9.2f}",
+                flush=True,
+            )
+
+
 @dataclass(frozen=True)
 class NativeTrace2CpConfig:
     step_voxels: float = 4.0
@@ -615,6 +763,7 @@ class NativeTraceFieldCache:
         core_margin_voxels: int,
         device: torch.device,
         max_cached_bytes: int | None = 8 * 1024**3,
+        profiler: _NativeTraceProfiler | None = None,
     ) -> None:
         self.record = record
         self.prediction_adapter = prediction_adapter
@@ -632,10 +781,24 @@ class NativeTraceFieldCache:
         if max_cached_bytes is not None and int(max_cached_bytes) < 0:
             raise ValueError("max_cached_bytes must be >= 0 or None")
         self.max_cached_bytes = None if max_cached_bytes is None else int(max_cached_bytes)
+        self.profiler = profiler
         self._blocks: OrderedDict[tuple[int, int, int], _InferredBlock] = OrderedDict()
         self.total_inferred_blocks = 0
         self.evicted_inferred_blocks = 0
         self.resident_inferred_block_bytes = 0
+
+    def _measure(
+        self,
+        name: str,
+        *,
+        sync: bool = False,
+    ) -> _NativeTraceProfileSpan | _NullNativeTraceProfileSpan:
+        if self.profiler is None:
+            return _NullNativeTraceProfileSpan()
+        return self.profiler.measure(
+            name,
+            sync_device=self.device if bool(sync) else None,
+        )
 
     def _block_origin_for_point(self, point_zyx: np.ndarray) -> np.ndarray:
         point = np.asarray(point_zyx, dtype=np.float64)
@@ -688,42 +851,46 @@ class NativeTraceFieldCache:
             raise ValueError("native 3D Trace2CP record must provide a coordinate sampler")
         if hasattr(sampler, "blocking") and not bool(getattr(sampler, "blocking")):
             raise ValueError("native 3D Trace2CP requires blocking coordinate sampling")
-        coords_base, valid = self._block_coords_base_and_valid(origin_zyx)
-        result = sampler.sample_coord_batch(coords_base, valid)
-        stats = dict(getattr(result, "stats", {}) or {})
-        error_chunks = int(stats.get("error_chunks", 0) or 0)
-        if error_chunks > 0:
-            raise ValueError(
-                "native 3D Trace2CP block sampling encountered chunk errors; "
-                f"stats={stats}"
-            )
-        if "requested_level_only" in stats and not bool(stats.get("requested_level_only")):
-            raise ValueError(
-                "native 3D Trace2CP block sampling did not use requested-level-only mode; "
-                f"stats={stats}"
-            )
-        fallback_levels = int(stats.get("fallback_levels", 0) or 0)
-        if fallback_levels != 0:
-            raise ValueError(
-                "native 3D Trace2CP block sampling used scale fallback; "
-                f"stats={stats}"
-            )
-        sampled_np = np.asarray(result.image, dtype=np.float32)
-        sampled_valid_np = np.asarray(result.valid_mask, dtype=bool) & valid
-        expected_shape = self.patch_shape_zyx
-        if sampled_np.shape != expected_shape:
-            raise ValueError(
-                "native 3D Trace2CP sampler returned incompatible image shape: "
-                f"shape={sampled_np.shape} expected={expected_shape}"
-            )
-        if sampled_valid_np.shape != expected_shape:
-            raise ValueError(
-                "native 3D Trace2CP sampler returned incompatible valid-mask shape: "
-                f"shape={sampled_valid_np.shape} expected={expected_shape}"
-            )
-        sampled = torch.as_tensor(sampled_np, dtype=torch.float32, device=self.device)
-        sampled_valid = torch.as_tensor(sampled_valid_np, dtype=torch.bool, device=self.device)
-        sampled = torch.where(sampled_valid, sampled, torch.zeros_like(sampled))
+        with self._measure("src_coords"):
+            coords_base, valid = self._block_coords_base_and_valid(origin_zyx)
+        with self._measure("src_read"):
+            result = sampler.sample_coord_batch(coords_base, valid)
+        with self._measure("src_validate"):
+            stats = dict(getattr(result, "stats", {}) or {})
+            error_chunks = int(stats.get("error_chunks", 0) or 0)
+            if error_chunks > 0:
+                raise ValueError(
+                    "native 3D Trace2CP block sampling encountered chunk errors; "
+                    f"stats={stats}"
+                )
+            if "requested_level_only" in stats and not bool(stats.get("requested_level_only")):
+                raise ValueError(
+                    "native 3D Trace2CP block sampling did not use requested-level-only mode; "
+                    f"stats={stats}"
+                )
+            fallback_levels = int(stats.get("fallback_levels", 0) or 0)
+            if fallback_levels != 0:
+                raise ValueError(
+                    "native 3D Trace2CP block sampling used scale fallback; "
+                    f"stats={stats}"
+                )
+            sampled_np = np.asarray(result.image, dtype=np.float32)
+            sampled_valid_np = np.asarray(result.valid_mask, dtype=bool) & valid
+            expected_shape = self.patch_shape_zyx
+            if sampled_np.shape != expected_shape:
+                raise ValueError(
+                    "native 3D Trace2CP sampler returned incompatible image shape: "
+                    f"shape={sampled_np.shape} expected={expected_shape}"
+                )
+            if sampled_valid_np.shape != expected_shape:
+                raise ValueError(
+                    "native 3D Trace2CP sampler returned incompatible valid-mask shape: "
+                    f"shape={sampled_valid_np.shape} expected={expected_shape}"
+                )
+        with self._measure("src_tensor"):
+            sampled = torch.as_tensor(sampled_np, dtype=torch.float32, device=self.device)
+            sampled_valid = torch.as_tensor(sampled_valid_np, dtype=torch.bool, device=self.device)
+            sampled = torch.where(sampled_valid, sampled, torch.zeros_like(sampled))
         return sampled, sampled_valid
 
     def _cached_output_slices(self) -> tuple[tuple[slice, slice, slice], np.ndarray]:
@@ -744,68 +911,80 @@ class NativeTraceFieldCache:
         key = tuple(int(v) for v in origin)
         block = self._blocks.get(key)
         if block is not None:
-            self._blocks.move_to_end(key)
+            with self._measure("inference_cache_hit"):
+                self._blocks.move_to_end(key)
             return block
         raw_t, valid = self._sample_block_volume(origin)
-        model_input = raw_t.view(1, 1, *self.patch_shape_zyx)
-        valid_input = valid.view(1, 1, *self.patch_shape_zyx)
-        model_input = self.prediction_adapter.preprocess_tile(model_input, valid_input)
-        model_output = self.prediction_adapter.run_tile_inference(
-            self.model,
-            model_input,
-            device=self.device,
-        )
-        products = self.prediction_adapter.product_tensors_from_output(model_output)
-        option_tensors = []
-        for product in self.prediction_adapter.output_products:
-            tensor = products.get(product.name)
-            if tensor is None:
-                raise ValueError(
-                    f"fiber 3D prediction adapter did not return product {product.name!r}"
-                )
-            if tensor.ndim != 5 or int(tensor.shape[0]) != 1 or int(tensor.shape[1]) != 7:
-                raise ValueError(
-                    "fiber 3D prediction adapter product tensors must have shape "
-                    f"1,7,D,H,W; got {tuple(int(v) for v in tensor.shape)}"
-                )
-            option_tensors.append(tensor[0])
-        output = torch.cat(option_tensors, dim=0).detach().to(
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-        ).contiguous()
-        valid_cpu = valid.detach().to(device=torch.device("cpu")).contiguous()
-        core_lo = origin + int(self.core_margin)
-        core_hi = origin + np.asarray(self.patch_shape_zyx, dtype=np.int64) - int(self.core_margin)
-        crop_slices, crop_lo = self._cached_output_slices()
-        output_crop = output[
-            :,
-            crop_slices[0],
-            crop_slices[1],
-            crop_slices[2],
-        ].contiguous()
-        valid_crop = valid_cpu[crop_slices[0], crop_slices[1], crop_slices[2]].contiguous()
-        cache_nbytes = int(output_crop.numel() * output_crop.element_size())
-        cache_nbytes += int(valid_crop.numel() * valid_crop.element_size())
-        block = _InferredBlock(
-            origin_zyx=origin.astype(np.int64),
-            sample_origin_zyx=(origin + crop_lo).astype(np.int64),
-            shape_zyx=tuple(int(v) for v in valid_crop.shape),
-            core_lo_zyx=core_lo.astype(np.float32),
-            core_hi_zyx=core_hi.astype(np.float32),
-            output_czyx=output_crop,
-            valid_mask_zyx=valid_crop,
-            cache_nbytes=cache_nbytes,
-        )
+        with self._measure("inference_preprocess", sync=True):
+            model_input = raw_t.view(1, 1, *self.patch_shape_zyx)
+            valid_input = valid.view(1, 1, *self.patch_shape_zyx)
+            model_input = self.prediction_adapter.preprocess_tile(model_input, valid_input)
+        with self._measure("inference_forward", sync=True):
+            model_output = self.prediction_adapter.run_tile_inference(
+                self.model,
+                model_input,
+                device=self.device,
+            )
+        with self._measure("inference_decode_cache", sync=True):
+            products = self.prediction_adapter.product_tensors_from_output(model_output)
+            option_tensors = []
+            for product in self.prediction_adapter.output_products:
+                tensor = products.get(product.name)
+                if tensor is None:
+                    raise ValueError(
+                        f"fiber 3D prediction adapter did not return product {product.name!r}"
+                    )
+                if tensor.ndim != 5 or int(tensor.shape[0]) != 1 or int(tensor.shape[1]) != 7:
+                    raise ValueError(
+                        "fiber 3D prediction adapter product tensors must have shape "
+                        f"1,7,D,H,W; got {tuple(int(v) for v in tensor.shape)}"
+                    )
+                option_tensors.append(tensor[0])
+            output = torch.cat(option_tensors, dim=0).detach().to(
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            ).contiguous()
+            valid_cpu = valid.detach().to(device=torch.device("cpu")).contiguous()
+            core_lo = origin + int(self.core_margin)
+            core_hi = (
+                origin
+                + np.asarray(self.patch_shape_zyx, dtype=np.int64)
+                - int(self.core_margin)
+            )
+            crop_slices, crop_lo = self._cached_output_slices()
+            output_crop = output[
+                :,
+                crop_slices[0],
+                crop_slices[1],
+                crop_slices[2],
+            ].contiguous()
+            valid_crop = valid_cpu[crop_slices[0], crop_slices[1], crop_slices[2]].contiguous()
+            cache_nbytes = int(output_crop.numel() * output_crop.element_size())
+            cache_nbytes += int(valid_crop.numel() * valid_crop.element_size())
+            block = _InferredBlock(
+                origin_zyx=origin.astype(np.int64),
+                sample_origin_zyx=(origin + crop_lo).astype(np.int64),
+                shape_zyx=tuple(int(v) for v in valid_crop.shape),
+                core_lo_zyx=core_lo.astype(np.float32),
+                core_hi_zyx=core_hi.astype(np.float32),
+                output_czyx=output_crop,
+                valid_mask_zyx=valid_crop,
+                cache_nbytes=cache_nbytes,
+            )
         self.total_inferred_blocks += 1
-        if self.max_cached_bytes is None or self.max_cached_bytes > 0:
-            self._blocks[key] = block
-            self._blocks.move_to_end(key)
-            self.resident_inferred_block_bytes += int(block.cache_nbytes)
-            if self.max_cached_bytes is not None:
-                while self._blocks and self.resident_inferred_block_bytes > self.max_cached_bytes:
-                    _evicted_key, evicted = self._blocks.popitem(last=False)
-                    self.resident_inferred_block_bytes -= int(evicted.cache_nbytes)
-                    self.evicted_inferred_blocks += 1
+        with self._measure("inference_cache_store"):
+            if self.max_cached_bytes is None or self.max_cached_bytes > 0:
+                self._blocks[key] = block
+                self._blocks.move_to_end(key)
+                self.resident_inferred_block_bytes += int(block.cache_nbytes)
+                if self.max_cached_bytes is not None:
+                    while (
+                        self._blocks
+                        and self.resident_inferred_block_bytes > self.max_cached_bytes
+                    ):
+                        _evicted_key, evicted = self._blocks.popitem(last=False)
+                        self.resident_inferred_block_bytes -= int(evicted.cache_nbytes)
+                        self.evicted_inferred_blocks += 1
         return block
 
     def block_for_point(self, point_zyx: np.ndarray) -> _InferredBlock:
@@ -902,58 +1081,61 @@ class NativeTraceFieldCache:
                 continue
             usable_indices = indices[usable]
             usable_points = points[usable_indices]
-            block_output = block.output_czyx.to(device=self.device, non_blocking=True)
-            sampled = _grid_sample_channels_at_points(
-                block_output,
-                usable_points,
-                origin_zyx=block.sample_origin_zyx,
-            )
-            sampled_branch_count = direction_branch_count_from_channels(int(sampled.shape[1]))
-            if branch_count is None:
-                branch_count = sampled_branch_count
-                directions = torch.zeros(
-                    (count, branch_count, 3),
+            with self._measure("field_sample_lookup"):
+                block_output = block.output_czyx.to(device=self.device, non_blocking=True)
+                sampled = _grid_sample_channels_at_points(
+                    block_output,
+                    usable_points,
+                    origin_zyx=block.sample_origin_zyx,
+                )
+                sampled_branch_count = direction_branch_count_from_channels(int(sampled.shape[1]))
+                if branch_count is None:
+                    branch_count = sampled_branch_count
+                    directions = torch.zeros(
+                        (count, branch_count, 3),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    presence = torch.zeros(
+                        (count, branch_count),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    valid = torch.zeros(
+                        (count, branch_count),
+                        dtype=torch.bool,
+                        device=self.device,
+                    )
+                elif sampled_branch_count != branch_count:
+                    raise ValueError(
+                        "native 3D Trace2CP sampled blocks disagree on branch count: "
+                        f"{sampled_branch_count} != {branch_count}"
+                    )
+                block_valid = block.valid_mask_zyx.to(
+                    device=self.device,
                     dtype=torch.float32,
-                    device=self.device,
+                    non_blocking=True,
                 )
-                presence = torch.zeros(
-                    (count, branch_count),
-                    dtype=torch.float32,
-                    device=self.device,
+                valid_values = _grid_sample_channels_at_points(
+                    block_valid.view(1, *block.shape_zyx),
+                    usable_points,
+                    origin_zyx=block.sample_origin_zyx,
+                )[:, 0]
+                axis_choices_zyx, group_presence, decoded_valid = (
+                    decode_grouped_direction_presence(sampled)
                 )
-                valid = torch.zeros(
-                    (count, branch_count),
-                    dtype=torch.bool,
-                    device=self.device,
+                group_valid = (
+                    (valid_values[:, None] > 0.5)
+                    & decoded_valid
                 )
-            elif sampled_branch_count != branch_count:
-                raise ValueError(
-                    "native 3D Trace2CP sampled blocks disagree on branch count: "
-                    f"{sampled_branch_count} != {branch_count}"
-                )
-            block_valid = block.valid_mask_zyx.to(
-                device=self.device,
-                dtype=torch.float32,
-                non_blocking=True,
-            )
-            valid_values = _grid_sample_channels_at_points(
-                block_valid.view(1, *block.shape_zyx),
-                usable_points,
-                origin_zyx=block.sample_origin_zyx,
-            )[:, 0]
-            axis_choices_zyx, group_presence, decoded_valid = decode_grouped_direction_presence(sampled)
-            group_valid = (
-                (valid_values[:, None] > 0.5)
-                & decoded_valid
-            )
-            valid_done += int(torch.count_nonzero(group_valid.any(dim=1)).detach().cpu())
-            index_t = torch.as_tensor(usable_indices, dtype=torch.long, device=self.device)
-            assert directions is not None
-            assert presence is not None
-            assert valid is not None
-            directions[index_t] = axis_choices_zyx
-            presence[index_t] = group_presence
-            valid[index_t] = group_valid
+                valid_done += int(torch.count_nonzero(group_valid.any(dim=1)).detach().cpu())
+                index_t = torch.as_tensor(usable_indices, dtype=torch.long, device=self.device)
+                assert directions is not None
+                assert presence is not None
+                assert valid is not None
+                directions[index_t] = axis_choices_zyx
+                presence[index_t] = group_presence
+                valid[index_t] = group_valid
             emit_progress(int(unique_index) + 1)
         emit_progress(int(unique_origins.shape[0]), force=True)
         if directions is None or presence is None or valid is None:
@@ -1061,6 +1243,7 @@ class _NativeLasagnaNormalSampler:
     geometry_loader: Any
     trace_record: Any
     normal_record: Any
+    profiler: _NativeTraceProfiler | None = None
 
     def __call__(
         self,
@@ -1083,18 +1266,24 @@ class _NativeLasagnaNormalSampler:
         spacing = float(getattr(self.trace_record, "volume_spacing_base", 1.0))
         if not math.isfinite(spacing) or spacing <= 0.0:
             raise ValueError(f"invalid volume_spacing_base for candidate normal sampling: {spacing!r}")
-        points_base = points_selected.astype(np.float64, copy=False) * float(spacing)
-        normals_xyz, valid, _invalid = self.geometry_loader._lasagna_normals_at_zyx_batch(
-            self.normal_record,
-            points_base,
-            line_indices=np.arange(count, dtype=np.int64),
+        span = (
+            self.profiler.measure("lasagna_normal_sample")
+            if self.profiler is not None
+            else _NullNativeTraceProfileSpan()
         )
-        normals_zyx = np.asarray(normals_xyz, dtype=np.float32)[:, [2, 1, 0]]
-        norms = np.linalg.norm(normals_zyx, axis=1)
-        ok = np.asarray(valid, dtype=bool) & np.isfinite(normals_zyx).all(axis=1)
-        ok &= np.isfinite(norms) & (norms > np.float32(_EPS))
-        normals_zyx[ok] /= norms[ok, None].astype(np.float32, copy=False)
-        normals_zyx[~ok] = 0.0
+        with span:
+            points_base = points_selected.astype(np.float64, copy=False) * float(spacing)
+            normals_xyz, valid, _invalid = self.geometry_loader._lasagna_normals_at_zyx_batch(
+                self.normal_record,
+                points_base,
+                line_indices=np.arange(count, dtype=np.int64),
+            )
+            normals_zyx = np.asarray(normals_xyz, dtype=np.float32)[:, [2, 1, 0]]
+            norms = np.linalg.norm(normals_zyx, axis=1)
+            ok = np.asarray(valid, dtype=bool) & np.isfinite(normals_zyx).all(axis=1)
+            ok &= np.isfinite(norms) & (norms > np.float32(_EPS))
+            normals_zyx[ok] /= norms[ok, None].astype(np.float32, copy=False)
+            normals_zyx[~ok] = 0.0
         return (
             torch.as_tensor(normals_zyx, dtype=torch.float32, device=device),
             torch.as_tensor(ok, dtype=torch.bool, device=device),
@@ -1157,6 +1346,21 @@ def _cache_device(cache: Any, fallback: torch.device | None = None) -> torch.dev
     if fallback is not None:
         return torch.device(fallback)
     return torch.device("cpu")
+
+
+def _profile_span_for_cache(
+    cache: Any,
+    name: str,
+    *,
+    sync: bool = False,
+) -> _NativeTraceProfileSpan | _NullNativeTraceProfileSpan:
+    profiler = getattr(cache, "profiler", None)
+    if profiler is None:
+        return _NullNativeTraceProfileSpan()
+    return profiler.measure(
+        name,
+        sync_device=_cache_device(cache) if bool(sync) else None,
+    )
 
 
 def _sample_point_choices_for_points_torch(
@@ -2250,11 +2454,12 @@ def _trace_native_3d_one_way_greedy(
         )
 
     emit_progress(start, 0)
-    initial_direction, _presence, valid = _sample_trace_start_direction_aligned(
-        cache,
-        start,
-        cp_reference_direction_zyx=initial_direction_zyx,
-    )
+    with _profile_span_for_cache(cache, "trace_start_sample"):
+        initial_direction, _presence, valid = _sample_trace_start_direction_aligned(
+            cache,
+            start,
+            cp_reference_direction_zyx=initial_direction_zyx,
+        )
     if not valid:
         raise ValueError(f"native 3D Trace2CP start point is invalid: {start.tolist()}")
     previous_direction = initial_direction.astype(np.float32, copy=False)
@@ -2266,11 +2471,12 @@ def _trace_native_3d_one_way_greedy(
         if _step_index == 0:
             current_direction = initial_direction.astype(np.float32, copy=False)
         else:
-            sampled_direction, _presence, valid = _sample_trace_point_aligned(
-                cache,
-                current,
-                reference_direction_zyx=previous_direction,
-            )
+            with _profile_span_for_cache(cache, "trace_current_sample"):
+                sampled_direction, _presence, valid = _sample_trace_point_aligned(
+                    cache,
+                    current,
+                    reference_direction_zyx=previous_direction,
+                )
             if not valid:
                 emit_progress(current, _step_index, reason="invalid_current_point")
                 return NativeTraceResult(
@@ -2280,38 +2486,41 @@ def _trace_native_3d_one_way_greedy(
                     steps=tuple(steps),
                 )
             current_direction = _align_axis(sampled_direction, previous_direction)
-        candidates_unit = _trace_candidate_directions(current_direction, cfg)
-        next_points = current[None, :] + candidates_unit * np.float32(cfg.step_voxels)
-        sampled_normals = _sample_candidate_normals_torch(
-            normal_sampler,
-            next_points,
-            device=_cache_device(cache),
-        )
+        with _profile_span_for_cache(cache, "trace_candidate_grid"):
+            candidates_unit = _trace_candidate_directions(current_direction, cfg)
+            next_points = current[None, :] + candidates_unit * np.float32(cfg.step_voxels)
+        with _profile_span_for_cache(cache, "trace_candidate_normals"):
+            sampled_normals = _sample_candidate_normals_torch(
+                normal_sampler,
+                next_points,
+                device=_cache_device(cache),
+            )
         candidate_normals = None if sampled_normals is None else sampled_normals[0]
         candidate_normals_valid = None if sampled_normals is None else sampled_normals[1]
-        best_index, _total, direction_loss, presence_loss, smoothness_loss, rejected = (
-            _score_candidate_batch(
-                cache,
-                current_direction=current_direction,
-                previous_step_direction=previous_direction,
-                candidate_directions=candidates_unit,
-                next_points=next_points,
-                current_point=current,
-                step_voxels=float(cfg.step_voxels),
-                candidate_substeps=int(cfg.candidate_substeps),
-                smoothness_weight=float(cfg.smoothness_weight),
-                smoothness_tangent_weight=cfg.smoothness_tangent_weight,
-                smoothness_normal_weight=cfg.smoothness_normal_weight,
-                smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
-                cumulative_smoothness_tangent_weight=float(
-                    cfg.cumulative_smoothness_tangent_weight
-                ),
-                all_pairs_direction_product=bool(cfg.all_pairs_direction_product),
-                candidate_normals=candidate_normals,
-                candidate_normals_valid=candidate_normals_valid,
-                history_direction=history_direction,
+        with _profile_span_for_cache(cache, "trace_candidate_score"):
+            best_index, _total, direction_loss, presence_loss, smoothness_loss, rejected = (
+                _score_candidate_batch(
+                    cache,
+                    current_direction=current_direction,
+                    previous_step_direction=previous_direction,
+                    candidate_directions=candidates_unit,
+                    next_points=next_points,
+                    current_point=current,
+                    step_voxels=float(cfg.step_voxels),
+                    candidate_substeps=int(cfg.candidate_substeps),
+                    smoothness_weight=float(cfg.smoothness_weight),
+                    smoothness_tangent_weight=cfg.smoothness_tangent_weight,
+                    smoothness_normal_weight=cfg.smoothness_normal_weight,
+                    smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
+                    cumulative_smoothness_tangent_weight=float(
+                        cfg.cumulative_smoothness_tangent_weight
+                    ),
+                    all_pairs_direction_product=bool(cfg.all_pairs_direction_product),
+                    candidate_normals=candidate_normals,
+                    candidate_normals_valid=candidate_normals_valid,
+                    history_direction=history_direction,
+                )
             )
-        )
         if best_index is None:
             emit_progress(current, _step_index, reason="all_candidates_invalid")
             return NativeTraceResult(
@@ -2605,11 +2814,12 @@ def _trace_native_3d_one_way_beam(
         )
 
     emit_progress(start, 0, active_beams=1)
-    initial_direction, _presence, valid = _sample_trace_start_direction_aligned(
-        cache,
-        start,
-        cp_reference_direction_zyx=initial_direction_zyx,
-    )
+    with _profile_span_for_cache(cache, "trace_start_sample"):
+        initial_direction, _presence, valid = _sample_trace_start_direction_aligned(
+            cache,
+            start,
+            cp_reference_direction_zyx=initial_direction_zyx,
+        )
     if not valid:
         raise ValueError(f"native 3D Trace2CP start point is invalid: {start.tolist()}")
     start_node = _NativeBeamNode(
@@ -2633,62 +2843,63 @@ def _trace_native_3d_one_way_beam(
         device=device,
     )
     while committed_step < step_limit:
-        root_points = torch.as_tensor(
-            np.stack([np.asarray(node.point_zyx, dtype=np.float32) for node in live], axis=0),
-            dtype=torch.float32,
-            device=device,
-        )
-        root_previous = torch.as_tensor(
-            np.stack(
-                [np.asarray(node.previous_direction_zyx, dtype=np.float32) for node in live],
-                axis=0,
-            ),
-            dtype=torch.float32,
-            device=device,
-        )
-        root_history = torch.as_tensor(
-            np.stack(
-                [np.asarray(node.history_direction_zyx, dtype=np.float32) for node in live],
-                axis=0,
-            ),
-            dtype=torch.float32,
-            device=device,
-        )
-        root_cumulative = torch.as_tensor(
-            [float(node.cumulative_loss) for node in live],
-            dtype=torch.float32,
-            device=device,
-        )
-        root_depth = torch.as_tensor(
-            [int(node.depth) for node in live],
-            dtype=torch.long,
-            device=device,
-        )
-        generations: list[_NativeBeamTensorGeneration] = [
-            _NativeBeamTensorGeneration(
-                points_zyx=root_points,
-                previous_directions_zyx=F.normalize(
-                    root_previous,
-                    p=2.0,
-                    dim=1,
-                    eps=float(_EPS),
-                ),
-                history_directions_zyx=F.normalize(
-                    root_history,
-                    p=2.0,
-                    dim=1,
-                    eps=float(_EPS),
-                ),
-                cumulative_loss=root_cumulative,
-                depth=root_depth,
-                parent_indices=None,
-                step_direction_loss=None,
-                step_presence_loss=None,
-                step_total_loss=None,
-                step_smoothness_loss=None,
-                step_rejected_candidates=None,
+        with _profile_span_for_cache(cache, "trace_beam_state"):
+            root_points = torch.as_tensor(
+                np.stack([np.asarray(node.point_zyx, dtype=np.float32) for node in live], axis=0),
+                dtype=torch.float32,
+                device=device,
             )
-        ]
+            root_previous = torch.as_tensor(
+                np.stack(
+                    [np.asarray(node.previous_direction_zyx, dtype=np.float32) for node in live],
+                    axis=0,
+                ),
+                dtype=torch.float32,
+                device=device,
+            )
+            root_history = torch.as_tensor(
+                np.stack(
+                    [np.asarray(node.history_direction_zyx, dtype=np.float32) for node in live],
+                    axis=0,
+                ),
+                dtype=torch.float32,
+                device=device,
+            )
+            root_cumulative = torch.as_tensor(
+                [float(node.cumulative_loss) for node in live],
+                dtype=torch.float32,
+                device=device,
+            )
+            root_depth = torch.as_tensor(
+                [int(node.depth) for node in live],
+                dtype=torch.long,
+                device=device,
+            )
+            generations: list[_NativeBeamTensorGeneration] = [
+                _NativeBeamTensorGeneration(
+                    points_zyx=root_points,
+                    previous_directions_zyx=F.normalize(
+                        root_previous,
+                        p=2.0,
+                        dim=1,
+                        eps=float(_EPS),
+                    ),
+                    history_directions_zyx=F.normalize(
+                        root_history,
+                        p=2.0,
+                        dim=1,
+                        eps=float(_EPS),
+                    ),
+                    cumulative_loss=root_cumulative,
+                    depth=root_depth,
+                    parent_indices=None,
+                    step_direction_loss=None,
+                    step_presence_loss=None,
+                    step_total_loss=None,
+                    step_smoothness_loss=None,
+                    step_rejected_candidates=None,
+                )
+            ]
         frontier_generation_index = 0
         reached_generation_index: int | None = None
         reached_state_index: int | None = None
@@ -2709,20 +2920,23 @@ def _trace_native_3d_one_way_beam(
                 dim=1,
                 eps=float(_EPS),
             )
-            current_directions, _current_presence, state_valid = _sample_trace_points_aligned_torch(
-                cache,
-                current_points,
-                reference_directions_zyx=previous_directions,
-            )
-            root_mask = frontier_gen.depth == 0
-            if bool(torch.any(root_mask).detach().cpu()):
-                current_directions = current_directions.clone()
-                state_valid = state_valid.clone()
-                current_directions[root_mask] = initial_direction_t.expand(
-                    int(current_directions.shape[0]),
-                    3,
-                )[root_mask]
-                state_valid[root_mask] = True
+            with _profile_span_for_cache(cache, "trace_current_sample"):
+                current_directions, _current_presence, state_valid = (
+                    _sample_trace_points_aligned_torch(
+                        cache,
+                        current_points,
+                        reference_directions_zyx=previous_directions,
+                    )
+                )
+                root_mask = frontier_gen.depth == 0
+                if bool(torch.any(root_mask).detach().cpu()):
+                    current_directions = current_directions.clone()
+                    state_valid = state_valid.clone()
+                    current_directions[root_mask] = initial_direction_t.expand(
+                        int(current_directions.shape[0]),
+                        3,
+                    )[root_mask]
+                    state_valid[root_mask] = True
             valid_state_indices = torch.nonzero(state_valid, as_tuple=False).flatten()
             if int(valid_state_indices.numel()) == 0:
                 break
@@ -2735,43 +2949,48 @@ def _trace_native_3d_one_way_beam(
                 dim=1,
                 eps=float(_EPS),
             )
-            candidate_dirs = _trace_candidate_directions_torch(current_directions_v, cfg)
-            next_points = current_points_v[:, None, :] + candidate_dirs * float(cfg.step_voxels)
-            sampled_normals = _sample_candidate_normals_torch(
-                normal_sampler,
-                next_points,
-                device=device,
-            )
+            with _profile_span_for_cache(cache, "trace_candidate_grid"):
+                candidate_dirs = _trace_candidate_directions_torch(current_directions_v, cfg)
+                next_points = (
+                    current_points_v[:, None, :] + candidate_dirs * float(cfg.step_voxels)
+                )
+            with _profile_span_for_cache(cache, "trace_candidate_normals"):
+                sampled_normals = _sample_candidate_normals_torch(
+                    normal_sampler,
+                    next_points,
+                    device=device,
+                )
             candidate_normals_t = None if sampled_normals is None else sampled_normals[0]
             candidate_normals_valid_t = None if sampled_normals is None else sampled_normals[1]
-            (
-                total_loss_t,
-                direction_loss_t,
-                presence_loss_t,
-                smoothness_loss_t,
-                candidate_valid_t,
-                rejected_per_state_t,
-            ) = _score_candidate_loss_tensors_batched(
-                cache,
-                current_directions=current_directions_v,
-                previous_step_directions=previous_directions_v,
-                candidate_directions=candidate_dirs,
-                next_points=next_points,
-                current_points=current_points_v,
-                step_voxels=float(cfg.step_voxels),
-                candidate_substeps=int(cfg.candidate_substeps),
-                smoothness_weight=float(cfg.smoothness_weight),
-                smoothness_tangent_weight=cfg.smoothness_tangent_weight,
-                smoothness_normal_weight=cfg.smoothness_normal_weight,
-                smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
-                cumulative_smoothness_tangent_weight=float(
-                    cfg.cumulative_smoothness_tangent_weight
-                ),
-                all_pairs_direction_product=bool(cfg.all_pairs_direction_product),
-                candidate_normals=candidate_normals_t,
-                candidate_normals_valid=candidate_normals_valid_t,
-                history_directions=history_directions_v,
-            )
+            with _profile_span_for_cache(cache, "trace_candidate_score"):
+                (
+                    total_loss_t,
+                    direction_loss_t,
+                    presence_loss_t,
+                    smoothness_loss_t,
+                    candidate_valid_t,
+                    rejected_per_state_t,
+                ) = _score_candidate_loss_tensors_batched(
+                    cache,
+                    current_directions=current_directions_v,
+                    previous_step_directions=previous_directions_v,
+                    candidate_directions=candidate_dirs,
+                    next_points=next_points,
+                    current_points=current_points_v,
+                    step_voxels=float(cfg.step_voxels),
+                    candidate_substeps=int(cfg.candidate_substeps),
+                    smoothness_weight=float(cfg.smoothness_weight),
+                    smoothness_tangent_weight=cfg.smoothness_tangent_weight,
+                    smoothness_normal_weight=cfg.smoothness_normal_weight,
+                    smoothness_free_angle_degrees=float(cfg.smoothness_free_angle_degrees),
+                    cumulative_smoothness_tangent_weight=float(
+                        cfg.cumulative_smoothness_tangent_weight
+                    ),
+                    all_pairs_direction_product=bool(cfg.all_pairs_direction_product),
+                    candidate_normals=candidate_normals_t,
+                    candidate_normals_valid=candidate_normals_valid_t,
+                    history_directions=history_directions_v,
+                )
             candidate_best_loss_t, candidate_best_branch_t = torch.min(total_loss_t, dim=2)
             candidate_valid_t = candidate_valid_t & torch.isfinite(candidate_best_loss_t)
             child_local_state, child_candidate = torch.nonzero(
@@ -2891,20 +3110,22 @@ def _trace_native_3d_one_way_beam(
                 reason="all_candidates_invalid",
             )
         frontier = generations[frontier_generation_index]
-        kept_indices = _prune_native_beam_tensor_indices(
-            frontier,
-            beam_width=beam_width,
-            prune_distance_voxels=float(cfg.beam_prune_distance_voxels),
-        )
-        live = [
-            _native_beam_tensor_node(
-                generations=generations,
-                root_nodes=live,
-                generation_index=frontier_generation_index,
-                state_index=int(index.detach().cpu()),
+        with _profile_span_for_cache(cache, "trace_beam_prune"):
+            kept_indices = _prune_native_beam_tensor_indices(
+                frontier,
+                beam_width=beam_width,
+                prune_distance_voxels=float(cfg.beam_prune_distance_voxels),
             )
-            for index in kept_indices
-        ]
+        with _profile_span_for_cache(cache, "trace_beam_rebuild"):
+            live = [
+                _native_beam_tensor_node(
+                    generations=generations,
+                    root_nodes=live,
+                    generation_index=frontier_generation_index,
+                    state_index=int(index.detach().cpu()),
+                )
+                for index in kept_indices
+            ]
         if not live:
             emit_progress(
                 best_live.point_zyx,
@@ -3307,32 +3528,43 @@ def trace_native_3d_pair(
     cfg: NativeTrace2CpConfig,
     progress: bool = False,
     normal_sampler: NativeTraceNormalSampler | None = None,
+    profiler: _NativeTraceProfiler | None = None,
 ) -> NativeTracePairResult:
-    forward = trace_native_3d_one_way(
-        cache,
-        start_zyx=start_zyx,
-        target_zyx=target_zyx,
-        initial_direction_zyx=forward_initial_direction_zyx,
-        cfg=cfg,
-        progress_label="fw" if progress else None,
-        normal_sampler=normal_sampler,
-    )
-    reverse = trace_native_3d_one_way(
-        cache,
-        start_zyx=target_zyx,
-        target_zyx=start_zyx,
-        initial_direction_zyx=reverse_initial_direction_zyx,
-        cfg=cfg,
-        progress_label="bw" if progress else None,
-        normal_sampler=normal_sampler,
-    )
-    fusion = fuse_forward_reverse_traces(
-        forward.trace_zyx,
-        reverse.trace_zyx,
-        start_zyx=start_zyx,
-        target_zyx=target_zyx,
-        step_voxels=float(cfg.step_voxels),
-    )
+    measure = profiler.measure if profiler is not None else None
+    with (
+        measure("trace_forward") if measure is not None else _NullNativeTraceProfileSpan()
+    ):
+        forward = trace_native_3d_one_way(
+            cache,
+            start_zyx=start_zyx,
+            target_zyx=target_zyx,
+            initial_direction_zyx=forward_initial_direction_zyx,
+            cfg=cfg,
+            progress_label="fw" if progress else None,
+            normal_sampler=normal_sampler,
+        )
+    with (
+        measure("trace_reverse") if measure is not None else _NullNativeTraceProfileSpan()
+    ):
+        reverse = trace_native_3d_one_way(
+            cache,
+            start_zyx=target_zyx,
+            target_zyx=start_zyx,
+            initial_direction_zyx=reverse_initial_direction_zyx,
+            cfg=cfg,
+            progress_label="bw" if progress else None,
+            normal_sampler=normal_sampler,
+        )
+    with (
+        measure("trace_fusion") if measure is not None else _NullNativeTraceProfileSpan()
+    ):
+        fusion = fuse_forward_reverse_traces(
+            forward.trace_zyx,
+            reverse.trace_zyx,
+            start_zyx=start_zyx,
+            target_zyx=target_zyx,
+            step_voxels=float(cfg.step_voxels),
+        )
     span = float(np.linalg.norm(np.asarray(target_zyx, dtype=np.float32) - np.asarray(start_zyx, dtype=np.float32)))
     normal = _unit(np.asarray(target_zyx, dtype=np.float32) - np.asarray(start_zyx, dtype=np.float32))
     forward_plane = abs(_plane_distance(forward.trace_zyx[-1], target_zyx, normal))
@@ -3459,6 +3691,7 @@ def trace_native_3d_whole_fiber(
     segment_callback: Callable[[NativeWholeFiberSegmentResult, NativeWholeFiberResult | None], None] | None = None,
     trace_segment_fn: Callable[..., NativeTraceResult] | None = None,
     normal_sampler: NativeTraceNormalSampler | None = None,
+    profiler: _NativeTraceProfiler | None = None,
 ) -> NativeWholeFiberResult:
     cp_points = _record_control_points_selected_zyx(record)
     cp_count = int(cp_points.shape[0])
@@ -3545,17 +3778,22 @@ def trace_native_3d_whole_fiber(
         segment_span = float(np.linalg.norm(target_point - reference_start))
         if segment_span <= _EPS:
             raise ValueError(f"degenerate native whole-fiber CP span {start_cp}->{target_cp}")
-        result = tracer(
-            cache,
-            start_zyx=current_point.astype(np.float32),
-            target_zyx=target_point,
-            initial_direction_zyx=current_direction,
-            cfg=cfg,
-            target_plane_normal_zyx=segment_axis,
-            budget_span_voxels=segment_span,
-            progress_label=None,
-            normal_sampler=normal_sampler,
-        )
+        with (
+            profiler.measure("trace_segment")
+            if profiler is not None
+            else _NullNativeTraceProfileSpan()
+        ):
+            result = tracer(
+                cache,
+                start_zyx=current_point.astype(np.float32),
+                target_zyx=target_point,
+                initial_direction_zyx=current_direction,
+                cfg=cfg,
+                target_plane_normal_zyx=segment_axis,
+                budget_span_voxels=segment_span,
+                progress_label=None,
+                normal_sampler=normal_sampler,
+            )
         crossing = result.trace_zyx[-1].astype(np.float32)
         in_plane_error = (
             _target_plane_in_plane_error_voxels(
@@ -3628,7 +3866,12 @@ def trace_native_3d_whole_fiber(
             inferred_blocks=inferred_block_count(),
         )
         if segment_callback is not None:
-            segment_callback(segment, partial)
+            with (
+                profiler.measure("render_segment_callback")
+                if profiler is not None
+                else _NullNativeTraceProfileSpan()
+            ):
+                segment_callback(segment, partial)
         emit_progress(segment_index + 1, segment)
     stitched = (
         np.concatenate([part for part in stitched_parts if part.size], axis=0).astype(np.float32)
@@ -5189,6 +5432,7 @@ def run_native_trace2cp(
     device = _device_from_training(training)
     prediction_adapter = FiberTrace3DPredictAdapter(raw_config, checkpoint=checkpoint)
     model = prediction_adapter.load_model(device=device)
+    profiler = _NativeTraceProfiler()
     cache = NativeTraceFieldCache(
         record=record,
         prediction_adapter=prediction_adapter,
@@ -5197,11 +5441,13 @@ def run_native_trace2cp(
         core_margin_voxels=cfg.core_margin_voxels,
         device=device,
         max_cached_bytes=_cache_bytes_from_gib(float(cfg.max_cached_inference_gib)),
+        profiler=profiler,
     )
     normal_sampler = _NativeLasagnaNormalSampler(
         geometry_loader=geometry_loader,
         trace_record=record,
         normal_record=_native_trace_geometry_normal_record(geometry_loader, record),
+        profiler=profiler,
     )
     cfg = _native_trace_cfg_with_effective_smoothness(cfg, normal_sampler=normal_sampler)
     print(
@@ -5300,6 +5546,7 @@ def run_native_trace2cp(
             f"threshold_voxels={float(cfg.whole_fiber_error_threshold_voxels):.3f}",
             flush=True,
         )
+        profiler.restart_total()
         trace_wall_start = time.perf_counter()
         trace_cpu_start = time.process_time()
         whole = trace_native_3d_whole_fiber(
@@ -5310,9 +5557,11 @@ def run_native_trace2cp(
             progress=True,
             segment_callback=on_segment if render_visualization else None,
             normal_sampler=normal_sampler,
+            profiler=profiler,
         )
         trace_wall_seconds = float(time.perf_counter() - trace_wall_start)
         trace_cpu_seconds = float(time.process_time() - trace_cpu_start)
+        profiler.finish_total()
         summary = {
             "mode": "whole_fiber",
             "fiber_path": "" if record.fiber.path is None else str(record.fiber.path),
@@ -5356,6 +5605,7 @@ def run_native_trace2cp(
             ),
             "trace_wall_seconds": trace_wall_seconds,
             "trace_cpu_seconds": trace_cpu_seconds,
+            "trace_profile": profiler.summary(),
             "export": str(image_path) if render_visualization else None,
             "visualization_enabled": bool(render_visualization),
             "segments": [
@@ -5398,6 +5648,7 @@ def run_native_trace2cp(
             f"trace_cpu_s={trace_cpu_seconds:.3f}",
             flush=True,
         )
+        profiler.print_table()
         print(
             "native_trace2cp_3d whole_fiber "
             f"blocks={len(cache._blocks)} inferred={cache.total_inferred_blocks} "
@@ -5417,6 +5668,7 @@ def run_native_trace2cp(
         or reverse_initial_direction is None
     ):
         raise RuntimeError("native 3D Trace2CP single-pair selection was not initialized")
+    profiler.restart_total()
     trace_wall_start = time.perf_counter()
     trace_cpu_start = time.process_time()
     result = trace_native_3d_pair(
@@ -5428,6 +5680,7 @@ def run_native_trace2cp(
         cfg=cfg,
         progress=True,
         normal_sampler=normal_sampler,
+        profiler=profiler,
     )
     trace_wall_seconds = float(time.perf_counter() - trace_wall_start)
     trace_cpu_seconds = float(time.process_time() - trace_cpu_start)
@@ -5450,37 +5703,39 @@ def run_native_trace2cp(
                 sample_mode=selection.sample_mode,
             )
 
-        max_source = build_source()
-        max_side_overlays = _trace_overlays_for_view(
-            max_source,
-            result,
-            axis_name="offset_axis_xyz",
-        )
-        max_top_overlays = _trace_overlays_for_view(
-            max_source,
-            result,
-            axis_name="side_axis_xyz",
-        )
-        adaptive_height = _adaptive_trace2cp_cross_strip_height(
-            int(max_source.source_shape_hw[0]),
-            (max_side_overlays, max_top_overlays),
-        )
-        source = (
-            max_source
-            if int(adaptive_height) == int(max_source.source_shape_hw[0])
-            else build_source(cross_strip_height_px=int(adaptive_height))
-        )
-        visualization_cross_strip_height_px = int(source.source_shape_hw[0])
-        visualization_max_cross_strip_height_px = int(max_source.source_shape_hw[0])
-        sheet = _make_native_trace_visualization(
-            geometry_loader,
-            source,
-            result,
-            cache=cache,
-            image_normalization=loader_config.image_normalization,
-            partial_output_path=image_path,
-        )
-        sheet.convert("RGB").save(image_path, quality=95)
+        with profiler.measure("single_visualization"):
+            max_source = build_source()
+            max_side_overlays = _trace_overlays_for_view(
+                max_source,
+                result,
+                axis_name="offset_axis_xyz",
+            )
+            max_top_overlays = _trace_overlays_for_view(
+                max_source,
+                result,
+                axis_name="side_axis_xyz",
+            )
+            adaptive_height = _adaptive_trace2cp_cross_strip_height(
+                int(max_source.source_shape_hw[0]),
+                (max_side_overlays, max_top_overlays),
+            )
+            source = (
+                max_source
+                if int(adaptive_height) == int(max_source.source_shape_hw[0])
+                else build_source(cross_strip_height_px=int(adaptive_height))
+            )
+            visualization_cross_strip_height_px = int(source.source_shape_hw[0])
+            visualization_max_cross_strip_height_px = int(max_source.source_shape_hw[0])
+            sheet = _make_native_trace_visualization(
+                geometry_loader,
+                source,
+                result,
+                cache=cache,
+                image_normalization=loader_config.image_normalization,
+                partial_output_path=image_path,
+            )
+            sheet.convert("RGB").save(image_path, quality=95)
+    profiler.finish_total()
     summary = {
         "sample_index": int(selection.sample_index),
         "fiber_path": "" if record.fiber.path is None else str(record.fiber.path),
@@ -5538,6 +5793,7 @@ def run_native_trace2cp(
         ),
         "trace_wall_seconds": trace_wall_seconds,
         "trace_cpu_seconds": trace_cpu_seconds,
+        "trace_profile": profiler.summary(),
         "export": str(image_path) if render_visualization else None,
     }
     summary_path = out_dir / "trace2cp_native_3d_summary.json"
@@ -5560,6 +5816,7 @@ def run_native_trace2cp(
         f"trace_cpu_s={trace_cpu_seconds:.3f}",
         flush=True,
     )
+    profiler.print_table()
     print(
         "native_trace2cp_3d "
         f"sample_index={selection.sample_index} start_cp={selection.start_cp_index} "
