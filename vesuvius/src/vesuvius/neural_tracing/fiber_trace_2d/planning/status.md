@@ -1,24 +1,25 @@
-# Status: Truly Rolling Shared 3D Tiled Inference
+# Status: Fiber Scale-2 Output, Sparse Accumulator Activity, and 64³ Chunks
 
-- [x] Read local workflow, specs, overarching plan, and code-structure docs.
-- [x] Diagnose full-Z mmap reservation and full-XY flush allocations.
-- [x] Inventory independent Lasagna and Fiber inference paths.
-- [x] Discard the rejected RAM-budget/macroblock/re-inference design.
-- [x] Draft fixed-depth circular mmap and single-runner plan.
-- [x] Preserve the detailed Lasagna/Fiber divergence audit.
-- [x] Include spec, docs, tests, changelog, and task-log work.
-- [x] Independent review of the replacement plan.
-- [x] Incorporate review findings on ring sizing, weight/resume semantics, crop
-  storage, chunked clearing, portable lifecycle, and remaining divergences.
-- [x] Correct weight design to one geometric weight ring per scale with
-  cross-product liveness tracking.
-- [x] User approval of the replacement plan.
-- [x] Add behavior-characterization and circular-layout regression tests.
-- [x] Implement circular mmap planner/store and chunked flush.
-- [x] Consolidate Lasagna and Fiber onto one runner.
-- [x] Remove legacy runner, fake rolling mmap, and caller-owned flush loops.
-- [ ] Validate byte compatibility, resume/crop behavior, scratch sizing, and RSS.
-  Unit-level ring and one-pass multi-scale tests pass; Zarr-backed tests are
-  blocked in this environment by `zarr.open` hanging before inference, and a
-  representative GPU volume run remains outstanding.
-- [x] Update specs, code-structure docs, changelog, status, and task log.
+- [x] Read the local workflow and current shared inference specifications.
+- [x] Inspect current Fiber scale semantics and Lasagna/Fiber OME chunk defaults.
+- [x] Diagnose unconditional untouched-region mmap clearing and flush-time
+  support rescans.
+- [x] Draft implementation, spec, docs, tests, measurement, changelog, and
+  task-log plan.
+- [x] Independent review against task, specs, overarching plan, and code.
+- [x] Correct the initial conflation of `--inference-scaledown-power` with
+  tracer/model config `scaledown`.
+- [x] Incorporate review findings on direct-footprint boundary semantics,
+  exact scale validation, dirty-product state, ring reuse, store limitations,
+  progress deduplication, and interruption cleanup.
+- [x] User approved using the historical Lasagna weighted-pyrdown and border
+  behavior unchanged for Fiber inference.
+- [x] Obtain approval to begin the complete implementation plan.
+- [x] Implement Fiber inference-scaledown-power default and factor conversion.
+- [x] Implement lazy support/activity tracking and dirty-only flush/release.
+- [x] Change Lasagna/Fiber OME chunk defaults to 64³.
+- [x] Add shared progress/flush observability.
+- [ ] Run unit, integration, sparse-allocation, resume, crop, and representative
+  performance validation.
+- [x] Run focused shared-runner and circular reuse regressions.
+- [x] Update specs, docs, changelog, status, and task log after implementation.

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import json
 from pathlib import Path
 import time
@@ -77,8 +76,28 @@ def _tile_size_from_config(config: dict[str, Any], explicit_tile_size: int | Non
 
 
 def _level_from_scaledown(scaledown: int) -> int:
-    sd = max(1, int(scaledown))
-    return round(math.log2(sd)) if sd > 1 else 0
+    sd = int(scaledown)
+    if sd <= 0 or sd & (sd - 1):
+        raise ValueError(f"scaledown must be an exact positive power of two, got {sd}")
+    return sd.bit_length() - 1
+
+
+def _input_scaledown_from_base(
+    base_shape_zyx: tuple[int, int, int], input_shape_zyx: tuple[int, int, int]
+) -> int:
+    """Find one isotropic pyramid factor, accepting ceil-divided edge shapes."""
+    matches = [
+        1 << power
+        for power in range(31)
+        if all((int(base) + (1 << power) - 1) // (1 << power) == int(actual)
+               for base, actual in zip(base_shape_zyx, input_shape_zyx))
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "input shape is not one unambiguous isotropic power-of-two pyramid "
+            f"level of base shape: base={base_shape_zyx}, input={input_shape_zyx}"
+        )
+    return matches[0]
 
 
 def _resolve_inference_device(device: str | None) -> torch.device:
@@ -191,12 +210,12 @@ def run_fiber_trace_3d_inference(
     tile_size: int | None = None,
     overlap: int = 16,
     border: int = 16,
-    scaledown: int = 1,
+    inference_scaledown_power: int = 2,
     base_ref: str | None = None,
     base_scale: int | None = None,
     no_download: bool = False,
     levels: int = 5,
-    ome_chunk: int = 32,
+    ome_chunk: int = 64,
     pyramid_workers: int = 0,
     recurrent_steps: int | None = None,
 ) -> None:
@@ -226,8 +245,11 @@ def run_fiber_trace_3d_inference(
             "cannot determine base_shape_zyx. Pass --base-ref or use an input "
             "inside an OME-Zarr group with level 0 metadata."
         )
-    input_sd = max(1, round(int(base_shape_zyx[0]) / int(input_shape[0])))
-    output_sd_input = max(1, int(scaledown))
+    input_sd = _input_scaledown_from_base(base_shape_zyx, input_shape)
+    power = int(inference_scaledown_power)
+    if power < 0 or power > 30:
+        raise ValueError(f"inference_scaledown_power must be in [0, 30], got {power}")
+    output_sd_input = 1 << power
     effective_output_sd = input_sd * output_sd_input
     output_level = _level_from_scaledown(effective_output_sd)
     n_levels = max(int(levels), output_level + 2)
@@ -288,7 +310,8 @@ def run_fiber_trace_3d_inference(
     print(
         f"[fiber_trace_3d:infer] crop_zyx=({z0},{z1},{y0},{y1},{x0},{x1}) "
         f"output_region_zyx=({oz0},{oy0},{ox0},{oz1},{oy1},{ox1}) "
-        f"scaledown={output_sd_input} effective_sd={effective_output_sd} "
+        f"inference_scaledown_power={power} inference_factor={output_sd_input} "
+        f"effective_base_factor={effective_output_sd} "
         f"level={output_level} products={len(predict_adapter.output_products)} "
         f"device={torch_device}",
         flush=True,
@@ -365,7 +388,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tile-size", type=int, default=None, help="Inference tile cube size.")
     parser.add_argument("--overlap", type=int, default=16, help="Tile overlap in input voxels.")
     parser.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
-    parser.add_argument("--scaledown", type=int, default=1, help="Output downsample factor relative to input.")
+    parser.add_argument(
+        "--inference-scaledown-power", type=int, default=2,
+        help="Power-of-two output reduction relative to input (2 means factor 4).",
+    )
     parser.add_argument(
         "--crop",
         "--crop-xyzwhd",
@@ -399,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         default=5,
         help="Number of OME-Zarr levels to create.",
     )
-    parser.add_argument("--ome-chunk", type=int, default=32, help="Output OME-Zarr chunk size.")
+    parser.add_argument("--ome-chunk", type=int, default=64, help="Output OME-Zarr chunk size.")
     parser.add_argument(
         "--pyramid-workers",
         type=int,
@@ -424,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
         tile_size=args.tile_size,
         overlap=int(args.overlap),
         border=int(args.border),
-        scaledown=int(args.scaledown),
+        inference_scaledown_power=int(args.inference_scaledown_power),
         base_ref=args.base_ref,
         base_scale=args.base_scale,
         no_download=bool(args.no_download),

@@ -98,9 +98,12 @@ loading.
   fixed-depth circular product accumulation, output-chunk-only resume, temp cleanup, and
   atomic chunk writes.
 - Common tiled arguments are `--input`, `--output`, `--checkpoint`,
-  `--tile-size`, `--overlap`, `--border`, `--scaledown`, `--crop`,
+  `--tile-size`, `--overlap`, `--border`, `--inference-scaledown-power`, `--crop`,
   `--device`, `--no-download`, `--levels`, `--ome-chunk`, and
   `--pyramid-workers`.
+- Fiber defaults to `--inference-scaledown-power 2`: filtered factor-4 output,
+  or 0.25x per axis relative to the selected input. Power 0 keeps full input
+  resolution. This is independent of the tracer/model config's `scaledown`.
 
 ### Shared 3D tiled runner
 
@@ -122,15 +125,29 @@ scale relative to the selected input array, while `scaledown` remains the
 base-relative manifest scale.
 
 Each distinct inference scale has separate raw-product float32 mmap rings and
-one shared geometric weight ring. A logical Z plane maps to
+one shared geometric weight ring. Fiber and Lasagna use the same repeated
+separable `[1,4,6,4,1]/16` blur plus 2x decimation for both weighted
+predictions and weights. Predictions are weighted before filtering and then
+normalized by the filtered denominator, so power 2 is not stride-4 sampling.
+The tile `border` is zeroed before filtering; filtering may extend positive
+denominator support from retained core voxels into that border, but discarded
+border predictions never contribute.
+
+A logical Z plane maps to
 `physical_z = logical_z % ring_depth`; generation checks prevent an unflushed
 plane from being overwritten. Ring depth is planned from actual canonical tile
 positions and chunk-aligned flush frontiers, so backing size is
 `(raw_channels + 1) * ring_depth * working_y * working_x * 4` bytes and does
-not depend on full volume depth. Flushes visit Zarr chunks in Z/Y/X order,
+not depend on full volume depth. Candidate output chunks are lazily checked
+against their direct local Zarr-v2 input footprint. Unsupported chunks stay
+absent in output and scratch. Flushes visit only contribution-dirty chunks,
 normalize with chunk-sized denominator scratch, atomically write coherent
-channel bundles, clear that chunk region, and only then release its logical Z
-generation. Wrapped reads copy at most one output chunk.
+channel bundles, clear only dirty regions, and only then release their logical
+Z generations. Progress reports dirty/written/unsupported/resumed chunks and
+actual scratch bytes touched and cleared.
+
+Fiber and Lasagna OME-Zarr outputs default to 64x64x64 chunks;
+`--ome-chunk` remains an override.
 
 Lasagna's optional `pred_dt` is an external-source stage after neural
 inference. It is independently resumable and never schedules model tiles.

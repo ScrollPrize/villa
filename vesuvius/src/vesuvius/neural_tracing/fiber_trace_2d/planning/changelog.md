@@ -1,5 +1,8 @@
 # 2026-07-28
 
+- Defaulted Fiber whole-volume output to filtered 0.25x inference, changed
+  Fiber and Lasagna OME chunks to 64 cubed, and made the shared circular
+  runner touch, flush, and clear only supported contribution-dirty chunks.
 - Native 3D Trace2CP inference blocks now use a shared VC3D-backed
   requested-level axis-aligned block-read API and batch missing block forwards,
   avoiding dense coordinate-grid sampling for regular inference cubes.

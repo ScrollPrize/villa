@@ -1,20 +1,19 @@
-# Task: Truly Rolling Shared 3D Tiled Inference
+# Task: Fiber Scale-2 Output, Sparse Accumulator Activity, and 64³ Chunks
 
-Replace the current full-Z-stack sparse mmap accumulator with a genuinely
-rolling, fixed-depth circular mmap accumulator. Its backing storage must scale
-with the active Z window, Y/X dimensions, and channel count, but never with the
-full output Z depth. The operating system should manage mmap page residency;
-the application must not impose an artificial RAM budget.
+Plan changes to shared Lasagna/Fiber 3D tiled inference so that:
 
-Flush completed regions to output one small Zarr-aligned chunk at a time so
-normalization and product finalization never allocate a full-XY slab or a
-full-band multichannel temporary. Reuse circular slots only after their data
-has been finalized and written. Infer every globally anchored model tile once;
-do not partition the volume in a way that repeats model inference.
+- Fiber whole-volume inference defaults `--inference-scaledown-power` to 2,
+  meaning a source-relative factor of `2**2 == 4` and therefore `0.25x` output
+  in each spatial dimension. Downscaling includes the matching low-pass blur,
+  not direct stride-4 subsampling. The separate tracer/model-config
+  `scaledown` setting is out of scope and must remain unchanged.
+- The circular accumulator touches, normalizes, clears, and writes only output
+  chunks that actually receive supported model contributions. Masked or absent
+  outer volume regions must remain sparse: no output Zarr chunk and no scratch
+  mmap page should be created merely because a flush frontier crossed them.
+- Lasagna predict3d and Fiber inference default to cubic OME-Zarr chunks of
+  `64x64x64`, while retaining explicit CLI/API overrides.
 
-There must be one shared tiled-inference implementation for Lasagna and Fiber.
-The callers may provide model/product adapters and narrowly scoped derived
-output behavior, but must not independently implement tile traversal,
-blending, scaling, accumulation, resume scheduling, flushing, or progress.
-Audit and consolidate all current behavioral divergences while preserving the
-documented output, scale, crop, resume, atomic-write, and numerical semantics.
+Keep the single shared tiled runner and preserve global lattice, crop, resume,
+atomic-write, numerical, manifest-scale, and one-model-call-per-tile semantics.
+This task is planning-only until implementation is explicitly requested.

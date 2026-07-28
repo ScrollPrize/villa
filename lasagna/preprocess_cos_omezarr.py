@@ -771,7 +771,7 @@ def _compute_pred_dt_slab(
 	scaledown: int,
 	overlap: int = 48,
 	edt_chunk: int = 448,
-	ome_chunk: int = 32,
+	ome_chunk: int = 64,
 	n_levels: int = 0,
 	progress: dict | None = None,
 	read_workers: int = 0,
@@ -1556,7 +1556,7 @@ def run_preprocess_3d(
 	base_ref: str | None = None,
 	base_scale: int | None = None,
 	n_levels: int = 5,
-	ome_chunk: int = 32,
+	ome_chunk: int = 64,
 ) -> None:
 	"""Run 3D UNet inference and write .lasagna.json with OME-Zarr pyramids.
 
@@ -2694,8 +2694,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			 "needed chunks before inference.")
 	p.add_argument("--levels", type=int, default=5,
 		help="Number of OME-Zarr pyramid levels to generate (default 5).")
-	p.add_argument("--ome-chunk", type=int, default=32,
-		help="Chunk size for OME-Zarr output levels (default 128).")
+	p.add_argument("--ome-chunk", type=int, default=64,
+		help="Chunk size for OME-Zarr output levels (default 64).")
 	args = p.parse_args(argv)
 
 	if not args.no_download:

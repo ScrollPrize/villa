@@ -1,407 +1,387 @@
-# Plan: Truly Rolling Shared 3D Tiled Inference
+# Plan: Fiber Scale-2 Output, Sparse Accumulator Activity, and 64³ Chunks
 
-## Current failures
+## Current behavior and terminology
 
-`_RollingZBand` currently creates a sparse file and `np.memmap` shaped as
-`(full_output_z, full_output_y, full_output_x)` for every raw channel and weight
-array. Advancing `origin_z` and punching old pages does not make this a rolling
-mapping: the complete Z stack remains mapped and logically reserved. In the
-reported Fiber run, seven raw channels plus weights produce roughly 37.5 TiB
-of logical mappings.
+- The requested control is Fiber whole-volume inference's
+  `--inference-scaledown-power`, not the separate `scaledown` stored in the
+  tracer/model config. The config value is unrelated and must not be renamed,
+  reinterpreted, defaulted, or migrated by this task.
+- `--inference-scaledown-power=2` means factor `2**2 == 4`, or `0.25x` linear
+  output resolution relative to the selected inference input array. The shared
+  runner needs that literal factor for tensor pyrdown and ring geometry, so
+  convert power to factor at the Fiber whole-volume inference boundary; do not
+  store an exponent in `OutputProductSpec.inference_scaledown`.
+- Lasagna currently uses literal factors (`cos_scaledown=2`,
+  `scaledown=4`). Preserve those meanings. Only its OME chunk default changes.
+- Fiber and Lasagna CLI/function defaults are currently `ome_chunk=32` even
+  though one adapter constructor happens to default to 64. The caller-provided
+  value wins, so defaults must be made consistent at every public boundary.
+- The shared flush currently revisits every chunk in a completed full-XY Z
+  range. It separately guesses support with `_chunk_supported`, then clears
+  raw and weight mmap regions unconditionally. This writes zeros into untouched
+  sparse mmap pages and is the observed first-flush stall.
 
-Flushing is separately unbounded. It exposes a completed Z band across the
-entire XY plane, creates a weight-sized `np.maximum` temporary, and stacks all
-raw channels before finalization. For the reported geometry, this reaches tens
-to hundreds of GiB and is where interruption showed the process stuck.
+## 1. Default Fiber `--inference-scaledown-power` to 2
 
-The code is also not genuinely shared:
+Define the whole-volume inference control as a non-negative power:
 
-- Fiber calls `_infer_tiled_products_3d`.
-- Lasagna calls `_infer_tiled_3d` and owns a separate `_on_z_complete` flush
-  implementation in `preprocess_cos_omezarr.py`.
+```text
+inference_scaledown_power = 2                  # default
+inference_factor = 1 << inference_scaledown_power  # 4
+effective_base_factor = input_base_factor * inference_factor
+```
 
-They reuse helpers and types, but duplicate the inference engine.
+Use the factor for crop/output geometry, `_pyrdown3d`,
+`OutputProductSpec.inference_scaledown`, and base-relative manifest metadata.
+Use the effective base factor to derive the OME level and array shapes. Log
+both unambiguously, for example `inference_scaledown_power=2 inference_factor=4
+effective_base_factor=16`.
 
-## Target architecture
+The numerical downscale operation is the shared Lasagna `_pyrdown3d` pyramid
+operation, not direct `::4` sampling or interpolation. Power 2 performs two
+successive separable 5-tap low-pass blur plus 2x decimation stages, preserving
+the existing kernel, reflect-padding, sampling phase, float32 operation order,
+and prediction-times-blend-before-pyrdown behavior for both raw products and
+their geometric weights. Fiber and Lasagna must call the same implementation.
+This is characterization of the pre-unification Lasagna implementation as
+well: it already used the same `[1,4,6,4,1]/16` separable kernel and operation
+order, so this task must reuse it rather than introduce a new blur policy.
+Fiber inference must call this exact shared path with no Fiber-local filter,
+border crop, resampling, or weight construction. Given identical prediction
+tensors, tile geometry, scale factor, and crop phase, Lasagna and Fiber must
+produce identical downscaled weighted accumulations and denominators.
 
-### 1. One authoritative tiled runner
+Preserve the historical tile-border semantics and document their interaction
+with pyramid filtering precisely. `border` first zeroes the blend weight on
+every face of the full-resolution model tile, so predictions made inside that
+raw border never enter the numerator. The configured `overlap` is total
+input-tile overlap, and before filtering the nominal blend-ramp width remaining
+after both neighboring zeroed borders is:
 
-Make one runner in `lasagna.tiled_predict3d` authoritative for both Lasagna
-and Fiber. After compatibility tests pass, delete `_infer_tiled_3d`, the
-current `_RollingZBand`, and Lasagna's caller-owned neural flush loop. Do not
-retain a fallback engine.
+```text
+nominal_blend_width = max(0, overlap - 2 * border)
+```
 
-The shared runner owns:
+For downscaled outputs, however, that is not the final support. The runner
+multiplies prediction by the full-resolution weight, then filters both the
+weighted numerator and weight denominator with `_pyrdown3d`. One pyramid step
+has radius 2 in input voxels. Power `p` has effective input-space radius
+`2 * (2**p - 1)`; power 2 therefore has radius 6 and a 13-voxel effective
+kernel. Positive denominator support can extend by up to six input voxels into
+the nominally zero border. The raw border predictions remain excluded, but
+downscaled samples in that fringe are reconstructed from retained core
+predictions and normalized by the identically filtered weight.
 
-- global tile and output-chunk lattices;
-- crop-to-global coordinate mapping and edge padding;
-- tile traversal, input reads, dtype conversion, and missing-input handling;
-- blend weights and source-relative per-product downsampling;
-- output completeness and resume scheduling;
-- circular accumulation, readiness, chunked normalization/finalization,
-  atomic writes, slot reuse, cleanup, and interruption behavior;
-- shared progress and timing.
+Consequently, do not claim that `overlap < 2*border` necessarily creates an
+uncovered downscaled gap, and do not derive coverage from nominal widths alone.
+Validate the actual filtered weight lattice and sampling phase. For
+`border=32`, `overlap=96`, the pre-filter nominal blend width is 32 and the
+filtered transition is wider/smoother. For `border=32`, `overlap=64`, the
+pre-filter cores merely meet, but the factor-4 Gaussian still spreads weight
+across their boundary. This historical behavior must remain unchanged unless
+a separate future task requests a strict post-filter output border.
 
-Model adapters own model construction/loading, tile preprocessing,
-autocast/inference policy, raw-output splitting, activation semantics, and
-raw-to-persisted product conversion. Output adapters own coherent product
-completeness, metadata, and atomic channel writes. Pyramid creation remains a
-shared post-inference operation.
+At physical volume edges, read-side reflect padding places real edge voxels
+after the padded border so they retain core coverage. `_pyrdown3d` also uses
+reflect padding at the tile tensor edge, but with a border wider than the
+filter radius that reflected area is already zero-weight. Do not crop a
+separately scaled border by integer division.
 
-Lasagna's `pred_dt` is not a neural model product and is not derived from
-`cos`: it is generated from the separate user-supplied `--pred-dt` prediction
-Zarr. Keep it as an independently resumable external-source stage that cannot
-schedule neural inference when neural products are already complete.
+Keep an explicit `--inference-scaledown-power 0` full-resolution override.
+Reject negative powers and impractically large shifts before geometry
+allocation. Use the same explicit name in the Python API. Do not read or alter
+the tracer/model config's `scaledown`, and do not change Lasagna's
+factor-valued arguments.
 
-### 2. Fixed-depth circular mmap accumulator
+Validate divisibility requirements after conversion. With a factor of 4,
+Fiber tile size, stride, and border must satisfy the shared runner's alignment
+rules; error messages should name both the power and derived factor.
 
-Implement circular mmap accumulators grouped by distinct source-relative
-product scale. Each scale group contains:
+Validate the selected input's scale from all three axes, allowing the normal
+ceil-divided pyramid edge shapes. Require the effective base factor to be an
+exact isotropic power of two before assigning an OME level; do not use a
+Z-only rounded ratio or rounded `log2` to manufacture metadata.
 
-- separate raw float32 sum planes for every product/channel at that scale;
-- one shared float32 weight-sum ring determined solely by tile geometry,
-  blend support, input availability, and scale—not product resume masks;
-- a fixed number of physical Z slots;
-- the global logical Z represented by each slot or generation metadata;
-- a logical origin and completed/flushed frontier.
+## 2. Track actual accumulator activity lazily
 
-The mmap shape is `(channels, ring_depth, working_output_y, working_output_x)`, never
-`(channels, full_output_z, output_y, output_x)`. The kernel manages resident
-pages and writeback of this fixed backing file. There is no application-level
-RAM ceiling and no full-volume sparse reservation.
+Replace flush-time full-grid support discovery with an activity ledger built
+while scheduling and accumulating real work.
 
-The Y/X extent is the padded crop/output working extent with explicit global
-output offsets, not automatically the full-volume XY extent. Tiles and output
-chunks remain globally anchored so a crop and full run still produce identical
-bytes for a shared complete global chunk.
+For each source-relative scale and output chunk origin, track:
 
-Determine `ring_depth` from the actual canonical Z positions and actual
-nonzero support of each scale's downsampled blend weight. Evaluate the frontier
-after each complete Y/X tile row and include output-chunk-aligned flush lag.
-Capacity is the maximum span between the oldest not-yet-flushable logical plane
-and the greatest write end reached before the next flush opportunity. Do not
-approximate this using nominal tile size/overlap alone. Preserve the legacy
-common tile lattice alignment across the complete scale set (or prove nested
-factors explicitly); do not silently change max-scale alignment to a different
-per-scale/LCM lattice. Assert before every write that it cannot overwrite
-unflushed data.
+- whether its exact mapped source/output footprint is supported by locally
+  present input Zarr chunks;
+- which incomplete products still need it;
+- whether raw sums and the shared geometric weight actually received a
+  contribution in the current logical generation.
 
-When the inference frontier proves that no future tile can contribute to a
-logical Z range:
+Compute/cache source support lazily when a model tile intersects an incomplete
+output chunk. Do not pre-scan the complete volume. The support test must use
+the exact source-space footprint represented by that output chunk, clipped to
+the input/crop, rather than asking whether some much larger overlapping model
+tile contains any input somewhere. This prevents a central scroll chunk from
+making unrelated masked edge chunks appear supported. Preserve missing-chunk
+semantics; do not read/decompress every input voxel merely to predict sparsity.
 
-1. round the flush frontier down to complete output Zarr chunks, except for the
-   final clipped edge;
-2. visit output chunks in canonical Z/Y/X order;
-3. take only that chunk's views from the circular raw sums and weights,
-   splitting at the ring wrap when necessary;
-4. normalize with an in-place divide or reusable chunk-sized scratch—never a
-   full-XY `np.maximum` result;
-5. finalize only that chunk's raw channels into persisted channels;
-6. atomically write the coherent product chunk;
-7. clear each product's raw storage after that product chunk is finalized;
-8. clear shared weight storage only after every incomplete product using that
-   chunk region has been finalized or skipped, then reassign the physical Z
-   generation after every XY region for those planes has been cleared.
+This direct-footprint rule is an intentional sparse-output contract change at
+masked boundaries: an output chunk with no stored input in its own footprint
+remains absent even if a neighboring stored chunk lies inside the model or
+pyrdown filter halo and could numerically influence it. Specify the global
+output-to-selected-input coordinate phase exactly for every power, crop, and
+odd edge. The support footprint intentionally excludes model and Gaussian
+filter halos. Compatibility claims apply only to chunks supported under both
+the old and new policies; tests must compare output chunk-key sets as well as
+bytes.
 
-Where a wrapped chunk has two physical pieces, copy only that output chunk
-into a chunk-sized contiguous scratch buffer. No scratch allocation may scale
-with full XY, full output Z, or an entire multichannel Z band.
+The initial implementation may detect sparsity from absent local Zarr-v2 chunk
+keys (`.` or `/` dimension separators). A physically stored all-zero chunk is
+still considered present; do not claim value-mask discovery. Document and
+fail clearly for unsupported stores/layouts rather than silently treating them
+as empty.
 
-Use a reusable chunk-sized denominator scratch implementing exactly
-`maximum(weight, 1e-7)`, including weights strictly between zero and epsilon.
-Do not normalize or clear shared weight storage still needed by another
-product. Slot clearing must likewise remain chunked; never zero a complete XY
-plane in one operation.
+Only schedule a model tile if at least one incomplete, supported output chunk
+needs it. Run that tile once, then:
 
-Scratch is disposable and should not be flushed or fsynced during normal reuse
-or cleanup. Do not depend on Linux hole punching for correctness. Close mmap
-objects explicitly before unlinking and keep the lifecycle POSIX-portable for
-Ubuntu and macOS.
+- add raw values only to its supported, incomplete product chunks;
+- add the shared weight once over the union of those product regions;
+- mark a chunk dirty only when a nonzero blend-weight region was actually
+  added;
+- make no mmap write for unsupported or already-complete chunks.
 
-Every globally anchored model tile is inferred at most once per run. There are
-no macroblocks, no boundary re-inference, and no unbounded prediction cache.
+The dirty/activity ledger, not a second `_chunk_supported` scan during flush,
+is authoritative. Represent each `(scale, logical generation, chunk origin)`
+with one `weight_dirty` state and a set of `dirty_products`. This keeps resumed
+products independent while adding geometric weight once over their union. The
+generation key prevents circular slot reuse from confusing old and new chunks.
 
-### 3. Multiple product scales
+## 3. Flush, release, and resume sparse regions correctly
 
-The current `OutputProductSpec.scaledown` is effective scale relative to the
-base volume, while tile pyrdown needs scale relative to the selected input
-array. Represent the source-relative inference scale explicitly in the runner
-or product plan; do not accidentally apply the base-relative value to a `/1`
-or `/2` input. Validate the relationship with `input_sd` exactly and preserve
-manifest levels/base-relative scale.
+At each chunk-aligned Z frontier, iterate the active/dirty chunks for that
+frontier rather than the full XY chunk grid.
 
-Create one circular accumulator group and one shared weight ring per distinct
-source-relative scale. Products at that scale retain separate raw rings but
-share the geometrically defined denominator.
-Lasagna therefore uses a fine `cos` ring and a coarser `grad_mag/nx/ny` ring;
-Fiber normally uses one full-resolution-relative ring per option. Each ring has
-its own depth and flush frontier, while all products share the same single-pass
-tile traversal and model result.
+For a dirty chunk:
 
-Cache blend weights once per distinct scale. Preserve the existing operation
-order: multiply model predictions by the full-resolution blend weight, then
-apply `_pyrdown3d`, then accumulate float32 values in canonical tile order.
+1. confirm at least one incomplete product remains;
+2. read the chunk-sized shared weight and verify it contains positive support;
+3. normalize/finalize/write only products that received raw contributions;
+4. atomically write the coherent channel bundle;
+5. clear only the raw and weight regions that were dirtied;
+6. remove its activity record and release its generation.
 
-### 4. Resume and readiness
+For an unsupported, untouched, resumed-complete, or zero-weight chunk:
 
-Resume state remains durable output chunks only. Circular mmap files are
-disposable scratch and must be cleaned on normal completion or interruption;
-they are never treated as completion markers.
+- do not read accumulator storage;
+- do not normalize or finalize;
+- do not create output Zarr chunk files;
+- do not assign zero into mmap storage;
+- advance/release frontier bookkeeping without materializing sparse pages.
 
-Plan neural work per product and scale. A tile may still be needed for one
-product while every affected output chunk of another product is complete. Run
-the model once when any neural product needs the tile, but allocate/update only
-the exact incomplete chunks of each product. Mixed complete/incomplete chunks
-within a single tile must produce the same raw sums and weights as a clean run.
+New scratch files start logically zero. A physical circular region that was
+previously dirty must be cleared after its last consumer and before reuse;
+untouched regions need no clearing. Retain generation assertions so a dirty
+region can never be overwritten. Shared weights remain live until all dirty
+product consumers for that chunk complete.
 
-Accumulate the scale's shared weight once over the union of incomplete output
-regions at that scale. Weight scheduling is product-independent: every
-incomplete product chunk must receive denominator contributions from every
-input-supported global tile intersecting it, regardless of which product made
-the model tile necessary. Existing chunks do not receive raw accumulation and
-are not rewritten. Track per-region product liveness/reference counts so the
-shared weight region remains valid until the last incomplete consumer has been
-finalized or skipped.
+Prove safe reuse at XY-chunk granularity even though the ring currently tracks
+whole-Z-plane generations: every previously dirty rectangle must be cleared
+before reassignment, while disjoint untouched rectangles remain unmaterialized.
 
-Follow the spec-authoritative coherent-product rule: if any required sibling
-chunk is missing, the product chunk is incomplete and its complete sibling
-bundle is rewritten through atomic temporary paths. Missing only `pred_dt`
-schedules only external-source EDT work.
+Resume remains output-chunk-only. Existing coherent product chunks suppress
+new raw/weight contributions and are never rewritten. Partially present
+sibling bundles remain incomplete and are coherently regenerated. Empty
+regions have no output chunk and are rediscovered as unsupported on a later
+run; absence is not confused with a durable completion marker.
 
-Missing input tiles advance every relevant scale frontier without accumulator
-writes. Unsupported output chunks are finalized-as-skipped and their slot
-regions cleared. Readiness and reuse account for processed and deliberately
-skipped tiles so no product or generation can stall.
+## 4. Default Lasagna and Fiber OME chunks to 64³
 
-## Lasagna/Fiber divergence audit
+Set `ome_chunk=64` consistently in:
 
-Before consolidation, characterize both existing paths and assign every
-difference either to the shared runner or to a documented adapter hook.
+- Fiber inference CLI and Python entry point;
+- Fiber adapter construction defaults;
+- Lasagna `predict3d` CLI and `run_preprocess_3d` entry point;
+- shared group/pyramid creation call sites whose default is user-visible;
+- examples and tests that assert defaults.
 
-### Mechanics that must become identical shared code
+Keep `--ome-chunk` as an override. Do not alter unrelated 2D preprocessing
+chunk flags (`--chunk-z`, `--chunk-yx`, EDT work chunks) unless they directly
+represent these output OME-Zarr chunks.
 
-- canonical tile-position generation and global crop anchoring;
-- padded input reads and absent-input-chunk checks;
-- tile traversal order and output support calculation;
-- blend-ramp construction and scaled weight generation;
-- tile/output clipping and scale validation;
-- product completeness scheduling and skip decisions;
-- accumulation order, one geometric weight ring per scale, and product-liveness
-  tracking for weight normalization;
-- circular Z readiness, chunk flush ordering, and scratch reuse;
-- atomic output writes, interruption cleanup, and output-only resume;
-- progress counters, ETA calculation, and TTY/non-TTY rendering;
-- common pyramid and metadata orchestration where product policy permits.
+Because chunk size changes output storage layout and flush alignment, verify
+metadata, crop rounding, final edge chunks, resume checks, pyramid invalidation,
+and ring-depth planning at 64. Persisted voxel values must remain unchanged;
+only Fiber's requested default output scale and both pipelines' default chunk
+layout change.
 
-Neither CLI may retain its own tile loop, accumulator loop, or flush loop.
+## 5. Shared ownership and observability
 
-### Differences that belong in explicit adapters/specification
+Implement activity tracking, support mapping, dirty accumulation, sparse flush,
+clearing, resume, and counters once in
+`lasagna.tiled_predict3d.run_tiled_inference_3d`. Neither Fiber nor Lasagna may
+grow a private accumulator or flush loop.
 
-- Lasagna model/checkpoint construction versus Fiber model/config/snapshot
-  construction;
-- Lasagna activation policy (`sigmoid` or clamp) versus Fiber's trained output
-  semantics;
-- Lasagna's existing bfloat16/autocast behavior versus Fiber's configured
-  mixed-precision context;
-- Fiber per-tile image normalization and validity handling;
-- raw output shape/dictionary extraction and product/channel splitting;
-- Lasagna fine `cos` and coarse seven-channel normal product versus Fiber's
-  seven raw channels per option;
-- Lasagna `cos`, scaled `grad_mag`, and compact normal encoding versus Fiber
-  presence rounding and compact normal encoding;
-- multi-option Fiber completeness and channel naming;
-- per-product pyramid policy and manifest channel schema;
-- external `pred_dt_zarr` coordinate conversion, halo/chunk alignment, and
-  CPU/GPU EDT implementation.
+Extend the common progress output with:
 
-Remove the currently unused/misleading adapter methods that pretend sharing
-while the caller still owns accumulation. Keep adapter hooks narrow and named
-after semantic operations, not generic escape hatches.
+- inferred and skipped model tiles;
+- dirty/active chunks;
+- chunks written, resume-skipped, and unsupported-skipped;
+- dirty bytes touched/cleared versus logical ring backing size;
+- per-flush chunk progress and elapsed time.
 
-### Behavior that must be explicitly reconciled
-
-- `uint16` input conversion and any product-specific normalization;
-- first-tile diagnostics and NaN reporting;
-- partial sibling handling: use the coherent rewrite required by specs rather
-  than Lasagna's current missing-channel-only shortcut;
-- shared-weight liveness across different product/option resume masks;
-- independent readiness of products at different scales;
-- crop edge chunks and byte identity between full-volume and crop runs;
-- source-relative inference scale versus base-relative manifest scale;
-- pyramid timing and failure/resume behavior;
-- temporary path naming/removal and delayed Ctrl-C inside native NumPy work.
-- duplicate Lasagna `_download_one_path`/`_auto_download` logic versus the
-  shared download helpers, including independent auto-download of `pred_dt`;
-- Fiber-local crop expansion, output alignment, and base-scale resolution
-  versus Lasagna geometry setup;
-- model lifecycle: Lasagna `gpu_pause_context`, optional InstanceNorm
-  calibration, and CUDA cleanup versus Fiber lifecycle;
-- `torch.inference_mode`/`no_grad` ownership and scope;
-- validity masks, reflect padding, missing-chunk values, and normalization;
-- CLI/device/tile/default policy versus engine mechanics;
-- stale temporary cleanup and prefix policy;
-- `source_to_base`, grad-magnitude factor, and manifest metadata;
-- pyramid workers and pyramid failure/resume behavior.
-
-Keep GPU pause and InstanceNorm calibration as explicit Lasagna orchestration
-or semantic hooks; consolidation must not silently drop them. Keep `pred_dt`
-outside neural product lists/work scheduling, including its separate source
-download.
-
-## Progress and observability
-
-Use one shared progress reporter for both CLIs. Report:
-
-- stages: model load, planning, tiled inference, chunk flush/write, external
-  derived products, and pyramids;
-- tiles processed/skipped and ETA;
-- chunks finalized/written/skipped;
-- logical Z inference frontier and per-scale flushed frontier;
-- ring depth, backing-file size, current logical Z window, and wrap count;
-- tile inference time separately from flush/finalization time.
-
-Use carriage-return refresh only for a real TTY. For redirected/captured output,
-emit time-throttled newline records. Emit a durable line before and after a
-potentially long flush. Chunk-sized NumPy operations keep interrupt latency
-bounded; check for interruption between chunks and always clean scratch files.
+Skipped tiles and sparse flushes must update progress. A long flush must never
+sit indefinitely at only `flush z=[...]` without chunk counters.
+Count unsupported chunks uniquely per scale/generation; distinguish absent
+input, all-output-complete, and no-supported-target tile skips so ETA and
+diagnostics are meaningful.
 
 ## Implementation sequence
 
-1. Add characterization tests for both existing inference engines: lattices,
-   blend values, scale conversion, operation order, crop identity, resume,
-   missing input, output bytes, progress, and adapter-specific semantics.
-   Record a before/after call-graph and symbol-ownership table covering every
-   divergence above.
-2. Add a pure circular-layout planner that computes per-scale ring depth,
-   logical-to-physical Z mapping, safe flush frontiers, wrap splits, and backing
-   sizes without allocating a volume.
-3. Implement and test the fixed-depth circular mmap store, generation safety,
-   chunk views/copies across wrap, clearing, cleanup, and interruption.
-4. Refactor `_infer_tiled_products_3d` into the sole shared runner, adding
-   source-relative per-product scales and chunk-by-chunk finalization.
-5. Move all Lasagna model/product semantics into
-   `LasagnaCosPredict3DAdapter`; implement external `pred_dt` as an independent
-   resumable stage; route `predict3d` through the shared runner.
-6. Route Fiber through the same runner using only its semantic adapters.
-7. Delete `_infer_tiled_3d`, the old `_RollingZBand`, Lasagna's
-   `_on_z_complete`, duplicated imports/helpers, and fake accumulation adapter
-   methods. Test that both CLIs call the same exported runner and that the
-   legacy runner symbol is absent.
-8. Run byte-compatibility, resume, interruption, backing-size, memory-residency,
-   and representative throughput tests. Update specs/docs/changelog/task log.
+1. Characterize the current whole-volume inference scale behavior, separately
+   assert that tracer/model config `scaledown` is untouched, and characterize
+   current 32³ defaults.
+2. Wire/test `--inference-scaledown-power`, convert it to a literal runner
+   factor, and make power 2 the default.
+3. Add a pure, cached output-chunk-to-source-support mapper with crop/edge and
+   sparse-input fixtures.
+4. Add per-scale, per-generation activity/dirty records and route tile
+   scheduling plus accumulation through them.
+5. Replace full-XY flush iteration and `_chunk_supported` rescans with active
+   chunk iteration; clear only dirty regions and release untouched generations
+   without mmap writes.
+6. Change Lasagna and Fiber OME defaults to 64 at all public boundaries.
+7. Add shared progress counters/timing for sparse scheduling and flushes.
+8. Run compatibility, sparse-file allocation, resume, crop, wrap, and
+   representative-volume measurements, including exception/KeyboardInterrupt
+   cleanup; then update specs/docs/changelog/status and the task log.
 
 ## Testing and acceptance criteria
 
-### Circular accumulator tests
+### Scale and chunk defaults
 
-- Compare circular accumulation and chunked finalization to a small dense
-  reference across tile sizes, overlaps, borders, chunk sizes, scales, edges,
-  crops, and multiple wraps.
-- Prove with synthetic huge-Z planning tests that mmap shape/backing size is
-  independent of full output Z.
-- Assert a logical interval cannot overwrite unflushed slots and stale slot
-  generations cannot be read.
-- Test chunks wholly inside the ring, chunks split across wrap, final clipped
-  chunks, zero-weight regions, missing-input tiles, and interruption cleanup.
-- Assert temporary normalization/finalization memory is bounded by one output
-  chunk's raw and persisted channels, not full XY or the whole ring band.
-- Inspect the created scratch files: their logical size must match the computed
-  fixed ring, never the full output stack.
-- Compare raw sums, shared per-scale weights, normalized values, and final bytes
-  through several wraps, including zero and `0 < weight < 1e-7` cases.
-- Test crop-local Y/X allocation and global offset mapping explicitly.
-- Test explicit close/unlink lifecycle on Ubuntu and macOS-compatible paths;
-  correctness must not require hole punching, `flush`, or `fsync`.
+- Fiber default `--inference-scaledown-power=2` produces source-relative factor
+  4, shapes equal to ceil-divide-by-4, and correct effective base
+  scale/OME level/manifest.
+- Fiber power overrides 0, 1, and 3 produce factors 1, 2, and 8.
+- Power 2 output and blend weights exactly match two successive shared
+  blur-plus-decimate stages and differ from naive stride-4 subsampling on a
+  high-frequency fixture.
+- Impulse/ramp fixtures verify the 5-tap kernel, reflect edge behavior, global
+  sampling phase, and identical raw-product/weight downscale geometry.
+- A cross-adapter fixture feeds identical synthetic predictions through
+  Lasagna and Fiber adapters and asserts identical weighted numerators,
+  denominators, border support, and normalized values from the shared runner.
+- Border fixtures verify zero raw-prediction contribution from tile faces,
+  physical-edge reflect padding, nominal
+  `blend_width=overlap-2*border`, effective Gaussian support radius 2/6/14 for
+  powers 1/2/3, and denominator coverage at the exact sampling phase for
+  `border=32` with total overlaps 64 and 96.
+- Changing inference output power does not read, mutate, or reinterpret the
+  separate tracer/model config `scaledown` value.
+- Odd ceil-divided pyramid edges validate correctly; anisotropic or
+  non-power-of-two input/base relationships fail before output creation.
+- Lasagna factor-valued `cos_scaledown`/`scaledown` behavior is unchanged.
+- Both inference CLIs and Python entry points default to `ome_chunk=64`; an
+  explicit value such as 32 still works.
+- Created `.zarray` metadata uses `(64,64,64)` chunks at the prediction level,
+  including clipped array edges, and pyramids/resume use the same geometry.
 
-### Shared-runner and compatibility tests
+### Sparse activity and output
 
-- Assert Lasagna and Fiber entry points resolve and call the same runner;
-  assert `_infer_tiled_3d` no longer exists.
-- Count model calls and prove each scheduled global tile is inferred once,
-  including tiles contributing to multiple products/scales.
-- Preserve exact weight-before-pyrdown and float32 accumulation order.
-- Characterize and test sigmoid/clamp, autocast, normalization, output splitting,
-  first-tile diagnostics, and NaN behavior.
-- Compare exact persisted bytes and metadata against the old implementation on
-  small fixtures for Lasagna dual-scale output and Fiber single/multi-option
-  output.
-- Compare a crop run with the corresponding chunks from a full-volume run.
-- Test complete chunks, incomplete sibling bundles, missing input, restart
-  after interruption, and independently missing external `pred_dt`.
-- Test that a product complete at one scale is not accumulated merely because
-  another scale still needs the model tile.
-- Test mixed complete/incomplete chunks and different option masks inside one
-  tile, with a shared per-scale weight ring and clean-run byte equivalence.
-- Verify each geometric weight contribution is added once per scale—not once
-  per product—and that a weight region is retained until its final incomplete
-  product consumer finishes.
-- Verify atomic output integrity and scratch cleanup after interruption during
-  inference, ring flush, finalization, EDT, and pyramid creation.
+- A synthetic central island of input chunks surrounded by absent chunks
+  creates output chunks only for supported regions.
+- A model tile overlapping supported and unsupported output chunks updates
+  only the supported chunk records and mmap regions.
+- Boundary fixtures prove the intentional direct-footprint policy when a
+  neighboring present chunk lies inside the model/filter halo of an absent
+  output footprint; compare both chunk keys and supported-chunk bytes.
+- Support mapping covers powers 0/1/2/3, nonzero crops, odd edges, global
+  sampling phase, border padding, and both Zarr-v2 dimension separators.
+- Stored all-zero chunks count as present while absent chunk keys count as
+  unsupported; unsupported store types fail clearly.
+- Fully skipped Z/Y/X areas cause zero accumulator writes, zero clearing, and
+  zero output writes while frontiers continue advancing.
+- Spy/instrument mmap assignments and prove untouched regions are never
+  assigned zero during flush/release.
+- Dirty chunks are cleared exactly once after their final product consumer;
+  wrapped generations cannot observe stale values.
+- Disjoint and overlapping XY chunks across two logical generations sharing
+  physical Z slots show no stale leakage; inspect physical allocation through
+  `st_blocks`, not only logical `st_size`.
+- Zero blend-weight intersections remain absent even if bookkeeping considered
+  the chunk; positive weights below `1e-7` retain existing normalization
+  semantics.
+- Resume with complete, incomplete-sibling, unsupported, and mixed-product
+  chunks remains byte-identical to a clean run for every written chunk.
+- Model call counts prove one inference per needed global tile and no calls for
+  tiles serving only unsupported or complete output chunks.
+- Exceptions and KeyboardInterrupt remove disposable scratch files through
+  `finally`; no scratch state is required for resume.
 
-### Representative run measurements
+### Representative validation
 
-For the reported Fiber geometry/config, record:
+On the reported masked Fiber volume, record the exact command, input scale,
+crop, tile/overlap/border, output level/factor, and 64³ chunking. Report:
 
-- computed ring depth and per-ring backing-file size;
-- process virtual size, observational RSS, and scratch-file logical/allocated
-  sizes over time;
-- first-tile and steady tile throughput;
-- flush time per chunk and total flush overhead;
-- wrap count and progress beyond the first Z row.
+- old versus new scheduled/inferred/skipped tiles;
+- logical ring size versus physically allocated scratch bytes;
+- dirty versus unsupported output chunk counts;
+- first-flush and steady flush duration;
+- total wall time and peak RSS;
+- output chunk count and total output bytes.
 
-Acceptance requires no full-output-Z mmap, no full-XY or full-band flush
-temporary, one inference per scheduled tile, bounded interrupt latency at chunk
-boundaries, and the same persisted bytes as the characterized behavior.
-RSS is reported for diagnosis but is not a deterministic pass/fail threshold.
+Use two correctness references: the new default must match an explicit power-2
+run, and supported chunks must match old explicit factor-4 inference. Record
+chunk-key sets separately because deliberately omitted masked-boundary chunks
+are not byte-compatible with the old support policy.
+
+Acceptance requires output at 0.25x by default, no output chunks for unsupported
+regions, no mmap writes/clears for untouched regions, bounded visible flush
+progress, and unchanged bytes for supported chunks relative to an equivalent
+explicit-scale reference run.
 
 ## Spec update
 
-Update `planning/specs.md` to replace the inaccurate "rolling z-band" language
-with normative fixed-depth circular mmap behavior:
+Update `planning/specs.md` to specify:
 
-- backing shape and logical reservation are independent of full output Z;
-- ring depth derives from live tile support and output-chunk alignment;
-- the kernel manages mmap residency; no application RAM budget is imposed;
-- completed data is finalized one output chunk at a time before slot reuse;
-- products at one source-relative scale share one geometrically accumulated
-  weight ring; resume masks affect raw products and weight-region liveness, not
-  the denominator definition;
-- scratch temporaries cannot scale with full XY/full Z/full channel bands;
-- each model tile is inferred at most once;
-- both CLIs use one runner with explicit source-relative inference scales and
-  base-relative output scales;
-- output-only resume, coherent sibling rewriting, crop byte identity, progress,
-  interruption, and external `pred_dt` requirements remain normative.
+- Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2;
+  the shared runner's `inference_scaledown` remains a literal source-relative
+  factor, and tracer/model config `scaledown` remains separate and unchanged.
+- Inference downscaling uses repeated shared 5-tap low-pass-blur plus 2x
+  decimation stages; direct striding or independent Fiber filtering is not
+  allowed.
+- Lasagna's existing scaledown arguments remain literal factors.
+- Lasagna predict3d and Fiber inference default to 64³ OME-Zarr chunks.
+- accumulator/output activity is contribution-driven and lazy;
+- unsupported/untouched chunks produce neither output files nor scratch mmap
+  writes, including zero-clearing;
+- only dirty regions are normalized, finalized, cleared, and released;
+- progress includes active/written/unsupported/resume-skipped chunks and flush
+  timing.
 
-Preserve all existing model/output compatibility requirements.
+Remove the current statement that unsupported output chunks have their slot
+regions cleared; untouched regions must instead be released without touching
+their mmap pages.
 
-## Documentation updates
+## Docs updates
 
-Update `docs/code_structure.md` with the sole-runner call graph, circular mmap
-layout, logical/physical Z mapping, safe slot lifecycle, per-scale rings,
-chunked wrap-aware flush, adapter boundaries, external `pred_dt`, progress, and
-cleanup. Include a small data-flow diagram and backing-size example. Remove all
-claims that the old full-Z mapping was rolling or that Lasagna/Fiber already
-shared the complete engine.
+Update `docs/code_structure.md` with:
 
-## Changelog and task records
+- the Fiber inference-power-to-factor-to-effective-base-scale mapping;
+- the repeated blur-plus-decimate kernel, phase, padding, and why power 2 is
+  filtered 0.25x output rather than direct stride-4 sampling;
+- examples for default power 2 and explicit full-resolution power 0;
+- an explicit warning that tracer/model config `scaledown` is a separate
+  setting;
+- the lazy source-support cache and per-generation dirty chunk ledger;
+- dirty-only flush/release lifecycle and why sparse mmap pages remain sparse;
+- the 64³ defaults and override behavior;
+- new progress fields and interpretation.
 
-When implemented, add a dated `planning/changelog.md` entry. Replace
-`planning/task_log.md` with decisions, deviations, commands, test results,
-byte comparisons, ring/backing measurements, RSS observations, and throughput.
-Keep `planning/status.md` current.
+Update Fiber/Lasagna user-facing inference examples or README sections that
+need `--inference-scaledown-power` or still describe 32³ default chunks.
 
-## Risks and non-goals
+## Changelog and task log
 
-- The fixed ring can still have a large backing file because it spans full XY
-  for the live Z window and all raw channels. This is intentional: storage is
-  Z-bounded and mmap lets the kernel manage residency. Report its computed size
-  before inference.
-- Chunk-at-a-time flushing adds indexing and write overhead. Measure it, reuse
-  chunk-sized buffers, and optimize only without changing accumulation order.
-- OS/filesystem behavior for sparse allocation, page eviction, hole punching,
-  and mmap cleanup differs. Correctness must use portable mmap/close/unlink
-  behavior on Ubuntu and macOS; Linux-specific page advice may be an optional
-  optimization but normal reuse must not require flush/fsync/hole punching.
-- This task does not alter models, checkpoints, output resolution, prediction
-  precision, normalization, or numerical semantics.
+After implementation, add a changelog entry covering Fiber's new default scale,
+64³ output chunks, and contribution-driven sparse accumulator flushing. Record
+all validation commands, measurements, deviations, and unsupported cases in
+`planning/task_log.md`.
