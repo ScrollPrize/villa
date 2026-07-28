@@ -1,5 +1,9 @@
 # 2026-07-28
 
+- Native 3D Trace2CP candidate normal sampling now uses Lasagna streaming
+  sparse GPU sampling for `grad_mag`, `nx`, and `ny` on CUDA, and live inferred
+  blocks stay device-resident under the existing LRU cache budget for point
+  lookup.
 - Native 3D Trace2CP inference blocks now use a shared VC3D-backed
   requested-level axis-aligned block-read API and batch missing block forwards,
   avoiding dense coordinate-grid sampling for regular inference cubes.

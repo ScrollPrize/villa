@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import math
+import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
@@ -46,6 +48,27 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_
 _EPS = 1.0e-12
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 _GIB = 1024**3
+_NORMAL_CHANNELS = frozenset({"grad_mag", "nx", "ny"})
+
+
+def _ensure_lasagna_module_path() -> None:
+    """Make Lasagna's script-style imports available for this checkout."""
+
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "lasagna" / "fit_data.py"
+        if candidate.exists():
+            lasagna_dir = str(candidate.parent)
+            if lasagna_dir not in sys.path:
+                sys.path.insert(0, lasagna_dir)
+            return
+
+
+def _import_lasagna_fit_data() -> Any:
+    _ensure_lasagna_module_path()
+    try:
+        return importlib.import_module("fit_data")
+    except ImportError:
+        return importlib.import_module("lasagna.fit_data")
 
 
 @dataclass
@@ -359,7 +382,7 @@ class NativeTracePredictionField(Protocol):
 
     def sample_point_choices_torch(
         self,
-        points_zyx: np.ndarray,
+        points_zyx: torch.Tensor | np.ndarray,
         *,
         progress_label: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -848,7 +871,7 @@ def _gaussian_blur_channels_3d(
 
 def _grid_sample_channels_at_points(
     values_czyx: torch.Tensor,
-    points_zyx: np.ndarray,
+    points_zyx: torch.Tensor | np.ndarray,
     *,
     origin_zyx: np.ndarray,
     spacing_zyx: np.ndarray | float | int = 1.0,
@@ -856,16 +879,13 @@ def _grid_sample_channels_at_points(
     if values_czyx.ndim != 4:
         raise ValueError("values_czyx must have shape C,Z,Y,X")
     _channels, depth, height, width = (int(v) for v in values_czyx.shape)
-    points = np.asarray(points_zyx, dtype=np.float32)
+    points = torch.as_tensor(points_zyx, dtype=torch.float32, device=values_czyx.device)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points_zyx must have shape [N,3]")
     if int(points.shape[0]) == 0:
         return torch.zeros((0, int(values_czyx.shape[0])), dtype=values_czyx.dtype, device=values_czyx.device)
-    local = torch.as_tensor(
-        points - np.asarray(origin_zyx, dtype=np.float32),
-        dtype=torch.float32,
-        device=values_czyx.device,
-    )
+    origin = torch.as_tensor(origin_zyx, dtype=torch.float32, device=values_czyx.device)
+    local = points - origin.view(1, 3)
     spacing_np = np.asarray(spacing_zyx, dtype=np.float32)
     if spacing_np.ndim == 0:
         spacing_np = np.full((3,), float(spacing_np), dtype=np.float32)
@@ -1197,19 +1217,22 @@ class NativeTraceFieldCache:
                         _gaussian_blur_channels_3d(tensor, scaled_sigma)
                         for tensor in product_tensors
                     ]
-                valid_cpu = valid_for_cache.detach().to(device=torch.device("cpu")).contiguous()
+                valid_cache = valid_for_cache.detach().to(
+                    device=self.device,
+                    dtype=torch.bool,
+                ).contiguous()
                 for batch_index, origin in enumerate(batch_origins):
                     output = torch.cat(
                         [tensor[batch_index] for tensor in product_tensors],
                         dim=0,
                     ).detach().to(
-                        device=torch.device("cpu"),
+                        device=self.device,
                         dtype=torch.float32,
                     ).contiguous()
                     block = self._store_inferred_block(
                         origin=origin,
                         output=output,
-                        valid=valid_cpu[batch_index, 0],
+                        valid=valid_cache[batch_index, 0],
                     )
                     blocks_by_key[tuple(int(v) for v in origin)] = block
                 self.total_inferred_blocks += len(batch_origins)
@@ -1237,14 +1260,14 @@ class NativeTraceFieldCache:
     @torch.no_grad()
     def sample_point_choices_torch(
         self,
-        points_zyx: np.ndarray,
+        points_zyx: torch.Tensor | np.ndarray,
         *,
         progress_label: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        points = np.asarray(points_zyx, dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] != 3:
+        points_t = torch.as_tensor(points_zyx, dtype=torch.float32, device=self.device)
+        if points_t.ndim != 2 or points_t.shape[1] != 3:
             raise ValueError("points_zyx must have shape [N,3]")
-        count = int(points.shape[0])
+        count = int(points_t.shape[0])
         if count == 0:
             return (
                 torch.zeros((0, 1, 3), dtype=torch.float32, device=self.device),
@@ -1252,6 +1275,7 @@ class NativeTraceFieldCache:
                 torch.zeros((0, 1), dtype=torch.bool, device=self.device),
             )
 
+        points = points_t.detach().to(device=torch.device("cpu"), dtype=torch.float32).numpy()
         origins = self._block_origins_for_points(points)
         unique_origins, inverse = np.unique(origins, axis=0, return_inverse=True)
         progress_start = time.perf_counter()
@@ -1302,6 +1326,9 @@ class NativeTraceFieldCache:
             key = unique_keys[int(unique_index)]
             block = blocks_by_key[key]
             group_points = points[indices]
+            group_points_t = points_t[
+                torch.as_tensor(indices, dtype=torch.long, device=self.device)
+            ]
             shape = np.asarray(block.shape_zyx, dtype=np.float32)
             local = (
                 group_points - block.sample_origin_zyx.astype(np.float32)
@@ -1319,11 +1346,12 @@ class NativeTraceFieldCache:
                 emit_progress(int(unique_index) + 1)
                 continue
             usable_indices = indices[usable]
-            usable_points = points[usable_indices]
+            usable_points = group_points_t[
+                torch.as_tensor(np.flatnonzero(usable), dtype=torch.long, device=self.device)
+            ]
             with self._measure("field_sample_lookup"):
-                block_output = block.output_czyx.to(device=self.device, non_blocking=True)
                 sampled = _grid_sample_channels_at_points(
-                    block_output,
+                    block.output_czyx,
                     usable_points,
                     origin_zyx=block.sample_origin_zyx,
                     spacing_zyx=block.sample_spacing_zyx,
@@ -1351,13 +1379,8 @@ class NativeTraceFieldCache:
                         "native 3D Trace2CP sampled blocks disagree on branch count: "
                         f"{sampled_branch_count} != {branch_count}"
                     )
-                block_valid = block.valid_mask_zyx.to(
-                    device=self.device,
-                    dtype=torch.float32,
-                    non_blocking=True,
-                )
                 valid_values = _grid_sample_channels_at_points(
-                    block_valid.view(1, *block.shape_zyx),
+                    block.valid_mask_zyx.to(dtype=torch.float32).view(1, *block.shape_zyx),
                     usable_points,
                     origin_zyx=block.sample_origin_zyx,
                     spacing_zyx=block.sample_spacing_zyx,
@@ -1531,6 +1554,167 @@ class _NativeLasagnaNormalSampler:
         )
 
 
+@dataclass
+class _NativeSparseLasagnaNormalSampler:
+    trace_record: Any
+    data: Any
+    device: torch.device
+    profiler: _NativeTraceProfiler | None = None
+
+    @classmethod
+    def from_manifest(
+        cls,
+        *,
+        manifest_path: str | Path,
+        trace_record: Any,
+        device: torch.device,
+        profiler: _NativeTraceProfiler | None = None,
+    ) -> "_NativeSparseLasagnaNormalSampler":
+        fit_data = _import_lasagna_fit_data()
+        volume = fit_data.LasagnaVolume.load(str(manifest_path))
+        channels = set(volume.all_channels())
+        missing = _NORMAL_CHANNELS - channels
+        if missing:
+            raise ValueError(
+                "native 3D Trace2CP sparse normal sampling requires Lasagna "
+                f"channels {sorted(_NORMAL_CHANNELS)}; missing {sorted(missing)} "
+                f"in manifest {manifest_path}"
+            )
+        skip_channels = {channel for channel in channels if channel not in _NORMAL_CHANNELS}
+        data = fit_data.load_3d_streaming(
+            path=str(manifest_path),
+            device=torch.device(device),
+            skip_channels=skip_channels,
+            sparse_prefetch_backend="tensorstore",
+        )
+        if not getattr(data, "sparse_caches", None):
+            raise ValueError(
+                "native 3D Trace2CP sparse normal sampling requires Lasagna sparse caches"
+            )
+        return cls(
+            trace_record=trace_record,
+            data=data,
+            device=torch.device(device),
+            profiler=profiler,
+        )
+
+    def _measure(
+        self,
+        name: str,
+        *,
+        sync: bool = False,
+    ) -> _NativeTraceProfileSpan | _NullNativeTraceProfileSpan:
+        if self.profiler is None:
+            return _NullNativeTraceProfileSpan()
+        return self.profiler.measure(
+            name,
+            sync_device=self.device if bool(sync) else None,
+        )
+
+    def __call__(
+        self,
+        points_zyx_selected: torch.Tensor | np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        points = torch.as_tensor(points_zyx_selected, dtype=torch.float32, device=self.device)
+        if points.ndim != 2 or int(points.shape[1]) != 3:
+            raise ValueError("points_zyx_selected must have shape [N,3]")
+        count = int(points.shape[0])
+        if count == 0:
+            return (
+                torch.zeros((0, 3), dtype=torch.float32, device=self.device),
+                torch.zeros((0,), dtype=torch.bool, device=self.device),
+            )
+        spacing = float(getattr(self.trace_record, "volume_spacing_base", 1.0))
+        if not math.isfinite(spacing) or spacing <= 0.0:
+            raise ValueError(f"invalid volume_spacing_base for candidate normal sampling: {spacing!r}")
+
+        with self._measure("lasagna_normal_sample", sync=True):
+            points_base_zyx = points * float(spacing)
+            points_fullres_xyz = torch.stack(
+                [points_base_zyx[:, 2], points_base_zyx[:, 1], points_base_zyx[:, 0]],
+                dim=1,
+            ).reshape(1, 1, count, 3).contiguous()
+            with self._measure("normal_sparse_prefetch_sync", sync=True):
+                for cache in self.data.sparse_caches.values():
+                    if not (_NORMAL_CHANNELS & set(cache.channels)):
+                        continue
+                    cache.prefetch(
+                        points_fullres_xyz,
+                        self.data.origin_fullres,
+                        self.data._spacing_for(cache.channels[0]),
+                    )
+                for cache in self.data.sparse_caches.values():
+                    if _NORMAL_CHANNELS & set(cache.channels):
+                        cache.sync()
+            with self._measure("normal_sparse_grid_sample", sync=True):
+                sampled = self.data.grid_sample_fullres(
+                    points_fullres_xyz,
+                    channels=set(_NORMAL_CHANNELS),
+                )
+                normals_xyz = sampled.normal_3d
+                if normals_xyz is None or sampled.grad_mag is None:
+                    raise ValueError(
+                        "native 3D Trace2CP sparse normal sampling did not return "
+                        "grad_mag/nx/ny"
+                    )
+                normal_flat_xyz = normals_xyz.reshape(count, 3)
+                normals_zyx = normal_flat_xyz[:, [2, 1, 0]].contiguous()
+                norms = torch.linalg.norm(normals_zyx, dim=1)
+                valid = (
+                    (sampled.grad_mag.reshape(count) > 0.0)
+                    & torch.isfinite(normals_zyx).all(dim=1)
+                    & torch.isfinite(norms)
+                    & (norms > float(_EPS))
+                )
+                normals_zyx = torch.where(
+                    valid[:, None],
+                    normals_zyx / norms.clamp_min(float(_EPS))[:, None],
+                    torch.zeros_like(normals_zyx),
+                )
+        return normals_zyx, valid
+
+
+def _native_trace_manifest_path_for_record(
+    record: Any,
+    *,
+    raw_config: dict[str, Any],
+) -> str | None:
+    dataset_config = getattr(record, "dataset_config", None)
+    if not isinstance(dataset_config, dict):
+        return None
+    manifest_path = dataset_config.get("lasagna_manifest_path")
+    if not manifest_path:
+        return None
+    return _resolve_config_relative_path(
+        manifest_path,
+        {"_config_dir": raw_config.get("_config_dir")},
+    )
+
+
+def _make_native_trace_normal_sampler(
+    *,
+    geometry_loader: Any,
+    trace_record: Any,
+    raw_config: dict[str, Any],
+    device: torch.device,
+    profiler: _NativeTraceProfiler | None,
+) -> NativeTraceNormalSampler:
+    manifest_path = _native_trace_manifest_path_for_record(trace_record, raw_config=raw_config)
+    if manifest_path is not None and torch.device(device).type == "cuda":
+        return _NativeSparseLasagnaNormalSampler.from_manifest(
+            manifest_path=manifest_path,
+            trace_record=trace_record,
+            device=torch.device(device),
+            profiler=profiler,
+        )
+    return _NativeLasagnaNormalSampler(
+        geometry_loader=geometry_loader,
+        trace_record=trace_record,
+        normal_record=_native_trace_geometry_normal_record(geometry_loader, trace_record),
+        profiler=profiler,
+    )
+
+
 def _fiber_path_key(record: Any) -> str:
     path = getattr(getattr(record, "fiber", None), "path", None)
     return "" if path is None else str(path)
@@ -1608,12 +1792,13 @@ def _sample_point_choices_for_points_torch(
     cache: Any,
     points_zyx: torch.Tensor | np.ndarray,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    points_np = _points_to_numpy(points_zyx)
     fallback_device = points_zyx.device if isinstance(points_zyx, torch.Tensor) else None
     device = _cache_device(cache, fallback=fallback_device)
     if hasattr(cache, "sample_point_choices_torch"):
-        directions, presence, valid = cache.sample_point_choices_torch(points_np)
+        points = torch.as_tensor(points_zyx, dtype=torch.float32, device=device)
+        directions, presence, valid = cache.sample_point_choices_torch(points)
     else:
+        points_np = _points_to_numpy(points_zyx)
         directions_one, presence_one, valid_one = cache.sample_points_torch(points_np)
         directions = directions_one[:, None, :]
         presence = presence_one[:, None]
@@ -5726,10 +5911,11 @@ def run_native_trace2cp(
         inference_block_batch_size=int(cfg.inference_block_batch_size),
         profiler=profiler,
     )
-    normal_sampler = _NativeLasagnaNormalSampler(
+    normal_sampler = _make_native_trace_normal_sampler(
         geometry_loader=geometry_loader,
         trace_record=record,
-        normal_record=_native_trace_geometry_normal_record(geometry_loader, record),
+        raw_config=raw_config,
+        device=device,
         profiler=profiler,
     )
     cfg = _native_trace_cfg_with_effective_smoothness(cfg, normal_sampler=normal_sampler)

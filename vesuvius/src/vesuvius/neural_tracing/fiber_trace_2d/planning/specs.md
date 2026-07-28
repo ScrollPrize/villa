@@ -566,16 +566,19 @@
   all `K` Lasagna 3x2 direction branches plus their branch-local presence
   values. Branch 0 remains the compatibility layout for single-branch callers,
   but native tracing must not be branch-0-only for grouped outputs.
-- Native 3D Trace2CP cached inferred blocks must be CPU-resident. CUDA is used
-  for model inference and transient block sampling, but the cache must not keep
-  all inferred block output tensors on GPU across a long trace or strip render.
+- Native 3D Trace2CP cached inferred blocks are device-resident on the tracing
+  device and bounded by the existing LRU byte budget. CUDA tracing must sample
+  cached model-output blocks without copying every resident block back from CPU
+  for each lookup. Long whole-fiber traces still must not retain every
+  historical block until process exit; `--max-cached-inference-gib` bounds the
+  resident inferred field cache and eviction may cause re-inference.
 - Native 3D Trace2CP supports `--inference-scaledown-power N` for opt-in
   lower-resolution tracing over the raw model-output field. The scaledown
   factor is `2 ** N`: `0` is the default no-op, `1` samples a half-resolution
   field, and `2` samples a quarter-resolution field. The model input patch is
   unchanged; after inference, every raw product tensor is downscaled with the
   same Gaussian pyramid helper Lasagna predict3d uses (`_pyrdown3d`, repeated
-  `[1,4,6,4,1]/16` separable filtering plus `::2` subsampling) before the CPU
+  `[1,4,6,4,1]/16` separable filtering plus `::2` subsampling) before the
   field cache stores it. The valid mask remains a conservative support mask:
   it is reduced with the same factor and a scaled output voxel is valid only if
   all source voxels in the cell were valid. The inference patch shape and
@@ -586,13 +589,13 @@
 - Native 3D Trace2CP supports `--inference-blur-sigma-voxels` for opt-in 3D
   Gaussian blur over the inferred direction/presence fields. The blur runs
   after model inference and after optional `--inference-scaledown-power`
-  pyramid filtering, but before trusted-core margin cropping into the CPU field cache.
+  pyramid filtering, but before trusted-core margin cropping into the field cache.
   The configured sigma is measured in unscaled selected-level inference voxels;
   internally the scaled field uses `sigma / inference_scaledown_factor`, so
   changing scaledown does not change the selected-level blur size. The default
   `0.0` preserves unblurred behavior, and negative sigma values must fail
   before tracing.
-- Native 3D Trace2CP inferred blocks must also be bounded on the CPU by default.
+- Native 3D Trace2CP inferred blocks must be bounded by resident cache bytes by default.
   The native CLI uses an LRU byte budget exposed as
   `--max-cached-inference-gib`, defaults to 8 GiB, and reports total inferred,
   resident, evicted, and resident byte/GiB counts. Eviction may cause
@@ -600,7 +603,7 @@
   block until process exit. Cached model-output blocks retain only the trusted
   core plus the one-voxel upper interpolation halo needed to preserve
   trilinear point sampling inside the trusted core; full margin outputs must
-  not remain in the resident CPU cache after block inference.
+  not remain in the resident cache after block inference.
 - Native 3D Trace2CP inference blocks are regular axis-aligned selected-level
   regions and must be sampled through `CoordinateSampler.sample_block_zyx(...)`.
   This path is backed by VC3D requested-level chunk-cache reads and must not
@@ -669,10 +672,11 @@
   current-point branch selection, candidate scoring, target-plane crossing, and
   pruning operate on tensors. Candidate points are then grouped by trusted
   inference block, sampled with batched `grid_sample`, decoded with the
-  analytic Lasagna 3x2 torch decoder, and scored as tensors. The lazy
-  inferred-block cache remains CPU-resident by design, so point-to-block
-  routing and cache-miss block construction may still happen on CPU before
-  the sampled tensors return to `cache.device`.
+  analytic Lasagna 3x2 torch decoder, and scored as tensors. The bounded
+  inferred-block cache keeps sampled model-output tensors on `cache.device`;
+  cache-miss source-block construction may still involve CPU/VC3D reads, and
+  the current implementation may still use CPU trusted-core block grouping
+  before sampling those resident tensors.
   For multi-branch outputs, every candidate evaluates every branch at the
   candidate point and uses the branch with the best score. Candidate selection
   minimizes a cost. By default, the direction score uses all-pairs product
@@ -691,11 +695,13 @@
   two-dot scoring is enabled. A multi-substep candidate is valid only when
   every substep has at least one valid branch. Search smoothness defaults to normal-aware split
   smoothness in the native 3D CLI. Candidate Lasagna normals are sampled
-  directly at the candidate trace coordinates by converting selected-level ZYX
-  points to base ZYX with `record.volume_spacing_base` and calling the existing
-  batched Lasagna normal sampler/decoder used by the 2D geometry loader. The
-  implementation must not interpolate normals by reference-line progress and
-  must not reimplement Lasagna normal decoding in the candidate scorer. With a
+  directly at the candidate trace coordinates. In CUDA mode with a configured
+  Lasagna manifest, this must use Lasagna streaming
+  `FitData3D.grid_sample_fullres(...)` over the sparse GPU chunk cache for
+  `grad_mag`, `nx`, and `ny`, then use `FitData3D.normal_3d` for the
+  established ambiguous normal decode. The candidate scorer must not call a
+  per-candidate CPU geometry callback, interpolate normals by reference-line
+  progress, or reimplement Lasagna normal decoding. With a
   valid candidate normal, smoothness is split into tangent-plane turn and
   normal-tilt turn: tangent-plane turn is the angle between previous and
   candidate step directions after projection into the plane perpendicular to

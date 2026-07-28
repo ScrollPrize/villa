@@ -279,11 +279,13 @@ Ownership changed as follows:
   dot products, then multiplies that direction product by candidate presence.
   `--no-all-pairs-direction-product` restores the older
   `dot(current_dir, step_dir) * dot(candidate_dir, step_dir) * presence` score.
-  Smoothness uses Lasagna normals sampled directly at candidate trace points:
-  selected-level ZYX candidate coordinates are converted to base ZYX with
-  `record.volume_spacing_base` and passed through the existing batched
-  Lasagna normal sampler/decoder in the 2D geometry loader. The scorer does
-  not interpolate reference-line normals or reimplement normal decoding.
+  Smoothness uses Lasagna normals sampled directly at candidate trace points.
+  In CUDA mode with a configured Lasagna manifest, normal sampling uses
+  Lasagna streaming `FitData3D.grid_sample_fullres(...)` over the sparse GPU
+  chunk cache for `grad_mag`, `nx`, and `ny`, then reads `FitData3D.normal_3d`
+  for the established ambiguous normal decode. The scorer does not call a
+  per-candidate CPU geometry callback, interpolate reference-line normals, or
+  reimplement normal decoding.
   With a valid candidate normal, `--smoothness-tangent-weight` penalizes turns
   within the tangent plane perpendicular to the normal and
   `--smoothness-normal-weight` penalizes elevation change into/out of the
@@ -322,10 +324,11 @@ Ownership changed as follows:
   are generated in torch, current-point branch selection and candidate scoring
   run as tensor operations, target-plane crossing is evaluated in batch, and
   tensor pruning keeps the next live frontier before only the selected path is
-  reconstructed as Python trace steps. Candidate point sampling still routes
-  through the lazy CPU-resident inferred-block cache, so block lookup/cache
-  misses happen on CPU before each grouped point batch is sampled with
-  `grid_sample` on `cache.device`.
+  reconstructed as Python trace steps. Candidate point sampling uses the
+  bounded GPU-resident inferred-block cache; cache misses still read VC3D
+  source blocks before forwarding new inference blocks, and the current lookup
+  still groups points by trusted inference block before sampling tensors on
+  `cache.device`.
 - Uses a distance-derived step guard by default:
   `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
   `--max-step-factor 3.0`. `--max-steps` is an optional extra cap, and
@@ -337,9 +340,10 @@ Ownership changed as follows:
   sampling, trace overlay projection, and image composition. Presence sampling
   also prints block-level progress with sampled points, valid outputs, newly
   inferred blocks, cached blocks, and total cache blocks.
-- Inferred block outputs are cached on CPU. The tool moves one cached block at
-  a time back to the active device for point sampling, so long traces and
-  presence-strip renders do not retain all block outputs on the GPU.
+- Inferred block outputs are cached on the tracing device under the
+  `--max-cached-inference-gib` LRU budget. Point lookup samples resident
+  output tensors on `cache.device`; long traces and presence-strip renders are
+  still bounded by eviction rather than retaining all historical blocks.
 - With `--vis`, the regular `trace2cp_native_3d_vis.jpg` path is overwritten at
   render start, each stage start/end, and after each panel is added to the
   sheet. Before the first panel exists, the file contains a small status
@@ -596,7 +600,8 @@ Ownership changed as follows:
   `CoordinateSampler.sample_block_zyx(...)`, batches missing blocks for model
   forwarding where memory permits, calls `FiberTrace3DPredictAdapter` for
   per-tile normalization, recurrent/conditioned inference, mixed precision, and
-  raw option splitting, then exposes
+  raw option splitting, stores decoded trusted-core model outputs on the
+  tracing device under the configured LRU byte budget, then exposes
   branch-aware point sampling to the tracer. Precomputed fiber prediction
   outputs are not wired yet, but should use the same field-provider contract
   when added.

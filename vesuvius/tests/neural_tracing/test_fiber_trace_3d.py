@@ -86,6 +86,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _image_to_u8,
     _interpolate_plane_crossing,
     _NativeLasagnaNormalSampler,
+    _NativeSparseLasagnaNormalSampler,
     _native_cumulative_tangent_smoothness_loss_torch,
     _native_trace2cp_whole_fiber_mode,
     _native_whole_fiber_visual_spans,
@@ -98,6 +99,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
     _sample_presence_on_strip,
+    _sample_point_choices_for_points_torch,
     _sample_trace_start_direction_aligned,
     _sample_trace_point_aligned,
     _score_candidate_batch,
@@ -5301,6 +5303,105 @@ def test_native_3d_trace2cp_lasagna_normal_sampler_uses_geometry_record() -> Non
     assert np.allclose(geometry_loader.points_base, [[4.0, 8.0, 12.0]])
     assert valid.tolist() == [True]
     assert torch.allclose(normals_zyx, torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32))
+
+
+def test_native_3d_trace2cp_sparse_lasagna_normal_sampler_uses_fit_data_grid_sample() -> None:
+    class FakeSparseCache:
+        channels = ["grad_mag", "nx", "ny"]
+
+        def __init__(self) -> None:
+            self.prefetch_calls = 0
+            self.sync_calls = 0
+            self.prefetch_xyz = None
+
+        def prefetch(self, xyz_fullres, origin, spacing):
+            self.prefetch_calls += 1
+            self.prefetch_xyz = xyz_fullres.detach().clone()
+            assert origin == (0.0, 0.0, 0.0)
+            assert spacing == (16.0, 16.0, 16.0)
+
+        def sync(self):
+            self.sync_calls += 1
+
+    class FakeSampled:
+        def __init__(self, count: int) -> None:
+            self.grad_mag = torch.ones((1, 1, 1, 1, count), dtype=torch.float32)
+            normal = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32)
+            self._normal = normal.view(1, 1, 1, 3).expand(1, 1, count, 3)
+
+        @property
+        def normal_3d(self):
+            return self._normal
+
+    class FakeFitData:
+        origin_fullres = (0.0, 0.0, 0.0)
+
+        def __init__(self) -> None:
+            self.cache = FakeSparseCache()
+            self.sparse_caches = {"normal": self.cache}
+            self.sample_calls = 0
+            self.sample_xyz = None
+
+        def _spacing_for(self, _channel: str):
+            return (16.0, 16.0, 16.0)
+
+        def grid_sample_fullres(self, xyz_fullres, *, channels):
+            self.sample_calls += 1
+            self.sample_xyz = xyz_fullres.detach().clone()
+            assert channels == {"grad_mag", "nx", "ny"}
+            assert tuple(xyz_fullres.shape) == (1, 1, 2, 3)
+            return FakeSampled(int(xyz_fullres.shape[2]))
+
+    data = FakeFitData()
+    sampler = _NativeSparseLasagnaNormalSampler(
+        trace_record=SimpleNamespace(volume_spacing_base=4.0),
+        data=data,
+        device=torch.device("cpu"),
+    )
+
+    points = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float32)
+    normals_zyx, valid = sampler(points)
+
+    expected_xyz = torch.tensor(
+        [[12.0, 8.0, 4.0], [24.0, 20.0, 16.0]],
+        dtype=torch.float32,
+    ).view(1, 1, 2, 3)
+    assert data.cache.prefetch_calls == 1
+    assert data.cache.sync_calls == 1
+    assert data.sample_calls == 1
+    assert torch.allclose(data.cache.prefetch_xyz, expected_xyz)
+    assert torch.allclose(data.sample_xyz, expected_xyz)
+    assert valid.tolist() == [True, True]
+    assert torch.allclose(normals_zyx, torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]))
+
+
+def test_native_3d_trace2cp_point_choice_helper_keeps_torch_points() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def __init__(self) -> None:
+            self.received_type = None
+
+        def sample_point_choices_torch(self, points_zyx):
+            self.received_type = type(points_zyx)
+            assert isinstance(points_zyx, torch.Tensor)
+            assert tuple(points_zyx.shape) == (2, 3)
+            directions = torch.zeros((2, 1, 3), dtype=torch.float32)
+            directions[:, 0, 2] = 1.0
+            presence = torch.ones((2, 1), dtype=torch.float32)
+            valid = torch.ones((2, 1), dtype=torch.bool)
+            return directions, presence, valid
+
+    cache = FakeCache()
+    directions, presence, valid = _sample_point_choices_for_points_torch(
+        cache,
+        torch.ones((2, 3), dtype=torch.float32),
+    )
+
+    assert cache.received_type is torch.Tensor
+    assert tuple(directions.shape) == (2, 1, 3)
+    assert torch.all(presence == 1.0)
+    assert torch.all(valid)
 
 
 def test_native_3d_trace2cp_current_point_direction_uses_best_branch() -> None:
