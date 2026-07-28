@@ -1633,7 +1633,7 @@ def run_tiled_inference_3d(
 		)
 		bytes_total = (1 + sum(p.raw_channel_count for p in group_products)) * depth * Yo * Xo * 4
 		print(
-			f"[predict3d] ring sd={sd} depth={depth} logical_z={Zo} yx=({Yo},{Xo}) "
+			f"[predict3d] ring sd={sd} zyx=({depth},{Yo},{Xo}) logical_z={Zo} "
 			f"products={len(group_products)} backing={bytes_total / 1024**3:.2f}GiB",
 			flush=True,
 		)
