@@ -25,6 +25,32 @@ def patch_intersects_z_roi(patch, z_begin, z_end):
     return bool(((zs >= z_begin) & (zs < z_end)).any().item())
 
 
+def patch_dir_may_intersect_z_roi(segment_path, z_begin, z_end):
+    """Cheap conservative pre-filter, from meta.json alone.
+
+    Patches are discarded after loading when they miss the fitted z-roi, but
+    loading materialises three full-resolution tif grids each. On a whole-scroll
+    input set that is tens of thousands of patches read to keep a few hundred.
+    The bbox written by save_tifxyz is enough to exclude most of them without
+    touching the grids.
+
+    Returns True whenever the patch cannot be excluded with certainty (no
+    meta.json, no bbox, sentinel bbox, unreadable json), so the authoritative
+    per-vertex check in patch_intersects_z_roi still decides.
+    """
+    try:
+        with open(os.path.join(segment_path, 'meta.json'), 'r') as meta_json:
+            bbox = json.load(meta_json).get('bbox')
+    except (OSError, ValueError):
+        return True
+    if not bbox or len(bbox) != 2 or len(bbox[0]) != 3 or len(bbox[1]) != 3:
+        return True
+    z_min, z_max = bbox[0][2], bbox[1][2]  # bbox rows are xyz
+    if z_min == -1.0 and z_max == -1.0:  # sentinel written for empty patches
+        return True
+    return z_max >= z_begin and z_min < z_end
+
+
 def scale_counts_for_z_range(
     config,
     z_begin,

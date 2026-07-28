@@ -6,7 +6,11 @@ import unittest
 import numpy as np
 from PIL import Image
 
-from spiral_helpers import load_fiber_point_collection
+from spiral_helpers import (
+    load_fiber_point_collection,
+    patch_dir_may_intersect_z_roi,
+    patch_intersects_z_roi,
+)
 from tifxyz import load_tifxyz
 
 
@@ -68,6 +72,60 @@ class TifxyzMetadataTests(unittest.TestCase):
             patch = load_tifxyz(root)
 
             self.assertEqual(patch.erosion_cells(7), 7)
+
+
+class PatchDirZRoiPrefilterTests(unittest.TestCase):
+    def _write_patch(self, root, zs, bbox=None, write_meta=True):
+        """A 2x2 patch whose z grid is `zs`; bbox defaults to the true extent."""
+        root.mkdir(parents=True, exist_ok=True)
+        z_grid = np.asarray(zs, dtype=np.float32)
+        for coordinate, values in (
+            ("z", z_grid),
+            ("y", np.zeros_like(z_grid)),
+            ("x", np.zeros_like(z_grid)),
+        ):
+            Image.fromarray(values).save(root / f"{coordinate}.tif")
+        if write_meta:
+            if bbox is None:
+                bbox = [[0.0, 0.0, float(z_grid.min())], [0.0, 0.0, float(z_grid.max())]]
+            (root / "meta.json").write_text(json.dumps({
+                "format": "tifxyz", "scale": [1.0, 1.0], "bbox": bbox,
+            }))
+        return root
+
+    def test_excludes_patch_entirely_outside_the_roi(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._write_patch(Path(temporary) / "p", [[500, 501], [502, 503]])
+            self.assertFalse(patch_dir_may_intersect_z_roi(root, 100, 200))
+            # and the authoritative check agrees
+            self.assertFalse(patch_intersects_z_roi(load_tifxyz(root), 100, 200))
+
+    def test_keeps_overlapping_and_boundary_patches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            inside = self._write_patch(base / "inside", [[120, 130], [140, 150]])
+            straddling = self._write_patch(base / "straddling", [[80, 90], [100, 110]])
+            for root in (inside, straddling):
+                self.assertTrue(patch_dir_may_intersect_z_roi(root, 100, 200))
+                self.assertTrue(patch_intersects_z_roi(load_tifxyz(root), 100, 200))
+
+    def test_conservative_when_metadata_is_unusable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            no_meta = self._write_patch(base / "no_meta", [[500, 501], [502, 503]],
+                                        write_meta=False)
+            no_bbox = base / "no_bbox"
+            no_bbox.mkdir()
+            (no_bbox / "meta.json").write_text(json.dumps({"scale": [1.0, 1.0]}))
+            sentinel = self._write_patch(
+                base / "sentinel", [[500, 501], [502, 503]],
+                bbox=[[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]])
+            broken = base / "broken"
+            broken.mkdir()
+            (broken / "meta.json").write_text("{not json")
+
+            for root in (no_meta, no_bbox, sentinel, broken):
+                self.assertTrue(patch_dir_may_intersect_z_roi(root, 100, 200))
 
 
 if __name__ == "__main__":

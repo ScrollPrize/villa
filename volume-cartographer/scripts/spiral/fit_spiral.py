@@ -88,6 +88,7 @@ from spiral_helpers import (
     load_fiber_point_collections,
     scale_counts_for_z_range,
     _infer_shell_outer_winding_idx,
+    patch_dir_may_intersect_z_roi,
     patch_intersects_z_roi,
     save_combined_preview,
 )
@@ -845,13 +846,21 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
     def load_patches_from_dir(path):
         patches = {}
+        skipped = 0
         for entry in sorted(os.listdir(path)):
             segment_path = os.path.join(path, entry)
+            # Patches outside the fitted z-roi are dropped a few lines below;
+            # skip reading their grids at all when meta.json already proves it.
+            if not patch_dir_may_intersect_z_roi(segment_path, z_begin, z_end):
+                skipped += 1
+                continue
             try:
                 patches[entry] = load_tifxyz(segment_path)
             except Exception as e:
                 print(f'Failed to load segment {entry}: {e}')
                 continue
+        if skipped:
+            print(f' skipped {skipped} patches outside the z-roi (bbox pre-filter)')
         return patches
 
     filter_tracks_by_shell = (
