@@ -175,6 +175,7 @@ class FiberTrace3DPredictAdapter:
         checkpoint: str | Path | None = None,
         level: int = 0,
         scaledown: int = 1,
+        inference_scaledown: int = 1,
         chunk_size: int = 64,
         product_prefix: str = "fiber",
         zarr_path_prefix: str | Path | None = None,
@@ -201,6 +202,7 @@ class FiberTrace3DPredictAdapter:
                 option_index,
                 level=int(level),
                 scaledown=int(scaledown),
+                inference_scaledown=int(inference_scaledown),
                 chunk_size=int(chunk_size),
             )
             for option_index in range(self.option_count)
@@ -254,6 +256,7 @@ class FiberTrace3DPredictAdapter:
         *,
         level: int,
         scaledown: int,
+        inference_scaledown: int,
         chunk_size: int,
     ) -> OutputProductSpec:
         option_name = f"option_{int(option_index):03d}"
@@ -280,6 +283,7 @@ class FiberTrace3DPredictAdapter:
             value_range=(0.0, 255.0),
             pyramid_policy=PYRAMID_POLICY_CUSTOM,
             accumulator_channel_count=len(FIBER_TRACE_3D_INTERNAL_CHANNELS),
+            inference_scaledown=inference_scaledown,
         )
 
     def load_model(self, *, device: torch.device) -> torch.nn.Module:
@@ -392,36 +396,6 @@ class FiberTrace3DPredictAdapter:
                     break
         return out
 
-    def accumulate_tile_output(
-        self,
-        raw_output: Any,
-        *,
-        tile_origin_zyx: tuple[int, int, int],
-        tile_weight: torch.Tensor | np.ndarray,
-        accumulators: Mapping[str, Any],
-    ) -> None:
-        del tile_origin_zyx
-        products = self.product_tensors_from_output(raw_output)
-        for product_name, tensor in products.items():
-            target = accumulators.get(product_name)
-            if target is None:
-                continue
-            weight = tile_weight
-            if isinstance(target, torch.Tensor):
-                weight_t = torch.as_tensor(
-                    weight,
-                    dtype=target.dtype,
-                    device=target.device,
-                )
-                target += tensor.to(dtype=target.dtype, device=target.device) * weight_t
-            elif isinstance(target, np.ndarray):
-                weight_np = np.asarray(weight, dtype=target.dtype)
-                target += tensor.detach().cpu().numpy().astype(target.dtype) * weight_np
-            else:
-                raise TypeError(
-                    f"unsupported accumulator type for product {product_name!r}: "
-                    f"{type(target).__name__}"
-                )
 
 
 __all__ = [

@@ -14,3 +14,6 @@
 - VC3D remote volume metadata normalization now always discovers public
   `scan/tomo/acquisition/detector/samplePixelSize` as `voxelsize` when no
   explicit positive `voxelsize` exists.
+- Replaced full-Z predict3d scratch mappings with fixed-depth circular mmap
+  rings and consolidated Lasagna/Fiber neural inference onto one multi-scale,
+  chunk-flushing runner.

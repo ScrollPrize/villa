@@ -665,7 +665,7 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
 
 `predict3d` now runs through the shared tiled 3D inference mechanics in
 `lasagna/tiled_predict3d.py`. The shared layer owns global tile/output-chunk
-lattices, rolling z-band scratch, output-chunk resume, temp cleanup, and
+lattices, fixed-depth circular Z scratch, output-chunk resume, temp cleanup, and
 atomic chunk writes. The Lasagna wrapper still owns the cos/normal products,
 normal estimation, `.lasagna.json` groups, pyramid generation, and all legacy
 CLI defaults.

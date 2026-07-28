@@ -1,60 +1,62 @@
-# Task Log: Native 3D Trace2CP Hot-Path Acceleration
+# Task Log: Truly Rolling Shared 3D Tiled Inference
 
 ## Implemented
 
-- Added `Volume.sample_zyx_block(...)` to the VC3D Python binding for strict
-  requested-level axis-aligned ZYX block reads through the VC3D chunk cache.
-- Added `CoordinateSampler.sample_block_zyx(...)` and implemented it for the
-  production VC3D sampler and local NumPy test sampler.
-- Switched native 3D Trace2CP inference-block loading from dense
-  `[D,H,W,3]` coordinate grids plus `sample_coord_batch(...)` to direct
-  selected-level block reads.
-- Added missing-block materialization batching in `NativeTraceFieldCache` and
-  batched model forwards controlled by `--inference-block-batch-size`
-  (default `2`).
-- Updated native 3D Trace2CP defaults to the trained/in-use path:
-  `--inference-patch-shape-zyx 128 128 128` and `--core-margin-voxels 48`.
-- Updated `FiberTrace3DPredictAdapter.preprocess_tile(...)` to accept batched
-  tiles while preserving the existing per-tile normalization semantics.
-- Updated tests for the direct block sampler, native field-cache block routing,
-  and new native 3D Trace2CP defaults.
-- Rebuilt and reinstalled the local editable VC3D Python binding so the active
-  user-site `vc.volume.Volume` exposes `sample_zyx_block`.
+- Replaced the full-output-Z `_RollingZBand` with `_CircularZBand`, whose mmap
+  depth is planned from canonical Z tile writes and chunk-aligned flush
+  frontiers and is independent of full volume depth.
+- Added logical-to-physical generation checks, wrap-aware chunk reads,
+  chunk-region clearing, explicit mmap close/unlink cleanup, and backing-size
+  reporting.
+- Added `run_tiled_inference_3d` as the sole neural runner. Both Lasagna
+  predict3d and Fiber 3D inference now use it; the legacy `_infer_tiled_3d` and
+  `_infer_tiled_products_3d` loops were removed.
+- Added explicit `OutputProductSpec.inference_scaledown` semantics so the
+  runner can feed Lasagna fine/coarse products in one model traversal while
+  retaining base-relative manifest scales.
+- Changed normalization/finalization from full XY bands to globally anchored
+  output chunks. Each scale owns one geometric weight ring shared by its raw
+  products; already complete product chunks receive no raw accumulation.
+- Kept external `pred_dt` outside neural scheduling and moved it to an
+  independently resumable post-inference stage.
+- Changed progress rendering to carriage-return updates only on a TTY and
+  durable per-Z-row lines otherwise; ring depth/backing and flush boundaries
+  are reported explicitly.
 
-## Audit Notes
+## Compatibility decisions
 
-- Candidate scoring was already torch-vectorized for flattened candidate sets;
-  this task kept that math unchanged.
-- Lasagna normals are already sampled once per flattened candidate batch in the
-  current native tracer path. I did not add a spatial normal cache in this task
-  because that would change cache behavior without a fresh profile showing it
-  dominates after block-read removal.
-- Point lookup still groups by inferred block and transfers each resident CPU
-  block needed by the lookup call to CUDA. The change now materializes misses
-  before that loop, but it does not add a packed global GPU texture/cache.
-
-## Deviations / Deferred Items
-
-- No fiber-only zarr/raw reader was added; all production reads stay behind the
-  shared VC3D-backed sampler boundary.
-- No scoring, metric, restart, fusion, normalization, or checkpoint-selection
-  semantics were changed.
-- I did not run a full native Trace2CP metric benchmark in this pass. The code
-  and targeted tests are validated; a full before/after wall-time comparison
-  still needs the exact long-running metric command/dataset run.
+- Tile traversal remains canonical Z/Y/X order and each scheduled tile is run
+  once.
+- The numerical order remains prediction times full-resolution blend weight,
+  followed by `_pyrdown3d`, followed by float32 accumulation.
+- Coherent products are written as complete sibling bundles through the
+  existing atomic output adapter.
+- GPU pause, optional InstanceNorm calibration, Fiber normalization/autocast,
+  pyramid creation, manifests, and output encodings remain adapter or caller
+  responsibilities and were preserved.
 
 ## Validation
 
-- `cmake --build volume-cartographer/build/python-bindings --target vc_volume -j 8`
-  passed.
-- `python -m pip install -e volume-cartographer --no-deps --break-system-packages`
-  passed.
-- `python -c "import vc.volume; print(vc.volume.__file__); print(hasattr(vc.volume.Volume, 'sample_zyx_block'))"`
-  printed the user-site VC3D extension path and `True`.
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/inference_adapter.py vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/sampling.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "native_3d or whole_fiber_trace"`
-  passed: `60 passed, 89 deselected`.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "vc3d_coordinate_sampler_direct_block_read_uses_binding or numpy_coordinate_sampler_direct_block_read_masks_out_of_bounds"`
-  passed: `2 passed, 147 deselected`.
-- `git diff --check` passed.
+- Python bytecode compilation passed for the shared engine, Lasagna wrapper,
+  Fiber adapter/CLI, and regression tests.
+- Circular wrap/overwrite/backing-size, one-pass multi-scale, and adapter
+  protocol/schema tests passed (`5 tests`).
+- The existing Zarr-backed crop/resume tests could not complete in this Python
+  3.14 environment: a standalone `zarr.open(..., mode="w")` blocks in Zarr's
+  synchronous wrapper before entering the changed inference code. A timed
+  faulthandler trace confirmed the wait is in `zarr.core.sync.sync` at test
+  setup, not in the circular runner.
+- A standalone 10-second `zarr.open(..., mode="w")` smoke test reproduced the
+  same pre-inference hang and exited through `timeout` with status 124.
+- `pytest` is not installed in `/home/hendrik/.venv_las`, so the Fiber pytest
+  module was not run; no dependency installation was authorized for this task.
+
+## Deviations / remaining validation
+
+- A representative full Fiber volume run was not started because it is a
+  long-running GPU/data workload and the exact output path is user-owned.
+  Ring/backing/RSS/throughput measurements therefore remain operational
+  validation for the next real inference run.
+- Cross-platform macOS execution was not available; the implementation uses
+  portable mmap close/unlink behavior and no longer depends on Linux
+  `madvise` or hole punching.

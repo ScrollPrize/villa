@@ -1,24 +1,20 @@
-# Task: Accelerate Native 3D Trace2CP Hot Path
+# Task: Truly Rolling Shared 3D Tiled Inference
 
-Use the native 3D Trace2CP profile to plan low-risk acceleration work.
+Replace the current full-Z-stack sparse mmap accumulator with a genuinely
+rolling, fixed-depth circular mmap accumulator. Its backing storage must scale
+with the active Z window, Y/X dimensions, and channel count, but never with the
+full output Z depth. The operating system should manage mmap page residency;
+the application must not impose an artificial RAM budget.
 
-Current measured hot spots:
+Flush completed regions to output one small Zarr-aligned chunk at a time so
+normalization and product finalization never allocate a full-XY slab or a
+full-band multichannel temporary. Reuse circular slots only after their data
+has been finalized and written. Infer every globally anchored model tile once;
+do not partition the volume in a way that repeats model inference.
 
-- `src_read`: 195.995 s wall, 53.85 percent
-- `src_coords`: 44.719 s wall, 12.29 percent
-- `inference_forward`: 37.148 s wall, 10.21 percent
-- `field_sample_lookup`: 33.384 s wall, 9.17 percent
-- `lasagna_normal_sample`: 13.553 s wall, 3.72 percent
-
-Constraints:
-
-- Keep the trained inference block size and artifact margin setup:
-  `--inference-patch-shape-zyx 128 128 128` and
-  `--core-margin-voxels 48` remain supported and should be the target path.
-- Do not change model outputs, trace scoring semantics, requested volume scale,
-  normalization, or strict requested-level VC3D blocking behavior.
-- Replace generic coordinate sampling for regular axis-aligned inference blocks
-  with a proper shared VC3D/sampler block-read path.
-- Batch missing block reads and model forwards where practical.
-- Check whether Lasagna-normal sampling, field lookup, and related tracing
-  stages can be further vectorized or batched.
+There must be one shared tiled-inference implementation for Lasagna and Fiber.
+The callers may provide model/product adapters and narrowly scoped derived
+output behavior, but must not independently implement tile traversal,
+blending, scaling, accumulation, resume scheduling, flushing, or progress.
+Audit and consolidate all current behavioral divergences while preserving the
+documented output, scale, crop, resume, atomic-write, and numerical semantics.

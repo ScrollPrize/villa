@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import atexit
-import ctypes
-import ctypes.util
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -82,6 +81,7 @@ class OutputProductSpec:
 	value_range: tuple[float, float] | None = (0.0, 255.0)
 	pyramid_policy: str = PYRAMID_POLICY_NONE
 	accumulator_channel_count: int | None = None
+	inference_scaledown: int | None = None
 
 	def __post_init__(self) -> None:
 		name = str(self.name).strip()
@@ -94,6 +94,9 @@ class OutputProductSpec:
 			None
 			if self.accumulator_channel_count is None
 			else int(self.accumulator_channel_count)
+		)
+		inference_scaledown = (
+			None if self.inference_scaledown is None else int(self.inference_scaledown)
 		)
 		if level < 0:
 			raise ValueError(f"output product {name!r} level must be >= 0")
@@ -115,6 +118,10 @@ class OutputProductSpec:
 		if accumulator_channel_count is not None and accumulator_channel_count <= 0:
 			raise ValueError(
 				f"output product {name!r} accumulator_channel_count must be > 0"
+			)
+		if inference_scaledown is not None and inference_scaledown <= 0:
+			raise ValueError(
+				f"output product {name!r} inference_scaledown must be > 0"
 			)
 		dtype = np.dtype(self.dtype)
 		value_range = self.value_range
@@ -142,6 +149,7 @@ class OutputProductSpec:
 			"accumulator_channel_count",
 			accumulator_channel_count,
 		)
+		object.__setattr__(self, "inference_scaledown", inference_scaledown)
 
 	@property
 	def channel_count(self) -> int:
@@ -175,17 +183,6 @@ class ModelAdapter(Protocol):
 
 	def run_tile_inference(self, model: Any, tile: torch.Tensor, *, device: torch.device) -> Any:
 		"""Run one normalized tile through the model and return raw model output."""
-		...
-
-	def accumulate_tile_output(
-		self,
-		raw_output: Any,
-		*,
-		tile_origin_zyx: TileOriginZYX,
-		tile_weight: torch.Tensor | np.ndarray,
-		accumulators: Mapping[str, Any],
-	) -> None:
-		"""Convert raw tile output into logical product accumulators."""
 		...
 
 	def product_tensors_from_output(self, raw_output: Any) -> Mapping[str, torch.Tensor]:
@@ -927,15 +924,6 @@ def _iter_chunk_origins_for_region(
 				yield z, y, x
 
 
-def _rolling_band_has_range(band: object, z0: int, z1: int) -> bool:
-	"""Return True when a rolling band currently contains z=[z0,z1)."""
-	origin = getattr(band, "origin_z", None)
-	if origin is None:
-		return False
-	end_z = getattr(band, "end_z", 0)
-	return int(z0) >= int(origin) and int(z1) <= int(end_z)
-
-
 def _omezarr_level_shape(
 	base_shape: tuple[int, int, int], level: int,
 ) -> tuple[int, int, int]:
@@ -1239,71 +1227,69 @@ def _find_resume_z(omezarr_path: str, level: int) -> int:
 		return 0
 
 
-_libc = None
+@dataclass(frozen=True)
+class _CircularZLayout:
+	"""Pure logical layout for a fixed-depth circular Z accumulator."""
+
+	ring_depth: int
+	y_size: int
+	x_size: int
+
+	@property
+	def plane_size(self) -> int:
+		return int(self.y_size) * int(self.x_size)
+
+	def split(self, z0: int, z1: int) -> tuple[tuple[int, int, int], ...]:
+		"""Return ``(physical_z, logical_z, length)`` pieces for ``[z0,z1)``."""
+		z0, z1 = int(z0), int(z1)
+		if z1 < z0 or z1 - z0 > self.ring_depth:
+			raise ValueError(
+				f"logical z range [{z0},{z1}) does not fit ring depth {self.ring_depth}"
+			)
+		pieces: list[tuple[int, int, int]] = []
+		logical = z0
+		while logical < z1:
+			physical = logical % self.ring_depth
+			length = min(z1 - logical, self.ring_depth - physical)
+			pieces.append((physical, logical, length))
+			logical += length
+		return tuple(pieces)
 
 
-def _get_libc():
-	global _libc
-	if _libc is None:
-		_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-	return _libc
-
-
-def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
-	"""Release memmap pages for z-slice range [z0, z1)."""
-	if z1 <= z0 or not hasattr(arr, 'ctypes'):
-		return
-	page = 4096
-	aligned_offset = 0
-	aligned_length = 0
-	try:
-		libc = _get_libc()
-		if arr.ndim == 3:
-			bytes_per_z = int(np.prod(arr.shape[1:])) * arr.itemsize
-			offset = z0 * bytes_per_z
-		elif arr.ndim == 4:
-			for ch in range(arr.shape[0]):
-				_release_memmap_pages(arr[ch], z0, z1)
-			return
+def _plan_circular_z_depth(
+	*,
+	z_positions: Sequence[int],
+	tile_size: int,
+	scaledown: int,
+	z_size: int,
+	chunk_size: int,
+	output_begin: int,
+	output_end: int,
+) -> int:
+	"""Compute capacity from actual row writes and chunk-aligned flush frontiers."""
+	sd = max(1, int(scaledown))
+	oc = max(1, int(chunk_size))
+	ts_out = int(tile_size) // sd
+	oldest = 0
+	max_live = 1
+	positions = tuple(int(v) for v in z_positions)
+	for index, tz in enumerate(positions):
+		az0, az1, _, _ = _downscaled_tile_clip(tz, sd, ts_out, int(z_size))
+		max_live = max(max_live, az1 - oldest)
+		next_tz = positions[index + 1] if index + 1 < len(positions) else int(z_size) * sd
+		complete = next_tz // sd
+		if complete >= int(output_end):
+			flush_to = int(output_end)
 		else:
-			return
-		length = (z1 - z0) * bytes_per_z
-		aligned_offset = ((offset + page - 1) // page) * page
-		aligned_end = ((offset + length) // page) * page
-		aligned_length = aligned_end - aligned_offset
-		if aligned_length <= 0:
-			return
-		addr = ctypes.c_void_p(arr.ctypes.data + aligned_offset)
-		MADV_DONTNEED = 4
-		libc.madvise(addr, ctypes.c_size_t(aligned_length), ctypes.c_int(MADV_DONTNEED))
-	except Exception:
-		pass
-	try:
-		path = getattr(arr, "_lasagna_tmp_path", None)
-		if path and aligned_length > 0 and os.path.exists(path):
-			fd = os.open(path, os.O_RDWR)
-			try:
-				libc = _get_libc()
-				FALLOC_FL_KEEP_SIZE = 0x01
-				FALLOC_FL_PUNCH_HOLE = 0x02
-				ret = libc.fallocate(
-					ctypes.c_int(fd),
-					ctypes.c_int(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE),
-					ctypes.c_longlong(aligned_offset),
-					ctypes.c_longlong(aligned_length),
-				)
-				if ret != 0:
-					err = ctypes.get_errno()
-					if err not in (0, 38, 45, 95):
-						print(f"[predict3d] warning: hole punch failed for {path}: errno={err}", flush=True)
-			finally:
-				os.close(fd)
-	except Exception:
-		pass
+			flush_to = int(output_begin) + (
+				max(0, complete - int(output_begin)) // oc
+			) * oc
+		oldest = max(oldest, flush_to)
+	return min(int(z_size), max(1, int(max_live)))
 
 
-class _RollingZBand:
-	"""Per-channel sparse mmap-backed z band with fixed logical coordinates."""
+class _CircularZBand:
+	"""Fixed-depth mmap ring addressed by monotonically increasing logical Z."""
 
 	def __init__(
 		self,
@@ -1315,15 +1301,22 @@ class _RollingZBand:
 		x_size: int,
 		tmp_dir: str | None,
 		prefix: str,
+		ring_depth: int | None = None,
 	) -> None:
 		self.name = str(name)
 		self.channel_count = int(channel_count)
 		self.z_size = int(z_size)
 		self.y_size = int(y_size)
 		self.x_size = int(x_size)
+		self.ring_depth = min(
+			self.z_size,
+			max(1, int(self.z_size if ring_depth is None else ring_depth)),
+		)
+		self.layout = _CircularZLayout(self.ring_depth, self.y_size, self.x_size)
 		self.tmp_dir = tmp_dir
 		self.prefix = str(prefix)
 		self.origin_z = 0
+		self._generation = np.full(self.ring_depth, -1, dtype=np.int64)
 		self._arrays = [self._new_array(ch) for ch in range(self.channel_count)]
 
 	def _new_array(self, ch: int) -> np.memmap:
@@ -1334,7 +1327,7 @@ class _RollingZBand:
 		)
 		try:
 			logical_bytes = (
-				max(0, self.z_size)
+				max(0, self.ring_depth)
 				* max(0, self.y_size)
 				* max(0, self.x_size)
 				* np.dtype(np.float32).itemsize
@@ -1349,7 +1342,7 @@ class _RollingZBand:
 			path,
 			dtype=np.float32,
 			mode="r+",
-			shape=(self.z_size, self.y_size, self.x_size),
+			shape=(self.ring_depth, self.y_size, self.x_size),
 		)
 		mm._lasagna_tmp_path = path
 		atexit.register(lambda p=path: os.path.exists(p) and os.unlink(p))
@@ -1374,6 +1367,19 @@ class _RollingZBand:
 				f"{self.name} rolling band cannot extend to z={z1}; "
 				f"logical size is {self.z_size}"
 			)
+		if z1 - self.origin_z > self.ring_depth:
+			raise ValueError(
+				f"{self.name} ring overwrite: write end {z1}, origin {self.origin_z}, "
+				f"depth {self.ring_depth}"
+			)
+		for logical_z in range(z0, z1):
+			physical_z = logical_z % self.ring_depth
+			generation = int(self._generation[physical_z])
+			if generation not in (-1, logical_z):
+				raise ValueError(
+					f"{self.name} would overwrite unflushed z={generation} with z={logical_z}"
+				)
+			self._generation[physical_z] = logical_z
 
 	def add(
 		self,
@@ -1389,9 +1395,16 @@ class _RollingZBand:
 		if z1 <= z0 or y1 <= y0 or x1 <= x0:
 			return
 		self.ensure(z0, z1)
-		self._arrays[int(ch)][int(z0):int(z1), y0:y1, x0:x1] += data
+		data_offset = 0
+		for physical_z, _logical_z, length in self.layout.split(z0, z1):
+			self._arrays[int(ch)][physical_z:physical_z + length, y0:y1, x0:x1] += data[
+				data_offset:data_offset + length
+			]
+			data_offset += length
 
-	def view(self, ch: int, z0: int, z1: int) -> np.ndarray:
+	def read(
+		self, ch: int, z0: int, z1: int, y0: int, y1: int, x0: int, x1: int,
+	) -> np.ndarray:
 		if z1 <= z0:
 			raise ValueError(f"{self.name} rolling band has no data for z=[{z0},{z1})")
 		if z0 < self.origin_z or z1 > self.end_z:
@@ -1399,23 +1412,46 @@ class _RollingZBand:
 				f"{self.name} rolling band missing z=[{z0},{z1}); "
 				f"available=[{self.origin_z},{self.end_z})"
 			)
-		return self._arrays[int(ch)][int(z0):int(z1)]
+		out = np.zeros((int(z1) - int(z0), int(y1) - int(y0), int(x1) - int(x0)), dtype=np.float32)
+		for offset, logical_z in enumerate(range(int(z0), int(z1))):
+			physical_z = logical_z % self.ring_depth
+			generation = int(self._generation[physical_z])
+			if generation == logical_z:
+				out[offset] = self._arrays[int(ch)][physical_z, y0:y1, x0:x1]
+			elif generation != -1:
+				raise ValueError(
+					f"{self.name} stale logical z={logical_z}; slot contains z={generation}"
+				)
+		return out
+
+	def view(self, ch: int, z0: int, z1: int) -> np.ndarray:
+		"""Compatibility read; returned data is bounded to the requested Z range."""
+		return self.read(ch, z0, z1, 0, self.y_size, 0, self.x_size)
+
+	def clear(self, z0: int, z1: int, y0: int, y1: int, x0: int, x1: int) -> None:
+		for physical_z, _logical_z, length in self.layout.split(z0, z1):
+			for arr in self._arrays:
+				arr[physical_z:physical_z + length, y0:y1, x0:x1] = 0.0
 
 	def discard_before(self, z_new: int) -> None:
 		z_new = int(z_new)
 		if z_new <= self.origin_z:
 			return
 		z_release = min(z_new, self.z_size)
-		for arr in self._arrays:
-			_release_memmap_pages(arr, self.origin_z, z_release)
+		for logical_z in range(self.origin_z, z_release):
+			physical_z = logical_z % self.ring_depth
+			if int(self._generation[physical_z]) == logical_z:
+				self._generation[physical_z] = -1
 		self.origin_z = z_release
 
 	def _cleanup_array(self, arr: np.ndarray) -> None:
 		path = getattr(arr, "_lasagna_tmp_path", None)
-		try:
-			arr.flush()
-		except Exception:
-			pass
+		mmap_obj = getattr(arr, "_mmap", None)
+		if mmap_obj is not None:
+			try:
+				mmap_obj.close()
+			except Exception:
+				pass
 		if path:
 			_remove_path_quiet(path)
 
@@ -1472,784 +1508,347 @@ def _read_tile_zarr(
 	return chunk
 
 
-def _infer_tiled_products_3d(
+def run_tiled_inference_3d(
 	model,
 	zarr_arr,
 	*,
-	crop_slices: tuple[int, int, int, int, int, int],
+	crop_slices: RegionZYX,
 	device: torch.device,
 	model_adapter: ModelAdapter,
 	output_adapter: OutputAdapter,
 	products: Sequence[OutputProductSpec],
-	output_region_zyx: tuple[int, int, int, int, int, int],
-	full_output_shape_zyx: tuple[int, int, int],
+	output_regions_zyx: Mapping[str, RegionZYX],
+	full_output_shapes_zyx: Mapping[str, tuple[int, int, int]],
 	input_zarr_path: str | None = None,
-	output_scaledown_base: int | None = None,
+	output_scaledown_base: Mapping[str, int] | int | None = None,
 	tile_size: int = 256,
 	overlap: int = 64,
 	border: int = 16,
-	scaledown: int = 1,
 	tmp_dir: str | None = None,
 	progress: dict | None = None,
 	temp_prefix: str = "",
 ) -> None:
-	"""Run tiled 3D inference for coherent products stored at one output scale."""
-	z0, z1, y0, y1, x0, x1 = crop_slices
-	nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
-	volume_shape = tuple(int(v) for v in zarr_arr.shape)
+	"""Authoritative one-pass, multi-scale tiled inference engine."""
 	products = tuple(products)
 	if not products:
-		raise ValueError("at least one output product is required")
-
-	sd = max(1, int(scaledown))
-	stride = max(1, int(tile_size) - int(overlap))
-	for name, val in [("tile_size", tile_size), ("stride", stride), ("border", border)]:
-		if int(val) % sd != 0:
-			raise ValueError(f"{name}={val} must be divisible by scaledown={sd}")
-
-	pad0 = max(0, int(border))
-	Zp = _round_up_to_multiple(nz + 2 * pad0, sd)
-	Yp = _round_up_to_multiple(ny + 2 * pad0, sd)
-	Xp = _round_up_to_multiple(nx + 2 * pad0, sd)
-	Zo, Yo, Xo = Zp // sd, Yp // sd, Xp // sd
-
-	out_oz0, out_oy0, out_ox0, out_oz1, out_oy1, out_ox1 = (
-		int(v) for v in output_region_zyx
-	)
-	out_wz = out_oz1 - out_oz0
-	out_wy = out_oy1 - out_oy0
-	out_wx = out_ox1 - out_ox0
-	if out_wz <= 0 or out_wy <= 0 or out_wx <= 0:
-		raise ValueError(f"empty output region: {output_region_zyx}")
-	full_out_shape = tuple(int(v) for v in full_output_shape_zyx)
-	oc = int(products[0].chunk_size)
-	if any(int(product.chunk_size) != oc for product in products):
-		raise ValueError("single-scale tiled product inference requires one chunk size")
-
-	ov_eff = max(0, int(overlap) - 2 * pad0)
-
-	def _blend_ramp(length, ov, b):
-		ramp = np.zeros(length, dtype=np.float32)
-		if length <= 0:
-			return ramp
-		core_start = min(b, length)
-		core_end = max(core_start, length - b)
-		core_len = core_end - core_start
-		if core_len <= 0:
-			return ramp
-		core = np.ones(core_len, dtype=np.float32)
-		if ov > 0:
-			ov_core = min(ov, core_len // 2)
-			if ov_core > 0:
-				edges = np.linspace(0.0, 1.0, ov_core + 1, dtype=np.float32)[1:]
-				core[:ov_core] = edges
-				core[-ov_core:] = edges[::-1]
-		ramp[core_start:core_end] = core
-		return ramp
-
-	rz_full = _blend_ramp(int(tile_size), ov_eff, pad0)
-	ry_full = _blend_ramp(int(tile_size), ov_eff, pad0)
-	rx_full = _blend_ramp(int(tile_size), ov_eff, pad0)
-	w_full = torch.from_numpy(
-		rz_full[:, None, None] * ry_full[None, :, None] * rx_full[None, None, :]
-	).to(device)
-	w_out = (
-		_pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0).cpu().numpy()
-		if sd > 1
-		else w_full.cpu().numpy()
-	)
-
-	z_positions = _canonical_local_tile_positions(
-		volume_size=volume_shape[0],
-		crop_start=z0,
-		crop_padded_size=Zp,
-		tile_size=int(tile_size),
-		stride=stride,
-		border=pad0,
-		scaledown_multiple=sd,
-	)
-	y_positions = _canonical_local_tile_positions(
-		volume_size=volume_shape[1],
-		crop_start=y0,
-		crop_padded_size=Yp,
-		tile_size=int(tile_size),
-		stride=stride,
-		border=pad0,
-		scaledown_multiple=sd,
-	)
-	x_positions = _canonical_local_tile_positions(
-		volume_size=volume_shape[2],
-		crop_start=x0,
-		crop_padded_size=Xp,
-		tile_size=int(tile_size),
-		stride=stride,
-		border=pad0,
-		scaledown_multiple=sd,
-	)
-
-	accumulators: dict[str, _RollingZBand] = {}
-	wsums: dict[str, _RollingZBand] = {}
-	for product in products:
-		accumulators[product.name] = _RollingZBand(
-			name=f"acc_{product.name}",
-			channel_count=int(product.raw_channel_count),
-			z_size=Zo,
-			y_size=Yo,
-			x_size=Xo,
-			tmp_dir=tmp_dir,
-			prefix=temp_prefix,
-		)
-		wsums[product.name] = _RollingZBand(
-			name=f"wsum_{product.name}",
-			channel_count=1,
-			z_size=Zo,
-			y_size=Yo,
-			x_size=Xo,
-			tmp_dir=tmp_dir,
-			prefix=temp_prefix,
-		)
-	print(
-		f"[predict3d] rolling product accumulators: products={len(products)} "
-		f"zyx=({Zo},{Yo},{Xo}) sd={sd}",
-		flush=True,
-	)
-
-	crop_offset = (z0, y0, x0)
-	if input_zarr_path is not None:
-		input_zarr_dir = str(Path(str(input_zarr_path).rstrip("/")).resolve())
-	else:
-		store_path = getattr(getattr(zarr_arr, "store", None), "path", None)
-		input_zarr_dir = str(Path(str(store_path or ".")).resolve())
-	b = pad0 // sd
-	out_end = b + out_wz
-	prev_flush = 0
-	progress_scaledown = max(1, int(output_scaledown_base if output_scaledown_base is not None else sd))
-	tiles_per_zrow = len(y_positions) * len(x_positions)
-	total_tiles = len(z_positions) * tiles_per_zrow
-	done = 0
-	processed_tiles = 0
-	tile_time_sum = 0.0
-	t0 = time.time()
-	if progress is not None:
-		progress["tiles_total"] = total_tiles
-		progress["tiles_done"] = 0
-		progress["tiles_skipped"] = 0
-		progress["tiles_processed"] = 0
-		progress["tile_time_sum"] = 0.0
-		progress["tiles_remaining_est"] = total_tiles
-		initial_status = _predict3d_progress_line(progress)
-	else:
-		initial_status = (
-			f"[predict3d] [{'-' * 30}] 0/{total_tiles} tiles (0.0%) eta --:--"
-		)
-	print(initial_status, flush=True)
-
-	def _output_chunk_has_input_support(cz: int, cy: int, cx: int) -> bool:
-		z_end = min(full_out_shape[0], int(cz) + oc)
-		y_end = min(full_out_shape[1], int(cy) + oc)
-		x_end = min(full_out_shape[2], int(cx) + oc)
-		z_pos = _canonical_tile_positions_for_output_region(
-			volume_size=volume_shape[0],
-			output_start=int(cz),
-			output_end=z_end,
-			scaledown=sd,
-			tile_size=int(tile_size),
-			stride=stride,
-			border=pad0,
-			scaledown_multiple=sd,
-		)
-		y_pos = _canonical_tile_positions_for_output_region(
-			volume_size=volume_shape[1],
-			output_start=int(cy),
-			output_end=y_end,
-			scaledown=sd,
-			tile_size=int(tile_size),
-			stride=stride,
-			border=pad0,
-			scaledown_multiple=sd,
-		)
-		x_pos = _canonical_tile_positions_for_output_region(
-			volume_size=volume_shape[2],
-			output_start=int(cx),
-			output_end=x_end,
-			scaledown=sd,
-			tile_size=int(tile_size),
-			stride=stride,
-			border=pad0,
-			scaledown_multiple=sd,
-		)
-		for pz in z_pos:
-			src_z0 = max(0, int(pz) - pad0)
-			src_z1 = min(volume_shape[0], int(pz) - pad0 + int(tile_size))
-			for py in y_pos:
-				src_y0 = max(0, int(py) - pad0)
-				src_y1 = min(volume_shape[1], int(py) - pad0 + int(tile_size))
-				for px in x_pos:
-					src_x0 = max(0, int(px) - pad0)
-					src_x1 = min(volume_shape[2], int(px) - pad0 + int(tile_size))
-					if _input_has_chunks(input_zarr_dir, src_z0, src_z1, src_y0, src_y1, src_x0, src_x1):
-						return True
-		return False
-
-	def _is_tile_done(tz: int, ty: int, tx: int) -> bool:
-		in_z0 = max(0, int(tz) + z0 - pad0)
-		in_z1 = min(volume_shape[0], int(tz) + z0 - pad0 + int(tile_size))
-		in_y0 = max(0, int(ty) + y0 - pad0)
-		in_y1 = min(volume_shape[1], int(ty) + y0 - pad0 + int(tile_size))
-		in_x0 = max(0, int(tx) + x0 - pad0)
-		in_x1 = min(volume_shape[2], int(tx) + x0 - pad0 + int(tile_size))
-		if not _input_has_chunks(input_zarr_dir, in_z0, in_z1, in_y0, in_y1, in_x0, in_x1):
-			return True
-		ts_out = int(tile_size) // sd
-		az0, az1, _, _ = _downscaled_tile_clip(tz, sd, ts_out, Zo)
-		ay0, ay1, _, _ = _downscaled_tile_clip(ty, sd, ts_out, Yo)
-		ax0, ax1, _, _ = _downscaled_tile_clip(tx, sd, ts_out, Xo)
-		rz0 = max(out_oz0, out_oz0 + az0 - b)
-		rz1 = min(out_oz1, out_oz0 + az1 - b)
-		ry0 = max(out_oy0, out_oy0 + ay0 - b)
-		ry1 = min(out_oy1, out_oy0 + ay1 - b)
-		rx0 = max(out_ox0, out_ox0 + ax0 - b)
-		rx1 = min(out_ox1, out_ox0 + ax1 - b)
-		for chunk_origin in _iter_chunk_origins_for_region(
-			rz0, rz1, ry0, ry1, rx0, rx1, oc, full_out_shape,
-		):
-			for product in products:
-				if not output_adapter.product_chunk_complete(
-					product,
-					chunk_origin_zyx=chunk_origin,
-				):
-					return False
-		return True
-
-	def _flush(complete_z_padded: int) -> None:
-		nonlocal prev_flush
-		complete_z = int(complete_z_padded) // sd
-		flush_from = max(prev_flush, b)
-		if complete_z >= out_end:
-			flush_to = out_end
-		else:
-			complete_out_z = complete_z - b
-			flush_to = b + (complete_out_z // oc) * oc
-		if flush_to <= flush_from:
-			return
-		out_zs = flush_from - b
-		out_ze = flush_to - b
-		if out_ze > out_zs:
-			for product in products:
-				acc = accumulators[product.name]
-				wsum = wsums[product.name]
-				have_acc = _rolling_band_has_range(acc, flush_from, flush_to)
-				if not have_acc:
-					continue
-				acc_bands = [
-					acc.view(ch, flush_from, flush_to)
-					for ch in range(int(product.raw_channel_count))
-				]
-				ws_band = wsum.view(0, flush_from, flush_to)
-				for acc_band in acc_bands:
-					acc_band /= np.maximum(ws_band, 1.0e-7)
-				persisted_slab = None
-				oz = out_oz0 + out_zs
-				local_from = 0
-				local_to = flush_to - flush_from
-				y_base = pad0 // sd
-				x_base = pad0 // sd
-				for dz in range(0, out_ze - out_zs, oc):
-					for dy in range(0, out_wy, oc):
-						for dx in range(0, out_wx, oc):
-							cz = oz + dz
-							cy = out_oy0 + dy
-							cx = out_ox0 + dx
-							chunk_origin = (cz, cy, cx)
-							if output_adapter.product_chunk_complete(
-								product,
-								chunk_origin_zyx=chunk_origin,
-							):
-								continue
-							if not _output_chunk_has_input_support(cz, cy, cx):
-								continue
-							if persisted_slab is None:
-								raw_slab = np.ascontiguousarray(np.stack([
-									acc_band[
-										local_from:local_to,
-										y_base:y_base + out_wy,
-										x_base:x_base + out_wx,
-									]
-									for acc_band in acc_bands
-								], axis=0))
-								finalize_product_slab = getattr(
-									model_adapter,
-									"finalize_product_slab",
-									None,
-								)
-								if finalize_product_slab is None:
-									persisted_slab = {
-										channel.name: np.clip(
-											raw_slab[channel_index] * 255.0,
-											0.0,
-											255.0,
-										).astype(product.dtype, copy=False)
-										for channel_index, channel in enumerate(product.channels)
-									}
-								else:
-									persisted_slab = finalize_product_slab(product, raw_slab)
-								missing_channels = [
-									channel.name
-									for channel in product.channels
-									if channel.name not in persisted_slab
-								]
-								if missing_channels:
-									raise ValueError(
-										f"product {product.name!r} finalizer missing channels: "
-										f"{missing_channels}"
-									)
-							cze = min(out_ze - out_zs, dz + oc)
-							cye = min(out_wy, dy + oc)
-							cxe = min(out_wx, dx + oc)
-							chunk_data = {
-								channel.name: persisted_slab[channel.name][dz:cze, dy:cye, dx:cxe]
-								for channel in product.channels
-							}
-							output_adapter.write_product_chunk(
-								product,
-								chunk_origin_zyx=chunk_origin,
-								data=chunk_data,
-							)
-		for product in products:
-			accumulators[product.name].discard_before(flush_to)
-			wsums[product.name].discard_before(flush_to)
-		prev_flush = max(prev_flush, flush_to)
-		if progress is not None:
-			progress["finalized_base_z"] = max(
-				int(progress.get("finalized_base_z", 0)),
-				int((out_oz0 + max(0, flush_to - b)) * progress_scaledown),
-			)
-
-	try:
-		for i_tz, tz in enumerate(z_positions):
-			for ty in y_positions:
-				for tx in x_positions:
-					if _is_tile_done(tz, ty, tx):
-						done += 1
-						if progress is not None:
-							progress["tiles_done"] = done
-							progress["tiles_skipped"] = int(progress.get("tiles_skipped", 0)) + 1
-							progress["tiles_remaining_est"] = max(0, total_tiles - done)
-						continue
-
-					tile_t0 = time.time()
-					tile_np = _read_tile_zarr(
-						zarr_arr,
-						volume_shape,
-						crop_offset,
-						tz,
-						ty,
-						tx,
-						int(tile_size),
-						pad0,
-					)
-					if tile_np.dtype == np.uint16:
-						tile_np = (tile_np // 257).astype(np.uint8)
-					tile_f = tile_np.astype(np.float32) / 255.0
-					tile_t = torch.from_numpy(tile_f).unsqueeze(0).unsqueeze(0).to(device)
-					valid_t = torch.ones_like(tile_t, dtype=torch.bool, device=device)
-					preprocess_tile = getattr(model_adapter, "preprocess_tile", None)
-					if preprocess_tile is not None:
-						tile_t = preprocess_tile(tile_t, valid_t)
-					with torch.inference_mode():
-						raw_output = model_adapter.run_tile_inference(
-							model,
-							tile_t,
-							device=device,
-						)
-					product_tensors = model_adapter.product_tensors_from_output(raw_output)
-					for product in products:
-						tensor = product_tensors[product.name][0] * w_full
-						if sd > 1:
-							tensor = _pyrdown3d(tensor, factor=sd)
-						product_np = tensor.detach().cpu().numpy()
-						if int(product_np.shape[0]) != int(product.raw_channel_count):
-							raise ValueError(
-								f"product {product.name!r} raw tensor has "
-								f"{int(product_np.shape[0])} channels, expected "
-								f"{int(product.raw_channel_count)}"
-							)
-						ts_out = int(tile_size) // sd
-						az0, az1, sz0, sz1 = _downscaled_tile_clip(tz, sd, ts_out, Zo)
-						ay0, ay1, sy0, sy1 = _downscaled_tile_clip(ty, sd, ts_out, Yo)
-						ax0, ax1, sx0, sx1 = _downscaled_tile_clip(tx, sd, ts_out, Xo)
-						if az1 > az0 and ay1 > ay0 and ax1 > ax0:
-							acc = accumulators[product.name]
-							wsum = wsums[product.name]
-							for ch in range(int(product.raw_channel_count)):
-								acc.add(
-									ch,
-									az0,
-									az1,
-									ay0,
-									ay1,
-									ax0,
-									ax1,
-									product_np[ch, sz0:sz1, sy0:sy1, sx0:sx1],
-								)
-							wsum.add(
-								0,
-								az0,
-								az1,
-								ay0,
-								ay1,
-								ax0,
-								ax1,
-								w_out[sz0:sz1, sy0:sy1, sx0:sx1],
-							)
-
-					tile_elapsed = time.time() - tile_t0
-					tile_time_sum += tile_elapsed
-					processed_tiles += 1
-					done += 1
-					if progress is not None:
-						progress["tiles_done"] = done
-						progress["tiles_processed"] = processed_tiles
-						progress["tile_time_sum"] = tile_time_sum
-						progress["tiles_remaining_est"] = max(0, total_tiles - done)
-						status = _predict3d_progress_line(progress)
-					else:
-						per = tile_time_sum / max(1, processed_tiles)
-						eta = max(0.0, per * (total_tiles - done))
-						bar_w = 30
-						fill = max(0, min(bar_w, int(round(done / max(1, total_tiles) * bar_w))))
-						bar = "#" * fill + "-" * (bar_w - fill)
-						status = (
-							f"[predict3d] [{bar}] {done}/{total_tiles} tiles "
-							f"({100.0 * done / max(1, total_tiles):.1f}%) "
-							f"eta {_format_eta(eta)} avg={1000.0 * per:.0f}ms/tile"
-						)
-					print(f"\r{status}  ", end="", flush=True)
-
-			next_tz = z_positions[i_tz + 1] if i_tz + 1 < len(z_positions) else Zp
-			_flush(next_tz)
-		print("", flush=True)
-		print(
-			f"[predict3d] product inference done in {time.time() - t0:.1f}s "
-			f"({processed_tiles} processed, {done - processed_tiles} skipped)",
-			flush=True,
-		)
-	finally:
-		for acc in accumulators.values():
-			acc.cleanup()
-		for wsum in wsums.values():
-			wsum.cleanup()
-
-
-def _infer_tiled_3d(
-	model,
-	zarr_arr,
-	*,
-	crop_slices: tuple[int, int, int, int, int, int],
-	device: torch.device,
-	tile_size: int = 256,
-	overlap: int = 64,
-	border: int = 16,
-	out_channels: int = 8,
-	cos_scaledown: int = 2,
-	other_scaledown: int = 4,
-	tmp_dir: str | None = None,
-	output_sigmoid: bool = True,
-	on_z_complete=None,
-	skip_z_positions: int = 0,
-	progress: dict | None = None,
-	is_tile_done=None,
-	temp_prefix: str = "",
-	model_adapter: ModelAdapter | None = None,
-) -> tuple[np.ndarray, np.ndarray] | None:
-	"""Run 3D UNet inference with dual-resolution accumulators."""
-	z0, z1, y0, y1, x0, x1 = crop_slices
-	nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
+		raise ValueError("at least one neural output product is required")
 	volume_shape = tuple(int(v) for v in zarr_arr.shape)
-
-	sd_fine = max(1, int(cos_scaledown))
-	sd_coarse = max(1, int(other_scaledown))
-	stride = max(1, tile_size - overlap)
-
-	for sd_label, sd_val in [("cos_scaledown", sd_fine), ("other_scaledown", sd_coarse)]:
-		if sd_val > 1:
-			for name, val in [("tile_size", tile_size), ("stride", stride), ("border", border)]:
-				if val % sd_val != 0:
-					raise ValueError(f"{name}={val} must be divisible by {sd_label}={sd_val}")
-
-	pad0 = max(0, int(border))
-	Zp = nz + 2 * pad0
-	Yp = ny + 2 * pad0
-	Xp = nx + 2 * pad0
-
-	sd_max = max(sd_fine, sd_coarse)
-	if sd_max > 1:
-		Zp = _round_up_to_multiple(Zp, sd_max)
-		Yp = _round_up_to_multiple(Yp, sd_max)
-		Xp = _round_up_to_multiple(Xp, sd_max)
-
-	Zo_f, Yo_f, Xo_f = Zp // sd_fine, Yp // sd_fine, Xp // sd_fine
-	Zo_c, Yo_c, Xo_c = Zp // sd_coarse, Yp // sd_coarse, Xp // sd_coarse
-
-	ov_eff = max(0, overlap - 2 * border)
-
+	z0, z1, y0, y1, x0, x1 = (int(v) for v in crop_slices)
+	nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
+	pad = max(0, int(border))
+	stride = max(1, int(tile_size) - int(overlap))
+	scales = {
+		p.name: max(1, int(p.inference_scaledown or 1))
+		for p in products
+	}
+	if isinstance(output_scaledown_base, Mapping):
+		input_scales = set()
+		for product in products:
+			base_sd = int(output_scaledown_base[product.name])
+			if base_sd != int(product.scaledown):
+				raise ValueError(
+					f"product {product.name!r} base scaledown mismatch: "
+					f"spec={product.scaledown}, runner={base_sd}"
+				)
+			if base_sd % scales[product.name]:
+				raise ValueError(
+					f"product {product.name!r} base scaledown {base_sd} is not divisible "
+					f"by inference_scaledown {scales[product.name]}"
+				)
+			input_scales.add(base_sd // scales[product.name])
+		if len(input_scales) != 1:
+			raise ValueError(f"products disagree on selected input scale: {sorted(input_scales)}")
+	sd_max = max(scales.values())
+	for sd in sorted(set(scales.values())):
+		for label, value in (("tile_size", tile_size), ("stride", stride), ("border", pad)):
+			if int(value) % sd:
+				raise ValueError(f"{label}={value} must be divisible by inference_scaledown={sd}")
+	Zp = _round_up_to_multiple(nz + 2 * pad, sd_max)
+	Yp = _round_up_to_multiple(ny + 2 * pad, sd_max)
+	Xp = _round_up_to_multiple(nx + 2 * pad, sd_max)
 	z_positions = _canonical_local_tile_positions(
 		volume_size=volume_shape[0], crop_start=z0, crop_padded_size=Zp,
-		tile_size=tile_size, stride=stride, border=pad0, scaledown_multiple=sd_max,
+		tile_size=tile_size, stride=stride, border=pad, scaledown_multiple=sd_max,
 	)
 	y_positions = _canonical_local_tile_positions(
 		volume_size=volume_shape[1], crop_start=y0, crop_padded_size=Yp,
-		tile_size=tile_size, stride=stride, border=pad0, scaledown_multiple=sd_max,
+		tile_size=tile_size, stride=stride, border=pad, scaledown_multiple=sd_max,
 	)
 	x_positions = _canonical_local_tile_positions(
 		volume_size=volume_shape[2], crop_start=x0, crop_padded_size=Xp,
-		tile_size=tile_size, stride=stride, border=pad0, scaledown_multiple=sd_max,
+		tile_size=tile_size, stride=stride, border=pad, scaledown_multiple=sd_max,
 	)
 
-	def _blend_ramp(length, ov, b):
+	def _blend_ramp(length: int) -> np.ndarray:
 		ramp = np.zeros(length, dtype=np.float32)
-		if length <= 0:
-			return ramp
-		core_start = min(b, length)
-		core_end = max(core_start, length - b)
+		core_start, core_end = min(pad, length), max(min(pad, length), length - pad)
 		core_len = core_end - core_start
 		if core_len <= 0:
 			return ramp
 		core = np.ones(core_len, dtype=np.float32)
-		if ov > 0:
-			ov_core = min(ov, core_len // 2)
-			if ov_core > 0:
-				edges = np.linspace(0.0, 1.0, ov_core + 1, dtype=np.float32)[1:]
-				core[:ov_core] = edges
-				core[-ov_core:] = edges[::-1]
+		ov = min(max(0, int(overlap) - 2 * pad), core_len // 2)
+		if ov:
+			edges = np.linspace(0.0, 1.0, ov + 1, dtype=np.float32)[1:]
+			core[:ov], core[-ov:] = edges, edges[::-1]
 		ramp[core_start:core_end] = core
 		return ramp
 
-	rz_full = _blend_ramp(tile_size, ov_eff, border)
-	ry_full = _blend_ramp(tile_size, ov_eff, border)
-	rx_full = _blend_ramp(tile_size, ov_eff, border)
-	w_full = torch.from_numpy(
-		rz_full[:, None, None] * ry_full[None, :, None] * rx_full[None, None, :]
-	).to(device)
-
-	w_fine = (_pyrdown3d(w_full.unsqueeze(0), factor=sd_fine).squeeze(0).cpu().numpy()
-			  if sd_fine > 1 else w_full.cpu().numpy())
-	w_coarse = (_pyrdown3d(w_full.unsqueeze(0), factor=sd_coarse).squeeze(0).cpu().numpy()
-				if sd_coarse > 1 else w_full.cpu().numpy())
-
-	streaming = on_z_complete is not None
-
-	def _make_memmap(suffix, shape):
-		fd, p = tempfile.mkstemp(
-			prefix=f".predict3d_pid{os.getpid()}_{temp_prefix}{suffix}_",
-			suffix=".tmp",
-			dir=tmp_dir if tmp_dir else None,
+	r = _blend_ramp(int(tile_size))
+	w_full = torch.from_numpy(r[:, None, None] * r[None, :, None] * r[None, None, :]).to(device)
+	w_by_scale = {
+		sd: (_pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0).cpu().numpy()
+			 if sd > 1 else w_full.cpu().numpy())
+		for sd in sorted(set(scales.values()))
+	}
+	groups: dict[int, dict[str, Any]] = {}
+	for sd in sorted(set(scales.values())):
+		group_products = tuple(p for p in products if scales[p.name] == sd)
+		chunk_sizes = {int(p.chunk_size) for p in group_products}
+		if len(chunk_sizes) != 1:
+			raise ValueError(f"products at inference scale {sd} must share a chunk size")
+		oc = chunk_sizes.pop()
+		Zo, Yo, Xo = Zp // sd, Yp // sd, Xp // sd
+		regions = {p.name: tuple(int(v) for v in output_regions_zyx[p.name]) for p in group_products}
+		# Products sharing a denominator must describe the same output region.
+		if len(set(regions.values())) != 1:
+			raise ValueError(f"products at inference scale {sd} must share output_region_zyx")
+		region = next(iter(regions.values()))
+		oz0, oy0, ox0, oz1, oy1, ox1 = region
+		b = pad // sd
+		depth = _plan_circular_z_depth(
+			z_positions=z_positions, tile_size=tile_size, scaledown=sd,
+			z_size=Zo, chunk_size=oc, output_begin=b, output_end=b + (oz1 - oz0),
 		)
-		os.close(fd)
-		mm = np.memmap(p, dtype=np.float32, mode="w+", shape=shape)
-		mm._lasagna_tmp_path = p
-		atexit.register(lambda path=p: os.path.exists(path) and os.unlink(path))
-		return mm
-
-	n_other = out_channels - 1
-	if streaming:
-		acc_fine = _RollingZBand(
-			name="acc_fine", channel_count=1, z_size=Zo_f, y_size=Yo_f, x_size=Xo_f,
-			tmp_dir=tmp_dir, prefix=temp_prefix,
+		acc = {
+			p.name: _CircularZBand(
+				name=f"acc_{p.name}", channel_count=p.raw_channel_count,
+				z_size=Zo, y_size=Yo, x_size=Xo, tmp_dir=tmp_dir,
+				prefix=temp_prefix, ring_depth=depth,
+			)
+			for p in group_products
+		}
+		weight = _CircularZBand(
+			name=f"weight_sd{sd}", channel_count=1, z_size=Zo, y_size=Yo, x_size=Xo,
+			tmp_dir=tmp_dir, prefix=temp_prefix, ring_depth=depth,
 		)
-		wsum_fine = _RollingZBand(
-			name="wsum_fine", channel_count=1, z_size=Zo_f, y_size=Yo_f, x_size=Xo_f,
-			tmp_dir=tmp_dir, prefix=temp_prefix,
-		)
-		acc_coarse = _RollingZBand(
-			name="acc_coarse", channel_count=n_other, z_size=Zo_c, y_size=Yo_c, x_size=Xo_c,
-			tmp_dir=tmp_dir, prefix=temp_prefix,
-		)
-		wsum_coarse = _RollingZBand(
-			name="wsum_coarse", channel_count=1, z_size=Zo_c, y_size=Yo_c, x_size=Xo_c,
-			tmp_dir=tmp_dir, prefix=temp_prefix,
-		)
+		bytes_total = (1 + sum(p.raw_channel_count for p in group_products)) * depth * Yo * Xo * 4
 		print(
-			f"[predict3d] rolling accumulators: fine channels=1 zyx=({Zo_f},{Yo_f},{Xo_f}) sd={sd_fine}; "
-			f"coarse channels={n_other} zyx=({Zo_c},{Yo_c},{Xo_c}) sd={sd_coarse}",
+			f"[predict3d] ring sd={sd} depth={depth} logical_z={Zo} yx=({Yo},{Xo}) "
+			f"products={len(group_products)} backing={bytes_total / 1024**3:.2f}GiB",
 			flush=True,
 		)
+		groups[sd] = dict(
+			products=group_products, oc=oc, shape=(Zo, Yo, Xo), region=region,
+			b=b, depth=depth, acc=acc, weight=weight, flushed=b,
+		)
+
+	if input_zarr_path is not None:
+		input_dir = str(Path(str(input_zarr_path).rstrip("/")).resolve())
 	else:
-		acc_fine = _make_memmap("acc_fine", (1, Zo_f, Yo_f, Xo_f))
-		wsum_fine = _make_memmap("wsum_fine", (1, Zo_f, Yo_f, Xo_f))
-		acc_coarse = _make_memmap("acc_coarse", (n_other, Zo_c, Yo_c, Xo_c))
-		wsum_coarse = _make_memmap("wsum_coarse", (1, Zo_c, Yo_c, Xo_c))
+		store_path = getattr(getattr(zarr_arr, "store", None), "path", None)
+		input_dir = str(Path(str(store_path or ".")).resolve())
 
-		fine_bytes = (np.prod(acc_fine.shape) + np.prod(wsum_fine.shape)) * 4
-		coarse_bytes = (np.prod(acc_coarse.shape) + np.prod(wsum_coarse.shape)) * 4
-		print(
-			f"[predict3d] accumulators: fine ({1},{Zo_f},{Yo_f},{Xo_f}) sd={sd_fine} "
-			f"({fine_bytes / (1024**3):.2f} GiB) + "
-			f"coarse ({n_other},{Zo_c},{Yo_c},{Xo_c}) sd={sd_coarse} "
-			f"({coarse_bytes / (1024**3):.2f} GiB)",
-			flush=True,
+	def _chunk_supported(sd: int, origin: ChunkOriginZYX, shape: tuple[int, int, int], oc: int) -> bool:
+		ends = tuple(min(shape[i], int(origin[i]) + oc) for i in range(3))
+		axes = [
+			_canonical_tile_positions_for_output_region(
+				volume_size=volume_shape[i], output_start=int(origin[i]), output_end=ends[i],
+				scaledown=sd, tile_size=tile_size, stride=stride, border=pad,
+				scaledown_multiple=sd_max,
+			)
+			for i in range(3)
+		]
+		for pz in axes[0]:
+			for py in axes[1]:
+				for px in axes[2]:
+					bounds = (
+						max(0, pz - pad), min(volume_shape[0], pz - pad + tile_size),
+						max(0, py - pad), min(volume_shape[1], py - pad + tile_size),
+						max(0, px - pad), min(volume_shape[2], px - pad + tile_size),
+					)
+					if _input_has_chunks(input_dir, *bounds):
+						return True
+		return False
+
+	def _tile_work(tz: int, ty: int, tx: int) -> bool:
+		bounds = (
+			max(0, tz + z0 - pad), min(volume_shape[0], tz + z0 - pad + tile_size),
+			max(0, ty + y0 - pad), min(volume_shape[1], ty + y0 - pad + tile_size),
+			max(0, tx + x0 - pad), min(volume_shape[2], tx + x0 - pad + tile_size),
 		)
+		if not _input_has_chunks(input_dir, *bounds):
+			return False
+		for sd, g in groups.items():
+			Zo, Yo, Xo = g["shape"]
+			ts = tile_size // sd
+			clips = [_downscaled_tile_clip(v, sd, ts, size) for v, size in zip((tz, ty, tx), (Zo, Yo, Xo))]
+			oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
+			b = g["b"]
+			reg = (
+				max(oz0, oz0 + clips[0][0] - b), min(oz1, oz0 + clips[0][1] - b),
+				max(oy0, oy0 + clips[1][0] - b), min(oy1, oy0 + clips[1][1] - b),
+				max(ox0, ox0 + clips[2][0] - b), min(ox1, ox0 + clips[2][1] - b),
+			)
+			shape = tuple(int(v) for v in full_output_shapes_zyx[g["products"][0].name])
+			for origin in _iter_chunk_origins_for_region(*reg, g["oc"], shape):
+				if any(not output_adapter.product_chunk_complete(p, chunk_origin_zyx=origin) for p in g["products"]):
+					return True
+		return False
 
-	tiles_per_zrow = len(y_positions) * len(x_positions)
-	total_tiles = len(z_positions) * tiles_per_zrow
-	skipped_tiles = skip_z_positions * tiles_per_zrow
-	done = skipped_tiles
-	processed_tiles = 0
+	def _accumulate_group(sd: int, g: dict[str, Any], tensors: Mapping[str, torch.Tensor], tz: int, ty: int, tx: int) -> None:
+		Zo, Yo, Xo = g["shape"]
+		ts = tile_size // sd
+		clips = [_downscaled_tile_clip(v, sd, ts, size) for v, size in zip((tz, ty, tx), (Zo, Yo, Xo))]
+		(az0, az1, sz0, sz1), (ay0, ay1, sy0, sy1), (ax0, ax1, sx0, sx1) = clips
+		if az1 <= az0 or ay1 <= ay0 or ax1 <= ax0:
+			return
+		oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
+		b, oc = g["b"], g["oc"]
+		reg = (
+			max(oz0, oz0 + az0 - b), min(oz1, oz0 + az1 - b),
+			max(oy0, oy0 + ay0 - b), min(oy1, oy0 + ay1 - b),
+			max(ox0, ox0 + ax0 - b), min(ox1, ox0 + ax1 - b),
+		)
+		shape = tuple(int(v) for v in full_output_shapes_zyx[g["products"][0].name])
+		incomplete_by_chunk: dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]] = {}
+		for origin in _iter_chunk_origins_for_region(*reg, oc, shape):
+			missing = tuple(p for p in g["products"] if not output_adapter.product_chunk_complete(p, chunk_origin_zyx=origin))
+			if missing:
+				incomplete_by_chunk[origin] = missing
+		if not incomplete_by_chunk:
+			return
+		product_np: dict[str, np.ndarray] = {}
+		for product in {p for ps in incomplete_by_chunk.values() for p in ps}:
+			tensor = tensors[product.name][0] * w_full
+			if sd > 1:
+				tensor = _pyrdown3d(tensor, factor=sd)
+			product_np[product.name] = tensor.detach().cpu().numpy()
+		weight_np = w_by_scale[sd]
+		for origin, missing in incomplete_by_chunk.items():
+			cz, cy, cx = origin
+			gz0, gy0, gx0 = max(reg[0], cz), max(reg[2], cy), max(reg[4], cx)
+			gz1, gy1, gx1 = min(reg[1], cz + oc), min(reg[3], cy + oc), min(reg[5], cx + oc)
+			lz0, ly0, lx0 = b + gz0 - oz0, b + gy0 - oy0, b + gx0 - ox0
+			lz1, ly1, lx1 = b + gz1 - oz0, b + gy1 - oy0, b + gx1 - ox0
+			pz0, py0, px0 = sz0 + lz0 - az0, sy0 + ly0 - ay0, sx0 + lx0 - ax0
+			pz1, py1, px1 = pz0 + lz1 - lz0, py0 + ly1 - ly0, px0 + lx1 - lx0
+			g["weight"].add(0, lz0, lz1, ly0, ly1, lx0, lx1, weight_np[pz0:pz1, py0:py1, px0:px1])
+			for product in missing:
+				arr = product_np[product.name]
+				for ch in range(product.raw_channel_count):
+					g["acc"][product.name].add(ch, lz0, lz1, ly0, ly1, lx0, lx1, arr[ch, pz0:pz1, py0:py1, px0:px1])
+
+	def _flush_group(sd: int, g: dict[str, Any], complete_padded: int) -> None:
+		complete = int(complete_padded) // sd
+		b, oc = g["b"], g["oc"]
+		oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
+		end = b + oz1 - oz0
+		flush_from = max(int(g["flushed"]), b)
+		flush_to = end if complete >= end else b + (max(0, complete - b) // oc) * oc
+		if flush_to <= flush_from:
+			return
+		print(f"[predict3d] flush sd={sd} z=[{oz0 + flush_from - b},{oz0 + flush_to - b})", flush=True)
+		shape = tuple(int(v) for v in full_output_shapes_zyx[g["products"][0].name])
+		for lz0 in range(flush_from, flush_to, oc):
+			gz = oz0 + lz0 - b
+			zlen = min(oc, flush_to - lz0, oz1 - gz)
+			for gy in range(oy0, oy1, oc):
+				ylen = min(oc, oy1 - gy)
+				for gx in range(ox0, ox1, oc):
+					xlen = min(oc, ox1 - gx)
+					origin = (gz, gy, gx)
+					ly0, lx0 = b + gy - oy0, b + gx - ox0
+					lz1, ly1, lx1 = lz0 + zlen, ly0 + ylen, lx0 + xlen
+					supported = _chunk_supported(sd, origin, shape, oc)
+					missing = tuple(p for p in g["products"] if not output_adapter.product_chunk_complete(p, chunk_origin_zyx=origin))
+					if supported and missing:
+						denom = g["weight"].read(0, lz0, lz1, ly0, ly1, lx0, lx1)
+						np.maximum(denom, 1.0e-7, out=denom)
+						for product in missing:
+							raw = np.stack([g["acc"][product.name].read(ch, lz0, lz1, ly0, ly1, lx0, lx1) for ch in range(product.raw_channel_count)])
+							raw /= denom[None]
+							finalizer = getattr(model_adapter, "finalize_product_slab", None)
+							if finalizer is None:
+								persisted = {
+									channel.name: np.clip(raw[index] * 255.0, 0.0, 255.0).astype(product.dtype)
+									for index, channel in enumerate(product.channels)
+								}
+							else:
+								persisted = finalizer(product, raw)
+							output_adapter.write_product_chunk(product, chunk_origin_zyx=origin, data={c.name: persisted[c.name] for c in product.channels})
+					for acc in g["acc"].values():
+						acc.clear(lz0, lz1, ly0, ly1, lx0, lx1)
+					g["weight"].clear(lz0, lz1, ly0, ly1, lx0, lx1)
+		for acc in g["acc"].values():
+			acc.discard_before(flush_to)
+		g["weight"].discard_before(flush_to)
+		g["flushed"] = flush_to
+		if progress is not None:
+			if isinstance(output_scaledown_base, Mapping):
+				base_sd = min(int(output_scaledown_base[p.name]) for p in g["products"])
+			elif output_scaledown_base is None:
+				base_sd = sd
+			else:
+				base_sd = int(output_scaledown_base)
+			progress[f"finalized_base_z_sd{sd}"] = (oz0 + flush_to - b) * base_sd
+			progress["finalized_base_z"] = min(
+				int(progress.get(f"finalized_base_z_sd{group_sd}", progress.get("finalized_base_z", 0)))
+				for group_sd in groups
+			)
+		print(f"[predict3d] flush complete sd={sd} z={oz0 + flush_to - b}", flush=True)
+
+	total = len(z_positions) * len(y_positions) * len(x_positions)
+	done = processed = skipped = 0
+	tile_time = 0.0
 	t0 = time.time()
-	_tile_time_sum = 0.0
-	crop_offset = (z0, y0, x0)
 	if progress is not None:
-		progress["tiles_total"] = total_tiles
-		progress["tiles_done"] = done
-		progress["tiles_skipped"] = skipped_tiles
-		progress["tiles_processed"] = 0
-		progress["tile_time_sum"] = 0.0
-		progress["tiles_remaining_est"] = max(0, total_tiles - done)
-
-	for i_tz, tz in enumerate(z_positions):
-		if i_tz < skip_z_positions:
-			continue
-
-		for ty in y_positions:
-			for tx in x_positions:
-				if is_tile_done is not None and is_tile_done(tz, ty, tx):
-					done += 1
+		progress.update(tiles_total=total, tiles_done=0, tiles_processed=0, tiles_skipped=0, tile_time_sum=0.0, tiles_remaining_est=total)
+	print(_predict3d_progress_line(progress) if progress is not None else f"[predict3d] 0/{total} tiles", flush=True)
+	try:
+		for iz, tz in enumerate(z_positions):
+			for ty in y_positions:
+				for tx in x_positions:
+					if not _tile_work(tz, ty, tx):
+						done += 1; skipped += 1
+						continue
+					tile_t0 = time.time()
+					tile_np = _read_tile_zarr(zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad)
+					if tile_np.dtype == np.uint16:
+						tile_np = (tile_np // 257).astype(np.uint8)
+					tile = torch.from_numpy(tile_np.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+					preprocess = getattr(model_adapter, "preprocess_tile", None)
+					if preprocess is not None:
+						tile = preprocess(tile, torch.ones_like(tile, dtype=torch.bool))
+					with torch.inference_mode():
+						raw_output = model_adapter.run_tile_inference(model, tile, device=device)
+					diagnostic = raw_output.get("output") if isinstance(raw_output, dict) else raw_output
+					if isinstance(diagnostic, torch.Tensor):
+						nan_count = int(torch.isnan(diagnostic).sum().item())
+						if nan_count or processed == 0:
+							print(
+								f"[predict3d] tile pos=({tz},{ty},{tx}) "
+								f"input=({float(tile.min()):.4f},{float(tile.max()):.4f}) "
+								f"raw=({float(diagnostic.min()):.4f},{float(diagnostic.max()):.4f}) "
+								f"nan={nan_count}/{diagnostic.numel()} dtype={diagnostic.dtype}",
+								flush=True,
+							)
+					tensors = model_adapter.product_tensors_from_output(raw_output)
+					for sd, g in groups.items():
+						_accumulate_group(sd, g, tensors, tz, ty, tx)
+					done += 1; processed += 1; tile_time += time.time() - tile_t0
 					if progress is not None:
-						progress["tiles_done"] = done
-						progress["tiles_skipped"] = int(progress.get("tiles_skipped", 0)) + 1
-						progress["tiles_remaining_est"] = max(0, total_tiles - done)
-					continue
-
-				_tile_t0 = time.time()
-				tile_np = _read_tile_zarr(
-					zarr_arr, volume_shape, crop_offset,
-					tz, ty, tx, tile_size, border,
-				)
-				if tile_np.dtype == np.uint16:
-					tile_np = (tile_np // 257).astype(np.uint8)
-
-				tile_f = tile_np.astype(np.float32) / 255.0
-				tile_t = torch.from_numpy(tile_f).unsqueeze(0).unsqueeze(0).to(device)
-
-				with torch.inference_mode(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-					if model_adapter is None:
-						pred = model(tile_t)
-					else:
-						pred = model_adapter.run_tile_inference(model, tile_t, device=device)
-				if isinstance(pred, dict):
-					pred = pred["output"]
-
-				raw_nan = torch.isnan(pred).sum().item()
-				if raw_nan > 0 or done == skipped_tiles:
-					print(flush=True)
-					print(
-						f"  tile {done}/{total_tiles} "
-						f"pos=({tz},{ty},{tx}) "
-						f"input: min={tile_f.min():.4f} max={tile_f.max():.4f} "
-						f"raw_out: min={pred.min().item():.4f} max={pred.max().item():.4f} "
-						f"nan={raw_nan}/{pred.numel()} "
-						f"dtype={pred.dtype}",
-						flush=True,
-					)
-
-				if output_sigmoid:
-					pred = torch.sigmoid(pred.float())
-				else:
-					pred = pred.float().clamp(0.0, 1.0)
-
-				pred_cos = pred[0, 0:1] * w_full
-				pred_other = pred[0, 1:] * w_full
-
-				if sd_fine > 1:
-					pred_cos = _pyrdown3d(pred_cos, factor=sd_fine)
-				cos_np = pred_cos.cpu().numpy()
-				ts_f = tile_size // sd_fine
-				azl_f, azr_f, szl_f, szr_f = _downscaled_tile_clip(tz, sd_fine, ts_f, Zo_f)
-				ayl_f, ayr_f, syl_f, syr_f = _downscaled_tile_clip(ty, sd_fine, ts_f, Yo_f)
-				axl_f, axr_f, sxl_f, sxr_f = _downscaled_tile_clip(tx, sd_fine, ts_f, Xo_f)
-				if azr_f > azl_f and ayr_f > ayl_f and axr_f > axl_f:
-					if streaming:
-						acc_fine.add(0, azl_f, azr_f, ayl_f, ayr_f, axl_f, axr_f,
-									 cos_np[0, szl_f:szr_f, syl_f:syr_f, sxl_f:sxr_f])
-						wsum_fine.add(0, azl_f, azr_f, ayl_f, ayr_f, axl_f, axr_f,
-									  w_fine[szl_f:szr_f, syl_f:syr_f, sxl_f:sxr_f])
-					else:
-						acc_fine[:, azl_f:azr_f, ayl_f:ayr_f, axl_f:axr_f] += cos_np[:, szl_f:szr_f, syl_f:syr_f, sxl_f:sxr_f]
-						wsum_fine[0, azl_f:azr_f, ayl_f:ayr_f, axl_f:axr_f] += w_fine[szl_f:szr_f, syl_f:syr_f, sxl_f:sxr_f]
-
-				if sd_coarse > 1:
-					pred_other = _pyrdown3d(pred_other, factor=sd_coarse)
-				other_np = pred_other.cpu().numpy()
-				ts_c = tile_size // sd_coarse
-				azl_c, azr_c, szl_c, szr_c = _downscaled_tile_clip(tz, sd_coarse, ts_c, Zo_c)
-				ayl_c, ayr_c, syl_c, syr_c = _downscaled_tile_clip(ty, sd_coarse, ts_c, Yo_c)
-				axl_c, axr_c, sxl_c, sxr_c = _downscaled_tile_clip(tx, sd_coarse, ts_c, Xo_c)
-				if azr_c > azl_c and ayr_c > ayl_c and axr_c > axl_c:
-					if streaming:
-						for ch in range(n_other):
-							acc_coarse.add(ch, azl_c, azr_c, ayl_c, ayr_c, axl_c, axr_c,
-										   other_np[ch, szl_c:szr_c, syl_c:syr_c, sxl_c:sxr_c])
-						wsum_coarse.add(0, azl_c, azr_c, ayl_c, ayr_c, axl_c, axr_c,
-										w_coarse[szl_c:szr_c, syl_c:syr_c, sxl_c:sxr_c])
-					else:
-						acc_coarse[:, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += other_np[:, szl_c:szr_c, syl_c:syr_c, sxl_c:sxr_c]
-						wsum_coarse[0, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += w_coarse[szl_c:szr_c, syl_c:syr_c, sxl_c:sxr_c]
-
-				tile_elapsed = time.time() - _tile_t0
-				_tile_time_sum += tile_elapsed
-				processed_tiles += 1
-				done += 1
-				if progress is not None:
-					progress["tiles_done"] = done
-					progress["tiles_processed"] = processed_tiles
-					progress["tile_time_sum"] = _tile_time_sum
-					progress["tiles_remaining_est"] = max(0, total_tiles - done)
-				if progress is None:
-					per = _tile_time_sum / max(1, processed_tiles)
-					remaining = total_tiles - done
-					eta = max(0.0, per * remaining)
-					bar_w = 30
-					fill = int(round(done / max(1, total_tiles) * bar_w))
-					fill = max(0, min(bar_w, fill))
-					bar = "#" * fill + "-" * (bar_w - fill)
-					status = (
-						f"[predict3d] [{bar}] {done}/{total_tiles} tiles "
-						f"({100.0 * done / max(1, total_tiles):.1f}%) "
-						f"eta {_format_eta(eta)} "
-						f"avg={1000.0 * per:.0f}ms/tile"
-					)
-				else:
-					status = _predict3d_progress_line(progress)
-				print(f"\r{status}  ", end="", flush=True)
-
-		if on_z_complete is not None:
-			next_tz = z_positions[i_tz + 1] if i_tz + 1 < len(z_positions) else Zp
-			on_z_complete(acc_fine, wsum_fine, acc_coarse, wsum_coarse, next_tz, pad0)
-
-	print("", flush=True)
-	print(
-		f"[predict3d] inference done in {time.time() - t0:.1f}s "
-		f"({processed_tiles} processed, {done - processed_tiles} skipped)",
-		flush=True,
-	)
-
-	if on_z_complete is not None:
-		acc_fine.cleanup()
-		wsum_fine.cleanup()
-		acc_coarse.cleanup()
-		wsum_coarse.cleanup()
-		del acc_fine, wsum_fine, acc_coarse, wsum_coarse
-		return None
-
-	acc_fine /= np.maximum(wsum_fine, 1e-7)
-	acc_coarse /= np.maximum(wsum_coarse, 1e-7)
-	del wsum_fine, wsum_coarse
-
-	b_f = pad0 // sd_fine
-	b_c = pad0 // sd_coarse
-	nz_f, ny_f, nx_f = nz // sd_fine, ny // sd_fine, nx // sd_fine
-	nz_c, ny_c, nx_c = nz // sd_coarse, ny // sd_coarse, nx // sd_coarse
-
-	result_fine = acc_fine[:, b_f:b_f + nz_f, b_f:b_f + ny_f, b_f:b_f + nx_f]
-	result_coarse = acc_coarse[:, b_c:b_c + nz_c, b_c:b_c + ny_c, b_c:b_c + nx_c]
-	return result_fine, result_coarse
+						progress.update(tiles_done=done, tiles_processed=processed, tiles_skipped=skipped, tile_time_sum=tile_time, tiles_remaining_est=total-done)
+					status = _predict3d_progress_line(progress) if progress is not None else f"[predict3d] {done}/{total} tiles"
+					if sys.stdout.isatty():
+						print(f"\r{status}  ", end="", flush=True)
+					elif done == total or done % max(1, len(y_positions) * len(x_positions)) == 0:
+						print(status, flush=True)
+			next_tz = z_positions[iz + 1] if iz + 1 < len(z_positions) else Zp
+			for sd, g in groups.items():
+				_flush_group(sd, g, next_tz)
+		print(f"[predict3d] inference done in {time.time()-t0:.1f}s ({processed} processed, {skipped} skipped)", flush=True)
+	finally:
+		for g in groups.values():
+			for acc in g["acc"].values():
+				acc.cleanup()
+			g["weight"].cleanup()

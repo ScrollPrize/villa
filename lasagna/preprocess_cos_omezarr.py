@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
 import shutil
+import sys
 import threading
 import time
 
@@ -47,7 +48,8 @@ try:
 		PYRAMID_POLICY_NONE,
 		PYRAMID_POLICY_SCALAR,
 		VALID_PYRAMID_POLICIES,
-		_RollingZBand,
+		_CircularZBand,
+		_plan_circular_z_depth,
 		_atomic_zarr_write,
 		build_product_omezarr_pyramids,
 		_build_tile_positions,
@@ -61,9 +63,7 @@ try:
 		_find_resume_z,
 		_format_eta,
 		_get_input_meta,
-		_get_libc,
-		_infer_tiled_products_3d,
-		_infer_tiled_3d,
+		run_tiled_inference_3d,
 		_invalidate_pyramid_chunks,
 		_input_has_chunks,
 		_iter_chunk_origins_for_region,
@@ -79,9 +79,7 @@ try:
 		_pid_is_running,
 		_pyrdown3d,
 		_read_tile_zarr,
-		_release_memmap_pages,
 		_remove_path_quiet,
-		_rolling_band_has_range,
 		_zarr_chunk_path,
 		write_lasagna_product_manifest,
 	)
@@ -97,7 +95,8 @@ except ImportError:
 		PYRAMID_POLICY_NONE,
 		PYRAMID_POLICY_SCALAR,
 		VALID_PYRAMID_POLICIES,
-		_RollingZBand,
+		_CircularZBand,
+		_plan_circular_z_depth,
 		_atomic_zarr_write,
 		build_product_omezarr_pyramids,
 		_build_tile_positions,
@@ -111,9 +110,7 @@ except ImportError:
 		_find_resume_z,
 		_format_eta,
 		_get_input_meta,
-		_get_libc,
-		_infer_tiled_products_3d,
-		_infer_tiled_3d,
+		run_tiled_inference_3d,
 		_invalidate_pyramid_chunks,
 		_input_has_chunks,
 		_iter_chunk_origins_for_region,
@@ -129,9 +126,7 @@ except ImportError:
 		_pid_is_running,
 		_pyrdown3d,
 		_read_tile_zarr,
-		_release_memmap_pages,
 		_remove_path_quiet,
-		_rolling_band_has_range,
 		_zarr_chunk_path,
 		write_lasagna_product_manifest,
 	)
@@ -242,24 +237,13 @@ class LasagnaCosPredict3DAdapter:
 		return model
 
 	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
-		_ = device
-		return model(tile)
-
-	def accumulate_tile_output(
-		self,
-		raw_output,
-		*,
-		tile_origin_zyx,
-		tile_weight,
-		accumulators,
-	) -> None:
-		# The current Lasagna rolling loop owns accumulation until the shared
-		# runner is fully generalized; this method satisfies the shared boundary.
-		_ = tile_origin_zyx, tile_weight
-		accumulators["raw_output"] = raw_output
+		with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+			output = model(tile)
+		return output["output"] if isinstance(output, dict) else output
 
 	def product_tensors_from_output(self, raw_output) -> dict[str, torch.Tensor]:
 		output = raw_output.to(dtype=torch.float32)
+		output = torch.sigmoid(output) if self.output_sigmoid else output.clamp(0.0, 1.0)
 		if output.ndim != 5:
 			raise ValueError("Lasagna predict3d model output must have shape B,C,D,H,W")
 		if int(output.shape[1]) < 8:
@@ -1781,6 +1765,7 @@ def run_preprocess_3d(
 			channels=(OutputChannelSpec("cos", relative_path=cos_omezarr_path),),
 			chunk_size=oc,
 			pyramid_policy=PYRAMID_POLICY_SCALAR,
+			inference_scaledown=cos_sd,
 		),
 		normal_product=OutputProductSpec(
 			name=LasagnaCosPredict3DAdapter.NORMAL_PRODUCT,
@@ -1793,6 +1778,7 @@ def run_preprocess_3d(
 			),
 			chunk_size=oc,
 			pyramid_policy=PYRAMID_POLICY_CUSTOM,
+			inference_scaledown=other_sd,
 		),
 		pred_dt_product=(
 			OutputProductSpec(
@@ -1869,451 +1855,110 @@ def run_preprocess_3d(
 			tile_size=tile_size,
 		)
 
-	# --- Streaming flush callback ---
-	# Captures OME-Zarr arrays, offsets, pred_dt state from enclosing scope.
-	_prev_flush_fine = [0]   # accumulator z (fine res) already flushed
-	_prev_flush_coarse = [0]
-	_flush_t0 = [time.time()]
-	sd_ratio = other_sd // cos_sd
-	n_other = 7
-
-	# Accumulator-to-output coordinate helpers
-	b_f = pad0 // sd_fine   # fine accumulator index where output starts
-	b_c = pad0 // sd_coarse
-	out_end_f = b_f + cos_wz   # fine accumulator index where output ends
-	out_end_c = b_c + other_wz
-
-	# Input zarr path for chunk existence checks (resolve level path)
-	_input_zarr_dir = str(Path(str(input_path).rstrip("/")).resolve())
-
-	def _output_chunk_has_input_support(cz, cy, cx, sd):
-		z_end = min(_ds_size(sh[0], sd), int(cz) + oc)
-		y_end = min(_ds_size(sh[1], sd), int(cy) + oc)
-		x_end = min(_ds_size(sh[2], sd), int(cx) + oc)
-		z_pos = _canonical_tile_positions_for_output_region(
-			volume_size=sh[0], output_start=int(cz), output_end=z_end,
-			scaledown=sd, tile_size=tile_size, stride=stride,
-			border=pad0, scaledown_multiple=sd_max,
-		)
-		y_pos = _canonical_tile_positions_for_output_region(
-			volume_size=sh[1], output_start=int(cy), output_end=y_end,
-			scaledown=sd, tile_size=tile_size, stride=stride,
-			border=pad0, scaledown_multiple=sd_max,
-		)
-		x_pos = _canonical_tile_positions_for_output_region(
-			volume_size=sh[2], output_start=int(cx), output_end=x_end,
-			scaledown=sd, tile_size=tile_size, stride=stride,
-			border=pad0, scaledown_multiple=sd_max,
-		)
-		for pz in z_pos:
-			src_z0 = max(0, int(pz) - pad0)
-			src_z1 = min(sh[0], int(pz) - pad0 + tile_size)
-			for py in y_pos:
-				src_y0 = max(0, int(py) - pad0)
-				src_y1 = min(sh[1], int(py) - pad0 + tile_size)
-				for px in x_pos:
-					src_x0 = max(0, int(px) - pad0)
-					src_x1 = min(sh[2], int(px) - pad0 + tile_size)
-					if _input_has_chunks(_input_zarr_dir, src_z0, src_z1, src_y0, src_y1, src_x0, src_x1):
-						return True
-		return False
-
-	def _is_tile_done(tz, ty, tx):
-		"""Check if all output chunks exist OR no input chunks in tile region."""
-		ts = tile_size
-		# Check if input has any data in this tile's region
-		# Tile reads from input at [tz + z0 - border, tz + z0 + ts - border]
-		in_z0 = max(0, tz + z0 - pad0)
-		in_z1 = min(sh[0], tz + z0 - pad0 + ts)
-		in_y0 = max(0, ty + y0 - pad0)
-		in_y1 = min(sh[1], ty + y0 - pad0 + ts)
-		in_x0 = max(0, tx + x0 - pad0)
-		in_x1 = min(sh[2], tx + x0 - pad0 + ts)
-		if not _input_has_chunks(_input_zarr_dir, in_z0, in_z1, in_y0, in_y1, in_x0, in_x1):
-			return True  # no input data → skip tile
-		# Fine (cos) output chunks touched by this tile.
-		ts_f = ts // sd_fine
-		az0, az1, _, _ = _downscaled_tile_clip(tz, sd_fine, ts_f, Zo_f_acc)
-		ay0, ay1, _, _ = _downscaled_tile_clip(ty, sd_fine, ts_f, Yo_f_acc)
-		ax0, ax1, _, _ = _downscaled_tile_clip(tx, sd_fine, ts_f, Xo_f_acc)
-		fz0 = max(cos_oz0, cos_oz0 + az0 - b_f)
-		fz1 = min(cos_oz1, cos_oz0 + az1 - b_f)
-		fy0 = max(cos_oy0, cos_oy0 + ay0 - b_f)
-		fy1 = min(cos_oy1, cos_oy0 + ay1 - b_f)
-		fx0 = max(cos_ox0, cos_ox0 + ax0 - b_f)
-		fx1 = min(cos_ox1, cos_ox0 + ax1 - b_f)
-		for z, y, x in _iter_chunk_origins_for_region(
-			fz0, fz1, fy0, fy1, fx0, fx1, oc, (full_cos_z, full_cos_y, full_cos_x),
-		):
-			if not output_adapter.product_chunk_complete(
-				cos_product,
-				chunk_origin_zyx=(z, y, x),
-			):
-				return False
-
-		# Coarse (prediction) output chunks touched by this tile.
-		ts_c = ts // sd_coarse
-		az0c, az1c, _, _ = _downscaled_tile_clip(tz, sd_coarse, ts_c, Zo_c_acc)
-		ay0c, ay1c, _, _ = _downscaled_tile_clip(ty, sd_coarse, ts_c, Yo_c_acc)
-		ax0c, ax1c, _, _ = _downscaled_tile_clip(tx, sd_coarse, ts_c, Xo_c_acc)
-		cz0 = max(other_oz0, other_oz0 + az0c - b_c)
-		cz1 = min(other_oz1, other_oz0 + az1c - b_c)
-		cy0 = max(other_oy0, other_oy0 + ay0c - b_c)
-		cy1 = min(other_oy1, other_oy0 + ay1c - b_c)
-		cx0 = max(other_ox0, other_ox0 + ax0c - b_c)
-		cx1 = min(other_ox1, other_ox0 + ax1c - b_c)
-		for z, y, x in _iter_chunk_origins_for_region(
-			cz0, cz1, cy0, cy1, cx0, cx1, oc, (full_other_z, full_other_y, full_other_x),
-		):
-			if not output_adapter.product_chunk_complete(
-				normal_product,
-				chunk_origin_zyx=(z, y, x),
-			):
-				return False
-		return True
-
-	def _update_finalized_z(
-		*,
-		cos_base_z: int | None = None,
-		other_base_z: int | None = None,
-	) -> None:
-		prev_cos = int(_progress.get("finalized_cos_base_z", _finalized_start_base_z))
-		prev_other = int(_progress.get("finalized_other_base_z", _finalized_start_base_z))
-		changed = False
-		if cos_base_z is not None:
-			next_cos = min(int(base_shape_zyx[0]), max(prev_cos, int(cos_base_z)))
-			_progress["finalized_cos_base_z"] = next_cos
-			changed = changed or next_cos != prev_cos
-		if other_base_z is not None:
-			next_other = min(int(base_shape_zyx[0]), max(prev_other, int(other_base_z)))
-			_progress["finalized_other_base_z"] = next_other
-			changed = changed or next_other != prev_other
-		cos_done = int(_progress.get("finalized_cos_base_z", _finalized_start_base_z))
-		other_done = int(_progress.get("finalized_other_base_z", _finalized_start_base_z))
-		_progress["finalized_base_z"] = min(cos_done, other_done)
-		if changed and int(_progress.get("tiles_total", 0)) > 0:
-			print(f"\r{_predict3d_progress_line(_progress)}  ", end="", flush=True)
-
-	def _on_z_complete(acc_fine, wsum_fine, acc_coarse, wsum_coarse,
-					   complete_z_padded, pad0_inner):
-		"""Flush completed z-bands to OME-Zarr, compute pred_dt, release pages."""
-		# --- Flush fine (cos + pred_dt) ---
-		complete_z_f = complete_z_padded // sd_fine
-		flush_from_f = max(_prev_flush_fine[0], b_f)
-		# Round flush point down to oc-aligned output z (complete chunks only).
-		# If complete_z_f reaches or exceeds out_end_f, flush everything (last band).
-		if complete_z_f >= out_end_f:
-			flush_to_f = out_end_f
-		else:
-			complete_out_z = complete_z_f - b_f  # in output coords
-			aligned_out_z = (complete_out_z // oc) * oc
-			flush_to_f = b_f + aligned_out_z
-
-		if flush_to_f > flush_from_f:
-			out_zs = flush_from_f - b_f   # output z-start
-			out_ze = flush_to_f - b_f     # output z-end
-			if out_ze > out_zs:
-				have_fine_acc = _rolling_band_has_range(acc_fine, flush_from_f, flush_to_f)
-				if have_fine_acc:
-					# Normalize accumulator in-place for this band
-					acc_band = acc_fine.view(0, flush_from_f, flush_to_f)
-					ws_band = wsum_fine.view(0, flush_from_f, flush_to_f)
-					acc_band /= np.maximum(ws_band, 1e-7)
-
-				eff_out_zs = out_zs
-				eff_out_ze = out_ze
-
-				if have_fine_acc and eff_out_ze > eff_out_zs:
-					local_from = 0
-					local_to = flush_to_f - flush_from_f
-					# Trim to crop region (Y, X)
-					yf = pad0_inner // sd_fine
-					xf = pad0_inner // sd_fine
-					oz = cos_oz0 + eff_out_zs
-					# Process per output chunk — skip any that already exist
-					cos_slab = None  # lazy: only compute if needed
-					n_skip_cos = 0
-					n_write_cos = 0
-					for dz in range(0, eff_out_ze - eff_out_zs, oc):
-						for dy in range(0, cos_wy, oc):
-							for dx in range(0, cos_wx, oc):
-								cz = oz + dz
-								cy = cos_oy0 + dy
-								cx = cos_ox0 + dx
-								if output_adapter.product_chunk_complete(
-									cos_product,
-									chunk_origin_zyx=(cz, cy, cx),
-								):
-									n_skip_cos += 1
-									continue
-								if not _output_chunk_has_input_support(cz, cy, cx, cos_sd):
-									n_skip_cos += 1
-									continue
-								# Compute slab lazily on first needed chunk
-								if cos_slab is None:
-									cos_slab = np.ascontiguousarray(
-										acc_band[local_from:local_to, yf:yf + cos_wy, xf:xf + cos_wx])
-									cos_slab = np.clip(cos_slab * 255.0, 0.0, 255.0).astype(np.uint8)
-								# Write just this chunk's region
-								cze = min(eff_out_ze - eff_out_zs, dz + oc)
-								cye = min(cos_wy, dy + oc)
-								cxe = min(cos_wx, dx + oc)
-								wz = cze - dz; wy = cye - dy; wx = cxe - dx
-								if wz > 0 and wy > 0 and wx > 0:
-									output_adapter.write_product_chunk(
-										cos_product,
-										chunk_origin_zyx=(cz, cy, cx),
-										data={"cos": cos_slab[dz:cze, dy:cye, dx:cxe]},
-									)
-								n_write_cos += 1
-
-				# --- pred_dt for this z-band ---
-				if pred_dt_zarr is not None and dt_lv_arr is not None:
-					# cos output z → base z → pred_src z
-					# All coords go through base as common frame
-					base_z0 = (cos_oz0 + eff_out_zs) * effective_cos_sd
-					base_z1 = (cos_oz0 + eff_out_ze) * effective_cos_sd
-					pdt_z0 = base_z0 // pred_sd
-					pdt_z1 = base_z1 // pred_sd
-					# Crop YX: source coords → base → pred_src
-					if crop_xyzwhd is not None:
-						pdt_y0 = y0 * input_sd // pred_sd
-						pdt_y1 = (y0 + ny) * input_sd // pred_sd
-						pdt_x0 = x0 * input_sd // pred_sd
-						pdt_x1 = (x0 + nx_dim) * input_sd // pred_sd
-					else:
-						pdt_y0 = 0
-						pdt_y1 = int(pred_dt_zarr.shape[1])
-						pdt_x0 = 0
-						pdt_x1 = int(pred_dt_zarr.shape[2])
-					_t_edt0 = time.time()
-					_compute_pred_dt_slab(
-						pred_zarr=pred_dt_zarr,
-						pred_path=pred_dt_path,
-						output_level_arr=dt_lv_arr,
-						output_omezarr_path=dt_omezarr_path,
-						output_level_key=str(cos_level),
-						pred_z0=pdt_z0, pred_z1=pdt_z1,
-						pred_y0=pdt_y0, pred_y1=pdt_y1,
-						pred_x0=pdt_x0, pred_x1=pdt_x1,
-						out_z0=cos_oz0 + eff_out_zs,
-						out_y0=cos_oy0, out_x0=cos_ox0,
-						scaledown=pred_per_cos,
-						ome_chunk=oc,
-						n_levels=n_levels,
-						progress=_progress,
-					)
-					_t_edt_total[0] += time.time() - _t_edt0
-
-			fine_final_base_z = (cos_oz0 + max(0, flush_to_f - b_f)) * effective_cos_sd
-			_update_finalized_z(cos_base_z=fine_final_base_z)
-			acc_fine.discard_before(flush_to_f)
-			wsum_fine.discard_before(flush_to_f)
-
-		_prev_flush_fine[0] = max(_prev_flush_fine[0], flush_to_f)
-
-		# --- Flush coarse (grad_mag, nx, ny) ---
-		complete_z_c = complete_z_padded // sd_coarse
-		flush_from_c = max(_prev_flush_coarse[0], b_c)
-		if complete_z_c >= out_end_c:
-			flush_to_c = out_end_c
-		else:
-			complete_out_zc = complete_z_c - b_c
-			aligned_out_zc = (complete_out_zc // oc) * oc
-			flush_to_c = b_c + aligned_out_zc
-
-		if flush_to_c > flush_from_c:
-			out_zs_c = flush_from_c - b_c
-			out_ze_c = flush_to_c - b_c
-			if out_ze_c > out_zs_c:
-				have_coarse_acc = _rolling_band_has_range(acc_coarse, flush_from_c, flush_to_c)
-				if have_coarse_acc:
-					# Normalize
-					acc_band_c = [acc_coarse.view(ch, flush_from_c, flush_to_c) for ch in range(n_other)]
-					ws_band_c = wsum_coarse.view(0, flush_from_c, flush_to_c)
-					for band_ch in acc_band_c:
-						band_ch /= np.maximum(ws_band_c, 1e-7)
-
-				eff_out_zs_c = out_zs_c
-				eff_out_ze_c = out_ze_c
-
-				if have_coarse_acc and eff_out_ze_c > eff_out_zs_c:
-					oz_c = other_oz0 + eff_out_zs_c
-					# Process per output chunk — skip existing
-					slab = None  # lazy compute
-					n_skip_c = 0
-					n_write_c = 0
-					for dz in range(0, eff_out_ze_c - eff_out_zs_c, oc):
-						for dy in range(0, other_wy, oc):
-							for dx in range(0, other_wx, oc):
-								cz = oz_c + dz
-								cy = other_oy0 + dy
-								cx = other_ox0 + dx
-								chunk_origin = (cz, cy, cx)
-								if output_adapter.product_chunk_complete(
-									normal_product,
-									chunk_origin_zyx=chunk_origin,
-								):
-									n_skip_c += 1
-									continue
-								gm_exists = output_adapter.channel_chunk_exists(
-									normal_product, "grad_mag", chunk_origin_zyx=chunk_origin)
-								nx_exists = output_adapter.channel_chunk_exists(
-									normal_product, "nx", chunk_origin_zyx=chunk_origin)
-								ny_exists = output_adapter.channel_chunk_exists(
-									normal_product, "ny", chunk_origin_zyx=chunk_origin)
-								if not _output_chunk_has_input_support(cz, cy, cx, other_sd):
-									n_skip_c += 1
-									continue
-								if slab is None:
-									local_from_c = 0
-									local_to_c = flush_to_c - flush_from_c
-									yc = pad0_inner // sd_coarse
-									xc = pad0_inner // sd_coarse
-									slab = np.ascontiguousarray(np.stack([
-										band_ch[local_from_c:local_to_c, yc:yc + other_wy, xc:xc + other_wx]
-										for band_ch in acc_band_c
-									], axis=0))
-								cze = min(eff_out_ze_c - eff_out_zs_c, dz + oc)
-								cye = min(other_wy, dy + oc)
-								cxe = min(other_wx, dx + oc)
-								s = slab[:, dz:cze, dy:cye, dx:cxe]
-
-								# grad_mag
-								gm_u8 = np.clip(s[0] * 1000.0, 0.0, 255.0).astype(np.uint8)
-								wz = gm_u8.shape[0]; wy = gm_u8.shape[1]; wx = gm_u8.shape[2]
-								chunk_data = {}
-								if not gm_exists:
-									chunk_data["grad_mag"] = gm_u8
-
-								# Normals
-								if not (nx_exists and ny_exists):
-									nx_u8, ny_u8 = encode_normal_nxny_u8(
-										s[1], s[2], s[3], s[4], s[5], s[6])
-									if not nx_exists:
-										chunk_data["nx"] = nx_u8
-									if not ny_exists:
-										chunk_data["ny"] = ny_u8
-								if chunk_data:
-									output_adapter.write_product_chunk(
-										normal_product,
-										chunk_origin_zyx=chunk_origin,
-										data=chunk_data,
-									)
-								n_write_c += 1
-
-			other_final_base_z = (other_oz0 + max(0, flush_to_c - b_c)) * effective_other_sd
-			_update_finalized_z(other_base_z=other_final_base_z)
-			acc_coarse.discard_before(flush_to_c)
-			wsum_coarse.discard_before(flush_to_c)
-
-		_prev_flush_coarse[0] = max(_prev_flush_coarse[0], flush_to_c)
-
-	_t_inference_start = time.time()
-	# --- Streaming inference + flush ---
-	# Shared progress tracker for unified ETA across tiles + EDT
-	_t_edt_total = [0.0]  # accumulated wall time in EDT calls
-	_finalized_start_base_z = min(
-		cos_oz0 * effective_cos_sd,
-		other_oz0 * effective_other_sd,
-	)
-	_finalized_end_base_z = min(
-		int(base_shape_zyx[0]),
-		cos_oz1 * effective_cos_sd,
-		other_oz1 * effective_other_sd,
-	)
+	# The neural path is owned entirely by the shared multi-scale runner.  The
+	# prediction distance transform remains an independent external-source stage.
 	_progress = {
 		"t0": time.time(),
-		"tiles_done": 0,
-		"tiles_total": 0,  # set by _infer_tiled_3d
-		"tiles_skipped": 0,
-		"tiles_processed": 0,
-		"tile_time_sum": 0.0,
-		"tiles_remaining_est": 0,
-		"edt_done": 0,
-		"edt_skipped": 0,
-		"edt_processed": 0,
-		"edt_time_sum": 0.0,
-		"edt_total_est": 0,  # updated below
-		"edt_remaining_est": 0,
-		"finalized_base_z": int(_finalized_start_base_z),
-		"finalized_cos_base_z": int(_finalized_start_base_z),
-		"finalized_other_base_z": int(_finalized_start_base_z),
-		"finalized_base_z_total": int(_finalized_end_base_z),
+		"finalized_base_z": min(
+			cos_oz0 * effective_cos_sd,
+			other_oz0 * effective_other_sd,
+		),
+		"finalized_base_z_total": min(
+			int(base_shape_zyx[0]),
+			cos_oz1 * effective_cos_sd,
+			other_oz1 * effective_other_sd,
+		),
 	}
-	# Initial EDT estimate; each slab tightens this with its actual skip/work list.
-	if pred_dt_zarr is not None:
-		_psh = tuple(int(v) for v in pred_dt_zarr.shape)
-		import math as _m2
-		_edt_nz = max(1, _m2.ceil((pred_z1_total := (cos_oz1 - cos_oz0) * effective_cos_sd // max(1, pred_sd)) / 448))
-		_edt_ny = max(1, _m2.ceil((_psh[1]) / 448))
-		_edt_nx = max(1, _m2.ceil((_psh[2]) / 448))
-		_progress["edt_total_est"] = _edt_nz * _edt_ny * _edt_nx
-		_progress["edt_remaining_est"] = _progress["edt_total_est"]
+	_t_inference_start = time.time()
+	try:
+		run_tiled_inference_3d(
+			model,
+			a_in,
+			crop_slices=(z0, z1, y0, y1, x0, x1),
+			device=torch_device,
+			model_adapter=predict_adapter,
+			output_adapter=output_adapter,
+			products=predict_adapter.model_output_products,
+			output_regions_zyx={
+				cos_product.name: (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1),
+				normal_product.name: (other_oz0, other_oy0, other_ox0, other_oz1, other_oy1, other_ox1),
+			},
+			full_output_shapes_zyx={
+				cos_product.name: (full_cos_z, full_cos_y, full_cos_x),
+				normal_product.name: (full_other_z, full_other_y, full_other_x),
+			},
+			input_zarr_path=str(input_path),
+			output_scaledown_base={
+				cos_product.name: effective_cos_sd,
+				normal_product.name: effective_other_sd,
+			},
+			tile_size=tile_size,
+			overlap=overlap,
+			border=border,
+			tmp_dir=out_dir,
+			progress=_progress,
+			temp_prefix=prefix,
+		)
+	except BaseException:
+		if _gpu_ctx is not None:
+			_gpu_ctx.__exit__(*sys.exc_info())
+			_gpu_ctx = None
+		raise
+	finally:
+		del model
+		if torch_device.type == "cuda":
+			torch.cuda.empty_cache()
 
-	_infer_tiled_3d(
-		model, a_in,
-		crop_slices=(z0, z1, y0, y1, x0, x1),
-		device=torch_device,
-		tile_size=tile_size,
-		overlap=overlap,
-		border=border,
-		cos_scaledown=cos_sd,
-		other_scaledown=other_sd,
-		tmp_dir=out_dir,
-		output_sigmoid=_output_sigmoid,
-		on_z_complete=_on_z_complete,
-		skip_z_positions=0,
-		progress=_progress,
-		is_tile_done=_is_tile_done,
-		temp_prefix=prefix,
-		model_adapter=predict_adapter,
-	)
-	del model
-	torch.cuda.empty_cache()
+	if pred_dt_zarr is not None and dt_lv_arr is not None:
+		base_z0 = cos_oz0 * effective_cos_sd
+		base_z1 = cos_oz1 * effective_cos_sd
+		if crop_xyzwhd is not None:
+			pdt_y0, pdt_y1 = y0 * input_sd // pred_sd, (y0 + ny) * input_sd // pred_sd
+			pdt_x0, pdt_x1 = x0 * input_sd // pred_sd, (x0 + nx_dim) * input_sd // pred_sd
+		else:
+			pdt_y0, pdt_y1 = 0, int(pred_dt_zarr.shape[1])
+			pdt_x0, pdt_x1 = 0, int(pred_dt_zarr.shape[2])
+		_compute_pred_dt_slab(
+			pred_zarr=pred_dt_zarr,
+			pred_path=pred_dt_path,
+			output_level_arr=dt_lv_arr,
+			output_omezarr_path=dt_omezarr_path,
+			output_level_key=str(cos_level),
+			pred_z0=base_z0 // pred_sd,
+			pred_z1=base_z1 // pred_sd,
+			pred_y0=pdt_y0,
+			pred_y1=pdt_y1,
+			pred_x0=pdt_x0,
+			pred_x1=pdt_x1,
+			out_z0=cos_oz0,
+			out_y0=cos_oy0,
+			out_x0=cos_ox0,
+			scaledown=pred_per_cos,
+			ome_chunk=oc,
+			n_levels=n_levels,
+			progress=_progress,
+		)
 
-	# --- Build pyramids ---
-	_t_inference_end = time.time()
-	_t_pyramid_start = time.time()
 	print("[predict3d] building OME-Zarr pyramids ...", flush=True)
-	cos_crop_zyx = (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1)
-	other_crop_zyx = (other_oz0, other_oy0, other_ox0, other_oz1, other_oy1, other_ox1)
-	crop_by_product = {
-		cos_product.name: cos_crop_zyx,
-		normal_product.name: other_crop_zyx,
-	}
-	if predict_adapter.pred_dt_product is not None:
-		crop_by_product[predict_adapter.pred_dt_product.name] = cos_crop_zyx
 	build_product_omezarr_pyramids(
 		products=predict_adapter.output_products,
 		n_levels=n_levels,
 		ome_chunk=oc,
-		crop_zyx_by_product=crop_by_product,
+		crop_zyx_by_product={
+			cos_product.name: (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1),
+			normal_product.name: (other_oz0, other_oy0, other_ox0, other_oz1, other_oy1, other_ox1),
+			**(
+				{predict_adapter.pred_dt_product.name: (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1)}
+				if predict_adapter.pred_dt_product is not None else {}
+			),
+		},
 	)
-
-	# --- Resume training ---
 	if _gpu_ctx is not None:
 		_gpu_ctx.__exit__(None, None, None)
-
-	_removed_tmp_finish = _cleanup_predict3d_temp_files(
-		out_dir, prefix, remove_current_process=True,
-	)
-	if _removed_tmp_finish > 0:
-		print(f"[predict3d] removed {_removed_tmp_finish} temp path(s) on finish", flush=True)
-	_t_total_end = time.time()
-	_t_inf_edt = _t_inference_end - _t_inference_start
-	_t_edt = _t_edt_total[0]
-	_t_inf = _t_inf_edt - _t_edt  # inference = total streaming phase minus EDT
-	_t_pyr = _t_total_end - _t_pyramid_start
-	_t_setup = _t_inference_start - _t_total_start
-	_t_total = _t_total_end - _t_total_start
+	_cleanup_predict3d_temp_files(out_dir, prefix, remove_current_process=True)
 	print(f"[predict3d] done. manifest: {output_path}", flush=True)
-	print(f"[predict3d] timing: total={_t_total:.1f}s "
-		  f"setup={_t_setup:.1f}s ({100*_t_setup/max(1e-9,_t_total):.0f}%) "
-		  f"inference={_t_inf:.1f}s ({100*_t_inf/max(1e-9,_t_total):.0f}%) "
-		  f"edt={_t_edt:.1f}s ({100*_t_edt/max(1e-9,_t_total):.0f}%) "
-		  f"pyramid={_t_pyr:.1f}s ({100*_t_pyr/max(1e-9,_t_total):.0f}%)",
-		  flush=True)
+	return
+
 
 
 _N_WORKERS = min(16, os.cpu_count() or 4)

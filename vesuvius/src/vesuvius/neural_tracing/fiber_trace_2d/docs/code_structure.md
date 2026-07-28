@@ -95,12 +95,56 @@ loading.
 
 - Reuses the shared predict3d mechanics for crop handling, canonical tile and
   output-chunk lattices, automatic S3 download from `_download` metadata,
-  rolling product accumulation, output-chunk-only resume, temp cleanup, and
+  fixed-depth circular product accumulation, output-chunk-only resume, temp cleanup, and
   atomic chunk writes.
 - Common tiled arguments are `--input`, `--output`, `--checkpoint`,
   `--tile-size`, `--overlap`, `--border`, `--scaledown`, `--crop`,
   `--device`, `--no-download`, `--levels`, `--ome-chunk`, and
   `--pyramid-workers`.
+
+### Shared 3D tiled runner
+
+Both entry points terminate in `lasagna.tiled_predict3d.run_tiled_inference_3d`:
+
+```text
+Lasagna CLI -> LasagnaCosPredict3DAdapter --+
+                                               +-> run_tiled_inference_3d
+Fiber CLI   -> FiberTrace3DPredictAdapter ---+       |
+                                                       +-> per-scale circular mmap rings
+                                                       +-> chunk atomic output writes
+```
+
+The runner traverses the globally anchored model-tile lattice once. Model
+adapters provide preprocessing, model execution, raw product splitting, and
+raw-to-persisted conversion; they do not own traversal, accumulation, resume,
+or flushing. `OutputProductSpec.inference_scaledown` describes a product's
+scale relative to the selected input array, while `scaledown` remains the
+base-relative manifest scale.
+
+Each distinct inference scale has separate raw-product float32 mmap rings and
+one shared geometric weight ring. A logical Z plane maps to
+`physical_z = logical_z % ring_depth`; generation checks prevent an unflushed
+plane from being overwritten. Ring depth is planned from actual canonical tile
+positions and chunk-aligned flush frontiers, so backing size is
+`(raw_channels + 1) * ring_depth * working_y * working_x * 4` bytes and does
+not depend on full volume depth. Flushes visit Zarr chunks in Z/Y/X order,
+normalize with chunk-sized denominator scratch, atomically write coherent
+channel bundles, clear that chunk region, and only then release its logical Z
+generation. Wrapped reads copy at most one output chunk.
+
+Lasagna's optional `pred_dt` is an external-source stage after neural
+inference. It is independently resumable and never schedules model tiles.
+
+Ownership changed as follows:
+
+| Concern | Before | Current owner |
+| --- | --- | --- |
+| Lasagna traversal/flush | `_infer_tiled_3d` plus `_on_z_complete` | `run_tiled_inference_3d` |
+| Fiber traversal/flush | `_infer_tiled_products_3d` | `run_tiled_inference_3d` |
+| Model preprocessing/autocast/output split | partly embedded in each loop | model adapter |
+| Tile lattice, resume, blend, rings, progress | duplicated/divergent | shared runner |
+| Coherent atomic channel writes | output adapter | output adapter |
+| Lasagna prediction EDT | Lasagna flush callback | independent Lasagna post-stage |
   Fiber-specific arguments are the positional config, `--recurrent-steps`,
   `--base-ref`, and `--base-scale`.
 - Writes a Lasagna-style `.lasagna.json` manifest plus OME-Zarr groups derived
@@ -109,7 +153,7 @@ loading.
   `<stem>_ny.ome.zarr`; multi-option runs prefix channel names with
   `option_000_`, `option_001_`, etc.
 - The fiber model's raw seven-channel option output is internal only. The
-  shared rolling accumulator stores raw `dir0_z/dir1_z/dir0_y/dir1_y/dir0_x/
+  shared circular accumulator stores raw `dir0_z/dir1_z/dir0_y/dir1_y/dir0_x/
   dir1_x/presence`, and the fiber adapter finalizes those raw slabs to
   persisted `presence/nx/ny` chunks using Lasagna's compact hemisphere
   encoding. Coarser presence and normal pyramids are built with the existing

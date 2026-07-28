@@ -19,7 +19,7 @@ try:
         _crop_xyzwhd_bounds,
         _ds_index,
         _ds_size,
-        _infer_tiled_products_3d,
+        run_tiled_inference_3d,
         OmeZarrOutputAdapter,
         write_lasagna_product_manifest,
     )
@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs
         _crop_xyzwhd_bounds,
         _ds_index,
         _ds_size,
-        _infer_tiled_products_3d,
+        run_tiled_inference_3d,
         OmeZarrOutputAdapter,
         write_lasagna_product_manifest,
     )
@@ -257,6 +257,7 @@ def run_fiber_trace_3d_inference(
         checkpoint=checkpoint,
         level=output_level,
         scaledown=effective_output_sd,
+        inference_scaledown=output_sd_input,
         chunk_size=int(ome_chunk),
         product_prefix=json_stem,
         zarr_path_prefix=output_dir / json_stem,
@@ -305,7 +306,7 @@ def run_fiber_trace_3d_inference(
         "finalized_base_z": int(oz0 * effective_output_sd),
         "finalized_base_z_total": int(oz1 * effective_output_sd),
     }
-    _infer_tiled_products_3d(
+    run_tiled_inference_3d(
         model,
         a_in,
         crop_slices=crop_slices,
@@ -313,14 +314,13 @@ def run_fiber_trace_3d_inference(
         model_adapter=predict_adapter,
         output_adapter=output_adapter,
         products=predict_adapter.output_products,
-        output_region_zyx=output_region,
-        full_output_shape_zyx=full_output_shape,
+		output_regions_zyx={p.name: output_region for p in predict_adapter.output_products},
+		full_output_shapes_zyx={p.name: full_output_shape for p in predict_adapter.output_products},
         input_zarr_path=str(input_path),
-        output_scaledown_base=effective_output_sd,
+		output_scaledown_base={p.name: effective_output_sd for p in predict_adapter.output_products},
         tile_size=tile_size_i,
         overlap=int(overlap),
         border=int(border),
-        scaledown=output_sd_input,
         tmp_dir=str(output_dir),
         progress=progress,
         temp_prefix=f"{json_stem}_",
