@@ -56,6 +56,7 @@ from tracks import (
     prepare_main_phase_tracks,
     validate_track_sampling_config,
 )
+from track_graph import TrackGraph
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 from sample_spiral import (
     get_spiral_points,
@@ -951,6 +952,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     track_families = None
     track_source_ids = None
     track_crossing_cache = None
+    track_graph = None
     track_reload_source = None
     track_reload_families = None
     track_reload_source_ids = None
@@ -959,6 +961,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         if (track_sampling_config['crossing_precompute_max'] > 0
                 or track_sampling_config['crossing_mode'] == 'track_walk'):
             track_crossing_cache = load_track_crossing_cache(tracks_dbm_path)
+            if track_crossing_cache is not None:
+                track_graph = TrackGraph(track_crossing_cache)
+                print(
+                    f'built TrackGraph: {len(track_graph)} tracks, '
+                    f'{track_graph.edge_count} crossings in '
+                    f'{track_graph.build_seconds:.1f}s')
+                track_crossing_cache = None
             tracks, track_families, track_source_ids = load_tracks_from_dbm(
                 tracks_dbm_path, z_begin, z_end, return_families=True,
                 return_source_ids=True)
@@ -1640,11 +1649,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             track_families=track_families,
             track_source_ids=track_source_ids,
             crossing_cache=track_crossing_cache,
+            track_graph=track_graph,
         )
         # The sidecar CSR is setup-only. The prepared bundle now owns only its
         # fixed-width training tables, so release the whole-DB graph promptly.
         if interactive_driver is None:
             track_crossing_cache = None
+            track_graph = None
         # With the usual zero exclusion radius, the training bundle already
         # contains every authoritative track point as one flat CPU tensor.  Reuse it
         # for preview bounds instead of walking millions of short NumPy tracks.
@@ -2203,7 +2214,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                             sampling_config=validate_track_sampling_config(cfg),
                             track_families=rebuilt_families,
                             track_source_ids=rebuilt_source_ids,
-                            crossing_cache=track_crossing_cache)
+                            crossing_cache=track_crossing_cache,
+                            track_graph=track_graph)
                         replace_prepared_tracks = True
 
                     rebuilt_shell_map = (
@@ -2225,6 +2237,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 reprepare_tracks = bool(changed & {
                     'track_max_tortuosity',
                     'track_walk_require_loop_consistency',
+                    'track_exclusion_radius',
                 })
                 if reprepare_tracks and rebuilt_tracks is None and tracks:
                     rebuilt_tracks = prepare_main_phase_tracks(
@@ -2233,7 +2246,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                         sampling_config=validate_track_sampling_config(cfg),
                         track_families=track_families,
                         track_source_ids=track_source_ids,
-                        crossing_cache=track_crossing_cache)
+                        crossing_cache=track_crossing_cache,
+                        track_graph=track_graph)
                     replace_prepared_tracks = True
 
                 target_tracks = (

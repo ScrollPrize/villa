@@ -2142,7 +2142,7 @@ def _track_points_far_from_anchors_mask(track_zyx, anchor_tree, threshold):
 def prepare_main_phase_tracks(
         tracks, anchor_scroll_zyxs, exclusion_radius, device, anchor_tree=None,
         sampling_config=None, track_families=None, track_source_ids=None,
-        crossing_cache=None):
+        crossing_cache=None, track_graph=None):
     if not tracks:
         return None
     if sampling_config is not None and 'length_bin_weights' in sampling_config:
@@ -2170,6 +2170,10 @@ def prepare_main_phase_tracks(
         raise ValueError('track_source_ids must be parallel to tracks')
     if crossing_cache is not None and working_source_ids is None:
         raise ValueError('a crossing cache requires stable track_source_ids')
+    if track_graph is not None and working_source_ids is None:
+        raise ValueError('a track graph requires stable track_source_ids')
+    if crossing_cache is not None and track_graph is not None:
+        raise ValueError('pass either crossing_cache or track_graph, not both')
     if crossing_cache is not None and exclusion_radius > 0:
         print(
             'WARNING: track crossing cache cannot be used after point-level '
@@ -2201,7 +2205,8 @@ def prepare_main_phase_tracks(
         anchor_tree = _build_anchor_kdtree(anchor_scroll_zyxs)
 
     def finish_prepared(
-            flat_zyx_np, lengths_new, surviving_indices, prepared_track_list):
+            flat_zyx_np, lengths_new, surviving_indices, prepared_track_list,
+            crossing_csr_override=None):
         offsets_new = np.empty(len(lengths_new) + 1, dtype=np.int64)
         offsets_new[0] = 0
         np.cumsum(lengths_new, out=offsets_new[1:])
@@ -2220,7 +2225,9 @@ def prepare_main_phase_tracks(
             'active_max_crossings': 0,
             'crossing_precompute_max': (
                 crossing_precompute_max
-                if working_families is not None or crossing_cache is not None
+                if (working_families is not None
+                    or crossing_cache is not None
+                    or track_graph is not None)
                 else 0),
             'track_crossing_mode': crossing_mode,
             'track_walk_require_loop_consistency': require_walk_loop,
@@ -2231,10 +2238,16 @@ def prepare_main_phase_tracks(
         if ((crossing_mode == 'count' and crossing_precompute_max > 0)
                 or crossing_mode == 'track_walk'):
             crossing_index = None
-            restricted_csr = None
+            restricted_csr = crossing_csr_override
             walk_index = None
             native = _load_native_track_crossings()
-            if crossing_cache is not None:
+            active_crossing_cache = crossing_cache
+            if restricted_csr is None and track_graph is not None:
+                active_crossing_cache = track_graph
+                print(
+                    f'track crossings: using TrackGraph cache for '
+                    f'{len(surviving_indices)} surviving tracks')
+            if active_crossing_cache is not None:
                 eligible_source_ids = working_source_ids[surviving_indices]
                 try:
                     if crossing_mode == 'track_walk':
@@ -2243,19 +2256,19 @@ def prepare_main_phase_tracks(
                                     native, 'prepare_cached_walk_index')):
                             walk_index = native.prepare_cached_walk_index(
                                 np.asarray(
-                                    crossing_cache['source_ids'],
+                                    active_crossing_cache['source_ids'],
                                     dtype=np.uint64),
                                 np.asarray(
-                                    crossing_cache['offsets'],
+                                    active_crossing_cache['offsets'],
                                     dtype=np.int64),
                                 np.asarray(
-                                    crossing_cache['partners'],
+                                    active_crossing_cache['partners'],
                                     dtype=np.int32),
                                 np.asarray(
-                                    crossing_cache['self_local'],
+                                    active_crossing_cache['self_local'],
                                     dtype=np.int32),
                                 np.asarray(
-                                    crossing_cache['partner_local'],
+                                    active_crossing_cache['partner_local'],
                                     dtype=np.int32),
                                 np.asarray(
                                     eligible_source_ids, dtype=np.uint64),
@@ -2263,33 +2276,33 @@ def prepare_main_phase_tracks(
                                 require_loop_consistency=require_walk_loop)
                         else:
                             restricted_csr = _restrict_crossing_partner_csr(
-                                crossing_cache, eligible_source_ids)
+                                active_crossing_cache, eligible_source_ids)
                     elif crossing_precompute_max > 0:
                         if (native is not None
                                 and hasattr(
                                     native, 'prepare_cached_crossing_index')):
                             crossing_index = native.prepare_cached_crossing_index(
                                 np.asarray(
-                                    crossing_cache['source_ids'],
+                                    active_crossing_cache['source_ids'],
                                     dtype=np.uint64),
                                 np.asarray(
-                                    crossing_cache['offsets'],
+                                    active_crossing_cache['offsets'],
                                     dtype=np.int64),
                                 np.asarray(
-                                    crossing_cache['partners'],
+                                    active_crossing_cache['partners'],
                                     dtype=np.int32),
                                 np.asarray(
-                                    crossing_cache['self_local'],
+                                    active_crossing_cache['self_local'],
                                     dtype=np.int32),
                                 np.asarray(
-                                    crossing_cache['partner_local'],
+                                    active_crossing_cache['partner_local'],
                                     dtype=np.int32),
                                 np.asarray(
                                     eligible_source_ids, dtype=np.uint64),
                                 np.asarray(lengths_new, dtype=np.int32))
                         else:
                             restricted_csr = _restrict_crossing_partner_csr(
-                                crossing_cache, eligible_source_ids)
+                                active_crossing_cache, eligible_source_ids)
                     print(
                         f'track crossings: used cached CSR for '
                         f'{len(eligible_source_ids)} surviving tracks')
@@ -2424,14 +2437,23 @@ def prepare_main_phase_tracks(
 
     if packed_input:
         flat_materialized, packed_offsets = working_tracks.materialize()
+        input_offsets = np.asarray(packed_offsets, dtype=np.int64)
         working_tracks = _MemmapTrackCollection(
             flat_materialized, packed_offsets)
+    else:
+        input_lengths = np.fromiter(
+            (len(track) for track in working_tracks),
+            dtype=np.int64, count=len(working_tracks))
+        input_offsets = np.empty(len(input_lengths) + 1, dtype=np.int64)
+        input_offsets[0] = 0
+        np.cumsum(input_lengths, out=input_offsets[1:])
 
     flat_zyx_np = np.concatenate([t.astype(np.float32) for t in working_tracks], axis=0)
     track_id_np = np.concatenate([
         np.full(len(t), i, dtype=np.int64) for i, t in enumerate(working_tracks)
     ])
     keep_np = _track_points_far_from_anchors_mask(flat_zyx_np, anchor_tree, exclusion_radius)
+    original_keep_np = keep_np
     flat_zyx_np = flat_zyx_np[keep_np]
     track_id_np = track_id_np[keep_np]
     num_tracks_orig = len(working_tracks)
@@ -2449,13 +2471,31 @@ def prepare_main_phase_tracks(
     sort_idx = np.argsort(new_id, kind='stable')
     flat_zyx_np = flat_zyx_np[sort_idx]
     lengths_new = new_lengths[surviving].astype(np.int64)
+    crossing_csr_override = None
+    if track_graph is not None:
+        retained_old_points = np.flatnonzero(original_keep_np)[keep2][sort_idx]
+        old_point_to_new = np.full(
+            len(original_keep_np), -1, dtype=np.int32)
+        old_point_to_new[retained_old_points] = np.arange(
+            len(retained_old_points), dtype=np.int32)
+        output_offsets = np.empty(len(lengths_new) + 1, dtype=np.int64)
+        output_offsets[0] = 0
+        np.cumsum(lengths_new, out=output_offsets[1:])
+        crossing_csr_override = track_graph.clipped_csr(
+            working_source_ids, input_offsets, surviving,
+            old_point_to_new, output_offsets)
+        del old_point_to_new, retained_old_points
+        print(
+            f'track crossings: remapped TrackGraph after point exclusion '
+            f'({len(crossing_csr_override["partners"])} directed crossings)')
     prepared_track_list = list(np.split(flat_zyx_np, np.cumsum(lengths_new)[:-1]))
     print(
         f'track radius loss: {len(surviving)}/{num_tracks_orig} tracks survive exclusion '
         f'(radius {exclusion_radius:.1f}); {int(lengths_new.sum())} points retained'
     )
     return finish_prepared(
-        flat_zyx_np, lengths_new, surviving, prepared_track_list)
+        flat_zyx_np, lengths_new, surviving, prepared_track_list,
+        crossing_csr_override=crossing_csr_override)
 
 
 def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
