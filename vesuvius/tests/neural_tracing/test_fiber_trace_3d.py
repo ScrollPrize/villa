@@ -94,6 +94,8 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _parse_args,
     _render_native_whole_fiber_span_panels,
     _native_trace_geometry_normal_record,
+    _format_trace2cp_kvx_rate,
+    _format_trace2cp_meter_rate,
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
     _sample_presence_on_strip,
@@ -3312,6 +3314,7 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().cumulative_smoothness_tangent_weight == 2.0
     assert NativeTrace2CpConfig().all_pairs_direction_product is True
     assert NativeTrace2CpConfig().core_margin_voxels == 48
+    assert NativeTrace2CpConfig().inference_scaledown_power == 0
     assert NativeTrace2CpConfig().inference_block_batch_size == 2
     assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 10.0
     assert NativeTrace2CpConfig().max_cached_inference_gib == pytest.approx(8.0)
@@ -3338,9 +3341,32 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.smoothness_normal_weight == 0.1
     assert args.smoothness_tangent_weight == 10.0
     assert args.core_margin_voxels == 48
+    assert args.inference_scaledown_power == 0
     assert args.inference_block_batch_size == 2
     assert args.max_cached_inference_gib == pytest.approx(8.0)
     assert args.vis is False
+
+
+def test_native_3d_trace2cp_help_shows_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("sys.argv", ["trace2cp_tool", "--help"])
+
+    with pytest.raises(SystemExit) as exc:
+        _parse_args()
+
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    option_text = help_text.split("options:", 1)[1]
+    assert "--step-voxels" in option_text
+    assert "[4.0]" in option_text
+    assert "--inference-scaledown-power" in option_text
+    assert "[0] Power-of-two box scaledown applied" in option_text
+    assert "--core-margin-voxels" in option_text
+    assert "[48]" in option_text
+    assert "STEP_VOXELS" not in option_text
+    assert "(default:" not in help_text
 
 
 def test_native_3d_trace2cp_mode_routes_only_unselected_fiber_json_to_whole_fiber() -> None:
@@ -3874,7 +3900,7 @@ def test_native_3d_whole_fiber_trace_reports_restarts_per_meter_when_voxel_size_
 def test_native_3d_whole_fiber_progress_reports_compact_error_units_when_known(capsys) -> None:
     record = _whole_native_trace_record()
     record.sampler = SimpleNamespace(
-        volume=SimpleNamespace(metadata={"voxelsize": 2.0})
+        volume=SimpleNamespace(metadata={"voxelsize": 2000.0})
     )
     cache = SimpleNamespace(_blocks={})
     calls = 0
@@ -3913,14 +3939,28 @@ def test_native_3d_whole_fiber_progress_reports_compact_error_units_when_known(c
     )
 
     output = capsys.readouterr().out
-    assert "err/kvx=" in output
-    assert "err/m=" in output
+    assert "err/kvx=50.0" in output
+    assert "err/m=25.0 (20.0mm)" in output
     assert "\r" in output
     assert output.count("\n") == 1
+    assert "err/kvx=50.000" not in output
+    assert "err/m=25.000" not in output
     assert "restarts_per_kvx=" not in output
     assert "restarts_per_meter=" not in output
     assert "reference_length_meters=" not in output
     assert "physical_unit=m" not in output
+
+
+def test_native_3d_whole_fiber_error_format_helpers_use_one_decimal() -> None:
+    assert _format_trace2cp_kvx_rate(0.502) == "0.5"
+    assert (
+        _format_trace2cp_meter_rate(
+            52.329,
+            restart_count=8,
+            reference_length_meters=0.153,
+        )
+        == "err/m=52.3 (17.0mm)"
+    )
 
 
 def test_native_3d_whole_fiber_ignores_non_vc3d_voxel_size_metadata() -> None:
@@ -4395,6 +4435,112 @@ def test_native_3d_trace2cp_field_cache_uses_block_sampler() -> None:
     assert shape == (4, 4, 4)
     assert model.input_volume is not None
     assert float(model.input_volume[0, 0, 0, 0, 0]) == 1.0
+
+
+def test_native_3d_trace2cp_scaled_inference_downsamples_cached_field() -> None:
+    encoded = encode_lasagna_direction_3x2(
+        torch.tensor([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    )[0]
+
+    class ZRampSampler:
+        blocking = True
+
+        def sample_block_zyx(
+            self,
+            start_zyx: np.ndarray,
+            shape_zyx: tuple[int, int, int],
+        ) -> CoordinateSampleResult:
+            start = np.asarray(start_zyx, dtype=np.int64)
+            shape = tuple(int(v) for v in shape_zyx)
+            zz = np.arange(shape[0], dtype=np.float32)[:, None, None] + np.float32(start[0])
+            return CoordinateSampleResult(
+                image=np.broadcast_to(zz, shape).astype(np.float32, copy=True),
+                valid_mask=np.ones(shape, dtype=bool),
+                stats={
+                    "sample_block_zyx": 1,
+                    "requested_level_only": True,
+                    "fallback_levels": 0,
+                    "error_chunks": 0,
+                },
+            )
+
+    class PresenceRampModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, :6] = encoded.to(volume.device).view(1, 6, 1, 1, 1)
+            out[:, 6:7] = volume / 10.0
+            return out
+
+    record = _native_trace_record(
+        np.zeros((16, 16, 16), dtype=np.float32),
+        sampler=ZRampSampler(),
+    )
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=PresenceRampModel(),
+        patch_shape_zyx=(8, 8, 8),
+        core_margin_voxels=2,
+        inference_scaledown_power=1,
+        device=torch.device("cpu"),
+    )
+
+    block = cache._infer_block(np.asarray([0, 0, 0], dtype=np.int64))
+
+    assert cache.inference_scaledown_factor == 2
+    assert cache.inference_field_shape_zyx == (4, 4, 4)
+    assert cache.scaled_core_margin == 1
+    assert block.output_czyx.shape == (7, 3, 3, 3)
+    assert block.valid_mask_zyx.shape == (3, 3, 3)
+    assert np.allclose(block.sample_origin_zyx, [2.0, 2.0, 2.0])
+    assert np.allclose(block.sample_spacing_zyx, [2.0, 2.0, 2.0])
+    assert float(block.output_czyx[6, 0, 0, 0]) == pytest.approx(0.25)
+    assert float(block.output_czyx[6, 1, 0, 0]) == pytest.approx(0.45)
+
+    _directions, presence, valid = cache.sample_points_torch(
+        np.asarray([[4.0, 2.0, 2.0]], dtype=np.float32)
+    )
+
+    assert bool(valid[0].item())
+    assert float(presence[0].item()) == pytest.approx(0.45)
+
+
+def test_native_3d_trace2cp_scaled_inference_rejects_indivisible_shapes() -> None:
+    record = _native_trace_record(np.zeros((16, 16, 16), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="inference_patch_shape_zyx.*divisible"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(7, 8, 8),
+            core_margin_voxels=2,
+            inference_scaledown_power=1,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(ValueError, match="core_margin_voxels.*divisible"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(8, 8, 8),
+            core_margin_voxels=3,
+            inference_scaledown_power=1,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(ValueError, match="inference_scaledown_power"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(8, 8, 8),
+            core_margin_voxels=2,
+            inference_scaledown_power=-1,
+            device=torch.device("cpu"),
+        )
 
 
 def test_native_3d_trace2cp_candidate_score_maximizes_dot_product_presence() -> None:
