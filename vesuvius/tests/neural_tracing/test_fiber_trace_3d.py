@@ -3303,6 +3303,7 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().all_pairs_direction_product is True
     assert NativeTrace2CpConfig().core_margin_voxels == 48
     assert NativeTrace2CpConfig().inference_scaledown_power == 0
+    assert NativeTrace2CpConfig().inference_blur_sigma_voxels == pytest.approx(0.0)
     assert NativeTrace2CpConfig().inference_block_batch_size == 2
     assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 10.0
     assert NativeTrace2CpConfig().max_cached_inference_gib == pytest.approx(8.0)
@@ -3330,6 +3331,7 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.smoothness_tangent_weight == 10.0
     assert args.core_margin_voxels == 48
     assert args.inference_scaledown_power == 0
+    assert args.inference_blur_sigma_voxels == pytest.approx(0.0)
     assert args.inference_block_batch_size == 2
     assert args.max_cached_inference_gib == pytest.approx(8.0)
     assert args.vis is False
@@ -3350,7 +3352,9 @@ def test_native_3d_trace2cp_help_shows_defaults(
     assert "--step-voxels" in option_text
     assert "[4.0]" in option_text
     assert "--inference-scaledown-power" in option_text
-    assert "[0] Power-of-two box scaledown applied" in option_text
+    assert "[0] Power-of-two Gaussian pyramid scaledown applied" in option_text
+    assert "--inference-blur-sigma-voxels" in option_text
+    assert "[0.0] 3D Gaussian sigma applied" in option_text
     assert "--core-margin-voxels" in option_text
     assert "[48]" in option_text
     assert "STEP_VOXELS" not in option_text
@@ -4483,15 +4487,69 @@ def test_native_3d_trace2cp_scaled_inference_downsamples_cached_field() -> None:
     assert block.valid_mask_zyx.shape == (3, 3, 3)
     assert np.allclose(block.sample_origin_zyx, [2.0, 2.0, 2.0])
     assert np.allclose(block.sample_spacing_zyx, [2.0, 2.0, 2.0])
-    assert float(block.output_czyx[6, 0, 0, 0]) == pytest.approx(0.25)
-    assert float(block.output_czyx[6, 1, 0, 0]) == pytest.approx(0.45)
+    assert float(block.output_czyx[6, 0, 0, 0]) == pytest.approx(0.2)
+    assert float(block.output_czyx[6, 1, 0, 0]) == pytest.approx(0.4)
 
     _directions, presence, valid = cache.sample_points_torch(
         np.asarray([[4.0, 2.0, 2.0]], dtype=np.float32)
     )
 
     assert bool(valid[0].item())
-    assert float(presence[0].item()) == pytest.approx(0.45)
+    assert float(presence[0].item()) == pytest.approx(0.4)
+
+
+def test_native_3d_trace2cp_inference_blur_runs_after_scaledown_before_crop() -> None:
+    class OnesSampler:
+        blocking = True
+
+        def sample_block_zyx(
+            self,
+            start_zyx: np.ndarray,
+            shape_zyx: tuple[int, int, int],
+        ) -> CoordinateSampleResult:
+            del start_zyx
+            return CoordinateSampleResult(
+                image=np.ones(shape_zyx, dtype=np.float32),
+                valid_mask=np.ones(shape_zyx, dtype=bool),
+                stats={
+                    "sample_block_zyx": 1,
+                    "requested_level_only": True,
+                    "fallback_levels": 0,
+                    "error_chunks": 0,
+                },
+            )
+
+    class ScaledImpulseModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            b, _c, d, h, w = volume.shape
+            out = torch.zeros((b, 7, d, h, w), dtype=torch.float32, device=volume.device)
+            out[:, 6, 4:6, 4:6, 4:6] = 8.0
+            return out
+
+    record = _native_trace_record(
+        np.zeros((16, 16, 16), dtype=np.float32),
+        sampler=OnesSampler(),
+    )
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=_NativeTraceTestPredictionAdapter(),
+        model=ScaledImpulseModel(),
+        patch_shape_zyx=(8, 8, 8),
+        core_margin_voxels=2,
+        inference_scaledown_power=1,
+        inference_blur_sigma_voxels=2.0,
+        device=torch.device("cpu"),
+    )
+
+    block = cache._infer_block(np.asarray([0, 0, 0], dtype=np.int64))
+    presence = block.output_czyx[6]
+
+    assert block.output_czyx.shape == (7, 3, 3, 3)
+    assert float(presence[1, 1, 1]) < 8.0
+    assert float(presence[1, 1, 1]) > float(presence[0, 1, 1])
+    assert float(presence[0, 1, 1]) > 0.0
+    assert float(presence[1, 0, 1]) > 0.0
+    assert float(presence[1, 1, 0]) > 0.0
 
 
 def test_native_3d_trace2cp_scaled_inference_rejects_indivisible_shapes() -> None:
@@ -4527,6 +4585,17 @@ def test_native_3d_trace2cp_scaled_inference_rejects_indivisible_shapes() -> Non
             patch_shape_zyx=(8, 8, 8),
             core_margin_voxels=2,
             inference_scaledown_power=-1,
+            device=torch.device("cpu"),
+        )
+
+    with pytest.raises(ValueError, match="inference_blur_sigma_voxels"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=_NativeTraceTestPredictionAdapter(),
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(8, 8, 8),
+            core_margin_voxels=2,
+            inference_blur_sigma_voxels=-0.1,
             device=torch.device("cpu"),
         )
 

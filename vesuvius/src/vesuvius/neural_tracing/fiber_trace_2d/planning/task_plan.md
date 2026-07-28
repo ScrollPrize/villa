@@ -1,55 +1,40 @@
-# Plan: Native 3D Trace2CP Scaled Inference Field
+# Plan: Native 3D Trace2CP Pyramid Scaledown
 
 ## Implementation
 
-1. Add `NativeTrace2CpConfig.inference_scaledown_power` and a CLI flag
-   `--inference-scaledown-power`.
-2. Validate the power at cache construction:
-   - power must be a non-negative integer;
-   - factor is `1 << power`;
-   - every inference patch axis must be divisible by the factor;
-   - `core_margin_voxels` must be divisible by the factor;
-   - the native patch must still be larger than `2 * core_margin_voxels`.
-3. Keep model input loading unchanged: read the requested native selected-level
-   block with `CoordinateSampler.sample_block_zyx(...)`, preprocess it, and run
-   the model exactly as before.
-4. Before storing inferred products in the CPU field cache, apply 3D box
-   downsampling with `torch.nn.functional.avg_pool3d` to each raw product tensor.
-   Downsample the validity mask with the same factor and mark a scaled output
-   voxel valid only when all source voxels in the box were valid.
-5. Store scaled cached blocks with:
-   - scaled output spatial shape;
-   - scaled crop margin;
-   - native-coordinate sample origin and sample spacing equal to the scaledown
-     factor.
-6. Update point sampling so it converts native selected-level point coordinates
-   to cached scaled-grid coordinates via `(point - sample_origin) / spacing`
-   before `grid_sample`.
-7. Include the scaledown power/factor in startup output and JSON summaries.
+1. Import Lasagna's shared `_pyrdown3d` helper from `lasagna.tiled_predict3d`
+   with the same package/non-package fallback style used by the fiber 3D
+   inference code.
+2. Replace Trace2CP raw product scaledown with a wrapper that reshapes
+   `B,C,D,H,W` tensors to `B*C,D,H,W`, calls `_pyrdown3d(..., factor=...)`,
+   and reshapes back.
+3. Keep validity-mask downsampling conservative by retaining the existing
+   all-voxels-valid box reduction; this mask is support coverage, not a signal
+   product.
+4. Preserve the order: model inference, optional pyramid scaledown, optional
+   inference-field Gaussian blur, trusted-core crop/cache.
+5. Rename helpers/docs from box scaledown to pyramid scaledown where they
+   describe product tensor signal scaling.
 
 ## Spec Update
 
-Add a native 3D Trace2CP spec entry documenting `--inference-scaledown-power`,
-the power-of-two factor, box filtering, divisibility checks, scaled trusted
-core margin, and default no-op value.
+Update native 3D Trace2CP scaled inference specs to say Gaussian pyramid
+downscale via Lasagna `_pyrdown3d`, not box filtering, while retaining the
+conservative validity-mask rule.
 
 ## Docs Updates
 
-No standalone docs update is needed beyond the specs: this is a CLI option on
-the native 3D Trace2CP tool and does not change training or data loading.
+No standalone docs update is needed beyond specs.
 
 ## Tests
 
-Add focused tests for:
+Update scaled inference regression tests so their expected values match
+Lasagna pyrdown behavior and still verify point routing through the scaled
+field. Keep the blur-after-scaledown test.
 
-- CLI/dataclass default remains exponent `0`.
-- Invalid scaledown combinations fail loudly.
-- Scaled cache storage uses box-filtered raw output and routes point sampling
-  through the scaled grid.
-- Default exponent `0` preserves existing cache shapes.
-
-Run the relevant 3D Trace2CP tests and `py_compile`.
+Run the relevant native 3D Trace2CP tests and `py_compile`.
 
 ## Changelog
 
-Add one changelog line for the native 3D Trace2CP scaled inference option.
+Add one changelog line noting that native 3D Trace2CP scaled inference now
+uses Lasagna Gaussian pyramid scaling.

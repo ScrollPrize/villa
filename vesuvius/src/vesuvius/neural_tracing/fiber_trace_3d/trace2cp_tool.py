@@ -13,12 +13,18 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+try:
+    from lasagna.tiled_predict3d import _pyrdown3d
+except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
+    from tiled_predict3d import _pyrdown3d
+
 from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
     FiberTrace3DPredictAdapter,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DConfig,
     FiberTrace3DLoader,
+    _gaussian_kernel1d,
     _normalize_image,
     load_config,
 )
@@ -247,6 +253,7 @@ class NativeTrace2CpConfig:
     inference_patch_shape_zyx: tuple[int, int, int] = (128, 128, 128)
     core_margin_voxels: int = 48
     inference_scaledown_power: int = 0
+    inference_blur_sigma_voxels: float = 0.0
     inference_block_batch_size: int = 2
     whole_fiber_error_threshold_voxels: float = 10.0
     max_cached_inference_gib: float = 8.0
@@ -788,13 +795,55 @@ def _validate_inference_scaledown(
     return factor, scaled_shape, scaled_margin
 
 
-def _box_downsample_3d(tensor: torch.Tensor, factor: int) -> torch.Tensor:
+def _pyramid_downsample_3d(tensor: torch.Tensor, factor: int) -> torch.Tensor:
     factor_i = int(factor)
     if factor_i <= 1:
         return tensor
     if tensor.ndim != 5:
-        raise ValueError("box downsample expects tensor shape B,C,D,H,W")
+        raise ValueError("pyramid downsample expects tensor shape B,C,D,H,W")
+    batch, channels, depth, height, width = (int(v) for v in tensor.shape)
+    flat = tensor.reshape(batch * channels, depth, height, width)
+    down = _pyrdown3d(flat, factor=factor_i)
+    return down.reshape(batch, channels, *down.shape[-3:])
+
+
+def _all_valid_downsample_3d(tensor: torch.Tensor, factor: int) -> torch.Tensor:
+    factor_i = int(factor)
+    if factor_i <= 1:
+        return tensor
+    if tensor.ndim != 5:
+        raise ValueError("validity downsample expects tensor shape B,C,D,H,W")
     return F.avg_pool3d(tensor, kernel_size=factor_i, stride=factor_i)
+
+
+def _gaussian_blur_channels_3d(
+    tensor: torch.Tensor,
+    sigma_voxels: float,
+) -> torch.Tensor:
+    sigma = float(sigma_voxels)
+    if sigma <= 0.0:
+        return tensor
+    if tensor.ndim != 5:
+        raise ValueError("3D Gaussian blur expects tensor shape B,C,D,H,W")
+    channels = int(tensor.shape[1])
+    if channels <= 0:
+        return tensor
+    kernel = _gaussian_kernel1d(sigma, device=tensor.device).to(dtype=tensor.dtype)
+    radius = int((int(kernel.numel()) - 1) // 2)
+    out = tensor
+    for axis in range(3):
+        shape = [1, 1, 1, 1, 1]
+        shape[2 + axis] = int(kernel.numel())
+        weight = kernel.view(*shape).repeat(channels, 1, 1, 1, 1)
+        padding = [0, 0, 0, 0, 0, 0]
+        padding[(2 - axis) * 2] = radius
+        padding[(2 - axis) * 2 + 1] = radius
+        out = F.conv3d(
+            F.pad(out, padding, mode="replicate"),
+            weight,
+            groups=channels,
+        )
+    return out
 
 
 def _grid_sample_channels_at_points(
@@ -862,6 +911,7 @@ class NativeTraceFieldCache:
         patch_shape_zyx: tuple[int, int, int],
         core_margin_voxels: int,
         inference_scaledown_power: int = 0,
+        inference_blur_sigma_voxels: float = 0.0,
         device: torch.device,
         max_cached_bytes: int | None = 8 * 1024**3,
         inference_block_batch_size: int = 1,
@@ -882,6 +932,9 @@ class NativeTraceFieldCache:
             inference_scaledown_power=int(inference_scaledown_power),
         )
         self.inference_scaledown_power = int(inference_scaledown_power)
+        self.inference_blur_sigma_voxels = float(inference_blur_sigma_voxels)
+        if self.inference_blur_sigma_voxels < 0.0:
+            raise ValueError("inference_blur_sigma_voxels must be >= 0")
         self.core_shape_zyx = tuple(v - 2 * self.core_margin for v in self.patch_shape_zyx)
         self.device = torch.device(device)
         if max_cached_bytes is not None and int(max_cached_bytes) < 0:
@@ -1123,15 +1176,27 @@ class NativeTraceFieldCache:
                 if int(self.inference_scaledown_factor) > 1:
                     factor = int(self.inference_scaledown_factor)
                     product_tensors = [
-                        _box_downsample_3d(tensor, factor)
+                        _pyramid_downsample_3d(tensor, factor)
                         for tensor in product_tensors
                     ]
                     valid_for_cache = (
-                        _box_downsample_3d(valid_batch.to(dtype=torch.float32), factor)
+                        _all_valid_downsample_3d(
+                            valid_batch.to(dtype=torch.float32),
+                            factor,
+                        )
                         >= 1.0
                     )
                 else:
                     valid_for_cache = valid_batch
+                if self.inference_blur_sigma_voxels > 0.0:
+                    scaled_sigma = (
+                        float(self.inference_blur_sigma_voxels)
+                        / float(self.inference_scaledown_factor)
+                    )
+                    product_tensors = [
+                        _gaussian_blur_channels_3d(tensor, scaled_sigma)
+                        for tensor in product_tensors
+                    ]
                 valid_cpu = valid_for_cache.detach().to(device=torch.device("cpu")).contiguous()
                 for batch_index, origin in enumerate(batch_origins):
                     output = torch.cat(
@@ -5655,6 +5720,7 @@ def run_native_trace2cp(
         patch_shape_zyx=cfg.inference_patch_shape_zyx,
         core_margin_voxels=cfg.core_margin_voxels,
         inference_scaledown_power=int(cfg.inference_scaledown_power),
+        inference_blur_sigma_voxels=float(cfg.inference_blur_sigma_voxels),
         device=device,
         max_cached_bytes=_cache_bytes_from_gib(float(cfg.max_cached_inference_gib)),
         inference_block_batch_size=int(cfg.inference_block_batch_size),
@@ -5674,6 +5740,7 @@ def run_native_trace2cp(
         f"image_normalization={loader_config.image_normalization} "
         f"inference_scaledown_power={int(cfg.inference_scaledown_power)} "
         f"inference_scaledown_factor={int(cache.inference_scaledown_factor)} "
+        f"inference_blur_sigma_voxels={float(cfg.inference_blur_sigma_voxels):.3f} "
         f"sampler={type(getattr(record, 'sampler', None)).__name__} "
         f"blocking={getattr(getattr(record, 'sampler', None), 'blocking', 'n/a')}",
         flush=True,
@@ -5818,6 +5885,7 @@ def run_native_trace2cp(
             "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
             "inference_scaledown_power": int(cfg.inference_scaledown_power),
             "inference_scaledown_factor": int(cache.inference_scaledown_factor),
+            "inference_blur_sigma_voxels": float(cfg.inference_blur_sigma_voxels),
             "inference_block_batch_size": int(cfg.inference_block_batch_size),
             "inferred_blocks": int(cache.total_inferred_blocks),
             "resident_inferred_blocks": int(len(cache._blocks)),
@@ -5995,6 +6063,7 @@ def run_native_trace2cp(
         "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
         "inference_scaledown_power": int(cfg.inference_scaledown_power),
         "inference_scaledown_factor": int(cache.inference_scaledown_factor),
+        "inference_blur_sigma_voxels": float(cfg.inference_blur_sigma_voxels),
         "inference_block_batch_size": int(cfg.inference_block_batch_size),
         "visualization_enabled": bool(render_visualization),
         "visualization_cross_strip_height_px": visualization_cross_strip_height_px,
@@ -6114,8 +6183,18 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Power-of-two box scaledown applied to raw native 3D inference outputs "
-            "before tracing samples them: 0=1x, 1=0.5x, 2=0.25x."
+            "Power-of-two Gaussian pyramid scaledown applied to raw native 3D "
+            "inference outputs before tracing samples them: 0=1x, 1=0.5x, 2=0.25x."
+        ),
+    )
+    parser.add_argument(
+        "--inference-blur-sigma-voxels",
+        type=float,
+        default=0.0,
+        help=(
+            "3D Gaussian sigma applied to raw inference outputs after optional "
+            "scaledown and before trusted-core cropping, measured in unscaled "
+            "selected-level inference voxels."
         ),
     )
     parser.add_argument(
@@ -6173,6 +6252,7 @@ def main() -> None:
         inference_patch_shape_zyx=patch_shape,
         core_margin_voxels=int(args.core_margin_voxels),
         inference_scaledown_power=int(args.inference_scaledown_power),
+        inference_blur_sigma_voxels=float(args.inference_blur_sigma_voxels),
         inference_block_batch_size=int(args.inference_block_batch_size),
         whole_fiber_error_threshold_voxels=float(args.whole_fiber_error_threshold_voxels),
         max_cached_inference_gib=float(args.max_cached_inference_gib),

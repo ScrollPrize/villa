@@ -573,14 +573,25 @@
   lower-resolution tracing over the raw model-output field. The scaledown
   factor is `2 ** N`: `0` is the default no-op, `1` samples a half-resolution
   field, and `2` samples a quarter-resolution field. The model input patch is
-  unchanged; after inference, every raw product tensor is box-filtered with
-  kernel/stride equal to the factor before the CPU field cache stores it. The
-  valid mask is box-filtered with the same factor and a scaled output voxel is
-  valid only if all source voxels in the box were valid. The inference patch
-  shape and `--core-margin-voxels` must be evenly divisible by the factor, and
-  invalid combinations must fail before tracing starts. The trusted core is
-  still defined in selected-level voxel coordinates, while cached output
-  lookups convert points to the scaled field with the same factor.
+  unchanged; after inference, every raw product tensor is downscaled with the
+  same Gaussian pyramid helper Lasagna predict3d uses (`_pyrdown3d`, repeated
+  `[1,4,6,4,1]/16` separable filtering plus `::2` subsampling) before the CPU
+  field cache stores it. The valid mask remains a conservative support mask:
+  it is reduced with the same factor and a scaled output voxel is valid only if
+  all source voxels in the cell were valid. The inference patch shape and
+  `--core-margin-voxels` must be evenly divisible by the factor, and invalid
+  combinations must fail before tracing starts. The trusted core is still
+  defined in selected-level voxel coordinates, while cached output lookups
+  convert points to the scaled field with the same factor.
+- Native 3D Trace2CP supports `--inference-blur-sigma-voxels` for opt-in 3D
+  Gaussian blur over the inferred direction/presence fields. The blur runs
+  after model inference and after optional `--inference-scaledown-power`
+  pyramid filtering, but before trusted-core margin cropping into the CPU field cache.
+  The configured sigma is measured in unscaled selected-level inference voxels;
+  internally the scaled field uses `sigma / inference_scaledown_factor`, so
+  changing scaledown does not change the selected-level blur size. The default
+  `0.0` preserves unblurred behavior, and negative sigma values must fail
+  before tracing.
 - Native 3D Trace2CP inferred blocks must also be bounded on the CPU by default.
   The native CLI uses an LRU byte budget exposed as
   `--max-cached-inference-gib`, defaults to 8 GiB, and reports total inferred,
