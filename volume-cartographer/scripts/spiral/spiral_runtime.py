@@ -18,7 +18,6 @@ from typing import Mapping
 import uuid
 
 from fit_session import (SpiralInputPaths, SpiralPreviewConfig, SpiralRunConfig,
-                         apply_optional_input_selection,
                          run_mutable_config)
 from config import Config
 
@@ -154,15 +153,8 @@ class InteractiveFitSession:
             if checkpoint_profile_config is not None:
                 default_advanced_config = checkpoint_profile_config
             else:
-                # Without a checkpoint, Default is the Python baseline adapted
-                # to the inputs selected for this session.
+                # Without a checkpoint, Default is the Python baseline.
                 default_advanced_config = copy.deepcopy(config)
-                for key in (
-                        'input_use_verified_patches', 'input_use_unverified_patches',
-                        'input_use_normals', 'input_use_surf_sdt', 'input_use_tracks',
-                        'input_use_gradient_magnitude', 'input_use_fibers'):
-                    if key in self.run_config.config:
-                        default_advanced_config[key] = self.run_config.config[key]
             # Explicit sample-count overrides are literal active counts. This
             # lets VC3D round-trip the host's post-scaling values through a
             # reload without applying the z-range/DDP transforms twice.
@@ -191,9 +183,6 @@ class InteractiveFitSession:
                     floors=SAMPLING_COUNT_FLOORS)
                 split_counts_across_ranks(default_advanced_config, count_keys)
             config.update(explicit_sampling_counts)
-            if checkpoint_profile_config is None:
-                apply_optional_input_selection(default_advanced_config)
-            apply_optional_input_selection(config)
             self.requested_config = dict(config)
             with self._condition:
                 self._applied_config = copy.deepcopy(config)
@@ -439,7 +428,6 @@ class InteractiveFitSession:
                         "The resident fitter does not support Run configuration changes")
                 requested_config = dict(self.requested_config)
                 requested_config.update(run_config)
-                apply_optional_input_selection(requested_config)
                 run_config = {
                     key: requested_config[key]
                     for key in run_config

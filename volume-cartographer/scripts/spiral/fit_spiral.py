@@ -130,7 +130,7 @@ pcl_json_paths = [
 pcl_input_specs = None
 fibers_path = f'{dataset_path}/fibers'
 verified_patches_path = f'{dataset_path}/verified_patches'
-unverified_patches_path = f'{dataset_path}/unverified_patches'
+unverified_patches_path = None
 run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
 shell_path = f'{dataset_path}/outer_shell'
 tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'  # or: m7_ds2_z3000_18000_surf.dbm
@@ -535,7 +535,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
     filter_tracks_by_shell = (
         not load_only_patches_and_point_collections
-        and bool(cfg.get('input_use_tracks', True))
         and bool(tracks_dbm_path)
         and bool(shell_path)
     )
@@ -545,10 +544,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
         shell_patch = load_tifxyz(shell_path)
 
-    use_verified_patches = (
-        bool(cfg.get('input_use_verified_patches', True)) and not cfg['input_disable_patches'])
-    use_unverified_patches = (
-        bool(cfg.get('input_use_unverified_patches', True)) and not cfg['input_disable_patches'])
+    use_verified_patches = bool(verified_patches_path) and not cfg['input_disable_patches']
+    use_unverified_patches = bool(unverified_patches_path) and not cfg['input_disable_patches']
     if not use_verified_patches and not use_unverified_patches:
         verified_patches = {}
         unverified_patches = {}
@@ -624,7 +621,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 next_id += 1
 
     fiber_point_collections, next_id = load_fiber_point_collections(
-        fibers_path if cfg.get('input_use_fibers', True) else None,
+        fibers_path,
         next_id,
         min_point_spacing=cfg['pcl_fiber_min_point_spacing'],
     )
@@ -868,14 +865,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         raise ValueError(
             f'dense_spacing_mode={dense_spacing_mode!r} must be '
             "'phase' or 'grad_mag'")
-    phase_mode = (
-        dense_spacing_mode == 'phase'
-        and cfg.get('input_use_normals', True)
-        and cfg.get('input_use_surf_sdt', True)
-    )
+    phase_mode = dense_spacing_mode == 'phase'
     grad_mag_spacing_enabled = (
         dense_spacing_mode == 'grad_mag'
-        and cfg.get('input_use_gradient_magnitude', True)
         and cfg['loss_weight_dense_spacing'] > 0
     )
     shell_envelope = None
@@ -891,8 +883,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
     lasagna_volume = prepare_lasagna_volume(
         scroll_zarr,
-        use_normals=(cfg.get('input_use_normals', True)
-                     and (cfg['loss_weight_dense_normals'] > 0 or phase_mode)),
+        use_normals=(cfg['loss_weight_dense_normals'] > 0 or phase_mode),
         use_spacing=grad_mag_spacing_enabled,
         normal_nx_zarr_path=normal_nx_zarr_path,
         normal_ny_zarr_path=normal_ny_zarr_path,
@@ -963,7 +954,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     track_reload_source = None
     track_reload_families = None
     track_reload_source_ids = None
-    if tracks_dbm_path is not None and cfg.get('input_use_tracks', True):
+    if tracks_dbm_path is not None:
         print(f'loading tracks from {tracks_dbm_path}')
         if (track_sampling_config['crossing_precompute_max'] > 0
                 or track_sampling_config['crossing_mode'] == 'track_walk'):

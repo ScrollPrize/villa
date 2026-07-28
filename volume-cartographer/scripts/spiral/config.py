@@ -76,14 +76,6 @@ def _runtime_impact(key):
 def _dependencies(key):
     if key.startswith(("patch_", "pcl_")):
         return ["patch_pcl", "trusted_geometry", "tracks"]
-    if key.startswith("input_"):
-        if key == "input_use_tracks":
-            return ["tracks"]
-        if key in {
-                "input_use_normals", "input_use_surf_sdt",
-                "input_use_gradient_magnitude"}:
-            return ["dense_stores", "dense_losses"]
-        return ["patch_pcl", "trusted_geometry", "tracks"]
     if key.startswith("track_"):
         return ["tracks"]
     if key.startswith("dense_"):
@@ -144,13 +136,6 @@ def _field_spec(key, default):
 
 class Config:
     def __init__(self, overrides=None):
-        self.input_use_verified_patches = True
-        self.input_use_unverified_patches = True
-        self.input_use_normals = True
-        self.input_use_surf_sdt = True
-        self.input_use_tracks = True
-        self.input_use_gradient_magnitude = True
-        self.input_use_fibers = True
         self.optimizer_random_seed = 1
         self.optimizer_distributed_split_batch = True
         self.optimizer_learning_rate = 3e-05

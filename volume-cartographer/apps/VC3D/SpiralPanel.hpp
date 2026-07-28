@@ -56,13 +56,10 @@ private:
     QJsonObject influenceConfig() const;
     QJsonObject sessionAdvancedConfig() const;
     QJsonObject runAdvancedConfig() const;
-    void applyOptionalInputConfig(QJsonObject& config, bool includeSelectionFlags) const;
     void applyTrackSamplingConfig(QJsonObject& config) const;
     void syncTrackSamplingControlsFromAdvanced();
     void writeTrackSamplingControlsToAdvanced();
     void updateTrackSamplingUi();
-    bool optionalInputEnabled(const QString& key) const;
-    void updateOptionalInputUi();
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
     void synchronizeSession(const QJsonObject& request,
                             const QJsonObject& status);
@@ -88,7 +85,6 @@ private:
     QHash<QString, QLineEdit*> _paths;
     QHash<QString, QToolButton*> _pathBrowseButtons;
     QHash<QString, QCheckBox*> _visibilityChecks;
-    QHash<QString, QCheckBox*> _optionalInputs;
     QHash<QString, bool> _pathDirectories;
     QDialog* _displayDialog = nullptr;
     QSpinBox* _minimumDisplayedWinding = nullptr;

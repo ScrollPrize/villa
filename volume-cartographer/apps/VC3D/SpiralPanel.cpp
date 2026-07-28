@@ -176,33 +176,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* pathsForm = new QFormLayout(pathsContents);
     pathsGroup->contentLayout()->addWidget(pathsContents);
 
-    auto* optionalInputs = new QWidget(pathsContents);
-    auto* optionalGrid = new QGridLayout(optionalInputs);
-    optionalGrid->setContentsMargins(0, 0, 0, 0);
-    optionalGrid->setHorizontalSpacing(12);
-    optionalGrid->setVerticalSpacing(2);
-    const auto optionalSpecs = std::initializer_list<std::pair<const char*, const char*>>{
-        {"verified_patches", "Verified"}, {"unverified_patches", "Unverified"},
-        {"normals", "Normals"}, {"surf_sdt", "SDT"},
-        {"tracks_dbm", "Tracks"}, {"gradient_magnitude", "Grad mag"},
-        {"fibers", "Fibers"},
-    };
-    int optionalIndex = 0;
-    for (const auto& spec : optionalSpecs) {
-        const QString key = QString::fromLatin1(spec.first);
-        auto* check = new QCheckBox(tr(spec.second), optionalInputs);
-        check->setObjectName(QStringLiteral("spiralUse_") + key);
-        check->setChecked(true);
-        check->setToolTip(tr("Include this dataset input and its associated losses and sampling"));
-        _optionalInputs.insert(key, check);
-        optionalGrid->addWidget(check, optionalIndex / 4, optionalIndex % 4);
-        ++optionalIndex;
-        connect(check, &QCheckBox::toggled, this, [this](bool) {
-            updateOptionalInputUi();
-            refreshReloadRequired();
-        });
-    }
-    pathsForm->addRow(tr("Use inputs"), optionalInputs);
     addPathRow(pathsForm, "dataset_root", tr("Dataset root"), true);
     _refill = new QPushButton(tr("Refill from Dataset Root"), pathsContents);
     pathsForm->addRow(_refill);
@@ -1059,7 +1032,6 @@ void SpiralPanel::setRemoteMode(bool remote)
         for (QLineEdit* edit : {_paths["dataset_root"], _paths["umbilicus"]})
             edit->setToolTip(tr("Service-host path, owned by the service"));
     }
-    updateOptionalInputUi();
 }
 
 QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const QString& label, bool directory)
@@ -1168,13 +1140,8 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
 QJsonObject SpiralPanel::sessionRequest() const
 {
     QJsonObject paths;
-    for (auto it = _paths.begin(); it != _paths.end(); ++it) {
-        QString optionalKey = it.key();
-        if (optionalKey == QStringLiteral("normal_x")
-            || optionalKey == QStringLiteral("normal_y"))
-            optionalKey = QStringLiteral("normals");
-        paths[it.key()] = optionalInputEnabled(optionalKey) ? it.value()->text() : QString();
-    }
+    for (auto it = _paths.begin(); it != _paths.end(); ++it)
+        paths[it.key()] = it.value()->text();
     QJsonArray pcls;
     for (int row = 0; row < _pclList->count(); ++row) {
         const QListWidgetItem* item = _pclList->item(row);
@@ -1261,7 +1228,6 @@ QJsonObject SpiralPanel::sessionAdvancedConfig() const
         else
             ++it;
     }
-    applyOptionalInputConfig(config, true);
     return config;
 }
 
@@ -1271,7 +1237,6 @@ QJsonObject SpiralPanel::runAdvancedConfig() const
         QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
     if (!advanced.isObject()) return {};
     QJsonObject config = advanced.object();
-    applyOptionalInputConfig(config, false);
     for (auto it = config.begin(); it != config.end();) {
         if (it.key().startsWith(QStringLiteral("influence_"))
             || it.key() == QStringLiteral("loss_weight_anchor"))
@@ -1280,12 +1245,6 @@ QJsonObject SpiralPanel::runAdvancedConfig() const
             ++it;
     }
     return config;
-}
-
-bool SpiralPanel::optionalInputEnabled(const QString& key) const
-{
-    const auto it = _optionalInputs.constFind(key);
-    return it == _optionalInputs.cend() || it.value()->isChecked();
 }
 
 void SpiralPanel::applyTrackSamplingConfig(QJsonObject& config) const
@@ -1362,88 +1321,13 @@ void SpiralPanel::writeTrackSamplingControlsToAdvanced()
 
 void SpiralPanel::updateTrackSamplingUi()
 {
-    const bool tracksEnabled = optionalInputEnabled(QStringLiteral("tracks_dbm"));
+    const bool tracksEnabled =
+        !_paths.value(QStringLiteral("tracks_dbm"))->text().trimmed().isEmpty();
     _trackLengthBinSampling->setEnabled(tracksEnabled);
     _trackShortWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
     _trackMediumWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
     _trackLongWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
     _maxTrackCrossings->setEnabled(tracksEnabled);
-}
-
-void SpiralPanel::applyOptionalInputConfig(QJsonObject& config,
-                                            bool includeSelectionFlags) const
-{
-    const bool verified = optionalInputEnabled(QStringLiteral("verified_patches"));
-    const bool unverified = optionalInputEnabled(QStringLiteral("unverified_patches"));
-    const bool normals = optionalInputEnabled(QStringLiteral("normals"));
-    const bool sdt = optionalInputEnabled(QStringLiteral("surf_sdt"));
-    const bool tracks = optionalInputEnabled(QStringLiteral("tracks_dbm"));
-    const bool gradMag = optionalInputEnabled(QStringLiteral("gradient_magnitude"));
-    const bool fibers = optionalInputEnabled(QStringLiteral("fibers"));
-
-    if (includeSelectionFlags) {
-        config[QStringLiteral("input_use_verified_patches")] = verified;
-        config[QStringLiteral("input_use_unverified_patches")] = unverified;
-        config[QStringLiteral("input_use_normals")] = normals;
-        config[QStringLiteral("input_use_surf_sdt")] = sdt;
-        config[QStringLiteral("input_use_tracks")] = tracks;
-        config[QStringLiteral("input_use_gradient_magnitude")] = gradMag;
-        config[QStringLiteral("input_use_fibers")] = fibers;
-    }
-
-    auto zero = [&config](std::initializer_list<const char*> keys) {
-        for (const char* key : keys) config[QString::fromLatin1(key)] = 0;
-    };
-    if (!verified) {
-        zero({"loss_weight_patch_radius", "loss_weight_patch_dt",
-              "loss_weight_umbilicus", "loss_weight_shell_patch_radius",
-              "sample_count_patches_per_step", "sample_count_patches_per_step_for_dt",
-              "sample_count_points_per_patch"});
-    }
-    if (!unverified) {
-        zero({"loss_weight_unverified_patch_radius", "loss_weight_unverified_patch_dt",
-              "sample_count_unverified_patches_per_step",
-              "sample_count_unverified_patches_per_step_for_dt",
-              "sample_count_unverified_points_per_patch"});
-    }
-    if (!normals)
-        zero({"loss_weight_dense_normals", "sample_count_dense_normal_points"});
-    if (!tracks) {
-        zero({"loss_weight_track_radius", "loss_weight_track_dt",
-              "sample_count_tracks_per_step", "sample_count_track_points_per_step"});
-    }
-    if (!fibers) {
-        zero({"loss_weight_unattached_pcl_radius", "loss_weight_unattached_pcl_dt",
-              "sample_count_unattached_pcls_per_step", "sample_count_unattached_pcl_points_per_step"});
-    }
-
-    const QString spacingMode =
-        config.value(QStringLiteral("dense_spacing_mode")).toString(QStringLiteral("phase"));
-    if (!sdt || !normals) {
-        zero({"loss_weight_dense_spacing_count", "loss_weight_dense_spacing_density",
-              "loss_weight_dense_attachment",
-              "sample_count_dense_spacing_count_extra_pairs", "sample_count_dense_spacing_density_extra_pairs",
-              "sample_count_dense_attachment_points"});
-        if (spacingMode == QStringLiteral("phase"))
-            zero({"loss_weight_dense_spacing", "sample_count_dense_spacing_pairs"});
-    }
-    if (!gradMag && spacingMode == QStringLiteral("grad_mag"))
-        zero({"loss_weight_dense_spacing", "sample_count_dense_spacing_pairs"});
-}
-
-void SpiralPanel::updateOptionalInputUi()
-{
-    for (auto it = _paths.begin(); it != _paths.end(); ++it) {
-        QString optionalKey = it.key();
-        if (optionalKey == QStringLiteral("normal_x")
-            || optionalKey == QStringLiteral("normal_y"))
-            optionalKey = QStringLiteral("normals");
-        const bool enabled = optionalInputEnabled(optionalKey);
-        it.value()->setEnabled(enabled);
-        if (_pathBrowseButtons.contains(it.key()))
-            _pathBrowseButtons[it.key()]->setEnabled(enabled);
-    }
-    updateTrackSamplingUi();
 }
 
 void SpiralPanel::applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration)
@@ -1461,8 +1345,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
         request.value(QStringLiteral("paths")).toObject();
     const QJsonObject run =
         request.value(QStringLiteral("run")).toObject();
-    const QJsonObject requestedConfig =
-        run.value(QStringLiteral("config")).toObject();
     const QJsonObject activeRunConfig =
         status.value(QStringLiteral("run_config")).toObject();
     QJsonObject defaultConfig =
@@ -1479,20 +1361,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         it.value()->setText(paths.value(it.key()).toString());
-
-    const QHash<QString, QString> selectionFlags{
-        {QStringLiteral("verified_patches"), QStringLiteral("input_use_verified_patches")},
-        {QStringLiteral("unverified_patches"), QStringLiteral("input_use_unverified_patches")},
-        {QStringLiteral("normals"), QStringLiteral("input_use_normals")},
-        {QStringLiteral("surf_sdt"), QStringLiteral("input_use_surf_sdt")},
-        {QStringLiteral("tracks_dbm"), QStringLiteral("input_use_tracks")},
-        {QStringLiteral("gradient_magnitude"), QStringLiteral("input_use_gradient_magnitude")},
-        {QStringLiteral("fibers"), QStringLiteral("input_use_fibers")},
-    };
-    for (auto it = selectionFlags.begin(); it != selectionFlags.end(); ++it) {
-        _optionalInputs.value(it.key())->setChecked(
-            requestedConfig.value(it.value()).toBool(true));
-    }
 
     _pclList->clear();
     for (const QJsonValue& value : paths.value(QStringLiteral("pcls")).toArray()) {
@@ -1539,14 +1407,14 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
         applySessionRunConfig(activeRunConfig, sessionGeneration);
     else
         _advancedSessionGeneration = -1;
-    updateOptionalInputUi();
+    updateTrackSamplingUi();
     _applyingResolution = false;
 
     _hasManualEdits = false;
     _hasSession = true;
     // Reload comparisons use the panel's adopted representation. The host
-    // request is canonical and sparse, whereas the form expands defaults and
-    // applies optional-input gating; both describe the same resident fit.
+    // request is canonical and sparse, whereas the form expands the active
+    // session defaults; both describe the same resident fit.
     _loadedSessionRequest = sessionRequest();
     _reloadRequired = false;
     for (auto it = _visibilityChecks.begin(); it != _visibilityChecks.end(); ++it)
@@ -1706,39 +1574,6 @@ void SpiralPanel::refreshReloadRequired()
 
     QJsonObject current = sessionRequest();
 
-    // A loaded input may be disabled at a Run boundary by forcing its mutable
-    // loss weights and sample counts to zero. Re-enabling an input that was not
-    // loaded, or changing its path, still requires rebuilding the session.
-    QJsonObject currentRun = current.value(QStringLiteral("run")).toObject();
-    QJsonObject currentConfig = currentRun.value(QStringLiteral("config")).toObject();
-    const QJsonObject loadedRun =
-        _loadedSessionRequest.value(QStringLiteral("run")).toObject();
-    const QJsonObject loadedConfig =
-        loadedRun.value(QStringLiteral("config")).toObject();
-    QJsonObject currentPaths = current.value(QStringLiteral("paths")).toObject();
-    const QJsonObject loadedPaths =
-        _loadedSessionRequest.value(QStringLiteral("paths")).toObject();
-    const QHash<QString, QStringList> optionalInputs{
-        {QStringLiteral("input_use_normals"), {QStringLiteral("normal_x"), QStringLiteral("normal_y")}},
-        {QStringLiteral("input_use_surf_sdt"), {QStringLiteral("surf_sdt")}},
-        {QStringLiteral("input_use_tracks"), {QStringLiteral("tracks_dbm")}},
-        {QStringLiteral("input_use_gradient_magnitude"), {QStringLiteral("gradient_magnitude")}},
-        {QStringLiteral("input_use_fibers"), {QStringLiteral("fibers")}},
-    };
-    for (auto it = optionalInputs.begin(); it != optionalInputs.end(); ++it) {
-        const QString& flag = it.key();
-        const bool loaded = loadedConfig.value(flag).toBool(true);
-        const bool enabled = currentConfig.value(flag).toBool(true);
-        if (!loaded || enabled) continue;
-        currentConfig[flag] = true;
-        for (const QString& pathKey : it.value()) {
-            currentPaths[pathKey] = loadedPaths.value(pathKey);
-        }
-    }
-    currentRun[QStringLiteral("config")] = currentConfig;
-    current[QStringLiteral("run")] = currentRun;
-    current[QStringLiteral("paths")] = currentPaths;
-
     const bool wasReloadRequired = _reloadRequired;
     _reloadRequired = normalizedReloadRequest(current)
         != normalizedReloadRequest(_loadedSessionRequest);
@@ -1755,9 +1590,6 @@ void SpiralPanel::persist() const
     const QString prefix = formSettingsPrefix();
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         settings.setValue(prefix + QStringLiteral("paths/") + it.key(), it.value()->text());
-    for (auto it = _optionalInputs.begin(); it != _optionalInputs.end(); ++it)
-        settings.setValue(prefix + QStringLiteral("use_inputs/") + it.key(),
-                          it.value()->isChecked());
     QJsonArray pcls;
     for (int row = 0; row < _pclList->count(); ++row) {
         const QListWidgetItem* item = _pclList->item(row);
@@ -1805,9 +1637,6 @@ void SpiralPanel::restore()
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         it.value()->setText(settings.value(pathsPrefix + it.key()).toString());
-    for (auto it = _optionalInputs.begin(); it != _optionalInputs.end(); ++it)
-        it.value()->setChecked(settings.value(
-            valuePrefix + QStringLiteral("use_inputs/") + it.key(), true).toBool());
     _pclList->clear();
     const QByteArray savedPcls = settings.value(valuePrefix + QStringLiteral("pcls")).toByteArray();
     const QJsonDocument pclDocument = QJsonDocument::fromJson(savedPcls);
@@ -1863,5 +1692,5 @@ void SpiralPanel::restore()
     _loadedSessionRequest = {};
     _attachedAdvancedConfig = {};
     _defaultAdvancedConfig = {};
-    updateOptionalInputUi();
+    updateTrackSamplingUi();
 }

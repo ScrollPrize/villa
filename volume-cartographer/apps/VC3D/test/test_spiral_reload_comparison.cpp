@@ -13,7 +13,6 @@ private slots:
         const QJsonObject defaults{
             {"track_dt_loss_margin", 0.025},
             {"patch_erode_patches", 2},
-            {"input_use_verified_patches", true},
         };
         QJsonObject loaded{
             {"paths", QJsonObject{
@@ -42,21 +41,15 @@ private slots:
                 loaded, defaults, mutableConfig, mutablePaths));
     }
 
-    void PatchToggleStillRequiresReload()
+    void PatchPathChangeStillRequiresReload()
     {
-        const QJsonObject defaults{
-            {"input_use_verified_patches", true},
-        };
+        const QJsonObject defaults;
         QJsonObject loaded{
             {"paths", QJsonObject{{"verified_patches", "/patches"}}},
             {"run", QJsonObject{{"config", defaults}}},
         };
         QJsonObject current = loaded;
-        QJsonObject run = current["run"].toObject();
-        QJsonObject config = run["config"].toObject();
-        config["input_use_verified_patches"] = false;
-        run["config"] = config;
-        current["run"] = run;
+        current["paths"] = QJsonObject{{"verified_patches", "/other-patches"}};
 
         QVERIFY(
             vc3d::normalizedSpiralReloadRequest(current, defaults, {})

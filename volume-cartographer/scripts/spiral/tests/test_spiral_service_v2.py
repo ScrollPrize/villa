@@ -571,33 +571,20 @@ class DatasetOwnershipTests(unittest.TestCase):
                              "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(caught.exception.status, 400)
 
-    def test_dataset_request_omits_disabled_optional_inputs(self):
-        config = {
-            "input_use_verified_patches": False,
-            "input_use_unverified_patches": False,
-            "input_use_normals": False,
-            "input_use_surf_sdt": False,
-            "input_use_tracks": False,
-            "input_use_gradient_magnitude": False,
-            "input_use_fibers": False,
-        }
+    def test_dataset_request_uses_resolved_paths_without_input_toggles(self):
         request = self.state._dataset_session_request({
-            "run": {"z_begin": 0, "z_end": 10, "config": config},
+            "run": {"z_begin": 0, "z_end": 10},
         })
-        for field in ("verified_patches", "unverified_patches", "normal_x",
-                      "normal_y", "surf_sdt", "tracks_dbm",
-                      "gradient_magnitude", "fibers"):
-            self.assertEqual(request["paths"][field], "")
+        self.assertEqual(
+            request["paths"]["verified_patches"],
+            str(self.root / "verified_patches"))
+        self.assertEqual(request["paths"]["unverified_patches"], "")
 
     def test_status_advertises_canonical_active_session_request(self):
         config = {
-            "input_use_verified_patches": True,
-            "input_use_unverified_patches": False,
-            "input_use_normals": False,
-            "input_use_surf_sdt": False,
-            "input_use_tracks": False,
-            "input_use_gradient_magnitude": False,
-            "input_use_fibers": False,
+            "dense_spacing_mode": "grad_mag",
+            "loss_weight_dense_spacing": 0,
+            "loss_weight_dense_normals": 0,
             "loss_weight_shell_outer": 0,
             "loss_weight_shell_patch_radius": 0,
             "loss_weight_patch_radius": 7.5,
@@ -637,13 +624,9 @@ class DatasetOwnershipTests(unittest.TestCase):
                 "z_begin": 0,
                 "z_end": 10,
                 "config": {
-                    "input_use_verified_patches": False,
-                    "input_use_unverified_patches": False,
-                    "input_use_normals": False,
-                    "input_use_surf_sdt": False,
-                    "input_use_tracks": False,
-                    "input_use_gradient_magnitude": False,
-                    "input_use_fibers": False,
+                    "dense_spacing_mode": "grad_mag",
+                    "loss_weight_dense_spacing": 0,
+                    "loss_weight_dense_normals": 0,
                     "loss_weight_shell_outer": 0,
                     "loss_weight_shell_patch_radius": 0,
                 },

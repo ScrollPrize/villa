@@ -29,48 +29,6 @@ def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
             if fields[key]["runtime_impact"] in {"run_boundary", "shell_reload"}}
 
 
-def apply_optional_input_selection(config: dict[str, Any]) -> dict[str, Any]:
-    """Force losses and sample counts off for session-disabled inputs."""
-    def zero(*keys: str) -> None:
-        for key in keys:
-            config[key] = 0
-
-    if not bool(config.get("input_use_verified_patches", True)):
-        zero("loss_weight_patch_radius", "loss_weight_patch_dt",
-             "loss_weight_umbilicus", "loss_weight_shell_patch_radius",
-             "sample_count_patches_per_step", "sample_count_patches_per_step_for_dt",
-             "sample_count_points_per_patch")
-    if not bool(config.get("input_use_unverified_patches", True)):
-        zero("loss_weight_unverified_patch_radius",
-             "loss_weight_unverified_patch_dt",
-             "sample_count_unverified_patches_per_step",
-             "sample_count_unverified_patches_per_step_for_dt",
-             "sample_count_unverified_points_per_patch")
-    normals = bool(config.get("input_use_normals", True))
-    sdt = bool(config.get("input_use_surf_sdt", True))
-    if not normals:
-        zero("loss_weight_dense_normals", "sample_count_dense_normal_points")
-    if not bool(config.get("input_use_tracks", True)):
-        zero("loss_weight_track_radius", "loss_weight_track_dt",
-             "sample_count_tracks_per_step", "sample_count_track_points_per_step")
-    if not bool(config.get("input_use_fibers", True)):
-        zero("loss_weight_unattached_pcl_radius", "loss_weight_unattached_pcl_dt",
-             "sample_count_unattached_pcls_per_step", "sample_count_unattached_pcl_points_per_step")
-
-    spacing_mode = str(config.get("dense_spacing_mode", "phase"))
-    if not sdt or not normals:
-        zero("loss_weight_dense_spacing_count",
-             "loss_weight_dense_spacing_density",
-             "loss_weight_dense_attachment", "sample_count_dense_spacing_count_extra_pairs",
-             "sample_count_dense_spacing_density_extra_pairs", "sample_count_dense_attachment_points")
-        if spacing_mode == "phase":
-            zero("loss_weight_dense_spacing", "sample_count_dense_spacing_pairs")
-    if (not bool(config.get("input_use_gradient_magnitude", True))
-            and spacing_mode == "grad_mag"):
-        zero("loss_weight_dense_spacing", "sample_count_dense_spacing_pairs")
-    return config
-
-
 class PclRole(str, Enum):
     ABSOLUTE = "absolute"
     PATCH_OVERLAP = "patch_overlap"
@@ -391,13 +349,11 @@ def validate_session_request(
 
     require_file(paths.umbilicus, "umbilicus", json_file=True)
     disable_patches = bool(run.config.get("input_disable_patches", False))
-    use_verified = bool(run.config.get("input_use_verified_patches", True)) and not disable_patches
-    use_unverified = bool(run.config.get("input_use_unverified_patches", True)) and not disable_patches
-    optional_dir(paths.verified_patches, "verified_patches", required=use_verified)
-    if use_unverified:
+    optional_dir(paths.verified_patches, "verified_patches",
+                 required=not disable_patches)
+    if not disable_patches:
         optional_dir(paths.unverified_patches, "unverified_patches")
-    if bool(run.config.get("input_use_fibers", True)):
-        optional_dir(paths.fibers, "fibers")
+    optional_dir(paths.fibers, "fibers")
 
     shell_enabled = (
         float(run.config.get("loss_weight_shell_outer", 1.0)) > 0
@@ -405,8 +361,7 @@ def validate_session_request(
     )
     optional_dir(paths.outer_shell, "outer_shell", required=shell_enabled)
 
-    if (bool(run.config.get("input_use_tracks", True)) and paths.tracks_dbm
-            and not resolve_logical_dbm(paths.tracks_dbm)):
+    if paths.tracks_dbm and not resolve_logical_dbm(paths.tracks_dbm):
         errors.append({"field": "tracks_dbm", "message": "DBM logical base or backing file was not found"})
 
     for index, spec in enumerate(paths.pcls):
@@ -428,15 +383,11 @@ def validate_session_request(
                        "message": "Must be phase or grad_mag"})
         spacing_mode = None
 
-    normals_selected = bool(run.config.get("input_use_normals", True))
-    sdt_selected = bool(run.config.get("input_use_surf_sdt", True))
-    grad_mag_selected = bool(run.config.get("input_use_gradient_magnitude", True))
-    use_normals = (normals_selected
-                   and float(run.config.get("loss_weight_dense_normals", 100.0)) > 0)
+    use_normals = float(
+        run.config.get("loss_weight_dense_normals", 100.0)) > 0
     spacing_enabled = float(run.config.get("loss_weight_dense_spacing", 12.0)) > 0
-    use_phase = spacing_mode == "phase" and normals_selected and sdt_selected
-    use_grad_mag = (
-        spacing_mode == "grad_mag" and spacing_enabled and grad_mag_selected)
+    use_phase = spacing_mode == "phase"
+    use_grad_mag = spacing_mode == "grad_mag" and spacing_enabled
     # The phase bundle requires its core inputs (SDT for phase, count, and
     # attachment; both normal channels for band incidence handling) even when
     # individual sub-weights are zero, so run-mutable weights can be raised

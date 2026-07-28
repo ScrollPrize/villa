@@ -21,6 +21,14 @@ def test_every_key_has_generated_metadata():
         assert field["label"] == key.split("_", 1)[1].replace("_", " ").title()
 
 
+def test_input_participation_is_not_part_of_advanced_configuration():
+    catalog = Config.catalog()
+    assert not any(
+        key.startswith("input_use_")
+        for key in catalog["defaults"]
+    )
+
+
 def test_interactive_runtime_impacts_match_resident_capabilities():
     schema = Config.catalog()["schema"]
     fields = schema["fields"]
