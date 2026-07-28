@@ -1913,6 +1913,8 @@ class _FailFastNormalComparisonSampler:
         self.call_count += 1
         points = _points_to_numpy(points_zyx_selected)
         primary_normals, primary_valid = self.primary(points_zyx_selected)
+        selected_normals: torch.Tensor | np.ndarray = primary_normals
+        selected_valid: torch.Tensor | np.ndarray = primary_valid
         for label, sampler in self.alternates:
             alt_normals, alt_valid = sampler(points_zyx_selected)
             self._compare(
@@ -1923,7 +1925,10 @@ class _FailFastNormalComparisonSampler:
                 alt_normals=alt_normals,
                 alt_valid=alt_valid,
             )
-        return primary_normals, primary_valid
+            if selected_normals is primary_normals:
+                selected_normals = alt_normals
+                selected_valid = alt_valid
+        return selected_normals, selected_valid
 
 
 def _make_debug_normal_comparison_sampler(
@@ -6696,7 +6701,7 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Debug-only: run sparse corner/tensor Lasagna normal sampling in "
             "parallel with the baseline sampler and fail fast on differences. "
-            "The tracer still uses baseline normals."
+            "The tracer uses the sparse sampler after comparison succeeds."
         ),
     )
     parser.add_argument(

@@ -1,4 +1,4 @@
-# Plan: Fail-Fast Native 3D Trace2CP Acceleration Comparison
+# Plan: Native 3D Trace2CP Accelerated Normal Debug Run
 
 ## Implementation
 
@@ -14,7 +14,8 @@
 2. Add a fail-fast comparison wrapper.
    - Wrap the restored `_NativeLasagnaNormalSampler` as the primary sampler.
    - Call debug alternate samplers on the same points.
-   - Return primary normals to the tracer so the traced metric stays baseline.
+   - Return the sparse corner/tensor normals to the tracer after comparison
+     succeeds, so the traced metric exercises the accelerated path.
    - Raise `ValueError` immediately on valid-mask mismatch or angle difference
      above the configured threshold.
 
@@ -32,7 +33,7 @@
 ## Spec Update
 
 - Add a debug-only native 3D Trace2CP comparison mode that is explicitly
-  non-production and fail-fast.
+  fail-fast but can drive tracing with the accelerated sampler.
 - Reaffirm that default scoring uses the restored geometry-loader sampler.
 
 ## Docs Updates

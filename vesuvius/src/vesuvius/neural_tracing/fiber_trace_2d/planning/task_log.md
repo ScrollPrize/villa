@@ -16,6 +16,9 @@
 - Added `_FailFastNormalComparisonSampler`, which raises immediately on
   valid-mask mismatch or on angular difference above
   `--debug-normal-angle-threshold-degrees`.
+- Inverted the comparison wrapper return path so normal-aware smoothness now
+  receives sparse corner/tensor normals after they pass comparison against the
+  baseline sampler.
 - The failure message includes sampler label, call number, point index,
   selected-level ZYX coordinate, valid flags, normals, and angle/threshold where
   applicable.
@@ -38,12 +41,21 @@
 - Re-ran after removing the bad raw mode from the CLI/code:
   `err/kvx=0.7`, `restarts=11`, `segments=87`, `err/m=72.0 (12.7mm)`,
   `trace_wall_s=129.556`, no debug comparison failure.
+- Next run target: same command, but now the trace is driven by the sparse
+  corner/tensor normals instead of only comparing them.
+- Accelerated-primary run with `--beam-lookahead-steps 1` completed without
+  comparison failure but produced 11 restarts. This was the wrong comparison
+  command for the 3-restart reference.
+- Accelerated-primary run with the reference command's
+  `--beam-lookahead-steps 2` completed without comparison failure and recovered
+  the expected quality: `err/kvx=0.2`, `restarts=3`, `segments=87`,
+  `err/m=19.6 (38.2mm)`, `trace_wall_s=679.960`.
 
 ## Deviations / Deferred Items
 
-- The accelerated samplers are debug-only and are not used for production
-  scoring. This is intentional so the restored baseline metric stays unchanged
-  while we localize acceleration differences.
+- The accelerated sparse corner/tensor sampler is still only selected by the
+  debug comparison flag, but when selected it now drives tracing after passing
+  fail-fast comparison.
 - No long traces or JSON diff reports are written; the user requested fail-fast
   behavior instead.
 
@@ -55,4 +67,6 @@
 - `PYTHONPATH=vesuvius/src:lasagna:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool --help | rg -n "debug-compare-normal-sampler|debug-normal-angle"`: passed.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "normal_comparison or lasagna_normal_sampler"` after the import fix: 4 passed, 156 deselected.
 - Same focused test after removing the bad raw mode: 4 passed, 156 deselected.
+- Same focused test after inverting the comparison wrapper to return the
+  accelerated normals: 4 passed, 156 deselected.
 - `git diff --check`: passed.

@@ -5305,7 +5305,7 @@ def test_native_3d_trace2cp_lasagna_normal_sampler_uses_geometry_record() -> Non
     assert torch.allclose(normals_zyx, torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32))
 
 
-def test_native_3d_trace2cp_normal_comparison_returns_baseline_below_threshold() -> None:
+def test_native_3d_trace2cp_normal_comparison_returns_alternate_below_threshold() -> None:
     points = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
     baseline_normals = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32)
     baseline_valid = torch.tensor([True])
@@ -5327,8 +5327,8 @@ def test_native_3d_trace2cp_normal_comparison_returns_baseline_below_threshold()
     normals, valid = sampler(points)
 
     assert sampler.call_count == 1
-    assert torch.equal(normals, baseline_normals)
-    assert torch.equal(valid, baseline_valid)
+    assert torch.equal(normals, alternate_normals)
+    assert torch.equal(valid, alternate_valid)
 
 
 def test_native_3d_trace2cp_normal_comparison_raises_on_valid_mismatch() -> None:
