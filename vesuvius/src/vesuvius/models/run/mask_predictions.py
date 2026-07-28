@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import math
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
@@ -24,6 +25,27 @@ from vesuvius.utils.k8s import get_tqdm_kwargs
 
 _worker_state = {}
 _MAX_DEFAULT_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+def _bounded_executor_map(executor, function, iterable, max_pending):
+    """Yield ordered results while keeping a bounded number of futures queued."""
+    iterator = iter(iterable)
+    pending = deque()
+
+    for _ in range(max_pending):
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        pending.append(executor.submit(function, item))
+
+    while pending:
+        yield pending.popleft().result()
+        try:
+            item = next(iterator)
+        except StopIteration:
+            continue
+        pending.append(executor.submit(function, item))
 
 
 def _prediction_spatial_shape(prediction_store) -> tuple[int, int, int]:
@@ -246,11 +268,11 @@ def mask_finalized_predictions(
             anonymous,
         ),
     ) as executor:
-        results = executor.map(
+        results = _bounded_executor_map(
+            executor,
             _process_chunk,
             _iter_spatial_slices(spatial_shape, chunks),
-            chunksize=1,
-            buffersize=max(2, num_workers * 2),
+            max_pending=max(2, num_workers * 2),
         )
         for stats in tqdm(
             results,

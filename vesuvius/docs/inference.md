@@ -42,8 +42,8 @@ vesuvius.predict \
 | `--normalization` | Runtime normalization (`instance_zscore`, `global_zscore`, `instance_minmax`, `ct`, `none`).
 | `--intensity-properties-json` | nnU-Net style JSON with intensity stats for CT normalization.
 | `--device` | Device string such as `cuda`, `cuda:1`, or `cpu`.
-| `--skip-empty-patches` / `--no-skip-empty-patches` | Toggle automatic removal of homogeneous patches.
-| `--zarr-compressor` / `--zarr-compression-level` | Configure output compression (`zstd` with level `3` by default).
+| `--skip_empty_patches` / `--no_skip_empty_patches` | Toggle automatic removal of homogeneous patches.
+| `--zarr_compressor` / `--zarr_compression_level` | Configure output compression (`zstd` with level `3` by default).
 | `--scroll_id`, `--segment_id`, `--energy`, `--resolution` | Metadata when reading remote scrolls via the `Volume` helper.
 | `--hf_token` | Hugging Face token for private repositories.
 | `--config-yaml` | Training YAML to resolve model architecture when the checkpoint lacks embedded metadata.
@@ -123,11 +123,11 @@ Finalize logits into probabilities or masks and optionally build a multiscale py
 ```bash
 vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
   --mode binary \
-  --threshold --threshold-value 0.3 \
-  --delete-intermediates
+  --threshold --threshold_value 0.3 \
+  --delete_intermediates
 ```
 
-`--threshold` toggles binarization on (default cutoff `0.5`). `--threshold-value T` overrides the cutoff with any value in `(0, 1)` and requires `--threshold`. The right cutoff is model-dependent and should come from validation — `0.3` above is illustrative, not a recommendation.
+`--threshold` toggles binarization on (default cutoff `0.5`). `--threshold_value T` overrides the cutoff with any value in `(0, 1)` and requires `--threshold`. The right cutoff is model-dependent and should come from validation — `0.3` above is illustrative, not a recommendation.
 
 ### Options
 
@@ -136,23 +136,23 @@ vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
 | `input_path` | Path to the blended logits Zarr (level `0` is the logits array).
 | `output_path` | Destination multiscale Zarr root.
 | `--mode` | `binary` (default), `multiclass`, or `surface_frame` (keeps 9-channel frame outputs; no thresholding).
-| `--threshold` | Binarize the probability map. In `binary` mode cuts at the probability given by `--threshold-value` (default `0.5`). In `multiclass` mode emits the argmax channel. Ignored in `surface_frame` mode.
-| `--threshold-value T` | Override the `--threshold` cutoff with `T` in `(0, 1)`. Requires `--threshold`. Binary mode only — rejected in `multiclass` since argmax ignores the cutoff.
-| `--support-volume PATH` | Mask finalized binary predictions with an exactly aligned 3-D support Zarr array (or a singleton-channel 4-D array).
-| `--support-threshold T` | Treat support values `<= T` as background (default `0`). Requires `--support-volume` when set to a non-default value.
-| `--support-authenticated` | Use configured credentials for an S3 support volume. Public S3 access is anonymous by default.
-| `--delete-intermediates` | Remove the source logits after a successful run.
-| `--chunk-size` | Spatial chunk size for the output store (`Z,Y,X`). Defaults to the logits chunking.
-| `--num-workers` | Worker processes for finalization (defaults to half of CPU cores).
+| `--threshold` | Binarize the probability map. In `binary` mode cuts at the probability given by `--threshold_value` (default `0.5`). In `multiclass` mode emits the argmax channel. Ignored in `surface_frame` mode.
+| `--threshold_value T` | Override the `--threshold` cutoff with `T` in `(0, 1)`. Requires `--threshold`. Binary mode only — rejected in `multiclass` since argmax ignores the cutoff.
+| `--support_volume PATH` | Mask finalized binary predictions with an exactly aligned 3-D support Zarr array (or a singleton-channel 4-D array).
+| `--support_threshold T` | Treat support values `<= T` as background (default `0`). Requires `--support_volume` when set to a non-default value.
+| `--support_authenticated` | Use configured credentials for an S3 support volume. Public S3 access is anonymous by default.
+| `--delete_intermediates` | Remove the source logits after a successful run.
+| `--chunk_size` | Spatial chunk size for the output store (`Z,Y,X`). Defaults to the logits chunking.
+| `--num_workers` | Worker processes for finalization (defaults to half of CPU cores).
 | `--quiet` | Suppress verbose logging.
 
 Without `--threshold`, binary mode outputs a single softmax foreground channel; multiclass mode writes one channel per class plus an argmax channel. `surface_frame` mode bypasses thresholding entirely and stores orthonormal 9-channel frames in float32.
 
 ### Optional CT/support masking
 
-`vesuvius.finalize_outputs` and the fused `vesuvius.blend_and_finalize` command share the three support-mask options above. This feature is opt-in and currently supports only `--mode binary`. `--support-volume` must point directly to a Zarr array with spatial shape `(Z,Y,X)` exactly matching the output grid; a `(1,Z,Y,X)` singleton-channel array is also accepted. For an OME-Zarr pyramid, include the aligned resolution level in the path. The command validates rank and shape; the caller must verify that both arrays represent the same physical scan, axes, resolution level, and coordinate transform.
+`vesuvius.finalize_outputs` and the fused `vesuvius.blend_and_finalize` command share the three support-mask options above. This feature is opt-in and currently supports only `--mode binary`. `--support_volume` must point directly to a Zarr array with spatial shape `(Z,Y,X)` exactly matching the output grid; a `(1,Z,Y,X)` singleton-channel array is also accepted. For an OME-Zarr pyramid, include the aligned resolution level in the path. The command validates rank and shape; the caller must verify that both arrays represent the same physical scan, axes, resolution level, and coordinate transform.
 
-The support mask is applied after softmax and optional prediction thresholding. A voxel remains supported only when its support value is finite and greater than `--support-threshold`; all output values at other voxels are set to background. Public `s3://` support volumes use anonymous access by default. Add `--support-authenticated` only when the support array requires configured AWS credentials.
+The support mask is applied after softmax and optional prediction thresholding. A voxel remains supported only when its support value is finite and greater than `--support_threshold`; all output values at other voxels are set to background. Public `s3://` support volumes use anonymous access by default. Add `--support_authenticated` only when the support array requires configured AWS credentials.
 
 #### Relation to inference-time masking
 
@@ -169,9 +169,9 @@ with level `2` of the aligned masked CT volume; both have shape `(8398,3941,3941
 ```bash
 vesuvius.finalize_outputs /path/to/PHerc0332-merged-logits.zarr /path/to/final.zarr \
   --mode binary \
-  --threshold --threshold-value 0.2 \
-  --support-volume s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2 \
-  --support-threshold 5
+  --threshold --threshold_value 0.2 \
+  --support_volume s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2 \
+  --support_threshold 5
 ```
 
 The same mask can be applied without writing merged logits first:
@@ -179,9 +179,9 @@ The same mask can be applied without writing merged logits first:
 ```bash
 vesuvius.blend_and_finalize /path/to/partial-logits /path/to/final.zarr \
   --mode binary \
-  --threshold --threshold-value 0.2 \
-  --support-volume s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2 \
-  --support-threshold 5
+  --threshold --threshold_value 0.2 \
+  --support_volume s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/2 \
+  --support_threshold 5
 ```
 
 Masked runs record `support_mask_applied`, the support path, threshold, and access mode in the output Zarr attributes. They also print the number and fraction of nonzero predictions removed. Single-part runs store those metrics in `support_mask_stats`; its scope is explicitly marked as chunks with nonempty finalized output.
@@ -273,9 +273,9 @@ vesuvius.predict --model_path hf://scrollprize/surface_recto \
     --num_parts 4 \
     --part_id 0 \
     --device cuda:0 \
-    --zarr-compressor zstd \
-    --zarr-compression-level 3 \
-    --skip-empty-patches
+    --zarr_compressor zstd \
+    --zarr_compression_level 3 \
+    --skip_empty_patches
 
 # ...repeat for part_id 1,2,3 on other hosts...
 
@@ -284,11 +284,11 @@ vesuvius.blend_logits s3://vesuvius/tmp/logits s3://vesuvius/tmp/merged_logits.z
     --num_workers 32 \
     --chunk_size 256,256,256
 
-# 3. Finalize outputs (bare --threshold cuts at 0.5; add --threshold-value 0.3 for a different cutoff)
+# 3. Finalize outputs (bare --threshold cuts at 0.5; add --threshold_value 0.3 for a different cutoff)
 vesuvius.finalize_outputs s3://vesuvius/tmp/merged_logits.zarr s3://vesuvius/output/final.zarr \
     --mode binary \
     --threshold \
-    --delete-intermediates
+    --delete_intermediates
 ```
 
 After finalization the destination Zarr contains a multiscale hierarchy (`0/`, `1/`, …) and a `metadata.json` file describing the inference run. Rechunk the output if you plan to serve it through a viewer that expects different chunk sizes.

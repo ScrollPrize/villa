@@ -16,6 +16,7 @@ from functools import partial
 from vesuvius.data.utils import open_zarr
 from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 def _canonical_store_path(path: str):
@@ -557,7 +558,7 @@ def finalize_logits(
             if verbose:
                 print(f"Using input chunk size: {output_chunks}")
         except:
-            raise ValueError("Cannot determine input chunk size. Please specify --chunk-size.")
+            raise ValueError("Cannot determine input chunk size. Please specify --chunk_size.")
     else:
         output_chunks = chunk_size
         if verbose:
@@ -802,15 +803,15 @@ def finalize_logits(
 
 # --- Shared CLI helpers ---
 def add_threshold_arguments(parser):
-    """Register the shared `--threshold` / `--threshold-value` arguments on an argparse parser.
+    """Register the shared `--threshold` / `--threshold_value` arguments on an argparse parser.
 
     - `--threshold` toggles thresholding on (default cutoff = 0.5).
-    - `--threshold-value T` overrides the cutoff (must be in (0, 1)); requires --threshold.
+    - `--threshold_value T` overrides the cutoff (must be in (0, 1)); requires --threshold.
     """
     parser.add_argument('--threshold', dest='threshold', action='store_true',
                         help='Binarize the probability map (default cutoff 0.5). '
                              'In multiclass mode this emits the argmax channel.')
-    parser.add_argument('--threshold-value', dest='threshold_value', type=float, default=None,
+    parser.add_argument('--threshold_value', type=float, default=None,
                         help='Override the probability cutoff used by --threshold '
                              '(float in (0, 1)). Binary mode only.')
 
@@ -818,27 +819,24 @@ def add_threshold_arguments(parser):
 def add_support_mask_arguments(parser):
     """Register opt-in source-volume support masking arguments."""
     parser.add_argument(
-        '--support-volume',
-        dest='support_volume',
+        '--support_volume',
         type=str,
         default=None,
         help=(
             'Shape-aligned 3D source/support Zarr array. Finalized predictions are set '
-            'to background where its value is <= --support-threshold. For an '
+            'to background where its value is <= --support_threshold. For an '
             "OME-Zarr pyramid, include the matching resolution level (for example '/2'). "
             'The caller must assert physical-grid alignment.'
         ),
     )
     parser.add_argument(
-        '--support-threshold',
-        dest='support_threshold',
+        '--support_threshold',
         type=float,
         default=0.0,
         help='Maximum source value treated as unsupported. Default: 0.',
     )
     parser.add_argument(
-        '--support-authenticated',
-        dest='support_authenticated',
+        '--support_authenticated',
         action='store_true',
         help='Use configured credentials for an S3 support volume. Public S3 is anonymous by default.',
     )
@@ -848,16 +846,16 @@ def resolve_support_mask(parser, args):
     """Validate support-mask CLI arguments and return path, threshold, anon."""
     if args.support_volume is None:
         if args.support_threshold != 0.0:
-            parser.error("--support-threshold requires --support-volume")
+            parser.error("--support_threshold requires --support_volume")
         if args.support_authenticated:
-            parser.error("--support-authenticated requires --support-volume")
+            parser.error("--support_authenticated requires --support_volume")
         return None, 0.0, True
 
     if args.mode != 'binary':
-        parser.error("--support-volume is currently supported only with --mode binary")
+        parser.error("--support_volume is currently supported only with --mode binary")
     if not np.isfinite(args.support_threshold):
         parser.error(
-            f"--support-threshold must be finite, got {args.support_threshold}"
+            f"--support_threshold must be finite, got {args.support_threshold}"
         )
     return (
         args.support_volume,
@@ -867,26 +865,26 @@ def resolve_support_mask(parser, args):
 
 
 def resolve_threshold(parser, args):
-    """Validate --threshold / --threshold-value and return the effective Optional[float] cutoff.
+    """Validate --threshold / --threshold_value and return the effective Optional[float] cutoff.
 
     Returns None if thresholding is disabled, else a float in (0, 1) (0.5 if no override).
     Calls parser.error on invalid combinations.
     """
     if args.threshold_value is not None and not args.threshold:
-        parser.error("--threshold-value requires --threshold")
+        parser.error("--threshold_value requires --threshold")
     if args.threshold_value is not None and not (0.0 < args.threshold_value < 1.0):
-        parser.error(f"--threshold-value must be in (0, 1), got {args.threshold_value}")
+        parser.error(f"--threshold_value must be in (0, 1), got {args.threshold_value}")
     if args.mode == 'multiclass' and args.threshold_value is not None:
-        parser.error("--threshold-value is not applicable in multiclass mode (argmax ignores the cutoff)")
+        parser.error("--threshold_value is not applicable in multiclass mode (argmax ignores the cutoff)")
     if not args.threshold:
         return None
     return args.threshold_value if args.threshold_value is not None else 0.5
 
 
 # --- Command Line Interface ---
-def main():
-    """Entry point for the vesuvius.finalize command."""
-    parser = argparse.ArgumentParser(description='Process merged logits to produce final outputs.')
+def build_parser() -> argparse.ArgumentParser:
+    """Build the finalize_outputs CLI parser (separate from main so it can be tested)."""
+    parser = HyphenUnderscoreParser(description='Process merged logits to produce final outputs.')
     parser.add_argument('input_path', type=str,
                       help='Path to the merged logits Zarr store')
     parser.add_argument('output_path', type=str,
@@ -895,11 +893,11 @@ def main():
                       help='Processing mode. "binary" for 2-class segmentation, "multiclass" for >2 classes. Default: binary')
     add_threshold_arguments(parser)
     add_support_mask_arguments(parser)
-    parser.add_argument('--delete-intermediates', dest='delete_intermediates', action='store_true',
+    parser.add_argument('--delete_intermediates', action='store_true',
                       help='Delete intermediate logits after processing')
-    parser.add_argument('--chunk-size', dest='chunk_size', type=str, default=None,
+    parser.add_argument('--chunk_size', type=str, default=None,
                       help='Spatial chunk size (Z,Y,X) for output Zarr. Comma-separated. If not specified, input chunks will be used.')
-    parser.add_argument('--num-workers', dest='num_workers', type=int, default=None,
+    parser.add_argument('--num_workers', type=int, default=None,
                       help='Number of worker processes for parallel processing. Default: CPU_COUNT // 2')
     parser.add_argument('--quiet', dest='quiet', action='store_true',
                       help='Suppress verbose output')
@@ -907,7 +905,12 @@ def main():
                       help='Number of parts to split the finalization process into. Default: 1')
     parser.add_argument('--part_id', type=int, default=0,
                       help='Part ID for this process (0-indexed). Default: 0')
+    return parser
 
+
+def main():
+    """Entry point for the vesuvius.finalize command."""
+    parser = build_parser()
     args = parser.parse_args()
 
     # Validate partitioning arguments

@@ -2050,6 +2050,10 @@ def main(argv: list[str] | None = None) -> int:
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
 		  f"cylinder_enabled={getattr(mdl, 'cylinder_enabled', False)}")
 	_stage_done("construct_model", _t)
+	require_umbilicus = bool(
+		getattr(mdl, "cylinder_enabled", False)
+		and hasattr(mdl, "prepare_umbilicus_tube_init")
+	)
 
 	# Load external reference surfaces
 	_t = _stage_start("load_external_surfaces")
@@ -2183,6 +2187,7 @@ def main(argv: list[str] | None = None) -> int:
 			device=device,
 			sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
 			skip_channels=_streaming_skip_channels(needed_channels),
+			require_umbilicus=require_umbilicus,
 		)
 		Z, Y, X = d.size
 		# Volume extent covers the full zarr volume

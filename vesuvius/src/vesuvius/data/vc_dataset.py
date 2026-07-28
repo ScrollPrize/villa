@@ -45,6 +45,7 @@ class VCDataset(Dataset):
             domain: Optional[str] = None,
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
             anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
+            read_retries: int = 4,  # Attempts per read, forwarded to Volume
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -83,6 +84,9 @@ class VCDataset(Dataset):
                              (e.g., 'np.float16', 'np.float32'). Default is 'np.float32'.
             domain: Data source domain for Volume ('dl.ash2txt', 'local'). Auto-detected if None.
             anon: Use anonymous requests for input S3 reads.
+            read_retries: Attempts per read, forwarded to Volume (default 4). Transient
+                remote failures are retried with exponential backoff so one dropped
+                connection does not abort a long streaming run. Pass 1 to disable.
         """
         self.input_path = input_path
         self.input_format = input_format # Keep for informational purposes
@@ -228,6 +232,7 @@ class VCDataset(Dataset):
                 domain=domain,
                 path=use_path,
                 anon=self.anon,
+                read_retries=read_retries,
             )
 
             # Get shape and dtype from the primary resolution level (0)
@@ -290,12 +295,23 @@ class VCDataset(Dataset):
                     print(f"\nUsing bbox-restricted sliding window (global coords): "
                           f"z=[{roi[0][0]}, {roi[0][1]}), y=[{roi[1][0]}, {roi[1][1]}), "
                           f"x=[{roi[2][0]}, {roi[2][1]})")
-                # Grid over the ROI extent, offset back into the global frame so all
-                # emitted coordinates remain volume-absolute.
+                # Build the grid the whole volume would have used, then keep the
+                # patches that touch the ROI. Anchoring the grid to the ROI origin
+                # instead would place patches the full-volume run never places -
+                # a 256-long ROI yields stride 64 where the volume yields ~96 - so
+                # every voxel gets a different set of overlapping patches and the
+                # blended result no longer matches the corresponding sub-region of
+                # a full run. Selecting from the global grid keeps them identical,
+                # which is the whole point of being able to redo one region.
                 (z0, z1), (y0, y1), (x0, x1) = roi
-                z_positions = [z0 + s for s in compute_steps_for_sliding_window(z1 - z0, pZ, self.step_size)]
-                y_positions = [y0 + s for s in compute_steps_for_sliding_window(y1 - y0, pY, self.step_size)]
-                x_positions = [x0 + s for s in compute_steps_for_sliding_window(x1 - x0, pX, self.step_size)]
+
+                def _overlapping(extent, patch, lo, hi):
+                    return [s for s in compute_steps_for_sliding_window(extent, patch, self.step_size)
+                            if s < hi and s + patch > lo]
+
+                z_positions = _overlapping(image_size[0], pZ, z0, z1)
+                y_positions = _overlapping(image_size[1], pY, y0, y1)
+                x_positions = _overlapping(image_size[2], pX, x0, x1)
             else:
                 # Full-volume sliding window
                 if self.verbose:
@@ -340,9 +356,16 @@ class VCDataset(Dataset):
 
             # Apply Z-axis partitioning if num_parts > 1
             if self.num_parts > 1:
-                # Partition the tiled Z extent: with a bbox active, splitting the full
-                # volume range would leave most parts empty, so split the ROI instead.
-                part_z0, part_z1 = (roi[0] if roi is not None else (0, image_size[0]))
+                # Partition the Z span the selected patches actually occupy. With a
+                # bbox active, splitting the full volume range would leave most parts
+                # empty; splitting the ROI range instead would silently drop the
+                # patches that start before it, since the grid comes from the whole
+                # volume and the first patch covering the ROI usually begins outside.
+                if self.all_positions:
+                    occupied_z = sorted({pos[0] for pos in self.all_positions})
+                    part_z0, part_z1 = occupied_z[0], occupied_z[-1] + 1
+                else:
+                    part_z0, part_z1 = (0, image_size[0])
                 z_per_part = (part_z1 - part_z0) / self.num_parts
                 z_start = part_z0 + int(z_per_part * self.part_id)
                 z_end = part_z0 + int(z_per_part * (self.part_id + 1)) if self.part_id < self.num_parts - 1 else part_z1

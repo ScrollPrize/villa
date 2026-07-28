@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +26,7 @@ from vesuvius.models.run.finalize_outputs import (
     resolve_support_mask,
     validate_support_volume,
 )
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 def _zarr_format_kwargs(zarr_format: int) -> dict[str, int]:
@@ -478,8 +478,8 @@ def test_fused_finalize_rejects_support_output_overlap_before_scanning(
         )
 
 
-def _support_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
+def _support_parser() -> HyphenUnderscoreParser:
+    parser = HyphenUnderscoreParser()
     parser.add_argument('--mode', choices=['binary', 'multiclass'], default='binary')
     add_support_mask_arguments(parser)
     return parser

@@ -119,17 +119,14 @@ surf_sdt_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_surf_sdt.ome.zarr'
 surf_sdt_zarr_group = '1'
 pcl_json_paths = [
     f'{dataset_path}/abs_winding.json',
-    f'{dataset_path}/patch-overlap-pcls.json',
     f'{dataset_path}/relative_windings.json',
-    f'{dataset_path}/same_windings.json',
-    f'{dataset_path}/drawn_control_points.json',
 ]
 # The interactive session API supplies explicit roles.  The legacy CLI leaves
 # this as None and retains the historical abs_winding.json basename behavior.
 pcl_input_specs = None
 fibers_path = f'{dataset_path}/fibers'
 verified_patches_path = f'{dataset_path}/verified_patches'
-unverified_patches_path = f'{dataset_path}/unverified_patches'
+unverified_patches_path = None
 run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
 shell_path = f'{dataset_path}/outer_shell'
 tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'  # or: m7_ds2_z3000_18000_surf.dbm
@@ -140,16 +137,15 @@ z_begin, z_end = 4000, 17000
 voxel_size_um = 9.6
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 lasagna_scale = 4
-# mmap is the default everywhere: the SDT store must be mmap-served, and the
-# session API already resolved 'auto' to mmap before this changed.
-lasagna_storage_backend = 'auto'
+# Normals, grad magnitude, and SDT are served by bounded sparse CUDA LRU caches.
+lasagna_storage_backend = 'sparse_cuda'
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
 _active_lasagna_store = None
 _active_scalar_stores = []
 
 
 def release_interactive_resources():
-    """Release worker pools and mmap handles owned by the resident session."""
+    """Release sparse volume stores owned by the resident session."""
     global _active_lasagna_store
     store, _active_lasagna_store = _active_lasagna_store, None
     if store is not None:
@@ -261,7 +257,7 @@ default_config = {
     'unattached_pcl_num_points_per_step': 32,
     'unattached_pcl_min_point_spacing': 16.,
     'track_num_per_step': 48000,
-    'track_num_points_per_step': 24,
+    'track_num_points_per_step': 96,
     # Resample each complete track in full-resolution polyline arclength.
     # track_num_points_per_step selects target-estimation points; the spacing
     # bounds control how many points contribute to the complete-track loss.
@@ -269,14 +265,22 @@ default_config = {
     'track_max_sample_spacing': 60.0,
     # Optional track-pool policies. None preserves uniform sampling and keeps
     # every track regardless of tortuosity; crossing supplements are opt-in.
-    'track_length_bin_weights': None,  # [short, medium, long], using eligible-track arclength tertiles
+    'track_length_bin_weights': [0.0, 0.15, 0.85],  # [short, medium, long], using eligible-track arclength tertiles
     'track_max_tortuosity': None,  # whole-track arclength / endpoint chord; None disables filtering
-    # Crossing discovery is session-scoped; the active per-step count can then
-    # change freely up to this prepared ceiling at a Run boundary.
+    # The complete eligible crossing CSR is retained for the session. The active
+    # per-step random sample can change freely up to this safety ceiling at a
+    # Run boundary. The legacy setting name is kept for profile compatibility.
     'track_crossing_precompute_max': 8,
     # Opposite-family partners joined to each primary track's shared winding
     # target. Zero disables crossing-connected sampling.
-    'max_track_crossing_per_step': 0,
+    'max_track_crossing_per_step': 1,
+    # Native crossing-chain sampling. "count" preserves the historical
+    # fixed-width primary/partner sampler exactly.
+    'track_crossing_mode': 'count',
+    'min_walk_steps_per_track': 24,
+    'max_walk_steps_per_track': 256,
+    'n_walks_per_track': 4,
+    'track_walk_require_loop_consistency': False,
     'track_exclusion_radius': 16.0,
     'track_radius_target': 'mean',
     'track_radius_loss_margin': 0.025,
@@ -285,16 +289,6 @@ default_config = {
     'track_dt_norm_p': 0.5,  # across tracks; -> 0 prefers many fully-satisfied tracks (winner-take-all snapping)
     'track_dt_loss_margin': 0.025,
     'dense_normals_num_points': 60_000,
-    # Interior paging of the dense volume stores (SDT + lasagna normals): chunk
-    # the store grid and keep only chunks inside the outer-shell envelope +
-    # margin when promoting to GPU residency. Nothing samples outside the
-    # shell (reads there return no-data = invalid, like past the canvas edge),
-    # and interior-only residency fits windows whose full plane cannot
-    # (z8500-16500 SDT: 66 GB plane -> ~15-20 GB interior). 0 disables (full
-    # plane / bbox behaviour). Margin is in working voxels and must cover ray
-    # extension past the shell + the chunk half-diagonal (~110 wv at 64x2).
-    'volume_paging_chunk': 64,
-    'volume_interior_margin': 300.0,
     'regularisation_num_points': 4500,
     'grad_mag_encode_scale': 1000.0,
     'grad_mag_factor': 0.25,
@@ -303,7 +297,7 @@ default_config = {
     # soft-sequence phase registration, crossing count, native minimum
     # spacing, and SDT attachment, each with its own weight) and 'grad_mag'
     # (the legacy density integral and default inherited from origin/main).
-    'dense_spacing_mode': 'grad_mag',
+    'dense_spacing_mode': 'phase',
     'dense_spacing_num_pairs': 12_000,
     # m is a two-range mixture biased short: longer baselines average out
     # per-gap counting noise (std ~ 0.5 * sqrt(m)) and let rays straddle wide
@@ -360,7 +354,7 @@ default_config = {
     'dense_spacing_phase_min_matched_mass': 1.0,
     # Native pre-expansion anti-collapse barrier. This is asset-independent
     # and can run in either dense-spacing mode.
-    'loss_weight_min_spacing': 0.0,
+    'loss_weight_min_spacing': 2.0,
     # Crossing count: per-step it is gradient-starved on coarse fits and its
     # support gate self-confirms, but its integer-topology pressure compounds
     # - at 2000-step held-out probes (2026-07-17, wrap-aware scorer) count 8
@@ -382,7 +376,7 @@ default_config = {
     # r<1000, under-reads ~12% at r>1000 (detection recall - partial
     # crossings), and is blind below ~12 wv detected spacing (SDT resolution
     # floor) - hence the min-gap abstention below.
-    'loss_weight_dense_spacing_density': 0.0,
+    'loss_weight_dense_spacing_density': 12.0,
     # Sub-resolution abstention: below ~12 wv detected spacing the store
     # under-reads winding density ~30% (measured), so steps bracketed by a
     # gap under min_gap_wv can abstain (contribute nothing, target-corrected
@@ -1210,14 +1204,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         and cfg.get('use_gradient_magnitude', True)
         and cfg['loss_weight_dense_spacing'] > 0
     )
-    # Interior membership for dense-store GPU paging: inside the outer-shell
-    # polar envelope + margin (see volume_paging_chunk config comment). Built
-    # on CPU from the same shell/umbilicus inputs on every rank
-    # (deterministic), used only at store-promotion time.
-    volume_interior_fn = None
     shell_envelope = None
-    if (shell_patch is not None
-            and (int(cfg['volume_paging_chunk']) > 0 or filter_tracks_by_shell)):
+    if shell_patch is not None and filter_tracks_by_shell:
         shell_envelope = ShellPolarMap(
             shell_patch,
             umbilicus,
@@ -1226,37 +1214,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             num_theta_bins=cfg['shell_num_theta_bins'],
             device='cpu',
         )
-        if int(cfg['volume_paging_chunk']) > 0:
-            interior_margin = float(cfg['volume_interior_margin'])
 
-            def volume_interior_fn(points_working_zyx):
-                points = torch.from_numpy(
-                    np.ascontiguousarray(points_working_zyx, dtype=np.float32))
-                target_radius, radius, _confidence, _valid = \
-                    shell_envelope.lookup(points)
-                # The radius table is distance-transform-filled and smoothed over
-                # the whole (z, theta) grid, so it is meaningful even in
-                # low-confidence bins — do NOT gate the mask on confidence (that
-                # kept ~87% of chunks). Stay conservative only outside the
-                # table's z coverage.
-                keep = radius <= target_radius + interior_margin
-                out_of_z = ((points[:, 0] < shell_envelope.z_min)
-                            | (points[:, 0] > shell_envelope.z_max))
-                return (keep | out_of_z).cpu().numpy()
-
-    # FIT_SPIRAL_PAGED_STORES: which stores may take GPU residency.
-    #   'all' (default) - both stores page/promote under the usual budget.
-    #   'sdt' - only the SDT pool is GPU-resident; the lasagna store is
-    #           FORCED to mmap. For big-window production runs where the
-    #           training state (full patch atlas + optimizer) already claims
-    #           ~38 GB/rank: SDT pool + both would OOM (observed 2026-07-19,
-    #           z8500-16500: 27.4 + 10.4 + ~38 > 79 GiB).
-    paged_stores = os.environ.get('FIT_SPIRAL_PAGED_STORES', 'all').strip().lower()
-    lasagna_backend_choice = lasagna_storage_backend
-    lasagna_interior_fn = volume_interior_fn
-    if paged_stores == 'sdt':
-        lasagna_backend_choice = 'mmap'
-        lasagna_interior_fn = None
     lasagna_volume = prepare_lasagna_volume(
         scroll_zarr,
         use_normals=(cfg.get('use_normals', True)
@@ -1269,12 +1227,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         z_begin=z_begin,
         z_end=z_end,
         lasagna_scale=lasagna_scale,
-        storage_backend=lasagna_backend_choice,
+        storage_backend=lasagna_storage_backend,
         cache_directory=cache_path,
-        interior_fn=lasagna_interior_fn,
-        paged_chunk=int(cfg['volume_paging_chunk']) or 64,
     )
-    if interactive_driver is not None and lasagna_volume and lasagna_volume.get('backend') == 'mmap':
+    if interactive_driver is not None and lasagna_volume:
         _active_lasagna_store = lasagna_volume['store']
 
     # Surf-SDT store: a core input of the whole phase bundle (registration,
@@ -1298,10 +1254,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             z_end=z_end,
             cache_directory=cache_path,
             storage_backend=lasagna_storage_backend,
-            interior_fn=volume_interior_fn,
-            paged_chunk=int(cfg['volume_paging_chunk']) or 64,
         )
-        if interactive_driver is not None and sdt_volume.get('backend') == 'mmap':
+        if interactive_driver is not None:
             _active_scalar_stores.append(sdt_volume['store'])
 
     def phase_mode_active():
@@ -1334,7 +1288,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     track_crossing_cache = None
     if tracks_dbm_path is not None and cfg.get('use_tracks', True):
         print(f'loading tracks from {tracks_dbm_path}')
-        if track_sampling_config['crossing_precompute_max'] > 0:
+        if (track_sampling_config['crossing_precompute_max'] > 0
+                or track_sampling_config['crossing_mode'] == 'track_walk'):
             track_crossing_cache = load_track_crossing_cache(tracks_dbm_path)
             tracks, track_families, track_source_ids = load_tracks_from_dbm(
                 tracks_dbm_path, z_begin, z_end, return_families=True,
@@ -1887,7 +1842,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         temporary = f'{destination}.tmp-{os.getpid()}-{time.time_ns()}'
         try:
             torch.save(checkpoint_payload(completed_iterations), temporary)
-            with open(temporary, 'rb') as stream:
+            # 'rb+' not 'rb': fsync on Windows (_commit) requires a writable descriptor.
+            with open(temporary, 'rb+') as stream:
                 os.fsync(stream.fileno())
             os.replace(temporary, destination)
             try:
@@ -2479,7 +2435,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         def configure_interactive_run(config):
             # Only called by the resident driver on the fitter thread at a
             # pause boundary. These settings are read afresh by every step.
-            if ({'track_length_bin_weights', 'max_track_crossing_per_step'}
+            if ({'track_length_bin_weights', 'max_track_crossing_per_step',
+                 'min_walk_steps_per_track', 'max_walk_steps_per_track',
+                 'n_walks_per_track'}
                     & set(config)):
                 configure_prepared_track_sampling(prepared_main_tracks, config)
             cfg.update(config, allow_val_change=True)
@@ -2701,7 +2659,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 # Release before the generator builds the next loss's graph,
                 # or both large transform graphs are resident at peak.
                 del dense_loss_value
-            if lasagna_volume.get('backend') == 'mmap':
+            if lasagna_volume.get('backend') == 'sparse_cuda':
                 log_metrics.update({
                     f'lasagna_{name}': value
                     for name, value in lasagna_volume['store'].last_timings.items()
@@ -2758,12 +2716,12 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 backward_family(pending_shared)
             del pending_shared
             if (phase_components_active
-                    and lasagna_volume['backend'] == 'mmap'):
+                    and lasagna_volume['backend'] == 'sparse_cuda'):
                 log_metrics.update({
                     f'dense_spacing_phase_normal_{name}': value
                     for name, value in lasagna_volume['store'].last_timings.items()
                 })
-            if phase_components_active and sdt_volume['backend'] == 'mmap':
+            if phase_components_active and sdt_volume['backend'] == 'sparse_cuda':
                 log_metrics.update({
                     f'dense_spacing_phase_sdt_store_{name}': value
                     for name, value in sdt_volume['store'].last_timings.items()
