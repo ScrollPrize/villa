@@ -21,6 +21,7 @@ inline constexpr std::string_view kOpenDataLasagnaModelTagPrefix =
 struct OpenDataLasagnaInfo {
     std::string sampleId;
     std::string volumeId;
+    std::size_t artifactIndex = 0;
     std::string artifactUrl;
     std::string modelId;
     int sourceCoordinateLevel = 0;

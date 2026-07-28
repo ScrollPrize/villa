@@ -229,6 +229,7 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
     const auto artifacts = lasagnaArtifacts(sample.id, volume);
     REQUIRE(artifacts.size() == 1);
     CHECK(artifacts.front().volumeId == "volume");
+    CHECK(artifacts.front().artifactIndex == 0);
     CHECK(artifacts.front().artifactUrl == "https://example.test/lasagna/volume");
     CHECK(artifacts.front().modelId == "model-7");
     CHECK(artifacts.front().sourceCoordinateLevel == 2);
@@ -241,6 +242,44 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
     missingLevelVolume.artifacts.front().levelParameterPresent = false;
     missingLevelVolume.artifacts.front().sourceCoordinateLevel.reset();
     CHECK(lasagnaArtifacts(sample.id, missingLevelVolume).empty());
+}
+
+TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
+{
+    OpenDataSample sample;
+    sample.id = "sample";
+    OpenDataVolume volume;
+    volume.id = "volume";
+    for (int level : {1, 3}) {
+        OpenDataArtifact artifact;
+        artifact.type = "lasagna";
+        artifact.resolvedUrl =
+            "https://example.test/lasagna/L" + std::to_string(level);
+        artifact.levelParameterPresent = true;
+        artifact.sourceCoordinateLevel = level;
+        volume.artifacts.push_back(std::move(artifact));
+    }
+    sample.volumes.push_back(std::move(volume));
+
+    const auto infos =
+        lasagnaArtifacts(sample.id, sample.volumes.front());
+    REQUIRE(infos.size() == 2);
+    CHECK(infos[0].artifactIndex == 0);
+    CHECK(infos[0].sourceCoordinateLevel == 1);
+    CHECK(infos[1].artifactIndex == 1);
+    CHECK(infos[1].sourceCoordinateLevel == 3);
+
+    auto pkg = VolumePkg::newEmpty();
+    OpenDataResourceSelection selection;
+    selection.representations =
+        std::vector<OpenDataRepresentationRef>{{0, 1,
+                                                OpenDataRepresentationKind::Lasagna}};
+    std::vector<std::string> messages;
+    CHECK(attachOpenDataLasagna(
+              *pkg, sample, {}, &messages, &selection) == 0);
+    REQUIRE(messages.size() == 1);
+    CHECK(messages.front().find("coordinate level L3") != std::string::npos);
+    CHECK(messages.front().find("ambiguous") == std::string::npos);
 }
 
 TEST_CASE("OpenDataManifest enumerates derived volume representations")

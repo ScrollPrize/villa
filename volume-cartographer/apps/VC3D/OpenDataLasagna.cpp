@@ -372,7 +372,9 @@ std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
     const OpenDataVolume& volume)
 {
     std::vector<OpenDataLasagnaInfo> result;
-    for (const auto& artifact : volume.artifacts) {
+    for (std::size_t artifactIndex = 0;
+         artifactIndex < volume.artifacts.size(); ++artifactIndex) {
+        const auto& artifact = volume.artifacts[artifactIndex];
         if (lowerCopy(artifact.type) != kLasagnaArtifactType) continue;
         const auto url = trimSlashes(
             artifact.resolvedUrl.empty() ? artifact.sourcePath : artifact.resolvedUrl);
@@ -380,6 +382,7 @@ std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
         OpenDataLasagnaInfo info;
         info.sampleId = sampleId;
         info.volumeId = volume.id;
+        info.artifactIndex = artifactIndex;
         info.artifactUrl = url;
         info.modelId = artifact.modelId.value_or(std::string{});
         if (!artifact.levelParameterPresent || !artifact.sourceCoordinateLevel)
@@ -523,52 +526,39 @@ int attachOpenDataLasagna(VolumePkg& pkg,
                 ": parameters.level is missing or invalid.");
             continue;
         }
-        if (infos.size() > 1) {
-            if (messages) messages->push_back(
-                "Skipped Lasagna for " + volume.id +
-                ": multiple manifest artifacts are ambiguous.");
-            continue;
-        }
         if (infos.empty()) continue;
-        if (selection) {
-            // Map the representation back to its artifact index before applying
-            // the representation and kind filters.
-            std::optional<std::size_t> artifactIndex;
-            for (std::size_t ai = 0; ai < volume.artifacts.size(); ++ai) {
-                const auto& art = volume.artifacts[ai];
-                if (lowerCopy(art.type) != kLasagnaArtifactType) continue;
-                const auto url = trimSlashes(
-                    art.resolvedUrl.empty() ? art.sourcePath : art.resolvedUrl);
-                if (url == infos.front().artifactUrl) {
-                    artifactIndex = ai;
-                    break;
-                }
-            }
-            if (!artifactIndex ||
+
+        for (const auto& info : infos) {
+            if (selection &&
                 !selection->allowsRepresentation(
-                    volumeIndex, *artifactIndex,
+                    volumeIndex, info.artifactIndex,
                     OpenDataRepresentationKind::Lasagna, volume.id)) {
                 continue;
             }
+            std::string error;
+            const auto manifest =
+                prepareOpenDataLasagna(info, remoteCacheRoot, &error);
+            if (manifest.empty()) {
+                if (messages) {
+                    messages->push_back(
+                        "Failed to prepare Lasagna for " + volume.id +
+                        " at coordinate level L" +
+                        std::to_string(info.sourceCoordinateLevel) + ": " + error);
+                }
+                continue;
+            }
+            expected.insert(manifest.string());
+            const auto tags = entryTags(info);
+            if (!pkg.addLasagnaDatasetEntry(manifest.string(), tags)) {
+                pkg.reconcileLasagnaDatasetEntryTags(
+                    manifest.string(), tags,
+                    {std::string(kOpenDataLasagnaArtifactTagPrefix),
+                     std::string(kOpenDataLasagnaModelTagPrefix),
+                     "vc-open-data-source-coordinate-level:",
+                     "vc-open-data-coordinate-space:"});
+            }
+            ++attached;
         }
-        std::string error;
-        const auto manifest = prepareOpenDataLasagna(infos.front(), remoteCacheRoot, &error);
-        if (manifest.empty()) {
-            if (messages) messages->push_back(
-                "Failed to prepare Lasagna for " + volume.id + ": " + error);
-            continue;
-        }
-        expected.insert(manifest.string());
-        const auto tags = entryTags(infos.front());
-        if (!pkg.addLasagnaDatasetEntry(manifest.string(), tags)) {
-            pkg.reconcileLasagnaDatasetEntryTags(
-                manifest.string(), tags,
-                {std::string(kOpenDataLasagnaArtifactTagPrefix),
-                 std::string(kOpenDataLasagnaModelTagPrefix),
-                 "vc-open-data-source-coordinate-level:",
-                 "vc-open-data-coordinate-space:"});
-        }
-        ++attached;
     }
 
     std::vector<std::string> stale;
