@@ -884,13 +884,13 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     selected_pcls = [point_collections[i] for i in selected_idxs]
 
     for pcl in selected_pcls:
-        # Uniform chain interface (attach_sequence_chain_fns): id-sorted order
-        # for ordinary pcls, the fiber-graph route (hopping fibers at junctions)
+        # Uniform chain interface (spiral_helpers.Chain): id-sorted order for
+        # ordinary pcls, the fiber-graph route (hopping fibers at junctions)
         # for merged fiber-link components -- whose id-sorted order is NOT
         # chain-valid across members. The full chain is used even in
         # adjacent-patches mode, since adjacent patches may sit far apart along
         # the pcl (or on different fibers).
-        chain_fn = pcl['chain_zyxs_between']
+        chain = pcl['chain']
 
         # Pair patches either only with their immediate neighbour in the pcl's
         # patch ordering (first-seen order; built in main()),
@@ -917,7 +917,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             i1, j1 = int(p1['on_patch']['ij'][0]), int(p1['on_patch']['ij'][1])
             i2, j2 = int(p2['on_patch']['ij'][0]), int(p2['on_patch']['ij'][1])
 
-            pcl_chain_zyxs = chain_fn(p1, p2)
+            pcl_chain_zyxs = chain.zyxs_between(p1, p2)
             pair_requests.append((
                 (pid1, i1, j1), (pid2, i2, j2),
                 pid1, pid2, winding_diff, pcl_chain_zyxs,

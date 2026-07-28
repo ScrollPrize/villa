@@ -309,109 +309,88 @@ def build_link_components(resolved_links):
     return components
 
 
-def attach_sequence_chain_fns(pcl):
-    """Give an ordinary (single-sequence) pcl the uniform chain interface.
+class Chain:
+    """Traversal interface every cross-patch pcl carries as pcl['chain'].
 
-    Every cross-patch pcl exposes exactly two traversal entry points, and
-    consumers must use them rather than assuming id-sorted point order is
-    chain-valid (it is not for merged fiber-link components, whose chains route
-    through their fiber graph):
-      - 'chain_zyxs_between'(p1, p2): ordered (N, 3) [z, y, x] chain from p1 to
-        p2 with every consecutive pair |dtheta| < pi apart, for sequential
-        theta=0 unwrapping;
-      - 'iter_chain'(): a chain-valid point sequence covering the whole pcl.
-    For an ordinary pcl both are the id-sorted order (a segment of it, resp.
-    all of it). The sort is cached against the pcl's points dict identity, so
-    replacing pcl['points'] wholesale invalidates it."""
-    cache = {}
+    Consumers go through this and never assume the pcl's id-sorted point order
+    is chain-valid (it is not for merged fiber-link components, whose chains
+    route through their fiber graph). Two entry points:
+      - zyxs_between(p1, p2): ordered (N, 3) [z, y, x] chain from p1 to p2 with
+        every consecutive pair |dtheta| < pi apart, for sequential theta=0
+        unwrapping;
+      - iter_chain(): a chain-valid point sequence covering the whole pcl (may
+        revisit points; consumers wanting each adjacency once must dedupe)."""
 
-    def _ordered():
-        points = pcl['points']
-        if cache.get('source') is not points:
-            ordered = [p for _, p in sorted(points.items(), key=lambda kv: int(kv[0]))]
-            cache['source'] = points
-            cache['ordered'] = ordered
-            cache['index_of'] = {id(p): k for k, p in enumerate(ordered)}
-        return cache['ordered'], cache['index_of']
+    def zyxs_between(self, p1, p2):
+        raise NotImplementedError
 
-    def chain_zyxs_between(p1, p2):
-        ordered, index_of = _ordered()
+    def iter_chain(self):
+        raise NotImplementedError
+
+    @staticmethod
+    def _zyxs(points):
+        return np.stack([p['zyx'] for p in points], axis=0).astype(np.float32)
+
+
+class SequenceChain(Chain):
+    """Chain for an ordinary (single-sequence) pcl: id-sorted point order.
+
+    Holds a reference to the pcl dict; the sorted view is cached against the
+    identity of pcl['points'], so replacing the points dict wholesale (as the
+    z-roi trims do) invalidates it."""
+
+    def __init__(self, pcl):
+        self.pcl = pcl
+        self._source = None
+        self._ordered = None
+        self._index_of = None
+
+    def _sorted(self):
+        points = self.pcl['points']
+        if self._source is not points:
+            self._source = points
+            self._ordered = [p for _, p in sorted(points.items(), key=lambda kv: int(kv[0]))]
+            self._index_of = {id(p): k for k, p in enumerate(self._ordered)}
+        return self._ordered, self._index_of
+
+    def zyxs_between(self, p1, p2):
+        ordered, index_of = self._sorted()
         i1, i2 = index_of[id(p1)], index_of[id(p2)]
         if i1 <= i2:
             chain = ordered[i1:i2 + 1]
         else:
             chain = list(reversed(ordered[i2:i1 + 1]))
-        return np.stack([p['zyx'] for p in chain], axis=0).astype(np.float32)
+        return self._zyxs(chain)
 
-    def iter_chain():
-        return _ordered()[0]
-
-    pcl['chain_zyxs_between'] = chain_zyxs_between
-    pcl['iter_chain'] = iter_chain
+    def iter_chain(self):
+        return self._sorted()[0]
 
 
-def _component_euler_tour(member_sorted, tree_parent):
-    """Ordered point walk covering a merged fiber-link component.
+class ComponentChain(Chain):
+    """Chain for a merged fiber-link component: routes through the fiber graph.
 
-    member_sorted[m] is member m's id-sorted point list, tree_parent the
-    component's BFS spanning tree (member -> None | (parent, pos_in_parent,
-    pos_in_member)). The tour walks each member end-to-end and back, detouring
-    into each child at its junction position (and returning), so every
-    consecutive pair of tour points is either an adjacent same-fiber pair or a
-    nearly-coincident junction hop -- a chain-valid (|dtheta| < pi) sequence
-    threading the whole component. Points are revisited; consumers wanting each
-    adjacency once must dedupe."""
-    children = {m: {} for m in tree_parent}
-    root = None
-    for m, parent in tree_parent.items():
-        if parent is None:
-            root = m
-        else:
-            parent_m, pos_in_parent, pos_in_child = parent
-            children[parent_m].setdefault(pos_in_parent, []).append((m, pos_in_child))
-    out = []
-
-    def tour(m, enter_pos):
-        points = member_sorted[m]
-        n = len(points)
-        kids = children[m]
-        seen_pos = set()
-        walk = (list(range(enter_pos, -1, -1)) + list(range(1, n))
-                + list(range(n - 2, enter_pos - 1, -1)))
-        for pos in walk:
-            out.append(points[pos])
-            if pos in seen_pos:
-                continue
-            seen_pos.add(pos)
-            for child, child_pos in kids.get(pos, []):
-                tour(child, child_pos)
-                out.append(points[pos])  # hop back through the junction
-
-    tour(root, 0)
-    return out
-
-
-def _make_component_chain_fn(member_sorted, pos_of, tree_parent):
-    """Chain routing for a merged link component.
-
-    member_sorted[m] is member m's points in int-id order; pos_of maps id(point)
-    -> (member, position); tree_parent[m] is None for the root else
+    member_sorted[m] is member m's points in int-id order; pos_of maps
+    id(point) -> (member, position); tree_parent[m] is None for the root else
     (parent_member, pos_in_parent, pos_in_m) for the link joining m to its
-    spanning-tree parent. The returned function gives the ordered [z, y, x] chain
-    from p1 to p2: within-member index ranges concatenated across the tree path,
-    hopping fibers at each junction (the hop endpoints are nearly coincident, so
-    every consecutive chain pair satisfies the |dtheta| < pi unwrap assumption)."""
+    spanning-tree parent. Junction hop endpoints are nearly coincident, so every
+    consecutive chain pair satisfies the |dtheta| < pi unwrap assumption."""
 
-    def path_to_root(m):
+    def __init__(self, member_sorted, pos_of, tree_parent):
+        self.member_sorted = member_sorted
+        self.pos_of = pos_of
+        self.tree_parent = tree_parent
+
+    def _path_to_root(self, m):
         path = [m]
-        while tree_parent[m] is not None:
-            m = tree_parent[m][0]
+        while self.tree_parent[m] is not None:
+            m = self.tree_parent[m][0]
             path.append(m)
         return path
 
-    def hop_positions(m_from, m_to):
+    def _hop_positions(self, m_from, m_to):
         # Positions (leave in m_from, arrive in m_to) of the tree link between
         # two adjacent members, whichever of the two is the tree child.
+        tree_parent = self.tree_parent
         if tree_parent[m_to] is not None and tree_parent[m_to][0] == m_from:
             _, pos_parent, pos_child = tree_parent[m_to]
             return pos_parent, pos_child
@@ -419,20 +398,22 @@ def _make_component_chain_fn(member_sorted, pos_of, tree_parent):
         _, pos_parent, pos_child = tree_parent[m_from]
         return pos_child, pos_parent
 
-    def member_segment(m, pos_from, pos_to):
-        points = member_sorted[m]
+    def _member_segment(self, m, pos_from, pos_to):
+        points = self.member_sorted[m]
         if pos_from <= pos_to:
             return points[pos_from:pos_to + 1]
         return list(reversed(points[pos_to:pos_from + 1]))
 
-    def chain_zyxs_between(p1, p2):
-        m1, i1 = pos_of[id(p1)]
-        m2, i2 = pos_of[id(p2)]
+    def zyxs_between(self, p1, p2):
+        # Within-member index ranges concatenated across the spanning-tree path
+        # from p1's member to p2's, hopping fibers at each junction.
+        m1, i1 = self.pos_of[id(p1)]
+        m2, i2 = self.pos_of[id(p2)]
         if m1 == m2:
             member_path = [m1]
         else:
-            up1 = path_to_root(m1)
-            up2 = path_to_root(m2)
+            up1 = self._path_to_root(m1)
+            up2 = self._path_to_root(m2)
             in_up2 = {m: k for k, m in enumerate(up2)}
             lca_idx1 = next(k for k, m in enumerate(up1) if m in in_up2)
             lca = up1[lca_idx1]
@@ -440,13 +421,45 @@ def _make_component_chain_fn(member_sorted, pos_of, tree_parent):
         chain = []
         pos = i1
         for m_from, m_to in zip(member_path, member_path[1:]):
-            leave, arrive = hop_positions(m_from, m_to)
-            chain.extend(member_segment(m_from, pos, leave))
+            leave, arrive = self._hop_positions(m_from, m_to)
+            chain.extend(self._member_segment(m_from, pos, leave))
             pos = arrive
-        chain.extend(member_segment(member_path[-1], pos, i2))
-        return np.stack([p['zyx'] for p in chain], axis=0).astype(np.float32)
+        chain.extend(self._member_segment(member_path[-1], pos, i2))
+        return self._zyxs(chain)
 
-    return chain_zyxs_between
+    def iter_chain(self):
+        # Euler tour of the member tree: walk each member end-to-end and back,
+        # detouring into each child at its junction position (and returning), so
+        # every consecutive pair of tour points is either an adjacent same-fiber
+        # pair or a nearly-coincident junction hop.
+        children = {m: {} for m in self.tree_parent}
+        root = None
+        for m, parent in self.tree_parent.items():
+            if parent is None:
+                root = m
+            else:
+                parent_m, pos_in_parent, pos_in_child = parent
+                children[parent_m].setdefault(pos_in_parent, []).append((m, pos_in_child))
+        out = []
+
+        def tour(m, enter_pos):
+            points = self.member_sorted[m]
+            n = len(points)
+            kids = children[m]
+            seen_pos = set()
+            walk = (list(range(enter_pos, -1, -1)) + list(range(1, n))
+                    + list(range(n - 2, enter_pos - 1, -1)))
+            for pos in walk:
+                out.append(points[pos])
+                if pos in seen_pos:
+                    continue
+                seen_pos.add(pos)
+                for child, child_pos in kids.get(pos, []):
+                    tour(child, child_pos)
+                    out.append(points[pos])  # hop back through the junction
+
+        tour(root, 0)
+        return out
 
 
 def merge_linked_point_collections(point_collections, resolved_links,
@@ -456,12 +469,10 @@ def merge_linked_point_collections(point_collections, resolved_links,
     For each link component, removes the member collections from the cross-patch
     pool and (when the union holds >= 2 attached points) adds one merged pcl
     whose points are the union of all member points, renumbered member-major.
-    The merged pcl exposes the same uniform chain interface as ordinary pcls
-    (see attach_sequence_chain_fns) -- 'chain_zyxs_between'(p1, p2) routing
-    through the fiber graph (see _make_component_chain_fn) and 'iter_chain'()
-    yielding an Euler tour of the member tree -- since its id-sorted point
-    order is NOT chain-valid across members. 'link_member_cids' records the
-    member collection ids for diagnostics.
+    The merged pcl carries the same uniform chain interface as ordinary pcls
+    (pcl['chain'], see Chain) -- a ComponentChain routing through the fiber
+    graph, since its id-sorted point order is NOT chain-valid across members.
+    'link_member_cids' records the member collection ids for diagnostics.
     Components where any member carries explicit winding annotations are left
     unmerged with a warning (links are same-winding statements between fibers,
     which never carry annotations).
@@ -553,10 +564,7 @@ def merge_linked_point_collections(point_collections, resolved_links,
                          'input_role': 'fiber_link_component'},
             'points': merged_points,
             'link_member_cids': [cid for cid, _ in members],
-            'chain_zyxs_between': _make_component_chain_fn(
-                member_sorted, pos_of, tree_parent),
-            'iter_chain': (lambda member_sorted=member_sorted, tree_parent=tree_parent:
-                           _component_euler_tour(member_sorted, tree_parent)),
+            'chain': ComponentChain(member_sorted, pos_of, tree_parent),
         }
         num_merged += 1
     return cross_patch_point_collections, num_merged

@@ -449,8 +449,8 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
     """patch_id -> list of relative-winding edges leaving that patch.
 
     For each relative-winding pcl we walk its chain-valid point sequence
-    (pcl['iter_chain'](): id-sorted order for ordinary pcls, an Euler tour of
-    the member tree for merged fiber-link components -- whose id-sorted order is
+    (pcl['chain'].iter_chain(): id-sorted order for ordinary pcls, an Euler tour
+    of the member tree for merged fiber-link components -- whose id-sorted order is
     not chain-valid across members) and connect each *consecutive* pair of
     attached points that lands on two different (loaded) patches. Each such pair
     yields a pair of directed edges, one per direction. An edge records the
@@ -472,7 +472,7 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
             return (on_patch is not None and on_patch['id'] in patches
                     and np.isfinite(float(p['winding_annotation'])))
 
-        tour = list(pcl['iter_chain']())
+        tour = list(pcl['chain'].iter_chain())
         tour_adjustments = _tour_unwrap_adjustments(transform, dr, tour)
         attached_tour = [(k, p) for k, p in enumerate(tour) if attached(p)]
         pairs = []

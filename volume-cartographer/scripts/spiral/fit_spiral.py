@@ -88,7 +88,7 @@ from spiral_helpers import (
     load_fiber_point_collections,
     resolve_fiber_links,
     merge_linked_point_collections,
-    attach_sequence_chain_fns,
+    SequenceChain,
     scale_counts_for_z_range,
     _infer_shell_outer_winding_idx,
     patch_intersects_z_roi,
@@ -1136,10 +1136,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # winding-number loss. Patches are ordered by the first attached point that
     # hits them when scanning the pcl's points in int(json-key) order; within
     # each patch, points are also in int(key) order.
-    # Also give every pcl the uniform chain interface (chain_zyxs_between /
-    # iter_chain); merged fiber-link components arrive with their graph-routing
-    # versions already attached, ordinary pcls get the id-sorted ones. Consumers
-    # go through these and never assume id-sorted order is chain-valid.
+    # Also give every pcl the uniform chain interface (pcl['chain'], see
+    # spiral_helpers.Chain); merged fiber-link components arrive with their
+    # graph-routing ComponentChain already attached, ordinary pcls get a
+    # SequenceChain over the id-sorted order. Consumers go through this and
+    # never assume id-sorted order is chain-valid.
     for pcl in cross_patch_point_collections.values():
         points_by_patch = {}
         for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
@@ -1150,8 +1151,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 continue
             points_by_patch.setdefault(pid, []).append(point)
         pcl['points_by_patch'] = points_by_patch
-        if 'chain_zyxs_between' not in pcl:
-            attach_sequence_chain_fns(pcl)
+        if 'chain' not in pcl:
+            pcl['chain'] = SequenceChain(pcl)
     unattached_pcl_strips = _UnattachedPclStripList()
     unattached_strip_sampling_groups = []  # parallel to unattached_pcl_strips
     min_point_spacing = cfg['unattached_pcl_min_point_spacing']
@@ -2484,8 +2485,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                             continue
                         points_by_patch.setdefault(pid, []).append(point)
                     pcl['points_by_patch'] = points_by_patch
-                    if 'chain_zyxs_between' not in pcl:
-                        attach_sequence_chain_fns(pcl)
+                    if 'chain' not in pcl:
+                        pcl['chain'] = SequenceChain(pcl)
                     cross_patch_pcls.append(pcl)
 
                 min_point_spacing = cfg['unattached_pcl_min_point_spacing']
