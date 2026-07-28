@@ -3721,6 +3721,40 @@ def _restarts_per_meter(restart_count: int, reference_length_meters: float | Non
     return float(int(restart_count)) / length
 
 
+def _mean_trace_run_length_meters(
+    restart_count: int,
+    reference_length_meters: float | None,
+) -> float | None:
+    if reference_length_meters is None:
+        return None
+    length = float(reference_length_meters)
+    if not math.isfinite(length) or length < 0.0:
+        return None
+    run_count = max(1, int(restart_count) + 1)
+    return length / float(run_count)
+
+
+def _format_trace2cp_kvx_rate(restarts_per_kvx: float) -> str:
+    return f"{float(restarts_per_kvx):.1f}"
+
+
+def _format_trace2cp_meter_rate(
+    restarts_per_meter: float | None,
+    *,
+    restart_count: int,
+    reference_length_meters: float | None,
+) -> str:
+    if restarts_per_meter is None or reference_length_meters is None:
+        return ""
+    mean_run_meters = _mean_trace_run_length_meters(
+        int(restart_count),
+        float(reference_length_meters),
+    )
+    if mean_run_meters is None:
+        return f"err/m={float(restarts_per_meter):.1f}"
+    return f"err/m={float(restarts_per_meter):.1f} ({mean_run_meters * 1000.0:.1f}mm)"
+
+
 def trace_native_3d_whole_fiber(
     cache: NativeTraceFieldCache,
     *,
@@ -3788,7 +3822,12 @@ def trace_native_3d_whole_fiber(
         physical_detail = ""
         if restarts_per_meter is not None and reference_length_meters is not None:
             physical_detail = (
-                f"err/m={restarts_per_meter:.3f} "
+                _format_trace2cp_meter_rate(
+                    restarts_per_meter,
+                    restart_count=restart_count,
+                    reference_length_meters=reference_length_meters,
+                )
+                + " "
             )
         _emit_native_progress(
             "whole fiber",
@@ -3798,7 +3837,7 @@ def trace_native_3d_whole_fiber(
             detail=(
                 f"segment={min(done + 1, segment_count)}/{segment_count} "
                 f"status={status} restarts={restart_count} "
-                f"err/kvx={restarts_per_kvx:.3f} "
+                f"err/kvx={_format_trace2cp_kvx_rate(restarts_per_kvx)} "
                 f"{physical_detail}"
                 f"eta={_format_eta(eta)} blocks={len(cache._blocks)}"
             ),
@@ -5553,7 +5592,12 @@ def run_native_trace2cp(
                 and partial.reference_length_meters is not None
             ):
                 physical_status = (
-                    f" err/m={partial.restarts_per_meter:.3f}"
+                    " "
+                    + _format_trace2cp_meter_rate(
+                        partial.restarts_per_meter,
+                        restart_count=int(partial.restart_count),
+                        reference_length_meters=partial.reference_length_meters,
+                    )
                 )
             _compose_whole_fiber_panel_blocks(
                 [panels],
@@ -5561,7 +5605,7 @@ def run_native_trace2cp(
                 status_text=(
                     f"segments={len(partial.segments) if partial is not None else 0} "
                     f"spans={closed_span_count + 1} restarts={restarts} "
-                    f"err/kvx={restarts_per_kvx:.3f}"
+                    f"err/kvx={_format_trace2cp_kvx_rate(restarts_per_kvx)}"
                     f"{physical_status}"
                 ),
             ).convert("RGB").save(image_path, quality=90)
@@ -5674,14 +5718,18 @@ def run_native_trace2cp(
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
         print(
             "native_trace2cp_fiber "
-            f"err/kvx={whole.restarts_per_kvx:.3f} restarts={whole.restart_count} "
+            f"err/kvx={_format_trace2cp_kvx_rate(whole.restarts_per_kvx)} restarts={whole.restart_count} "
             f"segments={whole.segment_count}",
             flush=True,
         )
         if whole.restarts_per_meter is not None and whole.reference_length_meters is not None:
             print(
                 "native_trace2cp_fiber "
-                f"err/m={whole.restarts_per_meter:.3f}",
+                + _format_trace2cp_meter_rate(
+                    whole.restarts_per_meter,
+                    restart_count=int(whole.restart_count),
+                    reference_length_meters=whole.reference_length_meters,
+                ),
                 flush=True,
             )
         print(

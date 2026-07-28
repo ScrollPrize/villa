@@ -743,11 +743,13 @@
   These are not the public 2D `trace2cp_error`.
 - Native 3D whole-fiber mode reports its tool-local human stdout metric as
   compact error-rate fields: `err/kvx=...` and, when physical units are
-  available, `err/m=...`. Human stdout/progress should use three digits after
-  the decimal for these rates and must not include physical unit or reference
-  length fields. Live whole-fiber progress must update one terminal line with
-  carriage returns; it must not print a fresh line for every segment. It should
-  emit a newline only when the progress reaches the terminal state.
+  available, `err/m=... (N.Nmm)`, where the parenthesized value is the mean
+  successful traced run length between restarts in millimeters. Human
+  stdout/progress should use one digit after the decimal for `err/kvx`,
+  `err/m`, and the millimeter run length, and must not include physical unit or
+  reference length fields. Live whole-fiber progress must update one terminal
+  line with carriage returns; it must not print a fresh line for every segment.
+  It should emit a newline only when the progress reaches the terminal state.
   The metric is `restart_count / (reference_length_voxels / 1000)`, where
   `reference_length_voxels` is measured along the original loaded fiber line
   between CP0 and the final CP in selected-level voxels. Physical units are

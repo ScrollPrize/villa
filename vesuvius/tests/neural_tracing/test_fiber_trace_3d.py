@@ -92,6 +92,8 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _parse_args,
     _render_native_whole_fiber_span_panels,
     _native_trace_geometry_normal_record,
+    _format_trace2cp_kvx_rate,
+    _format_trace2cp_meter_rate,
     _project_trace_to_initial_strip,
     _resolve_native_trace2cp_selection,
     _sample_presence_on_strip,
@@ -3820,7 +3822,7 @@ def test_native_3d_whole_fiber_trace_reports_restarts_per_meter_when_voxel_size_
 def test_native_3d_whole_fiber_progress_reports_compact_error_units_when_known(capsys) -> None:
     record = _whole_native_trace_record()
     record.sampler = SimpleNamespace(
-        volume=SimpleNamespace(metadata={"voxelsize": 2.0})
+        volume=SimpleNamespace(metadata={"voxelsize": 2000.0})
     )
     cache = SimpleNamespace(_blocks={})
     calls = 0
@@ -3859,14 +3861,28 @@ def test_native_3d_whole_fiber_progress_reports_compact_error_units_when_known(c
     )
 
     output = capsys.readouterr().out
-    assert "err/kvx=" in output
-    assert "err/m=" in output
+    assert "err/kvx=50.0" in output
+    assert "err/m=25.0 (20.0mm)" in output
     assert "\r" in output
     assert output.count("\n") == 1
+    assert "err/kvx=50.000" not in output
+    assert "err/m=25.000" not in output
     assert "restarts_per_kvx=" not in output
     assert "restarts_per_meter=" not in output
     assert "reference_length_meters=" not in output
     assert "physical_unit=m" not in output
+
+
+def test_native_3d_whole_fiber_error_format_helpers_use_one_decimal() -> None:
+    assert _format_trace2cp_kvx_rate(0.502) == "0.5"
+    assert (
+        _format_trace2cp_meter_rate(
+            52.329,
+            restart_count=8,
+            reference_length_meters=0.153,
+        )
+        == "err/m=52.3 (17.0mm)"
+    )
 
 
 def test_native_3d_whole_fiber_ignores_non_vc3d_voxel_size_metadata() -> None:
