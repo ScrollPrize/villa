@@ -495,6 +495,9 @@
   separate native 3D Trace2CP inspection tool. It must not replace the
   projected `test/trace2cp_error` training metric or best-checkpoint selection
   unless that migration is explicitly requested.
+- Native 3D Trace2CP is metric-only by default. It always prints native metric
+  lines and writes `trace2cp_native_3d_summary.json`; JPG visualization and
+  partial image updates are opt-in and run only when `--vis` is supplied.
 - Native 3D Trace2CP selection supports both the existing
   `--sample-index`/`--target-offset` mode and explicit fiber segment mode:
   `--fiber-json <path> --start-cp-index A --target-cp-index B`. Explicit CP
@@ -666,13 +669,15 @@
 - The native 3D CLI prints live progress bars for forward and backward tracing.
   Progress is measured by signed target-plane progress along the initial
   CP-to-CP direction. It includes step count, ETA, and inferred-block count.
-- Native 3D strip visualization prints live progress for rendering stages and
+- When `--vis` is supplied, native 3D strip visualization prints live progress
+  for rendering stages and
   for side/top presence-strip sampling. Presence progress must report
   processed inference blocks, total unique inference blocks, sampled strip
   points, valid output points, newly inferred blocks, cached blocks, and total
   cache block count. Regular trace candidate sampling remains quiet unless a
   caller explicitly supplies a progress label.
-- Native 3D strip visualization progressively overwrites the regular
+- When `--vis` is supplied, native 3D strip visualization progressively
+  overwrites the regular
   `trace2cp_native_3d_vis.jpg` output at render start, stage start/end, and as
   panels are rendered and added to the sheet. Before the first panel is
   available, the file must contain a status canvas rather than being absent.

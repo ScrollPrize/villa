@@ -176,6 +176,12 @@ loading.
   python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool <config.json> --checkpoint <snapshot.pt> --sample-index 13 --export-dir <dir>
   ```
 
+- The native 3D CLI is metric-only by default: it traces, prints
+  `native_trace2cp_plane_error` / `native_trace2cp_closest_target_error`
+  or `native_trace2cp_fiber_restart_rate`, and writes
+  `trace2cp_native_3d_summary.json`. Add `--vis` to render
+  `trace2cp_native_3d_vis.jpg` and enable partial image updates during long
+  renders.
 - `--fiber-json <path>` without sample or CP selectors runs native whole-fiber
   tracing over all consecutive CP pairs from that fiber. Supplying
   `--fiber-json <path> --sample-index N` keeps deterministic flat
@@ -282,21 +288,21 @@ loading.
   `--trace-step-limit` intentionally produces partial traces for debugging.
   Forward/backward progress bars report signed target-plane progress along the
   initial CP-to-CP direction, ETA, step count, and inferred-block count.
-- Native strip rendering prints coarse stage progress for side/top volume
-  rendering, coordinate extraction, side/top presence sampling, trace overlay
-  projection, and image composition. Presence sampling also prints block-level
-  progress with sampled points, valid outputs, newly inferred blocks, cached
-  blocks, and total cache blocks.
+- When `--vis` is enabled, native strip rendering prints coarse stage progress
+  for side/top volume rendering, coordinate extraction, side/top presence
+  sampling, trace overlay projection, and image composition. Presence sampling
+  also prints block-level progress with sampled points, valid outputs, newly
+  inferred blocks, cached blocks, and total cache blocks.
 - Inferred block outputs are cached on CPU. The tool moves one cached block at
   a time back to the active device for point sampling, so long traces and
   presence-strip renders do not retain all block outputs on the GPU.
-- During visualization, the regular `trace2cp_native_3d_vis.jpg` path is
-  overwritten at render start, each stage start/end, and after each panel is
-  added to the sheet. Before the first panel exists, the file contains a small
-  status canvas, so there is always one current status/partial/final image to
-  inspect during long renders.
-- In whole-fiber mode, `trace2cp_native_3d_vis.jpg` is also overwritten after
-  every completed CP segment. The whole-fiber sheet has eight stitched rows:
+- With `--vis`, the regular `trace2cp_native_3d_vis.jpg` path is overwritten at
+  render start, each stage start/end, and after each panel is added to the
+  sheet. Before the first panel exists, the file contains a small status
+  canvas, so there is always one current status/partial/final image to inspect
+  during long renders.
+- In whole-fiber `--vis` mode, `trace2cp_native_3d_vis.jpg` is also overwritten
+  after every completed CP segment. The whole-fiber sheet has eight stitched rows:
   initial side volume, initial side 3D presence, initial top volume, initial top
   3D presence, regenerated side volume, regenerated side 3D presence,
   regenerated top volume, and regenerated top 3D presence. Those rows are
@@ -562,6 +568,7 @@ PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --resume /path/to/current.pt
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.train vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --trace2cp-vis --checkpoint /path/to/best.pt --sample-index 13 --export-dir /tmp/fiber_trace_3d_trace2cp
 PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --checkpoint /path/to/best.pt --sample-index 13 --export-dir /tmp/fiber_trace_3d_native_trace2cp
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --checkpoint /path/to/best.pt --sample-index 13 --export-dir /tmp/fiber_trace_3d_native_trace2cp --vis
 PYTHONPATH=lasagna:vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace_3d.infer vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/loader_example.json --input /path/to/volume.zarr/0 --output /tmp/fiber_trace_3d_infer --checkpoint /path/to/best.pt
 ```
 

@@ -5018,6 +5018,7 @@ def run_native_trace2cp(
     target_offset: int = 1,
     sample_mode: str | None = None,
     native_cfg: NativeTrace2CpConfig | None = None,
+    render_visualization: bool = False,
 ) -> NativeTracePairResult | NativeWholeFiberResult:
     raw_config = _load_raw_config(config_path)
     cfg = NativeTrace2CpConfig() if native_cfg is None else native_cfg
@@ -5118,11 +5119,12 @@ def run_native_trace2cp(
         closed_span_count = 0
         active_segments: list[NativeWholeFiberSegmentResult] = []
         active_start_cp_index = 0
-        _compose_whole_fiber_panel_blocks(
-            [],
-            status_text="initializing whole-fiber trace",
-        ).convert("RGB").save(image_path, quality=90)
-        print(f"native whole-fiber partial={image_path} initializing", flush=True)
+        if render_visualization:
+            _compose_whole_fiber_panel_blocks(
+                [],
+                status_text="initializing whole-fiber trace",
+            ).convert("RGB").save(image_path, quality=90)
+            print(f"native whole-fiber partial={image_path} initializing", flush=True)
 
         def on_segment(
             segment: NativeWholeFiberSegmentResult,
@@ -5192,7 +5194,7 @@ def run_native_trace2cp(
             cfg=cfg,
             error_threshold_voxels=float(cfg.whole_fiber_error_threshold_voxels),
             progress=True,
-            segment_callback=on_segment,
+            segment_callback=on_segment if render_visualization else None,
             normal_sampler=normal_sampler,
         )
         summary = {
@@ -5226,7 +5228,8 @@ def run_native_trace2cp(
             "max_cached_inference_bytes": _cache_bytes_from_gib(
                 float(cfg.max_cached_inference_gib)
             ),
-            "export": str(image_path),
+            "export": str(image_path) if render_visualization else None,
+            "visualization_enabled": bool(render_visualization),
             "segments": [
                 {
                     "start_control_point_index": int(segment.start_cp_index),
@@ -5260,7 +5263,8 @@ def run_native_trace2cp(
             f"blocks={len(cache._blocks)} inferred={cache.total_inferred_blocks} "
             f"evicted={cache.evicted_inferred_blocks} "
             f"cache_gib={cache.resident_inferred_block_bytes / float(_GIB):.3f} "
-            f"export={image_path}",
+            f"summary={summary_path}"
+            + (f" export={image_path}" if render_visualization else ""),
             flush=True,
         )
         return whole
@@ -5283,51 +5287,56 @@ def run_native_trace2cp(
         progress=True,
         normal_sampler=normal_sampler,
     )
-    def build_source(cross_strip_height_px: int | None = None) -> _Trace2CpSegmentSource:
-        return geometry_loader.build_trace2cp_segment_source(
-            int(selection.sample_index),
-            target_control_point_index=int(selection.target_cp_index)
-            if selection.explicit_segment
-            else None,
-            target_offset=int(target_offset),
-            rf_margin_px=trace2cp_cfg.rf_margin_px,
-            cross_strip_height_px=cross_strip_height_px,
-            device=torch.device("cpu"),
-            sample_mode=selection.sample_mode,
-        )
-
-    max_source = build_source()
-    max_side_overlays = _trace_overlays_for_view(
-        max_source,
-        result,
-        axis_name="offset_axis_xyz",
-    )
-    max_top_overlays = _trace_overlays_for_view(
-        max_source,
-        result,
-        axis_name="side_axis_xyz",
-    )
-    adaptive_height = _adaptive_trace2cp_cross_strip_height(
-        int(max_source.source_shape_hw[0]),
-        (max_side_overlays, max_top_overlays),
-    )
-    source = (
-        max_source
-        if int(adaptive_height) == int(max_source.source_shape_hw[0])
-        else build_source(cross_strip_height_px=int(adaptive_height))
-    )
     out_dir = Path(export_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     image_path = out_dir / "trace2cp_native_3d_vis.jpg"
-    sheet = _make_native_trace_visualization(
-        geometry_loader,
-        source,
-        result,
-        cache=cache,
-        image_normalization=loader_config.image_normalization,
-        partial_output_path=image_path,
-    )
-    sheet.convert("RGB").save(image_path, quality=95)
+    visualization_cross_strip_height_px: int | None = None
+    visualization_max_cross_strip_height_px: int | None = None
+    if render_visualization:
+        def build_source(cross_strip_height_px: int | None = None) -> _Trace2CpSegmentSource:
+            return geometry_loader.build_trace2cp_segment_source(
+                int(selection.sample_index),
+                target_control_point_index=int(selection.target_cp_index)
+                if selection.explicit_segment
+                else None,
+                target_offset=int(target_offset),
+                rf_margin_px=trace2cp_cfg.rf_margin_px,
+                cross_strip_height_px=cross_strip_height_px,
+                device=torch.device("cpu"),
+                sample_mode=selection.sample_mode,
+            )
+
+        max_source = build_source()
+        max_side_overlays = _trace_overlays_for_view(
+            max_source,
+            result,
+            axis_name="offset_axis_xyz",
+        )
+        max_top_overlays = _trace_overlays_for_view(
+            max_source,
+            result,
+            axis_name="side_axis_xyz",
+        )
+        adaptive_height = _adaptive_trace2cp_cross_strip_height(
+            int(max_source.source_shape_hw[0]),
+            (max_side_overlays, max_top_overlays),
+        )
+        source = (
+            max_source
+            if int(adaptive_height) == int(max_source.source_shape_hw[0])
+            else build_source(cross_strip_height_px=int(adaptive_height))
+        )
+        visualization_cross_strip_height_px = int(source.source_shape_hw[0])
+        visualization_max_cross_strip_height_px = int(max_source.source_shape_hw[0])
+        sheet = _make_native_trace_visualization(
+            geometry_loader,
+            source,
+            result,
+            cache=cache,
+            image_normalization=loader_config.image_normalization,
+            partial_output_path=image_path,
+        )
+        sheet.convert("RGB").save(image_path, quality=95)
     summary = {
         "sample_index": int(selection.sample_index),
         "fiber_path": "" if record.fiber.path is None else str(record.fiber.path),
@@ -5354,8 +5363,9 @@ def run_native_trace2cp(
         **_native_trace_smoothness_summary(cfg),
         "max_steps": None if cfg.max_steps is None else int(cfg.max_steps),
         "trace_step_limit": None if cfg.trace_step_limit is None else int(cfg.trace_step_limit),
-        "visualization_cross_strip_height_px": int(source.source_shape_hw[0]),
-        "visualization_max_cross_strip_height_px": int(max_source.source_shape_hw[0]),
+        "visualization_enabled": bool(render_visualization),
+        "visualization_cross_strip_height_px": visualization_cross_strip_height_px,
+        "visualization_max_cross_strip_height_px": visualization_max_cross_strip_height_px,
         "fusion_reason": result.fusion.reason,
         "fusion_reached_overlap": bool(result.fusion.reached_overlap),
         "fusion_closest_progress": float(result.fusion.closest_progress),
@@ -5372,17 +5382,17 @@ def run_native_trace2cp(
             float(v) for v in np.asarray(result.fusion.closest_midpoint_zyx, dtype=np.float32)
         ],
         "inferred_blocks": int(cache.total_inferred_blocks),
-            "resident_inferred_blocks": int(len(cache._blocks)),
-            "evicted_inferred_blocks": int(cache.evicted_inferred_blocks),
-            "resident_inferred_block_bytes": int(cache.resident_inferred_block_bytes),
-            "resident_inferred_block_gib": float(
-                cache.resident_inferred_block_bytes / float(_GIB)
-            ),
-            "max_cached_inference_gib": float(cfg.max_cached_inference_gib),
-            "max_cached_inference_bytes": _cache_bytes_from_gib(
-                float(cfg.max_cached_inference_gib)
-            ),
-            "export": str(image_path),
+        "resident_inferred_blocks": int(len(cache._blocks)),
+        "evicted_inferred_blocks": int(cache.evicted_inferred_blocks),
+        "resident_inferred_block_bytes": int(cache.resident_inferred_block_bytes),
+        "resident_inferred_block_gib": float(
+            cache.resident_inferred_block_bytes / float(_GIB)
+        ),
+        "max_cached_inference_gib": float(cfg.max_cached_inference_gib),
+        "max_cached_inference_bytes": _cache_bytes_from_gib(
+            float(cfg.max_cached_inference_gib)
+        ),
+        "export": str(image_path) if render_visualization else None,
     }
     summary_path = out_dir / "trace2cp_native_3d_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
@@ -5406,7 +5416,8 @@ def run_native_trace2cp(
         f"blocks={len(cache._blocks)} inferred={cache.total_inferred_blocks} "
         f"evicted={cache.evicted_inferred_blocks} "
         f"cache_gib={cache.resident_inferred_block_bytes / float(_GIB):.3f} "
-        f"export={image_path}",
+        f"summary={summary_path}"
+        + (f" export={image_path}" if render_visualization else ""),
         flush=True,
     )
     return result
@@ -5417,6 +5428,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("config", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--export-dir", type=Path, required=True)
+    parser.add_argument(
+        "--vis",
+        action="store_true",
+        help="Render Trace2CP JPG visualization. By default only metrics/summary are written.",
+    )
     parser.add_argument("--sample-index", type=int, default=None)
     parser.add_argument("--fiber-json", type=Path, default=None)
     parser.add_argument("--start-cp-index", type=int, default=None)
@@ -5508,6 +5524,7 @@ def main() -> None:
         target_offset=int(args.target_offset),
         sample_mode=args.sample_mode,
         native_cfg=native_cfg,
+        render_visualization=bool(args.vis),
     )
 
 

@@ -3223,6 +3223,7 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.smoothness_tangent_weight == 10.0
     assert args.core_margin_voxels == 20
     assert args.max_cached_inference_gib == pytest.approx(8.0)
+    assert args.vis is False
 
 
 def test_native_3d_trace2cp_mode_routes_only_unselected_fiber_json_to_whole_fiber() -> None:
