@@ -5300,6 +5300,8 @@ def run_native_trace2cp(
             f"threshold_voxels={float(cfg.whole_fiber_error_threshold_voxels):.3f}",
             flush=True,
         )
+        trace_wall_start = time.perf_counter()
+        trace_cpu_start = time.process_time()
         whole = trace_native_3d_whole_fiber(
             cache,
             record=record,
@@ -5309,6 +5311,8 @@ def run_native_trace2cp(
             segment_callback=on_segment if render_visualization else None,
             normal_sampler=normal_sampler,
         )
+        trace_wall_seconds = float(time.perf_counter() - trace_wall_start)
+        trace_cpu_seconds = float(time.process_time() - trace_cpu_start)
         summary = {
             "mode": "whole_fiber",
             "fiber_path": "" if record.fiber.path is None else str(record.fiber.path),
@@ -5350,6 +5354,8 @@ def run_native_trace2cp(
             "max_cached_inference_bytes": _cache_bytes_from_gib(
                 float(cfg.max_cached_inference_gib)
             ),
+            "trace_wall_seconds": trace_wall_seconds,
+            "trace_cpu_seconds": trace_cpu_seconds,
             "export": str(image_path) if render_visualization else None,
             "visualization_enabled": bool(render_visualization),
             "segments": [
@@ -5387,6 +5393,12 @@ def run_native_trace2cp(
                 flush=True,
             )
         print(
+            "native_trace2cp_timing "
+            f"trace_wall_s={trace_wall_seconds:.3f} "
+            f"trace_cpu_s={trace_cpu_seconds:.3f}",
+            flush=True,
+        )
+        print(
             "native_trace2cp_3d whole_fiber "
             f"blocks={len(cache._blocks)} inferred={cache.total_inferred_blocks} "
             f"evicted={cache.evicted_inferred_blocks} "
@@ -5405,6 +5417,8 @@ def run_native_trace2cp(
         or reverse_initial_direction is None
     ):
         raise RuntimeError("native 3D Trace2CP single-pair selection was not initialized")
+    trace_wall_start = time.perf_counter()
+    trace_cpu_start = time.process_time()
     result = trace_native_3d_pair(
         cache,
         start_zyx=start_zyx,
@@ -5415,6 +5429,8 @@ def run_native_trace2cp(
         progress=True,
         normal_sampler=normal_sampler,
     )
+    trace_wall_seconds = float(time.perf_counter() - trace_wall_start)
+    trace_cpu_seconds = float(time.process_time() - trace_cpu_start)
     out_dir = Path(export_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     image_path = out_dir / "trace2cp_native_3d_vis.jpg"
@@ -5520,6 +5536,8 @@ def run_native_trace2cp(
         "max_cached_inference_bytes": _cache_bytes_from_gib(
             float(cfg.max_cached_inference_gib)
         ),
+        "trace_wall_seconds": trace_wall_seconds,
+        "trace_cpu_seconds": trace_cpu_seconds,
         "export": str(image_path) if render_visualization else None,
     }
     summary_path = out_dir / "trace2cp_native_3d_summary.json"
@@ -5534,6 +5552,12 @@ def run_native_trace2cp(
         f"raw_gap={result.fusion.raw_gap_voxels:.6f} "
         f"considered_gap={result.fusion.considered_gap_voxels:.6f} "
         f"center_penalty={result.fusion.center_penalty:.6f}",
+        flush=True,
+    )
+    print(
+        "native_trace2cp_timing "
+        f"trace_wall_s={trace_wall_seconds:.3f} "
+        f"trace_cpu_s={trace_cpu_seconds:.3f}",
         flush=True,
     )
     print(

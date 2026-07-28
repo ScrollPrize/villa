@@ -1,52 +1,32 @@
-# Task Log: VC3D-Only Physical Units For Native 3D Trace2CP
+# Task Log: Metric-Only 3D Trace2CP Config
 
 ## Implementation Notes
 
-- Started from the existing length-normalized whole-fiber Trace2CP metric.
-- Removed the previous broad metadata probing helpers for dataset config,
-  record metadata, alternate voxel-size keys, unit parsing, and OME multiscales.
-- Added a single VC3D-only helper that reads
-  `record.sampler.volume.metadata["voxelsize"]`, interprets it as micrometers,
-  and converts to meters.
-- Physical reference length is now the original base-coordinate fiber arc
-  length multiplied by the VC3D voxel size in meters.
-- Per-meter stdout/progress/summary output remains conditional: if VC3D does
-  not expose a finite positive `voxelsize`, physical units are omitted.
-- Updated tests to use fake VC3D sampler metadata and added a regression that
-  dataset-config voxel-size keys are ignored.
-- Updated specs, code-structure docs, and changelog wording to document the
-  VC3D-only source.
-- Removed VC3D's `discoverPublicSamplePixelSize` flag so remote volume
-  metadata normalization always discovers
-  `scan/tomo/acquisition/detector/samplePixelSize` when no explicit positive
-  `voxelsize` exists.
-- Rebuilt `volume-cartographer/build/python-bindings` target `vc_volume`.
-- Refreshed the editable/local `volume-cartographer` pip install with
-  `python -m pip install -e volume-cartographer --no-deps --break-system-packages`.
-- Shortened whole-fiber human progress/stdout metrics to `err/kvx` and
-  `err/m` with three decimals, and removed `physical_unit=m` plus reference
-  length fields from human progress output. JSON summary fields remain
-  full-precision and explicitly named.
-- Restored native progress output to carriage-return line updates for
-  non-terminal states, with a newline only at completion.
+- Replaced `metric_sd2_s1.json`, which was a full training config clone, with a
+  compact native 3D Trace2CP metric config.
+- Kept a single `datasets` entry only as a volume/scale/manifest template.
+- Removed the config-local JSON fiber glob because this metric config expects
+  the concrete fiber to be supplied through `--fiber-json`.
+- Removed the NML training glob, affine transform, transform inversion,
+  `test_datasets`, augmentations, prefetch settings, training-loop settings,
+  loss weights, TensorBoard settings, and run/checkpoint settings.
+- Kept `lasagna_manifest_path` because the Trace2CP geometry path still uses
+  Lasagna normals for strip geometry; this is not NML-specific.
+- Kept `training.mixed_precision` because native 3D model inference reads it.
+- Added a spec note that dedicated native 3D Trace2CP metric configs may be
+  `--fiber-json` only and should not carry unrelated full training config
+  fields or config-local fiber sources.
 
 ## Deviations / Deferred Items
 
-- None so far.
+- None.
 
 ## Validation
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py`
+- `python -m json.tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/metric_sd2_s1.json`
   passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "whole_fiber_trace"`
-  passed: 5 passed, 142 deselected.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "whole_fiber_progress or whole_fiber_trace"`
-  passed: 6 passed, 141 deselected.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  passed: 145 passed, 2 skipped.
-- `git diff --check` passed.
-- `cmake --build volume-cartographer/build/python-bindings --target vc_volume -j 8`
-  passed.
-- `python -m pip install -e volume-cartographer --no-deps --break-system-packages`
-  passed.
-- `python -c "import vc.volume as v; print(v.Volume)"` passed.
+- `PYTHONPATH=vesuvius/src:lasagna:. python -c "from vesuvius.neural_tracing.fiber_trace_3d.loader import load_config; cfg=load_config('vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/metric_sd2_s1.json'); print(len(cfg.datasets), sorted(cfg.datasets[0]))"`
+  passed and printed only `base_volume_path`, `base_volume_scale`, and
+  `lasagna_manifest_path` in the dataset template.
+- `PYTHONPATH=vesuvius/src:lasagna:. python -c "from pathlib import Path; from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import _load_raw_config, _tool_raw_config; raw=_load_raw_config('vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/metric_sd2_s1.json'); patched=_tool_raw_config(raw, fiber_json=Path('/tmp/example.json')); print(patched['datasets'][0]['fiber_paths'])"`
+  passed and confirmed the CLI fiber path is injected as `fiber_paths`.

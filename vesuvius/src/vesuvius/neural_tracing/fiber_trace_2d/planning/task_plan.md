@@ -1,77 +1,46 @@
-# Plan: VC3D-Only Physical Units For Native 3D Trace2CP
+# Plan: Metric-Only 3D Trace2CP Config
 
 ## Goals
 
-- Remove the previous custom physical voxel-size readers.
-- Use only `record.sampler.volume.metadata["voxelsize"]` from the VC3D Python
-  `Volume` binding.
-- Treat `voxelsize` as micrometers and convert to meters with `1e-6`.
-- Omit per-meter stdout/progress/summary values when the VC3D metadata path is
-  unavailable or invalid.
-- Use compact human stdout/progress labels `err/kvx` and `err/m`, rounded to
-  three decimals, without physical unit or reference length fields.
-- Restore single-line live progress updates with carriage returns instead of
-  printing one line per whole-fiber segment.
-
-## Non-Goals
-
-- Do not change the primary `restarts_per_kvx` metric.
-- Do not change tracing, restart detection, visualization, or cache behavior.
-- Do not parse metadata files directly in fiber code.
-- Do not add fallback keys, filename inference, or dataset-config physical-unit
-  handling.
+- Keep `metric_sd2_s1.json` focused on native 3D Trace2CP metric execution.
+- Support JSON fibers supplied via `--fiber-json` only.
+- Remove training-only, augmentation-only, prefetch-only, and NML-only config
+  keys.
+- Preserve the fields the metric path still needs: model construction,
+  inference normalization/precision, VC3D volume cache, base volume path/scale,
+  and Lasagna manifest for geometry normals.
 
 ## Implementation Steps
 
-1. Replace `_selected_voxel_size_xyz_m` and its helper stack with one
-   VC3D-only helper that reads `record.sampler.volume.metadata["voxelsize"]`.
-2. Compute physical reference length from original base-coordinate fiber line
-   arc length multiplied by the VC3D voxel size in meters.
-3. Keep per-meter progress/stdout/summary output conditional on the helper
-   returning a finite positive value.
-4. Update tests to attach fake VC3D sampler metadata instead of dataset-config
-   voxel-size keys.
-5. Replace docs/spec wording that described dataset config, record metadata,
-   OME multiscales, or other custom fallback readers as accepted sources with
-   explicit language rejecting those paths.
-6. Remove VC3D's `discoverPublicSamplePixelSize` gate so remote
-   `metadata.json` values at
-   `scan/tomo/acquisition/detector/samplePixelSize` are always normalized into
-   `metadata["voxelsize"]` when no explicit positive `voxelsize` exists.
-7. Rebuild the local VC3D Python binding and refresh the editable/local pip
-   install with `--no-deps`.
-8. Shorten whole-fiber human progress/stdout metric labels and precision while
-   keeping full-precision JSON summary fields.
-9. Update `_emit_native_progress()` to use carriage-return progress updates for
-   non-terminal states and a newline only at completion.
+1. Replace the full training-style config clone with a compact metric config.
+2. Use a single `datasets` entry as the volume/scale/manifest template.
+3. Remove `test_datasets`; the trace tool already patches the single dataset
+   when `--fiber-json` is provided.
+4. Remove NML-specific dataset fields: NML glob, affine transform, and transform
+   inversion.
+5. Remove augmentation, prefetch, loss, TensorBoard, checkpoint, run, loader, and
+   training-loop settings that the metric CLI does not need.
+6. Keep only minimal `training.mixed_precision` because model inference reads it.
+7. Remove the config-local fiber glob because the fiber is supplied by CLI.
+8. Validate that the JSON parses, the 3D config loader accepts it, and the
+   native Trace2CP CLI patch path injects `fiber_paths` from `--fiber-json`.
 
 ## Spec Update
 
-- Native 3D whole-fiber Trace2CP physical units come only from VC3D volume
-  metadata key `voxelsize` in micrometers.
-- If VC3D does not supply a valid positive `voxelsize`, per-meter output is
-  omitted.
-- VC3D remote volume metadata normalization always discovers the public
-  `samplePixelSize` field when needed; this is independent of base-scale
-  rebasing.
-- Human whole-fiber progress/stdout uses `err/kvx` and `err/m` labels with
-  three decimal places and omits reference length and physical unit tokens.
-- Live progress uses carriage returns to update one line and must not emit one
-  newline per segment.
+- Add/confirm that dedicated native 3D Trace2CP metric configs may be
+  `--fiber-json` only and should not carry unrelated training/NML settings or
+  config-local fiber globs.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` native 3D whole-fiber metric description to
-  reference VC3D `volume.metadata["voxelsize"]` only.
+- No public docs update needed for this config-only cleanup.
 
 ## Validation Commands
 
-- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "whole_fiber_trace"`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:lasagna:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-- `git diff --check`
+- `python -m json.tool vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/metric_sd2_s1.json`
+- `PYTHONPATH=vesuvius/src:lasagna:. python -c "from vesuvius.neural_tracing.fiber_trace_3d.loader import load_config; cfg=load_config('vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/metric_sd2_s1.json'); print(len(cfg.datasets), sorted(cfg.datasets[0]))"`
+- `PYTHONPATH=vesuvius/src:lasagna:. python -c "from pathlib import Path; from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import _load_raw_config, _tool_raw_config; raw=_load_raw_config('vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/configs/metric_sd2_s1.json'); patched=_tool_raw_config(raw, fiber_json=Path('/tmp/example.json')); print(patched['datasets'][0]['fiber_paths'])"`
 
 ## Changelog Update
 
-- Update the existing native 3D whole-fiber Trace2CP changelog entry to state
-  that per-meter reporting uses VC3D `voxelsize` metadata only.
+- Not needed; this is a small config cleanup.

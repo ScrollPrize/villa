@@ -1,16 +1,14 @@
-# Status: VC3D-Only Physical Units For Native 3D Trace2CP
+# Status: Metric-Only 3D Trace2CP Config
 
 - [x] Read current task request.
 - [x] Read `fiber_trace_2d/AGENTS.md`.
-- [x] Inspect current physical-unit implementation and tests.
+- [x] Inspect `metric_sd2_s1.json`.
+- [x] Inspect native 3D Trace2CP config readers.
 - [x] Write `planning/task.md`.
 - [x] Write `planning/task_plan.md`.
-- [x] Remove custom metadata fallback code.
-- [x] Use only VC3D `volume.metadata["voxelsize"]`.
-- [x] Update tests.
-- [x] Update specs/docs/changelog/task log.
-- [x] Remove VC3D `samplePixelSize` discovery gate.
-- [x] Rebuild local VC3D Python binding.
-- [x] Refresh editable/local VC3D pip install.
-- [x] Restore single-line carriage-return progress output.
-- [x] Run validation commands.
+- [x] Trim config to JSON-fiber metric-only fields.
+- [x] Remove config-local fiber glob; fiber comes from `--fiber-json`.
+- [x] Confirm the config contains no NML transform/test-dataset duplication.
+- [x] Update specs.
+- [x] Validate JSON parsing, 3D config loading, and CLI fiber patching.
+- [x] Update task log with validation results.

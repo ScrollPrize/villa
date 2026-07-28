@@ -498,6 +498,14 @@
 - Native 3D Trace2CP is metric-only by default. It always prints native metric
   lines and writes `trace2cp_native_3d_summary.json`; JPG visualization and
   partial image updates are opt-in and run only when `--vis` is supplied.
+- Dedicated native 3D Trace2CP metric configs may require the JSON fiber to be
+  supplied by `--fiber-json`. In that mode the config `datasets` entry is only
+  a volume/scale/manifest template and must not carry a config-local
+  `fiber_glob` or `fiber_paths` list. It should contain only metric/runtime
+  fields and must not carry unrelated NML training datasets, affine transforms,
+  train/test duplicate dataset blocks, augmentation settings, prefetch
+  settings, loss weights, TensorBoard settings, or training-loop/run/checkpoint
+  settings.
 - Native 3D Trace2CP selection supports both the existing
   `--sample-index`/`--target-offset` mode and explicit fiber segment mode:
   `--fiber-json <path> --start-cp-index A --target-cp-index B`. Explicit CP
