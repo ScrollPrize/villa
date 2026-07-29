@@ -709,7 +709,7 @@
   not supported.
 - Native 3D Trace2CP uses beam search by default. `--beam-width 8` keeps
   multiple cumulative candidate histories, `--beam-prune-distance-voxels 1.0`
-  merges near-duplicate live beam states, and `--beam-lookahead-steps 1`
+  merges near-duplicate live beam states, and `--beam-lookahead-steps 2`
   expands short future trees before pruning. Pruning happens after the
   configured lookahead expansion, not after every single candidate step.
   `--beam-width 1` preserves the previous greedy one-step-commit control flow
@@ -777,9 +777,11 @@
   sign ambiguity must not affect this penalty. The CLI flags
   `--smoothness-tangent-weight` and `--smoothness-normal-weight` override the
   component weights independently; their native 3D CLI defaults are `10.0` for
-  tangent-plane turn and `0.1` for normal-tilt turn. If candidate normal
-  sampling is unavailable or invalid for one candidate, that candidate falls
-  back to the previous isotropic smoothness term
+  tangent-plane turn and `0.1` for normal-tilt turn. Native Trace2CP must fail
+  before tracing when these normal-aware terms, or the cumulative tangent term,
+  are active and no Lasagna normal sampler is available. If a Lasagna normal
+  sampler exists but returns an invalid normal for one candidate, that
+  candidate falls back to the previous isotropic smoothness term
   `smoothness_weight * max(0, angle(previous_step_dir, step_dir) - free_angle)^2`.
   Native 3D Trace2CP also adds cumulative tangent-only smoothness over a
   short history direction so several small tangent-plane turns cannot compound
@@ -788,9 +790,10 @@
   `--cumulative-smoothness-steps` to update a running trace heading and
   `--cumulative-smoothness-tangent-weight` to penalize the tangent-plane angle
   between that heading and the candidate step. It never penalizes
-  normal/elevation change. If candidate normal sampling is unavailable,
-  invalid, or tangent projection is degenerate, the cumulative term is zero for
-  that candidate.
+  normal/elevation change. Missing Lasagna normal sampling is a hard error when
+  this term has positive weight. If a sampled candidate normal is invalid or the
+  tangent projection is degenerate, the cumulative term is zero for that
+  candidate.
   The optional `--debug-compare-normal-sampler` mode is diagnostic only. It
   wraps the production geometry-loader sampler, runs one or more accelerated
   sparse Lasagna samplers on the same candidate points, returns the production
@@ -938,19 +941,37 @@
   output. It loads one `vc3d_fiber` JSON, requires exact control-point matches
   in `line_points`, traces one-sided from CP to next CP plane, continues from
   the reached point after success, restarts from the failed CP after failure,
-  and reports restart rate per 1000 selected-level voxels as `err/kvx`.
-  `--working-to-base-scale` defines the selected-level coordinate system used
-  by the metric. Physical `err/m` is reported only when the caller provides an
-  explicit positive `--voxel-size-um`; the runner must not invent physical
-  units from filenames or parse unrelated metadata. The CLI is a thin wrapper
-  over `vc_fiber_tracer`, `vc_lasagna` dataset opening, and optional
+  and reports restart rate per 1000 manifest-prediction voxels as `err/kvx`.
+  The runner derives its working-to-base scale from the persisted prediction
+  channels in the fiber inference manifest: each required prediction channel's
+  effective scale is `source_to_base * 2**scaledown`, and all `presence`/`nx`/
+  `ny` channels used by the tracer, including prefixed multi-output channel
+  sets, must agree. Missing or scale-mismatched prediction channels are a hard
+  error. The JSON fiber is assumed to already be in the manifest base
+  coordinate system; no command-line fiber rescaling is currently exposed.
+  Default trace-control parameters are `--step-voxels 4.0`, `--beam-width 8`,
+  `--beam-lookahead-steps 2`, `--smoothness-normal-weight 0.1`, and
+  `--smoothness-tangent-weight 10.0`, matching the regular Python Trace2CP
+  defaults except for inference-only options.
+  `vc_fiber_trace_metric` requires an explicit `--normal-manifest` pointing to
+  the Lasagna normal manifest used for tangent/normal smoothness. It must not
+  try to derive normals from the fiber prediction manifest because the
+  precomputed fiber products do not persist Lasagna normal channels. Physical
+  `err/m` is reported only when the caller provides an explicit
+  positive `--voxel-size-um`; the runner must not invent physical units from
+  filenames or parse unrelated metadata. The CLI is a thin wrapper over
+  `vc_fiber_tracer`, `vc_lasagna` dataset opening, and the required
   `LasagnaNormalSampler`.
 - The native Lasagna dataset opener supports local `.lasagna.json` manifests,
   local manifests with an adjacent `lasagna-remote.json` read-through marker,
   and direct remote `s3://`, `s3+REGION://`, `http://`, or `https://`
   manifests when the caller supplies an explicit remote cache root. Direct
   remote manifest JSON is fetched transiently for the current run and is not
-  durable cache state; only referenced Zarr objects are persisted.
+  durable cache state; only referenced Zarr objects are persisted. Remote
+  manifest fetch failures must include the original location, redacted resolved
+  request URL, HTTP status or no-response marker, response metadata and body
+  excerpt when available, plus S3 region and credential-loaded status for S3
+  requests.
 - Lasagna manifest group `zarr` paths are location strings. Relative paths
   resolve against the containing manifest location: the parent directory for
   local manifests or the parent URL for direct remote manifests. Absolute local

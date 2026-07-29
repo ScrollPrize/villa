@@ -9,6 +9,15 @@
   each strip and include CP indices for explicit trace selection.
 - Python native 3D whole-fiber Trace2CP can now start metric tracing at a
   selected CP with `--whole-fiber-start-cp-index`.
+- Improved remote Lasagna manifest fetch errors with resolved URL, HTTP
+  response metadata/body excerpts, and S3 region/auth diagnostics.
+- Required Lasagna normal samplers for native Trace2CP normal-aware smoothing
+  and made `vc_fiber_trace_metric` require explicit `--normal-manifest`.
+- Changed Python native Trace2CP and the native C++ fiber metric default beam
+  lookahead to 2 so their relevant trace-control defaults match.
+- Changed native `vc_fiber_trace_metric` to infer its tracer working scale from
+  the precomputed fiber inference manifest channels instead of a CLI scale
+  argument.
 - Extended native VC3D Lasagna dataset opening so `vc_fiber_trace_metric` can
   stream precomputed fiber inference manifests directly from HTTP/S3 locations
   with an explicit remote cache directory, including relative and absolute

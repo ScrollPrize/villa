@@ -297,6 +297,26 @@ TEST_CASE("LasagnaDataset remote manifest requires explicit cache before fetch")
         std::runtime_error);
 }
 
+TEST_CASE("LasagnaDataset remote manifest fetch errors include diagnostics")
+{
+    const auto dir = makeTmpDir("remote-fetch-diagnostics");
+    try {
+        (void)vc::lasagna::LasagnaDataset::openLocation(
+            "http://",
+            vc::lasagna::LasagnaDatasetOpenOptions{1.0, dir});
+        FAIL("expected invalid remote fetch to throw");
+    } catch (const std::runtime_error& exc) {
+        const std::string what = exc.what();
+        CHECK(what.find("Failed to fetch remote Lasagna manifest") != std::string::npos);
+        CHECK(what.find("request_url=") != std::string::npos);
+        CHECK(what.find("received_bytes=") != std::string::npos);
+        CHECK(
+            what.find("HTTP ") != std::string::npos ||
+            what.find("no_http_response") != std::string::npos);
+    }
+    fs::remove_all(dir);
+}
+
 TEST_CASE("LasagnaDatasetManifest requires grad_mag for normal source")
 {
     auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({

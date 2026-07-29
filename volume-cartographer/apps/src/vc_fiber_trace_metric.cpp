@@ -13,6 +13,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -23,7 +24,6 @@ struct CliOptions {
     std::filesystem::path fiberJson;
     std::string normalManifest;
     std::filesystem::path remoteCacheDir;
-    double workingToBaseScale = 1.0;
     std::optional<double> voxelSizeUm;
     double errorThresholdVoxels = 10.0;
     size_t cacheBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -40,17 +40,17 @@ void printUsage(const char* argv0)
 {
     std::cerr
         << "Usage: " << argv0
-        << " <fiber.lasagna.json> <fiber.json> [options]\n\n"
+        << " <fiber.lasagna.json> <fiber.json>"
+        << " --normal-manifest <lasagna.lasagna.json> [options]\n\n"
         << "Options:\n"
-        << "  --working-to-base-scale N       coordinate scale from runner voxels to base voxels [1]\n"
-        << "  --normal-manifest PATH          Lasagna normal manifest for tangent/normal smoothness\n"
+        << "  --normal-manifest PATH          required Lasagna normal manifest for tangent/normal smoothness\n"
         << "  --remote-cache-dir PATH         required for remote HTTP/S3 Lasagna manifests\n"
         << "  --voxel-size-um N               base-voxel size in micrometers for err/m output\n"
-        << "  --step-voxels N                 trace step in runner voxels [4]\n"
+        << "  --step-voxels N                 trace step in manifest prediction voxels [4]\n"
         << "  --cone-angle-degrees N          candidate cone half-angle [25]\n"
         << "  --cone-angle-step-degrees N     candidate cone grid step [5]\n"
         << "  --beam-width N                  kept beams per step [8]\n"
-        << "  --beam-lookahead-steps N        expand this many steps before pruning [1]\n"
+        << "  --beam-lookahead-steps N        expand this many steps before pruning [2]\n"
         << "  --smoothness-weight N           smoothness scale [2]\n"
         << "  --smoothness-normal-weight N    normal-axis smoothness weight [0.1]\n"
         << "  --smoothness-tangent-weight N   tangent-plane smoothness weight [10]\n"
@@ -109,10 +109,6 @@ CliOptions parseArgs(int argc, char** argv)
         if (arg == "--help" || arg == "-h") {
             printUsage(argv[0]);
             std::exit(0);
-        } else if (arg == "--working-to-base-scale") {
-            options.workingToBaseScale =
-                parseDouble(requireValue(i, argc, argv, "working-to-base-scale"),
-                            "working-to-base-scale");
         } else if (arg == "--normal-manifest") {
             options.normalManifest =
                 requireValue(i, argc, argv, "normal-manifest");
@@ -176,8 +172,6 @@ CliOptions parseArgs(int argc, char** argv)
             failOption("unknown option: " + arg);
         }
     }
-    if (!(options.workingToBaseScale > 0.0))
-        failOption("--working-to-base-scale must be positive");
     if (!(options.trace.stepVoxels > 0.0))
         failOption("--step-voxels must be positive");
     if (options.trace.beamWidth < 1)
@@ -186,10 +180,14 @@ CliOptions parseArgs(int argc, char** argv)
         failOption("--beam-lookahead-steps must be at least 1");
     if (!(options.errorThresholdVoxels >= 0.0))
         failOption("--error-threshold-voxels must be non-negative");
+    if (options.normalManifest.empty()) {
+        failOption(
+            "--normal-manifest is required; pass the Lasagna normal manifest used for "
+            "tangent/normal smoothness");
+    }
     const bool usesRemoteManifest =
         vc::lasagna::isRemoteLasagnaLocation(options.fiberManifest) ||
-        (!options.normalManifest.empty() &&
-         vc::lasagna::isRemoteLasagnaLocation(options.normalManifest));
+        vc::lasagna::isRemoteLasagnaLocation(options.normalManifest);
     if (usesRemoteManifest && options.remoteCacheDir.empty()) {
         failOption("remote Lasagna manifests require --remote-cache-dir");
     }
@@ -229,43 +227,34 @@ int main(int argc, char** argv)
     try {
         const CliOptions options = parseArgs(argc, argv);
 
-        vc::lasagna::LasagnaDatasetOpenOptions datasetOptions{
-            options.workingToBaseScale,
-            options.remoteCacheDir,
-        };
+        vc::lasagna::LasagnaDatasetOpenOptions datasetOptions;
+        datasetOptions.remoteCacheRoot = options.remoteCacheDir;
 
-        const auto dataset = vc::lasagna::LasagnaDataset::openLocation(
+        const auto openedDataset = vc::lasagna::LasagnaDataset::openLocation(
             options.fiberManifest,
             datasetOptions);
+        const double workingToBaseScale =
+            vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(
+                openedDataset.manifest());
+        auto predictionManifest = openedDataset.manifest();
+        predictionManifest.workingToBaseScale = workingToBaseScale;
+        const vc::lasagna::LasagnaDataset dataset(std::move(predictionManifest));
         const vc::fiber_tracer::FiberPredictionField predictions(
             dataset,
             options.cacheBytes);
 
         std::optional<vc::lasagna::LasagnaDataset> normalDataset;
         std::optional<vc::lasagna::LasagnaNormalSampler> normalSampler;
-        const vc::lasagna::NormalSampler* normalSamplerPtr = nullptr;
-        if (!options.normalManifest.empty()) {
-            normalDataset.emplace(vc::lasagna::LasagnaDataset::openLocation(
-                options.normalManifest,
-                datasetOptions));
-            normalSampler.emplace(
-                *normalDataset,
-                vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
-            normalSamplerPtr = &*normalSampler;
-        } else if (dataset.hasNormalSource()) {
-            try {
-                normalSampler.emplace(
-                    dataset,
-                    vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
-                normalSamplerPtr = &*normalSampler;
-            } catch (const std::exception& exc) {
-                if (!options.quiet) {
-                    std::cout
-                        << "vc_fiber_trace_metric note: no usable normal sampler from "
-                        << options.fiberManifest << ": " << exc.what() << '\n';
-                }
-            }
-        }
+        vc::lasagna::LasagnaDatasetOpenOptions normalDatasetOptions;
+        normalDatasetOptions.workingToBaseScale = workingToBaseScale;
+        normalDatasetOptions.remoteCacheRoot = options.remoteCacheDir;
+        normalDataset.emplace(vc::lasagna::LasagnaDataset::openLocation(
+            options.normalManifest,
+            normalDatasetOptions));
+        normalSampler.emplace(
+            *normalDataset,
+            vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
+        const vc::lasagna::NormalSampler* normalSamplerPtr = &*normalSampler;
 
         const auto fiber = vc::fiber_tracer::loadFiberJson(options.fiberJson);
         if (!options.quiet) {
@@ -275,14 +264,15 @@ int main(int argc, char** argv)
                 << " fiber_json=" << options.fiberJson
                 << " control_points=" << fiber.controlPointsXyzBase.size()
                 << " segments=" << (fiber.controlPointsXyzBase.size() - 1)
-                << " working_to_base_scale=" << options.workingToBaseScale
+                << " working_to_base_scale=" << workingToBaseScale
+                << " working_to_base_scale_source=manifest"
                 << " normal_sampler=" << (normalSamplerPtr != nullptr ? "on" : "off")
                 << '\n';
         }
 
         vc::fiber_tracer::FiberTraceWholeFiberMetricRequest request;
         request.fiber = fiber;
-        request.workingToBaseScale = options.workingToBaseScale;
+        request.workingToBaseScale = workingToBaseScale;
         request.errorThresholdVoxels = options.errorThresholdVoxels;
         request.voxelSizeUm = options.voxelSizeUm;
         request.config = options.trace;

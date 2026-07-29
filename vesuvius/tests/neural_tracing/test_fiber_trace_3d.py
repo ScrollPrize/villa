@@ -163,6 +163,18 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
 )
 
 
+def _constant_native_normal_sampler(normal_zyx=(1.0, 0.0, 0.0)):
+    normal = np.asarray(normal_zyx, dtype=np.float32)
+
+    def normal_sampler(points_zyx):
+        points = np.asarray(points_zyx, dtype=np.float32)
+        normals = np.broadcast_to(normal[None, :], (points.shape[0], 3)).copy()
+        valid = np.ones((points.shape[0],), dtype=bool)
+        return normals, valid
+
+    return normal_sampler
+
+
 def test_snapshot_intervals_must_align_with_evaluation() -> None:
     _validate_snapshot_intervals(
         checkpoint_interval=500,
@@ -3311,7 +3323,7 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().cone_angle_step_degrees == 5.0
     assert NativeTrace2CpConfig().beam_width == 8
     assert NativeTrace2CpConfig().beam_prune_distance_voxels == 1.0
-    assert NativeTrace2CpConfig().beam_lookahead_steps == 1
+    assert NativeTrace2CpConfig().beam_lookahead_steps == 2
     assert NativeTrace2CpConfig().candidate_substeps == 1
     assert NativeTrace2CpConfig().max_step_factor == 3.0
     assert NativeTrace2CpConfig().max_steps is None
@@ -3347,7 +3359,7 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert args.sample_index is None
     assert args.beam_width == 8
-    assert args.beam_lookahead_steps == 1
+    assert args.beam_lookahead_steps == 2
     assert args.smoothness_normal_weight == 0.1
     assert args.smoothness_tangent_weight == 10.0
     assert args.core_margin_voxels == 48
@@ -5266,6 +5278,17 @@ def test_native_3d_trace2cp_start_direction_uses_best_alignment_not_presence() -
     assert np.allclose(direction, [0.0, 0.0, 1.0], atol=1.0e-6)
 
 
+def test_native_3d_trace2cp_requires_lasagna_normals_for_normal_aware_smoothing() -> None:
+    with pytest.raises(ValueError, match="requires Lasagna normals"):
+        trace_native_3d_one_way(
+            object(),
+            start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            target_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            cfg=NativeTrace2CpConfig(trace_step_limit=1),
+        )
+
+
 def test_native_3d_trace2cp_first_step_applies_regular_smoothness() -> None:
     class FakeCache:
         device = torch.device("cpu")
@@ -5860,6 +5883,7 @@ def test_native_3d_trace2cp_first_step_uses_sampled_direction_aligned_to_line_ta
             cone_grid_size=1,
             trace_step_limit=1,
         ),
+        normal_sampler=_constant_native_normal_sampler(),
     )
 
     assert result.reason == "trace_step_limit"
@@ -6011,6 +6035,7 @@ def test_native_3d_trace2cp_beam_lookahead_keeps_initially_worse_valid_path() ->
         start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
         target_zyx=np.asarray([0.0, 0.0, 2.7], dtype=np.float32),
         initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        normal_sampler=_constant_native_normal_sampler(),
     )
     greedy = trace_native_3d_one_way(
         **kwargs,
@@ -6127,6 +6152,7 @@ def test_native_3d_trace2cp_constant_field_reaches_target_plane() -> None:
             inference_patch_shape_zyx=(16, 16, 16),
             core_margin_voxels=2,
         ),
+        normal_sampler=_constant_native_normal_sampler(),
     )
 
     assert result.forward.reached_target_plane
@@ -6174,6 +6200,7 @@ def test_native_3d_trace2cp_trace_step_limit_stops_partial_trace() -> None:
             inference_patch_shape_zyx=(16, 16, 16),
             core_margin_voxels=2,
         ),
+        normal_sampler=_constant_native_normal_sampler(),
     )
 
     assert not result.forward.reached_target_plane
@@ -6222,6 +6249,7 @@ def test_native_3d_trace2cp_max_step_factor_limits_trace() -> None:
             inference_patch_shape_zyx=(16, 16, 16),
             core_margin_voxels=2,
         ),
+        normal_sampler=_constant_native_normal_sampler(),
     )
 
     assert not result.forward.reached_target_plane

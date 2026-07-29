@@ -20,7 +20,7 @@ struct FiberTraceConfig {
     double coneAngleDegrees = 25.0;
     double coneAngleStepDegrees = 5.0;
     int beamWidth = 8;
-    int beamLookaheadSteps = 1;
+    int beamLookaheadSteps = 2;
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
     double smoothnessTangentWeight = 10.0;
@@ -165,6 +165,9 @@ using FiberTraceWholeFiberProgressCallback =
     std::function<void(const FiberTraceWholeFiberProgress&)>;
 
 [[nodiscard]] FiberInput loadFiberJson(const std::filesystem::path& path);
+
+[[nodiscard]] double inferFiberPredictionWorkingToBaseScale(
+    const vc::lasagna::LasagnaDatasetManifest& manifest);
 
 [[nodiscard]] FiberTraceOneWayResult traceFiberOneWay(
     const FiberPredictionSource& predictions,

@@ -3,10 +3,12 @@
 #include "vc/lasagna/ChannelSampler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -65,6 +67,67 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 {
     return value.size() >= suffix.size() &&
            value.substr(value.size() - suffix.size()) == suffix;
+}
+
+[[nodiscard]] std::vector<std::string> fiberPredictionPrefixes(
+    const vc::lasagna::LasagnaDatasetManifest& manifest)
+{
+    std::vector<std::string> prefixes;
+    if (manifest.groupForChannel("presence") != nullptr &&
+        manifest.groupForChannel("nx") != nullptr &&
+        manifest.groupForChannel("ny") != nullptr) {
+        prefixes.push_back({});
+    }
+    for (const auto& group : manifest.groups) {
+        for (const auto& channel : group.channels) {
+            constexpr std::string_view suffix = "_presence";
+            if (!endsWith(channel, suffix))
+                continue;
+            const std::string prefix = channel.substr(0, channel.size() - suffix.size());
+            if (manifest.groupForChannel(prefix + "_nx") != nullptr &&
+                manifest.groupForChannel(prefix + "_ny") != nullptr) {
+                prefixes.push_back(prefix);
+            }
+        }
+    }
+    std::sort(prefixes.begin(), prefixes.end());
+    prefixes.erase(std::unique(prefixes.begin(), prefixes.end()), prefixes.end());
+    return prefixes;
+}
+
+[[nodiscard]] std::array<std::string, 3> predictionChannelNames(
+    const std::string& prefix)
+{
+    if (prefix.empty())
+        return {"presence", "nx", "ny"};
+    return {prefix + "_presence", prefix + "_nx", prefix + "_ny"};
+}
+
+[[nodiscard]] double predictionChannelEffectiveScale(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    const std::string& channel)
+{
+    const auto* group = manifest.groupForChannel(channel);
+    if (group == nullptr) {
+        throw std::runtime_error(
+            "fiber inference dataset is missing required channel '" +
+            channel + "'");
+    }
+    const double scale =
+        manifest.sourceToBase * static_cast<double>(group->scaleFactor());
+    if (!(scale > 0.0) || !std::isfinite(scale)) {
+        throw std::runtime_error(
+            "fiber inference channel '" + channel +
+            "' has a non-positive or non-finite effective scale");
+    }
+    return scale;
+}
+
+[[nodiscard]] bool nearlySameScale(double a, double b)
+{
+    const double tolerance =
+        1.0e-9 * std::max({1.0, std::abs(a), std::abs(b)});
+    return std::abs(a - b) <= tolerance;
 }
 
 [[nodiscard]] cv::Vec3d arbitraryPerpendicular(const cv::Vec3d& direction)
@@ -257,6 +320,22 @@ struct ScoredDirection {
         }
     }
     return best;
+}
+
+[[nodiscard]] bool normalAwareSmoothnessEnabled(const FiberTraceConfig& config)
+{
+    return config.smoothnessNormalWeight > 0.0 ||
+           config.smoothnessTangentWeight > 0.0;
+}
+
+void requireNormalSamplerForNormalAwareSmoothness(
+    const FiberTraceConfig& config,
+    const vc::lasagna::NormalSampler* normalSampler)
+{
+    if (normalSampler != nullptr || !normalAwareSmoothnessEnabled(config))
+        return;
+    throw std::invalid_argument(
+        "Lasagna normal sampler is required for tangent/normal fiber trace smoothness");
 }
 
 [[nodiscard]] double smoothnessLoss(
@@ -535,6 +614,43 @@ struct BeamState {
 
 } // namespace
 
+double inferFiberPredictionWorkingToBaseScale(
+    const vc::lasagna::LasagnaDatasetManifest& manifest)
+{
+    if (!(manifest.sourceToBase > 0.0) || !std::isfinite(manifest.sourceToBase)) {
+        throw std::runtime_error(
+            "fiber inference manifest source_to_base must be positive and finite");
+    }
+
+    const auto prefixes = fiberPredictionPrefixes(manifest);
+    if (prefixes.empty()) {
+        throw std::runtime_error(
+            "fiber inference dataset must contain presence/nx/ny channels");
+    }
+
+    std::optional<double> inferredScale;
+    std::optional<std::string> inferredChannel;
+    for (const auto& prefix : prefixes) {
+        for (const auto& channel : predictionChannelNames(prefix)) {
+            const double scale = predictionChannelEffectiveScale(manifest, channel);
+            if (!inferredScale.has_value()) {
+                inferredScale = scale;
+                inferredChannel = channel;
+                continue;
+            }
+            if (!nearlySameScale(*inferredScale, scale)) {
+                throw std::runtime_error(
+                    "fiber inference prediction channels must share one effective "
+                    "working-to-base scale; channel '" + channel +
+                    "' has scale " + std::to_string(scale) + " but channel '" +
+                    *inferredChannel + "' has scale " +
+                    std::to_string(*inferredScale));
+            }
+        }
+    }
+    return *inferredScale;
+}
+
 class FiberPredictionField::Impl {
 public:
     struct Option {
@@ -548,40 +664,19 @@ public:
         : cache_(vc::lasagna::sharedLasagnaChannelChunkCache(maxCachedBytes))
     {
         const auto& manifest = dataset.manifest();
-        std::vector<std::string> prefixes;
-        if (manifest.groupForChannel("presence") != nullptr &&
-            manifest.groupForChannel("nx") != nullptr &&
-            manifest.groupForChannel("ny") != nullptr) {
-            prefixes.push_back({});
-        }
-        for (const auto& group : manifest.groups) {
-            for (const auto& channel : group.channels) {
-                constexpr std::string_view suffix = "_presence";
-                if (!endsWith(channel, suffix))
-                    continue;
-                const std::string prefix = channel.substr(0, channel.size() - suffix.size());
-                if (manifest.groupForChannel(prefix + "_nx") != nullptr &&
-                    manifest.groupForChannel(prefix + "_ny") != nullptr) {
-                    prefixes.push_back(prefix);
-                }
-            }
-        }
-        std::sort(prefixes.begin(), prefixes.end());
-        prefixes.erase(std::unique(prefixes.begin(), prefixes.end()), prefixes.end());
+        const auto prefixes = fiberPredictionPrefixes(manifest);
         if (prefixes.empty())
             throw std::runtime_error(
                 "fiber inference dataset must contain presence/nx/ny channels");
 
         options_.reserve(prefixes.size());
         for (const auto& prefix : prefixes) {
-            const std::string presenceName = prefix.empty() ? "presence" : prefix + "_presence";
-            const std::string nxName = prefix.empty() ? "nx" : prefix + "_nx";
-            const std::string nyName = prefix.empty() ? "ny" : prefix + "_ny";
+            const auto channels = predictionChannelNames(prefix);
             options_.push_back({
                 prefix.empty() ? std::string("option_000") : prefix,
-                vc::lasagna::bindLasagnaChannel(manifest, presenceName),
-                vc::lasagna::bindLasagnaChannel(manifest, nxName),
-                vc::lasagna::bindLasagnaChannel(manifest, nyName),
+                vc::lasagna::bindLasagnaChannel(manifest, channels[0]),
+                vc::lasagna::bindLasagnaChannel(manifest, channels[1]),
+                vc::lasagna::bindLasagnaChannel(manifest, channels[2]),
             });
         }
     }
@@ -727,6 +822,7 @@ FiberTraceOneWayResult traceFiberOneWay(
     if (length(request.targetPlaneNormal) <= kEpsilon) {
         throw std::invalid_argument("fiber trace one-way request target plane normal is degenerate");
     }
+    requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
     return traceOneWayCore(
         predictions, request, normalSampler, progress, "trace");
 }
@@ -745,6 +841,7 @@ FiberTraceSegmentResult traceFiberSegment(
     }
     if (request.startIndex == request.targetIndex)
         throw std::invalid_argument("fiber trace request start and target indices must differ");
+    requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
 
     FiberTraceSegmentRequest forwardRequest = request;
     forwardRequest.targetPlaneNormal =
@@ -845,6 +942,7 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
         throw std::invalid_argument(
             "whole-fiber metric control-point line-index count mismatch");
     }
+    requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
 
     const auto lineWorking =
         scaledPoints(request.fiber.linePointsXyzBase, request.workingToBaseScale);
