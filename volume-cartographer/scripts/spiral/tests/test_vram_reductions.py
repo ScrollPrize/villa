@@ -291,7 +291,7 @@ class CpuTrackStorageTests(unittest.TestCase):
         self.assertEqual(filtered['lengths'].numel(), 1)
         np.testing.assert_array_equal(filtered['flat_zyx_cpu'].numpy(), straight)
 
-    def test_crossing_partners_are_opposite_family_angled_and_spaced(self):
+    def test_crossing_partners_are_sampled_from_all_exact_partners(self):
         primary = self._line_track(20, z=10, y=10, axis=2)
 
         def vertical_at(x):
@@ -319,13 +319,9 @@ class CpuTrackStorageTests(unittest.TestCase):
             track_families=['horizontal', 'vertical', 'vertical', 'vertical', 'vertical'],
         )
 
-        np.testing.assert_array_equal(
-            prepared['crossing_partners'][0].numpy(), [1, 3])
-        np.testing.assert_array_equal(
-            prepared['crossing_self_local'][0].numpy(), [4, 16])
-        np.testing.assert_array_equal(
-            prepared['crossing_partner_local'][0].numpy(), [10, 10])
-        self.assertNotIn(4, prepared['crossing_partners'][0].tolist())
+        self.assertIn('crossing_index', prepared)
+        self.assertEqual(
+            int(prepared['crossing_index_stats']['directed_crossings']), 6)
 
         configure_prepared_track_sampling(prepared, {
             'max_track_crossing_per_step': 1,
@@ -333,8 +329,15 @@ class CpuTrackStorageTests(unittest.TestCase):
 
         # Force primary track zero so the first draw uses the Run-scoped limit.
         prepared['sampling_probabilities'] = torch.tensor([1., 0., 0., 0., 0.])
-        sample = _sample_prepared_track_points(prepared, 1, 4)
-        np.testing.assert_array_equal(sample['track_idx'].numpy(), [0, 1])
+        torch.manual_seed(123)
+        first = _sample_prepared_track_points(prepared, 1, 4)
+        torch.manual_seed(123)
+        repeated = _sample_prepared_track_points(prepared, 1, 4)
+        np.testing.assert_array_equal(
+            first['track_idx'].numpy(), repeated['track_idx'].numpy())
+        self.assertEqual(first['track_idx'][0], 0)
+        self.assertIn(int(first['track_idx'][1]), {1, 2, 3})
+        sample = first
         self.assertEqual(sample['row_lengths'].shape, (2,))
         self.assertEqual(sample['group_id'].tolist(), [0, 0])
         self.assertEqual(sample['group_width'], 2)
@@ -343,7 +346,9 @@ class CpuTrackStorageTests(unittest.TestCase):
             'max_track_crossing_per_step': 2,
         })
         sample = _sample_prepared_track_points(prepared, 1, 4)
-        np.testing.assert_array_equal(sample['track_idx'].numpy(), [0, 1, 3])
+        self.assertEqual(sample['track_idx'][0], 0)
+        self.assertEqual(len(set(sample['track_idx'][1:].tolist())), 2)
+        self.assertTrue(set(sample['track_idx'][1:].tolist()) <= {1, 2, 3})
         self.assertEqual(sample['group_width'], 3)
         for primary_flat, partner_flat in zip(
                 sample['primary_cross_flat'], sample['partner_cross_flat']):
@@ -351,6 +356,16 @@ class CpuTrackStorageTests(unittest.TestCase):
                 sample['sampled_scroll'][primary_flat],
                 sample['sampled_scroll'][partner_flat],
             )
+
+        configure_prepared_track_sampling(prepared, {
+            'max_track_crossing_per_step': 1,
+        })
+        observed = set()
+        for seed in range(32):
+            torch.manual_seed(seed)
+            draw = _sample_prepared_track_points(prepared, 1, 4)
+            observed.add(int(draw['track_idx'][1]))
+        self.assertEqual(observed, {1, 2, 3})
 
     def test_crossing_index_uses_first_local_index_for_repeated_voxel(self):
         horizontal = np.array([
@@ -378,10 +393,16 @@ class CpuTrackStorageTests(unittest.TestCase):
             track_families=['horizontal', 'vertical', 'vertical'],
         )
 
-        self.assertEqual(prepared['crossing_partners'][0, 0], 1)
-        self.assertEqual(prepared['crossing_self_local'][0, 0], 2)
-        self.assertEqual(prepared['crossing_partner_local'][0, 0], 2)
-        self.assertNotIn(2, prepared['crossing_partners'][1].tolist())
+        self.assertEqual(
+            int(prepared['crossing_index_stats']['directed_crossings']), 4)
+        prepared['sampling_probabilities'] = torch.tensor([1., 0., 0.])
+        sample = _sample_prepared_track_points(prepared, 1, 4)
+        self.assertEqual(sample['track_idx'][0], 0)
+        self.assertIn(int(sample['track_idx'][1]), {1, 2})
+        torch.testing.assert_close(
+            sample['sampled_scroll'][sample['primary_cross_flat'][0]],
+            sample['sampled_scroll'][sample['partner_cross_flat'][0]],
+        )
 
     def test_track_point_packing_is_chunk_independent(self):
         points = np.array([

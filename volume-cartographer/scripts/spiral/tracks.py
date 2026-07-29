@@ -44,20 +44,17 @@ def _load_native_track_crossings():
     if os.environ.get('VC_DISABLE_NATIVE_TRACK_CROSSINGS') == '1':
         return None
     try:
+        # Editable VC installs may point ``vc`` at site-packages even while a
+        # newer extension exists in this checkout's build tree. Prefer that
+        # developer build so repo scripts use the matching native kernel
+        # immediately after ``ninja -C build vc_track_crossings``.
+        import vc
+        build_package = Path(__file__).resolve().parents[2] / 'build/python/vc'
+        if build_package.is_dir() and str(build_package) not in vc.__path__:
+            vc.__path__.insert(0, str(build_package))
         return importlib.import_module('vc.track_crossings')
     except ImportError:
-        # Editable VC installs may point ``vc`` at site-packages even while a
-        # newer extension exists in this checkout's build tree. Make that
-        # developer build discoverable so repo scripts use the matching native
-        # kernel immediately after ``ninja -C build vc_track_crossings``.
-        try:
-            import vc
-            build_package = Path(__file__).resolve().parents[2] / 'build/python/vc'
-            if build_package.is_dir() and str(build_package) not in vc.__path__:
-                vc.__path__.append(str(build_package))
-            return importlib.import_module('vc.track_crossings')
-        except ImportError:
-            return None
+        return None
 
 
 def _load_native_track_store():
@@ -600,6 +597,31 @@ def validate_track_sampling_config(config):
     crossing_precompute_max = max(
         int(crossing_precompute_max), int(max_crossings))
 
+    crossing_mode = config.get('track_crossing_mode', 'count')
+    if crossing_mode not in ('count', 'track_walk'):
+        raise ValueError(
+            "track_crossing_mode must be 'count' or 'track_walk'")
+    walk_values = {}
+    for key, default in (
+            ('min_walk_steps_per_track', 24),
+            ('max_walk_steps_per_track', 256),
+            ('n_walks_per_track', 4)):
+        value = config.get(key, default)
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not float(value).is_integer() or int(value) <= 0):
+            raise ValueError(f'{key} must be a positive integer')
+        walk_values[key] = int(value)
+    if (walk_values['min_walk_steps_per_track']
+            > walk_values['max_walk_steps_per_track']):
+        raise ValueError(
+            'min_walk_steps_per_track must be <= max_walk_steps_per_track')
+    require_loop = config.get(
+        'track_walk_require_loop_consistency', False)
+    if not isinstance(require_loop, bool):
+        raise ValueError(
+            'track_walk_require_loop_consistency must be boolean')
+
     sample_spacings = {}
     for key, default in (
             ('track_min_sample_spacing', 20.0),
@@ -621,6 +643,9 @@ def validate_track_sampling_config(config):
         'max_tortuosity': max_tortuosity,
         'max_crossings': int(max_crossings),
         'crossing_precompute_max': crossing_precompute_max,
+        'crossing_mode': crossing_mode,
+        **walk_values,
+        'walk_require_loop_consistency': require_loop,
         'min_sample_spacing': sample_spacings['track_min_sample_spacing'],
         'max_sample_spacing': sample_spacings['track_max_sample_spacing'],
     }
@@ -749,6 +774,15 @@ def configure_prepared_track_sampling(prepared_tracks, config):
         'max_track_crossing_per_step': prepared_tracks.get('active_max_crossings', 0),
         'track_crossing_precompute_max': prepared_tracks.get(
             'crossing_precompute_max', 0),
+        'track_crossing_mode': prepared_tracks.get(
+            'track_crossing_mode', 'count'),
+        'min_walk_steps_per_track': prepared_tracks.get(
+            'min_walk_steps_per_track', 24),
+        'max_walk_steps_per_track': prepared_tracks.get(
+            'max_walk_steps_per_track', 256),
+        'n_walks_per_track': prepared_tracks.get('n_walks_per_track', 4),
+        'track_walk_require_loop_consistency': prepared_tracks.get(
+            'track_walk_require_loop_consistency', False),
     }
     current.update({
         key: config[key] for key in current
@@ -760,11 +794,15 @@ def configure_prepared_track_sampling(prepared_tracks, config):
         weights = policy['length_bin_weights']
         if weights is None:
             prepared_tracks.pop('sampling_probabilities', None)
+            prepared_tracks.pop('sampling_probabilities_cpu', None)
             prepared_tracks['length_bin_weights'] = None
         else:
-            prepared_tracks['sampling_probabilities'] = _length_bin_probabilities(
+            probabilities = _length_bin_probabilities(
                 prepared_tracks['arclengths_cpu'], weights,
                 prepared_tracks['device'])
+            prepared_tracks['sampling_probabilities'] = probabilities
+            prepared_tracks['sampling_probabilities_cpu'] = np.asarray(
+                probabilities.detach().cpu(), dtype=np.float64)
             prepared_tracks['length_bin_weights'] = weights.tolist()
 
     maximum = policy['max_crossings']
@@ -775,6 +813,9 @@ def configure_prepared_track_sampling(prepared_tracks, config):
             f'prepared crossing ceiling ({prepared_maximum}); reload with a larger '
             'track_crossing_precompute_max')
     prepared_tracks['active_max_crossings'] = maximum
+    for key in ('min_walk_steps_per_track', 'max_walk_steps_per_track',
+                'n_walks_per_track'):
+        prepared_tracks[key] = policy[key]
 
 
 def _track_tangent(track, raw_index, radius_voxels=12.0):
@@ -2110,6 +2151,8 @@ def prepare_main_phase_tracks(
     max_tortuosity = policy['max_tortuosity']
     max_crossings = policy['max_crossings']
     crossing_precompute_max = policy['crossing_precompute_max']
+    crossing_mode = policy['crossing_mode']
+    require_walk_loop = policy['walk_require_loop_consistency']
 
     input_track_count = len(tracks)
     packed_input = isinstance(tracks, PackedTrackCollection)
@@ -2177,37 +2220,155 @@ def prepare_main_phase_tracks(
                 crossing_precompute_max
                 if working_families is not None or crossing_cache is not None
                 else 0),
+            'track_crossing_mode': crossing_mode,
+            'track_walk_require_loop_consistency': require_walk_loop,
+            'min_walk_steps_per_track': policy['min_walk_steps_per_track'],
+            'max_walk_steps_per_track': policy['max_walk_steps_per_track'],
+            'n_walks_per_track': policy['n_walks_per_track'],
         }
-        if crossing_precompute_max > 0:
-            tables = None
+        if ((crossing_mode == 'count' and crossing_precompute_max > 0)
+                or crossing_mode == 'track_walk'):
+            crossing_index = None
+            restricted_csr = None
+            walk_index = None
+            native = _load_native_track_crossings()
             if crossing_cache is not None:
                 eligible_source_ids = working_source_ids[surviving_indices]
                 try:
-                    tables = _materialize_cached_crossing_partner_table(
-                        crossing_cache, eligible_source_ids,
-                        crossing_precompute_max, device)
+                    if crossing_mode == 'track_walk':
+                        if (native is not None
+                                and hasattr(
+                                    native, 'prepare_cached_walk_index')):
+                            walk_index = native.prepare_cached_walk_index(
+                                np.asarray(
+                                    crossing_cache['source_ids'],
+                                    dtype=np.uint64),
+                                np.asarray(
+                                    crossing_cache['offsets'],
+                                    dtype=np.int64),
+                                np.asarray(
+                                    crossing_cache['partners'],
+                                    dtype=np.int32),
+                                np.asarray(
+                                    crossing_cache['self_local'],
+                                    dtype=np.int32),
+                                np.asarray(
+                                    crossing_cache['partner_local'],
+                                    dtype=np.int32),
+                                np.asarray(
+                                    eligible_source_ids, dtype=np.uint64),
+                                np.asarray(lengths_new, dtype=np.int32),
+                                require_loop_consistency=require_walk_loop)
+                        else:
+                            restricted_csr = _restrict_crossing_partner_csr(
+                                crossing_cache, eligible_source_ids)
+                    elif crossing_precompute_max > 0:
+                        if (native is not None
+                                and hasattr(
+                                    native, 'prepare_cached_crossing_index')):
+                            crossing_index = native.prepare_cached_crossing_index(
+                                np.asarray(
+                                    crossing_cache['source_ids'],
+                                    dtype=np.uint64),
+                                np.asarray(
+                                    crossing_cache['offsets'],
+                                    dtype=np.int64),
+                                np.asarray(
+                                    crossing_cache['partners'],
+                                    dtype=np.int32),
+                                np.asarray(
+                                    crossing_cache['self_local'],
+                                    dtype=np.int32),
+                                np.asarray(
+                                    crossing_cache['partner_local'],
+                                    dtype=np.int32),
+                                np.asarray(
+                                    eligible_source_ids, dtype=np.uint64),
+                                np.asarray(lengths_new, dtype=np.int32))
+                        else:
+                            restricted_csr = _restrict_crossing_partner_csr(
+                                crossing_cache, eligible_source_ids)
                     print(
                         f'track crossings: used cached CSR for '
                         f'{len(eligible_source_ids)} surviving tracks')
-                except ValueError as error:
+                except (ValueError, RuntimeError) as error:
                     print(
                         'WARNING: track crossing cache could not be remapped; '
                         f'rebuilding exact crossings: {error}')
-            if tables is None and working_families is not None:
+            needs_rebuild = (
+                (crossing_mode == 'count' and crossing_precompute_max > 0
+                 and crossing_index is None and restricted_csr is None)
+                or (restricted_csr is None and walk_index is None
+                    and crossing_mode == 'track_walk'))
+            if needs_rebuild and working_families is not None:
                 eligible_families = [
                     working_families[index] for index in surviving_indices]
-                tables = _build_crossing_partner_table(
+                rebuilt_csr = _build_crossing_partner_csr(
                     prepared_track_list, eligible_families,
-                    crossing_precompute_max, device,
                     flat_points=flat_zyx_np, offsets=offsets_new)
-            if tables is not None:
-                (prepared['crossing_partners'],
-                 prepared['crossing_self_local'],
-                 prepared['crossing_partner_local']) = tables
+                restricted_csr = rebuilt_csr
+            if crossing_mode == 'count' and crossing_precompute_max > 0:
+                if crossing_index is None and restricted_csr is not None:
+                    if (native is not None
+                            and hasattr(native, 'prepare_crossing_index')):
+                        crossing_index = native.prepare_crossing_index(
+                            np.asarray(restricted_csr['offsets'], dtype=np.int64),
+                            np.asarray(restricted_csr['partners'], dtype=np.int32),
+                            np.asarray(
+                                restricted_csr['self_local'], dtype=np.int32),
+                            np.asarray(
+                                restricted_csr['partner_local'], dtype=np.int32),
+                            np.asarray(lengths_new, dtype=np.int32))
+                    else:
+                        prepared['crossing_csr'] = restricted_csr
+                if crossing_index is not None:
+                    prepared['crossing_index'] = crossing_index
+                    stats = dict(native.crossing_index_stats(crossing_index))
+                    prepared['crossing_index_stats'] = stats
+                    print(
+                        'track crossing index: '
+                        f"{int(stats['connected_tracks'])}/{len(lengths_new)} "
+                        'tracks connected, '
+                        f"{int(stats['directed_crossings'])} directed crossings, "
+                        f"{int(stats['memory_bytes']) / (1 << 20):.1f} MiB")
+            if crossing_mode == 'track_walk':
+                if restricted_csr is None and walk_index is None:
+                    raise ValueError(
+                        'track_walk requires track-family provenance or a '
+                        'compatible exact-crossing cache')
+                if native is None or not hasattr(native, 'prepare_walk_index'):
+                    raise RuntimeError(
+                        'track_walk requires the native vc.track_crossings module')
+                if walk_index is None:
+                    walk_offsets = np.asarray(
+                        restricted_csr['offsets'], dtype=np.int64)
+                    walk_partners = np.asarray(
+                        restricted_csr['partners'], dtype=np.int32)
+                    walk_self = np.asarray(
+                        restricted_csr['self_local'], dtype=np.int32)
+                    walk_partner_local = np.asarray(
+                        restricted_csr['partner_local'], dtype=np.int32)
+                    walk_index = native.prepare_walk_index(
+                        walk_offsets, walk_partners, walk_self,
+                        walk_partner_local,
+                        np.asarray(lengths_new, dtype=np.int32),
+                        require_loop_consistency=require_walk_loop)
+                prepared['walk_index'] = walk_index
+                stats = native.walk_index_stats(prepared['walk_index'])
+                prepared['walk_index_stats'] = dict(stats)
+                print(
+                    'track walk index: '
+                    f"{int(stats['eligible_tracks'])}/{len(lengths_new)} "
+                    'tracks eligible, '
+                    f"{int(stats['eligible_directed_crossings'])} directed "
+                    f"crossings, {int(stats['memory_bytes']) / (1 << 20):.1f} MiB")
         configure_prepared_track_sampling(prepared, {
             'track_length_bin_weights': (
                 None if weights is None else weights.tolist()),
             'max_track_crossing_per_step': max_crossings,
+            'min_walk_steps_per_track': policy['min_walk_steps_per_track'],
+            'max_walk_steps_per_track': policy['max_walk_steps_per_track'],
+            'n_walks_per_track': policy['n_walks_per_track'],
         })
         return prepared
 
@@ -2299,7 +2460,18 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
     """Resample complete tracks between mandatory polyline anchors."""
     min_spacing = float(min_spacing)
     max_spacing = float(max_spacing)
-    cache_key = (min_spacing, max_spacing)
+    if prepared_tracks.get('track_crossing_mode', 'count') == 'track_walk':
+        cache_key = (
+            min_spacing, max_spacing, 'track_walk',
+            prepared_tracks.get('min_walk_steps_per_track', 24),
+            prepared_tracks.get('max_walk_steps_per_track', 256),
+            prepared_tracks.get('n_walks_per_track', 4),
+            prepared_tracks.get(
+                'track_walk_require_loop_consistency', False),
+        )
+    else:
+        # This key is intentionally unchanged for the default count mode.
+        cache_key = (min_spacing, max_spacing)
     cached = prepared_tracks['resampled_cache'].get(cache_key)
     if cached is not None:
         return cached
@@ -2308,6 +2480,8 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
     offsets = prepared_tracks['offsets_cpu'].numpy()
     num_tracks = len(offsets) - 1
     crossing_partners = prepared_tracks.get('crossing_partners')
+    crossing_index = prepared_tracks.get('crossing_index')
+    crossing_csr = prepared_tracks.get('crossing_csr')
     if crossing_partners is not None:
         partners_np = crossing_partners.cpu().numpy()
         self_local_np = prepared_tracks['crossing_self_local'].cpu().numpy()
@@ -2324,13 +2498,20 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
             partners_native = np.asarray(partners_np, dtype=np.int32)
             self_local_native = np.asarray(self_local_np, dtype=np.int32)
             partner_local_native = np.asarray(partner_local_np, dtype=np.int32)
+        resample_kwargs = {
+            'minimum_spacing': min_spacing,
+            'maximum_spacing': max_spacing,
+            'workers': min(32, os.cpu_count() or 1),
+        }
+        if prepared_tracks.get('track_crossing_mode') == 'track_walk':
+            resample_kwargs['walk_index'] = prepared_tracks['walk_index']
+        elif crossing_index is not None:
+            resample_kwargs['crossing_index'] = crossing_index
         result = native.resample_tracks(
             np.asarray(flat_source, dtype=np.float32),
             np.asarray(offsets, dtype=np.int64),
             partners_native, self_local_native, partner_local_native,
-            minimum_spacing=min_spacing, maximum_spacing=max_spacing,
-            workers=min(32, os.cpu_count() or 1),
-        )
+            **resample_kwargs)
         sampled_lengths = np.asarray(result['lengths'])
         device = prepared_tracks['device']
         bundle = {
@@ -2347,6 +2528,12 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
                 np.asarray(result['crossing_self_sample'])).to(device=device)
             bundle['crossing_partner_sample'] = torch.from_numpy(
                 np.asarray(result['crossing_partner_sample'])).to(device=device)
+        if 'walk_record_sample' in result:
+            bundle['walk_record_sample'] = torch.from_numpy(
+                np.asarray(result['walk_record_sample'])).to(device=device)
+        elif 'crossing_record_sample' in result:
+            bundle['crossing_record_sample_cpu'] = torch.from_numpy(
+                np.asarray(result['crossing_record_sample'])).contiguous()
         prepared_tracks['resampled_cache'].clear()
         prepared_tracks['resampled_cache'][cache_key] = bundle
         minimum_observed_spacing = float(result['minimum_observed_spacing'])
@@ -2369,6 +2556,23 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
             partner = int(partners_np[track_id, slot])
             mandatory[track_id].add(int(self_local_np[track_id, slot]))
             mandatory[partner].add(int(partner_local_np[track_id, slot]))
+    walk_crossings = prepared_tracks.get('walk_crossings')
+    if walk_crossings is not None:
+        walk_offsets = walk_crossings['offsets']
+        walk_self = walk_crossings['self_local']
+        for track_id in range(num_tracks):
+            mandatory[track_id].update(
+                map(int, walk_self[
+                    int(walk_offsets[track_id]):
+                    int(walk_offsets[track_id + 1])]))
+    if crossing_csr is not None:
+        crossing_offsets = crossing_csr['offsets']
+        crossing_self = crossing_csr['self_local']
+        for track_id in range(num_tracks):
+            mandatory[track_id].update(
+                map(int, crossing_self[
+                    int(crossing_offsets[track_id]):
+                    int(crossing_offsets[track_id + 1])]))
 
     sampled_parts = []
     source_index_parts = []
@@ -2473,6 +2677,28 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
             crossing_self_sample).to(device=device)
         bundle['crossing_partner_sample'] = torch.from_numpy(
             crossing_partner_sample).to(device=device)
+    if walk_crossings is not None:
+        walk_record_sample = np.empty(
+            len(walk_crossings['self_local']), dtype=np.int32)
+        for track_id in range(num_tracks):
+            begin = int(walk_crossings['offsets'][track_id])
+            end = int(walk_crossings['offsets'][track_id + 1])
+            for record in range(begin, end):
+                walk_record_sample[record] = local_maps[track_id][
+                    int(walk_crossings['self_local'][record])]
+        bundle['walk_record_sample'] = torch.from_numpy(
+            walk_record_sample).to(device=device)
+    if crossing_csr is not None:
+        crossing_record_sample = np.empty(
+            len(crossing_csr['self_local']), dtype=np.int32)
+        for track_id in range(num_tracks):
+            begin = int(crossing_csr['offsets'][track_id])
+            end = int(crossing_csr['offsets'][track_id + 1])
+            for record in range(begin, end):
+                crossing_record_sample[record] = local_maps[track_id][
+                    int(crossing_csr['self_local'][record])]
+        bundle['crossing_record_sample_cpu'] = torch.from_numpy(
+            crossing_record_sample).contiguous()
 
     # Run-scoped spacing edits can request a different density. Keep the cache
     # bounded to one whole-dataset resample rather than retaining every setting
@@ -2491,6 +2717,53 @@ def _build_resampled_track_bundle(prepared_tracks, min_spacing, max_spacing):
     return bundle
 
 
+def _sample_crossing_csr(csr, primaries, maximum, seed):
+    """Reference sampler for environments without the native crossing index."""
+    primaries = np.asarray(primaries, dtype=np.int32)
+    maximum = int(maximum)
+    shape = (len(primaries), maximum)
+    partners = np.full(shape, -1, dtype=np.int32)
+    records = np.full(shape, -1, dtype=np.int32)
+    partner_records = np.full(shape, -1, dtype=np.int32)
+    offsets = np.asarray(csr['offsets'], dtype=np.int64)
+    csr_partners = np.asarray(csr['partners'], dtype=np.int32)
+    self_local = np.asarray(csr['self_local'], dtype=np.int32)
+    partner_local = np.asarray(csr['partner_local'], dtype=np.int32)
+    for row, primary in enumerate(primaries):
+        begin, end = int(offsets[primary]), int(offsets[primary + 1])
+        count = min(maximum, end - begin)
+        if count <= 0:
+            continue
+        rng = np.random.default_rng(
+            (int(seed) + 0x9e3779b97f4a7c15 * (row + 1)) & ((1 << 64) - 1))
+        selected = rng.choice(
+            np.arange(begin, end, dtype=np.int32), size=count, replace=False)
+        for slot, record in enumerate(selected):
+            record = int(record)
+            partner = int(csr_partners[record])
+            reciprocal = -1
+            for candidate in range(
+                    int(offsets[partner]), int(offsets[partner + 1])):
+                if (int(csr_partners[candidate]) == int(primary)
+                        and int(self_local[candidate])
+                            == int(partner_local[record])
+                        and int(partner_local[candidate])
+                            == int(self_local[record])):
+                    reciprocal = candidate
+                    break
+            if reciprocal < 0:
+                raise ValueError(
+                    'crossing CSR requires reciprocal directed records')
+            partners[row, slot] = partner
+            records[row, slot] = record
+            partner_records[row, slot] = reciprocal
+    return {
+        'partners': partners,
+        'records': records,
+        'partner_records': partner_records,
+    }
+
+
 def _draw_track_sample(
         prepared_tracks, resampled, k, target_points, max_crossings,
         generator=None):
@@ -2507,10 +2780,50 @@ def _draw_track_sample(
             sampling_probabilities, k, replacement=True, generator=generator)
 
     crossing_partners = prepared_tracks.get('crossing_partners')
+    crossing_index = prepared_tracks.get('crossing_index')
+    crossing_csr = prepared_tracks.get('crossing_csr')
+    dynamic_crossings = crossing_index is not None or crossing_csr is not None
     partner_group = torch.empty(0, dtype=torch.int64, device=device)
     partner_slot = torch.empty(0, dtype=torch.int64, device=device)
     partner_track_idx = torch.empty(0, dtype=torch.int64, device=device)
-    if (crossing_partners is not None and crossing_partners.shape[1] > 0
+    selected_self_sample = torch.empty(
+        0, dtype=torch.int64, device=device)
+    selected_partner_sample = torch.empty(
+        0, dtype=torch.int64, device=device)
+    if dynamic_crossings and max_crossings > 0:
+        seed = int(torch.randint(
+            0, (1 << 63) - 1, (1,), dtype=torch.int64,
+            device=device, generator=generator).item())
+        primary_cpu = np.asarray(
+            primary_track_idx.detach().cpu(), dtype=np.int32)
+        native = _load_native_track_crossings()
+        if crossing_index is not None:
+            result = native.sample_crossing_partners(
+                crossing_index, primary_cpu, maximum=int(max_crossings),
+                seed=seed)
+        else:
+            result = _sample_crossing_csr(
+                crossing_csr, primary_cpu, max_crossings, seed)
+        selected_cpu = np.asarray(result['partners'], dtype=np.int32)
+        valid_cpu = selected_cpu >= 0
+        selected = torch.from_numpy(selected_cpu).to(device=device)
+        valid = selected >= 0
+        partner_track_idx = selected[valid].to(torch.int64)
+        partner_group = torch.arange(k, device=device)[:, None].expand_as(
+            selected)[valid]
+        partner_slot = torch.arange(
+            selected.shape[1], device=device)[None, :].expand_as(selected)[valid]
+        record_samples = resampled['crossing_record_sample_cpu']
+        selected_self_sample = record_samples[
+            torch.from_numpy(
+                np.asarray(result['records'], dtype=np.int32)[valid_cpu]).long()
+        ].to(device=device)
+        selected_partner_sample = record_samples[
+            torch.from_numpy(
+                np.asarray(
+                    result['partner_records'], dtype=np.int32)[valid_cpu]).long()
+        ].to(device=device)
+    elif (crossing_partners is not None and crossing_partners.shape[1] > 0
             and max_crossings > 0):
         selected = crossing_partners[primary_track_idx, :max_crossings]
         valid = selected >= 0
@@ -2566,10 +2879,14 @@ def _draw_track_sample(
     partner_cross_flat = torch.empty(0, dtype=torch.int64, device=device)
     partner_rows = torch.empty(0, dtype=torch.int64, device=device)
     if partner_track_idx.numel() > 0:
-        self_cross_local = resampled['crossing_self_sample'][
-            primary_track_idx[partner_group], partner_slot]
-        partner_cross_local = resampled['crossing_partner_sample'][
-            primary_track_idx[partner_group], partner_slot]
+        if dynamic_crossings:
+            self_cross_local = selected_self_sample
+            partner_cross_local = selected_partner_sample
+        else:
+            self_cross_local = resampled['crossing_self_sample'][
+                primary_track_idx[partner_group], partner_slot]
+            partner_cross_local = resampled['crossing_partner_sample'][
+                primary_track_idx[partner_group], partner_slot]
         partner_rows = torch.arange(
             k, len(track_idx), dtype=torch.int64, device=device)
         primary_cross_flat = row_starts[partner_group] + self_cross_local
@@ -2585,6 +2902,119 @@ def _draw_track_sample(
         'row_slot': row_slot,
         'num_groups': k,
         'group_width': max_crossings + 1,
+        'target_flat_idx': target_flat_idx,
+        'target_source_idx': target_source_idx,
+        'primary_cross_flat': primary_cross_flat,
+        'partner_cross_flat': partner_cross_flat,
+        'partner_rows': partner_rows,
+    }
+
+
+def _draw_track_walk_sample(
+        prepared_tracks, resampled, k, target_points, generator=None):
+    """Draw native crossing walks, then gather every complete track in them."""
+    device = prepared_tracks['device']
+    native = _load_native_track_crossings()
+    attempts = max(1024, k * 64)
+    probabilities = prepared_tracks.get('sampling_probabilities')
+    if probabilities is None:
+        probabilities_cpu = np.empty(0, dtype=np.float64)
+    else:
+        probabilities_cpu = prepared_tracks.get('sampling_probabilities_cpu')
+        if probabilities_cpu is None:
+            probabilities_cpu = np.asarray(
+                probabilities.detach().cpu(), dtype=np.float64)
+            prepared_tracks['sampling_probabilities_cpu'] = probabilities_cpu
+    seed = int(torch.randint(
+        0, (1 << 63) - 1, (1,), dtype=torch.int64,
+        device=device, generator=generator).item())
+    hops = int(prepared_tracks['n_walks_per_track'])
+    result = native.sample_walks_adaptive(
+        prepared_tracks['walk_index'], probabilities_cpu, seed=seed,
+        groups=k, target_points=target_points, hops=hops,
+        minimum_steps=int(prepared_tracks['min_walk_steps_per_track']),
+        maximum_steps=int(prepared_tracks['max_walk_steps_per_track']),
+        maximum_attempts=attempts,
+    )
+    produced = int(result['produced'])
+    if produced != k:
+        stats = prepared_tracks.get('walk_index_stats', {})
+        raise RuntimeError(
+            'track_walk could not produce the requested crossing-hop groups '
+            f'({produced}/{k} after {int(result["attempted_candidates"])} '
+            f'policy-compatible primary draws; '
+            f'{stats.get("eligible_tracks", "unknown")} eligible tracks, '
+            f'{hops} hops, raw-index bounds '
+            f'[{prepared_tracks["min_walk_steps_per_track"]}, '
+            f'{prepared_tracks["max_walk_steps_per_track"]}])')
+
+    width = hops + 1
+    track_matrix = torch.from_numpy(
+        np.asarray(result['tracks'], dtype=np.int64)).to(device=device)
+    record_matrix = torch.from_numpy(
+        np.asarray(result['records'], dtype=np.int64)).to(device=device)
+    track_idx = track_matrix.reshape(-1)
+    group_id = torch.arange(
+        k, device=device, dtype=torch.int64).repeat_interleave(width)
+    row_slot = torch.arange(
+        width, device=device, dtype=torch.int64).repeat(k)
+    row_lengths = resampled['lengths'][track_idx]
+    row_starts = torch.zeros(
+        len(track_idx) + 1, dtype=torch.int64, device=device)
+    torch.cumsum(row_lengths, dim=0, out=row_starts[1:])
+    row_id = torch.repeat_interleave(
+        torch.arange(len(track_idx), device=device), row_lengths)
+    local_idx = (
+        torch.arange(int(row_starts[-1]), device=device)
+        - row_starts[:-1][row_id])
+    flat_idx = resampled['offsets'][track_idx][row_id] + local_idx
+    flat_idx_cpu = flat_idx.cpu()
+    sampled_cpu = resampled['flat_zyx_cpu'][flat_idx_cpu]
+    if device.type == 'cuda':
+        staging = prepared_tracks.get('staging')
+        if staging is None or staging.shape != sampled_cpu.shape:
+            staging = torch.empty(
+                sampled_cpu.shape, dtype=torch.float32, pin_memory=True)
+            prepared_tracks['staging'] = staging
+        staging.copy_(sampled_cpu)
+        sampled_scroll = staging.to(device=device, non_blocking=False)
+    else:
+        sampled_scroll = sampled_cpu.to(device=device)
+
+    if target_points == 1:
+        target_local = torch.zeros(
+            [len(track_idx), 1], dtype=torch.int64, device=device)
+    else:
+        fractions = torch.linspace(0.0, 1.0, target_points, device=device)
+        target_local = torch.round(
+            fractions[None, :] * (row_lengths[:, None] - 1)).to(torch.int64)
+    target_flat_idx = row_starts[:-1, None] + target_local
+    target_source_idx = resampled['flat_source_local_cpu'][
+        flat_idx_cpu[target_flat_idx.reshape(-1).cpu()]].reshape(
+            len(track_idx), target_points).to(device=device)
+
+    hop_groups = torch.arange(k, device=device)[:, None]
+    hop_slots = torch.arange(hops, device=device)[None, :]
+    source_rows = (hop_groups * width + hop_slots).reshape(-1)
+    partner_rows = source_rows + 1
+    source_records = record_matrix[:, 0::2].reshape(-1)
+    partner_records = record_matrix[:, 1::2].reshape(-1)
+    record_samples = resampled['walk_record_sample']
+    primary_cross_flat = (
+        row_starts[source_rows] + record_samples[source_records])
+    partner_cross_flat = (
+        row_starts[partner_rows] + record_samples[partner_records])
+
+    return {
+        'track_idx': track_idx,
+        'sampled_scroll': sampled_scroll,
+        'row_id': row_id,
+        'row_starts': row_starts,
+        'row_lengths': row_lengths,
+        'group_id': group_id,
+        'row_slot': row_slot,
+        'num_groups': k,
+        'group_width': width,
         'target_flat_idx': target_flat_idx,
         'target_source_idx': target_source_idx,
         'primary_cross_flat': primary_cross_flat,
@@ -2611,6 +3041,28 @@ def _sample_prepared_track_points(
             f'max crossings must lie in [0, {prepared_crossings}] for this session')
     resampled = _build_resampled_track_bundle(
         prepared_tracks, min_sample_spacing, max_sample_spacing)
+
+    if prepared_tracks.get('track_crossing_mode', 'count') == 'track_walk':
+        if prefetch.prefetch_enabled() and device.type == 'cuda':
+            pf = prefetch.get_prefetcher()
+            generator = pf.torch_rng('tracks', device)
+            walk_key = (
+                'track_walk', k, num_points_per_track,
+                float(min_sample_spacing), float(max_sample_spacing),
+                int(prepared_tracks['min_walk_steps_per_track']),
+                int(prepared_tracks['max_walk_steps_per_track']),
+                int(prepared_tracks['n_walks_per_track']),
+                bool(prepared_tracks[
+                    'track_walk_require_loop_consistency']),
+            )
+            return pf.pop_or_run(
+                walk_key,
+                lambda: _draw_track_walk_sample(
+                    prepared_tracks, resampled, k,
+                    num_points_per_track, generator),
+            )
+        return _draw_track_walk_sample(
+            prepared_tracks, resampled, k, num_points_per_track)
 
     if prefetch.prefetch_enabled() and device.type == 'cuda':
         pf = prefetch.get_prefetcher()
@@ -2730,6 +3182,32 @@ def _grouped_same_radius_loss(
     return per_group.mean(), targets, hinged
 
 
+def _crossing_row_alignments(
+        shifted_radii, primary_cross_flat, partner_cross_flat,
+        partner_rows, row_count, chain=False):
+    row_alignment = torch.zeros(
+        row_count, device=shifted_radii.device, dtype=shifted_radii.dtype)
+    if chain:
+        edge_count = primary_cross_flat.numel()
+        group_count = row_count - edge_count
+        if edge_count == 0:
+            return row_alignment
+        if group_count <= 0 or edge_count % group_count:
+            raise ValueError("track-walk rows do not form fixed-width groups")
+        hops = edge_count // group_count
+        hop_deltas = (
+            shifted_radii[primary_cross_flat]
+            - shifted_radii[partner_cross_flat]
+        ).reshape(group_count, hops)
+        row_alignment[partner_rows] = hop_deltas.cumsum(dim=1).reshape(-1).detach()
+    else:
+        row_alignment[partner_rows] = (
+            shifted_radii[primary_cross_flat]
+            - shifted_radii[partner_cross_flat]
+        ).detach()
+    return row_alignment
+
+
 def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks, cfg, compute_dt=True, dt_max_winding=None, dt_target_cache=None):
     """Yield radius then DT losses so the caller can backward them separately.
 
@@ -2771,12 +3249,15 @@ def iter_track_losses(slice_to_spiral_transform, dr_per_winding, prepared_tracks
     # their exact shared voxel.  A single group target can then constrain all
     # points on both complete tracks to one winding.
     if sample['partner_rows'].numel() > 0:
-        row_alignment = torch.zeros(
-            len(track_idx), device=device, dtype=shifted_radii.dtype)
-        row_alignment[sample['partner_rows']] = (
-            shifted_radii[sample['primary_cross_flat']]
-            - shifted_radii[sample['partner_cross_flat']]
-        ).detach()
+        # Walk hops propagate the accumulated offset from the preceding,
+        # already aligned row. Count mode retains its independent primary to
+        # partner alignment.
+        row_alignment = _crossing_row_alignments(
+            shifted_radii, sample['primary_cross_flat'],
+            sample['partner_cross_flat'], sample['partner_rows'],
+            len(track_idx),
+            chain=(prepared_tracks.get(
+                'track_crossing_mode', 'count') == 'track_walk'))
         flat_alignment = row_alignment[row_id]
         shifted_radii = shifted_radii + flat_alignment
         crossing_adjustments = crossing_adjustments + flat_alignment

@@ -1583,6 +1583,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
 
 LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     fs::path manifestPath,
+    double workingToBaseScale,
     std::vector<vc::lasagna::LineControlPoint> controlPoints,
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
@@ -1593,7 +1594,8 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     int activeEnd)
 {
     vc::lasagna::LasagnaDataset dataset =
-        vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaDataset::open(
+            manifestPath, {workingToBaseScale});
     vc::lasagna::LasagnaNormalSampler sampler(dataset);
     return optimizeLineWithSampler(std::move(manifestPath),
                                    std::move(controlPoints),
@@ -1743,25 +1745,6 @@ LineAnnotationController::LineAnnotationController(CState* state,
     , _fiberSliceOverlay(std::make_unique<FiberSliceOverlayController>())
     , _datasetPicker([this](QWidget* parent, const fs::path& startDir) {
         return pickDataset(parent, startDir);
-    })
-    , _optimizationTaskFactory([](fs::path manifestPath,
-                                  std::vector<vc::lasagna::LineControlPoint> controlPoints,
-                                  std::vector<cv::Vec3d> initialLinePoints,
-                                  cv::Vec3d sourceSliceNormal,
-                                  InitialDirectionMode directionMode,
-                                  int initialCenterlineLengthVx,
-                                  bool forceFullOptimization,
-                                  int activeStart,
-                                  int activeEnd) {
-        return optimizeLineFromManifest(std::move(manifestPath),
-                                        std::move(controlPoints),
-                                        std::move(initialLinePoints),
-                                        sourceSliceNormal,
-                                        directionMode,
-                                        initialCenterlineLengthVx,
-                                        forceFullOptimization,
-                                        activeStart,
-                                        activeEnd);
     })
 {
     if (_state) {
@@ -6999,6 +6982,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
             });
 
     const auto manifestPath = session.selectedManifestPath;
+    const double workingToBaseScale = session.workingToBaseScale;
     auto factory = _optimizationTaskFactory;
     auto controlPoints = session.controlPoints;
     std::vector<cv::Vec3d> initialLinePoints;
@@ -7024,6 +7008,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            forceFullOptimization,
                                            activeStart,
                                            activeEnd,
+                                           workingToBaseScale,
                                            dataset,
                                            normalSampler]() mutable {
         if (factory) {
@@ -7051,6 +7036,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            *normalSampler);
         }
         return optimizeLineFromManifest(manifestPath,
+                                        workingToBaseScale,
                                         std::move(controlPoints),
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
@@ -7645,6 +7631,7 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
                                         activeEnd);
     }
     return optimizeLineFromManifest(std::move(manifestPath),
+                                    1.0,
                                     std::move(controlPoints),
                                     std::move(initialLinePoints),
                                     sourceSliceNormal,
