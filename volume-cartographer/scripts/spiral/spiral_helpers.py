@@ -850,6 +850,88 @@ def _infer_shell_outer_winding_idx(
     return int(observed_max + cfg['shell_outer_winding_margin'])
 
 
+def _resolve_shell_outer_winding_idx(cfg):
+    # Winding bound shared by every sampler that integrates over the spiral
+    # cylinder: the dense lasagna losses, the symmetric Dirichlet
+    # regulariser and the phase bundle (incl. min_spacing). Resolved once per
+    # run from the config; the shell branch may still override it with the
+    # inferred value. None disables those samplers (they early-return zero),
+    # whatever their weights: _structurally_disabled_dense_weight_keys
+    # reports that combination so the run can warn instead of staying silent.
+    configured = cfg['shell_outer_winding_idx']
+    if configured is None:
+        return None
+    try:
+        resolved = int(configured)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f'shell_outer_winding_idx must be an integer >= 2 or None, '
+            f'got {configured!r}')
+    if resolved < 2:
+        # sample_spiral_surface_frame draws windings from [1, idx); 0 and 1
+        # crash multinomial/arange at the first step with an opaque error.
+        raise ValueError(
+            f'shell_outer_winding_idx must be an integer >= 2 or None, '
+            f'got {configured!r}')
+    return resolved
+
+
+def resolve_outer_winding_idx_and_notes(cfg, shell_active, infer_outer_winding_idx):
+    """Resolve the run's outer winding index and the lines to print for it.
+
+    ``infer_outer_winding_idx`` is a zero-argument callable, invoked only
+    when shell losses are active and the config key is None (the historical
+    inference path). Returns ``(index_or_none, notes)``.
+    """
+    idx = _resolve_shell_outer_winding_idx(cfg)
+    notes = []
+    if shell_active:
+        if idx is None:
+            idx = int(infer_outer_winding_idx())
+            notes.append(f'inferred shell_outer_winding_idx = {idx}')
+        else:
+            notes.append(f'using configured shell_outer_winding_idx = {idx}')
+    elif idx is not None:
+        notes.append(
+            'no outer-shell losses; using configured shell_outer_winding_idx '
+            f'= {idx} for the dense and regularisation losses')
+    if idx is not None:
+        min_gap = idx + 3
+        if cfg['gap_expander_num_windings'] < min_gap:
+            notes.append(
+                f'WARNING: shell_outer_winding_idx {idx} requires '
+                f'gap_expander_num_windings >= {min_gap}, got '
+                f'gap_expander_num_windings {cfg["gap_expander_num_windings"]}; '
+                'increase gap_expander_num_windings or lower '
+                'shell_outer_winding_idx')
+    return idx, notes
+
+
+# Every loss weight whose term samples out to shell_outer_winding_idx and is
+# therefore silently zero while that index is unresolved.
+_DENSE_WEIGHT_KEYS_NEEDING_OUTER_WINDING_IDX = (
+    'loss_weight_dense_normals',
+    'loss_weight_dense_spacing',
+    'loss_weight_dense_spacing_count',
+    'loss_weight_dense_spacing_density',
+    'loss_weight_dense_attachment',
+    'loss_weight_min_spacing',
+    'loss_weight_sym_dirichlet',
+)
+
+
+def _structurally_disabled_dense_weight_keys(cfg, shell_outer_winding_idx):
+    """Nonzero weights that cannot produce a loss because no outer winding
+    index could be resolved (config key is None and no outer shell inferred
+    one)."""
+    if shell_outer_winding_idx is not None:
+        return ()
+    return tuple(
+        key for key in _DENSE_WEIGHT_KEYS_NEEDING_OUTER_WINDING_IDX
+        if cfg.get(key, 0.0) > 0
+    )
+
+
 def _warn_if_inputs_exceed_flow_bounds(
     patch_ids,
     patch_extents,

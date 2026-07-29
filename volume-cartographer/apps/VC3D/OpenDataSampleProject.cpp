@@ -490,6 +490,13 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         bool inferredSourceCoordinateLevel = false;
     };
     std::vector<PredictionCandidate> predictions;
+    struct VirtualSourceCandidate {
+        const OpenDataVolume* volume = nullptr;
+        std::string sourceUrl;
+        int sourceCoordinateLevel = 0;
+        std::string representationLabel;
+    };
+    std::vector<VirtualSourceCandidate> virtualSources;
     std::vector<std::string> attachedLocations;
 
     for (std::size_t volumeIndex = 0; volumeIndex < sample.volumes.size();
@@ -520,6 +527,30 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
              artifactIndex < volume.artifacts.size(); ++artifactIndex) {
             const auto& artifact = volume.artifacts[artifactIndex];
             const std::string url = artifactUrl(artifact);
+            if (lowerCopy(artifact.type) == kLasagnaArtifactType) {
+                if (selection &&
+                    !selection->allowsRepresentation(
+                        volumeIndex, artifactIndex,
+                        OpenDataRepresentationKind::Lasagna, volume.id)) {
+                    continue;
+                }
+                if (!artifact.levelParameterPresent ||
+                    !artifact.sourceCoordinateLevel) {
+                    result.messages.push_back(
+                        "Skipped coordinate view for " +
+                        volumeArtifactLabel(volume, artifact) +
+                        ": parameters.level is missing or invalid.");
+                    continue;
+                }
+                if (*artifact.sourceCoordinateLevel > 0) {
+                    virtualSources.push_back(VirtualSourceCandidate{
+                        &volume,
+                        preferredSourceUrl,
+                        *artifact.sourceCoordinateLevel,
+                        volumeArtifactLabel(volume, artifact)});
+                }
+                continue;
+            }
             if (!isSupportedRemoteZarr(volume, artifact, url)) {
                 continue;
             }
@@ -618,7 +649,6 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         }
     }
 
-    std::vector<std::string> attachedVirtualLocators;
     for (const auto& candidate : predictions) {
         const auto& volume = *candidate.volume;
         const auto& prediction = *candidate.prediction;
@@ -671,8 +701,40 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         if (level == 0)
             continue;
 
+        virtualSources.push_back(VirtualSourceCandidate{
+            &volume, candidate.sourceUrl, level, predictionLabel});
+    }
+
+    std::vector<std::string> attachedVirtualLocators;
+    for (const auto& candidate : virtualSources) {
+        const auto& volume = *candidate.volume;
+        const int level = candidate.sourceCoordinateLevel;
+        if (candidate.sourceUrl.empty() ||
+            std::find(attachedLocations.begin(), attachedLocations.end(),
+                      candidate.sourceUrl) == attachedLocations.end()) {
+            ++result.failedVolumes;
+            result.messages.push_back(
+                "Skipped virtual source for " +
+                candidate.representationLabel +
+                ": preferred source Zarr is unavailable or was not attached.");
+            continue;
+        }
+        if (!volume.pixelSizeUm || !std::isfinite(*volume.pixelSizeUm) ||
+            *volume.pixelSizeUm <= 0.0) {
+            ++result.failedVolumes;
+            result.messages.push_back(
+                "Skipped coordinate pairing for " +
+                candidate.representationLabel +
+                ": source volume has no positive voxel size.");
+            continue;
+        }
+
+        const double effectiveVoxelSize =
+            *volume.pixelSizeUm *
+            static_cast<double>(std::uint64_t{1} << level);
         const auto virtualLocator = vc::parseRemoteVolumeSpec(
-            candidate.sourceUrl + "#vc-base-scale=" + std::to_string(level)).portableLocator;
+            candidate.sourceUrl + "#vc-base-scale=" +
+            std::to_string(level)).portableLocator;
         if (std::find(attachedVirtualLocators.begin(), attachedVirtualLocators.end(),
                       virtualLocator) != attachedVirtualLocators.end()) {
             continue;
