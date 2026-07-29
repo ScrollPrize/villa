@@ -1459,7 +1459,7 @@ def get_unattached_pcl_strip_losses(
     sampled_flat_indices = np.empty([num_rows, num_points_per_pcl], dtype=np.int64)
     for k, comp_idx in enumerate(chosen_comps):
         members = component_strip_lists[comp_idx]
-        edges = component_edges[comp_idx] if component_edges is not None else []
+        edges = component_edges[comp_idx]
         if len(members) == 1 or not edges:
             strip_idx = members[np.random.randint(len(members))]
             segments = [(strip_idx, 0, len(pcl_strips[strip_idx]['zyxs']) - 1)]

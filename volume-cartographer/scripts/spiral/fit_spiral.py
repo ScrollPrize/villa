@@ -87,6 +87,7 @@ from spiral_helpers import (
     load_fiber_point_collection,
     load_fiber_point_collections,
     resolve_fiber_links,
+    build_link_components,
     merge_linked_point_collections,
     SequenceChain,
     scale_counts_for_z_range,
@@ -1010,6 +1011,15 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         general_hit_policy='largest_area',
     )
 
+    # Every pcl carries the uniform chain interface (pcl['chain'], see
+    # spiral_helpers.Chain): a SequenceChain over the id-sorted point order
+    # (lazy, so later point-dict replacements are picked up). Consumers go
+    # through this and never assume id-sorted order is chain-valid.
+    # merge_linked_point_collections below replaces link-connected members with
+    # a merged component pcl carrying a graph-routing ComponentChain instead.
+    for pcl in point_collections.values():
+        pcl['chain'] = SequenceChain(pcl)
+
     # ==========================================================================
     # Cross-fiber links ("branches")
     # ==========================================================================
@@ -1030,6 +1040,12 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             include_pending=cfg.get('use_pending_fiber_links', False),
         )
         print(f'fiber links: {len(resolved_links)} resolved')
+    # One shared component decomposition over the link graph, consumed twice:
+    # the cross-patch merge below unions each component's attached points, and
+    # rebuild_unattached_components maps the same components onto unattached
+    # strips for the walk-sampling loss.
+    link_components = build_link_components(resolved_links)
+    linked_cids = {cid for member_cids, _ in link_components for cid in member_cids}
 
     # ==========================================================================
     # Point collection classification
@@ -1082,7 +1098,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             continue
         if num_attached >= 2:
             cross_patch_point_collections[pid] = pcl
-        if num_unattached >= 1:
+        # Link-component members join the unattached pool even when fully
+        # attached: their strip is the geometry the component's chain walks (and
+        # theta=0 unwrap) run through between the fibers they link.
+        if num_unattached >= 1 or pid in linked_cids:
             unattached_point_collections[pid] = copy.deepcopy(pcl) if num_attached >= 2 else pcl
 
     # Merge each set of collections joined by cross-fiber links into one
@@ -1092,14 +1111,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # chain function that routes between any two points along the fibers, hopping
     # to the linked fiber at each junction. A junction hop is just another chain
     # step between nearly-coincident points (|dtheta| < pi), so the ordinary
-    # theta=0 unwrap along the chain handles the seam; whether the junction
-    # points themselves are attached to patches is irrelevant -- the chain merely
-    # passes through them. Members are removed from the cross-patch pool (the
-    # merged pcl subsumes their within-fiber pairs); their unattached role is
-    # untouched (handled by the walk-sampling in the unattached-strip loss).
-    if resolved_links:
+    # theta=0 unwrap along the chain handles the seam. Members are removed
+    # from the cross-patch pool (the merged pcl subsumes their within-fiber
+    # pairs); their unattached role is untouched (handled by the walk-sampling in
+    # the unattached-strip loss).
+    if link_components:
         cross_patch_point_collections, num_merged = merge_linked_point_collections(
-            point_collections, resolved_links, cross_patch_point_collections)
+            point_collections, link_components, cross_patch_point_collections)
         if num_merged:
             print(f'fiber links: merged into {num_merged} cross-patch components')
 
@@ -1136,11 +1154,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # winding-number loss. Patches are ordered by the first attached point that
     # hits them when scanning the pcl's points in int(json-key) order; within
     # each patch, points are also in int(key) order.
-    # Also give every pcl the uniform chain interface (pcl['chain'], see
-    # spiral_helpers.Chain); merged fiber-link components arrive with their
-    # graph-routing ComponentChain already attached, ordinary pcls get a
-    # SequenceChain over the id-sorted order. Consumers go through this and
-    # never assume id-sorted order is chain-valid.
     for pcl in cross_patch_point_collections.values():
         points_by_patch = {}
         for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0])):
@@ -1151,8 +1164,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 continue
             points_by_patch.setdefault(pid, []).append(point)
         pcl['points_by_patch'] = points_by_patch
-        if 'chain' not in pcl:
-            pcl['chain'] = SequenceChain(pcl)
     unattached_pcl_strips = _UnattachedPclStripList()
     unattached_strip_sampling_groups = []  # parallel to unattached_pcl_strips
     min_point_spacing = cfg['unattached_pcl_min_point_spacing']
@@ -1258,43 +1269,36 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         unattached_component_groups.clear()
         unattached_component_edges.clear()
         strip_by_coll = {strip['id']: idx for idx, strip in enumerate(unattached_pcl_strips)}
-        # Strip-level link adjacency: only links whose BOTH endpoint collections
-        # survive as unattached strips (some linked fibers are fully attached and
-        # have no unattached strip) AND whose endpoints survived the z-roi trim
-        # (they are exempt from decimation; see the strip loop above).
-        adjacency = {idx: [] for idx in range(len(unattached_pcl_strips))}
-        edges_by_strip = {idx: [] for idx in range(len(unattached_pcl_strips))}
-        for link in resolved_links:
-            a = strip_by_coll.get(link['a_coll'])
-            b = strip_by_coll.get(link['b_coll'])
-            if a is None or b is None or a == b:
+        # Strip-level view of the shared link_components decomposition. A link's
+        # junction survives here only when both endpoints survived the z-roi trim
+        # (they are exempt from decimation; see the strip loop above); a walk
+        # simply never crosses a dropped junction, so a component with trimmed
+        # links degrades to islands sampled independently within one entry.
+        in_linked_component = set()
+        for member_cids, member_links in link_components:
+            comp_members = [strip_by_coll[cid] for cid in member_cids if cid in strip_by_coll]
+            if not comp_members:
                 continue
-            pos_a = unattached_pcl_strips[a].get('link_points', {}).get(link['a_point'])
-            pos_b = unattached_pcl_strips[b].get('link_points', {}).get(link['b_point'])
-            if pos_a is None or pos_b is None:
-                continue
-            adjacency[a].append(b)
-            adjacency[b].append(a)
-            edges_by_strip[a].append((a, pos_a, b, pos_b))
-        # Connected components over the link adjacency.
-        seen = set()
-        for start in range(len(unattached_pcl_strips)):
-            if start in seen:
-                continue
-            comp_members = []
-            queue = [start]
-            seen.add(start)
-            while queue:
-                node = queue.pop(0)
-                comp_members.append(node)
-                for neighbour in adjacency[node]:
-                    if neighbour not in seen:
-                        seen.add(neighbour)
-                        queue.append(neighbour)
+            in_linked_component.update(comp_members)
+            edges = []
+            for link in member_links:
+                a = strip_by_coll.get(link['a_coll'])
+                b = strip_by_coll.get(link['b_coll'])
+                if a is None or b is None or a == b:
+                    continue
+                pos_a = unattached_pcl_strips[a].get('link_points', {}).get(link['a_point'])
+                pos_b = unattached_pcl_strips[b].get('link_points', {}).get(link['b_point'])
+                if pos_a is None or pos_b is None:
+                    continue
+                edges.append((a, pos_a, b, pos_b))
             unattached_components.append(comp_members)
-            unattached_component_groups.append(unattached_strip_sampling_groups[start])
-            unattached_component_edges.append(
-                [edge for member in comp_members for edge in edges_by_strip[member]])
+            unattached_component_groups.append(unattached_strip_sampling_groups[comp_members[0]])
+            unattached_component_edges.append(edges)
+        for idx in range(len(unattached_pcl_strips)):
+            if idx not in in_linked_component:
+                unattached_components.append([idx])
+                unattached_component_groups.append(unattached_strip_sampling_groups[idx])
+                unattached_component_edges.append([])
 
     def rebuild_pcl_sampling_strata():
         pcl_sampling_strata['cross_patch'] = build_pcl_sampling_strata(
@@ -2424,6 +2428,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                         point['zyx'] = np.array(
                             [point['p'][2], point['p'][1], point['p'][0]],
                             dtype=np.float32)
+                    pcl['chain'] = SequenceChain(pcl)
                 link_points_to_patches(
                     verified_patches,
                     new_collections,
@@ -2485,8 +2490,6 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                             continue
                         points_by_patch.setdefault(pid, []).append(point)
                     pcl['points_by_patch'] = points_by_patch
-                    if 'chain' not in pcl:
-                        pcl['chain'] = SequenceChain(pcl)
                     cross_patch_pcls.append(pcl)
 
                 min_point_spacing = cfg['unattached_pcl_min_point_spacing']

@@ -451,7 +451,9 @@ def build_rel_adjacency(cross_patch_pcls, patches, transform, dr):
     For each relative-winding pcl we walk its chain-valid point sequence
     (pcl['chain'].iter_chain(): id-sorted order for ordinary pcls, an Euler tour
     of the member tree for merged fiber-link components -- whose id-sorted order is
-    not chain-valid across members) and connect each *consecutive* pair of
+    not chain-valid across members -- crossing each loop-closing non-tree link
+    once too, so link cycles contribute their own patch edges and inconsistent
+    holonomy around them is detectable) and connect each *consecutive* pair of
     attached points that lands on two different (loaded) patches. Each such pair
     yields a pair of directed edges, one per direction. An edge records the
     departure point (`from_ij`) on this patch, the arrival point (`to_ij`) on
