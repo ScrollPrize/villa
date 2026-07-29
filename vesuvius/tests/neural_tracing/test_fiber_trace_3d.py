@@ -3356,6 +3356,7 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.inference_block_batch_size == 2
     assert args.max_cached_inference_gib == pytest.approx(8.0)
     assert args.normal_sampler == "sparse-corner-principal"
+    assert args.whole_fiber_start_cp_index == 0
     assert args.vis is False
     assert args.profile is False
 
@@ -3381,6 +3382,30 @@ def test_native_3d_trace2cp_cli_accepts_multiple_fiber_jsons(
     args = _parse_args()
 
     assert args.fiber_json == [Path("a.json"), Path("b.json")]
+
+
+def test_native_3d_trace2cp_cli_accepts_whole_fiber_start_cp_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "trace2cp_tool",
+            "config.json",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--export-dir",
+            "out",
+            "--fiber-json",
+            "fiber.json",
+            "--whole-fiber-start-cp-index",
+            "7",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.whole_fiber_start_cp_index == 7
 
 
 def test_native_3d_trace2cp_multi_fiber_output_stems_are_indexed() -> None:
@@ -3853,6 +3878,52 @@ def test_native_3d_whole_fiber_trace_all_success_has_zero_restarts_per_kvx() -> 
     assert result.restarts_per_kvx == pytest.approx(0.0)
     assert [segment.success for segment in result.segments] == [True, True]
     assert np.allclose(result.stitched_trace_zyx[[0, -1]], [[0.0, 0.0, 0.0], [0.0, 0.0, 20.0]])
+
+
+def test_native_3d_whole_fiber_trace_can_start_at_later_control_point() -> None:
+    record = _whole_native_trace_record()
+    cache = SimpleNamespace(_blocks={})
+    starts: list[np.ndarray] = []
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        starts.append(np.asarray(start_zyx, dtype=np.float32).copy())
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, target_zyx], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_voxels=1.0,
+        start_cp_index=1,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.segment_count == 1
+    assert result.reference_length_voxels == pytest.approx(10.0)
+    assert result.restarts_per_kvx == pytest.approx(0.0)
+    assert [(segment.start_cp_index, segment.target_cp_index) for segment in result.segments] == [(1, 2)]
+    assert np.allclose(starts[0], [0.0, 0.0, 10.0])
+    assert np.allclose(result.stitched_trace_zyx[[0, -1]], [[0.0, 0.0, 10.0], [0.0, 0.0, 20.0]])
+
+
+def test_native_3d_whole_fiber_trace_rejects_start_at_final_control_point() -> None:
+    record = _whole_native_trace_record()
+    cache = SimpleNamespace(_blocks={})
+
+    with pytest.raises(ValueError, match="start CP index"):
+        trace_native_3d_whole_fiber(
+            cache,
+            record=record,
+            cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+            error_threshold_voxels=1.0,
+            start_cp_index=2,
+            trace_segment_fn=lambda *_args, **_kwargs: None,
+        )
 
 
 def test_native_3d_whole_fiber_trace_restarts_after_plane_miss() -> None:

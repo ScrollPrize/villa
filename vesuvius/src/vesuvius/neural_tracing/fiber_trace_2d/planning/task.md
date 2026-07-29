@@ -1,13 +1,15 @@
-# Python Native 3D Trace2CP CP Label Placement
+# Python Native 3D Trace2CP Whole-Fiber Start CP
 
-Change native 3D whole-fiber Trace2CP visualization so CP labels no longer
-cover the point markers.
+Allow the Python native 3D Trace2CP whole-fiber metric to start at a selected
+control point so smaller failing suffixes of a fiber can be tested quickly.
 
 Requirements:
 
-- draw CP distance labels at the bottom of the respective strip instead of next
-  to/on top of the CP marker;
-- include the CP index in the label so the user can pass it back through
-  `--start-cp-index` / `--target-cp-index`;
-- keep the CP marker itself visible;
-- do not change tracing, metrics, inference, or output selection behavior.
+- add a CLI argument for whole-fiber start CP selection;
+- keep existing `--start-cp-index` / `--target-cp-index` as explicit
+  single-segment selection, not whole-fiber suffix selection;
+- trace from the selected CP through the final CP;
+- compute the restart-rate denominator over the original line length from the
+  selected CP to the final CP;
+- reject invalid start CP values that do not leave at least one segment;
+- preserve default CP0 behavior.

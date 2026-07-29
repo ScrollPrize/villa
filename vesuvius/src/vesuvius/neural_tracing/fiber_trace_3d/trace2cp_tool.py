@@ -4902,6 +4902,7 @@ def trace_native_3d_whole_fiber(
     record: Any,
     cfg: NativeTrace2CpConfig,
     error_threshold_voxels: float,
+    start_cp_index: int = 0,
     progress: bool = False,
     segment_callback: Callable[[NativeWholeFiberSegmentResult, NativeWholeFiberResult | None], None] | None = None,
     trace_segment_fn: Callable[..., NativeTraceResult] | None = None,
@@ -4915,39 +4916,50 @@ def trace_native_3d_whole_fiber(
     threshold = float(error_threshold_voxels)
     if not math.isfinite(threshold) or threshold < 0.0:
         raise ValueError("whole-fiber error threshold must be finite and >= 0")
+    first_cp = int(start_cp_index)
+    if first_cp < 0 or first_cp >= cp_count - 1:
+        raise ValueError(
+            "native whole-fiber start CP index must leave at least one target segment: "
+            f"start_cp_index={first_cp} control_points={cp_count}"
+        )
+    final_cp = cp_count - 1
     arc_by_cp = _control_point_reference_arc_voxels(record)
-    total_reference_length_voxels = float(abs(float(arc_by_cp[-1]) - float(arc_by_cp[0])))
+    reference_origin_arc = float(arc_by_cp[first_cp])
+    total_reference_length_voxels = float(
+        abs(float(arc_by_cp[final_cp]) - reference_origin_arc)
+    )
     total_reference_length_meters = _reference_line_length_meters_between_cps(
         record,
-        start_cp_index=0,
-        end_cp_index=cp_count - 1,
+        start_cp_index=first_cp,
+        end_cp_index=final_cp,
     )
-    segment_count = cp_count - 1
+    segment_count = final_cp - first_cp
     tracer = trace_native_3d_one_way if trace_segment_fn is None else trace_segment_fn
     run_start = time.perf_counter()
     segments: list[NativeWholeFiberSegmentResult] = []
     stitched_parts: list[np.ndarray] = []
     restart_count = 0
     last_persisted_restart_count = 0
-    last_success_cp_index = 0
-    current_point = cp_points[0].astype(np.float32)
+    last_success_cp_index = first_cp
+    current_point = cp_points[first_cp].astype(np.float32)
     current_direction = _fiber_line_tangent_zyx_toward_target(
         record,
-        start_control_point_index=0,
-        target_control_point_index=1,
+        start_control_point_index=first_cp,
+        target_control_point_index=first_cp + 1,
     )
 
-    def emit_progress(segment_index: int, segment: NativeWholeFiberSegmentResult | None = None) -> None:
+    def emit_progress(completed_segments: int, segment: NativeWholeFiberSegmentResult | None = None) -> None:
         nonlocal last_persisted_restart_count
         if not progress:
             return
-        done = int(segment_index)
+        done = int(completed_segments)
+        absolute_done_cp = min(first_cp + done, final_cp)
         elapsed = max(0.0, time.perf_counter() - run_start)
         frac = float(done) / float(max(1, segment_count))
         eta = None if frac <= 1.0e-6 else elapsed * (1.0 - frac) / frac
         status = "pending" if segment is None else ("ok" if segment.success else f"restart:{segment.reason}")
         reference_length = (
-            float(abs(float(arc_by_cp[min(done, cp_count - 1)]) - float(arc_by_cp[0])))
+            float(abs(float(arc_by_cp[absolute_done_cp]) - reference_origin_arc))
             if done > 0
             else 0.0
         )
@@ -4955,8 +4967,8 @@ def trace_native_3d_whole_fiber(
         reference_length_meters = (
             _reference_line_length_meters_between_cps(
                 record,
-                start_cp_index=0,
-                end_cp_index=min(done, cp_count - 1),
+                start_cp_index=first_cp,
+                end_cp_index=absolute_done_cp,
             )
             if done > 0
             else None
@@ -4980,6 +4992,7 @@ def trace_native_3d_whole_fiber(
             run_start,
             detail=(
                 f"segment={min(done + 1, segment_count)}/{segment_count} "
+                f"cp={first_cp}->{absolute_done_cp}/{final_cp} "
                 f"status={status} restarts={restart_count} "
                 f"err/kvx={_format_trace2cp_kvx_rate(restarts_per_kvx)} "
                 f"{physical_detail}"
@@ -4994,9 +5007,9 @@ def trace_native_3d_whole_fiber(
         return int(getattr(cache, "total_inferred_blocks", len(cache._blocks)))
 
     emit_progress(0)
-    for segment_index in range(segment_count):
-        start_cp = int(segment_index)
-        target_cp = int(segment_index + 1)
+    for segment_offset in range(segment_count):
+        start_cp = int(first_cp + segment_offset)
+        target_cp = int(start_cp + 1)
         previous_segment_success = bool(segments and segments[-1].success)
         target_point = cp_points[target_cp].astype(np.float32)
         reference_start = cp_points[start_cp].astype(np.float32)
@@ -5034,7 +5047,7 @@ def trace_native_3d_whole_fiber(
         if success:
             reason = result.reason
             restart = False
-            reference_arc = float(arc_by_cp[target_cp])
+            reference_arc = float(abs(float(arc_by_cp[target_cp]) - reference_origin_arc))
             current_point = crossing
             current_direction = _terminal_trace_direction(result.trace_zyx, fallback=current_direction)
             last_success_cp_index = target_cp
@@ -5042,7 +5055,9 @@ def trace_native_3d_whole_fiber(
             reason = result.reason if not bool(result.reached_target_plane) else "in_plane_error"
             restart = True
             restart_count += 1
-            reference_arc = float(arc_by_cp[last_success_cp_index])
+            reference_arc = float(
+                abs(float(arc_by_cp[last_success_cp_index]) - reference_origin_arc)
+            )
             current_point = target_point
             if target_cp < cp_count - 1:
                 current_direction = _fiber_line_tangent_zyx_toward_target(
@@ -5070,10 +5085,12 @@ def trace_native_3d_whole_fiber(
             step_count=int(len(result.steps)),
         )
         segments.append(segment)
-        partial_reference_length_voxels = float(abs(float(arc_by_cp[target_cp]) - float(arc_by_cp[0])))
+        partial_reference_length_voxels = float(
+            abs(float(arc_by_cp[target_cp]) - reference_origin_arc)
+        )
         partial_reference_length_meters = _reference_line_length_meters_between_cps(
             record,
-            start_cp_index=0,
+            start_cp_index=first_cp,
             end_cp_index=target_cp,
         )
         partial = NativeWholeFiberResult(
@@ -5098,7 +5115,7 @@ def trace_native_3d_whole_fiber(
                 else _NullNativeTraceProfileSpan()
             ):
                 segment_callback(segment, partial)
-        emit_progress(segment_index + 1, segment)
+        emit_progress(segment_offset + 1, segment)
     stitched = (
         np.concatenate([part for part in stitched_parts if part.size], axis=0).astype(np.float32)
         if any(part.size for part in stitched_parts)
@@ -6781,6 +6798,7 @@ def run_native_trace2cp(
     output_stem: str = "trace2cp_native_3d",
     prediction_adapter: FiberTrace3DPredictAdapter | None = None,
     model: torch.nn.Module | None = None,
+    whole_fiber_start_cp_index: int = 0,
 ) -> NativeTracePairResult | NativeWholeFiberResult:
     raw_config = _load_raw_config(config_path)
     cfg = NativeTrace2CpConfig() if native_cfg is None else native_cfg
@@ -6791,6 +6809,11 @@ def run_native_trace2cp(
         start_cp_index=start_cp_index,
         target_cp_index=target_cp_index,
     )
+    whole_start_cp = int(whole_fiber_start_cp_index)
+    if not whole_mode and whole_start_cp != 0:
+        raise ValueError(
+            "--whole-fiber-start-cp-index only applies to whole-fiber --fiber-json mode"
+        )
     tool_raw_config = _tool_raw_config(raw_config, fiber_json=fiber_path)
     loader_config = _load_tool_config(config_path, raw_config, fiber_json=fiber_path)
     loader = FiberTrace3DLoader(loader_config)
@@ -7053,10 +7076,12 @@ def run_native_trace2cp(
                 active_start_cp_index = int(segment.target_cp_index)
 
         cp_count = int(record.fiber.control_points_zyx.shape[0])
+        final_cp_index = cp_count - 1
         print(
             "native_trace2cp_3d whole_fiber "
             f"fiber_path={'' if record.fiber.path is None else record.fiber.path} "
-            f"control_points={cp_count} segments={max(0, cp_count - 1)} "
+            f"control_points={cp_count} start_cp={whole_start_cp} "
+            f"target_cp={final_cp_index} segments={max(0, final_cp_index - whole_start_cp)} "
             f"threshold_voxels={float(cfg.whole_fiber_error_threshold_voxels):.3f}",
             flush=True,
         )
@@ -7069,6 +7094,7 @@ def run_native_trace2cp(
             record=record,
             cfg=cfg,
             error_threshold_voxels=float(cfg.whole_fiber_error_threshold_voxels),
+            start_cp_index=int(whole_start_cp),
             progress=True,
             segment_callback=on_segment if render_visualization else None,
             normal_sampler=normal_sampler,
@@ -7082,6 +7108,8 @@ def run_native_trace2cp(
             "mode": "whole_fiber",
             "fiber_path": "" if record.fiber.path is None else str(record.fiber.path),
             "control_point_count": int(cp_count),
+            "start_control_point_index": int(whole_start_cp),
+            "target_control_point_index": int(final_cp_index),
             "segment_count": int(whole.segment_count),
             "restart_count": int(whole.restart_count),
             "native_trace2cp_fiber_restarts_per_kvx": float(whole.restarts_per_kvx),
@@ -7425,6 +7453,7 @@ def run_native_trace2cp_many(
     normal_principal_axis_method: str = "config",
     debug_compare_normal_sampler: str | None = None,
     debug_normal_angle_threshold_degrees: float = 1.0,
+    whole_fiber_start_cp_index: int = 0,
 ) -> NativeWholeFiberResult | NativeMultiFiberResult:
     paths = [Path(path) for path in fiber_jsons]
     if not paths:
@@ -7447,6 +7476,7 @@ def run_native_trace2cp_many(
             normal_principal_axis_method=normal_principal_axis_method,
             debug_compare_normal_sampler=debug_compare_normal_sampler,
             debug_normal_angle_threshold_degrees=float(debug_normal_angle_threshold_degrees),
+            whole_fiber_start_cp_index=int(whole_fiber_start_cp_index),
         )
     if sample_index is not None or start_cp_index is not None or target_cp_index is not None:
         raise ValueError(
@@ -7493,6 +7523,7 @@ def run_native_trace2cp_many(
             output_stem=stem,
             prediction_adapter=prediction_adapter,
             model=model,
+            whole_fiber_start_cp_index=int(whole_fiber_start_cp_index),
         )
         if not isinstance(result, NativeWholeFiberResult):
             raise RuntimeError("multi-fiber native Trace2CP unexpectedly returned a pair result")
@@ -7503,6 +7534,7 @@ def run_native_trace2cp_many(
                 "fiber_json": str(path),
                 "summary": str(out_dir / f"{stem}_summary.json"),
                 "export": str(out_dir / f"{stem}_vis.jpg") if render_visualization else None,
+                "start_control_point_index": int(whole_fiber_start_cp_index),
                 "restart_count": int(result.restart_count),
                 "segment_count": int(result.segment_count),
                 "native_trace2cp_fiber_restarts_per_kvx": float(result.restarts_per_kvx),
@@ -7520,6 +7552,7 @@ def run_native_trace2cp_many(
     summary = {
         "mode": "multi_whole_fiber",
         "fiber_count": int(len(paths)),
+        "start_control_point_index": int(whole_fiber_start_cp_index),
         "restart_count": int(aggregate.restart_count),
         "segment_count": int(aggregate.segment_count),
         "run_count": int(aggregate.run_count),
@@ -7588,6 +7621,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--start-cp-index", type=int, default=None)
     parser.add_argument("--target-cp-index", type=int, default=None)
     parser.add_argument("--target-offset", type=int, default=1)
+    parser.add_argument(
+        "--whole-fiber-start-cp-index",
+        type=int,
+        default=0,
+        help="Whole-fiber --fiber-json start CP index; traces from this CP to the final CP.",
+    )
     parser.add_argument("--sample-mode", choices=("random", "flat"), default=None)
     parser.add_argument("--step-voxels", type=float, default=4.0)
     parser.add_argument("--cone-angle-degrees", type=float, default=25.0)
@@ -7748,6 +7787,7 @@ def main() -> None:
             normal_principal_axis_method=str(args.normal_principal_axis_method),
             debug_compare_normal_sampler=args.debug_compare_normal_sampler,
             debug_normal_angle_threshold_degrees=float(args.debug_normal_angle_threshold_degrees),
+            whole_fiber_start_cp_index=int(args.whole_fiber_start_cp_index),
         )
     else:
         run_native_trace2cp_many(
@@ -7767,6 +7807,7 @@ def main() -> None:
             normal_principal_axis_method=str(args.normal_principal_axis_method),
             debug_compare_normal_sampler=args.debug_compare_normal_sampler,
             debug_normal_angle_threshold_degrees=float(args.debug_normal_angle_threshold_degrees),
+            whole_fiber_start_cp_index=int(args.whole_fiber_start_cp_index),
         )
 
 

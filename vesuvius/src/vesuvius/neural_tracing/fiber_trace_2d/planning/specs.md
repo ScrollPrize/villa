@@ -580,9 +580,12 @@
   source builder with `target_control_point_index`.
 - When `--fiber-json <path>` is supplied without explicit CP indices, native
   3D Trace2CP defaults to whole-fiber mode. Whole-fiber mode traces
-  consecutive CP pairs from CP `0` to the last CP. Supplying both explicit CP
-  indices keeps the single-segment debug mode; supplying only one CP index
-  must fail loudly.
+  consecutive CP pairs from CP `0` to the last CP by default. Supplying
+  `--whole-fiber-start-cp-index N` starts whole-fiber tracing at CP `N` and
+  measures the restart-rate denominator along the original line from CP `N` to
+  the final CP. The chosen start CP must leave at least one target segment.
+  Supplying both explicit CP indices keeps the single-segment debug mode;
+  supplying only one CP index must fail loudly.
 - The native 3D tool traces in selected-level ZYX voxel coordinates. It loads
   the same dataset/test-dataset CP pair as the visualization geometry loader,
   decodes six Lasagna 3x2 direction channels analytically, treats predicted
@@ -842,7 +845,8 @@
   selectors traces the entire fiber. `--fiber-json <path> --sample-index N`
   remains single-segment inspection using deterministic flat sample selection,
   and explicit `--start-cp-index/--target-cp-index` remains explicit
-  single-segment inspection.
+  single-segment inspection. `--whole-fiber-start-cp-index N` is only valid in
+  whole-fiber mode and traces CP `N` through the final CP.
 - In native 3D whole-fiber mode, each segment targets the plane through the
   next CP with the local CP-to-CP segment direction as plane normal. A segment
   succeeds only when the trace reaches that plane within the segment's step

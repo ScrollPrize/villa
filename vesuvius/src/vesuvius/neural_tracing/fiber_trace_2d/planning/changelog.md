@@ -7,6 +7,8 @@
   JPG output around restart boundaries and before the JPEG dimension limit.
 - Python native 3D whole-fiber Trace2CP CP labels now render at the bottom of
   each strip and include CP indices for explicit trace selection.
+- Python native 3D whole-fiber Trace2CP can now start metric tracing at a
+  selected CP with `--whole-fiber-start-cp-index`.
 - Extended native VC3D Lasagna dataset opening so `vc_fiber_trace_metric` can
   stream precomputed fiber inference manifests directly from HTTP/S3 locations
   with an explicit remote cache directory, including relative and absolute

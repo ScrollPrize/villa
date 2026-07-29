@@ -259,6 +259,9 @@ Ownership changed as follows:
   `--fiber-json <path> --start-cp-index A --target-cp-index B` keeps explicit
   single-segment debug mode. Existing `--sample-index` plus `--target-offset`
   selection remains available when no fiber JSON is supplied.
+- `--whole-fiber-start-cp-index N` is valid in whole-fiber mode and traces CP
+  `N` through the final CP. The reported restart-rate denominator is the
+  original reference line length from CP `N` to the final CP.
 - `--fiber-json <path> <path> ...` runs those fibers sequentially in
   whole-fiber mode using one shared loaded model. It writes indexed per-fiber
   outputs such as `trace2cp_native_3d_000_summary.json` and, with `--vis`,
