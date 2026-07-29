@@ -27,6 +27,7 @@ struct CliOptions {
     std::optional<double> voxelSizeUm;
     double errorThresholdVoxels = 10.0;
     size_t cacheBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+    int inferenceScaledownPower = 2;
     bool quiet = false;
     FiberTraceConfig trace;
 };
@@ -46,7 +47,8 @@ void printUsage(const char* argv0)
         << "  --normal-manifest PATH          required Lasagna normal manifest for tangent/normal smoothness\n"
         << "  --remote-cache-dir PATH         required for remote HTTP/S3 Lasagna manifests\n"
         << "  --voxel-size-um N               base-voxel size in micrometers for err/m output\n"
-        << "  --step-voxels N                 trace step in manifest prediction voxels [4]\n"
+        << "  --inference-scaledown-power N   prediction output scaledown relative to trace voxels, as 2^N [2]\n"
+        << "  --step-voxels N                 trace step in manifest trace voxels [4]\n"
         << "  --cone-angle-degrees N          candidate cone half-angle [25]\n"
         << "  --cone-angle-step-degrees N     candidate cone grid step [5]\n"
         << "  --cone-grid-size N              legacy square-to-disk grid size when cone step <= 0 [25]\n"
@@ -124,6 +126,10 @@ CliOptions parseArgs(int argc, char** argv)
             options.voxelSizeUm =
                 parseDouble(requireValue(i, argc, argv, "voxel-size-um"),
                             "voxel-size-um");
+        } else if (arg == "--inference-scaledown-power") {
+            options.inferenceScaledownPower =
+                parseInt(requireValue(i, argc, argv, "inference-scaledown-power"),
+                         "inference-scaledown-power");
         } else if (arg == "--step-voxels") {
             options.trace.stepVoxels =
                 parseDouble(requireValue(i, argc, argv, "step-voxels"),
@@ -225,6 +231,8 @@ CliOptions parseArgs(int argc, char** argv)
         failOption("--cumulative-smoothness-steps must be at least 1");
     if (!(options.errorThresholdVoxels >= 0.0))
         failOption("--error-threshold-voxels must be non-negative");
+    if (options.inferenceScaledownPower < 0 || options.inferenceScaledownPower > 30)
+        failOption("--inference-scaledown-power must be in [0, 30]");
     if (options.normalManifest.empty()) {
         failOption(
             "--normal-manifest is required; pass the Lasagna normal manifest used for "
@@ -278,9 +286,11 @@ int main(int argc, char** argv)
         const auto openedDataset = vc::lasagna::LasagnaDataset::openLocation(
             options.fiberManifest,
             datasetOptions);
-        const double workingToBaseScale =
-            vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(
-                openedDataset.manifest());
+        const auto traceScales =
+            vc::fiber_tracer::resolveFiberPredictionTraceScales(
+                openedDataset.manifest(),
+                options.inferenceScaledownPower);
+        const double workingToBaseScale = traceScales.traceToBaseScale;
         auto predictionManifest = openedDataset.manifest();
         predictionManifest.workingToBaseScale = workingToBaseScale;
         const vc::lasagna::LasagnaDataset dataset(std::move(predictionManifest));
@@ -309,8 +319,11 @@ int main(int argc, char** argv)
                 << " fiber_json=" << options.fiberJson
                 << " control_points=" << fiber.controlPointsXyzBase.size()
                 << " segments=" << (fiber.controlPointsXyzBase.size() - 1)
-                << " working_to_base_scale=" << workingToBaseScale
-                << " working_to_base_scale_source=manifest"
+                << " derived_trace_to_base=" << traceScales.traceToBaseScale
+                << " derived_prediction_to_base=" << traceScales.predictionToBaseScale
+                << " derived_prediction_spacing_trace_voxels="
+                << traceScales.predictionSpacingInTraceVoxels
+                << " inference_scaledown_power=" << options.inferenceScaledownPower
                 << " normal_sampler=" << (normalSamplerPtr != nullptr ? "on" : "off")
                 << '\n';
         }

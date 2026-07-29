@@ -54,6 +54,12 @@ struct FiberPredictionSample {
     std::vector<FiberPredictionSampleOption> options;
 };
 
+struct FiberPredictionTraceScales {
+    double traceToBaseScale = 1.0;
+    double predictionToBaseScale = 1.0;
+    double predictionSpacingInTraceVoxels = 1.0;
+};
+
 struct FiberInput {
     std::filesystem::path path;
     std::vector<cv::Vec3d> linePointsXyzBase;
@@ -171,8 +177,13 @@ using FiberTraceWholeFiberProgressCallback =
 
 [[nodiscard]] FiberInput loadFiberJson(const std::filesystem::path& path);
 
+[[nodiscard]] FiberPredictionTraceScales resolveFiberPredictionTraceScales(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    int inferenceScaledownPower = 2);
+
 [[nodiscard]] double inferFiberPredictionWorkingToBaseScale(
-    const vc::lasagna::LasagnaDatasetManifest& manifest);
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    int inferenceScaledownPower = 2);
 
 [[nodiscard]] FiberTraceOneWayResult traceFiberOneWay(
     const FiberPredictionSource& predictions,

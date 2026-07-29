@@ -1,5 +1,8 @@
 # 2026-07-29
 
+- Added native `vc_fiber_trace_metric --inference-scaledown-power`, defaulting
+  to 2, so existing fiber prediction manifests derive trace scale from the
+  persisted prediction scale without adding manifest fields.
 - Brought the native C++ `vc_fiber_tracer`/`vc_fiber_trace_metric` Trace2CP
   search controls into parity with the Python native tracer for persisted
   inference products: circular default cone candidates, presence-weighted

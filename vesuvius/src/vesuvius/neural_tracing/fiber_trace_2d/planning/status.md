@@ -1,13 +1,11 @@
-# Native C++ Trace2CP Parity Fix Status
+# Native C++ Trace2CP Inference Scaledown Argument Status
 
-- [x] Read workflow notes in `AGENTS.md`.
-- [x] Read current native Trace2CP spec/doc sections.
-- [x] Identify current C++/Python behavior mismatches.
-- [x] Create task description.
-- [x] Create implementation plan.
-- [x] Independent plan review against `specs.md`, `plan.md`, and `task.md`.
-- [x] Implement C++ tracer/config/CLI fixes.
-- [x] Add focused regression tests.
-- [x] Run C++ build/tests.
-- [x] Run user-provided `vc_fiber_trace_metric` command and record results.
-- [x] Update docs/spec/task log/changelog after implementation.
+- [x] Re-check Python inference writer and tracer coordinate scale code.
+- [x] Replace stale task with the inference-scaledown argument task.
+- [x] Replace task plan with corrected scale derivation.
+- [x] Update C++ scale resolver API and implementation.
+- [x] Add `vc_fiber_trace_metric --inference-scaledown-power`.
+- [x] Add resolver tests for current Python manifest scale layout.
+- [x] Update specs/docs/task log/changelog.
+- [x] Build focused native targets.
+- [x] Run focused native tests.

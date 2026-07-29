@@ -152,22 +152,46 @@ TEST_CASE("native fiber tracer defaults match regular Trace2CP command")
     CHECK(config.cumulativeSmoothnessTangentWeight == doctest::Approx(2.0));
 }
 
-TEST_CASE("fiber prediction working scale is inferred from single-output manifest")
+TEST_CASE("fiber prediction trace scales derive from existing manifest fields")
 {
     vc::lasagna::LasagnaDatasetManifest manifest;
-    manifest.sourceToBase = 2.0;
-    manifest.groups.push_back(makeGroup("fiber", 3, {"presence", "nx", "ny"}));
+    manifest.sourceToBase = 4.0;
+    manifest.groups.push_back(makeGroup("fiber", 2, {"presence", "nx", "ny"}));
 
-    const double scale =
-        vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(manifest);
+    const auto scales =
+        vc::fiber_tracer::resolveFiberPredictionTraceScales(manifest);
 
-    CHECK(scale == doctest::Approx(16.0));
+    CHECK(scales.traceToBaseScale == doctest::Approx(4.0));
+    CHECK(scales.predictionToBaseScale == doctest::Approx(16.0));
+    CHECK(scales.predictionSpacingInTraceVoxels == doctest::Approx(4.0));
+    CHECK(vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(manifest) ==
+          doctest::Approx(4.0));
 }
 
-TEST_CASE("fiber prediction working scale is inferred from prefixed multi-output manifest")
+TEST_CASE("fiber prediction trace scales use inference scaledown power")
 {
     vc::lasagna::LasagnaDatasetManifest manifest;
     manifest.sourceToBase = 1.0;
+    manifest.groups.push_back(makeGroup("fiber", 4, {"presence", "nx", "ny"}));
+
+    const auto scales =
+        vc::fiber_tracer::resolveFiberPredictionTraceScales(manifest);
+
+    CHECK(scales.traceToBaseScale == doctest::Approx(4.0));
+    CHECK(scales.predictionToBaseScale == doctest::Approx(16.0));
+    CHECK(scales.predictionSpacingInTraceVoxels == doctest::Approx(4.0));
+
+    const auto unscaledTrace =
+        vc::fiber_tracer::resolveFiberPredictionTraceScales(manifest, 0);
+    CHECK(unscaledTrace.traceToBaseScale == doctest::Approx(16.0));
+    CHECK(unscaledTrace.predictionToBaseScale == doctest::Approx(16.0));
+    CHECK(unscaledTrace.predictionSpacingInTraceVoxels == doctest::Approx(1.0));
+}
+
+TEST_CASE("fiber prediction trace scales support multi-output manifest")
+{
+    vc::lasagna::LasagnaDatasetManifest manifest;
+    manifest.sourceToBase = 4.0;
     manifest.groups.push_back(makeGroup(
         "fiber_option_000",
         2,
@@ -177,25 +201,27 @@ TEST_CASE("fiber prediction working scale is inferred from prefixed multi-output
         2,
         {"option_001_presence", "option_001_nx", "option_001_ny"}));
 
-    const double scale =
-        vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(manifest);
+    const auto scales =
+        vc::fiber_tracer::resolveFiberPredictionTraceScales(manifest);
 
-    CHECK(scale == doctest::Approx(4.0));
+    CHECK(scales.traceToBaseScale == doctest::Approx(4.0));
+    CHECK(scales.predictionToBaseScale == doctest::Approx(16.0));
+    CHECK(scales.predictionSpacingInTraceVoxels == doctest::Approx(4.0));
 }
 
-TEST_CASE("fiber prediction working scale rejects missing prediction channels")
+TEST_CASE("fiber prediction trace scales reject missing prediction channels")
 {
     vc::lasagna::LasagnaDatasetManifest manifest;
     manifest.sourceToBase = 1.0;
     manifest.groups.push_back(makeGroup("fiber", 2, {"presence", "nx"}));
 
     CHECK_THROWS_WITH_AS(
-        vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(manifest),
+        vc::fiber_tracer::resolveFiberPredictionTraceScales(manifest),
         doctest::Contains("presence/nx/ny"),
         std::runtime_error);
 }
 
-TEST_CASE("fiber prediction working scale rejects mixed prediction channel scales")
+TEST_CASE("fiber prediction trace scales reject mixed prediction channel scales")
 {
     vc::lasagna::LasagnaDatasetManifest manifest;
     manifest.sourceToBase = 1.0;
@@ -203,7 +229,54 @@ TEST_CASE("fiber prediction working scale rejects mixed prediction channel scale
     manifest.groups.push_back(makeGroup("directions", 3, {"nx", "ny"}));
 
     CHECK_THROWS_AS(
-        vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(manifest),
+        vc::fiber_tracer::resolveFiberPredictionTraceScales(manifest),
+        std::runtime_error);
+}
+
+TEST_CASE("fiber prediction trace scales reject invalid source_to_base")
+{
+    vc::lasagna::LasagnaDatasetManifest manifest;
+    manifest.sourceToBase = 0.0;
+    manifest.groups.push_back(makeGroup("fiber", 2, {"presence", "nx", "ny"}));
+
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::resolveFiberPredictionTraceScales(manifest),
+        doctest::Contains("source_to_base"),
+        std::runtime_error);
+}
+
+TEST_CASE("fiber prediction trace scales require manifest source_to_base field")
+{
+    const auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({
+        "version": 2,
+        "groups": {
+            "fiber": {
+                "zarr": "fiber.zarr",
+                "scaledown": 2,
+                "channels": ["presence", "nx", "ny"]
+            }
+        }
+    })");
+
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::resolveFiberPredictionTraceScales(manifest),
+        doctest::Contains("source_to_base"),
+        std::runtime_error);
+}
+
+TEST_CASE("fiber prediction trace scales reject invalid inference scaledown power")
+{
+    vc::lasagna::LasagnaDatasetManifest manifest;
+    manifest.sourceToBase = 1.0;
+    manifest.groups.push_back(makeGroup("fiber", 4, {"presence", "nx", "ny"}));
+
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::resolveFiberPredictionTraceScales(manifest, -1),
+        doctest::Contains("scaledown power"),
+        std::runtime_error);
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::resolveFiberPredictionTraceScales(manifest, 31),
+        doctest::Contains("scaledown power"),
         std::runtime_error);
 }
 

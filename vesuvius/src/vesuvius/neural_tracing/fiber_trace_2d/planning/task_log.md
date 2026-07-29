@@ -1,33 +1,50 @@
-# Native C++ Trace2CP Parity Fix Log
+# Native C++ Trace2CP Inference Scaledown Argument Task Log
 
-2026-07-29:
+## Notes
 
-- Implemented the non-output parity fixes in `vc_fiber_tracer`: circular
-  default angle-step cone candidates, legacy square-to-disk fallback for
-  disabled angle steps, presence-ignored start branch selection,
-  presence-weighted current branch selection, angle-squared normal-aware
-  smoothness, cumulative tangent smoothness, interpolated target-plane
-  crossing points, and spatial beam pruning after lookahead.
-- Exposed C++ metric CLI flags for beam pruning, smoothness free angle,
-  cumulative tangent smoothness, and legacy cone grid size.
-- Added focused public-regression tests in `test_fiber_trace3d.cpp` for the
-  default candidate count, crossing interpolation, start/current branch
-  selection behavior, required normals, beam diversity pruning, invalid start
-  samples, and the Python-style max-step guard calculation.
-- Updated the native Trace2CP spec/docs summaries and changelog.
-- Independent review found no blocking parity mismatch. It noted that the plan
-  wording for degenerate tangent projections should match Python's current
-  behavior; the plan was corrected to say valid-normal degenerate projections
-  use the isotropic tangent angle inside split smoothness while retaining the
-  normal/elevation component.
-- Verified with:
-  `cmake --build volume-cartographer/build --target test_fiber_trace3d vc_fiber_trace_metric -j 4`,
-  `volume-cartographer/build/bin/test_fiber_trace3d`, and
-  `ctest --test-dir volume-cartographer/build -R test_fiber_trace3d --output-on-failure`.
-- Ran the provided whole-fiber C++ metric workload with absolute local paths:
-  final default result was `native_trace2cp_fiber err/kvx=2.3 restarts=9 segments=87`,
-  `trace_wall_s=135.020`, `trace_cpu_s=98.235`.
-- Diagnostic rerun with `--cumulative-smoothness-tangent-weight 0` gave
-  `err/kvx=2.0 restarts=8 segments=87`, `trace_wall_s=95.777`,
-  `trace_cpu_s=95.397`. The default remains `2.0` because that is the
-  Python/native spec default.
+- Re-checked the Python code path:
+  - `fiber_trace_3d/infer.py` computes `input_sd`, `output_sd_input`, and
+    `effective_output_sd`.
+  - It passes `level=log2(effective_output_sd)`,
+    `scaledown=effective_output_sd`, and `inference_scaledown=output_sd_input`
+    into `FiberTrace3DPredictAdapter`.
+  - `write_lasagna_product_manifest(...)` is called without `source_to_base`,
+    so the writer default `source_to_base=1.0` is used for new manifests.
+  - The manifest writer serializes each group `scaledown` as `product.level`,
+    so current factor-16 persisted products are recorded as group
+    `scaledown=4`.
+- Re-checked the Python tracer coordinate code:
+  - `FiberTrace3DLoader` traces in selected input-level voxels using
+    `volume_spacing_base = 1 << base_volume_scale`.
+  - For the current config, `base_volume_scale=2`, so trace coordinates are
+    base/4.
+  - Python `--inference-scaledown-power 2` makes prediction samples spaced 4
+    trace voxels apart, or 16 base voxels.
+- Native C++ now derives:
+  - `prediction_to_base = source_to_base * 2**group.scaledown`
+  - `trace_to_base = prediction_to_base / 2**inference_scaledown_power`
+  - `prediction_spacing_in_trace_voxels = 2**inference_scaledown_power`
+- `vc_fiber_trace_metric` now accepts `--inference-scaledown-power`, default
+  `2`, and prints that value with the derived scale diagnostics.
+- No manifest fields were added or required.
+
+## Deviations
+
+- The previous task text/spec said `trace_to_base = source_to_base`; that was
+  inconsistent with the current Python writer and has been replaced.
+
+## Validation
+
+- `cmake --build volume-cartographer/build --target test_fiber_trace3d vc_fiber_trace_metric VC3D -j 4`
+  passed.
+- `volume-cartographer/build/bin/test_fiber_trace3d` passed: 18 test cases.
+- `volume-cartographer/build/bin/vc_fiber_trace_metric --help` shows
+  `--inference-scaledown-power`.
+- Short interrupted sanity run on the S3 manifest and local fiber confirmed:
+  `derived_trace_to_base=4`, `derived_prediction_to_base=16`,
+  `derived_prediction_spacing_trace_voxels=4`,
+  `inference_scaledown_power=2`, and first-segment max steps dropped from the
+  previously observed `242` to `61`.
+- `ctest --test-dir volume-cartographer/build -R test_fiber_trace3d --output-on-failure`
+  passed.
+- `git diff --check` passed.

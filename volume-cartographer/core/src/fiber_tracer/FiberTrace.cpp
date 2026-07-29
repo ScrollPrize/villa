@@ -115,7 +115,7 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
     return {prefix + "_presence", prefix + "_nx", prefix + "_ny"};
 }
 
-[[nodiscard]] double predictionChannelEffectiveScale(
+[[nodiscard]] const vc::lasagna::LasagnaChannelGroup& predictionChannelGroup(
     const vc::lasagna::LasagnaDatasetManifest& manifest,
     const std::string& channel)
 {
@@ -125,8 +125,16 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
             "fiber inference dataset is missing required channel '" +
             channel + "'");
     }
+    return *group;
+}
+
+[[nodiscard]] double predictionChannelEffectiveScale(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    const std::string& channel)
+{
+    const auto& group = predictionChannelGroup(manifest, channel);
     const double scale =
-        manifest.sourceToBase * static_cast<double>(group->scaleFactor());
+        manifest.sourceToBase * static_cast<double>(group.scaleFactor());
     if (!(scale > 0.0) || !std::isfinite(scale)) {
         throw std::runtime_error(
             "fiber inference channel '" + channel +
@@ -978,9 +986,24 @@ struct CandidateScore {
 
 } // namespace
 
-double inferFiberPredictionWorkingToBaseScale(
-    const vc::lasagna::LasagnaDatasetManifest& manifest)
+FiberPredictionTraceScales resolveFiberPredictionTraceScales(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    int inferenceScaledownPower)
 {
+    if (inferenceScaledownPower < 0 || inferenceScaledownPower > 30) {
+        throw std::runtime_error(
+            "fiber inference scaledown power must be in [0, 30]");
+    }
+    const double inferenceScaledown =
+        static_cast<double>(1 << inferenceScaledownPower);
+
+    if (!manifest.raw.empty()) {
+        const auto sourceIt = manifest.raw.find("source_to_base");
+        if (sourceIt == manifest.raw.end() || !sourceIt->is_number()) {
+            throw std::runtime_error(
+                "fiber inference manifest must contain numeric source_to_base");
+        }
+    }
     if (!(manifest.sourceToBase > 0.0) || !std::isfinite(manifest.sourceToBase)) {
         throw std::runtime_error(
             "fiber inference manifest source_to_base must be positive and finite");
@@ -992,27 +1015,61 @@ double inferFiberPredictionWorkingToBaseScale(
             "fiber inference dataset must contain presence/nx/ny channels");
     }
 
-    std::optional<double> inferredScale;
+    std::optional<double> predictionToBaseScale;
+    std::optional<double> predictionGroupScaleFactor;
     std::optional<std::string> inferredChannel;
     for (const auto& prefix : prefixes) {
         for (const auto& channel : predictionChannelNames(prefix)) {
+            const auto& group = predictionChannelGroup(manifest, channel);
             const double scale = predictionChannelEffectiveScale(manifest, channel);
-            if (!inferredScale.has_value()) {
-                inferredScale = scale;
+            const double groupScaleFactor =
+                static_cast<double>(group.scaleFactor());
+            if (!predictionToBaseScale.has_value()) {
+                predictionToBaseScale = scale;
+                predictionGroupScaleFactor = groupScaleFactor;
                 inferredChannel = channel;
-                continue;
-            }
-            if (!nearlySameScale(*inferredScale, scale)) {
+            } else if (!nearlySameScale(*predictionToBaseScale, scale)) {
                 throw std::runtime_error(
                     "fiber inference prediction channels must share one effective "
-                    "working-to-base scale; channel '" + channel +
+                    "prediction-to-base scale; channel '" + channel +
                     "' has scale " + std::to_string(scale) + " but channel '" +
                     *inferredChannel + "' has scale " +
-                    std::to_string(*inferredScale));
+                    std::to_string(*predictionToBaseScale));
+            } else if (!nearlySameScale(
+                           *predictionGroupScaleFactor,
+                           groupScaleFactor)) {
+                throw std::runtime_error(
+                    "fiber inference prediction channels must share one "
+                    "manifest group scale factor; channel '" + channel +
+                    "' has factor " +
+                    std::to_string(groupScaleFactor) +
+                    " but channel '" + *inferredChannel +
+                    "' has factor " +
+                    std::to_string(*predictionGroupScaleFactor));
             }
         }
     }
-    return *inferredScale;
+
+    const double traceToBaseScale = *predictionToBaseScale / inferenceScaledown;
+    if (!(traceToBaseScale > 0.0) || !std::isfinite(traceToBaseScale)) {
+        throw std::runtime_error(
+            "fiber inference manifest derived trace scale must be positive and finite");
+    }
+
+    return {
+        traceToBaseScale,
+        *predictionToBaseScale,
+        inferenceScaledown,
+    };
+}
+
+double inferFiberPredictionWorkingToBaseScale(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    int inferenceScaledownPower)
+{
+    return resolveFiberPredictionTraceScales(
+        manifest,
+        inferenceScaledownPower).traceToBaseScale;
 }
 
 class FiberPredictionField::Impl {

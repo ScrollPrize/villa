@@ -251,6 +251,44 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				chunk_size=32,
 			)
 
+	def test_product_manifest_does_not_write_trace_scale_aliases(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			output_path = root / "fiber.lasagna.json"
+			product = OutputProductSpec(
+				name="fiber_option_000",
+				level=4,
+				scaledown=16,
+				inference_scaledown=4,
+				channels=(
+					OutputChannelSpec("presence", relative_path=str(root / "presence.ome.zarr")),
+					OutputChannelSpec("nx", relative_path=str(root / "nx.ome.zarr")),
+					OutputChannelSpec("ny", relative_path=str(root / "ny.ome.zarr")),
+				),
+				chunk_size=64,
+			)
+
+			shared_predict3d.write_lasagna_product_manifest(
+				output_path=output_path,
+				products=(product,),
+				base_shape_zyx=(64, 64, 64),
+			)
+
+			raw = json.loads(output_path.read_text(encoding="utf-8"))
+			self.assertNotIn("trace_to_base_scale", raw)
+			self.assertNotIn("prediction_to_base_scale", raw)
+			self.assertNotIn("prediction_spacing_in_trace_voxels", raw)
+			self.assertNotIn("inference_scaledown_factor", raw)
+			self.assertEqual(raw["groups"]["presence"]["scaledown"], 4)
+			self.assertNotIn("inference_scaledown", raw["groups"]["presence"])
+			self.assertNotIn("inference_scaledown", raw["groups"]["nx"])
+			self.assertNotIn("inference_scaledown", raw["groups"]["ny"])
+
+			from lasagna_volume import LasagnaVolume
+
+			loaded = LasagnaVolume.load(output_path)
+			self.assertEqual(loaded.groups["presence"].scaledown, 4)
+
 	def test_predict3d_adapter_protocols_are_runtime_checkable(self):
 		self.assertIsInstance(_FakeModelAdapter(), ModelAdapter)
 		self.assertIsInstance(_FakeOutputAdapter(), OutputAdapter)
