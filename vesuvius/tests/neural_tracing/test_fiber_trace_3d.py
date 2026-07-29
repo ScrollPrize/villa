@@ -80,6 +80,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     NativeTrace2CpConfig,
     NativeTraceFieldCache,
     NativeTraceResult,
+    NativeTargetPlane,
     NativeWholeFiberResult,
     _adaptive_trace2cp_cross_strip_height,
     _aggregate_native_whole_fiber_results,
@@ -3844,6 +3845,127 @@ def test_native_3d_trace2cp_target_plane_error_uses_in_plane_distance() -> None:
     assert error == pytest.approx(5.0, abs=1.0e-6)
 
 
+def test_native_3d_trace2cp_one_way_requires_explicit_target_planes() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+    with pytest.raises(ValueError, match="explicit target planes"):
+        trace_native_3d_one_way(
+            FakeCache(),
+            start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+            target_zyx=np.asarray([4.0, 0.0, 0.0], dtype=np.float32),
+            initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            cfg=NativeTrace2CpConfig(
+                step_voxels=1.0,
+                cone_angle_degrees=0.0,
+                beam_width=1,
+                smoothness_weight=0.0,
+                smoothness_tangent_weight=0.0,
+                smoothness_normal_weight=0.0,
+            ),
+            normal_sampler=_constant_native_normal_sampler(),
+        )
+
+
+def test_native_3d_trace2cp_one_way_waits_for_all_target_planes() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            directions = torch.zeros((count, 1, 3), dtype=torch.float32)
+            directions[:, 0, 0] = 1.0
+            return (
+                directions,
+                torch.ones((count, 1), dtype=torch.float32),
+                torch.ones((count, 1), dtype=torch.bool),
+            )
+
+    target = np.asarray([4.0, 0.0, 0.0], dtype=np.float32)
+    result = trace_native_3d_one_way(
+        FakeCache(),
+        start_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        target_zyx=target,
+        initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        target_planes_zyx=(
+            NativeTargetPlane(
+                name="x_plane",
+                point_zyx=target,
+                normal_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            ),
+            NativeTargetPlane(
+                name="y_plane",
+                point_zyx=target,
+                normal_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+            ),
+        ),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=0.0,
+            beam_width=1,
+            trace_step_limit=5,
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=0.0,
+            smoothness_normal_weight=0.0,
+        ),
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+
+    assert not result.reached_target_plane
+    assert "missing_target_planes=y_plane" in result.reason
+    assert [crossing.name for crossing in result.target_plane_crossings] == ["x_plane"]
+
+
+def test_native_3d_trace2cp_one_way_selects_best_crossed_target_plane_error() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            directions = torch.zeros((count, 1, 3), dtype=torch.float32)
+            directions[:, 0, 0] = 1.0
+            return (
+                directions,
+                torch.ones((count, 1), dtype=torch.float32),
+                torch.ones((count, 1), dtype=torch.bool),
+            )
+
+    target = np.asarray([4.0, 0.0, 0.0], dtype=np.float32)
+    result = trace_native_3d_one_way(
+        FakeCache(),
+        start_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        target_zyx=target,
+        initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        target_planes_zyx=(
+            NativeTargetPlane(
+                name="x_plane",
+                point_zyx=target,
+                normal_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            ),
+            NativeTargetPlane(
+                name="diagonal_plane",
+                point_zyx=target,
+                normal_zyx=np.asarray([1.0, 1.0, 0.0], dtype=np.float32),
+            ),
+        ),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=0.0,
+            beam_width=1,
+            trace_step_limit=5,
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=0.0,
+            smoothness_normal_weight=0.0,
+        ),
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+
+    assert result.reached_target_plane
+    assert result.selected_target_plane_name == "x_plane"
+    assert result.selected_target_plane_error_voxels == pytest.approx(1.0, abs=1.0e-6)
+    assert np.allclose(result.trace_zyx[-1], [4.0, 1.0, 0.0], atol=1.0e-6)
+
+
 def _whole_native_trace_record() -> SimpleNamespace:
     points = np.asarray(
         [
@@ -5877,6 +5999,7 @@ def test_native_3d_trace2cp_first_step_uses_sampled_direction_aligned_to_line_ta
         start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
         target_zyx=np.asarray([10.0, 0.0, 10.0], dtype=np.float32),
         initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        target_plane_normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
         cfg=NativeTrace2CpConfig(
             step_voxels=2.0,
             cone_angle_degrees=0.0,
@@ -5886,7 +6009,7 @@ def test_native_3d_trace2cp_first_step_uses_sampled_direction_aligned_to_line_ta
         normal_sampler=_constant_native_normal_sampler(),
     )
 
-    assert result.reason == "trace_step_limit"
+    assert result.reason.startswith("trace_step_limit")
     assert np.allclose(result.trace_zyx[1], [0.0, 2.0, 0.0])
 
 
@@ -5918,6 +6041,7 @@ def test_native_3d_trace2cp_trace_paths_sample_candidate_normals() -> None:
             start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
             target_zyx=np.asarray([0.0, 0.0, 4.0], dtype=np.float32),
             initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+            target_plane_normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
             cfg=NativeTrace2CpConfig(
                 step_voxels=1.0,
                 cone_angle_degrees=0.0,
@@ -5928,7 +6052,7 @@ def test_native_3d_trace2cp_trace_paths_sample_candidate_normals() -> None:
             ),
             normal_sampler=normal_sampler,
         )
-        assert result.reason == "trace_step_limit"
+        assert result.reason.startswith("trace_step_limit")
         return calls
 
     greedy_calls = run_with_beam_width(1)
@@ -5975,6 +6099,7 @@ def test_native_3d_trace2cp_trace_paths_apply_first_step_tangent_gate() -> None:
             start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
             target_zyx=np.asarray([0.0, 10.0, 0.0], dtype=np.float32),
             initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+            target_plane_normal_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
             cfg=NativeTrace2CpConfig(
                 step_voxels=1.0,
                 cone_angle_degrees=90.0,
@@ -5990,7 +6115,7 @@ def test_native_3d_trace2cp_trace_paths_apply_first_step_tangent_gate() -> None:
         )
 
         assert not result.reached_target_plane
-        assert result.reason == "trace_step_limit"
+        assert result.reason.startswith("trace_step_limit")
         assert np.allclose(result.trace_zyx[-1], [1.0, 0.0, 0.0], atol=1.0e-5)
 
 
@@ -6035,6 +6160,7 @@ def test_native_3d_trace2cp_beam_lookahead_keeps_initially_worse_valid_path() ->
         start_zyx=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
         target_zyx=np.asarray([0.0, 0.0, 2.7], dtype=np.float32),
         initial_direction_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+        target_plane_normal_zyx=np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
         normal_sampler=_constant_native_normal_sampler(),
     )
     greedy = trace_native_3d_one_way(
@@ -6076,9 +6202,9 @@ def test_native_3d_trace2cp_beam_lookahead_keeps_initially_worse_valid_path() ->
     )
 
     assert not greedy.reached_target_plane
-    assert greedy.reason == "invalid_current_point"
+    assert greedy.reason.startswith("invalid_current_point")
     assert not one_step_beam.reached_target_plane
-    assert one_step_beam.reason == "all_candidates_invalid"
+    assert one_step_beam.reason.startswith("all_candidates_invalid")
     assert lookahead_beam.reached_target_plane
     assert lookahead_beam.reason == "target_plane"
     assert np.max(np.linalg.norm(lookahead_beam.trace_zyx[:, :2], axis=1)) > 0.1
@@ -6204,10 +6330,10 @@ def test_native_3d_trace2cp_trace_step_limit_stops_partial_trace() -> None:
     )
 
     assert not result.forward.reached_target_plane
-    assert result.forward.reason == "trace_step_limit"
+    assert result.forward.reason.startswith("trace_step_limit")
     assert len(result.forward.steps) == 3
     assert not result.reverse.reached_target_plane
-    assert result.reverse.reason == "trace_step_limit"
+    assert result.reverse.reason.startswith("trace_step_limit")
     assert len(result.reverse.steps) == 3
 
 
@@ -6253,8 +6379,8 @@ def test_native_3d_trace2cp_max_step_factor_limits_trace() -> None:
     )
 
     assert not result.forward.reached_target_plane
-    assert result.forward.reason == "max_step_factor"
+    assert result.forward.reason.startswith("max_step_factor")
     assert len(result.forward.steps) == 2
     assert not result.reverse.reached_target_plane
-    assert result.reverse.reason == "max_step_factor"
+    assert result.reverse.reason.startswith("max_step_factor")
     assert len(result.reverse.steps) == 2

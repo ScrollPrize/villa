@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -49,6 +50,12 @@ struct FiberPredictionSample {
     std::vector<FiberPredictionSampleOption> options;
 };
 
+struct FiberTargetPlane {
+    std::string name;
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    cv::Vec3d normal{1.0, 0.0, 0.0};
+};
+
 struct FiberInput {
     std::filesystem::path path;
     std::vector<cv::Vec3d> linePointsXyzBase;
@@ -85,7 +92,6 @@ struct FiberTraceSegmentRequest {
     std::vector<cv::Vec3d> referenceLine;
     size_t startIndex = 0;
     size_t targetIndex = 0;
-    std::optional<cv::Vec3d> targetPlaneNormal;
     FiberTraceConfig config;
 };
 
@@ -93,7 +99,7 @@ struct FiberTraceOneWayRequest {
     cv::Vec3d startPoint{0.0, 0.0, 0.0};
     cv::Vec3d targetPoint{0.0, 0.0, 0.0};
     cv::Vec3d initialDirection{1.0, 0.0, 0.0};
-    cv::Vec3d targetPlaneNormal{1.0, 0.0, 0.0};
+    std::vector<FiberTargetPlane> targetPlanes;
     double budgetSpanVoxels = 0.0;
     FiberTraceConfig config;
 };
@@ -103,6 +109,10 @@ struct FiberTraceOneWayResult {
     bool reachedTargetPlane = false;
     std::string reason;
     int steps = 0;
+    std::string selectedTargetPlaneName;
+    cv::Vec3d selectedTargetPlaneCrossing{0.0, 0.0, 0.0};
+    double selectedTargetPlaneErrorVoxels =
+        std::numeric_limits<double>::infinity();
 };
 
 struct FiberTraceSegmentResult {
@@ -125,6 +135,8 @@ struct FiberTraceWholeFiberSegmentResult {
     bool restart = false;
     std::string reason;
     double inPlaneErrorVoxels = 0.0;
+    std::string selectedTargetPlaneName;
+    cv::Vec3d selectedTargetPlaneCrossing{0.0, 0.0, 0.0};
     double referenceArcDistanceVoxels = 0.0;
 };
 

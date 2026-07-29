@@ -379,8 +379,17 @@ Ownership changed as follows:
   `ceil(max_step_factor * cp_distance_voxels / step_voxels)`, with
   `--max-step-factor 3.0`. `--max-steps` is an optional extra cap, and
   `--trace-step-limit` intentionally produces partial traces for debugging.
-  Forward/backward progress bars report signed target-plane progress along the
-  initial CP-to-CP direction, ETA, step count, and inferred-block count.
+  Forward/backward progress bars report distance-derived target progress, ETA,
+  step count, and inferred-block count; progress does not use a CP chord
+  target-plane normal.
+- Target-plane termination uses target-local planes only. For each one-way
+  trace, the target CP contributes up to two line-neighbor planes
+  (`target CP -> next line point`, `target CP -> previous line point`) plus one
+  inferred-direction plane sampled from the model at the target CP and
+  sign-aligned to the local target tangent. The trace keeps stepping until all
+  configured planes have been crossed, then selects the crossing with the
+  lowest in-plane CP error. The straight CP-to-CP chord is not a termination
+  plane.
 - When `--vis` is enabled, native strip rendering prints coarse stage progress
   for side/top volume rendering, coordinate extraction, side/top presence
   sampling, trace overlay projection, and image composition. Presence sampling

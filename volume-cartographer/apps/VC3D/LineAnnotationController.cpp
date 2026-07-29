@@ -6963,10 +6963,6 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
             request.referenceLine = initialLinePoints;
             request.startIndex = startLineIndex;
             request.targetIndex = targetLineIndex;
-            request.targetPlaneNormal =
-                vc::fiber_tracer::referenceTangentToward(initialLinePoints,
-                                                         startLineIndex,
-                                                         targetLineIndex);
             request.config.voxelSizeUm = voxelSizeUm;
             request.config.endpointAcceptThresholdUm = 50.0;
             const auto start = Clock::now();

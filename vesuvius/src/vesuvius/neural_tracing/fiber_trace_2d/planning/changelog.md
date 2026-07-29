@@ -1,5 +1,9 @@
 # 2026-07-29
 
+- Native 3D Trace2CP target-plane termination no longer uses the CP-to-CP
+  chord. Python and VC3D native tracers now require target-local line-neighbor
+  and inferred-direction planes, wait until all configured planes are crossed,
+  and score the lowest in-plane CP crossing error.
 - Python native 3D Trace2CP now accepts multiple `--fiber-json` paths, runs
   them sequentially with a shared loaded model, writes indexed per-fiber
   summaries/visualizations, and reports an accumulated restart-rate score.

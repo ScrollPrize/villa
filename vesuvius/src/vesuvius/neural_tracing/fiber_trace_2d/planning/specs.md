@@ -817,8 +817,9 @@
   For ordinary current-point lookup after the start CP, the branch is chosen by
   best `dot(branch_dir, previous_step_dir) * branch_presence`.
 - The native 3D CLI prints live progress bars for forward and backward tracing.
-  Progress is measured by signed target-plane progress along the initial
-  CP-to-CP direction. It includes step count, ETA, and inferred-block count.
+  Progress is measured from remaining Euclidean distance to the target CP, not
+  from a CP-to-CP chord target-plane normal. It includes step count, ETA, and
+  inferred-block count.
 - Native 3D Trace2CP always reports final metric lines plus total trace
   wall/CPU time. Detailed per-stage profiling is opt-in through `--profile`,
   because profiling uses instrumentation and some CUDA synchronizations that
@@ -841,21 +842,27 @@
   direction. When set, native tracing can intentionally return a partial trace
   with `reason=trace_step_limit`; this is distinct from the safety guard
   `--max-steps`.
-- Native 3D tracing stops by intersecting the plane through the target CP with
-  normal from start CP to target CP. The returned trace appends the exact
-  linear interpolation point on that target plane when crossing occurs.
+- Native 3D tracing must not use the straight CP-to-CP chord as a target-plane
+  normal. Each one-way trace targets explicit target-local planes through the
+  target CP: the plane normal from the target CP line point to the next fiber
+  line point when available, the plane normal from the target CP line point to
+  the previous fiber line point when available, and the sampled model
+  direction at the target CP sign-aligned to the local target tangent. The
+  trace continues until all configured target-local planes have been crossed,
+  then selects the crossed plane with the smallest in-plane CP error. Missing
+  required target planes are reported in the failure reason.
 - In native 3D whole-fiber mode, `--fiber-json <path>` without sample or CP
   selectors traces the entire fiber. `--fiber-json <path> --sample-index N`
   remains single-segment inspection using deterministic flat sample selection,
   and explicit `--start-cp-index/--target-cp-index` remains explicit
   single-segment inspection. `--whole-fiber-start-cp-index N` is only valid in
   whole-fiber mode and traces CP `N` through the final CP.
-- In native 3D whole-fiber mode, each segment targets the plane through the
-  next CP with the local CP-to-CP segment direction as plane normal. A segment
-  succeeds only when the trace reaches that plane within the segment's step
-  budget and the in-plane selected-voxel error to the target CP is at most
+- In native 3D whole-fiber mode, each segment targets the next CP using the
+  same target-local plane set described above. A segment succeeds only when
+  all configured target-local planes are crossed within the segment's step
+  budget and the selected smallest in-plane error to the target CP is at most
   `--whole-fiber-error-threshold-voxels` (default `10`). Successful segments
-  continue from the reached crossing and carry the accepted trace direction.
+  continue from the selected crossing and carry the accepted trace direction.
   Failed segments count one restart and resume tracing from the failed target
   CP with a fresh CP-local fiber tangent.
 - Native 3D forward/reverse fusion must preserve each trace's traced order.
@@ -927,10 +934,10 @@
   while the task is running, and splices the accepted fused segment back into
   the existing line. Original CP coordinates must remain exact.
 - Native GUI segment optimization applies only when both traced directions
-  reach the target plane and the maximum endpoint in-plane error is at most
-  `50 um`, converted with `Volume::voxelSize()`. If positive voxel-size
-  metadata is unavailable, or the endpoint threshold fails, the GUI must leave
-  the fiber unchanged and report the failure.
+  reach all configured target-local planes and the maximum selected endpoint
+  in-plane error is at most `50 um`, converted with `Volume::voxelSize()`. If
+  positive voxel-size metadata is unavailable, or the endpoint threshold fails,
+  the GUI must leave the fiber unchanged and report the failure.
 - Tracer-optimized segment metadata and regular-optimizer protection are part
   of the native GUI contract: accepted segments should persist endpoint error,
   tracer version/config, and unchanged endpoint signatures; unchanged optimized
