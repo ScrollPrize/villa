@@ -2779,6 +2779,7 @@ def _emit_native_progress(
     start_time: float,
     *,
     detail: str = "",
+    persist_line: bool = False,
 ) -> None:
     total_i = max(1, int(total))
     current_i = max(0, min(int(current), total_i))
@@ -2794,7 +2795,7 @@ def _emit_native_progress(
         f"elapsed={_format_eta(elapsed)} eta={_format_eta(eta)}{suffix}"
     )
     complete = current_i >= total_i
-    print(f"\r{message}", end="\n" if complete else "", flush=True)
+    print(f"\r{message}", end="\n" if complete or persist_line else "", flush=True)
 
 
 def _score_candidate_loss_tensors(
@@ -4891,6 +4892,7 @@ def trace_native_3d_whole_fiber(
     segments: list[NativeWholeFiberSegmentResult] = []
     stitched_parts: list[np.ndarray] = []
     restart_count = 0
+    last_persisted_restart_count = 0
     last_success_cp_index = 0
     current_point = cp_points[0].astype(np.float32)
     current_direction = _fiber_line_tangent_zyx_toward_target(
@@ -4900,6 +4902,7 @@ def trace_native_3d_whole_fiber(
     )
 
     def emit_progress(segment_index: int, segment: NativeWholeFiberSegmentResult | None = None) -> None:
+        nonlocal last_persisted_restart_count
         if not progress:
             return
         done = int(segment_index)
@@ -4923,6 +4926,7 @@ def trace_native_3d_whole_fiber(
             else None
         )
         restarts_per_meter = _restarts_per_meter(restart_count, reference_length_meters)
+        persist_restart_line = restart_count > last_persisted_restart_count
         physical_detail = ""
         if restarts_per_meter is not None and reference_length_meters is not None:
             physical_detail = (
@@ -4945,7 +4949,10 @@ def trace_native_3d_whole_fiber(
                 f"{physical_detail}"
                 f"eta={_format_eta(eta)} blocks={len(cache._blocks)}"
             ),
+            persist_line=persist_restart_line,
         )
+        if persist_restart_line:
+            last_persisted_restart_count = int(restart_count)
 
     def inferred_block_count() -> int:
         return int(getattr(cache, "total_inferred_blocks", len(cache._blocks)))
