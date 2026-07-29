@@ -37,6 +37,17 @@
 - `OutputProductSpec.scaledown` is base-relative output metadata;
   `inference_scaledown` is the explicit factor relative to the selected input
   array used for tile downsampling and ring geometry.
+- Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2
+  (factor 4 relative to selected input). It is converted to the runner's
+  literal factor and does not read or reinterpret tracer config `scaledown`.
+- Scaled output uses the shared repeated separable `[1,4,6,4,1]/16`
+  blur-plus-2x-decimation path for weighted predictions and weights. Fiber has
+  no private resampling, blending, or border implementation.
+- Lasagna predict3d and Fiber inference default to 64x64x64 OME-Zarr chunks.
+- Accumulator activity is contribution-driven. Unsupported, resume-complete,
+  and untouched chunks produce neither output chunks nor mmap zero-writes.
+  Only dirty product and shared-weight regions are flushed and cleared before
+  circular-slot reuse.
 - Output products are independently resumable. For Lasagna, missing `pred_dt`
   chunks schedule only derived distance-transform generation; they must not
   schedule neural model inference when `cos` and `grad_mag/nx/ny` chunks are

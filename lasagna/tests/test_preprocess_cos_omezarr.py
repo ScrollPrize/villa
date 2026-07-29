@@ -442,7 +442,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["base_ref"], "base.zarr")
 		self.assertEqual(kwargs["base_scale"], 1)
 		self.assertEqual(kwargs["n_levels"], 3)
-		self.assertEqual(kwargs["ome_chunk"], 32)
+		self.assertEqual(kwargs["ome_chunk"], 64)
 
 	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
 		progress = {
@@ -912,6 +912,48 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			out = stdout.getvalue()
 			self.assertIn("final_z=4/8", out)
 			self.assertIn("final_z=8/8", out)
+
+	def test_shared_runner_does_not_clear_or_write_unsupported_xy_chunks(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		adapter = _IdentityProductAdapter(product)
+
+		class Output:
+			def __init__(self):
+				self.written = []
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.written.append(chunk_origin_zyx)
+
+		output = Output()
+		clear_calls = []
+		original_clear = _CircularZBand.clear
+
+		def spy_clear(band, *args):
+			clear_calls.append((band.name, args))
+			return original_clear(band, *args)
+
+		with tempfile.TemporaryDirectory() as td:
+			input_path = Path(td) / "input.zarr"
+			arr = zarr.open(str(input_path), mode="w", shape=(4, 8, 8), chunks=(4, 4, 4), dtype="uint8")
+			arr[0:4, 0:4, 0:4] = 1
+			with mock.patch.object(_CircularZBand, "clear", new=spy_clear):
+				run_tiled_inference_3d(
+					object(), zarr.open(str(input_path), mode="r"),
+					crop_slices=(0, 4, 0, 8, 0, 8), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=output, products=(product,),
+					output_regions_zyx={"identity": (0, 0, 0, 4, 8, 8)},
+					full_output_shapes_zyx={"identity": (4, 8, 8)},
+					input_zarr_path=str(input_path), tile_size=4, overlap=0, border=0,
+					tmp_dir=td,
+				)
+		self.assertEqual(output.written, [(0, 0, 0)])
+		self.assertEqual([name for name, _ in clear_calls], ["acc_identity", "weight_sd1"])
 
 	def test_canonical_tile_positions_do_not_shift_with_crop_origin(self):
 		kwargs = {

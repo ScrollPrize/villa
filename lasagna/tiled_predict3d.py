@@ -1640,6 +1640,8 @@ def run_tiled_inference_3d(
 		groups[sd] = dict(
 			products=group_products, oc=oc, shape=(Zo, Yo, Xo), region=region,
 			b=b, depth=depth, acc=acc, weight=weight, flushed=b,
+			activity={}, support_cache={}, unsupported_origins=set(),
+			resume_origins=set(), touched_bytes=0, cleared_bytes=0,
 		)
 
 	if input_zarr_path is not None:
@@ -1648,27 +1650,40 @@ def run_tiled_inference_3d(
 		store_path = getattr(getattr(zarr_arr, "store", None), "path", None)
 		input_dir = str(Path(str(store_path or ".")).resolve())
 
-	def _chunk_supported(sd: int, origin: ChunkOriginZYX, shape: tuple[int, int, int], oc: int) -> bool:
-		ends = tuple(min(shape[i], int(origin[i]) + oc) for i in range(3))
-		axes = [
-			_canonical_tile_positions_for_output_region(
-				volume_size=volume_shape[i], output_start=int(origin[i]), output_end=ends[i],
-				scaledown=sd, tile_size=tile_size, stride=stride, border=pad,
-				scaledown_multiple=sd_max,
+	def _chunk_supported(sd: int, g: dict[str, Any], origin: ChunkOriginZYX) -> bool:
+		"""Whether the output chunk's own selected-input footprint has storage.
+
+		The footprint deliberately excludes the model and Gaussian halos.  This
+		keeps absent masked output chunks absent instead of materializing them
+		because a neighbouring source chunk happened to feed the same model tile.
+		"""
+		cache = g["support_cache"]
+		if origin not in cache:
+			shape = g["shape"]
+			ends = tuple(min(int(shape[i]), int(origin[i]) + int(g["oc"])) for i in range(3))
+			bounds = (
+				max(0, int(origin[0]) * sd), min(volume_shape[0], int(ends[0]) * sd),
+				max(0, int(origin[1]) * sd), min(volume_shape[1], int(ends[1]) * sd),
+				max(0, int(origin[2]) * sd), min(volume_shape[2], int(ends[2]) * sd),
 			)
-			for i in range(3)
-		]
-		for pz in axes[0]:
-			for py in axes[1]:
-				for px in axes[2]:
-					bounds = (
-						max(0, pz - pad), min(volume_shape[0], pz - pad + tile_size),
-						max(0, py - pad), min(volume_shape[1], py - pad + tile_size),
-						max(0, px - pad), min(volume_shape[2], px - pad + tile_size),
-					)
-					if _input_has_chunks(input_dir, *bounds):
-						return True
-		return False
+			cache[origin] = all(bounds[i] < bounds[i + 1] for i in (0, 2, 4)) and _input_has_chunks(input_dir, *bounds)
+		return bool(cache[origin])
+
+	def _needed_chunks(sd: int, g: dict[str, Any], reg: RegionZYX) -> dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]]:
+		shape = tuple(int(v) for v in full_output_shapes_zyx[g["products"][0].name])
+		needed: dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]] = {}
+		for origin in _iter_chunk_origins_for_region(*reg, g["oc"], shape):
+			missing = tuple(
+				p for p in g["products"]
+				if not output_adapter.product_chunk_complete(p, chunk_origin_zyx=origin)
+			)
+			if not missing:
+				g["resume_origins"].add(origin)
+			elif _chunk_supported(sd, g, origin):
+				needed[origin] = missing
+			else:
+				g["unsupported_origins"].add(origin)
+		return needed
 
 	def _tile_work(tz: int, ty: int, tx: int) -> bool:
 		bounds = (
@@ -1689,10 +1704,8 @@ def run_tiled_inference_3d(
 				max(oy0, oy0 + clips[1][0] - b), min(oy1, oy0 + clips[1][1] - b),
 				max(ox0, ox0 + clips[2][0] - b), min(ox1, ox0 + clips[2][1] - b),
 			)
-			shape = tuple(int(v) for v in full_output_shapes_zyx[g["products"][0].name])
-			for origin in _iter_chunk_origins_for_region(*reg, g["oc"], shape):
-				if any(not output_adapter.product_chunk_complete(p, chunk_origin_zyx=origin) for p in g["products"]):
-					return True
+			if _needed_chunks(sd, g, reg):
+				return True
 		return False
 
 	def _accumulate_group(sd: int, g: dict[str, Any], tensors: Mapping[str, torch.Tensor], tz: int, ty: int, tx: int) -> None:
@@ -1709,12 +1722,7 @@ def run_tiled_inference_3d(
 			max(oy0, oy0 + ay0 - b), min(oy1, oy0 + ay1 - b),
 			max(ox0, ox0 + ax0 - b), min(ox1, ox0 + ax1 - b),
 		)
-		shape = tuple(int(v) for v in full_output_shapes_zyx[g["products"][0].name])
-		incomplete_by_chunk: dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]] = {}
-		for origin in _iter_chunk_origins_for_region(*reg, oc, shape):
-			missing = tuple(p for p in g["products"] if not output_adapter.product_chunk_complete(p, chunk_origin_zyx=origin))
-			if missing:
-				incomplete_by_chunk[origin] = missing
+		incomplete_by_chunk = _needed_chunks(sd, g, reg)
 		if not incomplete_by_chunk:
 			return
 		product_np: dict[str, np.ndarray] = {}
@@ -1732,11 +1740,22 @@ def run_tiled_inference_3d(
 			lz1, ly1, lx1 = b + gz1 - oz0, b + gy1 - oy0, b + gx1 - ox0
 			pz0, py0, px0 = sz0 + lz0 - az0, sy0 + ly0 - ay0, sx0 + lx0 - ax0
 			pz1, py1, px1 = pz0 + lz1 - lz0, py0 + ly1 - ly0, px0 + lx1 - lx0
-			g["weight"].add(0, lz0, lz1, ly0, ly1, lx0, lx1, weight_np[pz0:pz1, py0:py1, px0:px1])
+			weight_part = weight_np[pz0:pz1, py0:py1, px0:px1]
+			if not np.any(weight_part > 0.0):
+				continue
+			g["weight"].add(0, lz0, lz1, ly0, ly1, lx0, lx1, weight_part)
+			voxels = (lz1 - lz0) * (ly1 - ly0) * (lx1 - lx0)
+			g["touched_bytes"] += voxels * 4
+			activity = g["activity"].setdefault(
+				origin, {"weight_dirty": False, "dirty_products": set()}
+			)
+			activity["weight_dirty"] = True
 			for product in missing:
 				arr = product_np[product.name]
 				for ch in range(product.raw_channel_count):
 					g["acc"][product.name].add(ch, lz0, lz1, ly0, ly1, lx0, lx1, arr[ch, pz0:pz1, py0:py1, px0:px1])
+				g["touched_bytes"] += product.raw_channel_count * voxels * 4
+				activity["dirty_products"].add(product.name)
 
 	def _flush_group(sd: int, g: dict[str, Any], complete_padded: int) -> None:
 		complete = int(complete_padded) // sd
@@ -1747,38 +1766,48 @@ def run_tiled_inference_3d(
 		flush_to = end if complete >= end else b + (max(0, complete - b) // oc) * oc
 		if flush_to <= flush_from:
 			return
-		print(f"[predict3d] flush sd={sd} z=[{oz0 + flush_from - b},{oz0 + flush_to - b})", flush=True)
-		shape = tuple(int(v) for v in full_output_shapes_zyx[g["products"][0].name])
-		for lz0 in range(flush_from, flush_to, oc):
-			gz = oz0 + lz0 - b
-			zlen = min(oc, flush_to - lz0, oz1 - gz)
-			for gy in range(oy0, oy1, oc):
-				ylen = min(oc, oy1 - gy)
-				for gx in range(ox0, ox1, oc):
-					xlen = min(oc, ox1 - gx)
-					origin = (gz, gy, gx)
-					ly0, lx0 = b + gy - oy0, b + gx - ox0
-					lz1, ly1, lx1 = lz0 + zlen, ly0 + ylen, lx0 + xlen
-					supported = _chunk_supported(sd, origin, shape, oc)
-					missing = tuple(p for p in g["products"] if not output_adapter.product_chunk_complete(p, chunk_origin_zyx=origin))
-					if supported and missing:
-						denom = g["weight"].read(0, lz0, lz1, ly0, ly1, lx0, lx1)
-						np.maximum(denom, 1.0e-7, out=denom)
-						for product in missing:
-							raw = np.stack([g["acc"][product.name].read(ch, lz0, lz1, ly0, ly1, lx0, lx1) for ch in range(product.raw_channel_count)])
-							raw /= denom[None]
-							finalizer = getattr(model_adapter, "finalize_product_slab", None)
-							if finalizer is None:
-								persisted = {
-									channel.name: np.clip(raw[index] * 255.0, 0.0, 255.0).astype(product.dtype)
-									for index, channel in enumerate(product.channels)
-								}
-							else:
-								persisted = finalizer(product, raw)
-							output_adapter.write_product_chunk(product, chunk_origin_zyx=origin, data={c.name: persisted[c.name] for c in product.channels})
-					for acc in g["acc"].values():
-						acc.clear(lz0, lz1, ly0, ly1, lx0, lx1)
-					g["weight"].clear(lz0, lz1, ly0, ly1, lx0, lx1)
+		eligible = sorted(
+			origin for origin in g["activity"]
+			if flush_from <= b + int(origin[0]) - oz0 < flush_to
+		)
+		flush_t0 = time.time()
+		print(
+			f"[predict3d] flush sd={sd} z=[{oz0 + flush_from - b},{oz0 + flush_to - b}) "
+			f"dirty_chunks={len(eligible)}",
+			flush=True,
+		)
+		written = 0
+		cleared_bytes = 0
+		by_name = {p.name: p for p in g["products"]}
+		for index, origin in enumerate(eligible, 1):
+			activity = g["activity"].pop(origin)
+			gz, gy, gx = origin
+			lz0, ly0, lx0 = b + gz - oz0, b + gy - oy0, b + gx - ox0
+			lz1 = min(lz0 + oc, b + oz1 - oz0)
+			ly1 = min(ly0 + oc, b + oy1 - oy0)
+			lx1 = min(lx0 + oc, b + ox1 - ox0)
+			if activity["weight_dirty"]:
+				denom = g["weight"].read(0, lz0, lz1, ly0, ly1, lx0, lx1)
+				if np.any(denom > 0.0):
+					np.maximum(denom, 1.0e-7, out=denom)
+					for name in sorted(activity["dirty_products"]):
+						product = by_name[name]
+						raw = np.stack([g["acc"][name].read(ch, lz0, lz1, ly0, ly1, lx0, lx1) for ch in range(product.raw_channel_count)])
+						raw /= denom[None]
+						finalizer = getattr(model_adapter, "finalize_product_slab", None)
+						if finalizer is None:
+							persisted = {channel.name: np.clip(raw[i] * 255.0, 0.0, 255.0).astype(product.dtype) for i, channel in enumerate(product.channels)}
+						else:
+							persisted = finalizer(product, raw)
+						output_adapter.write_product_chunk(product, chunk_origin_zyx=origin, data={c.name: persisted[c.name] for c in product.channels})
+						g["acc"][name].clear(lz0, lz1, ly0, ly1, lx0, lx1)
+						cleared_bytes += product.raw_channel_count * (lz1-lz0) * (ly1-ly0) * (lx1-lx0) * 4
+						written += 1
+				g["weight"].clear(lz0, lz1, ly0, ly1, lx0, lx1)
+				cleared_bytes += (lz1-lz0) * (ly1-ly0) * (lx1-lx0) * 4
+			if index == len(eligible) or index % 64 == 0:
+				print(f"[predict3d] flush sd={sd} chunks={index}/{len(eligible)} written={written}", flush=True)
+		g["cleared_bytes"] += cleared_bytes
 		for acc in g["acc"].values():
 			acc.discard_before(flush_to)
 		g["weight"].discard_before(flush_to)
@@ -1795,7 +1824,14 @@ def run_tiled_inference_3d(
 				int(progress.get(f"finalized_base_z_sd{group_sd}", progress.get("finalized_base_z", 0)))
 				for group_sd in groups
 			)
-		print(f"[predict3d] flush complete sd={sd} z={oz0 + flush_to - b}", flush=True)
+		print(
+			f"[predict3d] flush complete sd={sd} z={oz0 + flush_to - b} "
+			f"dirty_chunks={len(eligible)} products_written={written} "
+			f"unsupported={len(g['unsupported_origins'])} resume={len(g['resume_origins'])} "
+			f"touched={g['touched_bytes'] / 1024**2:.2f}MiB "
+			f"cleared={g['cleared_bytes'] / 1024**2:.2f}MiB elapsed={time.time()-flush_t0:.2f}s",
+			flush=True,
+		)
 
 	total = len(z_positions) * len(y_positions) * len(x_positions)
 	done = processed = skipped = 0
@@ -1810,6 +1846,8 @@ def run_tiled_inference_3d(
 				for tx in x_positions:
 					if not _tile_work(tz, ty, tx):
 						done += 1; skipped += 1
+						if progress is not None:
+							progress.update(tiles_done=done, tiles_processed=processed, tiles_skipped=skipped, tile_time_sum=tile_time, tiles_remaining_est=total-done)
 						continue
 					tile_t0 = time.time()
 					tile_np = _read_tile_zarr(zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad)

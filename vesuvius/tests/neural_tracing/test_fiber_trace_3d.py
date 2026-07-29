@@ -35,6 +35,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
     FiberTrace3DPredictAdapter,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.infer import (
+    _input_scaledown_from_base,
     _resolve_inference_device,
     run_fiber_trace_3d_inference,
 )
@@ -2738,7 +2739,7 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
         tile_size=8,
         overlap=0,
         border=0,
-        scaledown=1,
+        inference_scaledown_power=0,
         base_ref=str(input_path),
         base_scale=0,
         no_download=True,
@@ -2768,6 +2769,17 @@ def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) 
     assert not (tmp_path / "fiber_trace_3d_inference.json").exists()
     for raw_channel in FIBER_TRACE_3D_INTERNAL_CHANNELS:
         assert not (tmp_path / "fiber" / "option_000" / raw_channel).exists()
+
+
+def test_3d_fiber_inference_scale_defaults_and_validates_all_axes() -> None:
+    import inspect
+
+    parameters = inspect.signature(run_fiber_trace_3d_inference).parameters
+    assert parameters["inference_scaledown_power"].default == 2
+    assert parameters["ome_chunk"].default == 64
+    assert _input_scaledown_from_base((17, 33, 65), (5, 9, 17)) == 4
+    with pytest.raises(ValueError, match="isotropic power-of-two"):
+        _input_scaledown_from_base((17, 33, 65), (5, 17, 17))
 
 
 def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:
