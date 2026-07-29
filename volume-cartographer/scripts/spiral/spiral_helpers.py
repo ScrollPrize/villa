@@ -232,10 +232,7 @@ def resolve_fiber_links(point_collections, include_pending=False):
     undirected link appears once.
 
     Returns a list of dicts:
-        {'a_coll', 'a_point', 'b_coll', 'b_point', 'pending', 'junction_zyx'}
-    junction_zyx is the scroll-space [z, y, x] midpoint of the two (nearly
-    coincident) endpoints, cached so downstream consumers can locate the junction
-    without the point_collections (which are freed after startup).
+        {'a_coll', 'a_point', 'b_coll', 'b_point', 'pending'}
     """
     by_basename = {}
     for cid, pcl in point_collections.items():
@@ -276,15 +273,10 @@ def resolve_fiber_links(point_collections, include_pending=False):
             if key in seen:
                 continue
             seen.add(key)
-            a_xyz = np.asarray(pcl['points'][a_point]['p'], dtype=np.float32)
-            b_xyz = np.asarray(
-                point_collections[target_cid]['points'][b_point]['p'], dtype=np.float32)
-            junction_xyz = 0.5 * (a_xyz + b_xyz)
             links.append({
                 'a_coll': cid, 'a_point': a_point,
                 'b_coll': target_cid, 'b_point': b_point,
                 'pending': bool(br.get('pending')),
-                'junction_zyx': junction_xyz[::-1].copy(),  # [z, y, x]
             })
     return links
 
@@ -601,6 +593,11 @@ def merge_linked_point_collections(point_collections, link_components,
             member_sorted, pos_of = _index_component_members(members)
             link_edges = _component_link_edges(members, member_links, point_collections, pos_of)
             tree_parent, extra_edges = _link_spanning_tree(len(members), link_edges)
+        # Merged keys are fresh member-major ordinals, but the point dicts are the
+        # members' own (shared, not copied -- they also live on in the unattached
+        # pool) and keep their member-local 'id', which stays meaningful for
+        # tracing a point back to its source fiber. So on a merged pcl key !=
+        # point['id']: never index merged_points by a point's 'id'.
         merged_points = {}
         for points in member_sorted:
             for point in points:
@@ -620,7 +617,7 @@ def merge_linked_point_collections(point_collections, link_components,
         cross_patch_point_collections[merged_id] = {
             'id': merged_id,
             'name': merged_id,
-            'sampling_group': rep.get('sampling_group', 'fibers:H'),
+            'sampling_group': rep.get('sampling_group', 'fibers'),
             'metadata': {'winding_is_absolute': False,
                          'input_role': 'fiber_link_component'},
             'points': merged_points,

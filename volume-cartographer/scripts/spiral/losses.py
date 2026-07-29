@@ -42,7 +42,7 @@ def _pcl_sampling_group_weight(group):
     # Look up the per-step sampling weight of a sampling group in
     # cfg['pcl_sampling_weights']. Keys are matched on the group's basename with the
     # .json suffix stripped, so the source json stem (e.g. 'relative_windings') or the
-    # fiber tag ('fibers:H' / 'fibers:V'). When the dict is in use every group must
+    # single 'fibers' group. When the dict is in use every group must
     # have an explicit key, so a missing one is an error rather than a silent default.
     key = os.path.splitext(os.path.basename(str(group)))[0]
     try:
@@ -54,36 +54,58 @@ def _pcl_sampling_group_weight(group):
         )
 
 
-def build_pcl_sampling_strata(sampling_groups):
+def build_pcl_sampling_strata(sampling_groups, member_weights=None):
     # Precompute the per-step sampling pool for _choose_pcl_indices from each pool
-    # member's sampling group (source json file; fibers split into fibers:H /
-    # fibers:V). Members whose group is None are ineligible and excluded. When
+    # member's sampling group (source json file; all fibers share one 'fibers'
+    # group). Members whose group is None are ineligible and excluded. When
     # cfg['pcl_sampling_weights'] is a dict, every group must have an explicit weight
     # and groups with weight <= 0 are switched off (dropped from the pool entirely).
     # Otherwise all groups stay eligible; the legacy stratified_pcl_sampling flag
     # controls whether selection uses equal strata or the combined pool.
+    # member_weights (parallel to sampling_groups) sets each member's relative draw
+    # probability within its stratum (and within the combined pool); used to give a
+    # fiber-link component the sampling pressure of its member count rather than a
+    # single strip's. None means uniform.
     # Returns {'strata': [int64 pool-index array per group], 'groups': [group name
-    # per stratum], 'weights': float weight per stratum, 'all': all eligible indices}.
+    # per stratum], 'weights': float weight per stratum, 'member_probs': [per-stratum
+    # draw probabilities or None], 'all': all eligible indices, 'all_probs': draw
+    # probabilities over 'all' or None}.
+    sampling_groups = list(sampling_groups)
+    if member_weights is not None:
+        member_weights = np.asarray(list(member_weights), dtype=np.float64)
+        assert len(member_weights) == len(sampling_groups)
     group_to_indices = {}
     for idx, group in enumerate(sampling_groups):
         if group is None:
             continue
         group_to_indices.setdefault(group, []).append(idx)
     weighted = cfg['pcl_sampling_weights'] is not None
-    strata, groups, weights = [], [], []
+    strata, groups, weights, member_probs = [], [], [], []
     for group, indices in group_to_indices.items():
         weight = _pcl_sampling_group_weight(group) if weighted else 1.0
         if weighted and weight <= 0:
             continue  # switched off
-        strata.append(np.asarray(indices, dtype=np.int64))
+        indices = np.asarray(indices, dtype=np.int64)
+        strata.append(indices)
         groups.append(group)
         weights.append(weight)
+        if member_weights is None:
+            member_probs.append(None)
+        else:
+            w = member_weights[indices]
+            member_probs.append(w / w.sum())
     all_indices = np.concatenate(strata) if strata else np.empty(0, dtype=np.int64)
+    all_probs = None
+    if member_weights is not None and len(all_indices):
+        w = member_weights[all_indices]
+        all_probs = w / w.sum()
     return {
         'strata': strata,
         'groups': groups,
         'weights': np.asarray(weights, dtype=np.float64),
+        'member_probs': member_probs,
         'all': all_indices,
+        'all_probs': all_probs,
     }
 
 
@@ -91,10 +113,12 @@ def _choose_pcl_indices(sampling_strata, num_to_sample):
     # Choose num_to_sample pool indices from a build_pcl_sampling_strata() bundle.
     # Explicit weights allocate draws proportionally. Without them, the legacy
     # stratified_pcl_sampling switch selects equal group shares or uniform sampling
-    # over the combined pool.
+    # over the combined pool. Per-member weights (member_probs / all_probs), when
+    # the bundle carries them, skew the within-pool draws.
     weighted = cfg['pcl_sampling_weights'] is not None
     if not weighted and not cfg['stratified_pcl_sampling']:
-        return np.random.choice(sampling_strata['all'], num_to_sample, replace=False)
+        return np.random.choice(sampling_strata['all'], num_to_sample, replace=False,
+                                p=sampling_strata['all_probs'])
     strata = sampling_strata['strata']
     weights = sampling_strata['weights'] if weighted else np.ones(
         len(strata), dtype=np.float64)
@@ -106,8 +130,8 @@ def _choose_pcl_indices(sampling_strata, num_to_sample):
         probs = frac / frac.sum() if frac.sum() > 0 else weights / weights.sum()
         quotas[np.random.choice(len(strata), remainder, replace=False, p=probs)] += 1
     chosen = [
-        np.random.choice(stratum, quota, replace=quota > len(stratum))
-        for stratum, quota in zip(strata, quotas)
+        np.random.choice(stratum, quota, replace=quota > len(stratum), p=probs)
+        for stratum, quota, probs in zip(strata, quotas, sampling_strata['member_probs'])
         if quota > 0
     ]
     return np.concatenate(chosen) if chosen else np.empty(0, dtype=np.int64)

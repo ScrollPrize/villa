@@ -86,6 +86,7 @@ from spiral_helpers import (
     load_patches,
     load_fiber_point_collection,
     load_fiber_point_collections,
+    _decimate_ordered_points_min_spacing,
     resolve_fiber_links,
     build_link_components,
     merge_linked_point_collections,
@@ -261,13 +262,13 @@ default_config = {
     # losses). None uses stratified_pcl_sampling above. A dict switches on weighted
     # stratified sampling: each sampling group (pcl source json,
     # keyed by basename with the .json suffix stripped e.g. 'relative_windings';
-    # fibers split into 'fibers:H' / 'fibers:V') gets a per-step share of the samples
+    # all fibers form the single group 'fibers') gets a per-step share of the samples
     # proportional to its weight, regardless of how many pcls it holds. When set, the
     # dict must list every group explicitly (a missing group is an error); weight 0
     # switches a group off entirely. Equal weights reproduce plain stratification; e.g.
     # {'abs_winding': 1, 'patch-overlap-pcls': 1, 'relative_windings': 1,
-    #  'same_windings': 0, 'fibers:H': 2, 'fibers:V': 1} drops same-windings and
-    # doubles the horizontal-fiber share.
+    #  'same_windings': 0, 'fibers': 2} drops same-windings and doubles the
+    # fiber share.
     'pcl_sampling_weights': None,
     'abs_winding_num_pcls': 48,
     'abs_winding_num_points_per_pcl': 4,
@@ -965,17 +966,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         next_id,
         min_point_spacing=cfg['fiber_min_point_spacing'],
     )
-    # Fibers form two sampling groups, horizontal and vertical, rather than one
-    # group per source file like the regular pcls.
+    # All fibers (horizontal, vertical, and merged link components) form one
+    # sampling group, rather than one group per source file like the regular pcls.
     for pcl in fiber_point_collections.values():
-        hv_tag = pcl.get('metadata', {}).get('hv_classification', {}).get('automatic_tag')
-        if hv_tag not in ('H', 'V'):
-            print(
-                f'WARNING: fiber {pcl.get("name")!r} has hv_classification.automatic_tag '
-                f'{hv_tag!r} (expected "H" or "V"); grouping as horizontal'
-            )
-            hv_tag = 'H'
-        pcl['sampling_group'] = f'fibers:{hv_tag}'
+        pcl['sampling_group'] = 'fibers'
     point_collections.update(fiber_point_collections)
 
     for pcl in point_collections.values():
@@ -1189,17 +1183,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         zyxs = np.stack([point['zyx'] for _, point in sorted_items], axis=0).astype(np.float32)
         windings = np.array([point['winding_annotation'] for _, point in sorted_items], dtype=np.float32)
 
-        keep = list(range(len(zyxs)))
-        if min_point_spacing > 0 and len(zyxs) > 2:
-            keep = [0]
-            last_kept = zyxs[0]
-            for i in range(1, len(zyxs) - 1):
-                if i in force_keep or np.linalg.norm(zyxs[i] - last_kept) >= min_point_spacing:
-                    keep.append(i)
-                    last_kept = zyxs[i]
-            keep.append(len(zyxs) - 1)
-            zyxs = zyxs[keep]
-            windings = windings[keep]
+        zyxs, keep = _decimate_ordered_points_min_spacing(
+            zyxs, min_point_spacing, return_indices=True,
+            force_keep=force_keep | {len(zyxs) - 1})
+        windings = windings[keep]
 
         link_points = {
             int(sorted_items[orig_pos][0]): strip_pos
@@ -1301,13 +1288,23 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 unattached_component_edges.append([])
 
     def rebuild_pcl_sampling_strata():
+        # Weight merged fiber-link components by their member-pcl count: each
+        # draw samples at most rel_winding_num_patch_pairs_per_pcl patch pairs
+        # regardless of pcl size, so without this a component would get ~1/N the
+        # pair-sampling pressure its N members had before merging.
         pcl_sampling_strata['cross_patch'] = build_pcl_sampling_strata(
-            pcl['sampling_group'] if len(pcl['points']) > 1 else None
-            for pcl in cross_patch_pcls
+            [pcl['sampling_group'] if len(pcl['points']) > 1 else None
+             for pcl in cross_patch_pcls],
+            member_weights=[len(pcl.get('link_member_cids', ())) or 1
+                            for pcl in cross_patch_pcls],
         )
         rebuild_unattached_components()
+        # Weight each component by its member count so a linked component keeps
+        # the per-strip sampling pressure its members had before merging (each
+        # sampled walk covers only one random path through the component).
         pcl_sampling_strata['unattached'] = build_pcl_sampling_strata(
-            unattached_component_groups)
+            unattached_component_groups,
+            member_weights=[len(members) for members in unattached_components])
 
     rebuild_pcl_sampling_strata()
 
@@ -2378,8 +2375,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     pcl['source_file'] = path
                     pcl.setdefault('metadata', {})['winding_is_absolute'] = False
                     pcl['metadata']['input_role'] = 'fiber'
-                    hv_tag = pcl['metadata'].get('hv_classification', {}).get('automatic_tag')
-                    pcl['sampling_group'] = f'fibers:{hv_tag if hv_tag in ("H", "V") else "H"}'
+                    pcl['sampling_group'] = 'fibers'
                     new_collections[next_id] = pcl
                     next_id += 1
                 elif kind == 'pcl':
