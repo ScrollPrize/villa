@@ -313,6 +313,11 @@ class NativeTraceResult:
     selected_target_plane_name: str | None = None
     selected_target_plane_crossing_zyx: np.ndarray | None = None
     selected_target_plane_error_voxels: float = math.inf
+    terminal_point_zyx: np.ndarray | None = None
+    terminal_previous_direction_zyx: np.ndarray | None = None
+    terminal_history_direction_zyx: np.ndarray | None = None
+    terminal_sampled_current_direction_zyx: np.ndarray | None = None
+    terminal_sampled_current_valid: bool = False
 
 
 @dataclass(frozen=True)
@@ -3497,8 +3502,6 @@ def _update_target_plane_crossings(
     next_crossed = np.asarray(crossed, dtype=bool).copy()
     next_crossings = np.asarray(crossings_zyx, dtype=np.float32).copy()
     for index, plane in enumerate(planes):
-        if bool(next_crossed[index]):
-            continue
         crossing = _interpolate_plane_crossing(
             start_zyx,
             end_zyx,
@@ -3507,9 +3510,39 @@ def _update_target_plane_crossings(
         )
         if crossing is None:
             continue
+        replace = not bool(next_crossed[index])
+        if not replace:
+            old_error = _target_plane_in_plane_error_voxels(
+                next_crossings[index],
+                target_zyx=plane.point_zyx,
+                plane_normal_zyx=plane.normal_zyx,
+            )
+            new_error = _target_plane_in_plane_error_voxels(
+                crossing,
+                target_zyx=plane.point_zyx,
+                plane_normal_zyx=plane.normal_zyx,
+            )
+            replace = bool(new_error < old_error)
+        if not replace:
+            continue
         next_crossed[index] = True
         next_crossings[index] = crossing.astype(np.float32, copy=False)
     return next_crossed, next_crossings
+
+
+def _target_plane_selected_within_threshold(
+    selected: NativeTargetPlaneCrossing | None,
+    *,
+    threshold_voxels: float | None,
+) -> bool:
+    if selected is None:
+        return False
+    if threshold_voxels is None:
+        return True
+    threshold = float(threshold_voxels)
+    if not math.isfinite(threshold) or threshold < 0.0:
+        raise ValueError("target_plane_accept_threshold_voxels must be finite and non-negative")
+    return float(selected.error_voxels) <= threshold
 
 
 def _target_plane_in_plane_error_voxels(
@@ -3744,6 +3777,68 @@ def _fiber_target_planes_zyx(
     return _normalize_target_planes(target_zyx=target, target_planes_zyx=planes)
 
 
+def _native_trace_initial_state(
+    cache: Any,
+    start_zyx: np.ndarray,
+    *,
+    cp_reference_direction_zyx: np.ndarray,
+    initial_previous_direction_zyx: np.ndarray | None = None,
+    initial_history_direction_zyx: np.ndarray | None = None,
+    initial_sampled_current_direction_zyx: np.ndarray | None = None,
+    initial_sampled_current_valid: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    if bool(initial_sampled_current_valid) and initial_sampled_current_direction_zyx is not None:
+        previous = _require_unit(
+            cp_reference_direction_zyx
+            if initial_previous_direction_zyx is None
+            else initial_previous_direction_zyx,
+            label="native 3D Trace2CP continuation previous direction",
+        )
+        sampled_current = _align_axis(
+            _require_unit(
+                initial_sampled_current_direction_zyx,
+                label="native 3D Trace2CP continuation sampled direction",
+            ),
+            previous,
+        )
+        history = (
+            previous
+            if initial_history_direction_zyx is None
+            else _align_axis(
+                _require_unit(
+                    initial_history_direction_zyx,
+                    label="native 3D Trace2CP continuation history direction",
+                ),
+                previous,
+            )
+        )
+        return (
+            sampled_current.astype(np.float32, copy=False),
+            previous.astype(np.float32, copy=False),
+            history.astype(np.float32, copy=False),
+            True,
+        )
+
+    sampled_current, _presence, valid = _sample_trace_start_direction_aligned(
+        cache,
+        start_zyx,
+        cp_reference_direction_zyx=cp_reference_direction_zyx,
+    )
+    if not bool(valid):
+        return (
+            np.zeros((3,), dtype=np.float32),
+            np.zeros((3,), dtype=np.float32),
+            np.zeros((3,), dtype=np.float32),
+            False,
+        )
+    return (
+        sampled_current.astype(np.float32, copy=False),
+        sampled_current.astype(np.float32, copy=False),
+        sampled_current.astype(np.float32, copy=False),
+        True,
+    )
+
+
 def _trace_native_3d_one_way_greedy(
     cache: NativeTraceFieldCache,
     *,
@@ -3756,6 +3851,12 @@ def _trace_native_3d_one_way_greedy(
     budget_span_voxels: float | None = None,
     progress_label: str | None = None,
     normal_sampler: NativeTraceNormalSampler | None = None,
+    target_plane_accept_threshold_voxels: float | None = None,
+    snap_trace_to_selected_crossing: bool = True,
+    initial_previous_direction_zyx: np.ndarray | None = None,
+    initial_history_direction_zyx: np.ndarray | None = None,
+    initial_sampled_current_direction_zyx: np.ndarray | None = None,
+    initial_sampled_current_valid: bool = False,
 ) -> NativeTraceResult:
     start = np.asarray(start_zyx, dtype=np.float32)
     target = np.asarray(target_zyx, dtype=np.float32)
@@ -3809,15 +3910,17 @@ def _trace_native_3d_one_way_greedy(
 
     emit_progress(start, 0)
     with _profile_span_for_cache(cache, "trace_start_sample"):
-        initial_direction, _presence, valid = _sample_trace_start_direction_aligned(
+        initial_direction, previous_direction, history_direction, valid = _native_trace_initial_state(
             cache,
             start,
             cp_reference_direction_zyx=initial_direction_zyx,
+            initial_previous_direction_zyx=initial_previous_direction_zyx,
+            initial_history_direction_zyx=initial_history_direction_zyx,
+            initial_sampled_current_direction_zyx=initial_sampled_current_direction_zyx,
+            initial_sampled_current_valid=initial_sampled_current_valid,
         )
     if not valid:
         raise ValueError(f"native 3D Trace2CP start point is invalid: {start.tolist()}")
-    previous_direction = initial_direction.astype(np.float32, copy=False)
-    history_direction = initial_direction.astype(np.float32, copy=False)
     trace: list[np.ndarray] = [start.astype(np.float32)]
     steps: list[NativeTraceStep] = []
     current = start.astype(np.float32)
@@ -3847,10 +3950,13 @@ def _trace_native_3d_one_way_greedy(
                     target_plane_crossed,
                     target_plane_crossings,
                 )
+                all_crossed = bool(np.all(target_plane_crossed))
                 return NativeTraceResult(
                     trace_zyx=np.stack(trace, axis=0).astype(np.float32),
-                    reached_target_plane=False,
-                    reason=_missing_target_plane_reason(
+                    reached_target_plane=all_crossed,
+                    reason="target_plane_error_threshold"
+                    if all_crossed
+                    else _missing_target_plane_reason(
                         "invalid_current_point",
                         target_planes,
                         target_plane_crossed,
@@ -3864,6 +3970,17 @@ def _trace_native_3d_one_way_greedy(
                     selected_target_plane_error_voxels=math.inf
                     if selected is None
                     else float(selected.error_voxels),
+                    terminal_point_zyx=current.astype(np.float32, copy=False),
+                    terminal_previous_direction_zyx=previous_direction.astype(
+                        np.float32,
+                        copy=False,
+                    ),
+                    terminal_history_direction_zyx=history_direction.astype(
+                        np.float32,
+                        copy=False,
+                    ),
+                    terminal_sampled_current_direction_zyx=None,
+                    terminal_sampled_current_valid=False,
                 )
             current_direction = _align_axis(sampled_direction, previous_direction)
         with _profile_span_for_cache(cache, "trace_candidate_grid"):
@@ -3908,10 +4025,13 @@ def _trace_native_3d_one_way_greedy(
                 target_plane_crossed,
                 target_plane_crossings,
             )
+            all_crossed = bool(np.all(target_plane_crossed))
             return NativeTraceResult(
                 trace_zyx=np.stack(trace, axis=0).astype(np.float32),
-                reached_target_plane=False,
-                reason=_missing_target_plane_reason(
+                reached_target_plane=all_crossed,
+                reason="target_plane_error_threshold"
+                if all_crossed
+                else _missing_target_plane_reason(
                     "all_candidates_invalid",
                     target_planes,
                     target_plane_crossed,
@@ -3925,9 +4045,29 @@ def _trace_native_3d_one_way_greedy(
                 selected_target_plane_error_voxels=math.inf
                 if selected is None
                 else float(selected.error_voxels),
+                terminal_point_zyx=current.astype(np.float32, copy=False),
+                terminal_previous_direction_zyx=previous_direction.astype(
+                    np.float32,
+                    copy=False,
+                ),
+                terminal_history_direction_zyx=history_direction.astype(
+                    np.float32,
+                    copy=False,
+                ),
+                terminal_sampled_current_direction_zyx=current_direction.astype(
+                    np.float32,
+                    copy=False,
+                ),
+                terminal_sampled_current_valid=True,
             )
         chosen_direction = _align_axis(candidates_unit[int(best_index)], current_direction)
         next_point = (current + chosen_direction * np.float32(cfg.step_voxels)).astype(np.float32)
+        next_history_direction = _update_native_history_direction_np(
+            history_direction,
+            chosen_direction,
+            depth=_step_index,
+            cumulative_smoothness_steps=int(cfg.cumulative_smoothness_steps),
+        )
         next_crossed, next_crossings = _update_target_plane_crossings(
             start_zyx=current,
             end_zyx=next_point,
@@ -3943,28 +4083,48 @@ def _trace_native_3d_one_way_greedy(
             )
             if selected is None:
                 raise RuntimeError("all target planes crossed but no selected crossing was found")
-            trace.append(selected.point_zyx.astype(np.float32))
-            steps.append(
-                NativeTraceStep(
-                    point_zyx=selected.point_zyx.astype(np.float32),
-                    direction_loss=float(direction_loss),
-                    presence_loss=float(presence_loss),
-                    total_loss=float(_total),
-                    rejected_candidates=int(rejected),
-                    smoothness_loss=float(smoothness_loss),
+            if _target_plane_selected_within_threshold(
+                selected,
+                threshold_voxels=target_plane_accept_threshold_voxels,
+            ):
+                trace_point = (
+                    selected.point_zyx.astype(np.float32)
+                    if bool(snap_trace_to_selected_crossing)
+                    else next_point.astype(np.float32)
                 )
-            )
-            emit_progress(selected.point_zyx, _step_index + 1, reason="target_plane")
-            return NativeTraceResult(
-                trace_zyx=np.stack(trace, axis=0).astype(np.float32),
-                reached_target_plane=True,
-                reason="target_plane",
-                steps=tuple(steps),
-                target_plane_crossings=crossings,
-                selected_target_plane_name=selected.name,
-                selected_target_plane_crossing_zyx=selected.point_zyx,
-                selected_target_plane_error_voxels=float(selected.error_voxels),
-            )
+                trace.append(trace_point)
+                steps.append(
+                    NativeTraceStep(
+                        point_zyx=trace_point,
+                        direction_loss=float(direction_loss),
+                        presence_loss=float(presence_loss),
+                        total_loss=float(_total),
+                        rejected_candidates=int(rejected),
+                        smoothness_loss=float(smoothness_loss),
+                    )
+                )
+                emit_progress(selected.point_zyx, _step_index + 1, reason="target_plane")
+                return NativeTraceResult(
+                    trace_zyx=np.stack(trace, axis=0).astype(np.float32),
+                    reached_target_plane=True,
+                    reason="target_plane",
+                    steps=tuple(steps),
+                    target_plane_crossings=crossings,
+                    selected_target_plane_name=selected.name,
+                    selected_target_plane_crossing_zyx=selected.point_zyx,
+                    selected_target_plane_error_voxels=float(selected.error_voxels),
+                    terminal_point_zyx=next_point.astype(np.float32, copy=False),
+                    terminal_previous_direction_zyx=chosen_direction.astype(
+                        np.float32,
+                        copy=False,
+                    ),
+                    terminal_history_direction_zyx=next_history_direction.astype(
+                        np.float32,
+                        copy=False,
+                    ),
+                    terminal_sampled_current_direction_zyx=None,
+                    terminal_sampled_current_valid=False,
+                )
         trace.append(next_point.astype(np.float32))
         steps.append(
             NativeTraceStep(
@@ -3976,27 +4136,28 @@ def _trace_native_3d_one_way_greedy(
                 smoothness_loss=float(smoothness_loss),
             )
         )
-        history_direction = _update_native_history_direction_np(
-            history_direction,
-            chosen_direction,
-            depth=_step_index,
-            cumulative_smoothness_steps=int(cfg.cumulative_smoothness_steps),
-        )
+        history_direction = next_history_direction
         previous_direction = chosen_direction.astype(np.float32)
         current = next_point
         target_plane_crossed = next_crossed
         target_plane_crossings = next_crossings
         emit_progress(current, _step_index + 1)
-    emit_progress(current, progress_max, reason=limit_reason)
     crossings, selected = _target_plane_crossing_summary(
         target_planes,
         target_plane_crossed,
         target_plane_crossings,
     )
+    all_crossed = bool(np.all(target_plane_crossed))
+    reason = "target_plane_error_threshold" if all_crossed else limit_reason
+    emit_progress(current, progress_max, reason=reason)
     return NativeTraceResult(
         trace_zyx=np.stack(trace, axis=0).astype(np.float32),
-        reached_target_plane=False,
-        reason=_missing_target_plane_reason(limit_reason, target_planes, target_plane_crossed),
+        reached_target_plane=all_crossed,
+        reason=reason if all_crossed else _missing_target_plane_reason(
+            limit_reason,
+            target_planes,
+            target_plane_crossed,
+        ),
         steps=tuple(steps),
         target_plane_crossings=crossings,
         selected_target_plane_name=None if selected is None else selected.name,
@@ -4004,6 +4165,11 @@ def _trace_native_3d_one_way_greedy(
         selected_target_plane_error_voxels=math.inf
         if selected is None
         else float(selected.error_voxels),
+        terminal_point_zyx=current.astype(np.float32, copy=False),
+        terminal_previous_direction_zyx=previous_direction.astype(np.float32, copy=False),
+        terminal_history_direction_zyx=history_direction.astype(np.float32, copy=False),
+        terminal_sampled_current_direction_zyx=None,
+        terminal_sampled_current_valid=False,
     )
 
 
@@ -4014,6 +4180,7 @@ def _beam_node_result(
     reason: str,
     target_planes: Sequence[NativeTargetPlane] | None = None,
     selected_crossing: NativeTargetPlaneCrossing | None = None,
+    snap_trace_to_selected_crossing: bool = True,
 ) -> NativeTraceResult:
     nodes: list[_NativeBeamNode] = []
     current: _NativeBeamNode | None = node
@@ -4022,7 +4189,11 @@ def _beam_node_result(
         current = current.parent
     nodes.reverse()
     trace = np.stack([np.asarray(item.point_zyx, dtype=np.float32) for item in nodes], axis=0)
-    if selected_crossing is not None and trace.shape[0] > 0:
+    if (
+        bool(snap_trace_to_selected_crossing)
+        and selected_crossing is not None
+        and trace.shape[0] > 0
+    ):
         trace[-1] = selected_crossing.point_zyx.astype(np.float32, copy=False)
     steps = tuple(item.step for item in nodes[1:] if item.step is not None)
     crossings: tuple[NativeTargetPlaneCrossing, ...] = ()
@@ -4046,6 +4217,21 @@ def _beam_node_result(
         selected_target_plane_error_voxels=math.inf
         if selected is None
         else float(selected.error_voxels),
+        terminal_point_zyx=np.asarray(node.point_zyx, dtype=np.float32),
+        terminal_previous_direction_zyx=np.asarray(
+            node.previous_direction_zyx,
+            dtype=np.float32,
+        ),
+        terminal_history_direction_zyx=np.asarray(
+            node.history_direction_zyx,
+            dtype=np.float32,
+        ),
+        terminal_sampled_current_direction_zyx=None
+        if not bool(node.sampled_current_valid)
+        or node.sampled_current_direction_zyx is None
+        else np.asarray(node.sampled_current_direction_zyx, dtype=np.float32),
+        terminal_sampled_current_valid=bool(node.sampled_current_valid)
+        and node.sampled_current_direction_zyx is not None,
     )
 
 
@@ -4225,6 +4411,12 @@ def _trace_native_3d_one_way_beam(
     budget_span_voxels: float | None = None,
     progress_label: str | None = None,
     normal_sampler: NativeTraceNormalSampler | None = None,
+    target_plane_accept_threshold_voxels: float | None = None,
+    snap_trace_to_selected_crossing: bool = True,
+    initial_previous_direction_zyx: np.ndarray | None = None,
+    initial_history_direction_zyx: np.ndarray | None = None,
+    initial_sampled_current_direction_zyx: np.ndarray | None = None,
+    initial_sampled_current_valid: bool = False,
 ) -> NativeTraceResult:
     start = np.asarray(start_zyx, dtype=np.float32)
     target = np.asarray(target_zyx, dtype=np.float32)
@@ -4244,6 +4436,15 @@ def _trace_native_3d_one_way_beam(
         raise ValueError("_trace_native_3d_one_way_beam requires beam_width > 1")
     if not math.isfinite(float(cfg.beam_prune_distance_voxels)) or float(cfg.beam_prune_distance_voxels) < 0.0:
         raise ValueError("beam_prune_distance_voxels must be finite and non-negative")
+    accept_threshold = (
+        None
+        if target_plane_accept_threshold_voxels is None
+        else float(target_plane_accept_threshold_voxels)
+    )
+    if accept_threshold is not None and (
+        not math.isfinite(accept_threshold) or accept_threshold < 0.0
+    ):
+        raise ValueError("target_plane_accept_threshold_voxels must be finite and non-negative")
     lookahead_steps = int(cfg.beam_lookahead_steps)
     if lookahead_steps <= 0:
         raise ValueError("beam_lookahead_steps must be positive")
@@ -4295,10 +4496,14 @@ def _trace_native_3d_one_way_beam(
 
     emit_progress(start, 0, active_beams=1)
     with _profile_span_for_cache(cache, "trace_start_sample"):
-        initial_direction, _presence, valid = _sample_trace_start_direction_aligned(
+        initial_direction, initial_previous, initial_history, valid = _native_trace_initial_state(
             cache,
             start,
             cp_reference_direction_zyx=initial_direction_zyx,
+            initial_previous_direction_zyx=initial_previous_direction_zyx,
+            initial_history_direction_zyx=initial_history_direction_zyx,
+            initial_sampled_current_direction_zyx=initial_sampled_current_direction_zyx,
+            initial_sampled_current_valid=initial_sampled_current_valid,
         )
     if not valid:
         raise ValueError(f"native 3D Trace2CP start point is invalid: {start.tolist()}")
@@ -4313,8 +4518,8 @@ def _trace_native_3d_one_way_beam(
     )
     start_node = _NativeBeamNode(
         point_zyx=start.astype(np.float32),
-        previous_direction_zyx=initial_direction.astype(np.float32, copy=False),
-        history_direction_zyx=initial_direction.astype(np.float32, copy=False),
+        previous_direction_zyx=initial_previous.astype(np.float32, copy=False),
+        history_direction_zyx=initial_history.astype(np.float32, copy=False),
         parent=None,
         step=None,
         cumulative_loss=0.0,
@@ -4643,8 +4848,8 @@ def _trace_native_3d_one_way_beam(
                 * target_plane_normals_t[None, :, :],
                 dim=2,
             )
-            crossed_now = (~parent_crossed) & ((d0 == 0.0) | (d0 * d1 <= 0.0))
-            child_crossed = parent_crossed | crossed_now
+            crossed_this_step = (d0 == 0.0) | (d0 * d1 <= 0.0)
+            child_crossed = parent_crossed | crossed_this_step
             denom = d0 - d1
             safe_denom = torch.where(
                 torch.abs(denom) > float(_EPS),
@@ -4661,12 +4866,39 @@ def _trace_native_3d_one_way_beam(
                 current_child_points[:, None, :] * (1.0 - crossing_t[:, :, None])
                 + child_next_points[:, None, :] * crossing_t[:, :, None]
             )
+            old_deltas = parent_crossings - target_plane_points_t[None, :, :]
+            old_normal_projection = torch.sum(
+                old_deltas * target_plane_normals_t[None, :, :],
+                dim=2,
+            )
+            old_in_plane = (
+                old_deltas
+                - old_normal_projection[:, :, None] * target_plane_normals_t[None, :, :]
+            )
+            old_errors = torch.linalg.norm(old_in_plane, dim=2)
+            old_errors = torch.where(
+                parent_crossed,
+                old_errors,
+                torch.full_like(old_errors, torch.inf),
+            )
+            new_deltas = crossing_points - target_plane_points_t[None, :, :]
+            new_normal_projection = torch.sum(
+                new_deltas * target_plane_normals_t[None, :, :],
+                dim=2,
+            )
+            new_in_plane = (
+                new_deltas
+                - new_normal_projection[:, :, None] * target_plane_normals_t[None, :, :]
+            )
+            new_errors = torch.linalg.norm(new_in_plane, dim=2)
+            replace_crossing = crossed_this_step & (
+                (~parent_crossed) | (new_errors < old_errors)
+            )
             child_crossings = torch.where(
-                crossed_now[:, :, None],
+                replace_crossing[:, :, None],
                 crossing_points,
                 parent_crossings,
             )
-            reached_mask = torch.all(child_crossed, dim=1)
             deltas = child_crossings - target_plane_points_t[None, :, :]
             normal_projection = torch.sum(
                 deltas * target_plane_normals_t[None, :, :],
@@ -4682,18 +4914,20 @@ def _trace_native_3d_one_way_beam(
                 crossing_errors,
                 torch.full_like(crossing_errors, torch.inf),
             )
-            selected_plane_index = torch.argmin(crossing_errors, dim=1)
+            selected_errors, selected_plane_index = torch.min(crossing_errors, dim=1)
             selected_points = child_crossings[
                 torch.arange(int(child_crossings.shape[0]), device=device),
                 selected_plane_index,
             ]
-            child_points = torch.where(
-                reached_mask[:, None],
-                selected_points,
-                child_next_points,
-            )
+            all_planes_crossed_mask = torch.all(child_crossed, dim=1)
+            if accept_threshold is None:
+                reached_mask = all_planes_crossed_mask
+            else:
+                reached_mask = all_planes_crossed_mask & (
+                    selected_errors <= float(accept_threshold)
+                )
             child_generation = _NativeBeamTensorGeneration(
-                points_zyx=child_points,
+                points_zyx=child_next_points,
                 previous_directions_zyx=chosen_directions,
                 history_directions_zyx=child_history,
                 cumulative_loss=frontier_gen.cumulative_loss[child_parent_indices]
@@ -4746,6 +4980,7 @@ def _trace_native_3d_one_way_beam(
                 reason="target_plane",
                 target_planes=target_planes,
                 selected_crossing=selected,
+                snap_trace_to_selected_crossing=snap_trace_to_selected_crossing,
             )
         if expanded_steps == 0 or frontier_generation_index == 0:
             emit_progress(
@@ -4759,10 +4994,13 @@ def _trace_native_3d_one_way_beam(
                 if best_live.target_plane_crossed is not None
                 else np.zeros((len(target_planes),), dtype=bool)
             )
+            all_crossed = bool(np.all(best_crossed))
             return _beam_node_result(
                 best_live,
-                reached_target_plane=False,
-                reason=_missing_target_plane_reason(
+                reached_target_plane=all_crossed,
+                reason="target_plane_error_threshold"
+                if all_crossed
+                else _missing_target_plane_reason(
                     "all_candidates_invalid",
                     target_planes,
                     best_crossed,
@@ -4798,10 +5036,13 @@ def _trace_native_3d_one_way_beam(
                 if best_live.target_plane_crossed is not None
                 else np.zeros((len(target_planes),), dtype=bool)
             )
+            all_crossed = bool(np.all(best_crossed))
             return _beam_node_result(
                 best_live,
-                reached_target_plane=False,
-                reason=_missing_target_plane_reason(
+                reached_target_plane=all_crossed,
+                reason="target_plane_error_threshold"
+                if all_crossed
+                else _missing_target_plane_reason(
                     "all_candidates_invalid",
                     target_planes,
                     best_crossed,
@@ -4818,10 +5059,13 @@ def _trace_native_3d_one_way_beam(
         if best_live.target_plane_crossed is not None
         else np.zeros((len(target_planes),), dtype=bool)
     )
+    all_crossed = bool(np.all(best_crossed))
     return _beam_node_result(
         best_live,
-        reached_target_plane=False,
-        reason=_missing_target_plane_reason(limit_reason, target_planes, best_crossed),
+        reached_target_plane=all_crossed,
+        reason="target_plane_error_threshold"
+        if all_crossed
+        else _missing_target_plane_reason(limit_reason, target_planes, best_crossed),
         target_planes=target_planes,
     )
 
@@ -4838,6 +5082,12 @@ def trace_native_3d_one_way(
     budget_span_voxels: float | None = None,
     progress_label: str | None = None,
     normal_sampler: NativeTraceNormalSampler | None = None,
+    target_plane_accept_threshold_voxels: float | None = None,
+    snap_trace_to_selected_crossing: bool = True,
+    initial_previous_direction_zyx: np.ndarray | None = None,
+    initial_history_direction_zyx: np.ndarray | None = None,
+    initial_sampled_current_direction_zyx: np.ndarray | None = None,
+    initial_sampled_current_valid: bool = False,
 ) -> NativeTraceResult:
     if int(cfg.candidate_substeps) < 1:
         raise ValueError("candidate_substeps must be at least 1")
@@ -4854,6 +5104,12 @@ def trace_native_3d_one_way(
             budget_span_voxels=budget_span_voxels,
             progress_label=progress_label,
             normal_sampler=normal_sampler,
+            target_plane_accept_threshold_voxels=target_plane_accept_threshold_voxels,
+            snap_trace_to_selected_crossing=snap_trace_to_selected_crossing,
+            initial_previous_direction_zyx=initial_previous_direction_zyx,
+            initial_history_direction_zyx=initial_history_direction_zyx,
+            initial_sampled_current_direction_zyx=initial_sampled_current_direction_zyx,
+            initial_sampled_current_valid=initial_sampled_current_valid,
         )
     return _trace_native_3d_one_way_beam(
         cache,
@@ -4866,6 +5122,12 @@ def trace_native_3d_one_way(
         budget_span_voxels=budget_span_voxels,
         progress_label=progress_label,
         normal_sampler=normal_sampler,
+        target_plane_accept_threshold_voxels=target_plane_accept_threshold_voxels,
+        snap_trace_to_selected_crossing=snap_trace_to_selected_crossing,
+        initial_previous_direction_zyx=initial_previous_direction_zyx,
+        initial_history_direction_zyx=initial_history_direction_zyx,
+        initial_sampled_current_direction_zyx=initial_sampled_current_direction_zyx,
+        initial_sampled_current_valid=initial_sampled_current_valid,
     )
 
 
@@ -5498,6 +5760,10 @@ def trace_native_3d_whole_fiber(
         start_control_point_index=first_cp,
         target_control_point_index=first_cp + 1,
     )
+    current_previous_direction: np.ndarray | None = None
+    current_history_direction: np.ndarray | None = None
+    current_sampled_direction: np.ndarray | None = None
+    current_sampled_valid = False
 
     def emit_progress(completed_segments: int, segment: NativeWholeFiberSegmentResult | None = None) -> None:
         nonlocal last_persisted_restart_count
@@ -5585,17 +5851,25 @@ def trace_native_3d_whole_fiber(
             if profiler is not None
             else _NullNativeTraceProfileSpan()
         ):
-            result = tracer(
-                cache,
-                start_zyx=current_point.astype(np.float32),
-                target_zyx=target_point,
-                initial_direction_zyx=current_direction,
-                cfg=cfg,
-                target_planes_zyx=target_planes,
-                budget_span_voxels=segment_span,
-                progress_label=None,
-                normal_sampler=normal_sampler,
-            )
+            trace_kwargs = {
+                "start_zyx": current_point.astype(np.float32),
+                "target_zyx": target_point,
+                "initial_direction_zyx": current_direction,
+                "cfg": cfg,
+                "target_planes_zyx": target_planes,
+                "budget_span_voxels": segment_span,
+                "progress_label": None,
+                "normal_sampler": normal_sampler,
+            }
+            if trace_segment_fn is None:
+                trace_kwargs["target_plane_accept_threshold_voxels"] = threshold
+                trace_kwargs["snap_trace_to_selected_crossing"] = False
+                if current_previous_direction is not None:
+                    trace_kwargs["initial_previous_direction_zyx"] = current_previous_direction
+                    trace_kwargs["initial_history_direction_zyx"] = current_history_direction
+                    trace_kwargs["initial_sampled_current_direction_zyx"] = current_sampled_direction
+                    trace_kwargs["initial_sampled_current_valid"] = current_sampled_valid
+            result = tracer(cache, **trace_kwargs)
         crossing = (
             np.asarray(result.selected_target_plane_crossing_zyx, dtype=np.float32)
             if bool(result.reached_target_plane)
@@ -5635,8 +5909,29 @@ def trace_native_3d_whole_fiber(
             reason = result.reason
             restart = False
             reference_arc = float(abs(float(arc_by_cp[target_cp]) - reference_origin_arc))
-            current_point = crossing
-            current_direction = _terminal_trace_direction(result.trace_zyx, fallback=current_direction)
+            current_point = (
+                np.asarray(result.terminal_point_zyx, dtype=np.float32)
+                if result.terminal_point_zyx is not None
+                else np.asarray(result.trace_zyx[-1], dtype=np.float32)
+            )
+            current_direction = (
+                np.asarray(result.terminal_previous_direction_zyx, dtype=np.float32)
+                if result.terminal_previous_direction_zyx is not None
+                else _terminal_trace_direction(result.trace_zyx, fallback=current_direction)
+            )
+            current_history_direction = (
+                np.asarray(result.terminal_history_direction_zyx, dtype=np.float32)
+                if result.terminal_history_direction_zyx is not None
+                else current_direction.astype(np.float32, copy=False)
+            )
+            current_previous_direction = current_direction.astype(np.float32, copy=False)
+            current_sampled_direction = (
+                np.asarray(result.terminal_sampled_current_direction_zyx, dtype=np.float32)
+                if bool(result.terminal_sampled_current_valid)
+                and result.terminal_sampled_current_direction_zyx is not None
+                else None
+            )
+            current_sampled_valid = current_sampled_direction is not None
             last_success_cp_index = target_cp
         else:
             reason = result.reason if not bool(result.reached_target_plane) else "in_plane_error"
@@ -5652,6 +5947,10 @@ def trace_native_3d_whole_fiber(
                     start_control_point_index=target_cp,
                     target_control_point_index=target_cp + 1,
                 )
+            current_previous_direction = None
+            current_history_direction = None
+            current_sampled_direction = None
+            current_sampled_valid = False
         trace = np.asarray(result.trace_zyx, dtype=np.float32)
         if stitched_parts and trace.shape[0] > 0 and previous_segment_success and success:
             stitched_parts.append(trace[1:].copy())

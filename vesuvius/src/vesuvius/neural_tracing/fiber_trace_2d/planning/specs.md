@@ -849,8 +849,14 @@
   the previous fiber line point when available, and the sampled model
   direction at the target CP sign-aligned to the local target tangent. The
   trace continues until all configured target-local planes have been crossed,
-  then selects the crossed plane with the smallest in-plane CP error. Missing
-  required target planes are reported in the failure reason.
+  then selects the crossed plane with the smallest in-plane CP error. Later
+  crossings of the same target plane replace earlier crossings when their
+  in-plane CP error is lower. In Python whole-fiber tracing, all target-local
+  planes being crossed is necessary but not sufficient for segment acceptance:
+  the selected best crossing error must also be at or below the configured
+  whole-fiber threshold; otherwise tracing continues until the budget or another
+  failure condition ends the segment. Missing required target planes are
+  reported in the failure reason.
 - In native 3D whole-fiber mode, `--fiber-json <path>` without sample or CP
   selectors traces the entire fiber. `--fiber-json <path> --sample-index N`
   remains single-segment inspection using deterministic flat sample selection,
@@ -862,9 +868,12 @@
   all configured target-local planes are crossed within the segment's step
   budget and the selected smallest in-plane error to the target CP is at most
   `--whole-fiber-error-threshold-voxels` (default `10`). Successful segments
-  continue from the selected crossing and carry the accepted trace direction.
-  Failed segments count one restart and resume tracing from the failed target
-  CP with a fresh CP-local fiber tangent.
+  do not restart, resample CP-start direction, or reset smoothing history. The
+  selected crossing is only the metric/checkpoint location; live tracing
+  continues from the actual stepped trace point with previous direction,
+  sampled-current direction when cached, and smoothing-history direction
+  preserved. Failed segments count one restart and resume tracing from the
+  failed target CP with a fresh CP-local fiber tangent.
 - Native 3D forward/reverse fusion must preserve each trace's traced order.
   It must not sort points by CP-axis progress and average them. Fusion selects
   a forward/reverse point pair over traced arc length, not straight CP-axis

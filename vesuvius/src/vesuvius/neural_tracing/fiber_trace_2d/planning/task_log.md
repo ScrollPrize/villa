@@ -1,39 +1,48 @@
-# Native 3D Trace2CP Target Plane Normals
+# Task Log: Python Native 3D Trace2CP Continuous CP Handling
 
-## Implementation Notes
+## Notes
 
-- Replaced implicit CP-to-CP chord target-plane fallback in Python native 3D
-  Trace2CP with explicit target-plane objects.
-- Python whole-fiber and single-pair runs now build target-local planes from
-  target CP line-neighbor directions plus the model-inferred direction sampled
-  at the target CP.
-- Python greedy and beam tracing now track which target-local planes have
-  crossed and only report success after all configured target planes are
-  crossed.
-- Python selected endpoint error is now the minimum in-plane CP error among
-  crossed target-local planes; the selected plane name/crossing is stored in
-  trace and whole-fiber summaries.
-- Native C++ `vc_fiber_tracer` now takes explicit target plane sets, derives
-  segment/whole-fiber target planes internally from the reference line and
-  persisted prediction field, and reports selected endpoint plane metadata.
-- VC3D GUI segment optimization no longer passes a caller-supplied
-  target-plane normal; the native tracer derives the target-local planes from
-  the selected segment.
-- Progress now uses distance-to-target progress instead of signed progress
-  along a CP chord plane normal.
+- User clarified that crossings are only for the current segment target CP.
+  Previous segment planes and CP-to-CP chord planes must not be considered.
+- User requested focusing on Python first; C++ parity is intentionally deferred
+  until the Python behavior is validated.
+- Updated Python target-plane crossing storage to keep the closest in-plane
+  crossing seen so far per target plane instead of keeping the first crossing.
+- Added optional one-way `target_plane_accept_threshold_voxels` and wired the
+  whole-fiber Python tracer to pass its existing restart threshold.
+- In thresholded whole-fiber tracing, all target planes crossed is no longer
+  enough to terminate successfully; the best selected crossing error must be at
+  or below the threshold. Above-threshold all-crossed states keep tracing until
+  accepted or until budget/failure ends the segment.
+- Above-threshold all-crossed failures preserve the selected crossing/error so
+  whole-fiber reporting can show an in-plane error instead of `inf`.
+- User then identified the remaining visible bug: successful CP crossings were
+  still acting like a handoff/reinitialization point. The next segment could
+  reselect the ambiguous direction or inherit a terminal direction unrelated to
+  the selected crossing.
+- Added terminal live trace state to `NativeTraceResult`: actual stepped point,
+  previous step direction, smoothing-history direction, and sampled-current
+  direction when available.
+- Added continuation arguments to the Python one-way tracer. Whole-fiber success
+  now passes those fields into the next CP target instead of CP-start
+  resampling. The selected plane crossing remains metric-only.
+- In whole-fiber mode, accepted target crossings no longer snap the stored trace
+  endpoint to the selected crossing. The trace/visualization follows the live
+  stepped path through the CP; failures still restart from the failed CP.
+- Added Python regression tests for replacing farther plane crossings, for
+  beam-mode continuation after early far crossings, and for whole-fiber
+  continuation from the live endpoint rather than the selected crossing.
 
 ## Deviations / Deferred
 
-- No requirement was simplified or deferred.
-- Low-level Python `trace_native_3d_one_way` still accepts an explicitly
-  supplied single plane for synthetic tests/callers, but it no longer creates a
-  CP-to-CP chord fallback when no target plane is provided.
+- C++ native tracer parity is deferred by user request.
+- The full user-provided S3/cache visualization command was attempted inside
+  the sandbox and failed at VC3D remote open with `HTTP 0 fetching .zattrs`.
+  Retrying with escalation was interrupted by the user, who will run the command
+  locally.
 
 ## Validation
 
-- `PYTHONPATH=vesuvius/src:. python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  - Result: 174 passed, 2 skipped.
-- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target test_fiber_trace3d`
-- `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_fiber_trace3d`
-  - Result: 10 test case(s) passed.
+- `PYTHONPATH=vesuvius/src:. python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py` passed.
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py` passed: 177 passed, 2 skipped.
+- `git diff --check` passed.

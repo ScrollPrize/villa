@@ -114,6 +114,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _score_candidate_loss_tensors_batched,
     _split_whole_fiber_panel_blocks_for_pages,
     _target_plane_in_plane_error_voxels,
+    _update_target_plane_crossings,
     _trace_candidate_directions_torch,
     _volume_trace_to_source_trace_xyz,
     fuse_forward_reverse_traces,
@@ -3845,6 +3846,34 @@ def test_native_3d_trace2cp_target_plane_error_uses_in_plane_distance() -> None:
     assert error == pytest.approx(5.0, abs=1.0e-6)
 
 
+def test_native_3d_trace2cp_target_plane_crossing_replaces_farther_crossing() -> None:
+    plane = NativeTargetPlane(
+        name="y_plane",
+        point_zyx=np.asarray([0.0, 0.0, 10.0], dtype=np.float32),
+        normal_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+    )
+    crossed = np.zeros((1,), dtype=bool)
+    crossings = np.zeros((1, 3), dtype=np.float32)
+
+    crossed, crossings = _update_target_plane_crossings(
+        start_zyx=np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
+        end_zyx=np.asarray([0.0, -1.0, 0.0], dtype=np.float32),
+        planes=(plane,),
+        crossed=crossed,
+        crossings_zyx=crossings,
+    )
+    crossed, crossings = _update_target_plane_crossings(
+        start_zyx=np.asarray([0.0, -1.0, 9.0], dtype=np.float32),
+        end_zyx=np.asarray([0.0, 1.0, 9.0], dtype=np.float32),
+        planes=(plane,),
+        crossed=crossed,
+        crossings_zyx=crossings,
+    )
+
+    assert crossed.tolist() == [True]
+    assert np.allclose(crossings[0], [0.0, 0.0, 9.0], atol=1.0e-6)
+
+
 def test_native_3d_trace2cp_one_way_requires_explicit_target_planes() -> None:
     class FakeCache:
         device = torch.device("cpu")
@@ -3966,6 +3995,59 @@ def test_native_3d_trace2cp_one_way_selects_best_crossed_target_plane_error() ->
     assert np.allclose(result.trace_zyx[-1], [4.0, 1.0, 0.0], atol=1.0e-6)
 
 
+def test_native_3d_trace2cp_one_way_continues_when_crossing_error_exceeds_threshold() -> None:
+    class FakeCache:
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            directions = torch.zeros((count, 1, 3), dtype=torch.float32)
+            directions[:, 0, 0] = 1.0
+            return (
+                directions,
+                torch.ones((count, 1), dtype=torch.float32),
+                torch.ones((count, 1), dtype=torch.bool),
+            )
+
+    target = np.asarray([10.0, 0.0, 0.0], dtype=np.float32)
+    result = trace_native_3d_one_way(
+        FakeCache(),
+        start_zyx=np.asarray([0.0, 5.0, 0.0], dtype=np.float32),
+        target_zyx=target,
+        initial_direction_zyx=np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+        target_planes_zyx=(
+            NativeTargetPlane(
+                name="early_1",
+                point_zyx=target,
+                normal_zyx=np.asarray([1.0, 1.0, 0.0], dtype=np.float32),
+            ),
+            NativeTargetPlane(
+                name="early_2",
+                point_zyx=target,
+                normal_zyx=np.asarray([1.0, 0.5, 0.0], dtype=np.float32),
+            ),
+        ),
+        cfg=NativeTrace2CpConfig(
+            step_voxels=1.0,
+            cone_angle_degrees=0.0,
+            beam_width=2,
+            beam_lookahead_steps=2,
+            trace_step_limit=15,
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=0.0,
+            smoothness_normal_weight=0.0,
+        ),
+        normal_sampler=_constant_native_normal_sampler(),
+        target_plane_accept_threshold_voxels=1.0,
+    )
+
+    assert result.reached_target_plane
+    assert result.reason == "target_plane_error_threshold"
+    assert result.selected_target_plane_error_voxels > 1.0
+    assert result.trace_zyx.shape[0] == 16
+    assert np.allclose(result.trace_zyx[-1], [15.0, 5.0, 0.0], atol=1.0e-6)
+
+
 def _whole_native_trace_record() -> SimpleNamespace:
     points = np.asarray(
         [
@@ -4012,6 +4094,72 @@ def test_native_3d_whole_fiber_trace_all_success_has_zero_restarts_per_kvx() -> 
     assert result.restarts_per_kvx == pytest.approx(0.0)
     assert [segment.success for segment in result.segments] == [True, True]
     assert np.allclose(result.stitched_trace_zyx[[0, -1]], [[0.0, 0.0, 0.0], [0.0, 0.0, 20.0]])
+
+
+def test_native_3d_whole_fiber_success_continues_from_live_trace_state() -> None:
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [10.5, 0.0, 0.0],
+            [20.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    record = SimpleNamespace(
+        fiber=Vc3dFiber(
+            path=Path("fiber.json"),
+            version=1,
+            line_points_xyz=points,
+            control_points_xyz=points.copy(),
+            generation=1,
+            metadata={},
+        ),
+        volume_spacing_base=1.0,
+    )
+
+    class FakeCache:
+        _blocks = {}
+        device = torch.device("cpu")
+
+        def sample_point_choices_torch(self, points_zyx: np.ndarray):
+            count = int(np.asarray(points_zyx).shape[0])
+            directions = torch.zeros((count, 1, 3), dtype=torch.float32)
+            directions[:, 0, 2] = 1.0
+            return (
+                directions,
+                torch.ones((count, 1), dtype=torch.float32),
+                torch.ones((count, 1), dtype=torch.bool),
+            )
+
+    result = trace_native_3d_whole_fiber(
+        FakeCache(),
+        record=record,
+        cfg=NativeTrace2CpConfig(
+            step_voxels=4.0,
+            cone_angle_degrees=0.0,
+            beam_width=2,
+            beam_lookahead_steps=1,
+            max_step_factor=3.0,
+            smoothness_weight=0.0,
+            smoothness_tangent_weight=0.0,
+            smoothness_normal_weight=0.0,
+            cumulative_smoothness_tangent_weight=0.0,
+        ),
+        error_threshold_voxels=1.0,
+        normal_sampler=_constant_native_normal_sampler(),
+    )
+
+    assert result.restart_count == 0
+    assert result.segments[0].success
+    assert result.segments[0].selected_target_plane_crossing_zyx is not None
+    assert np.allclose(
+        result.segments[0].selected_target_plane_crossing_zyx,
+        [0.0, 0.0, 10.5],
+        atol=1.0e-5,
+    )
+    assert np.allclose(result.segments[0].trace_zyx[-1], [0.0, 0.0, 12.0], atol=1.0e-5)
+    assert np.allclose(result.segments[1].trace_zyx[0], [0.0, 0.0, 12.0], atol=1.0e-5)
+    assert np.allclose(result.stitched_trace_zyx[-1], [0.0, 0.0, 20.0], atol=1.0e-5)
 
 
 def test_native_3d_whole_fiber_trace_can_start_at_later_control_point() -> None:

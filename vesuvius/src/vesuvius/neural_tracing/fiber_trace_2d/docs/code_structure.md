@@ -388,8 +388,11 @@ Ownership changed as follows:
   inferred-direction plane sampled from the model at the target CP and
   sign-aligned to the local target tangent. The trace keeps stepping until all
   configured planes have been crossed, then selects the crossing with the
-  lowest in-plane CP error. The straight CP-to-CP chord is not a termination
-  plane.
+  lowest in-plane CP error. Python whole-fiber tracing also requires that best
+  crossing error to be within the configured restart threshold before accepting
+  the segment; until then it keeps tracing within the remaining budget and
+  replaces stored crossings when a later crossing of the same target plane is
+  closer to the CP. The straight CP-to-CP chord is not a termination plane.
 - When `--vis` is enabled, native strip rendering prints coarse stage progress
   for side/top volume rendering, coordinate extraction, side/top presence
   sampling, trace overlay projection, and image composition. Presence sampling
@@ -414,22 +417,23 @@ Ownership changed as follows:
   region and the displayed trace resumes from the restart CP in the next
   long-strip span. Whole-fiber visualization uses a fixed 64 px cross-strip
   width; paths leaving that strip are clipped visually only.
-- Stops when the trace crosses the plane through the target CP with normal
-  from start CP to target CP. The stdout/summary metrics are
-  `native_trace2cp_plane_error` and
+- Single-pair stdout/summary metrics are `native_trace2cp_plane_error` and
   `native_trace2cp_closest_target_error`; these are tool-local diagnostics and
   do not replace the projected `test/trace2cp_error` metric used by training.
 - Whole-fiber mode traces continuously from CP plane to CP plane. A segment
   succeeds when it reaches the next CP plane within the segment budget and its
   in-plane selected-voxel error to the target CP is below
-  `--whole-fiber-error-threshold-voxels` (default `10`). Failures count one
-  restart and resume from the failed target CP. Human stdout/progress prints
-  compact error rates as `err/kvx=...` and, when physical units are available,
-  `err/m=...`, rounded to one decimal. Reference lengths and
-  `physical_unit=m` are omitted from human progress output. Live progress uses
-  carriage-return updates on one terminal line and prints a newline only at
-  completion. Physical per-meter output is optional and comes only from the
-  VC3D sampler's
+  `--whole-fiber-error-threshold-voxels` (default `10`). Success only advances
+  target-CP bookkeeping: it keeps the actual live trace point, previous step
+  direction, sampled-current direction when cached, and smoothing-history
+  direction. The selected plane crossing is used for metric/error reporting,
+  not as a new trace start. Failures count one restart and resume from the
+  failed target CP. Human stdout/progress prints compact error rates as
+  `err/kvx=...` and, when physical units are available, `err/m=...`, rounded to
+  one decimal. Reference lengths and `physical_unit=m` are omitted from human
+  progress output. Live progress uses carriage-return updates on one terminal
+  line and prints a newline only at completion. Physical per-meter output is
+  optional and comes only from the VC3D sampler's
   `record.sampler.volume.metadata["voxelsize"]` value, interpreted as
   micrometers and converted to meters. If VC3D does not expose a finite
   positive `voxelsize`, stdout/progress omit physical units and JSON stores

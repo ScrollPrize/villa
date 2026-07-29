@@ -1,26 +1,24 @@
-# Native 3D Trace2CP Target Plane Normals
+# Python Native 3D Trace2CP Continuous Whole-Fiber CP Handling
 
-Fix Trace2CP target-plane termination and endpoint-error calculation so CP-to-CP
-chord normals are not used.
+Fix the Python native 3D Trace2CP whole-fiber path so reaching a CP plane does
+not reinitialize tracing or smoothing state when the segment succeeds.
 
 Requirements:
 
-- Do not use the straight chord from start CP to target CP as a target-plane
-  normal.
-- For each target CP, consider three target planes:
-  - plane through the CP with normal from the CP to the next loaded fiber line
-    point;
-  - plane through the CP with normal from the CP to the previous loaded fiber
-    line point;
-  - plane through the CP with normal from the sampled fiber-direction inference
-    at that CP.
-- Continue tracing until all three target planes have been crossed, or until
-  the existing failure conditions apply.
-- When all three planes are crossed, compute the in-plane CP error for each
-  crossing and use the smaller/best error for segment success and metric
-  reporting.
-- Apply the same behavior to Python native 3D Trace2CP and the native VC3D
-  fiber tracer/metric path so their target-plane semantics remain aligned.
-- Keep existing trace scoring, beam-search, restart, and visualization behavior
-  unchanged except for displaying/reporting the new selected crossing/error
-  information where relevant.
+- Scope this task to the Python tracer only. Do not adapt the C++ tracer until
+  the Python behavior has been validated.
+- Target-plane crossings are only for the current segment's target CP. The
+  tracer must not consider previous segment planes or any CP-to-CP chord plane.
+- Keep tracing while budget remains when all target-local planes have been
+  crossed but the best crossed-plane in-plane CP error is still above the
+  configured whole-fiber threshold.
+- Continue to update target-plane crossing candidates so later/closer crossings
+  can replace earlier far crossings of the same plane.
+- Accept a one-way target-plane result only when all configured target-local
+  planes have been crossed and the best in-plane crossing error is at or below
+  the threshold.
+- In whole-fiber mode, an accepted CP crossing is a checkpoint/metric event,
+  not a trace restart. The live trace must continue from its actual stepped
+  point with previous direction, sampled-current direction, and smoothing
+  history preserved.
+- Only failed segments count as restarts and reset tracing from the failed CP.

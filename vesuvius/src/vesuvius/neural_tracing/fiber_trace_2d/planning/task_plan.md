@@ -1,126 +1,96 @@
-# Plan: Native 3D Trace2CP Target Plane Normals
+# Plan: Python Native 3D Trace2CP Continuous Whole-Fiber CP Handling
 
 ## Context
 
-The current Python and C++ native 3D Trace2CP whole-fiber paths use the
-straight CP-to-CP chord as the target-plane normal. That is not the intended
-fiber-local stopping geometry. The trace should instead stop only after
-crossing all three target-local planes and score the best CP in-plane error
-among those crossings.
+The Python whole-fiber 3D Trace2CP path now uses target-local planes instead of
+the CP-to-CP chord, but it currently terminates as soon as every target plane
+has been crossed once. For skewed/far crossings this can stop too early and can
+snap the endpoint back to an old crossing. Separately, successful CP crossings
+were still treated like segment boundaries: whole-fiber tracing restarted the
+next one-way tracer from the selected crossing and reselected start direction /
+smoothing state. The tracer should continue through accepted CP planes as one
+continuous trace; CP planes are only metric/checkpoint events unless a segment
+fails.
 
 ## Implementation
 
-1. Shared plane model
-   - Add a small target-plane representation in the Python tracer containing:
-     name, target point, unit normal, crossed flag, and crossing point.
-   - Add the equivalent representation to `vc_fiber_tracer` in C++.
-   - Ensure every normal is normalized, finite, and rejected loudly if
-     degenerate.
+1. Crossing tracking
+   - Update the target-plane crossing helper so it checks every target plane on
+     every step, not only not-yet-crossed planes.
+   - Store a new crossing if the plane was not crossed before or if the new
+     crossing has a smaller in-plane CP error than the stored one.
+   - Keep crossing tests local to the current segment target CP only.
 
-2. Line-neighbor target normals
-   - For a target CP, derive line-neighbor normals from the loaded fiber line
-     point indices, not from CP-to-CP chords.
-   - `next` normal: vector from target CP line point to the next line point when
-     available.
-   - `prev` normal: vector from target CP line point to the previous line point
-     when available.
-   - If the target CP is at a line endpoint, only the available neighbor normal
-     is used; if neither exists, fail because the target-plane geometry is
-     invalid.
-   - Preserve coordinate-scale conventions: normals are in selected-scale ZYX
-     for Python live tracing and in the C++ tracer working coordinate system
-     for VC3D.
+2. Threshold-aware one-way trace acceptance
+   - Add an optional one-way `target_plane_accept_threshold_voxels` argument.
+   - With no threshold, keep existing behavior for single-pair and synthetic
+     callers: all planes crossed is sufficient.
+   - With a threshold, accept only when all planes are crossed and the best
+     crossed-plane error is `<= threshold`.
+   - If all planes are crossed but the best error is still above threshold,
+     continue stepping from the actual candidate point, not from the selected
+     crossing.
+   - If the budget/failure condition ends after all planes were crossed but
+     above threshold, return the best selected crossing/error so whole-fiber
+     restart reporting can show the actual in-plane error.
 
-3. Inference-direction target normal
-   - Sample the fiber prediction direction at the target CP using the same field
-     sampling and ambiguous-direction alignment used by trace scoring.
-   - Align the sampled direction sign with the local reference fiber tangent at
-     the target CP so the plane normal orientation is stable. Plane crossing
-     itself should still work regardless of sign.
-   - If the sampled target direction is invalid, fail loudly for this tracing
-     run rather than silently falling back to the chord.
+3. Continuous whole-fiber state
+   - Extend one-way trace results with terminal live state: actual stepped
+     point, previous step direction, smoothing-history direction, and cached
+     sampled-current direction when available.
+   - Add one-way continuation arguments so a trace can start from an existing
+     live state without CP-start direction resampling.
+   - In whole-fiber mode, accepted CP crossings must keep the actual live trace
+     endpoint and terminal state. The selected crossing remains stored for
+     metric/error reporting only.
+   - Keep snapping to the selected crossing as the default for single-pair
+     visualization/diagnostic callers.
+   - On failure/restart, reset the live state and initialize the next run from
+     the failed CP's local fiber tangent as before.
 
-4. One-way trace termination
-   - Replace single-plane crossing state with three-plane crossing state.
-   - At each accepted trace step, test the segment from current point to next
-     point against every not-yet-crossed target plane and store the interpolated
-     crossing point when crossed.
-   - Continue stepping until all configured target planes are crossed.
-   - If max steps, invalid current point, invalid candidates, or other existing
-     failures occur before all planes are crossed, return a visible failure
-     reason that names the missing planes.
+4. Whole-fiber wiring
+   - Pass the existing whole-fiber `error_threshold_voxels` into the Python
+     one-way tracer when using the real tracer.
+   - Keep fake `trace_segment_fn` tests compatible by not requiring test helpers
+     to accept the new production-only argument.
 
-5. Endpoint error and success
-   - Compute in-plane error for each crossed target plane using that plane's
-     own normal and crossing point.
-   - Select the smallest finite error as the segment endpoint error.
-   - Store/report the selected plane name and crossing point in Python segment
-     summaries and C++ result structs.
-   - Whole-fiber restart logic uses the selected/best error with the existing
-     threshold.
-
-6. Visualization
-   - Keep failed overlay trimming behavior unchanged for now so long strips do
-     not overlap restart CP regions.
-   - Add enough summary/debug metadata to explain which plane produced the
-     accepted/restart error and where the selected crossing was.
-   - Do not introduce new rows or visual clutter in this task unless needed for
-     debugging after implementation.
-
-7. Python/C++ parity
-   - Update both:
-     - `vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py`
-     - `volume-cartographer/core/src/fiber_tracer/FiberTrace.cpp`
-   - Keep CLI defaults and existing benchmark commands unchanged.
-   - Update native metric output only if necessary to expose selected-plane
-     debug fields; the public `err/kvx` and `err/m` labels remain unchanged.
+5. Regression tests
+   - Add a Python one-way test where all planes are crossed early with an error
+     above threshold, then later crossed closer to the CP and accepted.
+   - Add a whole-fiber test where a CP plane is crossed between trace steps and
+     the next CP segment starts from the live stepped endpoint rather than the
+     selected plane crossing.
+   - Keep existing all-plane and selected-best-error tests passing.
 
 ## Spec Update
 
-- Replace the current chord-normal target-plane spec with the three-plane
-  target-local rule.
-- State explicitly that CP-to-CP chord normals are not valid Trace2CP
-  termination planes.
-- Document that success/error uses the smallest in-plane error after all
-  configured target planes have been crossed.
-- Document failure behavior when one or more required planes are not crossed.
+- Update the native 3D Trace2CP spec to state that all target-local planes being
+  crossed is necessary but, in whole-fiber thresholded tracing, not sufficient:
+  the selected best in-plane CP error must also be within the configured
+  threshold.
+- State that later closer crossings of the same target plane replace earlier
+  farther crossings.
+- State that whole-fiber success does not restart or snap live tracing state to
+  the selected crossing; selected crossings are metric events, while only
+  failures reset from a CP.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` in the native 3D Trace2CP section to describe
-  the three target planes and the selected best-error reporting.
-- Update the C++ native metric section if public summary/debug fields change.
+- Update `docs/code_structure.md` in the native 3D Trace2CP section with the
+  threshold-aware crossing and continuous whole-fiber state behavior.
 
 ## Tests
 
-1. Python unit tests
-   - Add a synthetic one-way trace test where chord-plane crossing would stop
-     early but one of the target-local planes is not crossed yet.
-   - Add a test that all target planes are crossed and the selected error is
-     the minimum across plane-specific crossing points.
-   - Add endpoint-line-point cases for CPs at the beginning/end of a fiber line.
-
-2. C++ unit tests
-   - Add equivalent target-plane tests in `test_fiber_trace3d`.
-   - Verify whole-fiber restart success uses the selected best plane error.
-
-3. Regression validation
-   - Run the Python 3D neural tracing tests:
-     `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-   - Build and run the C++ fiber tracer tests:
-     `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target test_fiber_trace3d`
-     `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_fiber_trace3d`
-   - Run `git diff --check`.
+- Run:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
+- Run `git diff --check`.
 
 ## Changelog
 
-- Add a 2026-07-29 entry noting that native 3D Trace2CP target-plane
-  termination no longer uses CP chords and now uses target-local line-neighbor
-  and inferred-direction planes.
+- Add a short 2026-07-29 entry for threshold-aware Python target-plane
+  acceptance.
 
-## Review Notes
+## Explicit Scope
 
-- This plan keeps trace scoring/search unchanged; only target-plane
-  termination/error selection changes.
-- No fallback to chord normals is allowed.
-- No visualization redesign is planned beyond summary/debug metadata.
+- C++ tracer parity is intentionally deferred until the Python behavior has been
+  validated on the failing fiber.

@@ -1,5 +1,11 @@
 # 2026-07-29
 
+- Python native 3D Trace2CP whole-fiber tracing now keeps tracing after early
+  far target-plane crossings until the best selected crossing is within the
+  configured error threshold or the trace budget is exhausted.
+- Python native 3D Trace2CP whole-fiber tracing now preserves live trace point,
+  previous direction, sampled-current direction, and smoothing history across
+  successful CP crossings instead of reinitializing at each accepted CP.
 - Native 3D Trace2CP target-plane termination no longer uses the CP-to-CP
   chord. Python and VC3D native tracers now require target-local line-neighbor
   and inferred-direction planes, wait until all configured planes are crossed,
