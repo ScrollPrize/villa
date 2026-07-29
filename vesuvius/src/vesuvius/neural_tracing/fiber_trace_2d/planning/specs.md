@@ -552,6 +552,18 @@
   `trace2cp_native_3d_summary_all.json`, and reports the accumulated
   restart-rate score from summed restarts divided by summed original-line
   reference length.
+- Native 3D whole-fiber JPG visualization must never write a JPEG whose width
+  reaches the format limit. When `--vis` is enabled, completed restart spans
+  are packed into split pages with a target width of `32000` pixels so page
+  breaks prefer restart boundaries. A single very long no-restart span is split
+  internally before it reaches the JPEG dimension cap; split pages keep the
+  base output path for page zero and write additional pages with numbered
+  suffixes.
+- Native 3D whole-fiber visualization must mark CP positions without covering
+  the point with distance text. CP labels are drawn at the bottom edge of each
+  rendered strip and include the CP index plus the distance/miss state, e.g.
+  `cp=17 d=3.2`, so the same index can be used with explicit CP selection
+  arguments.
 - Dedicated native 3D Trace2CP metric configs may require the JSON fiber to be
   supplied by `--fiber-json`. In that mode the config `datasets` entry is only
   a volume/scale/manifest template and must not carry a config-local

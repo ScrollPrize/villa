@@ -1,32 +1,26 @@
-# Python Native 3D Trace2CP Multi-Fiber Task Log
+# Python Native 3D Trace2CP CP Label Task Log
 
 ## Implementation Notes
 
-- Changed `trace2cp_tool.py --fiber-json` to accept one or more paths.
-- Added indexed output stems while keeping existing single-run filenames
-  unchanged.
-- Added `run_native_trace2cp_many(...)`, which reuses one loaded model and runs
-  the existing whole-fiber tracer sequentially over the supplied JSON fibers.
-- Multi-fiber mode rejects sample-index and explicit CP selectors because the
-  accumulated score is defined over complete fibers.
-- Added accumulated scoring from summed restarts and summed original-line
-  reference lengths. Optional physical `err/m` is reported only when every
-  fiber result has a VC3D-derived physical length.
-- Added `trace2cp_native_3d_summary_all.json` for aggregate output and
-  per-fiber indexed summaries/JPGs.
+- `_draw_trace_panel(...)` now draws CP marker ellipses without nearby text and
+  renders CP labels at the bottom edge of the strip.
+- Bottom labels are clamped horizontally into the panel bounds and keep the
+  existing translucent text background.
+- Whole-fiber labels now include CP indices:
+  - `cp=<idx> d=<distance>`
+  - `cp=<idx> d=inf`
+  - `cp=<idx> miss`
 
 ## Deviations / Deferred Items
 
-- No parallel multi-fiber execution was added; the request specified sequential
-  execution.
-- No model/checkpoint reload per fiber is performed; this was improved by
-  sharing the loaded model across the sequential runs.
+- No tracing, metric, inference, output selection, or filename behavior was
+  changed.
 
 ## Validation
 
 - `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py`
   - passed
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
-  - passed: 164 tests, 2 skipped
+  - passed: 167 tests, 2 skipped
 - `git diff --check`
   - passed

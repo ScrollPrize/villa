@@ -265,6 +265,15 @@ Ownership changed as follows:
   `trace2cp_native_3d_000_vis.jpg`, plus an accumulated
   `trace2cp_native_3d_summary_all.json` score over summed restarts and summed
   original-line reference length.
+- Whole-fiber `--vis` output is page-split before JPEG's dimension limit:
+  completed restart spans are packed into pages around a 32000-pixel target
+  width, and a single very long no-restart span is split before the JPEG hard
+  limit. Page zero uses the normal `_vis.jpg` path; later pages use numbered
+  suffixes such as `_vis_001.jpg`.
+- Whole-fiber CP markers keep the point visible. Distance labels are drawn at
+  the bottom of each strip and include the CP index, for example
+  `cp=17 d=3.2` or `cp=17 miss`, so the same index can be passed to
+  `--start-cp-index` / `--target-cp-index`.
 - Traces directly in selected-level ZYX voxel coordinates, not in a projected
   2D strip. It lazily runs dense 3D inference blocks around queried points,
   crops each block to a trusted core, and routes every candidate lookup to the

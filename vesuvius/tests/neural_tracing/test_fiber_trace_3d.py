@@ -85,6 +85,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _aggregate_native_whole_fiber_results,
     _build_native_whole_fiber_span_source,
     _compose_whole_fiber_panel_blocks,
+    _draw_trace_panel,
     _fiber_line_tangent_zyx_toward_target,
     _FailFastNormalComparisonSampler,
     _image_to_u8,
@@ -107,8 +108,10 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     _sample_point_choices_for_points_torch,
     _sample_trace_start_direction_aligned,
     _sample_trace_point_aligned,
+    _save_whole_fiber_panel_pages,
     _score_candidate_batch,
     _score_candidate_loss_tensors_batched,
+    _split_whole_fiber_panel_blocks_for_pages,
     _target_plane_in_plane_error_voxels,
     _trace_candidate_directions_torch,
     _volume_trace_to_source_trace_xyz,
@@ -4341,7 +4344,42 @@ def test_native_3d_whole_fiber_span_panels_include_regenerated_rows(monkeypatch)
     ]
     assert len(draw_control_points) == 8
     assert all(points.shape == (3, 2) for points in draw_control_points)
-    assert draw_control_point_labels == [("d=0.0", "d=3.2", "miss")] * 8
+    assert draw_control_point_labels == [("cp=0 d=0.0", "cp=1 d=3.2", "cp=2 miss")] * 8
+
+
+def test_native_3d_trace_panel_draws_cp_labels_at_strip_bottom() -> None:
+    from PIL import ImageChops
+
+    image = np.full((32, 80), 80, dtype=np.uint8)
+    valid = np.ones((32, 80), dtype=bool)
+    line = np.asarray([[10.0, 8.0], [70.0, 8.0]], dtype=np.float32)
+    cp = np.asarray([[20.0, 8.0]], dtype=np.float32)
+
+    without_label = _draw_trace_panel(
+        image,
+        valid,
+        line,
+        np.asarray([10.0, 8.0], dtype=np.float32),
+        np.asarray([70.0, 8.0], dtype=np.float32),
+        title="panel",
+        control_points_xy=cp,
+    )
+    with_label = _draw_trace_panel(
+        image,
+        valid,
+        line,
+        np.asarray([10.0, 8.0], dtype=np.float32),
+        np.asarray([70.0, 8.0], dtype=np.float32),
+        title="panel",
+        control_points_xy=cp,
+        control_point_labels=("cp=7 d=3.0",),
+    )
+    diff = ImageChops.difference(with_label, without_label)
+    diff_arr = np.asarray(diff)
+    changed = np.argwhere(np.any(diff_arr != 0, axis=2))
+
+    assert changed.size > 0
+    assert int(changed[:, 0].min()) > 24 + 8 + 4
 
 
 def test_native_3d_whole_fiber_composer_can_prefix_closed_sheet() -> None:
@@ -4359,6 +4397,48 @@ def test_native_3d_whole_fiber_composer_can_prefix_closed_sheet() -> None:
     assert sheet.getpixel((0, 0)) == (11, 12, 13, 255)
     assert sheet.getpixel((17, 0)) == (21, 22, 23, 255)
     assert sheet.getpixel((17, 3)) == (31, 32, 33, 255)
+
+
+def test_native_3d_whole_fiber_vis_splits_pages_at_restart_blocks() -> None:
+    from PIL import Image
+
+    block_a = (Image.new("RGBA", (20, 4), (1, 2, 3, 255)),)
+    block_b = (Image.new("RGBA", (20, 4), (4, 5, 6, 255)),)
+
+    pages = _split_whole_fiber_panel_blocks_for_pages(
+        [block_a, block_b],
+        split_target_px=32,
+        single_block_max_px=64,
+    )
+
+    assert len(pages) == 2
+    assert pages[0] == (block_a,)
+    assert pages[1] == (block_b,)
+
+
+def test_native_3d_whole_fiber_vis_splits_single_wide_block_before_jpeg_limit(
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+
+    block = (Image.new("RGBA", (70, 4), (1, 2, 3, 255)),)
+    image_path = tmp_path / "trace2cp_native_3d_vis.jpg"
+
+    written = _save_whole_fiber_panel_pages(
+        [block],
+        image_path=image_path,
+        quality=90,
+        split_target_px=32,
+        single_block_max_px=64,
+    )
+
+    assert [path.name for path in written] == [
+        "trace2cp_native_3d_vis.jpg",
+        "trace2cp_native_3d_vis_001.jpg",
+    ]
+    with Image.open(written[0]) as first, Image.open(written[1]) as second:
+        assert first.size[0] <= 64
+        assert second.size[0] <= 64
 
 
 def test_native_3d_trace2cp_block_router_uses_trusted_core() -> None:

@@ -1,11 +1,13 @@
-# Python Native 3D Trace2CP Multi-Fiber Input
+# Python Native 3D Trace2CP CP Label Placement
 
-Update the Python native 3D Trace2CP tool so `--fiber-json` accepts multiple
-JSON fibers. In that mode the tool should:
+Change native 3D whole-fiber Trace2CP visualization so CP labels no longer
+cover the point markers.
 
-- run whole-fiber tracing over the supplied JSON files sequentially;
-- reuse one loaded model across the per-fiber runs;
-- report an accumulated restart-rate score over all fibers;
-- keep existing single-fiber and sample-index behavior unchanged;
-- write indexed per-fiber summaries and indexed per-fiber visualizations when
-  `--vis` is enabled, so each JSON gets its own output.
+Requirements:
+
+- draw CP distance labels at the bottom of the respective strip instead of next
+  to/on top of the CP marker;
+- include the CP index in the label so the user can pass it back through
+  `--start-cp-index` / `--target-cp-index`;
+- keep the CP marker itself visible;
+- do not change tracing, metrics, inference, or output selection behavior.

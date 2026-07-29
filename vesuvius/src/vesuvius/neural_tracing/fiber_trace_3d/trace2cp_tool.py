@@ -47,6 +47,8 @@ from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import control_point_
 _EPS = 1.0e-12
 _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 _GIB = 1024**3
+_NATIVE_WHOLE_FIBER_VIS_SPLIT_TARGET_PX = 32_000
+_NATIVE_WHOLE_FIBER_VIS_JPEG_SAFE_PX = 64_000
 _SPARSE_NORMAL_CHANNELS = frozenset({"grad_mag", "nx", "ny"})
 _NATIVE_NORMAL_SAMPLER_MODES = ("sparse-corner-principal", "baseline")
 _NATIVE_NORMAL_PRINCIPAL_AXIS_METHODS = ("eigh", "analytic")
@@ -5505,6 +5507,7 @@ def _draw_trace_panel(
         cp_points = np.asarray(control_points_xy, dtype=np.float32)
         if cp_points.ndim == 2 and cp_points.shape[1] == 2:
             labels = list(control_point_labels or ())
+            bottom_labels: list[tuple[float, str]] = []
             for cp_index, (x_f, y_f) in enumerate(cp_points):
                 if not (np.isfinite(x_f) and np.isfinite(y_f)):
                     continue
@@ -5518,27 +5521,30 @@ def _draw_trace_panel(
                 if cp_index < len(labels):
                     label = str(labels[cp_index])
                     if label:
-                        text_x = x + 4.0
-                        text_y = y - 9.0
-                        try:
-                            bbox = draw.textbbox((text_x, text_y), label)
-                        except AttributeError:
-                            bbox = (
-                                int(text_x),
-                                int(text_y),
-                                int(text_x + 6 * len(label)),
-                                int(text_y + 10),
-                            )
-                        draw.rectangle(
-                            (
-                                float(bbox[0]) - 1.0,
-                                float(bbox[1]) - 1.0,
-                                float(bbox[2]) + 1.0,
-                                float(bbox[3]) + 1.0,
-                            ),
-                            fill=(0, 0, 0, 150),
-                        )
-                        draw.text((text_x, text_y), label, fill=(255, 255, 255, 240))
+                        bottom_labels.append((x, label))
+            for x, label in bottom_labels:
+                try:
+                    bbox = draw.textbbox((0, 0), label)
+                    text_w = float(bbox[2] - bbox[0])
+                    text_h = float(bbox[3] - bbox[1])
+                except AttributeError:
+                    text_w = float(6 * len(label))
+                    text_h = 10.0
+                text_x = min(
+                    max(2.0, float(x) - 0.5 * text_w),
+                    max(2.0, float(padded.width) - text_w - 2.0),
+                )
+                text_y = float(text_pad + canvas.height) - text_h - 3.0
+                draw.rectangle(
+                    (
+                        text_x - 1.0,
+                        text_y - 1.0,
+                        text_x + text_w + 1.0,
+                        text_y + text_h + 1.0,
+                    ),
+                    fill=(0, 0, 0, 150),
+                )
+                draw.text((text_x, text_y), label, fill=(255, 255, 255, 240))
     for xy, color in (
         (start_xy, (0, 255, 255, 255)),
         (target_xy, (255, 64, 220, 255)),
@@ -5995,17 +6001,17 @@ def _whole_fiber_span_control_point_labels(
     end = int(span.end_cp_index)
     step = 1 if end >= start else -1
     cp_indices = np.arange(start, end + step, step, dtype=np.int64)
-    labels_by_cp: dict[int, str] = {start: "d=0.0"}
+    labels_by_cp: dict[int, str] = {start: f"cp={start} d=0.0"}
     for segment in span.segments:
         cp_index = int(segment.target_cp_index)
         if not bool(segment.reached_target_plane):
-            labels_by_cp[cp_index] = "miss"
+            labels_by_cp[cp_index] = f"cp={cp_index} miss"
             continue
         distance = float(segment.in_plane_error_voxels)
         if not math.isfinite(distance):
-            labels_by_cp[cp_index] = "d=inf"
+            labels_by_cp[cp_index] = f"cp={cp_index} d=inf"
         else:
-            labels_by_cp[cp_index] = f"d={distance:.1f}"
+            labels_by_cp[cp_index] = f"cp={cp_index} d={distance:.1f}"
     return tuple(labels_by_cp.get(int(cp_index), "") for cp_index in cp_indices)
 
 
@@ -6045,6 +6051,135 @@ def _native_whole_fiber_visual_spans(
         for span in spans
         if int(span.start_cp_index) != int(span.end_cp_index) and span.segments
     )
+
+
+def _native_whole_fiber_segment_trace_length_voxels(
+    segment: NativeWholeFiberSegmentResult,
+) -> float:
+    trace = np.asarray(segment.trace_zyx, dtype=np.float32)
+    if trace.ndim != 2 or trace.shape[0] < 2:
+        return 0.0
+    length = float(np.linalg.norm(np.diff(trace, axis=0), axis=1).sum())
+    return length if math.isfinite(length) and length >= 0.0 else 0.0
+
+
+def _native_whole_fiber_visual_span_estimated_width_px(
+    span: _NativeWholeFiberVisualSpan,
+    *,
+    trace2cp_rf_margin_px: float,
+) -> float:
+    trace_length = sum(
+        _native_whole_fiber_segment_trace_length_voxels(segment)
+        for segment in span.segments
+    )
+    return float(trace_length) + 2.0 * max(0.0, float(trace2cp_rf_margin_px))
+
+
+def _split_native_whole_fiber_visual_span(
+    span: _NativeWholeFiberVisualSpan,
+    *,
+    max_width_px: int,
+    trace2cp_rf_margin_px: float,
+) -> tuple[_NativeWholeFiberVisualSpan, ...]:
+    limit = max(1.0, float(max_width_px))
+    chunks: list[_NativeWholeFiberVisualSpan] = []
+    active: list[NativeWholeFiberSegmentResult] = []
+    active_width = 2.0 * max(0.0, float(trace2cp_rf_margin_px))
+    active_start = int(span.start_cp_index)
+    for segment in span.segments:
+        segment_width = _native_whole_fiber_segment_trace_length_voxels(segment)
+        if active and active_width + segment_width > limit:
+            chunks.append(
+                _NativeWholeFiberVisualSpan(
+                    start_cp_index=active_start,
+                    end_cp_index=int(active[-1].target_cp_index),
+                    segments=tuple(active),
+                    restart_after=False,
+                )
+            )
+            active = []
+            active_start = int(segment.start_cp_index)
+            active_width = 2.0 * max(0.0, float(trace2cp_rf_margin_px))
+        active.append(segment)
+        active_width += segment_width
+    if active:
+        chunks.append(
+            _NativeWholeFiberVisualSpan(
+                start_cp_index=active_start,
+                end_cp_index=int(active[-1].target_cp_index),
+                segments=tuple(active),
+                restart_after=bool(span.restart_after),
+            )
+        )
+    return tuple(chunks) if chunks else (span,)
+
+
+def _whole_fiber_panel_block_width(block: tuple[Any, ...]) -> int:
+    return max((int(panel.width) for panel in block), default=0)
+
+
+def _split_wide_whole_fiber_panel_block(
+    block: tuple[Any, ...],
+    *,
+    max_width_px: int,
+) -> tuple[tuple[Any, ...], ...]:
+    from PIL import Image
+
+    width = _whole_fiber_panel_block_width(block)
+    limit = max(1, int(max_width_px))
+    if width <= limit:
+        return (block,)
+    parts: list[tuple[Any, ...]] = []
+    for left in range(0, width, limit):
+        right = min(width, left + limit)
+        chunk_width = int(right - left)
+        cropped: list[Any] = []
+        for panel in block:
+            image = panel.convert("RGBA") if not isinstance(panel, Image.Image) else panel
+            canvas = Image.new("RGBA", (chunk_width, int(image.height)), (0, 0, 0, 255))
+            if left < int(image.width):
+                crop = image.crop((left, 0, min(right, int(image.width)), int(image.height)))
+                canvas.alpha_composite(crop, (0, 0))
+            cropped.append(canvas)
+        parts.append(tuple(cropped))
+    return tuple(parts)
+
+
+def _split_whole_fiber_panel_blocks_for_pages(
+    panel_blocks: Sequence[tuple[Any, ...]],
+    *,
+    split_target_px: int = _NATIVE_WHOLE_FIBER_VIS_SPLIT_TARGET_PX,
+    single_block_max_px: int = _NATIVE_WHOLE_FIBER_VIS_JPEG_SAFE_PX,
+) -> tuple[tuple[tuple[Any, ...], ...], ...]:
+    pages: list[list[tuple[Any, ...]]] = []
+    current: list[tuple[Any, ...]] = []
+    current_width = 0
+    separator_width = 12
+    target = max(1, int(split_target_px))
+    for block in panel_blocks:
+        for chunk in _split_wide_whole_fiber_panel_block(
+            tuple(block),
+            max_width_px=max(1, int(single_block_max_px)),
+        ):
+            chunk_width = _whole_fiber_panel_block_width(chunk)
+            projected_width = (
+                current_width + separator_width + chunk_width
+                if current
+                else chunk_width
+            )
+            if current and projected_width > target:
+                pages.append(current)
+                current = []
+                current_width = 0
+            current.append(chunk)
+            current_width = (
+                current_width + separator_width + chunk_width
+                if current_width > 0
+                else chunk_width
+            )
+    if current:
+        pages.append(current)
+    return tuple(tuple(page) for page in pages)
 
 
 def _compose_whole_fiber_panel_blocks(
@@ -6099,6 +6234,43 @@ def _compose_whole_fiber_panel_blocks(
         combined.alpha_composite(sheet, (int(prefix.width) + separator_width, 0))
         return combined
     return sheet
+
+
+def _whole_fiber_split_page_path(image_path: Path, page_index: int) -> Path:
+    return image_path.with_name(
+        f"{image_path.stem}_{int(page_index):03d}{image_path.suffix}"
+    )
+
+
+def _save_whole_fiber_panel_pages(
+    panel_blocks: Sequence[tuple[Any, ...]],
+    *,
+    image_path: Path,
+    status_text: str | None = None,
+    quality: int = 90,
+    split_target_px: int = _NATIVE_WHOLE_FIBER_VIS_SPLIT_TARGET_PX,
+    single_block_max_px: int = _NATIVE_WHOLE_FIBER_VIS_JPEG_SAFE_PX,
+) -> list[Path]:
+    pages = _split_whole_fiber_panel_blocks_for_pages(
+        panel_blocks,
+        split_target_px=int(split_target_px),
+        single_block_max_px=int(single_block_max_px),
+    )
+    if not pages:
+        sheet = _compose_whole_fiber_panel_blocks([], status_text=status_text)
+        sheet.convert("RGB").save(image_path, quality=int(quality))
+        return [image_path]
+    written: list[Path] = []
+    if len(pages) == 1:
+        sheet = _compose_whole_fiber_panel_blocks(list(pages[0]), status_text=status_text)
+        sheet.convert("RGB").save(image_path, quality=int(quality))
+        return [image_path]
+    for page_index, page_blocks in enumerate(pages):
+        path = image_path if page_index == 0 else _whole_fiber_split_page_path(image_path, page_index)
+        sheet = _compose_whole_fiber_panel_blocks(list(page_blocks), status_text=status_text)
+        sheet.convert("RGB").save(path, quality=int(quality))
+        written.append(path)
+    return written
 
 
 def _build_native_whole_fiber_span_source(
@@ -6768,22 +6940,52 @@ def run_native_trace2cp(
         out_dir.mkdir(parents=True, exist_ok=True)
         stem = str(output_stem)
         image_path = out_dir / f"{stem}_vis.jpg"
-        closed_panel_sheet: Any | None = None
+        closed_panel_blocks: list[tuple[Any, ...]] = []
         closed_span_count = 0
+        last_export_paths: list[Path] = []
         active_segments: list[NativeWholeFiberSegmentResult] = []
         active_start_cp_index = 0
         if render_visualization:
-            _compose_whole_fiber_panel_blocks(
+            last_export_paths = _save_whole_fiber_panel_pages(
                 [],
+                image_path=image_path,
                 status_text="initializing whole-fiber trace",
-            ).convert("RGB").save(image_path, quality=90)
+                quality=90,
+            )
             print(f"native whole-fiber partial={image_path} initializing", flush=True)
+
+        def render_span_blocks(
+            span: _NativeWholeFiberVisualSpan,
+            *,
+            split_inside_span: bool,
+        ) -> list[tuple[Any, ...]]:
+            spans = (
+                _split_native_whole_fiber_visual_span(
+                    span,
+                    max_width_px=_NATIVE_WHOLE_FIBER_VIS_JPEG_SAFE_PX,
+                    trace2cp_rf_margin_px=float(trace2cp_cfg.rf_margin_px),
+                )
+                if split_inside_span
+                else (span,)
+            )
+            return [
+                _render_native_whole_fiber_span_panels(
+                    geometry_loader,
+                    span=subspan,
+                    trace2cp_rf_margin_px=float(trace2cp_cfg.rf_margin_px),
+                    cache=cache,
+                    image_normalization=loader_config.image_normalization,
+                    strip_cross_width_px=64,
+                )
+                for subspan in spans
+            ]
 
         def on_segment(
             segment: NativeWholeFiberSegmentResult,
             partial: NativeWholeFiberResult | None,
         ) -> None:
-            nonlocal active_start_cp_index, active_segments, closed_panel_sheet, closed_span_count
+            nonlocal active_start_cp_index, active_segments, closed_panel_blocks
+            nonlocal closed_span_count, last_export_paths
             print(
                 "native whole-fiber render segment "
                 f"{segment.start_cp_index}->{segment.target_cp_index} "
@@ -6800,13 +7002,15 @@ def run_native_trace2cp(
                 segments=tuple(active_segments),
                 restart_after=not bool(segment.success),
             )
-            panels = _render_native_whole_fiber_span_panels(
-                geometry_loader,
-                span=active_span,
-                trace2cp_rf_margin_px=float(trace2cp_cfg.rf_margin_px),
-                cache=cache,
-                image_normalization=loader_config.image_normalization,
-                strip_cross_width_px=64,
+            active_panel_blocks = render_span_blocks(
+                active_span,
+                split_inside_span=(
+                    _native_whole_fiber_visual_span_estimated_width_px(
+                        active_span,
+                        trace2cp_rf_margin_px=float(trace2cp_cfg.rf_margin_px),
+                    )
+                    >= float(_NATIVE_WHOLE_FIBER_VIS_JPEG_SAFE_PX)
+                ),
             )
             restarts = 0 if partial is None else int(partial.restart_count)
             restarts_per_kvx = 0.0 if partial is None else float(partial.restarts_per_kvx)
@@ -6824,27 +7028,27 @@ def run_native_trace2cp(
                         reference_length_meters=partial.reference_length_meters,
                     )
                 )
-            _compose_whole_fiber_panel_blocks(
-                [panels],
-                prefix_sheet=closed_panel_sheet,
+            all_panel_blocks = [*closed_panel_blocks, *active_panel_blocks]
+            last_export_paths = _save_whole_fiber_panel_pages(
+                all_panel_blocks,
+                image_path=image_path,
                 status_text=(
                     f"segments={len(partial.segments) if partial is not None else 0} "
                     f"spans={closed_span_count + 1} restarts={restarts} "
                     f"err/kvx={_format_trace2cp_kvx_rate(restarts_per_kvx)}"
                     f"{physical_status}"
                 ),
-            ).convert("RGB").save(image_path, quality=90)
+                quality=90,
+            )
             print(
                 "native whole-fiber partial="
-                f"{image_path} segment={segment.start_cp_index}->{segment.target_cp_index}",
+                f"{last_export_paths[0]} pages={len(last_export_paths)} "
+                f"segment={segment.start_cp_index}->{segment.target_cp_index}",
                 flush=True,
             )
             if not bool(segment.success):
-                closed_panel_sheet = _compose_whole_fiber_panel_blocks(
-                    [panels],
-                    prefix_sheet=closed_panel_sheet,
-                )
-                closed_span_count += 1
+                closed_panel_blocks.extend(active_panel_blocks)
+                closed_span_count += len(active_panel_blocks)
                 active_segments = []
                 active_start_cp_index = int(segment.target_cp_index)
 
@@ -6922,7 +7126,8 @@ def run_native_trace2cp(
             "trace_wall_seconds": trace_wall_seconds,
             "trace_cpu_seconds": trace_cpu_seconds,
             "trace_profile": None if profiler is None else profiler.summary(),
-            "export": str(image_path) if render_visualization else None,
+            "export": str(last_export_paths[0]) if render_visualization and last_export_paths else None,
+            "exports": [str(path) for path in last_export_paths] if render_visualization else [],
             "visualization_enabled": bool(render_visualization),
             "segments": [
                 {
@@ -6976,7 +7181,11 @@ def run_native_trace2cp(
             f"evicted={cache.evicted_inferred_blocks} "
             f"cache_gib={cache.resident_inferred_block_bytes / float(_GIB):.3f} "
             f"summary={summary_path}"
-            + (f" export={image_path}" if render_visualization else ""),
+            + (
+                f" export={last_export_paths[0]} exports={len(last_export_paths)}"
+                if render_visualization and last_export_paths
+                else ""
+            ),
             flush=True,
         )
         return whole
