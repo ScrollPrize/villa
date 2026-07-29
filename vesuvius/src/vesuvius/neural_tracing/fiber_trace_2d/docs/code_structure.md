@@ -149,6 +149,15 @@ actual scratch bytes touched and cleared.
 Fiber and Lasagna OME-Zarr outputs default to 64x64x64 chunks;
 `--ome-chunk` remains an override.
 
+Pyramid levels use multiprocessing across output chunks. With the default
+`--pyramid-workers 0`, the existing automatic CPU-count process selection is
+retained. Each process is constrained to one BLAS/OpenMP thread, including
+OpenBLAS, MKL, BLIS, Apple vecLib, and NumExpr runtimes, so native libraries do
+not multiply the process count by another CPU-count-sized thread pool. Parent
+environment and native thread limits are restored when a level finishes or a
+worker fails. `--pyramid-workers` remains available to tune I/O and memory
+bandwidth performance.
+
 Lasagna's optional `pred_dt` is an external-source stage after neural
 inference. It is independently resumable and never schedules model tiles.
 

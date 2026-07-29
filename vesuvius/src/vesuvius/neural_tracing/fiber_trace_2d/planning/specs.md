@@ -44,6 +44,10 @@
   blur-plus-2x-decimation path for weighted predictions and weights. Fiber has
   no private resampling, blending, or border implementation.
 - Lasagna predict3d and Fiber inference default to 64x64x64 OME-Zarr chunks.
+- Pyramid multiprocessing may use the automatic available-CPU process count,
+  but every pyramid worker must run native BLAS/OpenMP libraries with one
+  thread. The same constraint applies to serial pyramid execution, and parent
+  environment/native limits must be restored on success and failure.
 - Accumulator activity is contribution-driven. Unsupported, resume-complete,
   and untouched chunks produce neither output chunks nor mmap zero-writes.
   Only dirty product and shared-weight regions are flushed and cleared before

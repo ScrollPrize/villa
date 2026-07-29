@@ -1,3 +1,8 @@
+# 2026-07-29
+
+- Prevented pyramid multiprocessing from multiplying every worker by a full
+  OpenBLAS/OpenMP thread pool while retaining automatic process parallelism.
+
 # 2026-07-28
 
 - Defaulted Fiber whole-volume output to filtered 0.25x inference, changed
