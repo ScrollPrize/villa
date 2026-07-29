@@ -667,9 +667,12 @@ Ownership changed as follows:
   without extra arguments. Direct remote `s3://`, `s3+REGION://`, `http://`, or
   `https://` manifests require `--remote-cache-dir`; the manifest JSON is
   downloaded transiently, while referenced Zarr objects are persisted through
-  the read-through cache. Relative group `zarr` paths resolve against the
-  manifest parent location, absolute local group paths stay local, and
-  absolute remote group paths open as independent cached remote Zarr roots.
+  the read-through cache. Remote manifest fetch failures report the original
+  location, redacted resolved URL, HTTP status or no-response marker, response
+  metadata/body excerpt, and S3 region/credential-loaded status when
+  applicable. Relative group `zarr` paths resolve against the manifest parent
+  location, absolute local group paths stay local, and absolute remote group
+  paths open as independent cached remote Zarr roots.
 
   ```bash
   volume-cartographer/build/ci-tests-clang-systemdeps/bin/vc_fiber_trace_metric \

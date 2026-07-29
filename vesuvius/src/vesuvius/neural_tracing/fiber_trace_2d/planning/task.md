@@ -1,25 +1,18 @@
-# Require Lasagna Normals For Native Trace2CP
+# Remote Lasagna Manifest Fetch Diagnostics
 
-Native 3D Trace2CP must not silently run normal-aware tangent/normal smoothing
-without Lasagna normals.
+Improve error messages when `vc_fiber_trace_metric` or any Lasagna dataset
+opener fails to fetch a remote `.lasagna.json` manifest.
 
 Desired behavior:
 
-- Python native Trace2CP should fail if a normal-aware smoothing configuration
-  reaches tracing with `normal_sampler=None`.
-- Python lower-level scoring may keep generic isotropic code paths, but they
-  must not be reachable from normal-aware native Trace2CP without a Lasagna
-  sampler.
-- `vc_fiber_trace_metric` must require an explicit `--normal-manifest` Lasagna
-  manifest and fail before tracing if it is omitted.
-- `vc_fiber_trace_metric` must not try to use normals from the fiber prediction
-  manifest. We do not create those manifests with normal channels.
-- The C++ fiber tracer core should reject normal-aware smoothing requests when
-  no normal sampler is passed, so the CLI cannot accidentally fall back to
-  isotropic smoothing through the library.
+- Include the original manifest location and the resolved HTTP/S3 request URL.
+- Include HTTP status, content type, reported content length, received body byte
+  count, and a bounded response-body excerpt when available.
+- For S3 locations, include the region used and whether AWS SigV4 credentials
+  were loaded, without printing credential values.
+- Preserve the existing behavior for successful fetches and local manifests.
 
 Out of scope for this task:
 
-- do not remove lower-level isotropic/no-normal code that is useful for explicit
-  non-normal-aware callers;
-- do not change scale semantics or the default trace-control values.
+- do not change credential discovery or region selection;
+- do not add network-dependent unit tests.

@@ -1,5 +1,7 @@
 # 2026-07-29
 
+- Improved remote Lasagna manifest fetch errors with resolved URL, HTTP
+  response metadata/body excerpts, and S3 region/auth diagnostics.
 - Required Lasagna normal samplers for native Trace2CP normal-aware smoothing
   and made `vc_fiber_trace_metric` require explicit `--normal-manifest`.
 - Changed Python native Trace2CP and the native C++ fiber metric default beam

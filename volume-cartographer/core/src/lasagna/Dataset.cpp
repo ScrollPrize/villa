@@ -77,16 +77,140 @@ namespace {
     return resolved;
 }
 
+struct RemoteClientDetails {
+    utils::HttpClient::Config config;
+    bool isS3 = false;
+    bool awsCredentialsLoaded = false;
+    std::string awsRegion;
+};
+
+[[nodiscard]] RemoteClientDetails makeRemoteClientDetails(const vc::ResolvedUrl& endpoint)
+{
+    RemoteClientDetails details;
+    details.config.transfer_timeout = std::chrono::seconds{60};
+    if (endpoint.useAwsSigv4) {
+        details.isS3 = true;
+        details.config.aws_auth = utils::AwsAuth::load();
+        if (!endpoint.awsRegion.empty())
+            details.config.aws_auth.region = endpoint.awsRegion;
+        details.awsCredentialsLoaded = !details.config.aws_auth.empty();
+        details.awsRegion = details.config.aws_auth.region;
+    }
+    return details;
+}
+
 [[nodiscard]] utils::HttpClient makeRemoteClient(const vc::ResolvedUrl& endpoint)
 {
-    utils::HttpClient::Config config;
-    config.transfer_timeout = std::chrono::seconds{60};
-    if (endpoint.useAwsSigv4) {
-        config.aws_auth = utils::AwsAuth::load();
-        if (!endpoint.awsRegion.empty())
-            config.aws_auth.region = endpoint.awsRegion;
+    auto details = makeRemoteClientDetails(endpoint);
+    return utils::HttpClient(std::move(details.config));
+}
+
+[[nodiscard]] std::string redactedUrlForDiagnostics(const std::string& url)
+{
+    const auto query = url.find('?');
+    if (query == std::string::npos)
+        return url;
+    return url.substr(0, query) + "?<redacted>";
+}
+
+[[nodiscard]] std::string escapedDiagnosticString(std::string_view value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (const char ch : value) {
+        if (ch == '\\' || ch == '"')
+            out.push_back('\\');
+        out.push_back(ch);
     }
-    return utils::HttpClient(std::move(config));
+    return out;
+}
+
+[[nodiscard]] std::string compactBodyExcerpt(std::string_view body)
+{
+    constexpr size_t kMaxExcerptBytes = 1024;
+    const size_t take = std::min(body.size(), kMaxExcerptBytes);
+    std::string out;
+    out.reserve(take);
+    bool previousWhitespace = false;
+    for (size_t index = 0; index < take; ++index) {
+        const unsigned char ch = static_cast<unsigned char>(body[index]);
+        if (std::isspace(ch)) {
+            if (!previousWhitespace && !out.empty()) {
+                out.push_back(' ');
+                previousWhitespace = true;
+            }
+            continue;
+        }
+        previousWhitespace = false;
+        out.push_back(std::isprint(ch) ? static_cast<char>(ch) : '.');
+    }
+    while (!out.empty() && out.back() == ' ')
+        out.pop_back();
+    if (body.size() > kMaxExcerptBytes)
+        out += "...";
+    return out;
+}
+
+[[nodiscard]] std::string xmlTagValue(std::string_view body, std::string_view tag)
+{
+    const std::string open = "<" + std::string(tag) + ">";
+    const std::string close = "</" + std::string(tag) + ">";
+    const auto start = body.find(open);
+    if (start == std::string_view::npos)
+        return {};
+    const auto valueStart = start + open.size();
+    const auto end = body.find(close, valueStart);
+    if (end == std::string_view::npos)
+        return {};
+    return compactBodyExcerpt(body.substr(valueStart, end - valueStart));
+}
+
+[[nodiscard]] std::string remoteManifestFetchFailureMessage(
+    const std::string& location,
+    const vc::ResolvedUrl& endpoint,
+    const RemoteClientDetails& clientDetails,
+    const utils::HttpResponse& response)
+{
+    std::string message =
+        "Failed to fetch remote Lasagna manifest: " + location +
+        " request_url=" + redactedUrlForDiagnostics(endpoint.httpsUrl);
+    if (response.status_code > 0) {
+        message += " HTTP " + std::to_string(response.status_code);
+    } else {
+        message += " no_http_response";
+    }
+    if (!response.content_type.empty())
+        message += " content_type=\"" + escapedDiagnosticString(response.content_type) + "\"";
+    if (response.content_length > 0)
+        message += " content_length=" + std::to_string(response.content_length);
+    message += " received_bytes=" + std::to_string(response.body.size());
+    if (clientDetails.isS3) {
+        message += " s3_region=" +
+            (clientDetails.awsRegion.empty() ? std::string{"<unset>"} : clientDetails.awsRegion);
+        message += " aws_sigv4_credentials=" +
+            std::string(clientDetails.awsCredentialsLoaded ? "loaded" : "missing");
+    }
+
+    const std::string body(response.body_string());
+    if (!body.empty()) {
+        const auto s3Code = xmlTagValue(body, "Code");
+        const auto s3Message = xmlTagValue(body, "Message");
+        const auto s3Region = xmlTagValue(body, "Region");
+        if (!s3Code.empty())
+            message += " s3_code=\"" + escapedDiagnosticString(s3Code) + "\"";
+        if (!s3Message.empty())
+            message += " s3_message=\"" + escapedDiagnosticString(s3Message) + "\"";
+        if (!s3Region.empty())
+            message += " s3_response_region=\"" + escapedDiagnosticString(s3Region) + "\"";
+        message += " response_body=\"" +
+            escapedDiagnosticString(compactBodyExcerpt(body)) + "\"";
+    }
+    if (clientDetails.isS3) {
+        message +=
+            " hint=\"For s3:// manifests, verify bucket/key, region "
+            "(use s3+REGION:// when needed), AWS login, and s3:GetObject permissions.\"";
+    }
+    return message;
 }
 
 [[nodiscard]] std::string remoteParentUrl(const std::string& normalizedRemoteUrl)
@@ -152,12 +276,15 @@ namespace {
 [[nodiscard]] std::string fetchRemoteText(const std::string& location)
 {
     const auto endpoint = resolveRemoteEndpoint(location);
-    auto client = makeRemoteClient(endpoint);
+    auto clientDetails = makeRemoteClientDetails(endpoint);
+    auto client = utils::HttpClient(std::move(clientDetails.config));
     const auto response = client.get(endpoint.httpsUrl);
     if (!response.ok()) {
-        throw std::runtime_error(
-            "Failed to fetch remote Lasagna manifest: " + location +
-            " HTTP " + std::to_string(response.status_code));
+        throw std::runtime_error(remoteManifestFetchFailureMessage(
+            location,
+            endpoint,
+            clientDetails,
+            response));
     }
     if (response.body.empty()) {
         throw std::runtime_error(

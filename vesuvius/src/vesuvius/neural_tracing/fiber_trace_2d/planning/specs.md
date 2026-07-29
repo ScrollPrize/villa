@@ -941,7 +941,11 @@
   and direct remote `s3://`, `s3+REGION://`, `http://`, or `https://`
   manifests when the caller supplies an explicit remote cache root. Direct
   remote manifest JSON is fetched transiently for the current run and is not
-  durable cache state; only referenced Zarr objects are persisted.
+  durable cache state; only referenced Zarr objects are persisted. Remote
+  manifest fetch failures must include the original location, redacted resolved
+  request URL, HTTP status or no-response marker, response metadata and body
+  excerpt when available, plus S3 region and credential-loaded status for S3
+  requests.
 - Lasagna manifest group `zarr` paths are location strings. Relative paths
   resolve against the containing manifest location: the parent directory for
   local manifests or the parent URL for direct remote manifests. Absolute local
