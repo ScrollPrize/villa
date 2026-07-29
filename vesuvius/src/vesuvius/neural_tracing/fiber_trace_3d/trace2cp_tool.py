@@ -350,6 +350,18 @@ class NativeWholeFiberResult:
 
 
 @dataclass(frozen=True)
+class NativeMultiFiberResult:
+    results: tuple[NativeWholeFiberResult, ...]
+    restart_count: int
+    restarts_per_kvx: float
+    segment_count: int
+    reference_length_voxels: float
+    reference_length_meters: float | None
+    restarts_per_meter: float | None
+    run_count: int
+
+
+@dataclass(frozen=True)
 class _NativeWholeFiberVisualSpan:
     start_cp_index: int
     end_cp_index: int
@@ -4830,13 +4842,22 @@ def _mean_trace_run_length_meters(
     restart_count: int,
     reference_length_meters: float | None,
 ) -> float | None:
+    return _mean_trace_run_length_meters_for_runs(
+        max(1, int(restart_count) + 1),
+        reference_length_meters,
+    )
+
+
+def _mean_trace_run_length_meters_for_runs(
+    run_count: int,
+    reference_length_meters: float | None,
+) -> float | None:
     if reference_length_meters is None:
         return None
     length = float(reference_length_meters)
     if not math.isfinite(length) or length < 0.0:
         return None
-    run_count = max(1, int(restart_count) + 1)
-    return length / float(run_count)
+    return length / float(max(1, int(run_count)))
 
 
 def _format_trace2cp_kvx_rate(restarts_per_kvx: float) -> str:
@@ -4849,10 +4870,23 @@ def _format_trace2cp_meter_rate(
     restart_count: int,
     reference_length_meters: float | None,
 ) -> str:
+    return _format_trace2cp_meter_rate_for_runs(
+        restarts_per_meter,
+        run_count=max(1, int(restart_count) + 1),
+        reference_length_meters=reference_length_meters,
+    )
+
+
+def _format_trace2cp_meter_rate_for_runs(
+    restarts_per_meter: float | None,
+    *,
+    run_count: int,
+    reference_length_meters: float | None,
+) -> str:
     if restarts_per_meter is None or reference_length_meters is None:
         return ""
-    mean_run_meters = _mean_trace_run_length_meters(
-        int(restart_count),
+    mean_run_meters = _mean_trace_run_length_meters_for_runs(
+        int(run_count),
         float(reference_length_meters),
     )
     if mean_run_meters is None:
@@ -6572,6 +6606,9 @@ def run_native_trace2cp(
     normal_principal_axis_method: str = "config",
     debug_compare_normal_sampler: str | None = None,
     debug_normal_angle_threshold_degrees: float = 1.0,
+    output_stem: str = "trace2cp_native_3d",
+    prediction_adapter: FiberTrace3DPredictAdapter | None = None,
+    model: torch.nn.Module | None = None,
 ) -> NativeTracePairResult | NativeWholeFiberResult:
     raw_config = _load_raw_config(config_path)
     cfg = NativeTrace2CpConfig() if native_cfg is None else native_cfg
@@ -6638,8 +6675,10 @@ def run_native_trace2cp(
         )
     training = dict(raw_config.get("training", {}))
     device = _device_from_training(training)
-    prediction_adapter = FiberTrace3DPredictAdapter(raw_config, checkpoint=checkpoint)
-    model = prediction_adapter.load_model(device=device)
+    if prediction_adapter is None:
+        prediction_adapter = FiberTrace3DPredictAdapter(raw_config, checkpoint=checkpoint)
+    if model is None:
+        model = prediction_adapter.load_model(device=device)
     profiler = _NativeTraceProfiler() if bool(profile) else None
     normal_sampler_mode = str(normal_sampler_mode)
     if normal_sampler_mode not in _NATIVE_NORMAL_SAMPLER_MODES:
@@ -6727,7 +6766,8 @@ def run_native_trace2cp(
     if whole_mode:
         out_dir = Path(export_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        image_path = out_dir / "trace2cp_native_3d_vis.jpg"
+        stem = str(output_stem)
+        image_path = out_dir / f"{stem}_vis.jpg"
         closed_panel_sheet: Any | None = None
         closed_span_count = 0
         active_segments: list[NativeWholeFiberSegmentResult] = []
@@ -6904,7 +6944,7 @@ def run_native_trace2cp(
                 for segment in whole.segments
             ],
         }
-        summary_path = out_dir / "trace2cp_native_3d_summary.json"
+        summary_path = out_dir / f"{stem}_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
         print(
             "native_trace2cp_fiber "
@@ -6968,7 +7008,8 @@ def run_native_trace2cp(
     trace_cpu_seconds = float(time.process_time() - trace_cpu_start)
     out_dir = Path(export_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    image_path = out_dir / "trace2cp_native_3d_vis.jpg"
+    stem = str(output_stem)
+    image_path = out_dir / f"{stem}_vis.jpg"
     visualization_cross_strip_height_px: int | None = None
     visualization_max_cross_strip_height_px: int | None = None
     if render_visualization:
@@ -7087,7 +7128,7 @@ def run_native_trace2cp(
         "trace_profile": None if profiler is None else profiler.summary(),
         "export": str(image_path) if render_visualization else None,
     }
-    summary_path = out_dir / "trace2cp_native_3d_summary.json"
+    summary_path = out_dir / f"{stem}_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(f"native_trace2cp_plane_error={result.plane_error:.8f}", flush=True)
     print(f"native_trace2cp_closest_target_error={result.closest_target_error:.8f}", flush=True)
@@ -7124,6 +7165,197 @@ def run_native_trace2cp(
     return result
 
 
+def _indexed_trace2cp_output_stem(index: int, count: int) -> str:
+    width = max(3, len(str(max(0, int(count) - 1))))
+    return f"trace2cp_native_3d_{int(index):0{width}d}"
+
+
+def _aggregate_native_whole_fiber_results(
+    results: Sequence[NativeWholeFiberResult],
+) -> NativeMultiFiberResult:
+    if not results:
+        raise ValueError("native Trace2CP multi-fiber aggregation requires at least one result")
+    restart_count = int(sum(int(result.restart_count) for result in results))
+    segment_count = int(sum(int(result.segment_count) for result in results))
+    reference_length_voxels = float(
+        sum(float(result.reference_length_voxels) for result in results)
+    )
+    reference_lengths_m = [result.reference_length_meters for result in results]
+    reference_length_meters = (
+        None
+        if any(length is None for length in reference_lengths_m)
+        else float(sum(float(length) for length in reference_lengths_m))
+    )
+    return NativeMultiFiberResult(
+        results=tuple(results),
+        restart_count=restart_count,
+        segment_count=segment_count,
+        restarts_per_kvx=_restarts_per_kvx(restart_count, reference_length_voxels),
+        reference_length_voxels=reference_length_voxels,
+        reference_length_meters=reference_length_meters,
+        restarts_per_meter=_restarts_per_meter(restart_count, reference_length_meters),
+        run_count=int(len(results) + restart_count),
+    )
+
+
+def run_native_trace2cp_many(
+    config_path: str | Path,
+    *,
+    checkpoint: str | Path,
+    export_dir: str | Path,
+    fiber_jsons: Sequence[str | Path],
+    sample_index: int | None,
+    start_cp_index: int | None = None,
+    target_cp_index: int | None = None,
+    target_offset: int = 1,
+    sample_mode: str | None = None,
+    native_cfg: NativeTrace2CpConfig | None = None,
+    render_visualization: bool = False,
+    profile: bool = False,
+    normal_sampler_mode: str = "sparse-corner-principal",
+    normal_principal_axis_method: str = "config",
+    debug_compare_normal_sampler: str | None = None,
+    debug_normal_angle_threshold_degrees: float = 1.0,
+) -> NativeWholeFiberResult | NativeMultiFiberResult:
+    paths = [Path(path) for path in fiber_jsons]
+    if not paths:
+        raise ValueError("native Trace2CP requires at least one --fiber-json path")
+    if len(paths) == 1:
+        return run_native_trace2cp(
+            config_path,
+            checkpoint=checkpoint,
+            export_dir=export_dir,
+            sample_index=sample_index,
+            fiber_json=paths[0],
+            start_cp_index=start_cp_index,
+            target_cp_index=target_cp_index,
+            target_offset=int(target_offset),
+            sample_mode=sample_mode,
+            native_cfg=native_cfg,
+            render_visualization=render_visualization,
+            profile=profile,
+            normal_sampler_mode=normal_sampler_mode,
+            normal_principal_axis_method=normal_principal_axis_method,
+            debug_compare_normal_sampler=debug_compare_normal_sampler,
+            debug_normal_angle_threshold_degrees=float(debug_normal_angle_threshold_degrees),
+        )
+    if sample_index is not None or start_cp_index is not None or target_cp_index is not None:
+        raise ValueError(
+            "multiple --fiber-json paths support whole-fiber mode only; "
+            "omit --sample-index and explicit CP selectors"
+        )
+    if sample_mode is not None and str(sample_mode) != "flat":
+        raise ValueError("multiple --fiber-json whole-fiber mode requires --sample-mode flat or omitted")
+
+    raw_config = _load_raw_config(config_path)
+    training = dict(raw_config.get("training", {}))
+    device = _device_from_training(training)
+    prediction_adapter = FiberTrace3DPredictAdapter(raw_config, checkpoint=checkpoint)
+    model = prediction_adapter.load_model(device=device)
+    out_dir = Path(export_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[NativeWholeFiberResult] = []
+    per_fiber_summaries: list[dict[str, Any]] = []
+    for index, path in enumerate(paths):
+        stem = _indexed_trace2cp_output_stem(index, len(paths))
+        print(
+            "native_trace2cp_3d multi_fiber "
+            f"index={index}/{len(paths)} fiber_json={path}",
+            flush=True,
+        )
+        result = run_native_trace2cp(
+            config_path,
+            checkpoint=checkpoint,
+            export_dir=export_dir,
+            sample_index=None,
+            fiber_json=path,
+            start_cp_index=None,
+            target_cp_index=None,
+            target_offset=int(target_offset),
+            sample_mode="flat" if sample_mode is None else sample_mode,
+            native_cfg=native_cfg,
+            render_visualization=render_visualization,
+            profile=profile,
+            normal_sampler_mode=normal_sampler_mode,
+            normal_principal_axis_method=normal_principal_axis_method,
+            debug_compare_normal_sampler=debug_compare_normal_sampler,
+            debug_normal_angle_threshold_degrees=float(debug_normal_angle_threshold_degrees),
+            output_stem=stem,
+            prediction_adapter=prediction_adapter,
+            model=model,
+        )
+        if not isinstance(result, NativeWholeFiberResult):
+            raise RuntimeError("multi-fiber native Trace2CP unexpectedly returned a pair result")
+        results.append(result)
+        per_fiber_summaries.append(
+            {
+                "index": int(index),
+                "fiber_json": str(path),
+                "summary": str(out_dir / f"{stem}_summary.json"),
+                "export": str(out_dir / f"{stem}_vis.jpg") if render_visualization else None,
+                "restart_count": int(result.restart_count),
+                "segment_count": int(result.segment_count),
+                "native_trace2cp_fiber_restarts_per_kvx": float(result.restarts_per_kvx),
+                "native_trace2cp_fiber_restarts_per_meter": None
+                if result.restarts_per_meter is None
+                else float(result.restarts_per_meter),
+                "reference_length_voxels": float(result.reference_length_voxels),
+                "reference_length_meters": None
+                if result.reference_length_meters is None
+                else float(result.reference_length_meters),
+            }
+        )
+
+    aggregate = _aggregate_native_whole_fiber_results(results)
+    summary = {
+        "mode": "multi_whole_fiber",
+        "fiber_count": int(len(paths)),
+        "restart_count": int(aggregate.restart_count),
+        "segment_count": int(aggregate.segment_count),
+        "run_count": int(aggregate.run_count),
+        "native_trace2cp_fiber_restarts_per_kvx": float(aggregate.restarts_per_kvx),
+        "native_trace2cp_fiber_restarts_per_meter": None
+        if aggregate.restarts_per_meter is None
+        else float(aggregate.restarts_per_meter),
+        "reference_length_voxels": float(aggregate.reference_length_voxels),
+        "reference_length_meters": None
+        if aggregate.reference_length_meters is None
+        else float(aggregate.reference_length_meters),
+        "restart_fraction_per_segment": float(
+            aggregate.restart_count / max(1, aggregate.segment_count)
+        ),
+        "visualization_enabled": bool(render_visualization),
+        "fibers": per_fiber_summaries,
+    }
+    summary_path = out_dir / "trace2cp_native_3d_summary_all.json"
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    print(
+        "native_trace2cp_fibers "
+        f"err/kvx={_format_trace2cp_kvx_rate(aggregate.restarts_per_kvx)} "
+        f"restarts={aggregate.restart_count} segments={aggregate.segment_count} "
+        f"fibers={len(paths)}",
+        flush=True,
+    )
+    if aggregate.restarts_per_meter is not None and aggregate.reference_length_meters is not None:
+        print(
+            "native_trace2cp_fibers "
+            + _format_trace2cp_meter_rate_for_runs(
+                aggregate.restarts_per_meter,
+                run_count=int(aggregate.run_count),
+                reference_length_meters=aggregate.reference_length_meters,
+            ),
+            flush=True,
+        )
+    print(
+        "native_trace2cp_3d multi_fiber "
+        f"summary={summary_path}"
+        + (" exports_indexed=true" if render_visualization else ""),
+        flush=True,
+    )
+    return aggregate
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Native 3D Trace2CP cone tracer",
@@ -7143,7 +7375,7 @@ def _parse_args() -> argparse.Namespace:
         help="Collect and print detailed Trace2CP stage timings.",
     )
     parser.add_argument("--sample-index", type=int, default=None)
-    parser.add_argument("--fiber-json", type=Path, default=None)
+    parser.add_argument("--fiber-json", type=Path, nargs="+", default=None)
     parser.add_argument("--start-cp-index", type=int, default=None)
     parser.add_argument("--target-cp-index", type=int, default=None)
     parser.add_argument("--target-offset", type=int, default=1)
@@ -7289,24 +7521,44 @@ def main() -> None:
         whole_fiber_error_threshold_voxels=float(args.whole_fiber_error_threshold_voxels),
         max_cached_inference_gib=float(args.max_cached_inference_gib),
     )
-    run_native_trace2cp(
-        args.config,
-        checkpoint=args.checkpoint,
-        export_dir=args.export_dir,
-        sample_index=None if args.sample_index is None else int(args.sample_index),
-        fiber_json=args.fiber_json,
-        start_cp_index=args.start_cp_index,
-        target_cp_index=args.target_cp_index,
-        target_offset=int(args.target_offset),
-        sample_mode=args.sample_mode,
-        native_cfg=native_cfg,
-        render_visualization=bool(args.vis),
-        profile=bool(args.profile),
-        normal_sampler_mode=str(args.normal_sampler),
-        normal_principal_axis_method=str(args.normal_principal_axis_method),
-        debug_compare_normal_sampler=args.debug_compare_normal_sampler,
-        debug_normal_angle_threshold_degrees=float(args.debug_normal_angle_threshold_degrees),
-    )
+    if args.fiber_json is None:
+        run_native_trace2cp(
+            args.config,
+            checkpoint=args.checkpoint,
+            export_dir=args.export_dir,
+            sample_index=None if args.sample_index is None else int(args.sample_index),
+            fiber_json=None,
+            start_cp_index=args.start_cp_index,
+            target_cp_index=args.target_cp_index,
+            target_offset=int(args.target_offset),
+            sample_mode=args.sample_mode,
+            native_cfg=native_cfg,
+            render_visualization=bool(args.vis),
+            profile=bool(args.profile),
+            normal_sampler_mode=str(args.normal_sampler),
+            normal_principal_axis_method=str(args.normal_principal_axis_method),
+            debug_compare_normal_sampler=args.debug_compare_normal_sampler,
+            debug_normal_angle_threshold_degrees=float(args.debug_normal_angle_threshold_degrees),
+        )
+    else:
+        run_native_trace2cp_many(
+            args.config,
+            checkpoint=args.checkpoint,
+            export_dir=args.export_dir,
+            sample_index=None if args.sample_index is None else int(args.sample_index),
+            fiber_jsons=list(args.fiber_json),
+            start_cp_index=args.start_cp_index,
+            target_cp_index=args.target_cp_index,
+            target_offset=int(args.target_offset),
+            sample_mode=args.sample_mode,
+            native_cfg=native_cfg,
+            render_visualization=bool(args.vis),
+            profile=bool(args.profile),
+            normal_sampler_mode=str(args.normal_sampler),
+            normal_principal_axis_method=str(args.normal_principal_axis_method),
+            debug_compare_normal_sampler=args.debug_compare_normal_sampler,
+            debug_normal_angle_threshold_degrees=float(args.debug_normal_angle_threshold_degrees),
+        )
 
 
 if __name__ == "__main__":

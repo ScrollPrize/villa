@@ -1,14 +1,12 @@
-# Remote Lasagna Manifest Support Status
+# Python Native 3D Trace2CP Multi-Fiber Status
 
-- [x] Read current Lasagna dataset/manifest open path.
-- [x] Read current remote URL and marker-backed remote cache behavior.
+- [x] Read current Python native 3D Trace2CP CLI and whole-fiber runner.
 - [x] Write task description.
 - [x] Write implementation plan.
-- [x] Add explicit group-location semantics for relative paths, absolute local
-  paths, and absolute remote paths.
-- [x] Review plan against existing specs/docs before implementation.
-- [x] Implement low-level remote manifest opener.
-- [x] Wire `vc_fiber_trace_metric --remote-cache-dir`.
-- [x] Add focused tests.
+- [x] Add multi-path `--fiber-json` parsing.
+- [x] Preserve existing no-fiber and single-fiber behavior.
+- [x] Add indexed per-fiber output stems for multi-fiber mode.
+- [x] Add accumulated multi-fiber metric reporting and JSON summary.
 - [x] Update specs/docs/changelog/task log.
-- [x] Run validation commands.
+- [x] Add focused tests.
+- [x] Run focused validation.

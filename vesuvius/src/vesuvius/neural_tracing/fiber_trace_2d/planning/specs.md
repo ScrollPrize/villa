@@ -542,6 +542,16 @@
 - Native 3D Trace2CP is metric-only by default. It always prints native metric
   lines and writes `trace2cp_native_3d_summary.json`; JPG visualization and
   partial image updates are opt-in and run only when `--vis` is supplied.
+- Native 3D Trace2CP accepts multiple `--fiber-json` paths in one invocation.
+  Multi-fiber mode is whole-fiber only: sample-index and explicit CP selectors
+  are rejected because the accumulated score is defined over complete fibers.
+  The tool traces the fibers sequentially with one shared loaded model, writes
+  one per-fiber summary as `trace2cp_native_3d_000_summary.json`,
+  `trace2cp_native_3d_001_summary.json`, etc., writes indexed JPGs with the
+  same stems when `--vis` is supplied, writes
+  `trace2cp_native_3d_summary_all.json`, and reports the accumulated
+  restart-rate score from summed restarts divided by summed original-line
+  reference length.
 - Dedicated native 3D Trace2CP metric configs may require the JSON fiber to be
   supplied by `--fiber-json`. In that mode the config `datasets` entry is only
   a volume/scale/manifest template and must not carry a config-local

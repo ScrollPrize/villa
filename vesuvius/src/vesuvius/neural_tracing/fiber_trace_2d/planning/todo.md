@@ -73,6 +73,8 @@
 - [ ] threshold/skeletonize fiber preds and explore the multiple discretet options for scoring!
 - [ ] check training augmentations again
 - [ ] --vis for fiber trace changes the quality?
+- [ ] fiber jsons should from now on save the volume size they are based on (for scale reference)
+    (vc_open_data_source_original_resolution and vc_open_data_source_coordinate_scale_factor)
     
 # beam-search
 - [ ] beamsearch

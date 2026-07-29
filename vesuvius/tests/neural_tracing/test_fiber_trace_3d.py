@@ -80,12 +80,15 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     NativeTrace2CpConfig,
     NativeTraceFieldCache,
     NativeTraceResult,
+    NativeWholeFiberResult,
     _adaptive_trace2cp_cross_strip_height,
+    _aggregate_native_whole_fiber_results,
     _build_native_whole_fiber_span_source,
     _compose_whole_fiber_panel_blocks,
     _fiber_line_tangent_zyx_toward_target,
     _FailFastNormalComparisonSampler,
     _image_to_u8,
+    _indexed_trace2cp_output_stem,
     _interpolate_plane_crossing,
     _NativeLasagnaNormalSampler,
     _native_cumulative_tangent_smoothness_loss_torch,
@@ -3354,6 +3357,35 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.profile is False
 
 
+def test_native_3d_trace2cp_cli_accepts_multiple_fiber_jsons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "trace2cp_tool",
+            "config.json",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--export-dir",
+            "out",
+            "--fiber-json",
+            "a.json",
+            "b.json",
+        ],
+    )
+
+    args = _parse_args()
+
+    assert args.fiber_json == [Path("a.json"), Path("b.json")]
+
+
+def test_native_3d_trace2cp_multi_fiber_output_stems_are_indexed() -> None:
+    assert _indexed_trace2cp_output_stem(0, 2) == "trace2cp_native_3d_000"
+    assert _indexed_trace2cp_output_stem(12, 1000) == "trace2cp_native_3d_012"
+    assert _indexed_trace2cp_output_stem(12, 1001) == "trace2cp_native_3d_0012"
+
+
 def test_native_3d_trace2cp_help_shows_defaults(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -3953,7 +3985,7 @@ def test_native_3d_whole_fiber_progress_reports_compact_error_units_when_known(c
     assert "err/kvx=50.0" in output
     assert "err/m=25.0 (20.0mm)" in output
     assert "\r" in output
-    assert output.count("\n") == 1
+    assert output.count("\n") == 2
     assert "err/kvx=50.000" not in output
     assert "err/m=25.000" not in output
     assert "restarts_per_kvx=" not in output
@@ -3972,6 +4004,42 @@ def test_native_3d_whole_fiber_error_format_helpers_use_one_decimal() -> None:
         )
         == "err/m=52.3 (17.0mm)"
     )
+
+
+def test_native_3d_multi_fiber_aggregation_sums_restart_metric_denominators() -> None:
+    empty_trace = np.zeros((0, 3), dtype=np.float32)
+    first = NativeWholeFiberResult(
+        segments=(),
+        restart_count=1,
+        restarts_per_kvx=10.0,
+        segment_count=4,
+        reference_length_voxels=100.0,
+        reference_length_meters=0.2,
+        restarts_per_meter=5.0,
+        stitched_trace_zyx=empty_trace,
+        inferred_blocks=0,
+    )
+    second = NativeWholeFiberResult(
+        segments=(),
+        restart_count=2,
+        restarts_per_kvx=10.0,
+        segment_count=6,
+        reference_length_voxels=200.0,
+        reference_length_meters=0.3,
+        restarts_per_meter=6.6666666667,
+        stitched_trace_zyx=empty_trace,
+        inferred_blocks=0,
+    )
+
+    aggregate = _aggregate_native_whole_fiber_results([first, second])
+
+    assert aggregate.restart_count == 3
+    assert aggregate.segment_count == 10
+    assert aggregate.reference_length_voxels == pytest.approx(300.0)
+    assert aggregate.restarts_per_kvx == pytest.approx(10.0)
+    assert aggregate.reference_length_meters == pytest.approx(0.5)
+    assert aggregate.restarts_per_meter == pytest.approx(6.0)
+    assert aggregate.run_count == 5
 
 
 def test_native_3d_whole_fiber_ignores_non_vc3d_voxel_size_metadata() -> None:

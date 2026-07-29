@@ -1,5 +1,8 @@
 # 2026-07-29
 
+- Python native 3D Trace2CP now accepts multiple `--fiber-json` paths, runs
+  them sequentially with a shared loaded model, writes indexed per-fiber
+  summaries/visualizations, and reports an accumulated restart-rate score.
 - Extended native VC3D Lasagna dataset opening so `vc_fiber_trace_metric` can
   stream precomputed fiber inference manifests directly from HTTP/S3 locations
   with an explicit remote cache directory, including relative and absolute

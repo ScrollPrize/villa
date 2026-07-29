@@ -259,6 +259,12 @@ Ownership changed as follows:
   `--fiber-json <path> --start-cp-index A --target-cp-index B` keeps explicit
   single-segment debug mode. Existing `--sample-index` plus `--target-offset`
   selection remains available when no fiber JSON is supplied.
+- `--fiber-json <path> <path> ...` runs those fibers sequentially in
+  whole-fiber mode using one shared loaded model. It writes indexed per-fiber
+  outputs such as `trace2cp_native_3d_000_summary.json` and, with `--vis`,
+  `trace2cp_native_3d_000_vis.jpg`, plus an accumulated
+  `trace2cp_native_3d_summary_all.json` score over summed restarts and summed
+  original-line reference length.
 - Traces directly in selected-level ZYX voxel coordinates, not in a projected
   2D strip. It lazily runs dense 3D inference blocks around queried points,
   crops each block to a trusted core, and routes every candidate lookup to the
@@ -395,7 +401,7 @@ Ownership changed as follows:
   `--whole-fiber-error-threshold-voxels` (default `10`). Failures count one
   restart and resume from the failed target CP. Human stdout/progress prints
   compact error rates as `err/kvx=...` and, when physical units are available,
-  `err/m=...`, rounded to three decimals. Reference lengths and
+  `err/m=...`, rounded to one decimal. Reference lengths and
   `physical_unit=m` are omitted from human progress output. Live progress uses
   carriage-return updates on one terminal line and prints a newline only at
   completion. Physical per-meter output is optional and comes only from the
