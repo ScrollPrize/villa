@@ -119,17 +119,14 @@ surf_sdt_zarr_path = f'{dataset_path}/lasagna_inputs/las_008_surf_sdt.ome.zarr'
 surf_sdt_zarr_group = '1'
 pcl_json_paths = [
     f'{dataset_path}/abs_winding.json',
-    f'{dataset_path}/patch-overlap-pcls.json',
     f'{dataset_path}/relative_windings.json',
-    f'{dataset_path}/same_windings.json',
-    f'{dataset_path}/drawn_control_points.json',
 ]
 # The interactive session API supplies explicit roles.  The legacy CLI leaves
 # this as None and retains the historical abs_winding.json basename behavior.
 pcl_input_specs = None
 fibers_path = f'{dataset_path}/fibers'
 verified_patches_path = f'{dataset_path}/verified_patches'
-unverified_patches_path = f'{dataset_path}/unverified_patches'
+unverified_patches_path = None
 run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
 shell_path = f'{dataset_path}/outer_shell'
 tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'  # or: m7_ds2_z3000_18000_surf.dbm
@@ -260,7 +257,7 @@ default_config = {
     'unattached_pcl_num_points_per_step': 32,
     'unattached_pcl_min_point_spacing': 16.,
     'track_num_per_step': 48000,
-    'track_num_points_per_step': 24,
+    'track_num_points_per_step': 96,
     # Resample each complete track in full-resolution polyline arclength.
     # track_num_points_per_step selects target-estimation points; the spacing
     # bounds control how many points contribute to the complete-track loss.
@@ -268,14 +265,22 @@ default_config = {
     'track_max_sample_spacing': 60.0,
     # Optional track-pool policies. None preserves uniform sampling and keeps
     # every track regardless of tortuosity; crossing supplements are opt-in.
-    'track_length_bin_weights': None,  # [short, medium, long], using eligible-track arclength tertiles
+    'track_length_bin_weights': [0.0, 0.15, 0.85],  # [short, medium, long], using eligible-track arclength tertiles
     'track_max_tortuosity': None,  # whole-track arclength / endpoint chord; None disables filtering
-    # Crossing discovery is session-scoped; the active per-step count can then
-    # change freely up to this prepared ceiling at a Run boundary.
+    # The complete eligible crossing CSR is retained for the session. The active
+    # per-step random sample can change freely up to this safety ceiling at a
+    # Run boundary. The legacy setting name is kept for profile compatibility.
     'track_crossing_precompute_max': 8,
     # Opposite-family partners joined to each primary track's shared winding
     # target. Zero disables crossing-connected sampling.
-    'max_track_crossing_per_step': 0,
+    'max_track_crossing_per_step': 1,
+    # Native crossing-chain sampling. "count" preserves the historical
+    # fixed-width primary/partner sampler exactly.
+    'track_crossing_mode': 'count',
+    'min_walk_steps_per_track': 24,
+    'max_walk_steps_per_track': 256,
+    'n_walks_per_track': 4,
+    'track_walk_require_loop_consistency': False,
     'track_exclusion_radius': 16.0,
     'track_radius_target': 'mean',
     'track_radius_loss_margin': 0.025,
@@ -292,7 +297,7 @@ default_config = {
     # soft-sequence phase registration, crossing count, native minimum
     # spacing, and SDT attachment, each with its own weight) and 'grad_mag'
     # (the legacy density integral and default inherited from origin/main).
-    'dense_spacing_mode': 'grad_mag',
+    'dense_spacing_mode': 'phase',
     'dense_spacing_num_pairs': 12_000,
     # m is a two-range mixture biased short: longer baselines average out
     # per-gap counting noise (std ~ 0.5 * sqrt(m)) and let rays straddle wide
@@ -349,7 +354,7 @@ default_config = {
     'dense_spacing_phase_min_matched_mass': 1.0,
     # Native pre-expansion anti-collapse barrier. This is asset-independent
     # and can run in either dense-spacing mode.
-    'loss_weight_min_spacing': 0.0,
+    'loss_weight_min_spacing': 2.0,
     # Crossing count: per-step it is gradient-starved on coarse fits and its
     # support gate self-confirms, but its integer-topology pressure compounds
     # - at 2000-step held-out probes (2026-07-17, wrap-aware scorer) count 8
@@ -371,7 +376,7 @@ default_config = {
     # r<1000, under-reads ~12% at r>1000 (detection recall - partial
     # crossings), and is blind below ~12 wv detected spacing (SDT resolution
     # floor) - hence the min-gap abstention below.
-    'loss_weight_dense_spacing_density': 0.0,
+    'loss_weight_dense_spacing_density': 12.0,
     # Sub-resolution abstention: below ~12 wv detected spacing the store
     # under-reads winding density ~30% (measured), so steps bracketed by a
     # gap under min_gap_wv can abstain (contribute nothing, target-corrected
@@ -1283,7 +1288,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     track_crossing_cache = None
     if tracks_dbm_path is not None and cfg.get('use_tracks', True):
         print(f'loading tracks from {tracks_dbm_path}')
-        if track_sampling_config['crossing_precompute_max'] > 0:
+        if (track_sampling_config['crossing_precompute_max'] > 0
+                or track_sampling_config['crossing_mode'] == 'track_walk'):
             track_crossing_cache = load_track_crossing_cache(tracks_dbm_path)
             tracks, track_families, track_source_ids = load_tracks_from_dbm(
                 tracks_dbm_path, z_begin, z_end, return_families=True,
@@ -1836,7 +1842,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         temporary = f'{destination}.tmp-{os.getpid()}-{time.time_ns()}'
         try:
             torch.save(checkpoint_payload(completed_iterations), temporary)
-            with open(temporary, 'rb') as stream:
+            # 'rb+' not 'rb': fsync on Windows (_commit) requires a writable descriptor.
+            with open(temporary, 'rb+') as stream:
                 os.fsync(stream.fileno())
             os.replace(temporary, destination)
             try:
@@ -2428,7 +2435,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         def configure_interactive_run(config):
             # Only called by the resident driver on the fitter thread at a
             # pause boundary. These settings are read afresh by every step.
-            if ({'track_length_bin_weights', 'max_track_crossing_per_step'}
+            if ({'track_length_bin_weights', 'max_track_crossing_per_step',
+                 'min_walk_steps_per_track', 'max_walk_steps_per_track',
+                 'n_walks_per_track'}
                     & set(config)):
                 configure_prepared_track_sampling(prepared_main_tracks, config)
             cfg.update(config, allow_val_change=True)

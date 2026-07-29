@@ -57,12 +57,17 @@ class FakeSession:
             "max_track_crossing_per_step": 0,
             "track_min_sample_spacing": 20.0,
             "track_max_sample_spacing": 60.0,
+            "min_walk_steps_per_track": 24,
+            "max_walk_steps_per_track": 256,
+            "n_walks_per_track": 4,
         }
         self.default_advanced_config = {
             "learning_rate": 3e-5,
             "num_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "track_crossing_precompute_max": 8,
+            "track_crossing_mode": "count",
+            "track_walk_require_loop_consistency": False,
         }
         self.saved = []
         self.closed = False
@@ -824,6 +829,9 @@ class UploadTests(unittest.TestCase):
             "max_track_crossing_per_step": 3,
             "track_min_sample_spacing": 12.0,
             "track_max_sample_spacing": 32.0,
+            "min_walk_steps_per_track": 18,
+            "max_walk_steps_per_track": 96,
+            "n_walks_per_track": 5,
         }
 
         response = self.state.run({"iterations": 10, "run_config": config})
@@ -858,6 +866,18 @@ class UploadTests(unittest.TestCase):
         with self.assertRaisesRegex(ApiError, "must be <="):
             self.state.run({"iterations": 10, "run_config": {
                 "track_min_sample_spacing": 33,
+            }})
+        with self.assertRaisesRegex(ApiError, "positive integer"):
+            self.state.run({"iterations": 10, "run_config": {
+                "n_walks_per_track": 0,
+            }})
+        with self.assertRaisesRegex(ApiError, "must be <="):
+            self.state.run({"iterations": 10, "run_config": {
+                "min_walk_steps_per_track": 97,
+            }})
+        with self.assertRaisesRegex(ApiError, "non-mutable"):
+            self.state.run({"iterations": 10, "run_config": {
+                "track_crossing_mode": "track_walk",
             }})
 
     def test_run_accepts_advertised_zero_count_for_disabled_input(self):

@@ -165,6 +165,9 @@ TEST_CASE("LasagnaNormalSampler supports 3D per-channel zarr groups and coordina
     vc::lasagna::LasagnaNormalSampler scaledSampler(scaledDataset);
     const auto scaledSample = scaledSampler.sampleNormal({1.0, 1.0, 1.0});
     REQUIRE(scaledSample.valid);
+    CHECK(scaledSample.normal[0] == doctest::Approx(sample.normal[0]));
+    CHECK(scaledSample.normal[1] == doctest::Approx(sample.normal[1]));
+    CHECK(scaledSample.normal[2] == doctest::Approx(sample.normal[2]));
     REQUIRE(scaledSampler.predDtSpacing() == std::nullopt);
     fs::remove_all(dir);
 }

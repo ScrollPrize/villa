@@ -318,6 +318,16 @@ def _validate_run_config(value, current, limits=None):
                                f"{key} must be a finite positive number")
             result[key] = float(item)
             continue
+        if key in ("min_walk_steps_per_track", "max_walk_steps_per_track",
+                   "n_walks_per_track"):
+            if (isinstance(item, bool) or not isinstance(item, (int, float))
+                    or not math.isfinite(float(item))
+                    or not float(item).is_integer() or int(item) <= 0):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    f"{key} must be a positive integer")
+            result[key] = int(item)
+            continue
         if key in RUN_MUTABLE_BOOLEAN_KEYS:
             if not isinstance(item, bool):
                 raise ApiError(HTTPStatus.BAD_REQUEST,
@@ -369,6 +379,16 @@ def _validate_run_config(value, current, limits=None):
         raise ApiError(
             HTTPStatus.BAD_REQUEST,
             "track_min_sample_spacing must be <= track_max_sample_spacing")
+    walk_minimum = effective.get("min_walk_steps_per_track")
+    walk_maximum = effective.get("max_walk_steps_per_track")
+    if (not isinstance(walk_minimum, bool)
+            and isinstance(walk_minimum, (int, float))
+            and not isinstance(walk_maximum, bool)
+            and isinstance(walk_maximum, (int, float))
+            and int(walk_minimum) > int(walk_maximum)):
+        raise ApiError(
+            HTTPStatus.BAD_REQUEST,
+            "min_walk_steps_per_track must be <= max_walk_steps_per_track")
     return result
 
 
