@@ -124,6 +124,43 @@ public:
     }
 };
 
+class BatchPrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    mutable int sampleCalls = 0;
+    mutable int batchCalls = 0;
+
+    [[nodiscard]] bool supportsConcurrentSampling() const noexcept override
+    {
+        return true;
+    }
+
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d&,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        ++sampleCalls;
+        vc::fiber_tracer::FiberPredictionSample out;
+        out.options.push_back({referenceDirection, 1.0, true});
+        return out;
+    }
+
+    void sampleBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        const std::vector<cv::Vec3d>& referenceDirections,
+        int,
+        std::vector<vc::fiber_tracer::FiberPredictionSample>& samples) const override
+    {
+        ++batchCalls;
+        samples.clear();
+        samples.reserve(volumePoints.size());
+        for (size_t index = 0; index < volumePoints.size(); ++index) {
+            vc::fiber_tracer::FiberPredictionSample out;
+            out.options.push_back({referenceDirections[index], 1.0, true});
+            samples.push_back(std::move(out));
+        }
+    }
+};
+
 class ConstantNormalSampler final : public vc::lasagna::NormalSampler {
 public:
     explicit ConstantNormalSampler(cv::Vec3d normal = {0.0, 1.0, 0.0})
@@ -173,6 +210,7 @@ TEST_CASE("native fiber tracer defaults match regular Trace2CP command")
     CHECK(config.beamWidth == 8);
     CHECK(config.beamPruneDistanceVoxels == doctest::Approx(1.0));
     CHECK(config.beamLookaheadSteps == 2);
+    CHECK(config.parallelThreads == 0);
     CHECK(config.smoothnessNormalWeight == doctest::Approx(0.1));
     CHECK(config.smoothnessTangentWeight == doctest::Approx(10.0));
     CHECK(config.smoothnessFreeAngleDegrees == doctest::Approx(0.0));
@@ -331,6 +369,49 @@ TEST_CASE("native fiber tracer requires normals for normal-aware smoothness")
     request.config.cumulativeSmoothnessTangentWeight = 0.0;
     CHECK_NOTHROW(
         vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr));
+}
+
+TEST_CASE("native fiber tracer parallel workers require concurrent samplers")
+{
+    CHECK(vc::fiber_tracer::testing::debugTraceWorkerCount(
+              true, true, true, 4, 64) == 4);
+    CHECK(vc::fiber_tracer::testing::debugTraceWorkerCount(
+              true, false, true, 4, 64) == 1);
+    CHECK(vc::fiber_tracer::testing::debugTraceWorkerCount(
+              false, true, true, 4, 64) == 1);
+    CHECK(vc::fiber_tracer::testing::debugTraceWorkerCount(
+              true, true, false, 4, 64) == 4);
+    CHECK(vc::fiber_tracer::testing::debugTraceWorkerCount(
+              true, true, true, 1, 64) == 1);
+    CHECK(vc::fiber_tracer::testing::debugTraceWorkerCount(
+              true, true, true, 4, 1) == 1);
+}
+
+TEST_CASE("native fiber tracer parallel path samples predictions in a batch")
+{
+    BatchPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {3.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 3.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 5.0;
+    request.config.coneAngleStepDegrees = 5.0;
+    request.config.beamWidth = 2;
+    request.config.parallelThreads = 2;
+    request.config.smoothnessWeight = 0.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    CHECK(result.reachedTargetPlane);
+    CHECK(predictions.sampleCalls == 1);
+    CHECK(predictions.batchCalls == 1);
 }
 
 TEST_CASE("native fiber tracer prunes beams by Python score and generation order")

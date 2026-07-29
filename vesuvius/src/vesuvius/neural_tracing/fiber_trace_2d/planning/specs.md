@@ -57,6 +57,16 @@
   symmetric eigensolver and then apply the same hint/no-hint sign convention as
   Python. The active `candidate_substeps=1` candidate loss is the Python
   all-pairs direction product plus the configured smoothness terms.
+- Native precomputed Trace2CP may score independent beam candidates in
+  parallel only when the prediction source and, if present, the Lasagna normal
+  sampler explicitly advertise concurrent sampling support. Parallel scoring
+  must build candidate tasks in deterministic beam/candidate order, keep
+  persisted Zarr/cache access chunky by preparing interpolation requests and
+  materializing prediction samples as a batch before fine-grained loss scoring,
+  and rebuild the next frontier serially in that same order, so pruning,
+  reached-state selection, and trace output remain deterministic. `--threads 0`
+  is the default and uses the OpenMP default thread count; `--threads 1` must
+  force serial lazy candidate scoring.
 - Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2
   (factor 4 relative to selected input). It is converted to the runner's
   literal factor and does not read or reinterpret tracer config `scaledown`.

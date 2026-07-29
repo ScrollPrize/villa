@@ -1,5 +1,12 @@
 # 2026-07-30
 
+- Added opt-in native C++ Trace2CP parallel candidate scoring through batched
+  persisted prediction materialization, batched Lasagna normals, and
+  `vc_fiber_trace_metric --threads`, while preserving deterministic beam output
+  order.
+- Reduced native Trace2CP beam expansion overhead by keeping internal trace
+  paths parent-linked and caching per-trace cone offsets instead of rebuilding
+  them per beam.
 - Matched native C++ Trace2CP beam pruning/reached-target selection and compact
   normal principal-axis decoding more closely to the Python tracer, with
   focused `test_fiber_trace3d` regression coverage for beam order, reached

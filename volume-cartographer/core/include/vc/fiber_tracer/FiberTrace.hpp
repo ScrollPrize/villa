@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,7 @@ struct FiberTraceConfig {
     int beamWidth = 8;
     double beamPruneDistanceVoxels = 1.0;
     int beamLookaheadSteps = 2;
+    int parallelThreads = 0;
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
     double smoothnessTangentWeight = 10.0;
@@ -70,6 +72,33 @@ struct FiberInput {
 class FiberPredictionSource {
 public:
     virtual ~FiberPredictionSource() = default;
+    [[nodiscard]] virtual bool supportsConcurrentSampling() const noexcept
+    {
+        return false;
+    }
+    [[nodiscard]] virtual vc::lasagna::NormalPrefetchReport prefetchSamples(
+        const std::vector<cv::Vec3d>& /*volumePoints*/) const
+    {
+        return {};
+    }
+    virtual void sampleBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        const std::vector<cv::Vec3d>& referenceDirections,
+        int parallelThreads,
+        std::vector<FiberPredictionSample>& samples) const
+    {
+        (void)parallelThreads;
+        if (volumePoints.size() != referenceDirections.size()) {
+            throw std::invalid_argument(
+                "fiber prediction batch points and reference directions size mismatch");
+        }
+        (void)prefetchSamples(volumePoints);
+        samples.clear();
+        samples.reserve(volumePoints.size());
+        for (size_t index = 0; index < volumePoints.size(); ++index) {
+            samples.push_back(sample(volumePoints[index], referenceDirections[index]));
+        }
+    }
     [[nodiscard]] virtual FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
         const cv::Vec3d& referenceDirection) const = 0;
@@ -82,6 +111,14 @@ public:
         size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL);
     ~FiberPredictionField() override;
 
+    [[nodiscard]] bool supportsConcurrentSampling() const noexcept override { return true; }
+    [[nodiscard]] vc::lasagna::NormalPrefetchReport prefetchSamples(
+        const std::vector<cv::Vec3d>& volumePoints) const override;
+    void sampleBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        const std::vector<cv::Vec3d>& referenceDirections,
+        int parallelThreads,
+        std::vector<FiberPredictionSample>& samples) const override;
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
         const cv::Vec3d& referenceDirection) const override;
@@ -193,6 +230,13 @@ struct BeamDebugState {
 
 [[nodiscard]] std::optional<size_t> debugBestReachedBeamStateIndex(
     const std::vector<BeamDebugState>& states);
+
+[[nodiscard]] int debugTraceWorkerCount(
+    bool predictionConcurrent,
+    bool normalConcurrent,
+    bool hasNormalSampler,
+    int parallelThreads,
+    size_t taskCount);
 
 } // namespace testing
 #endif

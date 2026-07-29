@@ -1,10 +1,8 @@
-# Native C++ Trace2CP Python-Parity Fixes
+# Native C++ Trace2CP Parallel Candidate Scoring
 
-Fix the remaining native C++ Trace2CP parity issues identified against the
-Python tracer:
+Speed up the native C++ Trace2CP tracer by parallelizing independent candidate
+scoring inside each beam generation while preserving deterministic Python-style
+beam ordering and trace results.
 
-- Match Python beam pruning and reached-target selection semantics.
-- Replace the C++ compact normal principal-axis power iteration with the same
-  symmetric eigensolver convention used by Python.
-- Preserve and test the existing candidate-loss all-pairs formula for the
-  `candidate_substeps=1` path used by the native metric command.
+The whole-fiber segment chain remains sequential because each segment starts
+from the previous segment's trace/restart state.

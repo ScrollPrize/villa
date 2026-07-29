@@ -55,6 +55,7 @@ void printUsage(const char* argv0)
         << "  --beam-width N                  kept beams per step [8]\n"
         << "  --beam-prune-distance-voxels N  beam endpoint merge radius after lookahead [1]\n"
         << "  --beam-lookahead-steps N        expand this many steps before pruning [2]\n"
+        << "  --threads N                     candidate scoring threads, 0 uses OpenMP default, 1 serial [0]\n"
         << "  --smoothness-weight N           smoothness scale [2]\n"
         << "  --smoothness-normal-weight N    normal-axis smoothness weight [0.1]\n"
         << "  --smoothness-tangent-weight N   tangent-plane smoothness weight [10]\n"
@@ -158,6 +159,9 @@ CliOptions parseArgs(int argc, char** argv)
             options.trace.beamLookaheadSteps =
                 parseInt(requireValue(i, argc, argv, "beam-lookahead-steps"),
                          "beam-lookahead-steps");
+        } else if (arg == "--threads") {
+            options.trace.parallelThreads =
+                parseInt(requireValue(i, argc, argv, "threads"), "threads");
         } else if (arg == "--smoothness-weight") {
             options.trace.smoothnessWeight =
                 parseDouble(requireValue(i, argc, argv, "smoothness-weight"),
@@ -219,6 +223,8 @@ CliOptions parseArgs(int argc, char** argv)
         failOption("--beam-prune-distance-voxels must be non-negative");
     if (options.trace.beamLookaheadSteps < 1)
         failOption("--beam-lookahead-steps must be at least 1");
+    if (options.trace.parallelThreads < 0)
+        failOption("--threads must be non-negative");
     if (!(options.trace.smoothnessWeight >= 0.0) ||
         !(options.trace.smoothnessNormalWeight >= 0.0) ||
         !(options.trace.smoothnessTangentWeight >= 0.0) ||
@@ -324,6 +330,10 @@ int main(int argc, char** argv)
                 << " derived_prediction_spacing_trace_voxels="
                 << traceScales.predictionSpacingInTraceVoxels
                 << " inference_scaledown_power=" << options.inferenceScaledownPower
+                << " threads="
+                << (options.trace.parallelThreads > 0
+                        ? std::to_string(options.trace.parallelThreads)
+                        : std::string("auto"))
                 << " normal_sampler=" << (normalSamplerPtr != nullptr ? "on" : "off")
                 << '\n';
         }
