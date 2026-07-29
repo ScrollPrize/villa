@@ -1,25 +1,20 @@
-# Native VC3D 3D Fiber Tracer Status
+# Native VC3D 3D Fiber Metric Runner Status
 
 - [x] Read project workflow instructions.
-- [x] Inspect relevant VC3D volume, Lasagna, and line annotation entry points.
-- [x] Write current task into `planning/task.md`.
-- [x] Write detailed implementation plan into `planning/task_plan.md`.
-- [x] Review `task_plan.md` against `task.md`/`specs.md` while implementing.
-- [x] Update `planning/specs.md` with native VC3D tracer requirements.
-- [x] Update docs for project dataset storage and GUI workflow.
-- [x] Extract shared C++ Lasagna compact-channel sampling helpers and port
-  existing normal sampling to them.
-- [x] Implement native core tracer library.
-- [x] Implement project-level fiber inference dataset storage.
-- [x] Implement Ctrl-right-click GUI action and edit blocking via the existing
-  optimization busy state.
-- [x] Add focused native tracer test and rebuild the VC3D target.
-- [x] Run validation commands and record results in `planning/task_log.md`.
-- [x] Add changelog entry.
-- [ ] Implement persisted tracer-optimized segment metadata/invalidation.
-- [ ] Protect unchanged tracer-optimized segments from regular Lasagna
-  reoptimization.
-- [ ] Add full Python-equivalent multi-step beam lookahead in the C++ core.
-- [ ] Add UI progress text/percentage beyond the existing busy overlay and
-  worker log messages.
-- [ ] Add real-data parity validation against the Python reference command.
+- [x] Inspect current native C++ tracer and Python whole-fiber metric path.
+- [x] Replace `planning/task.md` with the current continuation task.
+- [x] Replace `planning/task_plan.md` with the current implementation plan.
+- [x] Extend `vc_fiber_tracer` with shared fiber JSON loading and one-way
+  whole-fiber metric API.
+- [x] Add C++ CLI runner for `fiber.lasagna.json` plus `fiber.json`.
+- [x] Add focused whole-fiber metric tests.
+- [x] Update specs, docs, changelog, and current task log.
+- [x] Build and run validation commands.
+
+## Known Remaining Native GUI Gaps
+
+- [ ] Persisted tracer-optimized segment metadata/invalidation.
+- [ ] Protection from regular Lasagna reoptimization for unchanged
+  tracer-optimized segments.
+- [ ] Numeric GUI progress overlay beyond the existing busy state and logs.
+- [ ] Real-data parity validation against the Python reference command.

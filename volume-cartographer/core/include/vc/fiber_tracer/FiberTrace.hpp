@@ -49,6 +49,13 @@ struct FiberPredictionSample {
     std::vector<FiberPredictionSampleOption> options;
 };
 
+struct FiberInput {
+    std::filesystem::path path;
+    std::vector<cv::Vec3d> linePointsXyzBase;
+    std::vector<cv::Vec3d> controlPointsXyzBase;
+    std::vector<size_t> controlPointLineIndices;
+};
+
 class FiberPredictionSource {
 public:
     virtual ~FiberPredictionSource() = default;
@@ -82,6 +89,15 @@ struct FiberTraceSegmentRequest {
     FiberTraceConfig config;
 };
 
+struct FiberTraceOneWayRequest {
+    cv::Vec3d startPoint{0.0, 0.0, 0.0};
+    cv::Vec3d targetPoint{0.0, 0.0, 0.0};
+    cv::Vec3d initialDirection{1.0, 0.0, 0.0};
+    cv::Vec3d targetPlaneNormal{1.0, 0.0, 0.0};
+    double budgetSpanVoxels = 0.0;
+    FiberTraceConfig config;
+};
+
 struct FiberTraceOneWayResult {
     std::vector<cv::Vec3d> points;
     bool reachedTargetPlane = false;
@@ -101,13 +117,72 @@ struct FiberTraceSegmentResult {
     std::string reason;
 };
 
+struct FiberTraceWholeFiberSegmentResult {
+    size_t startControlPointIndex = 0;
+    size_t targetControlPointIndex = 0;
+    FiberTraceOneWayResult trace;
+    bool success = false;
+    bool restart = false;
+    std::string reason;
+    double inPlaneErrorVoxels = 0.0;
+    double referenceArcDistanceVoxels = 0.0;
+};
+
+struct FiberTraceWholeFiberResult {
+    std::vector<FiberTraceWholeFiberSegmentResult> segments;
+    std::vector<cv::Vec3d> stitchedTrace;
+    int restartCount = 0;
+    int segmentCount = 0;
+    double restartsPerKvx = 0.0;
+    double referenceLengthVoxels = 0.0;
+    std::optional<double> referenceLengthMeters;
+    std::optional<double> restartsPerMeter;
+};
+
+struct FiberTraceWholeFiberMetricRequest {
+    FiberInput fiber;
+    double workingToBaseScale = 1.0;
+    double errorThresholdVoxels = 10.0;
+    std::optional<double> voxelSizeUm;
+    FiberTraceConfig config;
+};
+
+struct FiberTraceWholeFiberProgress {
+    int completedSegments = 0;
+    int segmentCount = 0;
+    int currentSegment = 0;
+    int restartCount = 0;
+    double restartsPerKvx = 0.0;
+    std::optional<double> restartsPerMeter;
+    std::optional<double> referenceLengthMeters;
+    std::string status;
+    FiberTraceProgress traceProgress;
+    bool hasTraceProgress = false;
+};
+
 using FiberTraceProgressCallback = std::function<void(const FiberTraceProgress&)>;
+using FiberTraceWholeFiberProgressCallback =
+    std::function<void(const FiberTraceWholeFiberProgress&)>;
+
+[[nodiscard]] FiberInput loadFiberJson(const std::filesystem::path& path);
+
+[[nodiscard]] FiberTraceOneWayResult traceFiberOneWay(
+    const FiberPredictionSource& predictions,
+    const FiberTraceOneWayRequest& request,
+    const vc::lasagna::NormalSampler* normalSampler = nullptr,
+    const FiberTraceProgressCallback& progress = {});
 
 [[nodiscard]] FiberTraceSegmentResult traceFiberSegment(
     const FiberPredictionSource& predictions,
     const FiberTraceSegmentRequest& request,
     const vc::lasagna::NormalSampler* normalSampler = nullptr,
     const FiberTraceProgressCallback& progress = {});
+
+[[nodiscard]] FiberTraceWholeFiberResult traceWholeFiberMetric(
+    const FiberPredictionSource& predictions,
+    const FiberTraceWholeFiberMetricRequest& request,
+    const vc::lasagna::NormalSampler* normalSampler = nullptr,
+    const FiberTraceWholeFiberProgressCallback& progress = {});
 
 [[nodiscard]] cv::Vec3d referenceTangentToward(
     const std::vector<cv::Vec3d>& line,

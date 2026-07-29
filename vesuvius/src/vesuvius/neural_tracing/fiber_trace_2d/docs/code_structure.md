@@ -633,6 +633,14 @@ Ownership changed as follows:
   CP-to-CP span. The task runs through the existing line-optimization busy
   state, so line edits are blocked while it runs, and accepted results are
   spliced back through the existing generated-view/save path.
+- `volume-cartographer/apps/src/vc_fiber_trace_metric.cpp` is the native
+  no-visualization metric runner for precomputed 3D fiber inference products.
+  It opens a fiber inference `.lasagna.json`, loads one `vc3d_fiber` JSON,
+  runs one-way CP-to-CP tracing continuously over the full fiber, restarts from
+  a CP after failed target-plane hits, and prints `err/kvx` plus optional
+  `err/m` when an explicit `--voxel-size-um` is provided. The CLI is a thin
+  wrapper around `vc_fiber_tracer`; it does not run PyTorch, create strips, or
+  implement separate channel/remote-cache loading.
 - 3D prefetch computes a CP-centered selected-level augmentation-envelope bbox
   and asks VC3D for authoritative bbox-to-chunk dependency metadata. This avoids
   materializing representative coordinates or reconstructing chunk paths in

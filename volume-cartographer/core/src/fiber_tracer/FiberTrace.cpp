@@ -4,12 +4,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+
+#include <nlohmann/json.hpp>
 
 namespace vc::fiber_tracer {
 namespace {
@@ -118,6 +121,115 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 {
     const cv::Vec3d delta = point - target;
     return length(delta - planeNormal * delta.dot(planeNormal));
+}
+
+[[nodiscard]] bool finitePoint(const cv::Vec3d& point)
+{
+    return std::isfinite(point[0]) &&
+           std::isfinite(point[1]) &&
+           std::isfinite(point[2]);
+}
+
+[[nodiscard]] cv::Vec3d pointFromJson(
+    const nlohmann::json& value,
+    const std::filesystem::path& path,
+    const char* key)
+{
+    if (!value.is_array() || value.size() != 3) {
+        throw std::runtime_error(
+            "fiber JSON point in '" + std::string(key) +
+            "' must be a three-element array: " + path.string());
+    }
+    cv::Vec3d point{
+        value.at(0).get<double>(),
+        value.at(1).get<double>(),
+        value.at(2).get<double>(),
+    };
+    if (!finitePoint(point)) {
+        throw std::runtime_error(
+            "fiber JSON point in '" + std::string(key) +
+            "' contains non-finite coordinates: " + path.string());
+    }
+    return point;
+}
+
+[[nodiscard]] std::vector<cv::Vec3d> pointArrayFromJson(
+    const nlohmann::json& root,
+    const std::filesystem::path& path,
+    const char* key)
+{
+    if (!root.contains(key) || !root.at(key).is_array()) {
+        throw std::runtime_error(
+            "fiber JSON is missing array '" + std::string(key) +
+            "': " + path.string());
+    }
+    std::vector<cv::Vec3d> points;
+    points.reserve(root.at(key).size());
+    for (const auto& value : root.at(key)) {
+        points.push_back(pointFromJson(value, path, key));
+    }
+    return points;
+}
+
+[[nodiscard]] bool pointsExactlyEqual(const cv::Vec3d& a, const cv::Vec3d& b)
+{
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+}
+
+[[nodiscard]] size_t exactLineIndexForControlPoint(
+    const std::vector<cv::Vec3d>& line,
+    const cv::Vec3d& control,
+    size_t controlIndex,
+    const std::filesystem::path& path)
+{
+    for (size_t index = 0; index < line.size(); ++index) {
+        if (pointsExactlyEqual(line[index], control)) {
+            return index;
+        }
+    }
+    throw std::runtime_error(
+        "fiber JSON control point " + std::to_string(controlIndex) +
+        " is not an exact line point; refusing to guess line arc position: " +
+        path.string());
+}
+
+[[nodiscard]] std::vector<cv::Vec3d> scaledPoints(
+    const std::vector<cv::Vec3d>& points,
+    double divisor)
+{
+    std::vector<cv::Vec3d> out;
+    out.reserve(points.size());
+    for (const auto& point : points)
+        out.push_back(point / divisor);
+    return out;
+}
+
+[[nodiscard]] double referenceLengthMeters(
+    double referenceLengthWorkingVoxels,
+    double workingToBaseScale,
+    double voxelSizeUm)
+{
+    if (!(referenceLengthWorkingVoxels > 0.0) ||
+        !(workingToBaseScale > 0.0) ||
+        !(voxelSizeUm > 0.0)) {
+        return 0.0;
+    }
+    return referenceLengthWorkingVoxels * workingToBaseScale * voxelSizeUm * 1.0e-6;
+}
+
+[[nodiscard]] cv::Vec3d terminalTraceDirection(
+    const std::vector<cv::Vec3d>& points,
+    const cv::Vec3d& fallback)
+{
+    if (points.size() < 2)
+        return normalizedOr(fallback, {1.0, 0.0, 0.0});
+    for (size_t offset = 1; offset < points.size(); ++offset) {
+        const size_t index = points.size() - 1 - offset;
+        const cv::Vec3d direction = normalizedOrZero(points.back() - points[index]);
+        if (length(direction) > kEpsilon)
+            return direction;
+    }
+    return normalizedOr(fallback, {1.0, 0.0, 0.0});
 }
 
 struct ScoredDirection {
@@ -238,30 +350,30 @@ struct BeamState {
     return bestLoss;
 }
 
-[[nodiscard]] FiberTraceOneWayResult traceOneWay(
+[[nodiscard]] FiberTraceOneWayResult traceOneWayCore(
     const FiberPredictionSource& predictions,
-    const FiberTraceSegmentRequest& request,
-    size_t startIndex,
-    size_t targetIndex,
+    const FiberTraceOneWayRequest& request,
     const vc::lasagna::NormalSampler* normalSampler,
     const FiberTraceProgressCallback& progress,
     std::string phase)
 {
-    const auto& line = request.referenceLine;
-    const cv::Vec3d start = line.at(startIndex);
-    const cv::Vec3d target = line.at(targetIndex);
+    const cv::Vec3d start = request.startPoint;
+    const cv::Vec3d target = request.targetPoint;
     const cv::Vec3d targetPlaneNormal = normalizedOr(
-        request.targetPlaneNormal.value_or(target - start),
+        request.targetPlaneNormal,
         normalizedOr(target - start, {1.0, 0.0, 0.0}));
-    const cv::Vec3d referenceStartDirection =
-        referenceTangentToward(line, startIndex, targetIndex);
+    const cv::Vec3d referenceStartDirection = normalizedOr(
+        request.initialDirection,
+        normalizedOr(target - start, {1.0, 0.0, 0.0}));
     const ScoredDirection startPrediction =
         bestAlignedPrediction(predictions, start, referenceStartDirection);
     const cv::Vec3d startDirection = startPrediction.valid
         ? startPrediction.direction
         : referenceStartDirection;
 
-    const double distance = length(target - start);
+    const double distance = request.budgetSpanVoxels > 0.0
+        ? request.budgetSpanVoxels
+        : length(target - start);
     const double step = std::max(1.0e-3, request.config.stepVoxels);
     const int maxSteps = std::max(
         1,
@@ -276,45 +388,59 @@ struct BeamState {
     std::string reason = "max_step_factor";
 
     const double startSigned = pointToPlaneSigned(start, target, targetPlaneNormal);
-    for (int stepIndex = 0; stepIndex < maxSteps; ++stepIndex) {
-        std::vector<BeamState> expanded;
-        expanded.reserve(beams.size() * 16);
-        for (const auto& beam : beams) {
-            if (beam.reached) {
-                expanded.push_back(beam);
-                continue;
-            }
-            const auto directions = candidateDirections(
-                beam.currentSampleDirection, request.config);
-            for (const auto& direction : directions) {
-                BeamState next = beam;
-                const cv::Vec3d candidatePoint = beam.points.back() + direction * step;
-                const double loss = candidateLoss(
-                    predictions, normalSampler, beam, direction, candidatePoint, request.config);
-                if (!std::isfinite(loss))
+    const int lookaheadSteps = std::max(1, request.config.beamLookaheadSteps);
+    int stepIndex = 0;
+    while (stepIndex < maxSteps) {
+        std::vector<BeamState> expanded = beams;
+        int advanced = 0;
+        for (; advanced < lookaheadSteps && stepIndex + advanced < maxSteps; ++advanced) {
+            std::vector<BeamState> nextFrontier;
+            nextFrontier.reserve(expanded.size() * 16);
+            for (const auto& beam : expanded) {
+                if (beam.reached) {
+                    nextFrontier.push_back(beam);
                     continue;
-                next.points.push_back(candidatePoint);
-                next.tracedLength += step;
-                next.loss += loss;
-                next.previousStepDirection = direction;
-                const auto currentPrediction =
-                    bestAlignedPrediction(predictions, candidatePoint, direction);
-                next.currentSampleDirection =
-                    currentPrediction.valid ? currentPrediction.direction : direction;
-                const double signedDistance =
-                    pointToPlaneSigned(candidatePoint, target, targetPlaneNormal);
-                next.reached = startSigned <= 0.0 ? signedDistance >= 0.0
-                                                  : signedDistance <= 0.0;
-                if (next.reached) {
-                    next.reason = "target_plane";
                 }
-                expanded.push_back(std::move(next));
+                const auto directions = candidateDirections(
+                    beam.currentSampleDirection, request.config);
+                for (const auto& direction : directions) {
+                    BeamState next = beam;
+                    const cv::Vec3d candidatePoint = beam.points.back() + direction * step;
+                    const double loss = candidateLoss(
+                        predictions,
+                        normalSampler,
+                        beam,
+                        direction,
+                        candidatePoint,
+                        request.config);
+                    if (!std::isfinite(loss))
+                        continue;
+                    next.points.push_back(candidatePoint);
+                    next.tracedLength += step;
+                    next.loss += loss;
+                    next.previousStepDirection = direction;
+                    const auto currentPrediction =
+                        bestAlignedPrediction(predictions, candidatePoint, direction);
+                    next.currentSampleDirection =
+                        currentPrediction.valid ? currentPrediction.direction : direction;
+                    const double signedDistance =
+                        pointToPlaneSigned(candidatePoint, target, targetPlaneNormal);
+                    next.reached = startSigned <= 0.0 ? signedDistance >= 0.0
+                                                      : signedDistance <= 0.0;
+                    if (next.reached) {
+                        next.reason = "target_plane";
+                    }
+                    nextFrontier.push_back(std::move(next));
+                }
+            }
+            expanded = std::move(nextFrontier);
+            if (expanded.empty()) {
+                reason = "no_valid_candidates";
+                break;
             }
         }
-        if (expanded.empty()) {
-            reason = "no_valid_candidates";
+        if (expanded.empty())
             break;
-        }
 
         std::sort(expanded.begin(), expanded.end(), [](const auto& a, const auto& b) {
             if (a.reached != b.reached)
@@ -327,13 +453,14 @@ struct BeamState {
         if (expanded.size() > keep)
             expanded.resize(keep);
         beams = std::move(expanded);
+        stepIndex += std::max(1, advanced);
 
         if (progress) {
             const double signedDistance =
                 std::abs(pointToPlaneSigned(beams.front().points.back(), target, targetPlaneNormal));
             FiberTraceProgress event;
             event.phase = phase;
-            event.step = stepIndex + 1;
+            event.step = stepIndex;
             event.maxSteps = maxSteps;
             event.targetPlaneProgress =
                 distance > kEpsilon ? 1.0 - std::min(1.0, signedDistance / distance) : 1.0;
@@ -512,6 +639,48 @@ size_t FiberPredictionField::optionCount() const noexcept
     return impl_->optionCount();
 }
 
+FiberInput loadFiberJson(const std::filesystem::path& path)
+{
+    std::ifstream input(path);
+    if (!input.good()) {
+        throw std::runtime_error("could not open fiber JSON: " + path.string());
+    }
+    const nlohmann::json root = nlohmann::json::parse(input);
+    if (root.value("type", std::string{}) != "vc3d_fiber") {
+        throw std::runtime_error("fiber JSON type is not vc3d_fiber: " + path.string());
+    }
+    if (root.value("version", 0) != 1) {
+        throw std::runtime_error("unsupported vc3d_fiber version: " + path.string());
+    }
+
+    FiberInput fiber;
+    fiber.path = path;
+    fiber.linePointsXyzBase = pointArrayFromJson(root, path, "line_points");
+    fiber.controlPointsXyzBase = pointArrayFromJson(root, path, "control_points");
+    if (fiber.linePointsXyzBase.size() < 2) {
+        throw std::runtime_error(
+            "fiber JSON needs at least two line_points: " + path.string());
+    }
+    if (fiber.controlPointsXyzBase.size() < 2) {
+        throw std::runtime_error(
+            "fiber JSON needs at least two control_points: " + path.string());
+    }
+    fiber.controlPointLineIndices.reserve(fiber.controlPointsXyzBase.size());
+    for (size_t index = 0; index < fiber.controlPointsXyzBase.size(); ++index) {
+        fiber.controlPointLineIndices.push_back(exactLineIndexForControlPoint(
+            fiber.linePointsXyzBase, fiber.controlPointsXyzBase[index], index, path));
+    }
+    for (size_t index = 1; index < fiber.controlPointLineIndices.size(); ++index) {
+        if (fiber.controlPointLineIndices[index] <=
+            fiber.controlPointLineIndices[index - 1]) {
+            throw std::runtime_error(
+                "fiber JSON control_points are not strictly increasing along "
+                "line_points: " + path.string());
+        }
+    }
+    return fiber;
+}
+
 cv::Vec3d referenceTangentToward(
     const std::vector<cv::Vec3d>& line,
     size_t startIndex,
@@ -543,6 +712,25 @@ cv::Vec3d referenceTangentToward(
     return normalizedOr(line[targetIndex] - line[startIndex], {1.0, 0.0, 0.0});
 }
 
+FiberTraceOneWayResult traceFiberOneWay(
+    const FiberPredictionSource& predictions,
+    const FiberTraceOneWayRequest& request,
+    const vc::lasagna::NormalSampler* normalSampler,
+    const FiberTraceProgressCallback& progress)
+{
+    if (!finitePoint(request.startPoint) || !finitePoint(request.targetPoint)) {
+        throw std::invalid_argument("fiber trace one-way request has non-finite endpoint");
+    }
+    if (length(request.targetPoint - request.startPoint) <= kEpsilon) {
+        throw std::invalid_argument("fiber trace one-way request endpoints must differ");
+    }
+    if (length(request.targetPlaneNormal) <= kEpsilon) {
+        throw std::invalid_argument("fiber trace one-way request target plane normal is degenerate");
+    }
+    return traceOneWayCore(
+        predictions, request, normalSampler, progress, "trace");
+}
+
 FiberTraceSegmentResult traceFiberSegment(
     const FiberPredictionSource& predictions,
     const FiberTraceSegmentRequest& request,
@@ -568,12 +756,30 @@ FiberTraceSegmentResult traceFiberSegment(
     reverseRequest.targetPlaneNormal = -*forwardRequest.targetPlaneNormal;
 
     FiberTraceSegmentResult result;
-    result.forward = traceOneWay(
-        predictions, forwardRequest, request.startIndex, request.targetIndex,
-        normalSampler, progress, "forward");
-    result.reverse = traceOneWay(
-        predictions, reverseRequest, request.targetIndex, request.startIndex,
-        normalSampler, progress, "reverse");
+    const cv::Vec3d start = request.referenceLine[request.startIndex];
+    const cv::Vec3d target = request.referenceLine[request.targetIndex];
+    const double span = length(target - start);
+    FiberTraceOneWayRequest forwardOneWay;
+    forwardOneWay.startPoint = start;
+    forwardOneWay.targetPoint = target;
+    forwardOneWay.initialDirection =
+        referenceTangentToward(request.referenceLine, request.startIndex, request.targetIndex);
+    forwardOneWay.targetPlaneNormal = *forwardRequest.targetPlaneNormal;
+    forwardOneWay.budgetSpanVoxels = span;
+    forwardOneWay.config = request.config;
+    FiberTraceOneWayRequest reverseOneWay;
+    reverseOneWay.startPoint = target;
+    reverseOneWay.targetPoint = start;
+    reverseOneWay.initialDirection =
+        referenceTangentToward(request.referenceLine, request.targetIndex, request.startIndex);
+    reverseOneWay.targetPlaneNormal = *reverseRequest.targetPlaneNormal;
+    reverseOneWay.budgetSpanVoxels = span;
+    reverseOneWay.config = request.config;
+
+    result.forward = traceOneWayCore(
+        predictions, forwardOneWay, normalSampler, progress, "forward");
+    result.reverse = traceOneWayCore(
+        predictions, reverseOneWay, normalSampler, progress, "reverse");
 
     result.fusedLine = fuseTraces(
         result.forward.points, result.reverse.points,
@@ -583,8 +789,6 @@ FiberTraceSegmentResult traceFiberSegment(
         result.fusedLine.back() = request.referenceLine[request.targetIndex];
     }
 
-    const cv::Vec3d start = request.referenceLine[request.startIndex];
-    const cv::Vec3d target = request.referenceLine[request.targetIndex];
     const cv::Vec3d targetPlaneNormal = *forwardRequest.targetPlaneNormal;
     if (!result.forward.points.empty()) {
         result.forwardEndpointErrorVoxels =
@@ -613,6 +817,189 @@ FiberTraceSegmentResult traceFiberSegment(
         result.reason = "endpoint_error_threshold";
     else
         result.reason = "ok";
+    return result;
+}
+
+FiberTraceWholeFiberResult traceWholeFiberMetric(
+    const FiberPredictionSource& predictions,
+    const FiberTraceWholeFiberMetricRequest& request,
+    const vc::lasagna::NormalSampler* normalSampler,
+    const FiberTraceWholeFiberProgressCallback& progress)
+{
+    if (!(request.workingToBaseScale > 0.0) ||
+        !std::isfinite(request.workingToBaseScale)) {
+        throw std::invalid_argument("working-to-base scale must be positive");
+    }
+    if (!(request.errorThresholdVoxels >= 0.0) ||
+        !std::isfinite(request.errorThresholdVoxels)) {
+        throw std::invalid_argument("error threshold must be finite and non-negative");
+    }
+    if (request.fiber.controlPointsXyzBase.size() < 2) {
+        throw std::invalid_argument("whole-fiber metric needs at least two control points");
+    }
+    if (request.fiber.linePointsXyzBase.size() < 2) {
+        throw std::invalid_argument("whole-fiber metric needs at least two line points");
+    }
+    if (request.fiber.controlPointLineIndices.size() !=
+        request.fiber.controlPointsXyzBase.size()) {
+        throw std::invalid_argument(
+            "whole-fiber metric control-point line-index count mismatch");
+    }
+
+    const auto lineWorking =
+        scaledPoints(request.fiber.linePointsXyzBase, request.workingToBaseScale);
+    const auto cpWorking =
+        scaledPoints(request.fiber.controlPointsXyzBase, request.workingToBaseScale);
+    const auto lineLengths = arclengths(lineWorking);
+
+    std::vector<double> cpArcs;
+    cpArcs.reserve(request.fiber.controlPointLineIndices.size());
+    for (const size_t lineIndex : request.fiber.controlPointLineIndices) {
+        if (lineIndex >= lineLengths.size()) {
+            throw std::invalid_argument(
+                "whole-fiber metric control-point line index out of range");
+        }
+        cpArcs.push_back(lineLengths[lineIndex]);
+    }
+
+    FiberTraceWholeFiberResult result;
+    result.segmentCount = static_cast<int>(cpWorking.size() - 1);
+    result.referenceLengthVoxels = cpArcs.back() - cpArcs.front();
+    if (request.voxelSizeUm.has_value() && *request.voxelSizeUm > 0.0) {
+        result.referenceLengthMeters = referenceLengthMeters(
+            result.referenceLengthVoxels,
+            request.workingToBaseScale,
+            *request.voxelSizeUm);
+    }
+
+    auto updateMetricFields = [&]() {
+        if (result.referenceLengthVoxels > kEpsilon) {
+            result.restartsPerKvx =
+                static_cast<double>(result.restartCount) * 1000.0 /
+                result.referenceLengthVoxels;
+        }
+        if (result.referenceLengthMeters.has_value() &&
+            *result.referenceLengthMeters > 0.0) {
+            result.restartsPerMeter =
+                static_cast<double>(result.restartCount) /
+                *result.referenceLengthMeters;
+        }
+    };
+
+    auto emitProgress = [&](int completed,
+                            int currentSegment,
+                            std::string status,
+                            const FiberTraceProgress* traceEvent = nullptr) {
+        if (!progress)
+            return;
+        updateMetricFields();
+        FiberTraceWholeFiberProgress event;
+        event.completedSegments = completed;
+        event.segmentCount = result.segmentCount;
+        event.currentSegment = currentSegment;
+        event.restartCount = result.restartCount;
+        event.restartsPerKvx = result.restartsPerKvx;
+        event.restartsPerMeter = result.restartsPerMeter;
+        event.referenceLengthMeters = result.referenceLengthMeters;
+        event.status = std::move(status);
+        if (traceEvent != nullptr) {
+            event.traceProgress = *traceEvent;
+            event.hasTraceProgress = true;
+        }
+        progress(event);
+    };
+
+    cv::Vec3d currentPoint = cpWorking.front();
+    cv::Vec3d currentDirection = referenceTangentToward(
+        lineWorking,
+        request.fiber.controlPointLineIndices[0],
+        request.fiber.controlPointLineIndices[1]);
+    result.stitchedTrace.push_back(currentPoint);
+
+    emitProgress(0, 1, "start");
+    for (size_t cpIndex = 0; cpIndex + 1 < cpWorking.size(); ++cpIndex) {
+        const size_t targetCpIndex = cpIndex + 1;
+        const cv::Vec3d target = cpWorking[targetCpIndex];
+        const cv::Vec3d referenceStart = cpWorking[cpIndex];
+        const cv::Vec3d targetPlaneNormal = normalizedOr(
+            target - referenceStart,
+            normalizedOr(target - currentPoint, {1.0, 0.0, 0.0}));
+        const double budgetSpan = length(target - referenceStart);
+
+        FiberTraceOneWayRequest oneWay;
+        oneWay.startPoint = currentPoint;
+        oneWay.targetPoint = target;
+        oneWay.initialDirection = currentDirection;
+        oneWay.targetPlaneNormal = targetPlaneNormal;
+        oneWay.budgetSpanVoxels = budgetSpan;
+        oneWay.config = request.config;
+
+        FiberTraceWholeFiberSegmentResult segment;
+        segment.startControlPointIndex = cpIndex;
+        segment.targetControlPointIndex = targetCpIndex;
+        segment.referenceArcDistanceVoxels = cpArcs[targetCpIndex] - cpArcs[cpIndex];
+
+        const auto segmentProgress = [&](const FiberTraceProgress& traceEvent) {
+            emitProgress(
+                static_cast<int>(cpIndex),
+                static_cast<int>(targetCpIndex),
+                "tracing",
+                &traceEvent);
+        };
+        segment.trace = traceOneWayCore(
+            predictions, oneWay, normalSampler, segmentProgress, "fiber");
+
+        if (!segment.trace.points.empty()) {
+            segment.inPlaneErrorVoxels =
+                endpointPlaneError(segment.trace.points.back(), target, targetPlaneNormal);
+        } else {
+            segment.inPlaneErrorVoxels = std::numeric_limits<double>::infinity();
+        }
+        segment.success = segment.trace.reachedTargetPlane &&
+                          segment.inPlaneErrorVoxels <= request.errorThresholdVoxels;
+        segment.restart = !segment.success;
+        if (segment.success) {
+            segment.reason = "ok";
+            currentPoint = segment.trace.points.empty()
+                ? target
+                : segment.trace.points.back();
+            currentDirection = terminalTraceDirection(segment.trace.points, currentDirection);
+        } else {
+            ++result.restartCount;
+            segment.reason = segment.trace.reachedTargetPlane
+                ? "in_plane_error"
+                : segment.trace.reason;
+            currentPoint = target;
+            if (targetCpIndex + 1 < cpWorking.size()) {
+                currentDirection = referenceTangentToward(
+                    lineWorking,
+                    request.fiber.controlPointLineIndices[targetCpIndex],
+                    request.fiber.controlPointLineIndices[targetCpIndex + 1]);
+            }
+        }
+
+        if (!segment.trace.points.empty()) {
+            for (const auto& point : segment.trace.points) {
+                if (result.stitchedTrace.empty() ||
+                    length(result.stitchedTrace.back() - point) > kEpsilon) {
+                    result.stitchedTrace.push_back(point);
+                }
+            }
+        }
+        if (result.stitchedTrace.empty() ||
+            length(result.stitchedTrace.back() - currentPoint) > kEpsilon) {
+            result.stitchedTrace.push_back(currentPoint);
+        }
+
+        result.segments.push_back(std::move(segment));
+        const auto& saved = result.segments.back();
+        emitProgress(
+            static_cast<int>(targetCpIndex),
+            static_cast<int>(targetCpIndex),
+            saved.restart ? "restart:" + saved.reason : "ok");
+    }
+    updateMetricFields();
+    emitProgress(result.segmentCount, result.segmentCount, "done");
     return result;
 }
 

@@ -901,6 +901,18 @@
   tracer version/config, and unchanged endpoint signatures; unchanged optimized
   segments should be protected from ordinary reoptimization, while CP
   move/delete/insertion invalidates that metadata.
+- `vc_fiber_trace_metric <fiber.lasagna.json> <fiber.json>` is the native
+  no-visualization full-fiber metric runner for precomputed 3D fiber inference
+  output. It loads one `vc3d_fiber` JSON, requires exact control-point matches
+  in `line_points`, traces one-sided from CP to next CP plane, continues from
+  the reached point after success, restarts from the failed CP after failure,
+  and reports restart rate per 1000 selected-level voxels as `err/kvx`.
+  `--working-to-base-scale` defines the selected-level coordinate system used
+  by the metric. Physical `err/m` is reported only when the caller provides an
+  explicit positive `--voxel-size-um`; the runner must not invent physical
+  units from filenames or parse unrelated metadata. The CLI is a thin wrapper
+  over `vc_fiber_tracer`, `vc_lasagna` dataset opening, and optional
+  `LasagnaNormalSampler`.
 - Native 3D single-pair visualization first builds the initial side/top strip
   source from the existing 2D Trace2CP geometry loader for the input CP pair.
   In single-pair mode, the configured cross-strip height is a maximum cap: the

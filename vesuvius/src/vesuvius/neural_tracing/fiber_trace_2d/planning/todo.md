@@ -66,6 +66,12 @@
 - [ ] augment_anisotropic_blur_orientation "fiber"  - that does not sound correct ...
 - [ ] dir result dependent presencec supervision? supervise with dot between gt and estimated dir?
 - [ ] when we try embedding again (or other alignement ways) - focus on the left/right positioning on the fiber - that seems to be the biggest hurdle right now
+- [ ] multi-fiber tracer discrete optimization/dp/...
+    - trace multiple fibers (greedily)
+    - they make mistakes which depend on where they come from - possibly introduce additional randomness
+    - optimize sets of fibers for best explanation of the found predictions
+- [ ] threshold/skeletonize fiber preds and explore the multiple discretet options for scoring!
+- [ ] check training augmentations again
     
 # beam-search
 - [ ] beamsearch
