@@ -256,7 +256,7 @@ class NativeTrace2CpConfig:
     cone_angle_step_degrees: float = 5.0
     beam_width: int = 8
     beam_prune_distance_voxels: float = 1.0
-    beam_lookahead_steps: int = 1
+    beam_lookahead_steps: int = 2
     candidate_substeps: int = 1
     smoothness_weight: float = 2.0
     smoothness_tangent_weight: float | None = 10.0
@@ -2528,6 +2528,26 @@ def _optional_nonnegative_float(value: float | None, *, name: str) -> float | No
     return out
 
 
+def _native_trace_requires_normal_sampler(cfg: NativeTrace2CpConfig) -> bool:
+    tangent = _optional_nonnegative_float(
+        cfg.smoothness_tangent_weight,
+        name="smoothness_tangent_weight",
+    )
+    normal = _optional_nonnegative_float(
+        cfg.smoothness_normal_weight,
+        name="smoothness_normal_weight",
+    )
+    cumulative = _optional_nonnegative_float(
+        cfg.cumulative_smoothness_tangent_weight,
+        name="cumulative_smoothness_tangent_weight",
+    )
+    return bool(
+        (tangent is not None and tangent > 0.0)
+        or (normal is not None and normal > 0.0)
+        or (cumulative is not None and cumulative > 0.0)
+    )
+
+
 def _sample_candidate_normals_torch(
     normal_sampler: NativeTraceNormalSampler | None,
     points_zyx: torch.Tensor | np.ndarray,
@@ -2590,6 +2610,14 @@ def _native_smoothness_loss_torch(
     if not split_requested:
         return isotropic
     if candidate_normals is None:
+        if (
+            (tangent_weight is not None and tangent_weight > 0.0)
+            or (normal_weight is not None and normal_weight > 0.0)
+        ):
+            raise ValueError(
+                "candidate_normals are required for native 3D Trace2CP "
+                "tangent/normal smoothness"
+            )
         return isotropic
     if candidate_normals.ndim == 4:
         normals = candidate_normals[:, :, -1, :]
@@ -2662,8 +2690,13 @@ def _native_cumulative_tangent_smoothness_loss_torch(
     state_count = int(candidates.shape[0])
     if history.shape != (state_count, 3):
         raise ValueError("history must have shape [N,3]")
-    if weight <= 0.0 or candidate_normals is None:
+    if weight <= 0.0:
         return torch.zeros(candidates.shape[:2], dtype=torch.float32, device=candidates.device)
+    if candidate_normals is None:
+        raise ValueError(
+            "candidate_normals are required for native 3D Trace2CP "
+            "cumulative tangent smoothness"
+        )
 
     if candidate_normals.ndim == 4:
         normals = candidate_normals[:, :, -1, :]
@@ -3381,11 +3414,16 @@ def _native_trace_cfg_with_effective_smoothness(
         cfg.smoothness_normal_weight,
         name="smoothness_normal_weight",
     )
-    if normal_sampler is None:
-        return replace(cfg, smoothness_tangent_weight=None, smoothness_normal_weight=None)
     fallback = float(cfg.smoothness_weight)
     if not math.isfinite(fallback) or fallback < 0.0:
         raise ValueError("smoothness_weight must be finite and non-negative")
+    if normal_sampler is None:
+        if _native_trace_requires_normal_sampler(cfg):
+            raise ValueError(
+                "native 3D Trace2CP requires Lasagna normals for "
+                "tangent/normal smoothness; provide a normal_sampler"
+            )
+        return replace(cfg, smoothness_tangent_weight=None, smoothness_normal_weight=None)
     return replace(
         cfg,
         smoothness_tangent_weight=fallback if tangent is None else tangent,
@@ -7154,7 +7192,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cone-angle-step-degrees", type=float, default=5.0)
     parser.add_argument("--beam-width", type=int, default=8)
     parser.add_argument("--beam-prune-distance-voxels", type=float, default=1.0)
-    parser.add_argument("--beam-lookahead-steps", type=int, default=1)
+    parser.add_argument("--beam-lookahead-steps", type=int, default=2)
     parser.add_argument("--candidate-substeps", type=int, default=1)
     parser.add_argument("--smoothness-weight", type=float, default=2.0)
     parser.add_argument("--smoothness-tangent-weight", type=float, default=10.0)

@@ -322,6 +322,22 @@ struct ScoredDirection {
     return best;
 }
 
+[[nodiscard]] bool normalAwareSmoothnessEnabled(const FiberTraceConfig& config)
+{
+    return config.smoothnessNormalWeight > 0.0 ||
+           config.smoothnessTangentWeight > 0.0;
+}
+
+void requireNormalSamplerForNormalAwareSmoothness(
+    const FiberTraceConfig& config,
+    const vc::lasagna::NormalSampler* normalSampler)
+{
+    if (normalSampler != nullptr || !normalAwareSmoothnessEnabled(config))
+        return;
+    throw std::invalid_argument(
+        "Lasagna normal sampler is required for tangent/normal fiber trace smoothness");
+}
+
 [[nodiscard]] double smoothnessLoss(
     const cv::Vec3d& previousStepDirection,
     const cv::Vec3d& candidateStepDirection,
@@ -806,6 +822,7 @@ FiberTraceOneWayResult traceFiberOneWay(
     if (length(request.targetPlaneNormal) <= kEpsilon) {
         throw std::invalid_argument("fiber trace one-way request target plane normal is degenerate");
     }
+    requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
     return traceOneWayCore(
         predictions, request, normalSampler, progress, "trace");
 }
@@ -824,6 +841,7 @@ FiberTraceSegmentResult traceFiberSegment(
     }
     if (request.startIndex == request.targetIndex)
         throw std::invalid_argument("fiber trace request start and target indices must differ");
+    requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
 
     FiberTraceSegmentRequest forwardRequest = request;
     forwardRequest.targetPlaneNormal =
@@ -924,6 +942,7 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
         throw std::invalid_argument(
             "whole-fiber metric control-point line-index count mismatch");
     }
+    requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
 
     const auto lineWorking =
         scaledPoints(request.fiber.linePointsXyzBase, request.workingToBaseScale);

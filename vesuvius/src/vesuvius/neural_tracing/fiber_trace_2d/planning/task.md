@@ -1,27 +1,25 @@
-# Manifest-Scale Native Fiber Metric
+# Require Lasagna Normals For Native Trace2CP
 
-Adjust the VC C++ fiber metric/tracer command so it uses the precomputed fiber
-inference manifest scale as the tracer working scale.
+Native 3D Trace2CP must not silently run normal-aware tangent/normal smoothing
+without Lasagna normals.
 
 Desired behavior:
 
-- `vc_fiber_trace_metric` infers the working-to-base scale from the fiber
-  inference manifest's persisted prediction channels;
-- the manifest inference/output size and scale define the tracer coordinate
-  system;
-- the JSON fiber coordinates are assumed to already be in the base coordinate
-  system of that manifest;
-- `step_voxels`, candidate tracing, and restart thresholds remain expressed in
-  inferred working-grid voxels;
-- local and remote manifests continue to use the shared Lasagna opener and
-  remote cache behavior;
-- optional `--normal-manifest` sampling uses the same inferred working scale.
+- Python native Trace2CP should fail if a normal-aware smoothing configuration
+  reaches tracing with `normal_sampler=None`.
+- Python lower-level scoring may keep generic isotropic code paths, but they
+  must not be reachable from normal-aware native Trace2CP without a Lasagna
+  sampler.
+- `vc_fiber_trace_metric` must require an explicit `--normal-manifest` Lasagna
+  manifest and fail before tracing if it is omitted.
+- `vc_fiber_trace_metric` must not try to use normals from the fiber prediction
+  manifest. We do not create those manifests with normal channels.
+- The C++ fiber tracer core should reject normal-aware smoothing requests when
+  no normal sampler is passed, so the CLI cannot accidentally fall back to
+  isotropic smoothing through the library.
 
 Out of scope for this task:
 
-- do not add a command-line argument for scaling the fiber JSON into the
-  manifest base coordinate system;
-- do not change GUI segment tracing scale handling in this task unless needed
-  by the metric command;
-- do not change the generic Lasagna dataset runtime-scale API used by other
-  VC tools.
+- do not remove lower-level isotropic/no-normal code that is useful for explicit
+  non-normal-aware callers;
+- do not change scale semantics or the default trace-control values.

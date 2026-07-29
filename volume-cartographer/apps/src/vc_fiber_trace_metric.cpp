@@ -40,16 +40,17 @@ void printUsage(const char* argv0)
 {
     std::cerr
         << "Usage: " << argv0
-        << " <fiber.lasagna.json> <fiber.json> [options]\n\n"
+        << " <fiber.lasagna.json> <fiber.json>"
+        << " --normal-manifest <lasagna.lasagna.json> [options]\n\n"
         << "Options:\n"
-        << "  --normal-manifest PATH          Lasagna normal manifest for tangent/normal smoothness\n"
+        << "  --normal-manifest PATH          required Lasagna normal manifest for tangent/normal smoothness\n"
         << "  --remote-cache-dir PATH         required for remote HTTP/S3 Lasagna manifests\n"
         << "  --voxel-size-um N               base-voxel size in micrometers for err/m output\n"
         << "  --step-voxels N                 trace step in manifest prediction voxels [4]\n"
         << "  --cone-angle-degrees N          candidate cone half-angle [25]\n"
         << "  --cone-angle-step-degrees N     candidate cone grid step [5]\n"
         << "  --beam-width N                  kept beams per step [8]\n"
-        << "  --beam-lookahead-steps N        expand this many steps before pruning [1]\n"
+        << "  --beam-lookahead-steps N        expand this many steps before pruning [2]\n"
         << "  --smoothness-weight N           smoothness scale [2]\n"
         << "  --smoothness-normal-weight N    normal-axis smoothness weight [0.1]\n"
         << "  --smoothness-tangent-weight N   tangent-plane smoothness weight [10]\n"
@@ -179,10 +180,14 @@ CliOptions parseArgs(int argc, char** argv)
         failOption("--beam-lookahead-steps must be at least 1");
     if (!(options.errorThresholdVoxels >= 0.0))
         failOption("--error-threshold-voxels must be non-negative");
+    if (options.normalManifest.empty()) {
+        failOption(
+            "--normal-manifest is required; pass the Lasagna normal manifest used for "
+            "tangent/normal smoothness");
+    }
     const bool usesRemoteManifest =
         vc::lasagna::isRemoteLasagnaLocation(options.fiberManifest) ||
-        (!options.normalManifest.empty() &&
-         vc::lasagna::isRemoteLasagnaLocation(options.normalManifest));
+        vc::lasagna::isRemoteLasagnaLocation(options.normalManifest);
     if (usesRemoteManifest && options.remoteCacheDir.empty()) {
         failOption("remote Lasagna manifests require --remote-cache-dir");
     }
@@ -240,32 +245,16 @@ int main(int argc, char** argv)
 
         std::optional<vc::lasagna::LasagnaDataset> normalDataset;
         std::optional<vc::lasagna::LasagnaNormalSampler> normalSampler;
-        const vc::lasagna::NormalSampler* normalSamplerPtr = nullptr;
-        if (!options.normalManifest.empty()) {
-            vc::lasagna::LasagnaDatasetOpenOptions normalDatasetOptions;
-            normalDatasetOptions.workingToBaseScale = workingToBaseScale;
-            normalDatasetOptions.remoteCacheRoot = options.remoteCacheDir;
-            normalDataset.emplace(vc::lasagna::LasagnaDataset::openLocation(
-                options.normalManifest,
-                normalDatasetOptions));
-            normalSampler.emplace(
-                *normalDataset,
-                vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
-            normalSamplerPtr = &*normalSampler;
-        } else if (dataset.hasNormalSource()) {
-            try {
-                normalSampler.emplace(
-                    dataset,
-                    vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
-                normalSamplerPtr = &*normalSampler;
-            } catch (const std::exception& exc) {
-                if (!options.quiet) {
-                    std::cout
-                        << "vc_fiber_trace_metric note: no usable normal sampler from "
-                        << options.fiberManifest << ": " << exc.what() << '\n';
-                }
-            }
-        }
+        vc::lasagna::LasagnaDatasetOpenOptions normalDatasetOptions;
+        normalDatasetOptions.workingToBaseScale = workingToBaseScale;
+        normalDatasetOptions.remoteCacheRoot = options.remoteCacheDir;
+        normalDataset.emplace(vc::lasagna::LasagnaDataset::openLocation(
+            options.normalManifest,
+            normalDatasetOptions));
+        normalSampler.emplace(
+            *normalDataset,
+            vc::lasagna::LasagnaNormalSamplerOptions{options.cacheBytes});
+        const vc::lasagna::NormalSampler* normalSamplerPtr = &*normalSampler;
 
         const auto fiber = vc::fiber_tracer::loadFiberJson(options.fiberJson);
         if (!options.quiet) {

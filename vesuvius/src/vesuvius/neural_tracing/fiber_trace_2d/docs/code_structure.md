@@ -316,8 +316,11 @@ Ownership changed as follows:
   `--smoothness-normal-weight` penalizes elevation change into/out of the
   normal direction. The native CLI defaults to
   `--smoothness-tangent-weight 10.0` and
-  `--smoothness-normal-weight 0.1`; if candidate normals are unavailable or
-  invalid, the scorer falls back to the older isotropic previous-step smoothness. In
+  `--smoothness-normal-weight 0.1`. Native Trace2CP fails before tracing if
+  those normal-aware terms, or cumulative tangent smoothness, are active and no
+  Lasagna normal sampler is available. If a sampler exists but a candidate
+  normal sample is invalid, that candidate falls back to the older isotropic
+  previous-step smoothness. In
   addition, each greedy/beam state carries a running history heading. The
   optional cumulative smoothness term compares candidates against that heading
   only after projecting both into the candidate Lasagna-normal tangent plane.
@@ -341,7 +344,7 @@ Ownership changed as follows:
   Native Trace2CP now uses beam search by default (`--beam-width 8`) instead of
   committing greedily at every step. Each beam expands the same branch-aware
   candidate score for `--beam-lookahead-steps` future steps before pruning
-  (default `1`), cumulative loss selects the best target-plane-reaching state,
+  (default `2`), cumulative loss selects the best target-plane-reaching state,
   and `--beam-prune-distance-voxels` merges near-duplicate live states after
   the lookahead expansion. `--beam-width 1` preserves the previous greedy
   control flow and does not use lookahead. Beam candidate selection is batched
@@ -651,7 +654,12 @@ Ownership changed as follows:
   scale is inferred from the fiber inference manifest's persisted prediction
   channels, using the common `source_to_base * 2**scaledown` scale for
   `presence`/`nx`/`ny` channel sets. The input fiber JSON is assumed to already
-  be in the manifest base coordinate system. The CLI is a thin wrapper around
+  be in the manifest base coordinate system. The default trace parameters are
+  `step=4.0`, `beam_width=8`, `beam_lookahead_steps=2`,
+  `smoothness_normal_weight=0.1`, and `smoothness_tangent_weight=10.0`,
+  matching the Python Trace2CP default trace controls. It requires an explicit
+  `--normal-manifest` Lasagna manifest and does not try to read normals from
+  the fiber prediction manifest. The CLI is a thin wrapper around
   `vc_fiber_tracer`; it does not run PyTorch, create strips, or implement
   separate channel/remote-cache loading.
 - `vc_fiber_trace_metric` opens Lasagna manifests through the shared
@@ -666,6 +674,7 @@ Ownership changed as follows:
   ```bash
   volume-cartographer/build/ci-tests-clang-systemdeps/bin/vc_fiber_trace_metric \
     s3://bucket/path/fiber.lasagna.json fiber.json \
+    --normal-manifest s3://bucket/path/normals.lasagna.json \
     --remote-cache-dir /data/vc3d_remote_cache
 
   volume-cartographer/build/ci-tests-clang-systemdeps/bin/vc_fiber_trace_metric \

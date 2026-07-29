@@ -1,76 +1,66 @@
-# Plan: Manifest-Scale Native Fiber Metric
+# Plan: Require Lasagna Normals For Native Trace2CP
 
 ## Scope
 
-- Change only the native VC C++ fiber metric/tracer command path needed for
-  manifest-derived scale.
-- Keep generic Lasagna dataset runtime scale support for existing callers.
-- Keep JSON fiber coordinates interpreted as manifest-base coordinates.
-- Keep remote manifest/cache support unchanged.
-- Do not add a fiber coordinate scale argument yet.
+- Enforce explicit Lasagna normal data for normal-aware native 3D Trace2CP.
+- Keep existing isotropic/no-normal helpers available only for explicit
+  lower-level configurations that disable normal-aware weights.
+- Do not change trace scale handling or the existing trace-control defaults.
 
 ## Implementation
 
-1. Add a reusable manifest scale helper
-   - Add a `vc_fiber_tracer` helper that discovers prediction options with the
-     same channel naming rules as `FiberPredictionField`.
-   - Accept both single-output `presence/nx/ny` manifests and prefixed
-     multi-output manifests such as
-     `option_000_presence/option_000_nx/option_000_ny`.
-   - Compute each required channel's effective base scale as
-     `manifest.sourceToBase * group.scaleFactor()`.
-   - Require all persisted prediction channels used by the tracer to have the
-     same finite positive effective scale; fail loudly on missing or mismatched
-     channels.
+1. Python native Trace2CP
+   - Add a small helper that determines whether the native config has active
+     normal-aware smoothing terms.
+   - Change `_native_trace_cfg_with_effective_smoothness()` to raise when those
+     terms are active and no normal sampler is provided.
+   - Change lower-level tensor smoothness helpers to raise on missing candidate
+     normals only when the requested term actually needs them.
+   - Update focused tests so normal-aware trace calls pass a normal sampler, and
+     add a regression test for the hard failure.
 
-2. Wire `vc_fiber_trace_metric`
-   - Remove the `--working-to-base-scale` command-line option.
-   - Open the fiber inference manifest normally, infer the working scale, then
-     construct the prediction dataset with `manifest.workingToBaseScale` set to
-     that inferred scale.
-   - Open an optional `--normal-manifest` with the same inferred working scale.
-   - Log the inferred scale and make the whole-fiber metric request use it.
+2. C++ metric CLI
+   - Make `--normal-manifest` required in `vc_fiber_trace_metric` usage and
+     validation.
+   - Remove the CLI fallback that attempts to create a normal sampler from the
+     fiber prediction manifest.
+   - Keep remote-cache validation covering both fiber and normal manifests.
 
-3. Preserve fiber coordinate semantics
-   - Keep `loadFiberJson(...)` unchanged: `line_points` and `control_points`
-     are base-coordinate points.
-   - Keep `traceWholeFiberMetric(...)` scaling base fiber points into working
-     voxels by dividing by `request.workingToBaseScale`.
-   - Do not add a fiber-to-manifest-base conversion argument in this task.
-
-4. Tests
-   - Add focused `test_fiber_trace3d` cases for inferred effective scale,
-     missing required prediction channels, and mismatched channel scales.
-   - Keep existing whole-fiber metric tests passing.
+3. C++ tracer core
+   - Add a guard for normal-aware smoothing requests with a null normal sampler.
+   - Update synthetic tests to pass a constant normal sampler when using the
+     default normal-aware config.
+   - Add a regression test for the null-normal-sampler failure and for an
+     explicitly non-normal-aware no-sampler path.
 
 ## Spec Update
 
-- Update the native metric spec to say `vc_fiber_trace_metric` derives the
-  tracer working scale from persisted fiber prediction channel scales, not from
-  a `--working-to-base-scale` argument.
-- Explicitly state that JSON fibers are assumed to already be in the manifest
-  base coordinate system.
-- Document the fail-fast behavior for missing or scale-mismatched prediction
-  channels.
+- Update the native 3D Trace2CP spec to state that Lasagna normals are required
+  for normal-aware smoothing and missing samplers are hard errors.
+- Update the C++ metric spec to require explicit `--normal-manifest` and state
+  that prediction-manifest normals are not used.
 
 ## Docs Update
 
-- Update `docs/code_structure.md` for the manifest-derived tracer scale and
-  remove `--working-to-base-scale` guidance from the metric command.
+- Update `docs/code_structure.md` where native Trace2CP smoothness and
+  `vc_fiber_trace_metric` invocation are described.
 
 ## Changelog
 
-- Add a short 2026-07-29 entry for manifest-derived native fiber metric scale.
+- Add a 2026-07-29 entry for the normal-sampler requirement.
 
 ## Validation
 
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. python -m pytest vesuvius/tests/neural_tracing/test_fiber_trace_3d.py -k "native_3d_trace2cp"`
+- `python -m py_compile vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py vesuvius/tests/neural_tracing/test_fiber_trace_3d.py`
 - `cmake --build volume-cartographer/build --target test_fiber_trace3d`
 - `cmake --build volume-cartographer/build --target vc_fiber_trace_metric`
-- `volume-cartographer/build/bin/vc_fiber_trace_metric --help`
 - `volume-cartographer/build/bin/test_fiber_trace3d`
+- `volume-cartographer/build/bin/vc_fiber_trace_metric --help`
 - `git diff --check`
 
 ## Deferred Explicitly
 
-- Fiber JSON coordinate conversion into the manifest base coordinate system.
-- Changing GUI/native segment tracing scale/session semantics.
+- Real Lasagna normal manifest I/O is not added to C++ unit tests; those use a
+  synthetic normal sampler and the CLI/build smoke tests cover argument/help
+  behavior.

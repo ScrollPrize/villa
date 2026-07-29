@@ -1,5 +1,9 @@
 # 2026-07-29
 
+- Required Lasagna normal samplers for native Trace2CP normal-aware smoothing
+  and made `vc_fiber_trace_metric` require explicit `--normal-manifest`.
+- Changed Python native Trace2CP and the native C++ fiber metric default beam
+  lookahead to 2 so their relevant trace-control defaults match.
 - Changed native `vc_fiber_trace_metric` to infer its tracer working scale from
   the precomputed fiber inference manifest channels instead of a CLI scale
   argument.
