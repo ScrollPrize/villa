@@ -19,11 +19,16 @@ struct FiberTraceConfig {
     double stepVoxels = 4.0;
     double coneAngleDegrees = 25.0;
     double coneAngleStepDegrees = 5.0;
+    int coneGridSize = 25;
     int beamWidth = 8;
+    double beamPruneDistanceVoxels = 1.0;
     int beamLookaheadSteps = 2;
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
     double smoothnessTangentWeight = 10.0;
+    double smoothnessFreeAngleDegrees = 0.0;
+    int cumulativeSmoothnessSteps = 4;
+    double cumulativeSmoothnessTangentWeight = 2.0;
     double initialFreeAngleDegrees = 0.0;
     double maxStepFactor = 3.0;
     double fusionGapFactor = 2.0;

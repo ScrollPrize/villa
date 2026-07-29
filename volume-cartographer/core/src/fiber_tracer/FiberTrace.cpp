@@ -47,9 +47,21 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
     return std::clamp(value, 0.0, 1.0);
 }
 
+[[nodiscard]] double clampSignedUnit(double value)
+{
+    if (!std::isfinite(value))
+        return 0.0;
+    return std::clamp(value, -1.0, 1.0);
+}
+
 [[nodiscard]] double clampedPositiveDot(const cv::Vec3d& a, const cv::Vec3d& b)
 {
     return clamp01(normalizedOrZero(a).dot(normalizedOrZero(b)));
+}
+
+[[nodiscard]] double angleBetweenUnit(const cv::Vec3d& a, const cv::Vec3d& b)
+{
+    return std::acos(clampSignedUnit(normalizedOrZero(a).dot(normalizedOrZero(b))));
 }
 
 [[nodiscard]] cv::Vec3d alignTo(const cv::Vec3d& direction, const cv::Vec3d& reference)
@@ -130,12 +142,137 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
     return std::abs(a - b) <= tolerance;
 }
 
-[[nodiscard]] cv::Vec3d arbitraryPerpendicular(const cv::Vec3d& direction)
+[[nodiscard]] std::array<cv::Vec3d, 2> orthonormalBasis(const cv::Vec3d& direction)
 {
-    const cv::Vec3d d = normalizedOr(direction, {1.0, 0.0, 0.0});
-    cv::Vec3d axis = std::abs(d[0]) < 0.8 ? cv::Vec3d{1.0, 0.0, 0.0}
-                                          : cv::Vec3d{0.0, 1.0, 0.0};
-    return normalizedOrZero(axis.cross(d));
+    const cv::Vec3d axis = normalizedOr(direction, {1.0, 0.0, 0.0});
+    std::array<cv::Vec3d, 3> refs = {
+        cv::Vec3d{1.0, 0.0, 0.0},
+        cv::Vec3d{0.0, 1.0, 0.0},
+        cv::Vec3d{0.0, 0.0, 1.0},
+    };
+    size_t refIndex = 0;
+    double bestAbsDot = std::abs(axis.dot(refs[0]));
+    for (size_t index = 1; index < refs.size(); ++index) {
+        const double value = std::abs(axis.dot(refs[index]));
+        if (value < bestAbsDot) {
+            bestAbsDot = value;
+            refIndex = index;
+        }
+    }
+    const cv::Vec3d b0 = normalizedOrZero(axis.cross(refs[refIndex]));
+    const cv::Vec3d b1 = normalizedOrZero(axis.cross(b0));
+    return {b0, b1};
+}
+
+struct ConeOffset {
+    double u = 0.0;
+    double v = 0.0;
+    double radius2 = 0.0;
+    size_t order = 0;
+};
+
+[[nodiscard]] std::vector<ConeOffset> angleStepConeOffsets(
+    double maxAngleDegrees,
+    double angleStepDegrees)
+{
+    const double maxAngle = std::max(0.0, maxAngleDegrees);
+    if (maxAngle <= 0.0)
+        return {{0.0, 0.0, 0.0, 0}};
+    const double step = angleStepDegrees;
+    if (!std::isfinite(step) || step <= 0.0)
+        throw std::invalid_argument("cone angle step must be positive");
+
+    const int maxSteps = static_cast<int>(std::floor(maxAngle / step + 1.0e-6));
+    std::vector<ConeOffset> offsets;
+    bool hasCenter = false;
+    size_t order = 0;
+    for (int vStep = -maxSteps; vStep <= maxSteps; ++vStep) {
+        for (int uStep = -maxSteps; uStep <= maxSteps; ++uStep) {
+            const double uDeg = static_cast<double>(uStep) * step;
+            const double vDeg = static_cast<double>(vStep) * step;
+            const double radius2 = uDeg * uDeg + vDeg * vDeg;
+            if (radius2 > maxAngle * maxAngle + 1.0e-5)
+                continue;
+            if (uDeg == 0.0 && vDeg == 0.0)
+                hasCenter = true;
+            offsets.push_back({uDeg, vDeg, radius2, order++});
+        }
+    }
+    if (!hasCenter)
+        offsets.push_back({0.0, 0.0, 0.0, order++});
+    std::sort(offsets.begin(), offsets.end(), [](const auto& a, const auto& b) {
+        if (a.radius2 != b.radius2)
+            return a.radius2 < b.radius2;
+        if (a.u != b.u)
+            return a.u < b.u;
+        if (a.v != b.v)
+            return a.v < b.v;
+        return a.order < b.order;
+    });
+    for (auto& offset : offsets) {
+        offset.u = std::tan(offset.u * kPi / 180.0);
+        offset.v = std::tan(offset.v * kPi / 180.0);
+    }
+    return offsets;
+}
+
+[[nodiscard]] std::vector<ConeOffset> legacyGridConeOffsets(
+    double maxAngleDegrees,
+    int gridSize)
+{
+    const double maxAngle = std::max(0.0, maxAngleDegrees) * kPi / 180.0;
+    if (gridSize <= 0)
+        throw std::invalid_argument("cone grid size must be positive");
+    if (maxAngle <= 0.0 || gridSize == 1)
+        return {{0.0, 0.0, 0.0, 0}};
+
+    std::vector<ConeOffset> offsets;
+    offsets.reserve(static_cast<size_t>(gridSize) * static_cast<size_t>(gridSize));
+    const double tangentScale = std::tan(maxAngle);
+    size_t centerIndex = 0;
+    double centerRadius2 = std::numeric_limits<double>::infinity();
+    for (int y = 0; y < gridSize; ++y) {
+        const double b = gridSize == 1
+            ? 0.0
+            : -1.0 + 2.0 * static_cast<double>(y) / static_cast<double>(gridSize - 1);
+        for (int x = 0; x < gridSize; ++x) {
+            const double a = gridSize == 1
+                ? 0.0
+                : -1.0 + 2.0 * static_cast<double>(x) / static_cast<double>(gridSize - 1);
+            double diskX = 0.0;
+            double diskY = 0.0;
+            if (a != 0.0 || b != 0.0) {
+                double r = 0.0;
+                double phi = 0.0;
+                if (std::abs(a) > std::abs(b)) {
+                    r = a;
+                    phi = (kPi / 4.0) * b / a;
+                } else {
+                    r = b;
+                    phi = kPi / 2.0 - (kPi / 4.0) * a / b;
+                }
+                diskX = r * std::cos(phi);
+                diskY = r * std::sin(phi);
+            }
+            const double radius2 = diskX * diskX + diskY * diskY;
+            if (radius2 < centerRadius2) {
+                centerRadius2 = radius2;
+                centerIndex = offsets.size();
+            }
+            offsets.push_back({
+                tangentScale * diskX,
+                tangentScale * diskY,
+                radius2,
+                offsets.size(),
+            });
+        }
+    }
+    if (centerIndex < offsets.size() && centerIndex != 0) {
+        const ConeOffset center = offsets[centerIndex];
+        offsets.erase(offsets.begin() + static_cast<std::ptrdiff_t>(centerIndex));
+        offsets.insert(offsets.begin(), center);
+    }
+    return offsets;
 }
 
 [[nodiscard]] std::vector<cv::Vec3d> candidateDirections(
@@ -143,19 +280,16 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
     const FiberTraceConfig& config)
 {
     const cv::Vec3d forward = normalizedOr(reference, {1.0, 0.0, 0.0});
-    const cv::Vec3d axis0 = arbitraryPerpendicular(forward);
-    const cv::Vec3d axis1 = normalizedOrZero(forward.cross(axis0));
-    const double maxAngle = std::max(0.0, config.coneAngleDegrees);
-    const double angleStep = std::max(0.25, config.coneAngleStepDegrees);
-
+    const auto basis = orthonormalBasis(forward);
+    const auto offsets = config.coneAngleStepDegrees > 0.0
+        ? angleStepConeOffsets(config.coneAngleDegrees, config.coneAngleStepDegrees)
+        : legacyGridConeOffsets(config.coneAngleDegrees, config.coneGridSize);
     std::vector<cv::Vec3d> out;
-    for (double ay = -maxAngle; ay <= maxAngle + 1.0e-6; ay += angleStep) {
-        for (double ax = -maxAngle; ax <= maxAngle + 1.0e-6; ax += angleStep) {
-            const double tx = std::tan(ax * kPi / 180.0);
-            const double ty = std::tan(ay * kPi / 180.0);
-            out.push_back(normalizedOr(forward + axis0 * tx + axis1 * ty, forward));
-        }
-    }
+    out.reserve(offsets.size());
+    for (const auto& offset : offsets)
+        out.push_back(normalizedOr(
+            forward + basis[0] * offset.u + basis[1] * offset.v,
+            forward));
     if (out.empty())
         out.push_back(forward);
     return out;
@@ -302,30 +436,46 @@ struct ScoredDirection {
 };
 
 [[nodiscard]] ScoredDirection bestAlignedPrediction(
-    const FiberPredictionSource& predictions,
-    const cv::Vec3d& point,
-    const cv::Vec3d& referenceDirection)
+    const FiberPredictionSample& sample,
+    const cv::Vec3d& referenceDirection,
+    bool weightByPresence)
 {
-    const auto sample = predictions.sample(point, referenceDirection);
     ScoredDirection best;
     double bestScore = -std::numeric_limits<double>::infinity();
+    const cv::Vec3d reference = normalizedOrZero(referenceDirection);
     for (const auto& option : sample.options) {
         if (!option.valid)
             continue;
         const cv::Vec3d direction = alignTo(option.direction, referenceDirection);
-        const double score = direction.dot(normalizedOrZero(referenceDirection));
+        double score = clamp01(direction.dot(reference));
+        const double presence = clamp01(option.presence);
+        if (weightByPresence)
+            score *= presence;
         if (score > bestScore) {
             bestScore = score;
-            best = {direction, clamp01(option.presence), true};
+            best = {direction, presence, true};
         }
     }
     return best;
 }
 
+[[nodiscard]] ScoredDirection bestAlignedPrediction(
+    const FiberPredictionSource& predictions,
+    const cv::Vec3d& point,
+    const cv::Vec3d& referenceDirection,
+    bool weightByPresence)
+{
+    return bestAlignedPrediction(
+        predictions.sample(point, referenceDirection),
+        referenceDirection,
+        weightByPresence);
+}
+
 [[nodiscard]] bool normalAwareSmoothnessEnabled(const FiberTraceConfig& config)
 {
     return config.smoothnessNormalWeight > 0.0 ||
-           config.smoothnessTangentWeight > 0.0;
+           config.smoothnessTangentWeight > 0.0 ||
+           config.cumulativeSmoothnessTangentWeight > 0.0;
 }
 
 void requireNormalSamplerForNormalAwareSmoothness(
@@ -338,50 +488,166 @@ void requireNormalSamplerForNormalAwareSmoothness(
         "Lasagna normal sampler is required for tangent/normal fiber trace smoothness");
 }
 
+void validateTraceConfig(const FiberTraceConfig& config)
+{
+    auto requireFinite = [](double value, const char* name) {
+        if (!std::isfinite(value))
+            throw std::invalid_argument(std::string(name) + " must be finite");
+    };
+    requireFinite(config.stepVoxels, "step voxels");
+    requireFinite(config.coneAngleDegrees, "cone angle degrees");
+    requireFinite(config.coneAngleStepDegrees, "cone angle step degrees");
+    requireFinite(config.beamPruneDistanceVoxels, "beam prune distance");
+    requireFinite(config.smoothnessWeight, "smoothness weight");
+    requireFinite(config.smoothnessNormalWeight, "smoothness normal weight");
+    requireFinite(config.smoothnessTangentWeight, "smoothness tangent weight");
+    requireFinite(config.smoothnessFreeAngleDegrees, "smoothness free angle");
+    requireFinite(
+        config.cumulativeSmoothnessTangentWeight,
+        "cumulative smoothness tangent weight");
+    requireFinite(config.maxStepFactor, "max step factor");
+    requireFinite(config.fusionGapFactor, "fusion gap factor");
+    requireFinite(config.endpointAcceptThresholdUm, "endpoint accept threshold");
+    requireFinite(config.voxelSizeUm, "voxel size");
+    if (!(config.stepVoxels > 0.0))
+        throw std::invalid_argument("step voxels must be positive");
+    if (config.coneAngleDegrees < 0.0)
+        throw std::invalid_argument("cone angle degrees must be non-negative");
+    if (config.coneGridSize < 1)
+        throw std::invalid_argument("cone grid size must be at least 1");
+    if (config.beamWidth < 1)
+        throw std::invalid_argument("beam width must be at least 1");
+    if (config.beamPruneDistanceVoxels < 0.0)
+        throw std::invalid_argument("beam prune distance must be non-negative");
+    if (config.beamLookaheadSteps < 1)
+        throw std::invalid_argument("beam lookahead steps must be at least 1");
+    if (config.smoothnessWeight < 0.0 ||
+        config.smoothnessNormalWeight < 0.0 ||
+        config.smoothnessTangentWeight < 0.0 ||
+        config.cumulativeSmoothnessTangentWeight < 0.0) {
+        throw std::invalid_argument("smoothness weights must be non-negative");
+    }
+    if (config.smoothnessFreeAngleDegrees < 0.0)
+        throw std::invalid_argument("smoothness free angle must be non-negative");
+    if (config.cumulativeSmoothnessSteps < 1)
+        throw std::invalid_argument("cumulative smoothness steps must be at least 1");
+    if (config.maxStepFactor < 0.0)
+        throw std::invalid_argument("max step factor must be non-negative");
+}
+
+[[nodiscard]] double excessAngleSquared(double angle, double freeAngle)
+{
+    return std::pow(std::max(0.0, angle - freeAngle), 2.0);
+}
+
+[[nodiscard]] double isotropicSmoothnessLoss(
+    const cv::Vec3d& previousStepDirection,
+    const cv::Vec3d& candidateStepDirection,
+    const FiberTraceConfig& config)
+{
+    const double freeAngle = config.smoothnessFreeAngleDegrees * kPi / 180.0;
+    return config.smoothnessWeight *
+           excessAngleSquared(
+               angleBetweenUnit(previousStepDirection, candidateStepDirection),
+               freeAngle);
+}
+
 [[nodiscard]] double smoothnessLoss(
     const cv::Vec3d& previousStepDirection,
     const cv::Vec3d& candidateStepDirection,
     const cv::Vec3d& normal,
-    const FiberTraceConfig& config,
-    bool firstStep)
+    bool normalValid,
+    const FiberTraceConfig& config)
 {
     const cv::Vec3d prev = normalizedOrZero(previousStepDirection);
-    const cv::Vec3d cand = alignTo(candidateStepDirection, prev);
+    const cv::Vec3d cand = normalizedOrZero(candidateStepDirection);
     if (length(prev) <= kEpsilon || length(cand) <= kEpsilon)
         return 0.0;
 
+    const double isotropic = isotropicSmoothnessLoss(prev, cand, config);
     const cv::Vec3d n = normalizedOrZero(normal);
     const double normalWeight = config.smoothnessNormalWeight;
-    const double tangentWeight = firstStep ? 0.0 : config.smoothnessTangentWeight;
-    if (length(n) <= kEpsilon) {
-        return config.smoothnessWeight * (normalWeight + tangentWeight) *
-               (1.0 - clampedPositiveDot(prev, cand));
-    }
+    const double tangentWeight = config.smoothnessTangentWeight;
+    if (!normalValid || length(n) <= kEpsilon)
+        return isotropic;
 
-    const double prevN = prev.dot(n);
-    const double candN = cand.dot(n);
-    const double normalLoss = (candN - prevN) * (candN - prevN);
+    const double prevN = clampSignedUnit(prev.dot(n));
+    const double candN = clampSignedUnit(cand.dot(n));
     const cv::Vec3d prevT = normalizedOrZero(prev - n * prevN);
     const cv::Vec3d candT = normalizedOrZero(cand - n * candN);
-    const double tangentLoss =
-        length(prevT) > kEpsilon && length(candT) > kEpsilon
-            ? 1.0 - clampedPositiveDot(prevT, candT)
-            : 0.0;
-    return config.smoothnessWeight *
-           (normalWeight * normalLoss + tangentWeight * tangentLoss);
+    const bool tangentOk = length(prevT) > kEpsilon && length(candT) > kEpsilon;
+    const double tangentAngle = tangentOk
+        ? angleBetweenUnit(prevT, candT)
+        : angleBetweenUnit(prev, cand);
+    const double normalAngle = std::abs(std::asin(candN) - std::asin(prevN));
+    const double freeAngle = config.smoothnessFreeAngleDegrees * kPi / 180.0;
+    return tangentWeight * excessAngleSquared(tangentAngle, freeAngle) +
+           normalWeight * excessAngleSquared(normalAngle, freeAngle);
+}
+
+[[nodiscard]] double cumulativeTangentSmoothnessLoss(
+    const cv::Vec3d& historyDirection,
+    const cv::Vec3d& candidateStepDirection,
+    const cv::Vec3d& normal,
+    bool normalValid,
+    const FiberTraceConfig& config)
+{
+    const double weight = config.cumulativeSmoothnessTangentWeight;
+    if (!(weight > 0.0))
+        return 0.0;
+    const cv::Vec3d history = normalizedOrZero(historyDirection);
+    const cv::Vec3d cand = normalizedOrZero(candidateStepDirection);
+    const cv::Vec3d n = normalizedOrZero(normal);
+    if (!normalValid ||
+        length(history) <= kEpsilon ||
+        length(cand) <= kEpsilon ||
+        length(n) <= kEpsilon) {
+        return 0.0;
+    }
+    const double historyN = clampSignedUnit(history.dot(n));
+    const double candN = clampSignedUnit(cand.dot(n));
+    const cv::Vec3d historyT = normalizedOrZero(history - n * historyN);
+    const cv::Vec3d candT = normalizedOrZero(cand - n * candN);
+    if (length(historyT) <= kEpsilon || length(candT) <= kEpsilon)
+        return 0.0;
+    const double freeAngle = config.smoothnessFreeAngleDegrees * kPi / 180.0;
+    return weight * excessAngleSquared(angleBetweenUnit(historyT, candT), freeAngle);
+}
+
+[[nodiscard]] cv::Vec3d updateHistoryDirection(
+    const cv::Vec3d& historyDirection,
+    const cv::Vec3d& chosenDirection,
+    int depth,
+    int cumulativeSmoothnessSteps)
+{
+    const cv::Vec3d chosen = normalizedOrZero(chosenDirection);
+    if (depth <= 0 || cumulativeSmoothnessSteps <= 1)
+        return chosen;
+    const double count = static_cast<double>(
+        std::clamp(depth, 1, cumulativeSmoothnessSteps - 1));
+    return normalizedOr(chosen + normalizedOrZero(historyDirection) * count, chosen);
 }
 
 struct BeamState {
     std::vector<cv::Vec3d> points;
     cv::Vec3d previousStepDirection{0.0, 0.0, 0.0};
     cv::Vec3d currentSampleDirection{0.0, 0.0, 0.0};
+    cv::Vec3d historyDirection{0.0, 0.0, 0.0};
     double loss = 0.0;
     double tracedLength = 0.0;
+    int depth = 0;
     bool reached = false;
     std::string reason;
 };
 
-[[nodiscard]] double candidateLoss(
+struct CandidateScore {
+    double loss = std::numeric_limits<double>::infinity();
+    cv::Vec3d selectedCurrentDirection{0.0, 0.0, 0.0};
+    double selectedPresence = 0.0;
+    bool valid = false;
+};
+
+[[nodiscard]] CandidateScore candidateLoss(
     const FiberPredictionSource& predictions,
     const vc::lasagna::NormalSampler* normalSampler,
     const BeamState& beam,
@@ -391,13 +657,19 @@ struct BeamState {
 {
     const auto candidateSample =
         predictions.sample(candidatePoint, candidateDirection);
-    const bool firstStep = beam.points.size() <= 1;
+    const auto selectedCurrent =
+        bestAlignedPrediction(candidateSample, candidateDirection, true);
+    if (!selectedCurrent.valid)
+        return {};
 
     cv::Vec3d smoothNormal{0.0, 0.0, 0.0};
+    bool smoothNormalValid = false;
     if (normalSampler != nullptr) {
         const auto normalSample = normalSampler->sampleNormal(candidatePoint);
-        if (normalSample.valid)
+        if (normalSample.valid) {
             smoothNormal = normalSample.normal;
+            smoothNormalValid = true;
+        }
     }
 
     double bestLoss = std::numeric_limits<double>::infinity();
@@ -409,8 +681,7 @@ struct BeamState {
         const double presence = clamp01(option.presence);
 
         const cv::Vec3d prevStep = normalizedOrZero(beam.previousStepDirection);
-        const cv::Vec3d currentSample =
-            alignTo(beam.currentSampleDirection, candidateDirection);
+        const cv::Vec3d currentSample = normalizedOrZero(beam.currentSampleDirection);
         const cv::Vec3d currentStep = normalizedOrZero(candidateDirection);
 
         double score = presence;
@@ -422,11 +693,90 @@ struct BeamState {
         score *= clampedPositiveDot(currentStep, candidateSampleDirection);
 
         const double loss = (1.0 - score) +
-            smoothnessLoss(prevStep, currentStep, smoothNormal, config, firstStep);
+            smoothnessLoss(prevStep, currentStep, smoothNormal, smoothNormalValid, config) +
+            cumulativeTangentSmoothnessLoss(
+                beam.historyDirection,
+                currentStep,
+                smoothNormal,
+                smoothNormalValid,
+                config);
         if (loss < bestLoss)
             bestLoss = loss;
     }
-    return bestLoss;
+    return {bestLoss, selectedCurrent.direction, selectedCurrent.presence,
+            std::isfinite(bestLoss)};
+}
+
+[[nodiscard]] std::optional<cv::Vec3d> interpolatePlaneCrossing(
+    const cv::Vec3d& start,
+    const cv::Vec3d& end,
+    const cv::Vec3d& planePoint,
+    const cv::Vec3d& planeNormal)
+{
+    const double d0 = pointToPlaneSigned(start, planePoint, planeNormal);
+    const double d1 = pointToPlaneSigned(end, planePoint, planeNormal);
+    if (d0 == 0.0)
+        return start;
+    if (d0 * d1 > 0.0)
+        return std::nullopt;
+    const double denom = d0 - d1;
+    if (std::abs(denom) <= kEpsilon)
+        return end;
+    const double t = std::clamp(d0 / denom, 0.0, 1.0);
+    return start * (1.0 - t) + end * t;
+}
+
+[[nodiscard]] bool beamStateLess(const BeamState& a, const BeamState& b)
+{
+    if (a.loss != b.loss)
+        return a.loss < b.loss;
+    if (a.depth != b.depth)
+        return a.depth < b.depth;
+    return a.tracedLength < b.tracedLength;
+}
+
+[[nodiscard]] std::vector<BeamState> pruneBeamStates(
+    std::vector<BeamState> states,
+    int beamWidth,
+    double pruneDistanceVoxels)
+{
+    if (states.empty())
+        return {};
+    std::sort(states.begin(), states.end(), beamStateLess);
+    const size_t keep = static_cast<size_t>(std::max(1, beamWidth));
+    const double distance = std::max(0.0, pruneDistanceVoxels);
+    if (distance <= 0.0) {
+        if (states.size() > keep)
+            states.resize(keep);
+        return states;
+    }
+
+    std::vector<BeamState> out;
+    out.reserve(std::min(keep, states.size()));
+    for (auto& state : states) {
+        const cv::Vec3d point = state.points.empty()
+            ? cv::Vec3d{0.0, 0.0, 0.0}
+            : state.points.back();
+        bool tooClose = false;
+        for (const auto& existing : out) {
+            const cv::Vec3d existingPoint = existing.points.empty()
+                ? cv::Vec3d{0.0, 0.0, 0.0}
+                : existing.points.back();
+            if (length(point - existingPoint) < distance) {
+                tooClose = true;
+                break;
+            }
+        }
+        if (tooClose)
+            continue;
+        out.push_back(std::move(state));
+        if (out.size() >= keep)
+            break;
+    }
+    if (!out.empty())
+        return out;
+    out.push_back(std::move(states.front()));
+    return out;
 }
 
 [[nodiscard]] FiberTraceOneWayResult traceOneWayCore(
@@ -445,10 +795,12 @@ struct BeamState {
         request.initialDirection,
         normalizedOr(target - start, {1.0, 0.0, 0.0}));
     const ScoredDirection startPrediction =
-        bestAlignedPrediction(predictions, start, referenceStartDirection);
-    const cv::Vec3d startDirection = startPrediction.valid
-        ? startPrediction.direction
-        : referenceStartDirection;
+        bestAlignedPrediction(predictions, start, referenceStartDirection, false);
+    if (!startPrediction.valid) {
+        throw std::invalid_argument(
+            "fiber trace start point has no valid prediction direction");
+    }
+    const cv::Vec3d startDirection = startPrediction.direction;
 
     const double distance = request.budgetSpanVoxels > 0.0
         ? request.budgetSpanVoxels
@@ -457,55 +809,60 @@ struct BeamState {
     const int maxSteps = std::max(
         1,
         static_cast<int>(std::ceil(
-            distance * std::max(1.0, request.config.maxStepFactor) / step)));
+            distance * request.config.maxStepFactor / step)));
 
     BeamState initial;
     initial.points.push_back(start);
     initial.previousStepDirection = startDirection;
     initial.currentSampleDirection = startDirection;
+    initial.historyDirection = startDirection;
     std::vector<BeamState> beams{std::move(initial)};
     std::string reason = "max_step_factor";
 
-    const double startSigned = pointToPlaneSigned(start, target, targetPlaneNormal);
-    const int lookaheadSteps = std::max(1, request.config.beamLookaheadSteps);
+    const int lookaheadSteps = request.config.beamWidth <= 1
+        ? 1
+        : std::max(1, request.config.beamLookaheadSteps);
     int stepIndex = 0;
     while (stepIndex < maxSteps) {
         std::vector<BeamState> expanded = beams;
         int advanced = 0;
         for (; advanced < lookaheadSteps && stepIndex + advanced < maxSteps; ++advanced) {
             std::vector<BeamState> nextFrontier;
-            nextFrontier.reserve(expanded.size() * 16);
+            nextFrontier.reserve(expanded.size() * 81);
             for (const auto& beam : expanded) {
-                if (beam.reached) {
-                    nextFrontier.push_back(beam);
-                    continue;
-                }
                 const auto directions = candidateDirections(
                     beam.currentSampleDirection, request.config);
                 for (const auto& direction : directions) {
                     BeamState next = beam;
-                    const cv::Vec3d candidatePoint = beam.points.back() + direction * step;
-                    const double loss = candidateLoss(
+                    const cv::Vec3d currentPoint = beam.points.back();
+                    const cv::Vec3d candidatePoint = currentPoint + direction * step;
+                    const CandidateScore candidateScore = candidateLoss(
                         predictions,
                         normalSampler,
                         beam,
                         direction,
                         candidatePoint,
                         request.config);
-                    if (!std::isfinite(loss))
+                    if (!candidateScore.valid || !std::isfinite(candidateScore.loss))
                         continue;
-                    next.points.push_back(candidatePoint);
-                    next.tracedLength += step;
-                    next.loss += loss;
+                    const auto crossing = interpolatePlaneCrossing(
+                        currentPoint,
+                        candidatePoint,
+                        target,
+                        targetPlaneNormal);
+                    const cv::Vec3d nextPoint = crossing.value_or(candidatePoint);
+                    next.points.push_back(nextPoint);
+                    next.tracedLength += length(nextPoint - currentPoint);
+                    next.loss += candidateScore.loss;
                     next.previousStepDirection = direction;
-                    const auto currentPrediction =
-                        bestAlignedPrediction(predictions, candidatePoint, direction);
-                    next.currentSampleDirection =
-                        currentPrediction.valid ? currentPrediction.direction : direction;
-                    const double signedDistance =
-                        pointToPlaneSigned(candidatePoint, target, targetPlaneNormal);
-                    next.reached = startSigned <= 0.0 ? signedDistance >= 0.0
-                                                      : signedDistance <= 0.0;
+                    next.currentSampleDirection = candidateScore.selectedCurrentDirection;
+                    next.historyDirection = updateHistoryDirection(
+                        beam.historyDirection,
+                        direction,
+                        beam.depth,
+                        request.config.cumulativeSmoothnessSteps);
+                    next.depth = beam.depth + 1;
+                    next.reached = crossing.has_value();
                     if (next.reached) {
                         next.reason = "target_plane";
                     }
@@ -517,21 +874,36 @@ struct BeamState {
                 reason = "no_valid_candidates";
                 break;
             }
+            const auto reachedBegin = std::partition(
+                expanded.begin(), expanded.end(), [](const auto& state) {
+                    return state.reached;
+                });
+            if (reachedBegin != expanded.begin()) {
+                const auto bestReached = std::min_element(
+                    expanded.begin(), reachedBegin, beamStateLess);
+                if (progress) {
+                    FiberTraceProgress event;
+                    event.phase = phase;
+                    event.step = stepIndex + advanced + 1;
+                    event.maxSteps = maxSteps;
+                    event.targetPlaneProgress = 1.0;
+                    event.reason = "target_plane";
+                    progress(event);
+                }
+                return {bestReached->points, true, bestReached->reason,
+                        static_cast<int>(
+                            bestReached->points.size() > 0
+                                ? bestReached->points.size() - 1
+                                : 0)};
+            }
         }
         if (expanded.empty())
             break;
 
-        std::sort(expanded.begin(), expanded.end(), [](const auto& a, const auto& b) {
-            if (a.reached != b.reached)
-                return a.reached > b.reached;
-            if (a.loss != b.loss)
-                return a.loss < b.loss;
-            return a.tracedLength < b.tracedLength;
-        });
-        const size_t keep = static_cast<size_t>(std::max(1, request.config.beamWidth));
-        if (expanded.size() > keep)
-            expanded.resize(keep);
-        beams = std::move(expanded);
+        beams = pruneBeamStates(
+            std::move(expanded),
+            request.config.beamWidth,
+            request.config.beamPruneDistanceVoxels);
         stepIndex += std::max(1, advanced);
 
         if (progress) {
@@ -546,10 +918,6 @@ struct BeamState {
             event.reason = beams.front().reached ? beams.front().reason : reason;
             progress(event);
         }
-        if (beams.front().reached) {
-            reason = beams.front().reason;
-            break;
-        }
     }
 
     if (beams.empty()) {
@@ -557,11 +925,7 @@ struct BeamState {
     }
 
     const auto best = std::min_element(
-        beams.begin(), beams.end(), [](const auto& a, const auto& b) {
-            if (a.reached != b.reached)
-                return a.reached > b.reached;
-            return a.loss < b.loss;
-        });
+        beams.begin(), beams.end(), beamStateLess);
     return {best->points, best->reached, best->reached ? best->reason : reason,
             static_cast<int>(best->points.size() > 0 ? best->points.size() - 1 : 0)};
 }
@@ -822,6 +1186,7 @@ FiberTraceOneWayResult traceFiberOneWay(
     if (length(request.targetPlaneNormal) <= kEpsilon) {
         throw std::invalid_argument("fiber trace one-way request target plane normal is degenerate");
     }
+    validateTraceConfig(request.config);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
     return traceOneWayCore(
         predictions, request, normalSampler, progress, "trace");
@@ -841,6 +1206,7 @@ FiberTraceSegmentResult traceFiberSegment(
     }
     if (request.startIndex == request.targetIndex)
         throw std::invalid_argument("fiber trace request start and target indices must differ");
+    validateTraceConfig(request.config);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
 
     FiberTraceSegmentRequest forwardRequest = request;
@@ -942,6 +1308,7 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
         throw std::invalid_argument(
             "whole-fiber metric control-point line-index count mismatch");
     }
+    validateTraceConfig(request.config);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
 
     const auto lineWorking =

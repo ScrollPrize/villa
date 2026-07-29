@@ -74,8 +74,11 @@ presence/normal products.
      `tangent_weight * tangent_loss + normal_weight * normal_loss`.
    - Keep `smoothness_weight` as the isotropic fallback weight and as the
      component default only if tangent/normal weights are absent.
-   - If the sampler exists but a candidate normal is invalid or projections
-     are degenerate, fall back per candidate to isotropic smoothness.
+   - If the sampler exists but a candidate normal is invalid, fall back per
+     candidate to isotropic smoothness. If tangent projections are degenerate
+     with a valid normal, match Python: use the isotropic previous/candidate
+     angle for the tangent component and still include the normal/elevation
+     component.
 
 5. Add cumulative tangent smoothness to beam state.
    - Carry a history heading per beam, initialized to the selected sampled

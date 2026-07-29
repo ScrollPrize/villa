@@ -949,10 +949,15 @@
   sets, must agree. Missing or scale-mismatched prediction channels are a hard
   error. The JSON fiber is assumed to already be in the manifest base
   coordinate system; no command-line fiber rescaling is currently exposed.
-  Default trace-control parameters are `--step-voxels 4.0`, `--beam-width 8`,
-  `--beam-lookahead-steps 2`, `--smoothness-normal-weight 0.1`, and
-  `--smoothness-tangent-weight 10.0`, matching the regular Python Trace2CP
-  defaults except for inference-only options.
+  Default trace-control parameters are `--step-voxels 4.0`,
+  `--cone-angle-degrees 25.0`, `--cone-angle-step-degrees 5.0`,
+  `--cone-grid-size 25`, `--beam-width 8`,
+  `--beam-prune-distance-voxels 1.0`, `--beam-lookahead-steps 2`,
+  `--smoothness-weight 2.0`, `--smoothness-free-angle-degrees 0.0`,
+  `--smoothness-normal-weight 0.1`, `--smoothness-tangent-weight 10.0`,
+  `--cumulative-smoothness-steps 4`, and
+  `--cumulative-smoothness-tangent-weight 2.0`, matching the regular Python
+  Trace2CP defaults except for inference-only options.
   `vc_fiber_trace_metric` requires an explicit `--normal-manifest` pointing to
   the Lasagna normal manifest used for tangent/normal smoothness. It must not
   try to derive normals from the fiber prediction manifest because the

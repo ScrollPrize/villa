@@ -3,6 +3,7 @@
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
 
+#include <cmath>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,6 +24,84 @@ public:
             1.0,
             true,
         });
+        return out;
+    }
+};
+
+class CountingPrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    mutable int sampleCalls = 0;
+
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d&,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        ++sampleCalls;
+        vc::fiber_tracer::FiberPredictionSample out;
+        out.options.push_back({referenceDirection, 1.0, true});
+        return out;
+    }
+};
+
+class InvalidStartPrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d& point,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        vc::fiber_tracer::FiberPredictionSample out;
+        if (point[0] < 1.0e-6 && std::abs(point[1]) < 1.0e-6) {
+            out.options.push_back({});
+            return out;
+        }
+        out.options.push_back({referenceDirection, 1.0, true});
+        return out;
+    }
+};
+
+class StartAndCurrentBranchPrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d& point,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        vc::fiber_tracer::FiberPredictionSample out;
+        if (point[0] < 1.0e-6 && std::abs(point[1]) < 1.0e-6) {
+            out.options.push_back({{1.0, 0.0, 0.0}, 0.01, true});
+            out.options.push_back({{0.0, 1.0, 0.0}, 1.0, true});
+            return out;
+        }
+        if (std::abs(point[0] - 4.0) < 0.25 && std::abs(point[1]) < 0.25) {
+            out.options.push_back({{1.0, 0.0, 0.0}, 0.05, true});
+            out.options.push_back({{1.0, 1.0, 0.0}, 1.0, true});
+            return out;
+        }
+        out.options.push_back({referenceDirection, 1.0, true});
+        return out;
+    }
+};
+
+class PruningPrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d& point,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        vc::fiber_tracer::FiberPredictionSample out;
+        double presence = 1.0;
+        if (point[0] > 1.0e-6 && point[0] < 4.5) {
+            if (std::abs(point[1]) < 0.1 && std::abs(point[2]) < 0.1)
+                presence = 1.0;
+            else if (point[1] > 0.0 && point[1] < 0.6 && std::abs(point[2]) < 0.6)
+                presence = 0.99;
+            else if (point[1] > 1.5 && std::abs(point[2]) < 0.6)
+                presence = 0.98;
+            else
+                presence = 0.1;
+        } else if (point[0] >= 4.5) {
+            presence = point[1] > 1.0 ? 1.0 : 0.0;
+        }
+        out.options.push_back({referenceDirection, presence, true});
         return out;
     }
 };
@@ -62,10 +141,15 @@ TEST_CASE("native fiber tracer defaults match regular Trace2CP command")
     const vc::fiber_tracer::FiberTraceConfig config;
 
     CHECK(config.stepVoxels == doctest::Approx(4.0));
+    CHECK(config.coneGridSize == 25);
     CHECK(config.beamWidth == 8);
+    CHECK(config.beamPruneDistanceVoxels == doctest::Approx(1.0));
     CHECK(config.beamLookaheadSteps == 2);
     CHECK(config.smoothnessNormalWeight == doctest::Approx(0.1));
     CHECK(config.smoothnessTangentWeight == doctest::Approx(10.0));
+    CHECK(config.smoothnessFreeAngleDegrees == doctest::Approx(0.0));
+    CHECK(config.cumulativeSmoothnessSteps == 4);
+    CHECK(config.cumulativeSmoothnessTangentWeight == doctest::Approx(2.0));
 }
 
 TEST_CASE("fiber prediction working scale is inferred from single-output manifest")
@@ -143,8 +227,154 @@ TEST_CASE("native fiber tracer requires normals for normal-aware smoothness")
 
     request.config.smoothnessNormalWeight = 0.0;
     request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
     CHECK_NOTHROW(
         vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr));
+}
+
+TEST_CASE("native fiber tracer default angle-step cone uses circular 81-candidate disk")
+{
+    CountingPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {2.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 2.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, &normals);
+
+    CHECK(result.reachedTargetPlane);
+    CHECK(predictions.sampleCalls == 82);
+}
+
+TEST_CASE("native fiber tracer rejects invalid start predictions")
+{
+    InvalidStartPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {8.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 8.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr),
+        doctest::Contains("start point"),
+        std::invalid_argument);
+}
+
+TEST_CASE("native fiber tracer interpolates the target-plane crossing point")
+{
+    StraightPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {6.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 6.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    REQUIRE(result.reachedTargetPlane);
+    REQUIRE(!result.points.empty());
+    CHECK(result.points.back()[0] == doctest::Approx(6.0));
+    CHECK(result.points.back()[1] == doctest::Approx(0.0));
+    CHECK(result.points.back()[2] == doctest::Approx(0.0));
+}
+
+TEST_CASE("native fiber tracer max-step factor is not clamped before step-limit calculation")
+{
+    StraightPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {100.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 100.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.maxStepFactor = 0.1;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    CHECK(!result.reachedTargetPlane);
+    CHECK(result.reason == "max_step_factor");
+    CHECK(result.steps == 3);
+}
+
+TEST_CASE("native fiber tracer ignores presence only for the start branch")
+{
+    StartAndCurrentBranchPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {8.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 8.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.maxStepFactor = 4.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    REQUIRE(result.reachedTargetPlane);
+    REQUIRE(result.points.size() >= 3);
+    CHECK(result.points[1][0] == doctest::Approx(4.0));
+    CHECK(std::abs(result.points[1][1]) < 1.0e-6);
+    CHECK(std::abs(result.points.back()[1]) > 1.0);
+}
+
+TEST_CASE("native fiber tracer spatially prunes near-duplicate beam states")
+{
+    PruningPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {8.0, 2.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {0.0, 1.0, 0.0};
+    request.budgetSpanVoxels = 8.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 25.0;
+    request.config.coneAngleStepDegrees = 5.0;
+    request.config.beamWidth = 2;
+    request.config.beamLookaheadSteps = 1;
+    request.config.beamPruneDistanceVoxels = 1.0;
+    request.config.maxStepFactor = 1.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    REQUIRE(result.reachedTargetPlane);
+    REQUIRE(!result.points.empty());
+    const auto& endpoint = result.points.back();
+    CHECK(endpoint[1] == doctest::Approx(2.0));
+    CHECK(std::sqrt(endpoint[1] * endpoint[1] + endpoint[2] * endpoint[2]) > 1.0);
 }
 
 TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")

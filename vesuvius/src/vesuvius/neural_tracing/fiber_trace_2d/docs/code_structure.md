@@ -673,9 +673,13 @@ Ownership changed as follows:
   channels, using the common `source_to_base * 2**scaledown` scale for
   `presence`/`nx`/`ny` channel sets. The input fiber JSON is assumed to already
   be in the manifest base coordinate system. The default trace parameters are
-  `step=4.0`, `beam_width=8`, `beam_lookahead_steps=2`,
-  `smoothness_normal_weight=0.1`, and `smoothness_tangent_weight=10.0`,
-  matching the Python Trace2CP default trace controls. It requires an explicit
+  `step=4.0`, `cone_angle=25.0`, `cone_angle_step=5.0`,
+  `cone_grid_size=25`, `beam_width=8`, `beam_prune_distance=1.0`,
+  `beam_lookahead_steps=2`, `smoothness_weight=2.0`,
+  `smoothness_free_angle=0.0`, `smoothness_normal_weight=0.1`,
+  `smoothness_tangent_weight=10.0`, `cumulative_smoothness_steps=4`, and
+  `cumulative_smoothness_tangent_weight=2.0`, matching the Python Trace2CP
+  default trace controls. It requires an explicit
   `--normal-manifest` Lasagna manifest and does not try to read normals from
   the fiber prediction manifest. The CLI is a thin wrapper around
   `vc_fiber_tracer`; it does not run PyTorch, create strips, or implement

@@ -1,5 +1,11 @@
 # 2026-07-29
 
+- Brought the native C++ `vc_fiber_tracer`/`vc_fiber_trace_metric` Trace2CP
+  search controls into parity with the Python native tracer for persisted
+  inference products: circular default cone candidates, presence-weighted
+  current branch choice, angle-squared split smoothness, cumulative tangent
+  smoothness, target-plane crossing interpolation, spatial beam pruning, and
+  matching CLI flags/defaults.
 - Python native 3D Trace2CP now accepts multiple `--fiber-json` paths, runs
   them sequentially with a shared loaded model, writes indexed per-fiber
   summaries/visualizations, and reports an accumulated restart-rate score.

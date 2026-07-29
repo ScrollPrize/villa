@@ -49,11 +49,16 @@ void printUsage(const char* argv0)
         << "  --step-voxels N                 trace step in manifest prediction voxels [4]\n"
         << "  --cone-angle-degrees N          candidate cone half-angle [25]\n"
         << "  --cone-angle-step-degrees N     candidate cone grid step [5]\n"
+        << "  --cone-grid-size N              legacy square-to-disk grid size when cone step <= 0 [25]\n"
         << "  --beam-width N                  kept beams per step [8]\n"
+        << "  --beam-prune-distance-voxels N  beam endpoint merge radius after lookahead [1]\n"
         << "  --beam-lookahead-steps N        expand this many steps before pruning [2]\n"
         << "  --smoothness-weight N           smoothness scale [2]\n"
         << "  --smoothness-normal-weight N    normal-axis smoothness weight [0.1]\n"
         << "  --smoothness-tangent-weight N   tangent-plane smoothness weight [10]\n"
+        << "  --smoothness-free-angle-degrees N free turn before smoothness penalty [0]\n"
+        << "  --cumulative-smoothness-steps N history length for cumulative tangent smoothing [4]\n"
+        << "  --cumulative-smoothness-tangent-weight N cumulative tangent smoothing weight [2]\n"
         << "  --max-step-factor N             max steps as factor of CP span [3]\n"
         << "  --error-threshold-voxels N      restart threshold at target plane [10]\n"
         << "  --cache-gib N                   per-channel chunk-cache budget [8]\n"
@@ -131,10 +136,18 @@ CliOptions parseArgs(int argc, char** argv)
             options.trace.coneAngleStepDegrees =
                 parseDouble(requireValue(i, argc, argv, "cone-angle-step-degrees"),
                             "cone-angle-step-degrees");
+        } else if (arg == "--cone-grid-size") {
+            options.trace.coneGridSize =
+                parseInt(requireValue(i, argc, argv, "cone-grid-size"),
+                         "cone-grid-size");
         } else if (arg == "--beam-width") {
             options.trace.beamWidth =
                 parseInt(requireValue(i, argc, argv, "beam-width"),
                          "beam-width");
+        } else if (arg == "--beam-prune-distance-voxels") {
+            options.trace.beamPruneDistanceVoxels =
+                parseDouble(requireValue(i, argc, argv, "beam-prune-distance-voxels"),
+                            "beam-prune-distance-voxels");
         } else if (arg == "--beam-lookahead-steps") {
             options.trace.beamLookaheadSteps =
                 parseInt(requireValue(i, argc, argv, "beam-lookahead-steps"),
@@ -151,6 +164,22 @@ CliOptions parseArgs(int argc, char** argv)
             options.trace.smoothnessTangentWeight =
                 parseDouble(requireValue(i, argc, argv, "smoothness-tangent-weight"),
                             "smoothness-tangent-weight");
+        } else if (arg == "--smoothness-free-angle-degrees") {
+            options.trace.smoothnessFreeAngleDegrees =
+                parseDouble(requireValue(i, argc, argv, "smoothness-free-angle-degrees"),
+                            "smoothness-free-angle-degrees");
+        } else if (arg == "--cumulative-smoothness-steps") {
+            options.trace.cumulativeSmoothnessSteps =
+                parseInt(requireValue(i, argc, argv, "cumulative-smoothness-steps"),
+                         "cumulative-smoothness-steps");
+        } else if (arg == "--cumulative-smoothness-tangent-weight") {
+            options.trace.cumulativeSmoothnessTangentWeight =
+                parseDouble(requireValue(
+                                i,
+                                argc,
+                                argv,
+                                "cumulative-smoothness-tangent-weight"),
+                            "cumulative-smoothness-tangent-weight");
         } else if (arg == "--max-step-factor") {
             options.trace.maxStepFactor =
                 parseDouble(requireValue(i, argc, argv, "max-step-factor"),
@@ -174,10 +203,26 @@ CliOptions parseArgs(int argc, char** argv)
     }
     if (!(options.trace.stepVoxels > 0.0))
         failOption("--step-voxels must be positive");
+    if (!(options.trace.coneAngleDegrees >= 0.0))
+        failOption("--cone-angle-degrees must be non-negative");
+    if (options.trace.coneGridSize < 1)
+        failOption("--cone-grid-size must be at least 1");
     if (options.trace.beamWidth < 1)
         failOption("--beam-width must be at least 1");
+    if (!(options.trace.beamPruneDistanceVoxels >= 0.0))
+        failOption("--beam-prune-distance-voxels must be non-negative");
     if (options.trace.beamLookaheadSteps < 1)
         failOption("--beam-lookahead-steps must be at least 1");
+    if (!(options.trace.smoothnessWeight >= 0.0) ||
+        !(options.trace.smoothnessNormalWeight >= 0.0) ||
+        !(options.trace.smoothnessTangentWeight >= 0.0) ||
+        !(options.trace.cumulativeSmoothnessTangentWeight >= 0.0)) {
+        failOption("smoothness weights must be non-negative");
+    }
+    if (!(options.trace.smoothnessFreeAngleDegrees >= 0.0))
+        failOption("--smoothness-free-angle-degrees must be non-negative");
+    if (options.trace.cumulativeSmoothnessSteps < 1)
+        failOption("--cumulative-smoothness-steps must be at least 1");
     if (!(options.errorThresholdVoxels >= 0.0))
         failOption("--error-threshold-voxels must be non-negative");
     if (options.normalManifest.empty()) {
