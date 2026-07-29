@@ -1,5 +1,8 @@
 # 2026-07-29
 
+- Changed native `vc_fiber_trace_metric` to infer its tracer working scale from
+  the precomputed fiber inference manifest channels instead of a CLI scale
+  argument.
 - Extended native VC3D Lasagna dataset opening so `vc_fiber_trace_metric` can
   stream precomputed fiber inference manifests directly from HTTP/S3 locations
   with an explicit remote cache directory, including relative and absolute

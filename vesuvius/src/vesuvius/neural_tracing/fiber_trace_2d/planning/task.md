@@ -1,31 +1,27 @@
-# Remote Lasagna Manifest Support For Native Fiber Metric
+# Manifest-Scale Native Fiber Metric
 
-Add low-level support for opening Lasagna-style manifests directly from remote
-HTTP/S3 URLs, and use that path in the native 3D fiber metric command-line
-runner.
+Adjust the VC C++ fiber metric/tracer command so it uses the precomputed fiber
+inference manifest scale as the tracer working scale.
 
-Current behavior must continue to work:
+Desired behavior:
 
-- local `.lasagna.json` manifests;
-- local manifests with adjacent `lasagna-remote.json` read-through cache
-  markers;
-- explicit `--normal-manifest` for normals.
+- `vc_fiber_trace_metric` infers the working-to-base scale from the fiber
+  inference manifest's persisted prediction channels;
+- the manifest inference/output size and scale define the tracer coordinate
+  system;
+- the JSON fiber coordinates are assumed to already be in the base coordinate
+  system of that manifest;
+- `step_voxels`, candidate tracing, and restart thresholds remain expressed in
+  inferred working-grid voxels;
+- local and remote manifests continue to use the shared Lasagna opener and
+  remote cache behavior;
+- optional `--normal-manifest` sampling uses the same inferred working scale.
 
-New behavior:
+Out of scope for this task:
 
-- the fiber inference manifest positional argument may be a remote
-  `s3://`, `s3+REGION://`, `http://`, or `https://` manifest URL;
-- the normal manifest may use the same remote forms;
-- remote manifests are fetched on demand for the current run, parsed as
-  manifests, and not persisted as durable cache state;
-- relative `groups.*.zarr` paths in the manifest are resolved against the
-  remote manifest's parent URL, so the referenced Zarr groups stream from the
-  same artifact location;
-- absolute `groups.*.zarr` paths are also supported: local absolute paths are
-  opened as local Zarr groups, and absolute remote `s3://`, `s3+REGION://`,
-  `http://`, or `https://` paths stream through the same read-through cache;
-- remote Zarr objects are persisted in the user-supplied local remote cache
-  directory through the existing object-for-object read-through store;
-- if a remote manifest is requested without an explicit cache directory, fail
-  with a clear error;
-- no VC3D project JSON / volpkg support is required in this task.
+- do not add a command-line argument for scaling the fiber JSON into the
+  manifest base coordinate system;
+- do not change GUI segment tracing scale handling in this task unless needed
+  by the metric command;
+- do not change the generic Lasagna dataset runtime-scale API used by other
+  VC tools.

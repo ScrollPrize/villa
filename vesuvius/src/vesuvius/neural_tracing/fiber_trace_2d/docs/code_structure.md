@@ -647,9 +647,13 @@ Ownership changed as follows:
   It opens a fiber inference `.lasagna.json`, loads one `vc3d_fiber` JSON,
   runs one-way CP-to-CP tracing continuously over the full fiber, restarts from
   a CP after failed target-plane hits, and prints `err/kvx` plus optional
-  `err/m` when an explicit `--voxel-size-um` is provided. The CLI is a thin
-  wrapper around `vc_fiber_tracer`; it does not run PyTorch, create strips, or
-  implement separate channel/remote-cache loading.
+  `err/m` when an explicit `--voxel-size-um` is provided. Its tracer working
+  scale is inferred from the fiber inference manifest's persisted prediction
+  channels, using the common `source_to_base * 2**scaledown` scale for
+  `presence`/`nx`/`ny` channel sets. The input fiber JSON is assumed to already
+  be in the manifest base coordinate system. The CLI is a thin wrapper around
+  `vc_fiber_tracer`; it does not run PyTorch, create strips, or implement
+  separate channel/remote-cache loading.
 - `vc_fiber_trace_metric` opens Lasagna manifests through the shared
   location-aware `vc_lasagna` dataset opener. Local manifests continue to work
   without extra arguments. Direct remote `s3://`, `s3+REGION://`, `http://`, or

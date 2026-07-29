@@ -166,6 +166,9 @@ using FiberTraceWholeFiberProgressCallback =
 
 [[nodiscard]] FiberInput loadFiberJson(const std::filesystem::path& path);
 
+[[nodiscard]] double inferFiberPredictionWorkingToBaseScale(
+    const vc::lasagna::LasagnaDatasetManifest& manifest);
+
 [[nodiscard]] FiberTraceOneWayResult traceFiberOneWay(
     const FiberPredictionSource& predictions,
     const FiberTraceOneWayRequest& request,

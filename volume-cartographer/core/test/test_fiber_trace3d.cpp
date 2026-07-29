@@ -3,6 +3,10 @@
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
 
+#include <string>
+#include <utility>
+#include <vector>
+
 namespace {
 
 class StraightPrediction final : public vc::fiber_tracer::FiberPredictionSource {
@@ -23,7 +27,74 @@ public:
     }
 };
 
+vc::lasagna::LasagnaChannelGroup makeGroup(
+    std::string name,
+    int scaledown,
+    std::vector<std::string> channels)
+{
+    vc::lasagna::LasagnaChannelGroup group;
+    group.name = std::move(name);
+    group.scaledown = scaledown;
+    group.channels = std::move(channels);
+    return group;
+}
+
 } // namespace
+
+TEST_CASE("fiber prediction working scale is inferred from single-output manifest")
+{
+    vc::lasagna::LasagnaDatasetManifest manifest;
+    manifest.sourceToBase = 2.0;
+    manifest.groups.push_back(makeGroup("fiber", 3, {"presence", "nx", "ny"}));
+
+    const double scale =
+        vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(manifest);
+
+    CHECK(scale == doctest::Approx(16.0));
+}
+
+TEST_CASE("fiber prediction working scale is inferred from prefixed multi-output manifest")
+{
+    vc::lasagna::LasagnaDatasetManifest manifest;
+    manifest.sourceToBase = 1.0;
+    manifest.groups.push_back(makeGroup(
+        "fiber_option_000",
+        2,
+        {"option_000_presence", "option_000_nx", "option_000_ny"}));
+    manifest.groups.push_back(makeGroup(
+        "fiber_option_001",
+        2,
+        {"option_001_presence", "option_001_nx", "option_001_ny"}));
+
+    const double scale =
+        vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(manifest);
+
+    CHECK(scale == doctest::Approx(4.0));
+}
+
+TEST_CASE("fiber prediction working scale rejects missing prediction channels")
+{
+    vc::lasagna::LasagnaDatasetManifest manifest;
+    manifest.sourceToBase = 1.0;
+    manifest.groups.push_back(makeGroup("fiber", 2, {"presence", "nx"}));
+
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(manifest),
+        doctest::Contains("presence/nx/ny"),
+        std::runtime_error);
+}
+
+TEST_CASE("fiber prediction working scale rejects mixed prediction channel scales")
+{
+    vc::lasagna::LasagnaDatasetManifest manifest;
+    manifest.sourceToBase = 1.0;
+    manifest.groups.push_back(makeGroup("presence", 2, {"presence"}));
+    manifest.groups.push_back(makeGroup("directions", 3, {"nx", "ny"}));
+
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(manifest),
+        std::runtime_error);
+}
 
 TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")
 {

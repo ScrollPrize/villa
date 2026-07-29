@@ -912,12 +912,18 @@
   output. It loads one `vc3d_fiber` JSON, requires exact control-point matches
   in `line_points`, traces one-sided from CP to next CP plane, continues from
   the reached point after success, restarts from the failed CP after failure,
-  and reports restart rate per 1000 selected-level voxels as `err/kvx`.
-  `--working-to-base-scale` defines the selected-level coordinate system used
-  by the metric. Physical `err/m` is reported only when the caller provides an
-  explicit positive `--voxel-size-um`; the runner must not invent physical
-  units from filenames or parse unrelated metadata. The CLI is a thin wrapper
-  over `vc_fiber_tracer`, `vc_lasagna` dataset opening, and optional
+  and reports restart rate per 1000 manifest-prediction voxels as `err/kvx`.
+  The runner derives its working-to-base scale from the persisted prediction
+  channels in the fiber inference manifest: each required prediction channel's
+  effective scale is `source_to_base * 2**scaledown`, and all `presence`/`nx`/
+  `ny` channels used by the tracer, including prefixed multi-output channel
+  sets, must agree. Missing or scale-mismatched prediction channels are a hard
+  error. The JSON fiber is assumed to already be in the manifest base
+  coordinate system; no command-line fiber rescaling is currently exposed.
+  Physical `err/m` is reported only when the caller provides an explicit
+  positive `--voxel-size-um`; the runner must not invent physical units from
+  filenames or parse unrelated metadata. The CLI is a thin wrapper over
+  `vc_fiber_tracer`, `vc_lasagna` dataset opening, and optional
   `LasagnaNormalSampler`.
 - The native Lasagna dataset opener supports local `.lasagna.json` manifests,
   local manifests with an adjacent `lasagna-remote.json` read-through marker,

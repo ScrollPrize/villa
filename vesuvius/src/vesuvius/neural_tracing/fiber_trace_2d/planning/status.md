@@ -1,14 +1,11 @@
-# Remote Lasagna Manifest Support Status
+# Manifest-Scale Native Fiber Metric Status
 
-- [x] Read current Lasagna dataset/manifest open path.
-- [x] Read current remote URL and marker-backed remote cache behavior.
+- [x] Read current native metric CLI scale path.
+- [x] Read current fiber tracer base-to-working coordinate conversion.
 - [x] Write task description.
 - [x] Write implementation plan.
-- [x] Add explicit group-location semantics for relative paths, absolute local
-  paths, and absolute remote paths.
-- [x] Review plan against existing specs/docs before implementation.
-- [x] Implement low-level remote manifest opener.
-- [x] Wire `vc_fiber_trace_metric --remote-cache-dir`.
-- [x] Add focused tests.
+- [x] Add reusable manifest-derived prediction scale helper.
+- [x] Wire `vc_fiber_trace_metric` to use the inferred manifest scale.
+- [x] Add focused C++ tests.
 - [x] Update specs/docs/changelog/task log.
 - [x] Run validation commands.
