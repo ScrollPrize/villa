@@ -49,6 +49,11 @@ _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 _GIB = 1024**3
 _SPARSE_NORMAL_CHANNELS = frozenset({"grad_mag", "nx", "ny"})
 _NATIVE_NORMAL_SAMPLER_MODES = ("sparse-corner-principal", "baseline")
+_NATIVE_NORMAL_PRINCIPAL_AXIS_METHODS = ("eigh", "analytic")
+_NATIVE_NORMAL_PRINCIPAL_AXIS_CLI_CHOICES = (
+    "config",
+    *_NATIVE_NORMAL_PRINCIPAL_AXIS_METHODS,
+)
 _NORMAL_CORNER_BITS_XYZ = (
     (0.0, 0.0, 0.0),
     (1.0, 0.0, 0.0),
@@ -1620,13 +1625,82 @@ def _align_axes_torch(axes: torch.Tensor, references: torch.Tensor) -> torch.Ten
     return axes_n * sign
 
 
-def _principal_tensor_axes_torch(tensors: torch.Tensor, hints: torch.Tensor) -> torch.Tensor:
+def _principal_tensor_axes_torch_analytic(
+    tensors_t: torch.Tensor,
+    fallback_axis: torch.Tensor,
+) -> torch.Tensor:
+    a00 = tensors_t[:, 0, 0]
+    a01 = tensors_t[:, 0, 1]
+    a02 = tensors_t[:, 0, 2]
+    a11 = tensors_t[:, 1, 1]
+    a12 = tensors_t[:, 1, 2]
+    a22 = tensors_t[:, 2, 2]
+    q = (a00 + a11 + a22) / 3.0
+    b00 = a00 - q
+    b11 = a11 - q
+    b22 = a22 - q
+    p1 = a01 * a01 + a02 * a02 + a12 * a12
+    p2 = b00 * b00 + b11 * b11 + b22 * b22 + 2.0 * p1
+    p = torch.sqrt(torch.clamp(p2 / 6.0, min=0.0))
+    inv_p = torch.where(p > float(_EPS), 1.0 / p, torch.zeros_like(p))
+    c00 = b00 * inv_p
+    c01 = a01 * inv_p
+    c02 = a02 * inv_p
+    c11 = b11 * inv_p
+    c12 = a12 * inv_p
+    c22 = b22 * inv_p
+    det_c = (
+        c00 * (c11 * c22 - c12 * c12)
+        - c01 * (c01 * c22 - c12 * c02)
+        + c02 * (c01 * c12 - c11 * c02)
+    )
+    r = torch.clamp(det_c * 0.5, -1.0, 1.0)
+    phi = torch.acos(r) / 3.0
+    lambda_max = q + 2.0 * p * torch.cos(phi)
+    diag = torch.stack([a00, a11, a22], dim=1)
+    lambda_max = torch.where(
+        p > float(_EPS),
+        lambda_max,
+        torch.max(diag, dim=1).values,
+    )
+
+    matrix = tensors_t.clone()
+    rows = torch.arange(int(tensors_t.shape[0]), dtype=torch.long, device=tensors_t.device)
+    matrix[rows, 0, 0] -= lambda_max
+    matrix[rows, 1, 1] -= lambda_max
+    matrix[rows, 2, 2] -= lambda_max
+    r0 = matrix[:, 0, :]
+    r1 = matrix[:, 1, :]
+    r2 = matrix[:, 2, :]
+    candidates = torch.stack(
+        [
+            torch.cross(r0, r1, dim=1),
+            torch.cross(r0, r2, dim=1),
+            torch.cross(r1, r2, dim=1),
+            fallback_axis,
+        ],
+        dim=1,
+    )
+    candidate_norm2 = torch.sum(candidates * candidates, dim=2)
+    best = torch.argmax(candidate_norm2, dim=1)
+    return candidates[rows, best]
+
+
+def _principal_tensor_axes_torch(
+    tensors: torch.Tensor,
+    hints: torch.Tensor,
+    *,
+    method: str = "eigh",
+) -> torch.Tensor:
     tensors_t = tensors.to(dtype=torch.float32)
     hints_t = hints.to(device=tensors_t.device, dtype=torch.float32)
     if tensors_t.ndim != 3 or tuple(int(v) for v in tensors_t.shape[1:]) != (3, 3):
         raise ValueError("tensors must have shape [N,3,3]")
     if tuple(int(v) for v in hints_t.shape) != (int(tensors_t.shape[0]), 3):
         raise ValueError("hints must have shape [N,3]")
+    method_s = str(method)
+    if method_s not in _NATIVE_NORMAL_PRINCIPAL_AXIS_METHODS:
+        raise ValueError(f"unsupported principal-axis method: {method_s!r}")
     count = int(tensors_t.shape[0])
     axes = hints_t.clone()
     hint_norm = torch.linalg.norm(axes, dim=1)
@@ -1640,10 +1714,13 @@ def _principal_tensor_axes_torch(tensors: torch.Tensor, hints: torch.Tensor) -> 
         torch.arange(count, device=tensors_t.device),
         torch.argmax(diag, dim=1),
     ] = 1.0
-    eigenvalues, eigenvectors = torch.linalg.eigh(tensors_t)
-    best = torch.argmax(eigenvalues, dim=1)
-    rows = torch.arange(count, dtype=torch.long, device=tensors_t.device)
-    axes = eigenvectors[rows, :, best]
+    if method_s == "eigh":
+        eigenvalues, eigenvectors = torch.linalg.eigh(tensors_t)
+        best = torch.argmax(eigenvalues, dim=1)
+        rows = torch.arange(count, dtype=torch.long, device=tensors_t.device)
+        axes = eigenvectors[rows, :, best]
+    else:
+        axes = _principal_tensor_axes_torch_analytic(tensors_t, fallback_axis)
     axes = torch.where(torch.isfinite(axes).all(dim=1)[:, None], axes, fallback_axis)
     norms = torch.linalg.norm(axes, dim=1)
     valid_axes = torch.isfinite(norms) & (norms > float(_EPS))
@@ -1764,10 +1841,16 @@ class _SparseCornerLasagnaNormalSampler:
     trace_record: Any
     data: Any
     device: torch.device
+    principal_axis_method: str = "eigh"
     profiler: _NativeTraceProfiler | None = None
 
     def __post_init__(self) -> None:
         self.device = torch.device(self.device)
+        if str(self.principal_axis_method) not in _NATIVE_NORMAL_PRINCIPAL_AXIS_METHODS:
+            raise ValueError(
+                "unsupported sparse normal principal-axis method: "
+                f"{self.principal_axis_method!r}"
+            )
 
     def _measure(
         self,
@@ -1907,7 +1990,11 @@ class _SparseCornerLasagnaNormalSampler:
             & torch.isfinite(total_weight)
             & (total_weight > float(_EPS))
         )
-        axes = _principal_tensor_axes_torch(tensor, hint)
+        axes = _principal_tensor_axes_torch(
+            tensor,
+            hint,
+            method=str(self.principal_axis_method),
+        )
         axis_norm = torch.linalg.norm(axes, dim=1)
         axis_valid = torch.isfinite(axis_norm) & (axis_norm > float(_EPS))
         valid_t = valid_t & axis_valid
@@ -1936,6 +2023,7 @@ def _make_sparse_corner_normal_sampler(
     trace_record: Any,
     raw_config: dict[str, Any],
     device: torch.device,
+    principal_axis_method: str = "eigh",
     profiler: _NativeTraceProfiler | None,
 ) -> NativeTraceNormalSampler:
     manifest_path = _native_trace_manifest_path_for_record(trace_record, raw_config=raw_config)
@@ -1968,6 +2056,7 @@ def _make_sparse_corner_normal_sampler(
         trace_record=trace_record,
         data=data,
         device=device,
+        principal_axis_method=str(principal_axis_method),
         profiler=profiler,
     )
 
@@ -2139,6 +2228,7 @@ def _make_debug_normal_comparison_sampler(
     raw_config: dict[str, Any],
     device: torch.device,
     mode: str,
+    principal_axis_method: str,
     angle_threshold_degrees: float,
     profiler: _NativeTraceProfiler | None,
 ) -> NativeTraceNormalSampler:
@@ -2156,6 +2246,7 @@ def _make_debug_normal_comparison_sampler(
                 trace_record=trace_record,
                 device=device,
                 raw_config=raw_config,
+                principal_axis_method=str(principal_axis_method),
                 profiler=profiler,
             ),
         ),
@@ -6443,6 +6534,19 @@ def _native_trace_smoothness_summary(cfg: NativeTrace2CpConfig) -> dict[str, Any
     }
 
 
+def _native_trace_normal_principal_axis_method(raw_config: dict[str, Any]) -> str:
+    trace_cfg = raw_config.get("native_trace2cp", {})
+    if not isinstance(trace_cfg, dict):
+        return "eigh"
+    method = str(trace_cfg.get("normal_principal_axis_method", "eigh"))
+    if method not in _NATIVE_NORMAL_PRINCIPAL_AXIS_METHODS:
+        raise ValueError(
+            "unsupported native_trace2cp.normal_principal_axis_method: "
+            f"{method!r}"
+        )
+    return method
+
+
 def run_native_trace2cp(
     config_path: str | Path,
     *,
@@ -6456,7 +6560,9 @@ def run_native_trace2cp(
     sample_mode: str | None = None,
     native_cfg: NativeTrace2CpConfig | None = None,
     render_visualization: bool = False,
+    profile: bool = False,
     normal_sampler_mode: str = "sparse-corner-principal",
+    normal_principal_axis_method: str = "config",
     debug_compare_normal_sampler: str | None = None,
     debug_normal_angle_threshold_degrees: float = 1.0,
 ) -> NativeTracePairResult | NativeWholeFiberResult:
@@ -6527,11 +6633,19 @@ def run_native_trace2cp(
     device = _device_from_training(training)
     prediction_adapter = FiberTrace3DPredictAdapter(raw_config, checkpoint=checkpoint)
     model = prediction_adapter.load_model(device=device)
-    profiler = _NativeTraceProfiler()
+    profiler = _NativeTraceProfiler() if bool(profile) else None
     normal_sampler_mode = str(normal_sampler_mode)
     if normal_sampler_mode not in _NATIVE_NORMAL_SAMPLER_MODES:
         raise ValueError(
             f"unsupported native 3D Trace2CP normal sampler mode: {normal_sampler_mode!r}"
+        )
+    normal_principal_axis_method = str(normal_principal_axis_method)
+    if normal_principal_axis_method == "config":
+        normal_principal_axis_method = _native_trace_normal_principal_axis_method(raw_config)
+    if normal_principal_axis_method not in _NATIVE_NORMAL_PRINCIPAL_AXIS_METHODS:
+        raise ValueError(
+            "unsupported native 3D Trace2CP normal principal-axis method: "
+            f"{normal_principal_axis_method!r}"
         )
     cache = NativeTraceFieldCache(
         record=record,
@@ -6563,6 +6677,7 @@ def run_native_trace2cp(
             raw_config=raw_config,
             device=device,
             mode=str(debug_compare_normal_sampler),
+            principal_axis_method=normal_principal_axis_method,
             angle_threshold_degrees=float(debug_normal_angle_threshold_degrees),
             profiler=profiler,
         )
@@ -6571,6 +6686,7 @@ def run_native_trace2cp(
             trace_record=record,
             raw_config=raw_config,
             device=device,
+            principal_axis_method=normal_principal_axis_method,
             profiler=profiler,
         )
     elif baseline_normal_sampler is not None:
@@ -6594,6 +6710,7 @@ def run_native_trace2cp(
         f"inference_scaledown_factor={int(cache.inference_scaledown_factor)} "
         f"inference_blur_sigma_voxels={float(cfg.inference_blur_sigma_voxels):.3f} "
         f"normal_sampler={effective_normal_sampler} "
+        f"normal_principal_axis_method={normal_principal_axis_method} "
         f"debug_compare_normal_sampler={debug_compare_normal_sampler or 'off'} "
         f"debug_normal_angle_threshold_degrees={float(debug_normal_angle_threshold_degrees):.6g} "
         f"sampler={type(getattr(record, 'sampler', None)).__name__} "
@@ -6692,7 +6809,8 @@ def run_native_trace2cp(
             f"threshold_voxels={float(cfg.whole_fiber_error_threshold_voxels):.3f}",
             flush=True,
         )
-        profiler.restart_total()
+        if profiler is not None:
+            profiler.restart_total()
         trace_wall_start = time.perf_counter()
         trace_cpu_start = time.process_time()
         whole = trace_native_3d_whole_fiber(
@@ -6707,7 +6825,8 @@ def run_native_trace2cp(
         )
         trace_wall_seconds = float(time.perf_counter() - trace_wall_start)
         trace_cpu_seconds = float(time.process_time() - trace_cpu_start)
-        profiler.finish_total()
+        if profiler is not None:
+            profiler.finish_total()
         summary = {
             "mode": "whole_fiber",
             "fiber_path": "" if record.fiber.path is None else str(record.fiber.path),
@@ -6755,7 +6874,7 @@ def run_native_trace2cp(
             ),
             "trace_wall_seconds": trace_wall_seconds,
             "trace_cpu_seconds": trace_cpu_seconds,
-            "trace_profile": profiler.summary(),
+            "trace_profile": None if profiler is None else profiler.summary(),
             "export": str(image_path) if render_visualization else None,
             "visualization_enabled": bool(render_visualization),
             "segments": [
@@ -6802,7 +6921,8 @@ def run_native_trace2cp(
             f"trace_cpu_s={trace_cpu_seconds:.3f}",
             flush=True,
         )
-        profiler.print_table()
+        if profiler is not None:
+            profiler.print_table()
         print(
             "native_trace2cp_3d whole_fiber "
             f"blocks={len(cache._blocks)} inferred={cache.total_inferred_blocks} "
@@ -6822,7 +6942,8 @@ def run_native_trace2cp(
         or reverse_initial_direction is None
     ):
         raise RuntimeError("native 3D Trace2CP single-pair selection was not initialized")
-    profiler.restart_total()
+    if profiler is not None:
+        profiler.restart_total()
     trace_wall_start = time.perf_counter()
     trace_cpu_start = time.process_time()
     result = trace_native_3d_pair(
@@ -6857,7 +6978,11 @@ def run_native_trace2cp(
                 sample_mode=selection.sample_mode,
             )
 
-        with profiler.measure("single_visualization"):
+        with (
+            profiler.measure("single_visualization")
+            if profiler is not None
+            else _NullNativeTraceProfileSpan()
+        ):
             max_source = build_source()
             max_side_overlays = _trace_overlays_for_view(
                 max_source,
@@ -6889,7 +7014,8 @@ def run_native_trace2cp(
                 partial_output_path=image_path,
             )
             sheet.convert("RGB").save(image_path, quality=95)
-    profiler.finish_total()
+    if profiler is not None:
+        profiler.finish_total()
     summary = {
         "sample_index": int(selection.sample_index),
         "fiber_path": "" if record.fiber.path is None else str(record.fiber.path),
@@ -6951,7 +7077,7 @@ def run_native_trace2cp(
         ),
         "trace_wall_seconds": trace_wall_seconds,
         "trace_cpu_seconds": trace_cpu_seconds,
-        "trace_profile": profiler.summary(),
+        "trace_profile": None if profiler is None else profiler.summary(),
         "export": str(image_path) if render_visualization else None,
     }
     summary_path = out_dir / "trace2cp_native_3d_summary.json"
@@ -6974,7 +7100,8 @@ def run_native_trace2cp(
         f"trace_cpu_s={trace_cpu_seconds:.3f}",
         flush=True,
     )
-    profiler.print_table()
+    if profiler is not None:
+        profiler.print_table()
     print(
         "native_trace2cp_3d "
         f"sample_index={selection.sample_index} start_cp={selection.start_cp_index} "
@@ -7002,6 +7129,11 @@ def _parse_args() -> argparse.Namespace:
         "--vis",
         action="store_true",
         help="Render Trace2CP JPG visualization. By default only metrics/summary are written.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Collect and print detailed Trace2CP stage timings.",
     )
     parser.add_argument("--sample-index", type=int, default=None)
     parser.add_argument("--fiber-json", type=Path, default=None)
@@ -7075,6 +7207,16 @@ def _parse_args() -> argparse.Namespace:
             "Lasagna normal sampler for native 3D tracing. sparse-corner-principal "
             "uses sparse chunk reads and baseline-style tensor reconstruction; "
             "baseline uses the geometry-loader sampler."
+        ),
+    )
+    parser.add_argument(
+        "--normal-principal-axis-method",
+        choices=_NATIVE_NORMAL_PRINCIPAL_AXIS_CLI_CHOICES,
+        default="config",
+        help=(
+            "Principal-axis reconstruction for sparse-corner normals. config "
+            "uses native_trace2cp.normal_principal_axis_method or eigh; analytic "
+            "is a direct closed-form symmetric tensor experiment."
         ),
     )
     parser.add_argument(
@@ -7152,7 +7294,9 @@ def main() -> None:
         sample_mode=args.sample_mode,
         native_cfg=native_cfg,
         render_visualization=bool(args.vis),
+        profile=bool(args.profile),
         normal_sampler_mode=str(args.normal_sampler),
+        normal_principal_axis_method=str(args.normal_principal_axis_method),
         debug_compare_normal_sampler=args.debug_compare_normal_sampler,
         debug_normal_angle_threshold_degrees=float(args.debug_normal_angle_threshold_degrees),
     )

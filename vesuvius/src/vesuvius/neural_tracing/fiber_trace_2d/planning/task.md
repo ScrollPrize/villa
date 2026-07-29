@@ -1,27 +1,19 @@
-# Task: Native 3D Trace2CP GPU-Centric Beam Acceleration
+# Task: Native 3D Trace2CP Point-Lookup Optimization
 
-Speed up native 3D Trace2CP while preserving the current metric quality and
-semantics.
-
-Current measured state on the approved whole-fiber benchmark:
-
-- Sparse corner/tensor Lasagna normals are the default and match the baseline
-  quality: 3 restarts on the reference fiber.
-- Runtime improved from roughly 472s to roughly 201s, but the remaining hot
-  path is still not aligned with the intended GPU-centric tracer.
-- Remaining issues to fix:
-  - block routing/grouping for point lookup is still CPU-side,
-  - beam tracing is still step-wise Python orchestration,
-  - candidate scoring is vectorized only inside each expansion, not across
-    broader trace work,
-  - field lookup uses many small GPU calls instead of fewer larger calls.
+Continue optimizing native 3D Trace2CP while preserving the current
+quality-matching tracing behavior.
 
 Requirements:
 
-- Keep the same benchmark command and report before/after timings after each
-  implementation step.
-- Keep sparse corner/tensor normals as the default normal sampler and keep
-  baseline normals as an explicit debug/fallback mode.
-- Do not reintroduce raw compact `nx`/`ny` interpolation or dense inverse/search
-  normal decoding.
-- Preserve deterministic tracing and the current metric semantics.
+- Keep the sparse corner/tensor Lasagna normal sampler and `eigh` principal
+  axis reconstruction as the default quality path.
+- Reuse the same approved whole-fiber benchmark command; change defaults or
+  config rather than introducing new benchmark flags.
+- Try the more invasive lookup optimization: avoid repeated small
+  `grid_sample`/block-copy work for cached inference field point sampling.
+- Test whether larger missing-block inference batches improve speed without
+  changing the metric result.
+- Measure every optimization with the same benchmark and compare restarts,
+  wall/CPU time, and profile stages.
+- Document any experimental path that worsens quality or is not kept as the
+  default.

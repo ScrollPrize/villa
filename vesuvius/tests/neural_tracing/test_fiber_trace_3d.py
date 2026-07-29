@@ -3339,6 +3339,7 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.max_cached_inference_gib == pytest.approx(8.0)
     assert args.normal_sampler == "sparse-corner-principal"
     assert args.vis is False
+    assert args.profile is False
 
 
 def test_native_3d_trace2cp_help_shows_defaults(
@@ -5344,6 +5345,46 @@ def test_native_3d_principal_tensor_axes_torch_matches_numpy() -> None:
     )
 
     assert np.allclose(actual, expected, atol=2.0e-5)
+
+
+def test_native_3d_principal_tensor_axes_torch_analytic_matches_numpy() -> None:
+    rng = np.random.default_rng(11)
+    vectors = rng.normal(size=(12, 4, 3)).astype(np.float64)
+    weights = rng.uniform(0.2, 2.0, size=(12, 4)).astype(np.float64)
+    tensors = np.einsum("nk,nki,nkj->nij", weights, vectors, vectors, optimize=True)
+    tensors += np.eye(3, dtype=np.float64)[None, :, :] * 0.05
+    hints = rng.normal(size=(12, 3)).astype(np.float64)
+    hints[2] = 0.0
+    hints[7] = np.nan
+
+    eigenvalues, eigenvectors = np.linalg.eigh(tensors)
+    expected = eigenvectors[
+        np.arange(int(tensors.shape[0])),
+        :,
+        np.argmax(eigenvalues, axis=1),
+    ]
+    expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    hint_norm = np.linalg.norm(hints, axis=1)
+    valid_hint = np.isfinite(hint_norm) & (hint_norm > 1.0e-12)
+    hint_unit = np.zeros_like(hints)
+    hint_unit[valid_hint] = hints[valid_hint] / hint_norm[valid_hint, None]
+    expected[
+        valid_hint & (np.sum(expected * hint_unit, axis=1) < 0.0)
+    ] *= -1.0
+    expected[(~valid_hint) & (expected[:, 2] < 0.0)] *= -1.0
+
+    actual = (
+        _principal_tensor_axes_torch(
+            torch.as_tensor(tensors, dtype=torch.float32),
+            torch.as_tensor(hints, dtype=torch.float32),
+            method="analytic",
+        )
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    assert np.allclose(actual, expected, atol=1.0e-3)
 
 
 def test_native_3d_trace2cp_normal_comparison_returns_alternate_below_threshold() -> None:

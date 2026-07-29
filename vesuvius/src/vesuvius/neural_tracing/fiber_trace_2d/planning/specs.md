@@ -717,7 +717,13 @@
   perform grid search, or interpolate normals by reference-line progress.
   Once the sign-invariant local tensor is built from decoded compact-normal
   corners, the principal axis may be recovered with a batched symmetric
-  eigensolve or another measured tensor principal-axis method. With a valid
+  eigensolve or another measured tensor principal-axis method. The native 3D
+  default is `--normal-principal-axis-method config`, which resolves to
+  `native_trace2cp.normal_principal_axis_method` when present and otherwise to
+  `eigh`. The explicit `analytic` method is an experimental closed-form
+  symmetric-tensor principal-axis decoder. It must remain opt-in unless the
+  approved whole-fiber benchmark matches the `eigh` restart metric and improves
+  timing. With a valid
   candidate normal axis,
   smoothness is split into tangent-plane turn and normal-tilt turn using the
   vector-normal projection equations from the pre-acceleration tracer:
@@ -770,6 +776,10 @@
 - The native 3D CLI prints live progress bars for forward and backward tracing.
   Progress is measured by signed target-plane progress along the initial
   CP-to-CP direction. It includes step count, ETA, and inferred-block count.
+- Native 3D Trace2CP always reports final metric lines plus total trace
+  wall/CPU time. Detailed per-stage profiling is opt-in through `--profile`,
+  because profiling uses instrumentation and some CUDA synchronizations that
+  should not slow ordinary metric-only runs.
 - When `--vis` is supplied, native 3D strip visualization prints live progress
   for rendering stages and
   for side/top presence-strip sampling. Presence progress must report

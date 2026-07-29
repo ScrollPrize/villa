@@ -1,5 +1,10 @@
 # 2026-07-28
 
+- Native 3D Trace2CP detailed stage profiling is now opt-in with `--profile`;
+  ordinary metric runs still print final metric and total wall/CPU timing
+  without per-stage instrumentation overhead. Added an explicit experimental
+  `--normal-principal-axis-method analytic` path for sparse normal
+  reconstruction while keeping `eigh` as the quality-matching default.
 - Accelerated native 3D whole-fiber Trace2CP hot-path lookup/scoring while
   preserving the reference benchmark metric: point lookup now routes candidate
   batches with torch block-origin/grouping, duplicate current-point field
