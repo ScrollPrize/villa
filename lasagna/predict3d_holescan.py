@@ -1078,13 +1078,92 @@ def scan_target(
 	progress_total: int | None = None,
 	workers: int = 1,
 ) -> list[HoleFinding]:
+	Z, eff_slab_z, blocks = _target_blocks(target, block_yx, slab_z)
+	findings: list[HoleFinding] = []
+	target_total = len(blocks)
+	overall_total = int(progress_total) if progress_total is not None else target_total
 	max_workers = max(1, int(workers))
 	flood = _build_flood_filter(target, workers=max_workers, progress=progress)
-	return _report_findings_from_flood(
-		flood,
-		progress=progress,
-		on_finding=on_finding,
-	)
+	if max_workers <= 1 or target_total <= 1:
+		for done_blocks, (y0, y1, x0, x1) in enumerate(blocks):
+			if progress is not None:
+				progress(
+					target.name,
+					progress_offset + done_blocks,
+					overall_total,
+					f"y={y0}-{y1 - 1} x={x0}-{x1 - 1}",
+				)
+			block_findings = _filter_findings_with_flood(
+				_scan_block_job(
+					target,
+					Z,
+					y0,
+					y1,
+					x0,
+					x1,
+					eff_slab_z,
+					bracket_window,
+					min_neighbor_density,
+					drop_ratio,
+					max_low_density,
+				),
+				flood=flood,
+				progress=None,
+			)
+			findings.extend(block_findings)
+			if on_finding is not None:
+				for finding in block_findings:
+					on_finding(finding)
+	else:
+		kwargs = {}
+		ctx = _process_pool_context()
+		if ctx is not None:
+			kwargs["mp_context"] = ctx
+		kwargs["initializer"] = _init_tensorstore_worker
+		kwargs["initargs"] = (target, None, None)
+		with ProcessPoolExecutor(max_workers=max_workers, **kwargs) as pool:
+			futures = {
+				pool.submit(
+					_scan_block_worker,
+					(
+						Z,
+						y0,
+						y1,
+						x0,
+						x1,
+						eff_slab_z,
+						bracket_window,
+						min_neighbor_density,
+						drop_ratio,
+						max_low_density,
+					),
+				): (y0, y1, x0, x1)
+				for y0, y1, x0, x1 in blocks
+			}
+			done_blocks = 0
+			for future in as_completed(futures):
+				y0, y1, x0, x1 = futures[future]
+				block_findings = _filter_findings_with_flood(
+					future.result(),
+					flood=flood,
+					progress=None,
+				)
+				findings.extend(block_findings)
+				if on_finding is not None:
+					for finding in sorted(block_findings, key=lambda f: (f.z0, f.z1, f.y0, f.x0)):
+						on_finding(finding)
+				done_blocks += 1
+				if progress is not None:
+					progress(
+						target.name,
+						progress_offset + done_blocks,
+						overall_total,
+						f"finished y={y0}-{y1 - 1} x={x0}-{x1 - 1}",
+					)
+	if progress is not None:
+		progress(target.name, progress_offset + target_total, overall_total, "done")
+	findings.sort(key=lambda f: (f.z0, f.z1, f.y0, f.x0))
+	return findings
 
 
 def scan_path(
