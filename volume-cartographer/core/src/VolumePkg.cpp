@@ -614,6 +614,7 @@ const std::vector<vc::project::Entry>& VolumePkg::volumeEntries() const { return
 const std::vector<vc::project::Entry>& VolumePkg::segmentEntries() const { return segments_; }
 const std::vector<vc::project::Entry>& VolumePkg::normalGridEntries() const { return normalGrids_; }
 const std::vector<vc::project::Entry>& VolumePkg::lasagnaDatasetEntries() const { return lasagnaDatasets_; }
+const std::vector<vc::project::Entry>& VolumePkg::fiberInferenceDatasetEntries() const { return fiberInferenceDatasets_; }
 
 std::optional<vc::project::Entry>
 VolumePkg::matchingVolumeEntry(const std::string& location) const
@@ -1150,6 +1151,45 @@ bool VolumePkg::reconcileLasagnaDatasetEntryTags(
     return false;
 }
 
+bool VolumePkg::addFiberInferenceDatasetEntry(const std::string& location,
+                                              std::vector<std::string> tags)
+{
+    if (location.empty()) return false;
+    for (const auto& entry : fiberInferenceDatasets_)
+        if (entry.location == location) return false;
+    fiberInferenceDatasets_.push_back({location, std::move(tags)});
+    persistProjectState();
+    return true;
+}
+
+bool VolumePkg::reconcileFiberInferenceDatasetEntryTags(
+    const std::string& location,
+    const std::vector<std::string>& tags,
+    const std::vector<std::string>& singletonPrefixes)
+{
+    for (auto& entry : fiberInferenceDatasets_) {
+        if (entry.location != location) continue;
+        auto reconciled = entry.tags;
+        for (const auto& prefix : singletonPrefixes) {
+            reconciled.erase(
+                std::remove_if(reconciled.begin(), reconciled.end(), [&](const auto& tag) {
+                    return tag.rfind(prefix, 0) == 0;
+                }),
+                reconciled.end());
+        }
+        for (const auto& tag : tags) {
+            if (!tag.empty() &&
+                std::find(reconciled.begin(), reconciled.end(), tag) == reconciled.end())
+                reconciled.push_back(tag);
+        }
+        if (reconciled == entry.tags) return false;
+        entry.tags = std::move(reconciled);
+        persistProjectState();
+        return true;
+    }
+    return false;
+}
+
 bool VolumePkg::removeEntry(const std::string& location)
 {
     auto eraseFrom = [&](std::vector<vc::project::Entry>& v) {
@@ -1164,8 +1204,13 @@ bool VolumePkg::removeEntry(const std::string& location)
     if (eraseFrom(segments_)) removed = true;
     if (eraseFrom(normalGrids_)) removed = true;
     if (eraseFrom(lasagnaDatasets_)) removed = true;
+    if (eraseFrom(fiberInferenceDatasets_)) removed = true;
     if (removed) {
         if (outputSegments_ && *outputSegments_ == location) outputSegments_.reset();
+        if (selectedLasagnaDataset_ && *selectedLasagnaDataset_ == location)
+            selectedLasagnaDataset_.reset();
+        if (selectedFiberInferenceDataset_ && *selectedFiberInferenceDataset_ == location)
+            selectedFiberInferenceDataset_.reset();
         if (!opts_.deferResolution) resolveAll();
         persistProjectState();
     }
@@ -1221,6 +1266,35 @@ fs::path VolumePkg::selectedLasagnaDatasetPath() const
     if (!selectedLasagnaDataset_) return {};
     if (vc::project::isLocationRemote(*selectedLasagnaDataset_)) return {};
     return vc::project::resolveLocalPath(*selectedLasagnaDataset_, path_.parent_path());
+}
+
+std::string VolumePkg::selectedFiberInferenceDataset() const
+{
+    return selectedFiberInferenceDataset_.value_or(std::string{});
+}
+
+void VolumePkg::setSelectedFiberInferenceDataset(std::string location)
+{
+    if (location.empty()) {
+        clearSelectedFiberInferenceDataset();
+        return;
+    }
+    selectedFiberInferenceDataset_ = std::move(location);
+    persistProjectState();
+}
+
+void VolumePkg::clearSelectedFiberInferenceDataset()
+{
+    if (!selectedFiberInferenceDataset_) return;
+    selectedFiberInferenceDataset_.reset();
+    persistProjectState();
+}
+
+fs::path VolumePkg::selectedFiberInferenceDatasetPath() const
+{
+    if (!selectedFiberInferenceDataset_) return {};
+    if (vc::project::isLocationRemote(*selectedFiberInferenceDataset_)) return {};
+    return vc::project::resolveLocalPath(*selectedFiberInferenceDataset_, path_.parent_path());
 }
 
 bool VolumePkg::hasVolumes() const { return !loadedVolumes_.empty(); }
@@ -1960,9 +2034,11 @@ utils::Json VolumePkg::toJson() const
     j["segments"] = entriesToJson(segments_);
     j["normal_grids"] = entriesToJson(normalGrids_);
     j["lasagna_datasets"] = entriesToJson(lasagnaDatasets_);
+    j["fiber_inference_datasets"] = entriesToJson(fiberInferenceDatasets_);
     if (!remoteCacheRoot_.empty()) j["remote_cache_root"] = remoteCacheRoot_.string();
     if (outputSegments_) j["output_segments"] = *outputSegments_;
     if (selectedLasagnaDataset_) j["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
+    if (selectedFiberInferenceDataset_) j["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
     return j;
 }
 
@@ -1975,6 +2051,8 @@ void VolumePkg::fromJson(const utils::Json& j)
     if (j.contains("normal_grids")) normalGrids_ = entriesFromJson(j.at("normal_grids"));
     if (j.contains("lasagna_datasets"))
         lasagnaDatasets_ = entriesFromJson(j.at("lasagna_datasets"));
+    if (j.contains("fiber_inference_datasets"))
+        fiberInferenceDatasets_ = entriesFromJson(j.at("fiber_inference_datasets"));
     if (j.contains("remote_cache_root")) {
         remoteCacheRoot_ = j.at("remote_cache_root").get_string();
         if (!remoteCacheRoot_.empty()) {
@@ -1985,6 +2063,10 @@ void VolumePkg::fromJson(const utils::Json& j)
     if (j.contains("selected_lasagna_dataset")) {
         selectedLasagnaDataset_ = j.at("selected_lasagna_dataset").get_string();
         if (selectedLasagnaDataset_->empty()) selectedLasagnaDataset_.reset();
+    }
+    if (j.contains("selected_fiber_inference_dataset")) {
+        selectedFiberInferenceDataset_ = j.at("selected_fiber_inference_dataset").get_string();
+        if (selectedFiberInferenceDataset_->empty()) selectedFiberInferenceDataset_.reset();
     }
 }
 

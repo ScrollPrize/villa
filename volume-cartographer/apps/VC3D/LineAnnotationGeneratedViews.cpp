@@ -7,6 +7,7 @@
 #include "volume_viewers/CVolumeViewerView.hpp"
 
 #include <QAction>
+#include <QApplication>
 #include <QMenu>
 #include <QRect>
 #include <QWidget>
@@ -733,7 +734,55 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             ? selectedIndex
             : selectedControl.controlIndex;
 
+    std::optional<std::pair<size_t, size_t>> traceSegment;
+    if (options.traceFiberSegment &&
+        (QApplication::keyboardModifiers() & Qt::ControlModifier)) {
+        std::vector<const GeneratedOverlay::ControlPointMarker*> sortedControls;
+        sortedControls.reserve(options.controlPoints.size());
+        for (const auto& control : options.controlPoints) {
+            if (control.controlIndex == std::numeric_limits<size_t>::max() ||
+                !validGeneratedLinePosition(control.linePosition, options.linePointCount)) {
+                continue;
+            }
+            sortedControls.push_back(&control);
+        }
+        std::sort(sortedControls.begin(), sortedControls.end(), [](const auto* a, const auto* b) {
+            return a->linePosition < b->linePosition;
+        });
+        for (size_t i = 1; i < sortedControls.size(); ++i) {
+            const auto* prev = sortedControls[i - 1];
+            const auto* next = sortedControls[i];
+            if (options.linePosition >= prev->linePosition &&
+                options.linePosition <= next->linePosition) {
+                traceSegment = {prev->controlIndex, next->controlIndex};
+                break;
+            }
+        }
+        if (!traceSegment && sortedControls.size() >= 2) {
+            for (size_t i = 0; i < sortedControls.size(); ++i) {
+                if (sortedControls[i]->controlIndex != selectedControlIndex) {
+                    continue;
+                }
+                if (i + 1 < sortedControls.size()) {
+                    traceSegment = {
+                        sortedControls[i]->controlIndex,
+                        sortedControls[i + 1]->controlIndex};
+                } else if (i > 0) {
+                    traceSegment = {
+                        sortedControls[i - 1]->controlIndex,
+                        sortedControls[i]->controlIndex};
+                }
+                break;
+            }
+        }
+    }
+
     QMenu menu(options.parent);
+    QAction* traceFiberSegmentAction = nullptr;
+    if (traceSegment) {
+        traceFiberSegmentAction = menu.addAction(
+            QWidget::tr("Optimize segment with native fiber tracer"));
+    }
     QAction* deleteAction = menu.addAction(QWidget::tr("Delete control point"));
     deleteAction->setEnabled(options.controlPoints.size() > 1);
     QAction* designateLinkCandidateAction = nullptr;
@@ -854,6 +903,10 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         if (options.deleteControlPoint) {
             options.deleteControlPoint(selectedControl.linePosition, selectedControl.point);
         }
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (traceFiberSegmentAction && selected == traceFiberSegmentAction) {
+        options.traceFiberSegment(traceSegment->first, traceSegment->second);
         return GeneratedControlPointContextResult::Handled;
     }
     for (const auto& [action, branch] : openBranchActions) {

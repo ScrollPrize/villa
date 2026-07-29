@@ -34,6 +34,10 @@ development is based around the docs in the planning/ subdir
   or intentionally skipped requirement must be reported explicitly in
   planning/task_log.md and in the final user response for that task. Silent
   simplification or silent postponement is not allowed.
+- Do not copy an existing implementation into a new location because it is not
+  currently exported. Extract the common behavior into a shared helper/library
+  and port existing callers to it. If a task cannot do that cleanly, record it
+  as a deviation in planning/task_log.md before continuing.
 - planning/task_log.md is for the current active task only. When starting a new
   task, replace its contents with that task's implementation notes, deviations,
   validation commands, and results. Do not preserve or append historical logs

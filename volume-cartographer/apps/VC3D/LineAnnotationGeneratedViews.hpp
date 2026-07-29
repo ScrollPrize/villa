@@ -945,6 +945,7 @@ struct GeneratedControlPointContextMenuOptions {
     std::function<void(size_t, cv::Vec3f)> designateLinkCandidate;
     std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
     std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
+    std::function<void(size_t, size_t)> traceFiberSegment;
 };
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,

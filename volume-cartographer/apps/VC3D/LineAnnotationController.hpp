@@ -425,6 +425,9 @@ private:
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
+    void handleGeneratedFiberTraceSegment(const std::string& surfaceName,
+                                          size_t firstControlPointIndex,
+                                          size_t secondControlPointIndex);
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
                                                   size_t controlPointIndex,
                                                   cv::Vec3f volumePoint);
@@ -450,6 +453,7 @@ private:
             std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers,
             const std::vector<FiberBranchRef>& branches) const;
     bool ensureDatasetForSession(LineAnnotationSession& session);
+    bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session);
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
                                                   bool fireSuccessCallback);

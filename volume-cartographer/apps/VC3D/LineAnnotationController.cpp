@@ -30,6 +30,7 @@
 #include "vc/lasagna/LineModel.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/fiber_tracer/FiberTrace.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
@@ -106,9 +107,13 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string surfaceName;
     std::string selectedDatasetLocation;
     fs::path selectedManifestPath;
+    std::string selectedFiberInferenceDatasetLocation;
+    fs::path selectedFiberInferenceManifestPath;
     double workingToBaseScale = 1.0;
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
+    std::shared_ptr<vc::lasagna::LasagnaDataset> fiberInferenceDataset;
+    std::shared_ptr<vc::fiber_tracer::FiberPredictionField> fiberPredictionField;
     TaskState taskState = TaskState::Idle;
     cv::Vec3d seedPoint{0.0, 0.0, 0.0};
     std::string sourceAnnotationSurfaceName;
@@ -2101,6 +2106,16 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             this,
             [this](const std::string& name) {
                 handleGeneratedSideStripIntersectionQuery(name);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::generatedFiberTraceSegmentRequested,
+            this,
+            [this](const std::string& name,
+                   size_t firstControlPointIndex,
+                   size_t secondControlPointIndex) {
+                handleGeneratedFiberTraceSegment(name,
+                                                 firstControlPointIndex,
+                                                 secondControlPointIndex);
             });
     connect(dialog, &LineAnnotationDialog::showAsMeshRequested, this, [this, surfaceName]() {
         handleShowAsMesh(surfaceName);
@@ -6732,6 +6747,297 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     session.selectedManifestPath = manifestPath;
     session.workingToBaseScale = workingToBaseScale;
     return true;
+}
+
+bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
+    LineAnnotationSession& session)
+{
+    const bool headless = session.suppressErrorDialogs || _errorDialogsSuppressed;
+    if (!_state || !_state->vpkg()) {
+        showError(tr("No volume package loaded."), headless);
+        return false;
+    }
+
+    auto vpkg = _state->vpkg();
+    std::string selected = vpkg->selectedFiberInferenceDataset();
+    if (selected.empty() && vpkg->fiberInferenceDatasetEntries().size() == 1) {
+        selected = vpkg->fiberInferenceDatasetEntries().front().location;
+        vpkg->setSelectedFiberInferenceDataset(selected);
+    }
+
+    fs::path manifestPath;
+    if (!selected.empty() && !vc::project::isLocationRemote(selected)) {
+        manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
+    }
+    if (selected.empty()) {
+        const fs::path startDir = vpkg->path().empty()
+            ? fs::path{}
+            : vpkg->path().parent_path();
+        auto picked = (_datasetPicker && !headless)
+            ? _datasetPicker(_parentWidget, startDir)
+            : std::optional<std::string>{};
+        if (!picked || picked->empty()) {
+            if (headless) {
+                showError(tr("No fiber inference dataset is selected for the active project."),
+                          true);
+            }
+            return false;
+        }
+        selected = *picked;
+        if (vc::project::isLocationRemote(selected)) {
+            showError(tr("Fiber inference dataset selection must point to a local "
+                         "Lasagna-style manifest or manifest cache."),
+                      headless);
+            return false;
+        }
+        manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
+        vpkg->setSelectedFiberInferenceDataset(selected);
+        vpkg->addFiberInferenceDatasetEntry(selected);
+    }
+    if (manifestPath.empty()) {
+        showError(tr("Selected fiber inference dataset does not resolve to a local manifest."),
+                  headless);
+        return false;
+    }
+
+    const bool scaleChanged =
+        !session.fiberInferenceDataset ||
+        session.fiberInferenceDataset->manifest().workingToBaseScale !=
+            session.workingToBaseScale;
+    if (!session.fiberPredictionField ||
+        session.selectedFiberInferenceManifestPath != manifestPath ||
+        scaleChanged) {
+        try {
+            auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+                vc::lasagna::LasagnaDataset::open(
+                    manifestPath, {session.workingToBaseScale}));
+            auto field = std::make_shared<vc::fiber_tracer::FiberPredictionField>(*dataset);
+            session.fiberInferenceDataset = std::move(dataset);
+            session.fiberPredictionField = std::move(field);
+        } catch (const std::exception& ex) {
+            showError(tr("Invalid selected fiber inference dataset: %1")
+                          .arg(QString::fromStdString(ex.what())),
+                      headless);
+            return false;
+        }
+    }
+
+    session.selectedFiberInferenceDatasetLocation = selected;
+    session.selectedFiberInferenceManifestPath = manifestPath;
+    return true;
+}
+
+void LineAnnotationController::handleGeneratedFiberTraceSegment(
+    const std::string& surfaceName,
+    size_t firstControlPointIndex,
+    size_t secondControlPointIndex)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+
+    auto& session = *pane->session;
+    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+        showError(tr("Line optimization is already running."),
+                  session.suppressErrorDialogs);
+        return;
+    }
+    if (session.optimizedLine.points.size() < 2 || session.controlPoints.size() < 2) {
+        return;
+    }
+    if (firstControlPointIndex >= session.controlPoints.size() ||
+        secondControlPointIndex >= session.controlPoints.size() ||
+        firstControlPointIndex == secondControlPointIndex) {
+        showError(tr("Native fiber tracer received an invalid control-point segment."),
+                  session.suppressErrorDialogs);
+        return;
+    }
+    if (!ensureDatasetForSession(session) ||
+        !ensureFiberInferenceDatasetForSession(session)) {
+        return;
+    }
+    if (!session.normalSampler || !session.fiberPredictionField) {
+        showError(tr("Native fiber tracer requires both a Lasagna normal dataset and "
+                     "a fiber inference dataset."),
+                  session.suppressErrorDialogs);
+        return;
+    }
+
+    double voxelSizeUm = 0.0;
+    try {
+        if (_state && _state->currentVolume()) {
+            voxelSizeUm = _state->currentVolume()->voxelSize();
+        }
+    } catch (...) {
+        voxelSizeUm = 0.0;
+    }
+    if (!(voxelSizeUm > 0.0) || !std::isfinite(voxelSizeUm)) {
+        showError(tr("Native fiber tracer requires positive voxel-size metadata."),
+                  session.suppressErrorDialogs);
+        return;
+    }
+
+    auto resolveLineIndex = [&session](size_t controlIndex) -> std::optional<size_t> {
+        const auto& control = session.controlPoints[controlIndex];
+        const int pointCount = static_cast<int>(session.optimizedLine.points.size());
+        if (pointCount <= 0) {
+            return std::nullopt;
+        }
+        if (control.optimizedIndex >= 0 && control.optimizedIndex < pointCount) {
+            return static_cast<size_t>(control.optimizedIndex);
+        }
+        if (!std::isfinite(control.linePosition)) {
+            return std::nullopt;
+        }
+        const int index = std::clamp(static_cast<int>(std::llround(control.linePosition)),
+                                     0,
+                                     pointCount - 1);
+        return static_cast<size_t>(index);
+    };
+    const auto firstLineIndex = resolveLineIndex(firstControlPointIndex);
+    const auto secondLineIndex = resolveLineIndex(secondControlPointIndex);
+    if (!firstLineIndex || !secondLineIndex || *firstLineIndex == *secondLineIndex) {
+        showError(tr("Native fiber tracer could not resolve the selected CP span on the line."),
+                  session.suppressErrorDialogs);
+        return;
+    }
+
+    if (session.fiberId != 0 && session.fiberMetricsMatchStoredFiber) {
+        session.fiberMetricsMatchStoredFiber = false;
+        invalidateFiberAlignmentMetrics(session.fiberId, true);
+    }
+
+    std::vector<cv::Vec3d> initialLinePoints;
+    initialLinePoints.reserve(session.optimizedLine.points.size());
+    for (const auto& point : session.optimizedLine.points) {
+        initialLinePoints.push_back(point.position);
+    }
+    auto controlPoints = session.controlPoints;
+    const auto manifestPath = session.selectedManifestPath;
+    auto normalSampler = session.normalSampler;
+    auto predictionField = session.fiberPredictionField;
+    const size_t startLineIndex = *firstLineIndex;
+    const size_t targetLineIndex = *secondLineIndex;
+
+    session.taskState = LineAnnotationSession::TaskState::Running;
+    session.error.clear();
+    session.pendingOptimizationState = SessionOptimizationState::Incremental;
+    auto* watcher = new QFutureWatcher<OptimizationTaskResult>(this);
+    session.watcher = watcher;
+    if (pane->dialog) {
+        pane->dialog->setOptimizationBusy(true);
+    }
+    connect(watcher,
+            &QFutureWatcher<OptimizationTaskResult>::finished,
+            this,
+            [this, surfaceName, watcher]() {
+                finishOptimization(surfaceName);
+                watcher->deleteLater();
+            });
+
+    watcher->setFuture(QtConcurrent::run([manifestPath,
+                                           controlPoints = std::move(controlPoints),
+                                           initialLinePoints = std::move(initialLinePoints),
+                                           normalSampler,
+                                           predictionField,
+                                           startLineIndex,
+                                           targetLineIndex,
+                                           voxelSizeUm]() mutable {
+        OptimizationTaskResult task;
+        task.manifestPath = manifestPath;
+        task.controlPoints = std::move(controlPoints);
+        task.eventName = "native_fiber_trace3d_segment";
+        if (!task.controlPoints.empty()) {
+            const auto seedIt = std::find_if(task.controlPoints.begin(),
+                                             task.controlPoints.end(),
+                                             [](const vc::lasagna::LineControlPoint& control) {
+                                                 return control.isSeed;
+                                             });
+            task.seedPoint = (seedIt == task.controlPoints.end()
+                ? task.controlPoints.front()
+                : *seedIt).volumePoint;
+        }
+        try {
+            vc::fiber_tracer::FiberTraceSegmentRequest request;
+            request.referenceLine = initialLinePoints;
+            request.startIndex = startLineIndex;
+            request.targetIndex = targetLineIndex;
+            request.targetPlaneNormal =
+                vc::fiber_tracer::referenceTangentToward(initialLinePoints,
+                                                         startLineIndex,
+                                                         targetLineIndex);
+            request.config.voxelSizeUm = voxelSizeUm;
+            request.config.endpointAcceptThresholdUm = 50.0;
+            const auto start = Clock::now();
+            const vc::fiber_tracer::FiberTraceSegmentResult traced =
+                vc::fiber_tracer::traceFiberSegment(
+                    *predictionField,
+                    request,
+                    normalSampler.get(),
+                    [](const vc::fiber_tracer::FiberTraceProgress& progress) {
+                        if (progress.step == 0 ||
+                            !progress.reason.empty() ||
+                            (progress.step % 100) == 0) {
+                            Logger()->info("Native fiber trace: phase={} step={}/{} "
+                                           "plane_progress={:.3f} reason={}",
+                                           progress.phase,
+                                           progress.step,
+                                           progress.maxSteps,
+                                           progress.targetPlaneProgress,
+                                           progress.reason);
+                        }
+                    });
+            const double totalMs = elapsedMs(start, Clock::now());
+            if (!traced.accepted) {
+                task.ok = false;
+                std::ostringstream msg;
+                msg << "Native fiber trace rejected: reason=" << traced.reason
+                    << " max_endpoint_error_um=" << traced.maxEndpointErrorUm;
+                task.error = msg.str();
+                return task;
+            }
+            if (traced.fusedLine.size() < 2) {
+                task.ok = false;
+                task.error = "Native fiber trace produced fewer than two fused points.";
+                return task;
+            }
+
+            const size_t left = std::min(startLineIndex, targetLineIndex);
+            const size_t right = std::max(startLineIndex, targetLineIndex);
+            std::vector<cv::Vec3d> replacement = traced.fusedLine;
+            if (startLineIndex > targetLineIndex) {
+                std::reverse(replacement.begin(), replacement.end());
+            }
+            replacement.front() = initialLinePoints[left];
+            replacement.back() = initialLinePoints[right];
+
+            std::vector<cv::Vec3d> merged;
+            merged.reserve(left + replacement.size() +
+                           (initialLinePoints.size() - right - 1));
+            merged.insert(merged.end(),
+                          initialLinePoints.begin(),
+                          initialLinePoints.begin() + static_cast<std::ptrdiff_t>(left));
+            merged.insert(merged.end(), replacement.begin(), replacement.end());
+            merged.insert(merged.end(),
+                          initialLinePoints.begin() + static_cast<std::ptrdiff_t>(right + 1),
+                          initialLinePoints.end());
+
+            task.result.line =
+                LineAnnotationController::lineModelFromPoints(merged, normalSampler.get());
+            task.result.report.totalMs = totalMs;
+            task.result.report.message = "native_fiber_trace3d_segment";
+            task.result.report.finalRms = traced.maxEndpointErrorUm;
+            task.ok = true;
+        } catch (const std::exception& ex) {
+            task.ok = false;
+            task.error = ex.what();
+        } catch (...) {
+            task.ok = false;
+            task.error = "Unknown native fiber trace error.";
+        }
+        return task;
+    }));
 }
 
 bool LineAnnotationController::needsFinalOptimization(const LineAnnotationSession& session) const

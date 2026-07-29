@@ -87,6 +87,7 @@ public:
     [[nodiscard]] const std::vector<vc::project::Entry>& segmentEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& normalGridEntries() const;
     [[nodiscard]] const std::vector<vc::project::Entry>& lasagnaDatasetEntries() const;
+    [[nodiscard]] const std::vector<vc::project::Entry>& fiberInferenceDatasetEntries() const;
     [[nodiscard]] std::optional<vc::project::Entry>
     matchingVolumeEntry(const std::string& location) const;
     [[nodiscard]] std::optional<vc::project::Entry>
@@ -134,6 +135,12 @@ public:
         const std::string& location,
         const std::vector<std::string>& tags,
         const std::vector<std::string>& singletonPrefixes);
+    bool addFiberInferenceDatasetEntry(const std::string& location,
+                                       std::vector<std::string> tags = {});
+    bool reconcileFiberInferenceDatasetEntryTags(
+        const std::string& location,
+        const std::vector<std::string>& tags,
+        const std::vector<std::string>& singletonPrefixes);
     bool removeEntry(const std::string& location);
 
     void setOutputSegments(const std::string& location);
@@ -145,6 +152,10 @@ public:
     void setSelectedLasagnaDataset(std::string location);
     void clearSelectedLasagnaDataset();
     [[nodiscard]] std::filesystem::path selectedLasagnaDatasetPath() const;
+    [[nodiscard]] std::string selectedFiberInferenceDataset() const;
+    void setSelectedFiberInferenceDataset(std::string location);
+    void clearSelectedFiberInferenceDataset();
+    [[nodiscard]] std::filesystem::path selectedFiberInferenceDatasetPath() const;
 
     [[nodiscard]] bool hasVolumes() const;
     [[nodiscard]] bool hasVolume(const std::string& id) const;
@@ -215,8 +226,10 @@ private:
     std::vector<vc::project::Entry> segments_;
     std::vector<vc::project::Entry> normalGrids_;
     std::vector<vc::project::Entry> lasagnaDatasets_;
+    std::vector<vc::project::Entry> fiberInferenceDatasets_;
     std::optional<std::string> outputSegments_;
     std::optional<std::string> selectedLasagnaDataset_;
+    std::optional<std::string> selectedFiberInferenceDataset_;
 
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;

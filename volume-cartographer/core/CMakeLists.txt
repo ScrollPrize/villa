@@ -148,6 +148,7 @@ add_library(vc_inpaint src/InpaintSurface.cpp)
 target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
 
 add_library(vc_lasagna
+    src/lasagna/ChannelSampler.cpp
     src/lasagna/Dataset.cpp
     src/lasagna/EclMaxflow.cpp
     src/lasagna/EclMaxflowCut.cpp
@@ -185,6 +186,11 @@ add_library(vc_atlas
 )
 target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
 
+add_library(vc_fiber_tracer
+    src/fiber_tracer/FiberTrace.cpp
+)
+target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna)
+
 add_library(vc_tracer
     src/GrowPatch.cpp
     src/GrowSurface.cpp
@@ -199,7 +205,7 @@ target_link_libraries(vc_tracer PUBLIC vc_core vc_flattening Ceres::ceres)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 
 if(VC_USE_PCH)
-    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_atlas vc_tracer)
+    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_atlas vc_fiber_tracer vc_tracer)
         target_precompile_headers(${_lib} REUSE_FROM vc_common_pch)
     endforeach()
 endif()

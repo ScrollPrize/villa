@@ -873,6 +873,34 @@
   full-precision `native_trace2cp_fiber_restarts_per_kvx` and optional
   `native_trace2cp_fiber_restarts_per_meter`, and the old segment-normalized
   fraction only as `restart_fraction_per_segment`.
+- VC3D native GUI fiber tracing is a segment-local port of the 3D Trace2CP
+  behavior. It consumes a precomputed fiber inference `.lasagna.json` dataset
+  from the project and never runs PyTorch/model inference inside VC3D.
+- VC3D projects store fiber inference dataset entries independently from
+  normal Lasagna datasets, using the same project-entry pattern and the
+  selected-dataset field `selected_fiber_inference_dataset`. A native GUI trace
+  requires both a normal Lasagna dataset for geometry normals and a selected
+  fiber inference dataset for persisted `presence`/`nx`/`ny` prediction fields.
+- Native GUI fiber prediction must decode persisted fiber inference channels
+  with the shared `vc_lasagna` compact-channel helper. It must not copy private
+  normal-sampler logic, raw-interpolate compact `nx`/`ny` values as ordinary
+  directions, or invent a separate remote-cache path.
+- The first VC3D GUI action is Ctrl-right-click on a generated line annotation
+  CP/segment context menu, then "Optimize segment with native fiber tracer".
+  The action traces only the adjacent CP-to-CP span around the clicked line
+  position, runs bidirectional tracing in a background task, blocks line edits
+  while the task is running, and splices the accepted fused segment back into
+  the existing line. Original CP coordinates must remain exact.
+- Native GUI segment optimization applies only when both traced directions
+  reach the target plane and the maximum endpoint in-plane error is at most
+  `50 um`, converted with `Volume::voxelSize()`. If positive voxel-size
+  metadata is unavailable, or the endpoint threshold fails, the GUI must leave
+  the fiber unchanged and report the failure.
+- Tracer-optimized segment metadata and regular-optimizer protection are part
+  of the native GUI contract: accepted segments should persist endpoint error,
+  tracer version/config, and unchanged endpoint signatures; unchanged optimized
+  segments should be protected from ordinary reoptimization, while CP
+  move/delete/insertion invalidates that metadata.
 - Native 3D single-pair visualization first builds the initial side/top strip
   source from the existing 2D Trace2CP geometry loader for the input CP pair.
   In single-pair mode, the configured cross-strip height is a maximum cap: the

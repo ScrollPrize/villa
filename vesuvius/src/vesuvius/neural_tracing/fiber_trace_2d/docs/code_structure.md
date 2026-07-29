@@ -621,6 +621,18 @@ Ownership changed as follows:
   branch-aware point sampling to the tracer. Precomputed fiber prediction
   outputs are not wired yet, but should use the same field-provider contract
   when added.
+- VC3D contains an initial native C++ segment tracer under
+  `volume-cartographer/core/include/vc/fiber_tracer/` and
+  `volume-cartographer/core/src/fiber_tracer/`. The core target
+  `vc_fiber_tracer` is Qt-free, reads persisted fiber inference
+  `presence`/`nx`/`ny` channels from a Lasagna-style manifest, and uses the
+  shared `vc_lasagna` compact-channel sampling helper instead of duplicating
+  `LasagnaNormalSampler` internals. The VC3D line annotation GUI stores a
+  selected fiber inference dataset in the project and exposes a Ctrl-right-click
+  generated-line action, "Optimize segment with native fiber tracer", for a
+  CP-to-CP span. The task runs through the existing line-optimization busy
+  state, so line edits are blocked while it runs, and accepted results are
+  spliced back through the existing generated-view/save path.
 - 3D prefetch computes a CP-centered selected-level augmentation-envelope bbox
   and asks VC3D for authoritative bbox-to-chunk dependency metadata. This avoids
   materializing representative coordinates or reconstructing chunk paths in

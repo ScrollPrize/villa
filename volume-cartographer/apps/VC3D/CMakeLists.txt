@@ -334,6 +334,7 @@ target_link_libraries(VC3D
     vc_core
     vc_atlas
     vc_lasagna
+    vc_fiber_tracer
     vc_tracer
     vc_flattening
     Ceres::ceres

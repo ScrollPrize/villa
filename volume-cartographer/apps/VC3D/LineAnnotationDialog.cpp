@@ -1433,6 +1433,12 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                              branchControlPointIndex,
                                                              pending);
     };
+    options.traceFiberSegment = [this, surfaceName](size_t firstControlPointIndex,
+                                                    size_t secondControlPointIndex) {
+        emit generatedFiberTraceSegmentRequested(surfaceName,
+                                                 firstControlPointIndex,
+                                                 secondControlPointIndex);
+    };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }
 
