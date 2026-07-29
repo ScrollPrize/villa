@@ -91,6 +91,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
     - [CPU rendering](https://github.com/schillij95/ThaumatoAnakalyptor/commit/bcd382a0ef59b2a8566ec62a474479ea9d1bb8c2) by Julian Schilliger and Giorgio Angelotti
 
+- [Surface volume renderer for mesh-only segments](https://github.com/jonmarrs/vesuvius-autoresearch/blob/main/docs/SURFACE_RENDERER.md) by Jon Marrs. One-command CLI that rebuilds a detector-ready 26-layer surface volume from a segment's original.obj or its released tifxyz grids, for bucket segments that ship geometry with no surface volume. Validated against released surface volumes on two scrolls (PHerc 1667 center-layer NCC 0.78, all 26 layers matching the released stack).
+
 - [Volumetric Vesuvius Labelling](https://github.com/JamesDarby345/Volumetric_Vesuvius_Labelling) by James Darby. Provide custom tooling the [napari](https://napari.org/stable/) 3d viewer that will help manually annotate volumetric masks of the scrolls to train ML models for 3D segmentation.
 
 - [Autosegmentation preprocessing pipeline](https://github.com/giorgioangel/vesuvius_autoseg_preprocess) (work in progress) collection of scripts to pre-process volumes for autosegmentation. By Giorgio Angelotti
@@ -287,6 +289,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Unsupervised Ink Detection with DINO](https://github.com/jgcarrasco/dino-ink-detection) by Jorge García. Contains experiments related to detecting ink without labels, including a Colab notebook.
 
 - [Vesuvius AutoResearch](https://github.com/mojomast/vesuvius-autoresearch) by mojomast. Autonomous, evidence-gated experiment search for Vesuvius ink-detection research, with reproducible configs, metric contracts, synthetic demo data, and promotion checks.
+
+- [ScrollGT](https://github.com/jonmarrs/scrollgt) by Jon Marrs. Registered human ground-truth evaluation for the open SOTA surface volumes. Bridges the 2023 hand labels onto the re-flattened geometry, scores predictions with a threshold-swept F1 plus an AP-prevalence-lift anti-gaming gate, and publishes held-out baselines (including its author's own near-chance results) so reading ability can be told apart from agreement with another model's output.
 
 - [Vesuvius GP+](https://github.com/jaredlandau/Vesuvius-Grandprize-Winner-Plus) by Jared Landau. Updated version of the Grand Prize Ink Detection script with extra features.
   
