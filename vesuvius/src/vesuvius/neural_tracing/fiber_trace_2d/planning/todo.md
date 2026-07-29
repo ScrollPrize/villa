@@ -72,6 +72,7 @@
     - optimize sets of fibers for best explanation of the found predictions
 - [ ] threshold/skeletonize fiber preds and explore the multiple discretet options for scoring!
 - [ ] check training augmentations again
+- [ ] --vis for fiber trace changes the quality?
     
 # beam-search
 - [ ] beamsearch

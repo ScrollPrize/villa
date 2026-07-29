@@ -650,6 +650,25 @@ Ownership changed as follows:
   `err/m` when an explicit `--voxel-size-um` is provided. The CLI is a thin
   wrapper around `vc_fiber_tracer`; it does not run PyTorch, create strips, or
   implement separate channel/remote-cache loading.
+- `vc_fiber_trace_metric` opens Lasagna manifests through the shared
+  location-aware `vc_lasagna` dataset opener. Local manifests continue to work
+  without extra arguments. Direct remote `s3://`, `s3+REGION://`, `http://`, or
+  `https://` manifests require `--remote-cache-dir`; the manifest JSON is
+  downloaded transiently, while referenced Zarr objects are persisted through
+  the read-through cache. Relative group `zarr` paths resolve against the
+  manifest parent location, absolute local group paths stay local, and
+  absolute remote group paths open as independent cached remote Zarr roots.
+
+  ```bash
+  volume-cartographer/build/ci-tests-clang-systemdeps/bin/vc_fiber_trace_metric \
+    s3://bucket/path/fiber.lasagna.json fiber.json \
+    --remote-cache-dir /data/vc3d_remote_cache
+
+  volume-cartographer/build/ci-tests-clang-systemdeps/bin/vc_fiber_trace_metric \
+    https://example.test/artifact/fiber.lasagna.json fiber.json \
+    --normal-manifest s3://bucket/path/normals.lasagna.json \
+    --remote-cache-dir /data/vc3d_remote_cache
+  ```
 - 3D prefetch computes a CP-centered selected-level augmentation-envelope bbox
   and asks VC3D for authoritative bbox-to-chunk dependency metadata. This avoids
   materializing representative coordinates or reconstructing chunk paths in

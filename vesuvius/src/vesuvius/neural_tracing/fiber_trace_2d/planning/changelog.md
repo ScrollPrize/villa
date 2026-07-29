@@ -1,5 +1,9 @@
 # 2026-07-29
 
+- Extended native VC3D Lasagna dataset opening so `vc_fiber_trace_metric` can
+  stream precomputed fiber inference manifests directly from HTTP/S3 locations
+  with an explicit remote cache directory, including relative and absolute
+  group Zarr paths.
 - Prevented pyramid multiprocessing from multiplying every worker by a full
   OpenBLAS/OpenMP thread pool while retaining automatic process parallelism.
 - Added the first native VC3D 3D fiber Trace2CP segment tracer: shared

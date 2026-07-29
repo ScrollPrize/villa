@@ -153,6 +153,150 @@ TEST_CASE("LasagnaDataset recognizes a validated remote cache marker")
     fs::remove_all(dir);
 }
 
+TEST_CASE("LasagnaDataset resolves marker-backed remote relative groups")
+{
+    const auto dir = makeTmpDir("remote-marker-groups");
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    {
+        std::ofstream out(manifestPath);
+        out << R"({
+            "version": 2,
+            "groups": {
+                "pred": {
+                    "zarr": "pred.zarr",
+                    "scaledown": 2,
+                    "channels": ["presence"]
+                }
+            }
+        })";
+    }
+    {
+        std::ofstream out(dir / vc::lasagna::kLasagnaRemoteMarker);
+        out << R"({
+          "artifact_url":"s3://bucket/path/artifact/",
+          "manifest_file":"dataset.lasagna.json"
+        })";
+    }
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    REQUIRE(dataset.manifest().groups.size() == 1);
+    const auto& group = dataset.manifest().groups.front();
+    CHECK(group.isRemote());
+    CHECK(group.remoteZarrBaseUrl ==
+          "https://bucket.s3.us-east-1.amazonaws.com/path/artifact");
+    CHECK(group.remoteZarrKey == "pred.zarr");
+    CHECK(group.remoteCacheRoot == dir);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaDataset rejects escaping relative remote groups")
+{
+    const auto dir = makeTmpDir("remote-marker-escape");
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    {
+        std::ofstream out(manifestPath);
+        out << R"({
+            "version": 2,
+            "groups": {
+                "pred": {
+                    "zarr": "../pred.zarr",
+                    "channels": ["presence"]
+                }
+            }
+        })";
+    }
+    {
+        std::ofstream out(dir / vc::lasagna::kLasagnaRemoteMarker);
+        out << R"({
+          "artifact_url":"https://example.test/artifact",
+          "manifest_file":"dataset.lasagna.json"
+        })";
+    }
+
+    CHECK_THROWS_AS(vc::lasagna::LasagnaDataset::open(manifestPath),
+                    std::runtime_error);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaDataset preserves absolute local group paths")
+{
+    const auto dir = makeTmpDir("absolute-local-group");
+    const auto zarrPath = fs::absolute(dir / "absolute.zarr").lexically_normal();
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    {
+        std::ofstream out(manifestPath);
+        out << R"({
+            "version": 2,
+            "groups": {
+                "pred": {
+                    "zarr": ")" << zarrPath.generic_string() << R"(",
+                    "channels": ["presence"]
+                }
+            }
+        })";
+    }
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    REQUIRE(dataset.manifest().groups.size() == 1);
+    const auto& group = dataset.manifest().groups.front();
+    CHECK_FALSE(group.isRemote());
+    CHECK(group.zarrPath == zarrPath);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaDataset supports absolute remote group paths with explicit cache")
+{
+    const auto dir = makeTmpDir("absolute-remote-group");
+    const auto manifestPath = dir / "dataset.lasagna.json";
+    {
+        std::ofstream out(manifestPath);
+        out << R"({
+            "version": 2,
+            "groups": {
+                "pred": {
+                    "zarr": "s3+eu-west-2://bucket/other/pred.zarr",
+                    "channels": ["presence"]
+                }
+            }
+        })";
+    }
+
+    CHECK_THROWS_AS(vc::lasagna::LasagnaDataset::open(manifestPath),
+                    std::runtime_error);
+
+    const auto cacheRoot = dir / "cache";
+    const auto dataset = vc::lasagna::LasagnaDataset::open(
+        manifestPath,
+        vc::lasagna::LasagnaDatasetOpenOptions{1.0, cacheRoot});
+    REQUIRE(dataset.manifest().groups.size() == 1);
+    const auto& group = dataset.manifest().groups.front();
+    CHECK(group.isRemote());
+    CHECK(group.remoteZarrBaseUrl ==
+          "https://bucket.s3.eu-west-2.amazonaws.com/other/pred.zarr");
+    CHECK(group.remoteZarrKey.empty());
+    CHECK(group.remoteCacheRoot.string().find("remote_lasagna") !=
+          std::string::npos);
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaDataset remote manifest requires explicit cache before fetch")
+{
+    CHECK(vc::lasagna::isRemoteLasagnaLocation(
+        "s3://bucket/path/fiber.lasagna.json"));
+    CHECK(vc::lasagna::isRemoteLasagnaLocation(
+        "https://example.test/fiber.lasagna.json"));
+    CHECK_FALSE(vc::lasagna::isRemoteLasagnaLocation(
+        "/tmp/fiber.lasagna.json"));
+    CHECK_THROWS_AS(
+        vc::lasagna::LasagnaDataset::openLocation(
+            "s3://bucket/path/fiber.lasagna.json"),
+        std::runtime_error);
+}
+
 TEST_CASE("LasagnaDatasetManifest requires grad_mag for normal source")
 {
     auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({

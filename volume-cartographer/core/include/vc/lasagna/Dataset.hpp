@@ -3,6 +3,8 @@
 #include "vc/lasagna/Manifest.hpp"
 
 #include <filesystem>
+#include <string>
+#include <string_view>
 
 namespace utils { class ZarrArray; }
 
@@ -10,8 +12,11 @@ namespace vc::lasagna {
 
 inline constexpr const char* kLasagnaRemoteMarker = "lasagna-remote.json";
 
+[[nodiscard]] bool isRemoteLasagnaLocation(std::string_view location);
+
 struct LasagnaDatasetOpenOptions {
     double workingToBaseScale = 1.0;
+    std::filesystem::path remoteCacheRoot;
 };
 
 class LasagnaDataset {
@@ -20,6 +25,9 @@ public:
 
     static LasagnaDataset open(
         const std::filesystem::path& manifestPath,
+        LasagnaDatasetOpenOptions options = {});
+    static LasagnaDataset openLocation(
+        const std::string& manifestLocation,
         LasagnaDatasetOpenOptions options = {});
 
     [[nodiscard]] const LasagnaDatasetManifest& manifest() const noexcept;

@@ -856,7 +856,9 @@
   `err/m`, and the millimeter run length, and must not include physical unit or
   reference length fields. Live whole-fiber progress must update one terminal
   line with carriage returns; it must not print a fresh line for every segment.
-  It should emit a newline only when the progress reaches the terminal state.
+  It should emit a newline when the restart counter first increases to a new
+  value and when progress reaches the terminal state, so restart events remain
+  visible in persisted terminal logs.
   The metric is `restart_count / (reference_length_voxels / 1000)`, where
   `reference_length_voxels` is measured along the original loaded fiber line
   between CP0 and the final CP in selected-level voxels. Physical units are
@@ -917,6 +919,24 @@
   units from filenames or parse unrelated metadata. The CLI is a thin wrapper
   over `vc_fiber_tracer`, `vc_lasagna` dataset opening, and optional
   `LasagnaNormalSampler`.
+- The native Lasagna dataset opener supports local `.lasagna.json` manifests,
+  local manifests with an adjacent `lasagna-remote.json` read-through marker,
+  and direct remote `s3://`, `s3+REGION://`, `http://`, or `https://`
+  manifests when the caller supplies an explicit remote cache root. Direct
+  remote manifest JSON is fetched transiently for the current run and is not
+  durable cache state; only referenced Zarr objects are persisted.
+- Lasagna manifest group `zarr` paths are location strings. Relative paths
+  resolve against the containing manifest location: the parent directory for
+  local manifests or the parent URL for direct remote manifests. Absolute local
+  paths starting at `/` are opened as local Zarr groups. Absolute remote
+  `s3://`, `s3+REGION://`, `http://`, or `https://` group paths are opened as
+  independent remote read-through Zarr roots. Relative remote-backed group
+  paths that escape their manifest/artifact parent are rejected; absolute paths
+  are explicit and are not rewritten.
+- `vc_fiber_trace_metric` exposes `--remote-cache-dir PATH` and opens both the
+  fiber inference manifest and `--normal-manifest` through the shared
+  location-aware Lasagna opener. If either manifest argument is remote and no
+  remote cache directory is supplied, the CLI fails before tracing.
 - Native 3D single-pair visualization first builds the initial side/top strip
   source from the existing 2D Trace2CP geometry loader for the input CP pair.
   In single-pair mode, the configured cross-strip height is a maximum cap: the
