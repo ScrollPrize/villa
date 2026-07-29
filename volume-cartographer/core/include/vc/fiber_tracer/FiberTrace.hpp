@@ -175,6 +175,28 @@ using FiberTraceProgressCallback = std::function<void(const FiberTraceProgress&)
 using FiberTraceWholeFiberProgressCallback =
     std::function<void(const FiberTraceWholeFiberProgress&)>;
 
+#ifdef VC_TESTING
+namespace testing {
+
+struct BeamDebugState {
+    double loss = 0.0;
+    int depth = 0;
+    double tracedLength = 0.0;
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    bool reached = false;
+};
+
+[[nodiscard]] std::vector<size_t> debugPruneBeamStateIndices(
+    const std::vector<BeamDebugState>& states,
+    int beamWidth,
+    double pruneDistanceVoxels);
+
+[[nodiscard]] std::optional<size_t> debugBestReachedBeamStateIndex(
+    const std::vector<BeamDebugState>& states);
+
+} // namespace testing
+#endif
+
 [[nodiscard]] FiberInput loadFiberJson(const std::filesystem::path& path);
 
 [[nodiscard]] FiberPredictionTraceScales resolveFiberPredictionTraceScales(

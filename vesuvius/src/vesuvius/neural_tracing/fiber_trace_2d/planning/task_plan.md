@@ -1,45 +1,38 @@
-# Native C++ Trace2CP Inference Scaledown Argument Plan
+# Native C++ Trace2CP Python-Parity Fixes Plan
 
 ## Implementation
 
-1. Extend the native fiber prediction scale resolver:
-   - accept `inferenceScaledownPower`, default `2`
-   - validate the power is in `[0, 30]`
-   - keep prediction channel discovery and same-scale validation
-   - keep `prediction_to_base = source_to_base * 2**group.scaledown`
-   - compute `trace_to_base = prediction_to_base / 2**inferenceScaledownPower`
-   - compute `prediction_spacing_in_trace_voxels = 2**inferenceScaledownPower`
-2. Extend `vc_fiber_trace_metric`:
-   - add `--inference-scaledown-power`
-   - default to `2`, matching current Python inference/tracing commands
-   - pass it into the resolver
-   - print it with the derived scale diagnostics
-3. Keep the manifest schema unchanged:
-   - no top-level trace-scale aliases
-   - no per-group `inference_scaledown`
-   - no fiber-coordinate scale override
-4. Keep GUI/default resolver callers on the same default power for now.
+1. Match Python beam selection:
+   - score pruning as `cumulative_loss + depth * 1e-12`
+   - preserve original child generation order on ties
+   - use squared-distance pruning with the same `>= distance**2` keep rule
+   - select reached-target states by cumulative loss only
+   - remove `tracedLength` from search ordering decisions
+2. Match Python compact normal principal axes:
+   - replace the hint-seeded 16-step power iteration with a symmetric
+     eigensolver for the largest eigenvector
+   - keep existing hint/no-hint sign orientation semantics
+3. Preserve candidate-loss math:
+   - keep the active `candidate_substeps=1` all-pairs product unchanged
+   - add focused regression coverage that verifies the C++ public trace path
+     uses the all-pairs penalty rather than only presence or candidate/output
+     alignment
 
 ## Spec Update
 
-- Replace the stale rule that native tracing derives `trace_to_base` directly
-  from manifest `source_to_base`.
-- State that native precomputed tracing derives persisted prediction scale from
-  manifest fields, then divides by the explicit/default inference scaledown
-  factor to recover trace coordinates.
+- Add native Trace2CP parity requirements for beam pruning/reached-state
+  ordering, compact normal principal-axis decoding, and all-pairs candidate
+  loss.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` for `fiber_trace_3d/infer.py` manifest output
-  and native `vc_fiber_trace_metric` scale derivation.
-- Update `planning/status.md`, `planning/task_log.md`, and
-  `planning/changelog.md`.
+- No user-facing command documentation changes are needed.
+- Update planning status, task log, and changelog.
 
 ## Tests
 
-- Add C++ resolver coverage for the current Python-written manifest shape:
-  `source_to_base=1`, group `scaledown=4`, inference power `2`.
-- Add C++ resolver coverage for explicit alternate power and invalid powers.
-- Build and run focused native tests:
-  - `cmake --build volume-cartographer/build --target test_fiber_trace3d vc_fiber_trace_metric VC3D -j 4`
+- Extend `test_fiber_trace3d` with focused regression tests.
+- Build and run:
+  - `cmake --build volume-cartographer/build --target test_fiber_trace3d vc_fiber_trace_metric -j 4`
   - `volume-cartographer/build/bin/test_fiber_trace3d`
+  - `ctest --test-dir volume-cartographer/build -R test_fiber_trace3d --output-on-failure`

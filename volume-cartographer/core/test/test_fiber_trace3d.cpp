@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/lasagna/ChannelSampler.hpp"
 
 #include <cmath>
 #include <string>
@@ -106,6 +107,23 @@ public:
     }
 };
 
+class DirectionProductPrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d&,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        const cv::Vec3d ref = referenceDirection / cv::norm(referenceDirection);
+        const double axialPresence =
+            std::abs(ref.dot(cv::Vec3d{1.0, 0.0, 0.0})) > 0.999999
+                ? 0.80
+                : 1.0;
+        vc::fiber_tracer::FiberPredictionSample out;
+        out.options.push_back({ref, axialPresence, true});
+        return out;
+    }
+};
+
 class ConstantNormalSampler final : public vc::lasagna::NormalSampler {
 public:
     explicit ConstantNormalSampler(cv::Vec3d normal = {0.0, 1.0, 0.0})
@@ -132,6 +150,16 @@ vc::lasagna::LasagnaChannelGroup makeGroup(
     group.scaledown = scaledown;
     group.channels = std::move(channels);
     return group;
+}
+
+cv::Matx33d outer(const cv::Vec3d& v)
+{
+    cv::Matx33d out = cv::Matx33d::zeros();
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col)
+            out(row, col) = v[row] * v[col];
+    }
+    return out;
 }
 
 } // namespace
@@ -305,6 +333,77 @@ TEST_CASE("native fiber tracer requires normals for normal-aware smoothness")
         vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr));
 }
 
+TEST_CASE("native fiber tracer prunes beams by Python score and generation order")
+{
+    using vc::fiber_tracer::testing::BeamDebugState;
+    const std::vector<BeamDebugState> states = {
+        {.loss = 1.0, .depth = 2, .tracedLength = 50.0, .point = {0.0, 0.0, 0.0}},
+        {.loss = 1.0, .depth = 2, .tracedLength = 1.0, .point = {10.0, 0.0, 0.0}},
+        {.loss = 1.0, .depth = 1, .tracedLength = 100.0, .point = {20.0, 0.0, 0.0}},
+        {.loss = 1.0, .depth = 2, .tracedLength = 0.0, .point = {30.0, 0.0, 0.0}},
+    };
+
+    const auto kept =
+        vc::fiber_tracer::testing::debugPruneBeamStateIndices(states, 3, 0.0);
+
+    REQUIRE(kept.size() == 3);
+    CHECK(kept[0] == 2);
+    CHECK(kept[1] == 0);
+    CHECK(kept[2] == 1);
+}
+
+TEST_CASE("native fiber tracer spatial beam pruning preserves Python tensor order ties")
+{
+    using vc::fiber_tracer::testing::BeamDebugState;
+    const std::vector<BeamDebugState> states = {
+        {.loss = 0.5, .depth = 1, .tracedLength = 100.0, .point = {0.0, 0.0, 0.0}},
+        {.loss = 0.5, .depth = 1, .tracedLength = 0.0, .point = {0.5, 0.0, 0.0}},
+        {.loss = 0.5, .depth = 1, .tracedLength = 50.0, .point = {2.0, 0.0, 0.0}},
+    };
+
+    const auto kept =
+        vc::fiber_tracer::testing::debugPruneBeamStateIndices(states, 2, 1.0);
+
+    REQUIRE(kept.size() == 2);
+    CHECK(kept[0] == 0);
+    CHECK(kept[1] == 2);
+}
+
+TEST_CASE("native fiber tracer reached-state selection uses first minimum loss only")
+{
+    using vc::fiber_tracer::testing::BeamDebugState;
+    const std::vector<BeamDebugState> states = {
+        {.loss = 1.0, .depth = 3, .tracedLength = 100.0, .point = {0.0, 0.0, 0.0}, .reached = true},
+        {.loss = 1.0, .depth = 3, .tracedLength = 0.0, .point = {1.0, 0.0, 0.0}, .reached = true},
+        {.loss = 0.0, .depth = 3, .tracedLength = 0.0, .point = {2.0, 0.0, 0.0}, .reached = false},
+    };
+
+    const auto best =
+        vc::fiber_tracer::testing::debugBestReachedBeamStateIndex(states);
+
+    REQUIRE(best.has_value());
+    CHECK(*best == 0);
+}
+
+TEST_CASE("compact normal principal axis uses the symmetric eigensolver")
+{
+    const cv::Vec3d principal =
+        cv::Vec3d{1.0, 1.0, 0.0} / std::sqrt(2.0);
+    const cv::Vec3d secondary =
+        cv::Vec3d{1.0, -1.0, 0.0} / std::sqrt(2.0);
+    const cv::Vec3d z{0.0, 0.0, 1.0};
+    const cv::Matx33d tensor =
+        outer(principal) * 1.01 + outer(secondary) * 1.0 + outer(z) * 0.2;
+
+    const cv::Vec3d axis =
+        vc::lasagna::principalCompactTensorAxis(tensor, {0.0, 0.0, 0.0});
+    const cv::Vec3d flipped =
+        vc::lasagna::principalCompactTensorAxis(tensor, -principal);
+
+    CHECK(std::abs(axis.dot(principal)) > 0.999999);
+    CHECK(flipped.dot(-principal) > 0.999999);
+}
+
 TEST_CASE("native fiber tracer default angle-step cone uses circular 81-candidate disk")
 {
     CountingPrediction predictions;
@@ -418,6 +517,37 @@ TEST_CASE("native fiber tracer ignores presence only for the start branch")
     CHECK(result.points[1][0] == doctest::Approx(4.0));
     CHECK(std::abs(result.points[1][1]) < 1.0e-6);
     CHECK(std::abs(result.points.back()[1]) > 1.0);
+}
+
+TEST_CASE("native fiber tracer candidate loss uses the all-pairs direction product")
+{
+    DirectionProductPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {3.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 3.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 25.0;
+    request.config.coneAngleStepDegrees = 25.0;
+    request.config.beamWidth = 4;
+    request.config.beamLookaheadSteps = 1;
+    request.config.beamPruneDistanceVoxels = 0.0;
+    request.config.maxStepFactor = 2.0;
+    request.config.smoothnessWeight = 0.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    REQUIRE(result.reachedTargetPlane);
+    REQUIRE(!result.points.empty());
+    CHECK(result.points.back()[0] == doctest::Approx(3.0));
+    CHECK(std::abs(result.points.back()[1]) < 1.0e-6);
+    CHECK(std::abs(result.points.back()[2]) < 1.0e-6);
 }
 
 TEST_CASE("native fiber tracer spatially prunes near-duplicate beam states")

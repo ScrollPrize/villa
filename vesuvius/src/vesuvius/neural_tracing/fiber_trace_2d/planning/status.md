@@ -1,11 +1,11 @@
-# Native C++ Trace2CP Inference Scaledown Argument Status
+# Native C++ Trace2CP Python-Parity Fixes Status
 
-- [x] Re-check Python inference writer and tracer coordinate scale code.
-- [x] Replace stale task with the inference-scaledown argument task.
-- [x] Replace task plan with corrected scale derivation.
-- [x] Update C++ scale resolver API and implementation.
-- [x] Add `vc_fiber_trace_metric --inference-scaledown-power`.
-- [x] Add resolver tests for current Python manifest scale layout.
-- [x] Update specs/docs/task log/changelog.
+- [x] Re-check Python and C++ beam pruning/reached selection code.
+- [x] Re-check Python and C++ compact normal principal-axis code.
+- [x] Replace stale task and task plan with the parity task.
+- [x] Patch native C++ beam pruning/reached selection.
+- [x] Patch compact normal principal-axis decoding.
+- [x] Add focused C++ regression tests.
+- [x] Update specs/task log/changelog.
 - [x] Build focused native targets.
 - [x] Run focused native tests.

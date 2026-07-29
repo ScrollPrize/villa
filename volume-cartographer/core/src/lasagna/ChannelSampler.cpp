@@ -15,6 +15,8 @@
 #include <thread>
 #include <unordered_set>
 
+#include <opencv2/core.hpp>
+
 namespace vc::lasagna {
 namespace {
 
@@ -532,13 +534,6 @@ cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy)
 
 cv::Vec3d principalCompactTensorAxis(const cv::Matx33d& tensor, const cv::Vec3d& hint)
 {
-    auto tensorTimesVector = [](const cv::Matx33d& t, const cv::Vec3d& v) {
-        return cv::Vec3d{
-            t(0, 0) * v[0] + t(0, 1) * v[1] + t(0, 2) * v[2],
-            t(1, 0) * v[0] + t(1, 1) * v[1] + t(1, 2) * v[2],
-            t(2, 0) * v[0] + t(2, 1) * v[1] + t(2, 2) * v[2],
-        };
-    };
     auto fallbackTensorAxis = [](const cv::Matx33d& t) {
         int axis = 0;
         double value = t(0, 0);
@@ -554,17 +549,38 @@ cv::Vec3d principalCompactTensorAxis(const cv::Matx33d& tensor, const cv::Vec3d&
         return result;
     };
 
-    cv::Vec3d axis = normalizedOrZero(hint);
+    bool finiteTensor = true;
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            finiteTensor = finiteTensor && std::isfinite(tensor(row, col));
+        }
+    }
+    if (!finiteTensor) {
+        return {0.0, 0.0, 0.0};
+    }
+
+    cv::Mat source(3, 3, CV_64F);
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            source.at<double>(row, col) = tensor(row, col);
+        }
+    }
+    cv::Mat eigenvalues;
+    cv::Mat eigenvectors;
+    cv::Vec3d axis{0.0, 0.0, 0.0};
+    if (cv::eigen(source, eigenvalues, eigenvectors) &&
+        eigenvectors.rows >= 1 &&
+        eigenvectors.cols >= 3) {
+        axis = {
+            eigenvectors.at<double>(0, 0),
+            eigenvectors.at<double>(0, 1),
+            eigenvectors.at<double>(0, 2),
+        };
+    }
     if (length(axis) <= kEpsilon) {
         axis = fallbackTensorAxis(tensor);
     }
-    for (int iteration = 0; iteration < 16; ++iteration) {
-        const cv::Vec3d next = normalizedOrZero(tensorTimesVector(tensor, axis));
-        if (length(next) <= kEpsilon) {
-            break;
-        }
-        axis = next;
-    }
+    axis = normalizedOrZero(axis);
     if (length(axis) <= kEpsilon) {
         return {0.0, 0.0, 0.0};
     }

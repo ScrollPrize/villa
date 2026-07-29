@@ -734,13 +734,35 @@ struct CandidateScore {
     return start * (1.0 - t) + end * t;
 }
 
-[[nodiscard]] bool beamStateLess(const BeamState& a, const BeamState& b)
+[[nodiscard]] double beamPruneScore(const BeamState& state)
+{
+    return state.loss + static_cast<double>(state.depth) * 1.0e-12;
+}
+
+[[nodiscard]] bool beamSearchLess(const BeamState& a, const BeamState& b)
 {
     if (a.loss != b.loss)
         return a.loss < b.loss;
-    if (a.depth != b.depth)
-        return a.depth < b.depth;
-    return a.tracedLength < b.tracedLength;
+    return a.depth < b.depth;
+}
+
+[[nodiscard]] std::vector<size_t> beamIndicesInPythonPruneOrder(
+    const std::vector<BeamState>& states)
+{
+    std::vector<size_t> order(states.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        const double scoreA = beamPruneScore(states[a]);
+        const double scoreB = beamPruneScore(states[b]);
+        const bool finiteA = std::isfinite(scoreA);
+        const bool finiteB = std::isfinite(scoreB);
+        if (finiteA != finiteB)
+            return finiteA;
+        if (scoreA != scoreB)
+            return scoreA < scoreB;
+        return false;
+    });
+    return order;
 }
 
 [[nodiscard]] std::vector<BeamState> pruneBeamStates(
@@ -750,18 +772,31 @@ struct CandidateScore {
 {
     if (states.empty())
         return {};
-    std::sort(states.begin(), states.end(), beamStateLess);
     const size_t keep = static_cast<size_t>(std::max(1, beamWidth));
     const double distance = std::max(0.0, pruneDistanceVoxels);
+    const std::vector<size_t> order = beamIndicesInPythonPruneOrder(states);
     if (distance <= 0.0) {
-        if (states.size() > keep)
-            states.resize(keep);
-        return states;
+        std::vector<BeamState> out;
+        out.reserve(std::min(keep, states.size()));
+        for (const size_t index : order) {
+            if (!std::isfinite(beamPruneScore(states[index])))
+                continue;
+            out.push_back(std::move(states[index]));
+            if (out.size() >= keep)
+                break;
+        }
+        if (!out.empty())
+            return out;
+        return {std::move(states[order.front()])};
     }
 
     std::vector<BeamState> out;
     out.reserve(std::min(keep, states.size()));
-    for (auto& state : states) {
+    const double distance2 = distance * distance;
+    for (const size_t index : order) {
+        auto& state = states[index];
+        if (!std::isfinite(beamPruneScore(state)))
+            continue;
         const cv::Vec3d point = state.points.empty()
             ? cv::Vec3d{0.0, 0.0, 0.0}
             : state.points.back();
@@ -770,7 +805,8 @@ struct CandidateScore {
             const cv::Vec3d existingPoint = existing.points.empty()
                 ? cv::Vec3d{0.0, 0.0, 0.0}
                 : existing.points.back();
-            if (length(point - existingPoint) < distance) {
+            const cv::Vec3d delta = point - existingPoint;
+            if (delta.dot(delta) < distance2) {
                 tooClose = true;
                 break;
             }
@@ -783,8 +819,21 @@ struct CandidateScore {
     }
     if (!out.empty())
         return out;
-    out.push_back(std::move(states.front()));
-    return out;
+    return {std::move(states[order.front()])};
+}
+
+[[nodiscard]] std::optional<size_t> bestReachedStateIndexPythonParity(
+    const std::vector<BeamState>& states)
+{
+    std::optional<size_t> best;
+    for (size_t index = 0; index < states.size(); ++index) {
+        const auto& state = states[index];
+        if (!state.reached)
+            continue;
+        if (!best.has_value() || state.loss < states[*best].loss)
+            best = index;
+    }
+    return best;
 }
 
 [[nodiscard]] FiberTraceOneWayResult traceOneWayCore(
@@ -882,13 +931,9 @@ struct CandidateScore {
                 reason = "no_valid_candidates";
                 break;
             }
-            const auto reachedBegin = std::partition(
-                expanded.begin(), expanded.end(), [](const auto& state) {
-                    return state.reached;
-                });
-            if (reachedBegin != expanded.begin()) {
-                const auto bestReached = std::min_element(
-                    expanded.begin(), reachedBegin, beamStateLess);
+            const auto bestReachedIndex = bestReachedStateIndexPythonParity(expanded);
+            if (bestReachedIndex.has_value()) {
+                const auto& bestReached = expanded[*bestReachedIndex];
                 if (progress) {
                     FiberTraceProgress event;
                     event.phase = phase;
@@ -898,10 +943,10 @@ struct CandidateScore {
                     event.reason = "target_plane";
                     progress(event);
                 }
-                return {bestReached->points, true, bestReached->reason,
+                return {bestReached.points, true, bestReached.reason,
                         static_cast<int>(
-                            bestReached->points.size() > 0
-                                ? bestReached->points.size() - 1
+                            bestReached.points.size() > 0
+                                ? bestReached.points.size() - 1
                                 : 0)};
             }
         }
@@ -933,7 +978,7 @@ struct CandidateScore {
     }
 
     const auto best = std::min_element(
-        beams.begin(), beams.end(), beamStateLess);
+        beams.begin(), beams.end(), beamSearchLess);
     return {best->points, best->reached, best->reached ? best->reason : reason,
             static_cast<int>(best->points.size() > 0 ? best->points.size() - 1 : 0)};
 }
@@ -985,6 +1030,58 @@ struct CandidateScore {
 }
 
 } // namespace
+
+#ifdef VC_TESTING
+namespace testing {
+
+namespace {
+
+[[nodiscard]] std::vector<BeamState> debugStatesToBeamStates(
+    const std::vector<BeamDebugState>& states)
+{
+    std::vector<BeamState> out;
+    out.reserve(states.size());
+    for (size_t index = 0; index < states.size(); ++index) {
+        const auto& state = states[index];
+        BeamState beam;
+        beam.points.push_back(state.point);
+        beam.loss = state.loss;
+        beam.depth = state.depth;
+        beam.tracedLength = state.tracedLength;
+        beam.reached = state.reached;
+        beam.reason = std::to_string(index);
+        out.push_back(std::move(beam));
+    }
+    return out;
+}
+
+} // namespace
+
+std::vector<size_t> debugPruneBeamStateIndices(
+    const std::vector<BeamDebugState>& states,
+    int beamWidth,
+    double pruneDistanceVoxels)
+{
+    std::vector<size_t> indices;
+    auto pruned = pruneBeamStates(
+        debugStatesToBeamStates(states),
+        beamWidth,
+        pruneDistanceVoxels);
+    indices.reserve(pruned.size());
+    for (const auto& state : pruned)
+        indices.push_back(static_cast<size_t>(std::stoull(state.reason)));
+    return indices;
+}
+
+std::optional<size_t> debugBestReachedBeamStateIndex(
+    const std::vector<BeamDebugState>& states)
+{
+    const auto beamStates = debugStatesToBeamStates(states);
+    return bestReachedStateIndexPythonParity(beamStates);
+}
+
+} // namespace testing
+#endif
 
 FiberPredictionTraceScales resolveFiberPredictionTraceScales(
     const vc::lasagna::LasagnaDatasetManifest& manifest,

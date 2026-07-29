@@ -1,3 +1,10 @@
+# 2026-07-30
+
+- Matched native C++ Trace2CP beam pruning/reached-target selection and compact
+  normal principal-axis decoding more closely to the Python tracer, with
+  focused `test_fiber_trace3d` regression coverage for beam order, reached
+  ties, normal eigensolver behavior, and all-pairs candidate loss.
+
 # 2026-07-29
 
 - Added native `vc_fiber_trace_metric --inference-scaledown-power`, defaulting

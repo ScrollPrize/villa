@@ -48,6 +48,15 @@
   as `--inference-scaledown-power` (default `2`), then derives
   `trace_to_base = prediction_to_base / 2**power` and
   `prediction_spacing_in_trace_voxels = 2**power`.
+- Native precomputed Trace2CP search must match the Python tracer's beam
+  semantics: pruning is ordered by `cumulative_loss + depth * 1e-12` with
+  original tensor/generation order preserved on ties, spatial pruning uses the
+  squared-distance `>= distance**2` keep rule, and reached-target selection
+  chooses the first reached state with minimum cumulative loss only. Native
+  compact normal interpolation must choose the principal tensor axis with a
+  symmetric eigensolver and then apply the same hint/no-hint sign convention as
+  Python. The active `candidate_substeps=1` candidate loss is the Python
+  all-pairs direction product plus the configured smoothness terms.
 - Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2
   (factor 4 relative to selected input). It is converted to the runner's
   literal factor and does not read or reinterpret tracer config `scaledown`.

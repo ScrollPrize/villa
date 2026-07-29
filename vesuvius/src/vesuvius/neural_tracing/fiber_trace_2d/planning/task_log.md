@@ -1,50 +1,38 @@
-# Native C++ Trace2CP Inference Scaledown Argument Task Log
+# Native C++ Trace2CP Python-Parity Fixes Task Log
 
 ## Notes
 
-- Re-checked the Python code path:
-  - `fiber_trace_3d/infer.py` computes `input_sd`, `output_sd_input`, and
-    `effective_output_sd`.
-  - It passes `level=log2(effective_output_sd)`,
-    `scaledown=effective_output_sd`, and `inference_scaledown=output_sd_input`
-    into `FiberTrace3DPredictAdapter`.
-  - `write_lasagna_product_manifest(...)` is called without `source_to_base`,
-    so the writer default `source_to_base=1.0` is used for new manifests.
-  - The manifest writer serializes each group `scaledown` as `product.level`,
-    so current factor-16 persisted products are recorded as group
-    `scaledown=4`.
-- Re-checked the Python tracer coordinate code:
-  - `FiberTrace3DLoader` traces in selected input-level voxels using
-    `volume_spacing_base = 1 << base_volume_scale`.
-  - For the current config, `base_volume_scale=2`, so trace coordinates are
-    base/4.
-  - Python `--inference-scaledown-power 2` makes prediction samples spaced 4
-    trace voxels apart, or 16 base voxels.
-- Native C++ now derives:
-  - `prediction_to_base = source_to_base * 2**group.scaledown`
-  - `trace_to_base = prediction_to_base / 2**inference_scaledown_power`
-  - `prediction_spacing_in_trace_voxels = 2**inference_scaledown_power`
-- `vc_fiber_trace_metric` now accepts `--inference-scaledown-power`, default
-  `2`, and prints that value with the derived scale diagnostics.
-- No manifest fields were added or required.
+- Re-checked Python pruning:
+  - `_prune_native_beam_tensor_indices()` scores states as
+    `cumulative_loss + depth * 1e-12`.
+  - spatial pruning repeatedly takes the current tensor-order `argmin`, then
+    masks endpoints whose squared distance is below `distance**2`.
+  - reached-target selection takes the first reached state with minimum
+    cumulative loss only.
+- Updated C++ pruning to sort state indices stably by that same score and to
+  preserve generation order on score ties. Removed `tracedLength` from search
+  ordering decisions.
+- Updated C++ reached-target selection to use the same minimum-loss-only rule
+  and removed the previous `std::partition` plus comparator path.
+- Replaced compact normal principal-axis power iteration with `cv::eigen` on
+  the accumulated symmetric tensor. Existing hint/no-hint sign orientation is
+  preserved.
+- The active C++ candidate-loss formula for `candidate_substeps=1` already
+  matched Python's all-pairs direction product, so it was preserved and covered
+  with a public trace-path regression test.
 
 ## Deviations
 
-- The previous task text/spec said `trace_to_base = source_to_base`; that was
-  inconsistent with the current Python writer and has been replaced.
+- No command-line or manifest behavior changed.
+- The focused candidate-loss work is a regression test, not a formula rewrite,
+  because the active formula was already aligned with Python for the current
+  native metric command.
 
 ## Validation
 
-- `cmake --build volume-cartographer/build --target test_fiber_trace3d vc_fiber_trace_metric VC3D -j 4`
+- `cmake --build volume-cartographer/build --target test_fiber_trace3d vc_fiber_trace_metric -j 4`
   passed.
-- `volume-cartographer/build/bin/test_fiber_trace3d` passed: 18 test cases.
-- `volume-cartographer/build/bin/vc_fiber_trace_metric --help` shows
-  `--inference-scaledown-power`.
-- Short interrupted sanity run on the S3 manifest and local fiber confirmed:
-  `derived_trace_to_base=4`, `derived_prediction_to_base=16`,
-  `derived_prediction_spacing_trace_voxels=4`,
-  `inference_scaledown_power=2`, and first-segment max steps dropped from the
-  previously observed `242` to `61`.
+- `volume-cartographer/build/bin/test_fiber_trace3d` passed: 23 test cases.
 - `ctest --test-dir volume-cartographer/build -R test_fiber_trace3d --output-on-failure`
   passed.
 - `git diff --check` passed.
