@@ -344,6 +344,8 @@ int main(int argc, char** argv)
         request.errorThresholdVoxels = options.errorThresholdVoxels;
         request.voxelSizeUm = options.voxelSizeUm;
         request.config = options.trace;
+        vc::fiber_tracer::FiberTraceProfile profile;
+        request.config.profile = &profile;
 
         using Clock = std::chrono::steady_clock;
         const auto wallStart = Clock::now();
@@ -428,6 +430,29 @@ int main(int argc, char** argv)
         std::cout << "native_trace2cp_timing trace_wall_s=" << std::fixed
                   << std::setprecision(3) << wallSeconds
                   << " trace_cpu_s=" << cpuSeconds << '\n';
+        std::cout << "native_trace2cp_profile"
+                  << " one_way=" << profile.oneWayCalls
+                  << " generations=" << profile.generations
+                  << " candidates=" << profile.candidateTasks
+                  << " avg_candidates_per_generation="
+                  << (profile.generations > 0
+                          ? static_cast<double>(profile.candidateTasks) /
+                                static_cast<double>(profile.generations)
+                          : 0.0)
+                  << " start_sample_s=" << profile.startSampleSeconds
+                  << " task_build_s=" << profile.taskBuildSeconds
+                  << " prediction_batch_s=" << profile.predictionBatchSeconds
+                  << " prediction_prepare_s=" << profile.predictionPrepareSeconds
+                  << " prediction_prefetch_s=" << profile.predictionPrefetchSeconds
+                  << " prediction_assign_s=" << profile.predictionAssignSeconds
+                  << " prediction_materialize_s=" << profile.predictionMaterializeSeconds
+                  << " normal_batch_s=" << profile.normalBatchSeconds
+                  << " normal_prefetch_s=" << profile.normalPrefetchSeconds
+                  << " normal_materialize_s=" << profile.normalMaterializeSeconds
+                  << " candidate_score_s=" << profile.candidateScoreSeconds
+                  << " frontier_s=" << profile.frontierSeconds
+                  << " prune_s=" << profile.pruneSeconds
+                  << '\n';
         return 0;
     } catch (const std::exception& exc) {
         std::cerr << "vc_fiber_trace_metric error: " << exc.what() << '\n';

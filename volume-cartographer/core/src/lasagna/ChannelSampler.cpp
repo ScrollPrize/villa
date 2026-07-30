@@ -204,8 +204,14 @@ constexpr double kEpsilon = 1.0e-12;
             const size_t y = std::min(request.y0 + dy, binding.shapeZYX[1] - 1);
             for (size_t dx = 0; dx <= 1; ++dx) {
                 const size_t x = std::min(request.x0 + dx, binding.shapeZYX[2] - 1);
+                const size_t chunkIndex = request.singleChunk ? size_t{0} : cubeIndex;
                 const auto value = readSourceVoxel(
-                    binding, request.keys[cubeIndex], request.chunks[cubeIndex], z, y, x);
+                    binding,
+                    request.keys[chunkIndex],
+                    request.chunks[chunkIndex],
+                    z,
+                    y,
+                    x);
                 if (!value.has_value()) {
                     return std::nullopt;
                 }
@@ -215,6 +221,235 @@ constexpr double kEpsilon = 1.0e-12;
     }
     return LasagnaCubeValues{values[0], values[1], values[2], values[3],
                              values[4], values[5], values[6], values[7]};
+}
+
+[[nodiscard]] bool readInterpolationCubeValues(
+    const LasagnaChannelBinding& binding,
+    const LasagnaCubeRequest& request,
+    std::array<double, 8>& values)
+{
+    if (!request.valid) {
+        return false;
+    }
+
+    size_t cubeIndex = 0;
+    for (size_t dz = 0; dz <= 1; ++dz) {
+        const size_t z = std::min(request.z0 + dz, binding.shapeZYX[0] - 1);
+        for (size_t dy = 0; dy <= 1; ++dy) {
+            const size_t y = std::min(request.y0 + dy, binding.shapeZYX[1] - 1);
+            for (size_t dx = 0; dx <= 1; ++dx) {
+                const size_t x = std::min(request.x0 + dx, binding.shapeZYX[2] - 1);
+                const size_t chunkIndex = request.singleChunk ? size_t{0} : cubeIndex;
+                const auto& chunk = request.chunks[chunkIndex];
+                if (chunk == nullptr) {
+                    return false;
+                }
+                const size_t offset = originalChunkOffset(
+                    binding,
+                    z % binding.chunksZYX[0],
+                    y % binding.chunksZYX[1],
+                    x % binding.chunksZYX[2]);
+                if (offset >= chunk->values.size()) {
+                    throw std::runtime_error(
+                        "Lasagna cached source chunk is smaller than expected at chunk " +
+                        chunkKeyToString(request.keys[chunkIndex]));
+                }
+                values[cubeIndex++] = static_cast<double>(chunk->values[offset]);
+            }
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool readInterpolationCubeBytes(
+    const LasagnaChannelBinding& binding,
+    const LasagnaCubeRequest& request,
+    std::array<uint8_t, 8>& values)
+{
+    if (!request.valid) {
+        return false;
+    }
+
+    size_t cubeIndex = 0;
+    for (size_t dz = 0; dz <= 1; ++dz) {
+        const size_t z = std::min(request.z0 + dz, binding.shapeZYX[0] - 1);
+        for (size_t dy = 0; dy <= 1; ++dy) {
+            const size_t y = std::min(request.y0 + dy, binding.shapeZYX[1] - 1);
+            for (size_t dx = 0; dx <= 1; ++dx) {
+                const size_t x = std::min(request.x0 + dx, binding.shapeZYX[2] - 1);
+                const size_t chunkIndex = request.singleChunk ? size_t{0} : cubeIndex;
+                const auto& chunk = request.chunks[chunkIndex];
+                if (chunk == nullptr) {
+                    return false;
+                }
+                const size_t offset = originalChunkOffset(
+                    binding,
+                    z % binding.chunksZYX[0],
+                    y % binding.chunksZYX[1],
+                    x % binding.chunksZYX[2]);
+                if (offset >= chunk->values.size()) {
+                    throw std::runtime_error(
+                        "Lasagna cached source chunk is smaller than expected at chunk " +
+                        chunkKeyToString(request.keys[chunkIndex]));
+                }
+                values[cubeIndex++] = chunk->values[offset];
+            }
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] std::optional<double> sampleLasagnaChannelValues(
+    const LasagnaChannelBinding& binding,
+    const LasagnaCubeRequest& request)
+{
+    std::array<double, 8> values{};
+    if (!readInterpolationCubeValues(binding, request, values)) {
+        return std::nullopt;
+    }
+
+    const double c00 = values[0] * (1.0 - request.fx) + values[1] * request.fx;
+    const double c01 = values[2] * (1.0 - request.fx) + values[3] * request.fx;
+    const double c10 = values[4] * (1.0 - request.fx) + values[5] * request.fx;
+    const double c11 = values[6] * (1.0 - request.fx) + values[7] * request.fx;
+    const double c0 = c00 * (1.0 - request.fy) + c01 * request.fy;
+    const double c1 = c10 * (1.0 - request.fy) + c11 * request.fy;
+    return c0 * (1.0 - request.fz) + c1 * request.fz;
+}
+
+struct DecodedCompactNormal {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    bool valid = false;
+};
+
+[[nodiscard]] const std::array<DecodedCompactNormal, 256 * 256>&
+decodedCompactNormalTable()
+{
+    static const auto table = [] {
+        std::array<DecodedCompactNormal, 256 * 256> out{};
+        for (size_t rawNx = 0; rawNx < 256; ++rawNx) {
+            for (size_t rawNy = 0; rawNy < 256; ++rawNy) {
+                double nx = decodeCompactNormalComponent(static_cast<double>(rawNx));
+                double ny = decodeCompactNormalComponent(static_cast<double>(rawNy));
+                const double nzSq = std::max(0.0, 1.0 - nx * nx - ny * ny);
+                double nz = std::sqrt(nzSq);
+                const double normalLength = std::sqrt(nx * nx + ny * ny + nz * nz);
+                auto& entry = out[(rawNx << 8) | rawNy];
+                if (!(normalLength > kEpsilon) || !std::isfinite(normalLength)) {
+                    continue;
+                }
+                const double invLength = 1.0 / normalLength;
+                entry.x = nx * invLength;
+                entry.y = ny * invLength;
+                entry.z = nz * invLength;
+                entry.valid = true;
+            }
+        }
+        return out;
+    }();
+    return table;
+}
+
+[[nodiscard]] cv::Vec3d fallbackPrincipalAxis(
+    double a00,
+    double a11,
+    double a22)
+{
+    int axis = 0;
+    double value = a00;
+    if (a11 > value) {
+        axis = 1;
+        value = a11;
+    }
+    if (a22 > value) {
+        axis = 2;
+    }
+    cv::Vec3d result{0.0, 0.0, 0.0};
+    result[axis] = 1.0;
+    return result;
+}
+
+[[nodiscard]] cv::Vec3d principalCompactTensorAxisFromComponents(
+    double a00,
+    double a01,
+    double a02,
+    double a11,
+    double a12,
+    double a22,
+    const cv::Vec3d& hint)
+{
+    if (!std::isfinite(a00) || !std::isfinite(a01) || !std::isfinite(a02) ||
+        !std::isfinite(a11) || !std::isfinite(a12) || !std::isfinite(a22)) {
+        return {0.0, 0.0, 0.0};
+    }
+
+    cv::Vec3d axis{0.0, 0.0, 0.0};
+    const double offDiagonal = a01 * a01 + a02 * a02 + a12 * a12;
+    if (offDiagonal <= kEpsilon) {
+        axis = fallbackPrincipalAxis(a00, a11, a22);
+    } else {
+        const double q = (a00 + a11 + a22) / 3.0;
+        const double b00 = a00 - q;
+        const double b11 = a11 - q;
+        const double b22 = a22 - q;
+        const double p2 = b00 * b00 + b11 * b11 + b22 * b22 + 2.0 * offDiagonal;
+        const double p = std::sqrt(std::max(0.0, p2 / 6.0));
+        if (p <= kEpsilon) {
+            axis = fallbackPrincipalAxis(a00, a11, a22);
+        } else {
+            const double invP = 1.0 / p;
+            const double c00 = b00 * invP;
+            const double c01 = a01 * invP;
+            const double c02 = a02 * invP;
+            const double c11 = b11 * invP;
+            const double c12 = a12 * invP;
+            const double c22 = b22 * invP;
+            const double detC =
+                c00 * (c11 * c22 - c12 * c12) -
+                c01 * (c01 * c22 - c12 * c02) +
+                c02 * (c01 * c12 - c11 * c02);
+            const double r = std::clamp(0.5 * detC, -1.0, 1.0);
+            const double phi = std::acos(r) / 3.0;
+            const double lambda = q + 2.0 * p * std::cos(phi);
+            const cv::Vec3d row0{a00 - lambda, a01, a02};
+            const cv::Vec3d row1{a01, a11 - lambda, a12};
+            const cv::Vec3d row2{a02, a12, a22 - lambda};
+            const std::array<cv::Vec3d, 3> candidates = {
+                row0.cross(row1),
+                row0.cross(row2),
+                row1.cross(row2),
+            };
+            double bestNorm2 = -1.0;
+            for (const auto& candidate : candidates) {
+                const double norm2 = candidate.dot(candidate);
+                if (norm2 > bestNorm2) {
+                    bestNorm2 = norm2;
+                    axis = candidate;
+                }
+            }
+            if (!(bestNorm2 > kEpsilon * kEpsilon)) {
+                axis = fallbackPrincipalAxis(a00, a11, a22);
+            }
+        }
+    }
+    if (length(axis) <= kEpsilon) {
+        axis = fallbackPrincipalAxis(a00, a11, a22);
+    }
+    axis = normalizedOrZero(axis);
+    if (length(axis) <= kEpsilon) {
+        return {0.0, 0.0, 0.0};
+    }
+    const cv::Vec3d normalizedHint = normalizedOrZero(hint);
+    if (length(normalizedHint) > kEpsilon) {
+        if (axis.dot(normalizedHint) < 0.0) {
+            axis *= -1.0;
+        }
+    } else if (axis[2] < 0.0) {
+        axis *= -1.0;
+    }
+    return axis;
 }
 
 [[nodiscard]] std::optional<LasagnaCubeValues> readInterpolationCube(
@@ -500,6 +735,66 @@ void LasagnaChannelChunkCache::trim() const
     }
 }
 
+LasagnaLocalChunkResolver::LasagnaLocalChunkResolver(
+    const LasagnaChannelBinding& binding,
+    const LasagnaChannelChunkCache& cache)
+    : binding_(&binding)
+    , cache_(&cache)
+{
+}
+
+std::shared_ptr<const LasagnaCachedChunk> LasagnaLocalChunkResolver::resolveKey(
+    const LasagnaChannelChunkKey& key)
+{
+    if (hasLast_ && lastKey_ == key) {
+        return lastChunk_;
+    }
+    for (size_t index = 0; index < size_; ++index) {
+        if (keys_[index] == key) {
+            lastKey_ = key;
+            lastChunk_ = chunks_[index];
+            hasLast_ = true;
+            return chunks_[index];
+        }
+    }
+    auto chunk = cache_->get(*binding_, *binding_->array, key);
+    if (size_ < keys_.size()) {
+        keys_[size_] = key;
+        chunks_[size_] = chunk;
+        ++size_;
+    } else {
+        keys_[next_] = key;
+        chunks_[next_] = chunk;
+        next_ = (next_ + 1) % keys_.size();
+    }
+    lastKey_ = key;
+    lastChunk_ = chunk;
+    hasLast_ = true;
+    return chunk;
+}
+
+void LasagnaLocalChunkResolver::resolve(LasagnaCubeRequest& request)
+{
+    if (!request.valid)
+        return;
+    if (request.singleChunk) {
+        request.chunks[0] = resolveKey(request.keys[0]);
+        return;
+    }
+    for (size_t cubeIndex = 0; cubeIndex < request.keys.size(); ++cubeIndex) {
+        bool reused = false;
+        for (size_t previousIndex = 0; previousIndex < cubeIndex; ++previousIndex) {
+            if (request.keys[cubeIndex] == request.keys[previousIndex]) {
+                request.chunks[cubeIndex] = request.chunks[previousIndex];
+                reused = true;
+                break;
+            }
+        }
+        if (!reused)
+            request.chunks[cubeIndex] = resolveKey(request.keys[cubeIndex]);
+    }
+}
+
 size_t lasagnaReadWorkersPerChannel()
 {
     const unsigned hardwareThreads = std::thread::hardware_concurrency();
@@ -559,23 +854,61 @@ cv::Vec3d principalCompactTensorAxis(const cv::Matx33d& tensor, const cv::Vec3d&
         return {0.0, 0.0, 0.0};
     }
 
-    cv::Mat source(3, 3, CV_64F);
-    for (int row = 0; row < 3; ++row) {
-        for (int col = 0; col < 3; ++col) {
-            source.at<double>(row, col) = tensor(row, col);
-        }
-    }
-    cv::Mat eigenvalues;
-    cv::Mat eigenvectors;
     cv::Vec3d axis{0.0, 0.0, 0.0};
-    if (cv::eigen(source, eigenvalues, eigenvectors) &&
-        eigenvectors.rows >= 1 &&
-        eigenvectors.cols >= 3) {
-        axis = {
-            eigenvectors.at<double>(0, 0),
-            eigenvectors.at<double>(0, 1),
-            eigenvectors.at<double>(0, 2),
-        };
+
+    const double a00 = tensor(0, 0);
+    const double a01 = 0.5 * (tensor(0, 1) + tensor(1, 0));
+    const double a02 = 0.5 * (tensor(0, 2) + tensor(2, 0));
+    const double a11 = tensor(1, 1);
+    const double a12 = 0.5 * (tensor(1, 2) + tensor(2, 1));
+    const double a22 = tensor(2, 2);
+    const double offDiagonal = a01 * a01 + a02 * a02 + a12 * a12;
+    if (offDiagonal <= kEpsilon) {
+        axis = fallbackTensorAxis(tensor);
+    } else {
+        const double q = (a00 + a11 + a22) / 3.0;
+        const double b00 = a00 - q;
+        const double b11 = a11 - q;
+        const double b22 = a22 - q;
+        const double p2 = b00 * b00 + b11 * b11 + b22 * b22 + 2.0 * offDiagonal;
+        const double p = std::sqrt(std::max(0.0, p2 / 6.0));
+        if (p <= kEpsilon) {
+            axis = fallbackTensorAxis(tensor);
+        } else {
+            const double invP = 1.0 / p;
+            const double c00 = b00 * invP;
+            const double c01 = a01 * invP;
+            const double c02 = a02 * invP;
+            const double c11 = b11 * invP;
+            const double c12 = a12 * invP;
+            const double c22 = b22 * invP;
+            const double detC =
+                c00 * (c11 * c22 - c12 * c12) -
+                c01 * (c01 * c22 - c12 * c02) +
+                c02 * (c01 * c12 - c11 * c02);
+            const double r = std::clamp(0.5 * detC, -1.0, 1.0);
+            const double phi = std::acos(r) / 3.0;
+            const double lambda = q + 2.0 * p * std::cos(phi);
+            const cv::Vec3d row0{a00 - lambda, a01, a02};
+            const cv::Vec3d row1{a01, a11 - lambda, a12};
+            const cv::Vec3d row2{a02, a12, a22 - lambda};
+            const std::array<cv::Vec3d, 3> candidates = {
+                row0.cross(row1),
+                row0.cross(row2),
+                row1.cross(row2),
+            };
+            double bestNorm2 = -1.0;
+            for (const auto& candidate : candidates) {
+                const double norm2 = candidate.dot(candidate);
+                if (norm2 > bestNorm2) {
+                    bestNorm2 = norm2;
+                    axis = candidate;
+                }
+            }
+            if (!(bestNorm2 > kEpsilon * kEpsilon)) {
+                axis = fallbackTensorAxis(tensor);
+            }
+        }
     }
     if (length(axis) <= kEpsilon) {
         axis = fallbackTensorAxis(tensor);
@@ -680,6 +1013,19 @@ LasagnaCubeRequest prepareLasagnaCubeRequest(
     request.fx = x - static_cast<double>(request.x0);
     request.fy = y - static_cast<double>(request.y0);
     request.fz = z - static_cast<double>(request.z0);
+    const size_t x1 = std::min(request.x0 + size_t{1}, binding.shapeZYX[2] - 1);
+    const size_t y1 = std::min(request.y0 + size_t{1}, binding.shapeZYX[1] - 1);
+    const size_t z1 = std::min(request.z0 + size_t{1}, binding.shapeZYX[0] - 1);
+    const bool singleChunk =
+        request.x0 / binding.chunksZYX[2] == x1 / binding.chunksZYX[2] &&
+        request.y0 / binding.chunksZYX[1] == y1 / binding.chunksZYX[1] &&
+        request.z0 / binding.chunksZYX[0] == z1 / binding.chunksZYX[0];
+    if (singleChunk) {
+        request.keys[0] = chunkKeyForVoxel(binding, request.z0, request.y0, request.x0);
+        request.singleChunk = true;
+        request.valid = true;
+        return request;
+    }
     size_t cubeIndex = 0;
     for (size_t dz = 0; dz <= 1; ++dz) {
         const size_t gz = std::min(request.z0 + dz, binding.shapeZYX[0] - 1);
@@ -693,6 +1039,113 @@ LasagnaCubeRequest prepareLasagnaCubeRequest(
     }
     request.valid = true;
     return request;
+}
+
+bool sameLasagnaSamplingGrid(
+    const LasagnaChannelBinding& a,
+    const LasagnaChannelBinding& b)
+{
+    const double spacingTolerance =
+        1.0e-12 * std::max({1.0, std::abs(a.spacing), std::abs(b.spacing)});
+    return a.shapeZYX == b.shapeZYX &&
+           a.chunksZYX == b.chunksZYX &&
+           std::abs(a.spacing - b.spacing) <= spacingTolerance;
+}
+
+LasagnaCubeRequest cloneLasagnaCubeRequestForBinding(
+    const LasagnaCubeRequest& source,
+    const LasagnaChannelBinding& binding)
+{
+    LasagnaCubeRequest out = source;
+    out.chunks = {};
+    if (out.singleChunk) {
+        out.keys[0].arrayId = binding.arrayId;
+        out.keys[0].channelIndex = static_cast<uint32_t>(binding.channelIndex);
+        return out;
+    }
+    for (auto& key : out.keys) {
+        key.arrayId = binding.arrayId;
+        key.channelIndex = static_cast<uint32_t>(binding.channelIndex);
+    }
+    return out;
+}
+
+void assignResolvedLasagnaCubeRequestChunks(
+    LasagnaCubeRequest& request,
+    const LasagnaChannelChunkCache::ResolvedChunkMap& resolved)
+{
+    if (!request.valid) {
+        return;
+    }
+    if (request.singleChunk) {
+        auto it = resolved.find(request.keys.front());
+        if (it != resolved.end()) {
+            request.chunks[0] = it->second;
+        }
+        return;
+    }
+    for (size_t cubeIndex = 0; cubeIndex < request.keys.size(); ++cubeIndex) {
+        bool reused = false;
+        for (size_t previousIndex = 0; previousIndex < cubeIndex; ++previousIndex) {
+            if (request.keys[cubeIndex] == request.keys[previousIndex]) {
+                request.chunks[cubeIndex] = request.chunks[previousIndex];
+                reused = true;
+                break;
+            }
+        }
+        if (reused) {
+            continue;
+        }
+        auto it = resolved.find(request.keys[cubeIndex]);
+        if (it != resolved.end()) {
+            request.chunks[cubeIndex] = it->second;
+        }
+    }
+}
+
+void appendUniqueLasagnaCubeRequestChunkKeys(
+    const LasagnaCubeRequest& request,
+    std::vector<LasagnaChannelChunkKey>& keys)
+{
+    auto appendIfNewTail = [&](const LasagnaChannelChunkKey& key) {
+        if (keys.empty() || !(keys.back() == key)) {
+            keys.push_back(key);
+        }
+    };
+    if (!request.valid) {
+        return;
+    }
+    if (request.singleChunk) {
+        appendIfNewTail(request.keys.front());
+        return;
+    }
+    for (size_t cubeIndex = 0; cubeIndex < request.keys.size(); ++cubeIndex) {
+        bool duplicate = false;
+        for (size_t previousIndex = 0; previousIndex < cubeIndex; ++previousIndex) {
+            if (request.keys[cubeIndex] == request.keys[previousIndex]) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            appendIfNewTail(request.keys[cubeIndex]);
+        }
+    }
+}
+
+void deduplicateLasagnaChunkKeysInPlace(
+    std::vector<LasagnaChannelChunkKey>& keys)
+{
+    std::unordered_set<LasagnaChannelChunkKey, LasagnaChannelChunkKeyHash> seen;
+    seen.reserve(keys.size());
+    size_t writeIndex = 0;
+    for (const auto& key : keys) {
+        if (!seen.insert(key).second) {
+            continue;
+        }
+        keys[writeIndex++] = key;
+    }
+    keys.resize(writeIndex);
 }
 
 void appendLasagnaInterpolationChunkKeys(
@@ -750,18 +1203,7 @@ std::optional<double> sampleLasagnaChannel(
     const LasagnaChannelBinding& binding,
     const LasagnaCubeRequest& request)
 {
-    const auto cube = readInterpolationCube(binding, request);
-    if (!cube.has_value()) {
-        return std::nullopt;
-    }
-
-    const double c00 = cube->c000 * (1.0 - request.fx) + cube->c001 * request.fx;
-    const double c01 = cube->c010 * (1.0 - request.fx) + cube->c011 * request.fx;
-    const double c10 = cube->c100 * (1.0 - request.fx) + cube->c101 * request.fx;
-    const double c11 = cube->c110 * (1.0 - request.fx) + cube->c111 * request.fx;
-    const double c0 = c00 * (1.0 - request.fy) + c01 * request.fy;
-    const double c1 = c10 * (1.0 - request.fy) + c11 * request.fy;
-    return c0 * (1.0 - request.fz) + c1 * request.fz;
+    return sampleLasagnaChannelValues(binding, request);
 }
 
 std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
@@ -793,15 +1235,23 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
     if (!nxRequest.valid || !nyRequest.valid) {
         return std::nullopt;
     }
-    const auto nxCube = readInterpolationCube(nxBinding, nxRequest);
-    const auto nyCube = readInterpolationCube(nyBinding, nyRequest);
-    if (!nxCube.has_value() || !nyCube.has_value()) {
+    std::array<uint8_t, 8> nxValues{};
+    std::array<uint8_t, 8> nyValues{};
+    if (!readInterpolationCubeBytes(nxBinding, nxRequest, nxValues) ||
+        !readInterpolationCubeBytes(nyBinding, nyRequest, nyValues)) {
         return std::nullopt;
     }
 
-    cv::Matx33d tensor = cv::Matx33d::zeros();
+    const auto& normalTable = decodedCompactNormalTable();
+    double t00 = 0.0;
+    double t01 = 0.0;
+    double t02 = 0.0;
+    double t11 = 0.0;
+    double t12 = 0.0;
+    double t22 = 0.0;
     cv::Vec3d hint{0.0, 0.0, 0.0};
     double totalWeight = 0.0;
+    size_t cubeIndex = 0;
     for (int dz = 0; dz <= 1; ++dz) {
         const double wz = dz == 0 ? (1.0 - nxRequest.fz) : nxRequest.fz;
         for (int dy = 0; dy <= 1; ++dy) {
@@ -810,28 +1260,37 @@ std::optional<cv::Vec3d> sampleLasagnaCompactAxisTensor(
                 const double wx = dx == 0 ? (1.0 - nxRequest.fx) : nxRequest.fx;
                 const double weight = wx * wy * wz;
                 if (weight <= 0.0) {
+                    ++cubeIndex;
                     continue;
                 }
-                const cv::Vec3d normal = decodeCompactNormalFromRaw(
-                    cubeValue(*nxCube, dz, dy, dx),
-                    cubeValue(*nyCube, dz, dy, dx));
-                if (length(normal) <= kEpsilon) {
+                const auto& decoded =
+                    normalTable[(static_cast<size_t>(nxValues[cubeIndex]) << 8) |
+                                static_cast<size_t>(nyValues[cubeIndex])];
+                if (!decoded.valid) {
+                    ++cubeIndex;
                     continue;
                 }
-                for (int row = 0; row < 3; ++row) {
-                    for (int col = 0; col < 3; ++col) {
-                        tensor(row, col) += weight * normal[row] * normal[col];
-                    }
-                }
+                const double nx = decoded.x;
+                const double ny = decoded.y;
+                const double nz = decoded.z;
+                t00 += weight * nx * nx;
+                t01 += weight * nx * ny;
+                t02 += weight * nx * nz;
+                t11 += weight * ny * ny;
+                t12 += weight * ny * nz;
+                t22 += weight * nz * nz;
+                const cv::Vec3d normal{nx, ny, nz};
                 hint += normal * weight;
                 totalWeight += weight;
+                ++cubeIndex;
             }
         }
     }
     if (totalWeight <= kEpsilon) {
         return std::nullopt;
     }
-    const cv::Vec3d normal = principalCompactTensorAxis(tensor, hint);
+    const cv::Vec3d normal = principalCompactTensorAxisFromComponents(
+        t00, t01, t02, t11, t12, t22, hint);
     if (length(normal) <= kEpsilon) {
         return std::nullopt;
     }

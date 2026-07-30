@@ -4,8 +4,10 @@
 #include "vc/lasagna/LineModel.hpp"
 
 #include <cstddef>
+#include <array>
 #include <filesystem>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -15,6 +17,25 @@
 #include <opencv2/core/types.hpp>
 
 namespace vc::fiber_tracer {
+
+struct FiberTraceProfile {
+    size_t oneWayCalls = 0;
+    size_t generations = 0;
+    size_t candidateTasks = 0;
+    double startSampleSeconds = 0.0;
+    double taskBuildSeconds = 0.0;
+    double predictionBatchSeconds = 0.0;
+    double predictionPrepareSeconds = 0.0;
+    double predictionPrefetchSeconds = 0.0;
+    double predictionAssignSeconds = 0.0;
+    double predictionMaterializeSeconds = 0.0;
+    double normalBatchSeconds = 0.0;
+    double normalPrefetchSeconds = 0.0;
+    double normalMaterializeSeconds = 0.0;
+    double candidateScoreSeconds = 0.0;
+    double frontierSeconds = 0.0;
+    double pruneSeconds = 0.0;
+};
 
 struct FiberTraceConfig {
     double stepVoxels = 4.0;
@@ -36,6 +57,7 @@ struct FiberTraceConfig {
     double fusionGapFactor = 2.0;
     double endpointAcceptThresholdUm = 50.0;
     double voxelSizeUm = 0.0;
+    FiberTraceProfile* profile = nullptr;
 };
 
 struct FiberTraceProgress {
@@ -52,8 +74,95 @@ struct FiberPredictionSampleOption {
     bool valid = false;
 };
 
+class FiberPredictionSampleOptions {
+public:
+    class const_iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = FiberPredictionSampleOption;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const FiberPredictionSampleOption*;
+        using reference = const FiberPredictionSampleOption&;
+
+        const_iterator() = default;
+        const_iterator(const FiberPredictionSampleOptions* owner, size_t index)
+            : owner_(owner)
+            , index_(index)
+        {
+        }
+
+        reference operator*() const { return (*owner_)[index_]; }
+        pointer operator->() const { return &(*owner_)[index_]; }
+        const_iterator& operator++()
+        {
+            ++index_;
+            return *this;
+        }
+        const_iterator operator++(int)
+        {
+            const_iterator copy = *this;
+            ++(*this);
+            return copy;
+        }
+        [[nodiscard]] bool operator==(const const_iterator& other) const
+        {
+            return owner_ == other.owner_ && index_ == other.index_;
+        }
+        [[nodiscard]] bool operator!=(const const_iterator& other) const
+        {
+            return !(*this == other);
+        }
+
+    private:
+        const FiberPredictionSampleOptions* owner_ = nullptr;
+        size_t index_ = 0;
+    };
+
+    void clear()
+    {
+        size_ = 0;
+        overflow_.clear();
+    }
+
+    void reserve(size_t count)
+    {
+        if (count > inline_.size()) {
+            overflow_.reserve(count);
+        }
+    }
+
+    void push_back(const FiberPredictionSampleOption& option)
+    {
+        if (size_ < inline_.size() && overflow_.empty()) {
+            inline_[size_++] = option;
+            return;
+        }
+        if (overflow_.empty()) {
+            overflow_.assign(inline_.begin(), inline_.end());
+        }
+        overflow_.push_back(option);
+        ++size_;
+    }
+
+    [[nodiscard]] size_t size() const noexcept { return size_; }
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+
+    [[nodiscard]] const FiberPredictionSampleOption& operator[](size_t index) const
+    {
+        return overflow_.empty() ? inline_[index] : overflow_[index];
+    }
+
+    [[nodiscard]] const_iterator begin() const { return {this, 0}; }
+    [[nodiscard]] const_iterator end() const { return {this, size_}; }
+
+private:
+    std::array<FiberPredictionSampleOption, 4> inline_{};
+    std::vector<FiberPredictionSampleOption> overflow_;
+    size_t size_ = 0;
+};
+
 struct FiberPredictionSample {
-    std::vector<FiberPredictionSampleOption> options;
+    FiberPredictionSampleOptions options;
 };
 
 struct FiberPredictionTraceScales {
@@ -119,6 +228,12 @@ public:
         const std::vector<cv::Vec3d>& referenceDirections,
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples) const override;
+    void sampleBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        const std::vector<cv::Vec3d>& referenceDirections,
+        int parallelThreads,
+        std::vector<FiberPredictionSample>& samples,
+        FiberTraceProfile* profile) const;
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
         const cv::Vec3d& referenceDirection) const override;

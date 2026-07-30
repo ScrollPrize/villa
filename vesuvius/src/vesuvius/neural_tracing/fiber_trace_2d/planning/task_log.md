@@ -1,81 +1,68 @@
-# Native C++ Trace2CP Parallel Candidate Scoring Task Log
+# Native C++ Trace2CP Parallel Runtime Task Log
 
 ## Notes
 
-- Whole-fiber metric tracing remains sequential at the segment level because a
-  segment's start point/direction depends on the previous segment's traced or
-  restarted state.
-- Parallelism was added inside each beam generation in the same broad shape as
-  the Python tensor path:
-  - candidate tasks are built in original beam/candidate order
-  - persisted prediction interpolation cube requests are prepared for all
-    candidate points
-  - involved prediction chunks are prefetched/decode-materialized once per
-    generation
-  - candidate prediction samples are materialized as a batch before scoring
-  - Lasagna candidate normals are sampled in batch when normal-aware
-    smoothness is active
-  - independent candidate loss evaluation runs through OpenMP from the
-    materialized prediction/normal samples when the prediction source and
-    normal sampler are concurrent-safe
-  - `nextFrontier` is rebuilt serially in the original task order
-- Generic `FiberPredictionSource` remains serial by default. Persisted
-  `FiberPredictionField` opts into concurrent sampling and implements batched
-  sampling for presence/nx/ny chunks.
-- `FiberTraceConfig::parallelThreads` controls candidate scoring worker count:
-  `0` is the default and uses the OpenMP default, `1` forces serial lazy
-  scoring, and positive values greater than one clamp
-  to the current candidate count.
-- `vc_fiber_trace_metric` exposes this as `--threads`.
-- The first parallel attempt was slower because it called `predictions.sample()`
-  from inside the OpenMP loop. That caused fine-grained contention on the
-  shared sparse chunk cache. The current path removes cache/Zarr access from
-  the parallel scoring loop.
-- Follow-up measurement showed only about a 2x speedup while consuming several
-  cores and underutilizing a 32-thread machine. The remaining reason is that
-  chunk materialization/prefetch is still a large serial/bounded stage while
-  the fine-grained loss math is relatively small. Prediction prefetch was
-  changed from sequential presence/nx/ny prefetch calls to concurrent
-  per-channel prefetch, matching the normal sampler's structure.
-- A further check found that "batched" still only applied to sampler
-  materialization and candidate loss evaluation. Beam expansion still rebuilt
-  the same cone offset table for every beam, allocated a candidate-direction
-  vector per beam, reserved a hard-coded 81 candidates, and copied the full
-  traced path vector whenever creating a child candidate state.
-- Beam path storage is now parent-linked internally and only materialized back
-  to a vector when returning a public trace result. Candidate generation now
-  caches the per-trace cone offsets once and appends candidates directly in the
-  same beam/candidate order.
-- The duplicate candidate-point rebuild for batched normal sampling was also
-  removed; prediction and normal batch materialization now share the same
-  candidate point vector.
+- User-reported current runtime is nearly unchanged after previous batching
+  changes, so the next step is measurement from the actual workload rather than
+  more code inspection.
+- Representative command uses the remote fiber prediction manifest
+  `s3://philodemos/hendrik/fiber_vols/fiber_s1_001.lasagna.json`, the local
+  Paul test fiber glob ending in `01.json`, the Lasagna normal manifest, and
+  the local remote-cache directory under the shared `data/` tree.
+
+## Attempts
+
+- Invalid baseline attempt: ran the user workload with
+  `/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_zarr_cache`
+  as `--remote-cache-dir`. That was wrong for the user's `$VES` command and
+  created/filled a different remote-cache namespace. Do not use this run for
+  cache or performance conclusions.
+- Corrected cache root for the user's command is
+  `/home/hendrik/business/aiconsulting/vesuviuschallenge/vesuvius_fiber_trace_zarr_cache`.
+- Valid warm-cache baseline with corrected cache root:
+  - command: `volume-cartographer/build/bin/vc_fiber_trace_metric s3://philodemos/hendrik/fiber_vols/fiber_s1_001.lasagna.json /home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_test_paul_4/kb_20260605T150824406_000001.json --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --remote-cache-dir /home/hendrik/business/aiconsulting/vesuviuschallenge/vesuvius_fiber_trace_zarr_cache`
+  - note: current output can still print `[lasagna] streaming uncached data into .../remote_lasagna/url_hex/...` for the remote manifest cache path; do not confuse this with using the wrong cache root.
+  - `native_trace2cp_fiber err/kvx=0.3 restarts=5 segments=87`
+  - `native_trace2cp_timing trace_wall_s=314.087 trace_cpu_s=2396.381`
+  - `/usr/bin/time` reported `WALL_SECONDS=315.56`
+- Added stage profiling to `vc_fiber_trace_metric`.
+- Replaced full beam-frontier stable sort with deterministic bounded top-k
+  scanning. This preserved the 5-restart result and reduced prune time
+  modestly.
+- Added direct per-worker Lasagna chunk resolution for normal sampling.
+  This removed the per-generation normal key-map/prefetch/assign path and
+  reduced wall time from about 136s to about 113s.
+- Added direct per-worker chunk resolution for fiber prediction sampling.
+  This removed the analogous prediction key-map path and reduced wall time to
+  about 90s.
+- Flattened prepared-request scalar and compact-axis sampling to reduce
+  wrapper/matrix-loop overhead while preserving the compact tensor/eigen
+  semantics.
+- Added lightweight final-lookahead frontier records so the final generation
+  only allocates path nodes for selected/reached beams. This reduced
+  `frontier_s + prune_s`, but wall time remains dominated by prediction and
+  normal materialization.
+- Failed attempt: prediction-loss lower-bound pruning for final-generation
+  normal sampling. It was stopped after early progress showed a severe
+  regression because sorting/chunked batches dominated. The lower-bound path
+  was removed.
+- Final verification run after reverting the failed path:
+  - command: `volume-cartographer/build/bin/vc_fiber_trace_metric s3://philodemos/hendrik/fiber_vols/fiber_s1_001.lasagna.json /home/hendrik/business/aiconsulting/vesuviuschallenge/data/train_fibers/fibers_test_paul_4/kb_20260605T150824406_000001.json --normal-manifest /home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json --remote-cache-dir /home/hendrik/business/aiconsulting/vesuviuschallenge/vesuvius_fiber_trace_zarr_cache`
+  - `native_trace2cp_fiber err/kvx=0.3 restarts=5 segments=87`
+  - `native_trace2cp_timing trace_wall_s=85.958 trace_cpu_s=2453.293`
+  - profile: `prediction_batch_s=29.314 normal_batch_s=28.232 candidate_score_s=7.170 frontier_s=7.061 prune_s=6.509`
 
 ## Deviations
 
-- No full remote S3 workload benchmark was run in this agent shell because the
-  local `$SRC`/`$VES` environment variables used by the user's command are not
-  set here and the full workload can be long-running. Validation is focused on
-  build/tests/help smoke output.
+- The target of less than 30 seconds, or close to it, was not reached. The
+  best validated run is about 86 seconds. Further improvement likely needs a
+  larger redesign, such as fused prediction/normal/scoring kernels or a
+  behavior-approved change to segment independence/search shape.
+- Focused unit tests were not run because the user restricted approved runtime
+  commands to the exact `vc_fiber_trace_metric` workload. The native target was
+  rebuilt successfully and the representative workload was run.
 
 ## Validation
 
-- `cmake --build volume-cartographer/build --target test_fiber_trace3d vc_fiber_trace_metric -j 4`
-  passed.
-- `volume-cartographer/build/bin/test_fiber_trace3d` passed: 25 test cases.
-- `ctest --test-dir volume-cartographer/build -R test_fiber_trace3d --output-on-failure`
-  passed.
-- `volume-cartographer/build/bin/vc_fiber_trace_metric --help` shows
-  `--threads`.
-- After concurrent prediction-channel prefetch:
-  - `cmake --build volume-cartographer/build --target test_fiber_trace3d vc_fiber_trace_metric -j 4`
-    passed.
-  - `volume-cartographer/build/bin/test_fiber_trace3d` passed: 25 test cases.
-  - `ctest --test-dir volume-cartographer/build -R test_fiber_trace3d --output-on-failure`
-    passed.
-- After parent-linked beam paths and cached candidate offsets:
-  - `cmake --build volume-cartographer/build --target test_fiber_trace3d vc_fiber_trace_metric -j 4`
-    passed.
-  - `volume-cartographer/build/bin/test_fiber_trace3d` passed: 25 test cases.
-  - `ctest --test-dir volume-cartographer/build -R test_fiber_trace3d --output-on-failure`
-    passed.
-  - `git diff --check` passed.
+- Build: `cmake --build volume-cartographer/build --target vc_fiber_trace_metric -j 16`
+- Workload: exact corrected-cache `vc_fiber_trace_metric` command above.

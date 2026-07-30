@@ -1,5 +1,10 @@
 # 2026-07-30
 
+- Reduced native `vc_fiber_trace_metric` warm-cache runtime on the remote
+  fiber manifest workload from roughly 314s to roughly 86s with profiled
+  direct chunk-resolution sampling, bounded deterministic beam pruning, and
+  lightweight final-lookahead frontier records while preserving the measured
+  5-restart result.
 - Added opt-in native C++ Trace2CP parallel candidate scoring through batched
   persisted prediction materialization, batched Lasagna normals, and
   `vc_fiber_trace_metric --threads`, while preserving deterministic beam output

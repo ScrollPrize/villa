@@ -1,14 +1,17 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 
 #include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <exception>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -29,6 +32,13 @@ namespace {
 
 constexpr double kEpsilon = 1.0e-12;
 constexpr double kPi = 3.141592653589793238462643383279502884;
+
+using TraceClock = std::chrono::steady_clock;
+
+[[nodiscard]] double elapsedSeconds(TraceClock::time_point start)
+{
+    return std::chrono::duration<double>(TraceClock::now() - start).count();
+}
 
 [[nodiscard]] double length(const cv::Vec3d& v)
 {
@@ -715,6 +725,29 @@ struct CandidateTask {
     cv::Vec3d candidatePoint{0.0, 0.0, 0.0};
 };
 
+struct FrontierCandidate {
+    size_t beamIndex = 0;
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    cv::Vec3d previousStepDirection{0.0, 0.0, 0.0};
+    cv::Vec3d currentSampleDirection{0.0, 0.0, 0.0};
+    cv::Vec3d historyDirection{0.0, 0.0, 0.0};
+    double loss = 0.0;
+    double tracedLength = 0.0;
+    int depth = 0;
+    bool reached = false;
+    size_t order = 0;
+};
+
+struct CandidateScoringScratch {
+    std::vector<CandidateScore> scores;
+    std::vector<cv::Vec3d> candidatePoints;
+    std::vector<cv::Vec3d> referenceDirections;
+    std::vector<FiberPredictionSample> predictionSamples;
+    std::vector<vc::lasagna::NormalSampleWithDerivative> normalSamplesWithDerivative;
+    std::vector<vc::lasagna::NormalSample> normalSamples;
+    std::vector<FrontierCandidate> frontierCandidates;
+};
+
 void appendCandidateTasks(
     std::vector<CandidateTask>& tasks,
     size_t beamIndex,
@@ -839,36 +872,58 @@ void appendCandidateTasks(
     return std::clamp(available, 1, static_cast<int>(taskCount));
 }
 
-[[nodiscard]] std::vector<vc::lasagna::NormalSample> sampleCandidateNormals(
+void sampleCandidateNormals(
     const vc::lasagna::NormalSampler* normalSampler,
     const std::vector<cv::Vec3d>& candidatePoints,
-    const FiberTraceConfig& config)
+    const FiberTraceConfig& config,
+    int parallelThreads,
+    std::vector<vc::lasagna::NormalSampleWithDerivative>& samples,
+    std::vector<vc::lasagna::NormalSample>& out,
+    FiberTraceProfile* profile)
 {
-    std::vector<vc::lasagna::NormalSample> out;
+    out.clear();
     if (normalSampler == nullptr ||
         candidatePoints.empty() ||
         !normalAwareSmoothnessEnabled(config)) {
-        return out;
+        return;
     }
-    std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
-    (void)normalSampler->sampleNormalBatch(candidatePoints, false, samples);
-    out.reserve(samples.size());
-    for (const auto& sample : samples)
-        out.push_back(sample.sample);
-    return out;
+    vc::lasagna::NormalBatchReport report;
+    if (const auto* lasagnaSampler =
+            dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(normalSampler)) {
+        report = lasagnaSampler->sampleNormalBatch(
+            candidatePoints,
+            false,
+            parallelThreads,
+            samples);
+    } else {
+        report = normalSampler->sampleNormalBatch(candidatePoints, false, samples);
+    }
+    if (profile != nullptr) {
+        profile->normalPrefetchSeconds += report.prefetchMs / 1000.0;
+        profile->normalMaterializeSeconds += report.materializeMs / 1000.0;
+    }
+    out.resize(samples.size());
+    for (size_t index = 0; index < samples.size(); ++index)
+        out[index] = samples[index].sample;
 }
 
-[[nodiscard]] std::vector<CandidateScore> scoreCandidateTasks(
+[[nodiscard]] const std::vector<CandidateScore>& scoreCandidateTasks(
     const FiberPredictionSource& predictions,
     const vc::lasagna::NormalSampler* normalSampler,
     const std::vector<BeamState>& beams,
     const std::vector<CandidateTask>& tasks,
     const FiberTraceConfig& config,
-    const std::vector<vc::lasagna::NormalSample>& normals)
+    const std::vector<vc::lasagna::NormalSample>& normals,
+    CandidateScoringScratch& scratch,
+    FiberTraceProfile* profile)
 {
-    std::vector<CandidateScore> scores(tasks.size());
+    auto& scores = scratch.scores;
+    scores.clear();
+    scores.resize(tasks.size());
     if (tasks.empty())
         return scores;
+    if (profile != nullptr)
+        profile->candidateTasks += tasks.size();
 
     const int workers = traceWorkerCount(
         predictions,
@@ -876,6 +931,7 @@ void appendCandidateTasks(
         config,
         tasks.size());
     if (workers <= 1) {
+        const auto scoreStart = TraceClock::now();
         for (size_t index = 0; index < tasks.size(); ++index) {
             const auto& task = tasks[index];
             scores[index] = candidateLoss(
@@ -886,31 +942,58 @@ void appendCandidateTasks(
                 task.candidatePoint,
                 config);
         }
+        if (profile != nullptr)
+            profile->candidateScoreSeconds += elapsedSeconds(scoreStart);
         return scores;
     }
 
-    std::vector<cv::Vec3d> candidatePoints;
-    std::vector<cv::Vec3d> referenceDirections;
+    auto& candidatePoints = scratch.candidatePoints;
+    auto& referenceDirections = scratch.referenceDirections;
+    candidatePoints.clear();
+    referenceDirections.clear();
     candidatePoints.reserve(tasks.size());
     referenceDirections.reserve(tasks.size());
     for (const auto& task : tasks) {
         candidatePoints.push_back(task.candidatePoint);
         referenceDirections.push_back(task.direction);
     }
-    std::vector<FiberPredictionSample> predictionSamples;
-    predictions.sampleBatch(
-        candidatePoints,
-        referenceDirections,
-        workers,
-        predictionSamples);
+    auto& predictionSamples = scratch.predictionSamples;
+    const auto predictionStart = TraceClock::now();
+    if (const auto* field = dynamic_cast<const FiberPredictionField*>(&predictions)) {
+        field->sampleBatch(
+            candidatePoints,
+            referenceDirections,
+            workers,
+            predictionSamples,
+            profile);
+    } else {
+        predictions.sampleBatch(
+            candidatePoints,
+            referenceDirections,
+            workers,
+            predictionSamples);
+    }
+    if (profile != nullptr)
+        profile->predictionBatchSeconds += elapsedSeconds(predictionStart);
     if (predictionSamples.size() != tasks.size()) {
         throw std::runtime_error(
             "fiber prediction batch returned the wrong number of samples");
     }
-    const auto batchedNormals =
-        sampleCandidateNormals(normalSampler, candidatePoints, config);
-    const auto& normalsForScoring = normals.empty() ? batchedNormals : normals;
+    const auto normalStart = TraceClock::now();
+    sampleCandidateNormals(
+        normalSampler,
+        candidatePoints,
+        config,
+        workers,
+        scratch.normalSamplesWithDerivative,
+        scratch.normalSamples,
+        profile);
+    if (profile != nullptr)
+        profile->normalBatchSeconds += elapsedSeconds(normalStart);
+    const auto& normalsForScoring =
+        normals.empty() ? scratch.normalSamples : normals;
 
+    const auto scoreStart = TraceClock::now();
     std::atomic<bool> failed{false};
     std::exception_ptr firstError;
     auto scoreOne = [&](size_t index) {
@@ -951,6 +1034,8 @@ void appendCandidateTasks(
     for (size_t index = 0; index < tasks.size(); ++index)
         scoreOne(index);
 #endif
+    if (profile != nullptr)
+        profile->candidateScoreSeconds += elapsedSeconds(scoreStart);
     return scores;
 }
 
@@ -973,6 +1058,42 @@ void appendCandidateTasks(
     return start * (1.0 - t) + end * t;
 }
 
+[[nodiscard]] FrontierCandidate makeFrontierCandidate(
+    const BeamState& beam,
+    size_t beamIndex,
+    size_t order,
+    const cv::Vec3d& taskDirection,
+    const cv::Vec3d& candidatePoint,
+    const CandidateScore& candidateScore,
+    const cv::Vec3d& target,
+    const cv::Vec3d& targetPlaneNormal,
+    const FiberTraceConfig& config)
+{
+    const cv::Vec3d currentPoint = beamEndpoint(beam);
+    const auto crossing = interpolatePlaneCrossing(
+        currentPoint,
+        candidatePoint,
+        target,
+        targetPlaneNormal);
+    const cv::Vec3d nextPoint = crossing.value_or(candidatePoint);
+    return {
+        beamIndex,
+        nextPoint,
+        taskDirection,
+        candidateScore.selectedCurrentDirection,
+        updateHistoryDirection(
+            beam.historyDirection,
+            taskDirection,
+            beam.depth,
+            config.cumulativeSmoothnessSteps),
+        beam.loss + candidateScore.loss,
+        beam.tracedLength + length(nextPoint - currentPoint),
+        beam.depth + 1,
+        crossing.has_value(),
+        order,
+    };
+}
+
 [[nodiscard]] double beamPruneScore(const BeamState& state)
 {
     return state.loss + static_cast<double>(state.depth) * 1.0e-12;
@@ -985,25 +1106,6 @@ void appendCandidateTasks(
     return a.depth < b.depth;
 }
 
-[[nodiscard]] std::vector<size_t> beamIndicesInPythonPruneOrder(
-    const std::vector<BeamState>& states)
-{
-    std::vector<size_t> order(states.size());
-    std::iota(order.begin(), order.end(), size_t{0});
-    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        const double scoreA = beamPruneScore(states[a]);
-        const double scoreB = beamPruneScore(states[b]);
-        const bool finiteA = std::isfinite(scoreA);
-        const bool finiteB = std::isfinite(scoreB);
-        if (finiteA != finiteB)
-            return finiteA;
-        if (scoreA != scoreB)
-            return scoreA < scoreB;
-        return false;
-    });
-    return order;
-}
-
 [[nodiscard]] std::vector<BeamState> pruneBeamStates(
     std::vector<BeamState> states,
     int beamWidth,
@@ -1013,48 +1115,160 @@ void appendCandidateTasks(
         return {};
     const size_t keep = static_cast<size_t>(std::max(1, beamWidth));
     const double distance = std::max(0.0, pruneDistanceVoxels);
-    const std::vector<size_t> order = beamIndicesInPythonPruneOrder(states);
-    if (distance <= 0.0) {
-        std::vector<BeamState> out;
-        out.reserve(std::min(keep, states.size()));
-        for (const size_t index : order) {
-            if (!std::isfinite(beamPruneScore(states[index])))
+    std::vector<size_t> selected;
+    selected.reserve(std::min(keep, states.size()));
+    std::vector<unsigned char> unavailable(states.size(), 0);
+    const double distance2 = distance * distance;
+
+    while (selected.size() < keep) {
+        std::optional<size_t> best;
+        double bestScore = 0.0;
+        for (size_t index = 0; index < states.size(); ++index) {
+            if (unavailable[index])
                 continue;
-            out.push_back(std::move(states[index]));
-            if (out.size() >= keep)
-                break;
+            const double score = beamPruneScore(states[index]);
+            if (!std::isfinite(score))
+                continue;
+            if (distance > 0.0) {
+                const cv::Vec3d point = beamEndpoint(states[index]);
+                bool tooClose = false;
+                for (const size_t existingIndex : selected) {
+                    const cv::Vec3d delta = point - beamEndpoint(states[existingIndex]);
+                    if (delta.dot(delta) < distance2) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                if (tooClose)
+                    continue;
+            }
+            if (!best.has_value() || score < bestScore) {
+                best = index;
+                bestScore = score;
+            }
         }
-        if (!out.empty())
-            return out;
-        return {std::move(states[order.front()])};
+        if (!best.has_value())
+            break;
+        unavailable[*best] = 1;
+        selected.push_back(*best);
     }
 
     std::vector<BeamState> out;
-    out.reserve(std::min(keep, states.size()));
-    const double distance2 = distance * distance;
-    for (const size_t index : order) {
-        auto& state = states[index];
-        if (!std::isfinite(beamPruneScore(state)))
-            continue;
-        const cv::Vec3d point = beamEndpoint(state);
-        bool tooClose = false;
-        for (const auto& existing : out) {
-            const cv::Vec3d existingPoint = beamEndpoint(existing);
-            const cv::Vec3d delta = point - existingPoint;
-            if (delta.dot(delta) < distance2) {
-                tooClose = true;
-                break;
-            }
-        }
-        if (tooClose)
-            continue;
-        out.push_back(std::move(state));
-        if (out.size() >= keep)
-            break;
-    }
+    out.reserve(selected.size());
+    for (const size_t index : selected)
+        out.push_back(std::move(states[index]));
     if (!out.empty())
         return out;
-    return {std::move(states[order.front()])};
+    return {std::move(states.front())};
+}
+
+[[nodiscard]] double frontierPruneScore(const FrontierCandidate& candidate)
+{
+    return candidate.loss + static_cast<double>(candidate.depth) * 1.0e-12;
+}
+
+[[nodiscard]] std::vector<size_t> selectFrontierCandidateIndices(
+    const std::vector<FrontierCandidate>& candidates,
+    int beamWidth,
+    double pruneDistanceVoxels)
+{
+    if (candidates.empty())
+        return {};
+    const size_t keep = static_cast<size_t>(std::max(1, beamWidth));
+    const double distance = std::max(0.0, pruneDistanceVoxels);
+    const double distance2 = distance * distance;
+    std::vector<size_t> selected;
+    selected.reserve(std::min(keep, candidates.size()));
+    std::vector<unsigned char> unavailable(candidates.size(), 0);
+
+    while (selected.size() < keep) {
+        std::optional<size_t> best;
+        double bestScore = 0.0;
+        for (size_t index = 0; index < candidates.size(); ++index) {
+            if (unavailable[index])
+                continue;
+            const double score = frontierPruneScore(candidates[index]);
+            if (!std::isfinite(score))
+                continue;
+            if (distance > 0.0) {
+                bool tooClose = false;
+                for (const size_t existingIndex : selected) {
+                    const cv::Vec3d delta =
+                        candidates[index].point - candidates[existingIndex].point;
+                    if (delta.dot(delta) < distance2) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                if (tooClose)
+                    continue;
+            }
+            if (!best.has_value() || score < bestScore) {
+                best = index;
+                bestScore = score;
+            }
+        }
+        if (!best.has_value())
+            break;
+        unavailable[*best] = 1;
+        selected.push_back(*best);
+    }
+
+    if (selected.empty())
+        selected.push_back(0);
+    return selected;
+}
+
+[[nodiscard]] BeamState beamStateFromFrontierCandidate(
+    const std::vector<BeamState>& parents,
+    const FrontierCandidate& candidate)
+{
+    const BeamState& parent = parents[candidate.beamIndex];
+    BeamState out = parent;
+    out.path = appendBeamPathPoint(parent.path, candidate.point);
+    out.previousStepDirection = candidate.previousStepDirection;
+    out.currentSampleDirection = candidate.currentSampleDirection;
+    out.historyDirection = candidate.historyDirection;
+    out.loss = candidate.loss;
+    out.tracedLength = candidate.tracedLength;
+    out.depth = candidate.depth;
+    out.reached = candidate.reached;
+    out.reason = candidate.reached ? "target_plane" : std::string{};
+    return out;
+}
+
+[[nodiscard]] std::vector<BeamState> pruneFrontierCandidates(
+    const std::vector<FrontierCandidate>& candidates,
+    const std::vector<BeamState>& parents,
+    int beamWidth,
+    double pruneDistanceVoxels)
+{
+    if (candidates.empty())
+        return {};
+    const std::vector<size_t> selected = selectFrontierCandidateIndices(
+        candidates,
+        beamWidth,
+        pruneDistanceVoxels);
+    std::vector<BeamState> out;
+    out.reserve(selected.size());
+    for (const size_t index : selected) {
+        out.push_back(beamStateFromFrontierCandidate(parents, candidates[index]));
+    }
+    return out;
+}
+
+[[nodiscard]] std::optional<size_t> bestReachedFrontierCandidateIndex(
+    const std::vector<FrontierCandidate>& candidates)
+{
+    std::optional<size_t> best;
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        const auto& candidate = candidates[index];
+        if (!candidate.reached)
+            continue;
+        if (!best.has_value() || candidate.loss < candidates[*best].loss)
+            best = index;
+    }
+    return best;
 }
 
 [[nodiscard]] std::optional<size_t> bestReachedStateIndexPythonParity(
@@ -1086,8 +1300,14 @@ void appendCandidateTasks(
     const cv::Vec3d referenceStartDirection = normalizedOr(
         request.initialDirection,
         normalizedOr(target - start, {1.0, 0.0, 0.0}));
+    FiberTraceProfile* profile = request.config.profile;
+    if (profile != nullptr)
+        ++profile->oneWayCalls;
+    const auto startSampleStart = TraceClock::now();
     const ScoredDirection startPrediction =
         bestAlignedPrediction(predictions, start, referenceStartDirection, false);
+    if (profile != nullptr)
+        profile->startSampleSeconds += elapsedSeconds(startSampleStart);
     if (!startPrediction.valid) {
         throw std::invalid_argument(
             "fiber trace start point has no valid prediction direction");
@@ -1109,6 +1329,7 @@ void appendCandidateTasks(
     initial.currentSampleDirection = startDirection;
     initial.historyDirection = startDirection;
     std::vector<BeamState> beams{std::move(initial)};
+    CandidateScoringScratch scoringScratch;
     std::string reason = "max_step_factor";
 
     const int lookaheadSteps = request.config.beamWidth <= 1
@@ -1126,7 +1347,11 @@ void appendCandidateTasks(
     while (stepIndex < maxSteps) {
         std::vector<BeamState> expanded = beams;
         int advanced = 0;
+        bool prunedFinalFrontier = false;
         for (; advanced < lookaheadSteps && stepIndex + advanced < maxSteps; ++advanced) {
+            if (profile != nullptr)
+                ++profile->generations;
+            const auto taskBuildStart = TraceClock::now();
             std::vector<CandidateTask> tasks;
             tasks.reserve(expanded.size() * candidateCount);
             for (size_t beamIndex = 0; beamIndex < expanded.size(); ++beamIndex) {
@@ -1137,14 +1362,87 @@ void appendCandidateTasks(
                     coneOffsets,
                     step);
             }
-            const auto scores = scoreCandidateTasks(
+            if (profile != nullptr)
+                profile->taskBuildSeconds += elapsedSeconds(taskBuildStart);
+
+            const auto& scores = scoreCandidateTasks(
                 predictions,
                 normalSampler,
                 expanded,
                 tasks,
                 request.config,
-                {});
+                {},
+                scoringScratch,
+                profile);
 
+            const bool finalLookaheadGeneration =
+                advanced + 1 >= lookaheadSteps ||
+                stepIndex + advanced + 1 >= maxSteps;
+            if (finalLookaheadGeneration) {
+                const auto frontierStart = TraceClock::now();
+                auto& frontier = scoringScratch.frontierCandidates;
+                frontier.clear();
+                frontier.reserve(tasks.size());
+                for (size_t taskIndex = 0; taskIndex < tasks.size(); ++taskIndex) {
+                    const auto& task = tasks[taskIndex];
+                    const CandidateScore& candidateScore = scores[taskIndex];
+                    if (!candidateScore.valid || !std::isfinite(candidateScore.loss))
+                        continue;
+                    frontier.push_back(makeFrontierCandidate(
+                        expanded[task.beamIndex],
+                        task.beamIndex,
+                        taskIndex,
+                        task.direction,
+                        task.candidatePoint,
+                        candidateScore,
+                        target,
+                        targetPlaneNormal,
+                        request.config));
+                }
+                if (profile != nullptr)
+                    profile->frontierSeconds += elapsedSeconds(frontierStart);
+                if (frontier.empty()) {
+                    reason = "no_valid_candidates";
+                    expanded.clear();
+                    break;
+                }
+                const auto bestReachedIndex =
+                    bestReachedFrontierCandidateIndex(frontier);
+                if (bestReachedIndex.has_value()) {
+                    const BeamState bestReached = beamStateFromFrontierCandidate(
+                        expanded,
+                        frontier[*bestReachedIndex]);
+                    if (progress) {
+                        FiberTraceProgress event;
+                        event.phase = phase;
+                        event.step = stepIndex + advanced + 1;
+                        event.maxSteps = maxSteps;
+                        event.targetPlaneProgress = 1.0;
+                        event.reason = "target_plane";
+                        progress(event);
+                    }
+                    return {beamPathPoints(bestReached),
+                            true,
+                            bestReached.reason,
+                            static_cast<int>(
+                                beamPointCount(bestReached) > 0
+                                    ? beamPointCount(bestReached) - 1
+                                    : 0)};
+                }
+                const auto pruneStart = TraceClock::now();
+                beams = pruneFrontierCandidates(
+                    frontier,
+                    expanded,
+                    request.config.beamWidth,
+                    request.config.beamPruneDistanceVoxels);
+                if (profile != nullptr)
+                    profile->pruneSeconds += elapsedSeconds(pruneStart);
+                prunedFinalFrontier = true;
+                ++advanced;
+                break;
+            }
+
+            const auto frontierStart = TraceClock::now();
             std::vector<BeamState> nextFrontier;
             nextFrontier.reserve(tasks.size());
             for (size_t taskIndex = 0; taskIndex < tasks.size(); ++taskIndex) {
@@ -1178,6 +1476,8 @@ void appendCandidateTasks(
                 }
                 nextFrontier.push_back(std::move(next));
             }
+            if (profile != nullptr)
+                profile->frontierSeconds += elapsedSeconds(frontierStart);
             expanded = std::move(nextFrontier);
             if (expanded.empty()) {
                 reason = "no_valid_candidates";
@@ -1202,13 +1502,18 @@ void appendCandidateTasks(
                                 : 0)};
             }
         }
-        if (expanded.empty())
+        if (expanded.empty() && !prunedFinalFrontier)
             break;
 
-        beams = pruneBeamStates(
-            std::move(expanded),
-            request.config.beamWidth,
-            request.config.beamPruneDistanceVoxels);
+        if (!prunedFinalFrontier) {
+            const auto pruneStart = TraceClock::now();
+            beams = pruneBeamStates(
+                std::move(expanded),
+                request.config.beamWidth,
+                request.config.beamPruneDistanceVoxels);
+            if (profile != nullptr)
+                profile->pruneSeconds += elapsedSeconds(pruneStart);
+        }
         stepIndex += std::max(1, advanced);
 
         if (progress) {
@@ -1509,6 +1814,10 @@ public:
         vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap ny;
     };
 
+    struct OptionSamplingGrid {
+        bool sharedPresenceNxNy = false;
+    };
+
     Impl(const vc::lasagna::LasagnaDataset& dataset, size_t maxCachedBytes)
         : cache_(vc::lasagna::sharedLasagnaChannelChunkCache(maxCachedBytes))
     {
@@ -1526,6 +1835,13 @@ public:
                 vc::lasagna::bindLasagnaChannel(manifest, channels[0]),
                 vc::lasagna::bindLasagnaChannel(manifest, channels[1]),
                 vc::lasagna::bindLasagnaChannel(manifest, channels[2]),
+            });
+        }
+        optionGrids_.reserve(options_.size());
+        for (const auto& option : options_) {
+            optionGrids_.push_back({
+                vc::lasagna::sameLasagnaSamplingGrid(option.presence, option.nx) &&
+                vc::lasagna::sameLasagnaSamplingGrid(option.presence, option.ny),
             });
         }
     }
@@ -1563,7 +1879,8 @@ public:
         const std::vector<cv::Vec3d>& volumePoints,
         const std::vector<cv::Vec3d>& referenceDirections,
         int parallelThreads,
-        std::vector<FiberPredictionSample>& samples) const
+        std::vector<FiberPredictionSample>& samples,
+        FiberTraceProfile* profile) const
     {
         if (volumePoints.size() != referenceDirections.size()) {
             throw std::invalid_argument(
@@ -1575,47 +1892,282 @@ public:
             return;
 
         const size_t optionCount = options_.size();
+        const int workers =
+            std::clamp(parallelThreads, 1, static_cast<int>(volumePoints.size()));
+        const auto directStart = TraceClock::now();
+        auto materializeDirect = [&](
+            size_t pointIndex,
+            std::vector<vc::lasagna::LasagnaLocalChunkResolver>& presenceResolvers,
+            std::vector<vc::lasagna::LasagnaLocalChunkResolver>& nxResolvers,
+            std::vector<vc::lasagna::LasagnaLocalChunkResolver>& nyResolvers) {
+            auto& out = samples[pointIndex];
+            out.options.clear();
+            out.options.reserve(optionCount);
+            for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                const auto& option = options_[optionIndex];
+                auto presenceRequest = vc::lasagna::prepareLasagnaCubeRequest(
+                    option.presence, volumePoints[pointIndex]);
+                vc::lasagna::LasagnaCubeRequest nxRequest;
+                vc::lasagna::LasagnaCubeRequest nyRequest;
+                if (optionGrids_[optionIndex].sharedPresenceNxNy) {
+                    nxRequest = vc::lasagna::cloneLasagnaCubeRequestForBinding(
+                        presenceRequest,
+                        option.nx);
+                    nyRequest = vc::lasagna::cloneLasagnaCubeRequestForBinding(
+                        presenceRequest,
+                        option.ny);
+                } else {
+                    nxRequest = vc::lasagna::prepareLasagnaCubeRequest(
+                        option.nx, volumePoints[pointIndex]);
+                    nyRequest = vc::lasagna::prepareLasagnaCubeRequest(
+                        option.ny, volumePoints[pointIndex]);
+                }
+                presenceResolvers[optionIndex].resolve(presenceRequest);
+                nxResolvers[optionIndex].resolve(nxRequest);
+                nyResolvers[optionIndex].resolve(nyRequest);
+
+                const auto rawPresence =
+                    vc::lasagna::sampleLasagnaChannel(option.presence, presenceRequest);
+                const auto direction =
+                    vc::lasagna::sampleLasagnaCompactAxisTensor(
+                        option.nx, option.ny, nxRequest, nyRequest);
+                if (!rawPresence.has_value() || !direction.has_value()) {
+                    out.options.push_back({});
+                    continue;
+                }
+                out.options.push_back({
+                    alignTo(*direction, referenceDirections[pointIndex]),
+                    clamp01(*rawPresence / 255.0),
+                    true,
+                });
+            }
+        };
+        auto makeResolvers = [&](
+            const auto& bindingSelector) {
+            std::vector<vc::lasagna::LasagnaLocalChunkResolver> resolvers;
+            resolvers.reserve(optionCount);
+            for (const auto& option : options_)
+                resolvers.emplace_back(bindingSelector(option), *cache_);
+            return resolvers;
+        };
+
+        if (workers <= 1) {
+            auto presenceResolvers = makeResolvers([](const Option& option) -> const auto& {
+                return option.presence;
+            });
+            auto nxResolvers = makeResolvers([](const Option& option) -> const auto& {
+                return option.nx;
+            });
+            auto nyResolvers = makeResolvers([](const Option& option) -> const auto& {
+                return option.ny;
+            });
+            for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex) {
+                materializeDirect(
+                    pointIndex,
+                    presenceResolvers,
+                    nxResolvers,
+                    nyResolvers);
+            }
+        } else {
+#ifdef _OPENMP
+            std::atomic<bool> failed{false};
+            std::exception_ptr firstError;
+            const auto count = static_cast<std::ptrdiff_t>(volumePoints.size());
+            #pragma omp parallel num_threads(workers)
+            {
+                auto presenceResolvers = makeResolvers([](const Option& option) -> const auto& {
+                    return option.presence;
+                });
+                auto nxResolvers = makeResolvers([](const Option& option) -> const auto& {
+                    return option.nx;
+                });
+                auto nyResolvers = makeResolvers([](const Option& option) -> const auto& {
+                    return option.ny;
+                });
+                #pragma omp for schedule(static)
+                for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
+                    if (failed.load(std::memory_order_relaxed))
+                        continue;
+                    try {
+                        materializeDirect(
+                            static_cast<size_t>(rawIndex),
+                            presenceResolvers,
+                            nxResolvers,
+                            nyResolvers);
+                    } catch (...) {
+                        bool expected = false;
+                        if (failed.compare_exchange_strong(expected, true)) {
+                            #pragma omp critical(fiber_prediction_direct_error)
+                            {
+                                if (!firstError)
+                                    firstError = std::current_exception();
+                            }
+                        }
+                    }
+                }
+            }
+            if (firstError)
+                std::rethrow_exception(firstError);
+#else
+            std::vector<std::future<void>> futures;
+            futures.reserve(static_cast<size_t>(workers));
+            std::atomic<size_t> next{0};
+            for (int worker = 0; worker < workers; ++worker) {
+                futures.push_back(std::async(std::launch::async, [&]() {
+                    auto presenceResolvers = makeResolvers([](const Option& option) -> const auto& {
+                        return option.presence;
+                    });
+                    auto nxResolvers = makeResolvers([](const Option& option) -> const auto& {
+                        return option.nx;
+                    });
+                    auto nyResolvers = makeResolvers([](const Option& option) -> const auto& {
+                        return option.ny;
+                    });
+                    while (true) {
+                        const size_t pointIndex = next.fetch_add(1);
+                        if (pointIndex >= volumePoints.size())
+                            return;
+                        materializeDirect(
+                            pointIndex,
+                            presenceResolvers,
+                            nxResolvers,
+                            nyResolvers);
+                    }
+                }));
+            }
+            for (auto& future : futures)
+                future.get();
+#endif
+        }
+        if (profile != nullptr)
+            profile->predictionMaterializeSeconds += elapsedSeconds(directStart);
+        return;
+
+        const auto prepareStart = TraceClock::now();
         std::vector<PreparedOptionSample> prepared(volumePoints.size() * optionCount);
         std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>> presenceKeys(optionCount);
         std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>> nxKeys(optionCount);
         std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>> nyKeys(optionCount);
-        for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
-            presenceKeys[optionIndex].reserve(volumePoints.size() * 8);
-            nxKeys[optionIndex].reserve(volumePoints.size() * 8);
-            nyKeys[optionIndex].reserve(volumePoints.size() * 8);
-        }
-
-        for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex) {
+        const auto preparePoint = [&](size_t pointIndex,
+                                      std::vector<vc::lasagna::LasagnaChannelChunkKey>* localPresenceKeys,
+                                      std::vector<vc::lasagna::LasagnaChannelChunkKey>* localNxKeys,
+                                      std::vector<vc::lasagna::LasagnaChannelChunkKey>* localNyKeys) {
             for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
                 const auto& option = options_[optionIndex];
                 auto& point = prepared[pointIndex * optionCount + optionIndex];
                 point.presence = vc::lasagna::prepareLasagnaCubeRequest(
                     option.presence, volumePoints[pointIndex]);
-                point.nx = vc::lasagna::prepareLasagnaCubeRequest(
-                    option.nx, volumePoints[pointIndex]);
-                point.ny = vc::lasagna::prepareLasagnaCubeRequest(
-                    option.ny, volumePoints[pointIndex]);
-                if (point.presence.valid) {
-                    presenceKeys[optionIndex].insert(
-                        presenceKeys[optionIndex].end(),
-                        point.presence.keys.begin(),
-                        point.presence.keys.end());
+                if (optionGrids_[optionIndex].sharedPresenceNxNy) {
+                    point.nx = vc::lasagna::cloneLasagnaCubeRequestForBinding(
+                        point.presence,
+                        option.nx);
+                    point.ny = vc::lasagna::cloneLasagnaCubeRequestForBinding(
+                        point.presence,
+                        option.ny);
+                } else {
+                    point.nx = vc::lasagna::prepareLasagnaCubeRequest(
+                        option.nx, volumePoints[pointIndex]);
+                    point.ny = vc::lasagna::prepareLasagnaCubeRequest(
+                        option.ny, volumePoints[pointIndex]);
                 }
-                if (point.nx.valid) {
-                    nxKeys[optionIndex].insert(
-                        nxKeys[optionIndex].end(),
-                        point.nx.keys.begin(),
-                        point.nx.keys.end());
-                }
-                if (point.ny.valid) {
-                    nyKeys[optionIndex].insert(
-                        nyKeys[optionIndex].end(),
-                        point.ny.keys.begin(),
-                        point.ny.keys.end());
+                vc::lasagna::appendUniqueLasagnaCubeRequestChunkKeys(
+                    point.presence,
+                    localPresenceKeys[optionIndex]);
+                vc::lasagna::appendUniqueLasagnaCubeRequestChunkKeys(
+                    point.nx,
+                    localNxKeys[optionIndex]);
+                vc::lasagna::appendUniqueLasagnaCubeRequestChunkKeys(
+                    point.ny,
+                    localNyKeys[optionIndex]);
+            }
+        };
+
+#ifdef _OPENMP
+        if (workers > 1) {
+            const size_t workerCount = static_cast<size_t>(workers);
+            std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>>
+                presenceKeysByWorker(workerCount * optionCount);
+            std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>>
+                nxKeysByWorker(workerCount * optionCount);
+            std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>>
+                nyKeysByWorker(workerCount * optionCount);
+            const size_t reservePerWorker =
+                volumePoints.size() / workerCount + 16;
+            for (size_t worker = 0; worker < workerCount; ++worker) {
+                for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                    const size_t slot = worker * optionCount + optionIndex;
+                    presenceKeysByWorker[slot].reserve(reservePerWorker);
+                    nxKeysByWorker[slot].reserve(reservePerWorker);
+                    nyKeysByWorker[slot].reserve(reservePerWorker);
                 }
             }
+            const auto count = static_cast<std::ptrdiff_t>(volumePoints.size());
+            #pragma omp parallel num_threads(workers)
+            {
+                const size_t worker = static_cast<size_t>(omp_get_thread_num());
+                const size_t slotOffset = worker * optionCount;
+                #pragma omp for schedule(static)
+                for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
+                    preparePoint(
+                        static_cast<size_t>(rawIndex),
+                        presenceKeysByWorker.data() + slotOffset,
+                        nxKeysByWorker.data() + slotOffset,
+                        nyKeysByWorker.data() + slotOffset);
+                }
+                for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                    vc::lasagna::deduplicateLasagnaChunkKeysInPlace(
+                        presenceKeysByWorker[slotOffset + optionIndex]);
+                    vc::lasagna::deduplicateLasagnaChunkKeysInPlace(
+                        nxKeysByWorker[slotOffset + optionIndex]);
+                    vc::lasagna::deduplicateLasagnaChunkKeysInPlace(
+                        nyKeysByWorker[slotOffset + optionIndex]);
+                }
+            }
+            auto mergeKeys = [&](std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>>& out,
+                                 std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>>& byWorker) {
+                for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                    size_t total = 0;
+                    for (size_t worker = 0; worker < workerCount; ++worker) {
+                        total += byWorker[worker * optionCount + optionIndex].size();
+                    }
+                    out[optionIndex].reserve(total);
+                    for (size_t worker = 0; worker < workerCount; ++worker) {
+                        auto& local = byWorker[worker * optionCount + optionIndex];
+                        out[optionIndex].insert(
+                            out[optionIndex].end(),
+                            std::make_move_iterator(local.begin()),
+                            std::make_move_iterator(local.end()));
+                    }
+                }
+            };
+            mergeKeys(presenceKeys, presenceKeysByWorker);
+            mergeKeys(nxKeys, nxKeysByWorker);
+            mergeKeys(nyKeys, nyKeysByWorker);
+        } else
+#endif
+        {
+            for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                presenceKeys[optionIndex].reserve(volumePoints.size());
+                nxKeys[optionIndex].reserve(volumePoints.size());
+                nyKeys[optionIndex].reserve(volumePoints.size());
+            }
+            for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex) {
+                preparePoint(
+                    pointIndex,
+                    presenceKeys.data(),
+                    nxKeys.data(),
+                    nyKeys.data());
+            }
+            for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                vc::lasagna::deduplicateLasagnaChunkKeysInPlace(presenceKeys[optionIndex]);
+                vc::lasagna::deduplicateLasagnaChunkKeysInPlace(nxKeys[optionIndex]);
+                vc::lasagna::deduplicateLasagnaChunkKeysInPlace(nyKeys[optionIndex]);
+            }
         }
+        if (profile != nullptr)
+            profile->predictionPrepareSeconds += elapsedSeconds(prepareStart);
 
+        const auto prefetchStart = TraceClock::now();
         std::vector<OptionChunkMaps> chunks(optionCount);
         const size_t readWorkers = vc::lasagna::lasagnaReadWorkersPerChannel();
         std::vector<std::future<vc::lasagna::NormalPrefetchReport>> prefetches;
@@ -1651,30 +2203,43 @@ public:
         }
         for (auto& future : prefetches)
             (void)future.get();
+        if (profile != nullptr)
+            profile->predictionPrefetchSeconds += elapsedSeconds(prefetchStart);
 
-        auto assignChunks = [](
-            vc::lasagna::LasagnaCubeRequest& request,
-            const vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap& resolved) {
-            if (!request.valid)
-                return;
-            for (size_t cubeIndex = 0; cubeIndex < request.keys.size(); ++cubeIndex) {
-                auto it = resolved.find(request.keys[cubeIndex]);
-                if (it != resolved.end())
-                    request.chunks[cubeIndex] = it->second;
-            }
-        };
-        for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex) {
+        const auto assignStart = TraceClock::now();
+        const auto assignPointChunks = [&](size_t pointIndex) {
             for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
                 auto& point = prepared[pointIndex * optionCount + optionIndex];
                 const auto& maps = chunks[optionIndex];
-                assignChunks(point.presence, maps.presence);
-                assignChunks(point.nx, maps.nx);
-                assignChunks(point.ny, maps.ny);
+                vc::lasagna::assignResolvedLasagnaCubeRequestChunks(
+                    point.presence,
+                    maps.presence);
+                vc::lasagna::assignResolvedLasagnaCubeRequestChunks(point.nx, maps.nx);
+                vc::lasagna::assignResolvedLasagnaCubeRequestChunks(point.ny, maps.ny);
+            }
+        };
+
+#ifdef _OPENMP
+        if (workers > 1) {
+            const auto count = static_cast<std::ptrdiff_t>(volumePoints.size());
+            #pragma omp parallel for schedule(static) num_threads(workers)
+            for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
+                assignPointChunks(static_cast<size_t>(rawIndex));
+            }
+        } else
+#endif
+        {
+            for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex) {
+                assignPointChunks(pointIndex);
             }
         }
+        if (profile != nullptr)
+            profile->predictionAssignSeconds += elapsedSeconds(assignStart);
 
+        const auto materializeStart = TraceClock::now();
         auto materializeOne = [&](size_t pointIndex) {
-            FiberPredictionSample out;
+            auto& out = samples[pointIndex];
+            out.options.clear();
             out.options.reserve(optionCount);
             for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
                 const auto& option = options_[optionIndex];
@@ -1694,26 +2259,24 @@ public:
                     true,
                 });
             }
-            samples[pointIndex] = std::move(out);
         };
 
-        const int workers =
-            std::clamp(parallelThreads, 1, static_cast<int>(volumePoints.size()));
         if (workers <= 1) {
             for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex)
                 materializeOne(pointIndex);
-            return;
-        }
-
+        } else {
 #ifdef _OPENMP
-        const auto count = static_cast<std::ptrdiff_t>(volumePoints.size());
-        #pragma omp parallel for schedule(static) num_threads(workers)
-        for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex)
-            materializeOne(static_cast<size_t>(rawIndex));
+            const auto count = static_cast<std::ptrdiff_t>(volumePoints.size());
+            #pragma omp parallel for schedule(static) num_threads(workers)
+            for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex)
+                materializeOne(static_cast<size_t>(rawIndex));
 #else
-        for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex)
-            materializeOne(pointIndex);
+            for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex)
+                materializeOne(pointIndex);
 #endif
+        }
+        if (profile != nullptr)
+            profile->predictionMaterializeSeconds += elapsedSeconds(materializeStart);
     }
 
     [[nodiscard]] FiberPredictionSample sample(
@@ -1745,6 +2308,7 @@ public:
 
 private:
     std::vector<Option> options_;
+    std::vector<OptionSamplingGrid> optionGrids_;
     std::shared_ptr<vc::lasagna::LasagnaChannelChunkCache> cache_;
 };
 
@@ -1773,7 +2337,23 @@ void FiberPredictionField::sampleBatch(
         volumePoints,
         referenceDirections,
         parallelThreads,
-        samples);
+        samples,
+        nullptr);
+}
+
+void FiberPredictionField::sampleBatch(
+    const std::vector<cv::Vec3d>& volumePoints,
+    const std::vector<cv::Vec3d>& referenceDirections,
+    int parallelThreads,
+    std::vector<FiberPredictionSample>& samples,
+    FiberTraceProfile* profile) const
+{
+    impl_->sampleBatch(
+        volumePoints,
+        referenceDirections,
+        parallelThreads,
+        samples,
+        profile);
 }
 
 FiberPredictionSample FiberPredictionField::sample(
