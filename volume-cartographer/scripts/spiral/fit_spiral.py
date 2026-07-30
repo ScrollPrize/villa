@@ -1,4 +1,12 @@
 import os
+
+# Expandable segments stop the CUDA caching allocator from ratcheting its
+# reserved pool toward the VRAM ceiling under the variable-size per-step loss
+# graphs (measured ~12 GB lower steady-state envelope on the s1 fit). Must be
+# set before the allocator initialises; an explicit PYTORCH_CUDA_ALLOC_CONF in
+# the environment always wins.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import copy
 import itertools
 import json
