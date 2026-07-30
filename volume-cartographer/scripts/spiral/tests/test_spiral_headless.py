@@ -241,7 +241,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_250)
 
-    def test_interactive_run_keeps_horizon_when_target_is_within_it(self):
+    def test_interactive_run_extends_horizon_even_when_target_is_within_it(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
         session._state = "Ready"
@@ -257,9 +257,13 @@ class ProtocolTests(unittest.TestCase):
 
         session.run(250)
 
-        self.assertEqual(session._idle_actions, [])
+        self.assertEqual(session._idle_actions[0][0], "configure")
         self.assertEqual(
-            session._run_config["optimizer_num_training_steps"], 30_000)
+            session._idle_actions[0][1]["optimizer_num_training_steps"],
+            30_250,
+        )
+        self.assertEqual(
+            session._run_config["optimizer_num_training_steps"], 30_250)
 
     def test_run_queues_influence_config_with_only_pending_inputs(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)

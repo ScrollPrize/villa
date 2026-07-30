@@ -511,11 +511,12 @@ class InteractiveFitSession:
             configured_horizon = int(
                 requested_config.get("optimizer_num_training_steps", 0) or 0)
             # Interactive sessions are allowed to continue beyond the original
-            # headless horizon. Grow that horizon durably before the next step
-            # so the fitter can realign the exponential LR curve exactly.
-            if (getattr(self, "_configure_run", None) is not None
-                    and target > configured_horizon):
-                run_config["optimizer_num_training_steps"] = target
+            # headless horizon. Each Run extends the schedule by its requested
+            # iterations, based on at least the durable completed step, so the
+            # fitter can realign the exponential LR curve exactly.
+            if getattr(self, "_configure_run", None) is not None:
+                run_config["optimizer_num_training_steps"] = (
+                    max(configured_horizon, self._completed) + count)
             if run_config or path_changes:
                 if self._configure_run is None:
                     raise RuntimeError(
