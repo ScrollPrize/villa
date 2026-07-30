@@ -106,12 +106,12 @@ The spiral scripts declare their dependencies in their own [`pyproject.toml`](ht
 
 #### Get the dataset
 
-Ready-made inputs for PHerc. Paris 4 (Scroll 1) are published in the [`spiral-input` dataset](data_datasets#spiral-input-2026-07), which lives in the [`scrollprize/datasets` storage bucket](https://huggingface.co/buckets/scrollprize/datasets/tree/spiral) on Hugging Face (~50 GB):
+Ready-made inputs are published in the [`spiral-input` dataset](data_datasets#spiral-input-2026-07), which lives on the dl.ash2txt.org data server : [Spiral Datasets](https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/) (~90 GB):
 
 ```bash
-uvx --from huggingface_hub hf buckets sync \
-  hf://buckets/scrollprize/datasets/spiral/PHercParis4 \
-  ./spiral-dataset/PHercParis4
+rclone copy :http: /home/sean/Desktop/PHercParis4 \
+    --http-url https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/ \
+    --transfers 32 -P
 ```
 
 `hf buckets sync` works like `rsync`: re-running it resumes interrupted downloads. The dataset contains verified and unverified patches, tracks, fibers, the outer shell, winding annotation JSONs, the umbilicus, and the volume inputs — see the [dataset README](pathname:///data/datasets/spiral-input-PHercParis4-README.md) for the exact layout.
