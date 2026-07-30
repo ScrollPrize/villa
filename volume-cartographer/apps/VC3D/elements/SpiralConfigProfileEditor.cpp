@@ -21,6 +21,7 @@
 #include <QMap>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QPalette>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -567,7 +568,7 @@ void SpiralConfigProfileEditor::rebuildControls()
             impact->setProperty(
                 "spiralRuntimeImpact",
                 spec.value(QStringLiteral("runtime_impact")).toString());
-            impact->setStyleSheet(QStringLiteral("color: palette(mid);"));
+            impact->setForegroundRole(QPalette::WindowText);
             impact->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
             impact->setSizePolicy(
                 QSizePolicy::Minimum, QSizePolicy::Preferred);

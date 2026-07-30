@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPalette>
 #include <QScrollArea>
 #include <QSignalSpy>
 #include <QSpinBox>
@@ -202,6 +203,9 @@ int main(int argc, char** argv)
         QStringLiteral("spiralConfigImpact_optimizer_learning_rate"));
     require(impact && impact->text() == QStringLiteral("Next Run"),
             "Runtime impact should use its compact display label");
+    require(impact->foregroundRole() == QPalette::WindowText
+                && impact->styleSheet().isEmpty(),
+            "Runtime impact should inherit theme-aware window text");
 
     const QString beforeCollapse = editor.currentText();
     auto* optimizerGroup = editor._controlGroups[4].widget;

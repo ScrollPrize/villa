@@ -111,7 +111,6 @@ private:
     QPushButton* _addPclButton = nullptr;
     QToolButton* _browsePclButton = nullptr;
     QComboBox* _outwardSense = nullptr;
-    QComboBox* _storageBackend = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
     QCheckBox* _trackLengthBinSampling = nullptr;
     QDoubleSpinBox* _trackShortWeight = nullptr;

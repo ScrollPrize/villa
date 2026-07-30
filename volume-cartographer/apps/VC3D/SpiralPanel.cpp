@@ -293,12 +293,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _lasagnaScale = new QSpinBox(lasagnaContents);
     _lasagnaScale->setRange(1, 1024);
     _lasagnaScale->setValue(4);
-    _storageBackend = new QComboBox(lasagnaContents);
-    _storageBackend->addItem(tr("Sparse CUDA LRU"), QStringLiteral("sparse_cuda"));
     addPathRow(lasagnaForm, "cache_directory", tr("Cache directory"), true);
     lasagnaForm->addRow(tr("Zarr group"), _lasagnaGroup);
     lasagnaForm->addRow(tr("Coordinate scale"), _lasagnaScale);
-    lasagnaForm->addRow(tr("Storage backend"), _storageBackend);
 
     auto* outputGroup = makeSection(tr("Fit and output"),
                                     QStringLiteral("spiralFitOutputGroup"),
@@ -842,8 +839,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { refreshReloadRequired(); });
     connect(_outwardSense, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int) { refreshReloadRequired(); });
-    connect(_storageBackend, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this](int) { refreshReloadRequired(); });
     connect(_savePngVisualizations, &QCheckBox::toggled, this,
             [this](bool) { refreshReloadRequired(); });
     connect(_advancedProfiles, &SpiralConfigProfileEditor::textChanged, this, [this]() {
@@ -1207,7 +1202,7 @@ QJsonObject SpiralPanel::sessionRequest() const
                     {"scroll_name", _scrollName->text()}, {"outward_sense", _outwardSense->currentText()},
                     {"voxel_size_um", _voxelSize->value()}, {"lasagna_group", _lasagnaGroup->text()},
                     {"lasagna_scale", _lasagnaScale->value()},
-                    {"storage_backend", _storageBackend->currentData().toString()},
+                    {"storage_backend", QStringLiteral("sparse_cuda")},
                     {"legacy_checkpoint_step", _legacyCheckpointStep->value()},
                     {"run_tag", _runTag->text()},
                     {"render_volume_scale", _renderVolumeScale->value()},
@@ -1435,9 +1430,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
         run.value(QStringLiteral("lasagna_group")).toString(_lasagnaGroup->text()));
     _lasagnaScale->setValue(
         run.value(QStringLiteral("lasagna_scale")).toInt(_lasagnaScale->value()));
-    const int backend = _storageBackend->findData(
-        run.value(QStringLiteral("storage_backend")).toString());
-    if (backend >= 0) _storageBackend->setCurrentIndex(backend);
     _legacyCheckpointStep->setValue(
         run.value(QStringLiteral("legacy_checkpoint_step"))
             .toInt(_legacyCheckpointStep->value()));
@@ -1678,7 +1670,7 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "voxel_size_um", _voxelSize->value());
     settings.setValue(prefix + "lasagna_group", _lasagnaGroup->text());
     settings.setValue(prefix + "lasagna_scale", _lasagnaScale->value());
-    settings.setValue(prefix + "storage_backend", _storageBackend->currentData().toString());
+    settings.setValue(prefix + "storage_backend", QStringLiteral("sparse_cuda"));
     settings.setValue(prefix + "legacy_checkpoint_step", _legacyCheckpointStep->value());
     settings.setValue(prefix + "run_tag", _runTag->text());
     settings.setValue(prefix + "render_volume_scale", _renderVolumeScale->value());
@@ -1737,9 +1729,6 @@ void SpiralPanel::restore()
     _voxelSize->setValue(settings.value(valuePrefix + "voxel_size_um", 9.6).toDouble());
     _lasagnaGroup->setText(settings.value(valuePrefix + "lasagna_group", "4").toString());
     _lasagnaScale->setValue(settings.value(valuePrefix + "lasagna_scale", 4).toInt());
-    const int backend = _storageBackend->findData(
-        settings.value(valuePrefix + "storage_backend", "sparse_cuda").toString());
-    if (backend >= 0) _storageBackend->setCurrentIndex(backend);
     _legacyCheckpointStep->setValue(settings.value(valuePrefix + "legacy_checkpoint_step", 0).toInt());
     _runTag->setText(settings.value(valuePrefix + "run_tag").toString());
     _renderVolumeScale->setValue(settings.value(valuePrefix + "render_volume_scale", 16).toInt());
