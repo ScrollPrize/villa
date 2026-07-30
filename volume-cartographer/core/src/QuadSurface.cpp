@@ -1978,6 +1978,12 @@ void QuadSurface::save(const std::filesystem::path &path_, const std::string &uu
 
     // Prepare and write metadata
     {
+        // The cached _bbox can be stale here: it is seeded from meta.json at
+        // load time, and the point grid can be mutated directly afterwards
+        // (rawPointsPtr(), validPoints(), ...) without any invalidation hook.
+        // Drop the cache so bbox() recomputes from the points actually being
+        // saved (#1272).
+        _bbox = {{-1, -1, -1}, {-1, -1, -1}};
         auto lo = utils::Json::array();
         lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
         auto hi = utils::Json::array();
@@ -2106,6 +2112,9 @@ void QuadSurface::save_meta()
     }
 
     {
+        // Same staleness hazard as in save(): recompute the bbox from the
+        // current points instead of trusting the load-time cache (#1272).
+        _bbox = {{-1, -1, -1}, {-1, -1, -1}};
         auto lo = utils::Json::array();
         lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
         auto hi = utils::Json::array();
