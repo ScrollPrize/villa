@@ -264,11 +264,10 @@ class _RK4SparseFlowIntegrate(torch.autograd.Function):
 
 class CartesianFlowField(nn.Module):
 
-    def __init__(self, resolution, spatial_scale_factor=6, lr_scale_factor=1.e-1, num_flow_timesteps=1, direct_lr=False):
+    def __init__(self, resolution, spatial_scale_factor=6, num_flow_timesteps=1, direct_lr=False):
         super().__init__()
         self.num_flow_timesteps = num_flow_timesteps
         self.direct_lr = direct_lr
-        self.flow_scales = [1., lr_scale_factor]
         self.flows = nn.ParameterList([
             nn.Parameter(torch.zeros([num_flow_timesteps, 3, *shape]))
             for shape in [
@@ -277,22 +276,21 @@ class CartesianFlowField(nn.Module):
             ]
         ])
         self._pending_lr_upsampled = None
-        self._pending_hr_scale = None
         self._field_grad_acc = None
         self._lr_grad_acc = None
         self._pending_direct = False
 
     def _prepare_time_invariant_fields(self):
         # Shared state for get_sampler / get_time_invariant_integrator when
-        # num_flow_timesteps == 1. Returns (low_field, high_field, high_scale,
-        # acc); acc is None outside training (no grad, or frozen fields).
+        # num_flow_timesteps == 1. Returns (low_field, high_field, acc); acc is
+        # None outside training (no grad, or frozen fields).
         lr_flow, hr_flow = self.flows[0], self.flows[1]
         hr_shape = tuple(hr_flow.shape[2:])
         # Time-invariant: HR flow is already at the target resolution, so skip interpolating it.
-        lr_upsampled = F.interpolate(lr_flow, size=hr_shape, mode='trilinear')[0] * self.flow_scales[0]
+        lr_upsampled = F.interpolate(lr_flow, size=hr_shape, mode='trilinear')[0]
         training_field = torch.is_grad_enabled() and (lr_flow.requires_grad or hr_flow.requires_grad)
         if not training_field:
-            return lr_upsampled, hr_flow[0], float(self.flow_scales[1]), None
+            return lr_upsampled, hr_flow[0], None
 
         # Sampling keeps the detached LR-upsampled and HR fields separate and
         # accumulates dL/d(their effective sum) in one caller-owned buffer.
@@ -306,14 +304,12 @@ class CartesianFlowField(nn.Module):
         else:
             self._field_grad_acc.zero_()
         self._pending_lr_upsampled = lr_upsampled
-        self._pending_hr_scale = float(self.flow_scales[1])
-        return low_field, high_field, self._pending_hr_scale, self._field_grad_acc
+        return low_field, high_field, self._field_grad_acc
 
     def _get_direct_integrator(self):
         # Direct-LR mode: sample the LR lattice at query points instead of
         # upsampling it to HR every step (FIT_SPIRAL_DIRECT_LR=1). Field
-        # gradients accumulate unscaled into per-lattice buffers; the value
-        # scales are applied in apply_accumulated_field_grad.
+        # gradients accumulate into per-lattice buffers.
         lr_flow, hr_flow = self.flows[0], self.flows[1]
         low, high = lr_flow[0], hr_flow[0]
         training_field = torch.is_grad_enabled() and (
@@ -335,12 +331,11 @@ class CartesianFlowField(nn.Module):
             # accumulator after the direct branch consumed it.
             assert self._pending_lr_upsampled is None
             self._pending_direct = True
-        lo_scale, hi_scale = float(self.flow_scales[0]), float(self.flow_scales[1])
         low_c, high_c = low.contiguous(), high.contiguous()
 
         def integrate(y_flat, h, n_steps):
             return flow_triton.rk4_direct_integrate(
-                y_flat, low_c, high_c, lo_scale, hi_scale, acc_lo, acc_hi, h, n_steps)
+                y_flat, low_c, high_c, 1.0, 1.0, acc_lo, acc_hi, h, n_steps)
 
         return integrate
 
@@ -352,14 +347,14 @@ class CartesianFlowField(nn.Module):
         if (flow_triton.direct_lr_enabled(self.direct_lr)
                 and flow_triton.rk4_triton_available(self.flows[0], self.flows[1])):
             return self._get_direct_integrator()
-        low_field, high_field, high_scale, acc = self._prepare_time_invariant_fields()
+        low_field, high_field, acc = self._prepare_time_invariant_fields()
 
         if flow_triton.rk4_triton_available(low_field, high_field, acc):
             low_c, high_c = low_field.contiguous(), high_field.contiguous()
 
             def integrate(y_flat, h, n_steps):
                 return flow_triton.rk4_integrate(
-                    y_flat, low_c, high_c, high_scale, acc, h, n_steps,
+                    y_flat, low_c, high_c, 1.0, acc, h, n_steps,
                 )
 
             return integrate
@@ -371,17 +366,17 @@ class CartesianFlowField(nn.Module):
                 # (matters for large no-grad evals like previews/satisfaction).
                 y = y_flat
                 for _ in range(n_steps):
-                    k1 = sample_field(y, low_field) + sample_field(y, high_field) * high_scale
+                    k1 = sample_field(y, low_field) + sample_field(y, high_field)
                     x2 = y + (h / 2) * k1
-                    k2 = sample_field(x2, low_field) + sample_field(x2, high_field) * high_scale
+                    k2 = sample_field(x2, low_field) + sample_field(x2, high_field)
                     x3 = y + (h / 2) * k2
-                    k3 = sample_field(x3, low_field) + sample_field(x3, high_field) * high_scale
+                    k3 = sample_field(x3, low_field) + sample_field(x3, high_field)
                     x4 = y + h * k3
-                    k4 = sample_field(x4, low_field) + sample_field(x4, high_field) * high_scale
+                    k4 = sample_field(x4, low_field) + sample_field(x4, high_field)
                     y = y + (h / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
                 return y
             return _RK4SparseFlowIntegrate.apply(
-                y_flat, low_field, high_field, high_scale, acc, h, n_steps,
+                y_flat, low_field, high_field, 1.0, acc, h, n_steps,
             )
 
         return integrate
@@ -393,11 +388,11 @@ class CartesianFlowField(nn.Module):
         lr_flow, hr_flow = self.flows[0], self.flows[1]
         hr_shape = tuple(hr_flow.shape[2:])
         if self.num_flow_timesteps == 1:
-            low_field, high_field, high_scale, acc = self._prepare_time_invariant_fields()
+            low_field, high_field, acc = self._prepare_time_invariant_fields()
             if acc is None:
                 return lambda y: (
                     sample_field(y, low_field)
-                    + sample_field(y, high_field) * high_scale
+                    + sample_field(y, high_field)
                 )
 
             def sample(normalised_zyx):
@@ -406,7 +401,7 @@ class CartesianFlowField(nn.Module):
                     flat,
                     low_field,
                     high_field,
-                    high_scale,
+                    1.0,
                     acc,
                 ).view(*normalised_zyx.shape[:-1], 3)
 
@@ -415,8 +410,8 @@ class CartesianFlowField(nn.Module):
             t_scaled = (t.clamp(-1. + 1.e-4, 1. - 1.e-4) + 1) / 2 * (self.num_flow_timesteps - 1)
             t_idx_before = int(t_scaled)
             flows_interpolated = [
-                F.interpolate(flow[t_idx_before : t_idx_before + 2], size=hr_shape, mode='trilinear') * flow_scale
-                for flow, flow_scale in zip(self.flows, self.flow_scales)
+                F.interpolate(flow[t_idx_before : t_idx_before + 2], size=hr_shape, mode='trilinear')
+                for flow in self.flows
             ]
             field = sum(
                 torch.lerp(flow_interpolated[0], flow_interpolated[1], t_scaled % 1.)
@@ -427,12 +422,11 @@ class CartesianFlowField(nn.Module):
     def apply_accumulated_field_grad(self):
         if self._pending_direct:
             self._pending_direct = False
-            for param, acc, scale in (
-                (self.flows[0], self._lr_grad_acc, self.flow_scales[0]),
-                (self.flows[1], self._field_grad_acc, self.flow_scales[1]),
+            for param, acc in (
+                (self.flows[0], self._lr_grad_acc),
+                (self.flows[1], self._field_grad_acc),
             ):
                 # Reuse the accumulator storage as the parameter gradient.
-                acc.mul_(scale)
                 grad = acc.unsqueeze(0)
                 if param.grad is None:
                     param.grad = grad
@@ -447,10 +441,8 @@ class CartesianFlowField(nn.Module):
         self._pending_lr_upsampled.backward(gradient=self._field_grad_acc)
         self._pending_lr_upsampled = None
 
-        # dL/dHR = scale * dL/dfield.  Reuse the accumulator storage as the
-        # parameter's gradient instead of materialising another [3,Z,Y,X] tensor.
-        self._field_grad_acc.mul_(self._pending_hr_scale)
-        self._pending_hr_scale = None
+        # Reuse the accumulator storage as the HR parameter's gradient instead
+        # of materialising another [3,Z,Y,X] tensor.
         hr_param = self.flows[1]
         hr_grad = self._field_grad_acc.unsqueeze(0)
         if hr_param.grad is None:
@@ -478,7 +470,7 @@ class CylindricalFlowField(nn.Module):
     # Note: near r=0 the cylindrical basis is degenerate; ring 0 holds a single cell that is
     # pinned to zero.
 
-    def __init__(self, resolution, spatial_scale_factor=6, lr_scale_factor=1.e-1, num_flow_timesteps=1, direct_lr=False):
+    def __init__(self, resolution, spatial_scale_factor=6, num_flow_timesteps=1, direct_lr=False):
         # resolution is interpreted as the equivalent cartesian (Z, Y, X) voxel shape; the
         # cylindrical lattice sizes are derived from it. direct_lr is accepted for
         # constructor parity with CartesianFlowField and ignored: the ragged
@@ -510,12 +502,11 @@ class CylindricalFlowField(nn.Module):
         self.register_buffer('_lr_offsets', lr_offsets)
         self.register_buffer('_hr_offsets', hr_offsets)
 
-        self.flow_scales = [1., lr_scale_factor]
         self.flows = nn.ParameterList([
             nn.Parameter(torch.zeros([num_flow_timesteps, 3, nz_lr, int(lr_offsets[-1])])),
             nn.Parameter(torch.zeros([num_flow_timesteps, 3, nz_hr, int(hr_offsets[-1])])),
         ])
-        # (pinned+scaled field graph output, detached leaf) pairs armed by
+        # (pinned field graph output, detached leaf) pairs armed by
         # get_sampler in training and consumed by apply_accumulated_field_grad.
         self._pending_field_graphs = None
 
@@ -588,7 +579,7 @@ class CylindricalFlowField(nn.Module):
     def get_sampler(self, t):
         # Returns a callable mapping normalised zyx points in [0, 1] to flow velocity at time t,
         # by sampling the cylindrical lattice directly at each query point. The closure captures
-        # the time-interpolated, scale-applied, axis-pinned LR & HR lattices so those one-time
+        # the time-interpolated, axis-pinned LR & HR lattices so those one-time
         # costs amortise across the integrator's sample calls.
         if self.num_flow_timesteps == 1:
             lr_field = self.flows[0][0]
@@ -603,14 +594,14 @@ class CylindricalFlowField(nn.Module):
         # constant zero, so no gradient flows to those parameters; they stay zero indefinitely.
         n0_lr = int(self._lr_num_phi[0])
         n0_hr = int(self._hr_num_phi[0])
-        lr_field = torch.cat([torch.zeros_like(lr_field[:, :, :n0_lr]), lr_field[:, :, n0_lr:]], dim=2) * self.flow_scales[0]
-        hr_field = torch.cat([torch.zeros_like(hr_field[:, :, :n0_hr]), hr_field[:, :, n0_hr:]], dim=2) * self.flow_scales[1]
+        lr_field = torch.cat([torch.zeros_like(lr_field[:, :, :n0_lr]), lr_field[:, :, n0_lr:]], dim=2)
+        hr_field = torch.cat([torch.zeros_like(hr_field[:, :, :n0_hr]), hr_field[:, :, n0_hr:]], dim=2)
 
         if self.num_flow_timesteps == 1 and torch.is_grad_enabled() and (
                 self.flows[0].requires_grad or self.flows[1].requires_grad):
             # The time-invariant sampler is cached by the diffeomorphism and
             # shared across every loss family in an iteration. Cut the
-            # pinned+scaled field graphs at detached leaves so each family's
+            # pinned field graphs at detached leaves so each family's
             # backward owns its whole graph (no retain_graph); the accumulated
             # leaf gradients flow to the parameters when the training loop
             # calls apply_accumulated_field_grad. Overwrites any previous

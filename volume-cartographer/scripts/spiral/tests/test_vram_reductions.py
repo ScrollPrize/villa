@@ -28,7 +28,7 @@ class CartesianFlowGradientTests(unittest.TestCase):
     def test_accumulator_reuse_matches_dense_autograd(self):
         torch.manual_seed(4)
         resolution = torch.tensor([12, 12, 12])
-        flow = CartesianFlowField(resolution, spatial_scale_factor=6, lr_scale_factor=0.2)
+        flow = CartesianFlowField(resolution, spatial_scale_factor=6)
         with torch.no_grad():
             flow.flows[0].normal_(std=0.1)
             flow.flows[1].normal_(std=0.1)
@@ -43,7 +43,7 @@ class CartesianFlowGradientTests(unittest.TestCase):
             size=tuple(reference_hr.shape[2:]),
             mode='trilinear',
         )[0]
-        reference_field = reference_lr_up + reference_hr[0] * 0.2
+        reference_field = reference_lr_up + reference_hr[0]
         reference_output = sample_field(reference_points, reference_field)
         reference_loss = reference_output.square().sum()
         reference_loss.backward()
@@ -65,8 +65,8 @@ class CartesianFlowGradientTests(unittest.TestCase):
     def test_multiple_streamed_backwards_accumulate_before_field_backward(self):
         torch.manual_seed(9)
         resolution = torch.tensor([12, 12, 12])
-        combined = CartesianFlowField(resolution, spatial_scale_factor=6, lr_scale_factor=0.2)
-        streamed = CartesianFlowField(resolution, spatial_scale_factor=6, lr_scale_factor=0.2)
+        combined = CartesianFlowField(resolution, spatial_scale_factor=6)
+        streamed = CartesianFlowField(resolution, spatial_scale_factor=6)
         with torch.no_grad():
             combined.flows[0].normal_(std=0.1)
             combined.flows[1].normal_(std=0.1)
@@ -93,7 +93,7 @@ class CartesianFlowGradientTests(unittest.TestCase):
 class CylindricalFlowGradientTests(unittest.TestCase):
     def test_streamed_backwards_and_pending_field_grad_match_dense_autograd(self):
         torch.manual_seed(11)
-        flow = CylindricalFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6, lr_scale_factor=0.2)
+        flow = CylindricalFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6)
         with torch.no_grad():
             flow.flows[0].normal_(std=0.1)
             flow.flows[1].normal_(std=0.1)
@@ -109,10 +109,10 @@ class CylindricalFlowGradientTests(unittest.TestCase):
         n0_hr = int(flow._hr_num_phi[0])
         reference_lr_field = torch.cat(
             [torch.zeros_like(reference_lr[0][:, :, :n0_lr]), reference_lr[0][:, :, n0_lr:]],
-            dim=2) * flow.flow_scales[0]
+            dim=2)
         reference_hr_field = torch.cat(
             [torch.zeros_like(reference_hr[0][:, :, :n0_hr]), reference_hr[0][:, :, n0_hr:]],
-            dim=2) * flow.flow_scales[1]
+            dim=2)
 
         def reference_sample(pts):
             return (

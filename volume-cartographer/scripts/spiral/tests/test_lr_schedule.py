@@ -54,21 +54,3 @@ def test_realign_uses_enlarged_horizon_and_tracks_next_optimizer_step():
             initial_lr, 0.9, 30_001, 60_000),
         rel_tol=1e-12,
     )
-
-
-def test_high_res_flow_scale_uses_absolute_iteration_after_resume(monkeypatch):
-    monkeypatch.setattr(fit_spiral, "cfg", {
-        "model_flow_field_high_res_lr_scale_initial": 0.2,
-        "model_flow_field_high_res_lr_scale_final": 0.8,
-        "model_flow_field_high_res_lr_ramp_start_step": 10_000,
-        "model_flow_field_high_res_lr_ramp_steps": 20_000,
-    })
-
-    assert math.isclose(
-        fit_spiral.get_flow_field_high_res_lr_scale(20_000), 0.5)
-    assert math.isclose(
-        fit_spiral.get_flow_field_high_res_lr_scale(30_000), 0.8)
-    # Extending optimizer_num_training_steps does not restart or stretch this
-    # explicitly step-based ramp; resumed execution supplies the durable step.
-    assert math.isclose(
-        fit_spiral.get_flow_field_high_res_lr_scale(30_001), 0.8)

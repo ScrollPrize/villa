@@ -150,10 +150,6 @@ class Config:
         self.model_flow_bounds_radius = 3200
         self.model_flow_voxel_resolution = 16
         self.model_flow_field_type = "cartesian"
-        self.model_flow_field_high_res_lr_scale_initial = 0.2
-        self.model_flow_field_high_res_lr_scale_final = 0.2
-        self.model_flow_field_high_res_lr_ramp_start_step = 0
-        self.model_flow_field_high_res_lr_ramp_steps = 1
         self.model_flow_field_direct_lr = True
         self.model_gap_expander_logit_resolution = 24
         self.model_gap_expander_num_windings = 130

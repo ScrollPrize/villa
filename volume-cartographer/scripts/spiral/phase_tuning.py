@@ -52,8 +52,6 @@ def _build_model(checkpoint, dataset, cfg, outward_sense):
     ).to(device)
     model.load_state_dict(checkpoint['spiral_and_transform'])
     model.eval()
-    model.flow_field.flow_scales[1] = cfg[
-        'model_flow_field_high_res_lr_scale_final']
     return model
 
 

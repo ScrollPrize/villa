@@ -245,8 +245,8 @@ class InteractiveInfluenceState:
         for flow_field in spiral_and_transform.flow_fields:
             lr_flow, hr_flow = flow_field.flows
             v_max = v_max + (
-                lr_flow[:, 0].abs().max() * float(flow_field.flow_scales[0])
-                + hr_flow[:, 0].abs().max() * float(flow_field.flow_scales[1])
+                lr_flow[:, 0].abs().max()
+                + hr_flow[:, 0].abs().max()
             )
         z_range = float(spiral_and_transform.flow_max_corner_zyx[0]
                         - spiral_and_transform.flow_min_corner_zyx[0])

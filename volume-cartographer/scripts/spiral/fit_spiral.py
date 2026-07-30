@@ -457,19 +457,6 @@ def get_or_build_unattached_pcl_flat(pcl_strips, device):
     return flat
 
 
-def get_flow_field_high_res_lr_scale(iteration):
-    # Factor multiplying the high-resolution flow logits, which scales down their effective
-    # learning rate relative to the main LR (kept <= 1 so the hi-res LR stays bounded by the
-    # main LR). Ramps linearly from _initial to _final over _ramp_steps steps, starting at
-    # _ramp_start_step; constant when _initial == _final.
-    initial = cfg['model_flow_field_high_res_lr_scale_initial']
-    final = cfg['model_flow_field_high_res_lr_scale_final']
-    start_step = cfg['model_flow_field_high_res_lr_ramp_start_step']
-    ramp_steps = max(1, int(cfg['model_flow_field_high_res_lr_ramp_steps']))
-    frac = min(1., max(0., (iteration - start_step) / ramp_steps))
-    return min(1., initial + frac * (final - initial))
-
-
 def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding_idx):
     # When `dt_progressive_windings` is set, the DT losses (patch, track, unattached-pcl) only act
     # on tracks/patches whose snapped spiral-space winding is <= the returned cutoff. The cutoff
@@ -2552,9 +2539,6 @@ def main(
         if interactive_driver is not None and not interactive_driver.wait_for_iteration(iteration):
             break
         step_timer.start('fwd')
-        flow_field_high_res_lr_scale = get_flow_field_high_res_lr_scale(iteration)
-        for flow_field in spiral_and_transform.flow_fields:
-            flow_field.flow_scales[1] = flow_field_high_res_lr_scale
 
         # The tiny graph paths shared by every transform evaluation this
         # iteration (dr softplus, scaled linear logits, pinned gap logits) are
@@ -2572,9 +2556,7 @@ def main(
         dr_per_winding = shared_transform_leaves[0]
 
         losses = {}
-        log_metrics = {
-            'flow_field_high_res_lr_scale': spiral_and_transform.flow_field.flow_scales[1],
-        }
+        log_metrics = {}
 
         def backward_family(weighted_losses):
             """Accumulate one loss family's gradients, then release its graph."""

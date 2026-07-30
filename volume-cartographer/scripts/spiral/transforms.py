@@ -465,7 +465,6 @@ class SpiralAndTransform(nn.Module):
         def make_flow_field():
             return flow_field_cls(
                 flow_resolution,
-                lr_scale_factor=config['model_flow_field_high_res_lr_scale_initial'],
                 num_flow_timesteps=config['model_num_flow_timesteps'],
                 direct_lr=config.get('model_flow_field_direct_lr', False),
             )

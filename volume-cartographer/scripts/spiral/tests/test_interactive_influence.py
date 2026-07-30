@@ -19,7 +19,6 @@ TINY_CONFIG = {
     'model_initial_dr_per_winding': 16.,
     'model_flow_voxel_resolution': 8,  # 24^3 high-res lattice, 4^3 low-res: both have interior points
     'model_flow_field_type': 'cartesian',
-    'model_flow_field_high_res_lr_scale_initial': 2.0e-1,
     'model_num_flow_timesteps': 1,
     'model_linear_z_resolution': 48,
     'model_gap_expander_logit_resolution': 24,

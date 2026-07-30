@@ -49,8 +49,6 @@ MODEL_CONFIG_KEYS = (
     "flow_bounds_radius",
     "flow_voxel_resolution",
     "flow_field_type",
-    "flow_field_high_res_lr_scale_initial",
-    "flow_field_high_res_lr_scale_final",
     "gap_expander_logit_resolution",
     "gap_expander_num_windings",
     "gap_expander_lr_scale",
@@ -175,9 +173,6 @@ def _build_model(
     ).to(device)
     model.load_state_dict(state)
     model.eval()
-    for flow_field in model.flow_fields:
-        flow_field.flow_scales[1] = float(
-            config["model_flow_field_high_res_lr_scale_final"])
     return model
 
 
