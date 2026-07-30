@@ -1455,6 +1455,19 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
     shell_map = None
     shell_valid_zyxs_gpu = None
+
+    def subsample_shell_radius_pool(patch):
+        # The shell-patch radius loss draws sample_count_shell_samples random
+        # shell points per step; keep a pool of exactly that size resident on
+        # the GPU instead of the full shell cloud. A dedicated generator makes
+        # the pool deterministic (identical across DDP ranks) without
+        # perturbing the training RNG streams.
+        pool_generator = torch.Generator()
+        pool_generator.manual_seed(int(cfg['optimizer_random_seed']))
+        return subsample_rows(
+            patch.valid_zyxs, int(cfg['sample_count_shell_samples']), pool_generator,
+        ).to(device=device, dtype=torch.float32)
+
     shell_active = shell_patch is not None and shell_losses_enabled()
     if shell_active:
         if cfg['loss_weight_shell_outer'] > 0:
@@ -1467,7 +1480,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 device=device,
             )
         if cfg['loss_weight_shell_patch_radius'] > 0:
-            shell_valid_zyxs_gpu = shell_patch.valid_zyxs.to(device=device, dtype=torch.float32)
+            shell_valid_zyxs_gpu = subsample_shell_radius_pool(shell_patch)
 
     def infer_outer_winding_idx_for_this_run():
         return _infer_shell_outer_winding_idx(
@@ -2247,8 +2260,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                         if cfg['loss_weight_shell_outer'] > 0 else None
                     )
                     rebuilt_shell_valid = (
-                        rebuilt_shell_patch.valid_zyxs.to(
-                            device=device, dtype=torch.float32)
+                        subsample_shell_radius_pool(rebuilt_shell_patch)
                         if cfg['loss_weight_shell_patch_radius'] > 0 else None
                     )
                     rebuilt_shell_outer = int(cfg['shell_outer_winding_idx'])
@@ -2379,8 +2391,20 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         for flow_field in spiral_and_transform.flow_fields:
             flow_field.flow_scales[1] = flow_field_high_res_lr_scale
 
-        slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
-        dr_per_winding = spiral_and_transform.get_dr_per_winding()
+        # The tiny graph paths shared by every transform evaluation this
+        # iteration (dr softplus, scaled linear logits, pinned gap logits) are
+        # cut at detached leaves. Each loss family's backward then owns its
+        # whole graph, so autograd can free the family's buffers as the
+        # backward pass consumes them instead of retaining the full graph
+        # (retain_graph) until the family is released. The leaf gradients
+        # accumulated across families flow through the real shared paths once,
+        # next to the flow-field gradient flush below.
+        shared_transform_outputs = spiral_and_transform.get_shared_transform_tensors()
+        shared_transform_leaves = tuple(
+            output.detach().requires_grad_(True) for output in shared_transform_outputs)
+        slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform(
+            shared=shared_transform_leaves)
+        dr_per_winding = shared_transform_leaves[0]
 
         losses = {}
         log_metrics = {
@@ -2393,10 +2417,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             if family_loss.requires_grad:
                 step_timer.stop('fwd')
                 step_timer.start('bwd')
-                # dr_per_winding and the transform's scaled linear logits are shared
-                # by later families. retain_graph keeps those tiny common paths valid;
-                # the family-specific graph is released when this function returns.
-                family_loss.backward(retain_graph=True)
+                # The paths shared with later families end at detached leaves
+                # (shared_transform_leaves and the flow fields' internal
+                # accumulators), so this family's graph is self-contained and
+                # its buffers are freed as the backward pass consumes them.
+                family_loss.backward()
                 step_timer.stop('bwd')
                 step_timer.start('fwd')
             for name, value in weighted_losses.items():
@@ -2707,6 +2732,18 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             apply_accumulated_field_grad = getattr(flow_field, 'apply_accumulated_field_grad', None)
             if apply_accumulated_field_grad is not None:
                 apply_accumulated_field_grad()
+        # Propagate the leaf gradients the family backwards accumulated on the
+        # shared transform paths through the real parameters, exactly once.
+        shared_transform_pending = [
+            (output, leaf.grad)
+            for output, leaf in zip(shared_transform_outputs, shared_transform_leaves)
+            if output.requires_grad and leaf.grad is not None
+        ]
+        if shared_transform_pending:
+            torch.autograd.backward(
+                [output for output, _ in shared_transform_pending],
+                [grad for _, grad in shared_transform_pending],
+            )
         step_timer.stop('bwd')
         step_timer.start('comm')
         allreduce_grads_(dist_grad_params)
@@ -2715,7 +2752,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=nonfinite_grad_steps.device)
         for name, p in dist_grad_named:
             if p.grad is not None:
-                param_nonfinite = (~torch.isfinite(p.grad)).any()
+                # aminmax propagates NaN and surfaces +/-inf through two scalar
+                # reductions, avoiding the gradient-sized boolean temporaries
+                # that (~torch.isfinite(grad)).any() allocates per parameter.
+                grad_min, grad_max = torch.aminmax(p.grad)
+                param_nonfinite = ~(torch.isfinite(grad_min) & torch.isfinite(grad_max))
                 step_had_nonfinite |= param_nonfinite
                 nonfinite_grad_by_param[name] += param_nonfinite.to(nonfinite_grad_steps.dtype)
                 torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)

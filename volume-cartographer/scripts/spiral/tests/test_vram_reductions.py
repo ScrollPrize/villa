@@ -6,9 +6,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flow_fields import CartesianFlowField, sample_field
+from config import Config
+from flow_fields import CartesianFlowField, CylindricalFlowField, sample_field
 from checkpoint_io import load_checkpoint_cpu
 from tifxyz import Patch
+from transforms import SpiralAndTransform
 from tracks import (
     _grouped_same_radius_loss,
     _pack_track_points,
@@ -85,6 +87,170 @@ class CartesianFlowGradientTests(unittest.TestCase):
 
         torch.testing.assert_close(streamed.flows[0].grad, combined.flows[0].grad)
         torch.testing.assert_close(streamed.flows[1].grad, combined.flows[1].grad)
+
+
+class CylindricalFlowGradientTests(unittest.TestCase):
+    def test_streamed_backwards_and_pending_field_grad_match_dense_autograd(self):
+        torch.manual_seed(11)
+        flow = CylindricalFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6, lr_scale_factor=0.2)
+        with torch.no_grad():
+            flow.flows[0].normal_(std=0.1)
+            flow.flows[1].normal_(std=0.1)
+
+        points_a = torch.rand(29, 3, requires_grad=True)
+        points_b = torch.rand(41, 3, requires_grad=True)
+        reference_a = points_a.detach().clone().requires_grad_(True)
+        reference_b = points_b.detach().clone().requires_grad_(True)
+        reference_lr = flow.flows[0].detach().clone().requires_grad_(True)
+        reference_hr = flow.flows[1].detach().clone().requires_grad_(True)
+
+        n0_lr = int(flow._lr_num_phi[0])
+        n0_hr = int(flow._hr_num_phi[0])
+        reference_lr_field = torch.cat(
+            [torch.zeros_like(reference_lr[0][:, :, :n0_lr]), reference_lr[0][:, :, n0_lr:]],
+            dim=2) * flow.flow_scales[0]
+        reference_hr_field = torch.cat(
+            [torch.zeros_like(reference_hr[0][:, :, :n0_hr]), reference_hr[0][:, :, n0_hr:]],
+            dim=2) * flow.flow_scales[1]
+
+        def reference_sample(pts):
+            return (
+                CylindricalFlowField._sample_lattice(reference_lr_field, flow._lr_num_phi, flow._lr_offsets, pts)
+                + CylindricalFlowField._sample_lattice(reference_hr_field, flow._hr_num_phi, flow._hr_offsets, pts)
+            )
+
+        reference_out_a = reference_sample(reference_a)
+        reference_out_b = reference_sample(reference_b)
+        (reference_out_a.square().mean() + reference_out_b.abs().mean()).backward()
+
+        sampler = flow.get_sampler(0.0)
+        out_a = sampler(points_a)
+        out_b = sampler(points_b)
+        # Two independent backwards through the one cached sampler, WITHOUT
+        # retain_graph: the shared pinned+scaled field graphs are cut at
+        # detached leaves, so neither backward touches the other's graph.
+        out_a.square().mean().backward()
+        out_b.abs().mean().backward()
+        flow.apply_accumulated_field_grad()
+
+        torch.testing.assert_close(out_a, reference_out_a)
+        torch.testing.assert_close(out_b, reference_out_b)
+        torch.testing.assert_close(points_a.grad, reference_a.grad)
+        torch.testing.assert_close(points_b.grad, reference_b.grad)
+        torch.testing.assert_close(flow.flows[0].grad, reference_lr.grad)
+        torch.testing.assert_close(flow.flows[1].grad, reference_hr.grad)
+        self.assertIsNone(flow._pending_field_graphs)
+
+
+def _make_small_spiral_model(seed, flow_field_type):
+    cfg = Config().as_dict()
+    cfg['model_flow_field_type'] = flow_field_type
+    cfg['model_gap_expander_num_windings'] = 10
+    z_span = 16 * 12  # 12 flow lattice voxels per axis at the default resolution
+    flow_min = torch.tensor([0, -96, -96], dtype=torch.int64)
+    flow_max = torch.tensor([z_span, 96, 96], dtype=torch.int64)
+    zs = torch.arange(0, z_span + 1, dtype=torch.float32)
+    umbilicus_zyx = torch.stack(
+        [zs, torch.full_like(zs, 3.), torch.full_like(zs, -2.)], dim=-1)
+    torch.manual_seed(seed)
+    model = SpiralAndTransform(
+        flow_integration_steps=3,
+        flow_integration_solver='rk4',
+        flow_min_corner_zyx=flow_min,
+        flow_max_corner_zyx=flow_max,
+        umbilicus_zyx=umbilicus_zyx,
+        config=cfg,
+        spiral_outward_sense='CW',
+    )
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.numel() > 1:
+                parameter.normal_(std=0.01)
+    return model
+
+
+def _sample_scroll_points(num_points, seed):
+    generator = torch.Generator().manual_seed(seed)
+    z = torch.rand(num_points, generator=generator) * 150 + 20
+    theta = torch.rand(num_points, generator=generator) * 2 * torch.pi
+    radius = torch.rand(num_points, generator=generator) * 60 + 20
+    y = 3. + torch.sin(theta) * radius
+    x = -2. + torch.cos(theta) * radius
+    return torch.stack([z, y, x], dim=-1)
+
+
+class SharedTransformLeafTests(unittest.TestCase):
+    def _loss_families(self, transform, dr_per_winding, points_a, points_b):
+        spiral_a = transform(points_a)
+        family_a = (spiral_a[..., 1:].norm(dim=-1) / dr_per_winding).mean()
+        spiral_b = transform(points_b)
+        family_b = spiral_b.square().mean() * 1.e-4 + dr_per_winding * 0.01
+        return family_a, family_b
+
+    def _check_streamed_leaf_backwards_match_combined(self, flow_field_type):
+        reference = _make_small_spiral_model(23, flow_field_type)
+        streamed = _make_small_spiral_model(23, flow_field_type)
+        streamed.load_state_dict(reference.state_dict())
+        points_a = _sample_scroll_points(31, 5)
+        points_b = _sample_scroll_points(17, 6)
+
+        transform = reference.get_slice_to_spiral_transform()
+        family_a, family_b = self._loss_families(
+            transform, reference.get_dr_per_winding(), points_a, points_b)
+        (family_a + family_b).backward()
+        for flow_field in reference.flow_fields:
+            flow_field.apply_accumulated_field_grad()
+
+        shared_outputs = streamed.get_shared_transform_tensors()
+        shared_leaves = tuple(
+            output.detach().requires_grad_(True) for output in shared_outputs)
+        leaf_transform = streamed.get_slice_to_spiral_transform(shared=shared_leaves)
+        leaf_a, leaf_b = self._loss_families(
+            leaf_transform, shared_leaves[0], points_a, points_b)
+        torch.testing.assert_close(leaf_a, family_a)
+        torch.testing.assert_close(leaf_b, family_b)
+        # One backward per family, WITHOUT retain_graph: every path shared
+        # between families ends at a detached leaf.
+        leaf_a.backward()
+        leaf_b.backward()
+        for flow_field in streamed.flow_fields:
+            flow_field.apply_accumulated_field_grad()
+        pending = [
+            (output, leaf.grad) for output, leaf in zip(shared_outputs, shared_leaves)
+            if output.requires_grad and leaf.grad is not None
+        ]
+        self.assertTrue(pending)
+        torch.autograd.backward(
+            [output for output, _ in pending], [grad for _, grad in pending])
+
+        reference_grads = {name: p.grad for name, p in reference.named_parameters()}
+        for name, parameter in streamed.named_parameters():
+            reference_grad = reference_grads[name]
+            if parameter.grad is None and reference_grad is None:
+                continue
+            torch.testing.assert_close(
+                parameter.grad, reference_grad, rtol=1e-4, atol=1e-6,
+                msg=lambda base, name=name: f'{name}: {base}')
+
+    def test_cartesian_streamed_leaf_backwards_match_combined(self):
+        self._check_streamed_leaf_backwards_match_combined('cartesian')
+
+    def test_cylindrical_streamed_leaf_backwards_match_combined(self):
+        self._check_streamed_leaf_backwards_match_combined('cylindrical')
+
+
+class NonFiniteGradCheckTests(unittest.TestCase):
+    def test_aminmax_detects_every_nonfinite_class(self):
+        # The training loop relies on aminmax propagating NaN and surfacing
+        # +/-inf so the non-finite-gradient telemetry needs no gradient-sized
+        # boolean temporaries.
+        for bad in (float('nan'), float('inf'), float('-inf')):
+            grad = torch.zeros(1024)
+            grad[381] = bad
+            grad_min, grad_max = torch.aminmax(grad)
+            self.assertFalse(bool(torch.isfinite(grad_min) & torch.isfinite(grad_max)))
+        grad_min, grad_max = torch.aminmax(torch.randn(1024))
+        self.assertTrue(bool(torch.isfinite(grad_min) & torch.isfinite(grad_max)))
 
 
 class CpuTrackStorageTests(unittest.TestCase):

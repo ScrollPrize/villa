@@ -512,6 +512,9 @@ class CylindricalFlowField(nn.Module):
             nn.Parameter(torch.zeros([num_flow_timesteps, 3, nz_lr, int(lr_offsets[-1])])),
             nn.Parameter(torch.zeros([num_flow_timesteps, 3, nz_hr, int(hr_offsets[-1])])),
         ])
+        # (pinned+scaled field graph output, detached leaf) pairs armed by
+        # get_sampler in training and consumed by apply_accumulated_field_grad.
+        self._pending_field_graphs = None
 
     @staticmethod
     def _sample_lattice(field, ring_num_phi, ring_offsets, normalised_zyx):
@@ -600,6 +603,20 @@ class CylindricalFlowField(nn.Module):
         lr_field = torch.cat([torch.zeros_like(lr_field[:, :, :n0_lr]), lr_field[:, :, n0_lr:]], dim=2) * self.flow_scales[0]
         hr_field = torch.cat([torch.zeros_like(hr_field[:, :, :n0_hr]), hr_field[:, :, n0_hr:]], dim=2) * self.flow_scales[1]
 
+        if self.num_flow_timesteps == 1 and torch.is_grad_enabled() and (
+                self.flows[0].requires_grad or self.flows[1].requires_grad):
+            # The time-invariant sampler is cached by the diffeomorphism and
+            # shared across every loss family in an iteration. Cut the
+            # pinned+scaled field graphs at detached leaves so each family's
+            # backward owns its whole graph (no retain_graph); the accumulated
+            # leaf gradients flow to the parameters when the training loop
+            # calls apply_accumulated_field_grad. Overwrites any previous
+            # pending record, matching CartesianFlowField's one-armed-record-
+            # per-iteration discipline.
+            leaves = [field.detach().requires_grad_(True) for field in (lr_field, hr_field)]
+            self._pending_field_graphs = list(zip((lr_field, hr_field), leaves))
+            lr_field, hr_field = leaves
+
         sample_lattice = self._sample_lattice
         lr_num_phi = self._lr_num_phi
         lr_offsets = self._lr_offsets
@@ -612,3 +629,14 @@ class CylindricalFlowField(nn.Module):
                 + sample_lattice(hr_field, hr_num_phi, hr_offsets, normalised_zyx)
             )
         return sample
+
+    def apply_accumulated_field_grad(self):
+        pending, self._pending_field_graphs = self._pending_field_graphs, None
+        if not pending:
+            return
+        outputs = [output for output, leaf in pending if leaf.grad is not None]
+        if outputs:
+            torch.autograd.backward(
+                outputs,
+                [leaf.grad for _, leaf in pending if leaf.grad is not None],
+            )
