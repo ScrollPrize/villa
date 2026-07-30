@@ -4,6 +4,27 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## Flattening a fitted checkpoint
+
+`flatten_spiral_checkpoint.py` is a standalone, one-shot exporter. It
+reconstructs the combined surface from a fitted checkpoint, launches a private
+Lasagna service, flattens with `flatten_fast_nofilter.json`, writes the final
+TIFXYZ directory, and tears the service down even if the job fails or is
+interrupted:
+
+```sh
+python flatten_spiral_checkpoint.py \
+    /path/to/checkpoint_fitted.ckpt \
+    /path/to/output.tifxyz
+```
+
+The checkpoint format does not embed the fixed umbilicus curve. The script
+looks for `umbilicus.json` in the checkpoint's ancestors, in
+`$SPIRAL_DATASET`, and in the standard local s1 dataset location. For other
+layouts, pass `--umbilicus /path/to/umbilicus.json`. Use `--lasagna-dir` if
+the Lasagna repository is not in its standard sibling or `~/villa` location.
+An existing output path is never overwritten.
+
 ## Spiral service host setup
 
 VC3D connects to a Spiral service in one of three modes, all speaking the same
