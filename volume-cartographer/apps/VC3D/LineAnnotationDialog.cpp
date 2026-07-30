@@ -2114,6 +2114,9 @@ void LineAnnotationDialog::resetGeneratedViews()
     }
     restoreInitialGeneratedViewerCameras();
     updateFixedStripGeometry();
+    // _currentCutFollowsStripMouse was reset by direct assignment above; keep the
+    // pause badge in sync.
+    updatePauseIndicator();
     if (_currentCutViewer) {
         _currentCutViewer->renderVisible(true, "line annotation reset current cut");
     }
