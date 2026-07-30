@@ -357,8 +357,11 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng):
 
 def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
                         num_points_per_direction, patch_atlas=None):
-    # Returns (combined_ijs_gpu (2,N,P,2), patch_indices_gpu (N,)). With
-    # prefetch enabled the batch was assembled and uploaded for this step
+    # Returns (combined_ijs_gpu (2,N,P,2), patch_indices_gpu (N,),
+    # slice_zyxs_gpu (2,N,P,3)). The atlas is host-resident and the ijs are
+    # born on the CPU, so the bilinear gather runs here at batch-build time
+    # and only the interpolated points are uploaded. With prefetch enabled the
+    # batch - sampling, gather, and uploads - was assembled for this step
     # during the previous one, and next step's batch is scheduled now.
     if num_to_sample <= 0:
         raise ValueError('Expected at least one patch index')
@@ -377,10 +380,15 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
         else:
             ijs_np = _build_patch_ijs(
                 patches, patch_indices, num_points_per_direction, rng)
-        ijs_gpu = torch.from_numpy(ijs_np).cuda(non_blocking=True)
-        idx_gpu = torch.from_numpy(
-            np.ascontiguousarray(patch_indices, dtype=np.int64)).cuda(non_blocking=True)
-        return ijs_gpu, idx_gpu
+        ijs_cpu = torch.from_numpy(ijs_np)
+        idx_cpu = torch.from_numpy(
+            np.ascontiguousarray(patch_indices, dtype=np.int64))
+        _, N, P, _ = ijs_cpu.shape
+        slice_zyxs_gpu = patch_atlas.lookup(
+            idx_cpu[None, :, None].expand(2, N, P), ijs_cpu)
+        ijs_gpu = ijs_cpu.cuda(non_blocking=True)
+        idx_gpu = idx_cpu.cuda(non_blocking=True)
+        return ijs_gpu, idx_gpu, slice_zyxs_gpu
 
     if prefetch.prefetch_enabled() and torch.cuda.is_available():
         pf = prefetch.get_prefetcher()
@@ -390,22 +398,14 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
     return build(prefetch.LegacyNumpyRandom)
 
 
-def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, batch, extra_zyxs=None, num_points_per_patch=None):
+def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, batch, extra_zyxs=None):
     # For each patch, take one row and one column in straight mode, or two
     # geodesic paths in dijkstra mode. Either representation is a contiguous
     # walk, so unwrapping can stitch theta=0 crossings between samples.
 
-    if num_points_per_patch is None:
-        num_points_per_patch = cfg['sample_count_points_per_patch']
-    num_points_per_direction = num_points_per_patch // 2
-
-    # Batched bilinear interp on GPU: ijs are guaranteed to fall on valid quads by the
-    # strip sampler (it draws i0/j0 from `_sampling_valid_quad_*`), so we
-    # skip the per-call validity check used by patch.ij_to_zyx.
-    combined_ijs_gpu, patch_indices_gpu = batch
-    N = combined_ijs_gpu.shape[1]
-    patch_idx_per_sample = patch_indices_gpu[None, :, None].expand(2, N, num_points_per_direction)
-    all_slice_zyxs = patch_atlas.lookup(patch_idx_per_sample, combined_ijs_gpu)
+    # The bilinear atlas gather already ran on the CPU at batch-build time
+    # (see _sample_patch_batch); the batch carries the interpolated points.
+    combined_ijs_gpu, patch_indices_gpu, all_slice_zyxs = batch
 
     # When the caller has extra points (umbilicus, shell, ...), pack them into the same
     # forward ODE call to amortise the per-call overhead.
@@ -674,7 +674,6 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
         patches,
         patch_atlas,
         batch,
-        num_points_per_patch=cfg['sample_count_unverified_points_per_patch'],
     )
 
     return _patch_radius_and_dt_losses(
@@ -959,16 +958,16 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             flat_ijs[base + num_strips_per_pcl + s] = strip
         flat_pids.extend([pid1] * num_strips_per_pcl + [pid2] * num_strips_per_pcl)
 
-    # Batched GPU bilinear interp across all strips.
+    # Batched bilinear gather on the host-resident atlas; only the
+    # interpolated points are uploaded.
     patch_idx_per_strip_np = np.fromiter(
         (patch_atlas.id_to_idx[pid] for pid in flat_pids),
         dtype=np.int64,
         count=total_strips,
     )
-    patch_idx_per_strip_gpu = torch.from_numpy(patch_idx_per_strip_np).cuda(non_blocking=True)
-    ijs_gpu = torch.from_numpy(flat_ijs).cuda(non_blocking=True)
-    patch_idx_per_sample = patch_idx_per_strip_gpu[:, None].expand(total_strips, num_points_per_strip)
-    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, ijs_gpu)
+    patch_idx_per_strip = torch.from_numpy(patch_idx_per_strip_np)
+    patch_idx_per_sample = patch_idx_per_strip[:, None].expand(total_strips, num_points_per_strip)
+    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, torch.from_numpy(flat_ijs))
 
     # Mask out strip samples whose z falls outside [z_begin - margin, z_end + margin).
     # Computed before unwrapping but applied after, since _unwrap_track_shifted_radii
@@ -1088,16 +1087,16 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             flat_ijs[base + s] = strip
         flat_pids.extend([pid] * num_strips_per_point)
 
-    # Batched GPU bilinear interp across all strips.
+    # Batched bilinear gather on the host-resident atlas; only the
+    # interpolated points are uploaded.
     patch_idx_per_strip_np = np.fromiter(
         (patch_atlas.id_to_idx[pid] for pid in flat_pids),
         dtype=np.int64,
         count=total_strips,
     )
-    patch_idx_per_strip_gpu = torch.from_numpy(patch_idx_per_strip_np).cuda(non_blocking=True)
-    ijs_gpu = torch.from_numpy(flat_ijs).cuda(non_blocking=True)
-    patch_idx_per_sample = patch_idx_per_strip_gpu[:, None].expand(total_strips, num_points_per_strip)
-    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, ijs_gpu)
+    patch_idx_per_strip = torch.from_numpy(patch_idx_per_strip_np)
+    patch_idx_per_sample = patch_idx_per_strip[:, None].expand(total_strips, num_points_per_strip)
+    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, torch.from_numpy(flat_ijs))
 
     # Mask out strip samples whose z falls outside [z_begin - margin, z_end + margin).
     # Computed before unwrapping but applied after, since _unwrap_track_shifted_radii

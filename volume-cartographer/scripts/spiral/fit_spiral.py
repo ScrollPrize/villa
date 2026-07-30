@@ -295,11 +295,16 @@ class ShellPolarMap:
 
 
 class PatchGpuAtlas:
-    """All patches' (H, W, 3) zyxs grids packed into one flat GPU tensor, so
-    fractional-(i, j) bilinear lookups can run as a single batched gather instead
-    of per-patch CPU dispatch."""
+    """All patches' (H, W, 3) zyxs grids packed into one flat tensor, batched
+    per lookup instead of per-patch dispatch. The packed grids stay resident in
+    host memory: the (i, j) samples are drawn on the CPU anyway, so the
+    bilinear gather runs there (mostly-contiguous strip reads, a few MB per
+    step) and only the interpolated points are uploaded to `device`. This
+    keeps the atlas - which scales with the input patch count, not with any
+    per-step budget - out of VRAM entirely."""
 
     def __init__(self, patches_by_id, device='cuda'):
+        self.device = torch.device(device)
         flat_pieces = []
         offsets = [0]
         widths = []
@@ -312,16 +317,13 @@ class PatchGpuAtlas:
             offsets.append(offsets[-1] + H * W)
             widths.append(W)
             heights.append(H)
-        # Concatenate on CPU and perform one CUDA transfer. Concatenating pieces
-        # after individually uploading them temporarily requires roughly two
-        # complete atlases of VRAM during construction.
         self.zyxs_flat = (
-            torch.cat(flat_pieces, dim=0).to(device=device)
+            torch.cat(flat_pieces, dim=0)
             if flat_pieces
-            else torch.empty([0, 3], dtype=torch.float32, device=device))
-        self.offsets = torch.tensor(offsets, device=device, dtype=torch.int64)  # (N+1,)
-        self.widths = torch.tensor(widths, device=device, dtype=torch.int64)  # (N,)
-        self.heights = torch.tensor(heights, device=device, dtype=torch.int64)  # (N,)
+            else torch.empty([0, 3], dtype=torch.float32))
+        self.offsets = torch.tensor(offsets, dtype=torch.int64)  # (N+1,)
+        self.widths = torch.tensor(widths, dtype=torch.int64)  # (N,)
+        self.heights = torch.tensor(heights, dtype=torch.int64)  # (N,)
         self.id_to_idx = {pid: i for i, pid in enumerate(patches_by_id.keys())}
         native = load_native_spiral_sampling()
         self.sampling_atlas = (
@@ -336,10 +338,16 @@ class PatchGpuAtlas:
         return self.zyxs_flat.numel() * 4 / 1e6
 
     def lookup(self, patch_idx_per_sample, ijs):
-        # patch_idx_per_sample: (...,) int64 on GPU
-        # ijs: (..., 2) float on GPU
-        # returns (..., 3) on GPU. Caller must ensure floor(ij) lies on a valid quad.
-        return bilinear_atlas_lookup(
+        # patch_idx_per_sample: (...,) int64 on CPU
+        # ijs: (..., 2) float on CPU
+        # Gathers and interpolates on the host-resident atlas and returns
+        # (..., 3) on self.device. Caller must ensure floor(ij) lies on a
+        # valid quad. Runs inside the batch prefetcher when that is enabled,
+        # so both the gather and the upload happen a step ahead.
+        assert not patch_idx_per_sample.is_cuda and not ijs.is_cuda, (
+            'the atlas is host-resident: pass CPU indices/ijs; only the '
+            'interpolated points are uploaded')
+        zyxs = bilinear_atlas_lookup(
             self.zyxs_flat,
             self.offsets,
             self.widths,
@@ -347,17 +355,17 @@ class PatchGpuAtlas:
             ijs,
             heights=self.heights,
         )
+        return zyxs.to(device=self.device, non_blocking=True)
 
     def append_patches(self, patches_by_id):
         """Append new patches without rebuilding the resident atlas.
 
-        Only the new grids are uploaded; the existing flat tensor is
-        concatenated onto, so a resident interactive session can incorporate a
-        handful of added patches in seconds.
+        A host-side concatenation of just the new grids, so a resident
+        interactive session can incorporate a handful of added patches in
+        seconds.
         """
         if not patches_by_id:
             return
-        device = self.zyxs_flat.device
         flat_pieces = []
         offsets = [int(self.offsets[-1].item())]
         widths = []
@@ -371,16 +379,16 @@ class PatchGpuAtlas:
             offsets.append(offsets[-1] + H * W)
             widths.append(W)
             heights.append(H)
-        new_flat = torch.cat(flat_pieces, dim=0).to(device=device)
+        new_flat = torch.cat(flat_pieces, dim=0)
         self.zyxs_flat = torch.cat([self.zyxs_flat, new_flat], dim=0)
         self.offsets = torch.cat([
             self.offsets,
-            torch.tensor(offsets[1:], device=device, dtype=torch.int64),
+            torch.tensor(offsets[1:], dtype=torch.int64),
         ])
         self.widths = torch.cat([
-            self.widths, torch.tensor(widths, device=device, dtype=torch.int64)])
+            self.widths, torch.tensor(widths, dtype=torch.int64)])
         self.heights = torch.cat([
-            self.heights, torch.tensor(heights, device=device, dtype=torch.int64)])
+            self.heights, torch.tensor(heights, dtype=torch.int64)])
         next_idx = len(self.id_to_idx)
         for pid in patches_by_id:
             self.id_to_idx[pid] = next_idx
@@ -1073,7 +1081,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     os.makedirs(out_path, exist_ok=True)
 
     patch_atlas = PatchGpuAtlas(verified_patches, device='cuda')
-    print(f'patch GPU atlas: {patch_atlas.memory_mb():.1f} MB')
+    print(f'patch atlas (host-resident): {patch_atlas.memory_mb():.1f} MB')
 
     # ==========================================================================================
     # trusted geometry (verified patches and pcls) kdtree / unverified patches + tracks masking
