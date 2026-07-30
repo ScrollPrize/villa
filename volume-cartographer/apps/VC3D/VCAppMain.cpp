@@ -78,6 +78,11 @@ static void setThreadPoliciesEarly()
     vcSetEnv("OPENBLAS_NUM_THREADS", "1", 0);
     vcSetEnv("GOTO_NUM_THREADS", "1", 0);      // legacy name for OpenBLAS
     vcSetEnv("MKL_NUM_THREADS", "1", 0);       // Intel MKL
+    // Wide surface-aligned Spiral overlays can legitimately exceed Qt's
+    // 128-MiB default image-I/O allocation limit. Keep a finite guard large
+    // enough for those generated loss maps and run-difference images while
+    // preserving an explicit user override.
+    vcSetEnv("QT_IMAGEIO_MAXALLOC", "512", 0);
 }
 #ifdef __linux__
 __attribute__((section(".preinit_array"), used))
