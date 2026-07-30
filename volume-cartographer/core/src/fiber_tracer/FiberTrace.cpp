@@ -948,6 +948,83 @@ void buildCandidateTasks(
             std::isfinite(bestLoss)};
 }
 
+void decodePredictionAndNormalCornerPoint(
+    const vc::lasagna::LasagnaCornerBatch& corners,
+    size_t firstVolume,
+    size_t optionCount,
+    size_t pointIndex,
+    const TraceVec& referenceDirection,
+    FiberPredictionSample& sample,
+    size_t normalFirstVolume = std::numeric_limits<size_t>::max(),
+    vc::lasagna::LasagnaNormalSampler::FloatNormalSample* normal = nullptr)
+{
+    sample.options.clear();
+    sample.options.reserve(optionCount);
+    const bool valid = corners.valid[pointIndex] != 0;
+    const auto weights = vc::lasagna::lasagnaCornerWeights(
+        corners.fractionsXYZ[pointIndex]);
+    for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+        const size_t volume = firstVolume + optionIndex * 3;
+        if (!valid) {
+            sample.options.push_back({});
+            continue;
+        }
+        TraceVec direction = vc::lasagna::interpolateLasagnaCompactAxisCorners(
+            corners.values[volume + 1][pointIndex],
+            corners.values[volume + 2][pointIndex],
+            weights,
+            referenceDirection);
+        if (direction.dot(referenceDirection) < 0.0f)
+            direction *= -1.0f;
+        const float rawPresence = vc::lasagna::interpolateLasagnaCorners(
+            corners.values[volume][pointIndex], weights);
+        sample.options.push_back({
+            direction,
+            std::clamp(rawPresence / 255.0f, 0.0f, 1.0f),
+            direction.dot(direction) > 1.0e-12f});
+    }
+    if (normal == nullptr)
+        return;
+    if (!valid ||
+        !(vc::lasagna::interpolateLasagnaCorners(
+              corners.values[normalFirstVolume][pointIndex], weights) > 0.0f)) {
+        *normal = {};
+        return;
+    }
+    normal->normal = vc::lasagna::interpolateLasagnaCompactAxisCorners(
+        corners.values[normalFirstVolume + 1][pointIndex],
+        corners.values[normalFirstVolume + 2][pointIndex],
+        weights);
+    normal->valid = normal->normal.dot(normal->normal) > 1.0e-12f;
+}
+
+[[nodiscard]] CandidateScore candidateLossFromCorners(
+    const vc::lasagna::LasagnaCornerBatch& corners,
+    size_t optionCount,
+    size_t pointIndex,
+    const BeamState& beam,
+    const TraceVec& candidateDirection,
+    const FiberTraceConfig& config)
+{
+    FiberPredictionSample sample;
+    vc::lasagna::LasagnaNormalSampler::FloatNormalSample normal;
+    decodePredictionAndNormalCornerPoint(
+        corners,
+        0,
+        optionCount,
+        pointIndex,
+        candidateDirection,
+        sample,
+        optionCount * 3,
+        &normal);
+    return candidateLossFromSample(
+        sample,
+        beam,
+        candidateDirection,
+        config,
+        &normal);
+}
+
 [[nodiscard]] CandidateScore candidateLoss(
     const FiberPredictionSource& predictions,
     const vc::lasagna::NormalSampler* normalSampler,
@@ -1088,11 +1165,8 @@ void sampleCandidateNormals(
     candidatePoints.clear();
     referenceDirections.clear();
     candidatePoints.reserve(tasks.size());
-    referenceDirections.reserve(tasks.size());
-    for (const auto& task : tasks) {
+    for (const auto& task : tasks)
         candidatePoints.push_back(task.candidatePoint);
-        referenceDirections.push_back(task.direction);
-    }
     auto& predictionSamples = scratch.predictionSamples;
     const auto predictionStart = TraceClock::now();
     const auto* field = dynamic_cast<const FiberPredictionField*>(&predictions);
@@ -1101,17 +1175,33 @@ void sampleCandidateNormals(
     const bool combinedCornerBatch =
         field != nullptr && lasagnaSampler != nullptr && normals.empty() &&
         normalAwareSmoothnessEnabled(config) &&
-        field->sampleBatchWithNormals(
+        field->sampleCornerBatchWithNormals(
             *lasagnaSampler,
             candidatePoints,
-            referenceDirections,
             workers,
-            predictionSamples,
-            scratch.floatNormalSamples,
             &scratch.cornerBatch,
             profile);
     if (combinedCornerBatch) {
-        // Both outputs were materialized from one six-volume corner traversal.
+        const size_t expectedVolumes = field->optionCount() * 3 + 3;
+        const bool validShape =
+            scratch.cornerBatch.values.size() == expectedVolumes &&
+            scratch.cornerBatch.fractionsXYZ.size() == tasks.size() &&
+            scratch.cornerBatch.valid.size() == tasks.size() &&
+            std::all_of(
+                scratch.cornerBatch.values.begin(),
+                scratch.cornerBatch.values.end(),
+                [&](const auto& values) { return values.size() == tasks.size(); });
+        if (!validShape) {
+            throw std::runtime_error(
+                "fiber prediction corner batch returned inconsistent dimensions");
+        }
+    } else {
+        referenceDirections.reserve(tasks.size());
+        for (const auto& task : tasks)
+            referenceDirections.push_back(task.direction);
+    }
+    if (combinedCornerBatch) {
+        // Corner-backed scoring decodes directly in the candidate score loop.
     } else if (field != nullptr) {
         field->sampleBatch(
             candidatePoints,
@@ -1136,7 +1226,7 @@ void sampleCandidateNormals(
     }
     if (profile != nullptr)
         profile->predictionBatchSeconds += elapsedSeconds(predictionStart);
-    if (predictionSamples.size() < tasks.size()) {
+    if (!combinedCornerBatch && predictionSamples.size() < tasks.size()) {
         throw std::runtime_error(
             "fiber prediction batch returned the wrong number of samples");
     }
@@ -1162,6 +1252,16 @@ void sampleCandidateNormals(
     std::exception_ptr firstError;
     auto scoreOne = [&](size_t index) {
         const auto& task = tasks[index];
+        if (combinedCornerBatch) {
+            scores[index] = candidateLossFromCorners(
+                scratch.cornerBatch,
+                field->optionCount(),
+                index,
+                beams[task.beamIndex],
+                task.direction,
+                config);
+            return;
+        }
         const vc::lasagna::LasagnaNormalSampler::FloatNormalSample* normal =
             index < normalsForScoring.size() ? &normalsForScoring[index] : nullptr;
         scores[index] = candidateLossFromSample(
@@ -1893,6 +1993,34 @@ int debugTraceWorkerCount(
         taskCount);
 }
 
+CandidateScoreDebug debugCandidateLossFromCorners(
+    const vc::lasagna::LasagnaCornerBatch& corners,
+    size_t optionCount,
+    size_t pointIndex,
+    const cv::Vec3d& previousStepDirection,
+    const cv::Vec3d& currentSampleDirection,
+    const cv::Vec3d& historyDirection,
+    const cv::Vec3d& candidateDirection,
+    const FiberTraceConfig& config)
+{
+    BeamState beam;
+    beam.previousStepDirection = toTraceVec(previousStepDirection);
+    beam.currentSampleDirection = toTraceVec(currentSampleDirection);
+    beam.historyDirection = toTraceVec(historyDirection);
+    const CandidateScore score = candidateLossFromCorners(
+        corners,
+        optionCount,
+        pointIndex,
+        beam,
+        toTraceVec(candidateDirection),
+        config);
+    return {
+        score.loss,
+        toVec3d(score.selectedCurrentDirection),
+        score.selectedPresence,
+        score.valid};
+}
+
 } // namespace testing
 #endif
 
@@ -2183,51 +2311,15 @@ public:
             parallelThreads, 1,
             static_cast<int>(std::max<size_t>(1, referenceDirections.size())));
         auto materialize = [&](size_t pointIndex) {
-            auto& out = samples[pointIndex];
-            out.options.clear();
-            out.options.reserve(optionCount);
-            const cv::Vec3f reference = referenceDirections[pointIndex];
-            const cv::Vec3f fraction = corners.fractionsXYZ[pointIndex];
-            const bool valid = corners.valid[pointIndex] != 0;
-            const auto weights = vc::lasagna::lasagnaCornerWeights(fraction);
-            for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
-                const size_t volume = firstVolume + optionIndex * 3;
-                if (!valid) {
-                    out.options.push_back({});
-                    continue;
-                }
-                cv::Vec3f direction =
-                    vc::lasagna::interpolateLasagnaCompactAxisCorners(
-                        corners.values[volume + 1][pointIndex],
-                        corners.values[volume + 2][pointIndex],
-                        weights,
-                        reference);
-                if (direction.dot(reference) < 0.0f)
-                    direction *= -1.0f;
-                const float rawPresence =
-                    vc::lasagna::interpolateLasagnaCorners(
-                        corners.values[volume][pointIndex], weights);
-                out.options.push_back({
-                    direction,
-                    std::clamp(rawPresence / 255.0f, 0.0f, 1.0f),
-                    direction.dot(direction) > 1.0e-12f,
-                });
-            }
-            if (normals == nullptr)
-                return;
-            if (!valid ||
-                !(vc::lasagna::interpolateLasagnaCorners(
-                      corners.values[normalFirstVolume][pointIndex], weights) > 0.0f)) {
-                (*normals)[pointIndex] = {};
-                return;
-            }
-            const cv::Vec3f normal =
-                vc::lasagna::interpolateLasagnaCompactAxisCorners(
-                    corners.values[normalFirstVolume + 1][pointIndex],
-                    corners.values[normalFirstVolume + 2][pointIndex],
-                    weights);
-            (*normals)[pointIndex] = {
-                normal, normal.dot(normal) > 1.0e-12f};
+            decodePredictionAndNormalCornerPoint(
+                corners,
+                firstVolume,
+                optionCount,
+                pointIndex,
+                referenceDirections[pointIndex],
+                samples[pointIndex],
+                normalFirstVolume,
+                normals != nullptr ? &(*normals)[pointIndex] : nullptr);
         };
 #ifdef _OPENMP
         if (workers > 1) {
@@ -2242,18 +2334,14 @@ public:
             materialize(pointIndex);
     }
 
-    [[nodiscard]] bool sampleBatchWithNormals(
+    [[nodiscard]] bool sampleCornerBatchWithNormals(
         const vc::lasagna::LasagnaNormalSampler& normalSampler,
         const std::vector<cv::Vec3f>& volumePoints,
-        const std::vector<cv::Vec3f>& referenceDirections,
         int parallelThreads,
-        std::vector<FiberPredictionSample>& samples,
-        std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample>& normals,
         vc::lasagna::LasagnaCornerBatch* cornerScratch,
         FiberTraceProfile* profile) const
     {
-        if (!cornerSamplingAvailable_ ||
-            volumePoints.size() != referenceDirections.size()) {
+        if (!cornerSamplingAvailable_ || cornerScratch == nullptr) {
             return false;
         }
         const auto normalSamplers = normalSampler.groupedCornerSamplers();
@@ -2271,9 +2359,7 @@ public:
         }
         samplers.insert(samplers.end(), normalSamplers.begin(), normalSamplers.end());
 
-        const auto batchStart = TraceClock::now();
-        vc::lasagna::LasagnaCornerBatch localCorners;
-        auto& corners = cornerScratch != nullptr ? *cornerScratch : localCorners;
+        auto& corners = *cornerScratch;
         const auto cornerStart = TraceClock::now();
         try {
             (void)vc::lasagna::sampleLasagnaChannelCornerBatch(
@@ -2283,20 +2369,6 @@ public:
         }
         if (profile != nullptr)
             profile->predictionCornerSeconds += elapsedSeconds(cornerStart);
-        const auto predictionDecodeStart = TraceClock::now();
-        materializeGroupedPredictionCorners(
-            corners,
-            0,
-            referenceDirections,
-            parallelThreads,
-            samples,
-            true,
-            options_.size() * 3,
-            &normals);
-        if (profile != nullptr) {
-            profile->predictionDecodeSeconds += elapsedSeconds(predictionDecodeStart);
-            profile->predictionMaterializeSeconds += elapsedSeconds(batchStart);
-        }
         return true;
     }
 
@@ -2959,23 +3031,17 @@ void FiberPredictionField::sampleBatch(
         profile);
 }
 
-bool FiberPredictionField::sampleBatchWithNormals(
+bool FiberPredictionField::sampleCornerBatchWithNormals(
     const vc::lasagna::LasagnaNormalSampler& normalSampler,
     const std::vector<cv::Vec3f>& volumePoints,
-    const std::vector<cv::Vec3f>& referenceDirections,
     int parallelThreads,
-    std::vector<FiberPredictionSample>& samples,
-    std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample>& normals,
     vc::lasagna::LasagnaCornerBatch* cornerScratch,
     FiberTraceProfile* profile) const
 {
-    return impl_->sampleBatchWithNormals(
+    return impl_->sampleCornerBatchWithNormals(
         normalSampler,
         volumePoints,
-        referenceDirections,
         parallelThreads,
-        samples,
-        normals,
         cornerScratch,
         profile);
 }

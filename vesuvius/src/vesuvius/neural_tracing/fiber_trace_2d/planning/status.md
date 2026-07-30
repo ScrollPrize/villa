@@ -11,6 +11,9 @@
 - [x] Add focused regression tests
 - [x] Build and run focused native tests
 - [x] Run approved representative benchmark and compare trace quality
+- [x] Fuse persisted corner decoding with candidate scoring
+- [x] Add direct-corner scoring coverage and rerun focused native tests
+- [ ] Measure fused decode/scoring on the approved representative workload
 - [ ] Update task log, changelog, and final consistency review
 
 The combined prediction-plus-normal sampler supports the workload's mixed
@@ -31,3 +34,9 @@ corner batching to 8.721s but total runtime was 38.117s due to slower contended
 OpenMP stages. A moderate `dynamic,64` scheduling control reduced the same
 contended workload to 37.277s wall / 1049.197s CPU. Trace quality remains at 8
 restarts, versus the 5-restart pre-float baseline.
+
+The next revision removes the full decoded prediction/normal sample arrays from
+the persisted fast path and scores candidates directly from the retained corner
+batch. All 26 fiber-trace, 15 strict corner-sampler, and 11 Lasagna normal tests
+pass. Its representative performance and restart result have not yet been
+measured.

@@ -387,6 +387,52 @@ TEST_CASE("native fiber tracer parallel workers require concurrent samplers")
               true, true, true, 4, 1) == 1);
 }
 
+TEST_CASE("native fiber tracer scores persisted corners without materialized samples")
+{
+    vc::lasagna::LasagnaCornerBatch corners;
+    constexpr size_t optionCount = 2;
+    corners.values.resize(optionCount * 3 + 3);
+    for (auto& volume : corners.values)
+        volume.resize(1);
+    corners.fractionsXYZ = {{0.25f, 0.5f, 0.75f}};
+    corners.valid = {1};
+    const auto constantCorners = [](uint8_t value) {
+        std::array<uint8_t, 8> out{};
+        out.fill(value);
+        return out;
+    };
+
+    // Option zero points along X at half presence; option one points along Y.
+    corners.values[0][0] = constantCorners(128);
+    corners.values[1][0] = constantCorners(255);
+    corners.values[2][0] = constantCorners(128);
+    corners.values[3][0] = constantCorners(255);
+    corners.values[4][0] = constantCorners(128);
+    corners.values[5][0] = constantCorners(255);
+    // A valid Z normal keeps straight X motion at zero smoothness cost.
+    corners.values[6][0] = constantCorners(255);
+    corners.values[7][0] = constantCorners(128);
+    corners.values[8][0] = constantCorners(128);
+
+    vc::fiber_tracer::FiberTraceConfig config;
+    const auto score = vc::fiber_tracer::testing::debugCandidateLossFromCorners(
+        corners,
+        optionCount,
+        0,
+        {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        config);
+
+    REQUIRE(score.valid);
+    CHECK(score.loss == doctest::Approx(1.0 - 128.0 / 255.0));
+    CHECK(score.selectedPresence == doctest::Approx(128.0 / 255.0));
+    CHECK(score.selectedDirection[0] == doctest::Approx(1.0));
+    CHECK(score.selectedDirection[1] == doctest::Approx(0.0));
+    CHECK(score.selectedDirection[2] == doctest::Approx(0.0));
+}
+
 TEST_CASE("native fiber tracer parallel path samples predictions in a batch")
 {
     BatchPrediction predictions;

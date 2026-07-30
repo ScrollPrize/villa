@@ -244,13 +244,10 @@ public:
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples,
         FiberTraceProfile* profile) const;
-    [[nodiscard]] bool sampleBatchWithNormals(
+    [[nodiscard]] bool sampleCornerBatchWithNormals(
         const vc::lasagna::LasagnaNormalSampler& normalSampler,
         const std::vector<cv::Vec3f>& volumePoints,
-        const std::vector<cv::Vec3f>& referenceDirections,
         int parallelThreads,
-        std::vector<FiberPredictionSample>& samples,
-        std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample>& normals,
         vc::lasagna::LasagnaCornerBatch* cornerScratch,
         FiberTraceProfile* profile) const;
     [[nodiscard]] FiberPredictionSample sample(
@@ -357,6 +354,13 @@ struct BeamDebugState {
     bool reached = false;
 };
 
+struct CandidateScoreDebug {
+    double loss = 0.0;
+    cv::Vec3d selectedDirection{0.0, 0.0, 0.0};
+    double selectedPresence = 0.0;
+    bool valid = false;
+};
+
 [[nodiscard]] std::vector<size_t> debugPruneBeamStateIndices(
     const std::vector<BeamDebugState>& states,
     int beamWidth,
@@ -371,6 +375,16 @@ struct BeamDebugState {
     bool hasNormalSampler,
     int parallelThreads,
     size_t taskCount);
+
+[[nodiscard]] CandidateScoreDebug debugCandidateLossFromCorners(
+    const vc::lasagna::LasagnaCornerBatch& corners,
+    size_t optionCount,
+    size_t pointIndex,
+    const cv::Vec3d& previousStepDirection,
+    const cv::Vec3d& currentSampleDirection,
+    const cv::Vec3d& historyDirection,
+    const cv::Vec3d& candidateDirection,
+    const FiberTraceConfig& config);
 
 } // namespace testing
 #endif

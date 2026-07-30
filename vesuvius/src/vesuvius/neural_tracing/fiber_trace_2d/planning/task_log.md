@@ -114,6 +114,20 @@
   38.117s run, decode improved from 8.570s to 7.917s, scoring from 8.153s to
   7.992s, and frontier construction from 5.856s to 5.760s. Corner batching was
   effectively unchanged at 8.648s versus 8.721s.
+- The next implementation removes the persisted-field decode/materialize/read
+  round trip. `FiberPredictionField` now returns the retained combined
+  prediction/normal corner batch without constructing per-candidate prediction
+  and normal arrays. Candidate scoring validates the batch dimensions once,
+  then decodes each option and normal directly from that candidate's corners
+  inside the existing deterministic score loop. Generic prediction sources
+  retain the existing decoded-sample batch path. The fast path also avoids
+  constructing the reference-direction array because corner fetching needs
+  only candidate coordinates. A test-only direct-corner score fixture covers
+  option selection, presence, compact-axis decoding, and loss calculation.
+  Validation before measurement: `test_fiber_trace3d` 26 passed,
+  `test_chunked_plane_sampler_fallback` 15 passed, and
+  `test_lasagna_normal_sampler` 11 passed. Representative measurement is
+  pending explicit approval.
 
 ## Open Acceptance Issue
 
