@@ -152,11 +152,11 @@ QString groupTitle(const QString& prefix)
 int groupOrder(const QString& prefix)
 {
     static const std::array<QString, 13> order{
+        QStringLiteral("sample"), QStringLiteral("loss"),
+        QStringLiteral("patch"), QStringLiteral("tracks"),
         QStringLiteral("optimizer"), QStringLiteral("model"),
-        QStringLiteral("patch"), QStringLiteral("sample"),
         QStringLiteral("input"), QStringLiteral("pcl"),
-        QStringLiteral("tracks"), QStringLiteral("dense"),
-        QStringLiteral("loss"), QStringLiteral("dt"),
+        QStringLiteral("dense"), QStringLiteral("dt"),
         QStringLiteral("output"), QStringLiteral("shell"),
         QStringLiteral("influence"),
     };
@@ -171,19 +171,33 @@ class ResponsiveGroupGrid final : public QWidget
 public:
     explicit ResponsiveGroupGrid(QWidget* parent = nullptr)
         : QWidget(parent)
-        , _layout(new QGridLayout(this))
+        , _layout(new QHBoxLayout(this))
     {
         setObjectName(QStringLiteral("spiralConfigGroupGrid"));
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
         _layout->setContentsMargins(0, 0, 0, 0);
-        _layout->setHorizontalSpacing(12);
-        _layout->setVerticalSpacing(12);
+        _layout->setSpacing(12);
+        for (int column = 0; column < 3; ++column) {
+            _columnWidgets[static_cast<size_t>(column)] = new QWidget(this);
+            auto* columnLayout = new QVBoxLayout(
+                _columnWidgets[static_cast<size_t>(column)]);
+            columnLayout->setContentsMargins(0, 0, 0, 0);
+            columnLayout->setSpacing(12);
+            _columnLayouts[static_cast<size_t>(column)] = columnLayout;
+            _layout->addWidget(
+                _columnWidgets[static_cast<size_t>(column)], 1);
+        }
         setProperty("spiralColumnCount", 1);
     }
 
     void addGroup(QWidget* group)
     {
         _groups.push_back(group);
+        if (auto* collapsible =
+                qobject_cast<CollapsibleSettingsGroup*>(group)) {
+            connect(collapsible, &CollapsibleSettingsGroup::toggled,
+                    this, [this] { refresh(); });
+        }
         reflow(width());
     }
 
@@ -217,29 +231,44 @@ private:
             [](const QWidget* group) {
                 return group->property("spiralFilterVisible").toBool();
             }));
-        if (!force && columns == _columns && _layout->count() == visibleGroups)
+        if (!force && columns == _columns && visibleGroups == _visibleGroups)
             return;
 
-        while (_layout->count() > 0)
-            _layout->takeAt(0);
-        for (int column = 0; column < 3; ++column)
-            _layout->setColumnStretch(column, column < columns ? 1 : 0);
-        int index = 0;
+        for (int column = 0; column < 3; ++column) {
+            QVBoxLayout* columnLayout =
+                _columnLayouts[static_cast<size_t>(column)];
+            while (columnLayout->count() > 0)
+                delete columnLayout->takeAt(0);
+            _columnWidgets[static_cast<size_t>(column)]
+                ->setVisible(column < columns);
+        }
+
+        std::array<int, 3> columnHeights{0, 0, 0};
         for (QWidget* group : _groups) {
             if (!group->property("spiralFilterVisible").toBool()) continue;
-            _layout->addWidget(group, index / columns, index % columns);
-            ++index;
+            const auto shortest = std::min_element(
+                columnHeights.begin(), columnHeights.begin() + columns);
+            const int column = static_cast<int>(
+                std::distance(columnHeights.begin(), shortest));
+            _columnLayouts[static_cast<size_t>(column)]
+                ->addWidget(group, 0, Qt::AlignTop);
+            *shortest += group->sizeHint().height() + 12;
         }
-        _layout->setRowStretch(
-            (visibleGroups + columns - 1) / columns, 1);
+        for (int column = 0; column < columns; ++column)
+            _columnLayouts[static_cast<size_t>(column)]->addStretch(1);
+
         _columns = columns;
+        _visibleGroups = visibleGroups;
         setProperty("spiralColumnCount", columns);
         updateGeometry();
     }
 
-    QGridLayout* _layout;
+    QHBoxLayout* _layout;
+    std::array<QWidget*, 3> _columnWidgets{};
+    std::array<QVBoxLayout*, 3> _columnLayouts{};
     std::vector<QWidget*> _groups;
     int _columns = 0;
+    int _visibleGroups = 0;
 };
 }
 
@@ -457,92 +486,100 @@ void SpiralConfigProfileEditor::rebuildControls()
                 spec.value(QStringLiteral("label")).toString();
             const QString impactText = impactLabel(
                 spec.value(QStringLiteral("runtime_impact")).toString());
-        const QString type = spec.value(QStringLiteral("type")).toString();
-        QWidget* editor = nullptr;
-        if (type == QStringLiteral("boolean")) {
-            auto* value = new QCheckBox(group);
-            connect(value, &QCheckBox::toggled,
-                    this, &SpiralConfigProfileEditor::controlsToJson);
-            editor = value;
-        } else if (type == QStringLiteral("integer")) {
-            auto* value = new QSpinBox(group);
-            value->setRange(spec.value(QStringLiteral("minimum")).toInt(),
-                            spec.value(QStringLiteral("maximum")).toInt());
-            connect(value, qOverload<int>(&QSpinBox::valueChanged),
-                    this, [this] { controlsToJson(); });
-            editor = value;
-        } else if (type == QStringLiteral("number")) {
-            auto* value = new QDoubleSpinBox(group);
-            value->setRange(spec.value(QStringLiteral("minimum")).toDouble(),
-                            spec.value(QStringLiteral("maximum")).toDouble());
-            value->setDecimals(spec.value(QStringLiteral("precision")).toInt(6));
-            value->setSingleStep(spec.value(QStringLiteral("step")).toDouble(.01));
-            connect(value, qOverload<double>(&QDoubleSpinBox::valueChanged),
-                    this, [this] { controlsToJson(); });
-            editor = value;
-        } else if (type == QStringLiteral("enum")) {
-            auto* value = new QComboBox(group);
-            for (const QJsonValue& option :
-                 spec.value(QStringLiteral("values")).toArray())
-                value->addItem(option.toString());
-            connect(value, qOverload<int>(&QComboBox::currentIndexChanged),
-                    this, [this] { controlsToJson(); });
-            editor = value;
-        } else {
-            auto* value = new QLineEdit(group);
-            value->setPlaceholderText(
-                type == QStringLiteral("dictionary")
-                    ? tr("{ key: value }") : tr("[ values ]"));
-            connect(value, &QLineEdit::editingFinished,
-                    this, &SpiralConfigProfileEditor::controlsToJson);
-            editor = value;
-        }
-        editor->setObjectName(QStringLiteral("spiralConfigEditor_%1").arg(key));
-        editor->setProperty("spiralConfigKey", key);
-        editor->setToolTip(key);
-        QWidget* displayed = editor;
-        if (spec.value(QStringLiteral("nullable")).toBool()) {
-            displayed = new QWidget(group);
-            auto* row = new QHBoxLayout(displayed);
-            row->setContentsMargins(0, 0, 0, 0);
-            auto* enabled = new QCheckBox(tr("Enabled"), displayed);
-            editor->setProperty("nullableToggle",
-                                QVariant::fromValue<QObject*>(enabled));
-            row->addWidget(enabled);
-            row->addWidget(editor, 1);
-            connect(enabled, &QCheckBox::toggled, editor,
-                    [this, editor](bool on) {
-                        editor->setEnabled(on);
-                        controlsToJson();
-                    });
-        }
-        _fieldEditors.insert(key, editor);
+            const QString type = spec.value(QStringLiteral("type")).toString();
+            QWidget* editor = nullptr;
+            if (type == QStringLiteral("boolean")) {
+                auto* value = new QCheckBox(group);
+                connect(value, &QCheckBox::toggled,
+                        this, &SpiralConfigProfileEditor::controlsToJson);
+                editor = value;
+            } else if (type == QStringLiteral("integer")) {
+                auto* value = new QSpinBox(group);
+                value->setRange(spec.value(QStringLiteral("minimum")).toInt(),
+                                spec.value(QStringLiteral("maximum")).toInt());
+                connect(value, qOverload<int>(&QSpinBox::valueChanged),
+                        this, [this] { controlsToJson(); });
+                editor = value;
+            } else if (type == QStringLiteral("number")) {
+                auto* value = new QDoubleSpinBox(group);
+                value->setRange(spec.value(QStringLiteral("minimum")).toDouble(),
+                                spec.value(QStringLiteral("maximum")).toDouble());
+                value->setDecimals(
+                    spec.value(QStringLiteral("precision")).toInt(6));
+                value->setSingleStep(
+                    spec.value(QStringLiteral("step")).toDouble(.01));
+                connect(value, qOverload<double>(&QDoubleSpinBox::valueChanged),
+                        this, [this] { controlsToJson(); });
+                editor = value;
+            } else if (type == QStringLiteral("enum")) {
+                auto* value = new QComboBox(group);
+                for (const QJsonValue& option :
+                     spec.value(QStringLiteral("values")).toArray())
+                    value->addItem(option.toString());
+                connect(value, qOverload<int>(&QComboBox::currentIndexChanged),
+                        this, [this] { controlsToJson(); });
+                editor = value;
+            } else {
+                auto* value = new QLineEdit(group);
+                value->setPlaceholderText(
+                    type == QStringLiteral("dictionary")
+                        ? tr("{ key: value }") : tr("[ values ]"));
+                connect(value, &QLineEdit::editingFinished,
+                        this, &SpiralConfigProfileEditor::controlsToJson);
+                editor = value;
+            }
+            editor->setObjectName(
+                QStringLiteral("spiralConfigEditor_%1").arg(key));
+            editor->setProperty("spiralConfigKey", key);
+            editor->setToolTip(key);
+            QWidget* displayed = editor;
+            if (spec.value(QStringLiteral("nullable")).toBool()) {
+                displayed = new QWidget(group);
+                auto* nullableRow = new QHBoxLayout(displayed);
+                nullableRow->setContentsMargins(0, 0, 0, 0);
+                auto* enabled = new QCheckBox(tr("Enabled"), displayed);
+                editor->setProperty("nullableToggle",
+                                    QVariant::fromValue<QObject*>(enabled));
+                nullableRow->addWidget(enabled);
+                nullableRow->addWidget(editor, 1);
+                connect(enabled, &QCheckBox::toggled, editor,
+                        [this, editor](bool on) {
+                            editor->setEnabled(on);
+                            controlsToJson();
+                        });
+            }
+            _fieldEditors.insert(key, editor);
 
-        auto* rowWidget = new QWidget(group->contentWidget());
-        rowWidget->setObjectName(QStringLiteral("spiralConfigRow_%1").arg(key));
-        rowWidget->setProperty("spiralConfigKey", key);
-        auto* row = new QGridLayout(rowWidget);
-        row->setContentsMargins(0, 0, 0, 0);
-        row->setHorizontalSpacing(8);
-        auto* label = new QLabel(labelText, rowWidget);
-        label->setObjectName(QStringLiteral("spiralConfigLabel_%1").arg(key));
-        label->setToolTip(key);
-        auto* impact = new QLabel(impactText, rowWidget);
-        impact->setObjectName(QStringLiteral("spiralConfigImpact_%1").arg(key));
-        impact->setProperty("spiralRuntimeImpact",
-                            spec.value(QStringLiteral("runtime_impact")).toString());
-        impact->setStyleSheet(QStringLiteral("color: palette(mid);"));
-        impact->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        impact->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
-        row->addWidget(label, 0, 0);
-        row->addWidget(displayed, 0, 1);
-        row->addWidget(impact, 0, 2);
-        row->setColumnStretch(1, 1);
-        group->addFullWidthWidget(rowWidget, key);
-        groupState.rows.push_back(
-            {key, labelText + QLatin1Char(' ') + key + QLatin1Char(' ')
-                      + impactText,
-             rowWidget});
+            auto* rowWidget = new QWidget(group->contentWidget());
+            rowWidget->setObjectName(
+                QStringLiteral("spiralConfigRow_%1").arg(key));
+            rowWidget->setProperty("spiralConfigKey", key);
+            auto* row = new QGridLayout(rowWidget);
+            row->setContentsMargins(0, 0, 0, 0);
+            row->setHorizontalSpacing(8);
+            auto* label = new QLabel(labelText, rowWidget);
+            label->setObjectName(
+                QStringLiteral("spiralConfigLabel_%1").arg(key));
+            label->setToolTip(key);
+            auto* impact = new QLabel(impactText, rowWidget);
+            impact->setObjectName(
+                QStringLiteral("spiralConfigImpact_%1").arg(key));
+            impact->setProperty(
+                "spiralRuntimeImpact",
+                spec.value(QStringLiteral("runtime_impact")).toString());
+            impact->setStyleSheet(QStringLiteral("color: palette(mid);"));
+            impact->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            impact->setSizePolicy(
+                QSizePolicy::Minimum, QSizePolicy::Preferred);
+            row->addWidget(label, 0, 0);
+            row->addWidget(displayed, 0, 1);
+            row->addWidget(impact, 0, 2);
+            row->setColumnStretch(1, 1);
+            group->addFullWidthWidget(rowWidget, key);
+            groupState.rows.push_back(
+                {key, labelText + QLatin1Char(' ') + key + QLatin1Char(' ')
+                          + impactText,
+                 rowWidget});
         }
         _controlGroups.push_back(groupState);
         static_cast<ResponsiveGroupGrid*>(_controlsGrid)->addGroup(group);

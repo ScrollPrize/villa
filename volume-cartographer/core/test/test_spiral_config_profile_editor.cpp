@@ -61,6 +61,16 @@ QJsonObject syntheticCatalog()
     fields[QStringLiteral("optimizer_learning_rate")] = optimizer;
     defaults[QStringLiteral("optimizer_learning_rate")] = 0.5;
 
+    QJsonObject momentum = field(
+        QStringLiteral("Momentum"), QStringLiteral("number"),
+        QStringLiteral("run_boundary"));
+    momentum[QStringLiteral("minimum")] = 0.0;
+    momentum[QStringLiteral("maximum")] = 1.0;
+    momentum[QStringLiteral("precision")] = 2;
+    momentum[QStringLiteral("step")] = 0.05;
+    fields[QStringLiteral("optimizer_momentum")] = momentum;
+    defaults[QStringLiteral("optimizer_momentum")] = 0.9;
+
     QJsonObject model = field(
         QStringLiteral("Iterations"), QStringLiteral("integer"),
         QStringLiteral("new_fit"));
@@ -143,20 +153,20 @@ int main(int argc, char** argv)
     editor.setCatalog(syntheticCatalog());
 
     const QStringList expectedPrefixes{
+        QStringLiteral("sample"), QStringLiteral("loss"),
+        QStringLiteral("patch"), QStringLiteral("tracks"),
         QStringLiteral("optimizer"), QStringLiteral("model"),
-        QStringLiteral("patch"), QStringLiteral("sample"),
         QStringLiteral("input"), QStringLiteral("pcl"),
-        QStringLiteral("tracks"), QStringLiteral("dense"),
-        QStringLiteral("loss"), QStringLiteral("dt"),
+        QStringLiteral("dense"), QStringLiteral("dt"),
         QStringLiteral("output"), QStringLiteral("shell"),
         QStringLiteral("influence"),
     };
     const QStringList expectedTitles{
+        QStringLiteral("Sample Count"), QStringLiteral("Loss"),
+        QStringLiteral("Patch"), QStringLiteral("Tracks"),
         QStringLiteral("Optimizer"), QStringLiteral("Model"),
-        QStringLiteral("Patch"), QStringLiteral("Sample Count"),
         QStringLiteral("Input"), QStringLiteral("PCL"),
-        QStringLiteral("Tracks"), QStringLiteral("Dense"),
-        QStringLiteral("Loss"), QStringLiteral("DT"),
+        QStringLiteral("Dense"), QStringLiteral("DT"),
         QStringLiteral("Output"), QStringLiteral("Shell"),
         QStringLiteral("Influence"),
     };
@@ -194,7 +204,7 @@ int main(int argc, char** argv)
             "Runtime impact should use its compact display label");
 
     const QString beforeCollapse = editor.currentText();
-    auto* optimizerGroup = editor._controlGroups.front().widget;
+    auto* optimizerGroup = editor._controlGroups[4].widget;
     optimizerGroup->setExpanded(false);
     require(!optimizerGroup->isExpanded(),
             "Configuration groups should be collapsible");
@@ -207,6 +217,9 @@ int main(int argc, char** argv)
             "Search should temporarily expand a matching group");
     require(!optimizerGroup->isHidden(),
             "Search should retain groups containing matching rows");
+    require(editor.findChild<QWidget*>(
+                QStringLiteral("spiralConfigRow_optimizer_momentum"))->isHidden(),
+            "Search should hide non-matching rows within a matching group");
     require(editor._controlGroups[1].widget->isHidden(),
             "Search should hide groups with no matching rows");
     editor._search->clear();
@@ -232,6 +245,23 @@ int main(int argc, char** argv)
                     == Qt::ScrollBarAlwaysOff,
                 "Controls area should never show a horizontal scrollbar");
     }
+    require(editor._controlGroups[0].widget->y()
+                == editor._controlGroups[1].widget->y()
+            && editor._controlGroups[1].widget->y()
+                == editor._controlGroups[2].widget->y(),
+            "Groups in the same grid row should be top aligned");
+    const int sampleTop =
+        editor._controlGroups[3].widget->mapTo(grid, QPoint()).y();
+    bool packedBelowColumnHead = false;
+    for (int index = 0; index < 3; ++index) {
+        const int headBottom =
+            editor._controlGroups[index].widget->mapTo(grid, QPoint()).y()
+            + editor._controlGroups[index].widget->height();
+        packedBelowColumnHead |=
+            sampleTop >= headBottom && sampleTop - headBottom <= 16;
+    }
+    require(packedBelowColumnHead,
+            "Groups should pack into columns without fixed-row gaps");
 
     auto* iterations = qobject_cast<QSpinBox*>(
         editor._fieldEditors.value(QStringLiteral("model_iterations")));
