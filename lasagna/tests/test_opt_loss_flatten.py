@@ -43,6 +43,7 @@ def _make_flatten_model(
 	flatten_direction: str = "inverse",
 	flatten_output_step: float | None = None,
 	flatten_output_margin: float = 0.10,
+	flatten_initial_uv_rescale: bool = True,
 ) -> fit_model.Model3D:
 	if valid is None:
 		valid = torch.ones(xyz.shape[:2], dtype=torch.bool)
@@ -60,6 +61,7 @@ def _make_flatten_model(
 		flatten_direction=flatten_direction,
 		flatten_output_step=flatten_output_step,
 		flatten_output_margin=flatten_output_margin,
+		flatten_initial_uv_rescale=flatten_initial_uv_rescale,
 	)
 
 
@@ -231,6 +233,37 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertEqual(stages[0].global_opt.eff["flatten_map_step"], 0.001)
 		self.assertEqual(stages[0].global_opt.eff["flatten_avg_offset"], 1.0)
 		self.assertEqual(stages[0].global_opt.eff["flatten_orient"], 0.001)
+
+	def test_top_level_edge_step_global_scale_applies_to_flatten_stages(self) -> None:
+		stages = optimizer.load_stages_cfg({
+			"args": {
+				"model-init": "flatten",
+				"flatten_edge_step_global_scale": 100.0,
+			},
+			"base": {
+				"flatten_sdir": 1.0,
+				"flatten_edge_step": 1.0,
+			},
+			"stages": [
+				{
+					"name": "flatten0",
+					"steps": 1,
+					"lr": 0.1,
+					"params": ["map_flatten_ms"],
+					"args": {},
+				},
+				{
+					"name": "flatten1",
+					"steps": 1,
+					"lr": 0.1,
+					"params": ["map_flatten_ms"],
+					"args": {"flatten_edge_step_global_scale": 5.0},
+				},
+			],
+		})
+
+		self.assertEqual(stages[0].global_opt.args["flatten_edge_step_global_scale"], 100.0)
+		self.assertEqual(stages[1].global_opt.args["flatten_edge_step_global_scale"], 5.0)
 
 	def test_old_flatten_param_name_is_rejected(self) -> None:
 		with self.assertRaisesRegex(ValueError, "map_flatten_ms"):
@@ -745,6 +778,23 @@ class FlattenLossTest(unittest.TestCase):
 			places=5,
 		)
 
+	def test_forward_init_uv_rescale_can_be_disabled(self) -> None:
+		mdl = _make_flatten_model(
+			_flat_grid(5, 5, sx=27.0, sy=27.0),
+			mesh_step=20,
+			flatten_direction="forward",
+			flatten_output_step=20.0,
+			flatten_output_margin=0.0,
+			flatten_initial_uv_rescale=False,
+		)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+		stats = opt_loss_flatten.current_grid_step_stats(res)
+
+		self.assertEqual(mdl.flatten_output_shape, (5, 5))
+		self.assertAlmostEqual(float(mdl.flatten_measured_source_step.detach()), 27.0, places=5)
+		self.assertAlmostEqual(float(mdl.flatten_map_step.detach()), 1.0, places=5)
+		self.assertAlmostEqual(stats["flatten_grid_step_avg"], 27.0, places=5)
+
 	def test_anisotropic_deformation_increases_sdir(self) -> None:
 		mdl = _make_flatten_model(_flat_grid(7, 7), mesh_step=1)
 		map_yx = mdl.flatten_map().detach().clone()
@@ -809,6 +859,37 @@ class FlattenLossTest(unittest.TestCase):
 		loss, _lms, _masks = opt_loss_flatten.flatten_edge_step_loss(res=res)
 
 		self.assertGreater(float(loss.detach()), 0.03)
+
+	def test_edge_step_global_scale_amplifies_average_mismatch(self) -> None:
+		target_step = 20.0
+		avg_mismatch = 0.01
+		global_scale = 10.0
+		mdl = _make_flatten_model(
+			_flat_grid(4, 4, sx=target_step, sy=target_step),
+			mesh_step=20,
+			flatten_direction="forward",
+			flatten_output_step=target_step,
+			flatten_output_margin=0.0,
+		)
+		map_yx = mdl.flatten_map().detach().clone() / (1.0 + avg_mismatch)
+		_set_flatten_map(mdl, map_yx)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		try:
+			opt_loss_flatten.configure(edge_step_global_scale=global_scale, reset_history=True)
+			loss, _lms, _masks = opt_loss_flatten.flatten_edge_step_loss(res=res)
+		finally:
+			opt_loss_flatten.configure(edge_step_global_scale=1.0, reset_history=True)
+
+		uv_scale = 1.0 / (1.0 + avg_mismatch)
+		target_scale = 1.0 + global_scale * avg_mismatch
+		edge_count = 2 * 4 * 3
+		diag_count = 2 * 3 * 3
+		expected = (
+			edge_count * (uv_scale - target_scale) ** 2
+			+ diag_count * 2.0 * (uv_scale - target_scale) ** 2
+		) / (edge_count + diag_count)
+		self.assertAlmostEqual(float(loss.detach()), expected, places=5)
 
 	def test_edge_step_regularizer_masks_invalid_vertices(self) -> None:
 		xyz = _flat_grid(2, 2, sx=20.0, sy=20.0)

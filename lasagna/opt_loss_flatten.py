@@ -8,6 +8,7 @@ import model as fit_model
 _sdir_eps = 1.0e-8
 _orient_min_det = 1.0e-2
 _order_margin = 0.05
+_edge_step_global_scale = 1.0
 _diagnostics_enabled = True
 _last_stats: dict[str, float] = {}
 _prev_point_mask: torch.Tensor | None = None
@@ -28,10 +29,11 @@ def configure(
 	sdir_eps: float | None = None,
 	orient_min_det: float | None = None,
 	order_margin: float | None = None,
+	edge_step_global_scale: float | None = None,
 	diagnostics: bool = True,
 	reset_history: bool = True,
 ) -> None:
-	global _sdir_eps, _orient_min_det, _order_margin
+	global _sdir_eps, _orient_min_det, _order_margin, _edge_step_global_scale
 	global _diagnostics_enabled, _last_stats, _prev_point_mask
 	if sdir_eps is not None:
 		_sdir_eps = max(1.0e-12, float(sdir_eps))
@@ -39,6 +41,8 @@ def configure(
 		_orient_min_det = float(orient_min_det)
 	if order_margin is not None:
 		_order_margin = max(0.0, float(order_margin))
+	if edge_step_global_scale is not None:
+		_edge_step_global_scale = max(0.0, float(edge_step_global_scale))
 	_diagnostics_enabled = bool(diagnostics)
 	if reset_history or not _diagnostics_enabled:
 		_last_stats = {}
@@ -330,6 +334,7 @@ def _flatten_forward_combined_core(
 	orient_min_det: float,
 	order_margin: float,
 	use_edge_step: bool,
+	edge_step_global_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 	"""Combined diagnostics-free forward flatten objective.
 
@@ -405,7 +410,13 @@ def _flatten_forward_combined_core(
 		map_step_sum * 0.0,
 	)
 	if use_edge_step:
-		map_step_loss = _flatten_edge_step_core(uv, source_xyz, vertex_valid, domain_step)
+		map_step_loss = _flatten_edge_step_core(
+			uv,
+			source_xyz,
+			vertex_valid,
+			domain_step,
+			edge_step_global_scale,
+		)
 
 	avg_mask_f = avg_mask.to(dtype=uv.dtype)
 	avg_weight = avg_mask_f.sum()
@@ -472,6 +483,7 @@ def _flatten_edge_step_core(
 	xyz: torch.Tensor,
 	vertex_valid: torch.Tensor,
 	domain_step: torch.Tensor,
+	global_scale: float,
 ) -> torch.Tensor:
 	"""Match each local UV edge length to its measured physical source length."""
 	step = domain_step.to(device=uv.device, dtype=uv.dtype).clamp_min(1.0e-12)
@@ -553,7 +565,8 @@ def _flatten_edge_step_core(
 		sum_ratio / sum_ratio_weight.clamp_min(1.0),
 		step,
 	).detach()
-	target_scale = (current_step / step).clamp_min(1.0e-12)
+	avg_mismatch = current_step / step - 1.0
+	target_scale = (1.0 + float(global_scale) * avg_mismatch).clamp_min(1.0e-12)
 	if int(uv.shape[0]) > 1:
 		part_loss, part_weight = _loss_contribution(
 			uv[1:, :] - uv[:-1, :],
@@ -661,6 +674,7 @@ def flatten_combined_loss_parts(
 		float(_orient_min_det),
 		float(_order_margin),
 		step_loss == "edge",
+		float(_edge_step_global_scale),
 	)
 
 
@@ -883,6 +897,7 @@ def flatten_edge_step_loss(
 		xyz.to(device=uv.device, dtype=uv.dtype),
 		vertex_valid.to(device=uv.device, dtype=torch.bool),
 		domain_step,
+		float(_edge_step_global_scale),
 	)
 	if not _diagnostics_enabled:
 		return loss, (), ()
@@ -912,7 +927,9 @@ def flatten_edge_step_loss(
 		phys_len = torch.linalg.vector_norm(delta_xyz, dim=-1)
 		target_scale = torch.where(
 			sum_ratio_weight > 0,
-			(sum_ratio / sum_ratio_weight.clamp_min(1.0)).detach() / step,
+			1.0 + float(_edge_step_global_scale) * (
+				(sum_ratio / sum_ratio_weight.clamp_min(1.0)).detach() / step - 1.0
+			),
 			step.new_tensor(1.0),
 		).clamp_min(1.0e-12)
 		lm = torch.nan_to_num((uv_len - (phys_len / step) * target_scale).square(), nan=0.0, posinf=1.0e12, neginf=0.0)

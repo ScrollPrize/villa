@@ -1330,6 +1330,12 @@ def _run_flatten_mode(
 		"flatten_output_step",
 		source_step,
 	))
+	flatten_initial_uv_rescale = _truthy_config_bool(
+		flatten_args.get(
+			"flatten_initial_uv_rescale",
+			flatten_args.get("flatten_initial_match_output_step", True),
+		)
+	)
 	filter_source_angles = _truthy_config_bool(flatten_args.get("flatten_filter_source_angles", True))
 	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
 	filter_radius = int(flatten_args.get("flatten_filter_radius", 2))
@@ -1348,6 +1354,7 @@ def _run_flatten_mode(
 		flatten_direction=flatten_direction,
 		flatten_output_margin=flatten_output_margin,
 		flatten_output_step=flatten_output_step,
+		flatten_initial_uv_rescale=flatten_initial_uv_rescale,
 	)
 	data = _dummy_flatten_data()
 
@@ -1359,7 +1366,8 @@ def _run_flatten_mode(
 		f"shape={tuple(xyz.shape)} valid={int(valid.sum())}/{valid.numel()} "
 		f"model_shape={mdl.mesh_h}x{mdl.mesh_w} "
 		f"source_step={source_step:.6g} output_step={flatten_output_step:.6g} "
-		f"measured_source_step={float(mdl.flatten_measured_source_step.detach().cpu()):.6g}",
+		f"measured_source_step={float(mdl.flatten_measured_source_step.detach().cpu()):.6g} "
+		f"initial_uv_rescale={int(flatten_initial_uv_rescale)}",
 		flush=True,
 	)
 	filter_stats = getattr(mdl, "flatten_source_filter_stats", {})

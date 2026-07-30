@@ -3396,6 +3396,7 @@ class Model3D(nn.Module):
 		flatten_direction: str = "inverse",
 		flatten_output_margin: float = 0.10,
 		flatten_output_step: float | None = None,
+		flatten_initial_uv_rescale: bool = True,
 	) -> None:
 		if xyz.ndim != 3 or int(xyz.shape[-1]) != 3:
 			raise ValueError(f"flatten source xyz must have shape (H,W,3), got {tuple(xyz.shape)}")
@@ -3422,6 +3423,7 @@ class Model3D(nn.Module):
 		source_layout_step = float(measured_source_step.detach().cpu())
 		if (
 			direction != "forward"
+			or not bool(flatten_initial_uv_rescale)
 			or not math.isfinite(source_layout_step)
 			or source_layout_step <= 0.0
 		):
@@ -3560,6 +3562,7 @@ class Model3D(nn.Module):
 		flatten_direction: str = "inverse",
 		flatten_output_margin: float = 0.10,
 		flatten_output_step: float | None = None,
+		flatten_initial_uv_rescale: bool = True,
 	) -> "Model3D":
 		H, W, _ = xyz.shape
 		output_step = (
@@ -3600,6 +3603,7 @@ class Model3D(nn.Module):
 			flatten_direction=direction,
 			flatten_output_margin=flatten_output_margin,
 			flatten_output_step=output_step,
+			flatten_initial_uv_rescale=flatten_initial_uv_rescale,
 		)
 		return mdl
 

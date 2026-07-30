@@ -526,6 +526,7 @@ def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
 def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 	cfg = dict(cfg)
 	args_cfg = cfg.pop("args", None)
+	top_args = dict(args_cfg) if isinstance(args_cfg, dict) else {}
 	model_init = _model_init_from_args(args_cfg)
 	if init_mode is None:
 		init_mode = _init_mode_from_args(args_cfg)
@@ -588,6 +589,14 @@ def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 			_require_consumed_dict(where=f"stage '{name}'", cfg=s)
 			if not isinstance(global_opt_cfg, dict):
 				raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
+			if "flatten_edge_step_global_scale" in top_args:
+				global_opt_cfg = dict(global_opt_cfg)
+				stage_args = dict(global_opt_cfg.get("args") or {})
+				stage_args.setdefault(
+					"flatten_edge_step_global_scale",
+					top_args["flatten_edge_step_global_scale"],
+				)
+				global_opt_cfg["args"] = stage_args
 			global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base)
 			out.append(Stage(name=name, global_opt=global_opt))
 		return out
@@ -2375,8 +2384,15 @@ def optimize(
 			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
 			orient_min_det=float(stage_args.get("flatten_orient_min_det", 1.0e-2)),
 			order_margin=float(stage_args.get("flatten_order_margin", 0.05)),
+			edge_step_global_scale=float(stage_args.get("flatten_edge_step_global_scale", 1.0)),
 			diagnostics=_flatten_diagnostics,
 		)
+		if _need_term("flatten_edge_step", stage_eff) > 0 and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: flatten_edge_step_global_scale="
+				f"{float(stage_args.get('flatten_edge_step_global_scale', 1.0)):g}",
+				flush=True,
+			)
 		_compile_flatten = _truthy(os.environ.get(
 			"LASAGNA_COMPILE_FLATTEN",
 			stage_args.get("compile_flatten", False),
