@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -334,15 +335,28 @@ struct FiberTraceSegmentRequest {
     std::vector<cv::Vec3d> referenceLine;
     size_t startIndex = 0;
     size_t targetIndex = 0;
-    std::optional<cv::Vec3d> targetPlaneNormal;
     FiberTraceConfig config;
+};
+
+struct FiberTraceTargetPlane {
+    std::string name;
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    cv::Vec3d normal{1.0, 0.0, 0.0};
+};
+
+struct FiberTraceTargetPlaneCrossing {
+    std::string name;
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    double inPlaneErrorVoxels = 0.0;
 };
 
 struct FiberTraceOneWayRequest {
     cv::Vec3d startPoint{0.0, 0.0, 0.0};
     cv::Vec3d targetPoint{0.0, 0.0, 0.0};
     cv::Vec3d initialDirection{1.0, 0.0, 0.0};
-    cv::Vec3d targetPlaneNormal{1.0, 0.0, 0.0};
+    std::vector<FiberTraceTargetPlane> targetPlanes;
+    std::optional<double> targetPlaneAcceptThresholdVoxels;
+    bool snapTraceToSelectedCrossing = true;
     double budgetSpanVoxels = 0.0;
     FiberTraceConfig config;
 };
@@ -352,6 +366,11 @@ struct FiberTraceOneWayResult {
     bool reachedTargetPlane = false;
     std::string reason;
     int steps = 0;
+    std::vector<FiberTraceTargetPlaneCrossing> targetPlaneCrossings;
+    std::string selectedTargetPlaneName;
+    std::optional<cv::Vec3d> selectedTargetPlaneCrossing;
+    double selectedTargetPlaneErrorVoxels =
+        std::numeric_limits<double>::infinity();
 };
 
 struct FiberTraceSegmentResult {
@@ -491,6 +510,15 @@ struct CandidateScoreDebug {
 [[nodiscard]] FiberTraceOneWayResult traceFiberOneWay(
     const FiberPredictionSource& predictions,
     const FiberTraceOneWayRequest& request,
+    const vc::lasagna::NormalSampler* normalSampler = nullptr,
+    const FiberTraceProgressCallback& progress = {});
+
+[[nodiscard]] FiberTraceOneWayResult traceFiberExtrapolation(
+    const FiberPredictionSource& predictions,
+    const cv::Vec3d& startPoint,
+    const cv::Vec3d& outwardDirection,
+    double distanceVoxels,
+    const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler = nullptr,
     const FiberTraceProgressCallback& progress = {});
 

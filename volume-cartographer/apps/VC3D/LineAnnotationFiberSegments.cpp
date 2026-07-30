@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_set>
@@ -63,7 +64,324 @@ nlohmann::json pointToJson(const cv::Vec3d& point)
     return {point[0], point[1], point[2]};
 }
 
+double pointDistance(const cv::Vec3d& a, const cv::Vec3d& b)
+{
+    return cv::norm(a - b);
+}
+
+size_t nearestPointIndex(const std::vector<cv::Vec3d>& points, const cv::Vec3d& target)
+{
+    if (points.empty()) {
+        throw std::invalid_argument("cannot resolve a control point on an empty line");
+    }
+    size_t best = 0;
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (size_t index = 0; index < points.size(); ++index) {
+        const double distance = pointDistance(points[index], target);
+        if (distance < bestDistance) {
+            best = index;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
+std::vector<cv::Vec3d> inclusiveLineSpan(
+    const std::vector<cv::Vec3d>& points, size_t first, size_t last)
+{
+    if (first > last || last >= points.size()) {
+        throw std::invalid_argument("invalid inclusive line span");
+    }
+    return {points.begin() + static_cast<std::ptrdiff_t>(first),
+            points.begin() + static_cast<std::ptrdiff_t>(last + 1)};
+}
+
 }  // namespace
+
+std::string fiberOptimizationModeToString(FiberOptimizationMode mode)
+{
+    switch (mode) {
+    case FiberOptimizationMode::Lasagna:
+        return "lasagna";
+    case FiberOptimizationMode::NativeFiberTrace3d:
+        return "native_fiber_trace3d";
+    }
+    throw std::runtime_error("unsupported fiber optimization mode");
+}
+
+FiberOptimizationMode fiberOptimizationModeFromString(const std::string& value)
+{
+    if (value == "lasagna") {
+        return FiberOptimizationMode::Lasagna;
+    }
+    if (value == "native_fiber_trace3d") {
+        return FiberOptimizationMode::NativeFiberTrace3d;
+    }
+    throw std::runtime_error("unsupported fiber optimization mode: " + value);
+}
+
+FiberModeOptimizationResult optimizeFiberWithNativeFallback(
+    FiberModeOptimizationRequest request)
+{
+    if (!request.predictions || !request.baseNormalSampler ||
+        !request.traceNormalSampler) {
+        throw std::invalid_argument(
+            "fiber-mode optimization requires prediction and normal samplers");
+    }
+    if (request.controlPoints.size() < 2 || request.linePointsBase.size() < 2) {
+        throw std::invalid_argument(
+            "fiber-mode optimization requires at least two control and line points");
+    }
+    if (!(request.traceToBaseScale > 0.0) ||
+        !std::isfinite(request.traceToBaseScale)) {
+        throw std::invalid_argument("trace-to-base scale must be finite and positive");
+    }
+    if (!(request.extrapolationDistanceBaseVoxels >= 0.0) ||
+        !std::isfinite(request.extrapolationDistanceBaseVoxels)) {
+        throw std::invalid_argument(
+            "extrapolation distance must be finite and non-negative");
+    }
+
+    std::stable_sort(request.controlPoints.begin(), request.controlPoints.end(),
+                     [](const LineControlPoint& lhs, const LineControlPoint& rhs) {
+                         return lhs.linePosition < rhs.linePosition;
+                     });
+    if (request.retraceAll) {
+        for (auto& control : request.controlPoints) {
+            control.segmentToNext.reset();
+        }
+    }
+
+    const vc::fiber_tracer::FiberTraceCoordinateAdapter coordinates(
+        request.traceToBaseScale);
+    request.traceConfig.traceToBaseScale = request.traceToBaseScale;
+    const std::vector<cv::Vec3d> referenceTrace =
+        coordinates.baseToTrace(request.linePointsBase);
+
+    std::vector<size_t> originalControlIndices;
+    originalControlIndices.reserve(request.controlPoints.size());
+    for (const auto& control : request.controlPoints) {
+        originalControlIndices.push_back(
+            nearestPointIndex(request.linePointsBase, control.volumePoint));
+    }
+    for (size_t index = 1; index < originalControlIndices.size(); ++index) {
+        if (originalControlIndices[index] <= originalControlIndices[index - 1]) {
+            throw std::runtime_error(
+                "fiber control points do not resolve in strict line order");
+        }
+    }
+
+    FiberModeOptimizationResult output;
+    std::vector<std::vector<cv::Vec3d>> spans(request.controlPoints.size() - 1);
+    std::vector<bool> nativeSpan(spans.size(), false);
+    for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
+        auto& owner = request.controlPoints[spanIndex];
+        const size_t first = originalControlIndices[spanIndex];
+        const size_t last = originalControlIndices[spanIndex + 1];
+        if (owner.segmentToNext) {
+            spans[spanIndex] = inclusiveLineSpan(request.linePointsBase, first, last);
+            nativeSpan[spanIndex] = true;
+            ++output.nativeSegments;
+            continue;
+        }
+
+        vc::fiber_tracer::FiberTraceSegmentRequest traceRequest;
+        traceRequest.referenceLine = referenceTrace;
+        traceRequest.startIndex = first;
+        traceRequest.targetIndex = last;
+        traceRequest.config = request.traceConfig;
+        std::optional<vc::fiber_tracer::FiberTraceSegmentResult> traced;
+        try {
+            traced = vc::fiber_tracer::traceFiberSegment(
+                *request.predictions,
+                traceRequest,
+                request.traceNormalSampler);
+        } catch (const std::exception&) {
+            traced.reset();
+        }
+        if (!traced || !traced->accepted || traced->fusedLine.size() < 2) {
+            spans[spanIndex] = inclusiveLineSpan(request.linePointsBase, first, last);
+            owner.segmentToNext.reset();
+            ++output.lasagnaFallbackSegments;
+            continue;
+        }
+
+        spans[spanIndex] = coordinates.traceSegmentToBase(
+            traced->fusedLine,
+            owner.volumePoint,
+            request.controlPoints[spanIndex + 1].volumePoint);
+        FiberTraceSegmentMetadata metadata;
+        metadata.normalManifestLocation = request.normalManifestLocation;
+        metadata.fiberManifestLocation = request.fiberManifestLocation;
+        metadata.traceToBaseScale = request.traceToBaseScale;
+        metadata.config = request.traceConfig;
+        metadata.config.baseVoxelSizeUm.reset();
+        metadata.config.profile = nullptr;
+        metadata.maxEndpointErrorBaseVoxels = traced->maxEndpointErrorBaseVoxels;
+        owner.segmentToNext = std::move(metadata);
+        nativeSpan[spanIndex] = true;
+        ++output.nativeSegments;
+    }
+
+    std::vector<cv::Vec3d> stitched;
+    stitched.insert(stitched.end(),
+                    request.linePointsBase.begin(),
+                    request.linePointsBase.begin() +
+                        static_cast<std::ptrdiff_t>(originalControlIndices.front()));
+    std::vector<int> controlIndices;
+    controlIndices.reserve(request.controlPoints.size());
+    for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
+        const auto& span = spans[spanIndex];
+        if (spanIndex == 0) {
+            controlIndices.push_back(static_cast<int>(stitched.size()));
+            stitched.insert(stitched.end(), span.begin(), span.end());
+        } else {
+            stitched.insert(stitched.end(), span.begin() + 1, span.end());
+        }
+        controlIndices.push_back(static_cast<int>(stitched.size()) - 1);
+    }
+    stitched.insert(
+        stitched.end(),
+        request.linePointsBase.begin() +
+            static_cast<std::ptrdiff_t>(originalControlIndices.back() + 1),
+        request.linePointsBase.end());
+    for (size_t index = 0; index < request.controlPoints.size(); ++index) {
+        request.controlPoints[index].optimizedIndex = controlIndices[index];
+        request.controlPoints[index].linePosition =
+            static_cast<double>(controlIndices[index]);
+    }
+
+    std::vector<std::pair<int, int>> protectedSpans;
+    std::optional<size_t> nativeSeedSpan;
+    for (size_t index = 0; index < nativeSpan.size(); ++index) {
+        if (nativeSpan[index]) {
+            protectedSpans.emplace_back(
+                static_cast<int>(index), static_cast<int>(index + 1));
+            if (!nativeSeedSpan) {
+                nativeSeedSpan = index;
+            }
+        }
+    }
+    auto optimizerControls = optimizerControlPoints(request.controlPoints);
+    if (nativeSeedSpan) {
+        for (auto& control : optimizerControls) {
+            control.isSeed = false;
+        }
+        optimizerControls[*nativeSeedSpan].isSeed = true;
+    }
+    vc::lasagna::LineOptimizer optimizer(*request.baseNormalSampler);
+    auto reinitialized = optimizer.reinitializeAndOptimizeExistingLine(
+        std::move(stitched),
+        std::move(optimizerControls),
+        controlIndices,
+        controlIndices[controlIndices.size() / 2],
+        request.lasagnaConfig,
+        std::move(protectedSpans));
+    if (reinitialized.failed) {
+        throw std::runtime_error(
+            "Lasagna fallback failed: " + reinitialized.failureReason);
+    }
+
+    auto finalLine = std::move(reinitialized.optimization.line);
+    std::vector<cv::Vec3d> finalPoints;
+    finalPoints.reserve(finalLine.points.size());
+    for (const auto& point : finalLine.points) {
+        finalPoints.push_back(point.position);
+    }
+    if (reinitialized.fixedPointIndices.size() != request.controlPoints.size()) {
+        throw std::runtime_error(
+            "Lasagna fallback returned an invalid control-point index map");
+    }
+    const int firstControl = reinitialized.fixedPointIndices.front();
+    const int lastControl = reinitialized.fixedPointIndices.back();
+    if (firstControl < 0 || lastControl <= firstControl ||
+        lastControl >= static_cast<int>(finalPoints.size())) {
+        throw std::runtime_error(
+            "Lasagna fallback returned invalid endpoint control indices");
+    }
+
+    std::vector<cv::Vec3d> leftTail(
+        finalPoints.begin(), finalPoints.begin() + firstControl + 1);
+    std::vector<cv::Vec3d> rightTail(
+        finalPoints.begin() + lastControl, finalPoints.end());
+    if (request.extrapolationDistanceBaseVoxels == 0.0) {
+        leftTail = {finalPoints[static_cast<size_t>(firstControl)]};
+        rightTail = {finalPoints[static_cast<size_t>(lastControl)]};
+    } else {
+        const double extrapolationTrace = coordinates.baseDistanceToTrace(
+            request.extrapolationDistanceBaseVoxels);
+        const auto traceTail = [&](int endpoint, int inner) {
+            return vc::fiber_tracer::traceFiberExtrapolation(
+                *request.predictions,
+                coordinates.baseToTrace(finalPoints[static_cast<size_t>(endpoint)]),
+                coordinates.baseToTrace(finalPoints[static_cast<size_t>(endpoint)]) -
+                    coordinates.baseToTrace(finalPoints[static_cast<size_t>(inner)]),
+                extrapolationTrace,
+                request.traceConfig,
+                request.traceNormalSampler);
+        };
+        std::optional<vc::fiber_tracer::FiberTraceOneWayResult> left;
+        try {
+            left = traceTail(firstControl, firstControl + 1);
+        } catch (const std::exception&) {
+            left.reset();
+        }
+        if (left && left->reachedTargetPlane && left->points.size() >= 2) {
+            leftTail = coordinates.traceToBase(left->points);
+            leftTail.front() = finalPoints[static_cast<size_t>(firstControl)];
+            std::reverse(leftTail.begin(), leftTail.end());
+            ++output.nativeExtrapolations;
+        } else {
+            ++output.lasagnaFallbackExtrapolations;
+        }
+        std::optional<vc::fiber_tracer::FiberTraceOneWayResult> right;
+        try {
+            right = traceTail(lastControl, lastControl - 1);
+        } catch (const std::exception&) {
+            right.reset();
+        }
+        if (right && right->reachedTargetPlane && right->points.size() >= 2) {
+            rightTail = coordinates.traceToBase(right->points);
+            rightTail.front() = finalPoints[static_cast<size_t>(lastControl)];
+            ++output.nativeExtrapolations;
+        } else {
+            ++output.lasagnaFallbackExtrapolations;
+        }
+    }
+
+    std::vector<cv::Vec3d> combined;
+    combined.reserve(leftTail.size() +
+                     static_cast<size_t>(lastControl - firstControl - 1) +
+                     rightTail.size());
+    combined.insert(combined.end(), leftTail.begin(), leftTail.end());
+    combined.insert(combined.end(),
+                    finalPoints.begin() + firstControl + 1,
+                    finalPoints.begin() + lastControl);
+    combined.insert(combined.end(), rightTail.begin(), rightTail.end());
+
+    output.optimization = std::move(reinitialized.optimization);
+    output.optimization.line.points.clear();
+    output.optimization.line.segmentSamples.clear();
+    output.optimization.line.displayFrameAnchorIndex =
+        static_cast<int>(combined.size() / 2);
+    output.optimization.line.points.reserve(combined.size());
+    for (const auto& point : combined) {
+        vc::lasagna::LinePoint linePoint;
+        linePoint.position = point;
+        linePoint.sampledNormal = request.baseNormalSampler->sampleNormal(point);
+        output.optimization.line.points.push_back(std::move(linePoint));
+    }
+    std::ostringstream message;
+    message << output.optimization.report.message
+            << "\nfiber_mode native_segments=" << output.nativeSegments
+            << " lasagna_fallback_segments=" << output.lasagnaFallbackSegments
+            << " native_extrapolations=" << output.nativeExtrapolations
+            << " lasagna_fallback_extrapolations="
+            << output.lasagnaFallbackExtrapolations;
+    output.optimization.report.message = message.str();
+    output.controlPoints = std::move(request.controlPoints);
+    return output;
+}
 
 nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& metadata)
 {

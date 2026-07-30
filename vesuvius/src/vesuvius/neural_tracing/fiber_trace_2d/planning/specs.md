@@ -921,12 +921,19 @@
   trace continues until all configured target-local planes have been crossed,
   then selects the crossed plane with the smallest in-plane CP error. Later
   crossings of the same target plane replace earlier crossings when their
-  in-plane CP error is lower. In Python whole-fiber tracing, all target-local
-  planes being crossed is necessary but not sufficient for segment acceptance:
+  in-plane CP error is lower. The shared C++ tracer used by VC3D and the native
+  metric CLI must preserve this state independently for every beam and compact
+  lazy-lookahead frontier. Its fixed-capacity representation supports the three
+  derived target-local planes and must reject larger explicit sets. In Python
+  and C++ whole-fiber tracing, all target-local planes being crossed is necessary
+  but not sufficient for segment acceptance:
   the selected best crossing error must also be at or below the configured
   whole-fiber threshold; otherwise tracing continues until the budget or another
-  failure condition ends the segment. Missing required target planes are
-  reported in the failure reason.
+  failure condition ends the segment. CP-pair tracing may snap its returned
+  trace endpoint to the selected crossing for fusion; whole-fiber tracing must
+  retain the actual stepped endpoint and use the selected crossing only for
+  acceptance and error reporting. Missing required target planes are reported
+  in the failure reason.
 - In native 3D whole-fiber mode, `--fiber-json <path>` without sample or CP
   selectors traces the entire fiber. `--fiber-json <path> --sample-index N`
   remains single-segment inspection using deterministic flat sample selection,
@@ -1058,6 +1065,29 @@
   selected endpoint-bounded span, protects all other traced spans, fixes both
   endpoints, and clears the owning CP metadata only after successful Lasagna
   completion.
+- Each VC3D fiber has a persisted top-level `optimization_mode`: `lasagna` or
+  `native_fiber_trace3d`. Missing mode metadata on existing version-1/version-2
+  files defaults to `lasagna`; unknown values are errors. The mode is the
+  fiber-wide policy for future interpolation and extrapolation, while each
+  CP-owned `segment_to_next` remains the record that its specific following
+  span was successfully native traced.
+- Changing `optimization_mode` runs a transactional full rebuild. Lasagna mode
+  clears native span records and uses the existing full normal-based
+  reinitializer. Native mode retraces every CP-to-CP span. Ordinary CP edits in
+  native mode retain unrelated valid native records and retrace only adjacency
+  changes that cleared a record.
+- Native-mode interpolation failure is local to its CP span. Successful native
+  spans are stitched and protected, while failed spans are rebuilt by the
+  shared Lasagna reinitializer. A protected native span is used as the
+  reinitialization seed when available, so its dense endpoint direction is the
+  continuation direction for neighboring Lasagna spans. The final shared
+  global solve keeps native samples fixed.
+- The line-annotation extrapolation control is measured in base voxels and
+  applies beyond both outer CPs. Native mode converts that distance to trace
+  voxels and uses the shared one-way tracer with a perpendicular distance
+  plane. Each successful tail replaces the corresponding Lasagna tail; native
+  tail failure retains that Lasagna tail. A zero distance trims the line to the
+  outer CPs.
 - `vc_fiber_trace_metric <fiber.lasagna.json> <fiber.json>` is the native
   no-visualization full-fiber metric runner for precomputed 3D fiber inference
   output. It loads one `vc3d_fiber` JSON, requires exact control-point matches

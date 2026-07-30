@@ -316,6 +316,8 @@ private:
         vc3d::line_annotation::FiberHvClassification hvClassification;
         std::string manualHvTag;
         std::vector<std::string> tags;
+        vc3d::line_annotation::FiberOptimizationMode optimizationMode =
+            vc3d::line_annotation::FiberOptimizationMode::Lasagna;
         bool needsSave = false;
     };
 
@@ -477,6 +479,11 @@ private:
                            bool fullOptimization = false,
                            int activeStart = -1,
                            int activeEnd = -1);
+    void startFiberModeOptimization(LineAnnotationSession& session,
+                                    bool retraceAll);
+    [[nodiscard]] vc3d::line_annotation::FiberModeOptimizationRequest
+        makeFiberModeOptimizationRequest(const LineAnnotationSession& session,
+                                         bool retraceAll) const;
     void finishOptimization(const std::string& surfaceName);
     bool materializeGeneratedViews(LineAnnotationSession& session);
     bool materializeGeneratedViews(LineAnnotationSession& session,

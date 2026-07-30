@@ -36,6 +36,7 @@ constexpr double kEpsilon = 1.0e-12;
 constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr float kTraceEpsilon = 1.0e-6f;
 constexpr float kTracePi = 3.14159265358979323846f;
+constexpr size_t kMaxTargetPlanes = 3;
 
 using TraceVec = cv::Vec3f;
 
@@ -446,15 +447,6 @@ struct ConeOffset {
     return (point - planePoint).dot(planeNormal);
 }
 
-[[nodiscard]] double endpointPlaneError(
-    const cv::Vec3d& point,
-    const cv::Vec3d& target,
-    const cv::Vec3d& planeNormal)
-{
-    const cv::Vec3d delta = point - target;
-    return length(delta - planeNormal * delta.dot(planeNormal));
-}
-
 [[nodiscard]] bool finitePoint(const cv::Vec3d& point)
 {
     return std::isfinite(point[0]) &&
@@ -803,6 +795,8 @@ struct BeamState {
     int depth = 0;
     bool valid = false;
     bool reached = false;
+    uint8_t crossedTargetPlaneMask = 0;
+    std::array<TraceVec, kMaxTargetPlanes> targetPlaneCrossings{};
     std::string reason;
 };
 
@@ -856,6 +850,15 @@ struct FrontierCandidate {
     size_t originalIndex = std::numeric_limits<size_t>::max();
     bool valid = false;
     bool reached = false;
+    uint8_t crossedTargetPlaneMask = 0;
+    std::array<TraceVec, kMaxTargetPlanes> targetPlaneCrossings{};
+};
+
+struct TraceTargetPlaneSet {
+    std::array<TraceVec, kMaxTargetPlanes> points{};
+    std::array<TraceVec, kMaxTargetPlanes> normals{};
+    std::array<std::string, kMaxTargetPlanes> names{};
+    size_t count = 0;
 };
 
 struct CandidateScoringScratch {
@@ -877,14 +880,14 @@ struct CandidateScoringScratch {
     const BeamState& beam,
     const TraceVec& candidatePoint,
     const CandidateScore& candidateScore,
-    const TraceVec& target,
-    const TraceVec& targetPlaneNormal,
+    const TraceTargetPlaneSet& targetPlanes,
+    std::optional<float> acceptThresholdVoxels,
     size_t originalIndex);
 
 struct FrontierScoreOutput {
     std::vector<FrontierCandidate>* candidates = nullptr;
-    const TraceVec* target = nullptr;
-    const TraceVec* targetPlaneNormal = nullptr;
+    const TraceTargetPlaneSet* targetPlanes = nullptr;
+    std::optional<float> acceptThresholdVoxels;
     const std::vector<size_t>* originalIndices = nullptr;
     size_t offset = 0;
 };
@@ -906,8 +909,8 @@ void storeScoredFrontierCandidate(
         beams[task.beamIndex],
         candidatePoint,
         score,
-        *output->target,
-        *output->targetPlaneNormal,
+        *output->targetPlanes,
+        output->acceptThresholdVoxels,
         originalIndex);
 }
 
@@ -1561,29 +1564,152 @@ void sampleCandidateNormals(
     return start * (1.0f - t) + end * t;
 }
 
+[[nodiscard]] TraceTargetPlaneSet makeTraceTargetPlaneSet(
+    const std::vector<FiberTraceTargetPlane>& planes)
+{
+    if (planes.empty())
+        throw std::invalid_argument("fiber trace requires at least one target plane");
+    if (planes.size() > kMaxTargetPlanes) {
+        throw std::invalid_argument(
+            "fiber trace supports at most three target-local planes");
+    }
+
+    TraceTargetPlaneSet out;
+    out.count = planes.size();
+    std::set<std::string> names;
+    for (size_t index = 0; index < planes.size(); ++index) {
+        const auto& plane = planes[index];
+        if (plane.name.empty())
+            throw std::invalid_argument("fiber target plane name must not be empty");
+        if (!names.insert(plane.name).second) {
+            throw std::invalid_argument(
+                "fiber target plane names must be unique: " + plane.name);
+        }
+        const TraceVec point = toTraceVec(plane.point);
+        const TraceVec normal = toTraceVec(plane.normal);
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) ||
+            !std::isfinite(point[2])) {
+            throw std::invalid_argument("fiber target plane point must be finite");
+        }
+        if (!(traceLength(normal) > kTraceEpsilon) ||
+            !std::isfinite(traceLength(normal))) {
+            throw std::invalid_argument(
+                "fiber target plane normal must be finite and non-degenerate");
+        }
+        out.points[index] = point;
+        out.normals[index] = traceNormalizedOrZero(normal);
+        out.names[index] = plane.name;
+    }
+    return out;
+}
+
+[[nodiscard]] float targetPlaneInPlaneError(
+    const TraceVec& point,
+    const TraceVec& planePoint,
+    const TraceVec& planeNormal)
+{
+    const TraceVec delta = point - planePoint;
+    return traceLength(delta - planeNormal * delta.dot(planeNormal));
+}
+
+void updateTargetPlaneCrossings(
+    const TraceVec& start,
+    const TraceVec& end,
+    const TraceTargetPlaneSet& planes,
+    uint8_t& crossedMask,
+    std::array<TraceVec, kMaxTargetPlanes>& crossings)
+{
+    for (size_t index = 0; index < planes.count; ++index) {
+        const auto crossing = interpolatePlaneCrossing(
+            start, end, planes.points[index], planes.normals[index]);
+        if (!crossing.has_value())
+            continue;
+        const uint8_t bit = static_cast<uint8_t>(1U << index);
+        const bool alreadyCrossed = (crossedMask & bit) != 0;
+        if (alreadyCrossed) {
+            const float oldError = targetPlaneInPlaneError(
+                crossings[index], planes.points[index], planes.normals[index]);
+            const float newError = targetPlaneInPlaneError(
+                *crossing, planes.points[index], planes.normals[index]);
+            if (!(newError < oldError))
+                continue;
+        }
+        crossedMask = static_cast<uint8_t>(crossedMask | bit);
+        crossings[index] = *crossing;
+    }
+}
+
+[[nodiscard]] uint8_t allTargetPlaneMask(const TraceTargetPlaneSet& planes)
+{
+    return static_cast<uint8_t>((1U << planes.count) - 1U);
+}
+
+[[nodiscard]] std::optional<size_t> selectedTargetPlaneIndex(
+    const TraceTargetPlaneSet& planes,
+    uint8_t crossedMask,
+    const std::array<TraceVec, kMaxTargetPlanes>& crossings)
+{
+    std::optional<size_t> selected;
+    float bestError = std::numeric_limits<float>::infinity();
+    for (size_t index = 0; index < planes.count; ++index) {
+        if ((crossedMask & static_cast<uint8_t>(1U << index)) == 0)
+            continue;
+        const float error = targetPlaneInPlaneError(
+            crossings[index], planes.points[index], planes.normals[index]);
+        if (error < bestError) {
+            bestError = error;
+            selected = index;
+        }
+    }
+    return selected;
+}
+
+[[nodiscard]] bool targetPlanesReached(
+    const TraceTargetPlaneSet& planes,
+    uint8_t crossedMask,
+    const std::array<TraceVec, kMaxTargetPlanes>& crossings,
+    std::optional<float> acceptThresholdVoxels)
+{
+    if ((crossedMask & allTargetPlaneMask(planes)) != allTargetPlaneMask(planes))
+        return false;
+    const auto selected = selectedTargetPlaneIndex(planes, crossedMask, crossings);
+    if (!selected.has_value())
+        return false;
+    return !acceptThresholdVoxels.has_value() ||
+        targetPlaneInPlaneError(
+            crossings[*selected], planes.points[*selected], planes.normals[*selected]) <=
+            *acceptThresholdVoxels;
+}
+
 [[nodiscard]] FrontierCandidate makeFrontierCandidate(
     const BeamState& beam,
     const TraceVec& candidatePoint,
     const CandidateScore& candidateScore,
-    const TraceVec& target,
-    const TraceVec& targetPlaneNormal,
+    const TraceTargetPlaneSet& targetPlanes,
+    std::optional<float> acceptThresholdVoxels,
     size_t originalIndex)
 {
     const TraceVec currentPoint = beamEndpoint(beam);
-    const auto crossing = interpolatePlaneCrossing(
+    FrontierCandidate out;
+    out.point = candidatePoint;
+    out.loss = beam.loss + candidateScore.loss;
+    out.depth = beam.depth + 1;
+    out.originalIndex = originalIndex;
+    out.valid = true;
+    out.crossedTargetPlaneMask = beam.crossedTargetPlaneMask;
+    out.targetPlaneCrossings = beam.targetPlaneCrossings;
+    updateTargetPlaneCrossings(
         currentPoint,
         candidatePoint,
-        target,
-        targetPlaneNormal);
-    const TraceVec nextPoint = crossing.value_or(candidatePoint);
-    return {
-        nextPoint,
-        beam.loss + candidateScore.loss,
-        beam.depth + 1,
-        originalIndex,
-        true,
-        crossing.has_value(),
-    };
+        targetPlanes,
+        out.crossedTargetPlaneMask,
+        out.targetPlaneCrossings);
+    out.reached = targetPlanesReached(
+        targetPlanes,
+        out.crossedTargetPlaneMask,
+        out.targetPlaneCrossings,
+        acceptThresholdVoxels);
+    return out;
 }
 
 [[nodiscard]] float beamPruneScore(const BeamState& state)
@@ -1741,6 +1867,8 @@ void sampleCandidateNormals(
         traceLength(candidate.point - beamEndpoint(parent));
     out.depth = candidate.depth;
     out.reached = candidate.reached;
+    out.crossedTargetPlaneMask = candidate.crossedTargetPlaneMask;
+    out.targetPlaneCrossings = candidate.targetPlaneCrossings;
     out.reason = candidate.reached ? "target_plane" : std::string{};
     return out;
 }
@@ -1869,8 +1997,8 @@ template <typename LossAt>
     const std::vector<BeamState>& parents,
     const std::vector<ConeOffset>& offsets,
     float step,
-    const TraceVec& target,
-    const TraceVec& targetPlaneNormal,
+    const TraceTargetPlaneSet& targetPlanes,
+    std::optional<float> acceptThresholdVoxels,
     const FiberTraceConfig& config,
     int lookaheadDepth,
     CandidateScoringScratch& scratch,
@@ -1930,8 +2058,8 @@ template <typename LossAt>
             profile->lookaheadFrontierStorageSeconds += elapsedSeconds(appendStart);
         const FrontierScoreOutput frontierOutput{
             &frontier,
-            &target,
-            &targetPlaneNormal,
+            &targetPlanes,
+            acceptThresholdVoxels,
             &scratch.lookaheadGlobalIndices,
             compactBegin};
         const auto& batchScores = scoreCandidateTasks(
@@ -2030,6 +2158,76 @@ template <typename LossAt>
     return best;
 }
 
+[[nodiscard]] std::string targetPlaneFailureReason(
+    std::string baseReason,
+    const TraceTargetPlaneSet& planes,
+    const BeamState& state,
+    std::optional<float> acceptThresholdVoxels)
+{
+    const uint8_t required = allTargetPlaneMask(planes);
+    if ((state.crossedTargetPlaneMask & required) == required) {
+        if (acceptThresholdVoxels.has_value())
+            return "target_plane_error_threshold";
+        return baseReason;
+    }
+    baseReason += ":missing_target_planes=";
+    bool first = true;
+    for (size_t index = 0; index < planes.count; ++index) {
+        if ((state.crossedTargetPlaneMask & static_cast<uint8_t>(1U << index)) != 0)
+            continue;
+        if (!first)
+            baseReason += ',';
+        baseReason += planes.names[index];
+        first = false;
+    }
+    return baseReason;
+}
+
+[[nodiscard]] FiberTraceOneWayResult oneWayResultFromState(
+    const BeamState& state,
+    const TraceTargetPlaneSet& planes,
+    bool reached,
+    std::string reason,
+    std::optional<float> acceptThresholdVoxels,
+    bool snapTraceToSelectedCrossing)
+{
+    FiberTraceOneWayResult result;
+    result.points = beamPathPoints(state);
+    result.reachedTargetPlane = reached;
+    result.reason = reached
+        ? std::move(reason)
+        : targetPlaneFailureReason(
+              std::move(reason), planes, state, acceptThresholdVoxels);
+    result.steps = static_cast<int>(
+        beamPointCount(state) > 0 ? beamPointCount(state) - 1 : 0);
+    for (size_t index = 0; index < planes.count; ++index) {
+        if ((state.crossedTargetPlaneMask & static_cast<uint8_t>(1U << index)) == 0)
+            continue;
+        result.targetPlaneCrossings.push_back({
+            planes.names[index],
+            toVec3d(state.targetPlaneCrossings[index]),
+            targetPlaneInPlaneError(
+                state.targetPlaneCrossings[index],
+                planes.points[index],
+                planes.normals[index]),
+        });
+    }
+    const auto selected = selectedTargetPlaneIndex(
+        planes, state.crossedTargetPlaneMask, state.targetPlaneCrossings);
+    if (selected.has_value()) {
+        result.selectedTargetPlaneName = planes.names[*selected];
+        result.selectedTargetPlaneCrossing =
+            toVec3d(state.targetPlaneCrossings[*selected]);
+        result.selectedTargetPlaneErrorVoxels = targetPlaneInPlaneError(
+            state.targetPlaneCrossings[*selected],
+            planes.points[*selected],
+            planes.normals[*selected]);
+        if (snapTraceToSelectedCrossing && !result.points.empty())
+            result.points.back() = *result.selectedTargetPlaneCrossing;
+    }
+    return result;
+}
+
 [[nodiscard]] FiberTraceOneWayResult traceOneWayCore(
     const FiberPredictionSource& predictions,
     const FiberTraceOneWayRequest& request,
@@ -2039,9 +2237,17 @@ template <typename LossAt>
 {
     const TraceVec start = toTraceVec(request.startPoint);
     const TraceVec target = toTraceVec(request.targetPoint);
-    const TraceVec targetPlaneNormal = traceNormalizedOr(
-        toTraceVec(request.targetPlaneNormal),
-        traceNormalizedOr(target - start, {1.0f, 0.0f, 0.0f}));
+    const TraceTargetPlaneSet targetPlanes = makeTraceTargetPlaneSet(
+        request.targetPlanes);
+    std::optional<float> acceptThresholdVoxels;
+    if (request.targetPlaneAcceptThresholdVoxels.has_value()) {
+        const double threshold = *request.targetPlaneAcceptThresholdVoxels;
+        if (!(threshold >= 0.0) || !std::isfinite(threshold)) {
+            throw std::invalid_argument(
+                "target-plane acceptance threshold must be finite and non-negative");
+        }
+        acceptThresholdVoxels = static_cast<float>(threshold);
+    }
     const TraceVec referenceStartDirection = traceNormalizedOr(
         toTraceVec(request.initialDirection),
         traceNormalizedOr(target - start, {1.0f, 0.0f, 0.0f}));
@@ -2076,7 +2282,27 @@ template <typename LossAt>
     initial.previousStepDirection = startDirection;
     initial.currentSampleDirection = startDirection;
     initial.historyDirection = startDirection;
-    std::vector<BeamState> beams{std::move(initial)};
+    updateTargetPlaneCrossings(
+        start,
+        start,
+        targetPlanes,
+        initial.crossedTargetPlaneMask,
+        initial.targetPlaneCrossings);
+    initial.reached = targetPlanesReached(
+        targetPlanes,
+        initial.crossedTargetPlaneMask,
+        initial.targetPlaneCrossings,
+        acceptThresholdVoxels);
+    std::vector<BeamState> beams{initial};
+    if (initial.reached) {
+        return oneWayResultFromState(
+            initial,
+            targetPlanes,
+            true,
+            "target_plane",
+            acceptThresholdVoxels,
+            request.snapTraceToSelectedCrossing);
+    }
     CandidateScoringScratch scoringScratch;
     std::string reason = "max_step_factor";
 
@@ -2118,8 +2344,8 @@ template <typename LossAt>
                         expanded,
                         coneOffsets,
                         step,
-                        target,
-                        targetPlaneNormal,
+                        targetPlanes,
+                        acceptThresholdVoxels,
                         request.config,
                         advanced + 1,
                         scoringScratch,
@@ -2149,8 +2375,8 @@ template <typename LossAt>
                     frontier.resize(scoringScratch.tasks.size());
                     frontierOutput = {
                         &frontier,
-                        &target,
-                        &targetPlaneNormal,
+                        &targetPlanes,
+                        acceptThresholdVoxels,
                         nullptr,
                         0};
                     frontierOutputPtr = &frontierOutput;
@@ -2204,13 +2430,13 @@ template <typename LossAt>
                         event.reason = "target_plane";
                         progress(event);
                     }
-                    return {beamPathPoints(bestReached),
-                            true,
-                            bestReached.reason,
-                            static_cast<int>(
-                                beamPointCount(bestReached) > 0
-                                    ? beamPointCount(bestReached) - 1
-                                    : 0)};
+                    return oneWayResultFromState(
+                        bestReached,
+                        targetPlanes,
+                        true,
+                        bestReached.reason,
+                        acceptThresholdVoxels,
+                        request.snapTraceToSelectedCrossing);
                 }
                 const auto pruneStart = TraceClock::now();
                 std::vector<size_t> selectedIndices;
@@ -2266,31 +2492,20 @@ template <typename LossAt>
                 if (!candidateScore.valid || !std::isfinite(candidateScore.loss))
                     continue;
                 const BeamState& beam = expanded[task.beamIndex];
-                const TraceVec currentPoint = beamEndpoint(beam);
-                const auto crossing = interpolatePlaneCrossing(
-                    currentPoint,
+                const FrontierCandidate candidate = makeFrontierCandidate(
+                    beam,
                     candidatePoints[taskIndex],
-                    target,
-                    targetPlaneNormal);
-                const TraceVec nextPoint = crossing.value_or(
-                    candidatePoints[taskIndex]);
-                BeamState next = beam;
-                next.path = appendBeamPathPoint(beam.path, nextPoint);
-                next.tracedLength += traceLength(nextPoint - currentPoint);
-                next.loss += candidateScore.loss;
-                next.previousStepDirection = task.direction;
-                next.currentSampleDirection = candidateScore.selectedCurrentDirection;
-                next.historyDirection = updateHistoryDirection(
-                    beam.historyDirection,
-                    task.direction,
-                    beam.depth,
-                    request.config.cumulativeSmoothnessSteps);
-                next.depth = beam.depth + 1;
-                next.reached = crossing.has_value();
-                if (next.reached) {
-                    next.reason = "target_plane";
-                }
-                nextFrontier.push_back(std::move(next));
+                    candidateScore,
+                    targetPlanes,
+                    acceptThresholdVoxels,
+                    taskIndex);
+                nextFrontier.push_back(beamStateFromFrontierCandidate(
+                    expanded,
+                    tasks,
+                    scores,
+                    taskIndex,
+                    candidate,
+                    request.config));
             }
             if (profile != nullptr)
                 profile->frontierSeconds += elapsedSeconds(frontierStart);
@@ -2311,11 +2526,13 @@ template <typename LossAt>
                     event.reason = "target_plane";
                     progress(event);
                 }
-                return {beamPathPoints(bestReached), true, bestReached.reason,
-                        static_cast<int>(
-                            beamPointCount(bestReached) > 0
-                                ? beamPointCount(bestReached) - 1
-                                : 0)};
+                return oneWayResultFromState(
+                    bestReached,
+                    targetPlanes,
+                    true,
+                    bestReached.reason,
+                    acceptThresholdVoxels,
+                    request.snapTraceToSelectedCrossing);
             }
         }
         if (expanded.empty() && !prunedFinalFrontier)
@@ -2333,15 +2550,14 @@ template <typename LossAt>
         stepIndex += std::max(1, advanced);
 
         if (progress) {
-            const float signedDistance = std::abs(
-                tracePointToPlaneSigned(beamEndpoint(beams.front()), target, targetPlaneNormal));
+            const float targetDistance = traceLength(beamEndpoint(beams.front()) - target);
             FiberTraceProgress event;
             event.phase = phase;
             event.step = stepIndex;
             event.maxSteps = maxSteps;
             event.targetPlaneProgress =
                 distance > kTraceEpsilon
-                    ? 1.0 - std::min(1.0f, signedDistance / distance)
+                    ? 1.0 - std::min(1.0f, targetDistance / distance)
                     : 1.0;
             event.reason = beams.front().reached ? beams.front().reason : reason;
             progress(event);
@@ -2349,13 +2565,24 @@ template <typename LossAt>
     }
 
     if (beams.empty()) {
-        return {{toVec3d(start)}, false, reason, 0};
+        return oneWayResultFromState(
+            initial,
+            targetPlanes,
+            false,
+            reason,
+            acceptThresholdVoxels,
+            request.snapTraceToSelectedCrossing);
     }
 
     const auto best = std::min_element(
         beams.begin(), beams.end(), beamSearchLess);
-    return {beamPathPoints(*best), best->reached, best->reached ? best->reason : reason,
-            static_cast<int>(beamPointCount(*best) > 0 ? beamPointCount(*best) - 1 : 0)};
+    return oneWayResultFromState(
+        *best,
+        targetPlanes,
+        best->reached,
+        best->reached ? best->reason : reason,
+        acceptThresholdVoxels,
+        request.snapTraceToSelectedCrossing);
 }
 
 [[nodiscard]] std::vector<cv::Vec3d> fuseTraces(
@@ -3924,6 +4151,58 @@ cv::Vec3d referenceTangentToward(
     return normalizedOr(line[targetIndex] - line[startIndex], {1.0, 0.0, 0.0});
 }
 
+[[nodiscard]] std::vector<FiberTraceTargetPlane> targetLocalPlanes(
+    const FiberPredictionSource& predictions,
+    const std::vector<cv::Vec3d>& referenceLine,
+    size_t targetLineIndex,
+    size_t sourceLineIndex,
+    const cv::Vec3d& targetPoint)
+{
+    if (targetLineIndex >= referenceLine.size() ||
+        sourceLineIndex >= referenceLine.size()) {
+        throw std::invalid_argument(
+            "fiber target-local plane line index is out of range");
+    }
+    std::vector<FiberTraceTargetPlane> planes;
+    planes.reserve(kMaxTargetPlanes);
+    const cv::Vec3d lineCenter = referenceLine[targetLineIndex];
+    const auto appendNeighbor = [&](std::string name, size_t neighborIndex) {
+        const cv::Vec3d normal = normalizedOrZero(
+            referenceLine[neighborIndex] - lineCenter);
+        if (length(normal) <= kEpsilon) {
+            throw std::invalid_argument(
+                "fiber target-local plane has a degenerate " + name + " normal");
+        }
+        planes.push_back({std::move(name), targetPoint, normal});
+    };
+    if (targetLineIndex + 1 < referenceLine.size())
+        appendNeighbor("line_next", targetLineIndex + 1);
+    if (targetLineIndex > 0)
+        appendNeighbor("line_prev", targetLineIndex - 1);
+    if (planes.empty()) {
+        throw std::invalid_argument(
+            "fiber target control point has no line-neighbor target planes");
+    }
+
+    const cv::Vec3d targetTangent = referenceTangentToward(
+        referenceLine, targetLineIndex, sourceLineIndex);
+    const ScoredDirection inferred = bestAlignedPrediction(
+        predictions,
+        targetPoint,
+        toTraceVec(targetTangent),
+        false);
+    if (!inferred.valid) {
+        throw std::invalid_argument(
+            "fiber target control point has no valid inferred-direction plane");
+    }
+    planes.push_back({
+        "inferred_direction",
+        targetPoint,
+        toVec3d(traceNormalizedOrZero(inferred.direction)),
+    });
+    return planes;
+}
+
 FiberTraceOneWayResult traceFiberOneWay(
     const FiberPredictionSource& predictions,
     const FiberTraceOneWayRequest& request,
@@ -3936,13 +4215,48 @@ FiberTraceOneWayResult traceFiberOneWay(
     if (length(request.targetPoint - request.startPoint) <= kEpsilon) {
         throw std::invalid_argument("fiber trace one-way request endpoints must differ");
     }
-    if (length(request.targetPlaneNormal) <= kEpsilon) {
-        throw std::invalid_argument("fiber trace one-way request target plane normal is degenerate");
-    }
     validateTraceConfig(request.config);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
     return traceOneWayCore(
         predictions, request, normalSampler, progress, "trace");
+}
+
+FiberTraceOneWayResult traceFiberExtrapolation(
+    const FiberPredictionSource& predictions,
+    const cv::Vec3d& startPoint,
+    const cv::Vec3d& outwardDirection,
+    double distanceVoxels,
+    const FiberTraceConfig& config,
+    const vc::lasagna::NormalSampler* normalSampler,
+    const FiberTraceProgressCallback& progress)
+{
+    if (!finitePoint(startPoint) || !finitePoint(outwardDirection)) {
+        throw std::invalid_argument(
+            "fiber extrapolation request contains a non-finite point or direction");
+    }
+    if (!(distanceVoxels > 0.0) || !std::isfinite(distanceVoxels)) {
+        throw std::invalid_argument(
+            "fiber extrapolation distance must be finite and positive");
+    }
+    const cv::Vec3d direction = normalizedOrZero(outwardDirection);
+    if (length(direction) <= kEpsilon) {
+        throw std::invalid_argument(
+            "fiber extrapolation direction must be non-degenerate");
+    }
+
+    FiberTraceOneWayRequest request;
+    request.startPoint = startPoint;
+    request.targetPoint = startPoint + direction * distanceVoxels;
+    request.initialDirection = direction;
+    request.targetPlanes = {{
+        "extrapolation_distance",
+        request.targetPoint,
+        direction,
+    }};
+    request.budgetSpanVoxels = distanceVoxels;
+    request.config = config;
+    return traceOneWayCore(
+        predictions, request, normalSampler, progress, "extrapolation");
 }
 
 FiberTraceSegmentResult traceFiberSegment(
@@ -3962,15 +4276,6 @@ FiberTraceSegmentResult traceFiberSegment(
     validateTraceConfig(request.config);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
 
-    FiberTraceSegmentRequest forwardRequest = request;
-    forwardRequest.targetPlaneNormal =
-        normalizedOr(request.targetPlaneNormal.value_or(
-                         request.referenceLine[request.targetIndex] -
-                         request.referenceLine[request.startIndex]),
-                     {1.0, 0.0, 0.0});
-    FiberTraceSegmentRequest reverseRequest = request;
-    reverseRequest.targetPlaneNormal = -*forwardRequest.targetPlaneNormal;
-
     FiberTraceSegmentResult result;
     const cv::Vec3d start = request.referenceLine[request.startIndex];
     const cv::Vec3d target = request.referenceLine[request.targetIndex];
@@ -3980,7 +4285,12 @@ FiberTraceSegmentResult traceFiberSegment(
     forwardOneWay.targetPoint = target;
     forwardOneWay.initialDirection =
         referenceTangentToward(request.referenceLine, request.startIndex, request.targetIndex);
-    forwardOneWay.targetPlaneNormal = *forwardRequest.targetPlaneNormal;
+    forwardOneWay.targetPlanes = targetLocalPlanes(
+        predictions,
+        request.referenceLine,
+        request.targetIndex,
+        request.startIndex,
+        target);
     forwardOneWay.budgetSpanVoxels = span;
     forwardOneWay.config = request.config;
     FiberTraceOneWayRequest reverseOneWay;
@@ -3988,7 +4298,12 @@ FiberTraceSegmentResult traceFiberSegment(
     reverseOneWay.targetPoint = start;
     reverseOneWay.initialDirection =
         referenceTangentToward(request.referenceLine, request.targetIndex, request.startIndex);
-    reverseOneWay.targetPlaneNormal = *reverseRequest.targetPlaneNormal;
+    reverseOneWay.targetPlanes = targetLocalPlanes(
+        predictions,
+        request.referenceLine,
+        request.startIndex,
+        request.targetIndex,
+        start);
     reverseOneWay.budgetSpanVoxels = span;
     reverseOneWay.config = request.config;
 
@@ -4005,15 +4320,10 @@ FiberTraceSegmentResult traceFiberSegment(
         result.fusedLine.back() = request.referenceLine[request.targetIndex];
     }
 
-    const cv::Vec3d targetPlaneNormal = *forwardRequest.targetPlaneNormal;
-    if (!result.forward.points.empty()) {
-        result.forwardEndpointErrorTraceVoxels =
-            endpointPlaneError(result.forward.points.back(), target, targetPlaneNormal);
-    }
-    if (!result.reverse.points.empty()) {
-        result.reverseEndpointErrorTraceVoxels =
-            endpointPlaneError(result.reverse.points.back(), start, targetPlaneNormal);
-    }
+    result.forwardEndpointErrorTraceVoxels =
+        result.forward.selectedTargetPlaneErrorVoxels;
+    result.reverseEndpointErrorTraceVoxels =
+        result.reverse.selectedTargetPlaneErrorVoxels;
     result.maxEndpointErrorTraceVoxels = std::max(
         result.forwardEndpointErrorTraceVoxels,
         result.reverseEndpointErrorTraceVoxels);
@@ -4140,16 +4450,21 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
         const size_t targetCpIndex = cpIndex + 1;
         const cv::Vec3d target = cpWorking[targetCpIndex];
         const cv::Vec3d referenceStart = cpWorking[cpIndex];
-        const cv::Vec3d targetPlaneNormal = normalizedOr(
-            target - referenceStart,
-            normalizedOr(target - currentPoint, {1.0, 0.0, 0.0}));
         const double budgetSpan = length(target - referenceStart);
 
         FiberTraceOneWayRequest oneWay;
         oneWay.startPoint = currentPoint;
         oneWay.targetPoint = target;
         oneWay.initialDirection = currentDirection;
-        oneWay.targetPlaneNormal = targetPlaneNormal;
+        oneWay.targetPlanes = targetLocalPlanes(
+            predictions,
+            lineWorking,
+            request.fiber.controlPointLineIndices[targetCpIndex],
+            request.fiber.controlPointLineIndices[cpIndex],
+            target);
+        oneWay.targetPlaneAcceptThresholdVoxels =
+            request.errorThresholdBaseVoxels / request.workingToBaseScale;
+        oneWay.snapTraceToSelectedCrossing = false;
         oneWay.budgetSpanVoxels = budgetSpan;
         oneWay.config = request.config;
 
@@ -4171,13 +4486,8 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
         const FiberTraceCoordinateAdapter coordinates(request.workingToBaseScale);
         const auto setSegmentOutcome = [&](FiberTraceOneWayResult trace) {
             segment.trace = std::move(trace);
-            if (!segment.trace.points.empty()) {
-                segment.inPlaneErrorTraceVoxels = endpointPlaneError(
-                    segment.trace.points.back(), target, targetPlaneNormal);
-            } else {
-                segment.inPlaneErrorTraceVoxels =
-                    std::numeric_limits<double>::infinity();
-            }
+            segment.inPlaneErrorTraceVoxels =
+                segment.trace.selectedTargetPlaneErrorVoxels;
             segment.inPlaneErrorBaseVoxels =
                 coordinates.traceDistanceToBase(segment.inPlaneErrorTraceVoxels);
             segment.success = segment.trace.reachedTargetPlane &&
@@ -4200,16 +4510,7 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
                 normalSampler,
                 segmentProgress,
                 "fiber_retry");
-            double retryErrorTraceVoxels =
-                std::numeric_limits<double>::infinity();
-            if (!retryTrace.points.empty()) {
-                retryErrorTraceVoxels = endpointPlaneError(
-                    retryTrace.points.back(), target, targetPlaneNormal);
-            }
-            const double retryErrorBaseVoxels =
-                coordinates.traceDistanceToBase(retryErrorTraceVoxels);
-            const bool retrySuccess = retryTrace.reachedTargetPlane &&
-                retryErrorBaseVoxels <= request.errorThresholdBaseVoxels;
+            const bool retrySuccess = retryTrace.reachedTargetPlane;
             if (retrySuccess) {
                 ++result.lookaheadRetryRecoveredCount;
                 setSegmentOutcome(std::move(retryTrace));

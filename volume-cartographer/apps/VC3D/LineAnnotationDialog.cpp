@@ -30,6 +30,7 @@
 #include <QPushButton>
 #include <QRect>
 #include <QResizeEvent>
+#include <QSignalBlocker>
 #include <QSettings>
 #include <QShortcut>
 #include <QSizePolicy>
@@ -338,6 +339,23 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
             [this](int) {
                 emit reoptimizationModeChanged(reoptimizationMode());
             });
+    _fiberOptimizationCombo = new QComboBox(buttonRow);
+    _fiberOptimizationCombo->setObjectName(
+        QStringLiteral("lineAnnotationFiberOptimizationModeCombo"));
+    _fiberOptimizationCombo->addItem(
+        tr("Lasagna"),
+        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::Lasagna));
+    _fiberOptimizationCombo->addItem(
+        tr("Fiber model"),
+        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d));
+    installComboEventFilter(_fiberOptimizationCombo, this);
+    buttonLayout->addWidget(_fiberOptimizationCombo);
+    connect(_fiberOptimizationCombo,
+            qOverload<int>(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) {
+                emit fiberOptimizationModeChanged(fiberOptimizationMode());
+            });
     _shiftScrollCombo = new QComboBox(buttonRow);
     _shiftScrollCombo->addItem(tr("along-line"),
                                static_cast<int>(ShiftScrollMode::AlongLine));
@@ -377,6 +395,34 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                 QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
                 settings.setValue(
                     vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX, value);
+            });
+    _extrapolationDistanceSpin = new QSpinBox(buttonRow);
+    _extrapolationDistanceSpin->setObjectName(
+        QStringLiteral("lineAnnotationExtrapolationDistanceSpinBox"));
+    _extrapolationDistanceSpin->setRange(0, 1000000);
+    _extrapolationDistanceSpin->setSingleStep(100);
+    _extrapolationDistanceSpin->setPrefix(tr("Extrapolation "));
+    _extrapolationDistanceSpin->setSuffix(tr(" vx"));
+    _extrapolationDistanceSpin->setToolTip(
+        tr("Distance generated beyond each outer control point."));
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _extrapolationDistanceSpin->setValue(
+            settings.value(
+                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
+                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT)
+                .toInt());
+    }
+    _extrapolationDistanceSpin->installEventFilter(this);
+    buttonLayout->addWidget(_extrapolationDistanceSpin);
+    connect(_extrapolationDistanceSpin,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            [](int value) {
+                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                settings.setValue(
+                    vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
+                    value);
             });
     auto* maxDistanceLabel = new QLabel(tr("Max CP dist"), buttonRow);
     maxDistanceLabel->installEventFilter(this);
@@ -510,6 +556,36 @@ int LineAnnotationDialog::initialCenterlineLengthVx() const
     return _initialCenterlineLengthSpin
         ? _initialCenterlineLengthSpin->value()
         : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
+}
+
+int LineAnnotationDialog::extrapolationDistanceVx() const
+{
+    return _extrapolationDistanceSpin
+        ? _extrapolationDistanceSpin->value()
+        : vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT;
+}
+
+vc3d::line_annotation::FiberOptimizationMode
+LineAnnotationDialog::fiberOptimizationMode() const
+{
+    if (!_fiberOptimizationCombo) {
+        return vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+    }
+    return static_cast<vc3d::line_annotation::FiberOptimizationMode>(
+        _fiberOptimizationCombo->currentData().toInt());
+}
+
+void LineAnnotationDialog::setFiberOptimizationMode(
+    vc3d::line_annotation::FiberOptimizationMode mode)
+{
+    if (!_fiberOptimizationCombo) {
+        return;
+    }
+    const QSignalBlocker blocker(_fiberOptimizationCombo);
+    const int index = _fiberOptimizationCombo->findData(static_cast<int>(mode));
+    if (index >= 0) {
+        _fiberOptimizationCombo->setCurrentIndex(index);
+    }
 }
 
 LineAnnotationDialog::ShiftScrollMode LineAnnotationDialog::shiftScrollMode() const
@@ -672,6 +748,12 @@ void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
 
 void LineAnnotationDialog::setOptimizationBusy(bool busy)
 {
+    if (_fiberOptimizationCombo) {
+        _fiberOptimizationCombo->setEnabled(!busy);
+    }
+    if (_extrapolationDistanceSpin) {
+        _extrapolationDistanceSpin->setEnabled(!busy);
+    }
     auto* content = centralWidget();
     if (!content) {
         return;

@@ -13,6 +13,14 @@
 namespace vc3d::line_annotation
 {
 
+enum class FiberOptimizationMode {
+    Lasagna,
+    NativeFiberTrace3d,
+};
+
+[[nodiscard]] std::string fiberOptimizationModeToString(FiberOptimizationMode mode);
+[[nodiscard]] FiberOptimizationMode fiberOptimizationModeFromString(const std::string& value);
+
 struct FiberTraceSegmentMetadata {
     static constexpr int MetadataVersion = 1;
     static constexpr int TracerVersion = 1;
@@ -44,6 +52,33 @@ struct StoredControlPoint : cv::Vec3d {
     StoredControlPoint() = default;
     explicit StoredControlPoint(const cv::Vec3d& position) : cv::Vec3d(position) {}
 };
+
+struct FiberModeOptimizationRequest {
+    std::vector<LineControlPoint> controlPoints;
+    std::vector<cv::Vec3d> linePointsBase;
+    const vc::fiber_tracer::FiberPredictionSource* predictions = nullptr;
+    const vc::lasagna::NormalSampler* baseNormalSampler = nullptr;
+    const vc::lasagna::NormalSampler* traceNormalSampler = nullptr;
+    vc::lasagna::LineOptimizationConfig lasagnaConfig;
+    vc::fiber_tracer::FiberTraceConfig traceConfig;
+    std::string normalManifestLocation;
+    std::string fiberManifestLocation;
+    double traceToBaseScale = 1.0;
+    double extrapolationDistanceBaseVoxels = 0.0;
+    bool retraceAll = false;
+};
+
+struct FiberModeOptimizationResult {
+    std::vector<LineControlPoint> controlPoints;
+    vc::lasagna::LineOptimizationResult optimization;
+    int nativeSegments = 0;
+    int lasagnaFallbackSegments = 0;
+    int nativeExtrapolations = 0;
+    int lasagnaFallbackExtrapolations = 0;
+};
+
+[[nodiscard]] FiberModeOptimizationResult optimizeFiberWithNativeFallback(
+    FiberModeOptimizationRequest request);
 
 [[nodiscard]] nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& metadata);
 [[nodiscard]] FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json& json);

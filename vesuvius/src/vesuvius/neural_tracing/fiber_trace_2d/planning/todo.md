@@ -107,3 +107,11 @@
 
 # later optimization ml experiments
 - ghost norm, seqnorm and other normalization techniques
+
+# vc3d fiber tracing
+- support extrapolation and interpolation with normal based optimizer and with trained fiber model
+- global switch per fiber, which is also stored per fiber
+- if the interpolation fails for the fiber model fall back to a lasagna optimize segment
+- any lasagna normal based segment neighboring a trained fiber one should use that fiber based ones cp dir (calc from the next point from the cp in the fiber line) as the cp direction which should be used for optimization
+- when switching the fiber-global mode from lasagna to trained fiber or beck we want to run a full opt (the existing one for lasagna) per-segment for the fiber tracing
+- if there isnt yet one please add a spinbox or similar to change the extrapolation distance

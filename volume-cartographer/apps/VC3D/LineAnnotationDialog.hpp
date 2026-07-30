@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "LineAnnotationGeneratedViews.hpp"
+#include "LineAnnotationFiberSegments.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include <opencv2/core/mat.hpp>
@@ -124,7 +125,10 @@ public:
     ReoptimizationMode reoptimizationMode() const;
     ShiftScrollMode shiftScrollMode() const;
     int initialCenterlineLengthVx() const;
+    int extrapolationDistanceVx() const;
     int maxControlPointDistanceVx() const;
+    vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
+    void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
     void setGeneratedBranchLinks(std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks);
@@ -199,6 +203,8 @@ signals:
     void fullOptimizationRequested();
     void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
+    void fiberOptimizationModeChanged(
+        vc3d::line_annotation::FiberOptimizationMode mode);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -295,8 +301,10 @@ private:
     QVBoxLayout* _layout = nullptr;
     QComboBox* _initialDirectionCombo = nullptr;
     QComboBox* _reoptimizationCombo = nullptr;
+    QComboBox* _fiberOptimizationCombo = nullptr;
     QComboBox* _shiftScrollCombo = nullptr;
     QSpinBox* _initialCenterlineLengthSpin = nullptr;
+    QSpinBox* _extrapolationDistanceSpin = nullptr;
     QSpinBox* _maxControlPointDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QLabel* _sliceStepLabel = nullptr;

@@ -204,7 +204,7 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${line_annotation_vccollection_moc}
             ${line_annotation_cstate_moc}
-    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_fiber_slice_geometry

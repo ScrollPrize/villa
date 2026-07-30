@@ -1,5 +1,13 @@
 # 2026-07-30
 
+- Added persisted fiber-global Lasagna/native modes to VC3D line annotation,
+  including full rebuilds on mode changes, invalid-span native retracing with
+  per-span Lasagna fallback, trained-neighbor continuation directions, and
+  configurable native/Lasagna tail extrapolation.
+- Ported Python's target-local multi-plane intersection behavior to the shared
+  C++ tracer used by VC3D and `vc_fiber_trace_metric`, including per-beam
+  recrossing state, all-plane termination, threshold-aware whole-fiber
+  continuation, and selected-crossing diagnostics.
 - Further reduced the approved native precomputed whole-fiber workload from
   1.869s wall / 8.222s CPU to a three-run median of 0.986s / 5.134s with
   deterministic partial parent ordering, compact lazy frontiers, unique-cube

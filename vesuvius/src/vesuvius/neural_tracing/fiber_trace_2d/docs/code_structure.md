@@ -393,11 +393,18 @@ Ownership changed as follows:
   inferred-direction plane sampled from the model at the target CP and
   sign-aligned to the local target tangent. The trace keeps stepping until all
   configured planes have been crossed, then selects the crossing with the
-  lowest in-plane CP error. Python whole-fiber tracing also requires that best
-  crossing error to be within the configured restart threshold before accepting
-  the segment; until then it keeps tracing within the remaining budget and
-  replaces stored crossings when a later crossing of the same target plane is
-  closer to the CP. The straight CP-to-CP chord is not a termination plane.
+  lowest in-plane CP error. Python and C++ whole-fiber tracing also require that
+  best crossing error to be within the configured restart threshold before
+  accepting the segment; until then it keeps tracing within the remaining
+  budget and replaces stored crossings when a later crossing of the same target
+  plane is closer to the CP. The straight CP-to-CP chord is not a termination
+  plane.
+  The shared C++ tracer used by VC3D and `vc_fiber_trace_metric` implements the
+  same construction with fixed-capacity state for these three derived planes.
+  Each beam and compact lazy-lookahead frontier carries its own crossed mask
+  and best interpolated crossing per plane. CP-pair traces expose and snap to
+  the selected crossing for fusion, while whole-fiber traces use that crossing
+  for the error metric but retain the actual stepped endpoint for continuation.
 - When `--vis` is enabled, native strip rendering prints coarse stage progress
   for side/top volume rendering, coordinate extraction, side/top presence
   sampling, trace overlay projection, and image composition. Presence sampling
@@ -723,6 +730,24 @@ Ownership changed as follows:
   span, the same Ctrl-right-click menu instead offers `Revert segment to
   Lasagna optimization`; the worker removes only that span's protection and
   commits its Lasagna result and metadata removal transactionally.
+
+  The toolbar also exposes a fiber-global `Lasagna`/`Fiber model` mode and an
+  explicit base-voxel extrapolation distance. `optimization_mode` is stored on
+  the fiber; `segment_to_next` remains the outcome/provenance for one
+  interpolation span. Switching mode runs a full background rebuild. Fiber
+  mode independently traces every required CP span, stitches successes, and
+  sends failures through one shared Lasagna reinitialization with successes
+  protected. A successful native span is selected as the temporary
+  reinitialization seed, which makes its dense endpoint tangent feed adjacent
+  Lasagna continuation candidates. Ordinary edits reuse unaffected traced
+  spans and retrace only invalidated adjacency.
+
+  Both open tails are first available from Lasagna reinitialization. Fiber mode
+  then calls `traceFiberExtrapolation`, a thin distance-plane request over the
+  shared one-way beam tracer, in trace coordinates. A successful crossing
+  replaces that tail; failure retains the normal-based tail. The controller
+  applies the combined line, CP metadata, and mode atomically and uses the same
+  path for save-time finalization after no-reoptimization edits.
 - `volume-cartographer/apps/src/vc_fiber_trace_metric.cpp` is the native
   no-visualization metric runner for precomputed 3D fiber inference products.
   It opens a fiber inference `.lasagna.json`, loads one `vc3d_fiber` JSON,

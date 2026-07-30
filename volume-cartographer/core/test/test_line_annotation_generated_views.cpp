@@ -27,6 +27,40 @@
 
 namespace {
 
+class FiberModeNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override
+    {
+        return {{0.0, 0.0, 1.0}, true, {}};
+    }
+};
+
+class FiberModePrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    explicit FiberModePrediction(double invalidX =
+                                     std::numeric_limits<double>::infinity())
+        : invalidX_(invalidX)
+    {
+    }
+
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d& point,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        vc::fiber_tracer::FiberPredictionSample sample;
+        if (std::abs(point[0] - invalidX_) < 1.0e-6) {
+            sample.options.push_back({});
+            return sample;
+        }
+        const float sign = referenceDirection[0] < 0.0 ? -1.0f : 1.0f;
+        sample.options.push_back({{sign, 0.0f, 0.0f}, 1.0f, true});
+        return sample;
+    }
+
+private:
+    double invalidX_;
+};
+
 vc::lasagna::NormalSample normal()
 {
     return {{0.0, 0.0, 1.0}, true, {}};
@@ -1099,6 +1133,73 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     std::vector<vc3d::line_annotation::StoredControlPoint> invalid{parsed};
     CHECK_THROWS_AS(vc3d::line_annotation::validateStoredControlPoints(invalid),
                     std::runtime_error);
+}
+
+TEST_CASE("fiber optimization mode has stable persisted values")
+{
+    using vc3d::line_annotation::FiberOptimizationMode;
+    CHECK(vc3d::line_annotation::fiberOptimizationModeToString(
+              FiberOptimizationMode::Lasagna) == "lasagna");
+    CHECK(vc3d::line_annotation::fiberOptimizationModeToString(
+              FiberOptimizationMode::NativeFiberTrace3d) ==
+          "native_fiber_trace3d");
+    CHECK(vc3d::line_annotation::fiberOptimizationModeFromString("lasagna") ==
+          FiberOptimizationMode::Lasagna);
+    CHECK(vc3d::line_annotation::fiberOptimizationModeFromString(
+              "native_fiber_trace3d") ==
+          FiberOptimizationMode::NativeFiberTrace3d);
+    CHECK_THROWS_AS(
+        vc3d::line_annotation::fiberOptimizationModeFromString("unknown"),
+        std::runtime_error);
+}
+
+TEST_CASE("fiber mode falls back only the failed native span")
+{
+    FiberModeNormalSampler normals;
+    FiberModePrediction predictions(32.0);
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+        {6.0, {16.0, 0.0, 0.0}, false, 6},
+        {10.0, {32.0, 0.0, 0.0}, false, 10},
+    };
+    for (int x = -8; x <= 40; x += 4) {
+        request.linePointsBase.push_back(
+            {static_cast<double>(x), 0.0, 0.0});
+    }
+    request.predictions = &predictions;
+    request.baseNormalSampler = &normals;
+    request.traceNormalSampler = &normals;
+    request.normalManifestLocation = "normal.lasagna.json";
+    request.fiberManifestLocation = "fiber.lasagna.json";
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.retraceAll = true;
+    request.traceConfig.stepVoxels = 4.0;
+    request.traceConfig.coneAngleDegrees = 0.0;
+    request.traceConfig.beamWidth = 1;
+    request.traceConfig.maxStepFactor = 2.0;
+    request.traceConfig.smoothnessWeight = 0.0;
+    request.traceConfig.smoothnessNormalWeight = 0.0;
+    request.traceConfig.smoothnessTangentWeight = 0.0;
+    request.traceConfig.cumulativeSmoothnessTangentWeight = 0.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+
+    REQUIRE(result.controlPoints.size() == 3);
+    CHECK(result.nativeSegments == 1);
+    CHECK(result.lasagnaFallbackSegments == 1);
+    CHECK(result.controlPoints[0].segmentToNext.has_value());
+    CHECK_FALSE(result.controlPoints[1].segmentToNext.has_value());
+    CHECK(result.nativeExtrapolations +
+              result.lasagnaFallbackExtrapolations == 2);
+    CHECK(result.lasagnaFallbackExtrapolations >= 1);
+    CHECK(result.optimization.line.points.size() >= 3);
 }
 
 TEST_CASE("fiber segment metadata invalidation follows CP adjacency")

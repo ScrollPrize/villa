@@ -143,6 +143,21 @@ public:
     }
 };
 
+class RecrossPrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d& point,
+        const cv::Vec3d&) const override
+    {
+        const cv::Vec3f direction = point[0] < 6.0
+            ? cv::Vec3f{1.0f, 0.5f, 0.0f}
+            : cv::Vec3f{1.0f, -0.5f, 0.0f};
+        vc::fiber_tracer::FiberPredictionSample out;
+        out.options.push_back({direction, 1.0f, true});
+        return out;
+    }
+};
+
 class BatchPrediction final : public vc::fiber_tracer::FiberPredictionSource {
 public:
     mutable int sampleCalls = 0;
@@ -195,6 +210,13 @@ public:
 private:
     cv::Vec3d normal_;
 };
+
+void setExplicitTargetPlane(
+    vc::fiber_tracer::FiberTraceOneWayRequest& request,
+    const cv::Vec3d& normal)
+{
+    request.targetPlanes = {{"explicit", request.targetPoint, normal}};
+}
 
 vc::lasagna::LasagnaChannelGroup makeGroup(
     std::string name,
@@ -405,7 +427,7 @@ TEST_CASE("native fiber tracer requires normals for normal-aware smoothness")
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {16.0, 0.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
     request.budgetSpanVoxels = 16.0;
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 0.0;
@@ -492,7 +514,7 @@ TEST_CASE("native fiber tracer parallel path samples predictions in a batch")
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {3.0, 0.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
     request.budgetSpanVoxels = 3.0;
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 5.0;
@@ -591,7 +613,7 @@ TEST_CASE("native fiber tracer default angle-step cone uses circular 81-candidat
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {2.0, 0.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
     request.budgetSpanVoxels = 2.0;
 
     const auto result =
@@ -608,7 +630,7 @@ TEST_CASE("native fiber tracer rejects invalid start predictions")
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {8.0, 0.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
     request.budgetSpanVoxels = 8.0;
     request.config.smoothnessNormalWeight = 0.0;
     request.config.smoothnessTangentWeight = 0.0;
@@ -627,7 +649,7 @@ TEST_CASE("native fiber tracer interpolates the target-plane crossing point")
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {6.0, 0.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
     request.budgetSpanVoxels = 6.0;
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 0.0;
@@ -646,6 +668,99 @@ TEST_CASE("native fiber tracer interpolates the target-plane crossing point")
     CHECK(result.points.back()[2] == doctest::Approx(0.0));
 }
 
+TEST_CASE("native fiber tracer requires every configured target plane")
+{
+    SlantedPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {12.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.1, 0.0};
+    request.targetPlanes = {
+        {"line_next", request.targetPoint, {1.0, 1.0, 0.0}},
+        {"line_prev", request.targetPoint, {1.0, 0.0, 0.0}},
+        {"inferred_direction", request.targetPoint, {1.0, -1.0, 0.0}},
+    };
+    request.budgetSpanVoxels = 12.0;
+    request.config.stepVoxels = 1.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.maxStepFactor = 3.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    REQUIRE(result.reachedTargetPlane);
+    CHECK(result.targetPlaneCrossings.size() == 3);
+    CHECK(result.steps >= 14);
+    CHECK(result.selectedTargetPlaneName == "line_prev");
+    REQUIRE(result.selectedTargetPlaneCrossing.has_value());
+    CHECK(result.selectedTargetPlaneErrorVoxels == doctest::Approx(1.2).epsilon(0.1));
+}
+
+TEST_CASE("native fiber tracer reports missing target planes")
+{
+    StraightPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {8.0, 1.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlanes = {
+        {"crossed", {8.0, 0.0, 0.0}, {1.0, 0.0, 0.0}},
+        {"missing", request.targetPoint, {0.0, 1.0, 0.0}},
+    };
+    request.budgetSpanVoxels = 8.0;
+    request.config.stepVoxels = 2.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.maxStepFactor = 2.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    CHECK_FALSE(result.reachedTargetPlane);
+    CHECK(result.reason == "max_step_factor:missing_target_planes=missing");
+    REQUIRE(result.targetPlaneCrossings.size() == 1);
+    CHECK(result.targetPlaneCrossings.front().name == "crossed");
+}
+
+TEST_CASE("native fiber tracer replaces a crossing with lower target error")
+{
+    RecrossPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, -2.0, 0.0};
+    request.targetPoint = {12.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.5, 0.0};
+    request.targetPlanes = {
+        {"recross", request.targetPoint, {0.0, 1.0, 0.0}},
+    };
+    request.targetPlaneAcceptThresholdVoxels = 3.0;
+    request.snapTraceToSelectedCrossing = false;
+    request.budgetSpanVoxels = 12.0;
+    request.config.stepVoxels = 2.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.maxStepFactor = 3.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    REQUIRE(result.reachedTargetPlane);
+    REQUIRE(result.selectedTargetPlaneCrossing.has_value());
+    CHECK((*result.selectedTargetPlaneCrossing)[0] > 9.0);
+    CHECK(result.selectedTargetPlaneErrorVoxels < 3.0);
+    REQUIRE(!result.points.empty());
+    CHECK(cv::norm(result.points.back() - *result.selectedTargetPlaneCrossing) > 0.1);
+}
+
 TEST_CASE("native fiber tracer max-step factor is not clamped before step-limit calculation")
 {
     StraightPrediction predictions;
@@ -653,7 +768,7 @@ TEST_CASE("native fiber tracer max-step factor is not clamped before step-limit 
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {100.0, 0.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
     request.budgetSpanVoxels = 100.0;
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 0.0;
@@ -667,7 +782,7 @@ TEST_CASE("native fiber tracer max-step factor is not clamped before step-limit 
         vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
 
     CHECK(!result.reachedTargetPlane);
-    CHECK(result.reason == "max_step_factor");
+    CHECK(result.reason == "max_step_factor:missing_target_planes=explicit");
     CHECK(result.steps == 3);
 }
 
@@ -678,7 +793,7 @@ TEST_CASE("native fiber tracer ignores presence only for the start branch")
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {8.0, 0.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
     request.budgetSpanVoxels = 8.0;
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 0.0;
@@ -705,7 +820,7 @@ TEST_CASE("native fiber tracer candidate loss uses the all-pairs direction produ
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {3.0, 0.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
     request.budgetSpanVoxels = 3.0;
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 25.0;
@@ -736,7 +851,7 @@ TEST_CASE("native fiber tracer spatially prunes near-duplicate beam states")
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {8.0, 2.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {0.0, 1.0, 0.0};
+    setExplicitTargetPlane(request, {0.0, 1.0, 0.0});
     request.budgetSpanVoxels = 8.0;
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 25.0;
@@ -806,7 +921,7 @@ TEST_CASE("native fiber tracer exact lazy lookahead matches exhaustive search")
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {32.0, 0.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
     request.budgetSpanVoxels = 32.0;
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 25.0;
@@ -851,7 +966,7 @@ TEST_CASE("native fiber tracer lookahead parent cap bounds final expansion")
     request.startPoint = {0.0, 0.0, 0.0};
     request.targetPoint = {32.0, 0.0, 0.0};
     request.initialDirection = {1.0, 0.0, 0.0};
-    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    setExplicitTargetPlane(request, {1.0, 0.0, 0.0});
     request.budgetSpanVoxels = 32.0;
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 25.0;
@@ -884,7 +999,6 @@ TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")
     };
     request.startIndex = 0;
     request.targetIndex = 1;
-    request.targetPlaneNormal = cv::Vec3d{1.0, 0.0, 0.0};
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 0.0;
     request.config.coneAngleStepDegrees = 5.0;
@@ -900,6 +1014,12 @@ TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")
     CHECK(result.forward.reachedTargetPlane);
     CHECK(result.reverse.reachedTargetPlane);
     CHECK(result.accepted);
+    REQUIRE(result.forward.targetPlaneCrossings.size() == 2);
+    CHECK(result.forward.targetPlaneCrossings[0].name == "line_prev");
+    CHECK(result.forward.targetPlaneCrossings[1].name == "inferred_direction");
+    REQUIRE(result.reverse.targetPlaneCrossings.size() == 2);
+    CHECK(result.reverse.targetPlaneCrossings[0].name == "line_next");
+    CHECK(result.reverse.targetPlaneCrossings[1].name == "inferred_direction");
     REQUIRE(result.fusedLine.size() >= 3);
     CHECK(result.fusedLine.front()[0] == doctest::Approx(0.0));
     CHECK(result.fusedLine.back()[0] == doctest::Approx(64.0));
@@ -926,7 +1046,6 @@ TEST_CASE("native fiber segment acceptance uses base-voxel endpoint error")
     };
     request.startIndex = 0;
     request.targetIndex = 1;
-    request.targetPlaneNormal = cv::Vec3d{1.0, 0.0, 0.0};
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 0.0;
     request.config.beamWidth = 1;
@@ -993,4 +1112,74 @@ TEST_CASE("native fiber tracer computes whole-fiber one-way restart metric")
     REQUIRE(result.segments.size() == 2);
     CHECK(result.segments[0].success);
     CHECK(result.segments[1].success);
+}
+
+TEST_CASE("native whole-fiber tracing keeps the live endpoint past a crossing")
+{
+    StraightPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberInput fiber;
+    fiber.path = "synthetic_unsnapped_fiber.json";
+    fiber.linePointsXyzBase = {
+        {0.0, 0.0, 0.0},
+        {6.0, 0.0, 0.0},
+        {12.0, 0.0, 0.0},
+    };
+    fiber.controlPointsXyzBase = fiber.linePointsXyzBase;
+    fiber.controlPointLineIndices = {0, 1, 2};
+
+    vc::fiber_tracer::FiberTraceWholeFiberMetricRequest request;
+    request.fiber = fiber;
+    request.errorThresholdBaseVoxels = 20.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.maxStepFactor = 3.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result =
+        vc::fiber_tracer::traceWholeFiberMetric(predictions, request, &normals);
+
+    REQUIRE(result.segments.size() == 2);
+    REQUIRE(result.segments[0].success);
+    REQUIRE(result.segments[0].trace.selectedTargetPlaneCrossing.has_value());
+    CHECK((*result.segments[0].trace.selectedTargetPlaneCrossing)[0] ==
+          doctest::Approx(6.0));
+    REQUIRE(!result.segments[0].trace.points.empty());
+    CHECK(result.segments[0].trace.points.back()[0] == doctest::Approx(8.0));
+}
+
+TEST_CASE("native fiber extrapolation stops on the requested distance plane")
+{
+    StraightPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 4.0;
+    config.coneAngleDegrees = 0.0;
+    config.beamWidth = 1;
+    config.maxStepFactor = 2.0;
+    config.smoothnessNormalWeight = 0.0;
+    config.smoothnessTangentWeight = 0.0;
+    config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result = vc::fiber_tracer::traceFiberExtrapolation(
+        predictions,
+        {3.0, 2.0, 1.0},
+        {2.0, 0.0, 0.0},
+        10.0,
+        config,
+        &normals);
+
+    REQUIRE(result.reachedTargetPlane);
+    REQUIRE(result.points.size() >= 2);
+    CHECK(result.points.front()[0] == doctest::Approx(3.0));
+    CHECK(result.points.back()[0] == doctest::Approx(13.0));
+    CHECK(result.points.back()[1] == doctest::Approx(2.0));
+    CHECK(result.selectedTargetPlaneName == "extrapolation_distance");
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::traceFiberExtrapolation(
+            predictions, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.0, config),
+        std::invalid_argument);
 }
