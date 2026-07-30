@@ -1,4 +1,12 @@
 import os
+
+# Expandable segments stop the CUDA caching allocator from ratcheting its
+# reserved pool toward the VRAM ceiling under the variable-size per-step loss
+# graphs (measured ~12 GB lower steady-state envelope on the s1 fit). Must be
+# set before the allocator initialises; an explicit PYTORCH_CUDA_ALLOC_CONF in
+# the environment always wins.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import copy
 import itertools
 import json
@@ -90,6 +98,8 @@ from spiral_helpers import (
     load_fiber_point_collections,
     scale_counts_for_z_range,
     _infer_shell_outer_winding_idx,
+    _structurally_disabled_dense_weight_keys,
+    resolve_outer_winding_idx_and_notes,
     patch_intersects_z_roi,
     save_combined_preview,
 )
@@ -142,7 +152,8 @@ z_begin, z_end = 4000, 17000
 voxel_size_um = 9.6
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 lasagna_scale = 4
-# Normals, grad magnitude, and SDT are served by bounded sparse CUDA LRU caches.
+# Normals, grad magnitude, and SDT are served by fully-resident sparse brick
+# pools loaded from pack_resident_pools.py sidecars next to the source zarrs.
 lasagna_storage_backend = 'sparse_cuda'
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
 _active_lasagna_store = None
@@ -1443,9 +1454,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # ==========================================================================
 
     shell_map = None
-    shell_outer_winding_idx = None
     shell_valid_zyxs_gpu = None
-    if shell_patch is not None and shell_losses_enabled():
+    shell_active = shell_patch is not None and shell_losses_enabled()
+    if shell_active:
         if cfg['loss_weight_shell_outer'] > 0:
             shell_map = ShellPolarMap(
                 shell_patch,
@@ -1457,31 +1468,39 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             )
         if cfg['loss_weight_shell_patch_radius'] > 0:
             shell_valid_zyxs_gpu = shell_patch.valid_zyxs.to(device=device, dtype=torch.float32)
-        initial_transform = spiral_and_transform.get_slice_to_spiral_transform()
-        initial_dr = spiral_and_transform.get_dr_per_winding()
-        if cfg['shell_outer_winding_idx'] is None:
-            shell_outer_winding_idx = _infer_shell_outer_winding_idx(
-                initial_transform,
-                initial_dr,
-                verified_patches_list,
-                unattached_pcl_strips,
-                cfg,
-                z_begin,
-                z_end,
-                get_or_build_unattached_pcl_flat,
-            )
-            print(f'inferred shell_outer_winding_idx = {shell_outer_winding_idx}')
-        else:
-            shell_outer_winding_idx = int(cfg['shell_outer_winding_idx'])
-            print(f'using configured shell_outer_winding_idx = {shell_outer_winding_idx}')
-        min_gap_expander_num_windings = shell_outer_winding_idx + 3
-        if cfg['model_gap_expander_num_windings'] < min_gap_expander_num_windings:
-            print(
-                f'WARNING: shell_outer_winding_idx {shell_outer_winding_idx} requires '
-                f'gap_expander_num_windings >= {min_gap_expander_num_windings}, got '
-                f'gap_expander_num_windings {cfg["model_gap_expander_num_windings"]}; '
-                'increase gap_expander_num_windings or lower shell_outer_winding_idx'
-            )
+
+    def infer_outer_winding_idx_for_this_run():
+        return _infer_shell_outer_winding_idx(
+            spiral_and_transform.get_slice_to_spiral_transform(),
+            spiral_and_transform.get_dr_per_winding(),
+            verified_patches_list,
+            unattached_pcl_strips,
+            cfg,
+            z_begin,
+            z_end,
+            get_or_build_unattached_pcl_flat,
+        )
+
+    # Dense losses sample out to this index even when shell losses are off.
+    shell_outer_winding_idx, outer_winding_notes = resolve_outer_winding_idx_and_notes(
+        cfg, shell_active, infer_outer_winding_idx_for_this_run)
+    for note in outer_winding_notes:
+        print(note)
+
+    dense_inactive_warned = set()
+
+    def warn_if_dense_losses_structurally_disabled():
+        # Loss weights are run-mutable, so re-check each step and warn once.
+        for weight_key in _structurally_disabled_dense_weight_keys(
+                cfg, shell_outer_winding_idx):
+            if weight_key not in dense_inactive_warned:
+                dense_inactive_warned.add(weight_key)
+                print(f'WARNING: {weight_key} > 0 but shell_outer_winding_idx '
+                      'is unresolved (config key is None and no outer shell '
+                      'inferred one); this loss samples the spiral out to that '
+                      'winding and stays INACTIVE. Set shell_outer_winding_idx '
+                      'to enable it (some of these losses also need the '
+                      'phase/SDT assets, see any warnings above).')
 
     # ==========================================================================
     # Optimizer and checkpoint helpers
@@ -2395,10 +2414,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         unverified_patch_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_unverified_patch_dt'] is None else cfg['loss_start_unverified_patch_dt']
         compute_unverified_patch_dt = not interactive_dt_suppressed and iteration > unverified_patch_dt_start
 
-        # Progressive-outward DT gating: winding cutoff that grows from the respective DT start
-        # step. Falls back to the configured shell_outer_winding_idx when shell losses are off so
-        # the feature still works; None => no gating.
-        dt_progressive_outer = shell_outer_winding_idx if shell_outer_winding_idx is not None else cfg['shell_outer_winding_idx']
+        # Progressive-outward DT gating: winding cutoff that grows from the
+        # respective DT start step. None means no gating.
+        dt_progressive_outer = shell_outer_winding_idx
         patch_dt_max_winding = get_progressive_dt_max_winding(iteration, cfg['loss_start_patch_dt'], dt_progressive_outer)
         track_dt_max_winding = get_progressive_dt_max_winding(iteration, track_dt_start, dt_progressive_outer)
         unverified_patch_dt_max_winding = get_progressive_dt_max_winding(iteration, unverified_patch_dt_start, dt_progressive_outer)
@@ -2553,6 +2571,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 })
 
         warn_if_sdt_loss_inactive()
+        warn_if_dense_losses_structurally_disabled()
         phase_components_active = phase_mode_active()
         min_spacing_active = cfg['loss_weight_min_spacing'] > 0
         if phase_components_active or min_spacing_active:
