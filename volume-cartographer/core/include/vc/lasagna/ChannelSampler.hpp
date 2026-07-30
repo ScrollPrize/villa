@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -173,6 +174,13 @@ struct LasagnaCornerBatch {
     std::vector<uint8_t> valid;
 };
 
+using LasagnaCornerPointVisitor = void (*)(
+    void* context,
+    size_t pointIndex,
+    const cv::Vec3f& fractionXYZ,
+    bool valid,
+    std::span<const std::array<uint8_t, 8>> volumeCorners);
+
 // Fetches the ordered eight nearest-neighbor voxel corners through VC3D's
 // blocking requested-level reader for caller-side interpolation.
 class LasagnaChannelCornerSampler {
@@ -203,6 +211,12 @@ private:
         const std::vector<cv::Vec3f>& volumePoints,
         LasagnaCornerBatch& samples,
         int parallelThreads);
+    friend NormalPrefetchReport visitLasagnaChannelCorners(
+        const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+        const std::vector<cv::Vec3f>& volumePoints,
+        void* visitorContext,
+        LasagnaCornerPointVisitor visitor,
+        int parallelThreads);
 
     class Impl;
     std::unique_ptr<Impl> impl_;
@@ -218,6 +232,13 @@ private:
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
     const std::vector<cv::Vec3f>& volumePoints,
     LasagnaCornerBatch& samples,
+    int parallelThreads = 0);
+
+[[nodiscard]] NormalPrefetchReport visitLasagnaChannelCorners(
+    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+    const std::vector<cv::Vec3f>& volumePoints,
+    void* visitorContext,
+    LasagnaCornerPointVisitor visitor,
     int parallelThreads = 0);
 
 [[nodiscard]] size_t lasagnaReadWorkersPerChannel();

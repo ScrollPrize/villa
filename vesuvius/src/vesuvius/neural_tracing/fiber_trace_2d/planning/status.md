@@ -1,59 +1,75 @@
-# Native Fiber Trace VC3D Corner-Batch Sampling Status
+# Native Fiber Trace Lookahead And Pipeline Optimization Status
 
 - [x] Read repository and fiber-trace workflow instructions
-- [x] Inspect current sampler/cache and VC3D blocking coordinate APIs
-- [x] Write task and implementation plan
-- [x] Update sampling and float-math specifications
-- [x] Export shared one-level VC3D Zarr cache construction
-- [x] Implement ordered batched eight-corner channel sampling
-- [x] Port fiber prediction and Lasagna normal batches
-- [x] Convert fiber tracer internal math to float
-- [x] Add focused regression tests
-- [x] Build and run focused native tests
-- [x] Run approved representative benchmark and compare trace quality
-- [x] Fuse persisted corner decoding with candidate scoring
-- [x] Add direct-corner scoring coverage and rerun focused native tests
-- [x] Measure fused decode/scoring on the approved representative workload
-- [x] Test cumulative-loss and orientation-decode quality controls
-- [x] Compact final frontier records and reconstruct selected beam state
-- [x] Profile corner preparation, layout, pinning, and gathering separately
-- [x] Optimize measured corner dependency and gather overhead
-- [x] Reject regressing parallel layout/preparation scheduling controls
-- [x] Confirm the retained implementation remains at no more than 8 restarts
-- [x] Update task log and changelog
-- [x] Final consistency review
+- [x] Replace the prior active task with the focused continuation task
+- [x] Write the implementation, testing, spec, and docs plan
+- [x] Review the plan directly against current Trace2CP specifications
+- [x] Instrument exact lazy-lookahead potential without changing results
+- [x] Benchmark exhaustive parent requirements and candidate reduction
+- [x] Implement and test exact lazy lookahead if supported by measurements
+- [x] Benchmark exact lazy lookahead and verify at most 8 restarts
+- [x] Implement and test fused sampling/scoring if still worthwhile
+- [x] Benchmark fused sampling/scoring and verify at most 8 restarts
+- [x] Test intermediate caps only after exact options proved insufficient
+- [x] Update specs and durable docs for retained behavior
+- [x] Run final focused tests, benchmark, and consistency review
 
-The combined prediction-plus-normal sampler supports the workload's mixed
-chunk grids (64-cubed prediction and 32-cubed normals) while sharing voxel
-coordinate/fraction construction. Its first contended benchmark measured
-76.724s and 8 restarts. Worker utilization reduced that to 70.867s, and option
-storage retention plus compact-normal lookup reduced it to 66.384s, both with
-8 restarts. Compact dependency metadata, tensor lookup, and direct raw-corner
-consumption reduced it to 57.789s with 8 restarts. Joint decode, retained raw
-buffers, and parallel final-frontier materialization reduced it to 44.070s
-with 8 restarts. Retained/parallel candidate construction, static scoring, and
-heap-based exact pruning regressed to 74.329s under the competing workload.
-The two regressing scheduling changes are removed; reusable task storage plus
-the successful heap pruning reduce runtime to 37.743s with 8 restarts. The
-within-chunk base-offset corner specialization is built and tested, pending
-explicit approval before another representative run. Its first run reduced
-corner batching to 8.721s but total runtime was 38.117s due to slower contended
-OpenMP stages. A moderate `dynamic,64` scheduling control reduced the same
-contended workload to 37.277s wall / 1049.197s CPU. Trace quality remains at 8
-restarts, versus the 5-restart pre-float baseline.
+Baseline: 21.155s wall / 619.366s CPU, 105,810,462 candidates, 4,170
+generations, and 8 restarts over 87 segments.
 
-The next revision removes the full decoded prediction/normal sample arrays from
-the persisted fast path and scores candidates directly from the retained corner
-batch. All 26 fiber-trace, 15 strict corner-sampler, and 11 Lasagna normal tests
-pass. The approved representative run completed in 27.291s wall / 768.058s CPU
-with 8 restarts, meeting the less-than-30s performance target without changing
-the pre-existing post-float restart result.
+The result-neutral instrumentation derives a conservative exact parent count
+from each already-computed exhaustive frontier. Equal lower bounds are retained
+and incomplete final beam sets require all parents. The focused fiber suite
+passes all 28 cases.
 
-The final retained revision reconstructs full beam state only for selected
-compact frontier entries and removes measured corner-batch overhead without
-changing corner values or ordering. The approved workload completes in
-21.155s wall / 619.366s CPU with 8 restarts. Corner batching accounts for
-7.300s: 2.182s preparation, 2.426s dependency layout, 0.066s cache pinning,
-and 1.938s gathering. Two-layout parallel construction, bounded parallel
-coordinate preparation, and consolidated gather tasks were tested and removed
-because they increased contention or did not improve their target stage.
+The approved exhaustive benchmark retained 8 restarts and found that 462,332
+of 1,290,087 intermediate parents are required (35.8%). Required parent count
+is mean 223.7, p50 230, p95 320, and max 495. Exact lazy expansion predicts
+37,448,892 second-step candidates instead of 104,497,047.
+
+Exact lazy mode remains available with `--lookahead-parent-cap 0`; it expands
+256 lowest-bound parents first, then batches of 64 until a strict exact
+stopping condition is met. `--exhaustive-lookahead` evaluates the full
+frontier. Original global child indices preserve exhaustive ties.
+
+The approved lazy benchmark completed in 12.868s wall / 395.718s CPU with
+47,001,222 candidates, 4,171 generations, and 7 restarts. It evaluated
+564,039 of 1,290,087 lookahead parents and 45,687,159 of 104,497,047
+second-step children. Relative to the committed baseline this is a 1.64x wall
+speedup and a 56% candidate reduction without a quality regression.
+
+Fused persisted sampling/scoring now uses a shared VC3D requested-level corner
+visitor. It gathers each point's ordered corners from the already pinned chunks,
+decodes prediction and normal tensors, and writes the candidate score before
+moving to the next point. The existing materializing corner API is implemented
+through the same visitor, while generic prediction/normal sources retain their
+previous fallback. Focused tests pass: 29 fiber, 16 corner sampler, and 11
+Lasagna normal sampler cases before the cap experiments.
+
+The approved fused benchmark completed in 7.624s wall / 51.303s CPU with the
+same 47,001,222 candidates, 4,171 generations, and 7 restarts as lazy-only.
+Combined pinned-corner gathering, decode, and score time is 3.864s versus the
+previous separate 4.916s corner plus 3.310s scoring stages. This is a 1.69x
+wall improvement over lazy-only and 2.77x over the committed baseline.
+
+The approved cap-64 benchmark completed in 2.750s wall / 13.328s CPU with
+12,018,375 candidates, 4,168 generations, and 6 restarts. It is 7.69x faster
+than the committed baseline and satisfies the quality threshold. Lower planned
+caps remain to be tested independently.
+
+The clean approved cap-32 benchmark completed in 1.869s wall / 8.222s CPU with
+6,910,839 candidates, 4,318 generations, and 7 restarts. An earlier run that
+overlapped a compile is excluded. Cap 32 is 11.3x faster than baseline and is
+the current best accepted trial.
+
+Cap 16 is rejected: its approved run took 4.190s wall and produced 10
+restarts, exceeding the quality threshold. Cap 8 remains as the final planned
+independent trial; cap 32 remains the retained candidate.
+
+Cap 8 is also rejected: 1.327s wall but 14 restarts. All planned cap trials are
+complete. Cap 32 is restored as the retained default, with `0` available for
+exact uncapped lazy expansion.
+
+Final validation on the restored cap-32 build passes 30 fiber-trace, 16 corner
+sampler, and 11 Lasagna normal sampler cases. The metric CLI builds and reports
+the retained default and exact/exhaustive controls; `git diff --check` is clean.

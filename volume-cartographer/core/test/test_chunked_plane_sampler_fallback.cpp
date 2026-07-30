@@ -370,6 +370,74 @@ TEST_CASE("ChunkedPlaneSampler grouped corner batch supports mixed chunk grids")
     CHECK(stats.requestedChunks == 2);
 }
 
+TEST_CASE("ChunkedPlaneSampler corner visitor preserves grouped corner semantics")
+{
+    PyramidChunkedArray coarseChunks(
+        vc::render::ChunkStatus::Data, 17,
+        vc::render::ChunkStatus::Data, 0,
+        {4, 4, 4}, {2, 2, 2}, {4, 4, 4});
+    PyramidChunkedArray fineChunks(
+        vc::render::ChunkStatus::Data, 93,
+        vc::render::ChunkStatus::Data, 0,
+        {4, 4, 4}, {2, 2, 2}, {2, 2, 2});
+    std::vector<vc::render::IChunkedArray*> arrays{&coarseChunks, &fineChunks};
+    const std::vector<cv::Vec3f> points{
+        {0.25f, 0.5f, 0.75f},
+        {-1.0f, 0.0f, 0.0f},
+    };
+    struct VisitorOutput {
+        std::vector<std::vector<std::array<uint8_t, 8>>> values;
+        std::vector<cv::Vec3f> fractions;
+        std::vector<uint8_t> valid;
+        std::vector<int> visits;
+        std::vector<size_t> cornerVolumes;
+    } output{
+        std::vector<std::vector<std::array<uint8_t, 8>>>(
+            arrays.size(),
+            std::vector<std::array<uint8_t, 8>>(points.size())),
+        std::vector<cv::Vec3f>(points.size()),
+        std::vector<uint8_t>(points.size()),
+        std::vector<int>(points.size()),
+        std::vector<size_t>(points.size()),
+    };
+    const auto visitor = +[](
+        void* rawOutput,
+        size_t pointIndex,
+        const cv::Vec3f& fraction,
+        bool valid,
+        std::span<const std::array<uint8_t, 8>> volumeCorners) {
+        auto& out = *static_cast<VisitorOutput*>(rawOutput);
+        ++out.visits[pointIndex];
+        out.fractions[pointIndex] = fraction;
+        out.valid[pointIndex] = valid ? uint8_t{1} : uint8_t{0};
+        out.cornerVolumes[pointIndex] = volumeCorners.size();
+        if (!valid)
+            return;
+        for (size_t volumeIndex = 0; volumeIndex < volumeCorners.size(); ++volumeIndex)
+            out.values[volumeIndex][pointIndex] = volumeCorners[volumeIndex];
+    };
+
+    const auto stats =
+        vc::render::ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+            arrays, 0, points, &output, visitor, 2);
+
+    CHECK(output.visits == std::vector<int>{1, 1});
+    CHECK(output.valid == std::vector<uint8_t>{1, 0});
+    CHECK(output.cornerVolumes == std::vector<size_t>{2, 0});
+    CHECK(output.fractions[0][0] == doctest::Approx(0.25f));
+    CHECK(output.fractions[0][1] == doctest::Approx(0.5f));
+    CHECK(output.fractions[0][2] == doctest::Approx(0.75f));
+    CHECK(std::all_of(
+        output.values[0][0].begin(),
+        output.values[0][0].end(),
+        [](uint8_t value) { return value == 17; }));
+    CHECK(std::all_of(
+        output.values[1][0].begin(),
+        output.values[1][0].end(),
+        [](uint8_t value) { return value == 93; }));
+    CHECK(stats.requestedChunks == 2);
+}
+
 TEST_CASE("ChunkedPlaneSampler can use fallback without queueing or promoting it")
 {
     PyramidChunkedArray array(vc::render::ChunkStatus::MissQueued, 0,

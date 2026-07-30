@@ -61,21 +61,34 @@
   parallel only when the prediction source and, if present, the Lasagna normal
   sampler explicitly advertise concurrent sampling support. Parallel scoring
   must build candidate tasks in deterministic beam/candidate order, keep
-  persisted Zarr/cache access chunky by preparing interpolation requests and
-  materializing prediction samples as a batch before fine-grained loss scoring,
-  and rebuild the next frontier serially in that same order, so pruning,
-  reached-state selection, and trace output remain deterministic. `--threads 0`
-  is the default and uses the OpenMP default thread count; `--threads 1` must
-  force serial lazy candidate scoring.
+  persisted Zarr/cache access chunky by preparing interpolation requests as a
+  batch, and rebuild the next frontier serially in original candidate order,
+  so pruning, reached-state selection, and trace output remain deterministic.
+  Persisted sources may decode and score each candidate directly while its
+  pinned corners are hot, provided scores are written at their original global
+  candidate indices. `--threads 0` is the default and uses the available
+  worker pool; `--threads 1` must force serial candidate scoring.
 - Native precomputed Trace2CP persisted sampling must use one long-lived VC3D
   decoded chunk cache per physical scalar Zarr volume. Each candidate batch
   must fetch the ordered eight integer voxel corners through blocking
   requested-level nearest-neighbor coordinate sampling, with dependencies
-  deduplicated and chunks pinned before candidate materialization. Scalar
-  channels are interpolated from those corners by the caller. Compact `nx/ny`
-  corners must be decoded as paired ambiguous axes and interpolated through the
-  weighted orientation tensor; independently interpolating encoded `nx` and
-  `ny` is not allowed.
+  deduplicated and chunks pinned before candidate access. The tracer must use
+  the shared corner visitor to interpolate scalar channels and decode/score
+  compact channels without candidate-sized corner arrays. The materializing
+  corner API must use that same visitor rather than duplicate cache/layout
+  behavior. Compact `nx/ny` corners must be decoded as paired ambiguous axes
+  and interpolated through the weighted orientation tensor; independently
+  interpolating encoded `nx` and `ny` is not allowed.
+- Native precomputed Trace2CP final lookahead orders intermediate parents by
+  nonnegative cumulative-loss lower bound and original parent index. With
+  `--lookahead-parent-cap 0`, it must expand parents lazily until the next lower
+  bound is strictly greater than the established reached loss or complete
+  spatial-beam threshold; equal bounds must remain observable, producing the
+  same result as exhaustive expansion. The production default intentionally
+  caps this ordered expansion at 32 parents. This is an accepted approximate
+  search-semantic change measured at 7 restarts on the representative
+  87-segment workload. Original global child indices remain required for ties.
+  `--exhaustive-lookahead` bypasses both lazy stopping and the parent cap.
 - Native fiber-trace internal geometry, direction, interpolation, beam, and
   loss math may use float. Public persisted coordinates may remain double at
   API boundaries. Candidate generation order, pruning tie order, and output

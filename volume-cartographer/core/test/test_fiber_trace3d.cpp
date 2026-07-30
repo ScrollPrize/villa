@@ -707,6 +707,98 @@ TEST_CASE("native fiber tracer spatially prunes near-duplicate beam states")
     CHECK(std::sqrt(endpoint[1] * endpoint[1] + endpoint[2] * endpoint[2]) > 1.0);
 }
 
+TEST_CASE("native fiber tracer exact lookahead bound retains equal-loss parents")
+{
+    const std::vector<double> parentBounds{0.1, 0.5, 0.5, 0.8};
+    CHECK(vc::fiber_tracer::testing::debugExactLookaheadRequiredParentCount(
+              parentBounds, 0.5, true) == 3);
+    CHECK(vc::fiber_tracer::testing::debugExactLookaheadRequiredParentCount(
+              parentBounds, 0.49, true) == 1);
+}
+
+TEST_CASE("native fiber tracer exact lookahead bound is conservative without a full result")
+{
+    const std::vector<double> parentBounds{0.1, 0.5, 0.8};
+    CHECK(vc::fiber_tracer::testing::debugExactLookaheadRequiredParentCount(
+              parentBounds, std::nullopt, true) == parentBounds.size());
+    CHECK(vc::fiber_tracer::testing::debugExactLookaheadRequiredParentCount(
+              parentBounds, 0.2, false) == parentBounds.size());
+}
+
+TEST_CASE("native fiber tracer exact lazy lookahead matches exhaustive search")
+{
+    StraightPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {32.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 32.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 25.0;
+    request.config.coneAngleStepDegrees = 5.0;
+    request.config.beamWidth = 4;
+    request.config.beamLookaheadSteps = 2;
+    request.config.beamPruneDistanceVoxels = 1.0;
+    request.config.maxStepFactor = 2.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    vc::fiber_tracer::FiberTraceProfile exhaustiveProfile;
+    request.config.lazyLookahead = false;
+    request.config.profile = &exhaustiveProfile;
+    const auto exhaustive =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    vc::fiber_tracer::FiberTraceProfile lazyProfile;
+    request.config.lazyLookahead = true;
+    request.config.lookaheadParentCap = 0;
+    request.config.profile = &lazyProfile;
+    const auto lazy =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    CHECK(lazy.reachedTargetPlane == exhaustive.reachedTargetPlane);
+    CHECK(lazy.reason == exhaustive.reason);
+    CHECK(lazy.steps == exhaustive.steps);
+    REQUIRE(lazy.points.size() == exhaustive.points.size());
+    for (size_t index = 0; index < lazy.points.size(); ++index) {
+        CHECK(cv::norm(lazy.points[index] - exhaustive.points[index]) < 1.0e-6);
+    }
+    CHECK(lazyProfile.lookaheadEvaluatedParents <=
+          lazyProfile.lookaheadTotalParents);
+    CHECK(lazyProfile.candidateTasks <= exhaustiveProfile.candidateTasks);
+}
+
+TEST_CASE("native fiber tracer lookahead parent cap bounds final expansion")
+{
+    StraightPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {32.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 32.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 25.0;
+    request.config.coneAngleStepDegrees = 5.0;
+    request.config.beamWidth = 4;
+    request.config.beamLookaheadSteps = 2;
+    request.config.lookaheadParentCap = 3;
+    request.config.maxStepFactor = 2.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+    vc::fiber_tracer::FiberTraceProfile profile;
+    request.config.profile = &profile;
+
+    (void)vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    CHECK(profile.lookaheadFinalFrontiers > 0);
+    CHECK(profile.lookaheadEvaluatedParents <=
+          profile.lookaheadFinalFrontiers * request.config.lookaheadParentCap);
+}
+
 TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")
 {
     StraightPrediction predictions;

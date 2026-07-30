@@ -1,5 +1,10 @@
 # 2026-07-30
 
+- Reduced the approved native precomputed whole-fiber workload from 21.155s
+  to 1.869s with exact lower-bound lookahead ordering, a measured default
+  32-parent final-lookahead cap, and fused pinned-corner decode/scoring. The
+  retained result has 7 restarts versus the 8-restart baseline; exact lazy and
+  exhaustive controls remain available.
 - Added shared requested-level VC3D eight-corner batch sampling for native
   fiber prediction and Lasagna normal volumes, including mixed physical chunk
   grids, one decoded cache per physical scalar volume, boundary-aware retained

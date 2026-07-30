@@ -55,7 +55,9 @@ void printUsage(const char* argv0)
         << "  --beam-width N                  kept beams per step [8]\n"
         << "  --beam-prune-distance-voxels N  beam endpoint merge radius after lookahead [1]\n"
         << "  --beam-lookahead-steps N        expand this many steps before pruning [2]\n"
-        << "  --threads N                     candidate scoring threads, 0 uses OpenMP default, 1 serial [0]\n"
+        << "  --lookahead-parent-cap N        final-lookahead parent cap, 0 is exact [32]\n"
+        << "  --exhaustive-lookahead          evaluate the full lookahead frontier\n"
+        << "  --threads N                     candidate scoring threads, 0 uses worker default, 1 serial [0]\n"
         << "  --smoothness-weight N           smoothness scale [2]\n"
         << "  --smoothness-normal-weight N    normal-axis smoothness weight [0.1]\n"
         << "  --smoothness-tangent-weight N   tangent-plane smoothness weight [10]\n"
@@ -86,6 +88,18 @@ int parseInt(const std::string& value, const std::string& name)
         failOption("--" + name + " requires an integer");
     }
     return out;
+}
+
+size_t percentileCount(const std::vector<size_t>& values, double quantile)
+{
+    if (values.empty())
+        return 0;
+    std::vector<size_t> sorted = values;
+    std::sort(sorted.begin(), sorted.end());
+    const size_t index = std::min(
+        sorted.size() - 1,
+        static_cast<size_t>(std::ceil(quantile * sorted.size())) - 1);
+    return sorted[index];
 }
 
 std::string requireValue(int& index, int argc, char** argv, const std::string& name)
@@ -159,6 +173,15 @@ CliOptions parseArgs(int argc, char** argv)
             options.trace.beamLookaheadSteps =
                 parseInt(requireValue(i, argc, argv, "beam-lookahead-steps"),
                          "beam-lookahead-steps");
+        } else if (arg == "--lookahead-parent-cap") {
+            const int cap = parseInt(
+                requireValue(i, argc, argv, "lookahead-parent-cap"),
+                "lookahead-parent-cap");
+            if (cap < 0)
+                failOption("--lookahead-parent-cap must be non-negative");
+            options.trace.lookaheadParentCap = static_cast<size_t>(cap);
+        } else if (arg == "--exhaustive-lookahead") {
+            options.trace.lazyLookahead = false;
         } else if (arg == "--threads") {
             options.trace.parallelThreads =
                 parseInt(requireValue(i, argc, argv, "threads"), "threads");
@@ -439,6 +462,39 @@ int main(int argc, char** argv)
                           ? static_cast<double>(profile.candidateTasks) /
                                 static_cast<double>(profile.generations)
                           : 0.0)
+                  << " lookahead_final_frontiers="
+                  << profile.lookaheadFinalFrontiers
+                  << " lookahead_total_parents=" << profile.lookaheadTotalParents
+                  << " lookahead_required_parents="
+                  << profile.lookaheadRequiredParents
+                  << " lookahead_evaluated_parents="
+                  << profile.lookaheadEvaluatedParents
+                  << " lookahead_parent_retain_ratio="
+                  << (profile.lookaheadTotalParents > 0
+                          ? static_cast<double>(profile.lookaheadRequiredParents) /
+                                static_cast<double>(profile.lookaheadTotalParents)
+                          : 0.0)
+                  << " lookahead_required_parent_mean="
+                  << (profile.lookaheadFinalFrontiers > 0
+                          ? static_cast<double>(profile.lookaheadRequiredParents) /
+                                static_cast<double>(profile.lookaheadFinalFrontiers)
+                          : 0.0)
+                  << " lookahead_required_parent_p50="
+                  << percentileCount(profile.lookaheadRequiredParentCounts, 0.50)
+                  << " lookahead_required_parent_p95="
+                  << percentileCount(profile.lookaheadRequiredParentCounts, 0.95)
+                  << " lookahead_required_parent_max="
+                  << (profile.lookaheadRequiredParentCounts.empty()
+                          ? 0
+                          : *std::max_element(
+                                profile.lookaheadRequiredParentCounts.begin(),
+                                profile.lookaheadRequiredParentCounts.end()))
+                  << " lookahead_total_children="
+                  << profile.lookaheadTotalChildCandidates
+                  << " lookahead_required_children="
+                  << profile.lookaheadRequiredChildCandidates
+                  << " lookahead_evaluated_children="
+                  << profile.lookaheadEvaluatedChildCandidates
                   << " start_sample_s=" << profile.startSampleSeconds
                   << " task_build_s=" << profile.taskBuildSeconds
                   << " prediction_batch_s=" << profile.predictionBatchSeconds
@@ -469,6 +525,7 @@ int main(int argc, char** argv)
                   << " candidate_score_s=" << profile.candidateScoreSeconds
                   << " frontier_s=" << profile.frontierSeconds
                   << " prune_s=" << profile.pruneSeconds
+                  << " lookahead_decision_s=" << profile.lookaheadDecisionSeconds
                   << '\n';
         return 0;
     } catch (const std::exception& exc) {

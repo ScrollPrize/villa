@@ -703,7 +703,7 @@ Ownership changed as follows:
   system. The default trace parameters are
   `step=4.0`, `cone_angle=25.0`, `cone_angle_step=5.0`,
   `cone_grid_size=25`, `beam_width=8`, `beam_prune_distance=1.0`,
-  `beam_lookahead_steps=2`, `smoothness_weight=2.0`,
+  `beam_lookahead_steps=2`, `lookahead_parent_cap=32`, `smoothness_weight=2.0`,
   `smoothness_free_angle=0.0`, `smoothness_normal_weight=0.1`,
   `smoothness_tangent_weight=10.0`, `cumulative_smoothness_steps=4`, and
   `cumulative_smoothness_tangent_weight=2.0`, matching the Python Trace2CP
@@ -712,6 +712,16 @@ Ownership changed as follows:
   the fiber prediction manifest. The CLI is a thin wrapper around
   `vc_fiber_tracer`; it does not run PyTorch, create strips, or implement
   separate channel/remote-cache loading.
+- The precomputed native tracer evaluates the final lookahead by ordering
+  intermediate parents by cumulative-loss lower bound and original index. The
+  default `--lookahead-parent-cap 32` intentionally limits second-step work;
+  `--lookahead-parent-cap 0` uses exact lazy stopping, and
+  `--exhaustive-lookahead` evaluates the full frontier. Persisted prediction
+  and Lasagna-normal channels share one requested-level VC3D corner visitor:
+  chunks are prefetched and pinned once per candidate batch, then each point's
+  ordered corners are decoded and scored directly without candidate-sized
+  per-volume corner arrays. Generic sampler sources retain the materialized
+  fallback.
 - `vc_fiber_trace_metric` opens Lasagna manifests through the shared
   location-aware `vc_lasagna` dataset opener. Local manifests continue to work
   without extra arguments. Direct remote `s3://`, `s3+REGION://`, `http://`, or

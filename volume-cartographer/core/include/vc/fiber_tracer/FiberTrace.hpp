@@ -24,6 +24,15 @@ struct FiberTraceProfile {
     size_t oneWayCalls = 0;
     size_t generations = 0;
     size_t candidateTasks = 0;
+    size_t lookaheadFinalFrontiers = 0;
+    size_t lookaheadTotalParents = 0;
+    size_t lookaheadRequiredParents = 0;
+    size_t lookaheadEvaluatedParents = 0;
+    size_t lookaheadTotalChildCandidates = 0;
+    size_t lookaheadRequiredChildCandidates = 0;
+    size_t lookaheadEvaluatedChildCandidates = 0;
+    std::vector<size_t> lookaheadParentCounts;
+    std::vector<size_t> lookaheadRequiredParentCounts;
     double startSampleSeconds = 0.0;
     double taskBuildSeconds = 0.0;
     double predictionBatchSeconds = 0.0;
@@ -47,6 +56,7 @@ struct FiberTraceProfile {
     double candidateScoreSeconds = 0.0;
     double frontierSeconds = 0.0;
     double pruneSeconds = 0.0;
+    double lookaheadDecisionSeconds = 0.0;
 };
 
 struct FiberTraceConfig {
@@ -57,6 +67,8 @@ struct FiberTraceConfig {
     int beamWidth = 8;
     double beamPruneDistanceVoxels = 1.0;
     int beamLookaheadSteps = 2;
+    bool lazyLookahead = true;
+    size_t lookaheadParentCap = 32;
     int parallelThreads = 0;
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
@@ -258,6 +270,13 @@ public:
         int parallelThreads,
         vc::lasagna::LasagnaCornerBatch* cornerScratch,
         FiberTraceProfile* profile) const;
+    [[nodiscard]] bool visitCornerBatchWithNormals(
+        const vc::lasagna::LasagnaNormalSampler& normalSampler,
+        const std::vector<cv::Vec3f>& volumePoints,
+        int parallelThreads,
+        void* visitorContext,
+        vc::lasagna::LasagnaCornerPointVisitor visitor,
+        FiberTraceProfile* profile) const;
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
         const cv::Vec3d& referenceDirection) const override;
@@ -393,6 +412,11 @@ struct CandidateScoreDebug {
     const cv::Vec3d& historyDirection,
     const cv::Vec3d& candidateDirection,
     const FiberTraceConfig& config);
+
+[[nodiscard]] size_t debugExactLookaheadRequiredParentCount(
+    const std::vector<double>& parentLowerBounds,
+    std::optional<double> resultThreshold,
+    bool finalBeamSetComplete);
 
 } // namespace testing
 #endif

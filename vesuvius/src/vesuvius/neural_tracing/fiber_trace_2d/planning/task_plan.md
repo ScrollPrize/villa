@@ -1,72 +1,97 @@
-# Native Fiber Trace VC3D Corner-Batch Sampling Plan
+# Native Fiber Trace Lookahead And Pipeline Optimization Plan
 
-## Scope
+## Baseline And Acceptance
 
-- Reuse VC3D's `ChunkCache` and blocking requested-level coordinate sampler for
-  persisted fiber prediction and Lasagna normal volumes.
-- Maintain one long-lived decoded cache per physical scalar Zarr volume.
-- Fetch the eight integer voxel corners for each candidate with nearest-neighbor
-  sampling, then interpolate in fiber/normal code.
-- Convert native fiber tracing internals to float while preserving public
-  double-based file and GUI boundaries where changing those interfaces would
-  expand the task unnecessarily.
+- Use commit `2bf48dea0` as the baseline: 21.155s wall / 619.366s CPU,
+  105,810,462 candidates, 4,170 generations, and 8 restarts over 87 segments.
+- Use only the approved remote-manifest/local-fiber benchmark command and its
+  existing remote cache.
+- Retain deterministic candidate generation, loss/tie ordering, and target
+  selection unless an approximate intermediate-cap experiment is explicitly
+  being measured.
+- Reject any retained implementation above 8 restarts.
+- Measure each option separately. Record wall/CPU time, stage timing, candidate
+  count, expanded lookahead parents, and restart count.
 
-## Implementation
+## Phase 1: Exact Lazy Lookahead
 
-1. Export a shared VC3D helper that wraps an already-open scalar Zarr array in a
-   one-level `ChunkCache`; do not duplicate the private Zarr fetcher.
-2. Add a shared Lasagna channel corner-batch helper that:
-   - prepares float source-grid coordinates and interpolation fractions;
-   - sends all eight integer corners through VC3D blocking nearest-neighbor
-     coordinate sampling;
-   - returns ordered uint8 corner values and validity;
-   - retains one cache for the channel binding's physical Zarr volume.
-3. Port persisted fiber prediction batching and Lasagna normal batching to the
-   corner helper. Scalar channels use float trilinear interpolation. Compact
-   `nx/ny` pairs decode each corresponding corner as one ambiguous axis,
-   accumulate the weighted orientation tensor, and select its principal axis.
-4. Fuse candidate prediction, normal decoding, and loss evaluation as far as
-   practical without changing candidate generation/pruning order.
-5. Convert internal fiber-trace vectors, interpolation weights, directions,
-   losses, beam state, and geometry calculations to float. Convert at the
-   existing public API boundaries.
-6. Remove or make unreachable the superseded direct per-thread resolver paths
-   from fiber tracing while retaining shared legacy channel APIs needed by
-   other Lasagna callers.
+1. Add result-neutral instrumentation to the exhaustive lookahead path.
+   Candidate incremental losses are nonnegative, so an intermediate parent's
+   cumulative loss is a lower bound for every descendant.
+2. From each exhaustive final frontier, compute the conservative exact parent
+   prefix required to reproduce the result:
+   - for reached-target generations, use the best reached loss as the bound;
+   - otherwise use the worst spatially accepted final beam loss;
+   - include every parent whose lower bound is less than or equal to the result
+     bound so equal-loss candidate order remains observable.
+3. Report total/mean/p50/p95/max intermediate parents and the predicted child
+   candidate reduction. Benchmark this instrumentation without changing the
+   trace result.
+4. If the reduction is substantial, implement batched lazy parent expansion.
+   Preserve original global child indices for deterministic ties, expand
+   parents by `(lower_bound, original_parent_index)`, and stop only when the
+   next lower bound is strictly greater than the established exact threshold.
+5. Add focused tests comparing lazy and exhaustive results, including equal
+   bounds, spatially rejected candidates, reached-target selection, and cases
+   where all parents must be expanded.
 
-## Correctness And Performance
+## Phase 2: Fused Sample And Score
 
-- Add focused tests for ordered eight-corner sampling, cross-chunk corners,
-  missing/error handling, scalar interpolation, and orientation-aware normal
-  interpolation.
-- Run native fiber and Lasagna sampler tests.
-- Build `vc_fiber_trace_metric` in the existing build tree.
-- Run only the approved representative command for end-to-end performance and
-  quality comparison. Record wall/CPU time, profile stages, restart count, and
-  segment count against the current approximately 86s / 5-restart result.
-- Confirm deterministic result stability with a repeated representative run if
-  runtime permits.
+1. Profile remaining memory traffic after lazy expansion.
+2. Extract a shared pinned-corner batch context from the existing VC3D sampler;
+   do not duplicate Zarr/cache fetching behavior.
+3. For persisted fiber tracing, fuse per-candidate coordinate flooring,
+   fraction calculation, pinned corner gathering, compact direction/normal
+   decode, and loss calculation in one parallel pass.
+4. Avoid materializing full candidate-sized voxel-cube, dependency, six-volume
+   corner, decoded-sample, and score arrays where downstream selection does not
+   require them.
+5. Preserve ordered eight-corner semantics, missing/error handling, compact
+   orientation-tensor interpolation, and generic sampler fallbacks.
+6. Test boundary, clamped-edge, missing-chunk, malformed-chunk, and fused versus
+   existing score parity before benchmarking.
+
+## Phase 3: Approximate Intermediate Cap
+
+- Run only if exact lazy expansion and fusion do not approach the requested
+  speedup.
+- Add an opt-in deterministic intermediate parent cap; do not silently change
+  default search semantics.
+- Test caps `64`, `32`, `16`, and `8` independently in that order.
+- Compare runtime, candidates, and restarts. Retain a default behavior change
+  only if it stays at or below 8 restarts and the spec is updated explicitly.
+
+## Testing
+
+- Build `vc_fiber_trace_metric`, `test_fiber_trace3d`,
+  `test_chunked_plane_sampler_fallback`, and `test_lasagna_normal_sampler`.
+- Run all three focused test binaries after each retained implementation.
+- Run the approved benchmark after each isolated option.
+- Run `git diff --check` and review the final diff for deterministic ordering,
+  portability, and accidental changes outside the active task.
 
 ## Spec Update
 
-- Change native precomputed Trace2CP sampling requirements to mandate one VC3D
-  decoded cache per physical scalar volume, batched nearest-neighbor reads of
-  the eight interpolation corners, and caller-side orientation-aware compact
-  normal interpolation.
-- Allow float internal native fiber-trace math while preserving deterministic
-  candidate order and requiring metric-based quality validation.
+- Exact lazy expansion requires no search-semantics change: document that
+  configured lookahead may be evaluated lazily using a proven nonnegative lower
+  bound, but must return the same reached state and spatially pruned beam set as
+  exhaustive expansion.
+- Document fused sampling/scoring only if retained, requiring the same ordered
+  corners, interpolation, error handling, and deterministic scores.
+- Do not change the intermediate-pruning spec for an experiment. Update it only
+  if an approximate cap is retained as intentional behavior.
 
 ## Docs Updates
 
-- Update the planning changelog with the shared VC3D batch reader and measured
-  performance/quality result.
-- Record implementation attempts, measurements, and deviations in
-  `planning/task_log.md`.
+- Replace the active task log with this task's measurements and deviations.
+- Keep prior optimization history only in `planning/changelog.md`.
+- Update `planning/status.md` incrementally.
+- Add a concise changelog entry for retained improvements, not each rejected
+  experiment.
 
 ## Review
 
-- Review the final diff against `planning/specs.md`, this task, and the
-  monorepo portability/determinism requirements.
-- The workflow requests an independent agent plan review, but higher-level
-  agent policy forbids spawning an agent without explicit user authorization;
-  record this as a process deviation and perform a direct consistency review.
+- Review this plan directly against `planning/specs.md`, `planning/plan.md`, and
+  the task before implementation.
+- Independent-agent review is unavailable in the current tool context; record
+  that workflow deviation and perform a direct consistency review.

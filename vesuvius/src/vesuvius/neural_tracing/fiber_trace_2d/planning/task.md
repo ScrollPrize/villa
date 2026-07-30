@@ -1,13 +1,17 @@
-# Native Fiber Trace VC3D Corner-Batch Sampling
+# Native Fiber Trace Lookahead And Pipeline Optimization
 
-Replace the native C++ fiber tracer's contended per-point Zarr/cache sampling
-with VC3D's batched, threaded chunk reader. Keep one decoded cache per physical
-prediction/Lasagna volume, fetch the eight nearest-neighbor voxel corners for
-every candidate as a batch, and perform scalar and orientation-aware
-interpolation in the tracer.
+Continue optimizing the precomputed native C++ fiber tracer from the committed
+21.155s wall / 619.366s CPU baseline while retaining no more than 8 restarts on
+the approved 87-segment whole-fiber workload.
 
-Convert the native fiber tracer's internal geometry, direction, loss, and beam
-math to float. Numeric parity with the previous double implementation is no
-longer required, but deterministic candidate ordering remains required and the
-representative whole-fiber restart metric must be checked for quality
-regressions.
+Test the following options independently and retain only measured improvements:
+
+1. Measure and implement exact lazy lookahead expansion using the nonnegative
+   candidate-loss lower bound.
+2. Fuse pinned-corner sampling, prediction/normal decoding, and candidate
+   scoring to avoid large intermediate arrays and repeated coordinate metadata.
+3. Only if exact pruning is insufficient, test deterministic intermediate beam
+   caps as an explicitly quality-changing fallback.
+
+Preserve deterministic candidate/tie order. Record unsuccessful experiments,
+and do not retain any result above 8 restarts.

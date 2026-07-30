@@ -650,15 +650,13 @@ NormalPrefetchReport LasagnaChannelCornerSampler::sampleBatch(
     return impl_->sampleBatch(volumePoints, samples);
 }
 
-NormalPrefetchReport sampleLasagnaChannelCornerBatch(
+NormalPrefetchReport visitLasagnaChannelCorners(
     const std::vector<const LasagnaChannelCornerSampler*>& samplers,
     const std::vector<cv::Vec3f>& volumePoints,
-    LasagnaCornerBatch& samples,
+    void* visitorContext,
+    LasagnaCornerPointVisitor visitor,
     int parallelThreads)
 {
-    samples.values.resize(samplers.size());
-    samples.fractionsXYZ.resize(volumePoints.size());
-    samples.valid.resize(volumePoints.size());
     if (samplers.empty() || volumePoints.empty())
         return {};
     if (samplers.front() == nullptr || !samplers.front()->impl_)
@@ -683,13 +681,12 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
     for (const auto& point : volumePoints)
         levelCoords.push_back(point / spacing);
     const auto stats =
-        vc::render::ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
+        vc::render::ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
             arrays,
             0,
             levelCoords,
-            samples.values,
-            samples.fractionsXYZ,
-            samples.valid,
+            visitorContext,
+            visitor,
             parallelThreads);
     return {
         static_cast<uint64_t>(stats.requestedChunks),
@@ -701,6 +698,42 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
         stats.cornerLayoutChunkRuns,
         stats.cornerBoundaryPoints,
         stats.cornerDependencies};
+}
+
+NormalPrefetchReport sampleLasagnaChannelCornerBatch(
+    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+    const std::vector<cv::Vec3f>& volumePoints,
+    LasagnaCornerBatch& samples,
+    int parallelThreads)
+{
+    samples.values.assign(
+        samplers.size(),
+        std::vector<std::array<uint8_t, 8>>(volumePoints.size()));
+    samples.fractionsXYZ.resize(volumePoints.size());
+    samples.valid.resize(volumePoints.size());
+    struct MaterializeContext {
+        LasagnaCornerBatch* samples;
+    } context{&samples};
+    const auto materialize = +[](
+        void* rawContext,
+        size_t pointIndex,
+        const cv::Vec3f& fractionXYZ,
+        bool valid,
+        std::span<const std::array<uint8_t, 8>> volumeCorners) {
+        auto& out = *static_cast<MaterializeContext*>(rawContext)->samples;
+        out.fractionsXYZ[pointIndex] = fractionXYZ;
+        out.valid[pointIndex] = valid ? uint8_t{1} : uint8_t{0};
+        if (!valid)
+            return;
+        for (size_t volumeIndex = 0; volumeIndex < volumeCorners.size(); ++volumeIndex)
+            out.values[volumeIndex][pointIndex] = volumeCorners[volumeIndex];
+    };
+    return visitLasagnaChannelCorners(
+        samplers,
+        volumePoints,
+        &context,
+        materialize,
+        parallelThreads);
 }
 
 NormalPrefetchReport sampleLasagnaChannelCornerBatch(

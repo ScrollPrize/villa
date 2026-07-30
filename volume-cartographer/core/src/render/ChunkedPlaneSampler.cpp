@@ -1527,28 +1527,27 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsLevelBlockingRequest
 }
 
 ChunkedPlaneSampler::Stats
-ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
+ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
     const std::vector<IChunkedArray*>& arrays,
     int level,
     const std::vector<cv::Vec3f>& levelCoords,
-    std::vector<std::vector<std::array<uint8_t, 8>>>& values,
-    std::vector<cv::Vec3f>& fractionsXYZ,
-    std::vector<uint8_t>& valid,
+    void* visitorContext,
+    TrilinearCornerPointVisitor visitor,
     int parallelThreads)
 {
     using Clock = std::chrono::steady_clock;
     const auto prepareStart = Clock::now();
     Stats stats;
     stats.requestedLevelOnly = true;
-    values.resize(arrays.size());
-    for (auto& volumeValues : values)
-        volumeValues.resize(levelCoords.size());
-    fractionsXYZ.resize(levelCoords.size());
-    valid.resize(levelCoords.size());
     if (arrays.empty() || levelCoords.empty())
         return stats;
+    if (visitor == nullptr)
+        throw std::invalid_argument("corner batch visitor must not be null");
     if (arrays.front() == nullptr || level < 0 || level >= arrays.front()->numLevels())
         throw std::invalid_argument("invalid requested-level corner batch source");
+
+    std::vector<cv::Vec3f> fractionsXYZ(levelCoords.size());
+    std::vector<uint8_t> valid(levelCoords.size());
 
     const LevelAccess firstAccess = makeLevelAccess(*arrays.front(), level);
     if (!hasSampleableLevel(firstAccess))
@@ -1894,87 +1893,100 @@ ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
     const size_t pointsPerWorker =
         (levelCoords.size() + workerCount - 1) / workerCount;
     std::vector<std::future<void>> sampleFutures;
-    sampleFutures.reserve(layouts.size() * workerCount);
-    for (size_t layoutIndex = 0; layoutIndex < layouts.size(); ++layoutIndex) {
-        for (size_t worker = 0; worker < workerCount; ++worker) {
-            const size_t begin = worker * pointsPerWorker;
-            const size_t end = std::min(begin + pointsPerWorker, levelCoords.size());
-            if (begin >= end)
-                break;
-            sampleFutures.push_back(cornerBatchPool().submit(
-                [&, layoutIndex, begin, end] {
-        const CornerLayout& layout = layouts[layoutIndex];
-        for (size_t pointIndex = begin; pointIndex < end; ++pointIndex) {
-            if (valid[pointIndex] == 0)
-                continue;
-            const PointCorners& point = layout.points[pointIndex];
-            std::array<uint32_t, 8> commonOffsets{};
-            uint32_t commonMaxOffset = 0;
-            const BoundaryCorners* boundary = nullptr;
-            if (point.singleDependency()) {
-                const uint32_t xStride = (point.clampedAxes & 1) != 0 ? 0U : 1U;
-                const uint32_t yStride = (point.clampedAxes & 2) != 0
-                    ? 0U
-                    : static_cast<uint32_t>(layout.chunkShape[2]);
-                const uint32_t zStride = (point.clampedAxes & 4) != 0
-                    ? 0U
-                    : static_cast<uint32_t>(layout.chunkShape[1]) *
-                          static_cast<uint32_t>(layout.chunkShape[2]);
-                const uint32_t base = point.baseByteOffset;
-                commonOffsets = {
-                    base,
-                    base + xStride,
-                    base + yStride,
-                    base + yStride + xStride,
-                    base + zStride,
-                    base + zStride + xStride,
-                    base + zStride + yStride,
-                    base + zStride + yStride + xStride};
-                commonMaxOffset = commonOffsets[7];
-            } else {
-                boundary = &layout.boundaryCorners[point.boundaryIndex];
-            }
-            for (const size_t volumeIndex : layout.volumes) {
-                const PinnedVolume& volume = pinned[volumeIndex];
-                const uint8_t fill = accesses[volumeIndex].fill;
-                if (point.singleDependency()) {
-                    const size_t dependencyIndex = point.dependencyIndex;
-                    const std::byte* data = volume.data[dependencyIndex];
-                    if (data == nullptr) {
-                        values[volumeIndex][pointIndex].fill(fill);
-                        continue;
-                    }
-                    if (commonMaxOffset >= volume.size[dependencyIndex]) {
-                        throw std::runtime_error(
-                            "corner batch decoded chunk has invalid byte extent");
-                    }
-                    auto& pointValues = values[volumeIndex][pointIndex];
-                    for (size_t corner = 0; corner < 8; ++corner) {
-                        pointValues[corner] =
-                            std::to_integer<uint8_t>(data[commonOffsets[corner]]);
-                    }
+    sampleFutures.reserve(workerCount);
+    for (size_t worker = 0; worker < workerCount; ++worker) {
+        const size_t begin = worker * pointsPerWorker;
+        const size_t end = std::min(begin + pointsPerWorker, levelCoords.size());
+        if (begin >= end)
+            break;
+        sampleFutures.push_back(cornerBatchPool().submit([&, begin, end] {
+            std::vector<std::array<uint8_t, 8>> pointValues(arrays.size());
+            for (size_t pointIndex = begin; pointIndex < end; ++pointIndex) {
+                if (valid[pointIndex] == 0) {
+                    visitor(
+                        visitorContext,
+                        pointIndex,
+                        fractionsXYZ[pointIndex],
+                        false,
+                        {});
                     continue;
                 }
-                for (size_t corner = 0; corner < 8; ++corner) {
-                    uint8_t value = fill;
-                    const size_t dependencyIndex =
-                        boundary->dependencyIndex[corner];
-                    const std::byte* data = volume.data[dependencyIndex];
-                    if (data != nullptr) {
-                        if (boundary->byteOffset[corner] >=
-                            volume.size[dependencyIndex]) {
-                            throw std::runtime_error(
-                                "corner batch decoded chunk has invalid byte extent");
-                        }
-                        value = std::to_integer<uint8_t>(
-                            data[boundary->byteOffset[corner]]);
+                for (const CornerLayout& layout : layouts) {
+                    const PointCorners& point = layout.points[pointIndex];
+                    std::array<uint32_t, 8> commonOffsets{};
+                    uint32_t commonMaxOffset = 0;
+                    const BoundaryCorners* boundary = nullptr;
+                    if (point.singleDependency()) {
+                        const uint32_t xStride =
+                            (point.clampedAxes & 1) != 0 ? 0U : 1U;
+                        const uint32_t yStride = (point.clampedAxes & 2) != 0
+                            ? 0U
+                            : static_cast<uint32_t>(layout.chunkShape[2]);
+                        const uint32_t zStride = (point.clampedAxes & 4) != 0
+                            ? 0U
+                            : static_cast<uint32_t>(layout.chunkShape[1]) *
+                                  static_cast<uint32_t>(layout.chunkShape[2]);
+                        const uint32_t base = point.baseByteOffset;
+                        commonOffsets = {
+                            base,
+                            base + xStride,
+                            base + yStride,
+                            base + yStride + xStride,
+                            base + zStride,
+                            base + zStride + xStride,
+                            base + zStride + yStride,
+                            base + zStride + yStride + xStride};
+                        commonMaxOffset = commonOffsets[7];
+                    } else {
+                        boundary = &layout.boundaryCorners[point.boundaryIndex];
                     }
-                    values[volumeIndex][pointIndex][corner] = value;
+                    for (const size_t currentVolumeIndex : layout.volumes) {
+                        const PinnedVolume& volume = pinned[currentVolumeIndex];
+                        const uint8_t fill = accesses[currentVolumeIndex].fill;
+                        auto& currentValues = pointValues[currentVolumeIndex];
+                        if (point.singleDependency()) {
+                            const size_t dependencyIndex = point.dependencyIndex;
+                            const std::byte* data = volume.data[dependencyIndex];
+                            if (data == nullptr) {
+                                currentValues.fill(fill);
+                                continue;
+                            }
+                            if (commonMaxOffset >= volume.size[dependencyIndex]) {
+                                throw std::runtime_error(
+                                    "corner batch decoded chunk has invalid byte extent");
+                            }
+                            for (size_t corner = 0; corner < 8; ++corner) {
+                                currentValues[corner] = std::to_integer<uint8_t>(
+                                    data[commonOffsets[corner]]);
+                            }
+                            continue;
+                        }
+                        for (size_t corner = 0; corner < 8; ++corner) {
+                            uint8_t value = fill;
+                            const size_t dependencyIndex =
+                                boundary->dependencyIndex[corner];
+                            const std::byte* data = volume.data[dependencyIndex];
+                            if (data != nullptr) {
+                                if (boundary->byteOffset[corner] >=
+                                    volume.size[dependencyIndex]) {
+                                    throw std::runtime_error(
+                                        "corner batch decoded chunk has invalid byte extent");
+                                }
+                                value = std::to_integer<uint8_t>(
+                                    data[boundary->byteOffset[corner]]);
+                            }
+                            currentValues[corner] = value;
+                        }
+                    }
                 }
+                visitor(
+                    visitorContext,
+                    pointIndex,
+                    fractionsXYZ[pointIndex],
+                    true,
+                    pointValues);
             }
-        }
-                }));
-        }
+        }));
     }
     for (auto& future : sampleFutures)
         future.get();
@@ -1987,6 +1999,50 @@ ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
     stats.coveredPixels = static_cast<int>(std::min<size_t>(
         covered, static_cast<size_t>(std::numeric_limits<int>::max())));
     return stats;
+}
+
+ChunkedPlaneSampler::Stats
+ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
+    const std::vector<IChunkedArray*>& arrays,
+    int level,
+    const std::vector<cv::Vec3f>& levelCoords,
+    std::vector<std::vector<std::array<uint8_t, 8>>>& values,
+    std::vector<cv::Vec3f>& fractionsXYZ,
+    std::vector<uint8_t>& valid,
+    int parallelThreads)
+{
+    values.assign(
+        arrays.size(),
+        std::vector<std::array<uint8_t, 8>>(levelCoords.size()));
+    fractionsXYZ.resize(levelCoords.size());
+    valid.resize(levelCoords.size());
+    struct MaterializeContext {
+        std::vector<std::vector<std::array<uint8_t, 8>>>* values;
+        std::vector<cv::Vec3f>* fractionsXYZ;
+        std::vector<uint8_t>* valid;
+    } context{&values, &fractionsXYZ, &valid};
+    const auto materialize = +[](
+        void* rawContext,
+        size_t pointIndex,
+        const cv::Vec3f& fractionXYZ,
+        bool pointValid,
+        std::span<const std::array<uint8_t, 8>> volumeCorners) {
+        auto& out = *static_cast<MaterializeContext*>(rawContext);
+        (*out.fractionsXYZ)[pointIndex] = fractionXYZ;
+        (*out.valid)[pointIndex] = pointValid ? uint8_t{1} : uint8_t{0};
+        if (!pointValid)
+            return;
+        for (size_t volumeIndex = 0; volumeIndex < volumeCorners.size(); ++volumeIndex) {
+            (*out.values)[volumeIndex][pointIndex] = volumeCorners[volumeIndex];
+        }
+    };
+    return visitTrilinearCornersLevelBlockingRequestedLevel(
+        arrays,
+        level,
+        levelCoords,
+        &context,
+        materialize,
+        parallelThreads);
 }
 
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneFineToCoarse(

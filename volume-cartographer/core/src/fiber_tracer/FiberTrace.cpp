@@ -843,6 +843,9 @@ struct FrontierCandidate {
 struct CandidateScoringScratch {
     std::vector<CandidateTask> tasks;
     std::vector<CandidateScore> scores;
+    std::vector<CandidateTask> lookaheadTasks;
+    std::vector<CandidateScore> lookaheadScores;
+    std::vector<size_t> lookaheadGlobalIndices;
     std::vector<TraceVec> candidatePoints;
     std::vector<TraceVec> referenceDirections;
     std::vector<FiberPredictionSample> predictionSamples;
@@ -850,8 +853,33 @@ struct CandidateScoringScratch {
     std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample> floatNormalSamples;
     std::vector<vc::lasagna::NormalSample> fallbackNormalSamples;
     std::vector<FrontierCandidate> frontierCandidates;
-    vc::lasagna::LasagnaCornerBatch cornerBatch;
 };
+
+void fillCandidateTasksForBeam(
+    CandidateTask* out,
+    const std::vector<BeamState>& beams,
+    size_t beamIndex,
+    const std::vector<ConeOffset>& offsets,
+    float step)
+{
+    const BeamState& beam = beams[beamIndex];
+    const TraceVec currentPoint = beamEndpoint(beam);
+    const TraceVec forward = traceNormalizedOr(
+        beam.currentSampleDirection, {1.0f, 0.0f, 0.0f});
+    const auto basis = traceOrthonormalBasis(forward);
+    if (offsets.empty()) {
+        out[0] = {beamIndex, forward, currentPoint + forward * step};
+        return;
+    }
+    for (size_t offsetIndex = 0; offsetIndex < offsets.size(); ++offsetIndex) {
+        const auto& offset = offsets[offsetIndex];
+        const TraceVec direction = traceNormalizedOr(
+            forward + basis[0] * offset.u + basis[1] * offset.v,
+            forward);
+        out[offsetIndex] = {
+            beamIndex, direction, currentPoint + direction * step};
+    }
+}
 
 void buildCandidateTasks(
     std::vector<CandidateTask>& tasks,
@@ -861,29 +889,44 @@ void buildCandidateTasks(
 {
     const size_t candidatesPerBeam = std::max<size_t>(1, offsets.size());
     tasks.resize(beams.size() * candidatesPerBeam);
-    const auto fillBeam = [&](size_t beamIndex) {
-        const BeamState& beam = beams[beamIndex];
-        const TraceVec currentPoint = beamEndpoint(beam);
-        const TraceVec forward = traceNormalizedOr(
-            beam.currentSampleDirection, {1.0f, 0.0f, 0.0f});
-        const auto basis = traceOrthonormalBasis(forward);
-        const size_t firstTask = beamIndex * candidatesPerBeam;
-        if (offsets.empty()) {
-            tasks[firstTask] = {
-                beamIndex, forward, currentPoint + forward * step};
-            return;
+    for (size_t beamIndex = 0; beamIndex < beams.size(); ++beamIndex) {
+        fillCandidateTasksForBeam(
+            tasks.data() + beamIndex * candidatesPerBeam,
+            beams,
+            beamIndex,
+            offsets,
+            step);
+    }
+}
+
+void buildCandidateTasksForOrderedParents(
+    std::vector<CandidateTask>& tasks,
+    std::vector<size_t>& globalIndices,
+    const std::vector<BeamState>& beams,
+    const std::vector<ConeOffset>& offsets,
+    float step,
+    const std::vector<size_t>& parentOrder,
+    size_t orderBegin,
+    size_t orderEnd)
+{
+    const size_t candidatesPerBeam = std::max<size_t>(1, offsets.size());
+    const size_t parentCount = orderEnd - orderBegin;
+    tasks.resize(parentCount * candidatesPerBeam);
+    globalIndices.resize(tasks.size());
+    for (size_t localParent = 0; localParent < parentCount; ++localParent) {
+        const size_t parentIndex = parentOrder[orderBegin + localParent];
+        const size_t firstLocalTask = localParent * candidatesPerBeam;
+        fillCandidateTasksForBeam(
+            tasks.data() + firstLocalTask,
+            beams,
+            parentIndex,
+            offsets,
+            step);
+        for (size_t offsetIndex = 0; offsetIndex < candidatesPerBeam; ++offsetIndex) {
+            globalIndices[firstLocalTask + offsetIndex] =
+                parentIndex * candidatesPerBeam + offsetIndex;
         }
-        for (size_t offsetIndex = 0; offsetIndex < offsets.size(); ++offsetIndex) {
-            const auto& offset = offsets[offsetIndex];
-            const TraceVec direction = traceNormalizedOr(
-                forward + basis[0] * offset.u + basis[1] * offset.v,
-                forward);
-            tasks[firstTask + offsetIndex] = {
-                beamIndex, direction, currentPoint + direction * step};
-        }
-    };
-    for (size_t beamIndex = 0; beamIndex < beams.size(); ++beamIndex)
-        fillBeam(beamIndex);
+    }
 }
 
 [[nodiscard]] CandidateScore candidateLossFromSample(
@@ -992,6 +1035,93 @@ void decodePredictionAndNormalCornerPoint(
     normal->valid = normal->normal.dot(normal->normal) > 1.0e-12f;
 }
 
+[[nodiscard]] CandidateScore candidateLossFromCornerValues(
+    std::span<const std::array<uint8_t, 8>> volumeCorners,
+    const cv::Vec3f& fractionXYZ,
+    bool valid,
+    size_t optionCount,
+    const BeamState& beam,
+    const TraceVec& candidateDirection,
+    const FiberTraceConfig& config)
+{
+    if (!valid)
+        return {};
+
+    const auto weights = vc::lasagna::lasagnaCornerWeights(fractionXYZ);
+    const size_t normalFirstVolume = optionCount * 3;
+    TraceVec smoothNormal{0.0f, 0.0f, 0.0f};
+    bool smoothNormalValid = false;
+    if (vc::lasagna::interpolateLasagnaCorners(
+            volumeCorners[normalFirstVolume], weights) > 0.0f) {
+        smoothNormal = vc::lasagna::interpolateLasagnaCompactAxisCorners(
+            volumeCorners[normalFirstVolume + 1],
+            volumeCorners[normalFirstVolume + 2],
+            weights);
+        smoothNormalValid = smoothNormal.dot(smoothNormal) > 1.0e-12f;
+    }
+
+    const TraceVec reference = traceNormalizedOrZero(candidateDirection);
+    const TraceVec prevStep = traceNormalizedOrZero(beam.previousStepDirection);
+    const TraceVec currentSample = traceNormalizedOrZero(beam.currentSampleDirection);
+    const TraceVec currentStep = traceNormalizedOrZero(candidateDirection);
+    float bestAlignmentScore = -std::numeric_limits<float>::infinity();
+    ScoredDirection selectedCurrent;
+    float bestLoss = std::numeric_limits<float>::infinity();
+    for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+        const size_t volume = optionIndex * 3;
+        TraceVec direction = vc::lasagna::interpolateLasagnaCompactAxisCorners(
+            volumeCorners[volume + 1],
+            volumeCorners[volume + 2],
+            weights,
+            candidateDirection);
+        if (direction.dot(candidateDirection) < 0.0f)
+            direction *= -1.0f;
+        if (!(direction.dot(direction) > 1.0e-12f))
+            continue;
+
+        const TraceVec alignedDirection = traceAlignTo(direction, candidateDirection);
+        const float presence = traceClamp01(
+            vc::lasagna::interpolateLasagnaCorners(
+                volumeCorners[volume], weights) /
+            255.0f);
+        const float alignmentScore =
+            traceClamp01(alignedDirection.dot(reference)) * presence;
+        if (alignmentScore > bestAlignmentScore) {
+            bestAlignmentScore = alignmentScore;
+            selectedCurrent = {alignedDirection, presence, true};
+        }
+
+        float score = presence;
+        score *= traceClampedPositiveDot(prevStep, currentStep);
+        score *= traceClampedPositiveDot(prevStep, currentSample);
+        score *= traceClampedPositiveDot(prevStep, alignedDirection);
+        score *= traceClampedPositiveDot(currentSample, currentStep);
+        score *= traceClampedPositiveDot(currentSample, alignedDirection);
+        score *= traceClampedPositiveDot(currentStep, alignedDirection);
+
+        const float loss = (1.0f - score) +
+            smoothnessLoss(
+                prevStep,
+                currentStep,
+                smoothNormal,
+                smoothNormalValid,
+                config) +
+            cumulativeTangentSmoothnessLoss(
+                beam.historyDirection,
+                currentStep,
+                smoothNormal,
+                smoothNormalValid,
+                config);
+        if (loss < bestLoss)
+            bestLoss = loss;
+    }
+    return {
+        bestLoss,
+        selectedCurrent.direction,
+        selectedCurrent.presence,
+        std::isfinite(bestLoss)};
+}
+
 [[nodiscard]] CandidateScore candidateLossFromCorners(
     const vc::lasagna::LasagnaCornerBatch& corners,
     size_t optionCount,
@@ -1000,23 +1130,17 @@ void decodePredictionAndNormalCornerPoint(
     const TraceVec& candidateDirection,
     const FiberTraceConfig& config)
 {
-    FiberPredictionSample sample;
-    vc::lasagna::LasagnaNormalSampler::FloatNormalSample normal;
-    decodePredictionAndNormalCornerPoint(
-        corners,
-        0,
+    std::vector<std::array<uint8_t, 8>> pointCorners(corners.values.size());
+    for (size_t volumeIndex = 0; volumeIndex < corners.values.size(); ++volumeIndex)
+        pointCorners[volumeIndex] = corners.values[volumeIndex][pointIndex];
+    return candidateLossFromCornerValues(
+        pointCorners,
+        corners.fractionsXYZ[pointIndex],
+        corners.valid[pointIndex] != 0,
         optionCount,
-        pointIndex,
-        candidateDirection,
-        sample,
-        optionCount * 3,
-        &normal);
-    return candidateLossFromSample(
-        sample,
         beam,
         candidateDirection,
-        config,
-        &normal);
+        config);
 }
 
 [[nodiscard]] CandidateScore candidateLoss(
@@ -1166,37 +1290,54 @@ void sampleCandidateNormals(
     const auto* field = dynamic_cast<const FiberPredictionField*>(&predictions);
     const auto* lasagnaSampler =
         dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(normalSampler);
-    const bool combinedCornerBatch =
+    struct CornerScoreContext {
+        const std::vector<BeamState>* beams;
+        const std::vector<CandidateTask>* tasks;
+        const FiberTraceConfig* config;
+        std::vector<CandidateScore>* scores;
+        size_t optionCount;
+    } cornerContext{&beams, &tasks, &config, &scores, field ? field->optionCount() : 0};
+    const auto scoreCornerPoint = +[](
+        void* rawContext,
+        size_t pointIndex,
+        const cv::Vec3f& fractionXYZ,
+        bool valid,
+        std::span<const std::array<uint8_t, 8>> volumeCorners) {
+        const auto& context = *static_cast<CornerScoreContext*>(rawContext);
+        const CandidateTask& task = (*context.tasks)[pointIndex];
+        if (valid && volumeCorners.size() != context.optionCount * 3 + 3) {
+            throw std::runtime_error(
+                "fiber prediction corner visitor returned inconsistent dimensions");
+        }
+        (*context.scores)[pointIndex] = candidateLossFromCornerValues(
+            volumeCorners,
+            fractionXYZ,
+            valid,
+            context.optionCount,
+            (*context.beams)[task.beamIndex],
+            task.direction,
+            *context.config);
+    };
+    const bool fusedCornerScoring =
         field != nullptr && lasagnaSampler != nullptr && normals.empty() &&
         normalAwareSmoothnessEnabled(config) &&
-        field->sampleCornerBatchWithNormals(
+        field->visitCornerBatchWithNormals(
             *lasagnaSampler,
             candidatePoints,
             workers,
-            &scratch.cornerBatch,
+            &cornerContext,
+            scoreCornerPoint,
             profile);
-    if (combinedCornerBatch) {
-        const size_t expectedVolumes = field->optionCount() * 3 + 3;
-        const bool validShape =
-            scratch.cornerBatch.values.size() == expectedVolumes &&
-            scratch.cornerBatch.fractionsXYZ.size() == tasks.size() &&
-            scratch.cornerBatch.valid.size() == tasks.size() &&
-            std::all_of(
-                scratch.cornerBatch.values.begin(),
-                scratch.cornerBatch.values.end(),
-                [&](const auto& values) { return values.size() == tasks.size(); });
-        if (!validShape) {
-            throw std::runtime_error(
-                "fiber prediction corner batch returned inconsistent dimensions");
-        }
-    } else {
-        referenceDirections.reserve(tasks.size());
-        for (const auto& task : tasks)
-            referenceDirections.push_back(task.direction);
+    if (fusedCornerScoring) {
+        if (profile != nullptr)
+            profile->predictionBatchSeconds += elapsedSeconds(predictionStart);
+        return scores;
     }
-    if (combinedCornerBatch) {
-        // Corner-backed scoring decodes directly in the candidate score loop.
-    } else if (field != nullptr) {
+
+    referenceDirections.reserve(tasks.size());
+    for (const auto& task : tasks)
+        referenceDirections.push_back(task.direction);
+    if (field != nullptr) {
         field->sampleBatch(
             candidatePoints,
             referenceDirections,
@@ -1220,22 +1361,20 @@ void sampleCandidateNormals(
     }
     if (profile != nullptr)
         profile->predictionBatchSeconds += elapsedSeconds(predictionStart);
-    if (!combinedCornerBatch && predictionSamples.size() < tasks.size()) {
+    if (predictionSamples.size() < tasks.size()) {
         throw std::runtime_error(
             "fiber prediction batch returned the wrong number of samples");
     }
     const auto normalStart = TraceClock::now();
-    if (!combinedCornerBatch) {
-        sampleCandidateNormals(
-            normalSampler,
-            candidatePoints,
-            config,
-            workers,
-            scratch.normalSamplesWithDerivative,
-            scratch.fallbackNormalSamples,
-            scratch.floatNormalSamples,
-            profile);
-    }
+    sampleCandidateNormals(
+        normalSampler,
+        candidatePoints,
+        config,
+        workers,
+        scratch.normalSamplesWithDerivative,
+        scratch.fallbackNormalSamples,
+        scratch.floatNormalSamples,
+        profile);
     if (profile != nullptr)
         profile->normalBatchSeconds += elapsedSeconds(normalStart);
     const auto& normalsForScoring =
@@ -1246,16 +1385,6 @@ void sampleCandidateNormals(
     std::exception_ptr firstError;
     auto scoreOne = [&](size_t index) {
         const auto& task = tasks[index];
-        if (combinedCornerBatch) {
-            scores[index] = candidateLossFromCorners(
-                scratch.cornerBatch,
-                field->optionCount(),
-                index,
-                beams[task.beamIndex],
-                task.direction,
-                config);
-            return;
-        }
         const vc::lasagna::LasagnaNormalSampler::FloatNormalSample* normal =
             index < normalsForScoring.size() ? &normalsForScoring[index] : nullptr;
         scores[index] = candidateLossFromSample(
@@ -1513,7 +1642,8 @@ void sampleCandidateNormals(
     const std::vector<CandidateScore>& scores,
     int beamWidth,
     double pruneDistanceVoxels,
-    const FiberTraceConfig& config)
+    const FiberTraceConfig& config,
+    std::vector<size_t>* selectedIndices = nullptr)
 {
     if (candidates.empty())
         return {};
@@ -1521,6 +1651,8 @@ void sampleCandidateNormals(
         candidates,
         beamWidth,
         pruneDistanceVoxels);
+    if (selectedIndices != nullptr)
+        *selectedIndices = selected;
     std::vector<BeamState> out;
     out.reserve(selected.size());
     for (const size_t index : selected) {
@@ -1528,6 +1660,169 @@ void sampleCandidateNormals(
             parents, tasks, scores, index, candidates[index], config));
     }
     return out;
+}
+
+[[nodiscard]] size_t exactLookaheadRequiredParentCount(
+    const std::vector<BeamState>& parents,
+    std::optional<float> resultThreshold,
+    bool finalBeamSetComplete)
+{
+    if (!resultThreshold.has_value() || !finalBeamSetComplete)
+        return parents.size();
+    return static_cast<size_t>(std::count_if(
+        parents.begin(), parents.end(), [&](const BeamState& parent) {
+            return parent.loss <= *resultThreshold;
+        }));
+}
+
+void recordExactLookaheadPotential(
+    FiberTraceProfile* profile,
+    const std::vector<BeamState>& parents,
+    size_t childCandidateCount,
+    size_t evaluatedParentCount,
+    size_t evaluatedChildCandidateCount,
+    std::optional<float> resultThreshold,
+    bool finalBeamSetComplete)
+{
+    if (profile == nullptr || parents.empty())
+        return;
+    const size_t requiredParents = exactLookaheadRequiredParentCount(
+        parents, resultThreshold, finalBeamSetComplete);
+    const size_t candidatesPerParent = childCandidateCount / parents.size();
+    ++profile->lookaheadFinalFrontiers;
+    profile->lookaheadTotalParents += parents.size();
+    profile->lookaheadRequiredParents += requiredParents;
+    profile->lookaheadEvaluatedParents += evaluatedParentCount;
+    profile->lookaheadTotalChildCandidates += childCandidateCount;
+    profile->lookaheadRequiredChildCandidates +=
+        requiredParents * candidatesPerParent;
+    profile->lookaheadEvaluatedChildCandidates += evaluatedChildCandidateCount;
+    profile->lookaheadParentCounts.push_back(parents.size());
+    profile->lookaheadRequiredParentCounts.push_back(requiredParents);
+}
+
+struct LazyLookaheadEvaluation {
+    size_t evaluatedParents = 0;
+    size_t evaluatedChildCandidates = 0;
+};
+
+[[nodiscard]] std::optional<size_t> bestReachedFrontierCandidateIndex(
+    const std::vector<FrontierCandidate>& candidates);
+
+[[nodiscard]] LazyLookaheadEvaluation evaluateLazyFinalFrontier(
+    const FiberPredictionSource& predictions,
+    const vc::lasagna::NormalSampler* normalSampler,
+    const std::vector<BeamState>& parents,
+    const std::vector<ConeOffset>& offsets,
+    float step,
+    const TraceVec& target,
+    const TraceVec& targetPlaneNormal,
+    const FiberTraceConfig& config,
+    CandidateScoringScratch& scratch,
+    FiberTraceProfile* profile)
+{
+    constexpr size_t kInitialParentBatch = 256;
+    constexpr size_t kAdditionalParentBatch = 64;
+    const size_t candidatesPerParent = std::max<size_t>(1, offsets.size());
+    const size_t totalCandidates = parents.size() * candidatesPerParent;
+    const size_t parentLimit = config.lookaheadParentCap > 0
+        ? std::min(config.lookaheadParentCap, parents.size())
+        : parents.size();
+    auto& fullTasks = scratch.lookaheadTasks;
+    auto& fullScores = scratch.lookaheadScores;
+    auto& frontier = scratch.frontierCandidates;
+    fullTasks.resize(totalCandidates);
+    fullScores.resize(totalCandidates);
+    frontier.assign(totalCandidates, FrontierCandidate{});
+
+    std::vector<size_t> parentOrder(parents.size());
+    std::iota(parentOrder.begin(), parentOrder.end(), size_t{0});
+    std::sort(parentOrder.begin(), parentOrder.end(), [&](size_t a, size_t b) {
+        if (parents[a].loss != parents[b].loss)
+            return parents[a].loss < parents[b].loss;
+        return a < b;
+    });
+
+    size_t orderBegin = 0;
+    size_t orderEnd = std::min(kInitialParentBatch, parentLimit);
+    while (orderBegin < orderEnd) {
+        const auto taskBuildStart = TraceClock::now();
+        buildCandidateTasksForOrderedParents(
+            scratch.tasks,
+            scratch.lookaheadGlobalIndices,
+            parents,
+            offsets,
+            step,
+            parentOrder,
+            orderBegin,
+            orderEnd);
+        if (profile != nullptr)
+            profile->taskBuildSeconds += elapsedSeconds(taskBuildStart);
+
+        const auto& batchScores = scoreCandidateTasks(
+            predictions,
+            normalSampler,
+            parents,
+            scratch.tasks,
+            config,
+            {},
+            scratch,
+            profile);
+        const auto frontierStart = TraceClock::now();
+        for (size_t localIndex = 0; localIndex < scratch.tasks.size(); ++localIndex) {
+            const size_t globalIndex = scratch.lookaheadGlobalIndices[localIndex];
+            fullTasks[globalIndex] = scratch.tasks[localIndex];
+            fullScores[globalIndex] = batchScores[localIndex];
+            const CandidateScore& score = batchScores[localIndex];
+            if (!score.valid || !std::isfinite(score.loss))
+                continue;
+            const CandidateTask& task = scratch.tasks[localIndex];
+            frontier[globalIndex] = makeFrontierCandidate(
+                parents[task.beamIndex],
+                task.candidatePoint,
+                score,
+                target,
+                targetPlaneNormal);
+        }
+        if (profile != nullptr)
+            profile->frontierSeconds += elapsedSeconds(frontierStart);
+
+        orderBegin = orderEnd;
+        if (orderBegin >= parentLimit)
+            break;
+
+        const auto decisionStart = TraceClock::now();
+        std::optional<float> threshold;
+        if (const auto reached = bestReachedFrontierCandidateIndex(frontier)) {
+            threshold = frontier[*reached].loss;
+        } else {
+            const auto selected = selectFrontierCandidateIndices(
+                frontier,
+                config.beamWidth,
+                config.beamPruneDistanceVoxels);
+            if (selected.size() >= static_cast<size_t>(config.beamWidth)) {
+                threshold = 0.0f;
+                for (const size_t index : selected) {
+                    threshold = std::max(
+                        *threshold, frontierPruneScore(frontier[index]));
+                }
+            }
+        }
+        const float nextLowerBound = parents[parentOrder[orderBegin]].loss;
+        const bool exactResultEstablished =
+            threshold.has_value() && nextLowerBound > *threshold;
+        if (profile != nullptr)
+            profile->lookaheadDecisionSeconds += elapsedSeconds(decisionStart);
+        if (exactResultEstablished)
+            break;
+        orderEnd = std::min(
+            orderBegin + kAdditionalParentBatch, parentLimit);
+    }
+
+    return {
+        orderBegin,
+        orderBegin * candidatesPerParent,
+    };
 }
 
 [[nodiscard]] std::optional<size_t> bestReachedFrontierCandidateIndex(
@@ -1615,7 +1910,6 @@ void sampleCandidateNormals(
         : legacyGridConeOffsets(
               request.config.coneAngleDegrees,
               request.config.coneGridSize);
-    const size_t candidateCount = std::max<size_t>(1, coneOffsets.size());
     int stepIndex = 0;
     while (stepIndex < maxSteps) {
         std::vector<BeamState> expanded = beams;
@@ -1624,64 +1918,105 @@ void sampleCandidateNormals(
         for (; advanced < lookaheadSteps && stepIndex + advanced < maxSteps; ++advanced) {
             if (profile != nullptr)
                 ++profile->generations;
-            const auto taskBuildStart = TraceClock::now();
-            auto& tasks = scoringScratch.tasks;
-            buildCandidateTasks(tasks, expanded, coneOffsets, step);
-            if (profile != nullptr)
-                profile->taskBuildSeconds += elapsedSeconds(taskBuildStart);
-
-            const auto& scores = scoreCandidateTasks(
-                predictions,
-                normalSampler,
-                expanded,
-                tasks,
-                request.config,
-                {},
-                scoringScratch,
-                profile);
-
             const bool finalLookaheadGeneration =
                 advanced + 1 >= lookaheadSteps ||
                 stepIndex + advanced + 1 >= maxSteps;
-            if (finalLookaheadGeneration) {
-                const auto frontierStart = TraceClock::now();
-                auto& frontier = scoringScratch.frontierCandidates;
-                frontier.clear();
-                frontier.resize(tasks.size());
-                const int frontierWorkers = traceWorkerCount(
+            const bool lazyFinalGeneration =
+                finalLookaheadGeneration && advanced > 0 &&
+                request.config.lazyLookahead;
+            const std::vector<CandidateTask>* tasksPtr = nullptr;
+            const std::vector<CandidateScore>* scoresPtr = nullptr;
+            size_t evaluatedParents = expanded.size();
+            size_t evaluatedChildCandidates = 0;
+            if (lazyFinalGeneration) {
+                const LazyLookaheadEvaluation evaluation =
+                    evaluateLazyFinalFrontier(
+                        predictions,
+                        normalSampler,
+                        expanded,
+                        coneOffsets,
+                        step,
+                        target,
+                        targetPlaneNormal,
+                        request.config,
+                        scoringScratch,
+                        profile);
+                tasksPtr = &scoringScratch.lookaheadTasks;
+                scoresPtr = &scoringScratch.lookaheadScores;
+                evaluatedParents = evaluation.evaluatedParents;
+                evaluatedChildCandidates = evaluation.evaluatedChildCandidates;
+            } else {
+                const auto taskBuildStart = TraceClock::now();
+                buildCandidateTasks(
+                    scoringScratch.tasks, expanded, coneOffsets, step);
+                if (profile != nullptr)
+                    profile->taskBuildSeconds += elapsedSeconds(taskBuildStart);
+                tasksPtr = &scoringScratch.tasks;
+                scoresPtr = &scoreCandidateTasks(
                     predictions,
                     normalSampler,
+                    expanded,
+                    scoringScratch.tasks,
                     request.config,
-                    tasks.size());
-                const auto materializeFrontier = [&](size_t taskIndex) {
-                    const auto& task = tasks[taskIndex];
-                    const CandidateScore& candidateScore = scores[taskIndex];
-                    if (!candidateScore.valid || !std::isfinite(candidateScore.loss))
-                        return;
-                    frontier[taskIndex] = makeFrontierCandidate(
-                        expanded[task.beamIndex],
-                        task.candidatePoint,
-                        candidateScore,
-                        target,
-                        targetPlaneNormal);
-                };
+                    {},
+                    scoringScratch,
+                    profile);
+                evaluatedChildCandidates = scoringScratch.tasks.size();
+            }
+            const auto& tasks = *tasksPtr;
+            const auto& scores = *scoresPtr;
+
+            if (finalLookaheadGeneration) {
+                auto& frontier = scoringScratch.frontierCandidates;
+                if (!lazyFinalGeneration) {
+                    const auto frontierStart = TraceClock::now();
+                    frontier.clear();
+                    frontier.resize(tasks.size());
+                    const int frontierWorkers = traceWorkerCount(
+                        predictions,
+                        normalSampler,
+                        request.config,
+                        tasks.size());
+                    const auto materializeFrontier = [&](size_t taskIndex) {
+                        const auto& task = tasks[taskIndex];
+                        const CandidateScore& candidateScore = scores[taskIndex];
+                        if (!candidateScore.valid || !std::isfinite(candidateScore.loss))
+                            return;
+                        frontier[taskIndex] = makeFrontierCandidate(
+                            expanded[task.beamIndex],
+                            task.candidatePoint,
+                            candidateScore,
+                            target,
+                            targetPlaneNormal);
+                    };
 #ifdef _OPENMP
-                if (frontierWorkers > 1) {
-                    const auto count = static_cast<std::ptrdiff_t>(tasks.size());
-                    #pragma omp parallel for schedule(dynamic, 64) num_threads(frontierWorkers)
-                    for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex)
-                        materializeFrontier(static_cast<size_t>(rawIndex));
-                } else
+                    if (frontierWorkers > 1) {
+                        const auto count = static_cast<std::ptrdiff_t>(tasks.size());
+                        #pragma omp parallel for schedule(dynamic, 64) num_threads(frontierWorkers)
+                        for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex)
+                            materializeFrontier(static_cast<size_t>(rawIndex));
+                    } else
 #endif
-                {
-                    for (size_t taskIndex = 0; taskIndex < tasks.size(); ++taskIndex)
-                        materializeFrontier(taskIndex);
+                    {
+                        for (size_t taskIndex = 0; taskIndex < tasks.size(); ++taskIndex)
+                            materializeFrontier(taskIndex);
+                    }
+                    if (profile != nullptr)
+                        profile->frontierSeconds += elapsedSeconds(frontierStart);
                 }
-                if (profile != nullptr)
-                    profile->frontierSeconds += elapsedSeconds(frontierStart);
                 const auto bestReachedIndex =
                     bestReachedFrontierCandidateIndex(frontier);
                 if (bestReachedIndex.has_value()) {
+                    if (advanced > 0) {
+                        recordExactLookaheadPotential(
+                            profile,
+                            expanded,
+                            tasks.size(),
+                            evaluatedParents,
+                            evaluatedChildCandidates,
+                            frontier[*bestReachedIndex].loss,
+                            true);
+                    }
                     const BeamState bestReached = beamStateFromFrontierCandidate(
                         expanded,
                         tasks,
@@ -1707,6 +2042,7 @@ void sampleCandidateNormals(
                                     : 0)};
                 }
                 const auto pruneStart = TraceClock::now();
+                std::vector<size_t> selectedIndices;
                 beams = pruneFrontierCandidates(
                     frontier,
                     expanded,
@@ -1714,7 +2050,29 @@ void sampleCandidateNormals(
                     scores,
                     request.config.beamWidth,
                     request.config.beamPruneDistanceVoxels,
-                    request.config);
+                    request.config,
+                    advanced > 0 ? &selectedIndices : nullptr);
+                if (advanced > 0) {
+                    const bool complete = selectedIndices.size() >=
+                        static_cast<size_t>(request.config.beamWidth);
+                    std::optional<float> threshold;
+                    if (complete) {
+                        threshold = 0.0f;
+                        for (const size_t index : selectedIndices) {
+                            threshold = std::max(
+                                *threshold,
+                                frontierPruneScore(frontier[index]));
+                        }
+                    }
+                    recordExactLookaheadPotential(
+                        profile,
+                        expanded,
+                        tasks.size(),
+                        evaluatedParents,
+                        evaluatedChildCandidates,
+                        threshold,
+                        complete);
+                }
                 if (profile != nullptr)
                     profile->pruneSeconds += elapsedSeconds(pruneStart);
                 if (beams.empty()) {
@@ -2017,6 +2375,21 @@ CandidateScoreDebug debugCandidateLossFromCorners(
         toVec3d(score.selectedCurrentDirection),
         score.selectedPresence,
         score.valid};
+}
+
+size_t debugExactLookaheadRequiredParentCount(
+    const std::vector<double>& parentLowerBounds,
+    std::optional<double> resultThreshold,
+    bool finalBeamSetComplete)
+{
+    std::vector<BeamState> parents(parentLowerBounds.size());
+    for (size_t index = 0; index < parentLowerBounds.size(); ++index)
+        parents[index].loss = static_cast<float>(parentLowerBounds[index]);
+    const std::optional<float> floatThreshold = resultThreshold.has_value()
+        ? std::optional<float>{static_cast<float>(*resultThreshold)}
+        : std::nullopt;
+    return exactLookaheadRequiredParentCount(
+        parents, floatThreshold, finalBeamSetComplete);
 }
 
 } // namespace testing
@@ -2332,23 +2705,19 @@ public:
             materialize(pointIndex);
     }
 
-    [[nodiscard]] bool sampleCornerBatchWithNormals(
+    [[nodiscard]] bool groupedCornerSamplersWithNormals(
         const vc::lasagna::LasagnaNormalSampler& normalSampler,
-        const std::vector<cv::Vec3f>& volumePoints,
-        int parallelThreads,
-        vc::lasagna::LasagnaCornerBatch* cornerScratch,
-        FiberTraceProfile* profile) const
+        std::vector<const vc::lasagna::LasagnaChannelCornerSampler*>& samplers) const
     {
-        if (!cornerSamplingAvailable_ || cornerScratch == nullptr) {
+        if (!cornerSamplingAvailable_)
             return false;
-        }
         const auto normalSamplers = normalSampler.groupedCornerSamplers();
         if (std::any_of(
                 normalSamplers.begin(), normalSamplers.end(),
                 [](const auto* sampler) { return sampler == nullptr; })) {
             return false;
         }
-        std::vector<const vc::lasagna::LasagnaChannelCornerSampler*> samplers;
+        samplers.clear();
         samplers.reserve(options_.size() * 3 + normalSamplers.size());
         for (const auto& option : options_) {
             samplers.push_back(option.presenceCorners.get());
@@ -2356,18 +2725,16 @@ public:
             samplers.push_back(option.nyCorners.get());
         }
         samplers.insert(samplers.end(), normalSamplers.begin(), normalSamplers.end());
+        return true;
+    }
 
-        auto& corners = *cornerScratch;
-        const auto cornerStart = TraceClock::now();
-        vc::lasagna::NormalPrefetchReport cornerReport;
-        try {
-            cornerReport = vc::lasagna::sampleLasagnaChannelCornerBatch(
-                samplers, volumePoints, corners, parallelThreads);
-        } catch (const std::invalid_argument&) {
-            return false;
-        }
+    static void recordCornerReport(
+        const vc::lasagna::NormalPrefetchReport& cornerReport,
+        double cornerSeconds,
+        FiberTraceProfile* profile)
+    {
         if (profile != nullptr) {
-            profile->predictionCornerSeconds += elapsedSeconds(cornerStart);
+            profile->predictionCornerSeconds += cornerSeconds;
             profile->predictionCornerPrepareSeconds +=
                 cornerReport.cornerPrepareSeconds;
             profile->predictionCornerLayoutSeconds +=
@@ -2380,6 +2747,58 @@ public:
                 cornerReport.cornerBoundaryPoints;
             profile->predictionCornerDependencies += cornerReport.cornerDependencies;
         }
+    }
+
+    [[nodiscard]] bool sampleCornerBatchWithNormals(
+        const vc::lasagna::LasagnaNormalSampler& normalSampler,
+        const std::vector<cv::Vec3f>& volumePoints,
+        int parallelThreads,
+        vc::lasagna::LasagnaCornerBatch* cornerScratch,
+        FiberTraceProfile* profile) const
+    {
+        if (cornerScratch == nullptr)
+            return false;
+        std::vector<const vc::lasagna::LasagnaChannelCornerSampler*> samplers;
+        if (!groupedCornerSamplersWithNormals(normalSampler, samplers))
+            return false;
+        const auto cornerStart = TraceClock::now();
+        vc::lasagna::NormalPrefetchReport cornerReport;
+        try {
+            cornerReport = vc::lasagna::sampleLasagnaChannelCornerBatch(
+                samplers, volumePoints, *cornerScratch, parallelThreads);
+        } catch (const std::invalid_argument&) {
+            return false;
+        }
+        recordCornerReport(
+            cornerReport, elapsedSeconds(cornerStart), profile);
+        return true;
+    }
+
+    [[nodiscard]] bool visitCornerBatchWithNormals(
+        const vc::lasagna::LasagnaNormalSampler& normalSampler,
+        const std::vector<cv::Vec3f>& volumePoints,
+        int parallelThreads,
+        void* visitorContext,
+        vc::lasagna::LasagnaCornerPointVisitor visitor,
+        FiberTraceProfile* profile) const
+    {
+        std::vector<const vc::lasagna::LasagnaChannelCornerSampler*> samplers;
+        if (!groupedCornerSamplersWithNormals(normalSampler, samplers))
+            return false;
+        const auto cornerStart = TraceClock::now();
+        vc::lasagna::NormalPrefetchReport cornerReport;
+        try {
+            cornerReport = vc::lasagna::visitLasagnaChannelCorners(
+                samplers,
+                volumePoints,
+                visitorContext,
+                visitor,
+                parallelThreads);
+        } catch (const std::invalid_argument&) {
+            return false;
+        }
+        recordCornerReport(
+            cornerReport, elapsedSeconds(cornerStart), profile);
         return true;
     }
 
@@ -3054,6 +3473,23 @@ bool FiberPredictionField::sampleCornerBatchWithNormals(
         volumePoints,
         parallelThreads,
         cornerScratch,
+        profile);
+}
+
+bool FiberPredictionField::visitCornerBatchWithNormals(
+    const vc::lasagna::LasagnaNormalSampler& normalSampler,
+    const std::vector<cv::Vec3f>& volumePoints,
+    int parallelThreads,
+    void* visitorContext,
+    vc::lasagna::LasagnaCornerPointVisitor visitor,
+    FiberTraceProfile* profile) const
+{
+    return impl_->visitCornerBatchWithNormals(
+        normalSampler,
+        volumePoints,
+        parallelThreads,
+        visitorContext,
+        visitor,
         profile);
 }
 
