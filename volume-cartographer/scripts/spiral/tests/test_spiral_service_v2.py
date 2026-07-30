@@ -76,6 +76,7 @@ class FakeSession:
         self.saved = []
         self.closed = False
         self.path_change_calls = []
+        self.progress = None
 
     def status(self):
         return {
@@ -86,6 +87,7 @@ class FakeSession:
             "run_config": dict(self.run_config),
             "run_config_limits": {"track_max_track_crossing_per_step": 8},
             "default_advanced_config": dict(self.default_advanced_config),
+            "progress": self.progress,
         }
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
@@ -122,6 +124,31 @@ def _attach_fake_session(state, output_directory, dataset_root=""):
     }
     state.session_revision += 1
     return state.session
+
+
+class ProgressStatusTests(unittest.TestCase):
+    def test_status_propagates_structured_fit_progress(self):
+        state = spiral_service.ServiceState()
+        session = _attach_fake_session(state, "/tmp/spiral-progress-test")
+        session.state = "Loading"
+        session.progress = {
+            "operation": "loading",
+            "stage_name": "Loading tracks",
+            "detail": "12,000 tracks retained",
+            "step": 3,
+            "total_steps": 10,
+            "unit": "DB keys",
+            "elapsed_seconds": 4.5,
+            "eta_seconds": 10.5,
+        }
+
+        status = state.status()
+
+        self.assertEqual(status["progress"], session.progress)
+        self.assertEqual(status["progress"]["stage_name"], "Loading tracks")
+
+    def test_empty_status_has_explicit_null_progress(self):
+        self.assertIsNone(spiral_service.ServiceState().status()["progress"])
 
 
 def _planned_run(state, request):

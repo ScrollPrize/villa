@@ -446,7 +446,8 @@ def _dbm_source_id(key_ordinal, source_index):
 
 def load_tracks_from_dbm(
         path, z_lo=None, z_hi=None, return_families=False,
-        return_source_ids=False, show_progress=True, low_memory=False):
+        return_source_ids=False, show_progress=True, low_memory=False,
+        progress=None):
     # Load tracks written by extract_surface_tracks.py. Each DBM value is a
     # pickled list of (N, 3) int32 zyx arrays; keep only tracks that lie entirely
     # within the full-resolution [z_lo, z_hi) ROI.
@@ -467,8 +468,14 @@ def load_tracks_from_dbm(
     source_ids = []
     with dbm.open(path, 'r') as db:
         keys = db.keys()
+        if progress is not None:
+            progress.begin(
+                'loading', 'Loading tracks',
+                step=0, total_steps=len(keys), unit='DB keys')
         key_ordinals = {key: index for index, key in enumerate(sorted(keys))}
-        for key in tqdm(keys, desc='loading tracks', disable=not show_progress):
+        for key_number, key in enumerate(tqdm(
+                keys, desc='loading tracks',
+                disable=not show_progress or progress is not None), start=1):
             family = None
             if return_families:
                 prefix = key.decode().split(':', 1)[0]
@@ -476,6 +483,9 @@ def load_tracks_from_dbm(
                     'vertical' if prefix in ('vx', 'vy') else None)
             entries = pickle.loads(db[key])
             if not entries:
+                if progress is not None:
+                    progress.update(
+                        key_number, detail=f'{len(tracks):,} tracks retained')
                 continue
             if low_memory:
                 for source_index, entry in enumerate(entries):
@@ -494,12 +504,18 @@ def load_tracks_from_dbm(
                     if return_source_ids:
                         source_ids.append(_dbm_source_id(
                             key_ordinals[key], source_index))
+                if progress is not None:
+                    progress.update(
+                        key_number, detail=f'{len(tracks):,} tracks retained')
                 continue
             # Vectorize the per-track z min/max across the whole key: concatenate
             # every non-empty track's z column and reduce per segment, rather
             # than calling .min()/.max() once per track.
             idx = [i for i in range(len(entries)) if len(entries[i])]
             if not idx:
+                if progress is not None:
+                    progress.update(
+                        key_number, detail=f'{len(tracks):,} tracks retained')
                 continue
             lengths = np.fromiter((len(entries[i]) for i in idx), dtype=np.intp, count=len(idx))
             zcat = np.concatenate([entries[i][:, 0] for i in idx])
@@ -520,6 +536,9 @@ def load_tracks_from_dbm(
                 if return_source_ids:
                     source_ids.append(_dbm_source_id(
                         key_ordinals[key], source_index))
+            if progress is not None:
+                progress.update(
+                    key_number, detail=f'{len(tracks):,} tracks retained')
     if return_families and return_source_ids:
         return tracks, families, np.asarray(source_ids, dtype=np.uint64)
     if return_families:

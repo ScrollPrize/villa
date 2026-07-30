@@ -19,8 +19,8 @@ import zipfile
 from config import Config
 
 
-# Version 14 adds shell-only reloads and advertised mutable input paths.
-API_VERSION = 14
+# Version 15 adds structured, stage-local operation progress.
+API_VERSION = 15
 
 
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:

@@ -138,6 +138,12 @@ accept it — VC3D deliberately never auto-trusts host keys.
 
 The fit survives viewer disconnects, laptop sleep, and network drops;
 disconnecting or closing VC3D never terminates a service it did not launch.
+The workspace reports the active loading, optimization, checkpoint, and
+preview stage with elapsed time. Stages with a real work total also show a
+counter and ETA; opaque native or CUDA operations deliberately use an
+indeterminate bar instead of a guessed overall percentage. The same stage
+updates are printed by standalone `fit_spiral.py`, with periodic elapsed-time
+heartbeats when output is captured to a log.
 While connected, the circular-arrow button beside the connection controls
 restarts the remote service and reconnects automatically. The service replaces
 its own process in place, so a containing `tmux` session remains alive and an

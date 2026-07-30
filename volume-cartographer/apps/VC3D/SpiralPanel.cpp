@@ -1518,14 +1518,68 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         _advancedSessionGeneration = -1;
         _runConfigKeys.clear();
     }
-    QString stateText = tr("Session: %1 — %2 — iteration %3/%4")
-        .arg(state, status.value("phase").toString())
-        .arg(status.value("current_iteration").toInteger())
-        .arg(status.value("target_iteration").toInteger());
+    const QJsonObject progress =
+        status.value(QStringLiteral("progress")).toObject();
+    QString stateText = progress.isEmpty()
+        ? tr("Session: %1 — %2")
+              .arg(state, status.value("phase").toString())
+        : tr("Session: %1").arg(state);
+    if (state == QStringLiteral("Running"))
+        stateText += tr(" — iteration %1/%2")
+            .arg(status.value("current_iteration").toInteger())
+            .arg(status.value("target_iteration").toInteger());
     const QJsonObject previewPublish =
         status.value(QStringLiteral("preview_publish")).toObject();
     if (_previewTransferActive && !_previewTransferText.isEmpty()) {
         stateText += QStringLiteral("\n") + _previewTransferText;
+    } else if (!progress.isEmpty()) {
+        const qint64 step =
+            progress.value(QStringLiteral("step")).toInteger(-1);
+        const qint64 total =
+            progress.value(QStringLiteral("total_steps")).toInteger(-1);
+        const QString unit =
+            progress.value(QStringLiteral("unit")).toString();
+        const QString detail =
+            progress.value(QStringLiteral("detail")).toString();
+        const double elapsed =
+            progress.value(QStringLiteral("elapsed_seconds")).toDouble();
+        const QJsonValue etaValue =
+            progress.value(QStringLiteral("eta_seconds"));
+        const auto durationText = [](double value) {
+            const qint64 seconds = qMax<qint64>(
+                0, qRound64(value));
+            if (seconds < 60)
+                return QObject::tr("%1s").arg(seconds);
+            const qint64 minutes = seconds / 60;
+            if (minutes < 60)
+                return QObject::tr("%1m %2s")
+                    .arg(minutes).arg(seconds % 60, 2, 10, QLatin1Char('0'));
+            return QObject::tr("%1h %2m")
+                .arg(minutes / 60)
+                .arg(minutes % 60, 2, 10, QLatin1Char('0'));
+        };
+        QString progressText =
+            progress.value(QStringLiteral("stage_name")).toString();
+        if (!detail.isEmpty())
+            progressText += QStringLiteral(" — ") + detail;
+        progressText += tr(" — elapsed %1").arg(durationText(elapsed));
+        if (etaValue.isDouble())
+            progressText += tr(" — ETA %1")
+                .arg(durationText(etaValue.toDouble()));
+        stateText += QStringLiteral("\n") + progressText;
+        _previewProgress->setVisible(true);
+        if (total > 0) {
+            _previewProgress->setRange(0, 1000);
+            _previewProgress->setValue(static_cast<int>(
+                qBound<qint64>(
+                    qint64{0}, step * 1000 / total, qint64{1000})));
+            QString format = tr("%1 / %2").arg(step).arg(total);
+            if (!unit.isEmpty())
+                format += QStringLiteral(" ") + unit;
+            _previewProgress->setFormat(format);
+        } else {
+            _previewProgress->setRange(0, 0);
+        }
     } else if (!previewPublish.isEmpty()) {
         const int step = previewPublish.value(QStringLiteral("step")).toInt();
         const int total =

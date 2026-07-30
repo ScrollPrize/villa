@@ -171,12 +171,27 @@ class ProtocolTests(unittest.TestCase):
             "error": None, "current_iteration": 0, "target_iteration": 0,
         }
         session._events.put(("status", 0, ready))
-        session._events.put(("status", 1, {**ready, "state": "Loading"}))
+        session._events.put(("status", 1, {
+            **ready,
+            "state": "Loading",
+            "progress": {
+                "operation": "loading",
+                "stage_name": "Loading tracks",
+                "detail": None,
+                "step": 2,
+                "total_steps": 10,
+                "unit": "DB keys",
+                "elapsed_seconds": 3.0,
+                "eta_seconds": 12.0,
+            },
+        }))
         deadline = time.time() + 2
         while len(published) < 2 and time.time() < deadline:
             time.sleep(0.01)
         self.assertEqual(published[-1]["state"], "Loading")
-        self.assertEqual(published[-1]["phase"], "Waiting for all GPU workers")
+        self.assertEqual(published[-1]["phase"], "Loading tracks")
+        self.assertIn(
+            "GPU worker 2/2", published[-1]["progress"]["detail"])
 
         session._events.put(("status", 1, ready))
         deadline = time.time() + 2

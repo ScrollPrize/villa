@@ -50,7 +50,7 @@ from fit_session import (API_VERSION, PclRole, parse_session_request,
 from config import Config
 
 
-SERVICE_VERSION = "6.0.0"
+SERVICE_VERSION = "6.1.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -1121,6 +1121,7 @@ class ServiceState:
         self._publishing_preview_generation = 0
         self._preview_artifact = None
         self._preview_publish = None
+        self._preview_progress_started = None
         self._preview_publish_error = None
         self._preview_process = None
         self._previous_raw_preview_manifest = None
@@ -1173,7 +1174,9 @@ class ServiceState:
                 "state": "Empty", "phase": "No session", "current_iteration": 0,
                 "target_iteration": 0, "latest_metrics": {}, "warnings": [],
                 "error": None, "preview_manifest_path": None, "preview_generation": 0,
+                "progress": None,
             })
+            response.setdefault("progress", None)
             response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview_artifact
             response["preview_publish"] = (
@@ -1185,6 +1188,36 @@ class ServiceState:
                     self._preview_publish.get("stage_name") or "").strip()
                 if stage_name:
                     response["phase"] = stage_name
+                    step = self._preview_publish.get("step")
+                    total = self._preview_publish.get("total_steps")
+                    elapsed = (
+                        max(
+                            0.0,
+                            time.monotonic()
+                            - self._preview_progress_started)
+                        if self._preview_progress_started is not None
+                        else 0.0)
+                    eta = None
+                    if (step is not None and total is not None
+                            and int(step) > 0 and int(total) > int(step)
+                            and elapsed >= 2.0):
+                        eta = elapsed * (
+                            int(total) - int(step)) / int(step)
+                    elif (step is not None and total is not None
+                          and int(total) > 0
+                          and int(step) >= int(total)):
+                        eta = 0.0
+                    response["progress"] = {
+                        "operation": "publishing_preview",
+                        "stage_name": stage_name,
+                        "detail": None,
+                        "step": int(step) if step is not None else None,
+                        "total_steps": (
+                            int(total) if total is not None else None),
+                        "unit": "steps",
+                        "elapsed_seconds": elapsed,
+                        "eta_seconds": eta,
+                    }
             response["ephemeral_inputs"] = [
                 {"id": record["id"], "kind": record["kind"],
                  "role": record.get("role"), "state": record["state"],
@@ -1359,6 +1392,7 @@ class ServiceState:
         self._publishing_preview_generation = 0
         self._preview_artifact = None
         self._preview_publish = None
+        self._preview_progress_started = None
         self._preview_publish_error = None
         self._previous_raw_preview_manifest = None
         if previous_raw:
@@ -1467,6 +1501,7 @@ class ServiceState:
                     if self._publishing_preview_generation == preview_generation:
                         self._publishing_preview_generation = 0
                     self._preview_publish = None
+                    self._preview_progress_started = None
                     self.status_generation += 1
 
     def _update_preview_publish(self, generation, **values):
@@ -1474,6 +1509,9 @@ class ServiceState:
             if self._publishing_preview_generation != generation:
                 return
             current = dict(self._preview_publish or {})
+            next_stage = values.get("stage_name", current.get("stage_name"))
+            if next_stage != current.get("stage_name"):
+                self._preview_progress_started = time.monotonic()
             current.update(values)
             current["generation"] = generation
             self._preview_publish = current

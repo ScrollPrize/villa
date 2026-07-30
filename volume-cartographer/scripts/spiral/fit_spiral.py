@@ -1,4 +1,5 @@
 import os
+import sys
 
 # Expandable segments stop the CUDA caching allocator from ratcheting its
 # reserved pool toward the VRAM ceiling under the variable-size per-step loss
@@ -112,6 +113,7 @@ from satisfaction_metrics import (
 )
 from visualization import overlay_patches_on_slices
 from transforms import SpiralAndTransform
+from spiral_progress import ProgressReporter, progress_or_null
 
 
 configure_torch_threads_from_env()
@@ -523,16 +525,22 @@ def get_dense_attachment_ramp(iteration):
     return min(1.0, (iteration - warmup + 1) / ramp)
 
 
-def main(load_only_patches_and_point_collections=False, interactive_driver=None):
+def main(
+        load_only_patches_and_point_collections=False, interactive_driver=None,
+        progress=None):
     global _active_lasagna_store
+    has_progress = progress is not None
+    progress = progress_or_null(progress)
 
     np.random.seed(cfg['optimizer_random_seed'])
     torch.random.manual_seed(cfg['optimizer_random_seed'])
     if load_only_patches_and_point_collections:
         scroll_zarr = None
     else:
+        progress.begin('loading', 'Loading umbilicus')
         umbilicus = umbilicus_z_to_yx()
         if scroll_zarr_path:
+            progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
             scroll_zarr = zarr.open(scroll_zarr_path, mode='r')
         else:
@@ -542,15 +550,20 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # Patch loading and ROI filtering
     # ==========================================================================
 
-    def load_patches_from_dir(path):
+    def load_patches_from_dir(path, label='patches'):
         patches = {}
-        for entry in sorted(os.listdir(path)):
+        entries = sorted(os.listdir(path))
+        progress.begin(
+            'loading', f'Loading {label}',
+            step=0, total_steps=len(entries), unit='patches')
+        for entry_number, entry in enumerate(entries, start=1):
             segment_path = os.path.join(path, entry)
             try:
                 patches[entry] = load_tifxyz(segment_path)
             except Exception as e:
                 print(f'Failed to load segment {entry}: {e}')
-                continue
+            progress.update(
+                entry_number, detail=f'{len(patches):,} loaded')
         return patches
 
     filter_tracks_by_shell = (
@@ -562,6 +575,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     if shell_losses_enabled() or filter_tracks_by_shell:
         if not shell_path:
             raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
+        progress.begin('loading', 'Loading outer shell')
         shell_patch = load_tifxyz(shell_path)
 
     use_verified_patches = bool(verified_patches_path) and not cfg['input_disable_patches']
@@ -574,12 +588,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         # An empty verified dir is allowed when unverified patches are supplied
         # (unverified-only ablations); both empty is a configuration error.
         verified_patches = (
-            load_patches_from_dir(verified_patches_path)
+            load_patches_from_dir(verified_patches_path, 'verified patches')
             if use_verified_patches and verified_patches_path else {}
         )
         unverified_patches = {}
         if use_unverified_patches and unverified_patches_path:
-            unverified_patches = load_patches_from_dir(unverified_patches_path)
+            unverified_patches = load_patches_from_dir(
+                unverified_patches_path, 'unverified patches')
 
     if (not verified_patches and not unverified_patches
             and (use_verified_patches or use_unverified_patches)):
@@ -588,24 +603,33 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     print(f" loaded {len(verified_patches)} patches")
     print(f" loaded {len(unverified_patches)} unverified patches")
 
+    patch_filter_total = len(verified_patches) + len(unverified_patches)
+    progress.begin(
+        'loading', 'Filtering patches to fit region',
+        step=0, total_steps=patch_filter_total, unit='patches')
+    filtered_count = 0
     for patches in (verified_patches, unverified_patches):
         for patch_id, patch in list(patches.items()):
-            # we erode cells this distance from any invalid cell to catch annotation errors
-            # which are hard to detect at the edges of patches
-            cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
-            if cells_to_erode > 0:
-                if not erode_patch_valid_region(patch, cells_to_erode):
+            try:
+                # we erode cells this distance from any invalid cell to catch annotation errors
+                # which are hard to detect at the edges of patches
+                cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
+                if cells_to_erode > 0:
+                    if not erode_patch_valid_region(patch, cells_to_erode):
+                        del patches[patch_id]
+                        continue
+
+                # remove any patches which do not intersect with the roi we are fitting
+                if not patch_intersects_z_roi(patch, z_begin, z_end):
                     del patches[patch_id]
                     continue
-
-            # remove any patches which do not intersect with the roi we are fitting
-            if not patch_intersects_z_roi(patch, z_begin, z_end):
-                del patches[patch_id]
-                continue
-            # ROI testing may materialise the compact valid-coordinate view.
-            # Training retains the base grid and masks, so regenerate this view
-            # lazily only for a later exporter that actually requests it.
-            patch.release_derived_caches()
+                # ROI testing may materialise the compact valid-coordinate view.
+                # Training retains the base grid and masks, so regenerate this view
+                # lazily only for a later exporter that actually requests it.
+                patch.release_derived_caches()
+            finally:
+                filtered_count += 1
+                progress.update(filtered_count)
 
     # ==========================================================================
     # Point collection loading
@@ -619,7 +643,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     input_specs = pcl_input_specs
     if input_specs is None:
         input_specs = [(pattern, None) for pattern in pcl_json_paths]
-    for pattern, explicit_role in input_specs:
+    progress.begin(
+        'loading', 'Loading point collections',
+        step=0, total_steps=len(input_specs), unit='inputs')
+    for spec_number, (pattern, explicit_role) in enumerate(input_specs, start=1):
         expanded = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
         for path in expanded:
             loaded = load_point_collection(path) or {}
@@ -639,7 +666,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 )
                 point_collections[next_id] = pcl
                 next_id += 1
+        progress.update(
+            spec_number, detail=f'{len(point_collections):,} collections loaded')
 
+    progress.begin('loading', 'Loading fiber point collections')
     fiber_point_collections, next_id = load_fiber_point_collections(
         fibers_path,
         next_id,
@@ -682,6 +712,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # patch area and use distance only as a tie-break. Between-patches pcls connect
     # overlapping patches and attach only to their named patch pair, using nearest
     # distance within that pair.
+    progress.begin(
+        'loading', 'Linking points to patches',
+        detail=(
+            f'{len(point_collections):,} collections, '
+            f'{len(verified_patches):,} patches'))
     link_points_to_patches(
         verified_patches,
         point_collections,
@@ -892,6 +927,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     )
     shell_envelope = None
     if shell_patch is not None and filter_tracks_by_shell:
+        progress.begin('loading', 'Building outer-shell lookup')
         shell_envelope = ShellPolarMap(
             shell_patch,
             umbilicus,
@@ -914,6 +950,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         lasagna_scale=lasagna_scale,
         storage_backend=lasagna_storage_backend,
         cache_directory=cache_path,
+        progress=progress,
     )
     if interactive_driver is not None and lasagna_volume:
         _active_lasagna_store = lasagna_volume['store']
@@ -939,6 +976,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             z_end=z_end,
             cache_directory=cache_path,
             storage_backend=lasagna_storage_backend,
+            progress=progress,
         )
         if interactive_driver is not None:
             _active_scalar_stores.append(sdt_volume['store'])
@@ -976,6 +1014,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     track_reload_families = None
     track_reload_source_ids = None
     if tracks_dbm_path is not None:
+        progress.begin(
+            'loading', 'Resolving track store',
+            detail=os.path.basename(tracks_dbm_path))
         print(f'loading tracks from {tracks_dbm_path}')
         if (track_sampling_config['crossing_precompute_max'] > 0
                 or track_sampling_config['crossing_mode'] == 'track_walk'):
@@ -989,13 +1030,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 track_crossing_cache = None
             tracks, track_families, track_source_ids = load_tracks_from_dbm(
                 tracks_dbm_path, z_begin, z_end, return_families=True,
-                return_source_ids=True)
+                return_source_ids=True, progress=progress)
         else:
-            tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end)
+            tracks = load_tracks_from_dbm(
+                tracks_dbm_path, z_begin, z_end, progress=progress)
         track_reload_source = tracks
         track_reload_families = track_families
         track_reload_source_ids = track_source_ids
         if filter_tracks_by_shell:
+            progress.begin(
+                'loading', 'Filtering tracks to outer shell',
+                detail=f'{len(tracks):,} tracks')
             tracks, track_families, kept_track_indices = filter_tracks_to_outer_shell(
                 tracks, shell_envelope, track_families, return_indices=True)
             if track_source_ids is not None:
@@ -1009,6 +1054,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # ==========================================================================
 
     def prepare_patch_sampling_cache(patches):
+        progress.begin(
+            'loading', 'Preparing patch sampling',
+            step=0, total_steps=len(patches), unit='patches')
         native_sampling_available = load_native_spiral_sampling() is not None
         patch_areas = np.empty(len(patches), dtype=np.float32)
         for patch_idx, patch in enumerate(patches):
@@ -1063,6 +1111,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 )
 
             patch_areas[patch_idx] = float(patch.area)
+            progress.update(patch_idx + 1)
 
         inv_weights = patch_areas ** 0.5
         return inv_weights / inv_weights.sum()
@@ -1080,6 +1129,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         out_path += f'_{run_tag}'
     os.makedirs(out_path, exist_ok=True)
 
+    progress.begin(
+        'loading', 'Building verified-patch GPU atlas',
+        detail=f'{len(verified_patches):,} patches')
     patch_atlas = PatchGpuAtlas(verified_patches, device='cuda')
     print(f'patch atlas (host-resident): {patch_atlas.memory_mb():.1f} MB')
 
@@ -1129,6 +1181,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         verified_patches_and_pcls_np = verified_patches_and_pcls_cpu.numpy()
         verified_patches_and_pcls_np = np.ascontiguousarray(verified_patches_and_pcls_np, dtype=np.float32)
         if verified_patches_and_pcls_np.shape[0] > 0:
+            progress.begin(
+                'loading', 'Building trusted-geometry index',
+                detail=f'{len(verified_patches_and_pcls_np):,} points')
             trusted_geometry_tree = cKDTree(verified_patches_and_pcls_np)
 
     def _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold):
@@ -1257,6 +1312,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         # of the DBM-track exclusion in tracks.py: untrusted patches only constrain regions
         # the trusted inputs don't already cover, so they can't fight verified geometry.
         exclusion_radius = float(cfg['patch_unverified_patch_exclusion_radius'])
+        progress.begin(
+            'loading', 'Masking unverified patches',
+            detail=f'{len(unverified_patches):,} patches')
         unverified_patches, n_masked_vertices, n_dropped_patches = (
             _mask_unverified_patches_near_trusted_geometry(
                 unverified_patches,
@@ -1365,6 +1423,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     resume_checkpoint = None
     model_z_begin, model_z_end = z_begin, z_end
     if resume_path:
+        progress.begin(
+            'loading', 'Loading fit checkpoint',
+            detail=os.path.basename(resume_path))
         resume_checkpoint = load_checkpoint_cpu(resume_path)
         checkpoint_lasagna_scale = resume_checkpoint.get('lasagna_scale') if isinstance(resume_checkpoint, dict) else None
         if checkpoint_lasagna_scale != lasagna_scale:
@@ -1446,6 +1507,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
     num_training_steps = cfg['optimizer_num_training_steps']
 
+    progress.begin('loading', 'Constructing spiral model')
     spiral_and_transform = SpiralAndTransform(
         flow_integration_steps=cfg['model_num_flow_integration_steps'],
         flow_integration_solver=cfg['model_flow_integration_solver'],
@@ -1540,6 +1602,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         {'params': gap_expander_params, 'weight_decay': cfg['optimizer_weight_decay_gap_expander']},
         {'params': flow_field_params, 'weight_decay': cfg['optimizer_weight_decay_flow_field']},
     ]
+    progress.begin('loading', 'Creating optimizer')
     optimiser = torch.optim.AdamW(param_groups, lr=cfg.optimizer_learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
     # Influence masks are scoped to one interactive Run request. They are
     # created from that run's pending inputs and discarded before its autosave.
@@ -1632,6 +1695,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         if embedded_iteration is not None:
             start_iteration = int(embedded_iteration)
         print(f'resuming from {resume_path} at iteration {start_iteration}')
+        progress.begin(
+            'loading', 'Restoring model and optimizer',
+            detail=os.path.basename(resume_path))
         load_model(resume_checkpoint)
         if not isinstance(resume_checkpoint, dict) or resume_checkpoint.get('scheduler') is None:
             for _ in range(start_iteration):
@@ -1658,6 +1724,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         del resume_checkpoint
         resume_checkpoint = None
 
+    progress.begin('loading', 'Synchronizing model across GPU workers')
     broadcast_model_params(spiral_and_transform)
 
     if os.environ.get('FIT_SPIRAL_TORCH_PROFILE') == '1':
@@ -1679,6 +1746,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     prepared_main_tracks = None
     preview_extent_tracks = tracks
     if using_tracks:
+        progress.begin(
+            'loading', 'Preparing tracks for optimization',
+            detail=f'{len(tracks):,} tracks')
         prepared_main_tracks = prepare_main_phase_tracks(
             tracks,
             None,
@@ -1738,6 +1808,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         raise ValueError(f"dt_target_mode must be 'strip_median' or 'whole_object_quantile', got {cfg['dt_target_mode']!r}")
     dt_target_whole_object = cfg['dt_target_mode'] == 'whole_object_quantile'
     if dt_target_whole_object:
+        progress.begin(
+            'loading', 'Preparing distance-target samples',
+            detail=(
+                f'{len(verified_patches_list) + len(unverified_patches_list):,} '
+                'patches'))
         prepare_patch_dt_target_samples(
             verified_patches_list, cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
         )
@@ -1820,6 +1895,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 get_or_build_unattached_pcl_flat,
                 tracks=preview_extent_tracks,
                 surface_id=surface_id,
+                progress=progress,
             )
             diagnostic_weights = {
                 name: cfg.get(f'loss_weight_{name}', 0.0)
@@ -1839,6 +1915,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     float(cfg['loss_weight_dense_spacing_count']), 1.0)
             transform = spiral_and_transform.get_slice_to_spiral_transform()
             dr = spiral_and_transform.get_dr_per_winding()
+            progress.begin(
+                'exporting_preview', 'Computing preview diagnostics')
             recorder = LossMapRecorder(
                 manifest,
                 generation_path,
@@ -2391,7 +2469,14 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         if interactive_driver is not None
         else range(start_iteration, num_training_steps)
     )
-    for iteration in tqdm(iteration_sequence, disable=not is_main_process()):
+    if interactive_driver is None:
+        progress.begin(
+            'optimizing', 'Optimizing',
+            step=0, total_steps=max(0, num_training_steps - start_iteration),
+            unit='iterations')
+    for iteration in tqdm(
+            iteration_sequence,
+            disable=not is_main_process() or has_progress):
         if interactive_driver is not None and not interactive_driver.wait_for_iteration(iteration):
             break
         step_timer.start('fwd')
@@ -2795,6 +2880,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 learning_rate=float(optimiser.param_groups[0]['lr']),
                 metrics={name: float(value) for name, value in log_metrics.items()},
             )
+        else:
+            progress.update(iteration - start_iteration + 1)
 
         if iteration % 200 == 0:
             # Only sync to CPU and log when we actually print, avoiding a per-iter
@@ -2828,8 +2915,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
     suffix = 'fitted'
     if is_main_process():
+        progress.begin(
+            'saving_checkpoint', 'Saving final checkpoint',
+            detail=f'checkpoint_{suffix}.ckpt')
         save_model(suffix, num_training_steps)
         if cfg.get('output_save_png_visualizations', False):
+            progress.begin(
+                'finalizing', 'Preparing final visualizations')
             (
                 zs_for_visualisation,
                 slice_yx,
@@ -2843,6 +2935,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             scroll_slices_for_visualisation = None
             prediction_slices_for_visualisation = None
             quad_label_map = None
+        progress.begin(
+            'finalizing', 'Computing satisfaction metrics and outputs')
         save_overlay_and_print_satisfaction(
             suffix,
             spiral_and_transform=spiral_and_transform,
@@ -2872,10 +2966,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             get_or_build_unattached_pcl_flat=get_or_build_unattached_pcl_flat,
             run_tag=run_tag,
             save_png_visualizations=cfg.get('output_save_png_visualizations', False),
+            progress=progress,
         )
+        progress.finish()
+        progress.clear()
 
 
 if __name__ == '__main__':
+    cli_progress = (
+        ProgressReporter(stream=sys.stderr)
+        if int(os.environ.get('RANK', '0')) == 0 else None
+    )
     maybe_init_distributed()
     try:
         config = Config().as_dict()
@@ -2920,6 +3021,8 @@ if __name__ == '__main__':
         wandb.init(project='scrolls', config=config, mode=wandb_mode)
         cfg = wandb.config
         configure_losses(cfg, z_begin, z_end)
-        main()
+        main(progress=cli_progress)
     finally:
+        if cli_progress is not None:
+            cli_progress.close()
         maybe_destroy_distributed()

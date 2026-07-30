@@ -42,6 +42,7 @@ class ResidentBrickPool:
         label: str,
         expected_channels: int | None = None,
         expected_shape_zyx: tuple[int, int, int] | None = None,
+        progress_callback=None,
     ) -> None:
         started = time.perf_counter()
         self.sidecar_dir = str(sidecar_dir)
@@ -89,11 +90,20 @@ class ResidentBrickPool:
                 f"({self.pool_bytes / 1024**3:.2f} GiB, {len(kept_ids)} bricks)"
             ) from exc
         slab = max(1, (256 << 20) // brick_voxels)
+        progress_total = self.channels * len(kept_ids)
+        progress_done = 0
         for channel, mm in enumerate(memmaps):
             for lo in range(0, len(kept_ids), slab):
                 ids = kept_ids[lo:lo + slab]
                 self.pool[channel, lo:lo + len(ids)] = torch.from_numpy(
                     np.ascontiguousarray(mm[ids])).to(self.device)
+                progress_done += len(ids)
+                if progress_callback is not None:
+                    progress_callback(
+                        progress_done,
+                        progress_total,
+                        f"channel {channel + 1}/{self.channels}",
+                    )
         self.table = torch.from_numpy(
             np.ascontiguousarray(remap[table_np])).to(self.device)
 

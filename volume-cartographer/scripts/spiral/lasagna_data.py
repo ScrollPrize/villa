@@ -41,6 +41,7 @@ def prepare_lasagna_volume(
     yx_bounds_working=None,
     interior_fn=None,
     paged_chunk=64,
+    progress=None,
 ):
     """Open normals/grad-magnitude as fully-resident sparse brick pools.
 
@@ -108,6 +109,10 @@ def prepare_lasagna_volume(
     device = torch.device('cuda')
     normal_cache = None
     if use_normals:
+        if progress is not None:
+            progress.begin(
+                'loading', 'Loading normal volumes onto GPU',
+                step=0, total_steps=0, unit='bricks')
         normal_cache = ResidentBrickPool(
             normal_sidecar,
             origin_zyx=(z_lo, 0, 0),
@@ -115,9 +120,18 @@ def prepare_lasagna_volume(
             device=device,
             label='lasagna normals',
             expected_channels=2,
+            progress_callback=(
+                (lambda current, total, detail: progress.update(
+                    current, total_steps=total, detail=detail))
+                if progress is not None else None
+            ),
         )
     grad_cache = None
     if use_spacing:
+        if progress is not None:
+            progress.begin(
+                'loading', 'Loading gradient volume onto GPU',
+                step=0, total_steps=0, unit='bricks')
         grad_cache = ResidentBrickPool(
             grad_sidecar,
             origin_zyx=(z_lo, 0, 0),
@@ -126,6 +140,11 @@ def prepare_lasagna_volume(
             label='lasagna grad_mag',
             expected_channels=1,
             expected_shape_zyx=reference_shape,
+            progress_callback=(
+                (lambda current, total, detail: progress.update(
+                    current, total_steps=total, detail=detail))
+                if progress is not None else None
+            ),
         )
     return {
         'backend': 'sparse_cuda',
@@ -182,6 +201,7 @@ def prepare_surf_sdt_volume(
     yx_bounds_working=None,
     interior_fn=None,
     paged_chunk=64,
+    progress=None,
 ):
     """Resolve and validate a surf-SDT store as a sparse CUDA input.
 
@@ -271,6 +291,10 @@ def prepare_surf_sdt_volume(
     shape = (z_hi - z_lo, int(array.shape[1]), int(array.shape[2]))
     from sparse_cuda_cache import ResidentBrickPool, SparseScalarStore
     sidecar = _require_sidecar(sdt_zarr_path, group_name, label='surf_sdt')
+    if progress is not None:
+        progress.begin(
+            'loading', 'Loading surface-distance volume onto GPU',
+            step=0, total_steps=0, unit='bricks')
     cache = ResidentBrickPool(
         sidecar,
         origin_zyx=(z_lo, 0, 0),
@@ -279,6 +303,11 @@ def prepare_surf_sdt_volume(
         label='surf_sdt',
         expected_channels=1,
         expected_shape_zyx=tuple(int(v) for v in array.shape),
+        progress_callback=(
+            (lambda current, total, detail: progress.update(
+                current, total_steps=total, detail=detail))
+            if progress is not None else None
+        ),
     )
     fingerprint['respool_ct_mask'] = cache.meta.get('ct_mask')
     common = {

@@ -11,6 +11,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -20,6 +21,10 @@ import uuid
 from fit_session import (SpiralInputPaths, SpiralPreviewConfig, SpiralRunConfig,
                          run_mutable_config)
 from config import Config
+from spiral_progress import NullProgressReporter, ProgressReporter
+
+
+_NO_PROGRESS = NullProgressReporter()
 
 
 class _SessionShutdown(BaseException):
@@ -62,6 +67,11 @@ class InteractiveFitSession:
         self._finish_run = None
         self._configure_run = None
         self._idle_actions = []
+        self.progress = ProgressReporter(
+            self._progress_changed,
+            stream=sys.stdout,
+        )
+        self._run_start_completed = 0
         self._thread = threading.Thread(target=self._fit_main, name="spiral-fit-worker", daemon=True)
         self._thread.start()
 
@@ -83,6 +93,7 @@ class InteractiveFitSession:
                 "preview_generation": self._preview_generation,
                 "supports_input_incorporation": self._incorporate_inputs is not None,
                 "input_manifest": copy.deepcopy(self.input_manifest),
+                "progress": self._progress_reporter().snapshot(),
             }
             if self._run_config is not None:
                 result["run_config"] = copy.deepcopy(self._run_config)
@@ -100,6 +111,15 @@ class InteractiveFitSession:
         if self._status_callback is not None:
             self._status_callback(self.status())
 
+    def _progress_reporter(self):
+        return getattr(self, "progress", _NO_PROGRESS)
+
+    def _progress_changed(self, snapshot):
+        if snapshot is not None:
+            with self._condition:
+                self._phase = str(snapshot.get("stage_name") or self._phase)
+        self._publish_status()
+
     def _set_state(self, state, phase=""):
         with self._condition:
             self._state = state
@@ -112,6 +132,7 @@ class InteractiveFitSession:
         wandb = None
         distributed_initialized = False
         try:
+            self._progress_reporter().begin("loading", "Importing Torch and fitter")
             self._set_state("Loading", "Importing Torch and fitter")
             import wandb
             import fit_spiral as fitter
@@ -127,6 +148,9 @@ class InteractiveFitSession:
             config = Config().as_dict()
             checkpoint_profile_config = None
             if self.paths.checkpoint:
+                self._progress_reporter().begin(
+                    "loading", "Reading checkpoint configuration",
+                    detail=Path(self.paths.checkpoint).name)
                 from checkpoint_io import load_checkpoint_cpu
                 checkpoint_config = load_checkpoint_cpu(self.paths.checkpoint)
                 try:
@@ -232,8 +256,9 @@ class InteractiveFitSession:
             wandb.init(project='scrolls', config=config, mode='disabled')
             fitter.cfg = wandb.config
             fitter.configure_losses(fitter.cfg, fitter.z_begin, fitter.z_end)
+            self._progress_reporter().begin("loading", "Loading fit inputs and model")
             self._set_state("Loading", "Loading fit inputs and model")
-            fitter.main(interactive_driver=self)
+            fitter.main(interactive_driver=self, progress=self.progress)
         except BaseException as exc:
             with self._condition:
                 if self._shutdown and isinstance(exc, _SessionShutdown):
@@ -251,6 +276,7 @@ class InteractiveFitSession:
                 wandb.finish(quiet=True)
             if distributed_initialized:
                 maybe_destroy_distributed()
+            self._progress_reporter().close()
 
     # Fitter-thread callbacks.
     def on_ready(self, *, completed_iterations, output_path,
@@ -266,7 +292,10 @@ class InteractiveFitSession:
             self._configure_run = configure_run
         if self.paths.checkpoint and getattr(self, "publishes_outputs", True):
             self._set_state("ExportingPreview", "Exporting restored checkpoint preview")
+            self._progress_reporter().begin(
+                "exporting_preview", "Exporting restored checkpoint preview")
             self._publish_preview()
+        self._progress_reporter().clear()
         self._set_state("Ready", "Ready")
 
     def wait_for_iteration(self, iteration):
@@ -292,12 +321,25 @@ class InteractiveFitSession:
             kind, path, done, result = action
             try:
                 if kind == "save":
+                    with self._condition:
+                        previous_state = self._state
+                        self._state, self._phase = "Saving", "Saving checkpoint"
+                    self._progress_reporter().begin(
+                        "saving_checkpoint", "Saving checkpoint",
+                        detail=Path(path).name)
                     result["path"] = self._save_checkpoint(path, self._completed)
+                    self._progress_reporter().finish()
                 else:
                     result["error"] = f"Unknown idle action {kind}"
             except Exception as exc:
                 result["error"] = f"{type(exc).__name__}: {exc}"
             finally:
+                if kind == "save":
+                    self._progress_reporter().clear()
+                    with self._condition:
+                        self._state = previous_state
+                        self._phase = previous_state
+                    self._publish_status()
                 done.set()
 
     def _run_incorporation(self, records, mark_incorporated, influence_config):
@@ -312,10 +354,14 @@ class InteractiveFitSession:
                     "The resident fitter does not support adding inputs to a running session")
             with self._condition:
                 self._phase = "Incorporating new session inputs"
+            self._progress_reporter().begin(
+                "incorporating_inputs", "Incorporating new session inputs",
+                step=0, total_steps=len(records), unit="inputs")
             self._publish_status()
             self._incorporate_inputs(records, influence_config)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
+            self._progress_reporter().clear()
             with self._condition:
                 self._pending = 0
                 self._target = self._completed
@@ -331,6 +377,10 @@ class InteractiveFitSession:
             with self._condition:
                 if self._state == "Running":
                     self._phase = "Optimizing"
+            if getattr(self, "_state", None) == "Running":
+                self._begin_optimization_progress()
+            else:
+                self._progress_reporter().clear()
             self._publish_status()
 
     def _run_configuration(
@@ -341,12 +391,18 @@ class InteractiveFitSession:
                 raise RuntimeError(
                     "The resident fitter does not support Run configuration changes")
             path_changes = dict(path_changes or {})
+            self._progress_reporter().begin(
+                "configuring", "Applying run configuration",
+                detail=(
+                    f"{len(config)} settings, {len(path_changes)} path changes"
+                ))
             if path_changes:
                 self._configure_run(dict(config), dict(path_changes))
             else:
                 self._configure_run(dict(config))
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
+            self._progress_reporter().clear()
             with self._condition:
                 self._pending = 0
                 self._target = self._completed
@@ -368,6 +424,20 @@ class InteractiveFitSession:
                     self._run_config.update(config)
                     self.requested_config.update(config)
                     self.input_manifest.update(path_changes)
+            if getattr(self, "_state", None) == "Running":
+                self._begin_optimization_progress()
+            else:
+                self._progress_reporter().clear()
+
+    def _begin_optimization_progress(self):
+        with self._condition:
+            run_start = getattr(
+                self, "_run_start_completed", self._completed)
+            step = max(0, self._completed - run_start)
+            total = max(0, self._target - run_start)
+        self._progress_reporter().begin(
+            "optimizing", "Optimizing",
+            step=step, total_steps=total, unit="iterations")
 
     def iteration_completed(self, *, completed_iterations, total_loss, losses, learning_rate, metrics=None):
         with self._condition:
@@ -379,18 +449,30 @@ class InteractiveFitSession:
                 self._pending = 0
                 self._stop_requested = False
             pause = self._pending == 0
+            run_start = getattr(
+                self, "_run_start_completed",
+                self._completed - max(0, self._target - self._completed))
+            run_step = max(0, self._completed - run_start)
+        self._progress_reporter().update(run_step)
         self._publish_status()
         if pause:
             if self._finish_run is not None:
                 self._finish_run()
             if not getattr(self, "publishes_outputs", True):
+                self._progress_reporter().clear()
                 self._set_state("Paused", "Paused")
                 return
             self._set_state("Saving", "Autosaving checkpoint")
+            self._progress_reporter().begin(
+                "saving_checkpoint", "Autosaving checkpoint",
+                detail="checkpoint_autosave.ckpt")
             autosave = str(Path(self._output_path) / "checkpoint_autosave.ckpt")
             self._save_checkpoint(autosave, self._completed)
             self._set_state("ExportingPreview", "Exporting preview")
+            self._progress_reporter().begin(
+                "exporting_preview", "Exporting preview")
             self._publish_preview()
+            self._progress_reporter().clear()
             self._set_state("Paused", "Paused")
 
     def _publish_preview(self):
@@ -448,8 +530,10 @@ class InteractiveFitSession:
                     ("incorporate", list(pending_inputs), mark_incorporated,
                      dict(influence_config or {})))
             self._pending = count
+            self._run_start_completed = self._completed
             self._target = self._completed + count
             self._state, self._phase = "Running", "Optimizing"
+            self._begin_optimization_progress()
             self._condition.notify_all()
             return self._target
 
@@ -570,6 +654,16 @@ class DistributedInteractiveFitSession:
             "error": None, "preview_manifest_path": None,
             "preview_generation": 0,
             "supports_input_incorporation": False,
+            "progress": {
+                "operation": "loading",
+                "stage_name": "Starting GPU workers",
+                "detail": None,
+                "step": 0,
+                "total_steps": len(self._gpu_ids),
+                "unit": "workers",
+                "elapsed_seconds": 0.0,
+                "eta_seconds": None,
+            },
         }
         self._acks = {}
         self._incorporation_callbacks = {}
@@ -656,11 +750,31 @@ class DistributedInteractiveFitSession:
                                     for item in self._rank_statuses.values())
                         )
                         if rank_zero.get("state") in ready_states and not all_ranks_ready:
+                            unfinished = next(
+                                ((worker_rank, item)
+                                 for worker_rank, item
+                                 in sorted(self._rank_statuses.items())
+                                 if item.get("state") not in ready_states),
+                                None)
                             self._status = copy.deepcopy(rank_zero)
                             self._status.update({
                                 "state": "Loading",
                                 "phase": "Waiting for all GPU workers",
                             })
+                            if unfinished is not None:
+                                worker_rank, worker_status = unfinished
+                                worker_progress = copy.deepcopy(
+                                    worker_status.get("progress"))
+                                if worker_progress:
+                                    detail = worker_progress.get("detail")
+                                    worker_progress["detail"] = (
+                                        f"GPU worker {worker_rank + 1}/"
+                                        f"{len(self._gpu_ids)}"
+                                        + (f" — {detail}" if detail else ""))
+                                    self._status["progress"] = worker_progress
+                                    self._status["phase"] = str(
+                                        worker_progress.get("stage_name")
+                                        or self._status["phase"])
                         elif all_ranks_ready:
                             # Rank zero owns user-facing metrics and artifacts.
                             # A later secondary Ready event completes startup.
