@@ -401,6 +401,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         QStringLiteral("lineAnnotationExtrapolationDistanceSpinBox"));
     _extrapolationDistanceSpin->setRange(0, 1000000);
     _extrapolationDistanceSpin->setSingleStep(100);
+    _extrapolationDistanceSpin->setKeyboardTracking(false);
     _extrapolationDistanceSpin->setPrefix(tr("Extrapolation "));
     _extrapolationDistanceSpin->setSuffix(tr(" vx"));
     _extrapolationDistanceSpin->setToolTip(
@@ -418,11 +419,12 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     connect(_extrapolationDistanceSpin,
             qOverload<int>(&QSpinBox::valueChanged),
             this,
-            [](int value) {
+            [this](int value) {
                 QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
                 settings.setValue(
                     vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
                     value);
+                emit extrapolationDistanceChanged(value);
             });
     auto* maxDistanceLabel = new QLabel(tr("Max CP dist"), buttonRow);
     maxDistanceLabel->installEventFilter(this);

@@ -15,11 +15,18 @@ optimization.
 In native mode, VC3D traces changed CP-to-CP spans against the selected fiber
 inference manifest. A rejected or invalid native result falls back only that
 span to the selected Lasagna normal dataset. Successful native spans are fixed
-during the fallback solve and provide their dense endpoint direction to
-neighboring Lasagna continuation candidates.
+during the fallback solve. At each native-adjacent control point, VC3D derives
+the tangent from the control point to the first distinct dense native point.
+Lasagna geometry on the opposite side is hard-constrained to leave the control
+point along the negative of that tangent. VC3D creates and fixes one adjacent
+proxy point on that direction, then runs the ordinary Lasagna Ceres solve and
+its existing smoothness terms for the remaining points. That fiber direction
+is the only rollout direction generated from the constrained CP side. This
+applies at both ends of a fallback span when it lies between native spans.
 
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way
 fiber tracer after converting the requested distance to trace voxels; a failed
 native tail keeps its Lasagna fallback. Stored line and control points always
-remain in base coordinates.
+remain in base coordinates. A retained Lasagna tail adjacent to a successful
+native span uses the same hard continuation direction.

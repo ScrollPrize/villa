@@ -42,6 +42,13 @@ constexpr double kReinitSeedMaxNormalAlignmentAbs = 0.17364817766693033; // sin(
     return v / len;
 }
 
+[[nodiscard]] bool finitePoint(const cv::Vec3d& point)
+{
+    return std::isfinite(point[0]) &&
+           std::isfinite(point[1]) &&
+           std::isfinite(point[2]);
+}
+
 [[nodiscard]] cv::Vec3d deterministicTangentFromNormal(const NormalSample& sample)
 {
     if (!sample.valid) {
@@ -1855,6 +1862,13 @@ struct OptimizedControlSpan {
     std::vector<LineDebugPolyline> continuationCandidateLines;
 };
 
+void growHardDirectionConstructedExtension(
+    const cv::Vec3d& startPoint,
+    const cv::Vec3d& hardDirection,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config,
+    std::vector<std::array<double, 3>>& out);
+
 [[nodiscard]] cv::Vec3d projectedChordTangentAtStart(
     const cv::Vec3d& start,
     const cv::Vec3d& target,
@@ -1912,16 +1926,21 @@ struct OptimizedControlSpan {
     int sign,
     const NormalSampler& sampler,
     const LineOptimizationConfig& config,
-    int rolloutSteps)
+    int rolloutSteps,
+    bool preserveStartDirection = false)
 {
     LineOptimizationConfig rolloutConfig = config;
     rolloutConfig.segmentsPerSide = rolloutSteps;
     std::vector<std::array<double, 3>> grown;
-    growNormalConstructedExtension(start,
-                                   unsignedStartTangent * static_cast<double>(sign),
-                                   sampler,
-                                   rolloutConfig,
-                                   grown);
+    const cv::Vec3d startDirection =
+        unsignedStartTangent * static_cast<double>(sign);
+    if (preserveStartDirection) {
+        growHardDirectionConstructedExtension(
+            start, startDirection, sampler, rolloutConfig, grown);
+    } else {
+        growNormalConstructedExtension(
+            start, startDirection, sampler, rolloutConfig, grown);
+    }
 
     std::vector<cv::Vec3d> rollout;
     rollout.reserve(grown.size() + 1);
@@ -2013,19 +2032,23 @@ struct OptimizedControlSpan {
     const cv::Vec3d& startDirection,
     const NormalSampler& sampler,
     const LineOptimizationConfig& config,
-    std::optional<double> knownPathBudget = std::nullopt)
+    std::optional<double> knownPathBudget = std::nullopt,
+    bool preserveStartDirection = false)
 {
     const double minimumBudget = knownPathBudget.value_or(1000.0);
     const double budget = std::max(2.0 * length(target - start), minimumBudget);
     const int steps = std::max(1, static_cast<int>(std::ceil(budget / config.segmentLength)));
-    const cv::Vec3d tangent = projectedDirectionAtStart(start, startDirection, sampler);
+    const cv::Vec3d tangent = preserveStartDirection
+        ? normalizedOrZero(startDirection)
+        : projectedDirectionAtStart(start, startDirection, sampler);
     return signedSpanRolloutCandidate(start,
                                       target,
                                       tangent,
                                       1,
                                       sampler,
                                       config,
-                                      steps);
+                                      steps,
+                                      preserveStartDirection);
 }
 
 [[nodiscard]] SpanRolloutResult existingSpanCandidate(
@@ -2143,6 +2166,33 @@ void growNormalConstructedExtension(
         out.push_back(toArray(point));
     }
     waitForNormalPrefetches(pendingPrefetches);
+}
+
+void growHardDirectionConstructedExtension(
+    const cv::Vec3d& startPoint,
+    const cv::Vec3d& hardDirection,
+    const NormalSampler& sampler,
+    const LineOptimizationConfig& config,
+    std::vector<std::array<double, 3>>& out)
+{
+    const cv::Vec3d direction = normalizedOrZero(hardDirection);
+    if (!finitePoint(startPoint) || length(direction) <= kEpsilon) {
+        throw std::invalid_argument(
+            "hard extension direction must be finite and non-degenerate");
+    }
+    out.clear();
+    out.reserve(static_cast<size_t>(config.segmentsPerSide));
+    const cv::Vec3d firstPoint = startPoint + direction * config.segmentLength;
+    out.push_back(toArray(firstPoint));
+    if (config.segmentsPerSide <= 1) {
+        return;
+    }
+    LineOptimizationConfig remaining = config;
+    remaining.segmentsPerSide = config.segmentsPerSide - 1;
+    std::vector<std::array<double, 3>> rest;
+    growNormalConstructedExtension(
+        firstPoint, direction, sampler, remaining, rest);
+    out.insert(out.end(), rest.begin(), rest.end());
 }
 
 [[nodiscard]] cv::Vec3d interpolateInitialLinePoint(
@@ -2555,6 +2605,7 @@ struct GlobalSolveResult {
     double milliseconds = 0.0;
     double ceresSolveMs = 0.0;
     PrefetchTiming prefetchTiming;
+    std::string solverMessage;
     std::string report;
 };
 
@@ -2760,6 +2811,7 @@ private:
     result.milliseconds = elapsedMs(chainStart, Clock::now());
     result.ceresSolveMs = std::max(0.0, ceresWallMs - normalCallbackMs);
     result.prefetchTiming = prefetchTiming;
+    result.solverMessage = summary.message;
     result.report = summary.FullReport();
     return result;
 }
@@ -2841,6 +2893,43 @@ struct LineDifference {
     return candidate ? candidate->finalRms : 0.0;
 }
 
+void applyHardSpanDirections(
+    SpanRolloutResult& rollout,
+    const cv::Vec3d& leftPoint,
+    const cv::Vec3d& rightPoint,
+    const std::optional<cv::Vec3d>& hardLeftDirection,
+    const std::optional<cv::Vec3d>& hardRightDirection,
+    double segmentLength)
+{
+    const size_t minimumPoints = 2 +
+        (hardLeftDirection.has_value() ? 1 : 0) +
+        (hardRightDirection.has_value() ? 1 : 0);
+    if (rollout.points.size() < minimumPoints) {
+        rollout.points.clear();
+        rollout.points.reserve(minimumPoints);
+        for (size_t index = 0; index < minimumPoints; ++index) {
+            const double t = static_cast<double>(index) /
+                static_cast<double>(minimumPoints - 1);
+            rollout.points.push_back(lerp(leftPoint, rightPoint, t));
+        }
+    }
+    rollout.points.front() = leftPoint;
+    rollout.points.back() = rightPoint;
+    const double chordLength = length(rightPoint - leftPoint);
+    const double fallbackRadius = std::max(
+        1.0e-6,
+        std::min(segmentLength,
+                 chordLength / static_cast<double>(minimumPoints - 1)));
+    if (hardLeftDirection.has_value()) {
+        rollout.points[1] = leftPoint + *hardLeftDirection * fallbackRadius;
+    }
+    if (hardRightDirection.has_value()) {
+        const size_t adjacentIndex = rollout.points.size() - 2;
+        rollout.points[adjacentIndex] =
+            rightPoint + *hardRightDirection * fallbackRadius;
+    }
+}
+
 [[nodiscard]] OptimizedControlSpan optimizedControlSpan(
     const cv::Vec3d& leftPoint,
     const cv::Vec3d& rightPoint,
@@ -2853,7 +2942,9 @@ struct LineDifference {
     std::optional<SpanRolloutResult> existingRollout = std::nullopt,
     std::optional<cv::Vec3d> leftContinuationDirection = std::nullopt,
     std::optional<cv::Vec3d> rightContinuationDirection = std::nullopt,
-    std::optional<double> knownPathBudget = std::nullopt)
+    std::optional<double> knownPathBudget = std::nullopt,
+    std::optional<cv::Vec3d> hardLeftDirection = std::nullopt,
+    std::optional<cv::Vec3d> hardRightDirection = std::nullopt)
 {
     if (length(rightPoint - leftPoint) <= kEpsilon) {
         throw std::invalid_argument("Adjacent reinitialization control points are coincident");
@@ -2861,36 +2952,70 @@ struct LineDifference {
 
     SpanRolloutResult leftRollout;
     SpanRolloutResult rightRollout;
+    const auto buildLeftRollout = [&]() {
+        return hardLeftDirection.has_value()
+            ? directedSpanRolloutCandidate(leftPoint,
+                                           rightPoint,
+                                           *hardLeftDirection,
+                                           sampler,
+                                           config,
+                                           knownPathBudget,
+                                           true)
+            : spanRolloutCandidate(leftPoint,
+                                   rightPoint,
+                                   sampler,
+                                   config,
+                                   knownPathBudget);
+    };
+    const auto buildRightRollout = [&]() {
+        return hardRightDirection.has_value()
+            ? directedSpanRolloutCandidate(rightPoint,
+                                           leftPoint,
+                                           *hardRightDirection,
+                                           sampler,
+                                           config,
+                                           knownPathBudget,
+                                           true)
+            : spanRolloutCandidate(rightPoint,
+                                   leftPoint,
+                                   sampler,
+                                   config,
+                                   knownPathBudget);
+    };
     if (sampler.supportsConcurrentSampling()) {
         auto rightRolloutFuture = std::async(std::launch::async, [&]() {
-            return spanRolloutCandidate(rightPoint,
-                                        leftPoint,
-                                        sampler,
-                                        config,
-                                        knownPathBudget);
+            return buildRightRollout();
         });
-        leftRollout = spanRolloutCandidate(leftPoint,
-                                           rightPoint,
-                                           sampler,
-                                           config,
-                                           knownPathBudget);
+        leftRollout = buildLeftRollout();
         rightRollout = rightRolloutFuture.get();
     } else {
-        leftRollout = spanRolloutCandidate(leftPoint,
-                                           rightPoint,
-                                           sampler,
-                                           config,
-                                           knownPathBudget);
-        rightRollout = spanRolloutCandidate(rightPoint,
-                                            leftPoint,
-                                            sampler,
-                                            config,
-                                            knownPathBudget);
+        leftRollout = buildLeftRollout();
+        rightRollout = buildRightRollout();
     }
     std::reverse(rightRollout.points.begin(), rightRollout.points.end());
     if (!rightRollout.points.empty()) {
         rightRollout.points.front() = leftPoint;
         rightRollout.points.back() = rightPoint;
+    }
+    applyHardSpanDirections(leftRollout,
+                            leftPoint,
+                            rightPoint,
+                            hardLeftDirection,
+                            hardRightDirection,
+                            config.segmentLength);
+    applyHardSpanDirections(rightRollout,
+                            leftPoint,
+                            rightPoint,
+                            hardLeftDirection,
+                            hardRightDirection,
+                            config.segmentLength);
+    if (existingRollout.has_value()) {
+        applyHardSpanDirections(*existingRollout,
+                                leftPoint,
+                                rightPoint,
+                                hardLeftDirection,
+                                hardRightDirection,
+                                config.segmentLength);
     }
 
     LineOptimizationConfig spanConfig = config;
@@ -2898,16 +3023,27 @@ struct LineDifference {
     const cv::Vec3d seedTangent = projectedChordTangentAtStart(leftPoint, rightPoint, sampler);
     const auto spanStart = Clock::now();
     const auto solveRollout = [&](std::string name, const SpanRolloutResult& rollout) {
+        std::vector<int> fixedPointIndices{
+            0, static_cast<int>(rollout.points.size()) - 1};
+        if (hardLeftDirection.has_value()) {
+            fixedPointIndices.push_back(1);
+        }
+        if (hardRightDirection.has_value()) {
+            fixedPointIndices.push_back(
+                static_cast<int>(rollout.points.size()) - 2);
+        }
         return solveGlobalCandidate(std::move(name),
                                     toArrayPoints(rollout.points),
                                     evenStepSpanConstraints(rollout.points.size() - 1,
                                                             segmentIndex),
-                                    {0, static_cast<int>(rollout.points.size()) - 1},
+                                    std::move(fixedPointIndices),
                                     sampler,
                                     spanConfig,
                                     seedTangent,
                                     false,
-                                    spanStart);
+                                    spanStart,
+                                    0,
+                                    -1);
     };
 
     GlobalSolveResult leftSolved;
@@ -2936,7 +3072,8 @@ struct LineDifference {
 
     std::optional<SpanRolloutResult> continueLeftRollout;
     std::optional<GlobalSolveResult> continueLeftSolved;
-    if (leftContinuationDirection.has_value() &&
+    if (!hardLeftDirection.has_value() &&
+        leftContinuationDirection.has_value() &&
         length(normalizedOrZero(*leftContinuationDirection)) > kEpsilon) {
         continueLeftRollout = directedSpanRolloutCandidate(leftPoint,
                                                            rightPoint,
@@ -2944,6 +3081,12 @@ struct LineDifference {
                                                            sampler,
                                                            config,
                                                            knownPathBudget);
+        applyHardSpanDirections(*continueLeftRollout,
+                                leftPoint,
+                                rightPoint,
+                                hardLeftDirection,
+                                hardRightDirection,
+                                config.segmentLength);
         continueLeftSolved =
             solveRollout(candidatePrefix + "-continue-left-" + std::to_string(segmentIndex),
                          *continueLeftRollout);
@@ -2951,7 +3094,8 @@ struct LineDifference {
 
     std::optional<SpanRolloutResult> continueRightRollout;
     std::optional<GlobalSolveResult> continueRightSolved;
-    if (rightContinuationDirection.has_value() &&
+    if (!hardRightDirection.has_value() &&
+        rightContinuationDirection.has_value() &&
         length(normalizedOrZero(*rightContinuationDirection)) > kEpsilon) {
         continueRightRollout = directedSpanRolloutCandidate(rightPoint,
                                                             leftPoint,
@@ -2964,6 +3108,12 @@ struct LineDifference {
             continueRightRollout->points.front() = leftPoint;
             continueRightRollout->points.back() = rightPoint;
         }
+        applyHardSpanDirections(*continueRightRollout,
+                                leftPoint,
+                                rightPoint,
+                                hardLeftDirection,
+                                hardRightDirection,
+                                config.segmentLength);
         continueRightSolved =
             solveRollout(candidatePrefix + "-continue-right-" + std::to_string(segmentIndex),
                          *continueRightRollout);
@@ -3125,47 +3275,32 @@ struct LineDifference {
     const bool spanFailed = chosen == nullptr;
     std::string failureReason;
     if (spanFailed) {
-        const auto appendCandidateDots =
+        const auto appendCandidateFailure =
             [&](std::ostringstream& error,
                 const char* name,
-                double leftDot,
-                double rightDot) {
-            error << ' ' << name << '=';
-            if (leftReferenceDirection.has_value() && rightReferenceDirection.has_value()) {
-                error << "(left_ref=" << leftDot << ",right_ref=" << rightDot << ')';
-            } else if (leftReferenceDirection.has_value()) {
-                error << leftDot;
-            } else if (rightReferenceDirection.has_value()) {
-                error << rightDot;
-            } else {
-                error << "no_reference";
-            }
+                const GlobalSolveResult& candidate) {
+            error << ' ' << name << "=\""
+                  << (candidate.solverMessage.empty()
+                          ? "Ceres returned an unusable solution"
+                          : candidate.solverMessage)
+                  << '"';
         };
         std::ostringstream error;
         error.imbue(std::locale::classic());
-        error << std::scientific << std::setprecision(3)
-              << "No reinitialization rollout candidate for span " << segmentIndex
-              << " is usable"
-              << " dots:";
-        appendCandidateDots(error, "left", leftCandidateLeftDot, leftCandidateRightDot);
-        appendCandidateDots(error, "right", rightCandidateLeftDot, rightCandidateRightDot);
+        error << "No reinitialization rollout candidate for span " << segmentIndex
+              << " produced a usable Ceres solution. Solver messages:";
+        appendCandidateFailure(error, "left", leftSolved);
+        appendCandidateFailure(error, "right", rightSolved);
         if (existingSolved.has_value()) {
-            appendCandidateDots(error,
-                                "existing",
-                                existingCandidateLeftDot,
-                                existingCandidateRightDot);
+            appendCandidateFailure(error, "existing", *existingSolved);
         }
         if (continueLeftSolved.has_value()) {
-            appendCandidateDots(error,
-                                "continue-left",
-                                continueLeftCandidateLeftDot,
-                                continueLeftCandidateRightDot);
+            appendCandidateFailure(
+                error, "continue-left", *continueLeftSolved);
         }
         if (continueRightSolved.has_value()) {
-            appendCandidateDots(error,
-                                "continue-right",
-                                continueRightCandidateLeftDot,
-                                continueRightCandidateRightDot);
+            appendCandidateFailure(
+                error, "continue-right", *continueRightSolved);
         }
         failureReason = error.str();
     }
@@ -3192,6 +3327,14 @@ struct LineDifference {
     result.report.leftControlIndex = leftControlIndex;
     result.report.rightControlIndex = rightControlIndex;
     result.report.points = spanFailed ? 0 : static_cast<int>(chosen->points.size());
+    result.report.hardLeftDirection = hardLeftDirection.has_value();
+    result.report.hardRightDirection = hardRightDirection.has_value();
+    if (hardLeftDirection.has_value()) {
+        result.report.hardLeftDirectionVector = *hardLeftDirection;
+    }
+    if (hardRightDirection.has_value()) {
+        result.report.hardRightDirectionVector = *hardRightDirection;
+    }
     result.report.candLeftRolloutSteps = leftRollout.rolloutSteps;
     result.report.candLeftTruncatedPoints = leftRollout.truncatedPoints;
     result.report.candRightRolloutSteps = rightRollout.rolloutSteps;
@@ -4252,7 +4395,8 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
     std::vector<int> fixedControlAnchorIndices,
     int displayFrameAnchorIndex,
     const LineOptimizationConfig& rawConfig,
-    std::vector<std::pair<int, int>> protectedControlSpans) const
+    std::vector<std::pair<int, int>> protectedControlSpans,
+    std::vector<LineControlPointHardDirectionConstraint> hardDirectionConstraints) const
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
     if (linePoints.size() < 2) {
@@ -4336,6 +4480,52 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
                 return protectedSpan.first == leftOriginal &&
                        protectedSpan.second == rightOriginal;
             });
+    }
+
+    std::vector<int> sortedIndexByOriginal(controlPoints.size(), -1);
+    for (size_t sortedIndex = 0; sortedIndex < originalControlIndices.size(); ++sortedIndex) {
+        sortedIndexByOriginal[static_cast<size_t>(
+            originalControlIndices[sortedIndex])] = static_cast<int>(sortedIndex);
+    }
+    std::vector<std::optional<cv::Vec3d>> hardBefore(controlPoints.size());
+    std::vector<std::optional<cv::Vec3d>> hardAfter(controlPoints.size());
+    for (const auto& constraint : hardDirectionConstraints) {
+        if (constraint.controlPointIndex < 0 ||
+            constraint.controlPointIndex >= static_cast<int>(controlPoints.size())) {
+            throw std::invalid_argument(
+                "hard control direction references an invalid original control index");
+        }
+        const int sortedIndex = sortedIndexByOriginal[static_cast<size_t>(
+            constraint.controlPointIndex)];
+        if (sortedIndex < 0) {
+            throw std::invalid_argument(
+                "hard control direction could not be mapped through control sorting");
+        }
+        const cv::Vec3d direction = normalizedOrZero(constraint.direction);
+        if (!finitePoint(constraint.direction) || length(direction) <= kEpsilon) {
+            throw std::invalid_argument(
+                "hard control direction must be finite and non-degenerate");
+        }
+        auto& target = constraint.side == LineControlPointSide::Before
+            ? hardBefore[static_cast<size_t>(sortedIndex)]
+            : hardAfter[static_cast<size_t>(sortedIndex)];
+        if (target.has_value()) {
+            throw std::invalid_argument(
+                "duplicate hard control direction for one control side");
+        }
+        if (constraint.side == LineControlPointSide::Before &&
+            sortedIndex > 0 &&
+            protectedSortedSpans[static_cast<size_t>(sortedIndex - 1)]) {
+            throw std::invalid_argument(
+                "hard control direction cannot target a protected span");
+        }
+        if (constraint.side == LineControlPointSide::After &&
+            sortedIndex + 1 < static_cast<int>(controlPoints.size()) &&
+            protectedSortedSpans[static_cast<size_t>(sortedIndex)]) {
+            throw std::invalid_argument(
+                "hard control direction cannot target a protected span");
+        }
+        target = direction;
     }
 
     std::vector<std::vector<std::array<double, 3>>> optimizedSpans(controlPoints.size() - 1);
@@ -4546,7 +4736,10 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
                                  "reinit-span",
                                  existingRollout,
                                  leftContinuationDirection,
-                                 rightContinuationDirection);
+                                 rightContinuationDirection,
+                                 std::nullopt,
+                                 hardAfter[controlIndex],
+                                 hardBefore[controlIndex + 1]);
         return span;
     };
     const auto recordSpanCandidateRange = [&](const OptimizedControlSpan& span) {
@@ -4713,13 +4906,22 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
         const int firstControlIndex = internalControlIndices.front();
         const cv::Vec3d outward = stitchedInternal[static_cast<size_t>(firstControlIndex)] -
                                   stitchedInternal[static_cast<size_t>(firstControlIndex + 1)];
-        growNormalConstructedExtension(stitchedInternal[static_cast<size_t>(firstControlIndex)],
-                                       projectedDirectionAtStart(stitchedInternal[static_cast<size_t>(firstControlIndex)],
-                                                                 outward,
-                                                                 normalSampler_),
-                                       normalSampler_,
-                                       config,
-                                       grown);
+        if (hardBefore.front().has_value()) {
+            growHardDirectionConstructedExtension(
+                stitchedInternal[static_cast<size_t>(firstControlIndex)],
+                *hardBefore.front(),
+                normalSampler_,
+                config,
+                grown);
+        } else {
+            growNormalConstructedExtension(stitchedInternal[static_cast<size_t>(firstControlIndex)],
+                                           projectedDirectionAtStart(stitchedInternal[static_cast<size_t>(firstControlIndex)],
+                                                                     outward,
+                                                                     normalSampler_),
+                                           normalSampler_,
+                                           config,
+                                           grown);
+        }
         leftOpenExtension.reserve(grown.size());
         for (auto it = grown.rbegin(); it != grown.rend(); ++it) {
             leftOpenExtension.push_back(toVec3d(*it));
@@ -4732,13 +4934,22 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
         const int lastControlIndex = internalControlIndices.back();
         const cv::Vec3d outward = stitchedInternal[static_cast<size_t>(lastControlIndex)] -
                                   stitchedInternal[static_cast<size_t>(lastControlIndex - 1)];
-        growNormalConstructedExtension(stitchedInternal[static_cast<size_t>(lastControlIndex)],
-                                       projectedDirectionAtStart(stitchedInternal[static_cast<size_t>(lastControlIndex)],
-                                                                 outward,
-                                                                 normalSampler_),
-                                       normalSampler_,
-                                       config,
-                                       grown);
+        if (hardAfter.back().has_value()) {
+            growHardDirectionConstructedExtension(
+                stitchedInternal[static_cast<size_t>(lastControlIndex)],
+                *hardAfter.back(),
+                normalSampler_,
+                config,
+                grown);
+        } else {
+            growNormalConstructedExtension(stitchedInternal[static_cast<size_t>(lastControlIndex)],
+                                           projectedDirectionAtStart(stitchedInternal[static_cast<size_t>(lastControlIndex)],
+                                                                     outward,
+                                                                     normalSampler_),
+                                           normalSampler_,
+                                           config,
+                                           grown);
+        }
         rightOpenExtension.reserve(grown.size());
         for (const auto& point : grown) {
             rightOpenExtension.push_back(toVec3d(point));
@@ -4765,6 +4976,23 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
                 stitchedControlIndices[spanIndex + 1]);
         }
     }
+    std::vector<int> stitchedFixedPointIndices = stitchedControlIndices;
+    for (size_t spanIndex = 0; spanIndex < optimizedSpans.size(); ++spanIndex) {
+        if (hardAfter[spanIndex].has_value()) {
+            stitchedFixedPointIndices.push_back(
+                stitchedControlIndices[spanIndex] + 1);
+        }
+        if (hardBefore[spanIndex + 1].has_value()) {
+            stitchedFixedPointIndices.push_back(
+                stitchedControlIndices[spanIndex + 1] - 1);
+        }
+    }
+    if (hardBefore.front().has_value()) {
+        stitchedFixedPointIndices.push_back(stitchedControlIndices.front() - 1);
+    }
+    if (hardAfter.back().has_value()) {
+        stitchedFixedPointIndices.push_back(stitchedControlIndices.back() + 1);
+    }
 
     if (stitched.size() < 2) {
         throw std::runtime_error("Existing line reinitialization produced fewer than two samples");
@@ -4789,7 +5017,7 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
 
     LineOptimizationResult finalOptimization =
         optimizeExistingLine(stitched,
-                             stitchedControlIndices,
+                             std::move(stitchedFixedPointIndices),
                              stitchedDisplayFrameAnchorIndex,
                              config,
                              -1,
@@ -4845,6 +5073,41 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
                 << std::setw(8) << report.chosenMaxNormalSmoothDeviation
                 << std::setw(8) << report.chosenMaxNormalAlignmentAbs
                 << ' ' << report.chosen << '\n';
+    }
+    message << "\nHard endpoint directions:\n";
+    bool reportedHardDirection = false;
+    const auto appendDirection = [&](int controlIndex,
+                                     const char* side,
+                                     const cv::Vec3d& direction) {
+        message << "cp=" << controlIndex << " side=" << side
+                << " direction=(" << direction[0] << ',' << direction[1]
+                << ',' << direction[2] << ")\n";
+        reportedHardDirection = true;
+    };
+    for (const auto& report : spanReports) {
+        if (report.hardLeftDirection) {
+            appendDirection(report.leftControlIndex,
+                            "after",
+                            report.hardLeftDirectionVector);
+        }
+        if (report.hardRightDirection) {
+            appendDirection(report.rightControlIndex,
+                            "before",
+                            report.hardRightDirectionVector);
+        }
+    }
+    if (hardBefore.front().has_value()) {
+        appendDirection(originalControlIndices.front(),
+                        "before-tail",
+                        *hardBefore.front());
+    }
+    if (hardAfter.back().has_value()) {
+        appendDirection(originalControlIndices.back(),
+                        "after-tail",
+                        *hardAfter.back());
+    }
+    if (!reportedHardDirection) {
+        message << "none\n";
     }
     message << "max_segment_candidate_alignment_score_diff="
             << maxCandidateAlignmentScoreDiff << "\n\n"

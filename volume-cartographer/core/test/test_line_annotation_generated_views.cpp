@@ -29,10 +29,18 @@ namespace {
 
 class FiberModeNormalSampler final : public vc::lasagna::NormalSampler {
 public:
+    explicit FiberModeNormalSampler(cv::Vec3d normal = {0.0, 0.0, 1.0})
+        : normal_(normal)
+    {
+    }
+
     vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override
     {
-        return {{0.0, 0.0, 1.0}, true, {}};
+        return {normal_, true, {}};
     }
+
+private:
+    cv::Vec3d normal_;
 };
 
 class FiberModePrediction final : public vc::fiber_tracer::FiberPredictionSource {
@@ -59,6 +67,19 @@ public:
 
 private:
     double invalidX_;
+};
+
+class AlwaysInvalidFiberModePrediction final
+    : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d&,
+        const cv::Vec3d&) const override
+    {
+        vc::fiber_tracer::FiberPredictionSample sample;
+        sample.options.push_back({});
+        return sample;
+    }
 };
 
 vc::lasagna::NormalSample normal()
@@ -1199,7 +1220,154 @@ TEST_CASE("fiber mode falls back only the failed native span")
     CHECK(result.nativeExtrapolations +
               result.lasagnaFallbackExtrapolations == 2);
     CHECK(result.lasagnaFallbackExtrapolations >= 1);
-    CHECK(result.optimization.line.points.size() >= 3);
+    const auto& points = result.optimization.line.points;
+    REQUIRE(points.size() >= 3);
+    size_t sharedIndex = 0;
+    double sharedDistance = std::numeric_limits<double>::infinity();
+    for (size_t index = 0; index < points.size(); ++index) {
+        const double distance = cv::norm(
+            points[index].position - cv::Vec3d{16.0, 0.0, 0.0});
+        if (distance < sharedDistance) {
+            sharedDistance = distance;
+            sharedIndex = index;
+        }
+    }
+    REQUIRE(sharedDistance < 1.0e-9);
+    REQUIRE(sharedIndex + 1 < points.size());
+    const cv::Vec3d fallbackDirection = vc3d::fiber_slice::normalizedOrZero(
+        points[sharedIndex + 1].position - points[sharedIndex].position);
+    CHECK(fallbackDirection.dot(cv::Vec3d{1.0, 0.0, 0.0}) ==
+          doctest::Approx(1.0).epsilon(1.0e-10));
+}
+
+TEST_CASE("fiber mode retraces both tails of a single-control seed")
+{
+    FiberModeNormalSampler normals;
+    FiberModePrediction predictions;
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+    };
+    for (int x = -8; x <= 8; x += 4) {
+        request.linePointsBase.push_back(
+            {static_cast<double>(x), 0.0, 0.0});
+    }
+    request.predictions = &predictions;
+    request.baseNormalSampler = &normals;
+    request.traceNormalSampler = &normals;
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.traceConfig.stepVoxels = 4.0;
+    request.traceConfig.coneAngleDegrees = 0.0;
+    request.traceConfig.beamWidth = 1;
+    request.traceConfig.maxStepFactor = 2.0;
+    request.traceConfig.smoothnessWeight = 0.0;
+    request.traceConfig.smoothnessNormalWeight = 0.0;
+    request.traceConfig.smoothnessTangentWeight = 0.0;
+    request.traceConfig.cumulativeSmoothnessTangentWeight = 0.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+
+    REQUIRE(result.controlPoints.size() == 1);
+    CHECK(result.nativeSegments == 0);
+    CHECK(result.lasagnaFallbackSegments == 0);
+    CHECK(result.nativeExtrapolations +
+              result.lasagnaFallbackExtrapolations == 2);
+    REQUIRE(result.optimization.line.points.size() >= 3);
+    const auto& points = result.optimization.line.points;
+    CHECK(cv::norm(points.front().position) == doctest::Approx(8.0));
+    CHECK(cv::norm(points.back().position) == doctest::Approx(8.0));
+}
+
+TEST_CASE("fiber mode hard-constrains fallback from stored native geometry")
+{
+    FiberModeNormalSampler baseNormals({1.0, 0.0, 0.0});
+    FiberModeNormalSampler traceNormals;
+    AlwaysInvalidFiberModePrediction predictions;
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+        {6.0, {16.0, 0.0, 0.0}, false, 6},
+        {10.0, {32.0, 0.0, 0.0}, false, 10},
+    };
+    request.controlPoints[1].segmentToNext.emplace();
+    request.linePointsBase = {
+        {-8.0, 0.0, 0.0},
+        {-4.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0},
+        {4.0, 0.0, 0.0},
+        {8.0, 0.0, 0.0},
+        {12.0, 0.0, 0.0},
+        {16.0, 0.0, 0.0},
+        {20.0, 4.0, 0.0},
+        {24.0, 5.0, 0.0},
+        {28.0, 3.0, 0.0},
+        {32.0, 0.0, 0.0},
+        {36.0, 0.0, 0.0},
+    };
+    request.predictions = &predictions;
+    request.baseNormalSampler = &baseNormals;
+    request.traceNormalSampler = &traceNormals;
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.traceConfig.stepVoxels = 4.0;
+    request.traceConfig.coneAngleDegrees = 0.0;
+    request.traceConfig.beamWidth = 1;
+    request.traceConfig.maxStepFactor = 2.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+
+    REQUIRE(result.nativeSegments == 1);
+    REQUIRE(result.lasagnaFallbackSegments == 1);
+    REQUIRE(result.lasagnaFallbackExtrapolations == 2);
+    const auto& points = result.optimization.line.points;
+    size_t sharedIndex = 0;
+    double sharedDistance = std::numeric_limits<double>::infinity();
+    for (size_t index = 0; index < points.size(); ++index) {
+        const double distance = cv::norm(
+            points[index].position - cv::Vec3d{16.0, 0.0, 0.0});
+        if (distance < sharedDistance) {
+            sharedDistance = distance;
+            sharedIndex = index;
+        }
+    }
+    REQUIRE(sharedDistance < 1.0e-9);
+    REQUIRE(sharedIndex > 0);
+    const cv::Vec3d expected =
+        vc3d::fiber_slice::normalizedOrZero({-1.0, -1.0, 0.0});
+    const cv::Vec3d actual = vc3d::fiber_slice::normalizedOrZero(
+        points[sharedIndex - 1].position - points[sharedIndex].position);
+    CHECK(actual.dot(expected) == doctest::Approx(1.0).epsilon(1.0e-10));
+
+    size_t tailControlIndex = 0;
+    double tailControlDistance = std::numeric_limits<double>::infinity();
+    for (size_t index = 0; index < points.size(); ++index) {
+        const double distance = cv::norm(
+            points[index].position - cv::Vec3d{32.0, 0.0, 0.0});
+        if (distance < tailControlDistance) {
+            tailControlDistance = distance;
+            tailControlIndex = index;
+        }
+    }
+    REQUIRE(tailControlDistance < 1.0e-9);
+    REQUIRE(tailControlIndex + 1 < points.size());
+    const cv::Vec3d expectedTail =
+        vc3d::fiber_slice::normalizedOrZero({4.0, -3.0, 0.0});
+    const cv::Vec3d actualTail = vc3d::fiber_slice::normalizedOrZero(
+        points[tailControlIndex + 1].position -
+        points[tailControlIndex].position);
+    CHECK(actualTail.dot(expectedTail) ==
+          doctest::Approx(1.0).epsilon(1.0e-10));
 }
 
 TEST_CASE("fiber segment metadata invalidation follows CP adjacency")

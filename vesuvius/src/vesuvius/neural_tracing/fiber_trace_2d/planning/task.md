@@ -1,51 +1,56 @@
-# VC3D Fiber-Global Tracing Mode
+# Hard Native Directions For Lasagna Fallback
 
 ## User Request
 
-- Support extrapolation and interpolation with the normal-based Lasagna
-  optimizer and with the trained fiber model.
-- Add a global switch per fiber and persist it with that fiber.
-- When trained-fiber interpolation fails, fall back to Lasagna optimization for
-  that segment.
-- A Lasagna-normal segment neighboring a trained-fiber segment must use the
-  trained segment's control-point direction, derived from the adjacent dense
-  line point, as its optimization continuation direction.
-- Switching the fiber-global mode between Lasagna and trained fiber must run a
-  full rebuild: the existing full optimization for Lasagna, and per-segment
-  tracing for trained fiber.
-- Add a spin box or equivalent control for extrapolation distance if one does
-  not already exist.
+- When a native fiber-traced span adjoins a Lasagna fallback at a CP, the
+  native span's endpoint direction must be a hard direction constraint for the
+  Lasagna geometry.
+- The direction is derived directly from the CP and the next dense point in the
+  successfully native-traced span.
+- Apply this rule at every CP that has native-traced geometry on one side and
+  Lasagna-generated geometry on the other side.
+- Fiber-derived directions supersede all normal-, chord-, existing-line-, and
+  candidate-derived starting directions. They are constraints, not candidates
+  or weighted preferences.
 
-## Scope
+## Direction Semantics
 
-- VC3D line-annotation dialog, session, stored-fiber JSON, and optimization
-  orchestration.
-- Shared native tracer support required for bounded open-ended extrapolation.
-- Shared Lasagna reinitializer use for per-segment fallback and continuation
-  from neighboring native-traced spans.
-- Focused persistence, orchestration, extrapolation, and UI tests.
+- At a native endpoint, `into_native = normalize(next_native_point - CP)`.
+- Lasagna on the opposite side must leave the CP along `-into_native`, thereby
+  continuing the same tangent through the CP.
+- The rule applies independently to both endpoints of every successful native
+  span, including a Lasagna span constrained at both ends.
+- If native extrapolation fails and the corresponding Lasagna open tail is
+  retained, the tail must obey the same hard continuation direction.
 
 ## Correctness Constraints
 
-- The mode is fiber-wide; per-segment `segment_to_next` remains the source of
-  truth for which interpolated spans were successfully native traced.
-- Native interpolation failure is local to one CP-to-CP span and must not undo
-  successful native spans.
-- Fallback must use the shared Lasagna optimizer. Native spans are passed as
-  protected spans so their endpoint directions seed neighboring fallback spans.
-- Native and Lasagna modes both produce open tails of the configured base-voxel
-  distance. Native tail failure falls back to the Lasagna-generated tail.
-- Mode changes and optimization results are transactional and run in the
-  existing background-task/edit-blocking flow.
-- Stored line/control geometry remains in base coordinates. Native inference
-  remains in trace coordinates through the existing coordinate adapter.
-- Existing version-1/version-2 fibers without a stored mode default to Lasagna.
+- The constraint must remain exact through span initialization, span solving,
+  stitching, and the final global Lasagna solve.
+- Do not implement this as a large residual weight, candidate score, seed-span
+  ordering rule, or post-solve correction.
+- Preserve successful native span samples bit-exactly.
+- Use the existing Lasagna/Ceres point optimization and smoothness residuals.
+  Add one fixed adjacent proxy point in the fiber-derived direction for each
+  constrained side; do not add a custom manifold or solver mechanism.
+- A fiber-constrained CP supplies exactly one rollout direction from that CP.
+  Do not also generate normal-, chord-, existing-, or continuation-derived
+  starting directions from the same side.
+- Invalid or degenerate native endpoint geometry is an explicit task failure;
+  it must not silently revert to a normal-derived direction.
+
+## Scope
+
+- Shared Lasagna reinitialization and global solve constraint plumbing.
+- VC3D mixed native/Lasagna construction of hard endpoint constraints.
+- Internal fallback spans and retained Lasagna open tails.
+- Focused C++ regression tests, specifications, code documentation, and
+  changelog.
 
 ## Out Of Scope
 
-- Changing native trace scoring, fusion, multi-plane intersection semantics,
-  or the 20-base-voxel interpolation acceptance threshold.
-- Running PyTorch or model inference inside VC3D.
-- Persisting the UI's extrapolation-distance preference in every fiber JSON;
-  the resulting extrapolated geometry is persisted, while the control remains
-  a normal VC3D setting.
+- Native tracer scoring, fusion, intersection, or acceptance changes.
+- Changing ordinary all-Lasagna behavior when no native hard constraint is
+  supplied.
+- Persisting redundant direction metadata; directions are derived from the
+  authoritative native dense geometry each time.

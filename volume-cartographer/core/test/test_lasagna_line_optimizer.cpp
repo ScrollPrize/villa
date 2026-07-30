@@ -102,6 +102,32 @@ public:
     mutable std::vector<cv::Vec3d> batchSampledPoints;
 };
 
+class InvalidDerivativeNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override
+    {
+        return {{0.0, 0.0, 1.0}, true, {}};
+    }
+
+    vc::lasagna::NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        bool,
+        std::vector<vc::lasagna::NormalSampleWithDerivative>& samples) const override
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        const cv::Matx33d invalidDerivative(
+            nan, nan, nan,
+            nan, nan, nan,
+            nan, nan, nan);
+        samples.assign(volumePoints.size(),
+                       vc::lasagna::NormalSampleWithDerivative{
+                           {{0.0, 0.0, 1.0}, true, {}},
+                           invalidDerivative,
+                           true});
+        return {};
+    }
+};
+
 class SeedThenTiltedNormalSampler final : public vc::lasagna::NormalSampler {
 public:
     vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override
@@ -844,6 +870,288 @@ TEST_CASE("LineOptimizer full reinitialization reuses protected stored spans")
         CHECK(result.optimization.line.points[static_cast<size_t>(protectedStart + offset)].position ==
               linePoints[static_cast<size_t>(offset)]);
     }
+}
+
+TEST_CASE("LineOptimizer hard native direction survives unsorted fallback and final solve")
+{
+    ConstantNormalSampler sampler({1.0, 0.0, 0.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 2;
+    config.segmentLength = 2.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 20;
+
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {5.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {12.0, 2.0, 0.0},
+        {16.0, 2.0, 0.0},
+        {20.0, 0.0, 0.0},
+    };
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {2.0, linePoints[2], true, 2},
+        {0.0, linePoints[0], false, 0},
+        {5.0, linePoints[5], false, 5},
+    };
+    const cv::Vec3d hardDirection = normalizedOrZero({-1.0, -1.0, 0.0});
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(
+        linePoints,
+        controls,
+        {0, 2, 5},
+        2,
+        config,
+        {{0, 2}},
+        {{0,
+          vc::lasagna::LineControlPointSide::Before,
+          hardDirection}});
+
+    REQUIRE_FALSE(result.failed);
+    REQUIRE(result.fixedPointIndices.size() == 3);
+    const int sharedControl = result.fixedPointIndices[1];
+    REQUIRE(sharedControl > 0);
+    const cv::Vec3d solvedDirection = normalizedOrZero(
+        result.optimization.line.points[static_cast<size_t>(sharedControl - 1)].position -
+        controls[0].volumePoint);
+    CHECK(solvedDirection.dot(hardDirection) == doctest::Approx(1.0).epsilon(1.0e-10));
+    CHECK(cv::norm(
+              result.optimization.line.points[
+                  static_cast<size_t>(sharedControl - 1)].position -
+              controls[0].volumePoint) ==
+          doctest::Approx(config.segmentLength).epsilon(1.0e-12));
+    CHECK(result.spans[0].hardRightDirection);
+    CHECK(std::none_of(result.spans[0].candidates.begin(),
+                       result.spans[0].candidates.end(),
+                       [](const auto& candidate) {
+                           return candidate.name == "continue-right";
+                       }));
+
+    const int protectedStart = result.fixedPointIndices[1];
+    const int protectedEnd = result.fixedPointIndices[2];
+    REQUIRE(protectedEnd - protectedStart == 3);
+    for (int offset = 0; offset <= 3; ++offset) {
+        CHECK(result.optimization.line.points[
+                  static_cast<size_t>(protectedStart + offset)].position ==
+              linePoints[static_cast<size_t>(2 + offset)]);
+    }
+}
+
+TEST_CASE("LineOptimizer enforces two hard directions on one fallback span")
+{
+    ConstantNormalSampler sampler({1.0, 0.0, 0.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 1;
+    config.segmentLength = 5.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 20;
+
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {5.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {15.0, 0.0, 0.0},
+        {20.0, 0.0, 0.0},
+        {25.0, 0.0, 0.0},
+        {30.0, 0.0, 0.0},
+    };
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+        {4.0, linePoints[4], false, 4},
+        {6.0, linePoints[6], false, 6},
+    };
+    const cv::Vec3d leftDirection = normalizedOrZero({1.0, 1.0, 0.0});
+    const cv::Vec3d rightDirection = normalizedOrZero({-1.0, 1.0, 0.0});
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(
+        linePoints,
+        controls,
+        {0, 2, 4, 6},
+        2,
+        config,
+        {{0, 1}, {2, 3}},
+        {
+            {1, vc::lasagna::LineControlPointSide::After, leftDirection},
+            {2, vc::lasagna::LineControlPointSide::Before, rightDirection},
+        });
+
+    REQUIRE_FALSE(result.failed);
+    REQUIRE(result.fixedPointIndices.size() == 4);
+    const int leftControl = result.fixedPointIndices[1];
+    const int rightControl = result.fixedPointIndices[2];
+    REQUIRE(rightControl - leftControl >= 3);
+    const cv::Vec3d solvedLeft = normalizedOrZero(
+        result.optimization.line.points[static_cast<size_t>(leftControl + 1)].position -
+        controls[1].volumePoint);
+    const cv::Vec3d solvedRight = normalizedOrZero(
+        result.optimization.line.points[static_cast<size_t>(rightControl - 1)].position -
+        controls[2].volumePoint);
+    CHECK(solvedLeft.dot(leftDirection) == doctest::Approx(1.0).epsilon(1.0e-10));
+    CHECK(solvedRight.dot(rightDirection) == doctest::Approx(1.0).epsilon(1.0e-10));
+    const double expectedProxyDistance = 10.0 / 3.0;
+    CHECK(cv::norm(
+              result.optimization.line.points[
+                  static_cast<size_t>(leftControl + 1)].position -
+              controls[1].volumePoint) ==
+          doctest::Approx(expectedProxyDistance).epsilon(1.0e-12));
+    CHECK(cv::norm(
+              result.optimization.line.points[
+                  static_cast<size_t>(rightControl - 1)].position -
+              controls[2].volumePoint) ==
+          doctest::Approx(expectedProxyDistance).epsilon(1.0e-12));
+    CHECK(result.spans[1].hardLeftDirection);
+    CHECK(result.spans[1].hardRightDirection);
+    CHECK(std::none_of(result.spans[1].candidates.begin(),
+                       result.spans[1].candidates.end(),
+                       [](const auto& candidate) {
+                           return candidate.name == "continue-left" ||
+                                  candidate.name == "continue-right";
+                       }));
+}
+
+TEST_CASE("LineOptimizer constrains both Lasagna tails next to a protected span")
+{
+    ConstantNormalSampler sampler({1.0, 0.0, 0.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 2;
+    config.segmentLength = 5.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 20;
+
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {5.0, 2.0, 0.0},
+        {10.0, 0.0, 0.0},
+    };
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+    };
+    const cv::Vec3d leftDirection = normalizedOrZero({-1.0, -1.0, 0.0});
+    const cv::Vec3d rightDirection = normalizedOrZero({1.0, -1.0, 0.0});
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(
+        linePoints,
+        controls,
+        {0, 2},
+        0,
+        config,
+        {{0, 1}},
+        {
+            {0, vc::lasagna::LineControlPointSide::Before, leftDirection},
+            {1, vc::lasagna::LineControlPointSide::After, rightDirection},
+        });
+
+    REQUIRE_FALSE(result.failed);
+    REQUIRE(result.fixedPointIndices.size() == 2);
+    const int firstControl = result.fixedPointIndices.front();
+    const int lastControl = result.fixedPointIndices.back();
+    REQUIRE(firstControl > 0);
+    REQUIRE(lastControl + 1 < static_cast<int>(result.optimization.line.points.size()));
+    const cv::Vec3d solvedLeft = normalizedOrZero(
+        result.optimization.line.points[static_cast<size_t>(firstControl - 1)].position -
+        controls.front().volumePoint);
+    const cv::Vec3d solvedRight = normalizedOrZero(
+        result.optimization.line.points[static_cast<size_t>(lastControl + 1)].position -
+        controls.back().volumePoint);
+    CHECK(solvedLeft.dot(leftDirection) == doctest::Approx(1.0).epsilon(1.0e-10));
+    CHECK(solvedRight.dot(rightDirection) == doctest::Approx(1.0).epsilon(1.0e-10));
+    CHECK(cv::norm(
+              result.optimization.line.points[
+                  static_cast<size_t>(firstControl - 1)].position -
+              controls.front().volumePoint) ==
+          doctest::Approx(config.segmentLength).epsilon(1.0e-12));
+    CHECK(cv::norm(
+              result.optimization.line.points[
+                  static_cast<size_t>(lastControl + 1)].position -
+              controls.back().volumePoint) ==
+          doctest::Approx(config.segmentLength).epsilon(1.0e-12));
+}
+
+TEST_CASE("LineOptimizer rejects conflicting control-point direction constraints")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {2.0, 0.0, 0.0},
+    };
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, linePoints[0], true, 0},
+        {2.0, linePoints[2], false, 2},
+    };
+    const vc::lasagna::LineControlPointHardDirectionConstraint constraint{
+        0,
+        vc::lasagna::LineControlPointSide::Before,
+        {-1.0, 0.0, 0.0},
+    };
+    CHECK_THROWS_AS(
+        optimizer.reinitializeAndOptimizeExistingLine(
+            linePoints,
+            controls,
+            {0, 2},
+            0,
+            {},
+            {},
+            {constraint, constraint}),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        optimizer.reinitializeAndOptimizeExistingLine(
+            linePoints,
+            controls,
+            {0, 2},
+            0,
+            {},
+            {{0, 1}},
+            {{0,
+              vc::lasagna::LineControlPointSide::After,
+              {1.0, 0.0, 0.0}}}),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        optimizer.reinitializeAndOptimizeExistingLine(
+            linePoints,
+            controls,
+            {0, 2},
+            0,
+            {},
+            {},
+            {{0,
+              vc::lasagna::LineControlPointSide::Before,
+              {0.0, 0.0, 0.0}}}),
+        std::invalid_argument);
+}
+
+TEST_CASE("LineOptimizer reports the actual Ceres candidate failure")
+{
+    InvalidDerivativeNormalSampler sampler;
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 2;
+    config.segmentLength = 2.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 2;
+    config.differentiableNormalSampling = true;
+    config.printSolverProgress = false;
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {2.0, 0.0, 0.0},
+        {4.0, 0.0, 0.0},
+        {6.0, 0.0, 0.0},
+    };
+    const std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, linePoints.front(), true, 0},
+        {3.0, linePoints.back(), false, 3},
+    };
+
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(
+        linePoints, controls, {0, 3}, 0, config);
+
+    REQUIRE(result.failed);
+    CHECK(result.failureReason.find("Initial residual and Jacobian") !=
+          std::string::npos);
+    CHECK(result.failureReason.find("dots:") == std::string::npos);
 }
 
 TEST_CASE("LineOptimizer reinitialization adds continuation candidates on both sides of seed")

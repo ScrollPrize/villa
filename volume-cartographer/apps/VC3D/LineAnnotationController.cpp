@@ -2259,7 +2259,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                     return;
                 }
                 if (session.optimizedLine.points.size() < 2 ||
-                    session.controlPoints.size() < 2) {
+                    session.controlPoints.empty()) {
                     session.fiberOptimizationMode = mode;
                     return;
                 }
@@ -2293,6 +2293,36 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                 }
             });
     connect(dialog,
+            &LineAnnotationDialog::extrapolationDistanceChanged,
+            this,
+            [this, surfaceName](int) {
+                auto* pane = paneForSurface(surfaceName);
+                if (!pane || !pane->session) {
+                    return;
+                }
+                auto& session = *pane->session;
+                if (session.optimizedLine.points.size() < 2 ||
+                    session.controlPoints.empty()) {
+                    return;
+                }
+                setSessionOptimizationState(
+                    session, SessionOptimizationState::Unoptimized);
+                if (pane->dialog &&
+                    pane->dialog->reoptimizationMode() !=
+                        LineAnnotationDialog::ReoptimizationMode::AutoReoptimize) {
+                    return;
+                }
+                if (session.taskState == LineAnnotationSession::TaskState::Running) {
+                    return;
+                }
+                if (session.fiberOptimizationMode ==
+                    vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d) {
+                    startFiberModeOptimization(session, false);
+                } else if (ensureDatasetForSession(session)) {
+                    startOptimization(session, true);
+                }
+            });
+    connect(dialog,
             &LineAnnotationDialog::reoptimizationModeChanged,
             this,
             [this, surfaceName](LineAnnotationDialog::ReoptimizationMode mode) {
@@ -2322,7 +2352,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                     vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d) {
                     startFiberModeOptimization(session, false);
                 } else {
-                    startOptimization(session, false);
+                    startOptimization(session, true);
                 }
             });
     connect(dialog, &QObject::destroyed, this, [this, surfaceName]() {
@@ -7855,7 +7885,7 @@ void LineAnnotationController::startFiberModeOptimization(
     LineAnnotationSession& session,
     bool retraceAll)
 {
-    if (session.controlPoints.size() < 2 || session.optimizedLine.points.size() < 2) {
+    if (session.controlPoints.empty() || session.optimizedLine.points.size() < 2) {
         return;
     }
     if (!ensureDatasetForSession(session) ||

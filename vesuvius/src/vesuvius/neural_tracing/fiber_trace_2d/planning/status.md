@@ -1,26 +1,29 @@
-# VC3D Fiber-Global Tracing Mode Status
+# Hard Native Directions For Lasagna Fallback Status
 
 ## Planning
 
-- [x] Read the todo request and repository instructions.
-- [x] Trace current native segment, Lasagna reinitialization, tail generation,
-  persistence, and dialog control paths.
+- [x] Read the user request and nested repository instructions.
+- [x] Trace current direction derivation, candidate selection, span ordering,
+  tail growth, and final global solve.
 - [x] Replace the active task, plan, status, and task log.
-- [x] Review the plan directly against current specs and implementation.
-- [ ] Obtain independent-agent review (not permitted unless explicitly requested).
+- [x] Obtain independent-agent review against task, specs, and current solver.
+- [x] Incorporate review findings.
 
 ## Implementation
 
-- [x] Add persisted fiber-global mode.
-- [x] Add dialog mode and extrapolation controls.
-- [x] Add shared native endpoint extrapolation.
-- [x] Add mixed whole-fiber native/Lasagna task.
-- [x] Route mode changes, full rebuilds, and CP edits by mode.
+- [x] Add shared structured hard endpoint constraints.
+- [x] Add exact fixed-proxy direction constraints using the regular solver.
+- [x] Enforce constraints in span initialization and span solves.
+- [x] Enforce constraints in open tails and the final global solve.
+- [x] Derive constraints for every native endpoint in the VC3D mixed helper.
+- [x] Remove candidate/seed-order direction dependence.
+- [x] Remove the custom manifold and use fixed proxy points in regular Ceres.
+- [x] Surface actual Ceres messages instead of legacy direction dots.
 
 ## Validation And Documentation
 
-- [x] Add focused C++ and persistence regressions.
-- [x] Build affected targets and VC3D with `-j32`.
-- [x] Run focused and broader relevant tests.
+- [x] Add adversarial, ordering, dual-ended, tail, and invalid-input tests.
+- [x] Rebuild affected tests and VC3D with `-j32` after proxy correction.
+- [x] Rerun focused regression suites after proxy correction.
 - [x] Update specs, docs, changelog, and task log.
 - [x] Perform final diff and consistency review.

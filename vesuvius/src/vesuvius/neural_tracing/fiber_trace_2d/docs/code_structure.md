@@ -734,18 +734,29 @@ Ownership changed as follows:
   The toolbar also exposes a fiber-global `Lasagna`/`Fiber model` mode and an
   explicit base-voxel extrapolation distance. `optimization_mode` is stored on
   the fiber; `segment_to_next` remains the outcome/provenance for one
-  interpolation span. Switching mode runs a full background rebuild. Fiber
-  mode independently traces every required CP span, stitches successes, and
+  interpolation span. Switching mode runs a full background rebuild, including
+  both tails when the new fiber still has only its seed CP. Changing the
+  distance immediately rebuilds the tails when Auto-reoptimize is active.
+  Fiber mode independently traces every required CP span, stitches successes, and
   sends failures through one shared Lasagna reinitialization with successes
-  protected. A successful native span is selected as the temporary
-  reinitialization seed, which makes its dense endpoint tangent feed adjacent
-  Lasagna continuation candidates. Ordinary edits reuse unaffected traced
-  spans and retrace only invalidated adjacency.
+  protected. Before reinitialization, `LineAnnotationFiberSegments.cpp` derives
+  each successful native span's two endpoint tangents from the CP and the first
+  distinct dense point inward. Every Lasagna span or retained tail on the
+  opposite side receives the negated tangent as a hard outgoing direction.
+  `LineOptimizer` creates one adjacent proxy sample on that direction and fixes
+  it alongside the CP in the ordinary per-span and final stitched Ceres solves.
+  The existing spacing and tangent/normal smoothness residuals optimize the
+  remaining points. A constrained CP side produces only its fiber-directed
+  rollout, so normal alignment, candidate selection, and seed ordering cannot
+  replace its starting direction. Ordinary edits reuse unaffected traced spans
+  and retrace only invalidated adjacency.
 
   Both open tails are first available from Lasagna reinitialization. Fiber mode
   then calls `traceFiberExtrapolation`, a thin distance-plane request over the
   shared one-way beam tracer, in trace coordinates. A successful crossing
-  replaces that tail; failure retains the normal-based tail. The controller
+  replaces that tail; failure retains the Lasagna tail, whose first point is
+  hard-constrained by adjoining native geometry when the outer CP owns a
+  successful native span. The controller
   applies the combined line, CP metadata, and mode atomically and uses the same
   path for save-time finalization after no-reoptimization edits.
 - `volume-cartographer/apps/src/vc_fiber_trace_metric.cpp` is the native

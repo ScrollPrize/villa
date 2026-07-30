@@ -1,5 +1,11 @@
 # 2026-07-30
 
+- Hard-constrained every Lasagna fallback span and retained tail adjacent to
+  native fiber geometry to continue the fitted dense native endpoint tangent,
+  using fixed proxy points in the regular Ceres solve, independent of normals,
+  candidate selection, seed choice, or solve order.
+- Fixed Fiber-model mode and extrapolation-distance changes to rebuild both
+  tails on newly seeded one-control-point fibers when Auto-reoptimize is active.
 - Added persisted fiber-global Lasagna/native modes to VC3D line annotation,
   including full rebuilds on mode changes, invalid-span native retracing with
   per-span Lasagna fallback, trained-neighbor continuation directions, and

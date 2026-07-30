@@ -1078,16 +1078,29 @@
   changes that cleared a record.
 - Native-mode interpolation failure is local to its CP span. Successful native
   spans are stitched and protected, while failed spans are rebuilt by the
-  shared Lasagna reinitializer. A protected native span is used as the
-  reinitialization seed when available, so its dense endpoint direction is the
-  continuation direction for neighboring Lasagna spans. The final shared
-  global solve keeps native samples fixed.
+  shared Lasagna reinitializer. At every native-adjacent CP, the tangent is
+  `normalize(first_distinct_native_point - CP)`, walking inward from that CP;
+  the Lasagna geometry on the opposite side must leave the CP along the
+  negated tangent. VC3D materializes one adjacent proxy point on that tangent
+  and fixes both the CP and proxy in the ordinary Ceres solve. No custom
+  manifold or weighted direction penalty is used. The fiber direction is the
+  only rollout direction generated from that CP side. This applies independently
+  to all native spans, to both ends of a Lasagna span bracketed by native
+  spans, and to a retained Lasagna tail after native extrapolation failure.
+  Per-span solves and the final shared global solve preserve the fixed proxy
+  while the existing Lasagna smoothness terms optimize the remaining points.
+  Native samples remain fixed. A successful native span without a finite,
+  distinct endpoint-neighbor sample is an error.
 - The line-annotation extrapolation control is measured in base voxels and
   applies beyond both outer CPs. Native mode converts that distance to trace
   voxels and uses the shared one-way tracer with a perpendicular distance
   plane. Each successful tail replaces the corresponding Lasagna tail; native
   tail failure retains that Lasagna tail. A zero distance trims the line to the
   outer CPs.
+- A fiber with only its initial seed CP still rebuilds both open tails when
+  switching modes or changing the extrapolation distance. Changing the
+  distance marks the line unoptimized and, when Auto-reoptimize is enabled,
+  immediately rebuilds both tails in the active fiber mode.
 - `vc_fiber_trace_metric <fiber.lasagna.json> <fiber.json>` is the native
   no-visualization full-fiber metric runner for precomputed 3D fiber inference
   output. It loads one `vc3d_fiber` JSON, requires exact control-point matches

@@ -205,6 +205,7 @@ signals:
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
     void fiberOptimizationModeChanged(
         vc3d::line_annotation::FiberOptimizationMode mode);
+    void extrapolationDistanceChanged(int distanceVx);
 
 protected:
     void closeEvent(QCloseEvent* event) override;

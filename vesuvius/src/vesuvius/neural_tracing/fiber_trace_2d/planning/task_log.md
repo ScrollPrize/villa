@@ -1,67 +1,147 @@
-# Task Log: VC3D Fiber-Global Tracing Mode
+# Task Log: Hard Native Directions For Lasagna Fallback
 
-## 2026-07-30 - Discovery And Planning
+## 2026-07-30 - Discovery
 
-- The existing GUI exposes only per-span Ctrl-right-click native tracing; normal
-  CP edits and the full-reoptimization button always dispatch to Lasagna.
-- Successful native interpolations already persist on their owning CP as
-  `segment_to_next`, and shared Lasagna reinitialization protects those spans.
-- The shared reinitializer solves outward from a seed span and passes the dense
-  endpoint direction of each completed/protected span into the neighboring
-  span's continuation candidates. This already provides the requested
-  native-neighbor direction behavior when native spans are protected during
-  fallback.
-- Lasagna reinitialization already generates both open tails from the endpoint
-  CP and inward dense-line direction. The native tracer exposes the shared
-  one-way beam path but requires target planes, so bounded extrapolation will
-  reuse it with an artificial distance plane rather than duplicate stepping.
-- The global mode belongs on the fiber/session, while `segment_to_next` remains
-  per-span outcome/provenance. Missing mode metadata will default to Lasagna.
-- The existing `Length` spin box controls total construction length from a
-  single seed, not explicit tail distance. A separate extrapolation spin box is
-  required.
+- The mixed VC3D helper protects successful native spans but currently chooses
+  the first native span as the Lasagna reinitialization seed to propagate
+  endpoint directions.
+- Lasagna constructs directed continuation candidates when a neighbor direction
+  is available, but candidate selectability ignores the computed direction dot
+  products and selection is based on normal-alignment score.
+- Sequential span processing means a fallback can be solved before a native
+  neighbor, so not every native-adjacent CP receives even the optional
+  continuation direction.
+- The final stitched global solve fixes protected native points and CPs but has
+  no endpoint-tangent constraint on adjacent Lasagna samples.
+- Lasagna open extensions project their initial direction through the normal
+  field, so a retained Lasagna tail can also rotate away from an adjoining
+  native endpoint direction.
 
-## Workflow Deviation
+## Prior Staged Fix
 
-- `AGENTS.md` asks for an independent plan review. Runtime policy prohibits
-  sub-agent delegation unless the user explicitly requests it, so a direct
-  review was performed and the independent-review checklist item remains open.
+- The preceding one-seed and extrapolation-distance reoptimization correction
+  remains staged and is intentionally preserved. Its durable summary is in the
+  2026-07-30 changelog before this task replaced the active task log.
 
-## 2026-07-30 - Implementation
+## Planned Contract
 
-- Added the persisted fiber-wide `optimization_mode` contract with `lasagna`
-  and `native_fiber_trace3d` values. Missing mode metadata defaults to Lasagna.
-- Added the line-annotation mode combo and a persisted base-voxel
-  extrapolation-distance spin box. Mode changes are transactional and restore
-  the prior mode and segment records if the rebuild cannot start or fails.
-- Exported native endpoint extrapolation through `vc_fiber_tracer`; it builds a
-  distance target plane and reuses the shared one-way beam tracer.
-- Added mixed whole-fiber orchestration. Native CP spans are protected,
-  unsuccessful native spans are rebuilt by the shared Lasagna reinitializer,
-  and native endpoint extrapolation falls back independently to each Lasagna
-  tail.
-- Routed full rebuilds, automatic CP edits, mode changes, and synchronous save
-  finalization through the fiber-wide mode. Manual per-span trace/revert remains
-  independent of the global mode.
-- Updated the specifications, code-structure documentation, VC3D fiber JSON
-  documentation, and changelog.
+- Every successful native span supplies exact endpoint tangents from its CP and
+  immediate adjacent dense point.
+- Every Lasagna span or retained tail on the opposite side receives the
+  corresponding outgoing direction as a hard positive-ray constraint.
+- Constraint coverage is derived before Lasagna runs and is independent of
+  seed choice, solve order, candidate selection, and normal alignment.
 
-## 2026-07-30 - Validation
+## Independent Plan Review
 
-- Built VC3D and the affected C++ test targets with 32 build jobs.
-- `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_fiber_trace3d`:
-  39 test cases passed.
-- `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_line_annotation_generated_views`:
-  47 test cases passed.
-- `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_lasagna_line_optimizer`:
-  29 test cases passed.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src python -m pytest vesuvius/tests/neural_tracing/test_fiber_trace.py volume-cartographer/scripts/tests/test_fiber_merge.py volume-cartographer/scripts/tests/test_vc_sync_helpers.py`:
-  185 tests passed.
+- The review confirmed the manifold approach but required an explicit
+  log-distance positive-ray retraction, Jacobians, numerical bounds, and clear
+  per-block Ceres ownership.
+- Replaced the initial span-pair key with an original-CP-index plus side key so
+  the same API represents internal spans and open tails.
+- Added minimum sample cardinality for one- and two-ended constraints, because
+  a two-point span has no movable adjacent point and a three-point span cannot
+  carry two different ray manifolds.
+- Required every candidate solve, the `optimizeExistingLine` wrapper path, the
+  final global solve, and final VC3D splicing to receive or validate the same
+  constraints.
+- Added explicit normal-transport bypass for the first constrained tail point,
+  unsorted-index mapping, conflict validation, manifold algebra/Jacobian tests,
+  and adversarial fresh/stored native geometry tests.
+
+## Implementation Finding
+
+- A successful fused native span may retain repeated endpoint samples. These
+  do not define a direction, so constraint derivation uses the first distinct
+  dense native point when walking inward from each CP. It fails explicitly if
+  the native span contains no distinct point; it never substitutes a normal-
+  derived direction.
+
+## Validation Iteration
+
+- The first expanded C++ test build failed only in new assertions because the
+  available normalization helper is namespaced as
+  `vc3d::fiber_slice::normalizedOrZero`. Qualified the test calls; production
+  sources had compiled successfully in the same build.
+
+## Implementation
+
+- Added CP-index/side hard-direction inputs to the shared Lasagna line
+  reinitializer and point-index/anchor/direction inputs to the existing-line
+  optimizer.
+- Added an anchored positive-ray Ceres manifold with log-distance updates,
+  analytic Plus/Minus Jacobians, positive-radius bounds, conflict checks, and
+  post-solve validation.
+- Applied the hard direction to every eligible span candidate, two-ended spans,
+  constructed tails, and the final stitched global solve. Protected native
+  samples remain fixed.
+- The VC3D mixed helper derives both endpoint tangents for every successful
+  native span before Lasagna runs and no longer changes the Lasagna seed to
+  communicate a direction.
+- Added constrained side/vector diagnostics to the reinitialization report.
+
+## Tests And Results
+
+- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target test_lasagna_line_optimizer test_line_annotation_generated_views test_fiber_trace3d -j32`
+  passed.
+- `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_lasagna_line_optimizer`
+  passed: 33 test cases.
+- `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_line_annotation_generated_views`
+  passed: 49 test cases.
+- `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_fiber_trace3d`
+  passed: 39 test cases.
+- `cmake --build volume-cartographer/build --target VC3D -j32` passed.
 - `git diff --check` passed.
 
-## Test Limitation
+## Explicit Test-Scope Deviation
 
-- The current focused test target does not instantiate `LineAnnotationDialog`,
-  and no standalone headless Qt dialog harness exists in this area. The new
-  controls and signal wiring are compile-checked through the VC3D target; their
-  interactive layout and behavior still require a GUI smoke test.
+- The private Ceres manifold is validated through end-to-end constrained
+  solves, positive orientation checks, two-ended cardinality, final-solve
+  persistence, and invalid/fixed/off-ray inputs. Its analytic Jacobians were
+  not exposed as a public or test-only API solely for standalone finite-
+  difference tests; adding such an API would expand the production interface
+  without changing the requested behavior.
+
+## User-Corrected Solver Design
+
+- Real VC3D data exposed four Ceres failures during initial residual/Jacobian
+  evaluation in the custom positive-ray manifold path. The surfaced fallback
+  error incorrectly printed legacy continuation-reference dots even though
+  those dots were no longer selection gates.
+- The user clarified that a fiber-adjacent CP supplies exactly one rollout
+  direction from that side and that the regular Lasagna Ceres solve should use
+  an additional fixed proxy point to encode it.
+- Removed the custom manifold, point-level ray API, Jacobians, and all related
+  solver plumbing. Each constrained side now fixes the CP and one adjacent
+  proxy point while the existing spacing and smoothness residuals optimize the
+  remaining points.
+- A constrained side creates one fiber-directed rollout and suppresses the
+  normal and continuation rollout variants from that same side. Candidates
+  originating from an unconstrained opposite side or existing interior geometry
+  share the same fixed proxies.
+- Candidate failure diagnostics now report `ceres::Solver::Summary::message`
+  for each unusable solve and no longer present legacy direction dots as the
+  cause.
+- The first shared-rollout refactor build found the new preserve-direction flag
+  on the generic rollout signature instead of the directed-rollout signature.
+  Moved the flag to the correct existing helper; no solver behavior from that
+  failed build was executed.
+- The new diagnostic regression initially expected `Residual` with an uppercase
+  first letter. Ceres reports `Initial residual and Jacobian evaluation failed.`;
+  corrected the exact case-sensitive assertion after confirming the GUI-facing
+  failure string contains that message for every rejected candidate.
+
+## Corrected Design Validation
+
+- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target test_lasagna_line_optimizer test_line_annotation_generated_views test_fiber_trace3d -j32`
+  passed after the fixed-proxy correction.
+- `test_lasagna_line_optimizer` passed 34 cases, including exact proxy
+  positions after the final solve, constrained-side candidate suppression, and
+  actual Ceres failure-message propagation.
+- `test_line_annotation_generated_views` passed 49 cases.
+- `test_fiber_trace3d` passed 39 cases.
+- `cmake --build volume-cartographer/build --target VC3D -j32` passed. The
+  existing Qt `-Wsfinae-incomplete` warnings remain unchanged.
+- `git diff --check` and the production search for `SetManifold`,
+  `AnchoredPositive`, and point-level ray constraint types passed with no
+  remaining custom manifold code.

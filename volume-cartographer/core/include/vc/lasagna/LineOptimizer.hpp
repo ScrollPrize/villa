@@ -114,6 +114,10 @@ struct LineReinitializationSpanReport {
     double chosenMaxTangentSmoothDeviation = 0.0;
     double chosenMaxNormalSmoothDeviation = 0.0;
     double chosenMaxNormalAlignmentAbs = 0.0;
+    bool hardLeftDirection = false;
+    bool hardRightDirection = false;
+    cv::Vec3d hardLeftDirectionVector{0.0, 0.0, 0.0};
+    cv::Vec3d hardRightDirectionVector{0.0, 0.0, 0.0};
     std::string chosen;
     std::vector<LineReinitializationCandidateReport> candidates;
 };
@@ -138,6 +142,17 @@ struct LineControlPoint {
     cv::Vec3d volumePoint{0.0, 0.0, 0.0};
     bool isSeed = false;
     int optimizedIndex = -1;
+};
+
+enum class LineControlPointSide {
+    Before,
+    After,
+};
+
+struct LineControlPointHardDirectionConstraint {
+    int controlPointIndex = -1;
+    LineControlPointSide side = LineControlPointSide::After;
+    cv::Vec3d direction{0.0, 0.0, 0.0};
 };
 
 struct LineControlPointUpdateResult {
@@ -194,7 +209,8 @@ public:
         std::vector<int> fixedControlAnchorIndices,
         int displayFrameAnchorIndex,
         const LineOptimizationConfig& config = {},
-        std::vector<std::pair<int, int>> protectedControlSpans = {}) const;
+        std::vector<std::pair<int, int>> protectedControlSpans = {},
+        std::vector<LineControlPointHardDirectionConstraint> hardDirectionConstraints = {}) const;
 
 private:
     const NormalSampler& normalSampler_;
