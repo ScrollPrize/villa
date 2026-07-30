@@ -3413,13 +3413,25 @@ class Model3D(nn.Module):
 			if flatten_output_step is None
 			else float(flatten_output_step)
 		)
+		measured_source_step = self._measured_flatten_target_step(
+			xyz_dev,
+			valid_dev,
+			fallback=float(mesh_step),
+		).detach()
+		direction = self._normalize_flatten_direction(flatten_direction)
+		source_layout_step = float(measured_source_step.detach().cpu())
+		if (
+			direction != "forward"
+			or not math.isfinite(source_layout_step)
+			or source_layout_step <= 0.0
+		):
+			source_layout_step = float(mesh_step)
 		Hout, Wout = self._flatten_output_shape_for_source(
 			H,
 			W,
-			source_step=float(mesh_step),
+			source_step=source_layout_step,
 			output_step=output_step,
 		)
-		direction = self._normalize_flatten_direction(flatten_direction)
 		map_h, map_w = (H, W) if direction == "forward" else (Hout, Wout)
 
 		self.depth = 1
@@ -3475,15 +3487,11 @@ class Model3D(nn.Module):
 			device=device,
 			dtype=torch.float32,
 		)
-		self.flatten_measured_source_step = self._measured_flatten_target_step(
-			xyz_dev,
-			valid_dev,
-			fallback=float(mesh_step),
-		).detach()
+		self.flatten_measured_source_step = measured_source_step
 		self.flatten_map_step = torch.tensor(
-			float(mesh_step) / output_step
+			source_layout_step / output_step
 			if direction == "forward"
-			else output_step / float(mesh_step),
+			else output_step / source_layout_step,
 			device=device,
 			dtype=torch.float32,
 		)
@@ -3493,7 +3501,7 @@ class Model3D(nn.Module):
 				source_w=W,
 				out_h=Hout,
 				out_w=Wout,
-				source_step=float(mesh_step),
+				source_step=source_layout_step,
 				output_step=output_step,
 				device=device,
 				dtype=torch.float32,
@@ -3505,7 +3513,7 @@ class Model3D(nn.Module):
 				source_w=W,
 				out_h=Hout,
 				out_w=Wout,
-				source_step=float(mesh_step),
+				source_step=source_layout_step,
 				output_step=output_step,
 				device=device,
 				dtype=torch.float32,
