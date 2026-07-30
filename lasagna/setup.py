@@ -103,6 +103,7 @@ setup(
             "lasagna-download-list=lasagna.scripts.download_volume_list:main",
             "lasagna-bootstrap=lasagna.scripts.bootstrap_venv:main",
             "lasagna-preprocess=preprocess_cos_omezarr:cli_main",
+            "lasagna-predict3d-holescan=predict3d_holescan:main",
         ],
     },
     zip_safe=False,
