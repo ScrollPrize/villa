@@ -180,6 +180,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Herculaneum Scroll Tools](https://github.com/axiosdevs/herculaneum-scroll-tools) by axiosdevs — CT-consistency QA for the published m7 surface predictions: voxel-exact phantom fractions measured for all 36 samples incl. all 13 grand-prize scrolls (43.3% of positives sit outside the masked CT), with a one-pass `clean` mode ([villa#1114](https://github.com/ScrollPrize/villa/issues/1114)); plus cross-scan registration (2023→2025 rescan, MAD 29 µm), a winding-constraint annotator/verifier in native spiral-input format, and dual-energy high-Z ink-candidate rendering.
 
+- [DecohesionTransform CUDA speedup](https://github.com/ScrollPrize/villa/pull/1072) by JGiraldo29. Vectorizes the causal smear step in `DecohesionTransform` with a single `F.conv1d` call, 2–7× faster on CUDA (Tesla T4), bit-equivalent output, CPU path unchanged. ([#201](https://github.com/ScrollPrize/villa/issues/201))
+
 
 ### 📦 Materials
 
