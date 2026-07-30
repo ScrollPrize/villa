@@ -109,7 +109,11 @@
 - The next control changes only the hot uniform decode, score, and frontier
   OpenMP loops to `dynamic,64`. This avoids static ownership of the externally
   occupied core while reducing scheduler traffic relative to `dynamic,8`.
-  Focused fiber tests pass; representative measurement is pending approval.
+  Focused fiber tests pass. The representative contended run measured 37.277s
+  wall / 1049.197s CPU with 8 restarts. Relative to the immediately preceding
+  38.117s run, decode improved from 8.570s to 7.917s, scoring from 8.153s to
+  7.992s, and frontier construction from 5.856s to 5.760s. Corner batching was
+  effectively unchanged at 8.648s versus 8.721s.
 
 ## Open Acceptance Issue
 

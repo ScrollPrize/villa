@@ -10,7 +10,7 @@
 - [x] Convert fiber tracer internal math to float
 - [x] Add focused regression tests
 - [x] Build and run focused native tests
-- [ ] Run approved representative benchmark and compare trace quality
+- [x] Run approved representative benchmark and compare trace quality
 - [ ] Update task log, changelog, and final consistency review
 
 The combined prediction-plus-normal sampler supports the workload's mixed
@@ -28,5 +28,6 @@ the successful heap pruning reduce runtime to 37.743s with 8 restarts. The
 within-chunk base-offset corner specialization is built and tested, pending
 explicit approval before another representative run. Its first run reduced
 corner batching to 8.721s but total runtime was 38.117s due to slower contended
-OpenMP stages. A moderate dynamic-scheduling control is built and tested,
-pending explicit approval.
+OpenMP stages. A moderate `dynamic,64` scheduling control reduced the same
+contended workload to 37.277s wall / 1049.197s CPU. Trace quality remains at 8
+restarts, versus the 5-restart pre-float baseline.
