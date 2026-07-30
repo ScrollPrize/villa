@@ -1,17 +1,34 @@
-# Native Fiber Trace Lookahead And Pipeline Optimization
+# Native Fiber Trace Locality And Scheduling Optimization
 
-Continue optimizing the precomputed native C++ fiber tracer from the committed
-21.155s wall / 619.366s CPU baseline while retaining no more than 8 restarts on
-the approved 87-segment whole-fiber workload.
+Continue optimizing the retained native precomputed C++ fiber tracer from the
+cap-32 baseline:
 
-Test the following options independently and retain only measured improvements:
+- 1.869s wall / 8.222s CPU
+- 6,910,839 candidates and 4,318 generations
+- 7 restarts over 87 segments
 
-1. Measure and implement exact lazy lookahead expansion using the nonnegative
-   candidate-loss lower bound.
-2. Fuse pinned-corner sampling, prediction/normal decoding, and candidate
-   scoring to avoid large intermediate arrays and repeated coordinate metadata.
-3. Only if exact pruning is insufficient, test deterministic intermediate beam
-   caps as an explicitly quality-changing fallback.
+Preserve at most 8 restarts. Result-neutral scheduling, storage, and locality
+changes must preserve deterministic output exactly. Search approximations may
+be tested separately but must not replace the retained default unless measured
+quality remains acceptable.
 
-Preserve deterministic candidate/tie order. Record unsuccessful experiments,
-and do not retain any result above 8 restarts.
+Investigate and test these proposals independently:
+
+1. Reduce small-batch thread-pool scheduling overhead.
+2. Select the capped parent prefix without fully sorting all parents.
+3. Store only evaluated capped-frontier children while preserving original
+   global indices for deterministic ties and reconstruction.
+4. Spatially order candidate sampling by chunk and integer voxel cube, then
+   scatter scores back to original candidate indices.
+5. Gather each unique integer voxel cube once and reuse its ordered corners for
+   candidates with different interpolation fractions.
+6. Keep a shared pinned sampling session across both lookahead depths, while
+   retaining the mandatory decision barrier between them.
+7. Measure bounded depth-two envelope prefetch and a small rolling pin window
+   across consecutive trace steps.
+8. Test fixed parent caps 28, 24, and 20 around the observed quality boundary.
+9. Test adaptive cap escalation only after the fixed and result-neutral options:
+   begin with a smaller cap and retry uncertain or failed work at cap 32/64.
+
+Ask for explicit user approval immediately before every representative
+benchmark invocation. Reuse the exact approved command and cache path.

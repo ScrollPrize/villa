@@ -1,97 +1,159 @@
-# Native Fiber Trace Lookahead And Pipeline Optimization Plan
+# Native Fiber Trace Locality And Scheduling Optimization Plan
 
 ## Baseline And Acceptance
 
-- Use commit `2bf48dea0` as the baseline: 21.155s wall / 619.366s CPU,
-  105,810,462 candidates, 4,170 generations, and 8 restarts over 87 segments.
-- Use only the approved remote-manifest/local-fiber benchmark command and its
-  existing remote cache.
-- Retain deterministic candidate generation, loss/tie ordering, and target
-  selection unless an approximate intermediate-cap experiment is explicitly
-  being measured.
-- Reject any retained implementation above 8 restarts.
-- Measure each option separately. Record wall/CPU time, stage timing, candidate
-  count, expanded lookahead parents, and restart count.
+- Use the retained cap-32 result as baseline: 1.869s wall / 8.222s CPU,
+  6,910,839 candidates, 4,318 generations, and 7 restarts over 87 segments.
+- Retain no result above 8 restarts.
+- For result-neutral phases, require identical trace output, candidate count,
+  generation count, and restart count.
+- Preserve candidate generation order, original global candidate indices,
+  reached-state ordering, spatial pruning semantics, corner order,
+  interpolation, missing/error handling, and float math.
+- Reuse the exact approved representative command and existing remote cache.
+- Ask the user immediately before every representative benchmark invocation.
+  Builds, unit tests, and synthetic microbenchmarks do not authorize or imply a
+  representative workload run.
 
-## Phase 1: Exact Lazy Lookahead
+## Phase 1: Result-Neutral Measurement
 
-1. Add result-neutral instrumentation to the exhaustive lookahead path.
-   Candidate incremental losses are nonnegative, so an intermediate parent's
-   cumulative loss is a lower bound for every descendant.
-2. From each exhaustive final frontier, compute the conservative exact parent
-   prefix required to reproduce the result:
-   - for reached-target generations, use the best reached loss as the bound;
-   - otherwise use the worst spatially accepted final beam loss;
-   - include every parent whose lower bound is less than or equal to the result
-     bound so equal-loss candidate order remains observable.
-3. Report total/mean/p50/p95/max intermediate parents and the predicted child
-   candidate reduction. Benchmark this instrumentation without changing the
-   trace result.
-4. If the reduction is substantial, implement batched lazy parent expansion.
-   Preserve original global child indices for deterministic ties, expand
-   parents by `(lower_bound, original_parent_index)`, and stop only when the
-   next lower bound is strictly greater than the established exact threshold.
-5. Add focused tests comparing lazy and exhaustive results, including equal
-   bounds, spatially rejected candidates, reached-target selection, and cases
-   where all parents must be expanded.
+Add low-overhead profile counters before choosing implementation details:
 
-## Phase 2: Fused Sample And Score
+1. Record candidate batch sizes by depth and submitted worker-task counts.
+2. Record time spent ordering capped parents, allocating/clearing full frontier
+   storage, and mapping selected children back to parents.
+3. Record per-depth unique chunk keys, unique integer voxel cubes, candidates
+   per cube, and p50/p95/max cube reuse.
+4. Record dependency overlap between depth one and depth two, plus overlap with
+   the following trace step.
+5. Keep instrumentation result-neutral and removable or profile-gated.
+6. Run focused tests, then request approval for one instrumented representative
+   benchmark. Use those measurements to order Phases 2-4.
 
-1. Profile remaining memory traffic after lazy expansion.
-2. Extract a shared pinned-corner batch context from the existing VC3D sampler;
-   do not duplicate Zarr/cache fetching behavior.
-3. For persisted fiber tracing, fuse per-candidate coordinate flooring,
-   fraction calculation, pinned corner gathering, compact direction/normal
-   decode, and loss calculation in one parallel pass.
-4. Avoid materializing full candidate-sized voxel-cube, dependency, six-volume
-   corner, decoded-sample, and score arrays where downstream selection does not
-   require them.
-5. Preserve ordered eight-corner semantics, missing/error handling, compact
-   orientation-tensor interpolation, and generic sampler fallbacks.
-6. Test boundary, clamped-edge, missing-chunk, malformed-chunk, and fused versus
-   existing score parity before benchmarking.
+## Phase 2: Scheduling And Frontier Overhead
 
-## Phase 3: Approximate Intermediate Cap
+Test each change separately and retain only measured improvements:
 
-- Run only if exact lazy expansion and fusion do not approach the requested
-  speedup.
-- Add an opt-in deterministic intermediate parent cap; do not silently change
-  default search semantics.
-- Test caps `64`, `32`, `16`, and `8` independently in that order.
-- Compare runtime, candidates, and restarts. Retain a default behavior change
-  only if it stays at or below 8 restarts and the spec is updated explicitly.
+1. **Worker granularity**
+   - Choose worker count from a minimum candidates-per-worker threshold instead
+     of always using every available corner-batch worker.
+   - Keep static point ranges and one callback per original candidate.
+   - Sweep a small set of thresholds with synthetic tests first; benchmark only
+     the best candidate after approval.
+2. **Top-K parent selection**
+   - Replace full parent sorting with deterministic partial selection for the
+     configured cap.
+   - Sort the retained prefix by `(lower_bound, original_parent_index)` after
+     selection so behavior matches the current first 32 exactly.
+   - Keep full sorting for uncapped exact lazy mode if it remains simpler.
+3. **Compact capped frontier**
+   - Store only evaluated child tasks, scores, frontier records, and their
+     original global indices.
+   - Compare original global indices for equal loss/depth ties.
+   - Reconstruct selected states through the compact-to-parent mapping.
+   - Keep the current full-index path for exhaustive mode if necessary.
+
+After each retained implementation, run focused tests and request approval
+before the unchanged representative benchmark.
+
+## Phase 3: Spatial Sampling Locality
+
+1. Build a stable spatial permutation for each candidate batch using
+   `(layout/chunk key, integer voxel cube, original candidate index)`.
+2. Gather in spatial order and scatter scores to original candidate indices;
+   beam/frontier code must never observe the spatial permutation.
+3. If measured cube reuse is material, build one record per unique integer
+   voxel cube:
+   - gather the ordered eight corners once per physical scalar volume;
+   - retain each candidate's interpolation fraction and original index;
+   - decode and score every candidate sharing the cube from those corners.
+4. Reuse the existing `ChunkedPlaneSampler` layout/cache machinery. Extract a
+   shared helper or session; do not copy its private dependency or pin logic
+   into the fiber tracer.
+5. Cover chunk boundaries, volume edges with clamped corners, mixed physical
+   chunk grids, missing chunks/fill values, malformed chunk extents, and
+   multiple fractions sharing one cube.
+6. Require score and selected-trace parity before benchmarking.
+
+## Phase 4: Persistent Two-Depth Sampling Session
+
+The second-depth coordinates depend on first-depth sampled directions, scores,
+and selected parents, so retain one explicit decision barrier. Optimize around
+that barrier rather than speculatively evaluating all second-depth parents.
+
+1. Introduce a bounded pinned-corner session owned by one lookahead step.
+2. Process depth one spatially, select the capped parents, then append only new
+   depth-two dependencies to the same session and process depth two.
+3. Measure optional prefetch of the conservative depth-two coordinate envelope
+   while depth one is being scored. Reject it if overfetch outweighs overlap.
+4. Measure a small budgeted rolling pin window across consecutive trace steps.
+   It must integrate with the existing decoded-cache budget and release pins
+   deterministically when the window advances.
+5. Keep generic sampler fallbacks unchanged.
+6. Test session lifetime, budget release, error propagation, and output parity.
+
+## Phase 5: Search Experiments
+
+Run only after result-neutral work is measured:
+
+1. Test fixed caps 28, 24, and 20 independently, in that order.
+2. Stop descending after a clear quality failure unless the user explicitly
+   requests further trials.
+3. If useful, test adaptive escalation:
+   - start with the best smaller cap;
+   - retry at cap 32 or 64 on no target, restart-worthy endpoint error, weak
+     selected-loss margin, or selection at the retained-prefix boundary;
+   - record retry count and which trigger fired.
+4. Adaptive behavior must be deterministic and exposed as an explicit config/
+   CLI mode until representative quality is established.
+5. Retain a new default only at 8 or fewer restarts and after an explicit spec
+   update.
 
 ## Testing
 
 - Build `vc_fiber_trace_metric`, `test_fiber_trace3d`,
   `test_chunked_plane_sampler_fallback`, and `test_lasagna_normal_sampler`.
-- Run all three focused test binaries after each retained implementation.
-- Run the approved benchmark after each isolated option.
-- Run `git diff --check` and review the final diff for deterministic ordering,
-  portability, and accidental changes outside the active task.
+- Run all three focused test binaries after each retained code change.
+- Add exact output-parity tests for top-K selection, compact frontier mapping,
+  spatial permutation/scatter, cube reuse, and persistent sessions.
+- Run `git diff --check` and review portability for Ubuntu/macOS and amd64/arm64.
+- Do not add architecture-specific SIMD in this task unless it is guarded with
+  a portable fallback and separately measured after the listed phases.
+
+## Performance Protocol
+
+- Ask immediately before every representative benchmark invocation.
+- Use the exact existing command, fiber manifest, fiber JSON, normal manifest,
+  and remote cache path. Do not substitute paths or add experimental flags;
+  compile isolated defaults for trials when required.
+- Record wall/CPU time, stage timing, candidates, generations, dependencies,
+  unique chunks/cubes, evaluated parents, and restarts.
+- When resources are stable, obtain three retained-final repetitions and report
+  min/median/max. Mark runs overlapping unrelated compilation or heavy work as
+  contaminated and exclude them.
+- Log failed and neutral experiments as well as improvements.
 
 ## Spec Update
 
-- Exact lazy expansion requires no search-semantics change: document that
-  configured lookahead may be evaluated lazily using a proven nonnegative lower
-  bound, but must return the same reached state and spatially pruned beam set as
-  exhaustive expansion.
-- Document fused sampling/scoring only if retained, requiring the same ordered
-  corners, interpolation, error handling, and deterministic scores.
-- Do not change the intermediate-pruning spec for an experiment. Update it only
-  if an approximate cap is retained as intentional behavior.
+- Document spatial reordering and compact storage as internal result-neutral
+  implementations that must preserve original global indices and tie behavior.
+- If retained, document shared-cube interpolation semantics and the bounded
+  two-depth pinned-session lifetime/budget rules.
+- Update cap/adaptive-search semantics only for retained behavior. Preserve
+  `--lookahead-parent-cap 0` exact lazy mode and full exhaustive mode.
 
 ## Docs Updates
 
-- Replace the active task log with this task's measurements and deviations.
-- Keep prior optimization history only in `planning/changelog.md`.
-- Update `planning/status.md` incrementally.
-- Add a concise changelog entry for retained improvements, not each rejected
+- Replace the active task files with this continuation; retain prior results
+  only in `planning/changelog.md` and git history.
+- Update `docs/code_structure.md` for any retained sampler-session or grouping
+  architecture.
+- Add one durable changelog entry summarizing retained improvements, not every
   experiment.
 
 ## Review
 
-- Review this plan directly against `planning/specs.md`, `planning/plan.md`, and
-  the task before implementation.
+- Review this plan directly against `planning/specs.md`, `planning/plan.md`,
+  `planning/task.md`, and the volume-cartographer portability requirements.
 - Independent-agent review is unavailable in the current tool context; record
-  that workflow deviation and perform a direct consistency review.
+  that workflow deviation and perform a direct consistency review before code.
