@@ -429,12 +429,13 @@ def resolve_outer_winding_idx_and_notes(cfg, shell_active, infer_outer_winding_i
             f'= {idx} for the dense and regularisation losses')
     if idx is not None:
         min_gap = idx + 3
-        if cfg['gap_expander_num_windings'] < min_gap:
+        gap_windings = cfg['model_gap_expander_num_windings']
+        if gap_windings < min_gap:
             notes.append(
                 f'WARNING: shell_outer_winding_idx {idx} requires '
-                f'gap_expander_num_windings >= {min_gap}, got '
-                f'gap_expander_num_windings {cfg["gap_expander_num_windings"]}; '
-                'increase gap_expander_num_windings or lower '
+                f'model_gap_expander_num_windings >= {min_gap}, got '
+                f'model_gap_expander_num_windings {gap_windings}; '
+                'increase model_gap_expander_num_windings or lower '
                 'shell_outer_winding_idx')
     return idx, notes
 

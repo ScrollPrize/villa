@@ -1,6 +1,7 @@
 #include "elements/SpiralConfigProfileEditor.hpp"
 
 #include "VCSettings.hpp"
+#include "elements/CollapsibleSettingsGroup.hpp"
 
 #include <QComboBox>
 #include <QCheckBox>
@@ -11,23 +12,27 @@
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QGridLayout>
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonParseError>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMap>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QResizeEvent>
+#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QTabWidget>
-#include <QTreeWidget>
 #include <QUuid>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <array>
 
 namespace {
 const QString kDefaultId = QStringLiteral("default");
@@ -119,6 +124,123 @@ QString impactLabel(const QString& impact)
     if (impact == QStringLiteral("new_fit")) return QObject::tr("Start New Fit");
     return impact;
 }
+
+QString groupTitle(const QString& prefix)
+{
+    static const QHash<QString, QString> titles{
+        {QStringLiteral("optimizer"), QObject::tr("Optimizer")},
+        {QStringLiteral("model"), QObject::tr("Model")},
+        {QStringLiteral("patch"), QObject::tr("Patch")},
+        {QStringLiteral("sample"), QObject::tr("Sample Count")},
+        {QStringLiteral("input"), QObject::tr("Input")},
+        {QStringLiteral("pcl"), QObject::tr("PCL")},
+        {QStringLiteral("tracks"), QObject::tr("Tracks")},
+        {QStringLiteral("dense"), QObject::tr("Dense")},
+        {QStringLiteral("loss"), QObject::tr("Loss")},
+        {QStringLiteral("dt"), QObject::tr("DT")},
+        {QStringLiteral("output"), QObject::tr("Output")},
+        {QStringLiteral("shell"), QObject::tr("Shell")},
+        {QStringLiteral("influence"), QObject::tr("Influence")},
+    };
+    const auto title = titles.constFind(prefix);
+    if (title != titles.cend()) return *title;
+    QString fallback = prefix;
+    if (!fallback.isEmpty()) fallback[0] = fallback[0].toUpper();
+    return fallback;
+}
+
+int groupOrder(const QString& prefix)
+{
+    static const std::array<QString, 13> order{
+        QStringLiteral("optimizer"), QStringLiteral("model"),
+        QStringLiteral("patch"), QStringLiteral("sample"),
+        QStringLiteral("input"), QStringLiteral("pcl"),
+        QStringLiteral("tracks"), QStringLiteral("dense"),
+        QStringLiteral("loss"), QStringLiteral("dt"),
+        QStringLiteral("output"), QStringLiteral("shell"),
+        QStringLiteral("influence"),
+    };
+    const auto found = std::find(order.cbegin(), order.cend(), prefix);
+    return found == order.cend()
+        ? static_cast<int>(order.size())
+        : static_cast<int>(std::distance(order.cbegin(), found));
+}
+
+class ResponsiveGroupGrid final : public QWidget
+{
+public:
+    explicit ResponsiveGroupGrid(QWidget* parent = nullptr)
+        : QWidget(parent)
+        , _layout(new QGridLayout(this))
+    {
+        setObjectName(QStringLiteral("spiralConfigGroupGrid"));
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        _layout->setContentsMargins(0, 0, 0, 0);
+        _layout->setHorizontalSpacing(12);
+        _layout->setVerticalSpacing(12);
+        setProperty("spiralColumnCount", 1);
+    }
+
+    void addGroup(QWidget* group)
+    {
+        _groups.push_back(group);
+        reflow(width());
+    }
+
+    void refresh()
+    {
+        reflow(width(), true);
+    }
+
+    QSize sizeHint() const override
+    {
+        QSize hint = QWidget::sizeHint();
+        hint.setWidth(400);
+        return hint;
+    }
+
+protected:
+    void resizeEvent(QResizeEvent* event) override
+    {
+        QWidget::resizeEvent(event);
+        reflow(event->size().width());
+    }
+
+private:
+    void reflow(int width, bool force = false)
+    {
+        const int available = std::max(1, width - _layout->contentsMargins().left()
+                                             - _layout->contentsMargins().right());
+        const int columns = std::clamp(available / 400, 1, 3);
+        const int visibleGroups = static_cast<int>(std::count_if(
+            _groups.cbegin(), _groups.cend(),
+            [](const QWidget* group) {
+                return group->property("spiralFilterVisible").toBool();
+            }));
+        if (!force && columns == _columns && _layout->count() == visibleGroups)
+            return;
+
+        while (_layout->count() > 0)
+            _layout->takeAt(0);
+        for (int column = 0; column < 3; ++column)
+            _layout->setColumnStretch(column, column < columns ? 1 : 0);
+        int index = 0;
+        for (QWidget* group : _groups) {
+            if (!group->property("spiralFilterVisible").toBool()) continue;
+            _layout->addWidget(group, index / columns, index % columns);
+            ++index;
+        }
+        _layout->setRowStretch(
+            (visibleGroups + columns - 1) / columns, 1);
+        _columns = columns;
+        setProperty("spiralColumnCount", columns);
+        updateGeometry();
+    }
+
+    QGridLayout* _layout;
+    std::vector<QWidget*> _groups;
+    int _columns = 0;
+};
 }
 
 SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
@@ -183,7 +305,7 @@ SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
     _dialog->setObjectName(QStringLiteral("spiralAdvancedConfigDialog"));
     _dialog->setWindowTitle(tr("Spiral Advanced Config JSON"));
     _dialog->setModal(false);
-    _dialog->resize(720, 620);
+    _dialog->resize(1280, 760);
     _dialog->setLayout(new QVBoxLayout);
     _dialog->installEventFilter(this);
     root->removeWidget(_editorContents);
@@ -195,9 +317,14 @@ SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
     _search = new QLineEdit(_controlsPage);
     _search->setPlaceholderText(tr("Search controls…"));
     controlsLayout->addWidget(_search);
-    _controls = new QTreeWidget(_controlsPage);
-    _controls->setHeaderLabels({tr("Control"), tr("Value"), tr("Impact")});
-    controlsLayout->addWidget(_controls);
+    _controlsScroll = new QScrollArea(_controlsPage);
+    _controlsScroll->setObjectName(QStringLiteral("spiralConfigControlsScroll"));
+    _controlsScroll->setWidgetResizable(true);
+    _controlsScroll->setFrameShape(QFrame::NoFrame);
+    _controlsScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    _controlsGrid = new ResponsiveGroupGrid(_controlsScroll);
+    _controlsScroll->setWidget(_controlsGrid);
+    controlsLayout->addWidget(_controlsScroll);
     tabs->addTab(_controlsPage, tr("Controls"));
     tabs->addTab(_editorContents, tr("Expert JSON"));
     _dialog->layout()->addWidget(tabs);
@@ -219,20 +346,8 @@ SpiralConfigProfileEditor::SpiralConfigProfileEditor(QWidget* parent)
     _popButton->hide();
     connect(_inlinePopInButton, &QPushButton::clicked,
             this, &SpiralConfigProfileEditor::showWindow);
-    connect(_search, &QLineEdit::textChanged, this, [this](const QString& text) {
-        for (int i = 0; i < _controls->topLevelItemCount(); ++i) {
-            auto* section = _controls->topLevelItem(i);
-            bool any = false;
-            for (int j = 0; j < section->childCount(); ++j) {
-                auto* field = section->child(j);
-                const bool visible = text.isEmpty()
-                    || field->text(0).contains(text, Qt::CaseInsensitive);
-                field->setHidden(!visible);
-                any |= visible;
-            }
-            section->setHidden(!any);
-        }
-    });
+    connect(_search, &QLineEdit::textChanged,
+            this, &SpiralConfigProfileEditor::filterControls);
 
     loadProfiles();
     rebuildCombo();
@@ -304,42 +419,60 @@ void SpiralConfigProfileEditor::setCatalog(const QJsonObject& catalog)
 
 void SpiralConfigProfileEditor::rebuildControls()
 {
-    _controls->clear();
+    _controlGroups.clear();
+    _preSearchExpanded.clear();
     _fieldEditors.clear();
+    QWidget* oldGrid = _controlsScroll->takeWidget();
+    delete oldGrid;
+    _controlsGrid = new ResponsiveGroupGrid(_controlsScroll);
+    _controlsScroll->setWidget(_controlsGrid);
+
     const QJsonObject schema = _catalog.value(QStringLiteral("schema")).toObject();
     const QJsonObject fields = schema.value(QStringLiteral("fields")).toObject();
-    QHash<QString, QTreeWidgetItem*> sections;
+    QMap<QString, QVector<QString>> fieldsByPrefix;
     for (auto it = fields.begin(); it != fields.end(); ++it) {
-        const QString sectionName = it.key().section('_', 0, 0).toUpper();
-        auto* section = sections.value(sectionName);
-        if (!section) {
-            section = new QTreeWidgetItem(_controls, {sectionName, {}});
-            section->setExpanded(true);
-            sections.insert(sectionName, section);
-        }
-        const QJsonObject spec = it.value().toObject();
-        auto* item = new QTreeWidgetItem(section, {
-            spec.value(QStringLiteral("label")).toString(),
-            {}, impactLabel(
-                spec.value(QStringLiteral("runtime_impact")).toString())
-        });
-        item->setToolTip(0, it.key());
+        fieldsByPrefix[it.key().section('_', 0, 0)].push_back(it.key());
+    }
+    QVector<QString> prefixes(fieldsByPrefix.keyBegin(), fieldsByPrefix.keyEnd());
+    std::stable_sort(prefixes.begin(), prefixes.end(),
+                     [](const QString& left, const QString& right) {
+        const int leftOrder = groupOrder(left);
+        const int rightOrder = groupOrder(right);
+        return leftOrder == rightOrder ? left < right : leftOrder < rightOrder;
+    });
+
+    for (const QString& prefix : prefixes) {
+        auto* group = new CollapsibleSettingsGroup(
+            groupTitle(prefix), _controlsGrid);
+        group->setObjectName(QStringLiteral("spiralConfigGroup_%1").arg(prefix));
+        group->setProperty("spiralConfigPrefix", prefix);
+        group->setProperty("spiralFilterVisible", true);
+        group->setExpanded(true);
+        group->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
+
+        ControlGroup groupState{prefix, group, {}};
+        for (const QString& key : fieldsByPrefix.value(prefix)) {
+            const QJsonObject spec = fields.value(key).toObject();
+            const QString labelText =
+                spec.value(QStringLiteral("label")).toString();
+            const QString impactText = impactLabel(
+                spec.value(QStringLiteral("runtime_impact")).toString());
         const QString type = spec.value(QStringLiteral("type")).toString();
         QWidget* editor = nullptr;
         if (type == QStringLiteral("boolean")) {
-            auto* value = new QCheckBox(_controls);
+            auto* value = new QCheckBox(group);
             connect(value, &QCheckBox::toggled,
                     this, &SpiralConfigProfileEditor::controlsToJson);
             editor = value;
         } else if (type == QStringLiteral("integer")) {
-            auto* value = new QSpinBox(_controls);
+            auto* value = new QSpinBox(group);
             value->setRange(spec.value(QStringLiteral("minimum")).toInt(),
                             spec.value(QStringLiteral("maximum")).toInt());
             connect(value, qOverload<int>(&QSpinBox::valueChanged),
                     this, [this] { controlsToJson(); });
             editor = value;
         } else if (type == QStringLiteral("number")) {
-            auto* value = new QDoubleSpinBox(_controls);
+            auto* value = new QDoubleSpinBox(group);
             value->setRange(spec.value(QStringLiteral("minimum")).toDouble(),
                             spec.value(QStringLiteral("maximum")).toDouble());
             value->setDecimals(spec.value(QStringLiteral("precision")).toInt(6));
@@ -348,7 +481,7 @@ void SpiralConfigProfileEditor::rebuildControls()
                     this, [this] { controlsToJson(); });
             editor = value;
         } else if (type == QStringLiteral("enum")) {
-            auto* value = new QComboBox(_controls);
+            auto* value = new QComboBox(group);
             for (const QJsonValue& option :
                  spec.value(QStringLiteral("values")).toArray())
                 value->addItem(option.toString());
@@ -356,7 +489,7 @@ void SpiralConfigProfileEditor::rebuildControls()
                     this, [this] { controlsToJson(); });
             editor = value;
         } else {
-            auto* value = new QLineEdit(_controls);
+            auto* value = new QLineEdit(group);
             value->setPlaceholderText(
                 type == QStringLiteral("dictionary")
                     ? tr("{ key: value }") : tr("[ values ]"));
@@ -364,10 +497,12 @@ void SpiralConfigProfileEditor::rebuildControls()
                     this, &SpiralConfigProfileEditor::controlsToJson);
             editor = value;
         }
-        editor->setProperty("spiralConfigKey", it.key());
+        editor->setObjectName(QStringLiteral("spiralConfigEditor_%1").arg(key));
+        editor->setProperty("spiralConfigKey", key);
+        editor->setToolTip(key);
         QWidget* displayed = editor;
         if (spec.value(QStringLiteral("nullable")).toBool()) {
-            displayed = new QWidget(_controls);
+            displayed = new QWidget(group);
             auto* row = new QHBoxLayout(displayed);
             row->setContentsMargins(0, 0, 0, 0);
             auto* enabled = new QCheckBox(tr("Enabled"), displayed);
@@ -381,11 +516,70 @@ void SpiralConfigProfileEditor::rebuildControls()
                         controlsToJson();
                     });
         }
-        _fieldEditors.insert(it.key(), editor);
-        _controls->setItemWidget(item, 1, displayed);
+        _fieldEditors.insert(key, editor);
+
+        auto* rowWidget = new QWidget(group->contentWidget());
+        rowWidget->setObjectName(QStringLiteral("spiralConfigRow_%1").arg(key));
+        rowWidget->setProperty("spiralConfigKey", key);
+        auto* row = new QGridLayout(rowWidget);
+        row->setContentsMargins(0, 0, 0, 0);
+        row->setHorizontalSpacing(8);
+        auto* label = new QLabel(labelText, rowWidget);
+        label->setObjectName(QStringLiteral("spiralConfigLabel_%1").arg(key));
+        label->setToolTip(key);
+        auto* impact = new QLabel(impactText, rowWidget);
+        impact->setObjectName(QStringLiteral("spiralConfigImpact_%1").arg(key));
+        impact->setProperty("spiralRuntimeImpact",
+                            spec.value(QStringLiteral("runtime_impact")).toString());
+        impact->setStyleSheet(QStringLiteral("color: palette(mid);"));
+        impact->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        impact->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
+        row->addWidget(label, 0, 0);
+        row->addWidget(displayed, 0, 1);
+        row->addWidget(impact, 0, 2);
+        row->setColumnStretch(1, 1);
+        group->addFullWidthWidget(rowWidget, key);
+        groupState.rows.push_back(
+            {key, labelText + QLatin1Char(' ') + key + QLatin1Char(' ')
+                      + impactText,
+             rowWidget});
+        }
+        _controlGroups.push_back(groupState);
+        static_cast<ResponsiveGroupGrid*>(_controlsGrid)->addGroup(group);
     }
-    for (int column = 0; column < _controls->columnCount(); ++column)
-        _controls->resizeColumnToContents(column);
+    filterControls(_search->text());
+}
+
+void SpiralConfigProfileEditor::filterControls(const QString& text)
+{
+    const QString query = text.trimmed();
+    const bool searching = !query.isEmpty();
+    if (searching && _preSearchExpanded.isEmpty()) {
+        for (const ControlGroup& group : _controlGroups)
+            _preSearchExpanded.insert(group.widget, group.widget->isExpanded());
+    }
+
+    for (ControlGroup& group : _controlGroups) {
+        bool anyVisible = false;
+        for (ControlRow& row : group.rows) {
+            const bool visible = !searching
+                || row.searchableText.contains(query, Qt::CaseInsensitive);
+            row.widget->setVisible(visible);
+            anyVisible |= visible;
+        }
+        group.widget->setVisible(anyVisible);
+        group.widget->setProperty("spiralFilterVisible", anyVisible);
+        if (searching && anyVisible)
+            group.widget->setExpanded(true);
+    }
+
+    if (!searching && !_preSearchExpanded.isEmpty()) {
+        for (ControlGroup& group : _controlGroups)
+            group.widget->setExpanded(
+                _preSearchExpanded.value(group.widget, true));
+        _preSearchExpanded.clear();
+    }
+    static_cast<ResponsiveGroupGrid*>(_controlsGrid)->refresh();
 }
 
 void SpiralConfigProfileEditor::controlsToJson()

@@ -11,6 +11,8 @@ class QEvent;
 class QLabel;
 class QPlainTextEdit;
 class QPushButton;
+class QScrollArea;
+class CollapsibleSettingsGroup;
 
 class SpiralConfigProfileEditor final : public QWidget
 {
@@ -71,6 +73,18 @@ private:
     void rebuildControls();
     void controlsToJson();
     void jsonToControls();
+    void filterControls(const QString& text);
+
+    struct ControlRow {
+        QString key;
+        QString searchableText;
+        QWidget* widget = nullptr;
+    };
+    struct ControlGroup {
+        QString prefix;
+        CollapsibleSettingsGroup* widget = nullptr;
+        QVector<ControlRow> rows;
+    };
 
     QWidget* _editorContents = nullptr;
     QComboBox* _profileCombo = nullptr;
@@ -85,9 +99,12 @@ private:
     QDialog* _dialog = nullptr;
     QJsonObject _catalog;
     QWidget* _controlsPage = nullptr;
-    class QTreeWidget* _controls = nullptr;
+    QScrollArea* _controlsScroll = nullptr;
+    QWidget* _controlsGrid = nullptr;
     class QLineEdit* _search = nullptr;
     QHash<QString, QWidget*> _fieldEditors;
+    QVector<ControlGroup> _controlGroups;
+    QHash<CollapsibleSettingsGroup*, bool> _preSearchExpanded;
 
     QVector<StoredProfile> _profiles;
     QString _currentProfileId = QStringLiteral("default");
