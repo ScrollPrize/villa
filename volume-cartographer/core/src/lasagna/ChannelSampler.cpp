@@ -1,5 +1,9 @@
 #include "vc/lasagna/ChannelSampler.hpp"
 
+#include "vc/core/render/ChunkedPlaneSampler.hpp"
+#include "vc/core/render/DecodedChunkCacheBudget.hpp"
+#include "vc/core/render/ZarrChunkFetcher.hpp"
+
 #include "utils/thread_pool.hpp"
 #include "utils/zarr.hpp"
 
@@ -21,6 +25,7 @@ namespace vc::lasagna {
 namespace {
 
 constexpr double kEpsilon = 1.0e-12;
+constexpr float kFloatEpsilon = 1.0e-6f;
 
 [[nodiscard]] double length(const cv::Vec3d& v)
 {
@@ -495,6 +500,251 @@ size_t LasagnaChannelChunkKeyHash::operator()(const LasagnaChannelChunkKey& key)
     return hash;
 }
 
+class LasagnaChannelCornerSampler::Impl {
+public:
+    Impl(const LasagnaChannelBinding& binding,
+         size_t maxCachedBytes,
+         std::shared_ptr<vc::render::DecodedChunkCacheBudget> sharedBudget)
+        : spacing_(static_cast<float>(binding.spacing))
+        , shapeZYX_{static_cast<int>(binding.shapeZYX[0]),
+                    static_cast<int>(binding.shapeZYX[1]),
+                    static_cast<int>(binding.shapeZYX[2])}
+    {
+        if (!binding.array)
+            throw std::runtime_error("VC3D corner-batch sampling requires an open Zarr array");
+        vc::render::ChunkCache::Options options;
+        options.decodedByteCapacity = std::max<size_t>(1, maxCachedBytes);
+        options.decodedByteBudget = std::move(sharedBudget);
+        options.maxConcurrentReads = 16;
+        cache_ = vc::render::createChunkCache(binding.array, std::move(options));
+    }
+
+    [[nodiscard]] NormalPrefetchReport sampleBatch(
+        const std::vector<cv::Vec3f>& volumePoints,
+        std::vector<LasagnaCornerSample>& samples) const
+    {
+        samples.clear();
+        samples.resize(volumePoints.size());
+        if (volumePoints.empty())
+            return {};
+        if (volumePoints.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::overflow_error("corner sample batch is too large for OpenCV matrices");
+
+        const int rows = static_cast<int>(volumePoints.size());
+        cv::Mat_<cv::Vec3f> coords(rows, 8);
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        for (int row = 0; row < rows; ++row) {
+            const cv::Vec3f point = volumePoints[static_cast<size_t>(row)] / spacing_;
+            auto& sample = samples[static_cast<size_t>(row)];
+            if (!std::isfinite(point[0]) || !std::isfinite(point[1]) ||
+                !std::isfinite(point[2]) || point[0] < 0.0f || point[1] < 0.0f ||
+                point[2] < 0.0f || point[0] > static_cast<float>(shapeZYX_[2] - 1) ||
+                point[1] > static_cast<float>(shapeZYX_[1] - 1) ||
+                point[2] > static_cast<float>(shapeZYX_[0] - 1)) {
+                for (int corner = 0; corner < 8; ++corner)
+                    coords(row, corner) = {nan, nan, nan};
+                continue;
+            }
+
+            const int x0 = static_cast<int>(std::floor(point[0]));
+            const int y0 = static_cast<int>(std::floor(point[1]));
+            const int z0 = static_cast<int>(std::floor(point[2]));
+            const int x1 = std::min(x0 + 1, shapeZYX_[2] - 1);
+            const int y1 = std::min(y0 + 1, shapeZYX_[1] - 1);
+            const int z1 = std::min(z0 + 1, shapeZYX_[0] - 1);
+            sample.fractionXYZ = {
+                point[0] - static_cast<float>(x0),
+                point[1] - static_cast<float>(y0),
+                point[2] - static_cast<float>(z0)};
+            int corner = 0;
+            for (int dz = 0; dz <= 1; ++dz) {
+                const int z = dz == 0 ? z0 : z1;
+                for (int dy = 0; dy <= 1; ++dy) {
+                    const int y = dy == 0 ? y0 : y1;
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int x = dx == 0 ? x0 : x1;
+                        coords(row, corner++) = {
+                            static_cast<float>(x),
+                            static_cast<float>(y),
+                            static_cast<float>(z)};
+                    }
+                }
+            }
+            sample.valid = true;
+        }
+
+        cv::Mat_<uint8_t> values(rows, 8, uint8_t{0});
+        cv::Mat_<uint8_t> coverage = cv::Mat_<uint8_t>::zeros(rows, 8);
+        vc::render::ChunkedPlaneSampler::Options options(
+            vc::Sampling::Nearest, 32);
+        const auto stats =
+            vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+                *cache_, 0, coords, values, coverage, options);
+        for (int row = 0; row < rows; ++row) {
+            auto& sample = samples[static_cast<size_t>(row)];
+            if (!sample.valid)
+                continue;
+            for (int corner = 0; corner < 8; ++corner) {
+                if (coverage(row, corner) == 0) {
+                    sample.valid = false;
+                    break;
+                }
+                sample.values[static_cast<size_t>(corner)] = values(row, corner);
+            }
+        }
+        return {static_cast<uint64_t>(stats.requestedChunks), 0};
+    }
+
+    [[nodiscard]] float spacing() const noexcept { return spacing_; }
+    [[nodiscard]] const std::array<int, 3>& shapeZYX() const noexcept { return shapeZYX_; }
+    [[nodiscard]] vc::render::IChunkedArray* cache() const noexcept { return cache_.get(); }
+
+private:
+    float spacing_ = 1.0f;
+    std::array<int, 3> shapeZYX_{};
+    std::unique_ptr<vc::render::ChunkCache> cache_;
+};
+
+LasagnaChannelCornerSampler::LasagnaChannelCornerSampler(
+    const LasagnaChannelBinding& binding,
+    size_t maxCachedBytes,
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> sharedBudget)
+    : impl_(std::make_unique<Impl>(
+          binding, maxCachedBytes, std::move(sharedBudget)))
+{
+}
+
+LasagnaChannelCornerSampler::~LasagnaChannelCornerSampler() = default;
+LasagnaChannelCornerSampler::LasagnaChannelCornerSampler(
+    LasagnaChannelCornerSampler&&) noexcept = default;
+LasagnaChannelCornerSampler& LasagnaChannelCornerSampler::operator=(
+    LasagnaChannelCornerSampler&&) noexcept = default;
+
+NormalPrefetchReport LasagnaChannelCornerSampler::sampleBatch(
+    const std::vector<cv::Vec3f>& volumePoints,
+    std::vector<LasagnaCornerSample>& samples) const
+{
+    return impl_->sampleBatch(volumePoints, samples);
+}
+
+NormalPrefetchReport visitLasagnaChannelCorners(
+    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+    const std::vector<cv::Vec3f>& volumePoints,
+    void* visitorContext,
+    LasagnaCornerPointVisitor visitor,
+    int parallelThreads,
+    bool collectLocalityStats)
+{
+    if (samplers.empty() || volumePoints.empty())
+        return {};
+    if (samplers.front() == nullptr || !samplers.front()->impl_)
+        throw std::invalid_argument("corner batch contains a null channel sampler");
+
+    const float spacing = samplers.front()->impl_->spacing();
+    const auto shape = samplers.front()->impl_->shapeZYX();
+    std::vector<vc::render::IChunkedArray*> arrays;
+    arrays.reserve(samplers.size());
+    for (const auto* sampler : samplers) {
+        if (sampler == nullptr || !sampler->impl_ ||
+            sampler->impl_->spacing() != spacing ||
+            sampler->impl_->shapeZYX() != shape) {
+            throw std::invalid_argument(
+                "grouped corner samplers must share one spatial grid");
+        }
+        arrays.push_back(sampler->impl_->cache());
+    }
+
+    std::vector<cv::Vec3f> levelCoords;
+    levelCoords.reserve(volumePoints.size());
+    for (const auto& point : volumePoints)
+        levelCoords.push_back(point / spacing);
+    const auto stats =
+        vc::render::ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+            arrays,
+            0,
+            levelCoords,
+            visitorContext,
+            visitor,
+            parallelThreads,
+            collectLocalityStats);
+    return {
+        static_cast<uint64_t>(stats.requestedChunks),
+        static_cast<uint64_t>(stats.requestedChunks),
+        stats.cornerPrepareSeconds,
+        stats.cornerLayoutSeconds,
+        stats.cornerPinSeconds,
+        stats.cornerGatherSeconds,
+        stats.cornerLayoutChunkRuns,
+        stats.cornerBoundaryPoints,
+        stats.cornerDependencies,
+        stats.cornerPointCount,
+        stats.cornerUniqueVoxelCubes,
+        stats.cornerWorkerTasks,
+        stats.cornerMaxCandidatesPerCube,
+        stats.cornerCubeOccupancyHistogram,
+        stats.cornerDependencyIds};
+}
+
+NormalPrefetchReport sampleLasagnaChannelCornerBatch(
+    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+    const std::vector<cv::Vec3f>& volumePoints,
+    LasagnaCornerBatch& samples,
+    int parallelThreads)
+{
+    samples.values.assign(
+        samplers.size(),
+        std::vector<std::array<uint8_t, 8>>(volumePoints.size()));
+    samples.fractionsXYZ.resize(volumePoints.size());
+    samples.valid.resize(volumePoints.size());
+    struct MaterializeContext {
+        LasagnaCornerBatch* samples;
+    } context{&samples};
+    const auto materialize = +[](
+        void* rawContext,
+        size_t pointIndex,
+        const cv::Vec3f& fractionXYZ,
+        bool valid,
+        std::span<const std::array<uint8_t, 8>> volumeCorners) {
+        auto& out = *static_cast<MaterializeContext*>(rawContext)->samples;
+        out.fractionsXYZ[pointIndex] = fractionXYZ;
+        out.valid[pointIndex] = valid ? uint8_t{1} : uint8_t{0};
+        if (!valid)
+            return;
+        for (size_t volumeIndex = 0; volumeIndex < volumeCorners.size(); ++volumeIndex)
+            out.values[volumeIndex][pointIndex] = volumeCorners[volumeIndex];
+    };
+    return visitLasagnaChannelCorners(
+        samplers,
+        volumePoints,
+        &context,
+        materialize,
+        parallelThreads);
+}
+
+NormalPrefetchReport sampleLasagnaChannelCornerBatch(
+    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+    const std::vector<cv::Vec3f>& volumePoints,
+    std::vector<std::vector<LasagnaCornerSample>>& samples,
+    int parallelThreads)
+{
+    LasagnaCornerBatch batch;
+    const NormalPrefetchReport report = sampleLasagnaChannelCornerBatch(
+        samplers, volumePoints, batch, parallelThreads);
+    samples.assign(
+        samplers.size(),
+        std::vector<LasagnaCornerSample>(volumePoints.size()));
+    for (size_t volumeIndex = 0; volumeIndex < samplers.size(); ++volumeIndex) {
+        for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex) {
+            samples[volumeIndex][pointIndex] = {
+                batch.values[volumeIndex][pointIndex],
+                batch.fractionsXYZ[pointIndex],
+                batch.valid[pointIndex] != 0,
+            };
+        }
+    }
+    return report;
+}
+
 struct LasagnaChannelChunkCache::InFlightLoad {
     std::mutex mutex;
     std::condition_variable finished;
@@ -793,6 +1043,213 @@ sharedLasagnaChannelChunkCache(size_t capacityBytes)
         cache = std::make_shared<LasagnaChannelChunkCache>(capacityBytes);
     }
     return cache;
+}
+
+namespace {
+
+[[nodiscard]] cv::Vec3f normalizedFloatOrZero(const cv::Vec3f& value)
+{
+    const float norm2 = value.dot(value);
+    if (!(norm2 > kFloatEpsilon * kFloatEpsilon) || !std::isfinite(norm2))
+        return {0.0f, 0.0f, 0.0f};
+    return value * (1.0f / std::sqrt(norm2));
+}
+
+[[nodiscard]] std::array<float, 8> cornerWeights(const cv::Vec3f& fractionXYZ)
+{
+    const float fx = fractionXYZ[0];
+    const float fy = fractionXYZ[1];
+    const float fz = fractionXYZ[2];
+    const float ax = 1.0f - fx;
+    const float ay = 1.0f - fy;
+    const float az = 1.0f - fz;
+    return {
+        az * ay * ax, az * ay * fx, az * fy * ax, az * fy * fx,
+        fz * ay * ax, fz * ay * fx, fz * fy * ax, fz * fy * fx};
+}
+
+struct DecodedCompactNormalFloat {
+    std::array<float, 6> tensor{};
+    bool valid = false;
+};
+
+[[nodiscard]] const std::array<DecodedCompactNormalFloat, 256 * 256>&
+decodedCompactNormalFloatTable()
+{
+    static const auto table = [] {
+        std::array<DecodedCompactNormalFloat, 256 * 256> out{};
+        for (size_t rawNx = 0; rawNx < 256; ++rawNx) {
+            for (size_t rawNy = 0; rawNy < 256; ++rawNy) {
+                const float x =
+                    (static_cast<float>(rawNx) - 128.0f) / 127.0f;
+                const float y =
+                    (static_cast<float>(rawNy) - 128.0f) / 127.0f;
+                const float z = std::sqrt(std::max(
+                    0.0f, 1.0f - x * x - y * y));
+                auto& decoded = out[(rawNx << 8) | rawNy];
+                const cv::Vec3f axis = normalizedFloatOrZero({x, y, z});
+                decoded.valid = axis.dot(axis) >
+                    kFloatEpsilon * kFloatEpsilon;
+                if (decoded.valid) {
+                    decoded.tensor = {
+                        axis[0] * axis[0],
+                        axis[0] * axis[1],
+                        axis[0] * axis[2],
+                        axis[1] * axis[1],
+                        axis[1] * axis[2],
+                        axis[2] * axis[2]};
+                }
+            }
+        }
+        return out;
+    }();
+    return table;
+}
+
+[[nodiscard]] cv::Vec3f principalFloatTensorAxis(
+    float a00,
+    float a01,
+    float a02,
+    float a11,
+    float a12,
+    float a22,
+    const cv::Vec3f& hint)
+{
+    if (!std::isfinite(a00) || !std::isfinite(a01) || !std::isfinite(a02) ||
+        !std::isfinite(a11) || !std::isfinite(a12) || !std::isfinite(a22)) {
+        return {0.0f, 0.0f, 0.0f};
+    }
+    auto fallback = [&]() {
+        cv::Vec3f result{1.0f, 0.0f, 0.0f};
+        if (a11 > a00 && a11 >= a22)
+            result = {0.0f, 1.0f, 0.0f};
+        else if (a22 > a00 && a22 > a11)
+            result = {0.0f, 0.0f, 1.0f};
+        return result;
+    };
+
+    cv::Vec3f axis{};
+    const float offDiagonal = a01 * a01 + a02 * a02 + a12 * a12;
+    if (offDiagonal <= kFloatEpsilon * kFloatEpsilon) {
+        axis = fallback();
+    } else {
+        const float q = (a00 + a11 + a22) / 3.0f;
+        const float b00 = a00 - q;
+        const float b11 = a11 - q;
+        const float b22 = a22 - q;
+        const float p2 = b00 * b00 + b11 * b11 + b22 * b22 + 2.0f * offDiagonal;
+        const float p = std::sqrt(std::max(0.0f, p2 / 6.0f));
+        if (!(p > kFloatEpsilon)) {
+            axis = fallback();
+        } else {
+            const float invP = 1.0f / p;
+            const float c00 = b00 * invP;
+            const float c01 = a01 * invP;
+            const float c02 = a02 * invP;
+            const float c11 = b11 * invP;
+            const float c12 = a12 * invP;
+            const float c22 = b22 * invP;
+            const float detC =
+                c00 * (c11 * c22 - c12 * c12) -
+                c01 * (c01 * c22 - c12 * c02) +
+                c02 * (c01 * c12 - c11 * c02);
+            const float phi = std::acos(std::clamp(0.5f * detC, -1.0f, 1.0f)) / 3.0f;
+            const float lambda = q + 2.0f * p * std::cos(phi);
+            const cv::Vec3f row0{a00 - lambda, a01, a02};
+            const cv::Vec3f row1{a01, a11 - lambda, a12};
+            const cv::Vec3f row2{a02, a12, a22 - lambda};
+            const std::array<cv::Vec3f, 3> candidates{
+                row0.cross(row1), row0.cross(row2), row1.cross(row2)};
+            float bestNorm2 = -1.0f;
+            for (const auto& candidate : candidates) {
+                const float norm2 = candidate.dot(candidate);
+                if (norm2 > bestNorm2) {
+                    bestNorm2 = norm2;
+                    axis = candidate;
+                }
+            }
+            if (!(bestNorm2 > kFloatEpsilon * kFloatEpsilon))
+                axis = fallback();
+        }
+    }
+
+    axis = normalizedFloatOrZero(axis);
+    if (axis.dot(axis) <= kFloatEpsilon * kFloatEpsilon)
+        return {0.0f, 0.0f, 0.0f};
+    const cv::Vec3f normalizedHint = normalizedFloatOrZero(hint);
+    if (normalizedHint.dot(normalizedHint) > kFloatEpsilon * kFloatEpsilon) {
+        if (axis.dot(normalizedHint) < 0.0f)
+            axis *= -1.0f;
+    } else if (axis[2] < 0.0f) {
+        axis *= -1.0f;
+    }
+    return axis;
+}
+
+} // namespace
+
+float interpolateLasagnaCorners(const LasagnaCornerSample& sample)
+{
+    if (!sample.valid)
+        return 0.0f;
+    return interpolateLasagnaCorners(
+        sample.values, lasagnaCornerWeights(sample.fractionXYZ));
+}
+
+std::array<float, 8> lasagnaCornerWeights(const cv::Vec3f& fractionXYZ)
+{
+    return cornerWeights(fractionXYZ);
+}
+
+float interpolateLasagnaCorners(
+    const std::array<uint8_t, 8>& values,
+    const std::array<float, 8>& weights)
+{
+    float value = 0.0f;
+    for (size_t corner = 0; corner < weights.size(); ++corner)
+        value = std::fma(weights[corner], static_cast<float>(values[corner]), value);
+    return value;
+}
+
+cv::Vec3f interpolateLasagnaCompactAxisCorners(
+    const LasagnaCornerSample& nx,
+    const LasagnaCornerSample& ny,
+    const cv::Vec3f& hint)
+{
+    if (!nx.valid || !ny.valid)
+        return {0.0f, 0.0f, 0.0f};
+    return interpolateLasagnaCompactAxisCorners(
+        nx.values, ny.values, lasagnaCornerWeights(nx.fractionXYZ), hint);
+}
+
+cv::Vec3f interpolateLasagnaCompactAxisCorners(
+    const std::array<uint8_t, 8>& nx,
+    const std::array<uint8_t, 8>& ny,
+    const std::array<float, 8>& weights,
+    const cv::Vec3f& hint)
+{
+    float a00 = 0.0f;
+    float a01 = 0.0f;
+    float a02 = 0.0f;
+    float a11 = 0.0f;
+    float a12 = 0.0f;
+    float a22 = 0.0f;
+    const auto& normalTable = decodedCompactNormalFloatTable();
+    for (size_t corner = 0; corner < weights.size(); ++corner) {
+        const auto& decoded = normalTable[
+            (static_cast<size_t>(nx[corner]) << 8) |
+            static_cast<size_t>(ny[corner])];
+        if (!decoded.valid)
+            continue;
+        const float weight = weights[corner];
+        a00 = std::fma(weight, decoded.tensor[0], a00);
+        a01 = std::fma(weight, decoded.tensor[1], a01);
+        a02 = std::fma(weight, decoded.tensor[2], a02);
+        a11 = std::fma(weight, decoded.tensor[3], a11);
+        a12 = std::fma(weight, decoded.tensor[4], a12);
+        a22 = std::fma(weight, decoded.tensor[5], a22);
+    }
+    return principalFloatTensorAxis(a00, a01, a02, a11, a12, a22, hint);
 }
 
 double decodeCompactNormalComponent(double raw)

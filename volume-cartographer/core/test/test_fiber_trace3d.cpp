@@ -40,7 +40,10 @@ public:
         constexpr double y = 0.09950371902099892;
         const double sign = referenceDirection[0] < 0.0 ? -1.0 : 1.0;
         vc::fiber_tracer::FiberPredictionSample out;
-        out.options.push_back({{sign * x, sign * y, 0.0}, 1.0, true});
+        out.options.push_back({
+            {static_cast<float>(sign * x), static_cast<float>(sign * y), 0.0f},
+            1.0f,
+            true});
         return out;
     }
 };
@@ -118,7 +121,7 @@ public:
         } else if (point[0] >= 4.5) {
             presence = point[1] > 1.0 ? 1.0 : 0.0;
         }
-        out.options.push_back({referenceDirection, presence, true});
+        out.options.push_back({referenceDirection, static_cast<float>(presence), true});
         return out;
     }
 };
@@ -135,7 +138,7 @@ public:
                 ? 0.80
                 : 1.0;
         vc::fiber_tracer::FiberPredictionSample out;
-        out.options.push_back({ref, axialPresence, true});
+        out.options.push_back({ref, static_cast<float>(axialPresence), true});
         return out;
     }
 };
@@ -226,6 +229,8 @@ TEST_CASE("native fiber tracer defaults match regular Trace2CP command")
     CHECK(config.beamWidth == 8);
     CHECK(config.beamPruneDistanceVoxels == doctest::Approx(1.0));
     CHECK(config.beamLookaheadSteps == 2);
+    CHECK(config.lookaheadParentCap == 32);
+    CHECK(config.lookaheadRetryParentCap == 0);
     CHECK(config.parallelThreads == 0);
     CHECK(config.smoothnessNormalWeight == doctest::Approx(0.1));
     CHECK(config.smoothnessTangentWeight == doctest::Approx(10.0));
@@ -432,6 +437,52 @@ TEST_CASE("native fiber tracer parallel workers require concurrent samplers")
               true, true, true, 1, 64) == 1);
     CHECK(vc::fiber_tracer::testing::debugTraceWorkerCount(
               true, true, true, 4, 1) == 1);
+}
+
+TEST_CASE("native fiber tracer scores persisted corners without materialized samples")
+{
+    vc::lasagna::LasagnaCornerBatch corners;
+    constexpr size_t optionCount = 2;
+    corners.values.resize(optionCount * 3 + 3);
+    for (auto& volume : corners.values)
+        volume.resize(1);
+    corners.fractionsXYZ = {{0.25f, 0.5f, 0.75f}};
+    corners.valid = {1};
+    const auto constantCorners = [](uint8_t value) {
+        std::array<uint8_t, 8> out{};
+        out.fill(value);
+        return out;
+    };
+
+    // Option zero points along X at half presence; option one points along Y.
+    corners.values[0][0] = constantCorners(128);
+    corners.values[1][0] = constantCorners(255);
+    corners.values[2][0] = constantCorners(128);
+    corners.values[3][0] = constantCorners(255);
+    corners.values[4][0] = constantCorners(128);
+    corners.values[5][0] = constantCorners(255);
+    // A valid Z normal keeps straight X motion at zero smoothness cost.
+    corners.values[6][0] = constantCorners(255);
+    corners.values[7][0] = constantCorners(128);
+    corners.values[8][0] = constantCorners(128);
+
+    vc::fiber_tracer::FiberTraceConfig config;
+    const auto score = vc::fiber_tracer::testing::debugCandidateLossFromCorners(
+        corners,
+        optionCount,
+        0,
+        {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        config);
+
+    REQUIRE(score.valid);
+    CHECK(score.loss == doctest::Approx(1.0 - 128.0 / 255.0));
+    CHECK(score.selectedPresence == doctest::Approx(128.0 / 255.0));
+    CHECK(score.selectedDirection[0] == doctest::Approx(1.0));
+    CHECK(score.selectedDirection[1] == doctest::Approx(0.0));
+    CHECK(score.selectedDirection[2] == doctest::Approx(0.0));
 }
 
 TEST_CASE("native fiber tracer parallel path samples predictions in a batch")
@@ -706,6 +757,120 @@ TEST_CASE("native fiber tracer spatially prunes near-duplicate beam states")
     const auto& endpoint = result.points.back();
     CHECK(endpoint[1] == doctest::Approx(2.0));
     CHECK(std::sqrt(endpoint[1] * endpoint[1] + endpoint[2] * endpoint[2]) > 1.0);
+}
+
+TEST_CASE("native fiber tracer exact lookahead bound retains equal-loss parents")
+{
+    const std::vector<double> parentBounds{0.1, 0.5, 0.5, 0.8};
+    CHECK(vc::fiber_tracer::testing::debugExactLookaheadRequiredParentCount(
+              parentBounds, 0.5, true) == 3);
+    CHECK(vc::fiber_tracer::testing::debugExactLookaheadRequiredParentCount(
+              parentBounds, 0.49, true) == 1);
+}
+
+TEST_CASE("native fiber tracer exact lookahead bound is conservative without a full result")
+{
+    const std::vector<double> parentBounds{0.1, 0.5, 0.8};
+    CHECK(vc::fiber_tracer::testing::debugExactLookaheadRequiredParentCount(
+              parentBounds, std::nullopt, true) == parentBounds.size());
+    CHECK(vc::fiber_tracer::testing::debugExactLookaheadRequiredParentCount(
+              parentBounds, 0.2, false) == parentBounds.size());
+}
+
+TEST_CASE("native fiber tracer capped parent order matches a full deterministic sort")
+{
+    const std::vector<double> losses{3.0, 1.0, 2.0, 1.0, 0.5, 2.0};
+    CHECK(vc::fiber_tracer::testing::debugOrderedIndexPrefix(losses, 3) ==
+          std::vector<size_t>{4, 1, 3});
+    CHECK(vc::fiber_tracer::testing::debugOrderedIndexPrefix(losses, losses.size()) ==
+          std::vector<size_t>{4, 1, 3, 2, 5, 0});
+    CHECK(vc::fiber_tracer::testing::debugOrderedIndexPrefix(losses, 0).empty());
+}
+
+TEST_CASE("native fiber tracer retries only failed lower capped lazy searches")
+{
+    using vc::fiber_tracer::testing::debugShouldRetryLookahead;
+    CHECK(debugShouldRetryLookahead(true, 28, 32, false));
+    CHECK_FALSE(debugShouldRetryLookahead(true, 28, 32, true));
+    CHECK_FALSE(debugShouldRetryLookahead(false, 28, 32, false));
+    CHECK_FALSE(debugShouldRetryLookahead(true, 0, 32, false));
+    CHECK_FALSE(debugShouldRetryLookahead(true, 28, 28, false));
+    CHECK_FALSE(debugShouldRetryLookahead(true, 28, 24, false));
+    CHECK_FALSE(debugShouldRetryLookahead(true, 28, 0, false));
+}
+
+TEST_CASE("native fiber tracer exact lazy lookahead matches exhaustive search")
+{
+    StraightPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {32.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 32.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 25.0;
+    request.config.coneAngleStepDegrees = 5.0;
+    request.config.beamWidth = 4;
+    request.config.beamLookaheadSteps = 2;
+    request.config.beamPruneDistanceVoxels = 1.0;
+    request.config.maxStepFactor = 2.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    vc::fiber_tracer::FiberTraceProfile exhaustiveProfile;
+    request.config.lazyLookahead = false;
+    request.config.profile = &exhaustiveProfile;
+    const auto exhaustive =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    vc::fiber_tracer::FiberTraceProfile lazyProfile;
+    request.config.lazyLookahead = true;
+    request.config.lookaheadParentCap = 0;
+    request.config.profile = &lazyProfile;
+    const auto lazy =
+        vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    CHECK(lazy.reachedTargetPlane == exhaustive.reachedTargetPlane);
+    CHECK(lazy.reason == exhaustive.reason);
+    CHECK(lazy.steps == exhaustive.steps);
+    REQUIRE(lazy.points.size() == exhaustive.points.size());
+    for (size_t index = 0; index < lazy.points.size(); ++index) {
+        CHECK(cv::norm(lazy.points[index] - exhaustive.points[index]) < 1.0e-6);
+    }
+    CHECK(lazyProfile.lookaheadEvaluatedParents <=
+          lazyProfile.lookaheadTotalParents);
+    CHECK(lazyProfile.candidateTasks <= exhaustiveProfile.candidateTasks);
+}
+
+TEST_CASE("native fiber tracer lookahead parent cap bounds final expansion")
+{
+    StraightPrediction predictions;
+    vc::fiber_tracer::FiberTraceOneWayRequest request;
+    request.startPoint = {0.0, 0.0, 0.0};
+    request.targetPoint = {32.0, 0.0, 0.0};
+    request.initialDirection = {1.0, 0.0, 0.0};
+    request.targetPlaneNormal = {1.0, 0.0, 0.0};
+    request.budgetSpanVoxels = 32.0;
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 25.0;
+    request.config.coneAngleStepDegrees = 5.0;
+    request.config.beamWidth = 4;
+    request.config.beamLookaheadSteps = 2;
+    request.config.lookaheadParentCap = 3;
+    request.config.maxStepFactor = 2.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+    vc::fiber_tracer::FiberTraceProfile profile;
+    request.config.profile = &profile;
+
+    (void)vc::fiber_tracer::traceFiberOneWay(predictions, request, nullptr);
+
+    CHECK(profile.lookaheadFinalFrontiers > 0);
+    CHECK(profile.lookaheadEvaluatedParents <=
+          profile.lookaheadFinalFrontiers * request.config.lookaheadParentCap);
 }
 
 TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")

@@ -1,10 +1,12 @@
 #pragma once
 
 #include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
-#include <cstddef>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <iterator>
@@ -22,6 +24,32 @@ struct FiberTraceProfile {
     size_t oneWayCalls = 0;
     size_t generations = 0;
     size_t candidateTasks = 0;
+    size_t lookaheadFinalFrontiers = 0;
+    size_t lookaheadTotalParents = 0;
+    size_t lookaheadRequiredParents = 0;
+    size_t lookaheadEvaluatedParents = 0;
+    size_t lookaheadTotalChildCandidates = 0;
+    size_t lookaheadRequiredChildCandidates = 0;
+    size_t lookaheadEvaluatedChildCandidates = 0;
+    std::vector<size_t> lookaheadParentCounts;
+    std::vector<size_t> lookaheadRequiredParentCounts;
+    size_t candidateDepth1Batches = 0;
+    size_t candidateDepth2Batches = 0;
+    size_t candidateDepth1Points = 0;
+    size_t candidateDepth2Points = 0;
+    std::vector<size_t> candidateDepth1BatchSizes;
+    std::vector<size_t> candidateDepth2BatchSizes;
+    uint64_t cornerPointCount = 0;
+    uint64_t cornerUniqueVoxelCubes = 0;
+    uint64_t cornerWorkerTasks = 0;
+    uint64_t cornerMaxCandidatesPerCube = 0;
+    std::array<uint64_t, 65> cornerCubeOccupancyHistogram{};
+    uint64_t depthDependencyShared = 0;
+    uint64_t depthDependencyUnion = 0;
+    uint64_t stepDependencyShared = 0;
+    uint64_t stepDependencyUnion = 0;
+    std::vector<uint64_t> localityCurrentDepth1Dependencies;
+    std::vector<uint64_t> localityPreviousStepDependencies;
     double startSampleSeconds = 0.0;
     double taskBuildSeconds = 0.0;
     double predictionBatchSeconds = 0.0;
@@ -29,12 +57,27 @@ struct FiberTraceProfile {
     double predictionPrefetchSeconds = 0.0;
     double predictionAssignSeconds = 0.0;
     double predictionMaterializeSeconds = 0.0;
+    double predictionCornerSeconds = 0.0;
+    double predictionCornerPrepareSeconds = 0.0;
+    double predictionCornerLayoutSeconds = 0.0;
+    double predictionCornerPinSeconds = 0.0;
+    double predictionCornerGatherSeconds = 0.0;
+    uint64_t predictionCornerLayoutChunkRuns = 0;
+    uint64_t predictionCornerBoundaryPoints = 0;
+    uint64_t predictionCornerDependencies = 0;
+    double predictionDecodeSeconds = 0.0;
+    double normalDecodeSeconds = 0.0;
     double normalBatchSeconds = 0.0;
     double normalPrefetchSeconds = 0.0;
     double normalMaterializeSeconds = 0.0;
     double candidateScoreSeconds = 0.0;
     double frontierSeconds = 0.0;
     double pruneSeconds = 0.0;
+    double lookaheadDecisionSeconds = 0.0;
+    double lookaheadParentOrderSeconds = 0.0;
+    double lookaheadFrontierStorageSeconds = 0.0;
+    size_t lookaheadFrontierAllocatedSlots = 0;
+    size_t lookaheadFrontierEvaluatedSlots = 0;
 };
 
 struct FiberTraceConfig {
@@ -45,6 +88,9 @@ struct FiberTraceConfig {
     int beamWidth = 8;
     double beamPruneDistanceVoxels = 1.0;
     int beamLookaheadSteps = 2;
+    bool lazyLookahead = true;
+    size_t lookaheadParentCap = 32;
+    size_t lookaheadRetryParentCap = 0;
     int parallelThreads = 0;
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
@@ -70,8 +116,8 @@ struct FiberTraceProgress {
 };
 
 struct FiberPredictionSampleOption {
-    cv::Vec3d direction{0.0, 0.0, 0.0};
-    double presence = 0.0;
+    cv::Vec3f direction{0.0f, 0.0f, 0.0f};
+    float presence = 0.0f;
     bool valid = false;
 };
 
@@ -254,6 +300,26 @@ public:
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples,
         FiberTraceProfile* profile) const;
+    void sampleBatch(
+        const std::vector<cv::Vec3f>& volumePoints,
+        const std::vector<cv::Vec3f>& referenceDirections,
+        int parallelThreads,
+        std::vector<FiberPredictionSample>& samples,
+        FiberTraceProfile* profile) const;
+    [[nodiscard]] bool sampleCornerBatchWithNormals(
+        const vc::lasagna::LasagnaNormalSampler& normalSampler,
+        const std::vector<cv::Vec3f>& volumePoints,
+        int parallelThreads,
+        vc::lasagna::LasagnaCornerBatch* cornerScratch,
+        FiberTraceProfile* profile) const;
+    [[nodiscard]] bool visitCornerBatchWithNormals(
+        const vc::lasagna::LasagnaNormalSampler& normalSampler,
+        const std::vector<cv::Vec3f>& volumePoints,
+        int parallelThreads,
+        void* visitorContext,
+        vc::lasagna::LasagnaCornerPointVisitor visitor,
+        int lookaheadDepth,
+        FiberTraceProfile* profile) const;
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
         const cv::Vec3d& referenceDirection) const override;
@@ -317,6 +383,8 @@ struct FiberTraceWholeFiberResult {
     std::vector<FiberTraceWholeFiberSegmentResult> segments;
     std::vector<cv::Vec3d> stitchedTrace;
     int restartCount = 0;
+    int lookaheadRetryCount = 0;
+    int lookaheadRetryRecoveredCount = 0;
     int segmentCount = 0;
     double restartsPerKvx = 0.0;
     double referenceLengthVoxels = 0.0;
@@ -360,6 +428,13 @@ struct BeamDebugState {
     bool reached = false;
 };
 
+struct CandidateScoreDebug {
+    double loss = 0.0;
+    cv::Vec3d selectedDirection{0.0, 0.0, 0.0};
+    double selectedPresence = 0.0;
+    bool valid = false;
+};
+
 [[nodiscard]] std::vector<size_t> debugPruneBeamStateIndices(
     const std::vector<BeamDebugState>& states,
     int beamWidth,
@@ -374,6 +449,31 @@ struct BeamDebugState {
     bool hasNormalSampler,
     int parallelThreads,
     size_t taskCount);
+
+[[nodiscard]] CandidateScoreDebug debugCandidateLossFromCorners(
+    const vc::lasagna::LasagnaCornerBatch& corners,
+    size_t optionCount,
+    size_t pointIndex,
+    const cv::Vec3d& previousStepDirection,
+    const cv::Vec3d& currentSampleDirection,
+    const cv::Vec3d& historyDirection,
+    const cv::Vec3d& candidateDirection,
+    const FiberTraceConfig& config);
+
+[[nodiscard]] size_t debugExactLookaheadRequiredParentCount(
+    const std::vector<double>& parentLowerBounds,
+    std::optional<double> resultThreshold,
+    bool finalBeamSetComplete);
+
+[[nodiscard]] std::vector<size_t> debugOrderedIndexPrefix(
+    const std::vector<double>& losses,
+    size_t limit);
+
+[[nodiscard]] bool debugShouldRetryLookahead(
+    bool lazyLookahead,
+    size_t parentCap,
+    size_t retryParentCap,
+    bool segmentSuccess);
 
 } // namespace testing
 #endif

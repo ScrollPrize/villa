@@ -5,12 +5,22 @@
 
 #include <opencv2/core/mat.hpp>
 
+#include <array>
 #include <cstdint>
+#include <span>
+#include <vector>
 
 namespace vc::render {
 
 class ChunkedPlaneSampler {
 public:
+    using TrilinearCornerPointVisitor = void (*)(
+        void* context,
+        size_t pointIndex,
+        const cv::Vec3f& fractionXYZ,
+        bool valid,
+        std::span<const std::array<uint8_t, 8>> volumeCorners);
+
     struct Options {
         Options()
             : sampling(vc::Sampling::Nearest)
@@ -46,6 +56,19 @@ public:
         int missingChunks = 0;
         int fallbackLevels = 0;
         bool requestedLevelOnly = false;
+        double cornerPrepareSeconds = 0.0;
+        double cornerLayoutSeconds = 0.0;
+        double cornerPinSeconds = 0.0;
+        double cornerGatherSeconds = 0.0;
+        uint64_t cornerLayoutChunkRuns = 0;
+        uint64_t cornerBoundaryPoints = 0;
+        uint64_t cornerDependencies = 0;
+        uint64_t cornerPointCount = 0;
+        uint64_t cornerUniqueVoxelCubes = 0;
+        uint64_t cornerWorkerTasks = 0;
+        uint64_t cornerMaxCandidatesPerCube = 0;
+        std::array<uint64_t, 65> cornerCubeOccupancyHistogram{};
+        std::vector<uint64_t> cornerDependencyIds;
     };
 
     // Queue chunk dependencies for pixels not already covered. The viewer can
@@ -106,6 +129,34 @@ public:
                                                          cv::Mat_<uint8_t>& out,
                                                          cv::Mat_<uint8_t>& coverage,
                                                          const Options& options = Options());
+
+    // Batch primitive for callers that need to interpolate structured values
+    // themselves. Input coordinates are XYZ voxel coordinates in the requested
+    // level (not logical level-0 coordinates). Geometry/dependencies are built
+    // once, every array must have the same requested-level shape and may use
+    // its own chunk grid. One dependency layout is reused per distinct chunk
+    // shape. values[volume][point] contains corners in dz/dy/dx order.
+    static Stats sampleTrilinearCornersLevelBlockingRequestedLevel(
+        const std::vector<IChunkedArray*>& arrays,
+        int level,
+        const std::vector<cv::Vec3f>& levelCoords,
+        std::vector<std::vector<std::array<uint8_t, 8>>>& values,
+        std::vector<cv::Vec3f>& fractionsXYZ,
+        std::vector<uint8_t>& valid,
+        int parallelThreads = 0);
+
+    // Equivalent requested-level corner access without materializing
+    // candidate-sized output arrays. The visitor is invoked once per point;
+    // its corner span follows the input array order and is valid only for the
+    // duration of the call.
+    static Stats visitTrilinearCornersLevelBlockingRequestedLevel(
+        const std::vector<IChunkedArray*>& arrays,
+        int level,
+        const std::vector<cv::Vec3f>& levelCoords,
+        void* visitorContext,
+        TrilinearCornerPointVisitor visitor,
+        int parallelThreads = 0,
+        bool collectLocalityStats = false);
 
     // Fine-to-coarse fallback. Finer covered pixels are never overwritten by
     // coarser levels.

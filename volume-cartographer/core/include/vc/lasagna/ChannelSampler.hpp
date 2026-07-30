@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,6 +22,7 @@
 #include <opencv2/core/types.hpp>
 
 namespace utils { class ZarrArray; }
+namespace vc::render { class DecodedChunkCacheBudget; }
 
 namespace vc::lasagna {
 
@@ -159,6 +161,87 @@ struct LasagnaPreparedCompactPoint {
     LasagnaCubeRequest ny;
 };
 
+struct LasagnaCornerSample {
+    std::array<uint8_t, 8> values{};
+    cv::Vec3f fractionXYZ{0.0f, 0.0f, 0.0f};
+    bool valid = false;
+};
+
+struct LasagnaCornerBatch {
+    std::vector<std::vector<std::array<uint8_t, 8>>> values;
+    std::vector<cv::Vec3f> fractionsXYZ;
+    std::vector<uint8_t> valid;
+};
+
+using LasagnaCornerPointVisitor = void (*)(
+    void* context,
+    size_t pointIndex,
+    const cv::Vec3f& fractionXYZ,
+    bool valid,
+    std::span<const std::array<uint8_t, 8>> volumeCorners);
+
+// Fetches the ordered eight nearest-neighbor voxel corners through VC3D's
+// blocking requested-level reader for caller-side interpolation.
+class LasagnaChannelCornerSampler {
+public:
+    LasagnaChannelCornerSampler(
+        const LasagnaChannelBinding& binding,
+        size_t maxCachedBytes,
+        std::shared_ptr<vc::render::DecodedChunkCacheBudget> sharedBudget = {});
+    ~LasagnaChannelCornerSampler();
+
+    LasagnaChannelCornerSampler(const LasagnaChannelCornerSampler&) = delete;
+    LasagnaChannelCornerSampler& operator=(const LasagnaChannelCornerSampler&) = delete;
+    LasagnaChannelCornerSampler(LasagnaChannelCornerSampler&&) noexcept;
+    LasagnaChannelCornerSampler& operator=(LasagnaChannelCornerSampler&&) noexcept;
+
+    [[nodiscard]] NormalPrefetchReport sampleBatch(
+        const std::vector<cv::Vec3f>& volumePoints,
+        std::vector<LasagnaCornerSample>& samples) const;
+
+private:
+    friend NormalPrefetchReport sampleLasagnaChannelCornerBatch(
+        const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+        const std::vector<cv::Vec3f>& volumePoints,
+        std::vector<std::vector<LasagnaCornerSample>>& samples,
+        int parallelThreads);
+    friend NormalPrefetchReport sampleLasagnaChannelCornerBatch(
+        const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+        const std::vector<cv::Vec3f>& volumePoints,
+        LasagnaCornerBatch& samples,
+        int parallelThreads);
+    friend NormalPrefetchReport visitLasagnaChannelCorners(
+        const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+        const std::vector<cv::Vec3f>& volumePoints,
+        void* visitorContext,
+        LasagnaCornerPointVisitor visitor,
+        int parallelThreads,
+        bool collectLocalityStats);
+
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+[[nodiscard]] NormalPrefetchReport sampleLasagnaChannelCornerBatch(
+    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+    const std::vector<cv::Vec3f>& volumePoints,
+    std::vector<std::vector<LasagnaCornerSample>>& samples,
+    int parallelThreads = 0);
+
+[[nodiscard]] NormalPrefetchReport sampleLasagnaChannelCornerBatch(
+    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+    const std::vector<cv::Vec3f>& volumePoints,
+    LasagnaCornerBatch& samples,
+    int parallelThreads = 0);
+
+[[nodiscard]] NormalPrefetchReport visitLasagnaChannelCorners(
+    const std::vector<const LasagnaChannelCornerSampler*>& samplers,
+    const std::vector<cv::Vec3f>& volumePoints,
+    void* visitorContext,
+    LasagnaCornerPointVisitor visitor,
+    int parallelThreads = 0,
+    bool collectLocalityStats = false);
+
 [[nodiscard]] size_t lasagnaReadWorkersPerChannel();
 [[nodiscard]] std::shared_ptr<LasagnaChannelChunkCache>
 sharedLasagnaChannelChunkCache(size_t capacityBytes);
@@ -168,6 +251,24 @@ sharedLasagnaChannelChunkCache(size_t capacityBytes);
 [[nodiscard]] cv::Vec3d principalCompactTensorAxis(
     const cv::Matx33d& tensor,
     const cv::Vec3d& hint);
+
+[[nodiscard]] float interpolateLasagnaCorners(
+    const LasagnaCornerSample& sample);
+[[nodiscard]] std::array<float, 8> lasagnaCornerWeights(
+    const cv::Vec3f& fractionXYZ);
+[[nodiscard]] float interpolateLasagnaCorners(
+    const std::array<uint8_t, 8>& values,
+    const std::array<float, 8>& weights);
+
+[[nodiscard]] cv::Vec3f interpolateLasagnaCompactAxisCorners(
+    const LasagnaCornerSample& nx,
+    const LasagnaCornerSample& ny,
+    const cv::Vec3f& hint = {0.0f, 0.0f, 0.0f});
+[[nodiscard]] cv::Vec3f interpolateLasagnaCompactAxisCorners(
+    const std::array<uint8_t, 8>& nx,
+    const std::array<uint8_t, 8>& ny,
+    const std::array<float, 8>& weights,
+    const cv::Vec3f& hint = {0.0f, 0.0f, 0.0f});
 
 [[nodiscard]] LasagnaChannelBinding bindLasagnaChannel(
     const LasagnaDatasetManifest& manifest,

@@ -1,5 +1,6 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/core/render/DecodedChunkCacheBudget.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -90,6 +91,18 @@ public:
         nx_ = nxFuture.get();
         ny_ = nyFuture.get();
         gradMag_ = gradMagFuture.get();
+
+        if (sameLasagnaSamplingGrid(gradMag_, nx_) &&
+            sameLasagnaSamplingGrid(gradMag_, ny_)) {
+            cornerBudget_ = std::make_shared<vc::render::DecodedChunkCacheBudget>(
+                options.maxCachedBytes);
+            gradMagCorners_ = std::make_unique<LasagnaChannelCornerSampler>(
+                gradMag_, options.maxCachedBytes, cornerBudget_);
+            nxCorners_ = std::make_unique<LasagnaChannelCornerSampler>(
+                nx_, options.maxCachedBytes, cornerBudget_);
+            nyCorners_ = std::make_unique<LasagnaChannelCornerSampler>(
+                ny_, options.maxCachedBytes, cornerBudget_);
+        }
 
         if (nx_.shapeZYX != ny_.shapeZYX) {
             throw std::runtime_error("Lasagna nx and ny channels must have matching spatial shapes");
@@ -244,6 +257,149 @@ public:
         return cache_->prefetchInterleaved(requests);
     }
 
+    [[nodiscard]] std::array<const LasagnaChannelCornerSampler*, 3>
+    groupedCornerSamplers() const noexcept
+    {
+        return {gradMagCorners_.get(), nxCorners_.get(), nyCorners_.get()};
+    }
+
+    void materializeGroupedCorners(
+        const std::vector<std::vector<LasagnaCornerSample>>& corners,
+        size_t firstVolume,
+        int parallelThreads,
+        std::vector<LasagnaNormalSampler::FloatNormalSample>& samples) const
+    {
+        if (firstVolume + 3 > corners.size())
+            throw std::invalid_argument("normal corner batch is missing channel volumes");
+        const auto& gradMagCorners = corners[firstVolume];
+        const auto& nxCorners = corners[firstVolume + 1];
+        const auto& nyCorners = corners[firstVolume + 2];
+        if (nxCorners.size() != gradMagCorners.size() ||
+            nyCorners.size() != gradMagCorners.size()) {
+            throw std::invalid_argument("normal corner channel sample counts differ");
+        }
+        samples.resize(gradMagCorners.size());
+        const int workers = std::clamp(
+            parallelThreads, 1, static_cast<int>(std::max<size_t>(1, samples.size())));
+        auto materialize = [&](size_t index) {
+            if (!gradMagCorners[index].valid ||
+                !(interpolateLasagnaCorners(gradMagCorners[index]) > 0.0f) ||
+                !nxCorners[index].valid ||
+                !nyCorners[index].valid) {
+                samples[index] = {};
+                return;
+            }
+            const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(
+                nxCorners[index], nyCorners[index]);
+            samples[index] = {normal, normal.dot(normal) > 1.0e-12f};
+        };
+#ifdef _OPENMP
+        if (workers > 1) {
+            const auto count = static_cast<std::ptrdiff_t>(samples.size());
+            #pragma omp parallel for schedule(static) num_threads(workers)
+            for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex)
+                materialize(static_cast<size_t>(rawIndex));
+            return;
+        }
+#endif
+        for (size_t index = 0; index < samples.size(); ++index)
+            materialize(index);
+    }
+
+    void materializeGroupedCorners(
+        const LasagnaCornerBatch& corners,
+        size_t firstVolume,
+        int parallelThreads,
+        std::vector<LasagnaNormalSampler::FloatNormalSample>& samples) const
+    {
+        if (firstVolume + 3 > corners.values.size())
+            throw std::invalid_argument("normal corner batch is missing channel volumes");
+        const size_t count = corners.fractionsXYZ.size();
+        if (corners.valid.size() != count ||
+            corners.values[firstVolume].size() != count ||
+            corners.values[firstVolume + 1].size() != count ||
+            corners.values[firstVolume + 2].size() != count) {
+            throw std::invalid_argument("normal corner channel sample counts differ");
+        }
+        samples.resize(count);
+        const int workers = std::clamp(
+            parallelThreads, 1, static_cast<int>(std::max<size_t>(1, count)));
+        auto materialize = [&](size_t index) {
+            if (corners.valid[index] == 0) {
+                samples[index] = {};
+                return;
+            }
+            const cv::Vec3f fraction = corners.fractionsXYZ[index];
+            const LasagnaCornerSample gradMag{
+                corners.values[firstVolume][index], fraction, true};
+            if (!(interpolateLasagnaCorners(gradMag) > 0.0f)) {
+                samples[index] = {};
+                return;
+            }
+            const LasagnaCornerSample nx{
+                corners.values[firstVolume + 1][index], fraction, true};
+            const LasagnaCornerSample ny{
+                corners.values[firstVolume + 2][index], fraction, true};
+            const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(nx, ny);
+            samples[index] = {normal, normal.dot(normal) > 1.0e-12f};
+        };
+#ifdef _OPENMP
+        if (workers > 1) {
+            const auto rawCount = static_cast<std::ptrdiff_t>(count);
+            #pragma omp parallel for schedule(static) num_threads(workers)
+            for (std::ptrdiff_t rawIndex = 0; rawIndex < rawCount; ++rawIndex)
+                materialize(static_cast<size_t>(rawIndex));
+            return;
+        }
+#endif
+        for (size_t index = 0; index < count; ++index)
+            materialize(index);
+    }
+
+    [[nodiscard]] NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3f>& volumePoints,
+        int parallelThreads,
+        std::vector<LasagnaNormalSampler::FloatNormalSample>& samples) const
+    {
+        using Clock = std::chrono::steady_clock;
+        NormalBatchReport report;
+        samples.clear();
+        samples.resize(volumePoints.size());
+        if (volumePoints.empty())
+            return report;
+
+        if (!gradMagCorners_ || !nxCorners_ || !nyCorners_) {
+            std::vector<cv::Vec3d> doublePoints;
+            doublePoints.reserve(volumePoints.size());
+            for (const auto& point : volumePoints)
+                doublePoints.emplace_back(point[0], point[1], point[2]);
+            std::vector<NormalSampleWithDerivative> fallback;
+            report = sampleNormalBatch(
+                doublePoints, false, parallelThreads, fallback);
+            for (size_t index = 0; index < fallback.size(); ++index) {
+                const auto& sample = fallback[index].sample;
+                samples[index] = {
+                    {static_cast<float>(sample.normal[0]),
+                     static_cast<float>(sample.normal[1]),
+                     static_cast<float>(sample.normal[2])},
+                    sample.valid};
+            }
+            return report;
+        }
+
+        const auto directStart = Clock::now();
+        std::vector<std::vector<LasagnaCornerSample>> groupedCorners;
+        report.prefetch = sampleLasagnaChannelCornerBatch(
+            {gradMagCorners_.get(), nxCorners_.get(), nyCorners_.get()},
+            volumePoints,
+            groupedCorners,
+            parallelThreads);
+        materializeGroupedCorners(groupedCorners, 0, parallelThreads, samples);
+        report.materializeMs = std::chrono::duration<double, std::milli>(
+            Clock::now() - directStart).count();
+        return report;
+    }
+
     [[nodiscard]] NormalBatchReport sampleNormalBatch(
         const std::vector<cv::Vec3d>& volumePoints,
         bool withDerivative,
@@ -264,109 +420,81 @@ public:
         const bool sharedSpatialGrid =
             sameLasagnaSamplingGrid(gradMag_, nx_) &&
             sameLasagnaSamplingGrid(gradMag_, ny_);
+        if (gradMagCorners_ && nxCorners_ && nyCorners_) {
         const auto directStart = Clock::now();
-        auto materializeDirect = [&](size_t index,
-                                     LasagnaLocalChunkResolver& gradMagResolver,
-                                     LasagnaLocalChunkResolver& nxResolver,
-                                     LasagnaLocalChunkResolver& nyResolver) {
-            auto gradMagRequest = prepareLasagnaCubeRequest(gradMag_, volumePoints[index]);
-            LasagnaCubeRequest nxRequest;
-            LasagnaCubeRequest nyRequest;
-            if (sharedSpatialGrid) {
-                nxRequest = cloneLasagnaCubeRequestForBinding(gradMagRequest, nx_);
-                nyRequest = cloneLasagnaCubeRequestForBinding(gradMagRequest, ny_);
-            } else {
-                nxRequest = prepareLasagnaCubeRequest(nx_, volumePoints[index]);
-                nyRequest = prepareLasagnaCubeRequest(ny_, volumePoints[index]);
-            }
-            gradMagResolver.resolve(gradMagRequest);
-            nxResolver.resolve(nxRequest);
-            nyResolver.resolve(nyRequest);
+        std::vector<cv::Vec3f> floatPoints;
+        floatPoints.reserve(volumePoints.size());
+        for (const auto& point : volumePoints) {
+            floatPoints.push_back({
+                static_cast<float>(point[0]),
+                static_cast<float>(point[1]),
+                static_cast<float>(point[2])});
+        }
+        std::vector<LasagnaCornerSample> gradMagCorners;
+        std::vector<LasagnaCornerSample> nxCorners;
+        std::vector<LasagnaCornerSample> nyCorners;
+        std::vector<std::vector<LasagnaCornerSample>> groupedCorners;
+        report.prefetch = sampleLasagnaChannelCornerBatch(
+            {gradMagCorners_.get(), nxCorners_.get(), nyCorners_.get()},
+            floatPoints,
+            groupedCorners,
+            parallelThreads);
+        gradMagCorners = std::move(groupedCorners[0]);
+        nxCorners = std::move(groupedCorners[1]);
+        nyCorners = std::move(groupedCorners[2]);
 
-            const auto gradMag = sampleLasagnaChannel(gradMag_, gradMagRequest);
-            if (!gradMag.has_value()) {
+        auto materializeDirect = [&](size_t index) {
+            if (!gradMagCorners[index].valid) {
                 samples[index] = {{{0.0, 0.0, 0.0}, false, "missing Lasagna grad_mag sample"},
                                   cv::Matx33d::zeros(),
                                   false};
                 return;
             }
-            if (*gradMag <= 0.0) {
+            const float gradMag = interpolateLasagnaCorners(gradMagCorners[index]);
+            if (!(gradMag > 0.0f)) {
                 samples[index] = {{{0.0, 0.0, 0.0}, false, "Lasagna grad_mag sample is zero"},
                                   cv::Matx33d::zeros(),
                                   false};
                 return;
             }
-
-            const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, nxRequest, nyRequest);
-            if (!normal.has_value()) {
+            if (!nxCorners[index].valid || !nyCorners[index].valid) {
                 samples[index] = {{{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"},
                                   cv::Matx33d::zeros(),
                                   false};
                 return;
             }
-            if (length(*normal) <= kEpsilon) {
+            const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(
+                nxCorners[index], nyCorners[index]);
+            if (normal.dot(normal) <= 1.0e-12f) {
                 samples[index] = {{{0.0, 0.0, 0.0}, false, "degenerate Lasagna normal sample"},
                                   cv::Matx33d::zeros(),
                                   false};
                 return;
             }
-            samples[index] = {{*normal, true, {}}, cv::Matx33d::zeros(), false};
+            samples[index] = {{{normal[0], normal[1], normal[2]}, true, {}},
+                              cv::Matx33d::zeros(), false};
         };
 
         if (batchWorkers <= 1) {
-            LasagnaLocalChunkResolver gradMagResolver(gradMag_, *cache_);
-            LasagnaLocalChunkResolver nxResolver(nx_, *cache_);
-            LasagnaLocalChunkResolver nyResolver(ny_, *cache_);
             for (size_t index = 0; index < volumePoints.size(); ++index)
-                materializeDirect(index, gradMagResolver, nxResolver, nyResolver);
+                materializeDirect(index);
         } else {
 #ifdef _OPENMP
-            std::atomic<bool> failed{false};
-            std::exception_ptr firstError;
             const auto count = static_cast<std::ptrdiff_t>(volumePoints.size());
-            #pragma omp parallel num_threads(static_cast<int>(batchWorkers))
-            {
-                LasagnaLocalChunkResolver gradMagResolver(gradMag_, *cache_);
-                LasagnaLocalChunkResolver nxResolver(nx_, *cache_);
-                LasagnaLocalChunkResolver nyResolver(ny_, *cache_);
-                #pragma omp for schedule(static)
-                for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
-                    if (failed.load(std::memory_order_relaxed))
-                        continue;
-                    try {
-                        materializeDirect(
-                            static_cast<size_t>(rawIndex),
-                            gradMagResolver,
-                            nxResolver,
-                            nyResolver);
-                    } catch (...) {
-                        bool expected = false;
-                        if (failed.compare_exchange_strong(expected, true)) {
-                            #pragma omp critical(lasagna_normal_direct_error)
-                            {
-                                if (!firstError)
-                                    firstError = std::current_exception();
-                            }
-                        }
-                    }
-                }
-            }
-            if (firstError)
-                std::rethrow_exception(firstError);
+            #pragma omp parallel for schedule(static) num_threads(static_cast<int>(batchWorkers))
+            for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex)
+                materializeDirect(static_cast<size_t>(rawIndex));
 #else
             std::vector<std::future<void>> futures;
             futures.reserve(batchWorkers);
             std::atomic<size_t> next{0};
             for (size_t worker = 0; worker < batchWorkers; ++worker) {
                 futures.push_back(std::async(std::launch::async, [&]() {
-                    LasagnaLocalChunkResolver gradMagResolver(gradMag_, *cache_);
-                    LasagnaLocalChunkResolver nxResolver(nx_, *cache_);
-                    LasagnaLocalChunkResolver nyResolver(ny_, *cache_);
                     while (true) {
                         const size_t index = next.fetch_add(1);
                         if (index >= volumePoints.size())
                             return;
-                        materializeDirect(index, gradMagResolver, nxResolver, nyResolver);
+                        materializeDirect(index);
                     }
                 }));
             }
@@ -379,6 +507,7 @@ public:
             directEnd - directStart).count();
         (void)withDerivative;
         return report;
+        }
 
         const auto prefetchStart = Clock::now();
         std::vector<PreparedNormalPoint> prepared(volumePoints.size());
@@ -611,6 +740,10 @@ private:
     double gradMagDecodeScale_ = 1000.0;
     LasagnaNormalSamplerOptions options_;
     std::shared_ptr<LasagnaChannelChunkCache> cache_;
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> cornerBudget_;
+    std::unique_ptr<LasagnaChannelCornerSampler> gradMagCorners_;
+    std::unique_ptr<LasagnaChannelCornerSampler> nxCorners_;
+    std::unique_ptr<LasagnaChannelCornerSampler> nyCorners_;
 };
 
 LasagnaNormalSampler::LasagnaNormalSampler(
@@ -686,6 +819,40 @@ NormalBatchReport LasagnaNormalSampler::sampleNormalBatch(
     std::vector<NormalSampleWithDerivative>& samples) const
 {
     return impl_->sampleNormalBatch(volumePoints, withDerivative, parallelThreads, samples);
+}
+
+NormalBatchReport LasagnaNormalSampler::sampleNormalBatch(
+    const std::vector<cv::Vec3f>& volumePoints,
+    int parallelThreads,
+    std::vector<FloatNormalSample>& samples) const
+{
+    return impl_->sampleNormalBatch(volumePoints, parallelThreads, samples);
+}
+
+std::array<const LasagnaChannelCornerSampler*, 3>
+LasagnaNormalSampler::groupedCornerSamplers() const noexcept
+{
+    return impl_->groupedCornerSamplers();
+}
+
+void LasagnaNormalSampler::materializeGroupedCorners(
+    const std::vector<std::vector<LasagnaCornerSample>>& corners,
+    size_t firstVolume,
+    int parallelThreads,
+    std::vector<FloatNormalSample>& samples) const
+{
+    impl_->materializeGroupedCorners(
+        corners, firstVolume, parallelThreads, samples);
+}
+
+void LasagnaNormalSampler::materializeGroupedCorners(
+    const LasagnaCornerBatch& corners,
+    size_t firstVolume,
+    int parallelThreads,
+    std::vector<FloatNormalSample>& samples) const
+{
+    impl_->materializeGroupedCorners(
+        corners, firstVolume, parallelThreads, samples);
 }
 
 } // namespace vc::lasagna
