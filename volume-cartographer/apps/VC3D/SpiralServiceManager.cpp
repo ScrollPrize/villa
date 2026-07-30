@@ -81,6 +81,13 @@ SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
                     phase, fileName, filesComplete, totalFiles,
                     bytesReceived, totalBytes);
             });
+    connect(_artifactCache, &SpiralArtifactCache::fetchProgress, this,
+            [this](const QString& artifactId, const QString& phase,
+                   const QString&, int, int,
+                   qint64 bytesReceived, qint64 totalBytes) {
+                if (artifactId != _fetchingCheckpointArtifact) return;
+                emit checkpointDownloadProgress(phase, bytesReceived, totalBytes);
+            });
 
     connect(_tunnel, &SpiralSshTunnel::logMessage, this, &SpiralServiceManager::logMessage);
     connect(_tunnel, &SpiralSshTunnel::ready, this, [this](int localPort) {
@@ -803,6 +810,7 @@ void SpiralServiceManager::saveCheckpoint(const QString& path)
 
 void SpiralServiceManager::downloadCheckpoint(const QString& localPath)
 {
+    emit checkpointDownloadProgress(QStringLiteral("creating"), 0, 0);
     postWithRetry(
         QStringLiteral("/session/download-checkpoint"),
         {{QStringLiteral("command_id"), commandId()}},
@@ -815,13 +823,16 @@ void SpiralServiceManager::downloadCheckpoint(const QString& localPath)
                 emit checkpointDownloadFinished(localPath, tr("The service did not return a checkpoint artifact"));
                 return;
             }
+            _fetchingCheckpointArtifact = artifactId;
             _artifactCache->fetchArtifact(
                 sessionId, artifactId,
                 [this, localPath](const QString& entryPath, const QString& error, bool) {
+                    _fetchingCheckpointArtifact.clear();
                     if (entryPath.isEmpty()) {
                         emit checkpointDownloadFinished(localPath, error);
                         return;
                     }
+                    emit checkpointDownloadProgress(QStringLiteral("copying"), 0, 0);
                     // Atomic replacement: a failed transfer cannot leave a
                     // partial file at the selected destination.
                     const QString temporary = localPath + QStringLiteral(".part");

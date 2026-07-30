@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QHash>
+#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QSet>
@@ -23,6 +24,7 @@ class QPlainTextEdit;
 class QProgressBar;
 class QSlider;
 class QToolButton;
+class QTimer;
 class SpiralServiceManager;
 class SpiralConfigProfileEditor;
 class QFormLayout;
@@ -131,6 +133,13 @@ private:
     QPushButton* _stop = nullptr;
     QPushButton* _save = nullptr;
     QPushButton* _downloadCheckpoint = nullptr;
+    QLabel* _checkpointDownloadStatus = nullptr;
+    QProgressBar* _checkpointDownloadProgress = nullptr;
+    QTimer* _checkpointDownloadTimer = nullptr;
+    QElapsedTimer _checkpointDownloadElapsed;
+    QString _checkpointDownloadPhase;
+    qint64 _checkpointBytesReceived = 0;
+    qint64 _checkpointTotalBytes = 0;
     QPushButton* _refill = nullptr;
     QLabel* _state = nullptr;
     QProgressBar* _previewProgress = nullptr;
@@ -178,6 +187,7 @@ private:
     bool _remoteMode = false;
     bool _connected = false;
     bool _previewTransferActive = false;
+    bool _checkpointDownloadActive = false;
     QString _previewTransferText;
     int _ephemeralCount = 0;
     int _uncommittedCount = 0;

@@ -100,6 +100,8 @@ signals:
     void previewTransferProgress(const QString& phase, const QString& fileName,
                                  int filesComplete, int totalFiles,
                                  qint64 bytesReceived, qint64 totalBytes);
+    void checkpointDownloadProgress(const QString& phase,
+                                    qint64 bytesReceived, qint64 totalBytes);
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
     void inputUploadFinished(const QString& inputId, const QString& error);
@@ -185,6 +187,7 @@ private:
     QString _installedPreviewArtifact;
     QString _installedPreviewSession;
     QString _fetchingPreviewArtifact;
+    QString _fetchingCheckpointArtifact;
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
     QString _synchronizedSessionId;

@@ -36,6 +36,7 @@
 #include <QSlider>
 #include <QStyle>
 #include <QToolButton>
+#include <QTimer>
 #include <QUuid>
 #include <QVBoxLayout>
 
@@ -533,6 +534,47 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     checkpointControls->addWidget(_downloadCheckpoint);
     checkpointControls->addStretch(1);
     runLayout->addLayout(checkpointControls);
+    _checkpointDownloadStatus = new QLabel(runContents);
+    _checkpointDownloadStatus->setVisible(false);
+    _checkpointDownloadProgress = new QProgressBar(runContents);
+    _checkpointDownloadProgress->setVisible(false);
+    runLayout->addWidget(_checkpointDownloadStatus);
+    runLayout->addWidget(_checkpointDownloadProgress);
+    _checkpointDownloadTimer = new QTimer(this);
+    _checkpointDownloadTimer->setInterval(1000);
+    auto refreshCheckpointDownload = [this]() {
+        const qint64 seconds = _checkpointDownloadElapsed.isValid()
+            ? _checkpointDownloadElapsed.elapsed() / 1000 : 0;
+        const QString elapsed = seconds < 60
+            ? tr("%1s").arg(seconds)
+            : tr("%1m %2s").arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0'));
+        QString phase;
+        if (_checkpointDownloadPhase == QStringLiteral("creating"))
+            phase = tr("Creating checkpoint on service");
+        else if (_checkpointDownloadPhase == QStringLiteral("verifying"))
+            phase = tr("Verifying checkpoint");
+        else if (_checkpointDownloadPhase == QStringLiteral("copying"))
+            phase = tr("Saving checkpoint");
+        else
+            phase = tr("Downloading checkpoint");
+        _checkpointDownloadStatus->setText(
+            tr("%1 — elapsed %2").arg(phase, elapsed));
+        if (_checkpointTotalBytes > 0) {
+            _checkpointDownloadProgress->setRange(0, 1000);
+            _checkpointDownloadProgress->setValue(static_cast<int>(
+                qBound<qint64>(qint64{0}, _checkpointBytesReceived * 1000
+                                  / _checkpointTotalBytes, qint64{1000})));
+            _checkpointDownloadProgress->setFormat(
+                tr("%1 / %2 MiB")
+                    .arg(_checkpointBytesReceived / (1024 * 1024))
+                    .arg(_checkpointTotalBytes / (1024 * 1024)));
+        } else {
+            _checkpointDownloadProgress->setRange(0, 0);
+            _checkpointDownloadProgress->setFormat(QString());
+        }
+    };
+    connect(_checkpointDownloadTimer, &QTimer::timeout, this,
+            refreshCheckpointDownload);
 
     auto* ephemeralLabel = new QLabel(tr("Inputs added to the running fit:"), runContents);
     _ephemeralList = new QListWidget(runContents);
@@ -634,9 +676,24 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 // Connection must succeed before dataset resolution or fit
                 // controls are enabled.
                 _load->setEnabled(_connected);
-                if (!_connected) { _run->setEnabled(false); _stop->setEnabled(false);
-                                   _save->setEnabled(false); _downloadCheckpoint->setEnabled(false);
-                                   _removeInput->setEnabled(false); }
+                if (!_connected) {
+                    _run->setEnabled(false);
+                    _stop->setEnabled(false);
+                    _save->setEnabled(false);
+                    _downloadCheckpoint->setEnabled(false);
+                    _removeInput->setEnabled(false);
+                    if (_checkpointDownloadActive) {
+                        _checkpointDownloadActive = false;
+                        _checkpointDownloadTimer->stop();
+                        const qint64 seconds =
+                            _checkpointDownloadElapsed.elapsed() / 1000;
+                        _checkpointDownloadProgress->setVisible(false);
+                        _checkpointDownloadStatus->setText(
+                            tr("Checkpoint download interrupted after %1m %2s")
+                                .arg(seconds / 60)
+                                .arg(seconds % 60, 2, 10, QLatin1Char('0')));
+                    }
+                }
                 if (state == CS::Starting || state == CS::Connecting) {
                     _hasSession = false;
                     _loadedSessionRequest = {};
@@ -735,10 +792,35 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::checkpointDownloadFinished, this,
             [this](const QString& path, const QString& error) {
-                if (error.isEmpty())
+                _checkpointDownloadTimer->stop();
+                _checkpointDownloadActive = false;
+                const qint64 seconds = _checkpointDownloadElapsed.elapsed() / 1000;
+                _checkpointDownloadProgress->setRange(0, 1000);
+                if (error.isEmpty()) {
+                    _checkpointDownloadProgress->setValue(1000);
+                    _checkpointDownloadProgress->setFormat(tr("Complete"));
+                    _checkpointDownloadStatus->setText(
+                        tr("Checkpoint download complete — %1m %2s")
+                            .arg(seconds / 60)
+                            .arg(seconds % 60, 2, 10, QLatin1Char('0')));
                     _warnings->setText(tr("Checkpoint downloaded to %1").arg(path));
-                else
+                } else {
+                    _checkpointDownloadProgress->setVisible(false);
+                    _checkpointDownloadStatus->setText(
+                        tr("Checkpoint download failed after %1m %2s")
+                            .arg(seconds / 60)
+                            .arg(seconds % 60, 2, 10, QLatin1Char('0')));
                     _warnings->setText(tr("Checkpoint download failed: %1").arg(error));
+                }
+                _downloadCheckpoint->setEnabled(_connected && _sessionRunnable);
+            });
+    connect(_service, &SpiralServiceManager::checkpointDownloadProgress, this,
+            [this, refreshCheckpointDownload](const QString& phase,
+                                              qint64 received, qint64 total) {
+                _checkpointDownloadPhase = phase;
+                _checkpointBytesReceived = received;
+                _checkpointTotalBytes = total;
+                refreshCheckpointDownload();
             });
     connect(_service, &SpiralServiceManager::inputUploadFinished, this,
             [this](const QString& inputId, const QString& error) {
@@ -803,7 +885,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             QDir::home().filePath(QStringLiteral("spiral_checkpoint.ckpt")),
             tr("Checkpoint (*.ckpt)"));
         if (path.isEmpty()) return;
-        _warnings->setText(tr("Downloading checkpoint… this can take a few minutes."));
+        _downloadCheckpoint->setEnabled(false);
+        _checkpointDownloadActive = true;
+        _checkpointDownloadPhase = QStringLiteral("creating");
+        _checkpointBytesReceived = 0;
+        _checkpointTotalBytes = 0;
+        _checkpointDownloadElapsed.start();
+        _checkpointDownloadStatus->setVisible(true);
+        _checkpointDownloadProgress->setVisible(true);
+        _checkpointDownloadTimer->start();
+        _warnings->setText(tr("Preparing checkpoint download…"));
         _service->downloadCheckpoint(path);
     });
     connect(_commitInputs, &QPushButton::clicked, this, [this]() {
@@ -1623,7 +1714,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _run->setEnabled(_connected && runnable && !_reloadRequired);
     _stop->setEnabled(state == "Running");
     _save->setEnabled(_connected && runnable);
-    _downloadCheckpoint->setEnabled(_connected && runnable);
+    _downloadCheckpoint->setEnabled(
+        _connected && runnable && !_checkpointDownloadActive);
 
     // Ephemeral inputs added to the running fit.
     const QJsonArray ephemeral = status.value(QStringLiteral("ephemeral_inputs")).toArray();
