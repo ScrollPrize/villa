@@ -4,8 +4,9 @@
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
-#include <cstddef>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <iterator>
@@ -31,6 +32,13 @@ struct FiberTraceProfile {
     double predictionAssignSeconds = 0.0;
     double predictionMaterializeSeconds = 0.0;
     double predictionCornerSeconds = 0.0;
+    double predictionCornerPrepareSeconds = 0.0;
+    double predictionCornerLayoutSeconds = 0.0;
+    double predictionCornerPinSeconds = 0.0;
+    double predictionCornerGatherSeconds = 0.0;
+    uint64_t predictionCornerLayoutChunkRuns = 0;
+    uint64_t predictionCornerBoundaryPoints = 0;
+    uint64_t predictionCornerDependencies = 0;
     double predictionDecodeSeconds = 0.0;
     double normalDecodeSeconds = 0.0;
     double normalBatchSeconds = 0.0;

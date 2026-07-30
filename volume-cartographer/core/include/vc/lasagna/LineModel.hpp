@@ -25,6 +25,13 @@ struct NormalSampleWithDerivative {
 struct NormalPrefetchReport {
     uint64_t requestedChunks = 0;
     uint64_t chunksRead = 0;
+    double cornerPrepareSeconds = 0.0;
+    double cornerLayoutSeconds = 0.0;
+    double cornerPinSeconds = 0.0;
+    double cornerGatherSeconds = 0.0;
+    uint64_t cornerLayoutChunkRuns = 0;
+    uint64_t cornerBoundaryPoints = 0;
+    uint64_t cornerDependencies = 0;
 };
 
 struct NormalBatchReport {

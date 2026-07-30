@@ -14,6 +14,12 @@
 - [x] Fuse persisted corner decoding with candidate scoring
 - [x] Add direct-corner scoring coverage and rerun focused native tests
 - [x] Measure fused decode/scoring on the approved representative workload
+- [x] Test cumulative-loss and orientation-decode quality controls
+- [x] Compact final frontier records and reconstruct selected beam state
+- [x] Profile corner preparation, layout, pinning, and gathering separately
+- [x] Optimize measured corner dependency and gather overhead
+- [x] Reject regressing parallel layout/preparation scheduling controls
+- [x] Confirm the retained implementation remains at no more than 8 restarts
 - [x] Update task log and changelog
 - [x] Final consistency review
 
@@ -42,3 +48,12 @@ batch. All 26 fiber-trace, 15 strict corner-sampler, and 11 Lasagna normal tests
 pass. The approved representative run completed in 27.291s wall / 768.058s CPU
 with 8 restarts, meeting the less-than-30s performance target without changing
 the pre-existing post-float restart result.
+
+The final retained revision reconstructs full beam state only for selected
+compact frontier entries and removes measured corner-batch overhead without
+changing corner values or ordering. The approved workload completes in
+21.155s wall / 619.366s CPU with 8 restarts. Corner batching accounts for
+7.300s: 2.182s preparation, 2.426s dependency layout, 0.066s cache pinning,
+and 1.938s gathering. Two-layout parallel construction, bounded parallel
+coordinate preparation, and consolidated gather tasks were tested and removed
+because they increased contention or did not improve their target stage.

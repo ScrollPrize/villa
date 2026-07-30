@@ -833,17 +833,11 @@ struct CandidateTask {
 };
 
 struct FrontierCandidate {
-    size_t beamIndex = 0;
     TraceVec point{0.0f, 0.0f, 0.0f};
-    TraceVec previousStepDirection{0.0f, 0.0f, 0.0f};
-    TraceVec currentSampleDirection{0.0f, 0.0f, 0.0f};
-    TraceVec historyDirection{0.0f, 0.0f, 0.0f};
     float loss = 0.0f;
-    float tracedLength = 0.0f;
     int depth = 0;
     bool valid = false;
     bool reached = false;
-    size_t order = 0;
 };
 
 struct CandidateScoringScratch {
@@ -1332,14 +1326,10 @@ void sampleCandidateNormals(
 
 [[nodiscard]] FrontierCandidate makeFrontierCandidate(
     const BeamState& beam,
-    size_t beamIndex,
-    size_t order,
-    const TraceVec& taskDirection,
     const TraceVec& candidatePoint,
     const CandidateScore& candidateScore,
     const TraceVec& target,
-    const TraceVec& targetPlaneNormal,
-    const FiberTraceConfig& config)
+    const TraceVec& targetPlaneNormal)
 {
     const TraceVec currentPoint = beamEndpoint(beam);
     const auto crossing = interpolatePlaneCrossing(
@@ -1349,21 +1339,11 @@ void sampleCandidateNormals(
         targetPlaneNormal);
     const TraceVec nextPoint = crossing.value_or(candidatePoint);
     return {
-        beamIndex,
         nextPoint,
-        taskDirection,
-        candidateScore.selectedCurrentDirection,
-        updateHistoryDirection(
-            beam.historyDirection,
-            taskDirection,
-            beam.depth,
-            config.cumulativeSmoothnessSteps),
         beam.loss + candidateScore.loss,
-        beam.tracedLength + traceLength(nextPoint - currentPoint),
         beam.depth + 1,
         true,
         crossing.has_value(),
-        order,
     };
 }
 
@@ -1499,16 +1479,27 @@ void sampleCandidateNormals(
 
 [[nodiscard]] BeamState beamStateFromFrontierCandidate(
     const std::vector<BeamState>& parents,
-    const FrontierCandidate& candidate)
+    const std::vector<CandidateTask>& tasks,
+    const std::vector<CandidateScore>& scores,
+    size_t candidateIndex,
+    const FrontierCandidate& candidate,
+    const FiberTraceConfig& config)
 {
-    const BeamState& parent = parents[candidate.beamIndex];
+    const CandidateTask& task = tasks[candidateIndex];
+    const CandidateScore& score = scores[candidateIndex];
+    const BeamState& parent = parents[task.beamIndex];
     BeamState out = parent;
     out.path = appendBeamPathPoint(parent.path, candidate.point);
-    out.previousStepDirection = candidate.previousStepDirection;
-    out.currentSampleDirection = candidate.currentSampleDirection;
-    out.historyDirection = candidate.historyDirection;
+    out.previousStepDirection = task.direction;
+    out.currentSampleDirection = score.selectedCurrentDirection;
+    out.historyDirection = updateHistoryDirection(
+        parent.historyDirection,
+        task.direction,
+        parent.depth,
+        config.cumulativeSmoothnessSteps);
     out.loss = candidate.loss;
-    out.tracedLength = candidate.tracedLength;
+    out.tracedLength = parent.tracedLength +
+        traceLength(candidate.point - beamEndpoint(parent));
     out.depth = candidate.depth;
     out.reached = candidate.reached;
     out.reason = candidate.reached ? "target_plane" : std::string{};
@@ -1518,8 +1509,11 @@ void sampleCandidateNormals(
 [[nodiscard]] std::vector<BeamState> pruneFrontierCandidates(
     const std::vector<FrontierCandidate>& candidates,
     const std::vector<BeamState>& parents,
+    const std::vector<CandidateTask>& tasks,
+    const std::vector<CandidateScore>& scores,
     int beamWidth,
-    double pruneDistanceVoxels)
+    double pruneDistanceVoxels,
+    const FiberTraceConfig& config)
 {
     if (candidates.empty())
         return {};
@@ -1530,7 +1524,8 @@ void sampleCandidateNormals(
     std::vector<BeamState> out;
     out.reserve(selected.size());
     for (const size_t index : selected) {
-        out.push_back(beamStateFromFrontierCandidate(parents, candidates[index]));
+        out.push_back(beamStateFromFrontierCandidate(
+            parents, tasks, scores, index, candidates[index], config));
     }
     return out;
 }
@@ -1665,14 +1660,10 @@ void sampleCandidateNormals(
                         return;
                     frontier[taskIndex] = makeFrontierCandidate(
                         expanded[task.beamIndex],
-                        task.beamIndex,
-                        taskIndex,
-                        task.direction,
                         task.candidatePoint,
                         candidateScore,
                         target,
-                        targetPlaneNormal,
-                        request.config);
+                        targetPlaneNormal);
                 };
 #ifdef _OPENMP
                 if (frontierWorkers > 1) {
@@ -1693,7 +1684,11 @@ void sampleCandidateNormals(
                 if (bestReachedIndex.has_value()) {
                     const BeamState bestReached = beamStateFromFrontierCandidate(
                         expanded,
-                        frontier[*bestReachedIndex]);
+                        tasks,
+                        scores,
+                        *bestReachedIndex,
+                        frontier[*bestReachedIndex],
+                        request.config);
                     if (progress) {
                         FiberTraceProgress event;
                         event.phase = phase;
@@ -1715,8 +1710,11 @@ void sampleCandidateNormals(
                 beams = pruneFrontierCandidates(
                     frontier,
                     expanded,
+                    tasks,
+                    scores,
                     request.config.beamWidth,
-                    request.config.beamPruneDistanceVoxels);
+                    request.config.beamPruneDistanceVoxels,
+                    request.config);
                 if (profile != nullptr)
                     profile->pruneSeconds += elapsedSeconds(pruneStart);
                 if (beams.empty()) {
@@ -2361,14 +2359,27 @@ public:
 
         auto& corners = *cornerScratch;
         const auto cornerStart = TraceClock::now();
+        vc::lasagna::NormalPrefetchReport cornerReport;
         try {
-            (void)vc::lasagna::sampleLasagnaChannelCornerBatch(
+            cornerReport = vc::lasagna::sampleLasagnaChannelCornerBatch(
                 samplers, volumePoints, corners, parallelThreads);
         } catch (const std::invalid_argument&) {
             return false;
         }
-        if (profile != nullptr)
+        if (profile != nullptr) {
             profile->predictionCornerSeconds += elapsedSeconds(cornerStart);
+            profile->predictionCornerPrepareSeconds +=
+                cornerReport.cornerPrepareSeconds;
+            profile->predictionCornerLayoutSeconds +=
+                cornerReport.cornerLayoutSeconds;
+            profile->predictionCornerPinSeconds += cornerReport.cornerPinSeconds;
+            profile->predictionCornerGatherSeconds += cornerReport.cornerGatherSeconds;
+            profile->predictionCornerLayoutChunkRuns +=
+                cornerReport.cornerLayoutChunkRuns;
+            profile->predictionCornerBoundaryPoints +=
+                cornerReport.cornerBoundaryPoints;
+            profile->predictionCornerDependencies += cornerReport.cornerDependencies;
+        }
         return true;
     }
 

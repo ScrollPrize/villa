@@ -48,6 +48,13 @@ public:
         int missingChunks = 0;
         int fallbackLevels = 0;
         bool requestedLevelOnly = false;
+        double cornerPrepareSeconds = 0.0;
+        double cornerLayoutSeconds = 0.0;
+        double cornerPinSeconds = 0.0;
+        double cornerGatherSeconds = 0.0;
+        uint64_t cornerLayoutChunkRuns = 0;
+        uint64_t cornerBoundaryPoints = 0;
+        uint64_t cornerDependencies = 0;
     };
 
     // Queue chunk dependencies for pixels not already covered. The viewer can

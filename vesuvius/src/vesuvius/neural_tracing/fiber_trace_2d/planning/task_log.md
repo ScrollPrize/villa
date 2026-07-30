@@ -132,11 +132,57 @@
   fused candidate scoring measured 7.606s, frontier construction improved to
   5.058s, and corner batching measured 9.019s. The performance target of less
   than 30s is met; the pre-existing 8-versus-5 restart quality issue remains.
+- Compact final-frontier records now retain only point, accumulated loss,
+  depth, validity, and reached state. Full direction/history/traced-length
+  state is reconstructed from the unchanged task, score, and parent only for
+  selected candidates. This measured 24.137s wall / 680.282s CPU with 8
+  restarts, down from 27.291s / 768.058s.
+- Additive corner-stage profiling split the then-8.875s corner batch into
+  2.321s coordinate/cube preparation, 3.247s dependency layout, 0.094s cache
+  prefetch/pinning, and 2.443s gathering. This confirmed the warmed workload is
+  not I/O-bound.
+- Constructing the two independent chunk-shape layouts concurrently did not
+  improve layout time (3.150s versus 3.247s) and increased the representative
+  run to 29.657s / 842.689s. Bounded eight-worker coordinate preparation cut
+  its own stage from about 2.3s to 1.896s but increased cross-stage contention;
+  consolidated gather tasks likewise did not improve gathering. All three
+  scheduling controls were removed.
+- The workload used only 9,996 summed unique layout dependencies across 4,170
+  generations, despite 105,810,462 candidates. Replacing full-candidate hash
+  reservations with a 16-entry linear table that promotes to hashing for broad
+  batches, retaining the chunk based on the interpolation base voxel,
+  resolving each unique adjacent chunk once per boundary point, and
+  precomputing boundary local coordinates reduced dependency layout from
+  3.247s to 2.426s in the final run.
+- The common single-chunk gather now validates its monotonic maximum corner
+  offset once per volume, while cross-chunk points retain per-corner extent
+  checks. This reduced gathering from roughly 2.44s to 1.938s. A single-write
+  coordinate validity/fraction pass also avoids clearing those arrays before
+  overwriting them.
+- Final validation passed 26 fiber-trace, 15 strict corner-sampler, and 11
+  Lasagna normal tests. The approved warm-cache workload measured 21.155s wall
+  / 619.366s CPU, with 8 restarts over 87 segments. The final profile reported
+  2.399s task build, 7.300s corner batch, 5.773s fused candidate scoring,
+  3.239s frontier construction, and 1.257s pruning.
 
-## Open Acceptance Issue
+## Quality Acceptance
 
 - The user-requested all-float trace conversion changes the representative
   restart result from 5 to 8 in the measured intermediate implementations.
-  Performance acceptance cannot hide this quality regression. After the
-  combined-path benchmark, cumulative beam-score precision is the first
-  targeted control to evaluate if the regression remains.
+  Precision controls below did not recover the former result. The user accepts
+  8 restarts as the quality floor for this performance task, while any result
+  above 8 must be discarded.
+- Restoring only accumulated beam/candidate/frontier loss storage and
+  comparison to double did not change quality: the representative result
+  remained at 8 restarts. It also regressed the contended run from 27.291s to
+  33.784s wall, with fused scoring increasing from 7.606s to 11.621s. The
+  control was reverted; cumulative loss precision is not the quality cause.
+- A one-shot comparison of 512 candidate predictions decoded from retained
+  corners versus the legacy per-point sampler found no validity or selected
+  branch mismatches, mean/max presence differences of 1.61e-8/1.19e-7, and
+  mean/max undirected axis differences of 0.000193/0.019782 degrees. A follow-up
+  double-precision prediction orientation-tensor control still produced 8
+  restarts and measured 27.764s wall. It was reverted because it improved
+  neither quality nor performance. Per user direction, 8 restarts is now the
+  accepted floor for subsequent performance controls; any regression above 8
+  must be discarded.

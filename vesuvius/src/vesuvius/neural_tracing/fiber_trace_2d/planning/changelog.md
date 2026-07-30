@@ -8,6 +8,12 @@
   scoring, eliminating full decoded candidate arrays and reducing the approved
   warm-cache whole-fiber workload from 37.277s to 27.291s wall time. The
   measured 8-restart post-float result is unchanged.
+- Reduced the same approved workload to 21.155s wall / 619.366s CPU with
+  compact reconstruct-on-selection frontier records and measured corner-batch
+  improvements: small dependency tables, correct base-voxel chunk retention,
+  deduplicated boundary dependencies, precomputed boundary offsets, and one
+  extent check for the common single-chunk gather path. The accepted
+  post-float result remains 8 restarts.
 - Converted native fiber tracing's internal geometry and candidate math to
   float while retaining double persisted/public coordinate boundaries. The
   representative quality check currently regresses from 5 to 8 restarts and

@@ -693,7 +693,14 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
             parallelThreads);
     return {
         static_cast<uint64_t>(stats.requestedChunks),
-        static_cast<uint64_t>(stats.requestedChunks)};
+        static_cast<uint64_t>(stats.requestedChunks),
+        stats.cornerPrepareSeconds,
+        stats.cornerLayoutSeconds,
+        stats.cornerPinSeconds,
+        stats.cornerGatherSeconds,
+        stats.cornerLayoutChunkRuns,
+        stats.cornerBoundaryPoints,
+        stats.cornerDependencies};
 }
 
 NormalPrefetchReport sampleLasagnaChannelCornerBatch(

@@ -447,6 +447,20 @@ int main(int argc, char** argv)
                   << " prediction_assign_s=" << profile.predictionAssignSeconds
                   << " prediction_materialize_s=" << profile.predictionMaterializeSeconds
                   << " prediction_corner_s=" << profile.predictionCornerSeconds
+                  << " prediction_corner_prepare_s="
+                  << profile.predictionCornerPrepareSeconds
+                  << " prediction_corner_layout_s="
+                  << profile.predictionCornerLayoutSeconds
+                  << " prediction_corner_pin_s="
+                  << profile.predictionCornerPinSeconds
+                  << " prediction_corner_gather_s="
+                  << profile.predictionCornerGatherSeconds
+                  << " prediction_corner_chunk_runs="
+                  << profile.predictionCornerLayoutChunkRuns
+                  << " prediction_corner_boundary_points="
+                  << profile.predictionCornerBoundaryPoints
+                  << " prediction_corner_dependencies="
+                  << profile.predictionCornerDependencies
                   << " prediction_decode_s=" << profile.predictionDecodeSeconds
                   << " normal_decode_s=" << profile.normalDecodeSeconds
                   << " normal_batch_s=" << profile.normalBatchSeconds
