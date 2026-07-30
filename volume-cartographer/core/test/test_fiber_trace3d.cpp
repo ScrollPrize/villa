@@ -210,6 +210,8 @@ TEST_CASE("native fiber tracer defaults match regular Trace2CP command")
     CHECK(config.beamWidth == 8);
     CHECK(config.beamPruneDistanceVoxels == doctest::Approx(1.0));
     CHECK(config.beamLookaheadSteps == 2);
+    CHECK(config.lookaheadParentCap == 32);
+    CHECK(config.lookaheadRetryParentCap == 0);
     CHECK(config.parallelThreads == 0);
     CHECK(config.smoothnessNormalWeight == doctest::Approx(0.1));
     CHECK(config.smoothnessTangentWeight == doctest::Approx(10.0));
@@ -733,6 +735,18 @@ TEST_CASE("native fiber tracer capped parent order matches a full deterministic 
     CHECK(vc::fiber_tracer::testing::debugOrderedIndexPrefix(losses, losses.size()) ==
           std::vector<size_t>{4, 1, 3, 2, 5, 0});
     CHECK(vc::fiber_tracer::testing::debugOrderedIndexPrefix(losses, 0).empty());
+}
+
+TEST_CASE("native fiber tracer retries only failed lower capped lazy searches")
+{
+    using vc::fiber_tracer::testing::debugShouldRetryLookahead;
+    CHECK(debugShouldRetryLookahead(true, 28, 32, false));
+    CHECK_FALSE(debugShouldRetryLookahead(true, 28, 32, true));
+    CHECK_FALSE(debugShouldRetryLookahead(false, 28, 32, false));
+    CHECK_FALSE(debugShouldRetryLookahead(true, 0, 32, false));
+    CHECK_FALSE(debugShouldRetryLookahead(true, 28, 28, false));
+    CHECK_FALSE(debugShouldRetryLookahead(true, 28, 24, false));
+    CHECK_FALSE(debugShouldRetryLookahead(true, 28, 0, false));
 }
 
 TEST_CASE("native fiber tracer exact lazy lookahead matches exhaustive search")

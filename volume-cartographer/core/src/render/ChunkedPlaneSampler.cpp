@@ -16,6 +16,7 @@
 #include <vector>
 
 namespace vc::render {
+
 namespace {
 
 struct LocalChunkCache {
@@ -1917,7 +1918,7 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
         const auto& dependencies = layouts[volumeLayout[volumeIndex]].dependencies;
         for (size_t dependencyIndex = 0;
              dependencyIndex < dependencies.size();
-             ++dependencyIndex) {
+            ++dependencyIndex) {
             const ChunkKey& key = dependencies[dependencyIndex];
             ChunkResult result = array->getChunkBlocking(
                 key.level, key.iz, key.iy, key.ix);

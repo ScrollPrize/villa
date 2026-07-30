@@ -1,16 +1,23 @@
 # Native Fiber Trace Locality And Scheduling Optimization
 
-Continue optimizing the retained native precomputed C++ fiber tracer from the
-cap-32 baseline:
+Continue optimizing the retained native precomputed C++ fiber tracer. The
+original cap-32 baseline was:
 
 - 1.869s wall / 8.222s CPU
 - 6,910,839 candidates and 4,318 generations
 - 7 restarts over 87 segments
 
-Preserve at most 8 restarts. Result-neutral scheduling, storage, and locality
+After result-neutral and accepted numeric-relaxed optimization, the new
+retained baseline is plain cap 32:
+
+- 1.161s wall / 4.945s CPU
+- 6,910,839 candidates and 4,318 generations
+- 7 restarts over 87 segments
+
+Preserve 7 restarts. Result-neutral scheduling, storage, and locality
 changes must preserve deterministic output exactly. Search approximations may
 be tested separately but must not replace the retained default unless measured
-quality remains acceptable.
+quality retains the 7-restart baseline.
 
 Investigate and test these proposals independently:
 

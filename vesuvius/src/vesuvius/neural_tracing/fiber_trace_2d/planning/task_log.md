@@ -149,3 +149,112 @@
   costs 0.195s, while pinning costs 0.046s. A result-neutral fused frontier
   construction trial was added to the plan ahead of persistent pin-session
   work because it has the larger measured ceiling.
+
+## Fused Final-Frontier Construction
+
+- Final frontier records are now produced by every scoring path immediately
+  after each candidate score. Lazy batches retain their explicit original
+  global child indices; ordinary batches retain task indices. The separate
+  evaluated-score scan was removed.
+- All 31 tracer tests pass, including serial/generic inference and exact
+  lazy-versus-exhaustive parity.
+- On a 99%-idle host, the representative result was 1.305s wall / 6.951s CPU
+  with unchanged 7 restarts and exact workload counts. Frontier time fell from
+  0.195s to 0.117s. The trial is retained.
+
+## Persistent-Pin Priority
+
+- Current pin time is 0.045s total, so a bounded cross-call session can recover
+  at most about 3.5% wall time before its own lookup/retention overhead. It
+  remains planned but is deferred until the fixed-cap quality trials, which can
+  reduce the dominant candidate-scoring work itself.
+
+## Fixed Cap 28 Trial
+
+- Temporarily changed the default and CLI help from cap 32 to cap 28. Explicit
+  cap 0 exact mode and explicit cap overrides are unchanged.
+- Representative quality/performance measurement is pending focused tests and
+  the host-load gate.
+- On a fully idle host: 1.234s wall / 6.405s CPU, 8 restarts, 6,217,479
+  candidates, 4,321 generations, and displayed error 0.5/kvx. This is 5.4%
+  faster than retained cap 32 and remains within the explicit 8-restart quality
+  boundary. Keep as a candidate while testing cap 24.
+
+## Fixed Cap 24 Trial
+
+- Temporarily changed the default and CLI help from cap 28 to cap 24. Quality
+  measurement is pending.
+- On an idle host: 2.112s wall / 6.017s CPU, 9 restarts, 5,670,567 candidates,
+  4,433 generations, and displayed error 0.6/kvx. It fails the explicit
+  8-restart boundary. The changed path also spent 0.969s pinning, consistent
+  with reaching different uncached dependencies. Cap 24 was rejected and cap
+  20 was not tested, as required by the stop-after-clear-quality-failure rule.
+- Restored cap 28 as the current default candidate.
+
+## Adaptive Cap Escalation
+
+- Added `lookaheadRetryParentCap` and
+  `--lookahead-retry-parent-cap`; whole-fiber tracing retries only segments that
+  would restart, uses a strictly larger cap, and adopts only successful retries.
+  Retry and recovered counts are reported. All 32 tracer tests pass.
+- The cap 28→32 trial recovered 1 of 8 retries and restored 7 restarts, but took
+  1.351s wall / 7.071s CPU and evaluated 6,918,615 candidates. This is slower
+  and slightly more work than plain cap 32 after result-neutral optimizations
+  (1.305s / 6,910,839 candidates).
+- Escalation remains available explicitly but defaults to disabled. Cap 28
+  remains available as an explicit speed/quality choice.
+
+## New Retained Baseline
+
+- Per user direction, retain 7-restart quality as the baseline. Plain cap 32 is
+  preferable to adaptive 28→32: it completed in 1.305s wall / 6.951s CPU with
+  6,910,839 candidates, versus 1.351s / 7.071s and 6,918,615 candidates for
+  adaptive retry.
+- Restored cap 32 as the default. Adaptive retry remains explicit and disabled
+  by default. The result-neutral implementation improvements remain active.
+
+## Two-Depth Pin Session Trial
+
+- Implemented an opaque shared-sampler session, threaded it through grouped
+  Lasagna corner sampling, and scoped it to one trace step so only depth-one /
+  depth-two resolved chunks remained pinned. Added direct reuse-and-clear test
+  coverage; all focused suites passed.
+- On a 99-100%-idle host: 1.299s wall / 6.945s CPU, with unchanged 7 restarts
+  and workload counts. Pin time remained 0.046s and total time was within noise
+  of the 1.305s baseline.
+- The existing decoded cache already makes repeated blocking lookups cheap.
+  The session API and its test were rejected and removed because they added
+  complexity without a measurable gain.
+
+## Unit-Vector Math Trial
+
+- Started a numeric-relaxed trial replacing repeated normalization inside the
+  six candidate dot products and unit-angle helper with direct clamped dots.
+  All current call sites normalize their inputs immediately before these
+  helpers; the corner path also reuses the already-normalized candidate
+  reference as its current-step vector.
+- This changed float rounding as expected but retained 7 restarts and identical
+  candidate/generation counts. The representative result was 1.250s wall /
+  5.705s CPU; required-parent and cube counts moved slightly. The 4.2% wall and
+  17.9% CPU improvement is retained.
+- Started a follow-up removing the second normalization/alignment of compact
+  tensor axes. `interpolateLasagnaCompactAxisCorners(..., hint)` already returns
+  a normalized axis aligned to that hint. It retained 7 restarts and exact
+  workload counts at 1.236s wall / 5.527s CPU, a further 1.1% wall and 3.1% CPU
+  improvement, and is retained.
+- Started a unit-invariant smoothness follow-up. It removes repeated
+  normalization of vectors already normalized by candidate/beam construction
+  and replaces square-root nonzero checks with squared norms. Quality
+  measurement retained 7 restarts and exact workload counts at 1.190s wall /
+  5.097s CPU, a further 3.7% wall and 7.8% CPU improvement. It is retained.
+- Started a follow-up using beam and candidate direction unit invariants at the
+  candidate-loss entry instead of normalizing those vectors once per candidate.
+  It retained 7 restarts and exact workload counts at 1.161s wall / 4.945s CPU,
+  a further 2.4% wall and 3.0% CPU improvement. It is retained.
+
+## Current Quality Baseline
+
+- Per user direction, the plain cap-32 result at 1.161s wall / 4.945s CPU,
+  6,910,839 candidates, 4,318 generations, and 7 restarts is now the baseline.
+- Further retained changes must preserve 7 restarts. The previously accepted
+  8-restart search-quality bound no longer applies.

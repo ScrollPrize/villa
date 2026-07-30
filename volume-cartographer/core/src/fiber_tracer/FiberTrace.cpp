@@ -86,13 +86,12 @@ using TraceClock = std::chrono::steady_clock;
 
 [[nodiscard]] float traceClampedPositiveDot(const TraceVec& a, const TraceVec& b)
 {
-    return traceClamp01(traceNormalizedOrZero(a).dot(traceNormalizedOrZero(b)));
+    return traceClamp01(a.dot(b));
 }
 
 [[nodiscard]] float traceAngleBetweenUnit(const TraceVec& a, const TraceVec& b)
 {
-    return std::acos(
-        traceClampSignedUnit(traceNormalizedOrZero(a).dot(traceNormalizedOrZero(b))));
+    return std::acos(traceClampSignedUnit(a.dot(b)));
 }
 
 [[nodiscard]] TraceVec traceAlignTo(
@@ -695,16 +694,17 @@ void validateTraceConfig(const FiberTraceConfig& config)
     bool normalValid,
     const FiberTraceConfig& config)
 {
-    const TraceVec prev = traceNormalizedOrZero(previousStepDirection);
-    const TraceVec cand = traceNormalizedOrZero(candidateStepDirection);
-    if (traceLength(prev) <= kTraceEpsilon || traceLength(cand) <= kTraceEpsilon)
+    const TraceVec& prev = previousStepDirection;
+    const TraceVec& cand = candidateStepDirection;
+    constexpr float kTraceEpsilon2 = kTraceEpsilon * kTraceEpsilon;
+    if (prev.dot(prev) <= kTraceEpsilon2 || cand.dot(cand) <= kTraceEpsilon2)
         return 0.0f;
 
     const float isotropic = isotropicSmoothnessLoss(prev, cand, config);
-    const TraceVec n = traceNormalizedOrZero(normal);
+    const TraceVec& n = normal;
     const float normalWeight = static_cast<float>(config.smoothnessNormalWeight);
     const float tangentWeight = static_cast<float>(config.smoothnessTangentWeight);
-    if (!normalValid || traceLength(n) <= kTraceEpsilon)
+    if (!normalValid || n.dot(n) <= kTraceEpsilon2)
         return isotropic;
 
     const float prevN = traceClampSignedUnit(prev.dot(n));
@@ -712,7 +712,7 @@ void validateTraceConfig(const FiberTraceConfig& config)
     const TraceVec prevT = traceNormalizedOrZero(prev - n * prevN);
     const TraceVec candT = traceNormalizedOrZero(cand - n * candN);
     const bool tangentOk =
-        traceLength(prevT) > kTraceEpsilon && traceLength(candT) > kTraceEpsilon;
+        prevT.dot(prevT) > kTraceEpsilon2 && candT.dot(candT) > kTraceEpsilon2;
     const float tangentAngle = tangentOk
         ? traceAngleBetweenUnit(prevT, candT)
         : traceAngleBetweenUnit(prev, cand);
@@ -733,21 +733,24 @@ void validateTraceConfig(const FiberTraceConfig& config)
     const float weight = static_cast<float>(config.cumulativeSmoothnessTangentWeight);
     if (!(weight > 0.0f))
         return 0.0f;
-    const TraceVec history = traceNormalizedOrZero(historyDirection);
-    const TraceVec cand = traceNormalizedOrZero(candidateStepDirection);
-    const TraceVec n = traceNormalizedOrZero(normal);
+    const TraceVec& history = historyDirection;
+    const TraceVec& cand = candidateStepDirection;
+    const TraceVec& n = normal;
+    constexpr float kTraceEpsilon2 = kTraceEpsilon * kTraceEpsilon;
     if (!normalValid ||
-        traceLength(history) <= kTraceEpsilon ||
-        traceLength(cand) <= kTraceEpsilon ||
-        traceLength(n) <= kTraceEpsilon) {
+        history.dot(history) <= kTraceEpsilon2 ||
+        cand.dot(cand) <= kTraceEpsilon2 ||
+        n.dot(n) <= kTraceEpsilon2) {
         return 0.0f;
     }
     const float historyN = traceClampSignedUnit(history.dot(n));
     const float candN = traceClampSignedUnit(cand.dot(n));
     const TraceVec historyT = traceNormalizedOrZero(history - n * historyN);
     const TraceVec candT = traceNormalizedOrZero(cand - n * candN);
-    if (traceLength(historyT) <= kTraceEpsilon || traceLength(candT) <= kTraceEpsilon)
+    if (historyT.dot(historyT) <= kTraceEpsilon2 ||
+        candT.dot(candT) <= kTraceEpsilon2) {
         return 0.0f;
+    }
     const float freeAngle =
         static_cast<float>(config.smoothnessFreeAngleDegrees) * kTracePi / 180.0f;
     return weight * traceExcessAngleSquared(
@@ -996,9 +999,9 @@ void buildCandidateTasksForOrderedParents(
             traceAlignTo(option.direction, candidateDirection);
         const float presence = traceClamp01(option.presence);
 
-        const TraceVec prevStep = traceNormalizedOrZero(beam.previousStepDirection);
-        const TraceVec currentSample = traceNormalizedOrZero(beam.currentSampleDirection);
-        const TraceVec currentStep = traceNormalizedOrZero(candidateDirection);
+        const TraceVec& prevStep = beam.previousStepDirection;
+        const TraceVec& currentSample = beam.currentSampleDirection;
+        const TraceVec& currentStep = candidateDirection;
 
         float score = presence;
         score *= traceClampedPositiveDot(prevStep, currentStep);
@@ -1098,10 +1101,10 @@ void decodePredictionAndNormalCornerPoint(
         smoothNormalValid = smoothNormal.dot(smoothNormal) > 1.0e-12f;
     }
 
-    const TraceVec reference = traceNormalizedOrZero(candidateDirection);
-    const TraceVec prevStep = traceNormalizedOrZero(beam.previousStepDirection);
-    const TraceVec currentSample = traceNormalizedOrZero(beam.currentSampleDirection);
-    const TraceVec currentStep = traceNormalizedOrZero(candidateDirection);
+    const TraceVec& reference = candidateDirection;
+    const TraceVec& prevStep = beam.previousStepDirection;
+    const TraceVec& currentSample = beam.currentSampleDirection;
+    const TraceVec& currentStep = candidateDirection;
     float bestAlignmentScore = -std::numeric_limits<float>::infinity();
     ScoredDirection selectedCurrent;
     float bestLoss = std::numeric_limits<float>::infinity();
@@ -1112,12 +1115,10 @@ void decodePredictionAndNormalCornerPoint(
             volumeCorners[volume + 2],
             weights,
             candidateDirection);
-        if (direction.dot(candidateDirection) < 0.0f)
-            direction *= -1.0f;
         if (!(direction.dot(direction) > 1.0e-12f))
             continue;
 
-        const TraceVec alignedDirection = traceAlignTo(direction, candidateDirection);
+        const TraceVec alignedDirection = direction;
         const float presence = traceClamp01(
             vc::lasagna::interpolateLasagnaCorners(
                 volumeCorners[volume], weights) /
@@ -1804,6 +1805,16 @@ template <typename LossAt>
     }
     std::sort(order.begin(), order.end(), better);
     return order;
+}
+
+[[nodiscard]] bool shouldRetryLookahead(
+    bool lazyLookahead,
+    size_t parentCap,
+    size_t retryParentCap,
+    bool segmentSuccess)
+{
+    return !segmentSuccess && lazyLookahead && parentCap > 0 &&
+        retryParentCap > parentCap;
 }
 
 [[nodiscard]] std::optional<size_t> bestReachedFrontierCandidateIndex(
@@ -2507,6 +2518,19 @@ std::vector<size_t> debugOrderedIndexPrefix(
     return orderedIndexPrefix(losses.size(), limit, [&](size_t index) {
         return losses[index];
     });
+}
+
+bool debugShouldRetryLookahead(
+    bool lazyLookahead,
+    size_t parentCap,
+    size_t retryParentCap,
+    bool segmentSuccess)
+{
+    return shouldRetryLookahead(
+        lazyLookahead,
+        parentCap,
+        retryParentCap,
+        segmentSuccess);
 }
 
 } // namespace testing
@@ -3544,12 +3568,35 @@ public:
     {
         FiberPredictionSample out;
         out.options.reserve(options_.size());
-        for (const auto& option : options_) {
+        for (size_t optionIndex = 0; optionIndex < options_.size(); ++optionIndex) {
+            const auto& option = options_[optionIndex];
+            auto presenceRequest = vc::lasagna::prepareLasagnaCubeRequest(
+                option.presence, volumePoint);
+            vc::lasagna::LasagnaCubeRequest nxRequest;
+            vc::lasagna::LasagnaCubeRequest nyRequest;
+            if (optionGrids_[optionIndex].sharedPresenceNxNy) {
+                nxRequest = vc::lasagna::cloneLasagnaCubeRequestForBinding(
+                    presenceRequest, option.nx);
+                nyRequest = vc::lasagna::cloneLasagnaCubeRequestForBinding(
+                    presenceRequest, option.ny);
+            } else {
+                nxRequest = vc::lasagna::prepareLasagnaCubeRequest(
+                    option.nx, volumePoint);
+                nyRequest = vc::lasagna::prepareLasagnaCubeRequest(
+                    option.ny, volumePoint);
+            }
+            vc::lasagna::LasagnaLocalChunkResolver presenceResolver(
+                option.presence, *cache_);
+            vc::lasagna::LasagnaLocalChunkResolver nxResolver(option.nx, *cache_);
+            vc::lasagna::LasagnaLocalChunkResolver nyResolver(option.ny, *cache_);
+            presenceResolver.resolve(presenceRequest);
+            nxResolver.resolve(nxRequest);
+            nyResolver.resolve(nyRequest);
             const auto rawPresence =
-                vc::lasagna::sampleLasagnaChannel(option.presence, *cache_, volumePoint);
+                vc::lasagna::sampleLasagnaChannel(option.presence, presenceRequest);
             const auto direction =
                 vc::lasagna::sampleLasagnaCompactAxisTensor(
-                    option.nx, option.ny, *cache_, volumePoint);
+                    option.nx, option.ny, nxRequest, nyRequest);
             if (!rawPresence.has_value() || !direction.has_value()) {
                 out.options.push_back({});
                 continue;
@@ -3994,14 +4041,46 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
         segment.trace = traceOneWayCore(
             predictions, oneWay, normalSampler, segmentProgress, "fiber");
 
-        if (!segment.trace.points.empty()) {
-            segment.inPlaneErrorVoxels =
-                endpointPlaneError(segment.trace.points.back(), target, targetPlaneNormal);
-        } else {
-            segment.inPlaneErrorVoxels = std::numeric_limits<double>::infinity();
+        const auto setSegmentOutcome = [&](FiberTraceOneWayResult trace) {
+            segment.trace = std::move(trace);
+            if (!segment.trace.points.empty()) {
+                segment.inPlaneErrorVoxels = endpointPlaneError(
+                    segment.trace.points.back(), target, targetPlaneNormal);
+            } else {
+                segment.inPlaneErrorVoxels =
+                    std::numeric_limits<double>::infinity();
+            }
+            segment.success = segment.trace.reachedTargetPlane &&
+                segment.inPlaneErrorVoxels <= request.errorThresholdVoxels;
+        };
+        setSegmentOutcome(std::move(segment.trace));
+        if (shouldRetryLookahead(
+                request.config.lazyLookahead,
+                request.config.lookaheadParentCap,
+                request.config.lookaheadRetryParentCap,
+                segment.success)) {
+            ++result.lookaheadRetryCount;
+            FiberTraceOneWayRequest retry = oneWay;
+            retry.config.lookaheadParentCap =
+                request.config.lookaheadRetryParentCap;
+            FiberTraceOneWayResult retryTrace = traceOneWayCore(
+                predictions,
+                retry,
+                normalSampler,
+                segmentProgress,
+                "fiber_retry");
+            double retryError = std::numeric_limits<double>::infinity();
+            if (!retryTrace.points.empty()) {
+                retryError = endpointPlaneError(
+                    retryTrace.points.back(), target, targetPlaneNormal);
+            }
+            const bool retrySuccess = retryTrace.reachedTargetPlane &&
+                retryError <= request.errorThresholdVoxels;
+            if (retrySuccess) {
+                ++result.lookaheadRetryRecoveredCount;
+                setSegmentOutcome(std::move(retryTrace));
+            }
         }
-        segment.success = segment.trace.reachedTargetPlane &&
-                          segment.inPlaneErrorVoxels <= request.errorThresholdVoxels;
         segment.restart = !segment.success;
         if (segment.success) {
             segment.reason = "ok";

@@ -56,6 +56,7 @@ void printUsage(const char* argv0)
         << "  --beam-prune-distance-voxels N  beam endpoint merge radius after lookahead [1]\n"
         << "  --beam-lookahead-steps N        expand this many steps before pruning [2]\n"
         << "  --lookahead-parent-cap N        final-lookahead parent cap, 0 is exact [32]\n"
+        << "  --lookahead-retry-parent-cap N  retry failed segments at this cap, 0 disables [0]\n"
         << "  --exhaustive-lookahead          evaluate the full lookahead frontier\n"
         << "  --threads N                     candidate scoring threads, 0 uses worker default, 1 serial [0]\n"
         << "  --smoothness-weight N           smoothness scale [2]\n"
@@ -200,6 +201,13 @@ CliOptions parseArgs(int argc, char** argv)
             if (cap < 0)
                 failOption("--lookahead-parent-cap must be non-negative");
             options.trace.lookaheadParentCap = static_cast<size_t>(cap);
+        } else if (arg == "--lookahead-retry-parent-cap") {
+            const int cap = parseInt(
+                requireValue(i, argc, argv, "lookahead-retry-parent-cap"),
+                "lookahead-retry-parent-cap");
+            if (cap < 0)
+                failOption("--lookahead-retry-parent-cap must be non-negative");
+            options.trace.lookaheadRetryParentCap = static_cast<size_t>(cap);
         } else if (arg == "--exhaustive-lookahead") {
             options.trace.lazyLookahead = false;
         } else if (arg == "--threads") {
@@ -460,6 +468,9 @@ int main(int argc, char** argv)
         std::cout << "native_trace2cp_fiber err/kvx=" << std::fixed
                   << std::setprecision(1) << result.restartsPerKvx
                   << " restarts=" << result.restartCount
+                  << " lookahead_retries=" << result.lookaheadRetryCount
+                  << " lookahead_retry_recovered="
+                  << result.lookaheadRetryRecoveredCount
                   << " segments=" << result.segmentCount << '\n';
         if (result.restartsPerMeter.has_value()) {
             std::cout << "native_trace2cp_fiber err/m=" << std::fixed

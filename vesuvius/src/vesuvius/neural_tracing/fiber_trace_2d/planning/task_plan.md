@@ -2,9 +2,11 @@
 
 ## Baseline And Acceptance
 
-- Use the retained cap-32 result as baseline: 1.869s wall / 8.222s CPU,
-  6,910,839 candidates, 4,318 generations, and 7 restarts over 87 segments.
-- Retain no result above 8 restarts.
+- Use the optimized cap-32 result as the current baseline: 1.161s wall / 4.945s
+  CPU, 6,910,839 candidates, 4,318 generations, and 7 restarts over 87
+  segments. The task started from 1.869s wall / 8.222s CPU at the same workload
+  and quality.
+- Retain only results that preserve the 7-restart baseline.
 - For result-neutral phases, require identical trace output, candidate count,
   generation count, and restart count.
 - Preserve candidate generation order, original global candidate indices,
@@ -118,8 +120,19 @@ Run only after result-neutral work is measured:
    - record retry count and which trigger fired.
 4. Adaptive behavior must be deterministic and exposed as an explicit config/
    CLI mode until representative quality is established.
-5. Retain a new default only at 8 or fewer restarts and after an explicit spec
+5. Retain a new default only at 7 restarts and after an explicit spec
    update.
+
+## Phase 6: Unit-Vector Math Trial
+
+1. Remove redundant normalizations only where the immediate caller has already
+   normalized every vector.
+2. Treat this as numeric-relaxed: direct dot products may differ by float
+   rounding from renormalizing the same value again.
+3. Require the current 7-restart quality baseline and compare candidate/
+   generation counts to identify any changed search path.
+4. Retain only with a material speedup; otherwise restore the defensive
+   normalization helpers.
 
 ## Testing
 

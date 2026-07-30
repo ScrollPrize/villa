@@ -90,6 +90,7 @@ struct FiberTraceConfig {
     int beamLookaheadSteps = 2;
     bool lazyLookahead = true;
     size_t lookaheadParentCap = 32;
+    size_t lookaheadRetryParentCap = 0;
     int parallelThreads = 0;
     double smoothnessWeight = 2.0;
     double smoothnessNormalWeight = 0.1;
@@ -360,6 +361,8 @@ struct FiberTraceWholeFiberResult {
     std::vector<FiberTraceWholeFiberSegmentResult> segments;
     std::vector<cv::Vec3d> stitchedTrace;
     int restartCount = 0;
+    int lookaheadRetryCount = 0;
+    int lookaheadRetryRecoveredCount = 0;
     int segmentCount = 0;
     double restartsPerKvx = 0.0;
     double referenceLengthVoxels = 0.0;
@@ -443,6 +446,12 @@ struct CandidateScoreDebug {
 [[nodiscard]] std::vector<size_t> debugOrderedIndexPrefix(
     const std::vector<double>& losses,
     size_t limit);
+
+[[nodiscard]] bool debugShouldRetryLookahead(
+    bool lazyLookahead,
+    size_t parentCap,
+    size_t retryParentCap,
+    bool segmentSuccess);
 
 } // namespace testing
 #endif

@@ -12,10 +12,11 @@
 - [x] Test compact capped-frontier storage
 - [ ] Test spatial chunk/cube ordering
 - [x] Test unique voxel-cube corner reuse if measurements support it
-- [ ] Test persistent two-depth sampling session
+- [x] Test persistent two-depth sampling session; reject as neutral
 - [ ] Test bounded envelope prefetch and rolling pins if measurements support them
-- [ ] Test fixed caps 28, 24, and 20 after result-neutral work
-- [ ] Test adaptive cap escalation if fixed-cap results support it
+- [x] Test fixed caps 28 and 24; stop before 20 after quality failure
+- [x] Test adaptive cap escalation; retain as explicit opt-in only
+- [x] Establish optimized cap-32 baseline at 1.161s / 7 restarts
 - [ ] Update specs, code-structure docs, changelog, status, and task log
 - [ ] Run final focused tests and consistency review
 - [ ] Request approval and run retained-final benchmark repetitions
