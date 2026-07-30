@@ -402,9 +402,11 @@ Ownership changed as follows:
   The shared C++ tracer used by VC3D and `vc_fiber_trace_metric` implements the
   same construction with fixed-capacity state for these three derived planes.
   Each beam and compact lazy-lookahead frontier carries its own crossed mask
-  and best interpolated crossing per plane. CP-pair traces expose and snap to
-  the selected crossing for fusion, while whole-fiber traces use that crossing
-  for the error metric but retain the actual stepped endpoint for continuation.
+  and best interpolated crossing per plane. Shared C++ CP-pair traces receive
+  the endpoint error threshold, continue after out-of-threshold crossings, and
+  retain the complete unsnapped path for post-trace meeting search. Whole-fiber
+  traces use the selected crossing for the error metric but retain the actual
+  stepped endpoint for continuation.
 - When `--vis` is enabled, native strip rendering prints coarse stage progress
   for side/top volume rendering, coordinate extraction, side/top presence
   sampling, trace overlay projection, and image composition. Presence sampling
@@ -461,17 +463,17 @@ Ownership changed as follows:
   lengths, full-precision `native_trace2cp_fiber_restarts_per_kvx`, optional
   full-precision `native_trace2cp_fiber_restarts_per_meter`, and the old
   segment fraction only as `restart_fraction_per_segment`.
-- Fuses forward and reverse traces in selected-level 3D ZYX coordinates by
-  preserving traced order and selecting a pairwise traced-arc meeting, not a
-  straight-axis overlap progress. The score is
-  `2 * 3D_pair_gap + forward_arc_length + reverse_arc_length` with exact ties
-  preferring smaller gap and then a more balanced/later meeting. The selected
-  pair midpoint becomes the shared meeting point; both partial traces are
-  warped to it by traced arc-length fraction and the concatenated CP-to-CP
-  fused line is arc-length-resampled. `closest_progress` remains in stdout and
-  JSON as a diagnostic projection of that midpoint onto the straight CP axis,
-  while the considered gap field is the full pair score and center penalty is
-  fixed to `1.0`.
+- The shared C++ CP-pair tracer fuses forward and reverse traces in trace-grid
+  3D ZYX coordinates without sorting by straight-axis progress. It repeatedly
+  moves a local tangent plane along each resampled path and intersects the
+  other path, adds endpoint-plane candidates, and selects the smallest raw
+  meeting error with deterministic progress/index tie breaking. The pair is
+  accepted when that error is at most 10% of the combined partial traced arc,
+  including when neither one-way trace reached its endpoint planes. Both
+  partial traces are cut at their interpolated meeting positions, warped to
+  their midpoint by cumulative arc-length fraction, concatenated, and
+  arc-length-resampled. Result diagnostics expose meeting error in trace and
+  base voxels, ratio, traced length, source, and a stable failure code.
 - For single-pair visualization, first builds a maximum-height initial side/top
   Trace2CP source to project the native forward, backward, and fused traces.
   The rendered cross-strip height is then reduced to the odd centered size that
@@ -707,16 +709,21 @@ Ownership changed as follows:
   opens both prediction and regular-normal samplers at that trace scale, and
   runs the native tracer there. Accepted points are multiplied back to base
   coordinates, original endpoints are restored exactly, and the final line is
-  rebuilt with the ordinary base-space normal sampler. Endpoint acceptance is
-  measured against `20` base voxels; at sd2 this is `5` trace voxels. A finite
-  positive base voxel size adds micrometer diagnostics, but is not required for
-  tracing and does not affect acceptance.
+  rebuilt with the ordinary base-space normal sampler. The `20`-base-voxel
+  endpoint threshold controls how long each one-way trace continues; at sd2 it
+  is `5` trace voxels. Final CP-pair acceptance uses a meeting-error limit of
+  10% of the combined partial traced length. A finite positive base voxel size
+  adds micrometer diagnostics, but is not required for tracing and does not
+  affect acceptance.
 
-  Accepted native segments are persisted in `vc3d_fiber` version 2. Each
+  Native attempts are persisted in `vc3d_fiber` version 2. Each
   `control_points` entry is an object containing `position` and optional
-  `segment_to_next`; the starting CP owns the following span's native-trace
-  provenance and effective configuration. The final CP cannot own a following
-  segment. VC3D's live and stored CP types keep this metadata attached to the
+  `segment_to_next`; the starting CP owns the following span's explicit
+  `accepted_native` or `lasagna_fallback` outcome, provenance, effective
+  configuration, and meeting/failure diagnostics. Only accepted outcomes
+  protect geometry; fallback outcomes remain available for strip display and
+  are replaced on retry. The final CP cannot own a following segment. VC3D's
+  live and stored CP types keep this metadata attached to the
   CP while explicit geometry-only adapters feed atlas, slice, and optimizer
   APIs. Version-1 point arrays load as ordinary unprotected CPs. The shared
   Python fiber parser, native metric reader, Lasagna probe, and sync/merge
@@ -726,7 +733,10 @@ Ownership changed as follows:
   and full reinitialization directly reuses protected stored spans before its
   final protected global solve. CP moves invalidate their incoming and
   outgoing records; insertion/deletion invalidate only changed adjacency.
-  Successful native traces are marked finalized before auto-save. On a traced
+  Successful native traces are marked finalized before auto-save. Accepted
+  spans display their persisted meeting error in base voxels below the strip;
+  fallback spans display a compact stable failure reason, with full detail in
+  the tooltip. On a traced
   span, the same Ctrl-right-click menu instead offers `Revert segment to
   Lasagna optimization`; the worker removes only that span's protection and
   commits its Lasagna result and metadata removal transactionally.

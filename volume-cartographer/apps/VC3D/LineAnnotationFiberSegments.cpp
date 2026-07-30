@@ -143,6 +143,69 @@ FiberOptimizationMode fiberOptimizationModeFromString(const std::string& value)
     throw std::runtime_error("unsupported fiber optimization mode: " + value);
 }
 
+bool isAcceptedNativeTrace(const FiberTraceSegmentMetadata& metadata) noexcept
+{
+    return metadata.outcome ==
+        FiberTraceSegmentMetadata::Outcome::AcceptedNative;
+}
+
+bool isAcceptedNativeTrace(
+    const std::optional<FiberTraceSegmentMetadata>& metadata) noexcept
+{
+    return metadata.has_value() && isAcceptedNativeTrace(*metadata);
+}
+
+FiberTraceSegmentMetadata fiberTraceSegmentMetadataForResult(
+    std::string normalManifestLocation,
+    std::string fiberManifestLocation,
+    double traceToBaseScale,
+    const vc::fiber_tracer::FiberTraceConfig& config,
+    const vc::fiber_tracer::FiberTraceSegmentResult& result)
+{
+    FiberTraceSegmentMetadata metadata;
+    metadata.outcome = result.accepted
+        ? FiberTraceSegmentMetadata::Outcome::AcceptedNative
+        : FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
+    metadata.normalManifestLocation = std::move(normalManifestLocation);
+    metadata.fiberManifestLocation = std::move(fiberManifestLocation);
+    metadata.traceToBaseScale = traceToBaseScale;
+    metadata.config = config;
+    metadata.config.baseVoxelSizeUm.reset();
+    metadata.config.profile = nullptr;
+    if (std::isfinite(result.meetingErrorBaseVoxels))
+        metadata.meetingErrorBaseVoxels = result.meetingErrorBaseVoxels;
+    if (std::isfinite(result.meetingErrorRatio))
+        metadata.meetingErrorRatio = result.meetingErrorRatio;
+    metadata.meetingSource = result.meetingSource;
+    if (!result.accepted) {
+        metadata.failureCode = result.reason.empty()
+            ? "fusion_failed"
+            : result.reason;
+        metadata.failureDetail = result.detail;
+    }
+    return metadata;
+}
+
+FiberTraceSegmentMetadata fiberTraceSegmentMetadataForException(
+    std::string normalManifestLocation,
+    std::string fiberManifestLocation,
+    double traceToBaseScale,
+    const vc::fiber_tracer::FiberTraceConfig& config,
+    std::string detail)
+{
+    FiberTraceSegmentMetadata metadata;
+    metadata.outcome = FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
+    metadata.normalManifestLocation = std::move(normalManifestLocation);
+    metadata.fiberManifestLocation = std::move(fiberManifestLocation);
+    metadata.traceToBaseScale = traceToBaseScale;
+    metadata.config = config;
+    metadata.config.baseVoxelSizeUm.reset();
+    metadata.config.profile = nullptr;
+    metadata.failureCode = "trace_exception";
+    metadata.failureDetail = std::move(detail);
+    return metadata;
+}
+
 namespace {
 
 void appendFiberModeReport(FiberModeOptimizationResult& output)
@@ -356,7 +419,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         auto& owner = request.controlPoints[spanIndex];
         const size_t first = originalControlIndices[spanIndex];
         const size_t last = originalControlIndices[spanIndex + 1];
-        if (owner.segmentToNext) {
+        if (isAcceptedNativeTrace(owner.segmentToNext)) {
             spans[spanIndex] = inclusiveLineSpan(request.linePointsBase, first, last);
             nativeSpan[spanIndex] = true;
             ++output.nativeSegments;
@@ -369,17 +432,34 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         traceRequest.targetIndex = last;
         traceRequest.config = request.traceConfig;
         std::optional<vc::fiber_tracer::FiberTraceSegmentResult> traced;
+        std::string traceException;
         try {
             traced = vc::fiber_tracer::traceFiberSegment(
                 *request.predictions,
                 traceRequest,
                 request.traceNormalSampler);
-        } catch (const std::exception&) {
+        } catch (const std::exception& ex) {
+            traceException = ex.what();
+            traced.reset();
+        } catch (...) {
+            traceException = "unknown native fiber trace exception";
             traced.reset();
         }
         if (!traced || !traced->accepted || traced->fusedLine.size() < 2) {
             spans[spanIndex] = inclusiveLineSpan(request.linePointsBase, first, last);
-            owner.segmentToNext.reset();
+            owner.segmentToNext = traced
+                ? fiberTraceSegmentMetadataForResult(
+                      request.normalManifestLocation,
+                      request.fiberManifestLocation,
+                      request.traceToBaseScale,
+                      request.traceConfig,
+                      *traced)
+                : fiberTraceSegmentMetadataForException(
+                      request.normalManifestLocation,
+                      request.fiberManifestLocation,
+                      request.traceToBaseScale,
+                      request.traceConfig,
+                      std::move(traceException));
             ++output.lasagnaFallbackSegments;
             continue;
         }
@@ -388,15 +468,12 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             traced->fusedLine,
             owner.volumePoint,
             request.controlPoints[spanIndex + 1].volumePoint);
-        FiberTraceSegmentMetadata metadata;
-        metadata.normalManifestLocation = request.normalManifestLocation;
-        metadata.fiberManifestLocation = request.fiberManifestLocation;
-        metadata.traceToBaseScale = request.traceToBaseScale;
-        metadata.config = request.traceConfig;
-        metadata.config.baseVoxelSizeUm.reset();
-        metadata.config.profile = nullptr;
-        metadata.maxEndpointErrorBaseVoxels = traced->maxEndpointErrorBaseVoxels;
-        owner.segmentToNext = std::move(metadata);
+        owner.segmentToNext = fiberTraceSegmentMetadataForResult(
+            request.normalManifestLocation,
+            request.fiberManifestLocation,
+            request.traceToBaseScale,
+            request.traceConfig,
+            *traced);
         nativeSpan[spanIndex] = true;
         ++output.nativeSegments;
     }
@@ -496,14 +573,26 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
 nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& metadata)
 {
     const auto& config = metadata.config;
-    return {
+    nlohmann::json json = {
         {"optimizer", kOptimizer},
         {"metadata_version", FiberTraceSegmentMetadata::MetadataVersion},
         {"tracer_version", FiberTraceSegmentMetadata::TracerVersion},
+        {"outcome",
+         metadata.outcome == FiberTraceSegmentMetadata::Outcome::AcceptedNative
+             ? "accepted_native"
+             : "lasagna_fallback"},
         {"normal_manifest", metadata.normalManifestLocation},
         {"fiber_manifest", metadata.fiberManifestLocation},
         {"trace_to_base_scale", metadata.traceToBaseScale},
-        {"max_endpoint_error_base_voxels", metadata.maxEndpointErrorBaseVoxels},
+        {"meeting_error_base_voxels", metadata.meetingErrorBaseVoxels
+             ? nlohmann::json(*metadata.meetingErrorBaseVoxels)
+             : nlohmann::json(nullptr)},
+        {"meeting_error_ratio", metadata.meetingErrorRatio
+             ? nlohmann::json(*metadata.meetingErrorRatio)
+             : nlohmann::json(nullptr)},
+        {"meeting_source", metadata.meetingSource},
+        {"failure_code", metadata.failureCode},
+        {"failure_detail", metadata.failureDetail},
         {"config",
          {
              {"step_voxels", config.stepVoxels},
@@ -521,10 +610,11 @@ nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& 
              {"cumulative_smoothness_tangent_weight", config.cumulativeSmoothnessTangentWeight},
              {"initial_free_angle_degrees", config.initialFreeAngleDegrees},
              {"max_step_factor", config.maxStepFactor},
-             {"fusion_gap_factor", config.fusionGapFactor},
+             {"meeting_accept_max_error_ratio", config.meetingAcceptMaxErrorRatio},
              {"endpoint_accept_threshold_base_voxels", config.endpointAcceptThresholdBaseVoxels},
          }},
     };
+    return json;
 }
 
 FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json& json)
@@ -532,25 +622,32 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
     if (!json.is_object()) {
         throw std::runtime_error("segment_to_next must be an object");
     }
-    rejectUnknownKeys(
-        json,
-        {"optimizer",
-         "metadata_version",
-         "tracer_version",
-         "normal_manifest",
-         "fiber_manifest",
-         "trace_to_base_scale",
-         "max_endpoint_error_base_voxels",
-         "config"},
-        "segment_to_next");
     if (json.at("optimizer").get<std::string>() != kOptimizer) {
         throw std::runtime_error("unsupported segment_to_next optimizer");
     }
-    if (json.at("metadata_version").get<int>() != FiberTraceSegmentMetadata::MetadataVersion) {
-        throw std::runtime_error("unsupported segment_to_next metadata_version");
-    }
-    if (json.at("tracer_version").get<int>() != FiberTraceSegmentMetadata::TracerVersion) {
-        throw std::runtime_error("unsupported native fiber tracer version");
+    const int metadataVersion = json.at("metadata_version").get<int>();
+    const int tracerVersion = json.at("tracer_version").get<int>();
+    const bool previousVersion = metadataVersion == 1 && tracerVersion == 1;
+    const bool currentVersion =
+        metadataVersion == FiberTraceSegmentMetadata::MetadataVersion &&
+        tracerVersion == FiberTraceSegmentMetadata::TracerVersion;
+    if (!previousVersion && !currentVersion)
+        throw std::runtime_error("unsupported segment_to_next metadata/tracer version");
+    if (previousVersion) {
+        rejectUnknownKeys(
+            json,
+            {"optimizer", "metadata_version", "tracer_version",
+             "normal_manifest", "fiber_manifest", "trace_to_base_scale",
+             "max_endpoint_error_base_voxels", "config"},
+            "segment_to_next");
+    } else {
+        rejectUnknownKeys(
+            json,
+            {"optimizer", "metadata_version", "tracer_version", "outcome",
+             "normal_manifest", "fiber_manifest", "trace_to_base_scale",
+             "meeting_error_base_voxels", "meeting_error_ratio",
+             "meeting_source", "failure_code", "failure_detail", "config"},
+            "segment_to_next");
     }
 
     FiberTraceSegmentMetadata metadata;
@@ -560,15 +657,39 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
         throw std::runtime_error("segment_to_next manifest locations must not be empty");
     }
     metadata.traceToBaseScale = json.at("trace_to_base_scale").get<double>();
-    metadata.maxEndpointErrorBaseVoxels = json.at("max_endpoint_error_base_voxels").get<double>();
+    if (previousVersion) {
+        metadata.outcome = FiberTraceSegmentMetadata::Outcome::AcceptedNative;
+        metadata.meetingErrorBaseVoxels =
+            json.at("max_endpoint_error_base_voxels").get<double>();
+        metadata.meetingSource = "legacy_endpoint";
+    } else {
+        const std::string outcome = json.at("outcome").get<std::string>();
+        if (outcome == "accepted_native") {
+            metadata.outcome = FiberTraceSegmentMetadata::Outcome::AcceptedNative;
+        } else if (outcome == "lasagna_fallback") {
+            metadata.outcome = FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
+        } else {
+            throw std::runtime_error("unsupported segment_to_next outcome");
+        }
+        if (!json.at("meeting_error_base_voxels").is_null()) {
+            metadata.meetingErrorBaseVoxels =
+                json.at("meeting_error_base_voxels").get<double>();
+        }
+        if (!json.at("meeting_error_ratio").is_null()) {
+            metadata.meetingErrorRatio =
+                json.at("meeting_error_ratio").get<double>();
+        }
+        metadata.meetingSource = json.at("meeting_source").get<std::string>();
+        metadata.failureCode = json.at("failure_code").get<std::string>();
+        metadata.failureDetail = json.at("failure_detail").get<std::string>();
+    }
 
     const auto& configJson = json.at("config");
     if (!configJson.is_object()) {
         throw std::runtime_error("segment_to_next config must be an object");
     }
-    rejectUnknownKeys(
-        configJson,
-        {"step_voxels",
+    std::unordered_set<std::string> configKeys{
+         "step_voxels",
          "cone_angle_degrees",
          "cone_angle_step_degrees",
          "cone_grid_size",
@@ -583,9 +704,11 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
          "cumulative_smoothness_tangent_weight",
          "initial_free_angle_degrees",
          "max_step_factor",
-         "fusion_gap_factor",
-         "endpoint_accept_threshold_base_voxels"},
-        "segment_to_next config");
+         "endpoint_accept_threshold_base_voxels"};
+    configKeys.insert(previousVersion
+        ? "fusion_gap_factor"
+        : "meeting_accept_max_error_ratio");
+    rejectUnknownKeys(configJson, configKeys, "segment_to_next config");
     auto& config = metadata.config;
     config.stepVoxels = configJson.at("step_voxels").get<double>();
     config.coneAngleDegrees = configJson.at("cone_angle_degrees").get<double>();
@@ -602,12 +725,37 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
     config.cumulativeSmoothnessTangentWeight = configJson.at("cumulative_smoothness_tangent_weight").get<double>();
     config.initialFreeAngleDegrees = configJson.at("initial_free_angle_degrees").get<double>();
     config.maxStepFactor = configJson.at("max_step_factor").get<double>();
-    config.fusionGapFactor = configJson.at("fusion_gap_factor").get<double>();
+    if (!previousVersion) {
+        config.meetingAcceptMaxErrorRatio =
+            configJson.at("meeting_accept_max_error_ratio").get<double>();
+    }
     config.endpointAcceptThresholdBaseVoxels = configJson.at("endpoint_accept_threshold_base_voxels").get<double>();
     config.traceToBaseScale = metadata.traceToBaseScale;
 
     requireFinitePositive(metadata.traceToBaseScale, "trace_to_base_scale");
-    requireFiniteNonNegative(metadata.maxEndpointErrorBaseVoxels, "max_endpoint_error_base_voxels");
+    if (metadata.meetingErrorBaseVoxels)
+        requireFiniteNonNegative(*metadata.meetingErrorBaseVoxels, "meeting_error_base_voxels");
+    if (metadata.meetingErrorRatio) {
+        requireFiniteNonNegative(*metadata.meetingErrorRatio, "meeting_error_ratio");
+    }
+    if (metadata.meetingErrorRatio && *metadata.meetingErrorRatio > 1.0)
+        throw std::runtime_error("meeting_error_ratio must be at most one");
+    if (!previousVersion) {
+        if (metadata.outcome == FiberTraceSegmentMetadata::Outcome::AcceptedNative) {
+            if (!metadata.meetingErrorBaseVoxels || !metadata.meetingErrorRatio ||
+                metadata.meetingSource.empty() || !metadata.failureCode.empty() ||
+                !metadata.failureDetail.empty()) {
+                throw std::runtime_error("accepted segment_to_next outcome is inconsistent");
+            }
+        } else if (metadata.failureCode.empty()) {
+            throw std::runtime_error("fallback segment_to_next requires a failure_code");
+        }
+        if (metadata.meetingErrorBaseVoxels.has_value() !=
+            metadata.meetingErrorRatio.has_value()) {
+            throw std::runtime_error(
+                "segment_to_next meeting error and ratio must be present together");
+        }
+    }
     requireFinitePositive(config.stepVoxels, "step_voxels");
     requireFinitePositive(config.coneAngleDegrees, "cone_angle_degrees");
     requireFinitePositive(config.coneAngleStepDegrees, "cone_angle_step_degrees");
@@ -619,7 +767,11 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
     requireFiniteNonNegative(config.cumulativeSmoothnessTangentWeight, "cumulative_smoothness_tangent_weight");
     requireFiniteNonNegative(config.initialFreeAngleDegrees, "initial_free_angle_degrees");
     requireFinitePositive(config.maxStepFactor, "max_step_factor");
-    requireFiniteNonNegative(config.fusionGapFactor, "fusion_gap_factor");
+    requireFiniteNonNegative(
+        config.meetingAcceptMaxErrorRatio,
+        "meeting_accept_max_error_ratio");
+    if (config.meetingAcceptMaxErrorRatio > 1.0)
+        throw std::runtime_error("meeting_accept_max_error_ratio must be at most one");
     requireFinitePositive(config.endpointAcceptThresholdBaseVoxels, "endpoint_accept_threshold_base_voxels");
     if (config.coneGridSize <= 0 || config.beamWidth <= 0 || config.beamLookaheadSteps < 0 || config.cumulativeSmoothnessSteps < 0) {
         throw std::runtime_error("segment_to_next config contains invalid integer values");

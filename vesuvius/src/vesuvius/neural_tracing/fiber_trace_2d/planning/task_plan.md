@@ -1,146 +1,168 @@
-# Hard Native Directions For Lasagna Fallback Plan
+# Native Fiber Trace Meeting Search And Persisted Diagnostics Plan
 
-## 1. Shared Constraint Contract
+## 1. Trace Termination Contract
 
-- Add a structured Lasagna endpoint-direction constraint keyed by original
-  control-point index and side (`before` or `after`). The direction points from
-  that CP into the generated Lasagna geometry on that side. This single
-  contract represents internal spans and both open tails.
-- Directions point from the constrained CP into the Lasagna span. Normalize
-  and validate them at the shared API boundary; reject non-finite or
-  degenerate directions, invalid original indices, duplicate/conflicting
-  `(control, side)` entries, and constraints targeting protected native sides.
-- Map original indices through the existing stable control sort explicitly;
-  do not rely on caller ordering or oriented protected-pair matching.
-- Keep this input separate from protected ranges: protected ranges freeze
-  native geometry, while endpoint constraints govern adjacent Lasagna
-  geometry.
+- Convert the configured endpoint threshold from base voxels to trace voxels
+  and pass it into both CP-pair one-way requests.
+- Preserve all target-local planes and require the existing multi-plane
+  crossing condition plus the selected in-plane threshold before early
+  termination.
+- Retain the full stepped path when a trace exhausts its budget. Do not snap a
+  failed/out-of-threshold trace back to an earlier plane crossing, because its
+  later samples are required by moving-plane fusion.
+- Run forward and reverse independently even if one succeeds first. Preserve
+  each direction's reason and crossings for final diagnostics.
 
-## 2. Exact Solver Constraint
+## 2. Symmetric Moving-Plane Meeting Search
 
-- Use only the existing point-parameter Ceres problem and its spacing,
-  tangent-straightness, normal-straightness, and normal-alignment residuals.
-- For each constrained CP side, create the adjacent proxy at
-  `CP + normalized_direction * proxy_distance` and add its sample index to the
-  existing fixed-point set alongside the CP.
-- Use a deterministic positive proxy distance bounded by the configured
-  Lasagna segment length and available CP-to-CP chord length.
-- Carry those fixed proxy indices through each per-span solve and the final
-  stitched global solve. Do not add a manifold, custom parameterization, or
-  high-weight direction residual.
+- Arc-length-resample both finite, deduplicated traces at a frequent,
+  deterministic interval derived from the configured trace step.
+- At each sample on trace A, fit its local tangent from adjacent resampled
+  points and construct the plane through that sample with the tangent as its
+  normal.
+- Intersect every segment of trace B with that plane, including deterministic
+  handling for endpoints and coplanar segments. Record interpolated positions
+  and arc lengths on both traces.
+- Repeat with A/B reversed so curved and asymmetric traces receive symmetric
+  coverage.
+- Also add endpoint-plane crossing candidates against the opposite CP when the
+  crossing is within the configured endpoint threshold.
+- Select by smallest finite 3D/in-plane gap. Break exact ties
+  deterministically by balanced progress, then combined progress and stable
+  indices.
 
-## 3. Deterministic Span And Tail Construction
+## 3. Acceptance And Fusion
 
-- Extend `reinitializeAndOptimizeExistingLine` with the structured hard
-  constraints.
-- For a constrained fallback endpoint, initialize the adjacent sample directly
-  on the required direction and fix it. Generate exactly one rollout from that
-  CP side using the fiber direction; do not also generate normal/chord or
-  continuation variants from the constrained side.
-- Other candidates may originate from an unconstrained opposite CP, but full
-  reinitialization never submits existing interior geometry as a candidate.
-- When a solved neighboring span supplies a continuation direction, use it as
-  the span's sole rollout candidate unless the opposite endpoint also has an
-  authoritative solved-neighbor direction. In that two-sided case, generate
-  exactly one rollout from each authoritative endpoint.
-- Support simultaneous left and right hard constraints for a fallback span
-  between two native spans.
-- Guarantee distinct movable samples: at least three span points for one hard
-  endpoint and at least four for two. Densify deterministically before solving
-  or fail explicitly; two constrained sides must not share one proxy point.
-- Apply outer-CP constraints while constructing Lasagna open extensions, so a
-  retained fallback tail starts on the exact native continuation ray. The
-  first generated tail point bypasses normal transport and is initialized
-  directly on the fiber direction.
-- Translate span-local and tail-local proxy indices to final stitched indices
-  and add them to the final solve's existing fixed-point list.
-- Leave local non-reinitialization Lasagna optimization and unconstrained tail
-  construction behaviorally unchanged.
-- Make tangent-plane projection total: if removal of the normal component is
-  degenerate, choose a deterministic perpendicular tangent rather than
-  returning the input direction.
+- Compute candidate traced length as forward arc length to the candidate plus
+  reverse arc length to the candidate.
+- Accept only a finite candidate with positive traced length and
+  `meeting_error / traced_length <= 0.10` by default.
+- Replace the obsolete gap-plus-arc selection factor with a persisted maximum
+  meeting-error ratio setting.
+- Port the Python fusion geometry into the shared C++ implementation: cut both
+  partial traces at interpolated meeting positions, warp each partial toward
+  their midpoint by cumulative arc-length fraction, reverse/concatenate, and
+  arc-length-resample at the configured native trace step.
+- Restore both original CPs exactly and expose raw trace/base-voxel error,
+  normalized ratio, selected traced length, candidate source, and failure
+  reason in `FiberTraceSegmentResult`.
+- Do not require either one-way trace to reach its endpoint planes when an
+  acceptable moving-plane meeting exists.
+- Use stable combined-result codes with deterministic precedence:
+  `invalid_trace_path`, `no_trace_plane_intersection`,
+  `meeting_error_ratio`, `fusion_failed`, and `ok`. Caller-side exceptions use
+  `trace_exception`. Keep forward/reverse one-way reasons and numeric context
+  in optional detail; do not turn arbitrary exception text into the stable
+  code.
 
-## 4. VC3D Constraint Derivation
+## 4. CP-Owned Outcome Persistence
 
-- In `optimizeFiberWithNativeFallback`, derive endpoint directions from each
-  successful native dense span after conversion to base coordinates:
-  `normalize(first_distinct_native_point - CP)`, walking inward from the CP so
-  repeated fused endpoint samples do not create a zero direction.
-- For each neighboring unprotected Lasagna span, pass the negated direction as
-  its outgoing hard constraint. If the native span touches an outer CP, pass
-  the same continuation rule to the possible Lasagna fallback tail.
-- Derive constraints for every native span before invoking Lasagna. Do not use
-  the first native span or solve order to deliver directions.
-- Remove the mixed helper's native-seed direction workaround. Seed choice may
-  remain an optimization detail, but it must have no effect on which hard
-  constraints are applied.
+- Generalize `FiberTraceSegmentMetadata` into an explicit versioned outcome:
+  accepted native geometry or Lasagna fallback after a native attempt.
+- Store manifest provenance, trace scale, effective config, optional meeting
+  error/ratio, and failure reason in the one existing `segment_to_next` object.
+- Treat only the accepted-native outcome as protected geometry. Update every
+  marker, protected-range, constraint-derivation, revert, retry, and
+  invalidation path that currently treats object presence as native success.
+- Persist a failed outcome from mixed-mode fallback and from the direct GUI
+  segment action while leaving/reconstructing Lasagna geometry.
+- Increment the metadata schema. Read the previous accepted-only schema as an
+  accepted outcome, ignore its obsolete gap-selection factor, and map its
+  endpoint error into the accepted diagnostic, while all writers emit the new
+  explicit schema. The new schema persists and validates
+  `meeting_accept_max_error_ratio` in `[0, 1]`; no conversion from
+  `fusion_gap_factor` is implied.
+- Update strict C++ core, Python, merge-script, and atlas fixture readers so
+  saved fibers remain consumable throughout the repository.
+- Define lifecycle transitions explicitly: adjacent CP move/insert/delete and
+  adjacency-changing reorder clear either outcome; retry replaces fallback
+  with its new accepted/fallback outcome atomically; ordinary Lasagna-mode
+  rebuilding clears native-attempt outcomes; explicit native-to-Lasagna revert
+  clears an accepted outcome only after the Lasagna result succeeds; scaling
+  clears both outcomes; unrelated edits preserve both.
 
-## 5. Diagnostics And Failure Semantics
+## 5. Generated-Strip Diagnostics
 
-- Report the constrained side and normalized direction in span diagnostics.
-- Verify the fixed proxies remain exact after each solve and after final
-  stitching. Treat violations as failures rather than silently returning
-  unconstrained geometry.
-- When no candidate is usable, surface each Ceres summary message. Do not print
-  legacy continuation-direction dots as though they caused rejection.
-- Reject a successful native span with no finite, distinct endpoint-neighbor
-  sample relative to its CP.
+- Generalize the span-label data model so each span can display one of:
+  Lasagna normal-alignment state, accepted native meeting error, or persisted
+  native failure reason.
+- For an accepted native span, display the meeting error in base `vx` and put
+  the ratio/source in the tooltip.
+- For a native fallback, display a compact failure reason below the strip and
+  the complete persisted reason in the tooltip.
+- Populate native diagnostics directly from session CP metadata, independent
+  of asynchronous Lasagna metric availability, so reload reproduces them.
+- Continue showing existing normal-alignment metrics for spans without a
+  native attempt.
 
 ## 6. Tests
 
-- Add Lasagna-level adversarial-normal tests for native-left/fallback-right,
-  fallback-left/native-right, native/fallback/native dual constraints, multiple
-  separated protected spans, constrained open tails, final-global persistence,
-  and invalid/degenerate constraints.
-- Add fixed-proxy position, minimum-cardinality, unsorted-control remap, and
-  duplicate/conflict tests.
-- Add a normal-parallel transport regression proving the rollout turns onto a
-  deterministic tangent instead of continuing along the normal.
-- Assert full reinitialization reports no `existing` candidate and that a
-  supplied neighbor continuation replaces, rather than supplements, the
-  corresponding generic side rollout.
-- Add a VC3D mixed-helper regression deriving constraints from actual native
-  dense points deliberately non-collinear with the chord and adversarial
-  normal, verifying every adjacent fallback/tail direction for both newly
-  traced and already-protected native spans.
-- Retain existing bit-exact protected-span and unconstrained Lasagna tests.
-- Build VC3D and affected tests with `-j32`; run
-  `test_lasagna_line_optimizer`, `test_line_annotation_generated_views`, and
-  `test_fiber_trace3d`.
+- Add shared C++ tests for threshold-aware continued tracing, symmetric moving
+  planes, interpolated crossings, curved/asymmetric meetings, endpoint-plane
+  candidates, no-intersection failure, 10% acceptance/rejection, deterministic
+  selection, exact endpoints, and Python-style arc-length warp behavior.
+- Add VC3D tests for accepted/fallback outcome serialization, previous-schema
+  reading, protection based on outcome, retry/invalidation behavior, and
+  generated-strip diagnostics after a simulated reload.
+- Add a deterministic synthetic CP-pair corpus containing endpoint-plane
+  misses that have valid trace-to-trace meetings. Record the old endpoint-only
+  accepted/fallback count in the fixture and require the new search to reduce
+  fallbacks while preserving exact CP endpoints.
+- Update strict Python metadata-reader and merge-script tests for both outcome
+  variants and malformed combinations.
+- Add a non-unit trace-scale test proving raw trace error converts exactly to
+  base voxels, the ratio is scale-independent, and both values survive JSON
+  save/reload.
+- Build with `-j32` and run `test_fiber_trace3d`,
+  `test_line_annotation_generated_views`, `test_lasagna_line_optimizer`, the
+  focused Python reader tests, and merge-script tests.
+- Build `VC3D` and `vc_fiber_trace_metric` from the main build tree with
+  `-j32`.
 
 ## 7. Spec Update
 
-- Replace candidate/seed-based native-neighbor wording with the exact hard
-  endpoint-direction contract.
-- Specify the CP/adjacent-native-point formula, outgoing sign, all-CP coverage,
-  dual-ended fallback behavior, tail behavior, validation, and explicit
-  failure semantics.
+- Replace gap-plus-arc CP-pair fusion selection with symmetric moving-plane
+  intersection selection, 10% traced-length acceptance, and arc-length-warped
+  fusion.
+- Specify threshold-aware one-way continuation, full-path retention, failure
+  reasons, base-voxel diagnostics, and the fact that moving-plane success can
+  accept a pair without endpoint-plane success.
+- Generalize CP-owned metadata from accepted-only protection to explicit
+  accepted/fallback outcomes and define protection semantics.
+- Define generated-strip display precedence for native outcomes versus
+  Lasagna alignment.
 
 ## 8. Docs Update
 
-- Update `docs/code_structure.md` to describe constraint derivation in the
-  mixed helper and fixed-proxy enforcement across the Lasagna span and final
-  solves.
-- Update the VC3D line-annotation fiber documentation if it currently describes
-  fallback direction behavior.
+- Update `docs/code_structure.md` for target-plane termination, moving-plane
+  search, fusion geometry, acceptance, result fields, and GUI persistence.
+- Update `volume-cartographer/docs/line_annotation_fibers.md` for explicit
+  segment outcomes, protection checks, fallback retries, and strip labels.
 
 ## 9. Changelog
 
-- Add a 2026-07-30 entry for exact native endpoint tangents on all adjacent
-  Lasagna fallback spans and tails.
+- Add a 2026-07-30 entry for symmetric native trace meeting search,
+  arc-length-warped fusion, reduced Lasagna fallback, and persisted VC3D
+  diagnostics.
 
 ## 10. Review Risks
 
-- Verify span-index remapping after control sorting and stitched-index remapping
-  after open-tail insertion.
-- Verify a constrained side generates only its fiber-directed rollout and that
-  every remaining candidate shares the same fixed proxy.
-- Verify constrained endpoints remain exact after the final global solve and
-  native samples remain bit-exact.
+- Verify that changing optional-object presence to explicit outcome does not
+  accidentally protect failed Lasagna spans or remove protection from older
+  accepted records.
+- Verify that an exhausted one-way trace keeps samples after an earlier bad
+  target-plane crossing.
+- Verify moving-plane intersection handles trace endpoints, coplanar segments,
+  duplicate samples, and interpolated cut locations without zero-length joins.
+- Verify error units are trace voxels in the core, base voxels in persistence
+  and GUI, and the normalized ratio is scale-independent.
+- Verify direct GUI rejection persists diagnostics without replacing the line
+  with partial native geometry.
+- Verify stable failure-code precedence and ensure verbose one-way/exception
+  details never become the GUI's persisted machine-readable discriminator.
 
 ## 11. Workflow Records
 
-- Update `planning/status.md` incrementally during implementation and
-  validation.
-- Replace and maintain `planning/task_log.md` with review findings, deviations,
-  commands, failures, and final test results.
+- Update `planning/status.md` incrementally.
+- Replace and maintain `planning/task_log.md` with review findings,
+  implementation discoveries, deviations, commands, and validation results.

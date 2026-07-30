@@ -918,8 +918,10 @@
   line point when available, the plane normal from the target CP line point to
   the previous fiber line point when available, and the sampled model
   direction at the target CP sign-aligned to the local target tangent. The
-  trace continues until all configured target-local planes have been crossed,
-  then selects the crossed plane with the smallest in-plane CP error. Later
+  trace continues until all configured target-local planes have been crossed
+  and the selected crossing is within the caller's endpoint threshold, or
+  until its step budget is exhausted. It selects the crossed plane with the
+  smallest in-plane CP error. Later
   crossings of the same target plane replace earlier crossings when their
   in-plane CP error is lower. The shared C++ tracer used by VC3D and the native
   metric CLI must preserve this state independently for every beam and compact
@@ -929,11 +931,12 @@
   but not sufficient for segment acceptance:
   the selected best crossing error must also be at or below the configured
   whole-fiber threshold; otherwise tracing continues until the budget or another
-  failure condition ends the segment. CP-pair tracing may snap its returned
-  trace endpoint to the selected crossing for fusion; whole-fiber tracing must
-  retain the actual stepped endpoint and use the selected crossing only for
-  acceptance and error reporting. Missing required target planes are reported
-  in the failure reason.
+  failure condition ends the segment. CP-pair tracing must retain the complete
+  unsnapped stepped path for post-trace meeting search, including samples after
+  an early out-of-threshold crossing. Whole-fiber tracing likewise retains the
+  actual stepped endpoint and uses the selected crossing only for acceptance
+  and error reporting. Missing required target planes are reported in the
+  failure reason.
 - In native 3D whole-fiber mode, `--fiber-json <path>` without sample or CP
   selectors traces the entire fiber. `--fiber-json <path> --sample-index N`
   remains single-segment inspection using deterministic flat sample selection,
@@ -952,19 +955,22 @@
   sampled-current direction when cached, and smoothing-history direction
   preserved. Failed segments count one restart and resume tracing from the
   failed target CP with a fresh CP-local fiber tangent.
-- Native 3D forward/reverse fusion must preserve each trace's traced order.
-  It must not sort points by CP-axis progress and average them. Fusion selects
-  a forward/reverse point pair over traced arc length, not straight CP-axis
-  overlap progress. Candidate score is
-  `3D_pair_gap * 2.0 + forward_arc_length_to_pair + reverse_arc_length_to_pair`.
-  Exact ties prefer smaller pair gap, then a more balanced/later meeting where
-  both traces have traveled farther. The selected pair midpoint is the fusion
+- Shared C++ CP-pair fusion must preserve each trace's traced order and search
+  the complete forward and reverse paths even when either trace exhausts its
+  endpoint-plane budget. It resamples both traces at a deterministic frequent
+  interval, moves a locally tangent plane along each trace, and intersects the
+  other trace's segments with that plane. The symmetric search also includes
+  qualifying target-CP endpoint-plane crossings. The selected candidate has
+  the smallest raw 3D/in-plane meeting error; exact ties prefer more balanced
+  progress, then greater combined progress and stable trace indices.
+  Acceptance requires positive combined partial traced length and
+  `meeting_error / combined_partial_trace_length <= 0.10` by default. An
+  acceptable moving-plane meeting does not require either one-way trace to
+  have reached all endpoint planes. The selected pair midpoint is the fusion
   meeting point: the forward start-to-meeting and reverse target-to-meeting
   partial traces are warped to that midpoint by traced arc-length fraction,
-  concatenated, then arc-length-resampled as the CP-to-CP fused line.
-  `closest_progress` is only a diagnostic projection of the selected midpoint
-  onto the straight CP axis. Native Trace2CP reports failure only when no
-  finite forward/reverse pair can be selected.
+  concatenated, then arc-length-resampled as the CP-to-CP fused line. Original
+  CP endpoints are restored exactly.
 - Native 3D Trace2CP reports tool-local debug metrics:
   `native_trace2cp_plane_error` and
   `native_trace2cp_closest_target_error`, plus fusion diagnostics such as
@@ -1035,20 +1041,25 @@
   position, runs bidirectional tracing in a background task, blocks line edits
   while the task is running, and splices the accepted fused segment back into
   the existing line. Original CP coordinates must remain exact.
-- Native GUI segment optimization applies only when both traced directions
-  reach all configured target-local planes and the maximum selected endpoint
-  in-plane error is at most `20` base voxels. At the default sd2 trace scale,
-  this is `5` trace voxels. `Volume::voxelSize()` is used only to add a
+- Native GUI segment optimization runs both directions until their configured
+  target-local planes are reached within `20` base voxels or their step budgets
+  are exhausted, then applies the symmetric moving-plane meeting search. At
+  the default sd2 trace scale the endpoint threshold is `5` trace voxels. A
+  fused span is accepted when the selected meeting error is at most 10% of its
+  combined partial traced length. `Volume::voxelSize()` is used only to add a
   micrometer diagnostic when it is finite and positive; unavailable physical
-  metadata must not block tracing. A failed endpoint threshold leaves the fiber
-  unchanged and reports the base-voxel error.
+  metadata must not block tracing.
 - `vc3d_fiber` version 2 stores every control point as an object with a finite
   `position` and optional `segment_to_next`. CP `i` owns the metadata for its
   span to the next CP in line order; the final CP must not contain it. Native
   fiber-traced metadata uses optimizer `native_fiber_trace3d`, metadata/tracer
   schema versions, normal and fiber manifest source locations, trace-to-base
-  scale, all effective geometry/acceptance trace settings, and the accepted
-  endpoint error in base voxels. Version-1 array-valued CPs remain readable as
+  scale, all effective geometry/acceptance trace settings, an explicit
+  `accepted_native` or `lasagna_fallback` outcome, optional meeting error in
+  base voxels and ratio, meeting source, and stable failure code/detail. Only
+  `accepted_native` protects its span; a fallback outcome remains attached for
+  display and is replaced by the next native retry. Version-1 array-valued CPs
+  remain readable as
   unprotected geometry; writers emit version 2. Unknown or malformed v2
   metadata is a hard error in VC3D, Python, native metric/probe, and sync/merge
   readers.
@@ -1069,8 +1080,8 @@
   `native_fiber_trace3d`. Missing mode metadata on existing version-1/version-2
   files defaults to `lasagna`; unknown values are errors. The mode is the
   fiber-wide policy for future interpolation and extrapolation, while each
-  CP-owned `segment_to_next` remains the record that its specific following
-  span was successfully native traced.
+  CP-owned `segment_to_next` remains the native attempt outcome for its
+  specific following span.
 - Changing `optimization_mode` runs a transactional full rebuild. Lasagna mode
   clears native span records and uses the existing full normal-based
   reinitializer. Native mode retraces every CP-to-CP span. Ordinary CP edits in

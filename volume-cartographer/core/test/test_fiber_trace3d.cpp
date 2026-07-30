@@ -259,6 +259,7 @@ TEST_CASE("native fiber tracer defaults match regular Trace2CP command")
     CHECK(config.smoothnessFreeAngleDegrees == doctest::Approx(0.0));
     CHECK(config.cumulativeSmoothnessSteps == 4);
     CHECK(config.cumulativeSmoothnessTangentWeight == doctest::Approx(2.0));
+    CHECK(config.meetingAcceptMaxErrorRatio == doctest::Approx(0.1));
     CHECK(config.endpointAcceptThresholdBaseVoxels == doctest::Approx(20.0));
     CHECK(config.traceToBaseScale == doctest::Approx(1.0));
     CHECK_FALSE(config.baseVoxelSizeUm.has_value());
@@ -1025,6 +1026,10 @@ TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")
     CHECK(result.fusedLine.back()[0] == doctest::Approx(64.0));
     CHECK(result.maxEndpointErrorTraceVoxels == doctest::Approx(0.0));
     CHECK(result.maxEndpointErrorBaseVoxels == doctest::Approx(0.0));
+    CHECK(result.meetingErrorTraceVoxels == doctest::Approx(0.0));
+    CHECK(result.meetingErrorBaseVoxels == doctest::Approx(0.0));
+    CHECK(result.meetingErrorRatio == doctest::Approx(0.0));
+    CHECK_FALSE(result.meetingSource.empty());
     REQUIRE(result.maxEndpointErrorUm.has_value());
     CHECK(*result.maxEndpointErrorUm == doctest::Approx(0.0));
 
@@ -1035,7 +1040,7 @@ TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")
     CHECK_FALSE(resultWithoutPhysicalSize.maxEndpointErrorUm.has_value());
 }
 
-TEST_CASE("native fiber segment acceptance uses base-voxel endpoint error")
+TEST_CASE("native fiber segment uses moving-plane fusion after endpoint misses")
 {
     SlantedPrediction predictions;
     ConstantNormalSampler normals;
@@ -1057,21 +1062,73 @@ TEST_CASE("native fiber segment acceptance uses base-voxel endpoint error")
     request.config.traceToBaseScale = 4.0;
     request.config.endpointAcceptThresholdBaseVoxels = 20.0;
 
-    const auto rejected =
+    const auto recovered =
         vc::fiber_tracer::traceFiberSegment(predictions, request, &normals);
 
-    REQUIRE(rejected.forward.reachedTargetPlane);
-    REQUIRE(rejected.reverse.reachedTargetPlane);
-    CHECK(rejected.maxEndpointErrorTraceVoxels < 20.0);
-    CHECK(rejected.maxEndpointErrorBaseVoxels > 20.0);
+    CHECK_FALSE(recovered.forward.reachedTargetPlane);
+    CHECK_FALSE(recovered.reverse.reachedTargetPlane);
+    CHECK(recovered.forward.steps > 16);
+    CHECK(recovered.reverse.steps > 16);
+    CHECK(recovered.maxEndpointErrorBaseVoxels > 20.0);
+    CHECK(recovered.accepted);
+    CHECK(recovered.reason == "ok");
+    CHECK(recovered.meetingErrorTraceVoxels > 0.0);
+    CHECK(recovered.meetingErrorRatio == doctest::Approx(0.1));
+    CHECK(recovered.meetingSource.find("moving_plane") != std::string::npos);
+}
+
+TEST_CASE("native fiber moving-plane fusion uses traced-length ratio and base scale")
+{
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 2.0;
+    config.traceToBaseScale = 4.0;
+    config.meetingAcceptMaxErrorRatio = 0.1;
+    const std::vector<cv::Vec3d> forward{
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+    };
+    const std::vector<cv::Vec3d> reverse{
+        {10.0, 1.0, 0.0},
+        {0.0, 1.0, 0.0},
+    };
+
+    const auto accepted = vc::fiber_tracer::testing::debugFuseTraceSegment(
+        forward, reverse, config);
+
+    REQUIRE(accepted.accepted);
+    CHECK(accepted.meetingErrorTraceVoxels == doctest::Approx(1.0));
+    CHECK(accepted.meetingErrorBaseVoxels == doctest::Approx(4.0));
+    CHECK(accepted.meetingTraceLengthTraceVoxels == doctest::Approx(10.0));
+    CHECK(accepted.meetingErrorRatio == doctest::Approx(0.1));
+    REQUIRE(accepted.fusedLine.size() >= 3);
+    CHECK(accepted.fusedLine.front() == forward.front());
+    CHECK(accepted.fusedLine.back() == reverse.front());
+    for (size_t index = 1; index < accepted.fusedLine.size(); ++index) {
+        CHECK(cv::norm(accepted.fusedLine[index] - accepted.fusedLine[index - 1]) <=
+              config.stepVoxels + 1.0e-8);
+    }
+
+    config.meetingAcceptMaxErrorRatio = 0.09;
+    const auto rejected = vc::fiber_tracer::testing::debugFuseTraceSegment(
+        forward, reverse, config);
     CHECK_FALSE(rejected.accepted);
+    CHECK(rejected.reason == "meeting_error_ratio");
+    CHECK(rejected.meetingErrorBaseVoxels == doctest::Approx(4.0));
+    CHECK(rejected.meetingErrorRatio == doctest::Approx(0.1));
+}
 
-    request.config.endpointAcceptThresholdBaseVoxels = 30.0;
-    const auto accepted =
-        vc::fiber_tracer::traceFiberSegment(predictions, request, &normals);
-    CHECK(accepted.maxEndpointErrorBaseVoxels ==
-          doctest::Approx(rejected.maxEndpointErrorBaseVoxels));
-    CHECK(accepted.accepted);
+TEST_CASE("native fiber moving-plane fusion reports no intersection")
+{
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 1.0;
+    const auto result = vc::fiber_tracer::testing::debugFuseTraceSegment(
+        {{0.0, 0.0, 0.0}, {2.0, 0.0, 0.0}},
+        {{10.0, 1.0, 0.0}, {8.0, 1.0, 0.0}},
+        config);
+
+    CHECK_FALSE(result.accepted);
+    CHECK(result.reason == "no_trace_plane_intersection");
+    CHECK(result.fusedLine.empty());
 }
 
 TEST_CASE("native fiber tracer computes whole-fiber one-way restart metric")

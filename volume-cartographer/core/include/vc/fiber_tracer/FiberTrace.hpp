@@ -101,7 +101,7 @@ struct FiberTraceConfig {
     double cumulativeSmoothnessTangentWeight = 2.0;
     double initialFreeAngleDegrees = 0.0;
     double maxStepFactor = 3.0;
-    double fusionGapFactor = 2.0;
+    double meetingAcceptMaxErrorRatio = 0.1;
     double endpointAcceptThresholdBaseVoxels = 20.0;
     double traceToBaseScale = 1.0;
     std::optional<double> baseVoxelSizeUm;
@@ -382,8 +382,18 @@ struct FiberTraceSegmentResult {
     double maxEndpointErrorTraceVoxels = 0.0;
     double maxEndpointErrorBaseVoxels = 0.0;
     std::optional<double> maxEndpointErrorUm;
+    double meetingErrorTraceVoxels =
+        std::numeric_limits<double>::infinity();
+    double meetingErrorBaseVoxels =
+        std::numeric_limits<double>::infinity();
+    double meetingErrorRatio =
+        std::numeric_limits<double>::infinity();
+    double meetingTraceLengthTraceVoxels = 0.0;
+    std::optional<double> meetingErrorUm;
+    std::string meetingSource;
     bool accepted = false;
     std::string reason;
+    std::string detail;
 };
 
 struct FiberTraceWholeFiberSegmentResult {
@@ -493,6 +503,11 @@ struct CandidateScoreDebug {
     size_t parentCap,
     size_t retryParentCap,
     bool segmentSuccess);
+
+[[nodiscard]] FiberTraceSegmentResult debugFuseTraceSegment(
+    const std::vector<cv::Vec3d>& forward,
+    const std::vector<cv::Vec3d>& reverse,
+    const FiberTraceConfig& config);
 
 } // namespace testing
 #endif

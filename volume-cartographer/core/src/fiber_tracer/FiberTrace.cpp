@@ -635,7 +635,9 @@ void validateTraceConfig(const FiberTraceConfig& config)
         config.cumulativeSmoothnessTangentWeight,
         "cumulative smoothness tangent weight");
     requireFinite(config.maxStepFactor, "max step factor");
-    requireFinite(config.fusionGapFactor, "fusion gap factor");
+    requireFinite(
+        config.meetingAcceptMaxErrorRatio,
+        "meeting accept maximum error ratio");
     requireFinite(
         config.endpointAcceptThresholdBaseVoxels,
         "endpoint accept threshold in base voxels");
@@ -666,6 +668,11 @@ void validateTraceConfig(const FiberTraceConfig& config)
         throw std::invalid_argument("cumulative smoothness steps must be at least 1");
     if (config.maxStepFactor < 0.0)
         throw std::invalid_argument("max step factor must be non-negative");
+    if (config.meetingAcceptMaxErrorRatio < 0.0 ||
+        config.meetingAcceptMaxErrorRatio > 1.0) {
+        throw std::invalid_argument(
+            "meeting accept maximum error ratio must be in [0, 1]");
+    }
     if (config.endpointAcceptThresholdBaseVoxels < 0.0)
         throw std::invalid_argument(
             "endpoint accept threshold in base voxels must be non-negative");
@@ -2585,50 +2592,466 @@ template <typename LossAt>
         request.snapTraceToSelectedCrossing);
 }
 
-[[nodiscard]] std::vector<cv::Vec3d> fuseTraces(
-    const std::vector<cv::Vec3d>& forward,
-    const std::vector<cv::Vec3d>& reverse,
-    double gapFactor)
-{
-    if (forward.empty())
-        return reverse;
-    if (reverse.empty())
-        return forward;
+struct ResampledTrace {
+    std::vector<cv::Vec3d> points;
+    std::vector<double> lengths;
+};
 
-    const auto forwardLengths = arclengths(forward);
-    const auto reverseLengths = arclengths(reverse);
-    double bestScore = std::numeric_limits<double>::infinity();
-    size_t bestI = forward.size() - 1;
-    size_t bestJ = reverse.size() - 1;
-    for (size_t i = 0; i < forward.size(); ++i) {
-        for (size_t j = 0; j < reverse.size(); ++j) {
-            const double gap = length(forward[i] - reverse[j]);
-            const double score = gapFactor * gap + forwardLengths[i] + reverseLengths[j];
-            if (score < bestScore) {
-                bestScore = score;
-                bestI = i;
-                bestJ = j;
-            }
-        }
+[[nodiscard]] std::vector<cv::Vec3d> finiteDeduplicatedTrace(
+    const std::vector<cv::Vec3d>& points)
+{
+    std::vector<cv::Vec3d> out;
+    out.reserve(points.size());
+    for (const auto& point : points) {
+        if (!finitePoint(point))
+            return {};
+        if (out.empty() || length(point - out.back()) > 1.0e-8)
+            out.push_back(point);
+    }
+    return out;
+}
+
+[[nodiscard]] ResampledTrace resampleTraceWithLengths(
+    const std::vector<cv::Vec3d>& input,
+    double stepVoxels)
+{
+    ResampledTrace out;
+    const auto points = finiteDeduplicatedTrace(input);
+    if (points.empty())
+        return out;
+    const auto sourceLengths = arclengths(points);
+    const double total = sourceLengths.back();
+    if (points.size() == 1 || !(total > 1.0e-8) || !std::isfinite(total)) {
+        out.points = points;
+        out.lengths.assign(points.size(), 0.0);
+        return out;
     }
 
-    const cv::Vec3d midpoint = (forward[bestI] + reverse[bestJ]) * 0.5;
-    std::vector<cv::Vec3d> fused;
-    fused.reserve(bestI + bestJ + 3);
-    for (size_t i = 0; i <= bestI; ++i)
-        fused.push_back(forward[i]);
-    fused.push_back(midpoint);
-    for (size_t count = 0; count <= bestJ; ++count) {
-        const size_t j = bestJ - count;
-        fused.push_back(reverse[j]);
-        if (j == 0)
+    const double stride = std::max(1.0e-6, stepVoxels);
+    const size_t sampleCount =
+        static_cast<size_t>(std::floor(total / stride)) + 1;
+    out.points.reserve(sampleCount + 1);
+    out.lengths.reserve(sampleCount + 1);
+    size_t segment = 0;
+    const auto appendAt = [&](double sampleLength,
+                              size_t& sourceSegment,
+                              ResampledTrace& result) {
+        while (sourceSegment + 1 < sourceLengths.size() &&
+               sourceLengths[sourceSegment + 1] < sampleLength) {
+            ++sourceSegment;
+        }
+        sourceSegment = std::min(sourceSegment, points.size() - 2);
+        const double begin = sourceLengths[sourceSegment];
+        const double end = sourceLengths[sourceSegment + 1];
+        const double t = end > begin
+            ? std::clamp((sampleLength - begin) / (end - begin), 0.0, 1.0)
+            : 0.0;
+        result.points.push_back(
+            points[sourceSegment] * (1.0 - t) + points[sourceSegment + 1] * t);
+        result.lengths.push_back(sampleLength);
+    };
+    for (size_t index = 0; index < sampleCount; ++index)
+        appendAt(std::min(total, static_cast<double>(index) * stride), segment, out);
+    if (out.lengths.empty() || total - out.lengths.back() > 1.0e-8)
+        appendAt(total, segment, out);
+    else {
+        out.points.back() = points.back();
+        out.lengths.back() = total;
+    }
+    out.points.front() = points.front();
+    out.points.back() = points.back();
+    return out;
+}
+
+[[nodiscard]] cv::Vec3d localTraceTangent(
+    const std::vector<cv::Vec3d>& points,
+    size_t index)
+{
+    if (points.size() < 2 || index >= points.size())
+        return {};
+    for (size_t radius = 1; radius < points.size(); ++radius) {
+        const size_t first = index > radius ? index - radius : 0;
+        const size_t last = std::min(points.size() - 1, index + radius);
+        const cv::Vec3d tangent = normalizedOrZero(points[last] - points[first]);
+        if (length(tangent) > kEpsilon)
+            return tangent;
+        if (first == 0 && last + 1 == points.size())
             break;
     }
-    if (!fused.empty()) {
-        fused.front() = forward.front();
-        fused.back() = reverse.front();
+    return {};
+}
+
+struct SegmentPlaneIntersection {
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    double segmentFraction = 0.0;
+};
+
+[[nodiscard]] std::optional<SegmentPlaneIntersection> segmentPlaneIntersection(
+    const cv::Vec3d& start,
+    const cv::Vec3d& end,
+    const cv::Vec3d& planePoint,
+    const cv::Vec3d& planeNormal)
+{
+    constexpr double epsilon = 1.0e-9;
+    const double d0 = pointToPlaneSigned(start, planePoint, planeNormal);
+    const double d1 = pointToPlaneSigned(end, planePoint, planeNormal);
+    if (!std::isfinite(d0) || !std::isfinite(d1))
+        return std::nullopt;
+    const cv::Vec3d delta = end - start;
+    const double lengthSquared = delta.dot(delta);
+    if (std::abs(d0) <= epsilon && std::abs(d1) <= epsilon) {
+        const double t = lengthSquared > epsilon
+            ? std::clamp((planePoint - start).dot(delta) / lengthSquared, 0.0, 1.0)
+            : 0.0;
+        return SegmentPlaneIntersection{start + delta * t, t};
     }
-    return fused;
+    if (d0 * d1 > 0.0)
+        return std::nullopt;
+    const double denominator = d0 - d1;
+    if (std::abs(denominator) <= epsilon)
+        return std::nullopt;
+    const double t = std::clamp(d0 / denominator, 0.0, 1.0);
+    return SegmentPlaneIntersection{start + delta * t, t};
+}
+
+struct TraceArcProjection {
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    double arcLength = 0.0;
+    double distance = std::numeric_limits<double>::infinity();
+};
+
+[[nodiscard]] std::optional<TraceArcProjection> projectPointToTrace(
+    const ResampledTrace& trace,
+    const cv::Vec3d& point)
+{
+    if (trace.points.empty() || trace.points.size() != trace.lengths.size())
+        return std::nullopt;
+    if (trace.points.size() == 1) {
+        return TraceArcProjection{
+            trace.points.front(), 0.0, length(trace.points.front() - point)};
+    }
+    TraceArcProjection best;
+    for (size_t index = 0; index + 1 < trace.points.size(); ++index) {
+        const cv::Vec3d delta = trace.points[index + 1] - trace.points[index];
+        const double lengthSquared = delta.dot(delta);
+        const double t = lengthSquared > 1.0e-16
+            ? std::clamp((point - trace.points[index]).dot(delta) / lengthSquared,
+                         0.0,
+                         1.0)
+            : 0.0;
+        const cv::Vec3d projected = trace.points[index] + delta * t;
+        const double distance = length(projected - point);
+        if (distance < best.distance) {
+            best.point = projected;
+            best.arcLength = trace.lengths[index] +
+                (trace.lengths[index + 1] - trace.lengths[index]) * t;
+            best.distance = distance;
+        }
+    }
+    return best;
+}
+
+struct TraceMeetingCandidate {
+    cv::Vec3d forwardPoint{0.0, 0.0, 0.0};
+    cv::Vec3d reversePoint{0.0, 0.0, 0.0};
+    double forwardArcLength = 0.0;
+    double reverseArcLength = 0.0;
+    double error = std::numeric_limits<double>::infinity();
+    std::string source;
+    size_t stableIndex = 0;
+};
+
+[[nodiscard]] bool meetingCandidateLess(
+    const TraceMeetingCandidate& lhs,
+    const TraceMeetingCandidate& rhs)
+{
+    if (lhs.error != rhs.error)
+        return lhs.error < rhs.error;
+    const double lhsBalanced =
+        std::min(lhs.forwardArcLength, lhs.reverseArcLength);
+    const double rhsBalanced =
+        std::min(rhs.forwardArcLength, rhs.reverseArcLength);
+    if (lhsBalanced != rhsBalanced)
+        return lhsBalanced > rhsBalanced;
+    const double lhsCombined = lhs.forwardArcLength + lhs.reverseArcLength;
+    const double rhsCombined = rhs.forwardArcLength + rhs.reverseArcLength;
+    if (lhsCombined != rhsCombined)
+        return lhsCombined > rhsCombined;
+    return lhs.stableIndex < rhs.stableIndex;
+}
+
+void appendMovingPlaneCandidates(
+    const ResampledTrace& source,
+    const ResampledTrace& opposite,
+    bool sourceIsForward,
+    std::vector<TraceMeetingCandidate>& candidates)
+{
+    if (source.points.size() < 2 || opposite.points.empty())
+        return;
+    for (size_t sourceIndex = 0; sourceIndex < source.points.size(); ++sourceIndex) {
+        const cv::Vec3d tangent = localTraceTangent(source.points, sourceIndex);
+        if (length(tangent) <= kEpsilon)
+            continue;
+        if (opposite.points.size() == 1) {
+            if (std::abs(pointToPlaneSigned(
+                    opposite.points.front(), source.points[sourceIndex], tangent)) >
+                1.0e-9) {
+                continue;
+            }
+            TraceMeetingCandidate candidate;
+            candidate.forwardPoint = sourceIsForward
+                ? source.points[sourceIndex]
+                : opposite.points.front();
+            candidate.reversePoint = sourceIsForward
+                ? opposite.points.front()
+                : source.points[sourceIndex];
+            candidate.forwardArcLength = sourceIsForward
+                ? source.lengths[sourceIndex]
+                : opposite.lengths.front();
+            candidate.reverseArcLength = sourceIsForward
+                ? opposite.lengths.front()
+                : source.lengths[sourceIndex];
+            candidate.error = length(candidate.forwardPoint - candidate.reversePoint);
+            candidate.source = sourceIsForward
+                ? "forward_moving_plane"
+                : "reverse_moving_plane";
+            candidate.stableIndex = candidates.size();
+            candidates.push_back(std::move(candidate));
+            continue;
+        }
+        for (size_t segment = 0; segment + 1 < opposite.points.size(); ++segment) {
+            const auto crossing = segmentPlaneIntersection(
+                opposite.points[segment],
+                opposite.points[segment + 1],
+                source.points[sourceIndex],
+                tangent);
+            if (!crossing)
+                continue;
+            const double oppositeArc = opposite.lengths[segment] +
+                (opposite.lengths[segment + 1] - opposite.lengths[segment]) *
+                    crossing->segmentFraction;
+            TraceMeetingCandidate candidate;
+            candidate.forwardPoint = sourceIsForward
+                ? source.points[sourceIndex]
+                : crossing->point;
+            candidate.reversePoint = sourceIsForward
+                ? crossing->point
+                : source.points[sourceIndex];
+            candidate.forwardArcLength = sourceIsForward
+                ? source.lengths[sourceIndex]
+                : oppositeArc;
+            candidate.reverseArcLength = sourceIsForward
+                ? oppositeArc
+                : source.lengths[sourceIndex];
+            candidate.error = length(candidate.forwardPoint - candidate.reversePoint);
+            candidate.source = sourceIsForward
+                ? "forward_moving_plane"
+                : "reverse_moving_plane";
+            candidate.stableIndex = candidates.size();
+            if (std::isfinite(candidate.error))
+                candidates.push_back(std::move(candidate));
+        }
+    }
+}
+
+[[nodiscard]] std::vector<cv::Vec3d> tracePrefixAtArc(
+    const ResampledTrace& trace,
+    double arcLength)
+{
+    if (trace.points.empty())
+        return {};
+    const double cut = std::clamp(arcLength, 0.0, trace.lengths.back());
+    std::vector<cv::Vec3d> out;
+    out.reserve(trace.points.size());
+    out.push_back(trace.points.front());
+    for (size_t index = 1; index < trace.points.size(); ++index) {
+        if (trace.lengths[index] < cut - 1.0e-9) {
+            if (length(trace.points[index] - out.back()) > 1.0e-8)
+                out.push_back(trace.points[index]);
+            continue;
+        }
+        const double begin = trace.lengths[index - 1];
+        const double end = trace.lengths[index];
+        const double t = end > begin
+            ? std::clamp((cut - begin) / (end - begin), 0.0, 1.0)
+            : 0.0;
+        const cv::Vec3d point =
+            trace.points[index - 1] * (1.0 - t) + trace.points[index] * t;
+        if (length(point - out.back()) > 1.0e-8)
+            out.push_back(point);
+        else
+            out.back() = point;
+        return out;
+    }
+    if (length(trace.points.back() - out.back()) > 1.0e-8)
+        out.push_back(trace.points.back());
+    return out;
+}
+
+[[nodiscard]] std::vector<cv::Vec3d> warpTracePrefixToMidpoint(
+    std::vector<cv::Vec3d> partial,
+    const cv::Vec3d& anchor,
+    const cv::Vec3d& sourceMeeting,
+    const cv::Vec3d& midpoint)
+{
+    if (partial.empty())
+        return {};
+    if (partial.size() == 1)
+        partial.push_back(sourceMeeting);
+    partial.front() = anchor;
+    partial.back() = sourceMeeting;
+    const auto lengths = arclengths(partial);
+    const double total = lengths.back();
+    const cv::Vec3d delta = midpoint - sourceMeeting;
+    for (size_t index = 0; index < partial.size(); ++index) {
+        const double blend = total > 1.0e-8
+            ? std::clamp(lengths[index] / total, 0.0, 1.0)
+            : (partial.size() > 1
+                   ? static_cast<double>(index) /
+                         static_cast<double>(partial.size() - 1)
+                   : 1.0);
+        partial[index] += delta * blend;
+    }
+    partial.front() = anchor;
+    partial.back() = midpoint;
+    return partial;
+}
+
+struct TraceMeetingFusion {
+    std::vector<cv::Vec3d> fusedLine;
+    double errorTraceVoxels = std::numeric_limits<double>::infinity();
+    double errorRatio = std::numeric_limits<double>::infinity();
+    double traceLengthTraceVoxels = 0.0;
+    std::string source;
+    std::string reason = "invalid_trace_path";
+    std::string detail;
+};
+
+[[nodiscard]] TraceMeetingFusion fuseTraceMeetings(
+    const FiberTraceOneWayResult& forwardResult,
+    const FiberTraceOneWayResult& reverseResult,
+    const FiberTraceConfig& config)
+{
+    TraceMeetingFusion result;
+    const double searchStep = std::max(1.0e-6, config.stepVoxels * 0.5);
+    const ResampledTrace forward =
+        resampleTraceWithLengths(forwardResult.points, searchStep);
+    const ResampledTrace reverse =
+        resampleTraceWithLengths(reverseResult.points, searchStep);
+    if (forward.points.empty() || reverse.points.empty()) {
+        result.detail = "forward or reverse trace is empty or non-finite";
+        return result;
+    }
+
+    std::vector<TraceMeetingCandidate> candidates;
+    const double endpointThresholdTrace =
+        config.endpointAcceptThresholdBaseVoxels / config.traceToBaseScale;
+    const auto appendEndpointCandidates = [&](const FiberTraceOneWayResult& traced,
+                                              const ResampledTrace& tracedPath,
+                                              bool forwardEndpoint) {
+        for (const auto& crossing : traced.targetPlaneCrossings) {
+            if (!(crossing.inPlaneErrorVoxels <= endpointThresholdTrace) ||
+                !finitePoint(crossing.point)) {
+                continue;
+            }
+            const auto projected = projectPointToTrace(tracedPath, crossing.point);
+            if (!projected)
+                continue;
+            TraceMeetingCandidate candidate;
+            candidate.forwardPoint = forwardEndpoint
+                ? crossing.point
+                : forward.points.front();
+            candidate.reversePoint = forwardEndpoint
+                ? reverse.points.front()
+                : crossing.point;
+            candidate.forwardArcLength = forwardEndpoint
+                ? projected->arcLength
+                : 0.0;
+            candidate.reverseArcLength = forwardEndpoint
+                ? 0.0
+                : projected->arcLength;
+            candidate.error = length(candidate.forwardPoint - candidate.reversePoint);
+            candidate.source = std::string(forwardEndpoint
+                    ? "forward_endpoint:"
+                    : "reverse_endpoint:") + crossing.name;
+            candidate.stableIndex = candidates.size();
+            if (std::isfinite(candidate.error))
+                candidates.push_back(std::move(candidate));
+        }
+    };
+    appendEndpointCandidates(forwardResult, forward, true);
+    appendEndpointCandidates(reverseResult, reverse, false);
+    appendMovingPlaneCandidates(forward, reverse, true, candidates);
+    appendMovingPlaneCandidates(reverse, forward, false, candidates);
+
+    candidates.erase(
+        std::remove_if(candidates.begin(), candidates.end(), [](const auto& candidate) {
+            const double tracedLength =
+                candidate.forwardArcLength + candidate.reverseArcLength;
+            return !std::isfinite(candidate.error) ||
+                !std::isfinite(tracedLength) || !(tracedLength > 1.0e-8);
+        }),
+        candidates.end());
+    if (candidates.empty()) {
+        result.reason = "no_trace_plane_intersection";
+        result.detail = "forward=" + forwardResult.reason +
+            " reverse=" + reverseResult.reason;
+        return result;
+    }
+
+    const auto best = std::min_element(
+        candidates.begin(), candidates.end(), meetingCandidateLess);
+    result.errorTraceVoxels = best->error;
+    result.traceLengthTraceVoxels =
+        best->forwardArcLength + best->reverseArcLength;
+    result.errorRatio = result.errorTraceVoxels /
+        result.traceLengthTraceVoxels;
+    result.source = best->source;
+
+    auto forwardPartial = tracePrefixAtArc(forward, best->forwardArcLength);
+    auto reversePartial = tracePrefixAtArc(reverse, best->reverseArcLength);
+    const cv::Vec3d midpoint =
+        (best->forwardPoint + best->reversePoint) * 0.5;
+    forwardPartial = warpTracePrefixToMidpoint(
+        std::move(forwardPartial),
+        forward.points.front(),
+        best->forwardPoint,
+        midpoint);
+    reversePartial = warpTracePrefixToMidpoint(
+        std::move(reversePartial),
+        reverse.points.front(),
+        best->reversePoint,
+        midpoint);
+    std::reverse(reversePartial.begin(), reversePartial.end());
+    std::vector<cv::Vec3d> fusedDense = std::move(forwardPartial);
+    if (!reversePartial.empty()) {
+        const size_t begin = fusedDense.empty() ? 0 : 1;
+        fusedDense.insert(
+            fusedDense.end(),
+            reversePartial.begin() + static_cast<std::ptrdiff_t>(begin),
+            reversePartial.end());
+    }
+    result.fusedLine =
+        resampleTraceWithLengths(fusedDense, config.stepVoxels).points;
+    if (result.fusedLine.size() < 2) {
+        result.reason = "fusion_failed";
+        result.detail = "selected meeting did not produce a CP-to-CP polyline";
+        result.fusedLine.clear();
+        return result;
+    }
+    result.fusedLine.front() = forward.points.front();
+    result.fusedLine.back() = reverse.points.front();
+    if (!(result.errorRatio <= config.meetingAcceptMaxErrorRatio)) {
+        result.reason = "meeting_error_ratio";
+        std::ostringstream detail;
+        detail << "ratio=" << result.errorRatio
+               << " threshold=" << config.meetingAcceptMaxErrorRatio
+               << " source=" << result.source;
+        result.detail = detail.str();
+        return result;
+    }
+    result.reason = "ok";
+    return result;
 }
 
 } // namespace
@@ -2812,6 +3235,33 @@ bool debugShouldRetryLookahead(
         parentCap,
         retryParentCap,
         segmentSuccess);
+}
+
+FiberTraceSegmentResult debugFuseTraceSegment(
+    const std::vector<cv::Vec3d>& forward,
+    const std::vector<cv::Vec3d>& reverse,
+    const FiberTraceConfig& config)
+{
+    validateTraceConfig(config);
+    FiberTraceSegmentResult result;
+    result.forward.points = forward;
+    result.forward.reason = "debug_forward";
+    result.reverse.points = reverse;
+    result.reverse.reason = "debug_reverse";
+    const TraceMeetingFusion fusion =
+        fuseTraceMeetings(result.forward, result.reverse, config);
+    result.fusedLine = fusion.fusedLine;
+    result.meetingErrorTraceVoxels = fusion.errorTraceVoxels;
+    const FiberTraceCoordinateAdapter coordinates(config.traceToBaseScale);
+    result.meetingErrorBaseVoxels =
+        coordinates.traceDistanceToBase(fusion.errorTraceVoxels);
+    result.meetingErrorRatio = fusion.errorRatio;
+    result.meetingTraceLengthTraceVoxels = fusion.traceLengthTraceVoxels;
+    result.meetingSource = fusion.source;
+    result.reason = fusion.reason;
+    result.detail = fusion.detail;
+    result.accepted = result.reason == "ok";
+    return result;
 }
 
 } // namespace testing
@@ -4291,6 +4741,10 @@ FiberTraceSegmentResult traceFiberSegment(
         request.targetIndex,
         request.startIndex,
         target);
+    forwardOneWay.targetPlaneAcceptThresholdVoxels =
+        request.config.endpointAcceptThresholdBaseVoxels /
+        request.config.traceToBaseScale;
+    forwardOneWay.snapTraceToSelectedCrossing = false;
     forwardOneWay.budgetSpanVoxels = span;
     forwardOneWay.config = request.config;
     FiberTraceOneWayRequest reverseOneWay;
@@ -4304,6 +4758,10 @@ FiberTraceSegmentResult traceFiberSegment(
         request.startIndex,
         request.targetIndex,
         start);
+    reverseOneWay.targetPlaneAcceptThresholdVoxels =
+        request.config.endpointAcceptThresholdBaseVoxels /
+        request.config.traceToBaseScale;
+    reverseOneWay.snapTraceToSelectedCrossing = false;
     reverseOneWay.budgetSpanVoxels = span;
     reverseOneWay.config = request.config;
 
@@ -4312,9 +4770,9 @@ FiberTraceSegmentResult traceFiberSegment(
     result.reverse = traceOneWayCore(
         predictions, reverseOneWay, normalSampler, progress, "reverse");
 
-    result.fusedLine = fuseTraces(
-        result.forward.points, result.reverse.points,
-        std::max(0.0, request.config.fusionGapFactor));
+    const TraceMeetingFusion fusion =
+        fuseTraceMeetings(result.forward, result.reverse, request.config);
+    result.fusedLine = fusion.fusedLine;
     if (!result.fusedLine.empty()) {
         result.fusedLine.front() = request.referenceLine[request.startIndex];
         result.fusedLine.back() = request.referenceLine[request.targetIndex];
@@ -4331,19 +4789,25 @@ FiberTraceSegmentResult traceFiberSegment(
     result.maxEndpointErrorBaseVoxels =
         coordinates.traceDistanceToBase(result.maxEndpointErrorTraceVoxels);
     if (request.config.baseVoxelSizeUm.has_value()) {
-        result.maxEndpointErrorUm =
-            result.maxEndpointErrorBaseVoxels * *request.config.baseVoxelSizeUm;
+        if (std::isfinite(result.maxEndpointErrorBaseVoxels)) {
+            result.maxEndpointErrorUm =
+                result.maxEndpointErrorBaseVoxels * *request.config.baseVoxelSizeUm;
+        }
     }
-    result.accepted = result.forward.reachedTargetPlane &&
-                      result.reverse.reachedTargetPlane &&
-                      result.maxEndpointErrorBaseVoxels <=
-                          request.config.endpointAcceptThresholdBaseVoxels;
-    if (!result.forward.reachedTargetPlane || !result.reverse.reachedTargetPlane)
-        result.reason = "target_plane_not_reached";
-    else if (!result.accepted)
-        result.reason = "endpoint_error_threshold";
-    else
-        result.reason = "ok";
+    result.meetingErrorTraceVoxels = fusion.errorTraceVoxels;
+    result.meetingErrorBaseVoxels =
+        coordinates.traceDistanceToBase(fusion.errorTraceVoxels);
+    result.meetingErrorRatio = fusion.errorRatio;
+    result.meetingTraceLengthTraceVoxels = fusion.traceLengthTraceVoxels;
+    if (request.config.baseVoxelSizeUm.has_value() &&
+        std::isfinite(result.meetingErrorBaseVoxels)) {
+        result.meetingErrorUm =
+            result.meetingErrorBaseVoxels * *request.config.baseVoxelSizeUm;
+    }
+    result.meetingSource = fusion.source;
+    result.reason = fusion.reason;
+    result.detail = fusion.detail;
+    result.accepted = result.reason == "ok";
     return result;
 }
 

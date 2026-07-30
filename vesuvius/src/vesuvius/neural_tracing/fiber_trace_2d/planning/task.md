@@ -1,66 +1,59 @@
-# Hard Native Directions For Lasagna Fallback
+# Native Fiber Trace Meeting Search And Persisted Diagnostics
 
 ## User Request
 
-- When a native fiber-traced span adjoins a Lasagna fallback at a CP, the
-  native span's endpoint direction must be a hard direction constraint for the
-  Lasagna geometry.
-- The direction is derived directly from the CP and the next dense point in the
-  successfully native-traced span.
-- Apply this rule at every CP that has native-traced geometry on one side and
-  Lasagna-generated geometry on the other side.
-- Fiber-derived directions supersede all normal-, chord-, existing-line-, and
-  candidate-derived starting directions. They are constraints, not candidates
-  or weighted preferences.
+- Make CP-to-CP native tracing fall back to Lasagna substantially less often.
+- Run both one-way tracers until they reach the opposite endpoint's local
+  target planes within the configured endpoint threshold or exhaust their
+  maximum step budgets.
+- After tracing, move locally tangent planes along both traces and intersect
+  the opposite trace at frequent intervals.
+- Select the endpoint-plane or moving-plane meeting with the smallest spatial
+  error and accept it when that error is at most 10% of the selected traced
+  path length.
+- Construct the final CP-to-CP line with the existing Python fusion-point
+  arc-length lerping behavior translated to shared C++.
+- Below the generated strip, show native meeting error in base voxels for
+  accepted native spans and the native failure reason for Lasagna fallbacks,
+  instead of a Lasagna normal-alignment error.
+- Persist that diagnostic per segment on the existing owning CP so it remains
+  visible after saving and reloading.
 
-## Direction Semantics
+## Required Semantics
 
-- At a native endpoint, `into_native = normalize(next_native_point - CP)`.
-- Lasagna on the opposite side must leave the CP along `-into_native`, thereby
-  continuing the same tangent through the CP.
-- The rule applies independently to both endpoints of every successful native
-  span, including a Lasagna span constrained at both ends.
-- If native extrapolation fails and the corresponding Lasagna open tail is
-  retained, the tail must obey the same hard continuation direction.
-
-## Correctness Constraints
-
-- The constraint must remain exact through span initialization, span solving,
-  stitching, and the final global Lasagna solve.
-- Do not implement this as a large residual weight, candidate score, seed-span
-  ordering rule, or post-solve correction.
-- Preserve successful native span samples bit-exactly.
-- Use the existing Lasagna/Ceres point optimization and smoothness residuals.
-  Add one fixed adjacent proxy point in the fiber-derived direction for each
-  constrained side; do not add a custom manifold or solver mechanism.
-- A fiber-constrained CP supplies exactly one rollout direction from that CP.
-  Do not also generate normal-, chord-, existing-, or continuation-derived
-  starting directions from the same side.
-- Full reinitialization must not submit the previous Lasagna span as a solve
-  candidate. The previous line may locate CPs and determine rollout budgets,
-  but it must not compete with newly constructed rollout geometry.
-- When a solved neighboring span supplies a continuation direction, that
-  direction replaces normal-, chord-, or previous-line initialization from
-  the shared CP side. It is not an additional candidate.
-- Projecting a rollout direction into the Lasagna tangent plane must always
-  return a tangent-plane direction. A direction parallel to the sampled normal
-  must fall back to a deterministic perpendicular tangent, never to the
-  original normal-parallel direction.
-- Invalid or degenerate native endpoint geometry is an explicit task failure;
-  it must not silently revert to a normal-derived direction.
+- Preserve the current target-local multi-plane construction; do not introduce
+  a straight CP-chord target plane.
+- Endpoint-plane success uses the existing 20-base-voxel threshold and tracing
+  continues after an out-of-threshold crossing while budget remains.
+- Moving-plane error is the Euclidean distance within the plane between the
+  plane's source-trace sample and the interpolated opposite-trace crossing. It
+  is not signed point-to-plane distance.
+- Search symmetrically by moving planes along both traces.
+- The 10% acceptance denominator is the selected forward partial arc length
+  plus selected reverse partial arc length. Store the scale-independent ratio
+  and the raw error converted to base voxels.
+- The smallest raw error wins. Deterministic tie-breaking may prefer a more
+  balanced/later meeting but must not replace raw error as the primary key.
+- Accepted geometry retains exact CP endpoints.
+- A failed native attempt stores its reason on the same CP-owned segment record
+  but does not protect the Lasagna fallback geometry as native.
 
 ## Scope
 
-- Shared Lasagna reinitialization and global solve constraint plumbing.
-- VC3D mixed native/Lasagna construction of hard endpoint constraints.
-- Internal fallback spans and retained Lasagna open tails.
-- Focused C++ regression tests, specifications, code documentation, and
-  changelog.
+- Shared C++ native CP-pair trace termination, meeting search, fusion, result
+  diagnostics, and tests.
+- VC3D mixed native/Lasagna optimization and direct segment action.
+- VC3D CP-owned segment metadata, JSON persistence, generated-strip labels,
+  and reload behavior.
+- Strict C++/Python/script readers of the versioned segment metadata.
+- Specifications, implementation documentation, changelog, and workflow
+  records.
 
 ## Out Of Scope
 
-- Native tracer scoring, fusion, intersection, or acceptance changes.
-- Changing ordinary all-Lasagna behavior when no native hard constraint is
-  supplied.
-- Persisting redundant direction metadata; directions are derived from the
-  authoritative native dense geometry each time.
+- Changing whole-fiber restart/continuation semantics.
+- Changing the model, prediction scoring, normal-aware smoothness, or beam
+  search numerics.
+- Adding actual 4D volume handling.
+- Changing ordinary Lasagna normal-alignment metrics for spans without a
+  native trace attempt.

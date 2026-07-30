@@ -1139,7 +1139,9 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     metadata.fiberManifestLocation = "s3://bucket/fibers.lasagna.json";
     metadata.traceToBaseScale = 4.0;
     metadata.config.traceToBaseScale = 4.0;
-    metadata.maxEndpointErrorBaseVoxels = 2.5;
+    metadata.meetingErrorBaseVoxels = 2.5;
+    metadata.meetingErrorRatio = 0.025;
+    metadata.meetingSource = "forward_moving_plane";
     control.segmentToNext = metadata;
 
     const auto json = vc3d::line_annotation::storedControlPointToJson(control);
@@ -1149,7 +1151,50 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     CHECK(parsed.segmentToNext->normalManifestLocation ==
           "s3://bucket/normals.lasagna.json");
     CHECK(parsed.segmentToNext->traceToBaseScale == doctest::Approx(4.0));
-    CHECK(parsed.segmentToNext->maxEndpointErrorBaseVoxels == doctest::Approx(2.5));
+    REQUIRE(parsed.segmentToNext->meetingErrorBaseVoxels.has_value());
+    REQUIRE(parsed.segmentToNext->meetingErrorRatio.has_value());
+    CHECK(*parsed.segmentToNext->meetingErrorBaseVoxels == doctest::Approx(2.5));
+    CHECK(*parsed.segmentToNext->meetingErrorRatio == doctest::Approx(0.025));
+    CHECK(parsed.segmentToNext->meetingSource == "forward_moving_plane");
+    CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
+        parsed.segmentToNext));
+
+    auto legacyJson = json;
+    auto& legacySegment = legacyJson["segment_to_next"];
+    legacySegment["metadata_version"] = 1;
+    legacySegment["tracer_version"] = 1;
+    legacySegment["max_endpoint_error_base_voxels"] = 2.5;
+    legacySegment.erase("outcome");
+    legacySegment.erase("meeting_error_base_voxels");
+    legacySegment.erase("meeting_error_ratio");
+    legacySegment.erase("meeting_source");
+    legacySegment.erase("failure_code");
+    legacySegment.erase("failure_detail");
+    legacySegment["config"]["fusion_gap_factor"] = 2.0;
+    legacySegment["config"].erase("meeting_accept_max_error_ratio");
+    const auto legacy = vc3d::line_annotation::storedControlPointFromJson(
+        legacyJson, 2);
+    REQUIRE(legacy.segmentToNext.has_value());
+    CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
+        legacy.segmentToNext));
+    REQUIRE(legacy.segmentToNext->meetingErrorBaseVoxels.has_value());
+    CHECK(*legacy.segmentToNext->meetingErrorBaseVoxels == doctest::Approx(2.5));
+
+    metadata.outcome = vc3d::line_annotation::FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
+    metadata.meetingErrorBaseVoxels.reset();
+    metadata.meetingErrorRatio.reset();
+    metadata.meetingSource.clear();
+    metadata.failureCode = "no_trace_plane_intersection";
+    metadata.failureDetail = "forward=max_step_factor reverse=no_valid_candidates";
+    control.segmentToNext = metadata;
+    const auto fallbackJson = vc3d::line_annotation::storedControlPointToJson(control);
+    const auto fallback = vc3d::line_annotation::storedControlPointFromJson(
+        fallbackJson, 2);
+    REQUIRE(fallback.segmentToNext.has_value());
+    CHECK_FALSE(vc3d::line_annotation::isAcceptedNativeTrace(
+        fallback.segmentToNext));
+    CHECK(fallback.segmentToNext->failureCode ==
+          "no_trace_plane_intersection");
 
     std::vector<vc3d::line_annotation::StoredControlPoint> invalid{parsed};
     CHECK_THROWS_AS(vc3d::line_annotation::validateStoredControlPoints(invalid),
@@ -1216,7 +1261,13 @@ TEST_CASE("fiber mode falls back only the failed native span")
     CHECK(result.nativeSegments == 1);
     CHECK(result.lasagnaFallbackSegments == 1);
     CHECK(result.controlPoints[0].segmentToNext.has_value());
-    CHECK_FALSE(result.controlPoints[1].segmentToNext.has_value());
+    CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
+        result.controlPoints[0].segmentToNext));
+    REQUIRE(result.controlPoints[1].segmentToNext.has_value());
+    CHECK_FALSE(vc3d::line_annotation::isAcceptedNativeTrace(
+        result.controlPoints[1].segmentToNext));
+    CHECK(result.controlPoints[1].segmentToNext->failureCode ==
+          "trace_exception");
     CHECK(result.nativeExtrapolations +
               result.lasagnaFallbackExtrapolations == 2);
     CHECK(result.lasagnaFallbackExtrapolations >= 1);

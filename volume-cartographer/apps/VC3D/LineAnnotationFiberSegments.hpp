@@ -22,15 +22,43 @@ enum class FiberOptimizationMode {
 [[nodiscard]] FiberOptimizationMode fiberOptimizationModeFromString(const std::string& value);
 
 struct FiberTraceSegmentMetadata {
-    static constexpr int MetadataVersion = 1;
-    static constexpr int TracerVersion = 1;
+    enum class Outcome {
+        AcceptedNative,
+        LasagnaFallback,
+    };
 
+    static constexpr int MetadataVersion = 2;
+    static constexpr int TracerVersion = 2;
+
+    Outcome outcome = Outcome::AcceptedNative;
     std::string normalManifestLocation;
     std::string fiberManifestLocation;
     double traceToBaseScale = 1.0;
     vc::fiber_tracer::FiberTraceConfig config;
-    double maxEndpointErrorBaseVoxels = 0.0;
+    std::optional<double> meetingErrorBaseVoxels;
+    std::optional<double> meetingErrorRatio;
+    std::string meetingSource;
+    std::string failureCode;
+    std::string failureDetail;
 };
+
+[[nodiscard]] bool isAcceptedNativeTrace(const FiberTraceSegmentMetadata& metadata) noexcept;
+[[nodiscard]] bool isAcceptedNativeTrace(
+    const std::optional<FiberTraceSegmentMetadata>& metadata) noexcept;
+
+[[nodiscard]] FiberTraceSegmentMetadata fiberTraceSegmentMetadataForResult(
+    std::string normalManifestLocation,
+    std::string fiberManifestLocation,
+    double traceToBaseScale,
+    const vc::fiber_tracer::FiberTraceConfig& config,
+    const vc::fiber_tracer::FiberTraceSegmentResult& result);
+
+[[nodiscard]] FiberTraceSegmentMetadata fiberTraceSegmentMetadataForException(
+    std::string normalManifestLocation,
+    std::string fiberManifestLocation,
+    double traceToBaseScale,
+    const vc::fiber_tracer::FiberTraceConfig& config,
+    std::string detail);
 
 struct LineControlPoint : vc::lasagna::LineControlPoint {
     std::optional<FiberTraceSegmentMetadata> segmentToNext;

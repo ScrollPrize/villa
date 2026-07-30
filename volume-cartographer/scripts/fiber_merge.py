@@ -78,43 +78,84 @@ def _finite_point(p):
         return False
 
 
-_SEGMENT_KEYS = {
+_SEGMENT_KEYS_V1 = {
     'optimizer', 'metadata_version', 'tracer_version', 'normal_manifest',
     'fiber_manifest', 'trace_to_base_scale',
     'max_endpoint_error_base_voxels', 'config',
 }
-_CONFIG_KEYS = {
+_SEGMENT_KEYS_V2 = {
+    'optimizer', 'metadata_version', 'tracer_version', 'outcome',
+    'normal_manifest', 'fiber_manifest', 'trace_to_base_scale',
+    'meeting_error_base_voxels', 'meeting_error_ratio', 'meeting_source',
+    'failure_code', 'failure_detail', 'config',
+}
+_CONFIG_KEYS_COMMON = {
     'step_voxels', 'cone_angle_degrees', 'cone_angle_step_degrees',
     'cone_grid_size', 'beam_width', 'beam_prune_distance_voxels',
     'beam_lookahead_steps', 'smoothness_weight',
     'smoothness_normal_weight', 'smoothness_tangent_weight',
     'smoothness_free_angle_degrees', 'cumulative_smoothness_steps',
     'cumulative_smoothness_tangent_weight', 'initial_free_angle_degrees',
-    'max_step_factor', 'fusion_gap_factor',
+    'max_step_factor',
     'endpoint_accept_threshold_base_voxels',
 }
+_CONFIG_KEYS_V1 = _CONFIG_KEYS_COMMON | {'fusion_gap_factor'}
+_CONFIG_KEYS_V2 = _CONFIG_KEYS_COMMON | {'meeting_accept_max_error_ratio'}
 
 
 def _valid_segment(segment):
-    if not isinstance(segment, dict) or set(segment) != _SEGMENT_KEYS:
+    if not isinstance(segment, dict):
         return False
-    if (segment.get('optimizer') != 'native_fiber_trace3d' or
-            segment.get('metadata_version') != 1 or
-            segment.get('tracer_version') != 1 or
+    version = (segment.get('metadata_version'), segment.get('tracer_version'))
+    if version == (1, 1):
+        segment_keys = _SEGMENT_KEYS_V1
+        config_keys = _CONFIG_KEYS_V1
+    elif version == (2, 2):
+        segment_keys = _SEGMENT_KEYS_V2
+        config_keys = _CONFIG_KEYS_V2
+    else:
+        return False
+    if (set(segment) != segment_keys or
+            segment.get('optimizer') != 'native_fiber_trace3d' or
             not isinstance(segment.get('normal_manifest'), str) or
             not segment['normal_manifest'] or
             not isinstance(segment.get('fiber_manifest'), str) or
             not segment['fiber_manifest']):
         return False
     config = segment.get('config')
-    numeric = [segment.get('trace_to_base_scale'),
-               segment.get('max_endpoint_error_base_voxels')]
-    if not isinstance(config, dict) or set(config) != _CONFIG_KEYS:
+    numeric = [segment.get('trace_to_base_scale')]
+    if not isinstance(config, dict) or set(config) != config_keys:
         return False
     numeric.extend(config.values())
-    return all(isinstance(value, (int, float)) and
+    if not all(isinstance(value, (int, float)) and
                not isinstance(value, bool) and math.isfinite(value)
-               for value in numeric)
+               for value in numeric):
+        return False
+    if version == (1, 1):
+        error = segment.get('max_endpoint_error_base_voxels')
+        return (isinstance(error, (int, float)) and not isinstance(error, bool)
+                and math.isfinite(error) and error >= 0)
+    outcome = segment.get('outcome')
+    error = segment.get('meeting_error_base_voxels')
+    ratio = segment.get('meeting_error_ratio')
+    strings = [segment.get('meeting_source'), segment.get('failure_code'),
+               segment.get('failure_detail')]
+    if (outcome not in {'accepted_native', 'lasagna_fallback'} or
+            not all(isinstance(value, str) for value in strings) or
+            (error is None) != (ratio is None)):
+        return False
+    if error is not None and not (
+            isinstance(error, (int, float)) and not isinstance(error, bool) and
+            math.isfinite(error) and error >= 0 and
+            isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and
+            math.isfinite(ratio) and 0 <= ratio <= 1):
+        return False
+    if not 0 <= config['meeting_accept_max_error_ratio'] <= 1:
+        return False
+    if outcome == 'accepted_native':
+        return (error is not None and bool(segment['meeting_source']) and
+                not segment['failure_code'] and not segment['failure_detail'])
+    return bool(segment['failure_code'])
 
 
 def is_fiber_doc(doc):

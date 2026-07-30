@@ -11,11 +11,25 @@ import numpy as np
 
 @dataclass(frozen=True)
 class FiberTraceSegmentMetadata:
+    outcome: str
     normal_manifest: str
     fiber_manifest: str
     trace_to_base_scale: float
-    max_endpoint_error_base_voxels: float
+    meeting_error_base_voxels: float | None
+    meeting_error_ratio: float | None
+    meeting_source: str
+    failure_code: str
+    failure_detail: str
     config: dict[str, float | int]
+
+    @property
+    def max_endpoint_error_base_voxels(self) -> float:
+        """Previous-schema compatibility alias for accepted-only callers."""
+        return (
+            math.nan
+            if self.meeting_error_base_voxels is None
+            else self.meeting_error_base_voxels
+        )
 
 
 @dataclass(frozen=True)
@@ -62,7 +76,7 @@ def _parse_points(
     return points.astype(np.float32, copy=False)
 
 
-_SEGMENT_KEYS = {
+_SEGMENT_KEYS_V1 = {
     "optimizer",
     "metadata_version",
     "tracer_version",
@@ -72,7 +86,22 @@ _SEGMENT_KEYS = {
     "max_endpoint_error_base_voxels",
     "config",
 }
-_CONFIG_KEYS = {
+_SEGMENT_KEYS_V2 = {
+    "optimizer",
+    "metadata_version",
+    "tracer_version",
+    "outcome",
+    "normal_manifest",
+    "fiber_manifest",
+    "trace_to_base_scale",
+    "meeting_error_base_voxels",
+    "meeting_error_ratio",
+    "meeting_source",
+    "failure_code",
+    "failure_detail",
+    "config",
+}
+_CONFIG_KEYS_COMMON = {
     "step_voxels",
     "cone_angle_degrees",
     "cone_angle_step_degrees",
@@ -88,20 +117,30 @@ _CONFIG_KEYS = {
     "cumulative_smoothness_tangent_weight",
     "initial_free_angle_degrees",
     "max_step_factor",
-    "fusion_gap_factor",
     "endpoint_accept_threshold_base_voxels",
 }
+_CONFIG_KEYS_V1 = _CONFIG_KEYS_COMMON | {"fusion_gap_factor"}
+_CONFIG_KEYS_V2 = _CONFIG_KEYS_COMMON | {"meeting_accept_max_error_ratio"}
 
 
 def _parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
-    if not isinstance(raw, dict) or set(raw) != _SEGMENT_KEYS:
+    if not isinstance(raw, dict):
         raise ValueError("segment_to_next has missing or unknown fields")
     if raw["optimizer"] != "native_fiber_trace3d":
         raise ValueError(f"unsupported segment_to_next optimizer: {raw['optimizer']!r}")
-    if raw["metadata_version"] != 1 or raw["tracer_version"] != 1:
+    version = (raw.get("metadata_version"), raw.get("tracer_version"))
+    if version == (1, 1):
+        segment_keys = _SEGMENT_KEYS_V1
+        config_keys = _CONFIG_KEYS_V1
+    elif version == (2, 2):
+        segment_keys = _SEGMENT_KEYS_V2
+        config_keys = _CONFIG_KEYS_V2
+    else:
         raise ValueError("unsupported segment_to_next metadata/tracer version")
+    if set(raw) != segment_keys:
+        raise ValueError("segment_to_next has missing or unknown fields")
     config = raw["config"]
-    if not isinstance(config, dict) or set(config) != _CONFIG_KEYS:
+    if not isinstance(config, dict) or set(config) != config_keys:
         raise ValueError("segment_to_next config has missing or unknown fields")
     normal_manifest = raw["normal_manifest"]
     fiber_manifest = raw["fiber_manifest"]
@@ -110,11 +149,53 @@ def _parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
     if not isinstance(fiber_manifest, str) or not fiber_manifest:
         raise ValueError("segment_to_next fiber_manifest must be a non-empty string")
     trace_scale = float(raw["trace_to_base_scale"])
-    endpoint_error = float(raw["max_endpoint_error_base_voxels"])
     if not math.isfinite(trace_scale) or trace_scale <= 0:
         raise ValueError("segment_to_next trace_to_base_scale must be positive")
-    if not math.isfinite(endpoint_error) or endpoint_error < 0:
-        raise ValueError("segment_to_next endpoint error must be non-negative")
+    if version == (1, 1):
+        outcome = "accepted_native"
+        meeting_error: float | None = float(raw["max_endpoint_error_base_voxels"])
+        meeting_ratio: float | None = None
+        meeting_source = "legacy_endpoint"
+        failure_code = ""
+        failure_detail = ""
+        if not math.isfinite(meeting_error) or meeting_error < 0:
+            raise ValueError("segment_to_next endpoint error must be non-negative")
+    else:
+        outcome = raw["outcome"]
+        if outcome not in {"accepted_native", "lasagna_fallback"}:
+            raise ValueError("segment_to_next outcome is invalid")
+        raw_error = raw["meeting_error_base_voxels"]
+        raw_ratio = raw["meeting_error_ratio"]
+        if (raw_error is None) != (raw_ratio is None):
+            raise ValueError("segment_to_next meeting diagnostics are inconsistent")
+        meeting_error = None if raw_error is None else float(raw_error)
+        meeting_ratio = None if raw_ratio is None else float(raw_ratio)
+        if meeting_error is not None and (
+            not math.isfinite(meeting_error) or meeting_error < 0
+        ):
+            raise ValueError("segment_to_next meeting error must be non-negative")
+        if meeting_ratio is not None and (
+            not math.isfinite(meeting_ratio) or not 0 <= meeting_ratio <= 1
+        ):
+            raise ValueError("segment_to_next meeting ratio must be in [0, 1]")
+        meeting_source = raw["meeting_source"]
+        failure_code = raw["failure_code"]
+        failure_detail = raw["failure_detail"]
+        if not all(
+            isinstance(value, str)
+            for value in (meeting_source, failure_code, failure_detail)
+        ):
+            raise ValueError("segment_to_next diagnostic strings must be strings")
+        if outcome == "accepted_native" and (
+            meeting_error is None
+            or meeting_ratio is None
+            or not meeting_source
+            or failure_code
+            or failure_detail
+        ):
+            raise ValueError("accepted segment_to_next outcome is inconsistent")
+        if outcome == "lasagna_fallback" and not failure_code:
+            raise ValueError("fallback segment_to_next requires failure_code")
     normalized_config: dict[str, float | int] = {}
     integer_keys = {
         "cone_grid_size",
@@ -122,7 +203,7 @@ def _parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
         "beam_lookahead_steps",
         "cumulative_smoothness_steps",
     }
-    for key in _CONFIG_KEYS:
+    for key in config_keys:
         value = config[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"segment_to_next config {key} must be numeric")
@@ -133,11 +214,18 @@ def _parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
         raise ValueError("segment_to_next grid and beam sizes must be positive")
     if normalized_config["beam_lookahead_steps"] < 0 or normalized_config["cumulative_smoothness_steps"] < 0:
         raise ValueError("segment_to_next step counts must be non-negative")
+    if version == (2, 2) and not 0 <= normalized_config["meeting_accept_max_error_ratio"] <= 1:
+        raise ValueError("segment_to_next meeting_accept_max_error_ratio must be in [0, 1]")
     return FiberTraceSegmentMetadata(
+        outcome=outcome,
         normal_manifest=normal_manifest,
         fiber_manifest=fiber_manifest,
         trace_to_base_scale=trace_scale,
-        max_endpoint_error_base_voxels=endpoint_error,
+        meeting_error_base_voxels=meeting_error,
+        meeting_error_ratio=meeting_ratio,
+        meeting_source=meeting_source,
+        failure_code=failure_code,
+        failure_detail=failure_detail,
         config=normalized_config,
     )
 

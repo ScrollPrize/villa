@@ -905,7 +905,9 @@ std::vector<std::pair<int, int>> protectedLinePointRanges(
     const auto order = controlPointOrder(controls);
     for (size_t sortedIndex = 0; sortedIndex + 1 < order.size(); ++sortedIndex) {
         const size_t owner = order[sortedIndex];
-        if (!controls[owner].segmentToNext || owner == excludedOwner) {
+        if (!vc3d::line_annotation::isAcceptedNativeTrace(
+                controls[owner].segmentToNext) ||
+            owner == excludedOwner) {
             continue;
         }
         int first = controlLineIndex(controls[owner], linePointCount - 1);
@@ -925,7 +927,8 @@ std::vector<std::pair<int, int>> protectedControlPointSpans(
     const auto order = controlPointOrder(controls);
     for (size_t sortedIndex = 0; sortedIndex + 1 < order.size(); ++sortedIndex) {
         const size_t owner = order[sortedIndex];
-        if (controls[owner].segmentToNext) {
+        if (vc3d::line_annotation::isAcceptedNativeTrace(
+                controls[owner].segmentToNext)) {
             spans.emplace_back(static_cast<int>(owner),
                                static_cast<int>(order[sortedIndex + 1]));
         }
@@ -1336,7 +1339,8 @@ generatedControlMarkers(
         marker.linePosition = control.linePosition;
         marker.controlIndex = i;
         marker.isSeed = control.isSeed;
-        marker.hasTracedSegmentToNext = control.segmentToNext.has_value();
+        marker.hasTracedSegmentToNext =
+            vc3d::line_annotation::isAcceptedNativeTrace(control.segmentToNext);
         if (auto it = branchesByControl.find(i); it != branchesByControl.end()) {
             std::sort(it->second.begin(),
                       it->second.end(),
@@ -7266,40 +7270,72 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
             request.config.traceToBaseScale = traceToBaseScale;
             request.config.baseVoxelSizeUm = baseVoxelSizeUm;
             const auto start = Clock::now();
-            const vc::fiber_tracer::FiberTraceSegmentResult traced =
-                vc::fiber_tracer::traceFiberSegment(
-                    *predictionField,
-                    request,
-                    traceNormalSampler.get(),
-                    [](const vc::fiber_tracer::FiberTraceProgress& progress) {
-                        if (progress.step == 0 ||
-                            !progress.reason.empty() ||
-                            (progress.step % 100) == 0) {
-                            Logger()->info("Native fiber trace: phase={} step={}/{} "
-                                           "plane_progress={:.3f} reason={}",
-                                           progress.phase,
-                                           progress.step,
-                                           progress.maxSteps,
-                                           progress.targetPlaneProgress,
-                                           progress.reason);
-                        }
-                    });
-            const double totalMs = elapsedMs(start, Clock::now());
-            if (!traced.accepted) {
-                task.ok = false;
-                std::ostringstream msg;
-                msg << "Native fiber trace rejected: reason=" << traced.reason
-                    << " max_endpoint_error_base_voxels="
-                    << traced.maxEndpointErrorBaseVoxels;
-                if (traced.maxEndpointErrorUm.has_value()) {
-                    msg << " max_endpoint_error_um=" << *traced.maxEndpointErrorUm;
-                }
-                task.error = msg.str();
-                return task;
+            std::optional<vc::fiber_tracer::FiberTraceSegmentResult> traced;
+            std::string traceException;
+            try {
+                traced = vc::fiber_tracer::traceFiberSegment(
+                        *predictionField,
+                        request,
+                        traceNormalSampler.get(),
+                        [](const vc::fiber_tracer::FiberTraceProgress& progress) {
+                            if (progress.step == 0 ||
+                                !progress.reason.empty() ||
+                                (progress.step % 100) == 0) {
+                                Logger()->info("Native fiber trace: phase={} step={}/{} "
+                                               "plane_progress={:.3f} reason={}",
+                                               progress.phase,
+                                               progress.step,
+                                               progress.maxSteps,
+                                               progress.targetPlaneProgress,
+                                               progress.reason);
+                            }
+                        });
+            } catch (const std::exception& ex) {
+                traceException = ex.what();
+            } catch (...) {
+                traceException = "unknown native fiber trace exception";
             }
-            if (traced.fusedLine.size() < 2) {
-                task.ok = false;
-                task.error = "Native fiber trace produced fewer than two fused points.";
+            const double totalMs = elapsedMs(start, Clock::now());
+            if (!traced || !traced->accepted || traced->fusedLine.size() < 2) {
+                task.result.line = LineAnnotationController::lineModelFromPoints(
+                    initialLinePoints, normalSampler.get());
+                task.result.report.totalMs = totalMs;
+                std::ostringstream msg;
+                if (traced) {
+                    msg << "native_fiber_trace3d_segment_fallback"
+                        << " reason=" << traced->reason;
+                    if (std::isfinite(traced->meetingErrorBaseVoxels)) {
+                        msg << " meeting_error_base_voxels="
+                            << traced->meetingErrorBaseVoxels
+                            << " meeting_error_ratio="
+                            << traced->meetingErrorRatio;
+                    }
+                    task.segmentMetadataUpdate = std::make_pair(
+                        segmentOwnerIndex,
+                        vc3d::line_annotation::fiberTraceSegmentMetadataForResult(
+                            normalManifestLocation,
+                            fiberManifestLocation,
+                            traceToBaseScale,
+                            request.config,
+                            *traced));
+                } else {
+                    msg << "native_fiber_trace3d_segment_fallback"
+                        << " reason=trace_exception detail=" << traceException;
+                    task.segmentMetadataUpdate = std::make_pair(
+                        segmentOwnerIndex,
+                        vc3d::line_annotation::fiberTraceSegmentMetadataForException(
+                            normalManifestLocation,
+                            fiberManifestLocation,
+                            traceToBaseScale,
+                            request.config,
+                            std::move(traceException)));
+                }
+                task.result.report.message = msg.str();
+                task.result.report.finalRms = traced &&
+                        std::isfinite(traced->meetingErrorBaseVoxels)
+                    ? traced->meetingErrorBaseVoxels
+                    : 0.0;
+                task.ok = true;
                 return task;
             }
 
@@ -7307,7 +7343,7 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
             const size_t right = std::max(startLineIndex, targetLineIndex);
             std::vector<cv::Vec3d> replacement =
                 coordinates.traceSegmentToBase(
-                    traced.fusedLine,
+                    traced->fusedLine,
                     initialLinePoints[startLineIndex],
                     initialLinePoints[targetLineIndex]);
             if (startLineIndex > targetLineIndex) {
@@ -7330,23 +7366,23 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
             task.result.report.totalMs = totalMs;
             std::ostringstream report;
             report << "native_fiber_trace3d_segment"
-                   << " max_endpoint_error_base_voxels="
-                   << traced.maxEndpointErrorBaseVoxels;
-            if (traced.maxEndpointErrorUm.has_value()) {
-                report << " max_endpoint_error_um=" << *traced.maxEndpointErrorUm;
+                   << " meeting_error_base_voxels="
+                   << traced->meetingErrorBaseVoxels
+                   << " meeting_error_ratio=" << traced->meetingErrorRatio
+                   << " meeting_source=" << traced->meetingSource;
+            if (traced->meetingErrorUm.has_value()) {
+                report << " meeting_error_um=" << *traced->meetingErrorUm;
             }
             task.result.report.message = report.str();
-            task.result.report.finalRms = traced.maxEndpointErrorBaseVoxels;
-            vc3d::line_annotation::FiberTraceSegmentMetadata metadata;
-            metadata.normalManifestLocation = normalManifestLocation;
-            metadata.fiberManifestLocation = fiberManifestLocation;
-            metadata.traceToBaseScale = traceToBaseScale;
-            metadata.config = request.config;
-            metadata.config.baseVoxelSizeUm.reset();
-            metadata.config.profile = nullptr;
-            metadata.maxEndpointErrorBaseVoxels = traced.maxEndpointErrorBaseVoxels;
-            task.segmentMetadataUpdate =
-                std::make_pair(segmentOwnerIndex, std::move(metadata));
+            task.result.report.finalRms = traced->meetingErrorBaseVoxels;
+            task.segmentMetadataUpdate = std::make_pair(
+                segmentOwnerIndex,
+                vc3d::line_annotation::fiberTraceSegmentMetadataForResult(
+                    normalManifestLocation,
+                    fiberManifestLocation,
+                    traceToBaseScale,
+                    request.config,
+                    *traced));
             task.ok = true;
         } catch (const std::exception& ex) {
             task.ok = false;
@@ -7394,7 +7430,8 @@ void LineAnnotationController::handleGeneratedFiberTraceSegmentRevert(
     const size_t targetIndex = ownerIndex == firstControlPointIndex
         ? secondControlPointIndex
         : firstControlPointIndex;
-    if (!session.controlPoints[ownerIndex].segmentToNext) {
+    if (!vc3d::line_annotation::isAcceptedNativeTrace(
+            session.controlPoints[ownerIndex].segmentToNext)) {
         showError(tr("The selected segment is not native-fiber traced."),
                   session.suppressErrorDialogs);
         return;
@@ -8052,9 +8089,7 @@ LineAnnotationController::generatedSpanAlignmentMetricsForSession(
     const LineAnnotationSession& session) const
 {
     std::vector<vc3d::line_annotation::GeneratedSpanAlignmentMetric> metrics;
-    if (session.fiberId == 0 ||
-        !session.fiberMetricsMatchStoredFiber ||
-        session.controlPoints.size() < 2) {
+    if (session.controlPoints.size() < 2) {
         return metrics;
     }
 
@@ -8095,11 +8130,31 @@ LineAnnotationController::generatedSpanAlignmentMetricsForSession(
             static_cast<int>(first.index),
             static_cast<int>(second.index),
             controls);
-        const auto alignment = cachedAlignmentForSpan(session.fiberId, spanIndex);
-        metric.available = alignment.available;
-        metric.pending = alignment.pending;
-        metric.maxErrorDegrees = alignment.maxErrorDegrees;
-        metric.error = alignment.error;
+        const auto& segment = session.controlPoints[first.index].segmentToNext;
+        if (segment) {
+            if (vc3d::line_annotation::isAcceptedNativeTrace(*segment)) {
+                metric.kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind::NativeMeetingError;
+            } else {
+                metric.kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind::NativeFailure;
+            }
+            if (segment->meetingErrorBaseVoxels) {
+                metric.meetingErrorBaseVoxels =
+                    *segment->meetingErrorBaseVoxels;
+            }
+            if (segment->meetingErrorRatio)
+                metric.meetingErrorRatio = *segment->meetingErrorRatio;
+            metric.meetingSource = segment->meetingSource;
+            metric.failureCode = segment->failureCode;
+            metric.failureDetail = segment->failureDetail;
+        } else if (session.fiberId != 0 &&
+                   session.fiberMetricsMatchStoredFiber) {
+            const auto alignment = cachedAlignmentForSpan(
+                session.fiberId, spanIndex);
+            metric.available = alignment.available;
+            metric.pending = alignment.pending;
+            metric.maxErrorDegrees = alignment.maxErrorDegrees;
+            metric.error = alignment.error;
+        }
         metrics.push_back(std::move(metric));
         ++spanIndex;
     }

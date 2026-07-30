@@ -1010,12 +1010,17 @@ def test_v2_control_point_objects_are_valid_and_preserved():
     doc['version'] = 2
     segment = {
         'optimizer': 'native_fiber_trace3d',
-        'metadata_version': 1,
-        'tracer_version': 1,
+        'metadata_version': 2,
+        'tracer_version': 2,
+        'outcome': 'accepted_native',
         'normal_manifest': '/data/normals.lasagna.json',
         'fiber_manifest': 's3://bucket/fibers.lasagna.json',
         'trace_to_base_scale': 4.0,
-        'max_endpoint_error_base_voxels': 2.0,
+        'meeting_error_base_voxels': 2.0,
+        'meeting_error_ratio': 0.02,
+        'meeting_source': 'forward_moving_plane',
+        'failure_code': '',
+        'failure_detail': '',
         'config': {
             'step_voxels': 4.0,
             'cone_angle_degrees': 25.0,
@@ -1032,7 +1037,7 @@ def test_v2_control_point_objects_are_valid_and_preserved():
             'cumulative_smoothness_tangent_weight': 2.0,
             'initial_free_angle_degrees': 0.0,
             'max_step_factor': 3.0,
-            'fusion_gap_factor': 2.0,
+            'meeting_accept_max_error_ratio': 0.1,
             'endpoint_accept_threshold_base_voxels': 20.0,
         },
     }
@@ -1044,6 +1049,19 @@ def test_v2_control_point_objects_are_valid_and_preserved():
     result = merge_fibers(doc, copy.deepcopy(doc), copy.deepcopy(doc))
     assert result['ok']
     assert result['merged']['control_points'][0]['segment_to_next'] == segment
+
+    fallback = copy.deepcopy(segment)
+    fallback.update({
+        'outcome': 'lasagna_fallback',
+        'meeting_error_base_voxels': None,
+        'meeting_error_ratio': None,
+        'meeting_source': '',
+        'failure_code': 'no_trace_plane_intersection',
+        'failure_detail': 'forward=max_step_factor',
+    })
+    fallback_doc = copy.deepcopy(doc)
+    fallback_doc['control_points'][0]['segment_to_next'] = fallback
+    assert fiber_merge.is_fiber_doc(fallback_doc)
 
     invalid = copy.deepcopy(doc)
     invalid['control_points'][-1]['segment_to_next'] = segment

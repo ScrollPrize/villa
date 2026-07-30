@@ -128,6 +128,12 @@ struct GeneratedOverlay {
 };
 
 struct GeneratedSpanAlignmentMetric {
+    enum class Kind {
+        LasagnaNormalAlignment,
+        NativeMeetingError,
+        NativeFailure,
+    };
+
     int spanIndex = 0;
     int firstControlIndex = 0;
     int secondControlIndex = 0;
@@ -137,6 +143,14 @@ struct GeneratedSpanAlignmentMetric {
     bool available = false;
     bool pending = false;
     std::string error;
+    Kind kind = Kind::LasagnaNormalAlignment;
+    double meetingErrorBaseVoxels =
+        std::numeric_limits<double>::quiet_NaN();
+    double meetingErrorRatio =
+        std::numeric_limits<double>::quiet_NaN();
+    std::string meetingSource;
+    std::string failureCode;
+    std::string failureDetail;
 };
 
 struct GeneratedViews {

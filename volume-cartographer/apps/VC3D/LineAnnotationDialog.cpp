@@ -161,6 +161,13 @@ bool finitePoint(const cv::Vec3f& point)
 bool shouldShowSpanAlignmentMetric(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
+    using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
+    if (metric.kind == Kind::NativeMeetingError) {
+        return std::isfinite(metric.meetingErrorBaseVoxels);
+    }
+    if (metric.kind == Kind::NativeFailure) {
+        return !metric.failureCode.empty();
+    }
     return metric.pending ||
            !metric.error.empty() ||
            (metric.available && std::isfinite(metric.maxErrorDegrees));
@@ -169,6 +176,11 @@ bool shouldShowSpanAlignmentMetric(
 bool shouldHighlightSpanAlignmentMetric(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
+    using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
+    if (metric.kind == Kind::NativeFailure)
+        return true;
+    if (metric.kind == Kind::NativeMeetingError)
+        return false;
     return metric.available &&
            std::isfinite(metric.maxErrorDegrees) &&
            metric.maxErrorDegrees > kSpanMetricHighlightThresholdDegrees;
@@ -177,6 +189,26 @@ bool shouldHighlightSpanAlignmentMetric(
 QString spanAlignmentMetricText(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
+    using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
+    if (metric.kind == Kind::NativeMeetingError) {
+        if (!std::isfinite(metric.meetingErrorBaseVoxels))
+            return {};
+        return QObject::tr("%1 vx").arg(
+            QString::number(metric.meetingErrorBaseVoxels, 'f', 1));
+    }
+    if (metric.kind == Kind::NativeFailure) {
+        if (metric.failureCode == "meeting_error_ratio")
+            return QObject::tr("fiber >10%");
+        if (metric.failureCode == "no_trace_plane_intersection")
+            return QObject::tr("fiber no meet");
+        if (metric.failureCode == "invalid_trace_path")
+            return QObject::tr("fiber invalid");
+        if (metric.failureCode == "fusion_failed")
+            return QObject::tr("fiber fusion fail");
+        if (metric.failureCode == "trace_exception")
+            return QObject::tr("fiber error");
+        return QString::fromStdString(metric.failureCode);
+    }
     if (metric.pending) {
         return QStringLiteral("...");
     }
@@ -194,6 +226,35 @@ QString spanAlignmentMetricText(
 QString spanAlignmentMetricToolTip(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
+    using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
+    if (metric.kind == Kind::NativeMeetingError) {
+        if (!std::isfinite(metric.meetingErrorBaseVoxels))
+            return {};
+        QString tooltip = QObject::tr("Trace meeting error: %1 base voxels")
+            .arg(QString::number(metric.meetingErrorBaseVoxels, 'f', 2));
+        if (std::isfinite(metric.meetingErrorRatio)) {
+            tooltip += QObject::tr(" (%1% of selected trace length)")
+                .arg(QString::number(metric.meetingErrorRatio * 100.0, 'f', 1));
+        }
+        if (!metric.meetingSource.empty()) {
+            tooltip += QObject::tr(". Source: %1")
+                .arg(QString::fromStdString(metric.meetingSource));
+        }
+        return tooltip;
+    }
+    if (metric.kind == Kind::NativeFailure) {
+        QString tooltip = QObject::tr("Native fiber trace failed: %1")
+            .arg(QString::fromStdString(metric.failureCode));
+        if (!metric.failureDetail.empty()) {
+            tooltip += QStringLiteral(". ") +
+                QString::fromStdString(metric.failureDetail);
+        }
+        if (std::isfinite(metric.meetingErrorBaseVoxels)) {
+            tooltip += QObject::tr(". Closest meeting: %1 base voxels")
+                .arg(QString::number(metric.meetingErrorBaseVoxels, 'f', 2));
+        }
+        return tooltip;
+    }
     if (metric.pending) {
         return QObject::tr("Sampling Lasagna normals.");
     }

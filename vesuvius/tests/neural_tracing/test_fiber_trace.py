@@ -123,12 +123,17 @@ def test_parse_vc3d_fiber_validates_and_preserves_xyz_order():
 def test_parse_vc3d_fiber_v2_segment_metadata():
     segment = {
         "optimizer": "native_fiber_trace3d",
-        "metadata_version": 1,
-        "tracer_version": 1,
+        "metadata_version": 2,
+        "tracer_version": 2,
+        "outcome": "accepted_native",
         "normal_manifest": "s3://bucket/normals.lasagna.json",
         "fiber_manifest": "s3://bucket/fibers.lasagna.json",
         "trace_to_base_scale": 4.0,
-        "max_endpoint_error_base_voxels": 2.5,
+        "meeting_error_base_voxels": 2.5,
+        "meeting_error_ratio": 0.025,
+        "meeting_source": "forward_moving_plane",
+        "failure_code": "",
+        "failure_detail": "",
         "config": {
             "step_voxels": 4.0,
             "cone_angle_degrees": 25.0,
@@ -145,7 +150,7 @@ def test_parse_vc3d_fiber_v2_segment_metadata():
             "cumulative_smoothness_tangent_weight": 2.0,
             "initial_free_angle_degrees": 0.0,
             "max_step_factor": 3.0,
-            "fusion_gap_factor": 2.0,
+            "meeting_accept_max_error_ratio": 0.1,
             "endpoint_accept_threshold_base_voxels": 20.0,
         },
     }
@@ -163,7 +168,34 @@ def test_parse_vc3d_fiber_v2_segment_metadata():
     np.testing.assert_array_equal(fiber.control_points_xyz[1], [4, 5, 6])
     assert fiber.control_point_segments[0] is not None
     assert fiber.control_point_segments[0].trace_to_base_scale == 4.0
+    assert fiber.control_point_segments[0].outcome == "accepted_native"
+    assert fiber.control_point_segments[0].meeting_error_base_voxels == 2.5
+    assert fiber.control_point_segments[0].meeting_error_ratio == 0.025
     assert fiber.control_point_segments[1] is None
+
+    fallback_segment = {
+        **segment,
+        "outcome": "lasagna_fallback",
+        "meeting_error_base_voxels": None,
+        "meeting_error_ratio": None,
+        "meeting_source": "",
+        "failure_code": "no_trace_plane_intersection",
+        "failure_detail": "forward=max_step_factor reverse=no_valid_candidates",
+    }
+    fallback_fiber = parse_vc3d_fiber(
+        {
+            "type": "vc3d_fiber",
+            "version": 2,
+            "line_points": [[1, 2, 3], [4, 5, 6]],
+            "control_points": [
+                {"position": [1, 2, 3], "segment_to_next": fallback_segment},
+                {"position": [4, 5, 6]},
+            ],
+        }
+    )
+    assert fallback_fiber.control_point_segments[0] is not None
+    assert fallback_fiber.control_point_segments[0].outcome == "lasagna_fallback"
+    assert fallback_fiber.control_point_segments[0].failure_code == "no_trace_plane_intersection"
 
     invalid = {
         "type": "vc3d_fiber",

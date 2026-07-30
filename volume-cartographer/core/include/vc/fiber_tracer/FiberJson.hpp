@@ -29,28 +29,65 @@ inline void requireExactKeys(const nlohmann::json& value, const std::unordered_s
 
 inline void validateSegmentMetadata(const nlohmann::json& value)
 {
-    requireExactKeys(
-        value,
-        {"optimizer",
-         "metadata_version",
-         "tracer_version",
-         "normal_manifest",
-         "fiber_manifest",
-         "trace_to_base_scale",
-         "max_endpoint_error_base_voxels",
-         "config"},
-        "segment_to_next");
-    if (value.at("optimizer").get<std::string>() != "native_fiber_trace3d" || value.at("metadata_version").get<int>() != 1 ||
-        value.at("tracer_version").get<int>() != 1) {
+    if (!value.is_object())
+        throw std::runtime_error("segment_to_next must be an object");
+    if (value.at("optimizer").get<std::string>() != "native_fiber_trace3d")
+        throw std::runtime_error("unsupported segment_to_next optimizer");
+    const int metadataVersion = value.at("metadata_version").get<int>();
+    const int tracerVersion = value.at("tracer_version").get<int>();
+    const bool previous = metadataVersion == 1 && tracerVersion == 1;
+    const bool current = metadataVersion == 2 && tracerVersion == 2;
+    if (!previous && !current) {
         throw std::runtime_error("unsupported segment_to_next optimizer or version");
     }
+    requireExactKeys(
+        value,
+        previous
+            ? std::unordered_set<std::string>{
+                  "optimizer", "metadata_version", "tracer_version",
+                  "normal_manifest", "fiber_manifest", "trace_to_base_scale",
+                  "max_endpoint_error_base_voxels", "config"}
+            : std::unordered_set<std::string>{
+                  "optimizer", "metadata_version", "tracer_version", "outcome",
+                  "normal_manifest", "fiber_manifest", "trace_to_base_scale",
+                  "meeting_error_base_voxels", "meeting_error_ratio",
+                  "meeting_source", "failure_code", "failure_detail", "config"},
+        "segment_to_next");
     if (value.at("normal_manifest").get<std::string>().empty() || value.at("fiber_manifest").get<std::string>().empty()) {
         throw std::runtime_error("segment_to_next manifest locations must not be empty");
     }
     const double scale = value.at("trace_to_base_scale").get<double>();
-    const double error = value.at("max_endpoint_error_base_voxels").get<double>();
-    if (!std::isfinite(scale) || scale <= 0.0 || !std::isfinite(error) || error < 0.0) {
-        throw std::runtime_error("segment_to_next scale/error values are invalid");
+    if (!std::isfinite(scale) || scale <= 0.0)
+        throw std::runtime_error("segment_to_next scale is invalid");
+    if (previous) {
+        const double error = value.at("max_endpoint_error_base_voxels").get<double>();
+        if (!std::isfinite(error) || error < 0.0)
+            throw std::runtime_error("segment_to_next endpoint error is invalid");
+    } else {
+        const std::string outcome = value.at("outcome").get<std::string>();
+        if (outcome != "accepted_native" && outcome != "lasagna_fallback")
+            throw std::runtime_error("segment_to_next outcome is invalid");
+        const bool haveError = !value.at("meeting_error_base_voxels").is_null();
+        const bool haveRatio = !value.at("meeting_error_ratio").is_null();
+        if (haveError != haveRatio)
+            throw std::runtime_error("segment_to_next meeting diagnostics are inconsistent");
+        if (haveError) {
+            const double error = value.at("meeting_error_base_voxels").get<double>();
+            const double ratio = value.at("meeting_error_ratio").get<double>();
+            if (!std::isfinite(error) || error < 0.0 ||
+                !std::isfinite(ratio) || ratio < 0.0 || ratio > 1.0) {
+                throw std::runtime_error("segment_to_next meeting diagnostics are invalid");
+            }
+        }
+        const std::string source = value.at("meeting_source").get<std::string>();
+        const std::string failure = value.at("failure_code").get<std::string>();
+        const std::string detail = value.at("failure_detail").get<std::string>();
+        if (outcome == "accepted_native" &&
+            (!haveError || source.empty() || !failure.empty() || !detail.empty())) {
+            throw std::runtime_error("accepted segment_to_next outcome is inconsistent");
+        }
+        if (outcome == "lasagna_fallback" && failure.empty())
+            throw std::runtime_error("fallback segment_to_next requires failure_code");
     }
     const auto& config = value.at("config");
     requireExactKeys(
@@ -70,13 +107,18 @@ inline void validateSegmentMetadata(const nlohmann::json& value)
          "cumulative_smoothness_tangent_weight",
          "initial_free_angle_degrees",
          "max_step_factor",
-         "fusion_gap_factor",
+         previous ? "fusion_gap_factor" : "meeting_accept_max_error_ratio",
          "endpoint_accept_threshold_base_voxels"},
         "segment_to_next config");
     for (const auto& [key, item] : config.items()) {
         if (!item.is_number() || !std::isfinite(item.get<double>())) {
             throw std::runtime_error("segment_to_next config field is invalid: " + key);
         }
+    }
+    if (!previous) {
+        const double ratio = config.at("meeting_accept_max_error_ratio").get<double>();
+        if (ratio < 0.0 || ratio > 1.0)
+            throw std::runtime_error("segment_to_next meeting ratio config is invalid");
     }
 }
 

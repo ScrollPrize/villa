@@ -1,5 +1,9 @@
 # 2026-07-30
 
+- Replaced VC3D's endpoint-only native CP-pair acceptance with symmetric
+  moving-plane trace intersection, 10%-of-traced-length acceptance, and
+  arc-length-warped fusion; persisted accepted/fallback outcomes now restore
+  meeting errors or stable failure labels after reload.
 - Hard-constrained every Lasagna fallback span and retained tail adjacent to
   native fiber geometry to continue the fitted dense native endpoint tangent,
   using fixed proxy points in the regular Ceres solve, independent of normals,
