@@ -63,6 +63,12 @@ public:
         uint64_t cornerLayoutChunkRuns = 0;
         uint64_t cornerBoundaryPoints = 0;
         uint64_t cornerDependencies = 0;
+        uint64_t cornerPointCount = 0;
+        uint64_t cornerUniqueVoxelCubes = 0;
+        uint64_t cornerWorkerTasks = 0;
+        uint64_t cornerMaxCandidatesPerCube = 0;
+        std::array<uint64_t, 65> cornerCubeOccupancyHistogram{};
+        std::vector<uint64_t> cornerDependencyIds;
     };
 
     // Queue chunk dependencies for pixels not already covered. The viewer can
@@ -149,7 +155,8 @@ public:
         const std::vector<cv::Vec3f>& levelCoords,
         void* visitorContext,
         TrilinearCornerPointVisitor visitor,
-        int parallelThreads = 0);
+        int parallelThreads = 0,
+        bool collectLocalityStats = false);
 
     // Fine-to-coarse fallback. Finer covered pixels are never overwritten by
     // coarser levels.

@@ -11,9 +11,11 @@
   reached-state ordering, spatial pruning semantics, corner order,
   interpolation, missing/error handling, and float math.
 - Reuse the exact approved representative command and existing remote cache.
-- Ask the user immediately before every representative benchmark invocation.
-  Builds, unit tests, and synthetic microbenchmarks do not authorize or imply a
-  representative workload run.
+- Before every representative benchmark, sample host CPU utilization and the
+  runnable queue. Run directly when the host is quiet; if a compile or other
+  significant CPU workload is active, wait for the user to confirm resources
+  are available. Builds, unit tests, and synthetic microbenchmarks do not imply
+  a representative workload run.
 
 ## Phase 1: Result-Neutral Measurement
 
@@ -27,8 +29,8 @@ Add low-overhead profile counters before choosing implementation details:
 4. Record dependency overlap between depth one and depth two, plus overlap with
    the following trace step.
 5. Keep instrumentation result-neutral and removable or profile-gated.
-6. Run focused tests, then request approval for one instrumented representative
-   benchmark. Use those measurements to order Phases 2-4.
+6. Run focused tests, apply the load gate, then run one instrumented
+   representative benchmark. Use those measurements to order Phases 2-4.
 
 ## Phase 2: Scheduling And Frontier Overhead
 
@@ -38,8 +40,8 @@ Test each change separately and retain only measured improvements:
    - Choose worker count from a minimum candidates-per-worker threshold instead
      of always using every available corner-batch worker.
    - Keep static point ranges and one callback per original candidate.
-   - Sweep a small set of thresholds with synthetic tests first; benchmark only
-     the best candidate after approval.
+   - Sweep a small set of thresholds with synthetic tests first; apply the load
+     gate before benchmarking only the best candidate.
 2. **Top-K parent selection**
    - Replace full parent sorting with deterministic partial selection for the
      configured cap.
@@ -52,8 +54,14 @@ Test each change separately and retain only measured improvements:
    - Compare original global indices for equal loss/depth ties.
    - Reconstruct selected states through the compact-to-parent mapping.
    - Keep the current full-index path for exhaustive mode if necessary.
+4. **Fused final-frontier construction**
+   - Build final frontier records in the existing parallel corner-score
+     callback instead of scanning every evaluated score in a serial follow-up
+     pass.
+   - Preserve compact task/score/frontier alignment and original global child
+     indices exactly.
 
-After each retained implementation, run focused tests and request approval
+After each retained implementation, run focused tests and apply the load gate
 before the unchanged representative benchmark.
 
 ## Phase 3: Spatial Sampling Locality
@@ -74,6 +82,10 @@ before the unchanged representative benchmark.
    chunk grids, missing chunks/fill values, malformed chunk extents, and
    multiple fractions sharing one cube.
 6. Require score and selected-trace parity before benchmarking.
+
+Measurements may justify unique-cube reuse before a separate spatial
+permutation. If corner records are already gathered once per unique cube,
+retain a permutation only if it produces an additional measured improvement.
 
 ## Phase 4: Persistent Two-Depth Sampling Session
 
@@ -122,7 +134,8 @@ Run only after result-neutral work is measured:
 
 ## Performance Protocol
 
-- Ask immediately before every representative benchmark invocation.
+- Apply the host-load gate immediately before every representative benchmark.
+  Run directly only when the host is quiet; otherwise wait for user clearance.
 - Use the exact existing command, fiber manifest, fiber JSON, normal manifest,
   and remote cache path. Do not substitute paths or add experimental flags;
   compile isolated defaults for trials when required.

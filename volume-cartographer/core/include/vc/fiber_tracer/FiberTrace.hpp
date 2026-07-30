@@ -33,6 +33,23 @@ struct FiberTraceProfile {
     size_t lookaheadEvaluatedChildCandidates = 0;
     std::vector<size_t> lookaheadParentCounts;
     std::vector<size_t> lookaheadRequiredParentCounts;
+    size_t candidateDepth1Batches = 0;
+    size_t candidateDepth2Batches = 0;
+    size_t candidateDepth1Points = 0;
+    size_t candidateDepth2Points = 0;
+    std::vector<size_t> candidateDepth1BatchSizes;
+    std::vector<size_t> candidateDepth2BatchSizes;
+    uint64_t cornerPointCount = 0;
+    uint64_t cornerUniqueVoxelCubes = 0;
+    uint64_t cornerWorkerTasks = 0;
+    uint64_t cornerMaxCandidatesPerCube = 0;
+    std::array<uint64_t, 65> cornerCubeOccupancyHistogram{};
+    uint64_t depthDependencyShared = 0;
+    uint64_t depthDependencyUnion = 0;
+    uint64_t stepDependencyShared = 0;
+    uint64_t stepDependencyUnion = 0;
+    std::vector<uint64_t> localityCurrentDepth1Dependencies;
+    std::vector<uint64_t> localityPreviousStepDependencies;
     double startSampleSeconds = 0.0;
     double taskBuildSeconds = 0.0;
     double predictionBatchSeconds = 0.0;
@@ -57,6 +74,10 @@ struct FiberTraceProfile {
     double frontierSeconds = 0.0;
     double pruneSeconds = 0.0;
     double lookaheadDecisionSeconds = 0.0;
+    double lookaheadParentOrderSeconds = 0.0;
+    double lookaheadFrontierStorageSeconds = 0.0;
+    size_t lookaheadFrontierAllocatedSlots = 0;
+    size_t lookaheadFrontierEvaluatedSlots = 0;
 };
 
 struct FiberTraceConfig {
@@ -276,6 +297,7 @@ public:
         int parallelThreads,
         void* visitorContext,
         vc::lasagna::LasagnaCornerPointVisitor visitor,
+        int lookaheadDepth,
         FiberTraceProfile* profile) const;
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
@@ -417,6 +439,10 @@ struct CandidateScoreDebug {
     const std::vector<double>& parentLowerBounds,
     std::optional<double> resultThreshold,
     bool finalBeamSetComplete);
+
+[[nodiscard]] std::vector<size_t> debugOrderedIndexPrefix(
+    const std::vector<double>& losses,
+    size_t limit);
 
 } // namespace testing
 #endif

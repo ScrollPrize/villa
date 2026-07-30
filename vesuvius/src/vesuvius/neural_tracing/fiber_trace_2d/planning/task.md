@@ -30,5 +30,7 @@ Investigate and test these proposals independently:
 9. Test adaptive cap escalation only after the fixed and result-neutral options:
    begin with a smaller cap and retry uncertain or failed work at cap 32/64.
 
-Ask for explicit user approval immediately before every representative
-benchmark invocation. Reuse the exact approved command and cache path.
+Before every representative benchmark, sample host load. Run directly when the
+host is quiet; if significant competing CPU work is active, wait for the user
+to confirm resources are available. Reuse the exact approved command and cache
+path.

@@ -383,6 +383,7 @@ TEST_CASE("ChunkedPlaneSampler corner visitor preserves grouped corner semantics
     std::vector<vc::render::IChunkedArray*> arrays{&coarseChunks, &fineChunks};
     const std::vector<cv::Vec3f> points{
         {0.25f, 0.5f, 0.75f},
+        {0.75f, 0.25f, 0.5f},
         {-1.0f, 0.0f, 0.0f},
     };
     struct VisitorOutput {
@@ -419,11 +420,11 @@ TEST_CASE("ChunkedPlaneSampler corner visitor preserves grouped corner semantics
 
     const auto stats =
         vc::render::ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
-            arrays, 0, points, &output, visitor, 2);
+            arrays, 0, points, &output, visitor, 2, true);
 
-    CHECK(output.visits == std::vector<int>{1, 1});
-    CHECK(output.valid == std::vector<uint8_t>{1, 0});
-    CHECK(output.cornerVolumes == std::vector<size_t>{2, 0});
+    CHECK(output.visits == std::vector<int>{1, 1, 1});
+    CHECK(output.valid == std::vector<uint8_t>{1, 1, 0});
+    CHECK(output.cornerVolumes == std::vector<size_t>{2, 2, 0});
     CHECK(output.fractions[0][0] == doctest::Approx(0.25f));
     CHECK(output.fractions[0][1] == doctest::Approx(0.5f));
     CHECK(output.fractions[0][2] == doctest::Approx(0.75f));
@@ -436,6 +437,12 @@ TEST_CASE("ChunkedPlaneSampler corner visitor preserves grouped corner semantics
         output.values[1][0].end(),
         [](uint8_t value) { return value == 93; }));
     CHECK(stats.requestedChunks == 2);
+    CHECK(stats.cornerPointCount == 2);
+    CHECK(stats.cornerUniqueVoxelCubes == 1);
+    CHECK(stats.cornerMaxCandidatesPerCube == 2);
+    CHECK(stats.cornerCubeOccupancyHistogram[2] == 1);
+    CHECK(stats.cornerWorkerTasks > 0);
+    CHECK(!stats.cornerDependencyIds.empty());
 }
 
 TEST_CASE("ChunkedPlaneSampler can use fallback without queueing or promoting it")

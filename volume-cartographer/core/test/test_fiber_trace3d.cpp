@@ -725,6 +725,16 @@ TEST_CASE("native fiber tracer exact lookahead bound is conservative without a f
               parentBounds, 0.2, false) == parentBounds.size());
 }
 
+TEST_CASE("native fiber tracer capped parent order matches a full deterministic sort")
+{
+    const std::vector<double> losses{3.0, 1.0, 2.0, 1.0, 0.5, 2.0};
+    CHECK(vc::fiber_tracer::testing::debugOrderedIndexPrefix(losses, 3) ==
+          std::vector<size_t>{4, 1, 3});
+    CHECK(vc::fiber_tracer::testing::debugOrderedIndexPrefix(losses, losses.size()) ==
+          std::vector<size_t>{4, 1, 3, 2, 5, 0});
+    CHECK(vc::fiber_tracer::testing::debugOrderedIndexPrefix(losses, 0).empty());
+}
+
 TEST_CASE("native fiber tracer exact lazy lookahead matches exhaustive search")
 {
     StraightPrediction predictions;

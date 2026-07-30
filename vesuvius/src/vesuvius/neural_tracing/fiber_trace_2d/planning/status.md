@@ -5,13 +5,13 @@
 - [x] Capture the retained 1.869s / 7-restart baseline
 - [x] Write implementation, testing, benchmark, spec, and docs plan
 - [x] Review plan directly against current specs and architecture
-- [ ] Add result-neutral locality and scheduling instrumentation
-- [ ] Request approval and benchmark instrumentation
-- [ ] Test worker granularity
-- [ ] Test deterministic top-K parent selection
-- [ ] Test compact capped-frontier storage
+- [x] Add result-neutral locality and scheduling instrumentation
+- [x] Request approval and benchmark instrumentation
+- [x] Test worker granularity
+- [x] Test deterministic top-K parent selection
+- [x] Test compact capped-frontier storage
 - [ ] Test spatial chunk/cube ordering
-- [ ] Test unique voxel-cube corner reuse if measurements support it
+- [x] Test unique voxel-cube corner reuse if measurements support it
 - [ ] Test persistent two-depth sampling session
 - [ ] Test bounded envelope prefetch and rolling pins if measurements support them
 - [ ] Test fixed caps 28, 24, and 20 after result-neutral work
@@ -20,5 +20,6 @@
 - [ ] Run final focused tests and consistency review
 - [ ] Request approval and run retained-final benchmark repetitions
 
-Representative benchmarks always require explicit user approval immediately
-before invocation and must reuse the exact approved command and cache path.
+Representative benchmarks use the unchanged approved command and cache path.
+Run them directly only after a short load gate shows the host is quiet;
+otherwise wait for explicit user confirmation that resources are available.

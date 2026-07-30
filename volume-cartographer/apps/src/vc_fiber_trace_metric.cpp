@@ -102,6 +102,26 @@ size_t percentileCount(const std::vector<size_t>& values, double quantile)
     return sorted[index];
 }
 
+size_t histogramPercentile(
+    const std::array<uint64_t, 65>& histogram,
+    double quantile)
+{
+    uint64_t total = 0;
+    for (const uint64_t count : histogram)
+        total += count;
+    if (total == 0)
+        return 0;
+    const uint64_t target = std::max<uint64_t>(
+        1, static_cast<uint64_t>(std::ceil(quantile * total)));
+    uint64_t cumulative = 0;
+    for (size_t index = 0; index < histogram.size(); ++index) {
+        cumulative += histogram[index];
+        if (cumulative >= target)
+            return index;
+    }
+    return histogram.size() - 1;
+}
+
 std::string requireValue(int& index, int argc, char** argv, const std::string& name)
 {
     if (index + 1 >= argc) {
@@ -495,6 +515,42 @@ int main(int argc, char** argv)
                   << profile.lookaheadRequiredChildCandidates
                   << " lookahead_evaluated_children="
                   << profile.lookaheadEvaluatedChildCandidates
+                  << " depth1_batches=" << profile.candidateDepth1Batches
+                  << " depth1_points=" << profile.candidateDepth1Points
+                  << " depth1_batch_p50="
+                  << percentileCount(profile.candidateDepth1BatchSizes, 0.50)
+                  << " depth1_batch_p95="
+                  << percentileCount(profile.candidateDepth1BatchSizes, 0.95)
+                  << " depth2_batches=" << profile.candidateDepth2Batches
+                  << " depth2_points=" << profile.candidateDepth2Points
+                  << " depth2_batch_p50="
+                  << percentileCount(profile.candidateDepth2BatchSizes, 0.50)
+                  << " depth2_batch_p95="
+                  << percentileCount(profile.candidateDepth2BatchSizes, 0.95)
+                  << " corner_points=" << profile.cornerPointCount
+                  << " corner_unique_cubes=" << profile.cornerUniqueVoxelCubes
+                  << " corner_points_per_cube="
+                  << (profile.cornerUniqueVoxelCubes > 0
+                          ? static_cast<double>(profile.cornerPointCount) /
+                                static_cast<double>(profile.cornerUniqueVoxelCubes)
+                          : 0.0)
+                  << " corner_cube_reuse_p50="
+                  << histogramPercentile(profile.cornerCubeOccupancyHistogram, 0.50)
+                  << " corner_cube_reuse_p95="
+                  << histogramPercentile(profile.cornerCubeOccupancyHistogram, 0.95)
+                  << " corner_cube_reuse_max="
+                  << profile.cornerMaxCandidatesPerCube
+                  << " corner_worker_tasks=" << profile.cornerWorkerTasks
+                  << " depth_dependency_overlap="
+                  << (profile.depthDependencyUnion > 0
+                          ? static_cast<double>(profile.depthDependencyShared) /
+                                static_cast<double>(profile.depthDependencyUnion)
+                          : 0.0)
+                  << " step_dependency_overlap="
+                  << (profile.stepDependencyUnion > 0
+                          ? static_cast<double>(profile.stepDependencyShared) /
+                                static_cast<double>(profile.stepDependencyUnion)
+                          : 0.0)
                   << " start_sample_s=" << profile.startSampleSeconds
                   << " task_build_s=" << profile.taskBuildSeconds
                   << " prediction_batch_s=" << profile.predictionBatchSeconds
@@ -526,6 +582,14 @@ int main(int argc, char** argv)
                   << " frontier_s=" << profile.frontierSeconds
                   << " prune_s=" << profile.pruneSeconds
                   << " lookahead_decision_s=" << profile.lookaheadDecisionSeconds
+                  << " lookahead_parent_order_s="
+                  << profile.lookaheadParentOrderSeconds
+                  << " lookahead_frontier_storage_s="
+                  << profile.lookaheadFrontierStorageSeconds
+                  << " lookahead_frontier_allocated_slots="
+                  << profile.lookaheadFrontierAllocatedSlots
+                  << " lookahead_frontier_evaluated_slots="
+                  << profile.lookaheadFrontierEvaluatedSlots
                   << '\n';
         return 0;
     } catch (const std::exception& exc) {

@@ -655,7 +655,8 @@ NormalPrefetchReport visitLasagnaChannelCorners(
     const std::vector<cv::Vec3f>& volumePoints,
     void* visitorContext,
     LasagnaCornerPointVisitor visitor,
-    int parallelThreads)
+    int parallelThreads,
+    bool collectLocalityStats)
 {
     if (samplers.empty() || volumePoints.empty())
         return {};
@@ -687,7 +688,8 @@ NormalPrefetchReport visitLasagnaChannelCorners(
             levelCoords,
             visitorContext,
             visitor,
-            parallelThreads);
+            parallelThreads,
+            collectLocalityStats);
     return {
         static_cast<uint64_t>(stats.requestedChunks),
         static_cast<uint64_t>(stats.requestedChunks),
@@ -697,7 +699,13 @@ NormalPrefetchReport visitLasagnaChannelCorners(
         stats.cornerGatherSeconds,
         stats.cornerLayoutChunkRuns,
         stats.cornerBoundaryPoints,
-        stats.cornerDependencies};
+        stats.cornerDependencies,
+        stats.cornerPointCount,
+        stats.cornerUniqueVoxelCubes,
+        stats.cornerWorkerTasks,
+        stats.cornerMaxCandidatesPerCube,
+        stats.cornerCubeOccupancyHistogram,
+        stats.cornerDependencyIds};
 }
 
 NormalPrefetchReport sampleLasagnaChannelCornerBatch(

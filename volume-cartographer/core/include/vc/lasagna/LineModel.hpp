@@ -2,6 +2,7 @@
 
 #include <opencv2/core/types.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,12 @@ struct NormalPrefetchReport {
     uint64_t cornerLayoutChunkRuns = 0;
     uint64_t cornerBoundaryPoints = 0;
     uint64_t cornerDependencies = 0;
+    uint64_t cornerPointCount = 0;
+    uint64_t cornerUniqueVoxelCubes = 0;
+    uint64_t cornerWorkerTasks = 0;
+    uint64_t cornerMaxCandidatesPerCube = 0;
+    std::array<uint64_t, 65> cornerCubeOccupancyHistogram{};
+    std::vector<uint64_t> cornerDependencyIds;
 };
 
 struct NormalBatchReport {

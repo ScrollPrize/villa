@@ -216,7 +216,8 @@ private:
         const std::vector<cv::Vec3f>& volumePoints,
         void* visitorContext,
         LasagnaCornerPointVisitor visitor,
-        int parallelThreads);
+        int parallelThreads,
+        bool collectLocalityStats);
 
     class Impl;
     std::unique_ptr<Impl> impl_;
@@ -239,7 +240,8 @@ private:
     const std::vector<cv::Vec3f>& volumePoints,
     void* visitorContext,
     LasagnaCornerPointVisitor visitor,
-    int parallelThreads = 0);
+    int parallelThreads = 0,
+    bool collectLocalityStats = false);
 
 [[nodiscard]] size_t lasagnaReadWorkersPerChannel();
 [[nodiscard]] std::shared_ptr<LasagnaChannelChunkCache>
