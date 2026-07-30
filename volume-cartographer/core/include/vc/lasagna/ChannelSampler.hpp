@@ -49,7 +49,6 @@ struct LasagnaChannelBinding {
     size_t channelIndex = 0;
     std::filesystem::path path;
     std::shared_ptr<utils::ZarrArray> array;
-    bool hasChannelDimension = false;
     std::array<size_t, 3> shapeZYX{0, 0, 0};
     std::array<size_t, 3> chunksZYX{0, 0, 0};
     double spacing = 1.0;

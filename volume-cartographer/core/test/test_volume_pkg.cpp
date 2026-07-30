@@ -6,6 +6,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Volume.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -579,6 +580,187 @@ TEST_CASE("VolumePkg persists manifest-backed Lasagna entries independently of n
     REQUIRE(loaded->lasagnaDatasetEntries().size() == 1);
     CHECK(loaded->lasagnaDatasetEntries().front().location == lasagna);
     CHECK(loaded->normalGridEntries().empty());
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one canonical array")
+{
+    auto d = tmpDir("canonical_lasagna_roles");
+    const auto project = d / "project.json";
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->addLasagnaDatasetEntry("regular.lasagna.json", {"user-tag"}));
+    REQUIRE(pkg->addFiberInferenceDatasetEntry("fiber.lasagna.json", {"model:v1"}));
+    pkg->setSelectedLasagnaDataset("regular.lasagna.json");
+    pkg->setSelectedFiberInferenceDataset("fiber.lasagna.json");
+    pkg->save(project);
+
+    const auto json = utils::Json::parse_file(project);
+    REQUIRE(json.contains("lasagna_datasets"));
+    CHECK_FALSE(json.contains("fiber_inference_datasets"));
+    REQUIRE(json.at("lasagna_datasets").size() == 2);
+
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    const auto loaded = VolumePkg::load(project, options);
+    REQUIRE(loaded->lasagnaDatasetEntries().size() == 1);
+    REQUIRE(loaded->fiberInferenceDatasetEntries().size() == 1);
+    CHECK(loaded->fiberInferenceDatasetEntries().front().location == "fiber.lasagna.json");
+    CHECK(vc::project::isFiberLasagnaEntry(loaded->fiberInferenceDatasetEntries().front()));
+    CHECK(loaded->selectedLasagnaDataset() == "regular.lasagna.json");
+    CHECK(loaded->selectedFiberInferenceDataset() == "fiber.lasagna.json");
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg migrates the legacy fiber inference array without losing tags")
+{
+    auto d = tmpDir("legacy_fiber_lasagna");
+    const auto project = d / "project.json";
+    {
+        std::ofstream out(project);
+        out << R"({
+          "name":"legacy",
+          "version":1,
+          "lasagna_datasets":[
+            {"location":"shared.lasagna.json","tags":["canonical-tag"]}
+          ],
+          "fiber_inference_datasets":[
+            {"location":"shared.lasagna.json","tags":["legacy-tag"]},
+            {"location":"fiber.lasagna.json","tags":[]}
+          ],
+          "selected_fiber_inference_dataset":"fiber.lasagna.json"
+        })";
+    }
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    const auto loaded = VolumePkg::load(project, options);
+    REQUIRE(loaded->fiberInferenceDatasetEntries().size() == 2);
+    REQUIRE(loaded->allLasagnaDatasetEntries().size() == 2);
+    const auto& shared = loaded->allLasagnaDatasetEntries().front();
+    CHECK(std::find(shared.tags.begin(), shared.tags.end(), "canonical-tag") != shared.tags.end());
+    CHECK(std::find(shared.tags.begin(), shared.tags.end(), "legacy-tag") != shared.tags.end());
+    CHECK(vc::project::isFiberLasagnaEntry(shared));
+
+    loaded->save(project);
+    const auto saved = utils::Json::parse_file(project);
+    CHECK_FALSE(saved.contains("fiber_inference_datasets"));
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg atomically attaches and detaches a Lasagna manifest with derived volumes")
+{
+    auto d = tmpDir("lasagna_batch_attach");
+    Volume::ZarrCreateOptions create;
+    create.shapeZYX = {2, 2, 2};
+    create.chunkShapeZYX = {2, 2, 2};
+    create.numLevels = 1;
+    create.uuid = "lasagna-view";
+    create.name = "presence";
+    create.compressor.clear();
+    auto volume = Volume::New(d / "backing.zarr", create);
+
+    VolumePkg::PreparedVolumeAttachment derived{
+        "lasagna-derived://abc",
+        {"vc-lasagna-derived", "vc-lasagna-manifest:manifest-1", "vc-lasagna-group:pred", "vc-lasagna-channel:presence"},
+        volume,
+    };
+    auto pkg = VolumePkg::newEmpty();
+    CHECK(pkg->attachPreparedLasagnaDataset("fiber.lasagna.json", {"user-tag"}, true, {derived}) == VolumePkg::AttachLasagnaResult::Attached);
+    REQUIRE(pkg->fiberInferenceDatasetEntries().size() == 1);
+    REQUIRE(pkg->volumeEntries().size() == 1);
+    CHECK(pkg->hasVolume("lasagna-view"));
+    CHECK(pkg->selectedFiberInferenceDataset() == "fiber.lasagna.json");
+    CHECK(
+        std::find(
+            pkg->allLasagnaDatasetEntries().front().tags.begin(),
+            pkg->allLasagnaDatasetEntries().front().tags.end(),
+            "vc-lasagna-manifest:manifest-1") != pkg->allLasagnaDatasetEntries().front().tags.end());
+
+    CHECK(pkg->removeEntry("fiber.lasagna.json"));
+    CHECK(pkg->allLasagnaDatasetEntries().empty());
+    CHECK(pkg->volumeEntries().empty());
+    CHECK_FALSE(pkg->hasVolume("lasagna-view"));
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg Lasagna reattachment reconciles roles tags and removed channels")
+{
+    auto d = tmpDir("lasagna_batch_reconcile");
+    Volume::ZarrCreateOptions create;
+    create.shapeZYX = {2, 2, 2};
+    create.chunkShapeZYX = {2, 2, 2};
+    create.numLevels = 1;
+    create.uuid = "old-channel";
+    create.name = "old";
+    create.compressor.clear();
+    auto oldVolume = Volume::New(d / "old.zarr", create);
+    create.uuid = "new-channel";
+    create.name = "new";
+    auto newVolume = Volume::New(d / "new.zarr", create);
+
+    const std::vector<VolumePkg::PreparedVolumeAttachment> oldAttachments{{
+        "lasagna-derived://old",
+        {"vc-lasagna-derived", "vc-lasagna-manifest:manifest-1", "vc-lasagna-channel:old"},
+        oldVolume,
+    }};
+    const std::vector<VolumePkg::PreparedVolumeAttachment> newAttachments{{
+        "lasagna-derived://new",
+        {"vc-lasagna-derived", "vc-lasagna-manifest:manifest-1", "vc-lasagna-channel:new"},
+        newVolume,
+    }};
+
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:old"}, true, oldAttachments) == VolumePkg::AttachLasagnaResult::Attached);
+    REQUIRE(
+        pkg->attachPreparedLasagnaDataset("data.lasagna.json", {"model:new"}, false, newAttachments, {}, true, true, {"model:"}) ==
+        VolumePkg::AttachLasagnaResult::Attached);
+
+    REQUIRE(pkg->lasagnaDatasetEntries().size() == 1);
+    CHECK(pkg->fiberInferenceDatasetEntries().empty());
+    CHECK(pkg->selectedLasagnaDataset() == "data.lasagna.json");
+    CHECK(pkg->selectedFiberInferenceDataset().empty());
+    const auto& manifestTags = pkg->allLasagnaDatasetEntries().front().tags;
+    CHECK(std::find(manifestTags.begin(), manifestTags.end(), "model:old") == manifestTags.end());
+    CHECK(std::find(manifestTags.begin(), manifestTags.end(), "model:new") != manifestTags.end());
+    REQUIRE(pkg->volumeEntries().size() == 1);
+    CHECK(pkg->volumeEntries().front().location == "lasagna-derived://new");
+    CHECK_FALSE(pkg->hasVolume("old-channel"));
+    CHECK(pkg->hasVolume("new-channel"));
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg detach preserves a derived volume owned by another manifest")
+{
+    auto d = tmpDir("lasagna_shared_ownership");
+    Volume::ZarrCreateOptions create;
+    create.shapeZYX = {2, 2, 2};
+    create.chunkShapeZYX = {2, 2, 2};
+    create.numLevels = 1;
+    create.uuid = "shared-lasagna-view";
+    create.name = "shared";
+    create.compressor.clear();
+    auto volume = Volume::New(d / "shared.zarr", create);
+
+    const VolumePkg::PreparedVolumeAttachment first{
+        "lasagna-derived://shared",
+        {"vc-lasagna-derived", "vc-lasagna-manifest:first", "vc-lasagna-channel:presence"},
+        volume,
+    };
+    const VolumePkg::PreparedVolumeAttachment second{
+        "lasagna-derived://shared",
+        {"vc-lasagna-derived", "vc-lasagna-manifest:second", "vc-lasagna-channel:presence"},
+        volume,
+    };
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->attachPreparedLasagnaDataset("first.lasagna.json", {}, false, {first}) == VolumePkg::AttachLasagnaResult::Attached);
+    REQUIRE(pkg->attachPreparedLasagnaDataset("second.lasagna.json", {}, false, {second}) == VolumePkg::AttachLasagnaResult::Attached);
+
+    REQUIRE(pkg->removeEntry("first.lasagna.json"));
+    REQUIRE(pkg->volumeEntries().size() == 1);
+    CHECK(pkg->hasVolume("shared-lasagna-view"));
+    CHECK(std::find(pkg->volumeEntries().front().tags.begin(), pkg->volumeEntries().front().tags.end(), "vc-lasagna-manifest:first") ==
+          pkg->volumeEntries().front().tags.end());
+    CHECK(std::find(pkg->volumeEntries().front().tags.begin(), pkg->volumeEntries().front().tags.end(), "vc-lasagna-manifest:second") !=
+          pkg->volumeEntries().front().tags.end());
     fs::remove_all(d);
 }
 

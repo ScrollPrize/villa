@@ -957,9 +957,13 @@
 - VC3D native GUI fiber tracing is a segment-local port of the 3D Trace2CP
   behavior. It consumes a precomputed fiber inference `.lasagna.json` dataset
   from the project and never runs PyTorch/model inference inside VC3D.
-- VC3D projects store fiber inference dataset entries independently from
-  normal Lasagna datasets, using the same project-entry pattern and the
-  selected-dataset field `selected_fiber_inference_dataset`. A native GUI trace
+- VC3D projects store normal and fiber inference manifests in the canonical
+  `lasagna_datasets` collection. The reserved `vc-lasagna-fiber` entry tag
+  identifies fiber inference data; an entry without that tag is regular
+  Lasagna data. `selected_lasagna_dataset` and
+  `selected_fiber_inference_dataset` select the two roles independently. The
+  old `fiber_inference_datasets` project field is accepted on read, migrated
+  into tagged canonical entries, and is not written. A native GUI trace
   requires both a normal Lasagna dataset for geometry normals and a selected
   fiber inference dataset for persisted `presence`/`nx`/`ny` prediction fields.
 - Native GUI fiber prediction must decode persisted fiber inference channels
@@ -1028,12 +1032,22 @@
   local manifests with an adjacent `lasagna-remote.json` read-through marker,
   and direct remote `s3://`, `s3+REGION://`, `http://`, or `https://`
   manifests when the caller supplies an explicit remote cache root. Direct
-  remote manifest JSON is fetched transiently for the current run and is not
-  durable cache state; only referenced Zarr objects are persisted. Remote
+  remote manifest JSON is materialized through the shared exact-byte remote
+  file cache and reused across runs. The CLI and VC3D therefore share durable
+  manifest and referenced-Zarr caching. Remote
   manifest fetch failures must include the original location, redacted resolved
   request URL, HTTP status or no-response marker, response metadata and body
   excerpt when available, plus S3 region and credential-loaded status for S3
   requests.
+- The shared remote-file cache stores one arbitrary file/object per request. It
+  supports HTTP, HTTPS, S3, and region-qualified S3 transports plus a custom
+  fetch-to-file callback. Cache-first and explicit refresh policies validate a
+  collision-free normalized source identity, byte size, and accounting class
+  from a sidecar. Publication is atomic, concurrent in-process fetches are
+  coalesced, failed refresh preserves the previous entry, and diagnostics must
+  redact URL queries. Managed payloads participate in the persistent cache
+  budget; unmanaged control files such as Lasagna manifests do not. Recursive
+  remote-directory caching and automatic TTL/ETag refresh are not implied.
 - Lasagna manifest group `zarr` paths are location strings. Relative paths
   resolve against the containing manifest location: the parent directory for
   local manifests or the parent URL for direct remote manifests. Absolute local
@@ -1042,6 +1056,17 @@
   independent remote read-through Zarr roots. Relative remote-backed group
   paths that escape their manifest/artifact parent are rejected; absolute paths
   are explicit and are not rewritten.
+- Attaching either a local or remote Lasagna manifest to a VC3D project also
+  attaches every referenced group/channel as a flat ordinary 3D project
+  volume. Every group must name exactly one channel and reference an actual ZYX
+  array. Flat channel-first CZYX arrays are older Lasagna preprocessing/fit
+  intermediates and must be converted to per-channel 3D OME-Zarr before VC3D
+  attachment. Generic `Volume`, remote-volume loading, project storage, and
+  VC3D remain strictly 3D. Stable manifest/group/channel provenance
+  tags drive deduplication, reload reconciliation, role changes, and detach
+  cleanup. Manifest entry, derived volume entries, and selected-role updates
+  are committed together or rolled back together; detaching removes a derived
+  volume only when no remaining manifest owns it.
 - `vc_fiber_trace_metric` exposes `--remote-cache-dir PATH` and opens both the
   fiber inference manifest and `--normal-manifest` through the shared
   location-aware Lasagna opener. If either manifest argument is remote and no

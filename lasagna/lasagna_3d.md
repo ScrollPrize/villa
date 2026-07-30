@@ -305,12 +305,17 @@ Two mask types (not needed for initial 3D model, but noted for completeness):
 
 ## Preprocessing (3D adaptation)
 
-### Current 2D pipeline
+### Older flat preprocessing pipeline
 1. Run UNet on z-slices → `(cos, grad_mag, dir0_z, dir1_z, valid)` per slice.
 2. Optionally run on y-slices and x-slices → `(dir0_y, dir1_y)` and `(dir0_x, dir1_x)`.
 3. Gaussian pyramid downscale by `scaledown` factor.
 4. Blur grad_mag and dir channels.
-5. Store as uint8 zarr with CZYX layout.
+5. Store an intermediate uint8 zarr with CZYX layout.
+
+The flat CZYX result belongs to the older preprocessing and Python fitting
+workflow. Current inference manifests, including Fiber 3D inference, expose
+each channel as a separate 3D ZYX OME-Zarr volume. VC3D consumes only that
+per-channel 3D representation; a flat intermediate must be converted first.
 
 ### 3D model preprocessing
 - **Uniform scaledown**: apply `scaledown` in all three dimensions (z included), so 1 model voxel = scaledown fullres voxels in every direction.

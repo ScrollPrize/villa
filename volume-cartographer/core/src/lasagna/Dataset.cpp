@@ -2,6 +2,7 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
+#include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "utils/http_fetch.hpp"
 #include "utils/zarr.hpp"
@@ -57,160 +58,25 @@ namespace {
     return std::filesystem::path(value).is_absolute();
 }
 
-[[nodiscard]] std::string trimRemotePathTrailingSlashes(std::string url)
-{
-    const auto query = url.find('?');
-    const auto pathEnd = query == std::string::npos ? url.size() : query;
-    auto trimmedEnd = pathEnd;
-    while (trimmedEnd > 0 && url[trimmedEnd - 1] == '/') {
-        --trimmedEnd;
-    }
-    if (trimmedEnd != pathEnd)
-        url.erase(trimmedEnd, pathEnd - trimmedEnd);
-    return url;
-}
-
 [[nodiscard]] vc::ResolvedUrl resolveRemoteEndpoint(const std::string& location)
 {
     auto resolved = vc::resolveRemoteUrl(location);
-    resolved.httpsUrl = trimRemotePathTrailingSlashes(std::move(resolved.httpsUrl));
+    resolved.httpsUrl = vc::core::util::normalizeRemoteFileLocation(location);
     return resolved;
 }
 
-struct RemoteClientDetails {
+[[nodiscard]] utils::HttpClient makeRemoteClient(const vc::ResolvedUrl& endpoint, const vc::HttpAuth& explicitAuth)
+{
     utils::HttpClient::Config config;
-    bool isS3 = false;
-    bool awsCredentialsLoaded = false;
-    std::string awsRegion;
-};
-
-[[nodiscard]] RemoteClientDetails makeRemoteClientDetails(const vc::ResolvedUrl& endpoint)
-{
-    RemoteClientDetails details;
-    details.config.transfer_timeout = std::chrono::seconds{60};
+    config.transfer_timeout = std::chrono::seconds{60};
+    config.aws_auth = explicitAuth;
     if (endpoint.useAwsSigv4) {
-        details.isS3 = true;
-        details.config.aws_auth = utils::AwsAuth::load();
+        if (config.aws_auth.empty())
+            config.aws_auth = utils::AwsAuth::load();
         if (!endpoint.awsRegion.empty())
-            details.config.aws_auth.region = endpoint.awsRegion;
-        details.awsCredentialsLoaded = !details.config.aws_auth.empty();
-        details.awsRegion = details.config.aws_auth.region;
+            config.aws_auth.region = endpoint.awsRegion;
     }
-    return details;
-}
-
-[[nodiscard]] utils::HttpClient makeRemoteClient(const vc::ResolvedUrl& endpoint)
-{
-    auto details = makeRemoteClientDetails(endpoint);
-    return utils::HttpClient(std::move(details.config));
-}
-
-[[nodiscard]] std::string redactedUrlForDiagnostics(const std::string& url)
-{
-    const auto query = url.find('?');
-    if (query == std::string::npos)
-        return url;
-    return url.substr(0, query) + "?<redacted>";
-}
-
-[[nodiscard]] std::string escapedDiagnosticString(std::string_view value)
-{
-    std::string out;
-    out.reserve(value.size());
-    for (const char ch : value) {
-        if (ch == '\\' || ch == '"')
-            out.push_back('\\');
-        out.push_back(ch);
-    }
-    return out;
-}
-
-[[nodiscard]] std::string compactBodyExcerpt(std::string_view body)
-{
-    constexpr size_t kMaxExcerptBytes = 1024;
-    const size_t take = std::min(body.size(), kMaxExcerptBytes);
-    std::string out;
-    out.reserve(take);
-    bool previousWhitespace = false;
-    for (size_t index = 0; index < take; ++index) {
-        const unsigned char ch = static_cast<unsigned char>(body[index]);
-        if (std::isspace(ch)) {
-            if (!previousWhitespace && !out.empty()) {
-                out.push_back(' ');
-                previousWhitespace = true;
-            }
-            continue;
-        }
-        previousWhitespace = false;
-        out.push_back(std::isprint(ch) ? static_cast<char>(ch) : '.');
-    }
-    while (!out.empty() && out.back() == ' ')
-        out.pop_back();
-    if (body.size() > kMaxExcerptBytes)
-        out += "...";
-    return out;
-}
-
-[[nodiscard]] std::string xmlTagValue(std::string_view body, std::string_view tag)
-{
-    const std::string open = "<" + std::string(tag) + ">";
-    const std::string close = "</" + std::string(tag) + ">";
-    const auto start = body.find(open);
-    if (start == std::string_view::npos)
-        return {};
-    const auto valueStart = start + open.size();
-    const auto end = body.find(close, valueStart);
-    if (end == std::string_view::npos)
-        return {};
-    return compactBodyExcerpt(body.substr(valueStart, end - valueStart));
-}
-
-[[nodiscard]] std::string remoteManifestFetchFailureMessage(
-    const std::string& location,
-    const vc::ResolvedUrl& endpoint,
-    const RemoteClientDetails& clientDetails,
-    const utils::HttpResponse& response)
-{
-    std::string message =
-        "Failed to fetch remote Lasagna manifest: " + location +
-        " request_url=" + redactedUrlForDiagnostics(endpoint.httpsUrl);
-    if (response.status_code > 0) {
-        message += " HTTP " + std::to_string(response.status_code);
-    } else {
-        message += " no_http_response";
-    }
-    if (!response.content_type.empty())
-        message += " content_type=\"" + escapedDiagnosticString(response.content_type) + "\"";
-    if (response.content_length > 0)
-        message += " content_length=" + std::to_string(response.content_length);
-    message += " received_bytes=" + std::to_string(response.body.size());
-    if (clientDetails.isS3) {
-        message += " s3_region=" +
-            (clientDetails.awsRegion.empty() ? std::string{"<unset>"} : clientDetails.awsRegion);
-        message += " aws_sigv4_credentials=" +
-            std::string(clientDetails.awsCredentialsLoaded ? "loaded" : "missing");
-    }
-
-    const std::string body(response.body_string());
-    if (!body.empty()) {
-        const auto s3Code = xmlTagValue(body, "Code");
-        const auto s3Message = xmlTagValue(body, "Message");
-        const auto s3Region = xmlTagValue(body, "Region");
-        if (!s3Code.empty())
-            message += " s3_code=\"" + escapedDiagnosticString(s3Code) + "\"";
-        if (!s3Message.empty())
-            message += " s3_message=\"" + escapedDiagnosticString(s3Message) + "\"";
-        if (!s3Region.empty())
-            message += " s3_response_region=\"" + escapedDiagnosticString(s3Region) + "\"";
-        message += " response_body=\"" +
-            escapedDiagnosticString(compactBodyExcerpt(body)) + "\"";
-    }
-    if (clientDetails.isS3) {
-        message +=
-            " hint=\"For s3:// manifests, verify bucket/key, region "
-            "(use s3+REGION:// when needed), AWS login, and s3:GetObject permissions.\"";
-    }
-    return message;
+    return utils::HttpClient(std::move(config));
 }
 
 [[nodiscard]] std::string remoteParentUrl(const std::string& normalizedRemoteUrl)
@@ -248,67 +114,21 @@ struct RemoteClientDetails {
     return normalized.generic_string();
 }
 
-[[nodiscard]] std::string hexEncode(std::string_view value)
+[[nodiscard]] std::filesystem::path collisionFreeRemoteCachePath(const std::filesystem::path& remoteCacheRoot, const std::string& normalizedRemoteLocation)
 {
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(value.size() * 2);
-    for (const unsigned char ch : value) {
-        out.push_back(kHex[ch >> 4]);
-        out.push_back(kHex[ch & 0x0f]);
-    }
-    return out;
+    return vc::core::util::remoteFileIdentityPath(remoteCacheRoot / "remote_lasagna" / "url_hex", normalizedRemoteLocation);
 }
 
-[[nodiscard]] std::filesystem::path collisionFreeRemoteCachePath(
-    const std::filesystem::path& remoteCacheRoot,
-    const std::string& normalizedRemoteLocation)
-{
-    auto path = remoteCacheRoot / "remote_lasagna" / "url_hex";
-    const auto hex = hexEncode(normalizedRemoteLocation);
-    constexpr size_t kSegmentChars = 96;
-    for (size_t pos = 0; pos < hex.size(); pos += kSegmentChars) {
-        path /= hex.substr(pos, std::min(kSegmentChars, hex.size() - pos));
-    }
-    return path;
-}
-
-[[nodiscard]] std::string fetchRemoteText(const std::string& location)
-{
-    const auto endpoint = resolveRemoteEndpoint(location);
-    auto clientDetails = makeRemoteClientDetails(endpoint);
-    auto client = utils::HttpClient(std::move(clientDetails.config));
-    const auto response = client.get(endpoint.httpsUrl);
-    if (!response.ok()) {
-        throw std::runtime_error(remoteManifestFetchFailureMessage(
-            location,
-            endpoint,
-            clientDetails,
-            response));
-    }
-    if (response.body.empty()) {
-        throw std::runtime_error(
-            "Remote Lasagna manifest is empty: " + location);
-    }
-    return std::string(reinterpret_cast<const char*>(response.body.data()),
-                       response.body.size());
-}
-
-void applyRemoteGroup(
-    LasagnaChannelGroup& group,
-    std::string remoteBaseUrl,
-    std::string remoteKey,
-    std::filesystem::path remoteCacheRoot)
+void applyRemoteGroup(LasagnaChannelGroup& group, std::string remoteBaseUrl, std::string remoteKey, std::filesystem::path remoteCacheRoot, const vc::HttpAuth& remoteAuth)
 {
     if (remoteCacheRoot.empty()) {
-        throw std::runtime_error(
-            "Remote Lasagna group requires a remote cache directory: " +
-            group.relativeZarrKey);
+        throw std::runtime_error("Remote Lasagna group requires a remote cache directory: " + group.relativeZarrKey);
     }
     const auto endpoint = resolveRemoteEndpoint(remoteBaseUrl);
     group.remoteZarrBaseUrl = endpoint.httpsUrl;
     group.remoteZarrKey = std::move(remoteKey);
     group.remoteCacheRoot = std::move(remoteCacheRoot);
+    group.remoteAuth = remoteAuth;
 }
 
 void resolveGroupLocations(
@@ -338,7 +158,7 @@ void resolveGroupLocations(
             }
             const auto cacheRoot =
                 collisionFreeRemoteCachePath(defaultRemoteCacheRoot, endpoint.httpsUrl);
-            applyRemoteGroup(group, endpoint.httpsUrl, {}, cacheRoot);
+            applyRemoteGroup(group, endpoint.httpsUrl, {}, cacheRoot, options.remoteAuth);
             continue;
         }
 
@@ -351,7 +171,7 @@ void resolveGroupLocations(
         if (!manifest.remoteBaseUrl.empty()) {
             const auto key = normalizedRelativeRemoteKey(group.relativeZarrKey);
             applyRemoteGroup(group, manifest.remoteBaseUrl, key,
-                             manifest.remoteCacheRoot);
+                             manifest.remoteCacheRoot, options.remoteAuth);
             continue;
         }
 
@@ -366,13 +186,16 @@ void resolveGroupLocations(
 // origin, whose own compressor remains responsible for lossless decoding.
 class PersistentHttpStore final : public utils::Store {
 public:
-    PersistentHttpStore(std::string baseUrl, std::filesystem::path cacheRoot)
+    PersistentHttpStore(std::string baseUrl,
+                        std::filesystem::path cacheRoot,
+                        vc::HttpAuth remoteAuth)
         : cacheRoot_(std::move(cacheRoot)),
           budget_(vc::render::PersistentZarrCacheBudget::findForPath(cacheRoot_))
     {
         const auto endpoint = resolveRemoteEndpoint(baseUrl);
         baseUrl_ = endpoint.httpsUrl;
-        client_ = std::make_unique<utils::HttpClient>(makeRemoteClient(endpoint));
+        client_ = std::make_unique<utils::HttpClient>(
+            makeRemoteClient(endpoint, remoteAuth));
     }
 
     bool exists(const std::string& key) const override
@@ -661,6 +484,37 @@ void loadRemoteMarker(LasagnaDatasetManifest& manifest)
     manifest.remoteCacheRoot = manifest.baseDirectory;
 }
 
+void writeRemoteMarker(const std::filesystem::path& manifestPath, const std::string& artifactUrl)
+{
+    static std::atomic<std::uint64_t> serial{0};
+    const auto markerPath = manifestPath.parent_path() / kLasagnaRemoteMarker;
+    const auto tmp = std::filesystem::path(markerPath.string() + ".tmp-" + std::to_string(serial.fetch_add(1)));
+    const nlohmann::json marker{
+        {"artifact_url", artifactUrl},
+        {"manifest_file", manifestPath.filename().string()},
+    };
+    {
+        std::ofstream output(tmp, std::ios::binary | std::ios::trunc);
+        if (!output)
+            throw std::runtime_error("Failed to create Lasagna remote marker");
+        output << marker.dump(2);
+        output.close();
+        if (!output)
+            throw std::runtime_error("Failed to write Lasagna remote marker");
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, markerPath, ec);
+    if (ec) {
+        std::filesystem::remove(markerPath, ec);
+        ec.clear();
+        std::filesystem::rename(tmp, markerPath, ec);
+    }
+    if (ec) {
+        std::filesystem::remove(tmp);
+        throw std::runtime_error("Failed to publish Lasagna remote marker: " + ec.message());
+    }
+}
+
 } // namespace
 
 LasagnaDataset::LasagnaDataset(LasagnaDatasetManifest manifest)
@@ -671,6 +525,39 @@ LasagnaDataset::LasagnaDataset(LasagnaDatasetManifest manifest)
 bool isRemoteLasagnaLocation(std::string_view location)
 {
     return isRemoteLocation(location);
+}
+
+MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manifestLocation, const LasagnaDatasetOpenOptions& options)
+{
+    if (!isRemoteLocation(manifestLocation)) {
+        return {
+            std::filesystem::absolute(std::filesystem::path(manifestLocation)).lexically_normal(),
+            manifestLocation,
+            true,
+        };
+    }
+    if (options.remoteCacheRoot.empty()) {
+        throw std::runtime_error("Remote Lasagna manifest requires --remote-cache-dir: " + vc::core::util::redactedRemoteLocation(manifestLocation));
+    }
+
+    const auto root = std::filesystem::absolute(options.remoteCacheRoot).lexically_normal();
+    const auto normalized = vc::core::util::normalizeRemoteFileLocation(manifestLocation);
+    const auto artifactDirectory = collisionFreeRemoteCachePath(root, normalized);
+    const auto manifestPath = artifactDirectory / kCachedLasagnaManifest;
+
+    vc::core::util::RemoteFileCacheOptions cacheOptions;
+    cacheOptions.cacheRoot = root;
+    cacheOptions.destination = manifestPath.lexically_relative(root);
+    cacheOptions.policy = options.cachePolicy;
+    cacheOptions.auth = options.remoteAuth;
+    cacheOptions.fetcher = options.remoteFileFetcher;
+    const auto cached = vc::core::util::cacheRemoteFile(manifestLocation, cacheOptions);
+    std::clog << "Lasagna manifest cache "
+              << (cached.cacheHit ? "hit: " : "download: ")
+              << vc::core::util::redactedRemoteLocation(cached.normalizedEndpoint)
+              << '\n';
+    writeRemoteMarker(cached.path, remoteParentUrl(cached.normalizedEndpoint));
+    return {cached.path, cached.normalizedEndpoint, cached.cacheHit};
 }
 
 namespace {
@@ -706,25 +593,34 @@ LasagnaDataset LasagnaDataset::openLocation(
     if (!isRemoteLocation(manifestLocation)) {
         return open(std::filesystem::path(manifestLocation), std::move(options));
     }
-    if (options.remoteCacheRoot.empty()) {
-        throw std::runtime_error(
-            "Remote Lasagna manifest requires --remote-cache-dir: " +
-            manifestLocation);
+    auto materialized = materializeLasagnaManifest(manifestLocation, options);
+    try {
+        auto dataset = open(materialized.path, options);
+        dataset.manifest_.manifestLocation = materialized.normalizedLocation;
+        dataset.manifest_.manifestIsRemote = true;
+        return dataset;
+    } catch (...) {
+        if (!materialized.cacheHit ||
+            options.cachePolicy == vc::core::util::RemoteFileCachePolicy::Refresh) {
+            throw;
+        }
     }
 
-    const auto endpoint = resolveRemoteEndpoint(manifestLocation);
-    auto manifest = LasagnaDatasetManifest::parseText(
-        fetchRemoteText(manifestLocation));
-    manifest.manifestLocation = endpoint.httpsUrl;
-    manifest.manifestIsRemote = true;
-    manifest.workingToBaseScale = options.workingToBaseScale;
-    manifest.remoteBaseUrl = remoteParentUrl(endpoint.httpsUrl);
-    const auto root = std::filesystem::absolute(
-        options.remoteCacheRoot).lexically_normal();
-    manifest.remoteCacheRoot =
-        collisionFreeRemoteCachePath(root, endpoint.httpsUrl);
-    resolveGroupLocations(manifest, options);
-    return LasagnaDataset(std::move(manifest));
+    // A size-valid cached object may still contain invalid JSON. Invalidate and
+    // refetch once; explicit sidecar-backed local manifests are never touched.
+    const auto root = std::filesystem::absolute(options.remoteCacheRoot)
+                          .lexically_normal();
+    vc::core::util::RemoteFileCacheOptions cacheOptions;
+    cacheOptions.cacheRoot = root;
+    cacheOptions.destination = materialized.path.lexically_relative(root);
+    vc::core::util::invalidateRemoteFileCacheEntry(cacheOptions);
+    auto refreshOptions = options;
+    refreshOptions.cachePolicy = vc::core::util::RemoteFileCachePolicy::Refresh;
+    materialized = materializeLasagnaManifest(manifestLocation, refreshOptions);
+    auto dataset = open(materialized.path, refreshOptions);
+    dataset.manifest_.manifestLocation = materialized.normalizedLocation;
+    dataset.manifest_.manifestIsRemote = true;
+    return dataset;
 }
 
 const LasagnaDatasetManifest& LasagnaDataset::manifest() const noexcept
@@ -754,7 +650,7 @@ utils::ZarrArray openLasagnaChannelArray(
     auto registry = vc::buildZarrCodecRegistry(dtypeSize);
     if (group.isRemote()) {
         auto store = std::make_shared<PersistentHttpStore>(
-            group.remoteZarrBaseUrl, group.remoteCacheRoot);
+            group.remoteZarrBaseUrl, group.remoteCacheRoot, group.remoteAuth);
         return utils::ZarrArray::open(
             std::move(store), group.remoteZarrKey, std::move(registry));
     }

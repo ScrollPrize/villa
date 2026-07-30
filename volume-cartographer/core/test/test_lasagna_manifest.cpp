@@ -307,13 +307,83 @@ TEST_CASE("LasagnaDataset remote manifest fetch errors include diagnostics")
         FAIL("expected invalid remote fetch to throw");
     } catch (const std::runtime_error& exc) {
         const std::string what = exc.what();
-        CHECK(what.find("Failed to fetch remote Lasagna manifest") != std::string::npos);
+        CHECK(what.find("failed to fetch remote file") != std::string::npos);
         CHECK(what.find("request_url=") != std::string::npos);
         CHECK(what.find("received_bytes=") != std::string::npos);
         CHECK(
             what.find("HTTP ") != std::string::npos ||
             what.find("no_http_response") != std::string::npos);
     }
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaDataset persistently caches direct remote manifests")
+{
+    const auto dir = makeTmpDir("remote-manifest-cache");
+    int fetches = 0;
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = dir;
+    options.remoteAuth.access_key = "test-access";
+    options.remoteAuth.secret_key = "test-secret";
+    options.remoteFileFetcher = [&](const std::string&, const fs::path& tmp) {
+        ++fetches;
+        std::ofstream(tmp) << R"({
+          "version": 2,
+          "groups": {
+            "pred": {
+              "zarr": "pred.zarr",
+              "scaledown": 3,
+              "channels": ["presence"]
+            }
+          }
+        })";
+    };
+
+    const std::string location =
+        "s3+eu-west-2://bucket/artifact/fiber.lasagna.json";
+    const auto first = vc::lasagna::LasagnaDataset::openLocation(location, options);
+    const auto second = vc::lasagna::LasagnaDataset::openLocation(location, options);
+
+    CHECK(fetches == 1);
+    CHECK(first.manifest().manifestIsRemote);
+    CHECK(first.manifest().manifestLocation ==
+          "https://bucket.s3.eu-west-2.amazonaws.com/artifact/fiber.lasagna.json");
+    REQUIRE(first.manifest().groups.size() == 1);
+    CHECK(first.manifest().groups.front().remoteZarrBaseUrl ==
+          "https://bucket.s3.eu-west-2.amazonaws.com/artifact");
+    CHECK(first.manifest().groups.front().remoteZarrKey == "pred.zarr");
+    CHECK(first.manifest().groups.front().remoteAuth.access_key == "test-access");
+    CHECK(first.manifest().groups.front().remoteCacheRoot ==
+          first.manifest().manifestPath.parent_path());
+    CHECK(second.manifest().manifestPath == first.manifest().manifestPath);
+    options.cachePolicy = vc::core::util::RemoteFileCachePolicy::Refresh;
+    (void)vc::lasagna::LasagnaDataset::openLocation(location, options);
+    CHECK(fetches == 2);
+    CHECK(fs::is_regular_file(
+        first.manifest().manifestPath.parent_path() /
+        vc::lasagna::kLasagnaRemoteMarker));
+    fs::remove_all(dir);
+}
+
+TEST_CASE("LasagnaDataset refreshes a corrupt size-valid cached manifest once")
+{
+    const auto dir = makeTmpDir("remote-manifest-corrupt");
+    int fetches = 0;
+    vc::lasagna::LasagnaDatasetOpenOptions options;
+    options.remoteCacheRoot = dir;
+    options.remoteFileFetcher = [&](const std::string&, const fs::path& tmp) {
+        ++fetches;
+        std::ofstream(tmp) << R"({"version":2,"groups":{}})";
+    };
+    const std::string location = "https://example.test/data/test.lasagna.json";
+    const auto initial = vc::lasagna::LasagnaDataset::openLocation(location, options);
+    {
+        std::ofstream(initial.manifest().manifestPath, std::ios::trunc) <<
+            std::string(fs::file_size(initial.manifest().manifestPath), 'x');
+    }
+    const auto recovered = vc::lasagna::LasagnaDataset::openLocation(location, options);
+    CHECK(fetches == 2);
+    CHECK(recovered.manifest().version == 2);
     fs::remove_all(dir);
 }
 

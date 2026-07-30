@@ -760,7 +760,10 @@ Output is a JSON manifest describing channel groups, each stored in a separate z
 
 - **`source_to_base`**: Factor from source volume voxels to base (VC3D) voxels. Default 1.0 (source = base). Set to 4 if source is 4x coarser than the VC3D coordinate system.
 - **`scaledown`** per group: OME-Zarr pyramid level (power of 2). The actual scale factor is `2^scaledown`. E.g. `scaledown: 4` → level 4 → 16x downsampled from base. Use `ChannelGroup.sd_fac` in code to get the actual factor.
-- **`channels`**: Ordered list — position = channel index in the CZYX zarr (for 3D zarrs, only one channel per group).
+- **`channels`**: Current inference manifests use exactly one channel per 3D
+  ZYX group. Older preprocessing/fit manifests may list channel positions in a
+  flat CZYX intermediate; convert those intermediates to per-channel 3D
+  OME-Zarr before attaching them to VC3D.
 - Zarr paths are relative to the JSON file's directory and include the OME-Zarr level suffix.
 - Updating a single group (e.g., adding pred_dt) leaves other groups untouched.
 

@@ -56,15 +56,6 @@ constexpr double kEpsilon = 1.0e-12;
     const LasagnaChannelBinding& binding,
     const LasagnaChannelChunkKey& key)
 {
-    if (binding.hasChannelDimension) {
-        const auto& chunks = binding.array->metadata().chunks;
-        return {
-            binding.channelIndex / chunks[0],
-            key.z,
-            key.y,
-            key.x,
-        };
-    }
     return {key.z, key.y, key.x};
 }
 
@@ -98,16 +89,6 @@ constexpr double kEpsilon = 1.0e-12;
     size_t localY,
     size_t localX)
 {
-    const auto& chunks = binding.array->metadata().chunks;
-    if (binding.hasChannelDimension) {
-        const size_t chunkC = chunks[0];
-        const size_t chunkZ = chunks[1];
-        const size_t chunkY = chunks[2];
-        const size_t chunkX = chunks[3];
-        return (((binding.channelIndex % chunkC) * chunkZ + localZ) * chunkY + localY) *
-                   chunkX +
-               localX;
-    }
     return (localZ * binding.chunksZYX[1] + localY) * binding.chunksZYX[2] + localX;
 }
 
@@ -941,7 +922,6 @@ LasagnaChannelBinding bindLasagnaChannel(
     if (!channelIndex.has_value()) {
         throw std::runtime_error("Internal Lasagna channel lookup failure");
     }
-
     LasagnaChannelBinding binding;
     binding.group = group;
     binding.channelIndex = *channelIndex;
@@ -956,28 +936,12 @@ LasagnaChannelBinding bindLasagnaChannel(
     if (meta.dtype != utils::ZarrDtype::uint8) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' must be uint8");
     }
-    if (meta.shape.size() == 3) {
-        if (meta.chunks.size() != 3) {
-            throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' zarr has invalid chunks");
-        }
-        binding.hasChannelDimension = false;
-        binding.shapeZYX = {meta.shape[0], meta.shape[1], meta.shape[2]};
-        binding.chunksZYX = {meta.chunks[0], meta.chunks[1], meta.chunks[2]};
-    } else if (meta.shape.size() == 4) {
-        if (meta.chunks.size() != 4) {
-            throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' zarr has invalid chunks");
-        }
-        if (*channelIndex >= meta.shape[0]) {
-            throw std::runtime_error("Lasagna channel index is outside zarr channel dimension for '" +
-                                     std::string(channel) + "'");
-        }
-        binding.hasChannelDimension = true;
-        binding.shapeZYX = {meta.shape[1], meta.shape[2], meta.shape[3]};
-        binding.chunksZYX = {meta.chunks[1], meta.chunks[2], meta.chunks[3]};
-    } else {
+    if (meta.shape.size() != 3 || meta.chunks.size() != 3) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) +
-                                 "' zarr must have shape (Z,Y,X) or (C,Z,Y,X)");
+                                 "' must reference a 3D (Z,Y,X) zarr");
     }
+    binding.shapeZYX = {meta.shape[0], meta.shape[1], meta.shape[2]};
+    binding.chunksZYX = {meta.chunks[0], meta.chunks[1], meta.chunks[2]};
 
     if (binding.spacing <= 0.0 || !std::isfinite(binding.spacing)) {
         throw std::runtime_error("Lasagna channel '" + std::string(channel) + "' has invalid spacing");

@@ -1,5 +1,3 @@
-WIP - ignore for now
-
 # AGENTS.md
 
 How to work with this project (fiber_trace_2d subproject of villa)

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vc/core/util/RemoteAuth.hpp"
+
 #include <filesystem>
 #include <array>
 #include <cstddef>
@@ -30,6 +32,7 @@ struct LasagnaChannelGroup {
     std::string remoteZarrBaseUrl;
     std::string remoteZarrKey;
     std::filesystem::path remoteCacheRoot;
+    vc::HttpAuth remoteAuth;
     int scaledown = 0;
     std::vector<std::string> channels;
 

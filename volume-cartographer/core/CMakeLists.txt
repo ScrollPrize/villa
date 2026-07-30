@@ -28,6 +28,7 @@ add_library(vc_core
         src/CacheCompression.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
+        src/RemoteFileCache.cpp
         src/HttpFetch.cpp
         src/PostProcess.cpp
         src/Geometry.cpp
@@ -159,6 +160,7 @@ add_library(vc_lasagna
     src/lasagna/LineOptimizer.cpp
     src/lasagna/Manifest.cpp
     src/lasagna/MaxflowGraph.cpp
+    src/lasagna/ProjectVolumes.cpp
 )
 if(VC_ENABLE_ECL_MAXFLOW)
     target_sources(vc_lasagna PRIVATE src/lasagna/EclMaxflow.cu)

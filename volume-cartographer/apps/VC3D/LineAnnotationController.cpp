@@ -6695,6 +6695,21 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         return false;
     }
 
+    if (selected.empty() && !vpkg->selectedLasagnaDataset().empty()) {
+        selected = vpkg->selectedLasagnaDataset();
+        if (!vc::project::isLocationRemote(selected)) {
+            manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
+        }
+    }
+    auto openSelectedDataset = [&](const std::string& location) {
+        vc::lasagna::LasagnaDatasetOpenOptions options;
+        options.workingToBaseScale = workingToBaseScale;
+        options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+        const std::string resolved =
+            vc::project::isLocationRemote(location) ? location : vc::project::resolveLocalPath(location, vpkg->path().parent_path()).string();
+        return vc::lasagna::LasagnaDataset::openLocation(resolved, options);
+    };
+
     if (selected.empty()) {
         const fs::path startDir = vpkg->path().empty()
             ? fs::path{}
@@ -6710,11 +6725,10 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             return false;
         }
         selected = *picked;
-        manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         try {
             auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                vc::lasagna::LasagnaDataset::open(
-                    manifestPath, {workingToBaseScale}));
+                openSelectedDataset(selected));
+            manifestPath = dataset->manifest().manifestPath;
             auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
             session.dataset = std::move(dataset);
             session.normalSampler = std::move(sampler);
@@ -6725,12 +6739,12 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
         }
         vpkg->setSelectedLasagnaDataset(selected);
     } else {
-        if (!session.normalSampler || session.selectedManifestPath != manifestPath ||
+        if (!session.normalSampler || session.selectedDatasetLocation != selected ||
             session.workingToBaseScale != workingToBaseScale) {
             try {
                 auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                    vc::lasagna::LasagnaDataset::open(
-                        manifestPath, {workingToBaseScale}));
+                    openSelectedDataset(selected));
+                manifestPath = dataset->manifest().manifestPath;
                 auto sampler = std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
                 session.dataset = std::move(dataset);
                 session.normalSampler = std::move(sampler);
@@ -6760,8 +6774,9 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
 
     auto vpkg = _state->vpkg();
     std::string selected = vpkg->selectedFiberInferenceDataset();
-    if (selected.empty() && vpkg->fiberInferenceDatasetEntries().size() == 1) {
-        selected = vpkg->fiberInferenceDatasetEntries().front().location;
+    const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
+    if (selected.empty() && fiberEntries.size() == 1) {
+        selected = fiberEntries.front().location;
         vpkg->setSelectedFiberInferenceDataset(selected);
     }
 
@@ -6784,20 +6799,10 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
             return false;
         }
         selected = *picked;
-        if (vc::project::isLocationRemote(selected)) {
-            showError(tr("Fiber inference dataset selection must point to a local "
-                         "Lasagna-style manifest or manifest cache."),
-                      headless);
-            return false;
-        }
-        manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
+        if (!vc::project::isLocationRemote(selected))
+            manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         vpkg->setSelectedFiberInferenceDataset(selected);
         vpkg->addFiberInferenceDatasetEntry(selected);
-    }
-    if (manifestPath.empty()) {
-        showError(tr("Selected fiber inference dataset does not resolve to a local manifest."),
-                  headless);
-        return false;
     }
 
     const bool scaleChanged =
@@ -6805,10 +6810,17 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         session.fiberInferenceDataset->manifest().workingToBaseScale !=
             session.workingToBaseScale;
     if (!session.fiberPredictionField ||
-        session.selectedFiberInferenceManifestPath != manifestPath ||
-        scaleChanged) {
+        session.selectedFiberInferenceDatasetLocation != selected || scaleChanged) {
         try {
-            auto openedDataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+            vc::lasagna::LasagnaDatasetOpenOptions options;
+            options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+            const std::string resolved = vc::project::isLocationRemote(selected)
+                ? selected
+                : vc::project::resolveLocalPath(
+                      selected, vpkg->path().parent_path()).string();
+            auto openedDataset = vc::lasagna::LasagnaDataset::openLocation(
+                resolved, options);
+            manifestPath = openedDataset.manifest().manifestPath;
             const auto traceScales =
                 vc::fiber_tracer::resolveFiberPredictionTraceScales(
                     openedDataset.manifest());

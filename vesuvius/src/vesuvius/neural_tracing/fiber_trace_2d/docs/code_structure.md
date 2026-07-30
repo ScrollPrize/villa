@@ -679,14 +679,25 @@ Ownership changed as follows:
   `vc_fiber_tracer` is Qt-free, reads persisted fiber inference
   `presence`/`nx`/`ny` channels from a Lasagna-style manifest, and uses the
   shared `vc_lasagna` compact-channel sampling helper instead of duplicating
-  `LasagnaNormalSampler` internals. The VC3D line annotation GUI stores a
-  selected fiber inference dataset in the project and exposes a Ctrl-right-click
-  generated-line action, "Optimize segment with native fiber tracer", for a
-  CP-to-CP span. The task runs through the existing line-optimization busy
-  state, so line edits are blocked while it runs, and accepted results are
-  spliced back through the existing generated-view/save path. The selected
-  fiber prediction manifest's derived trace scale must match the active
-  Lasagna line session scale before the GUI opens the prediction field.
+  `LasagnaNormalSampler` internals. VC projects keep regular and fiber
+  manifests in the canonical `lasagna_datasets` collection; the reserved
+  `vc-lasagna-fiber` tag marks fiber inference data, while no tag means regular
+  Lasagna data. The reader migrates the older separate
+  `fiber_inference_datasets` project field into tagged entries. The VC3D File
+  menu can attach local or remote manifests and automatically exposes all
+  referenced channels as flat ordinary 3D project volumes. Each attached group
+  names one channel and references one actual ZYX array. Older flat CZYX
+  preprocessing/fit intermediates require conversion and are not projected by
+  VC3D; generic volumes remain 3D-only.
+
+  The VC3D line annotation GUI resolves the selected tagged fiber entry and
+  exposes a Ctrl-right-click generated-line action, "Optimize segment with
+  native fiber tracer", for a CP-to-CP span. The task runs through the existing
+  line-optimization busy state, so line edits are blocked while it runs, and
+  accepted results are spliced back through the existing generated-view/save
+  path. The selected fiber prediction manifest's derived trace scale must match
+  the active Lasagna line session scale before the GUI opens the prediction
+  field.
 - `volume-cartographer/apps/src/vc_fiber_trace_metric.cpp` is the native
   no-visualization metric runner for precomputed 3D fiber inference products.
   It opens a fiber inference `.lasagna.json`, loads one `vc3d_fiber` JSON,
@@ -715,9 +726,11 @@ Ownership changed as follows:
 - `vc_fiber_trace_metric` opens Lasagna manifests through the shared
   location-aware `vc_lasagna` dataset opener. Local manifests continue to work
   without extra arguments. Direct remote `s3://`, `s3+REGION://`, `http://`, or
-  `https://` manifests require `--remote-cache-dir`; the manifest JSON is
-  downloaded transiently, while referenced Zarr objects are persisted through
-  the read-through cache. Remote manifest fetch failures report the original
+  `https://` manifests require `--remote-cache-dir`; both manifest JSON and
+  referenced Zarr objects are persisted and reused through their shared cache
+  layers. The exact-byte manifest cache is the same generic arbitrary-file
+  cache used by VC3D Open Data publication. Remote manifest fetch failures
+  report the original
   location, redacted resolved URL, HTTP status or no-response marker, response
   metadata/body excerpt, and S3 region/credential-loaded status when
   applicable. Relative group `zarr` paths resolve against the manifest parent

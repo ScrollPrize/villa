@@ -1,5 +1,12 @@
 # 2026-07-30
 
+- Added generic exact-byte arbitrary remote-file caching, persistent direct
+  remote Lasagna manifests, and VC3D local/remote manifest attachment with
+  canonical role tags and automatically reconciled ordinary 3D project
+  volumes.
+- Restricted VC3D Lasagna attachment and sampling to per-channel 3D ZYX arrays;
+  older flat CZYX preprocessing/fit artifacts now require conversion to
+  per-channel OME-Zarr.
 - Reduced native `vc_fiber_trace_metric` warm-cache runtime on the remote
   fiber manifest workload from roughly 314s to roughly 86s with profiled
   direct chunk-resolution sampling, bounded deterministic beam pruning, and
