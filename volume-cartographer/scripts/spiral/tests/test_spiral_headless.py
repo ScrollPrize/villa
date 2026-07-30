@@ -216,6 +216,51 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(session._target, 30_250)
         self.assertEqual(session._state, "Running")
 
+    def test_interactive_run_extends_training_horizon_to_target_iteration(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Paused"
+        session._completed = 30_000
+        session._pending = 0
+        session._target = 30_000
+        session._configure_run = lambda *_: None
+        session._idle_actions = []
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000,
+        }
+        session._run_config = dict(session.requested_config)
+
+        target = session.run(250)
+
+        self.assertEqual(target, 30_250)
+        self.assertEqual(session._idle_actions[0][0], "configure")
+        self.assertEqual(
+            session._idle_actions[0][1]["optimizer_num_training_steps"],
+            30_250,
+        )
+        self.assertEqual(
+            session._run_config["optimizer_num_training_steps"], 30_250)
+
+    def test_interactive_run_keeps_horizon_when_target_is_within_it(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Ready"
+        session._completed = 100
+        session._pending = 0
+        session._target = 100
+        session._configure_run = lambda *_: None
+        session._idle_actions = []
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000,
+        }
+        session._run_config = dict(session.requested_config)
+
+        session.run(250)
+
+        self.assertEqual(session._idle_actions, [])
+        self.assertEqual(
+            session._run_config["optimizer_num_training_steps"], 30_000)
+
     def test_run_queues_influence_config_with_only_pending_inputs(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()

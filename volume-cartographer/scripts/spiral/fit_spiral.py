@@ -525,6 +525,51 @@ def get_dense_attachment_ramp(iteration):
     return min(1.0, (iteration - warmup + 1) / ramp)
 
 
+def get_exponential_lr_at_step(
+        initial_lr, final_factor, completed_steps, training_horizon):
+    """LR on the absolute exponential curve for a completed-step count."""
+    horizon = max(1, int(training_horizon))
+    completed = max(0, int(completed_steps))
+    gamma = float(final_factor) ** (1.0 / horizon)
+    return float(initial_lr) * gamma ** completed
+
+
+def realign_optimizer_lr_schedule(
+        optimiser, lr_scheduler, *, initial_lr, final_factor,
+        completed_steps, training_horizon, exponential):
+    """Realign an optimizer and scheduler to an absolute training step."""
+    horizon = max(1, int(training_horizon))
+    completed = max(0, int(completed_steps))
+    initial_lr = float(initial_lr)
+
+    if exponential:
+        gamma = float(final_factor) ** (1.0 / horizon)
+        if not isinstance(
+                lr_scheduler, torch.optim.lr_scheduler.ExponentialLR):
+            lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                optimiser, gamma=gamma)
+        lr_scheduler.gamma = gamma
+        aligned_lr = get_exponential_lr_at_step(
+            initial_lr, final_factor, completed, horizon)
+    else:
+        if not isinstance(lr_scheduler, torch.optim.lr_scheduler.LambdaLR):
+            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimiser, lambda step: 1.)
+        aligned_lr = initial_lr
+
+    base_lrs = [initial_lr] * len(optimiser.param_groups)
+    aligned_lrs = [aligned_lr] * len(optimiser.param_groups)
+    for group, base_lr, current_lr in zip(
+            optimiser.param_groups, base_lrs, aligned_lrs):
+        group['initial_lr'] = base_lr
+        group['lr'] = current_lr
+    lr_scheduler.base_lrs = base_lrs
+    lr_scheduler.last_epoch = completed
+    lr_scheduler._last_lr = aligned_lrs
+    lr_scheduler._step_count = completed + 1
+    return lr_scheduler, horizon
+
+
 def main(
         load_only_patches_and_point_collections=False, interactive_driver=None,
         progress=None):
@@ -1615,6 +1660,19 @@ def main(
     else:
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lambda step: 1.)
 
+    def realign_lr_schedule(completed_steps):
+        """Align optimizer/scheduler state to the current absolute horizon."""
+        nonlocal lr_scheduler, num_training_steps
+        lr_scheduler, num_training_steps = realign_optimizer_lr_schedule(
+            optimiser,
+            lr_scheduler,
+            initial_lr=cfg['optimizer_learning_rate'],
+            final_factor=cfg['optimizer_lr_final_factor'],
+            completed_steps=completed_steps,
+            training_horizon=cfg['optimizer_num_training_steps'],
+            exponential=cfg['optimizer_exp_lr_schedule'],
+        )
+
     def checkpoint_payload(completed_iterations):
         def durable_config(value):
             return {
@@ -1723,6 +1781,11 @@ def main(
         # entering the resident training loop.
         del resume_checkpoint
         resume_checkpoint = None
+
+    if interactive_driver is not None:
+        # A checkpoint may carry the scheduler state from a shorter horizon.
+        # The active session configuration is authoritative.
+        realign_lr_schedule(start_iteration)
 
     progress.begin('loading', 'Synchronizing model across GPU workers')
     broadcast_model_params(spiral_and_transform)
@@ -2269,6 +2332,7 @@ def main(
             """Apply Run-scoped settings without replacing the resident fit."""
             global shell_path
             nonlocal dt_target_whole_object, prepared_main_tracks
+            nonlocal lr_scheduler, num_training_steps
             nonlocal patch_sampling_probabilities
             nonlocal unverified_patch_sampling_probabilities
             nonlocal unverified_patches, unverified_patches_list
@@ -2421,6 +2485,14 @@ def main(
                     dt_target_cache_manager.update_interval = max(
                         1, int(cfg['dt_target_update_interval']))
                     dt_target_cache_manager.reset()
+                if changed & {
+                        'optimizer_exp_lr_schedule',
+                        'optimizer_learning_rate',
+                        'optimizer_lr_final_factor',
+                        'optimizer_num_training_steps',
+                }:
+                    realign_lr_schedule(
+                        interactive_driver.status()['current_iteration'])
             except Exception:
                 cfg.update(old_values, allow_val_change=True)
                 raise

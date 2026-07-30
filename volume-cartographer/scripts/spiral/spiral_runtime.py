@@ -504,6 +504,18 @@ class InteractiveFitSession:
                 raise RuntimeError(f"Run is not allowed while session state is {self._state}")
             run_config = dict(run_config or {})
             path_changes = dict(path_changes or {})
+            target = self._completed + count
+            requested_config = dict(
+                getattr(self, "requested_config", {}) or {})
+            requested_config.update(run_config)
+            configured_horizon = int(
+                requested_config.get("optimizer_num_training_steps", 0) or 0)
+            # Interactive sessions are allowed to continue beyond the original
+            # headless horizon. Grow that horizon durably before the next step
+            # so the fitter can realign the exponential LR curve exactly.
+            if (getattr(self, "_configure_run", None) is not None
+                    and target > configured_horizon):
+                run_config["optimizer_num_training_steps"] = target
             if run_config or path_changes:
                 if self._configure_run is None:
                     raise RuntimeError(
@@ -531,7 +543,7 @@ class InteractiveFitSession:
                      dict(influence_config or {})))
             self._pending = count
             self._run_start_completed = self._completed
-            self._target = self._completed + count
+            self._target = target
             self._state, self._phase = "Running", "Optimizing"
             self._begin_optimization_progress()
             self._condition.notify_all()
