@@ -1,106 +1,86 @@
-# VC3D Path-Based Lasagna Volumes And Base-Space Fiber Tracing
+# VC3D Persistent Fiber-Traced Segments
 
 ## User request
 
-Remove the hexadecimal Lasagna identity scheme completely. Project state and
-cache metadata must use actual source locations that a developer can read and
-follow:
+Fix VC3D line annotation so a successfully native-fiber-traced CP-to-CP
+segment is not silently replaced by a full Lasagna optimization during
+auto-save and is not changed by edits to unrelated neighboring control points.
 
-- `lasagna_datasets[].location` remains the actual local manifest path or
-  remote manifest locator;
-- each automatically attached Lasagna volume uses its actual resolved local
-  Zarr path or remote Zarr locator as its project volume location;
-- Lasagna-derived provenance tags contain the actual local or remote manifest
-  location, not an encoding, hash, cache path, or synthetic source location;
-- remote access continues to use transparent persistent caching without
-  exposing cache identities in project JSON or the GUI.
+Store native fiber-trace information on the CP that starts the traced segment
+in line order. Each CP may carry an optional `segment_to_next` value describing
+the CP-to-next-CP span. The information persists in the VC3D fiber JSON and
+remains valid while that adjacency is unchanged.
 
-The encoded representation was unshipped WIP. Do not implement backward
-compatibility, decoding, migration, fallback lookup, or preservation for it.
-Remove the encoder, the encoded cache layout, the encoded sidecar identity,
-the synthetic derived-volume scheme, and their tests/documentation. Projects
-created with that WIP representation must be recreated by reattaching their
-manifests.
+Add a Ctrl-right-click context-menu action on a native-fiber-traced segment to
+revert that segment explicitly to ordinary Lasagna optimization.
 
-Correct native GUI fiber segment tracing so fiber lines remain stored in their
-native base-resolution coordinate system. The default fiber tracer works on
-the sd2 grid, or 0.25x linear resolution (`4` base voxels per trace voxel for
-the current/default manifests). The GUI must:
+## Required behavior
 
-1. convert the base-space reference segment into trace coordinates;
-2. let the prediction and normal samplers map trace coordinates into their
-   persisted channel grids;
-3. trace and evaluate the segment in trace coordinates;
-4. convert the accepted fused segment back into base coordinates;
-5. splice and persist only base-coordinate points, keeping original control
-   point coordinates exact.
-
-The current requirement that line storage scale equal trace working scale is
-incorrect and must be removed. Endpoint acceptance uses a fixed threshold of
-`20` base-resolution voxels in the Python CLI, native C++ CLI, and VC3D. Each
-tracer converts that threshold into its working grid before comparing errors.
-Physical voxel size is optional and is used only to add physical-unit reporting
-when trustworthy metadata is available; missing physical metadata must not
-block tracing.
+1. A successful native fiber trace is immediately saveable as the final
+   geometry. Auto-save and close must not run an implicit full Lasagna pass
+   over it.
+2. A CP's optional `segment_to_next` persists optimizer kind, tracer/config
+   version, effective trace configuration, selected data sources, trace scale,
+   and accepted endpoint error in base voxels. It does not duplicate endpoint
+   coordinates.
+3. Ordinary local and full Lasagna optimization preserves every valid traced
+   segment bit-exactly.
+4. Moving either endpoint clears the starting CP's `segment_to_next`. Deleting
+   either endpoint removes or clears it naturally with the affected CP
+   adjacency.
+5. Inserting a CP inside a traced span invalidates that span because it changes
+   the segment definition. Inserting, moving, or deleting a CP outside the
+   span preserves the traced segment and only remaps runtime indices.
+6. Ctrl-right-click on a traced CP-to-CP span offers `Revert segment to
+   Lasagna optimization`. Revert removes protection only if the local Lasagna
+   replacement succeeds; failure leaves both geometry and metadata unchanged.
+7. Fibers without CP segment metadata continue to load and behave as ordinary
+   Lasagna-optimized fibers.
+8. Add automated coverage for trace/save, persistence/reload, unrelated CP
+   edits, endpoint invalidation, optimizer protection, and explicit revert.
+9. Pack CP geometry and `segment_to_next` into one control-point JSON object.
+   Bump the fiber schema version and update every in-repository reader so
+   malformed or unsupported segment information fails loudly rather than
+   being silently ignored.
 
 ## Scope
 
-This task covers:
-
-1. Human-readable local/remote manifest provenance and actual Zarr volume
-   locations in VC project JSON.
-2. Deduplication, reconciliation, detach cleanup, and independent-volume
-   preservation using actual source locations.
-3. Direct-remote, explicit `lasagna-remote.json`, absolute-remote-group, and
-   plain-local manifest source-location resolution.
-4. A readable, path-mirroring remote cache layout and source-path sidecar
-   validation with no hexadecimal identity helper or `url_hex` directory.
-5. Base-to-trace and trace-to-base conversion for the VC3D native fiber
-   segment action.
-6. Trace-scale prediction and normal sampling while retaining the ordinary
-   base-scale normal sampler used to rebuild the stored line.
-7. Focused regression tests, VC3D/core builds, documentation, specifications,
-   task log, and changelog updates.
-8. Consistent `20` base-voxel endpoint acceptance in the Python native CLI,
-   native C++ metric CLI, and VC3D segment action.
+- VC3D line-annotation session and stored-fiber state.
+- VC3D fiber JSON read/write/import/export handling.
+- Shared Python fiber parsing, native C++ fiber CLI/probe parsing, and VC sync
+  and merge handling of the new CP object schema.
+- Shared Lasagna optimizer support needed to preserve protected spans.
+- Generated-line Ctrl-right-click menu plumbing.
+- Focused C++ tests, specifications, code-structure documentation, task log,
+  status, and changelog.
 
 ## Out of scope
 
-- Do not serialize cache paths, cache keys, credentials, or signed-query
-  diagnostics into project JSON.
-- Do not add generic 4D volume support.
-- Do not change Trace2CP search/scoring behavior, inference values, or model
-  output encoding.
-- Do not resample or rewrite existing fiber JSON files.
-- Do not add a user-facing trace-scale control in this task; retain the current
-  default inference scaledown power of 2.
+- Changing native 3D fiber tracing search, scoring, coordinate conversion, or
+  the fixed 20-base-voxel acceptance threshold.
+- Adding a generic annotation history or undo stack.
+- Protecting arbitrary user-selected line ranges that were not produced by
+  the native fiber tracer.
+- Changing unrelated fiber geometry, atlas, or branch-link semantics.
 
 ## Correctness constraints
 
-- Actual source location and transparent cached materialization are separate
-  concepts. Project state records the source; runtime loaders choose and reuse
-  the cache.
-- Cache directories mirror normalized remote scheme, authority, and object
-  path components. Authentication query parameters remain runtime-only and
-  are not persisted.
-- A remote relative group path resolves against its authoritative remote
-  manifest/artifact origin, never against the local cached manifest path.
-- A local relative group path resolves against the local manifest directory.
-- One actual ZYX source referenced by multiple manifests appears as one
-  project volume with multiple readable manifest-provenance tags.
-- Detaching one manifest removes only that manifest's provenance. The volume
-  remains if another manifest or an independent manual attachment owns it.
-- Fiber line/control-point storage remains in base coordinates. Trace and
-  prediction coordinates are runtime-only.
-- Default sd2 tracing uses the scale derived from the inference manifest and
-  default inference scaledown power. For the current factor-16 prediction
-  fields this is 4 base voxels per trace voxel.
-- The prediction sampler sees trace coordinates with prediction spacing
-  `prediction_to_base / trace_to_base`; it must not be passed base points or
-  points pre-divided directly into prediction voxels.
-- Endpoint errors are converted from the working trace/selected grid to base
-  voxels before the fixed `20` base-voxel acceptance check.
-- A base-space endpoint error is converted to micrometers only when a finite,
-  positive base-voxel size is available. Missing physical size omits that
-  report field and does not affect acceptance.
-- Original stored CP endpoints remain bit-exact after a successful splice.
+- In line order, CP `i` owns the optional optimization information for segment
+  `i -> i+1`; the last CP cannot own a following segment.
+- New files use `vc3d_fiber` version 2 and object-valued control points. Every
+  version-2 reader must parse and validate `segment_to_next`; treating a CP
+  object as an unknown extension is not allowed.
+- Version-1 array-valued control points remain readable as ordinary CPs so
+  existing fiber annotations are not discarded. Writers emit version 2.
+- Metadata moves with its owning CP when CPs are sorted or remapped. Do not
+  maintain a separate endpoint-signature registry.
+- Line-point ranges remain runtime values derived from the owning CP and its
+  current successor.
+- A protected span includes both endpoint samples and every stored line sample
+  between them.
+- Protection and explicit revert must use shared optimizer APIs; do not copy
+  optimizer logic into the controller.
+- Applying a trace or revert is transactional: failed work must not partially
+  update geometry, protection records, or saved state.
+- Physical voxel size remains reporting-only and is not part of record
+  validity or optimization acceptance.

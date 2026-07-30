@@ -1,433 +1,407 @@
-# Task Plan: Path-Based Lasagna Volumes And Base-Space Fiber Tracing
+# Task Plan: Persistent Fiber-Traced Segments And Explicit Lasagna Revert
 
-## 1. Goal And Accepted Coordinate Contract
+## 1. CP-Owned Data Contract
 
-Make VC project files describe data with real source locations and make the
-native GUI tracer treat coordinate systems explicitly.
+### 1.1 Attach following-segment state to each VC3D control point
 
-The canonical coordinate spaces are:
+Add a VC3D control-point state type that contains the existing
+`vc::lasagna::LineControlPoint` plus optional `segmentToNext` metadata. In line
+order, CP `i` owns the state for span `i -> i+1`; the last CP must have no
+`segmentToNext` value.
 
-- **base/fiber space:** persisted line and control-point coordinates;
-- **trace space:** runtime sd2 tracing grid; with the current/default fiber
-  manifests, one trace voxel spans 4 base voxels;
-- **prediction space:** persisted inference-channel voxels; for the current
-  manifests, one prediction voxel spans 16 base voxels or 4 trace voxels;
-- **normal-channel space:** each regular Lasagna group keeps its own manifest
-  scale and is sampled through the shared runtime coordinate adapter.
+The optional value contains:
 
-For a base point `p_base` and derived `trace_to_base`:
+- `optimizer: "native_fiber_trace3d"`;
+- a metadata schema version and native tracer algorithm/config version;
+- the regular-normal and fiber-inference manifest source locations;
+- the effective trace-to-base scale;
+- the effective `FiberTraceConfig` values that affect geometry/acceptance,
+  excluding runtime-only pointers and optional physical-size reporting;
+- the accepted maximum endpoint error in base voxels.
 
-```text
-p_trace = p_base / trace_to_base
-p_base  = p_trace * trace_to_base
-prediction_index = p_trace / (prediction_to_base / trace_to_base)
-```
+Do not persist endpoint signatures or a separate collection of segment
+records. The owning CP and its immediate successor are the endpoints. Do not
+add tracer fields to `vc::lasagna::LineControlPoint`, because that shared
+low-level type is used outside VC3D; convert between VC3D CP state and the
+low-level optimizer inputs at the existing task boundary.
 
-The implementation must use the derived scales rather than embedding literal
-`4` or `16` in the segment worker. The existing default
-`inference_scaledown_power=2` remains the source of the default 0.25x
-inference/trace relationship.
-
-## 2. Canonical Project Representation
-
-### 2.1 Manifest entries
-
-Keep the existing authoritative fields:
+Make the ownership explicit in JSON instead of using a parallel array:
 
 ```json
 {
-  "location": "/local/data/fiber.lasagna.json",
-  "tags": ["vc-lasagna-fiber"]
+  "type": "vc3d_fiber",
+  "version": 2,
+  "control_points": [
+    {
+      "position": [100.0, 200.0, 300.0],
+      "segment_to_next": {
+        "optimizer": "native_fiber_trace3d",
+        "metadata_version": 1,
+        "tracer_version": 1,
+        "max_endpoint_error_base_voxels": 3.5
+      }
+    },
+    {"position": [132.0, 204.0, 301.0]}
+  ]
 }
 ```
 
-or:
+The complete `segment_to_next` object also contains the source locations,
+trace scale, and effective config listed above. `line_points` remain numeric
+arrays.
 
-```json
-{
-  "location": "s3://bucket/run/fiber.lasagna.json",
-  "tags": ["vc-lasagna-fiber"]
-}
-```
+Bump `vc3d_fiber` to version 2. Version 2 requires every control point to be an
+object with a finite three-element `position`; `segment_to_next`, when
+present, must be fully recognized and valid, and it is forbidden on the final
+CP. Unknown optimizer kinds, metadata versions, missing required fields, or
+wrong types reject the file. This makes semantic reader gaps fail at the
+existing version/schema boundary instead of hiding provenance.
 
-The manifest entry needs no duplicate identity tag: its `location` is already
-the identity. Keep role and unrelated user/Open Data tags only.
+Updated readers continue accepting version-1 array-valued CPs as ordinary
+unprotected CPs so existing annotations remain usable. All VC3D writers emit
+version 2. Old binaries reject version 2 at their existing version check,
+which is the intended loud failure.
 
-### 2.2 Derived ordinary volumes
+The persisted endpoint error is the base-voxel value used for acceptance.
+Micrometer output remains an ephemeral diagnostic because physical voxel-size
+metadata can be absent or can differ in another project context.
 
-Replace `lasagna-derived://<encoded identity>` with the actual resolved group
-source:
+### 1.2 Mutation rules follow normal CP container operations
 
-- local group: absolute normalized Zarr array path, including its OME-Zarr
-  level suffix when present;
-- direct remote relative group: remote manifest parent plus relative group
-  key;
-- explicit-sidecar relative group: sidecar `artifact_url` plus relative group
-  key;
-- absolute remote group: the group's own remote locator.
+Implement small helpers for CP-owned metadata mutation:
 
-Keep only `vc-lasagna-derived:<actual local manifest path or remote locator>`
-as the combined provenance, auto-ownership, and reconstruction marker. Group,
-channel, spacing, dtype, and shape remain authoritative in the manifest/Zarr
-descriptor and must not be duplicated in project tags.
+- move CP `i`: clear `segmentToNext` on CP `i-1` and CP `i` because the moved
+  CP is the target of the former and source of the latter;
+- delete CP `i`: erase its own metadata with the CP and clear the previous
+  CP's `segmentToNext`, whose successor changed;
+- insert CP at `i`: insert it with empty metadata and clear the previous CP's
+  `segmentToNext`, because its old span was split;
+- sort/remap CPs without changing geometry: move the complete CP state so the
+  metadata stays with its owner;
+- edit elsewhere: no action is required for unrelated CPs;
+- replace/reseed the complete line: clear all following-segment metadata;
+- non-unit import/export scaling: clear all following-segment metadata because
+  its base-space trace configuration no longer describes the scaled fiber.
 
-The `volumes[].location` is a source locator, not a cache locator. A derived
-remote entry remains reconstructed by the Lasagna adapter so its exact-byte
-read-through cache behavior is preserved; generic project loading must not
-silently route it through a different lossy cache path.
-
-### 2.3 Source-location API
-
-Add one shared Lasagna helper that returns a group's authoritative source
-location after origin resolution. Do not reconstruct URLs separately in
-project code.
-
-The resolver must retain two distinct values:
-
-- human/project source location in its local, HTTP, or S3 form;
-- runtime fetch endpoint/cache metadata used by `PersistentHttpStore`.
-
-Use the existing remote URL join/normalization APIs for query-safe path joins.
-Do not derive a remote group source from the machine-local cached manifest.
-
-### 2.4 Deduplication and ownership
-
-Normalize actual locations only for comparison; preserve the canonical source
-string for serialization.
-
-- Merge repeated references to the same actual Zarr source into one volume
-  entry.
-- Add one `vc-lasagna-derived:<manifest location>` tag per referencing
-  manifest.
-- Do not persist descriptive metadata that can be reconstructed from the
-  manifest/Zarr descriptor.
-- If the volume existed as an independent manual project entry before a
-  Lasagna attachment, reuse it without adding an auto-ownership tag.
-- Detach removes one provenance tag at a time. Remove the volume entry only
-  when its final `vc-lasagna-derived:<manifest location>` tag is removed.
-- Reconciliation uses manifest paths and actual group locations only.
-
-## 3. Remove The Unshipped Encoded Representation
-
-Delete it rather than migrating it:
-
-1. Delete `remoteFileIdentityHex()` and `remoteFileIdentityPath()` from the
-   public and private implementation.
-2. Delete the `remote_lasagna/url_hex` layout and `source_identity_hex`
-   sidecar field.
-3. Delete synthetic derived-volume location generation and all recognizers or
-   tests for that scheme.
-4. Do not add a decoder, fallback reader, migration branch, or old-cache
-   lookup.
-5. Replace affected tests and fixtures with the path-based representation.
-6. Treat any locally created project containing the WIP schema as disposable;
-   reattach its manifests to recreate it.
-
-The resulting source must contain no implementation or documentation of the
-old encoded identity convention.
-
-## 3.1 Readable transparent cache layout
-
-Map normalized remote object paths into readable filesystem components, for
-example:
-
-```text
-<cache-root>/remote_sources/https/example.org/bucket/run/file.json
-<cache-root>/remote_sources/s3/bucket/run/file.json
-```
-
-The generic file cache still accepts a caller-selected destination. Its
-sidecar records a canonical source path string and size, not an encoded
-identity. Split and validate scheme, authority, and path components; reject
-empty, absolute-escape, `.`/`..`, or platform-invalid components instead of
-encoding an entire locator. Strip query/fragment authentication material from
-the persistent identity and layout while using the full supplied locator only
-for the in-memory request.
-
-## 4. Base-Space GUI Fiber Trace Adapter
-
-### 4.1 Dataset preparation
-
-Keep the regular line-optimization normal sampler configured for the line's
-base storage coordinates. Prepare separate native-trace runtime objects:
-
-- fiber prediction dataset/field configured with
-  `workingToBaseScale=trace_to_base`;
-- regular Lasagna normal dataset/sampler configured with the same
-  `workingToBaseScale=trace_to_base`.
-
-Do not reuse the base-space normal sampler for trace-space points. Cache these
-runtime objects in the line session by selected manifest locations and derived
-trace scale so repeated segment actions do not reopen descriptors.
-
-### 4.2 Remove the incorrect equality requirement
-
-Delete the condition requiring `trace_to_base == line_to_base`. Replace it
-with validation that:
-
-- trace scale is positive and finite;
-- all prediction channels agree on persisted prediction scale;
-- the default inference scaledown relation is valid;
-- both prediction and normal samplers were opened in trace coordinates.
-
-The line storage scale and trace runtime scale are expected to differ.
-
-### 4.3 Segment request conversion
-
-Before launching the background trace:
-
-1. Copy the base-space line and original endpoints.
-2. Divide all reference-line points by `trace_to_base`.
-3. Keep isotropic direction/plane-normal vectors normalized; their orientation
-   does not change under uniform scaling.
-4. Run `traceFiberSegment()` entirely in trace voxels.
-5. Multiply every accepted fused point by `trace_to_base`.
-6. Restore the first and last replacement points from the original base-space
-   line exactly.
-7. Splice the base-space replacement into the base-space line.
-8. Rebuild the final line model with the ordinary base-space normal sampler.
-
-Put the conversion in a small testable core/helper API also usable by future
-GUI/CLI callers. Do not bury independent arithmetic copies in Qt lambdas.
-
-### 4.4 Base-voxel acceptance and optional physical reporting
-
-The Python native CLI, C++ metric CLI, and VC3D segment action use one fixed
-endpoint threshold of `20` base-resolution voxels. Convert working-grid error
-to base voxels before acceptance:
-
-```text
-endpoint_error_base = endpoint_error_working * working_to_base
-```
-
-At the default sd2 trace scale, `working_to_base=4`, so the internal working
-threshold is `5` trace voxels. Physical size never controls acceptance. When a
-finite positive base-voxel size is available, report
-`endpoint_error_um = endpoint_error_base * base_voxel_um`; otherwise omit the
-physical report without rejecting the trace.
-
-Trace step, pruning distance, budgets, and other voxel-valued Trace2CP
-parameters remain expressed in trace voxels. They are not multiplied before
-calling the tracer.
-
-## 5. Implementation Sequence
-
-### Phase A: Remove encoded identity and replace the cache layout
-
-1. Delete `remoteFileIdentityHex()`, `remoteFileIdentityPath()`, and every call
-   site.
-2. Replace `source_identity_hex` with a canonical readable source-path field
-   in generic cache sidecars.
-3. Replace `remote_lasagna/url_hex` with the readable hierarchical remote
-   source layout.
-4. Remove old-cache lookup and compatibility tests; a cold cache after this
-   WIP change is accepted.
-5. Keep cache-first validation, atomic publication, refresh, invalidation,
-   authentication, and exact bytes unchanged.
+To protect a span, resolve the owning CP and its immediate successor to their
+current line indices. No endpoint matching or metadata reconciliation table is
+needed. Version-2 schema violations are hard load errors rather than warnings
+or best-effort repair.
 
 Expected files:
 
-- `volume-cartographer/core/include/vc/core/util/RemoteFileCache.hpp`
-- `volume-cartographer/core/src/RemoteFileCache.cpp`
-- `volume-cartographer/core/src/lasagna/ProjectVolumes.cpp`
+- new `volume-cartographer/apps/VC3D/LineAnnotationFiberSegments.hpp`
+- new `volume-cartographer/apps/VC3D/LineAnnotationFiberSegments.cpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationController.hpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationController.cpp`
+- `volume-cartographer/apps/VC3D/CMakeLists.txt`
 
-### Phase B: Expose authoritative group source locations
+## 2. Fix Trace Completion And Auto-Save
 
-1. Extend Lasagna group resolution with one authoritative source-location
-   value/helper.
-2. Populate it for local, direct remote, explicit-sidecar, and absolute remote
-   groups.
-3. Keep runtime HTTP/S3 endpoint, auth, and cache-root fields unchanged.
-4. Add focused resolver tests before changing project serialization.
+Carry a typed pending segment record in `OptimizationTaskResult`; stop encoding
+the only trace provenance in `LineOptimizationReport.message`.
 
-Expected files:
+On accepted native tracing:
 
-- `volume-cartographer/core/include/vc/lasagna/Manifest.hpp`
-- `volume-cartographer/core/include/vc/lasagna/Dataset.hpp`
-- `volume-cartographer/core/src/lasagna/Dataset.cpp`
-- `volume-cartographer/core/test/test_lasagna_manifest.cpp`
+1. Build the replacement line and segment record in the worker.
+2. Apply geometry and metadata together on the GUI thread.
+3. Mark the result `SessionOptimizationState::Optimized`, because tracing is a
+   completed operation for the selected span and the rest of the input line was
+   already finalized.
+4. Refresh generated views and auto-save that exact state.
+5. Confirm `saveSessionAsFiber()` does not call
+   `finalizeSessionOptimizationSynchronously()` for this result.
 
-### Phase C: Canonical path-based project volumes
-
-1. Prepare volume locations from the authoritative group source location.
-2. Generate `vc-lasagna-derived:<manifest location>` tags from the
-   authoritative `lasagna_datasets` entry location supplied by `VolumePkg`.
-3. Update attachment transaction, deduplication, reconciliation, and detach
-   ownership rules for shared actual locations.
-4. Remove all synthetic location and encoded-tag handling without a migration
-   path.
-5. Confirm reloading remote derived entries reconstructs their Lasagna exact
-   cache-backed runtime volume rather than treating the locator as an unrelated
-   generic volume.
+A rejected/failed trace changes neither line points nor CP metadata. Replacing
+a previously traced span with a successful new trace overwrites the starting
+CP's one `segmentToNext` value.
 
 Expected files:
 
-- `volume-cartographer/core/include/vc/lasagna/ProjectVolumes.hpp`
-- `volume-cartographer/core/src/lasagna/ProjectVolumes.cpp`
-- `volume-cartographer/core/include/vc/core/types/VolumePkg.hpp`
-- `volume-cartographer/core/src/VolumePkg.cpp`
-- `volume-cartographer/core/test/test_lasagna_project_volumes.cpp`
-- `volume-cartographer/core/test/test_volume_pkg.cpp`
-
-### Phase D: Add explicit trace coordinate conversion
-
-1. Add a shared/testable base-to-trace conversion helper.
-2. Change GUI inference preparation to retain the derived trace scale without
-   comparing it to base line scale.
-3. Prepare a trace-scale regular normal sampler separately from the base line
-   sampler.
-4. Convert request points into trace space and accepted results back into base
-   space around `traceFiberSegment()`.
-5. Convert endpoint error to base voxels for acceptance and use physical voxel
-   size only for optional reporting.
-6. Keep endpoint replacement exact and final line reconstruction in base
-   space.
-
-Expected files:
-
-- `volume-cartographer/core/include/vc/fiber_tracer/FiberTrace.hpp`
-- `volume-cartographer/core/src/fiber_tracer/FiberTrace.cpp`
 - `volume-cartographer/apps/VC3D/LineAnnotationController.cpp`
 - `volume-cartographer/apps/VC3D/LineAnnotationController.hpp`
-- `volume-cartographer/core/test/test_fiber_trace3d.cpp`
 
-### Phase E: Integration audit
+## 3. Preserve Traced Geometry During Lasagna Optimization
 
-1. Verify local and remote attachment menus persist readable paths.
-2. Verify selected regular/fiber manifest fields remain actual locations.
-3. Verify CLI remote-manifest caching and scale behavior remain unchanged.
-4. Verify ordinary line optimization still uses its base-space normal sampler.
-5. Verify detach/reload does not remove independent volume entries.
+Resolve every CP with `segmentToNext` and its immediate successor before
+starting an ordinary optimization, then pass those closed line-index ranges
+through the existing optimization task path.
 
-## 6. Testing And Validation
+### 3.1 Existing-line local/global optimization
 
-### 6.1 Project/path tests
+Extend the shared `LineOptimizer::optimizeExistingLine()` input to accept
+protected ranges (or their expanded fixed sample indices). Every sample in a
+protected range must be a Ceres constant, not only the endpoint CPs. Keep
+active-range boundary handling and CP fixed points unchanged.
 
-- Local manifest with relative Zarr groups writes actual resolved local paths.
-- Direct HTTP/S3 manifest with relative groups writes actual resolved remote
-  locators while a second open hits the transparent cache.
-- Explicit `lasagna-remote.json` resolves group paths from `artifact_url`.
-- Absolute remote group paths remain unchanged.
-- Project JSON contains only actual manifest/group source paths and readable
-  `vc-lasagna-derived:<manifest location>` provenance.
-- Source and documentation contain no encoded identity helper, `url_hex`,
-  `source_identity_hex`, synthetic derived scheme, decoder, or migration path.
-- Two manifests referencing one Zarr source deduplicate and retain two readable
-  provenance tags.
-- Detaching one manifest preserves the shared volume; detaching the last owner
-  removes only a manifest-owned volume.
-- An independently attached volume survives all manifest detaches.
-- Remote credentials/query diagnostics are not copied into logs or cache
-  metadata beyond the project's explicitly supplied source locator contract.
+### 3.2 Full reinitialization/finalization
 
-### 6.2 Scale tests
+Extend `reinitializeAndOptimizeExistingLine()` with protected CP spans. A
+protected span must select the existing stored span directly and skip its
+Lasagna reinitialization/optimization, while unprotected spans retain current
+full-reinitialization behavior. This preserves native-traced geometry even
+when save/close finalizes unrelated incremental edits.
 
-- Manifest `source_to_base=1`, prediction group level 4, default inference
-  power 2 resolves `prediction_to_base=16`, `trace_to_base=4`, and prediction
-  spacing 4 trace voxels.
-- Nontrivial base points round-trip base -> trace -> base within floating-point
-  tolerance; original endpoint objects are restored exactly.
-- Prediction and normal sampler probes at a trace point address the same base
-  location as a direct base-space probe.
-- The GUI/core segment adapter passes a base span of 64 voxels to the tracer as
-  16 trace voxels and returns a fused base-space span with exact endpoints.
-- A one-trace-voxel endpoint error at sd2 is reported as four base voxels and
-  is accepted against the fixed 20-base-voxel threshold.
-- Missing physical voxel-size metadata still permits tracing and omits only
-  micrometer output.
-- Repeated segment actions reuse trace-scale datasets and do not rebuild on the
-  expected base/trace scale difference.
-- Existing whole-fiber metric scale tests continue to pass.
+Use these shared APIs from async optimization, synchronous finalization, and
+the test factory seam. Do not splice protected geometry back into a completed
+result in controller-only code; protection must be enforced by the optimizer
+that owns point/range changes.
 
-### 6.3 Commands
+After an optimization result returns, reattach the moved CP state by CP order
+and assert in tests that each protected range is bit-exact. If the optimizer
+violates that invariant, reject the result instead of silently clearing the CP
+metadata.
 
-Use the existing configured build tree and focused targets first:
+Expected files:
+
+- `volume-cartographer/core/include/vc/lasagna/LineOptimizer.hpp`
+- `volume-cartographer/core/src/lasagna/LineOptimizer.cpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationController.cpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationController.hpp`
+
+## 4. Make CP Mutations Protection-Aware
+
+Centralize CP-state mutation alongside the existing branch metadata
+synchronization hook so every mutation path applies the same rules.
+
+- Existing CP move: clear the previous CP's and moved CP's following-segment
+  metadata before local reinitialization.
+- CP insertion: insert empty metadata and clear only the previous CP's
+  following-segment metadata.
+- CP deletion: erase its metadata with it and clear only the previous CP's
+  following-segment metadata.
+- No-reoptimize mode: apply the same metadata invalidation even though Lasagna
+  is not run.
+- Auto-reoptimize mode: the current radius-three active range may remain, but
+  valid traced ranges inside it are fixed/protected.
+- New seed/replacement line: construct CPs with empty metadata.
+
+The generic session state may still become `Unoptimized`/`Incremental` for CP
+edits. Save-time finalization then optimizes only unprotected geometry.
+
+Expected files:
+
+- `volume-cartographer/apps/VC3D/LineAnnotationController.cpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationFiberSegments.cpp`
+
+## 5. Persist, Reload, And Update Every Reader
+
+Use the CP-owned type in `LineAnnotationSession` and the corresponding stored
+CP type in `StoredFiber`. Update all conversion paths:
+
+- session to stored snapshot, using the existing sorted CP order;
+- JSON serialization/deserialization;
+- stored fiber to a reopened line-annotation session;
+- asynchronous save snapshots and in-memory `_fibers` replacement;
+- exact-scale bundle export/import;
+- version-2 object-valued `control_points` serialization/deserialization;
+- non-unit scale import/export invalidation with an explicit warning;
+- `scripts/fiber_merge.py`, so whichever geometry carrier supplies a CP also
+  supplies its metadata and any synthetically merged CP boundaries are cleared.
+
+Audit every in-repository `vc3d_fiber` reader rather than assuming unknown
+fields are harmless. At minimum update:
+
+- VC3D `LineAnnotationController` load/save/import/export;
+- shared Python `fiber_trace.fiber_json` parsing and its `fiber_trace_2d`
+  re-export, retaining geometry convenience arrays while exposing typed CP
+  segment metadata;
+- native `vc_fiber_trace_metric` parsing in `vc_fiber_tracer`;
+- `vc_lasagna_line_probe` and any other C++ point-array probe found by the
+  audit;
+- `scripts/fiber_merge.py`, `scripts/vc_sync.py`, and their validators/tests.
+
+Version-1 inputs synthesize CP state with no `segmentToNext`. Version-2 inputs
+are rejected if any reader cannot parse all required CP/segment fields. Do not
+infer traced state from report strings, endpoint coordinates, or fiber tags.
+
+For sync/merge, compare CP geometry through `position` but carry the complete
+CP object from the chosen geometry side. If geometry is synthetically merged
+and `line_points` are replaced by the CP polyline, clear all
+`segment_to_next` values because none of the traced dense spans survived.
+
+Expected files:
+
+- `volume-cartographer/apps/VC3D/LineAnnotationController.hpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationController.cpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationFiberSegments.*`
+- `volume-cartographer/core/src/fiber_tracer/FiberTrace.cpp`
+- `volume-cartographer/apps/src/vc_lasagna_line_probe.cpp`
+- `volume-cartographer/scripts/fiber_merge.py`
+- `volume-cartographer/scripts/vc_sync.py`
+- `vesuvius/src/vesuvius/neural_tracing/fiber_trace/fiber_json.py`
+
+## 6. Ctrl-Right-Click Revert
+
+Reuse the existing Ctrl-right-click span resolver in
+`showGeneratedControlPointContextMenu()`.
+
+- For an untraced span, retain `Optimize segment with native fiber tracer`.
+- For a valid traced span, show `Revert segment to Lasagna optimization` in
+  its place.
+- Pass whether the resolved starting CP has `segmentToNext` into the menu
+  options and add a typed revert callback through generated views,
+  `LineAnnotationDialog`, and `LineAnnotationController`.
+- Disable mutation actions while any line task is running, consistent with the
+  existing controller guard.
+
+Revert is transactional:
+
+1. Resolve the clicked starting CP, its `segmentToNext`, its successor, and
+   their current line indices.
+2. Run existing-line Lasagna optimization only on that closed span, protecting
+   all other traced spans but excluding the selected record.
+3. Keep both endpoints fixed exactly.
+4. On success, clear that CP's `segmentToNext`, apply/refresh/save the Lasagna
+   result, and mark it finalized so auto-save does not run a second full pass.
+5. On failure, keep the old traced geometry and CP metadata and report the
+   error.
+
+Expected files:
+
+- `volume-cartographer/apps/VC3D/LineAnnotationGeneratedViews.hpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationGeneratedViews.cpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationDialog.hpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationDialog.cpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationController.hpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationController.cpp`
+
+## 7. Testing
+
+### 7.1 Pure segment-state tests
+
+Add focused tests for:
+
+- version-1 CP arrays loading as ordinary CPs and version-2 CP objects
+  round-tripping all `segment_to_next` fields;
+- version-2 malformed positions, final-CP metadata, unknown optimizer kinds,
+  and unknown metadata versions failing loudly in C++ and Python;
+- CP sorting moving metadata with its owner;
+- unrelated insertion/deletion/index shifts preserving metadata;
+- source/target move, deletion, and insertion inside the span clearing exactly
+  the affected CP metadata;
+- malformed length/final-entry/schema metadata being rejected
+  deterministically;
+- non-unit scale conversion clearing metadata;
+- sync merge carrying metadata with its geometry carrier and clearing metadata
+  at synthetically merged boundaries.
+- native metric and line probe accepting version 2 while extracting the same
+  geometry as version 1.
+
+### 7.2 Optimizer tests
+
+Extend `test_lasagna_line_optimizer` to verify:
+
+- local/global existing-line optimization leaves every protected sample
+  bit-exact while changing an unprotected sample;
+- full reinitialization preserves protected CP spans bit-exact and still
+  reinitializes unprotected spans;
+- multiple disjoint protected spans and active-range overlap behave correctly.
+
+### 7.3 VC3D lifecycle/menu tests
+
+Extend the headless line-annotation test seams and generated-view tests to
+cover:
+
+- accepted trace is marked finalized and auto-save never launches a full
+  Lasagna task;
+- saved/reopened fibers restore CP-owned protection;
+- deleting a CP adjacent to, but not part of, a traced span preserves its line
+  samples through the radius-three optimization;
+- moving/deleting an endpoint clears only affected `segmentToNext` values;
+- Ctrl-right-click chooses trace for an untraced span and revert for a traced
+  span;
+- failed revert retains metadata/geometry; successful revert clears only the
+  selected CP's metadata and saves the Lasagna result.
+
+Keep menu decision logic separately testable without invoking modal
+`QMenu::exec()`.
+
+### 7.4 Build and run
+
+Use all 32 requested build threads:
 
 ```bash
-cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
-  --target test_remote_file_cache test_lasagna_manifest \
-  test_lasagna_project_volumes test_volume_pkg test_fiber_trace3d \
-  test_open_data_manifest VC3D vc_fiber_trace_metric -j32
+cmake --build volume-cartographer/build --target \
+  test_line_annotation_generated_views \
+  test_lasagna_line_optimizer \
+  test_fiber_trace3d \
+  VC3D -j32
+volume-cartographer/build/bin/test_line_annotation_generated_views
+volume-cartographer/build/bin/test_lasagna_line_optimizer
+volume-cartographer/build/bin/test_fiber_trace3d
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src \
+  python -m pytest \
+    vesuvius/tests/neural_tracing/test_fiber_trace.py \
+    volume-cartographer/scripts/tests/test_fiber_merge.py \
+    volume-cartographer/scripts/tests/test_vc_sync_helpers.py
 ```
 
-Run focused binaries/CTest entries with `--output-on-failure`, followed by the
-broader applicable core/VC3D suite if the focused set passes. Run
-`git diff --check`. No network-dependent test is allowed.
+Then run the configured broader VC/CTest suite relevant to VC3D/Lasagna if its
+runtime remains practical. Record exact commands/results in `task_log.md`.
 
-Perform a manual VC3D smoke test with the supplied project shape:
+Manual GUI regression with the user's local project:
 
-1. open the project and confirm volume entries show readable source paths;
-2. save and inspect JSON for actual local/remote source locations;
-3. select the base volume and optimize one generated fiber segment;
-4. confirm tracing runs at derived scale 4 and the stored line/control points
-   remain in base coordinates;
-5. reopen the project and confirm the resulting fiber geometry is unchanged.
+1. Trace a span and confirm the saved JSON immediately contains traced line
+   points plus one readable `segment_to_next` entry inside the starting CP
+   object.
+2. Delete a CP adjacent to but outside the span and confirm the traced points
+   are unchanged before and after save/reopen.
+3. Move one endpoint and confirm only the affected CP metadata disappears.
+4. Trace again, Ctrl-right-click the span, revert it, and confirm the record is
+   removed and the span changes to Lasagna output.
 
-## 7. Spec Update
+## 8. Spec Update
 
-Update `planning/specs.md` to:
+Update `planning/specs.md` to define CP-owned following-segment semantics:
 
-- require actual local/remote manifest and group source locations in project
-  JSON;
-- prohibit cache identities, reversible encodings, hashes, and synthetic
-  locations as project source fields;
-- state explicitly that the unshipped encoded representation has no backward
-  compatibility;
-- replace the incorrect trace/line scale equality requirement;
-- define base-space persisted fibers, runtime trace space, prediction spacing,
-  trace-scale normal sampling, result conversion, exact endpoints, and
-  physical-unit conversion.
+- CP `i` owns optional native-trace information for span `i -> i+1`;
+- moving a CP clears its own and its predecessor's metadata;
+- deletion/insertion clears only metadata whose adjacency changed;
+- edits outside the adjacency preserve metadata naturally with the owning CP;
+- ordinary local/full optimization protects valid spans;
+- native trace completion is final/saveable without an implicit full Lasagna
+  pass;
+- Ctrl-right-click exposes explicit Lasagna revert for a traced span.
 
-Replace the old cache-layout specification with the readable source-path
-layout and explicitly remove backward compatibility for the WIP layout.
+Document version-2 `control_points[].position` and
+`control_points[].segment_to_next`, strict reader behavior, version-1 loading,
+and base-coordinate units.
 
-## 8. Documentation Updates
+## 9. Docs Updates
 
-Update:
+Update
+`vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/code_structure.md`
+with:
 
-- `volume-cartographer/docs/vc3d_project_files.md` with readable local and
-  remote examples plus ownership/deduplication behavior;
-- `volume-cartographer/docs/remote_file_cache.md` with the readable mirrored
-  source layout and actual source-path sidecar metadata;
-- `fiber_trace_2d/docs/code_structure.md` with the base/trace/prediction
-  coordinate adapter and separate normal samplers;
-- planning task log/status throughout implementation.
+- the VC3D CP-owned `segmentToNext` model and adjacency invalidation rules;
+- optimizer protection flow for local and full Lasagna passes;
+- save/reload behavior and the JSON field;
+- trace versus revert Ctrl-right-click actions.
 
-## 9. Changelog Update
+Add a concise fiber JSON section to the most relevant VC3D document (or a new
+focused `volume-cartographer/docs/line_annotation_fibers.md` if no suitable
+document exists) so the persisted schema is documented near the C++ owner.
 
-Add one completion entry covering:
+## 10. Changelog Update
 
-- path-based Lasagna-derived project volumes and removal of encoded identities;
-- base-space VC3D fiber persistence with sd2 runtime tracing and correct
-  physical scale conversion.
+After implementation and validation, add one 2026-07-30 changelog entry:
+VC3D now stores native-fiber-traced span information on the starting CP,
+protects those spans through ordinary optimization, clears metadata only when
+the CP adjacency changes, and supports explicit Ctrl-right-click reversion to
+Lasagna optimization.
 
-## 10. Risks And Guardrails
+## 11. Risks And Review Gates
 
-- **Shared-source ownership:** actual-location deduplication can accidentally
-  delete a manually attached volume. Preserve independent ownership explicitly
-  and test it.
-- **Remote origin loss:** materialized manifests must not turn cache paths into
-  project sources. Carry authoritative origin separately and test every origin
-  form.
-- **Signed locators:** source locators are user-provided project data, but
-  diagnostics and cache metadata must still follow existing redaction rules.
-- **Sampler-space mix-up:** using the base normal sampler during trace-space
-  tracing silently samples the wrong location. Maintain separate typed/session
-  fields and integration tests.
-- **Threshold-unit regression:** comparing a working-grid error directly to
-  `20` would make acceptance scale-dependent. Test nonzero errors with
-  `working_to_base=4`.
-- **Endpoint drift:** multiplication back into base space can perturb CPs.
-  Restore endpoints from the original stored points exactly.
-- **Cache path safety:** readable URL mirroring must reject traversal and
-  platform-invalid components without falling back to whole-locator encoding.
-- **Cold cache:** removing the unshipped URL-hex layout intentionally discards
-  compatibility with any WIP cache contents.
-
-## 11. Plan Review
-
-The plan was checked directly against `task.md`, `planning/specs.md`, the
-current manifest/cache implementation, project attachment/reconciliation code,
-and GUI trace call path. Independent agent review is not performed because the
-active runtime policy prohibits delegation unless the user explicitly requests
-it; this is recorded rather than silently skipped.
+- Full reinitialization currently reconstructs CP spans, so protection must be
+  implemented in the shared reinitializer rather than only by adding Ceres
+  fixed points to the existing-line path.
+- The version bump intentionally requires a repository-wide reader audit. Any
+  missed old reader will reject version 2 loudly; the audit and cross-reader
+  fixtures are therefore release gates.
+- Sync merge must operate on complete CP objects. Comparing or merging only
+  their positions would silently detach `segment_to_next` from its owner.
+- Independent agent review is required by the nested workflow but cannot be
+  run under the active no-delegation policy unless the user explicitly asks
+  for sub-agent work. Keep that status open and do not represent the direct
+  consistency review as independent.
