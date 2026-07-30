@@ -97,6 +97,9 @@ signals:
     void sessionActiveChanged(bool active);
     // Local (cache) filesystem paths: artifact transfers already happened.
     void previewAvailable(const QString& manifestPath, qint64 generation);
+    void previewTransferProgress(const QString& phase, const QString& fileName,
+                                 int filesComplete, int totalFiles,
+                                 qint64 bytesReceived, qint64 totalBytes);
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
     void inputUploadFinished(const QString& inputId, const QString& error);

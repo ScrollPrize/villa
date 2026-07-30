@@ -27,6 +27,7 @@
 #include <QListWidgetItem>
 #include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSettings>
@@ -560,10 +561,17 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     runLayout->addWidget(_commitHint);
 
     _state = new QLabel(tr("Service disconnected"), runContents);
+    _previewProgress = new QProgressBar(runContents);
+    _previewProgress->setObjectName(QStringLiteral("spiralPreviewProgress"));
+    _previewProgress->setTextVisible(true);
+    _previewProgress->setVisible(false);
     _metrics = new QLabel(runContents);
     _warnings = new QLabel(runContents); _warnings->setWordWrap(true);
     _warnings->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    runLayout->addWidget(_state); runLayout->addWidget(_metrics); runLayout->addWidget(_warnings);
+    runLayout->addWidget(_state);
+    runLayout->addWidget(_previewProgress);
+    runLayout->addWidget(_metrics);
+    runLayout->addWidget(_warnings);
     layout->addStretch(1);
     scroll->setWidget(contents);
     rootLayout->addWidget(scroll);
@@ -673,6 +681,50 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     connect(_service, &SpiralServiceManager::configurationReviewRequested,
             _advancedProfiles, &SpiralConfigProfileEditor::showWindow);
     connect(_service, &SpiralServiceManager::sessionStatusChanged, this, &SpiralPanel::updateStatus);
+    connect(_service, &SpiralServiceManager::previewTransferProgress, this,
+            [this](const QString& phase, const QString& fileName,
+                   int filesComplete, int totalFiles,
+                   qint64 bytesReceived, qint64 totalBytes) {
+                _previewTransferActive =
+                    phase != QStringLiteral("finished")
+                    && phase != QStringLiteral("failed");
+                const QString action =
+                    phase == QStringLiteral("verifying")
+                        ? tr("Verifying preview")
+                        : phase == QStringLiteral("failed")
+                            ? tr("Preview download failed")
+                        : phase == QStringLiteral("finished")
+                            ? tr("Installing preview")
+                            : tr("Downloading preview");
+                _previewTransferText = fileName.isEmpty()
+                    ? action
+                    : tr("%1 (%2/%3): %4")
+                          .arg(action)
+                          .arg(qMin(filesComplete + 1, totalFiles))
+                          .arg(totalFiles)
+                          .arg(fileName);
+                _previewProgress->setVisible(
+                    phase != QStringLiteral("failed"));
+                if (totalBytes > 0) {
+                    _previewProgress->setRange(0, 1000);
+                    _previewProgress->setValue(static_cast<int>(
+                        qBound<qint64>(
+                            qint64{0}, bytesReceived * 1000 / totalBytes,
+                            qint64{1000})));
+                    _previewProgress->setFormat(
+                        tr("%1 / %2 MiB")
+                            .arg(bytesReceived / (1024 * 1024))
+                            .arg(totalBytes / (1024 * 1024)));
+                } else {
+                    _previewProgress->setRange(0, 0);
+                }
+            });
+    connect(_service, &SpiralServiceManager::previewAvailable, this,
+            [this](const QString&, qint64) {
+                _previewTransferActive = false;
+                _previewTransferText.clear();
+                _previewProgress->setVisible(false);
+            });
     connect(_service, &SpiralServiceManager::sessionSynchronized,
             this, &SpiralPanel::synchronizeSession);
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
@@ -1478,6 +1530,26 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         .arg(state, status.value("phase").toString())
         .arg(status.value("current_iteration").toInteger())
         .arg(status.value("target_iteration").toInteger());
+    const QJsonObject previewPublish =
+        status.value(QStringLiteral("preview_publish")).toObject();
+    if (_previewTransferActive && !_previewTransferText.isEmpty()) {
+        stateText += QStringLiteral("\n") + _previewTransferText;
+    } else if (!previewPublish.isEmpty()) {
+        const int step = previewPublish.value(QStringLiteral("step")).toInt();
+        const int total =
+            previewPublish.value(QStringLiteral("total_steps")).toInt();
+        _previewProgress->setVisible(true);
+        if (total > 0) {
+            _previewProgress->setRange(0, total);
+            _previewProgress->setValue(qBound(0, step, total));
+            _previewProgress->setFormat(
+                tr("%1 / %2").arg(step).arg(total));
+        } else {
+            _previewProgress->setRange(0, 0);
+        }
+    } else {
+        _previewProgress->setVisible(false);
+    }
     // Status polls arrive every second; without this the reload-required
     // notice set by refreshReloadRequired() vanishes immediately, leaving an
     // unexplained disabled Run button.

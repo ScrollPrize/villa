@@ -53,6 +53,11 @@ public:
 
     QString cacheRoot() const;
 
+signals:
+    void fetchProgress(const QString& artifactId, const QString& phase,
+                       const QString& fileName, int filesComplete, int totalFiles,
+                       qint64 bytesReceived, qint64 totalBytes);
+
 private:
     struct FetchJob;
     void startNextFile(const std::shared_ptr<FetchJob>& job);

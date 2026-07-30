@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
 import json
@@ -432,21 +433,34 @@ class ArtifactRegistry:
         self._pruned_ids = OrderedDict()
 
     def register_directory(self, kind, session_id, generation, root,
-                           entry_point, *, delete_root_on_prune=False):
+                           entry_point, *, delete_root_on_prune=False,
+                           progress=None, hash_workers=1):
         root = Path(root).resolve(strict=True)
-        files = {}
+        paths = []
         for directory, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames.sort()
             for filename in sorted(filenames):
                 path = Path(directory) / filename
                 if path.is_symlink() or not path.is_file():
                     continue
-                relative = path.relative_to(root).as_posix()
-                files[relative] = {"size": path.stat().st_size,
-                                   "sha256": _sha256_file(path)}
-                if len(files) > MAX_ARTIFACT_FILES:
+                paths.append(path)
+                if len(paths) > MAX_ARTIFACT_FILES:
                     raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR,
                                    "Artifact has too many files to register")
+
+        def digest(path):
+            return path, path.stat().st_size, _sha256_file(path)
+
+        files = {}
+        workers = max(1, min(int(hash_workers), len(paths) or 1))
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="spiral-artifact-hash") as executor:
+            for index, (path, size, sha256) in enumerate(
+                    executor.map(digest, paths), start=1):
+                relative = path.relative_to(root).as_posix()
+                files[relative] = {"size": size, "sha256": sha256}
+                if progress is not None:
+                    progress(index, len(paths), relative)
         if entry_point not in files:
             raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR,
                            f"Artifact entry point {entry_point!r} was not found")
@@ -839,8 +853,21 @@ def _validate_tifxyz_output_step(metadata, expected_step):
     return values
 
 
-def _load_flatten_correspondence(checkpoint_path):
+def _load_flatten_correspondence(checkpoint_path=None, map_path=None):
     """Read Lasagna's flattened-output -> Spiral-source grid map."""
+    if map_path is not None and Path(map_path).is_file():
+        mapping = np.load(str(map_path), mmap_mode="r", allow_pickle=False)
+        mapping = np.asarray(mapping, dtype=np.float32)
+        if mapping.ndim != 3 or mapping.shape[-1] != 2:
+            raise RuntimeError(
+                "Lasagna output-to-source map must have shape (rows, columns, 2)")
+        if not np.isfinite(mapping).all():
+            raise RuntimeError(
+                "Lasagna output-to-source map contains non-finite values")
+        return mapping
+
+    if checkpoint_path is None:
+        raise RuntimeError("Lasagna produced no flatten correspondence")
     import torch
 
     state = torch.load(
@@ -860,7 +887,8 @@ def _load_flatten_correspondence(checkpoint_path):
     return mapping
 
 
-def _sample_rgba_through_map(source_rgba, source_yx, output_valid):
+def _sample_rgba_through_map(source_rgba, source_yx, output_valid, *,
+                             executor=None):
     """Bilinearly warp RGBA using premultiplied alpha."""
     source = np.asarray(source_rgba, dtype=np.float32) / 255.0
     if source.ndim != 3 or source.shape[-1] != 4:
@@ -868,15 +896,21 @@ def _sample_rgba_through_map(source_rgba, source_yx, output_valid):
     alpha = source[..., 3]
     premultiplied = source[..., :3] * alpha[..., None]
     coordinates = [source_yx[..., 0], source_yx[..., 1]]
-    sampled_alpha = scipy.ndimage.map_coordinates(
-        alpha, coordinates, order=1, mode="constant", cval=0.0,
-        prefilter=False)
-    sampled_rgb = np.stack([
-        scipy.ndimage.map_coordinates(
-            premultiplied[..., channel], coordinates,
-            order=1, mode="constant", cval=0.0, prefilter=False)
-        for channel in range(3)
-    ], axis=-1)
+
+    def sample(channel):
+        values = alpha if channel == 3 else premultiplied[..., channel]
+        return scipy.ndimage.map_coordinates(
+            values, coordinates, order=1, mode="constant", cval=0.0,
+            prefilter=False)
+
+    if executor is None:
+        sampled = [sample(channel) for channel in range(4)]
+    else:
+        # Each channel is independent and scipy releases the GIL here.  Mapping
+        # them concurrently preserves the exact interpolation and output bytes.
+        sampled = list(executor.map(sample, range(4)))
+    sampled_alpha = sampled[3]
+    sampled_rgb = np.stack(sampled[:3], axis=-1)
     nonzero = sampled_alpha > 1.0e-8
     sampled_rgb[nonzero] /= sampled_alpha[nonzero, None]
     sampled_rgb[~nonzero] = 0.0
@@ -898,14 +932,18 @@ def _mapped_winding_ids(source_manifest, source_shape, source_yx,
     if (not isinstance(ranges, list) or not isinstance(windings, list)
             or len(ranges) != len(windings) or not ranges):
         raise RuntimeError("Spiral source preview has no winding mapping")
-    source_labels = np.full(source_shape, -1, dtype=np.int32)
+    winding_values = sorted({int(winding) for winding in windings})
+    winding_to_dense = {
+        winding: index + 1 for index, winding in enumerate(winding_values)
+    }
+    source_labels = np.zeros(source_shape, dtype=np.int32)
     for bounds, winding in zip(ranges, windings):
         if not isinstance(bounds, list) or len(bounds) != 2:
             raise RuntimeError("Malformed Spiral winding column range")
         begin, end = int(bounds[0]), int(bounds[1])
         if begin < 0 or end <= begin or end > source_shape[1]:
             raise RuntimeError("Spiral winding column range is out of bounds")
-        source_labels[:, begin:end] = int(winding)
+        source_labels[:, begin:end] = winding_to_dense[int(winding)]
 
     rows = np.rint(source_yx[..., 0]).astype(np.int64)
     columns = np.rint(source_yx[..., 1]).astype(np.int64)
@@ -914,30 +952,39 @@ def _mapped_winding_ids(source_manifest, source_shape, source_yx,
         & (rows >= 0) & (rows < source_shape[0])
         & (columns >= 0) & (columns < source_shape[1])
     )
-    result = np.full(output_valid.shape, -1, dtype=np.int32)
-    result[in_bounds] = source_labels[rows[in_bounds], columns[in_bounds]]
-    result[~output_valid] = -1
-
+    dense_result = np.zeros(output_valid.shape, dtype=np.int32)
+    dense_result[in_bounds] = source_labels[
+        rows[in_bounds], columns[in_bounds]]
     bounds = []
-    for winding in sorted(int(value) for value in np.unique(result)
-                          if int(value) >= 0):
-        yy, xx = np.nonzero(result == winding)
+    objects = scipy.ndimage.find_objects(
+        dense_result, max_label=len(winding_values))
+    for dense_label, slices in enumerate(objects, start=1):
+        if slices is None:
+            continue
+        row_slice, column_slice = slices
+        winding = winding_values[dense_label - 1]
         bounds.append({
             "winding": winding,
-            "row_begin": int(yy.min()),
-            "row_end": int(yy.max()) + 1,
-            "column_begin": int(xx.min()),
-            "column_end": int(xx.max()) + 1,
+            "row_begin": int(row_slice.start),
+            "row_end": int(row_slice.stop),
+            "column_begin": int(column_slice.start),
+            "column_end": int(column_slice.stop),
         })
     if not bounds:
         raise RuntimeError("Lasagna correspondence mapped no preview windings")
+    lookup = np.asarray([-1, *winding_values], dtype=np.int32)
+    result = lookup[dense_result]
     return result, bounds
 
 
-def _raw_run_diff_rgba(previous_manifest, current_manifest):
+def _raw_run_diff_rgba(previous_manifest, current_manifest, *,
+                       current_surface_data=None):
     """Build a current-source-grid displacement overlay by winding identity."""
-    current_surface = Path(current_manifest["surface_path"])
-    current_xyz, current_valid = _surface_xyz(current_surface)
+    if current_surface_data is None:
+        current_surface = Path(current_manifest["surface_path"])
+        current_xyz, current_valid = _surface_xyz(current_surface)
+    else:
+        current_xyz, current_valid = current_surface_data
     rgba = np.zeros((*current_valid.shape, 4), dtype=np.uint8)
     if previous_manifest is None:
         return rgba, 0
@@ -1362,10 +1409,33 @@ class ServiceState:
         try:
             published_manifest = self._publish_flattened_preview(
                 session_id, preview_generation, Path(preview_manifest))
+
+            def indexing_progress(current, total, relative):
+                self._update_preview_publish(
+                    preview_generation, state="indexing",
+                    stage_name=(
+                        f"Indexing preview files ({current}/{total}): "
+                        f"{relative}"),
+                    step=current, total_steps=total,
+                    overall_progress=(
+                        float(current) / float(total) if total else 1.0))
+
+            indexing_started = time.perf_counter()
+            self._update_preview_publish(
+                preview_generation, state="indexing",
+                stage_name="Indexing preview files",
+                step=0, total_steps=0, overall_progress=0.0)
             ref = self.artifacts.register_directory(
                 "spiral-preview", session_id, preview_generation,
                 published_manifest.parent, published_manifest.name,
-                delete_root_on_prune=True)
+                delete_root_on_prune=True, progress=indexing_progress,
+                hash_workers=4)
+            print(
+                "SPIRAL_PREVIEW_TIMING "
+                f"generation={preview_generation} "
+                "stage='Indexing preview files' "
+                f"seconds={time.perf_counter() - indexing_started:.6f}",
+                flush=True)
             with self.lock:
                 if self.session_id == session_id:
                     self._preview_artifact = ref
@@ -1654,6 +1724,23 @@ class ServiceState:
             self, session_id, generation, preview_manifest_path):
         process = None
         publish_root = None
+        timing_stage = None
+        timing_started = time.perf_counter()
+
+        def start_stage(state, stage_name, **values):
+            nonlocal timing_stage, timing_started
+            now = time.perf_counter()
+            if timing_stage is not None:
+                print(
+                    "SPIRAL_PREVIEW_TIMING "
+                    f"generation={generation} stage={timing_stage!r} "
+                    f"seconds={now - timing_started:.6f}",
+                    flush=True)
+            timing_stage = stage_name
+            timing_started = now
+            self._update_preview_publish(
+                generation, state=state, stage_name=stage_name, **values)
+
         try:
             fit_service = _find_lasagna_service()
             config_path = fit_service.parent / "configs" / "flatten_fast_nofilter.json"
@@ -1699,9 +1786,8 @@ class ServiceState:
             with tempfile.TemporaryDirectory(prefix="spiral_lasagna_") as temporary:
                 temporary = Path(temporary)
                 object_store = temporary / "objects"
-                self._update_preview_publish(
-                    generation, state="preparing",
-                    stage_name="Preparing Lasagna input surface",
+                start_stage(
+                    "preparing", "Preparing Lasagna input surface",
                     output_step_vx=LASAGNA_PREVIEW_OUTPUT_STEP_VX)
                 metadata = json.loads(
                     (surface_path / "meta.json").read_text(encoding="utf-8"))
@@ -1744,6 +1830,12 @@ class ServiceState:
                         if match:
                             port_holder["port"] = int(match.group(1))
                             ready.set()
+                        if "[fit] peak GPU memory:" in text:
+                            self._update_preview_publish(
+                                generation, state="saving",
+                                stage_name="Saving optimized flatten model",
+                                step=0, total_steps=0,
+                                overall_progress=0.0)
 
                 relay = threading.Thread(
                     target=relay_output, name="spiral-lasagna-log",
@@ -1767,6 +1859,9 @@ class ServiceState:
                     "output_name": surface_id,
                     "output_dir": str(publish_root),
                     "model_output": str(model_output),
+                    "embed_job_metadata": False,
+                    "omit_model": True,
+                    "export_flatten_map": True,
                     "source": "Spiral host service",
                 }
                 accepted = _fit_service_json(
@@ -1775,6 +1870,9 @@ class ServiceState:
                 if not fit_job_id:
                     raise RuntimeError(
                         "Temporary Lasagna service returned no job id")
+                start_stage(
+                    "running", "Flattening preview surface",
+                    step=0, total_steps=0, overall_progress=0.0)
 
                 while True:
                     with self.lock:
@@ -1808,18 +1906,23 @@ class ServiceState:
                 if not flattened_metadata_path.is_file():
                     raise RuntimeError(
                         "Lasagna reported success but produced no tifxyz output")
-                self._update_preview_publish(
-                    generation, state="mapping",
-                    stage_name="Mapping Spiral preview artifacts")
-
-                correspondence = _load_flatten_correspondence(model_output)
+                flatten_map_output = publish_root / ".flatten-map.npy"
+                start_stage(
+                    "loading", "Loading flattened preview output",
+                    step=0, total_steps=0, overall_progress=0.0)
+                correspondence = _load_flatten_correspondence(
+                    model_output, flatten_map_output)
                 flattened_xyz, flattened_valid = _surface_xyz(flattened_surface)
                 if correspondence.shape[:2] != flattened_xyz.shape[:2]:
                     raise RuntimeError(
                         "Lasagna correspondence dimensions do not match "
                         "the flattened surface")
+                source_xyz, source_valid = _surface_xyz(surface_path)
+                start_stage(
+                    "mapping", "Mapping preview winding membership",
+                    step=0, total_steps=0, overall_progress=0.0)
                 winding_ids, winding_bounds = _mapped_winding_ids(
-                    manifest, _surface_xyz(surface_path)[0].shape[:2],
+                    manifest, source_xyz.shape[:2],
                     correspondence, flattened_valid)
                 winding_map_name = "winding-ids.tif"
                 # OpenCV/Qt do not portably decode signed-int TIFF samples.
@@ -1832,37 +1935,65 @@ class ServiceState:
                 mapped_loss_maps = []
                 loss_output = publish_root / "loss-maps"
                 loss_output.mkdir(exist_ok=True)
-                for entry in manifest.get("loss_maps", []):
-                    if not isinstance(entry, dict):
-                        continue
-                    relative = str(entry.get("path") or "")
-                    source_overlay = preview_manifest_path.parent / relative
-                    if not source_overlay.is_file():
-                        continue
-                    with Image.open(source_overlay) as image:
-                        source_rgba = np.asarray(
-                            image.convert("RGBA"), dtype=np.uint8)
-                    mapped = _sample_rgba_through_map(
-                        source_rgba, correspondence, flattened_valid)
-                    destination = loss_output / Path(relative).name
-                    Image.fromarray(mapped, mode="RGBA").save(destination)
-                    mapped_entry = dict(entry)
-                    mapped_entry["path"] = (
-                        Path("loss-maps") / destination.name).as_posix()
-                    mapped_entry["supported_pixels"] = int(
-                        np.count_nonzero(mapped[..., 3]))
-                    mapped_loss_maps.append(mapped_entry)
+                loss_entries = [
+                    entry for entry in manifest.get("loss_maps", [])
+                    if isinstance(entry, dict)
+                    and (preview_manifest_path.parent
+                         / str(entry.get("path") or "")).is_file()
+                ]
+                remap_total = len(loss_entries)
+                start_stage(
+                    "mapping", (
+                        f"Remapping preview loss maps (0/{remap_total})"
+                        if remap_total else "No preview loss maps to remap"),
+                    step=0, total_steps=remap_total,
+                    overall_progress=0.0)
+                with ThreadPoolExecutor(
+                        max_workers=4,
+                        thread_name_prefix="spiral-overlay-channel") as remap_executor:
+                    for loss_index, entry in enumerate(loss_entries, start=1):
+                        relative = str(entry.get("path") or "")
+                        self._update_preview_publish(
+                            generation, state="mapping",
+                            stage_name=(
+                                f"Remapping preview loss maps "
+                                f"({loss_index}/{remap_total}): "
+                                f"{Path(relative).name}"),
+                            step=loss_index - 1, total_steps=remap_total,
+                            overall_progress=(
+                                float(loss_index - 1) / float(remap_total)
+                                if remap_total else 1.0))
+                        source_overlay = preview_manifest_path.parent / relative
+                        with Image.open(source_overlay) as image:
+                            source_rgba = np.asarray(
+                                image.convert("RGBA"), dtype=np.uint8)
+                        mapped = _sample_rgba_through_map(
+                            source_rgba, correspondence, flattened_valid,
+                            executor=remap_executor)
+                        destination = loss_output / Path(relative).name
+                        Image.fromarray(mapped, mode="RGBA").save(destination)
+                        mapped_entry = dict(entry)
+                        mapped_entry["path"] = (
+                            Path("loss-maps") / destination.name).as_posix()
+                        mapped_entry["supported_pixels"] = int(
+                            np.count_nonzero(mapped[..., 3]))
+                        mapped_loss_maps.append(mapped_entry)
 
-                previous_manifest = None
-                with self.lock:
-                    previous_path = self._previous_raw_preview_manifest
-                if previous_path and Path(previous_path).is_file():
-                    previous_manifest = json.loads(
-                        Path(previous_path).read_text(encoding="utf-8"))
-                raw_diff, changed_pixels = _raw_run_diff_rgba(
-                    previous_manifest, manifest)
-                mapped_diff = _sample_rgba_through_map(
-                    raw_diff, correspondence, flattened_valid)
+                    start_stage(
+                        "mapping", "Building preview run difference",
+                        step=0, total_steps=0, overall_progress=0.0)
+                    previous_manifest = None
+                    with self.lock:
+                        previous_path = self._previous_raw_preview_manifest
+                    if previous_path and Path(previous_path).is_file():
+                        previous_manifest = json.loads(
+                            Path(previous_path).read_text(encoding="utf-8"))
+                    raw_diff, changed_pixels = _raw_run_diff_rgba(
+                        previous_manifest, manifest,
+                        current_surface_data=(source_xyz, source_valid))
+                    mapped_diff = _sample_rgba_through_map(
+                        raw_diff, correspondence, flattened_valid,
+                        executor=remap_executor)
                 run_diff = None
                 if changed_pixels:
                     run_diff_name = "run-diff.png"
@@ -1875,6 +2006,9 @@ class ServiceState:
                             np.count_nonzero(mapped_diff[..., 3])),
                     }
 
+                start_stage(
+                    "finalizing", "Finalizing preview metadata",
+                    step=0, total_steps=0, overall_progress=0.0)
                 flattened_metadata = json.loads(
                     flattened_metadata_path.read_text(encoding="utf-8"))
                 _validate_tifxyz_output_step(
@@ -1921,7 +2055,12 @@ class ServiceState:
                     json.dumps(published, indent=2) + "\n",
                     encoding="utf-8")
 
+                # These are transient transport files.  The interactive Spiral
+                # preview never exposes a Lasagna model to VC3D.
+                del correspondence
                 model_output.unlink(missing_ok=True)
+                flatten_map_output.unlink(missing_ok=True)
+                (flattened_surface / "model.pt").unlink(missing_ok=True)
                 os.replace(publish_root, final_root)
                 publish_root = None
 
@@ -1931,9 +2070,9 @@ class ServiceState:
                         preview_manifest_path)
                 if old_raw and old_raw != str(preview_manifest_path):
                     shutil.rmtree(Path(old_raw).parent, ignore_errors=True)
-                self._update_preview_publish(
-                    generation, state="finished", stage_name="Finished",
-                    overall_progress=1.0)
+                start_stage(
+                    "finalizing", "Preparing preview artifact index",
+                    step=0, total_steps=0, overall_progress=0.0)
                 return final_root / "manifest.json"
         finally:
             _stop_process_group(process)

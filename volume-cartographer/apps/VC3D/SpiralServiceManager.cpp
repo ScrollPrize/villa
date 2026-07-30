@@ -72,6 +72,15 @@ SpiralServiceManager::SpiralServiceManager(QObject* parent) : QObject(parent)
     _remoteLogPoll->setInterval(kRemoteLogPollMs);
     connect(_remoteLogPoll, &QTimer::timeout, this,
             &SpiralServiceManager::pollRemoteLogs);
+    connect(_artifactCache, &SpiralArtifactCache::fetchProgress, this,
+            [this](const QString& artifactId, const QString& phase,
+                   const QString& fileName, int filesComplete, int totalFiles,
+                   qint64 bytesReceived, qint64 totalBytes) {
+                if (artifactId != _fetchingPreviewArtifact) return;
+                emit previewTransferProgress(
+                    phase, fileName, filesComplete, totalFiles,
+                    bytesReceived, totalBytes);
+            });
 
     connect(_tunnel, &SpiralSshTunnel::logMessage, this, &SpiralServiceManager::logMessage);
     connect(_tunnel, &SpiralSshTunnel::ready, this, [this](int localPort) {

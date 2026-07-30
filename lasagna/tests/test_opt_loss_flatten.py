@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import torch
 import tifffile
 
@@ -1052,6 +1053,38 @@ class FlattenLossTest(unittest.TestCase):
 			y = tifffile.imread(str(out / "vc3d_name.tifxyz" / "y.tif"))
 			z = tifffile.imread(str(out / "vc3d_name.tifxyz" / "z.tif"))
 			self.assertTrue(bool(((x == -1.0) & (y == -1.0) & (z == -1.0)).any()))
+			self.assertTrue((out / "vc3d_name.tifxyz" / "model.pt").is_file())
+
+	def test_fit2tifxyz_can_export_ephemeral_flatten_without_model(self) -> None:
+		xyz = _flat_grid(4, 4)
+		valid = torch.ones(4, 4, dtype=torch.bool)
+		mdl = _make_flatten_model(xyz, valid, mesh_step=1)
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			model_path = root / "flatten_model.pt"
+			map_path = root / "out" / ".flatten-map.npy"
+			out = root / "out"
+			fit._save_flatten_model(
+				str(model_path),
+				mdl=mdl,
+				data=fit._dummy_flatten_data(),
+				fit_config={"args": {"model-init": "flatten"}},
+			)
+
+			fit2tifxyz.main([
+				"--input", str(model_path),
+				"--output", str(out),
+				"--output-name", "preview.tifxyz",
+				"--omit-model",
+				"--flatten-map-output", str(map_path),
+			])
+
+			self.assertFalse((out / "preview.tifxyz" / "model.pt").exists())
+			expected = torch.load(
+				model_path, map_location="cpu", weights_only=False
+			)["flatten_map_flat"].numpy()
+			np.testing.assert_array_equal(
+				np.load(map_path, allow_pickle=False), expected)
 
 	def test_forward_fit_mode_writes_normal_flatten_outputs(self) -> None:
 		with tempfile.TemporaryDirectory() as td:

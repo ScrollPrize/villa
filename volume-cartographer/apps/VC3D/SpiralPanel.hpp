@@ -20,6 +20,7 @@ class QPushButton;
 class QSpinBox;
 class QDoubleSpinBox;
 class QPlainTextEdit;
+class QProgressBar;
 class QSlider;
 class QToolButton;
 class SpiralServiceManager;
@@ -133,6 +134,7 @@ private:
     QPushButton* _downloadCheckpoint = nullptr;
     QPushButton* _refill = nullptr;
     QLabel* _state = nullptr;
+    QProgressBar* _previewProgress = nullptr;
     QLabel* _metrics = nullptr;
     QLabel* _warnings = nullptr;
 
@@ -176,6 +178,8 @@ private:
     bool _sessionRunnable = false;
     bool _remoteMode = false;
     bool _connected = false;
+    bool _previewTransferActive = false;
+    QString _previewTransferText;
     int _ephemeralCount = 0;
     int _uncommittedCount = 0;
     std::function<void(std::function<void()>)> _sessionExitGuard;

@@ -7,6 +7,7 @@ faked; these tests exercise the service plumbing only.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import io
 import hashlib
 import json
@@ -35,6 +36,7 @@ import spiral_service
 from spiral_service import (ApiError, ArtifactRegistry, ExclusiveFileLock,
                             FileLockUnavailable, ServiceLogBuffer, ServiceState,
                             SpiralServer, _mapped_winding_ids,
+                            _load_flatten_correspondence,
                             _prepare_cleaned_lasagna_surface,
                             _raw_run_diff_rgba, _sample_rgba_through_map,
                             _validate_tifxyz_output_step,
@@ -431,6 +433,28 @@ class ArtifactHttpTests(HttpServiceFixture):
         self.assertEqual(manifest["entry_point"], "manifest.json")
         for entry in manifest["files"]:
             self.assertRegex(entry["sha256"], r"^[0-9a-f]{64}$")
+
+    def test_registration_reports_each_hashed_file(self):
+        artifact_root = self.root / "artifact-progress"
+        artifact_root.mkdir()
+        (artifact_root / "manifest.json").write_text("{}")
+        (artifact_root / "first.bin").write_bytes(b"first")
+        (artifact_root / "second.bin").write_bytes(b"second")
+        progress = []
+
+        self.state.artifacts.register_directory(
+            "spiral-preview", "session-1", 2, artifact_root, "manifest.json",
+            progress=lambda current, total, relative: progress.append(
+                (current, total, relative)),
+            hash_workers=2)
+
+        self.assertEqual(
+            progress,
+            [
+                (1, 3, "first.bin"),
+                (2, 3, "manifest.json"),
+                (3, 3, "second.bin"),
+            ])
 
     def test_unknown_artifact_is_not_found_and_pruned_is_gone(self):
         ref, _ = self._register_artifact()
@@ -1462,6 +1486,55 @@ class MappedPreviewArtifactTests(unittest.TestCase):
         np.testing.assert_array_equal(mapped[0, 0], [200, 0, 0, 255])
         np.testing.assert_allclose(mapped[0, 1], [100, 0, 100, 255], atol=1)
         np.testing.assert_array_equal(mapped[0, 2], [0, 0, 0, 0])
+
+    def test_threaded_loss_overlay_matches_sequential_bytes(self):
+        rng = np.random.default_rng(20260730)
+        source = rng.integers(0, 256, size=(17, 23, 4), dtype=np.uint8)
+        source_yx = np.stack([
+            rng.uniform(-1.0, 17.5, size=(13, 19)),
+            rng.uniform(-1.0, 23.5, size=(13, 19)),
+        ], axis=-1).astype(np.float32)
+        output_valid = rng.random((13, 19)) > 0.2
+
+        sequential = _sample_rgba_through_map(
+            source, source_yx, output_valid)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            threaded = _sample_rgba_through_map(
+                source, source_yx, output_valid, executor=executor)
+
+        np.testing.assert_array_equal(threaded, sequential)
+
+    def test_winding_bounds_union_duplicate_disjoint_ranges(self):
+        manifest = {
+            "winding_ids": [7, 9, 7],
+            "winding_column_ranges": [[0, 2], [2, 4], [4, 6]],
+        }
+        source_yx = np.asarray([[
+            [0, 0], [0, 2], [0, 5], [0, 3],
+        ]], dtype=np.float32)
+        result, bounds = _mapped_winding_ids(
+            manifest, (1, 6), source_yx, np.ones((1, 4), dtype=bool))
+
+        np.testing.assert_array_equal(result, [[7, 9, 7, 9]])
+        self.assertEqual(bounds, [
+            {
+                "winding": 7, "row_begin": 0, "row_end": 1,
+                "column_begin": 0, "column_end": 3,
+            },
+            {
+                "winding": 9, "row_begin": 0, "row_end": 1,
+                "column_begin": 1, "column_end": 4,
+            },
+        ])
+
+    def test_flatten_correspondence_prefers_npy_sidecar(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            map_path = Path(temporary) / "flatten-map.npy"
+            expected = np.arange(24, dtype=np.float32).reshape(3, 4, 2)
+            np.save(map_path, expected, allow_pickle=False)
+            actual = _load_flatten_correspondence(
+                Path(temporary) / "missing.pt", map_path)
+            np.testing.assert_array_equal(actual, expected)
 
     @staticmethod
     def _write_surface(path, xyz):
