@@ -27,3 +27,12 @@
 - [x] Rerun focused regression suites after proxy correction.
 - [x] Update specs, docs, changelog, and task log.
 - [x] Perform final diff and consistency review.
+
+## Follow-up Correction
+
+- [x] Make degenerate tangent-plane projection perpendicular to the normal.
+- [x] Remove previous-line candidates from full reinitialization.
+- [x] Make solved-neighbor continuation replace same-side generic rollout.
+- [x] Add focused projection and candidate-suppression regressions.
+- [x] Rebuild and rerun affected suites and VC3D with `-j32`.
+- [x] Update specifications, docs, changelog, and task log.

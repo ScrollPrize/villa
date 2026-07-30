@@ -36,6 +36,16 @@
 - A fiber-constrained CP supplies exactly one rollout direction from that CP.
   Do not also generate normal-, chord-, existing-, or continuation-derived
   starting directions from the same side.
+- Full reinitialization must not submit the previous Lasagna span as a solve
+  candidate. The previous line may locate CPs and determine rollout budgets,
+  but it must not compete with newly constructed rollout geometry.
+- When a solved neighboring span supplies a continuation direction, that
+  direction replaces normal-, chord-, or previous-line initialization from
+  the shared CP side. It is not an additional candidate.
+- Projecting a rollout direction into the Lasagna tangent plane must always
+  return a tangent-plane direction. A direction parallel to the sampled normal
+  must fall back to a deterministic perpendicular tangent, never to the
+  original normal-parallel direction.
 - Invalid or degenerate native endpoint geometry is an explicit task failure;
   it must not silently revert to a normal-derived direction.
 

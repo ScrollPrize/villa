@@ -746,10 +746,14 @@ Ownership changed as follows:
   `LineOptimizer` creates one adjacent proxy sample on that direction and fixes
   it alongside the CP in the ordinary per-span and final stitched Ceres solves.
   The existing spacing and tangent/normal smoothness residuals optimize the
-  remaining points. A constrained CP side produces only its fiber-directed
-  rollout, so normal alignment, candidate selection, and seed ordering cannot
-  replace its starting direction. Ordinary edits reuse unaffected traced spans
-  and retrace only invalidated adjacency.
+  remaining points. One constrained endpoint produces exactly one rollout
+  candidate from that endpoint; two constrained endpoints produce one from
+  each. Full reinitialization does not solve or score the previous Lasagna span
+  or its endpoint directions. Directions propagated from solved neighboring
+  spans likewise replace generic same-span CP/chord candidates. Normal-plane
+  transport resolves a degenerate projection with a deterministic perpendicular
+  tangent rather than retaining a normal-parallel input. Ordinary edits reuse
+  unaffected traced spans and retrace only invalidated adjacency.
 
   Both open tails are first available from Lasagna reinitialization. Fiber mode
   then calls `traceFiberExtrapolation`, a thin distance-plane request over the

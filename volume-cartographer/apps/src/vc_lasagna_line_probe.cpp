@@ -492,14 +492,10 @@ void printReinitSpanTable(const std::vector<vc::lasagna::LineReinitializationSpa
               << std::setw(8) << "lnear"
               << std::setw(5) << "rsgn"
               << std::setw(8) << "rnear"
-              << std::setw(8) << "clnear"
-              << std::setw(8) << "crnear"
               << std::setw(9) << "lirms"
               << std::setw(9) << "lfrms"
               << std::setw(9) << "rirms"
               << std::setw(9) << "rfrms"
-              << std::setw(9) << "clfrms"
-              << std::setw(9) << "crfrms"
               << std::setw(8) << "mxstep"
               << std::setw(8) << "mxtan"
               << std::setw(8) << "mxnorm"
@@ -514,14 +510,10 @@ void printReinitSpanTable(const std::vector<vc::lasagna::LineReinitializationSpa
                   << std::setw(8) << span.candLeftClosestTargetDistance
                   << std::setw(5) << span.candRightSelectedSign
                   << std::setw(8) << span.candRightClosestTargetDistance
-                  << std::setw(8) << span.candContinueLeftClosestTargetDistance
-                  << std::setw(8) << span.candContinueRightClosestTargetDistance
                   << std::setw(9) << initialRmsForCandidate(span, "left")
                   << std::setw(9) << finalRmsForCandidate(span, "left")
                   << std::setw(9) << initialRmsForCandidate(span, "right")
                   << std::setw(9) << finalRmsForCandidate(span, "right")
-                  << std::setw(9) << finalRmsForCandidate(span, "continue-left")
-                  << std::setw(9) << finalRmsForCandidate(span, "continue-right")
                   << std::setw(8) << span.chosenMaxEvenStepDeviation
                   << std::setw(8) << span.chosenMaxTangentSmoothDeviation
                   << std::setw(8) << span.chosenMaxNormalSmoothDeviation

@@ -145,3 +145,52 @@
 - `git diff --check` and the production search for `SetManifold`,
   `AnchoredPositive`, and point-level ray constraint types passed with no
   remaining custom manifold code.
+
+## Follow-up Findings
+
+- `projectDirectionToNormalPlane` returns the normalized input when its plane
+  projection is degenerate. For a normal-parallel input this preserves exactly
+  the forbidden normal direction during rollout transport.
+- Full reinitialization still builds, solves, and scores an `existing`
+  candidate from the previous Lasagna span.
+- A continuation direction from an already solved neighboring span currently
+  creates an additional `continue-left` or `continue-right` candidate. Generic
+  chord/normal rollouts from the same side remain eligible, so the propagated
+  direction can lose candidate selection.
+- Native hard directions are derived directly from protected dense native
+  geometry and are not obtained from the old Lasagna line. Non-hard seed
+  directions can still come from old adjacent line samples, and therefore can
+  be wrong when that old line is wrong.
+
+## Follow-up Correction
+
+- Degenerate normal-plane projection now returns a deterministic tangent that
+  is perpendicular to the sampled normal. It no longer preserves a
+  normal-parallel input direction.
+- Full reinitialization no longer constructs, solves, reports, or selects the
+  previous line geometry as an `existing` candidate.
+- Removed seed directions inferred from the previous line around each CP. An
+  unconstrained seed span is initialized only by fresh left/right rollouts.
+- A hard native direction or direction propagated from a newly solved neighbor
+  is authoritative for that endpoint. It replaces that side's generic rollout
+  instead of competing with it. A span with one authoritative endpoint has one
+  candidate; a span with authoritative directions at both endpoints has one
+  candidate from each endpoint.
+- Removed the obsolete `continue-left` and `continue-right` report fields and
+  line-probe columns.
+- Added regressions for normal-parallel projection, removal of previous-line
+  candidates, one-sided candidate suppression, two-sided hard directions, and
+  solved-neighbor propagation.
+
+## Follow-up Validation
+
+- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target test_lasagna_line_optimizer test_line_annotation_generated_views test_fiber_trace3d -j32`
+  passed.
+- `test_lasagna_line_optimizer` passed 35 cases.
+- `test_line_annotation_generated_views` passed 49 cases.
+- `test_fiber_trace3d` passed 39 cases.
+- `cmake --build volume-cartographer/build --target VC3D vc_lasagna_line_probe -j32`
+  passed. The existing Qt `-Wsfinae-incomplete` warnings remain unchanged.
+- `git diff --check`, `git diff --cached --check`, and the production search
+  for old direction extractors, previous-line candidate helpers, and
+  `continue-*` report fields passed.

@@ -37,8 +37,12 @@
   on the required direction and fix it. Generate exactly one rollout from that
   CP side using the fiber direction; do not also generate normal/chord or
   continuation variants from the constrained side.
-- Other candidates may originate from an unconstrained opposite CP or existing
-  interior geometry, but every solve includes the same fixed proxies.
+- Other candidates may originate from an unconstrained opposite CP, but full
+  reinitialization never submits existing interior geometry as a candidate.
+- When a solved neighboring span supplies a continuation direction, use it as
+  the span's sole rollout candidate unless the opposite endpoint also has an
+  authoritative solved-neighbor direction. In that two-sided case, generate
+  exactly one rollout from each authoritative endpoint.
 - Support simultaneous left and right hard constraints for a fallback span
   between two native spans.
 - Guarantee distinct movable samples: at least three span points for one hard
@@ -50,7 +54,11 @@
   directly on the fiber direction.
 - Translate span-local and tail-local proxy indices to final stitched indices
   and add them to the final solve's existing fixed-point list.
-- Leave unconstrained Lasagna spans and tails behaviorally unchanged.
+- Leave local non-reinitialization Lasagna optimization and unconstrained tail
+  construction behaviorally unchanged.
+- Make tangent-plane projection total: if removal of the normal component is
+  degenerate, choose a deterministic perpendicular tangent rather than
+  returning the input direction.
 
 ## 4. VC3D Constraint Derivation
 
@@ -86,6 +94,11 @@
   and invalid/degenerate constraints.
 - Add fixed-proxy position, minimum-cardinality, unsorted-control remap, and
   duplicate/conflict tests.
+- Add a normal-parallel transport regression proving the rollout turns onto a
+  deterministic tangent instead of continuing along the normal.
+- Assert full reinitialization reports no `existing` candidate and that a
+  supplied neighbor continuation replaces, rather than supplements, the
+  corresponding generic side rollout.
 - Add a VC3D mixed-helper regression deriving constraints from actual native
   dense points deliberately non-collinear with the chord and adversarial
   normal, verifying every adjacent fallback/tail direction for both newly

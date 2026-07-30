@@ -4,6 +4,10 @@
   native fiber geometry to continue the fitted dense native endpoint tangent,
   using fixed proxy points in the regular Ceres solve, independent of normals,
   candidate selection, seed choice, or solve order.
+- Removed previous Lasagna geometry and endpoint directions from full
+  reinitialization candidates, made solved-neighbor directions exclusive
+  rollout sources, and made degenerate normal-plane transport choose a
+  perpendicular tangent instead of preserving a normal-parallel direction.
 - Fixed Fiber-model mode and extrapolation-distance changes to rebuild both
   tails on newly seeded one-control-point fibers when Auto-reoptimize is active.
 - Added persisted fiber-global Lasagna/native modes to VC3D line annotation,

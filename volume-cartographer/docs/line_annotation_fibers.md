@@ -20,9 +20,15 @@ the tangent from the control point to the first distinct dense native point.
 Lasagna geometry on the opposite side is hard-constrained to leave the control
 point along the negative of that tangent. VC3D creates and fixes one adjacent
 proxy point on that direction, then runs the ordinary Lasagna Ceres solve and
-its existing smoothness terms for the remaining points. That fiber direction
-is the only rollout direction generated from the constrained CP side. This
-applies at both ends of a fallback span when it lies between native spans.
+its existing smoothness terms for the remaining points. With one constrained
+endpoint, that fiber direction is the span's only rollout candidate. With two,
+one rollout is generated from each constrained endpoint. Reinitialization does
+not submit the previous Lasagna span or its endpoint directions as candidates;
+a direction propagated from an already solved neighbor also replaces generic
+CP/chord initialization. Degenerate tangent-plane projection selects a
+deterministic perpendicular tangent instead of continuing along the sampled
+normal. This applies at both ends of a fallback span when it lies between
+native spans.
 
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way

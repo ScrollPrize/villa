@@ -1084,13 +1084,22 @@
   negated tangent. VC3D materializes one adjacent proxy point on that tangent
   and fixes both the CP and proxy in the ordinary Ceres solve. No custom
   manifold or weighted direction penalty is used. The fiber direction is the
-  only rollout direction generated from that CP side. This applies independently
-  to all native spans, to both ends of a Lasagna span bracketed by native
-  spans, and to a retained Lasagna tail after native extrapolation failure.
+  only rollout candidate when it is available at one endpoint; if both
+  endpoints have native directions, one rollout candidate is generated from
+  each endpoint. The old Lasagna span and its endpoint directions are never
+  reinitialization candidates. A direction propagated from an already solved
+  neighboring span has the same precedence over generic CP/chord rollout
+  initialization. This applies independently to all native spans, to both ends
+  of a Lasagna span bracketed by native spans, and to a retained Lasagna tail
+  after native extrapolation failure.
   Per-span solves and the final shared global solve preserve the fixed proxy
   while the existing Lasagna smoothness terms optimize the remaining points.
   Native samples remain fixed. A successful native span without a finite,
   distinct endpoint-neighbor sample is an error.
+- Lasagna direction transport must remain in the sampled-normal tangent plane.
+  If removing a direction's normal component is degenerate, transport chooses
+  a deterministic perpendicular tangent; it must never return the original
+  normal-parallel direction.
 - The line-annotation extrapolation control is measured in base voxels and
   applies beyond both outer CPs. Native mode converts that distance to trace
   voxels and uses the shared one-way tracer with a perpendicular distance

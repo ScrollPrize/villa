@@ -756,26 +756,27 @@ TEST_CASE("LineOptimizer reinit reopt reports rollout candidates and preserves f
 
     REQUIRE(result.spans.size() == 2);
     CHECK(result.initialSeedSpanIndex == 1);
-    CHECK(result.spans[0].candLeftRolloutSteps == 10);
+    CHECK(result.spans[0].candLeftRolloutSteps == 0);
     CHECK(result.spans[0].candRightRolloutSteps == 10);
-    CHECK(result.spans[0].candLeftTruncatedPoints == 3);
+    CHECK(result.spans[0].candLeftTruncatedPoints == 0);
     CHECK(result.spans[0].candRightTruncatedPoints == 3);
-    CHECK(result.spans[0].candLeftSelectedSign == 1);
+    CHECK(result.spans[0].candLeftSelectedSign == 0);
     CHECK(result.spans[0].candRightSelectedSign == 1);
-    CHECK(result.spans[0].candLeftClosestTargetDistance == doctest::Approx(50.0));
+    CHECK(result.spans[0].candLeftClosestTargetDistance == doctest::Approx(0.0));
     CHECK(result.spans[0].candRightClosestTargetDistance == doctest::Approx(50.0));
     CHECK(result.spans[0].points == 4);
     CHECK(result.spans[0].leftControlIndex == 1);
     CHECK(result.spans[0].rightControlIndex == 0);
-    CHECK(result.spans[0].chosen == "left");
-    REQUIRE(result.spans[0].candidates.size() >= 2);
-    CHECK(result.spans[0].candidates[0].name == "left");
-    CHECK(result.spans[0].candidates[1].name == "right");
-    CHECK(std::any_of(result.spans[0].candidates.begin(),
-                      result.spans[0].candidates.end(),
-                      [](const auto& candidate) {
-                          return candidate.name == "existing";
-                      }));
+    CHECK(result.spans[0].chosen == "right");
+    REQUIRE(result.spans[0].candidates.size() == 1);
+    CHECK(result.spans[0].candidates[0].name == "right");
+    CHECK(std::none_of(result.spans[0].candidates.begin(),
+                       result.spans[0].candidates.end(),
+                       [](const auto& candidate) {
+                           return candidate.name == "existing" ||
+                                  candidate.name == "continue-left" ||
+                                  candidate.name == "continue-right";
+                       }));
     int chosenCandidateCount = 0;
     double bestAlignmentScore = std::numeric_limits<double>::infinity();
     double chosenAlignmentScore = std::numeric_limits<double>::infinity();
@@ -921,6 +922,8 @@ TEST_CASE("LineOptimizer hard native direction survives unsorted fallback and fi
               controls[0].volumePoint) ==
           doctest::Approx(config.segmentLength).epsilon(1.0e-12));
     CHECK(result.spans[0].hardRightDirection);
+    REQUIRE(result.spans[0].candidates.size() == 1);
+    CHECK(result.spans[0].candidates.front().name == "right");
     CHECK(std::none_of(result.spans[0].candidates.begin(),
                        result.spans[0].candidates.end(),
                        [](const auto& candidate) {
@@ -1002,6 +1005,9 @@ TEST_CASE("LineOptimizer enforces two hard directions on one fallback span")
           doctest::Approx(expectedProxyDistance).epsilon(1.0e-12));
     CHECK(result.spans[1].hardLeftDirection);
     CHECK(result.spans[1].hardRightDirection);
+    REQUIRE(result.spans[1].candidates.size() == 2);
+    CHECK(result.spans[1].candidates[0].name == "left");
+    CHECK(result.spans[1].candidates[1].name == "right");
     CHECK(std::none_of(result.spans[1].candidates.begin(),
                        result.spans[1].candidates.end(),
                        [](const auto& candidate) {
@@ -1066,6 +1072,53 @@ TEST_CASE("LineOptimizer constrains both Lasagna tails next to a protected span"
               result.optimization.line.points[
                   static_cast<size_t>(lastControl + 1)].position -
               controls.back().volumePoint) ==
+          doctest::Approx(config.segmentLength).epsilon(1.0e-12));
+}
+
+TEST_CASE("LineOptimizer never preserves a normal-parallel rollout direction")
+{
+    const cv::Vec3d normal{0.0, 0.0, 1.0};
+    ConstantNormalSampler sampler(normal);
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 2;
+    config.segmentLength = 5.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 0;
+    config.printSolverProgress = false;
+
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {5.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+    };
+    const std::vector<vc::lasagna::LineControlPoint> controls{
+        {0.0, linePoints.front(), true, 0},
+        {2.0, linePoints.back(), false, 2},
+    };
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(
+        linePoints,
+        controls,
+        {0, 2},
+        0,
+        config,
+        {{0, 1}},
+        {{0, vc::lasagna::LineControlPointSide::Before, normal}});
+
+    REQUIRE_FALSE(result.failed);
+    REQUIRE(result.fixedPointIndices.size() == 2);
+    const int firstControl = result.fixedPointIndices.front();
+    REQUIRE(firstControl >= 2);
+    const cv::Vec3d proxy = result.optimization.line.points[
+        static_cast<size_t>(firstControl - 1)].position;
+    const cv::Vec3d outer = result.optimization.line.points[
+        static_cast<size_t>(firstControl - 2)].position;
+    const cv::Vec3d fixedDirection = normalizedOrZero(proxy - controls.front().volumePoint);
+    const cv::Vec3d transportedDirection = normalizedOrZero(outer - proxy);
+    CHECK(fixedDirection.dot(normal) == doctest::Approx(1.0).epsilon(1.0e-12));
+    CHECK(std::abs(transportedDirection.dot(normal)) ==
+          doctest::Approx(0.0).epsilon(1.0e-12));
+    CHECK(cv::norm(outer - proxy) ==
           doctest::Approx(config.segmentLength).epsilon(1.0e-12));
 }
 
@@ -1154,7 +1207,7 @@ TEST_CASE("LineOptimizer reports the actual Ceres candidate failure")
     CHECK(result.failureReason.find("dots:") == std::string::npos);
 }
 
-TEST_CASE("LineOptimizer reinitialization adds continuation candidates on both sides of seed")
+TEST_CASE("LineOptimizer reinitialization replaces side rollouts with propagated directions")
 {
     ConstantNormalSampler sampler({0.0, 0.0, 1.0});
     vc::lasagna::LineOptimizer optimizer(sampler);
@@ -1191,32 +1244,22 @@ TEST_CASE("LineOptimizer reinitialization adds continuation candidates on both s
 
     REQUIRE(result.spans.size() == 3);
     CHECK(result.initialSeedSpanIndex == 1);
-    CHECK(result.spans[0].candContinueLeftRolloutSteps == 0);
-    CHECK(result.spans[0].candContinueRightRolloutSteps > 0);
-    CHECK(result.spans[1].candContinueLeftRolloutSteps > 0);
-    CHECK(result.spans[1].candContinueRightRolloutSteps == 0);
-    CHECK(result.spans[2].candContinueLeftRolloutSteps > 0);
-    CHECK(result.spans[2].candContinueRightRolloutSteps == 0);
-    CHECK(std::isfinite(result.spans[0].candContinueRightClosestTargetDistance));
-    CHECK(std::isfinite(result.spans[1].candContinueLeftClosestTargetDistance));
-    CHECK(std::isfinite(result.spans[2].candContinueLeftClosestTargetDistance));
-    CHECK(result.spans[0].candidates.size() == 4);
-    CHECK(result.spans[1].candidates.size() == 4);
-    CHECK(result.spans[2].candidates.size() == 4);
-    CHECK(result.spans[0].candidates[2].name == "existing");
-    CHECK(result.spans[1].candidates[2].name == "existing");
-    CHECK(result.spans[2].candidates[2].name == "existing");
-    CHECK(result.spans[0].candidates.back().name == "continue-right");
-    CHECK(result.spans[1].candidates.back().name == "continue-left");
-    CHECK(result.spans[2].candidates.back().name == "continue-left");
-    REQUIRE(result.continuationCandidateLines.size() == 3);
-    CHECK(result.continuationCandidateLines[0].name == "reinit-span-continue-left-1");
-    CHECK(result.continuationCandidateLines[1].name == "reinit-span-continue-left-2");
-    CHECK(result.continuationCandidateLines[2].name == "reinit-span-continue-right-0");
-    for (const auto& line : result.continuationCandidateLines) {
-        CHECK(line.points.size() >= 2);
-    }
+    CHECK(result.continuationCandidateLines.empty());
+    REQUIRE(result.spans[0].candidates.size() == 1);
+    CHECK(result.spans[0].candidates[0].name == "right");
+    REQUIRE(result.spans[1].candidates.size() == 2);
+    CHECK(result.spans[1].candidates[0].name == "left");
+    CHECK(result.spans[1].candidates[1].name == "right");
+    REQUIRE(result.spans[2].candidates.size() == 1);
+    CHECK(result.spans[2].candidates[0].name == "left");
     for (const auto& span : result.spans) {
+        CHECK(std::none_of(span.candidates.begin(),
+                           span.candidates.end(),
+                           [](const auto& candidate) {
+                               return candidate.name == "existing" ||
+                                      candidate.name == "continue-left" ||
+                                      candidate.name == "continue-right";
+                           }));
         for (const auto& candidate : span.candidates) {
             if (candidate.chosen) {
                 CHECK(candidate.usable);
@@ -1344,10 +1387,10 @@ TEST_CASE("LineOptimizer reinit reopt handles degenerate projected rollout tange
 
     REQUIRE(result.spans.size() == 2);
     for (const auto& span : result.spans) {
-        CHECK(span.candLeftSelectedSign == 1);
-        CHECK(span.candRightSelectedSign == 1);
-        CHECK(std::isfinite(span.candLeftClosestTargetDistance));
-        CHECK(std::isfinite(span.candRightClosestTargetDistance));
+        for (const auto& candidate : span.candidates) {
+            CHECK(candidate.selectedSign == 1);
+            CHECK(std::isfinite(candidate.closestTargetDistance));
+        }
     }
     REQUIRE(result.fixedPointIndices.size() == 3);
     for (size_t controlIndex = 0; controlIndex < controls.size(); ++controlIndex) {
