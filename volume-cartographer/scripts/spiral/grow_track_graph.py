@@ -21,6 +21,8 @@ from pathlib import Path
 
 import numpy as np
 
+from tifxyz_quality import DEFAULT_MAX_THICK_CELL_FRAC
+
 
 TOP_ARCLENGTH_FRACTION = 0.30
 VOXEL_SIZE_UM = 9.6
@@ -29,6 +31,31 @@ DEFAULT_UV_RADIUS = 600.0
 DEFAULT_MAX_SIZE_CM2 = (
     4.0 * DEFAULT_UV_RADIUS**2 * VOXEL_SIZE_UM**2 / SQUARE_UM_PER_SQUARE_CM
 )
+
+# Internal algorithm tuning.  These are intentionally constants rather than
+# CLI options; change them here when experimenting with the growth pipeline.
+GRAPH_SPAN_WITNESSES = 1
+GRAPH_WITNESS_MIN_OFFSET = 4.0
+GRAPH_WITNESS_MAX_OFFSET = 150.0
+GRAPH_WITNESS_SHEAR_TOL = 8.0
+GRAPH_TRIM = "bridges"
+GRAPH_MAX_SPAN = 200.0
+GRAPH_BLIND_GAP = 0.0
+GRAPH_ANCHOR_CORROBORATE = False
+SPAN_VERIFY_TOL = 0.0
+
+LATTICE_EVIDENCE_SPACING = 6.0
+LATTICE_RAIL_AGREE_FRAC = 0.5
+LATTICE_RAIL_MIN_VOTES = 3
+LATTICE_PROPOSAL_AGREE_FRAC = 0.0
+LATTICE_GAP_PUBLISH_TOL = 5.0
+LATTICE_FILL_GAP = 60.0
+
+ANCHOR_REACH = 40.0
+RASTER_SUPPORT_RADIUS = 35.0
+MIN_COMPONENT_VX2 = 8000.0
+SLIM_FINE_RASTER = False
+SLIM_ITERATIONS = 8
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -154,32 +181,24 @@ class StoredNpz:
             order="C",
         )
 
-    def scalar_text(self, name: str) -> str:
-        with np.load(self.path, allow_pickle=False) as archive:
-            value = archive[name].item()
-        if not isinstance(value, str):
-            raise ValueError(f"{name} in {self.path} is not a string scalar")
-        return value
-
-
 class PackedTracks:
     """Read-only, memory-mapped access to a ``.vctracks`` directory."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
         try:
-            self.metadata = json.loads((self.path / "metadata.json").read_text())
+            metadata = json.loads((self.path / "metadata.json").read_text())
         except FileNotFoundError as error:
             raise FileNotFoundError(
                 f"not a packed .vctracks directory: {self.path}"
             ) from error
-        self.track_count = int(self.metadata["track_count"])
-        self.point_count = int(self.metadata["point_count"])
+        self.track_count = int(metadata["track_count"])
+        point_count = int(metadata["point_count"])
         self.coordinates = np.memmap(
             self.path / "coordinates.i32",
             mode="r",
             dtype="<i4",
-            shape=(self.point_count, 3),
+            shape=(point_count, 3),
         )
         self.offsets = np.memmap(
             self.path / "offsets.i64",
@@ -249,22 +268,21 @@ class CrossingCsr:
         *,
         validate_source_ids: bool = True,
     ):
-        self.npz = StoredNpz(path)
-        self.source_ids = self.npz.array("source_ids")
-        self.offsets = self.npz.array("offsets")
-        self.partners = self.npz.array("partners")
-        self.self_local = self.npz.array("self_local")
-        self.partner_local = self.npz.array("partner_local")
-        self.positions = self.npz.array("positions")
-        self.metadata = json.loads(self.npz.scalar_text("metadata"))
-        if self.source_ids.shape != (tracks.track_count,):
+        npz = StoredNpz(path)
+        source_ids = npz.array("source_ids")
+        self.offsets = npz.array("offsets")
+        self.partners = npz.array("partners")
+        self.self_local = npz.array("self_local")
+        self.partner_local = npz.array("partner_local")
+        self.positions = npz.array("positions")
+        if source_ids.shape != (tracks.track_count,):
             raise ValueError("crossing and track stores have different counts")
         if self.offsets.shape != (tracks.track_count + 1,):
             raise ValueError("crossing offsets have the wrong shape")
         if int(self.offsets[0]) != 0 or int(self.offsets[-1]) != len(self.partners):
             raise ValueError("crossing offsets do not span the record arrays")
         if validate_source_ids and not np.array_equal(
-            self.source_ids, tracks.source_ids
+            source_ids, tracks.source_ids
         ):
             raise ValueError("crossing and track source IDs do not match")
         expected = self.partners.shape
@@ -274,8 +292,6 @@ class CrossingCsr:
             or self.positions.shape != expected
         ):
             raise ValueError("crossing record arrays have inconsistent shapes")
-        self.track_count = tracks.track_count
-
     @functools.lru_cache(maxsize=32768)
     def incident(self, track: int) -> tuple[Crossing, ...]:
         track = int(track)
@@ -394,7 +410,6 @@ def previously_used_seed_rows(
 class TrackUV:
     """Piecewise-linear UV parameterization of one accepted track."""
 
-    track: int
     family: int  # 0 horizontal (u is the parallel coordinate), 1 vertical
     # anchors: sorted (arc_s, u, v)
     anchors: list
@@ -505,31 +520,6 @@ class TrackUV:
         self.anchors.sort(key=lambda x: x[0])
 
 
-def _catmull_rom_segment(
-    controls: np.ndarray, knots: np.ndarray, ts: np.ndarray
-) -> np.ndarray:
-    """Non-uniform Catmull-Rom interpolation for one segment."""
-    # Barry-Goldman evaluation expressed as four control-point weights.
-    # This is algebraically the same interpolation as the six nested lerps,
-    # but avoids creating all of their (samples, 3) temporary arrays.  This
-    # function is called once per fill segment (often >100k times/patch).
-    a = (ts - knots[0]) / (knots[1] - knots[0])
-    b = (ts - knots[1]) / (knots[2] - knots[1])
-    c = (ts - knots[2]) / (knots[3] - knots[2])
-    d = (ts - knots[0]) / (knots[2] - knots[0])
-    e = (ts - knots[1]) / (knots[3] - knots[1])
-    one_b = 1.0 - b
-    weights = np.empty((len(ts), 4), dtype=np.float64)
-    weights[:, 0] = one_b * (1.0 - d) * (1.0 - a)
-    weights[:, 1] = (
-        one_b * ((1.0 - d) * a + d * one_b)
-        + b * (1.0 - e) * one_b
-    )
-    weights[:, 2] = one_b * d * b + b * ((1.0 - e) * b + e * (1.0 - c))
-    weights[:, 3] = b * e * c
-    return weights @ controls
-
-
 def _catmull_rom_segments(
     controls: np.ndarray,
     knots: np.ndarray,
@@ -575,21 +565,20 @@ class GraphLatticeGrower:
         extrap_limit: float = 200.0,
         min_obs: int = 2,
         min_track_arclength: float = 200.0,
-        anchor_reach: float = 40.0,
+        anchor_reach: float = ANCHOR_REACH,
         min_connect: int = 3,
-        evidence_spacing: float = 6.0,
-        rail_agree_frac: float = 0.5,
-        rail_min_votes: int = 3,
-        proposal_agree_frac: float = 0.0,
-        trust_gap: float = 60.0,
-        span_witnesses: int = 1,
-        witness_min_offset: float = 4.0,
-        witness_max_offset: float = 150.0,
-        witness_shear_tol: float = 8.0,
-        graph_trim: str = "bridges",
-        max_span: float = 200.0,
-        blind_gap: float = 0.0,
-        anchor_corroborate: bool = False,
+        evidence_spacing: float = LATTICE_EVIDENCE_SPACING,
+        rail_agree_frac: float = LATTICE_RAIL_AGREE_FRAC,
+        rail_min_votes: int = LATTICE_RAIL_MIN_VOTES,
+        proposal_agree_frac: float = LATTICE_PROPOSAL_AGREE_FRAC,
+        span_witnesses: int = GRAPH_SPAN_WITNESSES,
+        witness_min_offset: float = GRAPH_WITNESS_MIN_OFFSET,
+        witness_max_offset: float = GRAPH_WITNESS_MAX_OFFSET,
+        witness_shear_tol: float = GRAPH_WITNESS_SHEAR_TOL,
+        graph_trim: str = GRAPH_TRIM,
+        max_span: float = GRAPH_MAX_SPAN,
+        blind_gap: float = GRAPH_BLIND_GAP,
+        anchor_corroborate: bool = GRAPH_ANCHOR_CORROBORATE,
         growth_min_span: float = 80.0,
     ) -> None:
         self.tracks = tracks
@@ -609,7 +598,6 @@ class GraphLatticeGrower:
         self.rail_agree_frac = float(rail_agree_frac)
         self.rail_min_votes = int(rail_min_votes)
         self.proposal_agree_frac = float(proposal_agree_frac)
-        self.trust_gap = float(trust_gap)
         self.discarded: set[int] = set()
         self.evidence: dict[int, list] = collections.defaultdict(list)
         self.span_witnesses = int(span_witnesses)
@@ -777,7 +765,6 @@ class GraphLatticeGrower:
                 sign = 1.0 if dot > 0 else -1.0
             s_partner = self.tracks.crossing_position(crossing, partner)
             tuv = TrackUV(
-                partner,
                 self._family(partner),
                 [(s_partner, uv[0], uv[1])],
                 sign=sign,
@@ -786,7 +773,6 @@ class GraphLatticeGrower:
                 mode="bootstrap",
             )
             self.accepted[partner] = tuv
-            self._add_sheet_points(tuv)
             self.diag["bootstrap_accepted"] += 1
 
     def refine_uv(
@@ -865,24 +851,6 @@ class GraphLatticeGrower:
             "median_shift": float(np.median(shift)) if n_nodes else 0.0,
             "p95_shift": float(np.percentile(shift, 95)) if n_nodes else 0.0,
         }
-
-    def _add_sheet_points(self, tuv: TrackUV) -> None:
-        # no sheet consensus in this mode; only maintain publish spans
-        self._lattice_spans(tuv)
-
-    def _lattice_spans(self, tuv: TrackUV) -> None:
-        """Publish spans: anchor neighborhoods plus interior stretches
-        bracketed by anchors closer than trust_gap (an unbracketed interior
-        stretch is where tracks drift across wraps unnoticed)."""
-        if tuv.gauge:
-            return
-        arcs = [a[0] for a in tuv.anchors]
-        tuv.ok_spans = None
-        for s in arcs:
-            tuv.add_ok_span(s - self.anchor_reach, s + self.anchor_reach)
-        for s0, s1 in zip(arcs, arcs[1:]):
-            if s1 - s0 <= self.trust_gap:
-                tuv.add_ok_span(s0, s1)
 
     def _thin_spaced(self, obs: list) -> list:
         """Greedy arclength thinning: evidence crossings must sit at least
@@ -979,8 +947,7 @@ class GraphLatticeGrower:
                 self.diag[rejection] += 1
                 continue
             anchors = [(s, u, v) for s, u, v, _, _ in chosen]
-            tuv = TrackUV(cand, fam, anchors, mode="multi")
-            self._lattice_spans(tuv)
+            tuv = TrackUV(fam, anchors, mode="multi")
             self.accepted[cand] = tuv
             self.evidence[cand] = list(chosen)
             committed += 1
@@ -993,7 +960,6 @@ class GraphLatticeGrower:
                     continue
                 partner_uv.add_anchor(s_partner, u, v)
                 self.evidence[partner].append((s_partner, u, v, cand, s))
-                self._lattice_spans(partner_uv)
                 self.diag["knitted_anchors"] += 1
         return committed, removed
 
@@ -1008,7 +974,7 @@ class GraphLatticeGrower:
             anchors = [(0.0, -total / 2.0, 0.0), (total, total / 2.0, 0.0)]
         else:
             anchors = [(0.0, 0.0, -total / 2.0), (total, 0.0, total / 2.0)]
-        seed_uv = TrackUV(seed, fam, anchors, gauge=True, mode="seed")
+        seed_uv = TrackUV(fam, anchors, gauge=True, mode="seed")
         self.accepted[seed] = seed_uv
         self._bootstrap(seed)
         t0 = time.time()
@@ -1185,13 +1151,12 @@ class GraphLatticeGrower:
     ) -> int:
         """Second-chance publishing against the trimmed surface.
 
-        Growth only publishes anchor-bracketed spans, which leaves holes
-        where anchors are sparse even though accepted tracks run straight
-        through them (measured: ~60%% of enclosed hole area).  This pass
-        verifies each unpublished window — interior gaps wider than
-        trust_gap and outward extensions past the last anchor — against a
-        local quadric fit of the trim-surviving surface and publishes the
-        windows that lie on it.  Returns the number published."""
+        Graph finalization only publishes corroborated spans, which leaves
+        holes where anchors are sparse even though accepted tracks run
+        straight through them.  This pass verifies each unpublished window
+        and outward extension against a local quadric fit of the
+        trim-surviving surface and publishes the windows that lie on it.
+        Returns the number published."""
         from scipy.spatial import cKDTree
 
         if not len(uv_kept):
@@ -1618,7 +1583,7 @@ class GraphLatticeGrower:
                 if tuv.gauge:
                     covered[t] = [(-1e18, 1e18)]
                     continue
-                probe = TrackUV(t, tuv.family, [])
+                probe = TrackUV(tuv.family, [])
                 spans = tracks_spans[t]
                 for lo, hi, _, _, _, ok in spans:
                     if ok:
@@ -1969,78 +1934,8 @@ def z_consistency_trim(
     return keep
 
 
-def mask_slip_ridges(
-    grid: np.ndarray,
-    *,
-    spacing: float = 2.0,
-    probe_vx: float = 10.0,
-    ridge_tol: float = 3.0,
-    dilate: int = 2,
-) -> tuple[np.ndarray, dict]:
-    """Mask wrap-slip transition bands — honest holes instead of a smooth
-    ramp onto the wrong winding.
-
-    A slip is an S-bend: the surface leaves its wrap and reattaches one
-    wrap over (~9vx) within a few tens of voxels of UV.  Along either grid
-    axis the second difference of position over a ~10vx probe, projected on
-    the local normal, is ~half the wrap spacing there, while genuine scroll
-    curvature at that scale is well under 1vx (bend radius >~150vx).  Works
-    on the UNSMOOTHED raster; run before masked smoothing blurs the step."""
-    from scipy import ndimage
-
-    valid = grid[..., 0] >= 0
-    k = max(1, int(round(probe_vx / spacing / 2.0)))
-    # smoothed normal field (same construction as mask_folded_cells)
-    du = np.zeros_like(grid)
-    dv = np.zeros_like(grid)
-    du[:, 1:-1] = grid[:, 2:] - grid[:, :-2]
-    dv[1:-1, :] = grid[2:, :] - grid[:-2, :]
-    normal = np.cross(du, dv)
-    size = np.linalg.norm(normal, axis=-1)
-    inner = np.zeros_like(valid)
-    inner[1:-1, 1:-1] = (
-        valid[1:-1, 1:-1]
-        & valid[:-2, 1:-1]
-        & valid[2:, 1:-1]
-        & valid[1:-1, :-2]
-        & valid[1:-1, 2:]
-    )
-    good = inner & (size > 0)
-    normal[good] /= size[good][..., None]
-    normal[~good] = 0.0
-    smooth_n = np.stack(
-        [ndimage.gaussian_filter(normal[..., c], 5.0) for c in range(3)],
-        axis=-1,
-    )
-    ssize = np.linalg.norm(smooth_n, axis=-1)
-    ok_n = ssize > 1e-6
-    smooth_n[ok_n] /= ssize[ok_n][..., None]
-
-    bad = np.zeros(valid.shape, dtype=bool)
-    for axis in (0, 1):
-        second = np.full(grid.shape[:2], 0.0)
-        if axis == 0:
-            trip = valid[2 * k :, :] & valid[k:-k, :] & valid[: -2 * k, :]
-            diff = grid[2 * k :, :] - 2.0 * grid[k:-k, :] + grid[: -2 * k, :]
-            proj = np.abs(np.einsum("ijc,ijc->ij", diff, smooth_n[k:-k, :]))
-            second[k:-k, :] = np.where(trip & ok_n[k:-k, :], proj, 0.0)
-        else:
-            trip = valid[:, 2 * k :] & valid[:, k:-k] & valid[:, : -2 * k]
-            diff = grid[:, 2 * k :] - 2.0 * grid[:, k:-k] + grid[:, : -2 * k]
-            proj = np.abs(np.einsum("ijc,ijc->ij", diff, smooth_n[:, k:-k]))
-            second[:, k:-k] = np.where(trip & ok_n[:, k:-k], proj, 0.0)
-        bad |= second > ridge_tol
-    if dilate:
-        bad = ndimage.binary_dilation(bad, iterations=dilate)
-    masked = int((bad & valid).sum())
-    grid = grid.copy()
-    grid[bad] = -1.0
-    return grid, {"slip_masked_vertices": masked}
-
-
 def masked_gaussian_smooth(grid: np.ndarray, sigma: float = 2.0) -> np.ndarray:
-    """Track points carry ~2-5vx sheet-normal noise; smooth valid vertices
-    only (extracted from rasterize so masking can run on the raw grid)."""
+    """Smooth valid vertices without bleeding invalid values into the grid."""
     from scipy import ndimage
 
     valid = grid[..., 0] >= 0
@@ -2100,35 +1995,6 @@ def mask_folded_cells(
     return grid, {"fold_masked_vertices": masked}
 
 
-def _spatially_thin_samples(
-    uv: np.ndarray,
-    xyz: np.ndarray,
-    spacing: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Keep the sample nearest each square-bin center.
-
-    The fill stage can produce more than a million samples for a two-million
-    vertex raster.  Qhull runtime is dominated by triangulating those samples,
-    even though several fall within one output-pixel footprint.  One
-    representative per small spatial bin retains the surface geometry while
-    making triangulation substantially cheaper.
-    """
-    if spacing <= 0.0 or len(uv) < 1024:
-        return uv, xyz
-    uv_min = uv.min(axis=0)
-    bins = np.floor((uv - uv_min) / spacing).astype(np.int64)
-    width = int(bins[:, 0].max()) + 1
-    keys = bins[:, 1] * width + bins[:, 0]
-    centers = uv_min + (bins + 0.5) * spacing
-    center_dist2 = np.sum((uv - centers) ** 2, axis=1)
-    order = np.lexsort((center_dist2, keys))
-    ordered_keys = keys[order]
-    take = order[
-        np.concatenate(([True], ordered_keys[1:] != ordered_keys[:-1]))
-    ]
-    return uv[take], xyz[take]
-
-
 def rasterize(
     uv: np.ndarray,
     xyz: np.ndarray,
@@ -2136,14 +2002,12 @@ def rasterize(
     spacing: float = 2.0,
     support_radius: float = 35.0,
     smooth: bool = True,
-    thin_spacing: float = 0.0,
     query_workers: int = -1,
 ) -> tuple[np.ndarray, dict]:
     from scipy.interpolate import LinearNDInterpolator
     from scipy.spatial import cKDTree
 
     input_points = len(uv)
-    uv, xyz = _spatially_thin_samples(uv, xyz, thin_spacing)
     uv_min = uv.min(axis=0)
     uv_max = uv.max(axis=0)
     nu = int(math.ceil((uv_max[0] - uv_min[0]) / spacing)) + 1
@@ -2175,8 +2039,6 @@ def rasterize(
             "support_radius": support_radius,
             "spacing": spacing,
             "input_points": input_points,
-            "triangulated_points": len(uv),
-            "thin_spacing": thin_spacing,
         }
         return grid, stats
     vmask = valid.reshape(nv, nu).astype(np.float64)
@@ -2195,8 +2057,6 @@ def rasterize(
         "support_radius": support_radius,
         "spacing": spacing,
         "input_points": input_points,
-        "triangulated_points": len(uv),
-        "thin_spacing": thin_spacing,
     }
     return grid, stats
 
@@ -2286,7 +2146,6 @@ def slim_reparameterize(
             spacing=spacing,
             support_radius=3.0 * spacing,
             smooth=False,
-            thin_spacing=0.0,
             query_workers=query_workers,
         )
         reraster_source = "fine_displacement"
@@ -2300,7 +2159,6 @@ def slim_reparameterize(
             spacing=spacing,
             support_radius=decimate * spacing,
             smooth=False,
-            thin_spacing=0.0,
             query_workers=query_workers,
         )
         reraster_source = "decimated_slim_mesh"
@@ -2492,21 +2350,20 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
             crossings,
             uv_radius=size_cm2_to_uv_radius(args.max_size),
             min_track_arclength=args.min_track_arclength,
-            anchor_reach=args.anchor_reach,
+            anchor_reach=ANCHOR_REACH,
             min_connect=args.min_connect,
-            evidence_spacing=args.evidence_spacing,
-            rail_agree_frac=args.rail_agree_frac,
-            rail_min_votes=args.rail_min_votes,
-            proposal_agree_frac=args.proposal_agree_frac,
-            trust_gap=args.trust_gap,
-            span_witnesses=args.span_witnesses,
-            witness_min_offset=args.witness_min_offset,
-            witness_max_offset=args.witness_max_offset,
-            witness_shear_tol=args.witness_shear_tol,
-            graph_trim=args.graph_trim,
-            max_span=args.max_span,
-            blind_gap=args.blind_gap,
-            anchor_corroborate=args.anchor_corroborate,
+            evidence_spacing=LATTICE_EVIDENCE_SPACING,
+            rail_agree_frac=LATTICE_RAIL_AGREE_FRAC,
+            rail_min_votes=LATTICE_RAIL_MIN_VOTES,
+            proposal_agree_frac=LATTICE_PROPOSAL_AGREE_FRAC,
+            span_witnesses=GRAPH_SPAN_WITNESSES,
+            witness_min_offset=GRAPH_WITNESS_MIN_OFFSET,
+            witness_max_offset=GRAPH_WITNESS_MAX_OFFSET,
+            witness_shear_tol=GRAPH_WITNESS_SHEAR_TOL,
+            graph_trim=GRAPH_TRIM,
+            max_span=GRAPH_MAX_SPAN,
+            blind_gap=GRAPH_BLIND_GAP,
+            anchor_corroborate=GRAPH_ANCHOR_CORROBORATE,
             growth_min_span=args.growth_min_span,
         )
         grower.grow(seed)
@@ -2516,19 +2373,19 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
         uv, xyz, track_ids, arcs, keep = _collect_trimmed_surface(
             grower, args, min_points=64
         )
-        if args.span_verify_tol > 0 and keep.any():
+        if SPAN_VERIFY_TOL > 0 and keep.any():
             unpublished = grower.verify_published_windows(
                 uv[keep],
                 xyz[keep],
                 track_ids[keep],
-                tol=args.span_verify_tol,
+                tol=SPAN_VERIFY_TOL,
             )
             if unpublished:
                 uv, xyz, track_ids, arcs, keep = _collect_trimmed_surface(grower, args)
         gap_published = 0
-        if args.gap_publish_tol > 0 and keep.any():
+        if LATTICE_GAP_PUBLISH_TOL > 0 and keep.any():
             gap_published = grower.publish_consensus_gaps(
-                uv[keep], xyz[keep], tol=args.gap_publish_tol
+                uv[keep], xyz[keep], tol=LATTICE_GAP_PUBLISH_TOL
             )
             if gap_published:
                 # re-collect (new spans publish new points) and re-trim
@@ -2546,7 +2403,7 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
         fill_uv, fill_xyz = grower.fill_points(
             kept_arcs,
             spacing=args.resample_spacing,
-            fill_gap=args.fill_gap,
+            fill_gap=LATTICE_FILL_GAP,
         )
         fill_count = int(len(fill_uv))
         if fill_count:
@@ -2554,14 +2411,28 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
             xyz_out = np.concatenate([xyz_out, fill_xyz])
         stage("fill")
         thickness = sheet_thickness_stats(uv_out, xyz_out)
+        thick_cell_frac = float(thickness["thick_cell_frac"])
+        if (
+            args.max_thick_cell_frac > 0
+            and thick_cell_frac >= args.max_thick_cell_frac
+        ):
+            return {
+                "ok": False,
+                "discarded": True,
+                "seed": seed,
+                "reason": (
+                    f"mixed-sheet cell fraction {thick_cell_frac:.2%} "
+                    f">= --max-thick-cell-frac "
+                    f"{args.max_thick_cell_frac:.2%}"
+                ),
+            }
         query_workers = -1 if args.workers <= 1 else 1
         grid, stats = rasterize(
             uv_out,
             xyz_out,
             spacing=args.resample_spacing,
-            support_radius=args.support_radius,
+            support_radius=RASTER_SUPPORT_RADIUS,
             smooth=False,
-            thin_spacing=args.raster_thin_spacing,
             query_workers=query_workers,
         )
         stage("rasterize")
@@ -2569,13 +2440,6 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
             stats["fill_points"] = fill_count
         if gap_published:
             stats["gap_windows_published"] = gap_published
-        if args.slip_ridge_tol > 0:
-            grid, slip_stats = mask_slip_ridges(
-                grid,
-                spacing=args.resample_spacing,
-                ridge_tol=args.slip_ridge_tol,
-            )
-            stats.update(slip_stats)
         # Keep filters at their historical physical scale (2 grid pixels at
         # 2-vx spacing for point smoothing; 5 pixels for the normal field).
         smooth_sigma = max(0.0, 4.0 / args.resample_spacing)
@@ -2587,25 +2451,38 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
             dilate=fold_dilate,
             normal_sigma=fold_normal_sigma,
         )
-        if not args.no_slim:
-            # SLIM historically solved an 8-vx mesh (2-vx raster, decimate
-            # 4).  At coarse working spacings, use every raster vertex.
-            slim_decimate = max(1, int(round(8.0 / args.resample_spacing)))
-            grid, slim_stats = slim_reparameterize(
-                grid,
-                spacing=args.resample_spacing,
-                decimate=slim_decimate,
-                iterations=args.slim_iterations,
-                query_workers=query_workers,
-                fine_raster=args.slim_fine_raster,
-                fold_normal_sigma=fold_normal_sigma,
-                fold_dilate=fold_dilate,
-            )
-            stats["slim"] = slim_stats
+        # SLIM historically solved an 8-vx mesh (2-vx raster, decimate 4).
+        # At coarse working spacings, use every raster vertex.
+        slim_decimate = max(1, int(round(8.0 / args.resample_spacing)))
+        grid, slim_stats = slim_reparameterize(
+            grid,
+            spacing=args.resample_spacing,
+            decimate=slim_decimate,
+            iterations=SLIM_ITERATIONS,
+            query_workers=query_workers,
+            fine_raster=SLIM_FINE_RASTER,
+            fold_normal_sigma=fold_normal_sigma,
+            fold_dilate=fold_dilate,
+        )
+        stats["slim"] = slim_stats
         stage("smooth_and_slim")
         stats.update(mask_stats)
         stats["valid_vertices"] = int((grid[..., 0] >= 0).sum())
         stats["trimmed_fraction"] = float(1.0 - keep.mean())
+        if args.reject_any_fold_fixes and (
+            int(mask_stats["fold_masked_vertices"]) > 0
+            or int(slim_stats["fold_masked_vertices"]) > 0
+        ):
+            return {
+                "ok": False,
+                "discarded": True,
+                "seed": seed,
+                "reason": (
+                    "fold fixes applied "
+                    f"(raster={int(mask_stats['fold_masked_vertices'])}, "
+                    f"slim={int(slim_stats['fold_masked_vertices'])})"
+                ),
+            }
         # --min-valid-vertices historically counts a 2-vx working raster.
         # Scale the threshold so changing working resolution does not change
         # the minimum accepted physical patch area by spacing².
@@ -2636,7 +2513,7 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
             cleaned = clean_valid_mask(
                 grid[..., 0] >= 0,
                 erode_px=erode_px,
-                min_component_px=int(args.min_component_vx2 / fine_edge**2),
+                min_component_px=int(MIN_COMPONENT_VX2 / fine_edge**2),
             )
             grid = grid.copy()
             grid[~cleaned] = -1.0
@@ -2674,28 +2551,28 @@ def process_seed(seed, out, args, tracks, crossings) -> dict:
                 "surface_points": int(len(uv)),
                 "min_size_cm2": args.min_size,
                 "max_size_cm2": args.max_size,
+                "max_thick_cell_frac": args.max_thick_cell_frac,
+                "reject_any_fold_fixes": args.reject_any_fold_fixes,
                 "sheet_gate_tol": args.gate_tol,
-                "anchor_reach": args.anchor_reach,
-                "slip_ridge_tol": args.slip_ridge_tol,
+                "anchor_reach": ANCHOR_REACH,
                 "lattice": {
                     "min_connect": args.min_connect,
-                    "evidence_spacing": args.evidence_spacing,
-                    "rail_agree_frac": args.rail_agree_frac,
-                    "rail_min_votes": args.rail_min_votes,
-                    "proposal_agree_frac": args.proposal_agree_frac,
-                    "trust_gap": args.trust_gap,
-                    "fill_gap": args.fill_gap,
-                    "gap_publish_tol": args.gap_publish_tol,
+                    "evidence_spacing": LATTICE_EVIDENCE_SPACING,
+                    "rail_agree_frac": LATTICE_RAIL_AGREE_FRAC,
+                    "rail_min_votes": LATTICE_RAIL_MIN_VOTES,
+                    "proposal_agree_frac": LATTICE_PROPOSAL_AGREE_FRAC,
+                    "fill_gap": LATTICE_FILL_GAP,
+                    "gap_publish_tol": LATTICE_GAP_PUBLISH_TOL,
                     "discarded_rails": len(grower.discarded),
                 },
                 "graph": {
-                    "span_witnesses": args.span_witnesses,
-                    "witness_min_offset": args.witness_min_offset,
-                    "witness_max_offset": args.witness_max_offset,
-                    "witness_shear_tol": args.witness_shear_tol,
-                    "graph_trim": args.graph_trim,
-                    "max_span": args.max_span,
-                    "blind_gap": args.blind_gap,
+                    "span_witnesses": GRAPH_SPAN_WITNESSES,
+                    "witness_min_offset": GRAPH_WITNESS_MIN_OFFSET,
+                    "witness_max_offset": GRAPH_WITNESS_MAX_OFFSET,
+                    "witness_shear_tol": GRAPH_WITNESS_SHEAR_TOL,
+                    "graph_trim": GRAPH_TRIM,
+                    "max_span": GRAPH_MAX_SPAN,
+                    "blind_gap": GRAPH_BLIND_GAP,
                     "growth_min_span": args.growth_min_span,
                 },
                 "quality": thickness,
@@ -2794,75 +2671,6 @@ def main(argv=None) -> int:
         ),
     )
     parser.add_argument(
-        "--span-witnesses",
-        type=int,
-        default=1,
-        help=(
-            "graph: distinct other tracks that must close a quad over an "
-            "anchor-to-anchor span for it to publish"
-        ),
-    )
-    parser.add_argument(
-        "--witness-min-offset",
-        type=float,
-        default=4.0,
-        help=(
-            "graph: minimum transverse offset (vx) between a witness and "
-            "the track it corroborates (bundle duplicates cannot witness)"
-        ),
-    )
-    parser.add_argument(
-        "--witness-max-offset",
-        type=float,
-        default=150.0,
-        help="graph: maximum transverse offset (vx) of a quad witness",
-    )
-    parser.add_argument(
-        "--witness-shear-tol",
-        type=float,
-        default=8.0,
-        help=(
-            "graph: maximum difference (vx) between a witness's transverse "
-            "offsets at the two rails of a span"
-        ),
-    )
-    parser.add_argument(
-        "--graph-trim",
-        choices=("none", "bridges"),
-        default="bridges",
-        help=(
-            "graph: bridges = remove crossing-graph bridge edges and keep "
-            "only tracks still connected to the seed (every survivor has "
-            ">=2 edge-disjoint return paths)"
-        ),
-    )
-    parser.add_argument(
-        "--max-span",
-        type=float,
-        default=200.0,
-        help=(
-            "graph: anchor-to-anchor spans longer than this (vx) never "
-            "publish, even when witnessed"
-        ),
-    )
-    parser.add_argument(
-        "--blind-gap",
-        type=float,
-        default=0.0,
-        help=(
-            "graph: anchor-to-anchor spans up to this length (vx) publish "
-            "without witnesses (0 = corroboration always required)"
-        ),
-    )
-    parser.add_argument(
-        "--anchor-corroborate",
-        action="store_true",
-        help=(
-            "graph: anchors publish their neighborhoods only when adjacent "
-            "to a cycle-witnessed span (wrong-wrap anchors go dark)"
-        ),
-    )
-    parser.add_argument(
         "--growth-min-span",
         type=float,
         default=80.0,
@@ -2873,87 +2681,12 @@ def main(argv=None) -> int:
         ),
     )
     parser.add_argument(
-        "--span-verify-tol",
-        type=float,
-        default=0.0,
-        help=(
-            "lattice/graph: after trims, re-judge published 40vx windows "
-            "against a local quadric fit of the kept surface (excluding "
-            "the track's own points) and unpublish windows whose median "
-            "residual exceeds this (vx); 0 disables"
-        ),
-    )
-    parser.add_argument(
         "--min-connect",
         type=int,
         default=3,
         help=(
             "lattice: distinct spaced opposite-family rails that must "
             "consistently cross a proposal for acceptance"
-        ),
-    )
-    parser.add_argument(
-        "--evidence-spacing",
-        type=float,
-        default=6.0,
-        help=(
-            "lattice: minimum arclength separation (vx) along the proposal "
-            "between crossings used as consistency evidence"
-        ),
-    )
-    parser.add_argument(
-        "--rail-agree-frac",
-        type=float,
-        default=0.5,
-        help=(
-            "lattice: rails included in fewer than this fraction of the "
-            "consistent sets that straddle them are discarded"
-        ),
-    )
-    parser.add_argument(
-        "--rail-min-votes",
-        type=int,
-        default=3,
-        help="lattice: straddling proposals needed before a rail can be voted out",
-    )
-    parser.add_argument(
-        "--proposal-agree-frac",
-        type=float,
-        default=0.0,
-        help=(
-            "lattice: reject proposals whose consistent rails are fewer "
-            "than this fraction of the spaced rails they straddle "
-            "(0 disables)"
-        ),
-    )
-    parser.add_argument(
-        "--trust-gap",
-        type=float,
-        default=60.0,
-        help=(
-            "lattice: interior stretches between consecutive anchors wider "
-            "than this (vx) are not published (tracks drift between sparse "
-            "anchors)"
-        ),
-    )
-    parser.add_argument(
-        "--gap-publish-tol",
-        type=float,
-        default=5.0,
-        help=(
-            "lattice: after trims, verify unpublished track windows "
-            "(interior anchor gaps + span-end extensions) against a local "
-            "quadric fit of the kept surface and publish windows whose "
-            "median 3D residual is below this (vx); 0 disables"
-        ),
-    )
-    parser.add_argument(
-        "--fill-gap",
-        type=float,
-        default=60.0,
-        help=(
-            "lattice: maximum transverse gap (vx) between adjacent rails "
-            "bridged by Catmull-Rom fill"
         ),
     )
     parser.add_argument(
@@ -2973,6 +2706,23 @@ def main(argv=None) -> int:
             "growth window (default preserves the former 600-vx radius)"
         ),
     )
+    parser.add_argument(
+        "--max-thick-cell-frac",
+        type=float,
+        default=DEFAULT_MAX_THICK_CELL_FRAC,
+        help=(
+            "discard patches with at least this fraction of locally "
+            "multi-layer UV cells; 0 disables (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--reject-any-fold-fixes",
+        action="store_true",
+        help=(
+            "discard a patch if either rasterization stage masks one or "
+            "more folded vertices"
+        ),
+    )
     parser.add_argument("--gate-tol", type=float, default=9.0)
     parser.add_argument(
         "--resample-spacing",
@@ -2980,51 +2730,14 @@ def main(argv=None) -> int:
         default=5.0,
         help=(
             "working raster spacing in voxels before the final output "
-            "reduction (default: 5; use 2 together with "
-            "--slim-fine-raster for the exact legacy pipeline)"
+            "reduction (default: 5)"
         ),
-    )
-    parser.add_argument(
-        "--raster-thin-spacing",
-        type=float,
-        default=0.0,
-        help=(
-            "retain one interpolation sample per this many UV voxels before "
-            "Delaunay triangulation (default: 0, disabled; 2-3 is a faster "
-            "approximation)"
-        ),
-    )
-    parser.add_argument(
-        "--support-radius",
-        type=float,
-        default=35.0,
-        help="maximum UV distance from track support that is interpolated",
     )
     parser.add_argument(
         "--min-track-arclength",
         type=float,
         default=40.0,
         help="skip candidate tracks shorter than this (voxels)",
-    )
-    parser.add_argument(
-        "--anchor-reach",
-        type=float,
-        default=40.0,
-        help=(
-            "arclength radius around each anchor trusted without window "
-            "verification; farther interior stretches must verify"
-        ),
-    )
-    parser.add_argument(
-        "--slip-ridge-tol",
-        type=float,
-        default=0.0,
-        help=(
-            "normal-projected second-difference (vx over a ~10vx probe) "
-            "above which vertices are masked as wrap-slip transitions; "
-            "0 disables (default: off — measured recall vs GT slip lines "
-            "was only ~4%%; wrap errors here are gradual, not sharp)"
-        ),
     )
     parser.add_argument(
         "--output-spacing",
@@ -3043,37 +2756,6 @@ def main(argv=None) -> int:
         help=(
             "erode this many voxels off the valid border before the "
             "output resample (ragged rims and interpolation streaks)"
-        ),
-    )
-    parser.add_argument(
-        "--min-component-vx2",
-        type=float,
-        default=8000.0,
-        help=(
-            "drop connected components smaller than this area (vx^2) "
-            "during output cleanup (also anything <1%% of the largest)"
-        ),
-    )
-    parser.add_argument(
-        "--no-slim",
-        action="store_true",
-        help="skip the SLIM isometric re-parameterization pass",
-    )
-    parser.add_argument(
-        "--slim-fine-raster",
-        action="store_true",
-        help=(
-            "restore the slower legacy SLIM rerasterization through every "
-            "fine-grid vertex (default uses the solved decimated mesh)"
-        ),
-    )
-    parser.add_argument(
-        "--slim-iterations",
-        type=int,
-        default=8,
-        help=(
-            "SLIM solve iterations (default: 8; use 10 to reproduce the "
-            "former convergence and output exactly)"
         ),
     )
     parser.add_argument(
@@ -3096,15 +2778,15 @@ def main(argv=None) -> int:
         parser.error("--max-size must be finite and positive")
     if args.min_size > args.max_size:
         parser.error("--min-size must not exceed --max-size")
+    if (
+        not math.isfinite(args.max_thick_cell_frac)
+        or not 0.0 <= args.max_thick_cell_frac <= 1.0
+    ):
+        parser.error("--max-thick-cell-frac must be a finite number in [0, 1]")
     if args.growth_min_span < 0:
         parser.error("--growth-min-span must be non-negative")
     if not math.isfinite(args.resample_spacing) or args.resample_spacing <= 0:
         parser.error("--resample-spacing must be finite and positive")
-    if not math.isfinite(args.raster_thin_spacing) or args.raster_thin_spacing < 0:
-        parser.error("--raster-thin-spacing must be finite and non-negative")
-    if args.slim_iterations < 1:
-        parser.error("--slim-iterations must be positive")
-
     tracks = PackedTracks(args.tracks)
     crossings = CrossingCsr(args.crossings, tracks, validate_source_ids=False)
     args.output.mkdir(parents=True, exist_ok=True)
