@@ -830,9 +830,8 @@ struct CandidateScore {
 };
 
 struct CandidateTask {
-    size_t beamIndex = 0;
+    uint32_t beamIndex = 0;
     TraceVec direction{0.0f, 0.0f, 0.0f};
-    TraceVec candidatePoint{0.0f, 0.0f, 0.0f};
 };
 
 struct FrontierCandidate {
@@ -879,6 +878,7 @@ void storeScoredFrontierCandidate(
     const FrontierScoreOutput* output,
     const std::vector<BeamState>& beams,
     const CandidateTask& task,
+    const TraceVec& candidatePoint,
     const CandidateScore& score,
     size_t taskIndex)
 {
@@ -889,7 +889,7 @@ void storeScoredFrontierCandidate(
         : taskIndex;
     (*output->candidates)[output->offset + taskIndex] = makeFrontierCandidate(
         beams[task.beamIndex],
-        task.candidatePoint,
+        candidatePoint,
         score,
         *output->target,
         *output->targetPlaneNormal,
@@ -898,6 +898,7 @@ void storeScoredFrontierCandidate(
 
 void fillCandidateTasksForBeam(
     CandidateTask* out,
+    TraceVec* outPoints,
     const std::vector<BeamState>& beams,
     size_t beamIndex,
     const std::vector<ConeOffset>& offsets,
@@ -909,7 +910,8 @@ void fillCandidateTasksForBeam(
         beam.currentSampleDirection, {1.0f, 0.0f, 0.0f});
     const auto basis = traceOrthonormalBasis(forward);
     if (offsets.empty()) {
-        out[0] = {beamIndex, forward, currentPoint + forward * step};
+        out[0] = {static_cast<uint32_t>(beamIndex), forward};
+        outPoints[0] = currentPoint + forward * step;
         return;
     }
     for (size_t offsetIndex = 0; offsetIndex < offsets.size(); ++offsetIndex) {
@@ -917,22 +919,27 @@ void fillCandidateTasksForBeam(
         const TraceVec direction = traceNormalizedOr(
             forward + basis[0] * offset.u + basis[1] * offset.v,
             forward);
-        out[offsetIndex] = {
-            beamIndex, direction, currentPoint + direction * step};
+        out[offsetIndex] = {static_cast<uint32_t>(beamIndex), direction};
+        outPoints[offsetIndex] = currentPoint + direction * step;
     }
 }
 
 void buildCandidateTasks(
     std::vector<CandidateTask>& tasks,
+    std::vector<TraceVec>& candidatePoints,
     const std::vector<BeamState>& beams,
     const std::vector<ConeOffset>& offsets,
     float step)
 {
+    if (beams.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+        throw std::overflow_error("fiber trace has too many beam states");
     const size_t candidatesPerBeam = std::max<size_t>(1, offsets.size());
     tasks.resize(beams.size() * candidatesPerBeam);
+    candidatePoints.resize(tasks.size());
     for (size_t beamIndex = 0; beamIndex < beams.size(); ++beamIndex) {
         fillCandidateTasksForBeam(
             tasks.data() + beamIndex * candidatesPerBeam,
+            candidatePoints.data() + beamIndex * candidatesPerBeam,
             beams,
             beamIndex,
             offsets,
@@ -942,6 +949,7 @@ void buildCandidateTasks(
 
 void buildCandidateTasksForOrderedParents(
     std::vector<CandidateTask>& tasks,
+    std::vector<TraceVec>& candidatePoints,
     std::vector<size_t>& globalIndices,
     const std::vector<BeamState>& beams,
     const std::vector<ConeOffset>& offsets,
@@ -950,15 +958,19 @@ void buildCandidateTasksForOrderedParents(
     size_t orderBegin,
     size_t orderEnd)
 {
+    if (beams.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+        throw std::overflow_error("fiber trace has too many beam states");
     const size_t candidatesPerBeam = std::max<size_t>(1, offsets.size());
     const size_t parentCount = orderEnd - orderBegin;
     tasks.resize(parentCount * candidatesPerBeam);
+    candidatePoints.resize(tasks.size());
     globalIndices.resize(tasks.size());
     for (size_t localParent = 0; localParent < parentCount; ++localParent) {
         const size_t parentIndex = parentOrder[orderBegin + localParent];
         const size_t firstLocalTask = localParent * candidatesPerBeam;
         fillCandidateTasksForBeam(
             tasks.data() + firstLocalTask,
+            candidatePoints.data() + firstLocalTask,
             beams,
             parentIndex,
             offsets,
@@ -1282,6 +1294,7 @@ void sampleCandidateNormals(
     const vc::lasagna::NormalSampler* normalSampler,
     const std::vector<BeamState>& beams,
     const std::vector<CandidateTask>& tasks,
+    const std::vector<TraceVec>& candidatePoints,
     const FiberTraceConfig& config,
     int lookaheadDepth,
     const std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample>& normals,
@@ -1289,6 +1302,8 @@ void sampleCandidateNormals(
     CandidateScoringScratch& scratch,
     FiberTraceProfile* profile)
 {
+    if (candidatePoints.size() != tasks.size())
+        throw std::invalid_argument("fiber candidate task/point size mismatch");
     auto& scores = scratch.scores;
     scores.clear();
     scores.resize(tasks.size());
@@ -1321,23 +1336,23 @@ void sampleCandidateNormals(
                 normalSampler,
                 beams[task.beamIndex],
                 task.direction,
-                task.candidatePoint,
+                candidatePoints[index],
                 config);
             storeScoredFrontierCandidate(
-                frontierOutput, beams, task, scores[index], index);
+                frontierOutput,
+                beams,
+                task,
+                candidatePoints[index],
+                scores[index],
+                index);
         }
         if (profile != nullptr)
             profile->candidateScoreSeconds += elapsedSeconds(scoreStart);
         return scores;
     }
 
-    auto& candidatePoints = scratch.candidatePoints;
     auto& referenceDirections = scratch.referenceDirections;
-    candidatePoints.clear();
     referenceDirections.clear();
-    candidatePoints.reserve(tasks.size());
-    for (const auto& task : tasks)
-        candidatePoints.push_back(task.candidatePoint);
     auto& predictionSamples = scratch.predictionSamples;
     const auto predictionStart = TraceClock::now();
     const auto* field = dynamic_cast<const FiberPredictionField*>(&predictions);
@@ -1346,6 +1361,7 @@ void sampleCandidateNormals(
     struct CornerScoreContext {
         const std::vector<BeamState>* beams;
         const std::vector<CandidateTask>* tasks;
+        const std::vector<TraceVec>* candidatePoints;
         const FiberTraceConfig* config;
         std::vector<CandidateScore>* scores;
         const FrontierScoreOutput* frontierOutput;
@@ -1353,6 +1369,7 @@ void sampleCandidateNormals(
     } cornerContext{
         &beams,
         &tasks,
+        &candidatePoints,
         &config,
         &scores,
         frontierOutput,
@@ -1382,6 +1399,7 @@ void sampleCandidateNormals(
             context.frontierOutput,
             *context.beams,
             task,
+            (*context.candidatePoints)[pointIndex],
             score,
             pointIndex);
     };
@@ -1462,7 +1480,12 @@ void sampleCandidateNormals(
             config,
             normal);
         storeScoredFrontierCandidate(
-            frontierOutput, beams, task, scores[index], index);
+            frontierOutput,
+            beams,
+            task,
+            candidatePoints[index],
+            scores[index],
+            index);
     };
 
 #ifdef _OPENMP
@@ -1729,7 +1752,12 @@ void sampleCandidateNormals(
     out.reserve(selected.size());
     for (const size_t index : selected) {
         out.push_back(beamStateFromFrontierCandidate(
-            parents, tasks, scores, index, candidates[index], config));
+            parents,
+            tasks,
+            scores,
+            index,
+            candidates[index],
+            config));
     }
     return out;
 }
@@ -1869,6 +1897,7 @@ template <typename LossAt>
         const auto taskBuildStart = TraceClock::now();
         buildCandidateTasksForOrderedParents(
             scratch.tasks,
+            scratch.candidatePoints,
             scratch.lookaheadGlobalIndices,
             parents,
             offsets,
@@ -1895,6 +1924,7 @@ template <typename LossAt>
             normalSampler,
             parents,
             scratch.tasks,
+            scratch.candidatePoints,
             config,
             lookaheadDepth,
             {},
@@ -2060,6 +2090,7 @@ template <typename LossAt>
                 finalLookaheadGeneration && advanced > 0 &&
                 request.config.lazyLookahead;
             const std::vector<CandidateTask>* tasksPtr = nullptr;
+            const std::vector<TraceVec>* candidatePointsPtr = nullptr;
             const std::vector<CandidateScore>* scoresPtr = nullptr;
             size_t evaluatedParents = expanded.size();
             size_t evaluatedChildCandidates = 0;
@@ -2086,10 +2117,15 @@ template <typename LossAt>
             } else {
                 const auto taskBuildStart = TraceClock::now();
                 buildCandidateTasks(
-                    scoringScratch.tasks, expanded, coneOffsets, step);
+                    scoringScratch.tasks,
+                    scoringScratch.candidatePoints,
+                    expanded,
+                    coneOffsets,
+                    step);
                 if (profile != nullptr)
                     profile->taskBuildSeconds += elapsedSeconds(taskBuildStart);
                 tasksPtr = &scoringScratch.tasks;
+                candidatePointsPtr = &scoringScratch.candidatePoints;
                 FrontierScoreOutput frontierOutput;
                 const FrontierScoreOutput* frontierOutputPtr = nullptr;
                 if (finalLookaheadGeneration) {
@@ -2109,6 +2145,7 @@ template <typename LossAt>
                     normalSampler,
                     expanded,
                     scoringScratch.tasks,
+                    scoringScratch.candidatePoints,
                     request.config,
                     advanced + 1,
                     {},
@@ -2205,6 +2242,7 @@ template <typename LossAt>
             }
 
             const auto frontierStart = TraceClock::now();
+            const auto& candidatePoints = *candidatePointsPtr;
             std::vector<BeamState> nextFrontier;
             nextFrontier.reserve(tasks.size());
             for (size_t taskIndex = 0; taskIndex < tasks.size(); ++taskIndex) {
@@ -2216,10 +2254,11 @@ template <typename LossAt>
                 const TraceVec currentPoint = beamEndpoint(beam);
                 const auto crossing = interpolatePlaneCrossing(
                     currentPoint,
-                    task.candidatePoint,
+                    candidatePoints[taskIndex],
                     target,
                     targetPlaneNormal);
-                const TraceVec nextPoint = crossing.value_or(task.candidatePoint);
+                const TraceVec nextPoint = crossing.value_or(
+                    candidatePoints[taskIndex]);
                 BeamState next = beam;
                 next.path = appendBeamPathPoint(beam.path, nextPoint);
                 next.tracedLength += traceLength(nextPoint - currentPoint);

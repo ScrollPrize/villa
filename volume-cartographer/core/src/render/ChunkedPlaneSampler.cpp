@@ -2029,39 +2029,33 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
         cornerBatchPool().worker_count(), requestedWorkers, levelCoords.size()});
     const size_t pointsPerWorker =
         (levelCoords.size() + workerCount - 1) / workerCount;
-    std::vector<std::future<void>> sampleFutures;
-    sampleFutures.reserve(workerCount);
-    for (size_t worker = 0; worker < workerCount; ++worker) {
+    const size_t taskCount =
+        (levelCoords.size() + pointsPerWorker - 1) / pointsPerWorker;
+    stats.cornerWorkerTasks = taskCount;
+    cornerBatchPool().run_indexed_batch(taskCount, [&](size_t worker) {
         const size_t begin = worker * pointsPerWorker;
         const size_t end = std::min(begin + pointsPerWorker, levelCoords.size());
-        if (begin >= end)
-            break;
-        sampleFutures.push_back(cornerBatchPool().submit([&, begin, end] {
-            for (size_t pointIndex = begin; pointIndex < end; ++pointIndex) {
-                if (valid[pointIndex] == 0) {
-                    visitor(
-                        visitorContext,
-                        pointIndex,
-                        fractionsXYZ[pointIndex],
-                        false,
-                        {});
-                    continue;
-                }
-                const size_t cubeIndex = pointCubeIndices[pointIndex];
+        for (size_t pointIndex = begin; pointIndex < end; ++pointIndex) {
+            if (valid[pointIndex] == 0) {
                 visitor(
                     visitorContext,
                     pointIndex,
                     fractionsXYZ[pointIndex],
-                    true,
-                    std::span<const std::array<uint8_t, 8>>(
-                        cubeValues.data() + cubeIndex * volumeCount,
-                        volumeCount));
+                    false,
+                    {});
+                continue;
             }
-        }));
-    }
-    stats.cornerWorkerTasks = sampleFutures.size();
-    for (auto& future : sampleFutures)
-        future.get();
+            const size_t cubeIndex = pointCubeIndices[pointIndex];
+            visitor(
+                visitorContext,
+                pointIndex,
+                fractionsXYZ[pointIndex],
+                true,
+                std::span<const std::array<uint8_t, 8>>(
+                    cubeValues.data() + cubeIndex * volumeCount,
+                    volumeCount));
+        }
+    });
     const auto gatherEnd = Clock::now();
     stats.cornerGatherSeconds =
         std::chrono::duration<double>(gatherEnd - pinEnd).count();

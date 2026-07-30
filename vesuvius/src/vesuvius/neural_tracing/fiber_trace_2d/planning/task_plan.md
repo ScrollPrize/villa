@@ -2,10 +2,10 @@
 
 ## Baseline And Acceptance
 
-- Use the optimized cap-32 result as the current baseline: 1.161s wall / 4.945s
-  CPU, 6,910,839 candidates, 4,318 generations, and 7 restarts over 87
-  segments. The task started from 1.869s wall / 8.222s CPU at the same workload
-  and quality.
+- Use the final optimized cap-32 result as the retained baseline: 0.986s median
+  wall / 5.134s median CPU, 6,910,839 candidates, 4,318 generations, and 7
+  restarts over 87 segments. The task started from 1.869s wall / 8.222s CPU at
+  the same workload and quality.
 - Retain only results that preserve the 7-restart baseline.
 - For result-neutral phases, require identical trace output, candidate count,
   generation count, and restart count.
@@ -14,10 +14,10 @@
   interpolation, missing/error handling, and float math.
 - Reuse the exact approved representative command and existing remote cache.
 - Before every representative benchmark, sample host CPU utilization and the
-  runnable queue. Run directly when the host is quiet; if a compile or other
-  significant CPU workload is active, wait for the user to confirm resources
-  are available. Builds, unit tests, and synthetic microbenchmarks do not imply
-  a representative workload run.
+  runnable queue. Run directly when the host is quiet under the user's current
+  continuing permission; if a compile or other significant CPU workload is
+  active, defer the run. Builds, unit tests, and synthetic microbenchmarks do
+  not imply that a contaminated representative result is usable.
 
 ## Phase 1: Result-Neutral Measurement
 
@@ -148,7 +148,8 @@ Run only after result-neutral work is measured:
 ## Performance Protocol
 
 - Apply the host-load gate immediately before every representative benchmark.
-  Run directly only when the host is quiet; otherwise wait for user clearance.
+  Run directly only when the host is quiet; otherwise defer until resources are
+  available.
 - Use the exact existing command, fiber manifest, fiber JSON, normal manifest,
   and remote cache path. Do not substitute paths or add experimental flags;
   compile isolated defaults for trials when required.

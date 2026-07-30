@@ -2,12 +2,14 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
+#include "utils/thread_pool.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 
 #include <opencv2/core.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -132,6 +134,32 @@ cv::Mat_<cv::Vec3f> singleCoord(const cv::Vec3f& coord)
 }
 
 } // namespace
+
+TEST_CASE("ThreadPool indexed batch visits every index once")
+{
+    utils::ThreadPool pool(4);
+    std::array<std::atomic<int>, 17> visits{};
+
+    pool.run_indexed_batch(visits.size(), [&](size_t index) {
+        visits[index].fetch_add(1, std::memory_order_relaxed);
+    });
+
+    for (const auto& count : visits)
+        CHECK(count.load(std::memory_order_relaxed) == 1);
+}
+
+TEST_CASE("ThreadPool indexed batch propagates worker exceptions")
+{
+    utils::ThreadPool pool(4);
+
+    CHECK_THROWS_WITH_AS(
+        pool.run_indexed_batch(8, [](size_t index) {
+            if (index == 3)
+                throw std::runtime_error("indexed batch failure");
+        }),
+        doctest::Contains("indexed batch failure"),
+        std::runtime_error);
+}
 
 TEST_CASE("ChunkedPlaneSampler fine-to-coarse fills missing high-res from coarse level")
 {

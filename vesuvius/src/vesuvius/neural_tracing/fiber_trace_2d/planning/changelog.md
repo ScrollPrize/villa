@@ -1,5 +1,11 @@
 # 2026-07-30
 
+- Further reduced the approved native precomputed whole-fiber workload from
+  1.869s wall / 8.222s CPU to a three-run median of 0.986s / 5.134s with
+  deterministic partial parent ordering, compact lazy frontiers, unique-cube
+  corner reuse, unit-vector invariant math, unique-key start sampling, indexed
+  worker batches, and compact candidate task storage. All final runs retained
+  7 restarts and the exact 6,910,839-candidate / 4,318-generation workload.
 - Reduced the approved native precomputed whole-fiber workload from 21.155s
   to 1.869s with exact lower-bound lookahead ordering, a measured default
   32-parent final-lookahead cap, and fused pinned-corner decode/scoring. The

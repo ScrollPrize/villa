@@ -7,10 +7,10 @@ original cap-32 baseline was:
 - 6,910,839 candidates and 4,318 generations
 - 7 restarts over 87 segments
 
-After result-neutral and accepted numeric-relaxed optimization, the new
+After result-neutral and accepted numeric-relaxed optimization, the final
 retained baseline is plain cap 32:
 
-- 1.161s wall / 4.945s CPU
+- 0.986s median wall / 5.134s median CPU
 - 6,910,839 candidates and 4,318 generations
 - 7 restarts over 87 segments
 

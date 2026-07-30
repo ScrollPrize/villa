@@ -721,7 +721,20 @@ Ownership changed as follows:
   chunks are prefetched and pinned once per candidate batch, then each point's
   ordered corners are decoded and scored directly without candidate-sized
   per-volume corner arrays. Generic sampler sources retain the materialized
-  fallback.
+  fallback. The corner visitor interns points by integer voxel cube, gathers
+  each physical volume's eight corners once per cube, and fans that record out
+  to the original point indices with their individual fractions. Worker ranges
+  are queued as one indexed `ThreadPool` batch with one completion latch rather
+  than one packaged task/future per range.
+- Candidate generation stores compact `{uint32 beam index, direction}` metadata
+  separately from one canonical point vector. The same index drives sampling,
+  score storage, frontier reconstruction, and original-order tie behavior.
+  Concrete start-point prediction sampling prepares each interpolation cube
+  once and resolves only its unique chunk keys through the shared local
+  resolver.
+- `--lookahead-retry-parent-cap N` can retry a failed lazy-lookahead segment at
+  a larger parent cap and adopt only a successful retry. It is disabled by
+  default (`0`); the measured cap-32 path remains the production baseline.
 - `vc_fiber_trace_metric` opens Lasagna manifests through the shared
   location-aware `vc_lasagna` dataset opener. Local manifests continue to work
   without extra arguments. Direct remote `s3://`, `s3+REGION://`, `http://`, or
