@@ -183,6 +183,20 @@ struct GeneratedViews {
     std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics;
 };
 
+inline void replaceGeneratedBranchOverlayData(
+    GeneratedViews& views,
+    std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
+    std::vector<std::vector<cv::Vec3f>> branchLinePoints,
+    std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
+    std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics)
+{
+    views.controlPoints = std::move(controlPoints);
+    views.branchLinePoints = std::move(branchLinePoints);
+    views.branchLinks = std::move(branchLinks);
+    views.fiberIntersections.clear();
+    views.spanAlignmentMetrics = std::move(spanAlignmentMetrics);
+}
+
 struct GeneratedControlPointLinePositionIndex {
     std::vector<size_t> sortedControlIndices;
 };

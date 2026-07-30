@@ -30,6 +30,29 @@ public:
     }
 };
 
+class PositiveEdgePrediction final
+    : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d& point,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        vc::fiber_tracer::FiberPredictionSample out;
+        if (point[0] >= 8.0) {
+            out.options.push_back({});
+            return out;
+        }
+        out.options.push_back({
+            referenceDirection[0] < 0.0
+                ? cv::Vec3f{-1.0f, 0.0f, 0.0f}
+                : cv::Vec3f{1.0f, 0.0f, 0.0f},
+            1.0f,
+            true,
+        });
+        return out;
+    }
+};
+
 class SlantedPrediction final : public vc::fiber_tracer::FiberPredictionSource {
 public:
     vc::fiber_tracer::FiberPredictionSample sample(
@@ -1239,4 +1262,32 @@ TEST_CASE("native fiber extrapolation stops on the requested distance plane")
         vc::fiber_tracer::traceFiberExtrapolation(
             predictions, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.0, config),
         std::invalid_argument);
+}
+
+TEST_CASE("native fiber extrapolation retains its path at invalid directions")
+{
+    PositiveEdgePrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 4.0;
+    config.coneAngleDegrees = 0.0;
+    config.beamWidth = 1;
+    config.maxStepFactor = 2.0;
+    config.smoothnessNormalWeight = 0.0;
+    config.smoothnessTangentWeight = 0.0;
+    config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result = vc::fiber_tracer::traceFiberExtrapolation(
+        predictions,
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        12.0,
+        config,
+        &normals);
+
+    CHECK_FALSE(result.reachedTargetPlane);
+    CHECK(result.reason.starts_with("no_valid_candidates"));
+    REQUIRE(result.points.size() == 2);
+    CHECK(result.points.front()[0] == doctest::Approx(0.0));
+    CHECK(result.points.back()[0] == doctest::Approx(4.0));
 }

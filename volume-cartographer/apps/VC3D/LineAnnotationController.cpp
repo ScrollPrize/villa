@@ -2235,10 +2235,6 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
             startFiberModeOptimization(session, true);
             return;
         }
-        session.controlPointsBeforeModeChange = session.controlPoints;
-        for (auto& control : session.controlPoints) {
-            control.segmentToNext.reset();
-        }
         startOptimization(session, true);
     });
     connect(dialog,
@@ -5970,7 +5966,9 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
             pane->dialog->setGeneratedBranchOverlayData(
                 controlMarkersForSession(session),
                 generatedBranchLinePointsForSession(session),
-                generatedBranchLinkMarkers(session.branches));
+                generatedBranchLinkMarkers(session.branches),
+                true,
+                generatedSpanAlignmentMetricsForSession(session));
             pane->dialog->setGeneratedPredSnapPoints(
                 generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
         }
@@ -6197,7 +6195,8 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
                 controlMarkersForSession(parentSession),
                 generatedBranchLinePointsForSession(parentSession),
                 generatedBranchLinkMarkers(parentSession.branches),
-                true);
+                true,
+                generatedSpanAlignmentMetricsForSession(parentSession));
         }
         showError(tr("Could not save linked fiber: %1")
                       .arg(QString::fromStdString(ex.what())),
@@ -6216,7 +6215,8 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
             std::move(controlMarkers),
             std::move(branchLinePoints),
             std::move(branchLinks),
-            true);
+            true,
+            generatedSpanAlignmentMetricsForSession(parentSession));
     }
     if (openAfterCreate) {
         openFiberAtControlPoint(linkedFiberId, 0);
@@ -6268,7 +6268,8 @@ void LineAnnotationController::handleGeneratedControlPointLinkCandidate(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
             generatedBranchLinkMarkers(session.branches),
-            false);
+            false,
+            generatedSpanAlignmentMetricsForSession(session));
     }
 }
 
@@ -6483,7 +6484,8 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
                 controlMarkersForSession(session),
                 generatedBranchLinePointsForSession(session),
                 generatedBranchLinkMarkers(session.branches),
-                true);
+                true,
+                generatedSpanAlignmentMetricsForSession(session));
         }
         showError(tr("Could not save linked fibers: %1")
                       .arg(QString::fromStdString(ex.what())));
@@ -6500,7 +6502,8 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
             generatedBranchLinkMarkers(session.branches),
-            true);
+            true,
+            generatedSpanAlignmentMetricsForSession(session));
     }
     refreshBranchLineViews(localFiberId);
 }
@@ -6574,7 +6577,8 @@ void LineAnnotationController::handleGeneratedControlPointUnlink(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
             generatedBranchLinkMarkers(session.branches),
-            true);
+            true,
+            generatedSpanAlignmentMetricsForSession(session));
     }
     refreshBranchLineViews(session.fiberId);
     refreshBranchLineViews(branchFiberId);
@@ -6691,7 +6695,8 @@ void LineAnnotationController::handleGeneratedControlPointSetLinkPending(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
             generatedBranchLinkMarkers(session.branches),
-            true);
+            true,
+            generatedSpanAlignmentMetricsForSession(session));
     }
     refreshBranchLineViews(session.fiberId);
     refreshBranchLineViews(branchFiberId);
@@ -6904,7 +6909,9 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
-            generatedBranchLinkMarkers(session.branches));
+            generatedBranchLinkMarkers(session.branches),
+            true,
+            generatedSpanAlignmentMetricsForSession(session));
         pane->dialog->setGeneratedPredSnapPoints(
             generatedPredSnapMarkers(session.controlPoints, session.predSnapSet));
     }
@@ -9386,7 +9393,9 @@ void LineAnnotationController::refreshBranchLineViews(uint64_t changedFiberId)
         pane.dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(*pane.session),
             generatedBranchLinePointsForSession(*pane.session),
-            generatedBranchLinkMarkers(pane.session->branches));
+            generatedBranchLinkMarkers(pane.session->branches),
+            true,
+            generatedSpanAlignmentMetricsForSession(*pane.session));
     }
 }
 

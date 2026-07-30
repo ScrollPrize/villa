@@ -49,11 +49,16 @@ Generated-strip labels use the CP-owned record directly. Accepted native spans
 show their persisted meeting error in base voxels; fallback spans show a
 compact stable failure reason, and the tooltip includes the full stored detail.
 Spans without a native attempt retain the ordinary Lasagna normal-alignment
-display.
+display. Reoptimization and branch-overlay refreshes repopulate these labels
+from the current records. Ordinary Reoptimize preserves accepted native spans;
+switching explicitly to Lasagna mode or reverting a span clears them.
 
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way
 fiber tracer after converting the requested distance to trace voxels; a failed
 native tail keeps its Lasagna fallback. Stored line and control points always
-remain in base coordinates. A retained Lasagna tail adjacent to a successful
-native span uses the same hard continuation direction.
+remain in base coordinates. When the prediction field returns no valid next
+direction at a volume edge, the tracer retains its last valid partial path and
+VC3D stops the native tail there. Step-budget and other failures still keep the
+Lasagna fallback. A retained Lasagna tail adjacent to a successful native span
+uses the same hard continuation direction.

@@ -136,7 +136,8 @@ public:
         std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
         std::vector<std::vector<cv::Vec3f>> branchLinePoints,
         std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
-        bool requestSideStripIntersections = true);
+        bool requestSideStripIntersections = true,
+        std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics = {});
     void setGeneratedFiberIntersectionMarkers(
         std::vector<GeneratedOverlay::FiberIntersectionMarker> markers);
     void setGeneratedSideStripIntersectionBusy(bool busy);

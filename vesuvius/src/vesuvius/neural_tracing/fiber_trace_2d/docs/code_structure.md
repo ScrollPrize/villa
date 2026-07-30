@@ -736,7 +736,11 @@ Ownership changed as follows:
   Successful native traces are marked finalized before auto-save. Accepted
   spans display their persisted meeting error in base voxels below the strip;
   fallback spans display a compact stable failure reason, with full detail in
-  the tooltip. On a traced
+  the tooltip. Branch/control overlay refreshes replace those labels from the
+  current CP metadata immediately, so reoptimization cannot clear the display.
+  Ordinary same-mode Reoptimize preserves accepted records and protected
+  geometry; explicit Lasagna mode transition and successful per-span revert
+  remain the clearing operations. On a traced
   span, the same Ctrl-right-click menu instead offers `Revert segment to
   Lasagna optimization`; the worker removes only that span's protection and
   commits its Lasagna result and metadata removal transactionally.
@@ -768,7 +772,10 @@ Ownership changed as follows:
   Both open tails are first available from Lasagna reinitialization. Fiber mode
   then calls `traceFiberExtrapolation`, a thin distance-plane request over the
   shared one-way beam tracer, in trace coordinates. A successful crossing
-  replaces that tail; failure retains the Lasagna tail, whose first point is
+  replaces that tail. If all next-step prediction directions are invalid, the
+  shared tracer returns its last valid partial path with
+  `no_valid_candidates`; VC3D uses it as a native tail ending at the data edge.
+  Step-budget and other failures retain the Lasagna tail, whose first point is
   hard-constrained by adjoining native geometry when the outer CP owns a
   successful native span. The controller
   applies the combined line, CP metadata, and mode atomically and uses the same

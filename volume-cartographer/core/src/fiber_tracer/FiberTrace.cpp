@@ -2301,6 +2301,14 @@ template <typename LossAt>
         initial.targetPlaneCrossings,
         acceptThresholdVoxels);
     std::vector<BeamState> beams{initial};
+    BeamState lastValidState = initial;
+    const auto retainBestValidState = [&lastValidState](
+                                          const std::vector<BeamState>& states) {
+        if (states.empty())
+            return;
+        lastValidState = *std::min_element(
+            states.begin(), states.end(), beamSearchLess);
+    };
     if (initial.reached) {
         return oneWayResultFromState(
             initial,
@@ -2456,6 +2464,7 @@ template <typename LossAt>
                     request.config.beamPruneDistanceVoxels,
                     request.config,
                     advanced > 0 ? &selectedIndices : nullptr);
+                retainBestValidState(beams);
                 if (advanced > 0) {
                     const bool complete = selectedIndices.size() >=
                         static_cast<size_t>(request.config.beamWidth);
@@ -2517,6 +2526,7 @@ template <typename LossAt>
             if (profile != nullptr)
                 profile->frontierSeconds += elapsedSeconds(frontierStart);
             expanded = std::move(nextFrontier);
+            retainBestValidState(expanded);
             if (expanded.empty()) {
                 reason = "no_valid_candidates";
                 break;
@@ -2551,6 +2561,7 @@ template <typename LossAt>
                 std::move(expanded),
                 request.config.beamWidth,
                 request.config.beamPruneDistanceVoxels);
+            retainBestValidState(beams);
             if (profile != nullptr)
                 profile->pruneSeconds += elapsedSeconds(pruneStart);
         }
@@ -2573,7 +2584,7 @@ template <typename LossAt>
 
     if (beams.empty()) {
         return oneWayResultFromState(
-            initial,
+            lastValidState,
             targetPlanes,
             false,
             reason,

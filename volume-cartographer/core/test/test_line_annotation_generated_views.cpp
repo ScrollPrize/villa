@@ -713,6 +713,32 @@ TEST_CASE("line annotation generated strip overlay includes controls and current
     CHECK(overlay.seedLineIndex == -1);
 }
 
+TEST_CASE("branch overlay replacement retains supplied native span diagnostics")
+{
+    vc3d::line_annotation::GeneratedViews views;
+    views.spanAlignmentMetrics.push_back({});
+    views.fiberIntersections.push_back({});
+    vc3d::line_annotation::GeneratedSpanAlignmentMetric metric;
+    metric.kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind::NativeMeetingError;
+    metric.meetingErrorBaseVoxels = 2.5;
+
+    vc3d::line_annotation::replaceGeneratedBranchOverlayData(
+        views,
+        {{{1.0f, 2.0f, 3.0f}, 4.0, false}},
+        {{{1.0f, 0.0f, 0.0f}}},
+        {},
+        {metric});
+
+    REQUIRE(views.controlPoints.size() == 1);
+    CHECK(views.controlPoints.front().linePosition == doctest::Approx(4.0));
+    REQUIRE(views.spanAlignmentMetrics.size() == 1);
+    CHECK(views.spanAlignmentMetrics.front().kind ==
+          vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind::NativeMeetingError);
+    CHECK(views.spanAlignmentMetrics.front().meetingErrorBaseVoxels ==
+          doctest::Approx(2.5));
+    CHECK(views.fiberIntersections.empty());
+}
+
 TEST_CASE("line annotation generated overlays include pred-snap connector endpoints")
 {
     vc3d::line_annotation::GeneratedViews views;
@@ -1291,10 +1317,10 @@ TEST_CASE("fiber mode falls back only the failed native span")
           doctest::Approx(1.0).epsilon(1.0e-10));
 }
 
-TEST_CASE("fiber mode retraces both tails of a single-control seed")
+TEST_CASE("fiber mode truncates extrapolation at an invalid prediction edge")
 {
     FiberModeNormalSampler normals;
-    FiberModePrediction predictions;
+    FiberModePrediction predictions(8.0);
     vc3d::line_annotation::FiberModeOptimizationRequest request;
     request.controlPoints = {
         {2.0, {0.0, 0.0, 0.0}, true, 2},
@@ -1327,12 +1353,12 @@ TEST_CASE("fiber mode retraces both tails of a single-control seed")
     REQUIRE(result.controlPoints.size() == 1);
     CHECK(result.nativeSegments == 0);
     CHECK(result.lasagnaFallbackSegments == 0);
-    CHECK(result.nativeExtrapolations +
-              result.lasagnaFallbackExtrapolations == 2);
+    CHECK(result.nativeExtrapolations == 2);
+    CHECK(result.lasagnaFallbackExtrapolations == 0);
     REQUIRE(result.optimization.line.points.size() >= 3);
     const auto& points = result.optimization.line.points;
-    CHECK(cv::norm(points.front().position) == doctest::Approx(8.0));
-    CHECK(cv::norm(points.back().position) == doctest::Approx(8.0));
+    CHECK(points.front().position[0] == doctest::Approx(-8.0));
+    CHECK(points.back().position[0] == doctest::Approx(4.0));
 }
 
 TEST_CASE("fiber mode hard-constrains fallback from stored native geometry")

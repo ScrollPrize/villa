@@ -1071,6 +1071,12 @@
   deletion clears the record whose successor changes, while unrelated CP
   edits preserve other traced spans. Non-unit fiber coordinate scaling clears
   all traced records.
+- Ordinary Reoptimize in the current mode must preserve accepted native records
+  and their protected geometry. Only an explicit transition to Lasagna mode or
+  successful per-span revert clears accepted records. Any generated
+  branch/control overlay refresh must immediately repopulate span diagnostics
+  from the current CP records so persisted native error/failure labels cannot
+  disappear after optimization.
 - Ctrl-right-click on a traced span shows `Revert segment to Lasagna
   optimization` instead of the native trace action. Revert optimizes only the
   selected endpoint-bounded span, protects all other traced spans, fixes both
@@ -1114,9 +1120,13 @@
 - The line-annotation extrapolation control is measured in base voxels and
   applies beyond both outer CPs. Native mode converts that distance to trace
   voxels and uses the shared one-way tracer with a perpendicular distance
-  plane. Each successful tail replaces the corresponding Lasagna tail; native
-  tail failure retains that Lasagna tail. A zero distance trims the line to the
-  outer CPs.
+  plane. Reaching the plane replaces the corresponding Lasagna tail. If the
+  next candidate generation has no valid prediction directions, the one-way
+  tracer retains its last valid path and VC3D uses that path as a native tail
+  truncated at the data edge. Other failures, including step-budget
+  exhaustion, retain the Lasagna tail. This extrapolation-only rule does not
+  change CP-pair or whole-fiber acceptance. A zero distance trims the line to
+  the outer CPs.
 - A fiber with only its initial seed CP still rebuilds both open tails when
   switching modes or changing the extrapolation distance. Changing the
   distance marks the line unoptimized and, when Auto-reoptimize is enabled,

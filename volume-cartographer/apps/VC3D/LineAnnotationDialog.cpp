@@ -704,16 +704,18 @@ void LineAnnotationDialog::setGeneratedBranchOverlayData(
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
     std::vector<std::vector<cv::Vec3f>> branchLinePoints,
     std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
-    bool requestSideStripIntersections)
+    bool requestSideStripIntersections,
+    std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics)
 {
     if (_closing || !_hasGeneratedViews) {
         return;
     }
-    _generatedViews.controlPoints = std::move(controlPoints);
-    _generatedViews.branchLinePoints = std::move(branchLinePoints);
-    _generatedViews.branchLinks = std::move(branchLinks);
-    _generatedViews.fiberIntersections.clear();
-    _generatedViews.spanAlignmentMetrics.clear();
+    vc3d::line_annotation::replaceGeneratedBranchOverlayData(
+        _generatedViews,
+        std::move(controlPoints),
+        std::move(branchLinePoints),
+        std::move(branchLinks),
+        std::move(spanAlignmentMetrics));
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);

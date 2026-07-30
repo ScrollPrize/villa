@@ -1,29 +1,22 @@
-# Native Fiber Trace Meeting Search And Persisted Diagnostics Status
+# Native Diagnostic Refresh And Edge Extrapolation Status
 
 ## Planning
 
-- [x] Read the user request and nested repository instructions.
-- [x] Inspect current C++ target-plane termination, fusion, CP metadata, and
-  generated-strip metric paths.
-- [x] Inspect the Python arc-length fusion reference.
-- [x] Replace the active task, plan, status, and task log.
-- [x] Obtain independent review against task, specs, plan, and current code.
-- [x] Incorporate review findings.
+- [x] Reproduce the diagnostic-clearing call sequence by inspection.
+- [x] Locate one-way invalid-candidate termination and VC3D tail fallback.
+- [x] Replace task, plan, status, and task log for the follow-up.
+- [x] Review the plan against the active specs and implementation.
 
 ## Implementation
 
-- [x] Continue both one-way traces until threshold success or budget exhaustion.
-- [x] Add symmetric moving-plane meeting candidates and 10% acceptance.
-- [x] Port Python arc-length fusion warping to shared C++.
-- [x] Add explicit accepted/fallback CP-owned segment outcomes.
-- [x] Persist mixed-mode and direct-action failures without protecting them.
-- [x] Show native error/failure diagnostics below generated strips.
-- [x] Update strict metadata readers and merge handling.
+- [x] Repopulate current span diagnostics after branch-overlay refresh.
+- [x] Preserve accepted spans during same-mode Reoptimize.
+- [x] Retain the last valid one-way path on invalid candidates.
+- [x] Accept invalid-candidate extrapolation as a truncated native tail.
+- [x] Add focused core and VC3D regressions.
 
 ## Validation And Documentation
 
-- [x] Add and update focused C++ and Python regression tests.
-- [x] Build and run affected suites with `-j32`.
-- [x] Build VC3D and the native metric CLI with `-j32`.
+- [x] Run focused tests and build VC3D with `-j32`.
 - [x] Update specs, docs, changelog, and task log.
-- [x] Perform final diff, schema, and staging review.
+- [x] Review and stage the follow-up with the existing task changes.

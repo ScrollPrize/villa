@@ -220,6 +220,14 @@ void appendFiberModeReport(FiberModeOptimizationResult& output)
     output.optimization.report.message = message.str();
 }
 
+bool usableNativeExtrapolation(
+    const vc::fiber_tracer::FiberTraceOneWayResult& traced)
+{
+    return traced.points.size() >= 2 &&
+        (traced.reachedTargetPlane ||
+         traced.reason.starts_with("no_valid_candidates"));
+}
+
 void replaceOpenTailsWithNative(
     const FiberModeOptimizationRequest& request,
     const vc::fiber_tracer::FiberTraceCoordinateAdapter& coordinates,
@@ -269,7 +277,7 @@ void replaceOpenTailsWithNative(
         } catch (const std::exception&) {
             left.reset();
         }
-        if (left && left->reachedTargetPlane && left->points.size() >= 2) {
+        if (left && usableNativeExtrapolation(*left)) {
             leftTail = coordinates.traceToBase(left->points);
             leftTail.front() = finalPoints[static_cast<size_t>(firstControl)];
             std::reverse(leftTail.begin(), leftTail.end());
@@ -283,7 +291,7 @@ void replaceOpenTailsWithNative(
         } catch (const std::exception&) {
             right.reset();
         }
-        if (right && right->reachedTargetPlane && right->points.size() >= 2) {
+        if (right && usableNativeExtrapolation(*right)) {
             rightTail = coordinates.traceToBase(right->points);
             rightTail.front() = finalPoints[static_cast<size_t>(lastControl)];
             ++output.nativeExtrapolations;

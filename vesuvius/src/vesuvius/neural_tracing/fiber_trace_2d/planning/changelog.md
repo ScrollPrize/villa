@@ -1,5 +1,8 @@
 # 2026-07-30
 
+- Preserved native span error labels through Reoptimize/branch refresh and made
+  native extrapolation stop at the last valid prediction before a volume edge
+  instead of restoring the Lasagna tail.
 - Replaced VC3D's endpoint-only native CP-pair acceptance with symmetric
   moving-plane trace intersection, 10%-of-traced-length acceptance, and
   arc-length-warped fusion; persisted accepted/fallback outcomes now restore
