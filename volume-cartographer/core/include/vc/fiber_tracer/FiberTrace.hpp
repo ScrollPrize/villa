@@ -251,6 +251,7 @@ public:
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples,
         std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample>& normals,
+        vc::lasagna::LasagnaCornerBatch* cornerScratch,
         FiberTraceProfile* profile) const;
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,

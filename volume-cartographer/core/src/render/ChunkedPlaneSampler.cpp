@@ -1530,11 +1530,14 @@ ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
 {
     Stats stats;
     stats.requestedLevelOnly = true;
-    values.assign(
-        arrays.size(),
-        std::vector<std::array<uint8_t, 8>>(levelCoords.size()));
-    fractionsXYZ.assign(levelCoords.size(), {0.0f, 0.0f, 0.0f});
-    valid.assign(levelCoords.size(), uint8_t{0});
+    values.resize(arrays.size());
+    for (auto& volumeValues : values)
+        volumeValues.resize(levelCoords.size());
+    fractionsXYZ.resize(levelCoords.size());
+    std::fill(
+        fractionsXYZ.begin(), fractionsXYZ.end(), cv::Vec3f{0.0f, 0.0f, 0.0f});
+    valid.resize(levelCoords.size());
+    std::fill(valid.begin(), valid.end(), uint8_t{0});
     if (arrays.empty() || levelCoords.empty())
         return stats;
     if (arrays.front() == nullptr || level < 0 || level >= arrays.front()->numLevels())
@@ -1568,14 +1571,19 @@ ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
     };
     constexpr uint32_t kNoBoundary = std::numeric_limits<uint32_t>::max();
     struct PointCorners {
-        std::array<uint32_t, 8> byteOffset{};
         uint32_t dependencyIndex = 0;
+        uint32_t baseByteOffset = 0;
         uint32_t boundaryIndex = std::numeric_limits<uint32_t>::max();
+        uint8_t clampedAxes = 0;
 
         [[nodiscard]] bool singleDependency() const noexcept
         {
             return boundaryIndex == std::numeric_limits<uint32_t>::max();
         }
+    };
+    struct BoundaryCorners {
+        std::array<uint32_t, 8> dependencyIndex{};
+        std::array<uint32_t, 8> byteOffset{};
     };
     std::vector<VoxelCube> voxelCubes(levelCoords.size());
     for (size_t pointIndex = 0; pointIndex < levelCoords.size(); ++pointIndex) {
@@ -1602,7 +1610,7 @@ ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
         std::array<int, 3> chunkShape{};
         std::vector<PointCorners> points;
         std::vector<ChunkKey> dependencies;
-        std::vector<std::array<uint32_t, 8>> boundaryDependencies;
+        std::vector<BoundaryCorners> boundaryCorners;
         std::vector<size_t> volumes;
     };
     std::vector<CornerLayout> layouts;
@@ -1676,18 +1684,39 @@ ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
                     "corner batch has too many chunk dependencies");
             }
             point.dependencyIndex = static_cast<uint32_t>(currentDependencyIndex);
-            std::array<uint32_t, 8>* boundaryDependencies = nullptr;
             if (!singleDependency) {
-                if (layout.boundaryDependencies.size() >=
+                if (layout.boundaryCorners.size() >=
                     static_cast<size_t>(kNoBoundary)) {
                     throw std::overflow_error(
                         "corner batch has too many boundary points");
                 }
                 point.boundaryIndex = static_cast<uint32_t>(
-                    layout.boundaryDependencies.size());
-                layout.boundaryDependencies.emplace_back();
-                boundaryDependencies = &layout.boundaryDependencies.back();
+                    layout.boundaryCorners.size());
+                layout.boundaryCorners.emplace_back();
+            } else {
+                const int lz = cube.z0 - currentBegin[0];
+                const int ly = cube.y0 - currentBegin[1];
+                const int lx = cube.x0 - currentBegin[2];
+                const size_t byteOffset =
+                    (static_cast<size_t>(lz) *
+                         static_cast<size_t>(layout.chunkShape[1]) +
+                     static_cast<size_t>(ly)) *
+                        static_cast<size_t>(layout.chunkShape[2]) +
+                    static_cast<size_t>(lx);
+                if (byteOffset >
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                    throw std::overflow_error(
+                        "corner batch chunk exceeds uint32 byte offsets");
+                }
+                point.baseByteOffset = static_cast<uint32_t>(byteOffset);
+                point.clampedAxes = static_cast<uint8_t>(
+                    (cube.x1 == cube.x0 ? 1 : 0) |
+                    (cube.y1 == cube.y0 ? 2 : 0) |
+                    (cube.z1 == cube.z0 ? 4 : 0));
+                continue;
             }
+            BoundaryCorners& boundary =
+                layout.boundaryCorners[point.boundaryIndex];
             size_t corner = 0;
             for (int dz = 0; dz <= 1; ++dz) {
                 const int z = dz == 0 ? cube.z0 : cube.z1;
@@ -1710,10 +1739,8 @@ ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
                             throw std::overflow_error(
                                 "corner batch has too many chunk dependencies");
                         }
-                        if (boundaryDependencies != nullptr) {
-                            (*boundaryDependencies)[corner] =
-                                static_cast<uint32_t>(dependencyIndex);
-                        }
+                        boundary.dependencyIndex[corner] =
+                            static_cast<uint32_t>(dependencyIndex);
                         const int lz = z - key.iz * layout.chunkShape[0];
                         const int ly = y - key.iy * layout.chunkShape[1];
                         const int lx = x - key.ix * layout.chunkShape[2];
@@ -1728,7 +1755,8 @@ ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
                             throw std::overflow_error(
                                 "corner batch chunk exceeds uint32 byte offsets");
                         }
-                        point.byteOffset[corner] = static_cast<uint32_t>(byteOffset);
+                        boundary.byteOffset[corner] =
+                            static_cast<uint32_t>(byteOffset);
                         ++corner;
                     }
                 }
@@ -1810,6 +1838,29 @@ ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
             if (valid[pointIndex] == 0)
                 continue;
             const PointCorners& point = layout.points[pointIndex];
+            std::array<uint32_t, 8> commonOffsets{};
+            const BoundaryCorners* boundary = nullptr;
+            if (point.singleDependency()) {
+                const uint32_t xStride = (point.clampedAxes & 1) != 0 ? 0U : 1U;
+                const uint32_t yStride = (point.clampedAxes & 2) != 0
+                    ? 0U
+                    : static_cast<uint32_t>(layout.chunkShape[2]);
+                const uint32_t zStride = (point.clampedAxes & 4) != 0
+                    ? 0U
+                    : static_cast<uint32_t>(layout.chunkShape[1]) *
+                          static_cast<uint32_t>(layout.chunkShape[2]);
+                size_t corner = 0;
+                for (uint32_t dz = 0; dz <= 1; ++dz) {
+                    for (uint32_t dy = 0; dy <= 1; ++dy) {
+                        for (uint32_t dx = 0; dx <= 1; ++dx) {
+                            commonOffsets[corner++] = point.baseByteOffset +
+                                dz * zStride + dy * yStride + dx * xStride;
+                        }
+                    }
+                }
+            } else {
+                boundary = &layout.boundaryCorners[point.boundaryIndex];
+            }
             for (const size_t volumeIndex : layout.volumes) {
                 const PinnedVolume& volume = pinned[volumeIndex];
                 const uint8_t fill = accesses[volumeIndex].fill;
@@ -1821,28 +1872,28 @@ ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
                         continue;
                     }
                     for (size_t corner = 0; corner < 8; ++corner) {
-                        if (point.byteOffset[corner] >= volume.size[dependencyIndex]) {
+                        if (commonOffsets[corner] >= volume.size[dependencyIndex]) {
                             throw std::runtime_error(
                                 "corner batch decoded chunk has invalid byte extent");
                         }
                         values[volumeIndex][pointIndex][corner] =
-                            std::to_integer<uint8_t>(data[point.byteOffset[corner]]);
+                            std::to_integer<uint8_t>(data[commonOffsets[corner]]);
                     }
                     continue;
                 }
-                const auto& boundaryDependencies =
-                    layout.boundaryDependencies[point.boundaryIndex];
                 for (size_t corner = 0; corner < 8; ++corner) {
                     uint8_t value = fill;
-                    const size_t dependencyIndex = boundaryDependencies[corner];
+                    const size_t dependencyIndex =
+                        boundary->dependencyIndex[corner];
                     const std::byte* data = volume.data[dependencyIndex];
                     if (data != nullptr) {
-                        if (point.byteOffset[corner] >= volume.size[dependencyIndex]) {
+                        if (boundary->byteOffset[corner] >=
+                            volume.size[dependencyIndex]) {
                             throw std::runtime_error(
                                 "corner batch decoded chunk has invalid byte extent");
                         }
                         value = std::to_integer<uint8_t>(
-                            data[point.byteOffset[corner]]);
+                            data[boundary->byteOffset[corner]]);
                     }
                     values[volumeIndex][pointIndex][corner] = value;
                 }

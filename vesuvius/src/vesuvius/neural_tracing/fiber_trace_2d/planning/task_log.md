@@ -77,8 +77,39 @@
   32-bit offsets, and a separate boundary-only dependency table. The float
   compact-normal lookup now stores tensor components, and the combined path
   consumes shared raw corner/fraction/valid arrays without duplicating those
-  fields into six channel sample arrays. All 51 focused tests pass;
-  representative measurement is pending approval.
+  fields into six channel sample arrays. It measured 57.789s wall / 1364.742s
+  CPU with 8 restarts. Corner batching fell from 22.013s to 12.684s; prediction
+  and normal decode remained 9.135s and 7.794s.
+- The next revision retains the raw corner output buffers across lookahead
+  generations, computes interpolation weights once while jointly decoding
+  prediction and normal outputs in one parallel pass, and materializes the
+  final lookahead frontier in deterministic task slots in parallel rather than
+  compacting it serially. It measured 44.070s wall / 1067.310s CPU with 8
+  restarts. Combined corner/decode time fell to 19.812s and frontier time fell
+  from 8.130s to 3.277s.
+- The next revision retains and parallel-fills candidate task buffers, uses
+  static scheduling for uniform in-memory candidate scoring, and replaces up
+  to eight full frontier pruning scans with one deterministic min-heap plus
+  spatial acceptance checks. The heap key preserves loss, depth, and original
+  generation order. The combined experiment regressed to 74.329s wall /
+  1826.523s CPU with 8 restarts under the one-core competing workload. Static
+  scoring rose from 6.134s to 20.374s and parallel task construction rose from
+  4.613s to 8.261s, while heap pruning improved from 7.482s to 1.777s.
+- Static scoring and parallel task construction were removed. The next control
+  retains only reusable task storage and exact heap pruning. It measured
+  37.743s wall / 944.706s CPU with 8 restarts. Pruning remained at 1.585s,
+  task construction fell to 2.489s, and dynamic scoring returned to 6.438s.
+- The next revision specializes the common within-one-chunk corner case: each
+  point stores one dependency, one base byte offset, and clamped-axis bits;
+  eight dependency/offset pairs are stored only for actual chunk-boundary
+  points. Corner offsets are reconstructed once per layout point and reused
+  across its three physical channel volumes. Corner batching improved from
+  13.422s to 8.721s, but contended decode/scoring/frontier variation produced
+  a 38.117s wall / 1075.379s CPU run with 8 restarts.
+- The next control changes only the hot uniform decode, score, and frontier
+  OpenMP loops to `dynamic,64`. This avoids static ownership of the externally
+  occupied core while reducing scheduler traffic relative to `dynamic,8`.
+  Focused fiber tests pass; representative measurement is pending approval.
 
 ## Open Acceptance Issue
 

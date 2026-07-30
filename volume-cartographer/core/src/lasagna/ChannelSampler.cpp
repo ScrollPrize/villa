@@ -656,12 +656,9 @@ NormalPrefetchReport sampleLasagnaChannelCornerBatch(
     LasagnaCornerBatch& samples,
     int parallelThreads)
 {
-    samples.values.assign(
-        samplers.size(),
-        std::vector<std::array<uint8_t, 8>>(volumePoints.size()));
-    samples.fractionsXYZ.assign(
-        volumePoints.size(), cv::Vec3f{0.0f, 0.0f, 0.0f});
-    samples.valid.assign(volumePoints.size(), uint8_t{0});
+    samples.values.resize(samplers.size());
+    samples.fractionsXYZ.resize(volumePoints.size());
+    samples.valid.resize(volumePoints.size());
     if (samplers.empty() || volumePoints.empty())
         return {};
     if (samplers.front() == nullptr || !samplers.front()->impl_)

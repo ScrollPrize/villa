@@ -19,5 +19,14 @@ coordinate/fraction construction. Its first contended benchmark measured
 76.724s and 8 restarts. Worker utilization reduced that to 70.867s, and option
 storage retention plus compact-normal lookup reduced it to 66.384s, both with
 8 restarts. Compact dependency metadata, tensor lookup, and direct raw-corner
-consumption are built and tested but require explicit approval before another
-representative run.
+consumption reduced it to 57.789s with 8 restarts. Joint decode, retained raw
+buffers, and parallel final-frontier materialization reduced it to 44.070s
+with 8 restarts. Retained/parallel candidate construction, static scoring, and
+heap-based exact pruning regressed to 74.329s under the competing workload.
+The two regressing scheduling changes are removed; reusable task storage plus
+the successful heap pruning reduce runtime to 37.743s with 8 restarts. The
+within-chunk base-offset corner specialization is built and tested, pending
+explicit approval before another representative run. Its first run reduced
+corner batching to 8.721s but total runtime was 38.117s due to slower contended
+OpenMP stages. A moderate dynamic-scheduling control is built and tested,
+pending explicit approval.
