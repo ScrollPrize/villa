@@ -23,6 +23,7 @@
 #include <opencv2/core/mat.hpp>
 
 #include "LineAnnotationFiberClassification.hpp"
+#include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
@@ -55,7 +56,9 @@ public:
         bool ok = false;
         std::filesystem::path manifestPath;
         cv::Vec3d seedPoint{0.0, 0.0, 0.0};
-        std::vector<vc::lasagna::LineControlPoint> controlPoints;
+        std::vector<vc3d::line_annotation::LineControlPoint> controlPoints;
+        std::optional<std::pair<size_t, vc3d::line_annotation::FiberTraceSegmentMetadata>>
+            segmentMetadataUpdate;
         cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
         InitialDirectionMode initialDirectionMode = InitialDirectionMode::Sideways;
         vc::lasagna::LineOptimizationResult result;
@@ -150,7 +153,7 @@ public:
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
     using OptimizationTaskFactory =
         std::function<OptimizationTaskResult(std::filesystem::path,
-                                             std::vector<vc::lasagna::LineControlPoint>,
+                                             std::vector<vc3d::line_annotation::LineControlPoint>,
                                              std::vector<cv::Vec3d>,
                                              cv::Vec3d,
                                              InitialDirectionMode,
@@ -304,7 +307,7 @@ private:
         uint64_t sequence = 0;
         std::string fileName;
         uint64_t generation = 1;
-        std::vector<cv::Vec3d> controlPoints;
+        std::vector<vc3d::line_annotation::StoredControlPoint> controlPoints;
         std::vector<cv::Vec3d> linePoints;
         // Stored snapshots only. Live-session branch metadata must be converted
         // through storedFiberFromSession()/saveSessionAsFiber() so the central
@@ -428,6 +431,9 @@ private:
     void handleGeneratedFiberTraceSegment(const std::string& surfaceName,
                                           size_t firstControlPointIndex,
                                           size_t secondControlPointIndex);
+    void handleGeneratedFiberTraceSegmentRevert(const std::string& surfaceName,
+                                                size_t firstControlPointIndex,
+                                                size_t secondControlPointIndex);
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
                                                   size_t controlPointIndex,
                                                   cv::Vec3f volumePoint);
@@ -485,7 +491,7 @@ private:
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
-                                                             std::vector<vc::lasagna::LineControlPoint> controlPoints,
+                                                             std::vector<vc3d::line_annotation::LineControlPoint> controlPoints,
                                                              std::vector<cv::Vec3d> initialLinePoints,
                                                              cv::Vec3d sourceSliceNormal,
                                                              InitialDirectionMode directionMode,
@@ -548,7 +554,7 @@ private:
     // changed, then schedule saves for returned linked fibers as needed.
     BranchMetadataSyncResult syncLinkedBranchMetadataAfterFiberModification(
         LineAnnotationSession& session,
-        const std::vector<vc::lasagna::LineControlPoint>* previousControlPoints = nullptr,
+        const std::vector<vc3d::line_annotation::LineControlPoint>* previousControlPoints = nullptr,
         const std::vector<FiberBranchRef>* previousBranches = nullptr);
     void scheduleBranchMetadataSaves(const std::vector<uint64_t>& fiberIds,
                                      uint64_t excludedFiberId = 0);

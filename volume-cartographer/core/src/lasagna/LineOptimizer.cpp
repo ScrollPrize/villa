@@ -4071,7 +4071,8 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
     const LineOptimizationConfig& rawConfig,
     int activeStart,
     int activeEnd,
-    std::string candidateName) const
+    std::string candidateName,
+    std::vector<std::pair<int, int>> protectedPointRanges) const
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
     if (linePoints.size() < 2) {
@@ -4109,6 +4110,16 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
     if (activeStart > 0 || activeEnd < maxIndex) {
         fixedPointIndices.push_back(activeStart);
         fixedPointIndices.push_back(activeEnd);
+    }
+    for (auto [rangeStart, rangeEnd] : protectedPointRanges) {
+        rangeStart = std::clamp(rangeStart, 0, maxIndex);
+        rangeEnd = std::clamp(rangeEnd, 0, maxIndex);
+        if (rangeEnd < rangeStart) {
+            std::swap(rangeStart, rangeEnd);
+        }
+        for (int index = rangeStart; index <= rangeEnd; ++index) {
+            fixedPointIndices.push_back(index);
+        }
     }
     std::sort(fixedPointIndices.begin(), fixedPointIndices.end());
     fixedPointIndices.erase(std::unique(fixedPointIndices.begin(), fixedPointIndices.end()),
@@ -4240,7 +4251,8 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
     std::vector<LineControlPoint> controlPoints,
     std::vector<int> fixedControlAnchorIndices,
     int displayFrameAnchorIndex,
-    const LineOptimizationConfig& rawConfig) const
+    const LineOptimizationConfig& rawConfig,
+    std::vector<std::pair<int, int>> protectedControlSpans) const
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
     if (linePoints.size() < 2) {
@@ -4311,6 +4323,19 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
     for (const auto& tagged : sortedControls) {
         controlPoints.push_back(tagged.first);
         originalControlIndices.push_back(tagged.second);
+    }
+
+    std::vector<bool> protectedSortedSpans(controlPoints.size() - 1, false);
+    for (size_t spanIndex = 0; spanIndex < protectedSortedSpans.size(); ++spanIndex) {
+        const int leftOriginal = originalControlIndices[spanIndex];
+        const int rightOriginal = originalControlIndices[spanIndex + 1];
+        protectedSortedSpans[spanIndex] = std::any_of(
+            protectedControlSpans.begin(),
+            protectedControlSpans.end(),
+            [leftOriginal, rightOriginal](const auto& protectedSpan) {
+                return protectedSpan.first == leftOriginal &&
+                       protectedSpan.second == rightOriginal;
+            });
     }
 
     std::vector<std::vector<std::array<double, 3>>> optimizedSpans(controlPoints.size() - 1);
@@ -4482,6 +4507,27 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
                                std::optional<cv::Vec3d> rightContinuationDirection) {
         const LineControlPoint& left = controlPoints[controlIndex];
         const LineControlPoint& right = controlPoints[controlIndex + 1];
+        if (protectedSortedSpans[controlIndex]) {
+            OptimizedControlSpan protectedSpan;
+            const int step = left.optimizedIndex <= right.optimizedIndex ? 1 : -1;
+            for (int index = left.optimizedIndex;; index += step) {
+                protectedSpan.points.push_back(
+                    toArray(linePoints[static_cast<size_t>(index)]));
+                if (index == right.optimizedIndex) {
+                    break;
+                }
+            }
+            if (protectedSpan.points.size() < 2) {
+                protectedSpan.points = {toArray(left.volumePoint), toArray(right.volumePoint)};
+            }
+            protectedSpan.points.front() = toArray(left.volumePoint);
+            protectedSpan.points.back() = toArray(right.volumePoint);
+            protectedSpan.report.segmentIndex = static_cast<int>(controlIndex);
+            protectedSpan.report.leftControlIndex = originalControlIndices[controlIndex];
+            protectedSpan.report.rightControlIndex = originalControlIndices[controlIndex + 1];
+            protectedSpan.report.chosen = "protected-existing";
+            return protectedSpan;
+        }
         const SpanRolloutResult existingRollout =
             existingSpanCandidate(linePoints,
                                   left.optimizedIndex,
@@ -4711,6 +4757,14 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
     for (const int index : internalControlIndices) {
         stitchedControlIndices.push_back(internalOffset + index);
     }
+    std::vector<std::pair<int, int>> stitchedProtectedRanges;
+    for (size_t spanIndex = 0; spanIndex < protectedSortedSpans.size(); ++spanIndex) {
+        if (protectedSortedSpans[spanIndex]) {
+            stitchedProtectedRanges.emplace_back(
+                stitchedControlIndices[spanIndex],
+                stitchedControlIndices[spanIndex + 1]);
+        }
+    }
 
     if (stitched.size() < 2) {
         throw std::runtime_error("Existing line reinitialization produced fewer than two samples");
@@ -4740,7 +4794,8 @@ LineReinitializationOptimizationResult LineOptimizer::reinitializeAndOptimizeExi
                              config,
                              -1,
                              -1,
-                             "reinit-reopt+global");
+                             "reinit-reopt+global",
+                             std::move(stitchedProtectedRanges));
 
     std::ostringstream message;
     message.imbue(std::locale::classic());

@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -2462,14 +2463,16 @@ FiberInput loadFiberJson(const std::filesystem::path& path)
     if (root.value("type", std::string{}) != "vc3d_fiber") {
         throw std::runtime_error("fiber JSON type is not vc3d_fiber: " + path.string());
     }
-    if (root.value("version", 0) != 1) {
+    const int version = root.value("version", 0);
+    if (version != 1 && version != 2) {
         throw std::runtime_error("unsupported vc3d_fiber version: " + path.string());
     }
 
     FiberInput fiber;
     fiber.path = path;
     fiber.linePointsXyzBase = pointArrayFromJson(root, path, "line_points");
-    fiber.controlPointsXyzBase = pointArrayFromJson(root, path, "control_points");
+    fiber.controlPointsXyzBase = vc3dFiberPointArrayFromJson(
+        root, "control_points", version, path.string());
     if (fiber.linePointsXyzBase.size() < 2) {
         throw std::runtime_error(
             "fiber JSON needs at least two line_points: " + path.string());

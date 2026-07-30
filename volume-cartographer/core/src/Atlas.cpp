@@ -3,6 +3,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/lasagna/Manifest.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
@@ -297,12 +298,14 @@ FiberInput loadSourceFiberInput(const fs::path& fiberPath,
     if (root.value("type", std::string{}) != "vc3d_fiber") {
         throw std::runtime_error("fiber JSON is not a vc3d_fiber: " + fiberPath.string());
     }
-    if (root.value("version", 0) != 1) {
+    const int version = root.value("version", 0);
+    if (version != 1 && version != 2) {
         throw std::runtime_error("unsupported vc3d_fiber version in " + fiberPath.string());
     }
     FiberInput input;
     input.fiberPath = fiberRelativePath;
-    input.controlPoints = pointArrayFromJson(root, "control_points", fiberPath);
+    input.controlPoints = vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        root, "control_points", version, fiberPath.string());
     input.linePoints = pointArrayFromJson(root, "line_points", fiberPath);
     validateFiberInputControlPoints(input);
     return input;

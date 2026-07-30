@@ -704,6 +704,25 @@ Ownership changed as follows:
   measured against `20` base voxels; at sd2 this is `5` trace voxels. A finite
   positive base voxel size adds micrometer diagnostics, but is not required for
   tracing and does not affect acceptance.
+
+  Accepted native segments are persisted in `vc3d_fiber` version 2. Each
+  `control_points` entry is an object containing `position` and optional
+  `segment_to_next`; the starting CP owns the following span's native-trace
+  provenance and effective configuration. The final CP cannot own a following
+  segment. VC3D's live and stored CP types keep this metadata attached to the
+  CP while explicit geometry-only adapters feed atlas, slice, and optimizer
+  APIs. Version-1 point arrays load as ordinary unprotected CPs. The shared
+  Python fiber parser, native metric reader, Lasagna probe, and sync/merge
+  validator also parse version 2 strictly.
+
+  Lasagna existing-line optimization receives protected dense sample ranges,
+  and full reinitialization directly reuses protected stored spans before its
+  final protected global solve. CP moves invalidate their incoming and
+  outgoing records; insertion/deletion invalidate only changed adjacency.
+  Successful native traces are marked finalized before auto-save. On a traced
+  span, the same Ctrl-right-click menu instead offers `Revert segment to
+  Lasagna optimization`; the worker removes only that span's protection and
+  commits its Lasagna result and metadata removal transactionally.
 - `volume-cartographer/apps/src/vc_fiber_trace_metric.cpp` is the native
   no-visualization metric runner for precomputed 3D fiber inference products.
   It opens a fiber inference `.lasagna.json`, loads one `vc3d_fiber` JSON,

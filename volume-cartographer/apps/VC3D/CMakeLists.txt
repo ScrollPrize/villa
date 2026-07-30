@@ -35,6 +35,8 @@ set(srcs
     FiberSliceGeometry.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
+    LineAnnotationFiberSegments.cpp
+    LineAnnotationFiberSegments.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp

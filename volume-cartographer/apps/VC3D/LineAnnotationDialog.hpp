@@ -189,6 +189,9 @@ signals:
     void generatedFiberTraceSegmentRequested(const std::string& surfaceName,
                                              size_t firstControlPointIndex,
                                              size_t secondControlPointIndex);
+    void generatedFiberTraceSegmentRevertRequested(const std::string& surfaceName,
+                                                   size_t firstControlPointIndex,
+                                                   size_t secondControlPointIndex);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);

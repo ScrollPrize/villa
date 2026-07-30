@@ -61,6 +61,10 @@ REOPTIMIZE_TAG = 'needs_reoptimization'
 #   in sync with kNeedsReoptimizationTag in LineAnnotationController.cpp.
 
 
+def _cp_position(value):
+    return value.get('position') if isinstance(value, dict) else value
+
+
 def _finite_point(p):
     """Strictly a 3-vector of finite numbers — no bools, no numeric
     strings. Anything looser either crashes the arithmetic below or writes
@@ -74,6 +78,45 @@ def _finite_point(p):
         return False
 
 
+_SEGMENT_KEYS = {
+    'optimizer', 'metadata_version', 'tracer_version', 'normal_manifest',
+    'fiber_manifest', 'trace_to_base_scale',
+    'max_endpoint_error_base_voxels', 'config',
+}
+_CONFIG_KEYS = {
+    'step_voxels', 'cone_angle_degrees', 'cone_angle_step_degrees',
+    'cone_grid_size', 'beam_width', 'beam_prune_distance_voxels',
+    'beam_lookahead_steps', 'smoothness_weight',
+    'smoothness_normal_weight', 'smoothness_tangent_weight',
+    'smoothness_free_angle_degrees', 'cumulative_smoothness_steps',
+    'cumulative_smoothness_tangent_weight', 'initial_free_angle_degrees',
+    'max_step_factor', 'fusion_gap_factor',
+    'endpoint_accept_threshold_base_voxels',
+}
+
+
+def _valid_segment(segment):
+    if not isinstance(segment, dict) or set(segment) != _SEGMENT_KEYS:
+        return False
+    if (segment.get('optimizer') != 'native_fiber_trace3d' or
+            segment.get('metadata_version') != 1 or
+            segment.get('tracer_version') != 1 or
+            not isinstance(segment.get('normal_manifest'), str) or
+            not segment['normal_manifest'] or
+            not isinstance(segment.get('fiber_manifest'), str) or
+            not segment['fiber_manifest']):
+        return False
+    config = segment.get('config')
+    numeric = [segment.get('trace_to_base_scale'),
+               segment.get('max_endpoint_error_base_voxels')]
+    if not isinstance(config, dict) or set(config) != _CONFIG_KEYS:
+        return False
+    numeric.extend(config.values())
+    return all(isinstance(value, (int, float)) and
+               not isinstance(value, bool) and math.isfinite(value)
+               for value in numeric)
+
+
 def is_fiber_doc(doc):
     """Structural AND content validity for every field this module
     computes over. Malformed (possibly remote-controlled) input must be
@@ -81,13 +124,29 @@ def is_fiber_doc(doc):
     crashing mid-merge."""
     if not (isinstance(doc, dict) and doc.get('type') == 'vc3d_fiber'):
         return False
-    if doc.get('version', 1) != 1:
-        return False  # the loader throws on unsupported versions
-    for key in ('control_points', 'line_points'):
-        points = doc.get(key)
-        if not isinstance(points, list) or not all(_finite_point(p)
-                                                   for p in points):
+    version = doc.get('version', 1)
+    if version not in (1, 2):
+        return False
+    line_points = doc.get('line_points')
+    if not isinstance(line_points, list) or not all(_finite_point(p)
+                                                    for p in line_points):
+        return False
+    control_points = doc.get('control_points')
+    if not isinstance(control_points, list):
+        return False
+    if version == 1:
+        if not all(_finite_point(p) for p in control_points):
             return False
+    else:
+        for index, cp in enumerate(control_points):
+            if (not isinstance(cp, dict) or
+                    not set(cp) <= {'position', 'segment_to_next'} or
+                    not _finite_point(cp.get('position'))):
+                return False
+            segment = cp.get('segment_to_next')
+            if segment is not None:
+                if index + 1 == len(control_points) or not _valid_segment(segment):
+                    return False
     tags = doc.get('tags', [])
     if not (isinstance(tags, list) and
             all(isinstance(tag, str) for tag in tags)):
@@ -106,6 +165,8 @@ def pos_eq(a, b, tol=POS_TOL):
     sqrt(3)*tol apart that the loader rejects — the exact class of
     inconsistency the destructive repair prompt punishes."""
     try:
+        a = _cp_position(a)
+        b = _cp_position(b)
         if len(a) != 3 or len(b) != 3:
             return False
         d2 = 0.0
@@ -125,7 +186,8 @@ def _seq_eq(a, b):
 
 
 def _dist2(a, b):
-    return sum((float(x) - float(y)) ** 2 for x, y in zip(a, b))
+    return sum((float(x) - float(y)) ** 2
+               for x, y in zip(_cp_position(a), _cp_position(b)))
 
 
 def _normalized(v):
@@ -546,7 +608,7 @@ def _rebind_local_anchors(entries, control_points, line_points):
                              "geometry")
         entry['control_point_index'] = index
         entry['control_point_position'] = [float(x)
-                                           for x in control_points[index]]
+                                           for x in _cp_position(control_points[index])]
         tangent = endpoint_tangent(line_points, entry['control_point_position'])
         entry['control_point_direction'] = _snapped_direction(
             entry.get('control_point_direction'), tangent)
@@ -714,9 +776,15 @@ def merge_fibers(base, local, remote):
             # merged control points AS the line — trivially satisfying the
             # loader's control-points-on-line invariant — and tag for
             # re-optimization.
-            merged_cps = [[float(x) for x in p] for p in merged_cps]
+            normalized_cps = []
+            for cp in merged_cps:
+                position = [float(x) for x in _cp_position(cp)]
+                normalized_cps.append(
+                    {'position': position} if isinstance(cp, dict) else position)
+            merged_cps = normalized_cps
             carrier = {'control_points': merged_cps,
-                       'line_points': copy.deepcopy(merged_cps)}
+                       'line_points': [[float(x) for x in _cp_position(cp)]
+                                       for cp in merged_cps]}
             reoptimize = True
             notes.append("geometry merged from both sides; line set to the "
                          "control-point polyline pending reoptimization in "
@@ -809,7 +877,7 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
     # be 2x tolerance apart from each other. VC3D-written fields are
     # already exact, so consistent pairs still see zero changes.
     def snap_position(entry, key, point, doc_flag):
-        set_field(entry, key, [float(x) for x in point], doc_flag)
+        set_field(entry, key, [float(x) for x in _cp_position(point)], doc_flag)
 
     def snap_direction(entry, key, tangent, doc_flag):
         set_field(entry, key, _snapped_direction(entry.get(key), tangent),

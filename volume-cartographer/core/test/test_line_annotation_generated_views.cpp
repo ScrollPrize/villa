@@ -6,6 +6,7 @@
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
+#include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -1073,4 +1074,54 @@ TEST_CASE("fiber slice intersection opacity fades from 45 to 90 degrees")
     const auto flat = ellipseStyleForAngle(89.0, 3.0);
     CHECK(flat.majorRadius > round.majorRadius);
     CHECK(flat.minorRadius < round.minorRadius);
+}
+
+TEST_CASE("fiber segment metadata round trips with its owning control point")
+{
+    vc3d::line_annotation::StoredControlPoint control{{1.0, 2.0, 3.0}};
+    vc3d::line_annotation::FiberTraceSegmentMetadata metadata;
+    metadata.normalManifestLocation = "s3://bucket/normals.lasagna.json";
+    metadata.fiberManifestLocation = "s3://bucket/fibers.lasagna.json";
+    metadata.traceToBaseScale = 4.0;
+    metadata.config.traceToBaseScale = 4.0;
+    metadata.maxEndpointErrorBaseVoxels = 2.5;
+    control.segmentToNext = metadata;
+
+    const auto json = vc3d::line_annotation::storedControlPointToJson(control);
+    const auto parsed = vc3d::line_annotation::storedControlPointFromJson(json, 2);
+    REQUIRE(parsed.segmentToNext.has_value());
+    CHECK(parsed[0] == doctest::Approx(1.0));
+    CHECK(parsed.segmentToNext->normalManifestLocation ==
+          "s3://bucket/normals.lasagna.json");
+    CHECK(parsed.segmentToNext->traceToBaseScale == doctest::Approx(4.0));
+    CHECK(parsed.segmentToNext->maxEndpointErrorBaseVoxels == doctest::Approx(2.5));
+
+    std::vector<vc3d::line_annotation::StoredControlPoint> invalid{parsed};
+    CHECK_THROWS_AS(vc3d::line_annotation::validateStoredControlPoints(invalid),
+                    std::runtime_error);
+}
+
+TEST_CASE("fiber segment metadata invalidation follows CP adjacency")
+{
+    using vc3d::line_annotation::LineControlPoint;
+    vc3d::line_annotation::FiberTraceSegmentMetadata metadata;
+    metadata.normalManifestLocation = "normal";
+    metadata.fiberManifestLocation = "fiber";
+    std::vector<LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, false, 0},
+        {20.0, {20.0, 0.0, 0.0}, false, 20},
+        {10.0, {10.0, 0.0, 0.0}, false, 10},
+    };
+    controls[0].segmentToNext = metadata;
+    controls[2].segmentToNext = metadata;
+
+    vc3d::line_annotation::invalidateSegmentsAdjacentToControl(controls, 1);
+    CHECK(controls[0].segmentToNext.has_value());
+    CHECK_FALSE(controls[2].segmentToNext.has_value());
+    CHECK_FALSE(controls[1].segmentToNext.has_value());
+
+    controls[0].segmentToNext = metadata;
+    controls.push_back({5.0, {5.0, 0.0, 0.0}, false, 5});
+    vc3d::line_annotation::invalidateSegmentSplitByInsertedControl(controls, 3);
+    CHECK_FALSE(controls[0].segmentToNext.has_value());
 }

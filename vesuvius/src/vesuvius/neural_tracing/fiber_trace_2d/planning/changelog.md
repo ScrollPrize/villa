@@ -1,5 +1,9 @@
 # 2026-07-30
 
+- Added persistent CP-owned native fiber segment metadata in strict
+  `vc3d_fiber` v2 files, Lasagna protection for traced spans, scoped CP-edit
+  invalidation, finalized trace auto-save, and Ctrl-right-click transactional
+  reversion of traced spans to Lasagna optimization.
 - Standardized Python CLI, native C++ CLI, and VC3D fiber endpoint acceptance
   on a `20` base-voxel threshold; physical voxel size is now optional and used
   only for physical-unit reporting.

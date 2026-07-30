@@ -1003,3 +1003,48 @@ def test_duplicate_a_entries_claim_distinct_reciprocals():
     out = refresh_pair_links(a, b, 'a.json', 'b.json')
     assert out['ok']
     assert len(out['b_doc']['branches']) == 2  # no third entry restored
+
+
+def test_v2_control_point_objects_are_valid_and_preserved():
+    doc = make_fiber([cp(0), cp(1)])
+    doc['version'] = 2
+    segment = {
+        'optimizer': 'native_fiber_trace3d',
+        'metadata_version': 1,
+        'tracer_version': 1,
+        'normal_manifest': '/data/normals.lasagna.json',
+        'fiber_manifest': 's3://bucket/fibers.lasagna.json',
+        'trace_to_base_scale': 4.0,
+        'max_endpoint_error_base_voxels': 2.0,
+        'config': {
+            'step_voxels': 4.0,
+            'cone_angle_degrees': 25.0,
+            'cone_angle_step_degrees': 5.0,
+            'cone_grid_size': 25,
+            'beam_width': 8,
+            'beam_prune_distance_voxels': 1.0,
+            'beam_lookahead_steps': 2,
+            'smoothness_weight': 2.0,
+            'smoothness_normal_weight': 0.1,
+            'smoothness_tangent_weight': 10.0,
+            'smoothness_free_angle_degrees': 0.0,
+            'cumulative_smoothness_steps': 4,
+            'cumulative_smoothness_tangent_weight': 2.0,
+            'initial_free_angle_degrees': 0.0,
+            'max_step_factor': 3.0,
+            'fusion_gap_factor': 2.0,
+            'endpoint_accept_threshold_base_voxels': 20.0,
+        },
+    }
+    doc['control_points'] = [
+        {'position': cp(0), 'segment_to_next': segment},
+        {'position': cp(1)},
+    ]
+    assert fiber_merge.is_fiber_doc(doc)
+    result = merge_fibers(doc, copy.deepcopy(doc), copy.deepcopy(doc))
+    assert result['ok']
+    assert result['merged']['control_points'][0]['segment_to_next'] == segment
+
+    invalid = copy.deepcopy(doc)
+    invalid['control_points'][-1]['segment_to_next'] = segment
+    assert not fiber_merge.is_fiber_doc(invalid)

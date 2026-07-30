@@ -779,9 +779,23 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
 
     QMenu menu(options.parent);
     QAction* traceFiberSegmentAction = nullptr;
+    QAction* revertFiberSegmentAction = nullptr;
     if (traceSegment) {
-        traceFiberSegmentAction = menu.addAction(
-            QWidget::tr("Optimize segment with native fiber tracer"));
+        const auto owner = std::find_if(
+            options.controlPoints.begin(),
+            options.controlPoints.end(),
+            [ownerIndex = traceSegment->first](const auto& control) {
+                return control.controlIndex == ownerIndex;
+            });
+        const bool traced = owner != options.controlPoints.end() &&
+                            owner->hasTracedSegmentToNext;
+        if (traced && options.revertFiberSegment) {
+            revertFiberSegmentAction = menu.addAction(
+                QWidget::tr("Revert segment to Lasagna optimization"));
+        } else {
+            traceFiberSegmentAction = menu.addAction(
+                QWidget::tr("Optimize segment with native fiber tracer"));
+        }
     }
     QAction* deleteAction = menu.addAction(QWidget::tr("Delete control point"));
     deleteAction->setEnabled(options.controlPoints.size() > 1);
@@ -907,6 +921,10 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     }
     if (traceFiberSegmentAction && selected == traceFiberSegmentAction) {
         options.traceFiberSegment(traceSegment->first, traceSegment->second);
+        return GeneratedControlPointContextResult::Handled;
+    }
+    if (revertFiberSegmentAction && selected == revertFiberSegmentAction) {
+        options.revertFiberSegment(traceSegment->first, traceSegment->second);
         return GeneratedControlPointContextResult::Handled;
     }
     for (const auto& [action, branch] : openBranchActions) {

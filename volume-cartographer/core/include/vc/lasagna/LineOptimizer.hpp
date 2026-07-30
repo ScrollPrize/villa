@@ -185,14 +185,16 @@ public:
         const LineOptimizationConfig& config = {},
         int activeStart = -1,
         int activeEnd = -1,
-        std::string candidateName = "existing-line+global") const;
+        std::string candidateName = "existing-line+global",
+        std::vector<std::pair<int, int>> protectedPointRanges = {}) const;
 
     [[nodiscard]] LineReinitializationOptimizationResult reinitializeAndOptimizeExistingLine(
         std::vector<cv::Vec3d> linePoints,
         std::vector<LineControlPoint> controlPoints,
         std::vector<int> fixedControlAnchorIndices,
         int displayFrameAnchorIndex,
-        const LineOptimizationConfig& config = {}) const;
+        const LineOptimizationConfig& config = {},
+        std::vector<std::pair<int, int>> protectedControlSpans = {}) const;
 
 private:
     const NormalSampler& normalSampler_;

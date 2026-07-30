@@ -995,11 +995,29 @@
   micrometer diagnostic when it is finite and positive; unavailable physical
   metadata must not block tracing. A failed endpoint threshold leaves the fiber
   unchanged and reports the base-voxel error.
-- Tracer-optimized segment metadata and regular-optimizer protection are part
-  of the native GUI contract: accepted segments should persist endpoint error,
-  tracer version/config, and unchanged endpoint signatures; unchanged optimized
-  segments should be protected from ordinary reoptimization, while CP
-  move/delete/insertion invalidates that metadata.
+- `vc3d_fiber` version 2 stores every control point as an object with a finite
+  `position` and optional `segment_to_next`. CP `i` owns the metadata for its
+  span to the next CP in line order; the final CP must not contain it. Native
+  fiber-traced metadata uses optimizer `native_fiber_trace3d`, metadata/tracer
+  schema versions, normal and fiber manifest source locations, trace-to-base
+  scale, all effective geometry/acceptance trace settings, and the accepted
+  endpoint error in base voxels. Version-1 array-valued CPs remain readable as
+  unprotected geometry; writers emit version 2. Unknown or malformed v2
+  metadata is a hard error in VC3D, Python, native metric/probe, and sync/merge
+  readers.
+- An accepted native GUI trace is a finalized edit: geometry and its owning
+  CP's metadata are applied atomically, and auto-save must persist that exact
+  result without a follow-up Lasagna optimization. Ordinary existing-line and
+  full-reinitialization Lasagna paths keep every sample in traced spans fixed.
+  Moving a CP clears its incoming and outgoing traced records; insertion or
+  deletion clears the record whose successor changes, while unrelated CP
+  edits preserve other traced spans. Non-unit fiber coordinate scaling clears
+  all traced records.
+- Ctrl-right-click on a traced span shows `Revert segment to Lasagna
+  optimization` instead of the native trace action. Revert optimizes only the
+  selected endpoint-bounded span, protects all other traced spans, fixes both
+  endpoints, and clears the owning CP metadata only after successful Lasagna
+  completion.
 - `vc_fiber_trace_metric <fiber.lasagna.json> <fiber.json>` is the native
   no-visualization full-fiber metric runner for precomputed 3D fiber inference
   output. It loads one `vc3d_fiber` JSON, requires exact control-point matches

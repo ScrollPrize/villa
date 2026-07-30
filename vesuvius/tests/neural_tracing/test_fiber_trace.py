@@ -109,7 +109,7 @@ def test_parse_vc3d_fiber_validates_and_preserves_xyz_order():
                 "control_points": [[1, 2, 3]],
             }
         )
-    with pytest.raises(ValueError, match="version"):
+    with pytest.raises(ValueError, match="version-2 control points"):
         parse_vc3d_fiber(
             {
                 "type": "vc3d_fiber",
@@ -118,6 +118,62 @@ def test_parse_vc3d_fiber_validates_and_preserves_xyz_order():
                 "control_points": [[1, 2, 3]],
             }
         )
+
+
+def test_parse_vc3d_fiber_v2_segment_metadata():
+    segment = {
+        "optimizer": "native_fiber_trace3d",
+        "metadata_version": 1,
+        "tracer_version": 1,
+        "normal_manifest": "s3://bucket/normals.lasagna.json",
+        "fiber_manifest": "s3://bucket/fibers.lasagna.json",
+        "trace_to_base_scale": 4.0,
+        "max_endpoint_error_base_voxels": 2.5,
+        "config": {
+            "step_voxels": 4.0,
+            "cone_angle_degrees": 25.0,
+            "cone_angle_step_degrees": 5.0,
+            "cone_grid_size": 25,
+            "beam_width": 8,
+            "beam_prune_distance_voxels": 1.0,
+            "beam_lookahead_steps": 2,
+            "smoothness_weight": 2.0,
+            "smoothness_normal_weight": 0.1,
+            "smoothness_tangent_weight": 10.0,
+            "smoothness_free_angle_degrees": 0.0,
+            "cumulative_smoothness_steps": 4,
+            "cumulative_smoothness_tangent_weight": 2.0,
+            "initial_free_angle_degrees": 0.0,
+            "max_step_factor": 3.0,
+            "fusion_gap_factor": 2.0,
+            "endpoint_accept_threshold_base_voxels": 20.0,
+        },
+    }
+    fiber = parse_vc3d_fiber(
+        {
+            "type": "vc3d_fiber",
+            "version": 2,
+            "line_points": [[1, 2, 3], [4, 5, 6]],
+            "control_points": [
+                {"position": [1, 2, 3], "segment_to_next": segment},
+                {"position": [4, 5, 6]},
+            ],
+        }
+    )
+    np.testing.assert_array_equal(fiber.control_points_xyz[1], [4, 5, 6])
+    assert fiber.control_point_segments[0] is not None
+    assert fiber.control_point_segments[0].trace_to_base_scale == 4.0
+    assert fiber.control_point_segments[1] is None
+
+    invalid = {
+        "type": "vc3d_fiber",
+        "version": 2,
+        "line_points": [[1, 2, 3], [4, 5, 6]],
+        "control_points": [{"position": [1, 2, 3]},
+                           {"position": [4, 5, 6], "segment_to_next": segment}],
+    }
+    with pytest.raises(ValueError, match="final control point"):
+        parse_vc3d_fiber(invalid)
 
 
 def test_tangent_uses_line_points_and_control_point_query():

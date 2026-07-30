@@ -1439,6 +1439,12 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                  firstControlPointIndex,
                                                  secondControlPointIndex);
     };
+    options.revertFiberSegment = [this, surfaceName](size_t firstControlPointIndex,
+                                                     size_t secondControlPointIndex) {
+        emit generatedFiberTraceSegmentRevertRequested(surfaceName,
+                                                       firstControlPointIndex,
+                                                       secondControlPointIndex);
+    };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }
 

@@ -664,6 +664,36 @@ TEST_CASE("LineOptimizer full existing-line solve uses current samples directly"
     }
 }
 
+TEST_CASE("LineOptimizer keeps protected existing-line ranges bit exact")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentLength = 1.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 20;
+
+    const std::vector<cv::Vec3d> linePoints{
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.25},
+        {2.0, 0.0, 0.5},
+        {3.0, 0.0, 0.25},
+        {4.0, 0.0, 0.0},
+    };
+    const auto result = optimizer.optimizeExistingLine(linePoints,
+                                                       {0, 4},
+                                                       0,
+                                                       config,
+                                                       -1,
+                                                       -1,
+                                                       "protected-range-test",
+                                                       {{1, 3}});
+    REQUIRE(result.line.points.size() == linePoints.size());
+    for (size_t index = 1; index <= 3; ++index) {
+        CHECK(result.line.points[index].position == linePoints[index]);
+    }
+}
+
 TEST_CASE("LineOptimizer reinit reopt reports rollout candidates and preserves fixed controls")
 {
     ConstantNormalSampler sampler({0.0, 0.0, 1.0});
@@ -777,6 +807,43 @@ TEST_CASE("LineOptimizer reinit reopt reports rollout candidates and preserves f
     CHECK(result.optimization.report.message.find("Reinitialized control spans") != std::string::npos);
     CHECK(result.optimization.report.message.find("lsgn") != std::string::npos);
     CHECK(result.optimization.report.message.find("reinit-reopt+global") != std::string::npos);
+}
+
+TEST_CASE("LineOptimizer full reinitialization reuses protected stored spans")
+{
+    ConstantNormalSampler sampler({0.0, 0.0, 1.0});
+    vc::lasagna::LineOptimizer optimizer(sampler);
+    vc::lasagna::LineOptimizationConfig config;
+    config.segmentsPerSide = 2;
+    config.segmentLength = 50.0;
+    config.samplesPerSegment = 1;
+    config.maxIterations = 10;
+
+    std::vector<cv::Vec3d> linePoints;
+    for (int index = 0; index <= 10; ++index) {
+        linePoints.push_back({static_cast<double>(index) * 50.0,
+                              0.0,
+                              index <= 5 ? static_cast<double>(index) * 0.125 : 0.0});
+    }
+    std::vector<vc::lasagna::LineControlPoint> controls{
+        {5.0, linePoints[5], true, 5},
+        {0.0, linePoints[0], false, 0},
+        {10.0, linePoints[10], false, 10},
+    };
+    const auto result = optimizer.reinitializeAndOptimizeExistingLine(
+        linePoints, controls, {0, 5, 10}, 5, config, {{1, 0}});
+
+    REQUIRE_FALSE(result.failed);
+    REQUIRE(result.spans.size() == 2);
+    CHECK(result.spans[0].chosen == "protected-existing");
+    REQUIRE(result.fixedPointIndices.size() == 3);
+    const int protectedStart = result.fixedPointIndices[0];
+    const int protectedEnd = result.fixedPointIndices[1];
+    REQUIRE(protectedEnd - protectedStart == 5);
+    for (int offset = 0; offset <= 5; ++offset) {
+        CHECK(result.optimization.line.points[static_cast<size_t>(protectedStart + offset)].position ==
+              linePoints[static_cast<size_t>(offset)]);
+    }
 }
 
 TEST_CASE("LineOptimizer reinitialization adds continuation candidates on both sides of seed")

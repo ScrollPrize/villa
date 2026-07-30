@@ -1,6 +1,7 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -160,11 +161,13 @@ FiberInput loadFiberInput(const std::filesystem::path& fiberPath)
     if (fiber.root.value("type", std::string{}) != "vc3d_fiber") {
         throw std::runtime_error("fiber JSON type is not vc3d_fiber");
     }
-    if (fiber.root.value("version", 0) != 1) {
+    const int version = fiber.root.value("version", 0);
+    if (version != 1 && version != 2) {
         throw std::runtime_error("unsupported vc3d_fiber version");
     }
 
-    fiber.controlPoints = readPointArray(fiber.root, "control_points");
+    fiber.controlPoints = vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        fiber.root, "control_points", version, fiberPath.string());
     fiber.linePoints = readPointArray(fiber.root, "line_points");
     if (fiber.controlPoints.empty()) {
         throw std::runtime_error("fiber JSON has no control_points");

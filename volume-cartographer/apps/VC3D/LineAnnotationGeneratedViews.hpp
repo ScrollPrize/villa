@@ -54,6 +54,7 @@ struct GeneratedOverlay {
         bool hasBranches = false;
         bool hasPendingLinks = false;
         bool isLinkCandidate = false;
+        bool hasTracedSegmentToNext = false;
         std::vector<uint64_t> branchIds;
         std::vector<BranchLink> branchLinks;
     };
@@ -946,6 +947,7 @@ struct GeneratedControlPointContextMenuOptions {
     std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
     std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
     std::function<void(size_t, size_t)> traceFiberSegment;
+    std::function<void(size_t, size_t)> revertFiberSegment;
 };
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
