@@ -75,6 +75,11 @@
 - [ ] --vis for fiber trace changes the quality?
 - [ ] fiber jsons should from now on save the volume size they are based on (for scale reference)
     (vc_open_data_source_original_resolution and vc_open_data_source_coordinate_scale_factor)
+- [ ] try a way smaller tangent angle range!
+- [ ] when we look at the top strip it should basically only contain h or v fibers - can we use this to help tracing?
+- [ ] if we follow a differnt dir fiber (turning not parallel) then the local h/v classification should change
+- [ ] can we do a local h/v classification?
+- [ ] if we turn wrong somewhere can we detect this by looking at the fiber normal?
     
 # beam-search
 - [ ] beamsearch

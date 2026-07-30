@@ -1,5 +1,8 @@
 # 2026-07-29
 
+- Native 3D Trace2CP refined/fused/regenerated presence panels now display
+  presence modulated by predicted direction alignment to the strip plane, while
+  original presence panels remain raw presence.
 - Python native 3D Trace2CP whole-fiber tracing now keeps tracing after early
   far target-plane crossings until the best selected crossing is within the
   configured error threshold or the trace budget is exhausted.

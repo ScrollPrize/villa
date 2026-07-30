@@ -3636,6 +3636,56 @@ def test_native_3d_trace2cp_strip_presence_samples_cache_in_one_batch() -> None:
     assert presence[1, 1] == pytest.approx(1.0)
 
 
+def test_native_3d_trace2cp_strip_presence_can_scale_by_strip_plane_alignment() -> None:
+    class FakeCache:
+        def sample_points_torch(
+            self,
+            points_zyx: np.ndarray,
+            *,
+            progress_label: str | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            del progress_label
+            count = int(points_zyx.shape[0])
+            assert count == 4
+            # Cache returns ZYX directions. The strip below lies in XYZ z=0,
+            # so XYZ x/y should stay visible and XYZ z should be suppressed.
+            directions_zyx = torch.tensor(
+                [
+                    [0.0, 0.0, 1.0],
+                    [0.0, 1.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [math.sqrt(0.5), 0.0, math.sqrt(0.5)],
+                ],
+                dtype=torch.float32,
+            )
+            presence = torch.ones((count,), dtype=torch.float32)
+            valid = torch.ones((count,), dtype=torch.bool)
+            return directions_zyx, presence, valid
+
+    coords_xyz = np.asarray(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+        ],
+        dtype=np.float32,
+    )
+    grid_valid = np.ones((2, 2), dtype=bool)
+
+    presence, valid = _sample_presence_on_strip(
+        FakeCache(),
+        coords_xyz,
+        grid_valid,
+        spacing_base=1.0,
+        scale_by_strip_tangent_plane=True,
+    )
+
+    assert valid.tolist() == [[True, True], [True, True]]
+    assert presence[0, 0] == pytest.approx(1.0)
+    assert presence[0, 1] == pytest.approx(1.0)
+    assert presence[1, 0] == pytest.approx(0.0)
+    assert presence[1, 1] == pytest.approx(math.sqrt(0.5), abs=1.0e-6)
+
+
 def test_native_3d_trace2cp_projects_trace_to_initial_strip_axis() -> None:
     line_points_xyz = np.asarray([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32)
     line_xy = np.asarray([[0.0, 5.0], [10.0, 5.0]], dtype=np.float32)

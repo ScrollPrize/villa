@@ -6063,6 +6063,69 @@ def _presence_to_u8(presence: np.ndarray, valid: np.ndarray) -> np.ndarray:
     return out
 
 
+def _strip_plane_normals_xyz(
+    coords_xyz_base: np.ndarray,
+    grid_valid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    coords = np.asarray(coords_xyz_base, dtype=np.float32)
+    if coords.ndim != 3 or coords.shape[2] != 3:
+        raise ValueError("coords_xyz_base must have shape H,W,3")
+    valid = np.asarray(grid_valid, dtype=bool)
+    if valid.shape != coords.shape[:2]:
+        raise ValueError(
+            "grid_valid shape must match coords: "
+            f"valid={valid.shape} coords={coords.shape[:2]}"
+        )
+    height, width = coords.shape[:2]
+    col_axis = np.zeros_like(coords, dtype=np.float32)
+    row_axis = np.zeros_like(coords, dtype=np.float32)
+    if width > 1:
+        col_axis[:, 1:-1] = coords[:, 2:] - coords[:, :-2]
+        col_axis[:, 0] = coords[:, 1] - coords[:, 0]
+        col_axis[:, -1] = coords[:, -1] - coords[:, -2]
+    if height > 1:
+        row_axis[1:-1, :] = coords[2:, :] - coords[:-2, :]
+        row_axis[0, :] = coords[1, :] - coords[0, :]
+        row_axis[-1, :] = coords[-1, :] - coords[-2, :]
+    normal = np.cross(col_axis, row_axis).astype(np.float32, copy=False)
+    norm = np.linalg.norm(normal, axis=2)
+    normal_valid = valid & np.isfinite(normal).all(axis=2) & np.isfinite(norm) & (norm > 1.0e-6)
+    normal_out = np.zeros_like(normal, dtype=np.float32)
+    normal_out[normal_valid] = normal[normal_valid] / norm[normal_valid, None]
+    return normal_out, normal_valid
+
+
+def _strip_plane_alignment_weights(
+    coords_xyz_base: np.ndarray,
+    grid_valid: np.ndarray,
+    directions_xyz: np.ndarray,
+    flat_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    directions = np.asarray(directions_xyz, dtype=np.float32)
+    indices = np.asarray(flat_indices, dtype=np.int64).reshape(-1)
+    if directions.ndim != 2 or directions.shape[1] != 3:
+        raise ValueError("directions_xyz must have shape N,3")
+    if int(directions.shape[0]) != int(indices.shape[0]):
+        raise ValueError(
+            "directions_xyz length must match flat_indices: "
+            f"directions={directions.shape[0]} indices={indices.shape[0]}"
+        )
+    plane_normals, plane_valid = _strip_plane_normals_xyz(coords_xyz_base, grid_valid)
+    selected_normals = plane_normals.reshape(-1, 3)[indices]
+    selected_plane_valid = plane_valid.reshape(-1)[indices]
+    dir_norm = np.linalg.norm(directions, axis=1)
+    dir_valid = np.isfinite(directions).all(axis=1) & np.isfinite(dir_norm) & (dir_norm > 1.0e-6)
+    unit_dirs = np.zeros_like(directions, dtype=np.float32)
+    unit_dirs[dir_valid] = directions[dir_valid] / dir_norm[dir_valid, None]
+    normal_component = np.sum(unit_dirs * selected_normals, axis=1)
+    alignment = np.sqrt(
+        np.clip(1.0 - np.square(normal_component.astype(np.float32, copy=False)), 0.0, 1.0)
+    ).astype(np.float32, copy=False)
+    valid = selected_plane_valid & dir_valid & np.isfinite(alignment)
+    alignment = np.where(valid, alignment, 0.0).astype(np.float32, copy=False)
+    return alignment, valid
+
+
 def _as_numpy_array(value: Any, *, dtype: np.dtype) -> np.ndarray:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().numpy().astype(dtype, copy=False)
@@ -6076,6 +6139,7 @@ def _sample_presence_on_strip(
     *,
     spacing_base: float,
     progress_label: str | None = None,
+    scale_by_strip_tangent_plane: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     coords = np.asarray(coords_xyz_base, dtype=np.float32)
     if coords.ndim != 3 or coords.shape[2] != 3:
@@ -6099,13 +6163,28 @@ def _sample_presence_on_strip(
             flat_coords[flat_valid][:, [2, 1, 0]].astype(np.float32, copy=False)
             / np.float32(spacing)
         )
-        _directions, sampled_presence, sampled_valid = cache.sample_points_torch(
+        directions, sampled_presence, sampled_valid = cache.sample_points_torch(
             points_zyx_selected,
             progress_label=progress_label,
         )
         presence_values = sampled_presence.detach().cpu().numpy().astype(np.float32, copy=False)
         valid_values = sampled_valid.detach().cpu().numpy().astype(bool, copy=False)
         flat_indices = np.flatnonzero(flat_valid)
+        if bool(scale_by_strip_tangent_plane):
+            directions_xyz = (
+                directions.detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)[:, [2, 1, 0]]
+            )
+            alignment, alignment_valid = _strip_plane_alignment_weights(
+                coords,
+                valid,
+                directions_xyz,
+                flat_indices,
+            )
+            presence_values = presence_values * alignment
+            valid_values = valid_values & alignment_valid
         presence[flat_indices] = presence_values
         out_valid[flat_indices] = valid_values
     return (
@@ -6736,6 +6815,7 @@ def _make_native_trace_visualization(
                 & np.asarray(fused_side_valid, dtype=bool),
                 spacing_base=spacing,
                 progress_label="fused-side",
+                scale_by_strip_tangent_plane=True,
             ),
         )
         add_panel(
@@ -6747,7 +6827,7 @@ def _make_native_trace_visualization(
                 fused_source.line_xy,
                 fused_source.start_control_point_xy,
                 fused_source.target_control_point_xy,
-                title="fused side 3D presence",
+                title="fused side 3D presence x plane align",
                 line_width=1,
             ),
             "fused_side_presence",
@@ -6761,6 +6841,7 @@ def _make_native_trace_visualization(
                 & np.asarray(fused_top_valid, dtype=bool),
                 spacing_base=spacing,
                 progress_label="fused-top",
+                scale_by_strip_tangent_plane=True,
             ),
         )
         add_panel(
@@ -6772,7 +6853,7 @@ def _make_native_trace_visualization(
                 fused_source.line_xy,
                 fused_source.start_control_point_xy,
                 fused_source.target_control_point_xy,
-                title="fused top 3D presence",
+                title="fused top 3D presence x plane align",
                 line_width=1,
             ),
             "fused_top_presence",
@@ -7366,6 +7447,7 @@ def _render_native_whole_fiber_span_panels(
         & np.asarray(regenerated_side_valid, dtype=bool),
         spacing_base=spacing,
         progress_label=f"span{span.start_cp_index}-{span.end_cp_index}-regenerated-side",
+        scale_by_strip_tangent_plane=True,
     )
     regenerated_top_presence, regenerated_top_presence_valid = _sample_presence_on_strip(
         cache,
@@ -7374,6 +7456,7 @@ def _render_native_whole_fiber_span_panels(
         & np.asarray(regenerated_top_valid, dtype=bool),
         spacing_base=spacing,
         progress_label=f"span{span.start_cp_index}-{span.end_cp_index}-regenerated-top",
+        scale_by_strip_tangent_plane=True,
     )
     failed = any(not bool(segment.success) for segment in span.segments)
     title_suffix = (
@@ -7446,7 +7529,7 @@ def _render_native_whole_fiber_span_panels(
             regenerated_source.line_xy,
             regenerated_source.start_control_point_xy,
             regenerated_source.target_control_point_xy,
-            title=f"regenerated side 3D presence {title_suffix}",
+            title=f"regenerated side 3D presence x plane align {title_suffix}",
             control_points_xy=regenerated_side_control_points,
             control_point_labels=control_point_labels,
             line_width=1,
@@ -7472,7 +7555,7 @@ def _render_native_whole_fiber_span_panels(
             regenerated_source.line_xy,
             regenerated_source.start_control_point_xy,
             regenerated_source.target_control_point_xy,
-            title=f"regenerated top 3D presence {title_suffix}",
+            title=f"regenerated top 3D presence x plane align {title_suffix}",
             control_points_xy=regenerated_top_control_points,
             control_point_labels=control_point_labels,
             line_width=1,

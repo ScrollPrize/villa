@@ -416,7 +416,11 @@ Ownership changed as follows:
   column per CP segment. Failed segment overlays are cut before the next CP
   region and the displayed trace resumes from the restart CP in the next
   long-strip span. Whole-fiber visualization uses a fixed 64 px cross-strip
-  width; paths leaving that strip are clipped visually only.
+  width; paths leaving that strip are clipped visually only. The initial
+  side/top presence rows show raw inferred presence. The regenerated/fused
+  presence rows multiply presence by the ambiguous predicted direction's
+  sign-invariant alignment to the displayed strip plane, computed from the
+  strip coordinate grid.
 - Single-pair stdout/summary metrics are `native_trace2cp_plane_error` and
   `native_trace2cp_closest_target_error`; these are tool-local diagnostics and
   do not replace the projected `test/trace2cp_error` metric used by training.

@@ -1,10 +1,7 @@
-# Python Native 3D Trace2CP Continuous CP Handling Status
+# Native 3D Trace2CP Refined Presence Visualization Status
 
-- [x] Read fiber-trace AGENTS workflow.
-- [x] Replace current task description.
-- [x] Replace implementation plan.
-- [x] Implement Python crossing replacement and threshold-aware acceptance.
-- [x] Preserve live trace state across successful whole-fiber CP crossings.
-- [x] Add/update Python regression tests.
+- [x] Read current task/spec/docs context.
+- [x] Write task and task plan.
+- [x] Implement strip-plane presence modulation.
 - [x] Update specs/docs/changelog/task log.
-- [x] Run validation.
+- [x] Run targeted tests and syntax checks.

@@ -1016,6 +1016,12 @@
   presence signal sampled on the displayed side/top strip coordinates from the
   native inference cache. Presence sampling should batch strip coordinates per
   strip rather than call model inference per pixel.
+- Refined/fused/regenerated native 3D presence panels are visualization-only
+  presence multiplied by the sampled ambiguous fiber direction's alignment to
+  the displayed strip plane. The alignment must be sign-invariant and compare
+  against the plane spanned by the strip column tangent and row axis, not a
+  signed dot product against a single tangent vector. Original/input presence
+  panels remain raw presence for comparison.
 - Native 3D whole-fiber visualization uses eight stitched panel rows: initial
   side volume, initial side 3D presence, initial top volume, initial top 3D
   presence, regenerated/fused side volume, regenerated/fused side 3D presence,
