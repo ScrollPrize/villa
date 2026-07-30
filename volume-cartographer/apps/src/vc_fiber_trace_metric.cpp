@@ -25,7 +25,7 @@ struct CliOptions {
     std::string normalManifest;
     std::filesystem::path remoteCacheDir;
     std::optional<double> voxelSizeUm;
-    double errorThresholdVoxels = 10.0;
+    double errorThresholdBaseVoxels = 20.0;
     size_t cacheBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
     int inferenceScaledownPower = 2;
     bool quiet = false;
@@ -63,7 +63,7 @@ void printUsage(const char* argv0)
         << "  --cumulative-smoothness-steps N history length for cumulative tangent smoothing [4]\n"
         << "  --cumulative-smoothness-tangent-weight N cumulative tangent smoothing weight [2]\n"
         << "  --max-step-factor N             max steps as factor of CP span [3]\n"
-        << "  --error-threshold-voxels N      restart threshold at target plane [10]\n"
+        << "  --error-threshold-base-voxels N restart threshold at target plane [20]\n"
         << "  --cache-gib N                   per-channel chunk-cache budget [8]\n"
         << "  --quiet                         suppress progress line\n";
 }
@@ -194,10 +194,11 @@ CliOptions parseArgs(int argc, char** argv)
             options.trace.maxStepFactor =
                 parseDouble(requireValue(i, argc, argv, "max-step-factor"),
                             "max-step-factor");
-        } else if (arg == "--error-threshold-voxels") {
-            options.errorThresholdVoxels =
-                parseDouble(requireValue(i, argc, argv, "error-threshold-voxels"),
-                            "error-threshold-voxels");
+        } else if (arg == "--error-threshold-base-voxels") {
+            options.errorThresholdBaseVoxels =
+                parseDouble(
+                    requireValue(i, argc, argv, "error-threshold-base-voxels"),
+                    "error-threshold-base-voxels");
         } else if (arg == "--cache-gib") {
             const double gib =
                 parseDouble(requireValue(i, argc, argv, "cache-gib"), "cache-gib");
@@ -235,8 +236,8 @@ CliOptions parseArgs(int argc, char** argv)
         failOption("--smoothness-free-angle-degrees must be non-negative");
     if (options.trace.cumulativeSmoothnessSteps < 1)
         failOption("--cumulative-smoothness-steps must be at least 1");
-    if (!(options.errorThresholdVoxels >= 0.0))
-        failOption("--error-threshold-voxels must be non-negative");
+    if (!(options.errorThresholdBaseVoxels >= 0.0))
+        failOption("--error-threshold-base-voxels must be non-negative");
     if (options.inferenceScaledownPower < 0 || options.inferenceScaledownPower > 30)
         failOption("--inference-scaledown-power must be in [0, 30]");
     if (options.normalManifest.empty()) {
@@ -341,7 +342,7 @@ int main(int argc, char** argv)
         vc::fiber_tracer::FiberTraceWholeFiberMetricRequest request;
         request.fiber = fiber;
         request.workingToBaseScale = workingToBaseScale;
-        request.errorThresholdVoxels = options.errorThresholdVoxels;
+        request.errorThresholdBaseVoxels = options.errorThresholdBaseVoxels;
         request.voxelSizeUm = options.voxelSizeUm;
         request.config = options.trace;
         vc::fiber_tracer::FiberTraceProfile profile;

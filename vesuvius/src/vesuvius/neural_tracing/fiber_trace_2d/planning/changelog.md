@@ -1,8 +1,12 @@
 # 2026-07-30
 
+- Standardized Python CLI, native C++ CLI, and VC3D fiber endpoint acceptance
+  on a `20` base-voxel threshold; physical voxel size is now optional and used
+  only for physical-unit reporting.
 - Replaced opaque Lasagna project/cache identities with actual local or remote
   Zarr source paths, readable remote-source cache paths, and path-bearing
-  manifest ownership tags.
+  manifest ownership tags without duplicating manifest-derived group, channel,
+  or spacing metadata.
 - Corrected VC3D native segment tracing to keep stored fibers in base
   coordinates while prediction and normal sampling run on the derived sd2
   trace grid with correctly scaled physical units.

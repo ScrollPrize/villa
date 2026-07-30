@@ -660,7 +660,7 @@ TEST_CASE("VolumePkg atomically attaches and detaches a Lasagna manifest with de
 
     VolumePkg::PreparedVolumeAttachment derived{
         (d / "backing.zarr").string(),
-        {"vc-lasagna-derived:fiber.lasagna.json", "vc-lasagna-group:pred", "vc-lasagna-channel:presence"},
+        {"vc-lasagna-derived:fiber.lasagna.json"},
         volume,
     };
     auto pkg = VolumePkg::newEmpty();
@@ -696,12 +696,12 @@ TEST_CASE("VolumePkg Lasagna reattachment reconciles roles tags and removed chan
 
     const std::vector<VolumePkg::PreparedVolumeAttachment> oldAttachments{{
         (d / "old.zarr").string(),
-        {"vc-lasagna-derived:data.lasagna.json", "vc-lasagna-channel:old"},
+        {"vc-lasagna-derived:data.lasagna.json"},
         oldVolume,
     }};
     const std::vector<VolumePkg::PreparedVolumeAttachment> newAttachments{{
         (d / "new.zarr").string(),
-        {"vc-lasagna-derived:data.lasagna.json", "vc-lasagna-channel:new"},
+        {"vc-lasagna-derived:data.lasagna.json"},
         newVolume,
     }};
 
@@ -739,12 +739,12 @@ TEST_CASE("VolumePkg detach preserves a derived volume owned by another manifest
 
     const VolumePkg::PreparedVolumeAttachment first{
         (d / "shared.zarr").string(),
-        {"vc-lasagna-derived:first.lasagna.json", "vc-lasagna-channel:presence"},
+        {"vc-lasagna-derived:first.lasagna.json"},
         volume,
     };
     const VolumePkg::PreparedVolumeAttachment second{
         (d / "shared.zarr").string(),
-        {"vc-lasagna-derived:second.lasagna.json", "vc-lasagna-channel:presence"},
+        {"vc-lasagna-derived:second.lasagna.json"},
         volume,
     };
     auto pkg = VolumePkg::newEmpty();
@@ -779,8 +779,7 @@ TEST_CASE("VolumePkg detach preserves an independently attached Lasagna source v
             VolumePkg::AttachVolumeResult::Attached);
     const VolumePkg::PreparedVolumeAttachment derived{
         location,
-        {"vc-lasagna-derived:data.lasagna.json",
-         "vc-lasagna-channel:presence"},
+        {"vc-lasagna-derived:data.lasagna.json"},
         volume,
     };
     REQUIRE(pkg->attachPreparedLasagnaDataset(

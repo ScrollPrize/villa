@@ -7,9 +7,7 @@
 #include "utils/zarr.hpp"
 
 #include <algorithm>
-#include <iomanip>
 #include <memory>
-#include <sstream>
 #include <stdexcept>
 
 namespace vc::lasagna
@@ -86,13 +84,6 @@ ChannelDescriptor describeChannel(const utils::ZarrArray& array, const LasagnaCh
     return descriptor;
 }
 
-std::string spacingString(double spacing)
-{
-    std::ostringstream output;
-    output << std::setprecision(17) << spacing;
-    return output.str();
-}
-
 }  // namespace
 
 std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
@@ -115,25 +106,14 @@ std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
         const auto& channel = group.channels.front();
         const std::string location = lasagnaGroupSourceLocation(group);
         const double spacing = static_cast<double>(group.scaleFactor()) * manifest.sourceToBase / manifest.workingToBaseScale;
-        const std::string spacingTag =
-            std::string(kLasagnaSpacingTagPrefix) + spacingString(spacing);
         if (auto existing = std::find_if(
                 prepared.begin(), prepared.end(), [&](const auto& candidate) {
                     return candidate.location == location;
                 }); existing != prepared.end()) {
-            if (std::find(existing->tags.begin(), existing->tags.end(), spacingTag) ==
-                existing->tags.end()) {
+            if (existing->volume->voxelSize() != spacing) {
                 throw std::runtime_error(
                     "Lasagna groups sharing source '" + location +
                     "' must use one spacing");
-            }
-            for (const auto& tag : {
-                     std::string(kLasagnaGroupTagPrefix) + group.name,
-                     std::string(kLasagnaChannelTagPrefix) + channel}) {
-                if (std::find(existing->tags.begin(), existing->tags.end(), tag) ==
-                    existing->tags.end()) {
-                    existing->tags.push_back(tag);
-                }
             }
             continue;
         }
@@ -167,12 +147,7 @@ std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
         metadata["voxelsize"] = spacing;
         prepared.push_back({
             location,
-            {
-                provenanceTag,
-                std::string(kLasagnaGroupTagPrefix) + group.name,
-                std::string(kLasagnaChannelTagPrefix) + channel,
-                spacingTag,
-            },
+            {provenanceTag},
             Volume::NewFromPreparedChunkedSource(sourceFactory, metadata),
         });
     }

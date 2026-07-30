@@ -431,8 +431,9 @@ Ownership changed as follows:
   do not replace the projected `test/trace2cp_error` metric used by training.
 - Whole-fiber mode traces continuously from CP plane to CP plane. A segment
   succeeds when it reaches the next CP plane within the segment budget and its
-  in-plane selected-voxel error to the target CP is below
-  `--whole-fiber-error-threshold-voxels` (default `10`). Success only advances
+  in-plane error to the target CP, converted from selected-volume voxels to
+  base voxels with `volume_spacing_base`, is at most
+  `--whole-fiber-error-threshold-base-voxels` (default `20`). Success only advances
   target-CP bookkeeping: it keeps the actual live trace point, previous step
   direction, sampled-current direction when cached, and smoothing-history
   direction. The selected plane crossing is used for metric/error reporting,
@@ -699,8 +700,10 @@ Ownership changed as follows:
   opens both prediction and regular-normal samplers at that trace scale, and
   runs the native tracer there. Accepted points are multiplied back to base
   coordinates, original endpoints are restored exactly, and the final line is
-  rebuilt with the ordinary base-space normal sampler. Trace physical voxel
-  size is `base_voxel_um * trace_to_base`, preserving the endpoint threshold.
+  rebuilt with the ordinary base-space normal sampler. Endpoint acceptance is
+  measured against `20` base voxels; at sd2 this is `5` trace voxels. A finite
+  positive base voxel size adds micrometer diagnostics, but is not required for
+  tracing and does not affect acceptance.
 - `volume-cartographer/apps/src/vc_fiber_trace_metric.cpp` is the native
   no-visualization metric runner for precomputed 3D fiber inference products.
   It opens a fiber inference `.lasagna.json`, loads one `vc3d_fiber` JSON,
@@ -714,7 +717,10 @@ Ownership changed as follows:
   `trace_to_base = prediction_to_base / 2**inference_scaledown_power` and
   `prediction_spacing_in_trace_voxels = 2**inference_scaledown_power`. The
   input fiber JSON is assumed to already be in the manifest base coordinate
-  system. The default trace parameters are
+  system. Segment acceptance uses
+  `--error-threshold-base-voxels`, defaulting to `20`; the shared tracer
+  converts each trace-grid error to base voxels before comparison. The default
+  trace parameters are
   `step=4.0`, `cone_angle=25.0`, `cone_angle_step=5.0`,
   `cone_grid_size=25`, `beam_width=8`, `beam_prune_distance=1.0`,
   `beam_lookahead_steps=2`, `smoothness_weight=2.0`,

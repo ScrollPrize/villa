@@ -897,7 +897,8 @@
   same target-local plane set described above. A segment succeeds only when
   all configured target-local planes are crossed within the segment's step
   budget and the selected smallest in-plane error to the target CP is at most
-  `--whole-fiber-error-threshold-voxels` (default `10`). Successful segments
+  `--whole-fiber-error-threshold-base-voxels` (default `20`) after converting
+  selected-volume distances with `volume_spacing_base`. Successful segments
   do not restart, resample CP-start direction, or reset smoothing history. The
   selected crossing is only the metric/checkpoint location; live tracing
   continues from the actual stepped trace point with previous direction,
@@ -978,9 +979,9 @@
   derived trace scale differs. The GUI must convert base points to trace space,
   open separate prediction and normal samplers with that trace-to-base scale,
   run tracing in trace voxels, then convert accepted points back to base space.
-  Original segment endpoints must be restored exactly. Endpoint physical units
-  use `base_voxel_um * trace_to_base`; the ordinary line sampler remains in
-  base space for final reconstruction.
+  Original segment endpoints must be restored exactly. Endpoint errors are
+  converted to base voxels before acceptance; the ordinary line sampler
+  remains in base space for final reconstruction.
 - The first VC3D GUI action is Ctrl-right-click on a generated line annotation
   CP/segment context menu, then "Optimize segment with native fiber tracer".
   The action traces only the adjacent CP-to-CP span around the clicked line
@@ -989,9 +990,11 @@
   the existing line. Original CP coordinates must remain exact.
 - Native GUI segment optimization applies only when both traced directions
   reach all configured target-local planes and the maximum selected endpoint
-  in-plane error is at most `50 um`, converted with `Volume::voxelSize()`. If
-  positive voxel-size metadata is unavailable, or the endpoint threshold fails,
-  the GUI must leave the fiber unchanged and report the failure.
+  in-plane error is at most `20` base voxels. At the default sd2 trace scale,
+  this is `5` trace voxels. `Volume::voxelSize()` is used only to add a
+  micrometer diagnostic when it is finite and positive; unavailable physical
+  metadata must not block tracing. A failed endpoint threshold leaves the fiber
+  unchanged and reports the base-voxel error.
 - Tracer-optimized segment metadata and regular-optimizer protection are part
   of the native GUI contract: accepted segments should persist endpoint error,
   tracer version/config, and unchanged endpoint signatures; unchanged optimized
@@ -1023,6 +1026,9 @@
   `--cumulative-smoothness-steps 4`, and
   `--cumulative-smoothness-tangent-weight 2.0`, matching the regular Python
   Trace2CP defaults except for inference-only options.
+  Endpoint acceptance uses `--error-threshold-base-voxels 20`; trace-grid
+  endpoint errors are multiplied by the derived `trace_to_base` before this
+  comparison.
   `vc_fiber_trace_metric` requires an explicit `--normal-manifest` pointing to
   the Lasagna normal manifest used for tangent/normal smoothness. It must not
   try to derive normals from the fiber prediction manifest because the
@@ -1072,8 +1078,9 @@
   VC3D remain strictly 3D. Each derived volume stores the actual resolved local
   or remote Zarr source as `location`; cache paths and synthetic identifiers
   are not project source fields. A `vc-lasagna-derived:<manifest location>`
-  ownership tag plus readable group/channel/spacing tags drives
-  deduplication, reload reconciliation, role changes, and detach cleanup. An
+  ownership tag drives deduplication, reload reconciliation, role changes, and
+  detach cleanup. Group, channel, spacing, dtype, and shape remain authoritative
+  in the manifest/Zarr descriptor and must not be duplicated in project tags. An
   independently attached primary volume is reused without an ownership tag and
   survives manifest detach. Manifest entry, derived volume entries, and selected-role updates
   are committed together or rolled back together; detaching removes a derived

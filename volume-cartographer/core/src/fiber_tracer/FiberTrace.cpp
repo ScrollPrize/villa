@@ -542,8 +542,12 @@ void validateTraceConfig(const FiberTraceConfig& config)
         "cumulative smoothness tangent weight");
     requireFinite(config.maxStepFactor, "max step factor");
     requireFinite(config.fusionGapFactor, "fusion gap factor");
-    requireFinite(config.endpointAcceptThresholdUm, "endpoint accept threshold");
-    requireFinite(config.voxelSizeUm, "voxel size");
+    requireFinite(
+        config.endpointAcceptThresholdBaseVoxels,
+        "endpoint accept threshold in base voxels");
+    requireFinite(config.traceToBaseScale, "trace-to-base scale");
+    if (config.baseVoxelSizeUm.has_value())
+        requireFinite(*config.baseVoxelSizeUm, "base voxel size");
     if (!(config.stepVoxels > 0.0))
         throw std::invalid_argument("step voxels must be positive");
     if (config.coneAngleDegrees < 0.0)
@@ -568,6 +572,13 @@ void validateTraceConfig(const FiberTraceConfig& config)
         throw std::invalid_argument("cumulative smoothness steps must be at least 1");
     if (config.maxStepFactor < 0.0)
         throw std::invalid_argument("max step factor must be non-negative");
+    if (config.endpointAcceptThresholdBaseVoxels < 0.0)
+        throw std::invalid_argument(
+            "endpoint accept threshold in base voxels must be non-negative");
+    if (!(config.traceToBaseScale > 0.0))
+        throw std::invalid_argument("trace-to-base scale must be positive");
+    if (config.baseVoxelSizeUm.has_value() && !(*config.baseVoxelSizeUm > 0.0))
+        throw std::invalid_argument("base voxel size must be positive when provided");
 }
 
 [[nodiscard]] double excessAngleSquared(double angle, double freeAngle)
@@ -1764,14 +1775,20 @@ std::vector<cv::Vec3d> FiberTraceCoordinateAdapter::traceSegmentToBase(
     return converted;
 }
 
-double FiberTraceCoordinateAdapter::traceVoxelSizeUm(
-    double baseVoxelSizeUm) const
+double FiberTraceCoordinateAdapter::baseDistanceToTrace(
+    double distanceBaseVoxels) const
 {
-    if (!(baseVoxelSizeUm > 0.0) || !std::isfinite(baseVoxelSizeUm)) {
-        throw std::invalid_argument(
-            "base voxel size must be positive and finite");
-    }
-    return baseVoxelSizeUm * traceToBaseScale;
+    if (std::isnan(distanceBaseVoxels))
+        throw std::invalid_argument("base distance must not be NaN");
+    return distanceBaseVoxels / traceToBaseScale;
+}
+
+double FiberTraceCoordinateAdapter::traceDistanceToBase(
+    double distanceTraceVoxels) const
+{
+    if (std::isnan(distanceTraceVoxels))
+        throw std::invalid_argument("trace distance must not be NaN");
+    return distanceTraceVoxels * traceToBaseScale;
 }
 
 FiberPredictionTraceScales resolveFiberPredictionTraceScales(
@@ -2591,26 +2608,27 @@ FiberTraceSegmentResult traceFiberSegment(
 
     const cv::Vec3d targetPlaneNormal = *forwardRequest.targetPlaneNormal;
     if (!result.forward.points.empty()) {
-        result.forwardEndpointErrorVoxels =
+        result.forwardEndpointErrorTraceVoxels =
             endpointPlaneError(result.forward.points.back(), target, targetPlaneNormal);
     }
     if (!result.reverse.points.empty()) {
-        result.reverseEndpointErrorVoxels =
+        result.reverseEndpointErrorTraceVoxels =
             endpointPlaneError(result.reverse.points.back(), start, targetPlaneNormal);
     }
-    result.maxEndpointErrorVoxels = std::max(
-        result.forwardEndpointErrorVoxels, result.reverseEndpointErrorVoxels);
-    result.maxEndpointErrorUm =
-        request.config.voxelSizeUm > 0.0
-            ? result.maxEndpointErrorVoxels * request.config.voxelSizeUm
-            : result.maxEndpointErrorVoxels;
-    const double thresholdVoxels =
-        request.config.voxelSizeUm > 0.0
-            ? request.config.endpointAcceptThresholdUm / request.config.voxelSizeUm
-            : request.config.endpointAcceptThresholdUm;
+    result.maxEndpointErrorTraceVoxels = std::max(
+        result.forwardEndpointErrorTraceVoxels,
+        result.reverseEndpointErrorTraceVoxels);
+    const FiberTraceCoordinateAdapter coordinates(request.config.traceToBaseScale);
+    result.maxEndpointErrorBaseVoxels =
+        coordinates.traceDistanceToBase(result.maxEndpointErrorTraceVoxels);
+    if (request.config.baseVoxelSizeUm.has_value()) {
+        result.maxEndpointErrorUm =
+            result.maxEndpointErrorBaseVoxels * *request.config.baseVoxelSizeUm;
+    }
     result.accepted = result.forward.reachedTargetPlane &&
                       result.reverse.reachedTargetPlane &&
-                      result.maxEndpointErrorVoxels <= thresholdVoxels;
+                      result.maxEndpointErrorBaseVoxels <=
+                          request.config.endpointAcceptThresholdBaseVoxels;
     if (!result.forward.reachedTargetPlane || !result.reverse.reachedTargetPlane)
         result.reason = "target_plane_not_reached";
     else if (!result.accepted)
@@ -2630,8 +2648,8 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
         !std::isfinite(request.workingToBaseScale)) {
         throw std::invalid_argument("working-to-base scale must be positive");
     }
-    if (!(request.errorThresholdVoxels >= 0.0) ||
-        !std::isfinite(request.errorThresholdVoxels)) {
+    if (!(request.errorThresholdBaseVoxels >= 0.0) ||
+        !std::isfinite(request.errorThresholdBaseVoxels)) {
         throw std::invalid_argument("error threshold must be finite and non-negative");
     }
     if (request.fiber.controlPointsXyzBase.size() < 2) {
@@ -2752,13 +2770,17 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
             predictions, oneWay, normalSampler, segmentProgress, "fiber");
 
         if (!segment.trace.points.empty()) {
-            segment.inPlaneErrorVoxels =
+            segment.inPlaneErrorTraceVoxels =
                 endpointPlaneError(segment.trace.points.back(), target, targetPlaneNormal);
         } else {
-            segment.inPlaneErrorVoxels = std::numeric_limits<double>::infinity();
+            segment.inPlaneErrorTraceVoxels = std::numeric_limits<double>::infinity();
         }
+        const FiberTraceCoordinateAdapter coordinates(request.workingToBaseScale);
+        segment.inPlaneErrorBaseVoxels =
+            coordinates.traceDistanceToBase(segment.inPlaneErrorTraceVoxels);
         segment.success = segment.trace.reachedTargetPlane &&
-                          segment.inPlaneErrorVoxels <= request.errorThresholdVoxels;
+                          segment.inPlaneErrorBaseVoxels <=
+                              request.errorThresholdBaseVoxels;
         segment.restart = !segment.success;
         if (segment.success) {
             segment.reason = "ok";

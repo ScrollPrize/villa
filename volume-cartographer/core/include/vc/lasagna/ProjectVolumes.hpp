@@ -14,9 +14,6 @@ namespace vc::lasagna
 {
 
 inline constexpr std::string_view kLasagnaDerivedVolumeTagPrefix = "vc-lasagna-derived:";
-inline constexpr std::string_view kLasagnaGroupTagPrefix = "vc-lasagna-group:";
-inline constexpr std::string_view kLasagnaChannelTagPrefix = "vc-lasagna-channel:";
-inline constexpr std::string_view kLasagnaSpacingTagPrefix = "vc-lasagna-spacing:";
 
 struct PreparedLasagnaProjectVolume {
     std::string location;

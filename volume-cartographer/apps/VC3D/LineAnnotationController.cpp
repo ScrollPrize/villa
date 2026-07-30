@@ -6913,18 +6913,16 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
         return;
     }
 
-    double voxelSizeUm = 0.0;
+    std::optional<double> baseVoxelSizeUm;
     try {
         if (_state && _state->currentVolume()) {
-            voxelSizeUm = _state->currentVolume()->voxelSize();
+            const double value = _state->currentVolume()->voxelSize();
+            if (value > 0.0 && std::isfinite(value)) {
+                baseVoxelSizeUm = value;
+            }
         }
     } catch (...) {
-        voxelSizeUm = 0.0;
-    }
-    if (!(voxelSizeUm > 0.0) || !std::isfinite(voxelSizeUm)) {
-        showError(tr("Native fiber tracer requires positive voxel-size metadata."),
-                  session.suppressErrorDialogs);
-        return;
+        baseVoxelSizeUm.reset();
     }
 
     auto resolveLineIndex = [&session](size_t controlIndex) -> std::optional<size_t> {
@@ -6995,7 +6993,7 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
                                            predictionField,
                                            startLineIndex,
                                            targetLineIndex,
-                                           voxelSizeUm,
+                                           baseVoxelSizeUm,
                                            traceToBaseScale]() mutable {
         OptimizationTaskResult task;
         task.manifestPath = manifestPath;
@@ -7018,9 +7016,8 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
             request.referenceLine = coordinates.baseToTrace(initialLinePoints);
             request.startIndex = startLineIndex;
             request.targetIndex = targetLineIndex;
-            request.config.voxelSizeUm =
-                coordinates.traceVoxelSizeUm(voxelSizeUm);
-            request.config.endpointAcceptThresholdUm = 50.0;
+            request.config.traceToBaseScale = traceToBaseScale;
+            request.config.baseVoxelSizeUm = baseVoxelSizeUm;
             const auto start = Clock::now();
             const vc::fiber_tracer::FiberTraceSegmentResult traced =
                 vc::fiber_tracer::traceFiberSegment(
@@ -7045,7 +7042,11 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
                 task.ok = false;
                 std::ostringstream msg;
                 msg << "Native fiber trace rejected: reason=" << traced.reason
-                    << " max_endpoint_error_um=" << traced.maxEndpointErrorUm;
+                    << " max_endpoint_error_base_voxels="
+                    << traced.maxEndpointErrorBaseVoxels;
+                if (traced.maxEndpointErrorUm.has_value()) {
+                    msg << " max_endpoint_error_um=" << *traced.maxEndpointErrorUm;
+                }
                 task.error = msg.str();
                 return task;
             }
@@ -7080,8 +7081,15 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
             task.result.line =
                 LineAnnotationController::lineModelFromPoints(merged, normalSampler.get());
             task.result.report.totalMs = totalMs;
-            task.result.report.message = "native_fiber_trace3d_segment";
-            task.result.report.finalRms = traced.maxEndpointErrorUm;
+            std::ostringstream report;
+            report << "native_fiber_trace3d_segment"
+                   << " max_endpoint_error_base_voxels="
+                   << traced.maxEndpointErrorBaseVoxels;
+            if (traced.maxEndpointErrorUm.has_value()) {
+                report << " max_endpoint_error_um=" << *traced.maxEndpointErrorUm;
+            }
+            task.result.report.message = report.str();
+            task.result.report.finalRms = traced.maxEndpointErrorBaseVoxels;
             task.ok = true;
         } catch (const std::exception& ex) {
             task.ok = false;

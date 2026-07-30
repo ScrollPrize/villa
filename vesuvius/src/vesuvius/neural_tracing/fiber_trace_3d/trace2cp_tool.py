@@ -275,7 +275,7 @@ class NativeTrace2CpConfig:
     inference_scaledown_power: int = 0
     inference_blur_sigma_voxels: float = 0.0
     inference_block_batch_size: int = 2
-    whole_fiber_error_threshold_voxels: float = 10.0
+    whole_fiber_error_threshold_base_voxels: float = 20.0
     max_cached_inference_gib: float = 8.0
 
 
@@ -357,6 +357,7 @@ class NativeWholeFiberSegmentResult:
     restart: bool
     reason: str
     in_plane_error_voxels: float
+    in_plane_error_base_voxels: float
     selected_target_plane_name: str | None
     selected_target_plane_crossing_zyx: np.ndarray | None
     reference_arc_distance_voxels: float
@@ -5714,7 +5715,7 @@ def trace_native_3d_whole_fiber(
     *,
     record: Any,
     cfg: NativeTrace2CpConfig,
-    error_threshold_voxels: float,
+    error_threshold_base_voxels: float,
     start_cp_index: int = 0,
     progress: bool = False,
     segment_callback: Callable[[NativeWholeFiberSegmentResult, NativeWholeFiberResult | None], None] | None = None,
@@ -5726,9 +5727,15 @@ def trace_native_3d_whole_fiber(
     cp_count = int(cp_points.shape[0])
     if cp_count < 2:
         raise ValueError("native whole-fiber Trace2CP requires at least two control points")
-    threshold = float(error_threshold_voxels)
-    if not math.isfinite(threshold) or threshold < 0.0:
-        raise ValueError("whole-fiber error threshold must be finite and >= 0")
+    threshold_base = float(error_threshold_base_voxels)
+    if not math.isfinite(threshold_base) or threshold_base < 0.0:
+        raise ValueError("whole-fiber base-voxel error threshold must be finite and >= 0")
+    working_to_base = float(getattr(record, "volume_spacing_base", 1.0))
+    if not math.isfinite(working_to_base) or working_to_base <= 0.0:
+        raise ValueError(
+            f"invalid volume_spacing_base for native whole-fiber trace: {working_to_base!r}"
+        )
+    threshold_working = threshold_base / working_to_base
     first_cp = int(start_cp_index)
     if first_cp < 0 or first_cp >= cp_count - 1:
         raise ValueError(
@@ -5862,7 +5869,7 @@ def trace_native_3d_whole_fiber(
                 "normal_sampler": normal_sampler,
             }
             if trace_segment_fn is None:
-                trace_kwargs["target_plane_accept_threshold_voxels"] = threshold
+                trace_kwargs["target_plane_accept_threshold_voxels"] = threshold_working
                 trace_kwargs["snap_trace_to_selected_crossing"] = False
                 if current_previous_direction is not None:
                     trace_kwargs["initial_previous_direction_zyx"] = current_previous_direction
@@ -5904,7 +5911,11 @@ def trace_native_3d_whole_fiber(
             in_plane_error = float("inf")
             selected_plane_name = result.selected_target_plane_name
             selected_crossing = result.selected_target_plane_crossing_zyx
-        success = bool(result.reached_target_plane) and in_plane_error <= threshold
+        in_plane_error_base = in_plane_error * working_to_base
+        success = (
+            bool(result.reached_target_plane)
+            and in_plane_error_base <= threshold_base
+        )
         if success:
             reason = result.reason
             restart = False
@@ -5967,6 +5978,7 @@ def trace_native_3d_whole_fiber(
             restart=bool(restart),
             reason=str(reason),
             in_plane_error_voxels=float(in_plane_error),
+            in_plane_error_base_voxels=float(in_plane_error_base),
             selected_target_plane_name=selected_plane_name,
             selected_target_plane_crossing_zyx=None
             if selected_crossing is None
@@ -7986,7 +7998,7 @@ def run_native_trace2cp(
                 "native whole-fiber render segment "
                 f"{segment.start_cp_index}->{segment.target_cp_index} "
                 f"success={segment.success} reason={segment.reason} "
-                f"error={segment.in_plane_error_voxels:.3f}",
+                f"error_base_voxels={segment.in_plane_error_base_voxels:.3f}",
                 flush=True,
             )
             if not active_segments:
@@ -8055,7 +8067,8 @@ def run_native_trace2cp(
             f"fiber_path={'' if record.fiber.path is None else record.fiber.path} "
             f"control_points={cp_count} start_cp={whole_start_cp} "
             f"target_cp={final_cp_index} segments={max(0, final_cp_index - whole_start_cp)} "
-            f"threshold_voxels={float(cfg.whole_fiber_error_threshold_voxels):.3f}",
+            "threshold_base_voxels="
+            f"{float(cfg.whole_fiber_error_threshold_base_voxels):.3f}",
             flush=True,
         )
         if profiler is not None:
@@ -8066,7 +8079,9 @@ def run_native_trace2cp(
             cache,
             record=record,
             cfg=cfg,
-            error_threshold_voxels=float(cfg.whole_fiber_error_threshold_voxels),
+            error_threshold_base_voxels=float(
+                cfg.whole_fiber_error_threshold_base_voxels
+            ),
             start_cp_index=int(whole_start_cp),
             progress=True,
             segment_callback=on_segment if render_visualization else None,
@@ -8096,7 +8111,9 @@ def run_native_trace2cp(
             "restart_fraction_per_segment": float(
                 whole.restart_count / max(1, whole.segment_count)
             ),
-            "whole_fiber_error_threshold_voxels": float(cfg.whole_fiber_error_threshold_voxels),
+            "whole_fiber_error_threshold_base_voxels": float(
+                cfg.whole_fiber_error_threshold_base_voxels
+            ),
             "step_voxels": float(cfg.step_voxels),
             "beam_width": int(cfg.beam_width),
             "beam_prune_distance_voxels": float(cfg.beam_prune_distance_voxels),
@@ -8139,6 +8156,9 @@ def run_native_trace2cp(
                     "reason": segment.reason,
                     "reached_target_plane": bool(segment.reached_target_plane),
                     "in_plane_error_voxels": float(segment.in_plane_error_voxels),
+                    "in_plane_error_base_voxels": float(
+                        segment.in_plane_error_base_voxels
+                    ),
                     "selected_target_plane_name": segment.selected_target_plane_name,
                     "selected_target_plane_crossing_zyx": None
                     if segment.selected_target_plane_crossing_zyx is None
@@ -8723,7 +8743,11 @@ def _parse_args() -> argparse.Namespace:
         default=1.0,
         help="Angular threshold for --debug-compare-normal-sampler fail-fast checks.",
     )
-    parser.add_argument("--whole-fiber-error-threshold-voxels", type=float, default=10.0)
+    parser.add_argument(
+        "--whole-fiber-error-threshold-base-voxels",
+        type=float,
+        default=20.0,
+    )
     _fill_missing_argparse_default_help(parser)
     return parser.parse_args()
 
@@ -8765,7 +8789,9 @@ def main() -> None:
         inference_scaledown_power=int(args.inference_scaledown_power),
         inference_blur_sigma_voxels=float(args.inference_blur_sigma_voxels),
         inference_block_batch_size=int(args.inference_block_batch_size),
-        whole_fiber_error_threshold_voxels=float(args.whole_fiber_error_threshold_voxels),
+        whole_fiber_error_threshold_base_voxels=float(
+            args.whole_fiber_error_threshold_base_voxels
+        ),
         max_cached_inference_gib=float(args.max_cached_inference_gib),
     )
     if args.fiber_json is None:

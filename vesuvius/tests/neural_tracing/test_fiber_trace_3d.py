@@ -3340,7 +3340,7 @@ def test_native_3d_trace2cp_defaults_to_training_patch_size() -> None:
     assert NativeTrace2CpConfig().inference_scaledown_power == 0
     assert NativeTrace2CpConfig().inference_blur_sigma_voxels == pytest.approx(0.0)
     assert NativeTrace2CpConfig().inference_block_batch_size == 2
-    assert NativeTrace2CpConfig().whole_fiber_error_threshold_voxels == 10.0
+    assert NativeTrace2CpConfig().whole_fiber_error_threshold_base_voxels == 20.0
     assert NativeTrace2CpConfig().max_cached_inference_gib == pytest.approx(8.0)
 
 
@@ -3371,6 +3371,7 @@ def test_native_3d_trace2cp_cli_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
     assert args.max_cached_inference_gib == pytest.approx(8.0)
     assert args.normal_sampler == "sparse-corner-principal"
     assert args.whole_fiber_start_cp_index == 0
+    assert args.whole_fiber_error_threshold_base_voxels == pytest.approx(20.0)
     assert args.vis is False
     assert args.profile is False
 
@@ -4134,7 +4135,7 @@ def test_native_3d_whole_fiber_trace_all_success_has_zero_restarts_per_kvx() -> 
         cache,
         record=record,
         cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
-        error_threshold_voxels=1.0,
+        error_threshold_base_voxels=1.0,
         trace_segment_fn=fake_trace,
     )
 
@@ -4195,7 +4196,7 @@ def test_native_3d_whole_fiber_success_continues_from_live_trace_state() -> None
             smoothness_normal_weight=0.0,
             cumulative_smoothness_tangent_weight=0.0,
         ),
-        error_threshold_voxels=1.0,
+        error_threshold_base_voxels=1.0,
         normal_sampler=_constant_native_normal_sampler(),
     )
 
@@ -4230,7 +4231,7 @@ def test_native_3d_whole_fiber_trace_can_start_at_later_control_point() -> None:
         cache,
         record=record,
         cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
-        error_threshold_voxels=1.0,
+        error_threshold_base_voxels=1.0,
         start_cp_index=1,
         trace_segment_fn=fake_trace,
     )
@@ -4252,7 +4253,7 @@ def test_native_3d_whole_fiber_trace_rejects_start_at_final_control_point() -> N
             cache,
             record=record,
             cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
-            error_threshold_voxels=1.0,
+            error_threshold_base_voxels=1.0,
             start_cp_index=2,
             trace_segment_fn=lambda *_args, **_kwargs: None,
         )
@@ -4289,7 +4290,7 @@ def test_native_3d_whole_fiber_trace_restarts_after_plane_miss() -> None:
         cache,
         record=record,
         cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
-        error_threshold_voxels=1.0,
+        error_threshold_base_voxels=1.0,
         trace_segment_fn=fake_trace,
     )
 
@@ -4337,7 +4338,7 @@ def test_native_3d_whole_fiber_trace_reports_restarts_per_meter_when_voxel_size_
         cache,
         record=record,
         cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
-        error_threshold_voxels=1.0,
+        error_threshold_base_voxels=1.0,
         trace_segment_fn=fake_trace,
     )
 
@@ -4382,7 +4383,7 @@ def test_native_3d_whole_fiber_progress_reports_compact_error_units_when_known(c
         cache,
         record=record,
         cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
-        error_threshold_voxels=1.0,
+        error_threshold_base_voxels=1.0,
         trace_segment_fn=fake_trace,
         progress=True,
     )
@@ -4465,7 +4466,7 @@ def test_native_3d_whole_fiber_ignores_non_vc3d_voxel_size_metadata() -> None:
         cache,
         record=record,
         cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
-        error_threshold_voxels=1.0,
+        error_threshold_base_voxels=1.0,
         trace_segment_fn=fake_trace,
     )
 
@@ -4497,7 +4498,7 @@ def test_native_3d_whole_fiber_trace_restarts_after_large_in_plane_error() -> No
         cache,
         record=record,
         cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
-        error_threshold_voxels=1.0,
+        error_threshold_base_voxels=1.0,
         trace_segment_fn=fake_trace,
     )
 
@@ -4505,6 +4506,36 @@ def test_native_3d_whole_fiber_trace_restarts_after_large_in_plane_error() -> No
     assert result.segments[0].reached_target_plane
     assert result.segments[0].reason == "in_plane_error"
     assert result.segments[0].in_plane_error_voxels == pytest.approx(5.0, abs=1.0e-6)
+
+
+def test_native_3d_whole_fiber_threshold_is_measured_in_base_voxels() -> None:
+    record = _whole_native_trace_record()
+    record.volume_spacing_base = 4.0
+    cache = SimpleNamespace(_blocks={})
+
+    def fake_trace(_cache, *, start_zyx, target_zyx, **_kwargs):
+        crossing = np.asarray(target_zyx, dtype=np.float32) + np.asarray(
+            [0.0, 5.0, 0.0], dtype=np.float32
+        )
+        return NativeTraceResult(
+            trace_zyx=np.stack([start_zyx, crossing], axis=0).astype(np.float32),
+            reached_target_plane=True,
+            reason="target_plane",
+            steps=(),
+        )
+
+    result = trace_native_3d_whole_fiber(
+        cache,
+        record=record,
+        cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
+        error_threshold_base_voxels=20.0,
+        trace_segment_fn=fake_trace,
+    )
+
+    assert result.restart_count == 0
+    assert result.segments[0].success
+    assert result.segments[0].in_plane_error_voxels == pytest.approx(5.0)
+    assert result.segments[0].in_plane_error_base_voxels == pytest.approx(20.0)
 
 
 def test_native_3d_whole_fiber_trace_last_segment_failure_finishes() -> None:
@@ -4537,7 +4568,7 @@ def test_native_3d_whole_fiber_trace_last_segment_failure_finishes() -> None:
         cache,
         record=record,
         cfg=NativeTrace2CpConfig(step_voxels=1.0, cone_grid_size=1),
-        error_threshold_voxels=1.0,
+        error_threshold_base_voxels=1.0,
         trace_segment_fn=fake_trace,
     )
 
@@ -4566,6 +4597,7 @@ def _native_whole_fiber_segment(
         restart=not bool(success),
         reason="target_plane" if success else "trace_step_limit",
         in_plane_error_voxels=0.0 if success else float("inf"),
+        in_plane_error_base_voxels=0.0 if success else float("inf"),
         reference_arc_distance_voxels=float(target_cp),
         step_count=1,
     )

@@ -36,9 +36,12 @@ the current/default manifests). The GUI must:
    point coordinates exact.
 
 The current requirement that line storage scale equal trace working scale is
-incorrect and must be removed. Physical endpoint thresholds and reported
-errors must retain their existing micrometer meaning after the coordinate
-conversion.
+incorrect and must be removed. Endpoint acceptance uses a fixed threshold of
+`20` base-resolution voxels in the Python CLI, native C++ CLI, and VC3D. Each
+tracer converts that threshold into its working grid before comparing errors.
+Physical voxel size is optional and is used only to add physical-unit reporting
+when trustworthy metadata is available; missing physical metadata must not
+block tracing.
 
 ## Scope
 
@@ -58,6 +61,8 @@ This task covers:
    base-scale normal sampler used to rebuild the stored line.
 7. Focused regression tests, VC3D/core builds, documentation, specifications,
    task log, and changelog updates.
+8. Consistent `20` base-voxel endpoint acceptance in the Python native CLI,
+   native C++ metric CLI, and VC3D segment action.
 
 ## Out of scope
 
@@ -93,6 +98,9 @@ This task covers:
 - The prediction sampler sees trace coordinates with prediction spacing
   `prediction_to_base / trace_to_base`; it must not be passed base points or
   points pre-divided directly into prediction voxels.
-- A trace-space endpoint error is converted to micrometers using the physical
-  size of a trace voxel, not the physical size of a base voxel.
+- Endpoint errors are converted from the working trace/selected grid to base
+  voxels before the fixed `20` base-voxel acceptance check.
+- A base-space endpoint error is converted to micrometers only when a finite,
+  positive base-voxel size is available. Missing physical size omits that
+  report field and does not affect acceptance.
 - Original stored CP endpoints remain bit-exact after a successful splice.

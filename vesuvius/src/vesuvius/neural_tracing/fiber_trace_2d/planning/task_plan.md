@@ -66,13 +66,10 @@ source:
   key;
 - absolute remote group: the group's own remote locator.
 
-Keep readable bookkeeping tags:
-
-- `vc-lasagna-derived:<actual local manifest path or remote locator>` as the
-  combined provenance, auto-ownership, and reconstruction marker;
-- `vc-lasagna-group:<name>`;
-- `vc-lasagna-channel:<name>`;
-- `vc-lasagna-spacing:<base voxel spacing>`.
+Keep only `vc-lasagna-derived:<actual local manifest path or remote locator>`
+as the combined provenance, auto-ownership, and reconstruction marker. Group,
+channel, spacing, dtype, and shape remain authoritative in the manifest/Zarr
+descriptor and must not be duplicated in project tags.
 
 The `volumes[].location` is a source locator, not a cache locator. A derived
 remote entry remains reconstructed by the Lasagna adapter so its exact-byte
@@ -102,7 +99,8 @@ string for serialization.
   entry.
 - Add one `vc-lasagna-derived:<manifest location>` tag per referencing
   manifest.
-- Preserve all group/channel tags needed to explain each reference.
+- Do not persist descriptive metadata that can be reconstructed from the
+  manifest/Zarr descriptor.
 - If the volume existed as an independent manual project entry before a
   Lasagna attachment, reuse it without adding an auto-ownership tag.
 - Detach removes one provenance tag at a time. Remove the volume entry only
@@ -192,19 +190,21 @@ Before launching the background trace:
 Put the conversion in a small testable core/helper API also usable by future
 GUI/CLI callers. Do not bury independent arithmetic copies in Qt lambdas.
 
-### 4.4 Physical units and metadata
+### 4.4 Base-voxel acceptance and optional physical reporting
 
-`FiberTraceConfig::voxelSizeUm` must describe one trace voxel while tracing.
-For a base voxel size `base_voxel_um`:
+The Python native CLI, C++ metric CLI, and VC3D segment action use one fixed
+endpoint threshold of `20` base-resolution voxels. Convert working-grid error
+to base voxels before acceptance:
 
 ```text
-trace_voxel_um = base_voxel_um * trace_to_base
+endpoint_error_base = endpoint_error_working * working_to_base
 ```
 
-This keeps the existing 50 um acceptance threshold unchanged. Preserve both
-trace-voxel and micrometer error meaning in results; any value persisted into
-line optimization reporting must be explicitly labeled/converted rather than
-silently changing units.
+At the default sd2 trace scale, `working_to_base=4`, so the internal working
+threshold is `5` trace voxels. Physical size never controls acceptance. When a
+finite positive base-voxel size is available, report
+`endpoint_error_um = endpoint_error_base * base_voxel_um`; otherwise omit the
+physical report without rejecting the trace.
 
 Trace step, pruning distance, budgets, and other voxel-valued Trace2CP
 parameters remain expressed in trace voxels. They are not multiplied before
@@ -278,7 +278,8 @@ Expected files:
    sampler.
 4. Convert request points into trace space and accepted results back into base
    space around `traceFiberSegment()`.
-5. Scale physical voxel size for endpoint acceptance/reporting.
+5. Convert endpoint error to base voxels for acceptance and use physical voxel
+   size only for optional reporting.
 6. Keep endpoint replacement exact and final line reconstruction in base
    space.
 
@@ -330,8 +331,10 @@ Expected files:
   location as a direct base-space probe.
 - The GUI/core segment adapter passes a base span of 64 voxels to the tracer as
   16 trace voxels and returns a fused base-space span with exact endpoints.
-- A one-trace-voxel endpoint error uses `4 * base_voxel_um` in the 50 um
-  acceptance calculation.
+- A one-trace-voxel endpoint error at sd2 is reported as four base voxels and
+  is accepted against the fixed 20-base-voxel threshold.
+- Missing physical voxel-size metadata still permits tracing and omits only
+  micrometer output.
 - Repeated segment actions reuse trace-scale datasets and do not rebuild on the
   expected base/trace scale difference.
 - Existing whole-fiber metric scale tests continue to pass.
@@ -344,7 +347,7 @@ Use the existing configured build tree and focused targets first:
 cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
   --target test_remote_file_cache test_lasagna_manifest \
   test_lasagna_project_volumes test_volume_pkg test_fiber_trace3d \
-  test_open_data_manifest VC3D vc_fiber_trace_metric -j2
+  test_open_data_manifest VC3D vc_fiber_trace_metric -j32
 ```
 
 Run focused binaries/CTest entries with `--output-on-failure`, followed by the
@@ -411,8 +414,9 @@ Add one completion entry covering:
 - **Sampler-space mix-up:** using the base normal sampler during trace-space
   tracing silently samples the wrong location. Maintain separate typed/session
   fields and integration tests.
-- **Physical threshold regression:** scaling geometry without scaling voxel
-  size changes the 50 um acceptance behavior. Test a nonzero endpoint error.
+- **Threshold-unit regression:** comparing a working-grid error directly to
+  `20` would make acceptance scale-dependent. Test nonzero errors with
+  `working_to_base=4`.
 - **Endpoint drift:** multiplication back into base space can perturb CPs.
   Restore endpoints from the original stored points exactly.
 - **Cache path safety:** readable URL mirroring must reject traversal and

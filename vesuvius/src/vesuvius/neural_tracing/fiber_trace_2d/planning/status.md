@@ -30,7 +30,7 @@
 - [x] Prepare distinct trace-scale prediction and normal samplers.
 - [x] Convert GUI segment inputs to trace space and accepted results to base
   space.
-- [x] Correct trace-voxel physical units and preserve exact endpoints.
+- [x] Correct base/trace coordinate units and preserve exact endpoints.
 
 ## Validation And Documentation
 
@@ -47,3 +47,15 @@
 - [x] Replace `planning/task_log.md` with final commands, results, findings,
   and deviations.
 - [x] Report limitations or skipped requirements explicitly.
+
+## Base-Voxel Threshold Follow-Up
+
+- [x] Confirm the C++ CLI, Python CLI, and VC3D working coordinate spaces.
+- [x] Update the task and implementation plan to supersede the physical
+  acceptance threshold.
+- [x] Use a `20` base-voxel threshold in the shared C++ tracer and metric CLI.
+- [x] Make VC3D physical voxel metadata optional and report-only.
+- [x] Use a `20` base-voxel threshold in the Python native CLI.
+- [x] Add focused scale and missing-physical-metadata regression tests.
+- [x] Build with `-j32`, run focused C++/Python tests, and audit stale names.
+- [x] Update specs, docs, changelog, and the current task log.

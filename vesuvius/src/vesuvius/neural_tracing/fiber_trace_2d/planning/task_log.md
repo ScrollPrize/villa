@@ -1,98 +1,81 @@
-# Path-Based Lasagna Volumes And Base-Space Fiber Tracing Task Log
+# Base-Voxel Fiber Acceptance Threshold Task Log
 
-## Planning findings
+## Findings
 
-- The reversible URL/path hex encoder originated in commit `458f19215` for a
-  collision-free, filesystem-safe remote Lasagna cache directory.
-- Commit `26e2d12b2` extracted that cache helper and incorrectly reused it for
-  project provenance and derived-volume locations.
-- Derived identities are currently double encoded because the code builds
-  `hex(hex(manifest_location) + "|group|channel")`.
-- `lasagna_datasets[].location` already retains the authoritative actual
-  manifest source, so encoded project identities are redundant.
-- The user confirmed this identity/cache representation was never shipped and
-  requires complete removal. No decoder, project migration, old-cache lookup,
-  or backward-compatible reader will be implemented.
-- The replacement cache layout will mirror readable remote scheme, authority,
-  and object-path components. Persistent sidecars will validate an actual
-  canonical source path rather than `source_identity_hex`.
-- Lasagna group resolution already distinguishes local paths, direct remote
-  origins, explicit remote sidecars, and absolute remote groups, but it does
-  not expose one authoritative human/project source-location field.
-- The GUI currently rejects a valid base-line/trace-grid difference. It passes
-  base-space line points directly into a prediction field configured for trace
-  coordinates if that rejection is simply removed.
-- Correct GUI tracing needs both point conversion and a separate normal sampler
-  configured for trace coordinates. The ordinary base-space sampler is still
-  needed to rebuild the stored line after converting results back.
-- Endpoint physical conversion must use trace voxel size
-  `base_voxel_um * trace_to_base`.
+- VC3D currently requires positive physical voxel-size metadata only because
+  its `50 um` acceptance threshold is converted to trace voxels. Trace geometry
+  itself does not need physical metadata.
+- The configured local base volume has no trustworthy positive physical size:
+  its generated VC metadata reports zero and its OME-Zarr transforms are
+  dimensionless. The filename is intentionally not parsed as metadata.
+- The C++ metric CLI currently compares its default threshold directly in
+  trace-grid voxels. The Python native CLI compares in selected-volume voxels.
+  Both therefore need explicit working-to-base conversion.
 
 ## Deviations
 
-- Independent agent review required by the local planning process was not run
-  because the active runtime policy prohibits delegation unless the user
-  explicitly requests it. A direct code/spec consistency review was completed.
-- Initial focused builds used the plan's conservative `-j2`. The user requested
-  full machine parallelism, so subsequent builds use `-j32`.
+- Independent agent review is not permitted by the active runtime policy
+  unless the user explicitly requests delegation. The implementation is being
+  reviewed directly against the task, specifications, and call sites.
 
 ## Validation
 
-Implemented and validated:
+Implemented:
 
-- Remote arbitrary-file sidecars now store a readable, query-free `source` and
-  Lasagna direct-manifest caches mirror
-  `remote_sources/<scheme>/<authority>/<path>`.
-- Lasagna groups retain an authoritative source locator independently of their
-  runtime HTTP endpoint and local cache path.
-- Project derived-volume locations are actual local/remote Zarr paths and use
-  one `vc-lasagna-derived:<manifest location>` ownership tag per manifest.
-- Shared-source reconciliation and detach preserve other manifest owners;
-  independently attached primary volumes receive no automatic ownership tag
-  and survive all manifest detaches.
-- VC3D keeps line/control coordinates in base space, runs prediction and a
-  dedicated normal sampler at the derived trace scale, converts accepted
-  results back to base space, restores endpoints exactly, and uses trace-scale
-  physical voxel size.
+- The shared C++ segment result now distinguishes trace-grid and base-grid
+  endpoint errors. Acceptance compares the base-grid error to `20` base
+  voxels; optional micrometer error is populated only from a finite positive
+  base-voxel size.
+- VC3D no longer rejects a segment action when `Volume::voxelSize()` is absent
+  or zero. Rejection and success reports always name the base-voxel endpoint
+  error and append micrometers only when available.
+- `vc_fiber_trace_metric` now exposes
+  `--error-threshold-base-voxels` with default `20`; its working trace error is
+  multiplied by the manifest-derived trace-to-base scale before acceptance.
+- The Python native CLI now exposes
+  `--whole-fiber-error-threshold-base-voxels` with default `20`; it divides the
+  public threshold by `volume_spacing_base` for internal target-plane search
+  and records both selected-grid and base-grid endpoint errors.
+- The former ambiguous CLI option/config names were removed rather than kept
+  as aliases. They described working-grid voxels and would preserve the wrong
+  scale-dependent contract.
 
-Build commands:
+Commands:
 
 ```bash
 cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
-  --target test_remote_file_cache test_lasagna_manifest \
-  test_lasagna_project_volumes test_volume_pkg test_fiber_trace3d -j2
-cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
-  --target test_lasagna_manifest test_open_data_manifest VC3D \
-  vc_fiber_trace_metric -j2
-cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
-  --target test_fiber_trace3d VC3D vc_fiber_trace_metric -j32
+  --target test_fiber_trace3d vc_fiber_trace_metric VC3D -j32
+volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_fiber_trace3d
+volume-cartographer/build/ci-tests-clang-systemdeps/bin/vc_fiber_trace_metric --help
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src \
+  python -m pytest -q vesuvius/tests/neural_tracing/test_fiber_trace_3d.py
+python -m py_compile \
+  vesuvius/src/vesuvius/neural_tracing/fiber_trace_3d/trace2cp_tool.py \
+  vesuvius/tests/neural_tracing/test_fiber_trace_3d.py
+git diff --check
 ```
 
-The final `-j32` build passed. Ninja reported a recoverable pre-existing
-`premature end of file` warning and rebuilt more targets than expected. VC3D
-also emitted existing Qt deprecation warnings in unrelated sources.
+Results:
 
-Test results:
+- `test_fiber_trace3d`: 27 passed, including a nonzero-error case proving a
+  trace error below 20 is rejected when its converted base error exceeds 20,
+  and a missing-physical-size case proving physical metadata is optional.
+- Python `test_fiber_trace_3d.py`: 179 passed, 2 skipped, including a
+  `volume_spacing_base=4` boundary case where 5 working voxels equals 20 base
+  voxels.
+- `vc_fiber_trace_metric --help`: passed and lists the new base-voxel option
+  with default 20.
+- Focused C++ targets built successfully with `-j32`. Ninja repeatedly emitted
+  its existing recoverable `premature end of file` warning and rebuilt more
+  dependencies than expected. VC3D emitted existing unrelated Qt deprecation
+  warnings.
 
-- `test_remote_file_cache`: 8 passed.
-- `test_lasagna_manifest`: 14 passed.
-- `test_lasagna_project_volumes`: 4 passed.
-- `test_volume_pkg`: 39 passed.
-- `test_fiber_trace3d`: 26 passed.
-- `test_open_data_manifest`: 32 passed.
-- `vc_fiber_trace_metric --help`: passed.
-- `git diff --check`: passed.
-- Source/doc audit found no stale development-only encoded location or cache
-  symbols in `volume-cartographer` implementation/docs or fiber docs/specs.
-
-Two initial test failures were corrected during the loop: direct manifest
-validation now expects malformed remote sources to fail before fetching, and
-the authoritative group-source helper supports directly parsed local test
-manifests through their resolved `zarrPath`.
+The first Python pytest attempt inherited an installed pytest plugin that
+requires unavailable `zarr.testing`; disabling third-party plugin autoload
+used the repository tests without installing or changing dependencies.
 
 ## Limitations
 
-- The interactive VC3D smoke test with the user's local project was not run in
-  this non-GUI session. The VC3D target and all relevant noninteractive tests
-  pass, but the attach/save/trace/reopen workflow still needs an interactive
-  check against that dataset.
+- The interactive VC3D segment action was not run in this non-GUI session.
+  Compilation and shared-core regressions pass, but the user's project remains
+  the required manual end-to-end check.

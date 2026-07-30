@@ -55,8 +55,9 @@ struct FiberTraceConfig {
     double initialFreeAngleDegrees = 0.0;
     double maxStepFactor = 3.0;
     double fusionGapFactor = 2.0;
-    double endpointAcceptThresholdUm = 50.0;
-    double voxelSizeUm = 0.0;
+    double endpointAcceptThresholdBaseVoxels = 20.0;
+    double traceToBaseScale = 1.0;
+    std::optional<double> baseVoxelSizeUm;
     FiberTraceProfile* profile = nullptr;
 };
 
@@ -184,7 +185,8 @@ struct FiberTraceCoordinateAdapter {
         const std::vector<cv::Vec3d>& points,
         const cv::Vec3d& exactStartBase,
         const cv::Vec3d& exactTargetBase) const;
-    [[nodiscard]] double traceVoxelSizeUm(double baseVoxelSizeUm) const;
+    [[nodiscard]] double baseDistanceToTrace(double distanceBaseVoxels) const;
+    [[nodiscard]] double traceDistanceToBase(double distanceTraceVoxels) const;
 
     double traceToBaseScale = 1.0;
 };
@@ -290,10 +292,11 @@ struct FiberTraceSegmentResult {
     FiberTraceOneWayResult forward;
     FiberTraceOneWayResult reverse;
     std::vector<cv::Vec3d> fusedLine;
-    double forwardEndpointErrorVoxels = 0.0;
-    double reverseEndpointErrorVoxels = 0.0;
-    double maxEndpointErrorVoxels = 0.0;
-    double maxEndpointErrorUm = 0.0;
+    double forwardEndpointErrorTraceVoxels = 0.0;
+    double reverseEndpointErrorTraceVoxels = 0.0;
+    double maxEndpointErrorTraceVoxels = 0.0;
+    double maxEndpointErrorBaseVoxels = 0.0;
+    std::optional<double> maxEndpointErrorUm;
     bool accepted = false;
     std::string reason;
 };
@@ -305,7 +308,8 @@ struct FiberTraceWholeFiberSegmentResult {
     bool success = false;
     bool restart = false;
     std::string reason;
-    double inPlaneErrorVoxels = 0.0;
+    double inPlaneErrorTraceVoxels = 0.0;
+    double inPlaneErrorBaseVoxels = 0.0;
     double referenceArcDistanceVoxels = 0.0;
 };
 
@@ -323,7 +327,7 @@ struct FiberTraceWholeFiberResult {
 struct FiberTraceWholeFiberMetricRequest {
     FiberInput fiber;
     double workingToBaseScale = 1.0;
-    double errorThresholdVoxels = 10.0;
+    double errorThresholdBaseVoxels = 20.0;
     std::optional<double> voxelSizeUm;
     FiberTraceConfig config;
 };

@@ -5,6 +5,7 @@
 #include "vc/lasagna/ChannelSampler.hpp"
 
 #include <cmath>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -25,6 +26,21 @@ public:
             1.0,
             true,
         });
+        return out;
+    }
+};
+
+class SlantedPrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d&,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        constexpr double x = 0.9950371902099892;
+        constexpr double y = 0.09950371902099892;
+        const double sign = referenceDirection[0] < 0.0 ? -1.0 : 1.0;
+        vc::fiber_tracer::FiberPredictionSample out;
+        out.options.push_back({{sign * x, sign * y, 0.0}, 1.0, true});
         return out;
     }
 };
@@ -216,6 +232,9 @@ TEST_CASE("native fiber tracer defaults match regular Trace2CP command")
     CHECK(config.smoothnessFreeAngleDegrees == doctest::Approx(0.0));
     CHECK(config.cumulativeSmoothnessSteps == 4);
     CHECK(config.cumulativeSmoothnessTangentWeight == doctest::Approx(2.0));
+    CHECK(config.endpointAcceptThresholdBaseVoxels == doctest::Approx(20.0));
+    CHECK(config.traceToBaseScale == doctest::Approx(1.0));
+    CHECK_FALSE(config.baseVoxelSizeUm.has_value());
 }
 
 TEST_CASE("fiber prediction trace scales derive from existing manifest fields")
@@ -234,7 +253,7 @@ TEST_CASE("fiber prediction trace scales derive from existing manifest fields")
           doctest::Approx(4.0));
 }
 
-TEST_CASE("fiber trace coordinate adapter round trips base points and physical scale")
+TEST_CASE("fiber trace coordinate adapter round trips base points and distances")
 {
     const vc::fiber_tracer::FiberTraceCoordinateAdapter coordinates(4.0);
     const std::vector<cv::Vec3d> base{
@@ -253,11 +272,13 @@ TEST_CASE("fiber trace coordinate adapter round trips base points and physical s
         trace, exactStart, exactTarget);
     CHECK(segment.front() == exactStart);
     CHECK(segment.back() == exactTarget);
-    CHECK(coordinates.traceVoxelSizeUm(2.4) == doctest::Approx(9.6));
+    CHECK(coordinates.baseDistanceToTrace(20.0) == doctest::Approx(5.0));
+    CHECK(coordinates.traceDistanceToBase(5.0) == doctest::Approx(20.0));
     CHECK_THROWS_AS(
         vc::fiber_tracer::FiberTraceCoordinateAdapter(0.0),
         std::invalid_argument);
-    CHECK_THROWS_AS(coordinates.traceVoxelSizeUm(0.0), std::invalid_argument);
+    CHECK(std::isinf(coordinates.traceDistanceToBase(
+        std::numeric_limits<double>::infinity())));
 }
 
 TEST_CASE("fiber prediction trace scales use inference scaledown power")
@@ -704,8 +725,9 @@ TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")
     request.config.coneAngleStepDegrees = 5.0;
     request.config.beamWidth = 1;
     request.config.maxStepFactor = 2.0;
-    request.config.endpointAcceptThresholdUm = 50.0;
-    request.config.voxelSizeUm = 1.0;
+    request.config.endpointAcceptThresholdBaseVoxels = 20.0;
+    request.config.traceToBaseScale = 4.0;
+    request.config.baseVoxelSizeUm = 2.0;
 
     const auto result =
         vc::fiber_tracer::traceFiberSegment(predictions, request, &normals);
@@ -716,7 +738,56 @@ TEST_CASE("native fiber tracer fuses a straight cp-to-cp segment")
     REQUIRE(result.fusedLine.size() >= 3);
     CHECK(result.fusedLine.front()[0] == doctest::Approx(0.0));
     CHECK(result.fusedLine.back()[0] == doctest::Approx(64.0));
-    CHECK(result.maxEndpointErrorVoxels == doctest::Approx(0.0));
+    CHECK(result.maxEndpointErrorTraceVoxels == doctest::Approx(0.0));
+    CHECK(result.maxEndpointErrorBaseVoxels == doctest::Approx(0.0));
+    REQUIRE(result.maxEndpointErrorUm.has_value());
+    CHECK(*result.maxEndpointErrorUm == doctest::Approx(0.0));
+
+    request.config.baseVoxelSizeUm.reset();
+    const auto resultWithoutPhysicalSize =
+        vc::fiber_tracer::traceFiberSegment(predictions, request, &normals);
+    CHECK(resultWithoutPhysicalSize.accepted);
+    CHECK_FALSE(resultWithoutPhysicalSize.maxEndpointErrorUm.has_value());
+}
+
+TEST_CASE("native fiber segment acceptance uses base-voxel endpoint error")
+{
+    SlantedPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceSegmentRequest request;
+    request.referenceLine = {
+        {0.0, 0.0, 0.0},
+        {64.0, 0.0, 0.0},
+    };
+    request.startIndex = 0;
+    request.targetIndex = 1;
+    request.targetPlaneNormal = cv::Vec3d{1.0, 0.0, 0.0};
+    request.config.stepVoxels = 4.0;
+    request.config.coneAngleDegrees = 0.0;
+    request.config.beamWidth = 1;
+    request.config.maxStepFactor = 2.0;
+    request.config.smoothnessWeight = 0.0;
+    request.config.smoothnessNormalWeight = 0.0;
+    request.config.smoothnessTangentWeight = 0.0;
+    request.config.cumulativeSmoothnessTangentWeight = 0.0;
+    request.config.traceToBaseScale = 4.0;
+    request.config.endpointAcceptThresholdBaseVoxels = 20.0;
+
+    const auto rejected =
+        vc::fiber_tracer::traceFiberSegment(predictions, request, &normals);
+
+    REQUIRE(rejected.forward.reachedTargetPlane);
+    REQUIRE(rejected.reverse.reachedTargetPlane);
+    CHECK(rejected.maxEndpointErrorTraceVoxels < 20.0);
+    CHECK(rejected.maxEndpointErrorBaseVoxels > 20.0);
+    CHECK_FALSE(rejected.accepted);
+
+    request.config.endpointAcceptThresholdBaseVoxels = 30.0;
+    const auto accepted =
+        vc::fiber_tracer::traceFiberSegment(predictions, request, &normals);
+    CHECK(accepted.maxEndpointErrorBaseVoxels ==
+          doctest::Approx(rejected.maxEndpointErrorBaseVoxels));
+    CHECK(accepted.accepted);
 }
 
 TEST_CASE("native fiber tracer computes whole-fiber one-way restart metric")
@@ -736,7 +807,7 @@ TEST_CASE("native fiber tracer computes whole-fiber one-way restart metric")
     vc::fiber_tracer::FiberTraceWholeFiberMetricRequest request;
     request.fiber = fiber;
     request.workingToBaseScale = 1.0;
-    request.errorThresholdVoxels = 10.0;
+    request.errorThresholdBaseVoxels = 20.0;
     request.voxelSizeUm = 2.0;
     request.config.stepVoxels = 4.0;
     request.config.coneAngleDegrees = 0.0;
