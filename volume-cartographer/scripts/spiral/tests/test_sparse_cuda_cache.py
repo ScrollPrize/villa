@@ -1,112 +1,114 @@
-from pathlib import Path
-
 import numpy as np
 import pytest
-import tensorstore as ts
 import torch
+import zarr
 
+from pack_resident_pools import pack_arrays, sidecar_path
 from sdt_losses import sample_sdt_trilinear
-from sparse_cuda_cache import (
-    CHUNK_VOXELS,
-    BoundedSparseCudaCache,
-    SparseScalarStore,
-)
+from sparse_cuda_cache import ResidentBrickPool, SparseScalarStore
 
 
-def write_array(path: Path, data: np.ndarray) -> str:
-    array = ts.open(
-        {
-            "driver": "zarr",
-            "kvstore": {"driver": "file", "path": str(path)},
-            "metadata": {
-                "dtype": "|u1",
-                "shape": list(data.shape),
-                "chunks": [16, 16, 16],
-                "compressor": None,
-                "order": "C",
-                "fill_value": 0,
-            },
-        },
-        create=True,
-        open=True,
-    ).result()
-    array.write(data).result()
+def write_array(path, data):
+    array = zarr.open(
+        str(path), mode='w', shape=data.shape, chunks=(16, 16, 16),
+        dtype='|u1', compressor=None, fill_value=0, zarr_format=2,
+        dimension_separator='/',
+    )
+    array[:] = data
     return str(path)
 
 
-def test_gather_matches_dense_across_lru_evictions(tmp_path):
+def make_pool(tmp_path, arrays, name, **kwargs):
+    paths = [write_array(tmp_path / f'{name}_{i}', a)
+             for i, a in enumerate(arrays)]
+    out = pack_arrays(paths, sidecar_path(paths[0], '0'), label=name)
+    return ResidentBrickPool(out, device='cpu', label=name, **kwargs)
+
+
+def test_gather_matches_dense_multichannel(tmp_path):
     z, y, x = np.indices((40, 40, 70))
     first = ((z * 17 + y * 5 + x) % 251 + 1).astype(np.uint8)
     second = ((z * 3 + y * 11 + x * 7) % 251 + 1).astype(np.uint8)
-    paths = [
-        write_array(tmp_path / "first", first),
-        write_array(tmp_path / "second", second),
-    ]
-    cache = BoundedSparseCudaCache(
-        source_paths=paths,
-        shape_zyx=first.shape,
-        budget_bytes=2 * 2 * CHUNK_VOXELS,
-        device="cpu",
-        label="test normals",
-        tensorstore_cache_bytes=1 << 20,
-    )
+    pool = make_pool(tmp_path, [first, second], 'pair')
 
-    requests = [
+    for indices in [
         torch.tensor([[0, 0, 0], [1, 2, 33], [5, 3, 63]]),
         torch.tensor([[35, 2, 2], [35, 35, 35]]),
-        torch.tensor([[0, 0, 0], [5, 3, 63]]),
-    ]
-    for indices in requests:
-        actual = cache.gather(indices)
+        torch.zeros([0, 3], dtype=torch.long),
+    ]:
+        actual = pool.gather(indices)
         expected = torch.from_numpy(np.stack([
             first[tuple(indices.numpy().T)], second[tuple(indices.numpy().T)]
         ], axis=-1))
         torch.testing.assert_close(actual, expected)
-    cache.gather(requests[-1])
-
-    stats = cache.stats()
-    assert stats["resident_chunks"] <= 2
-    assert stats["evictions"] > 0
-    assert stats["hits"] > 0
+    assert pool.stats()['gathers'] == 2  # the empty gather short-circuits
 
 
-def test_one_gather_must_fit_the_bounded_working_set(tmp_path):
-    data = np.arange(40 * 40 * 70, dtype=np.uint32).reshape(40, 40, 70)
-    data = (data % 255).astype(np.uint8)
-    path = write_array(tmp_path / "scalar", data)
-    cache = BoundedSparseCudaCache(
-        source_paths=[path],
-        shape_zyx=data.shape,
-        budget_bytes=CHUNK_VOXELS,
-        device="cpu",
-        label="test scalar",
-        tensorstore_cache_bytes=1 << 20,
-    )
-    with pytest.raises(RuntimeError, match="exceeding its 1-chunk LRU capacity"):
-        cache.gather(torch.tensor([[0, 0, 0], [0, 0, 33]]))
+def test_absent_bricks_read_zero(tmp_path):
+    data = np.zeros((48, 16, 16), dtype=np.uint8)
+    data[:16] = 9  # only the first chunk row is occupied
+    pool = make_pool(tmp_path, [data], 'sparse')
+    assert pool.resident_bricks < pool.table.numel()
+    values = pool.gather(torch.tensor([[2, 2, 2], [30, 5, 5], [47, 15, 15]]))
+    assert values[:, 0].tolist() == [9, 0, 0]
 
 
-def test_large_z_roi_uses_source_origin_and_eviction(tmp_path):
+def test_origin_and_z_roi_restriction(tmp_path):
     data = np.broadcast_to(
-        (np.arange(5200, dtype=np.uint16) % 251 + 1).astype(np.uint8)[:, None, None],
-        (5200, 2, 2),
+        (np.arange(64, dtype=np.uint16) % 251 + 1).astype(np.uint8)[:, None, None],
+        (64, 4, 4),
     ).copy()
-    path = write_array(tmp_path / "large_z", data)
-    cache = BoundedSparseCudaCache(
-        source_paths=[path],
-        shape_zyx=data.shape,
-        origin_zyx=(100, 0, 0),
-        budget_bytes=CHUNK_VOXELS,
-        device="cpu",
-        label="test 5000-slice ROI",
-        tensorstore_cache_bytes=1 << 20,
-    )
+    paths = [write_array(tmp_path / 'large_z', data)]
+    out = pack_arrays(paths, sidecar_path(paths[0], '0'), label='roi')
+    pool = ResidentBrickPool(
+        out, device='cpu', label='roi', origin_zyx=(32, 0, 0), z_roi=(32, 64))
+    full = ResidentBrickPool(out, device='cpu', label='full')
 
-    first = cache.gather(torch.tensor([[0, 0, 0]]))
-    last = cache.gather(torch.tensor([[4999, 1, 1]]))
-    assert int(first[0, 0]) == int(data[100, 0, 0])
-    assert int(last[0, 0]) == int(data[5099, 1, 1])
-    assert cache.stats()["evictions"] == 1
+    assert pool.resident_bricks < full.resident_bricks
+    first = pool.gather(torch.tensor([[0, 0, 0]]))
+    last = pool.gather(torch.tensor([[31, 3, 3]]))
+    assert int(first[0, 0]) == int(data[32, 0, 0])
+    assert int(last[0, 0]) == int(data[63, 3, 3])
+
+
+def test_bounds_check_env(tmp_path, monkeypatch):
+    monkeypatch.setenv('FIT_SPIRAL_RESIDENT_BOUNDS_CHECK', '1')
+    data = np.ones((16, 16, 16), dtype=np.uint8)
+    pool = make_pool(tmp_path, [data], 'bounds')
+    with pytest.raises(IndexError):
+        pool.gather(torch.tensor([[16, 0, 0]]))
+
+
+def test_pack_ct_mask_zeroes_and_drops_bricks(tmp_path):
+    from pack_resident_pools import CtMasker, verify_pool
+
+    rng = np.random.default_rng(3)
+    data = rng.integers(1, 255, size=(32, 32, 32), dtype=np.uint8)
+    store = write_array(tmp_path / 'sdt', data)
+    # CT at half resolution (ratio 2): zero except one occupied corner region,
+    # so only target voxels [0:16, 0:16, 0:16] survive the mask.
+    ct = np.zeros((16, 16, 16), dtype=np.uint8)
+    ct[:8, :8, :8] = 7
+    zarr.open(
+        str(tmp_path / 'ct' / '2'), mode='w', shape=ct.shape, chunks=(8, 8, 8),
+        dtype='|u1', compressor=None, fill_value=0, zarr_format=2,
+        dimension_separator='.',
+    )[:] = ct
+
+    masker = CtMasker(tmp_path / 'ct', '2', data.shape)
+    assert masker.ratio == (2, 2, 2)
+    out = pack_arrays([store], sidecar_path(store, '0'), label='masked',
+                      brick_shape=(8, 8, 8), ct_masker=masker)
+    verify_pool(out, 500)  # mask-aware: pool zeros are accepted iff CT == 0
+
+    pool = ResidentBrickPool(out, device='cpu', label='masked')
+    assert pool.meta['ct_mask']['ratio'] == [2, 2, 2]
+    # 64 bricks in the grid; only the 2x2x2 corner block survives
+    assert pool.resident_bricks == 8 + 1
+    inside = pool.gather(torch.tensor([[3, 3, 3]]))
+    outside = pool.gather(torch.tensor([[3, 3, 20], [25, 25, 25]]))
+    assert int(inside[0, 0]) == int(data[3, 3, 3])
+    assert outside[:, 0].tolist() == [0, 0]
 
 
 def test_sparse_sdt_sampling_matches_dense(tmp_path):
@@ -115,15 +117,7 @@ def test_sparse_sdt_sampling_matches_dense(tmp_path):
         np.clip(np.rint(np.abs(x - 35.0) - 2.0), -127, 127) + 128
     ).astype(np.uint8)
     data = np.broadcast_to(encoded, (6, 6, 70)).copy()
-    path = write_array(tmp_path / "sdt", data)
-    cache = BoundedSparseCudaCache(
-        source_paths=[path],
-        shape_zyx=data.shape,
-        budget_bytes=3 * CHUNK_VOXELS,
-        device="cpu",
-        label="test sdt",
-        tensorstore_cache_bytes=1 << 20,
-    )
+    pool = make_pool(tmp_path, [data], 'sdt')
     dense = {
         "backend": "dense_test",
         "kind": "sdt",
@@ -139,7 +133,7 @@ def test_sparse_sdt_sampling_matches_dense(tmp_path):
     sparse = {
         **dense,
         "backend": "sparse_cuda",
-        "store": SparseScalarStore(cache),
+        "store": SparseScalarStore(pool),
     }
     sparse.pop("volume")
     points_dense = (

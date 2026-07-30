@@ -139,7 +139,8 @@ z_begin, z_end = 4000, 17000
 voxel_size_um = 9.6
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 lasagna_scale = 4
-# Normals, grad magnitude, and SDT are served by bounded sparse CUDA LRU caches.
+# Normals, grad magnitude, and SDT are served by fully-resident sparse brick
+# pools loaded from pack_resident_pools.py sidecars next to the source zarrs.
 lasagna_storage_backend = 'sparse_cuda'
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
 _active_lasagna_store = None

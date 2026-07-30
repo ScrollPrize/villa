@@ -40,20 +40,25 @@ uv sync            # creates .venv from pyproject.toml
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e scripts/spiral`.
 
-### Sparse CUDA field cache
+### Resident sparse field pools
 
-Normals, gradient magnitude, and surf-SDT samples use a bounded 32³-chunk
-CUDA LRU backed directly by the source Zarr arrays. The default pool limits
-are 6 GiB for normals, 2 GiB for gradient magnitude, and 16 GiB for SDT;
-each is also capped to a fraction of currently free device memory. Override
-them with `FIT_SPIRAL_SPARSE_NORMAL_CACHE_GB`,
-`FIT_SPIRAL_SPARSE_GRAD_CACHE_GB`, and
-`FIT_SPIRAL_SPARSE_SDT_CACHE_GB`. `FIT_SPIRAL_TENSORSTORE_CACHE_GB`
-controls the host TensorStore cache (2 GiB per field by default).
+Normals, gradient magnitude, and surf-SDT samples are served by fully
+resident device brick pools. Each store's occupied bricks are packed once
+into a flat sidecar next to the source zarr by `pack_resident_pools.py`:
 
-A single gather's distinct chunks must fit its field pool. If it does not,
-the fitter reports the required working-set size and the corresponding
-environment variable instead of growing the cache or risking a CUDA OOM.
+```sh
+python pack_resident_pools.py /path/to/lasagna_inputs \
+    --ct /path/to/<scroll>_ds2.zarr --ct-group 2 --verify 2000
+```
+
+`--ct` zeroes every voxel whose CT voxel reads 0 (the mask region around the
+scroll) so those bricks drop out of the pool and sample as no-data. The
+fitter loads the sidecars restricted to the configured z-ROI in one
+sequential read per channel (for the full s1 ROI: ~33 GiB SDT + ~10 GiB
+normals); after that every gather is pure device indexing with no I/O and no
+eviction. A missing sidecar is a startup error naming the pack command.
+Set `FIT_SPIRAL_RESIDENT_BOUNDS_CHECK=1` to enable per-gather bounds
+assertions when debugging new sampling code.
 
 ### Internet flow (SSH attach)
 
