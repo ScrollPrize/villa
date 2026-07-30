@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
 #include <cstddef>
@@ -29,6 +30,9 @@ struct FiberTraceProfile {
     double predictionPrefetchSeconds = 0.0;
     double predictionAssignSeconds = 0.0;
     double predictionMaterializeSeconds = 0.0;
+    double predictionCornerSeconds = 0.0;
+    double predictionDecodeSeconds = 0.0;
+    double normalDecodeSeconds = 0.0;
     double normalBatchSeconds = 0.0;
     double normalPrefetchSeconds = 0.0;
     double normalMaterializeSeconds = 0.0;
@@ -69,8 +73,8 @@ struct FiberTraceProgress {
 };
 
 struct FiberPredictionSampleOption {
-    cv::Vec3d direction{0.0, 0.0, 0.0};
-    double presence = 0.0;
+    cv::Vec3f direction{0.0f, 0.0f, 0.0f};
+    float presence = 0.0f;
     bool valid = false;
 };
 
@@ -233,6 +237,20 @@ public:
         const std::vector<cv::Vec3d>& referenceDirections,
         int parallelThreads,
         std::vector<FiberPredictionSample>& samples,
+        FiberTraceProfile* profile) const;
+    void sampleBatch(
+        const std::vector<cv::Vec3f>& volumePoints,
+        const std::vector<cv::Vec3f>& referenceDirections,
+        int parallelThreads,
+        std::vector<FiberPredictionSample>& samples,
+        FiberTraceProfile* profile) const;
+    [[nodiscard]] bool sampleBatchWithNormals(
+        const vc::lasagna::LasagnaNormalSampler& normalSampler,
+        const std::vector<cv::Vec3f>& volumePoints,
+        const std::vector<cv::Vec3f>& referenceDirections,
+        int parallelThreads,
+        std::vector<FiberPredictionSample>& samples,
+        std::vector<vc::lasagna::LasagnaNormalSampler::FloatNormalSample>& normals,
         FiberTraceProfile* profile) const;
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,

@@ -446,6 +446,9 @@ int main(int argc, char** argv)
                   << " prediction_prefetch_s=" << profile.predictionPrefetchSeconds
                   << " prediction_assign_s=" << profile.predictionAssignSeconds
                   << " prediction_materialize_s=" << profile.predictionMaterializeSeconds
+                  << " prediction_corner_s=" << profile.predictionCornerSeconds
+                  << " prediction_decode_s=" << profile.predictionDecodeSeconds
+                  << " normal_decode_s=" << profile.normalDecodeSeconds
                   << " normal_batch_s=" << profile.normalBatchSeconds
                   << " normal_prefetch_s=" << profile.normalPrefetchSeconds
                   << " normal_materialize_s=" << profile.normalMaterializeSeconds

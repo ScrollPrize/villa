@@ -67,6 +67,21 @@
   reached-state selection, and trace output remain deterministic. `--threads 0`
   is the default and uses the OpenMP default thread count; `--threads 1` must
   force serial lazy candidate scoring.
+- Native precomputed Trace2CP persisted sampling must use one long-lived VC3D
+  decoded chunk cache per physical scalar Zarr volume. Each candidate batch
+  must fetch the ordered eight integer voxel corners through blocking
+  requested-level nearest-neighbor coordinate sampling, with dependencies
+  deduplicated and chunks pinned before candidate materialization. Scalar
+  channels are interpolated from those corners by the caller. Compact `nx/ny`
+  corners must be decoded as paired ambiguous axes and interpolated through the
+  weighted orientation tensor; independently interpolating encoded `nx` and
+  `ny` is not allowed.
+- Native fiber-trace internal geometry, direction, interpolation, beam, and
+  loss math may use float. Public persisted coordinates may remain double at
+  API boundaries. Candidate generation order, pruning tie order, and output
+  determinism remain required, and performance changes must report the
+  representative whole-fiber restart metric so numeric changes cannot silently
+  degrade trace quality.
 - Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2
   (factor 4 relative to selected input). It is converted to the runner's
   literal factor and does not read or reinterpret tracer config `scaledown`.

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <limits>
 #include <stdexcept>
@@ -101,6 +102,7 @@ enum class StrictSampleStatus {
 
 constexpr int kParallelMinPixels = 128 * 128;
 constexpr int kMaxRenderSamplerWorkers = 8;
+constexpr int kMaxCornerBatchWorkers = 64;
 
 int renderSamplerWorkerCount()
 {
@@ -120,6 +122,26 @@ utils::ThreadPool& renderSamplerPool()
     return *pool;
 #else
     static utils::ThreadPool pool(static_cast<std::size_t>(renderSamplerWorkerCount()));
+    return pool;
+#endif
+}
+
+int cornerBatchWorkerCount()
+{
+    const unsigned hc = std::thread::hardware_concurrency();
+    if (hc <= 2)
+        return 1;
+    return std::clamp(static_cast<int>(hc) - 2, 1, kMaxCornerBatchWorkers);
+}
+
+utils::ThreadPool& cornerBatchPool()
+{
+#if defined(_WIN32)
+    static auto* pool = new utils::ThreadPool(
+        static_cast<std::size_t>(cornerBatchWorkerCount()));
+    return *pool;
+#else
+    static utils::ThreadPool pool(static_cast<std::size_t>(cornerBatchWorkerCount()));
     return pool;
 #endif
 }
@@ -1494,6 +1516,349 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsLevelBlockingRequest
 {
     return sampleCoordsLevelBlockingRequestedLevelImpl(
         array, level, coords, out, coverage, options);
+}
+
+ChunkedPlaneSampler::Stats
+ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
+    const std::vector<IChunkedArray*>& arrays,
+    int level,
+    const std::vector<cv::Vec3f>& levelCoords,
+    std::vector<std::vector<std::array<uint8_t, 8>>>& values,
+    std::vector<cv::Vec3f>& fractionsXYZ,
+    std::vector<uint8_t>& valid,
+    int parallelThreads)
+{
+    Stats stats;
+    stats.requestedLevelOnly = true;
+    values.assign(
+        arrays.size(),
+        std::vector<std::array<uint8_t, 8>>(levelCoords.size()));
+    fractionsXYZ.assign(levelCoords.size(), {0.0f, 0.0f, 0.0f});
+    valid.assign(levelCoords.size(), uint8_t{0});
+    if (arrays.empty() || levelCoords.empty())
+        return stats;
+    if (arrays.front() == nullptr || level < 0 || level >= arrays.front()->numLevels())
+        throw std::invalid_argument("invalid requested-level corner batch source");
+
+    const LevelAccess firstAccess = makeLevelAccess(*arrays.front(), level);
+    if (!hasSampleableLevel(firstAccess))
+        throw std::invalid_argument("requested-level corner batch has an invalid grid");
+    std::vector<LevelAccess> accesses;
+    accesses.reserve(arrays.size());
+    for (IChunkedArray* array : arrays) {
+        if (array == nullptr || level >= array->numLevels() ||
+            array->shape(level) != firstAccess.shape ||
+            array->dtype() != ChunkDtype::UInt8) {
+            throw std::invalid_argument(
+                "requested-level corner batch arrays must share one uint8 shape");
+        }
+        LevelAccess access = makeLevelAccess(*array, level);
+        if (!hasSampleableLevel(access))
+            throw std::invalid_argument("requested-level corner batch has an invalid grid");
+        accesses.push_back(access);
+    }
+
+    struct VoxelCube {
+        int x0 = 0;
+        int y0 = 0;
+        int z0 = 0;
+        int x1 = 0;
+        int y1 = 0;
+        int z1 = 0;
+    };
+    constexpr uint32_t kNoBoundary = std::numeric_limits<uint32_t>::max();
+    struct PointCorners {
+        std::array<uint32_t, 8> byteOffset{};
+        uint32_t dependencyIndex = 0;
+        uint32_t boundaryIndex = std::numeric_limits<uint32_t>::max();
+
+        [[nodiscard]] bool singleDependency() const noexcept
+        {
+            return boundaryIndex == std::numeric_limits<uint32_t>::max();
+        }
+    };
+    std::vector<VoxelCube> voxelCubes(levelCoords.size());
+    for (size_t pointIndex = 0; pointIndex < levelCoords.size(); ++pointIndex) {
+        const cv::Vec3f point = levelCoords[pointIndex];
+        if (!finiteCoord(point) ||
+            !inLevelBounds(firstAccess.shape, point[2], point[1], point[0])) {
+            continue;
+        }
+        VoxelCube& cube = voxelCubes[pointIndex];
+        cube.x0 = static_cast<int>(std::floor(point[0]));
+        cube.y0 = static_cast<int>(std::floor(point[1]));
+        cube.z0 = static_cast<int>(std::floor(point[2]));
+        cube.x1 = std::min(cube.x0 + 1, firstAccess.shape[2] - 1);
+        cube.y1 = std::min(cube.y0 + 1, firstAccess.shape[1] - 1);
+        cube.z1 = std::min(cube.z0 + 1, firstAccess.shape[0] - 1);
+        fractionsXYZ[pointIndex] = {
+            point[0] - static_cast<float>(cube.x0),
+            point[1] - static_cast<float>(cube.y0),
+            point[2] - static_cast<float>(cube.z0)};
+        valid[pointIndex] = 1;
+    }
+
+    struct CornerLayout {
+        std::array<int, 3> chunkShape{};
+        std::vector<PointCorners> points;
+        std::vector<ChunkKey> dependencies;
+        std::vector<std::array<uint32_t, 8>> boundaryDependencies;
+        std::vector<size_t> volumes;
+    };
+    std::vector<CornerLayout> layouts;
+    std::vector<size_t> volumeLayout(arrays.size(), 0);
+    for (size_t volumeIndex = 0; volumeIndex < arrays.size(); ++volumeIndex) {
+        const auto chunkShape = accesses[volumeIndex].chunkShape;
+        auto it = std::find_if(
+            layouts.begin(), layouts.end(),
+            [&](const CornerLayout& layout) { return layout.chunkShape == chunkShape; });
+        if (it == layouts.end()) {
+            layouts.push_back({chunkShape, {}, {}, {}, {volumeIndex}});
+            volumeLayout[volumeIndex] = layouts.size() - 1;
+        } else {
+            volumeLayout[volumeIndex] =
+                static_cast<size_t>(std::distance(layouts.begin(), it));
+            it->volumes.push_back(volumeIndex);
+        }
+    }
+
+    for (auto& layout : layouts) {
+        layout.points.resize(levelCoords.size());
+        layout.dependencies.reserve(levelCoords.size());
+        std::unordered_map<ChunkKey, size_t, ChunkKeyHash> dependencyIndices;
+        dependencyIndices.reserve(levelCoords.size());
+        ChunkKey currentKey{};
+        size_t currentDependencyIndex = 0;
+        std::array<int, 3> currentBegin{};
+        std::array<int, 3> currentEnd{};
+        bool haveCurrentChunk = false;
+        const auto resolveDependency = [&](const ChunkKey& key) {
+            const auto [it, inserted] = dependencyIndices.try_emplace(
+                key, layout.dependencies.size());
+            if (inserted)
+                layout.dependencies.push_back(key);
+            return it->second;
+        };
+        for (size_t pointIndex = 0; pointIndex < voxelCubes.size(); ++pointIndex) {
+            if (valid[pointIndex] == 0)
+                continue;
+            const VoxelCube& cube = voxelCubes[pointIndex];
+            const bool withinCurrentChunk =
+                haveCurrentChunk &&
+                cube.x0 >= currentBegin[2] && cube.x1 < currentEnd[2] &&
+                cube.y0 >= currentBegin[1] && cube.y1 < currentEnd[1] &&
+                cube.z0 >= currentBegin[0] && cube.z1 < currentEnd[0];
+            if (!withinCurrentChunk) {
+                currentKey = {
+                    level,
+                    cube.z0 / layout.chunkShape[0],
+                    cube.y0 / layout.chunkShape[1],
+                    cube.x0 / layout.chunkShape[2]};
+                currentDependencyIndex = resolveDependency(currentKey);
+                currentBegin = {
+                    currentKey.iz * layout.chunkShape[0],
+                    currentKey.iy * layout.chunkShape[1],
+                    currentKey.ix * layout.chunkShape[2]};
+                currentEnd = {
+                    currentBegin[0] + layout.chunkShape[0],
+                    currentBegin[1] + layout.chunkShape[1],
+                    currentBegin[2] + layout.chunkShape[2]};
+                haveCurrentChunk = true;
+            }
+            PointCorners& point = layout.points[pointIndex];
+            const bool singleDependency =
+                cube.x1 < currentEnd[2] &&
+                cube.y1 < currentEnd[1] &&
+                cube.z1 < currentEnd[0];
+            if (currentDependencyIndex >
+                static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                throw std::overflow_error(
+                    "corner batch has too many chunk dependencies");
+            }
+            point.dependencyIndex = static_cast<uint32_t>(currentDependencyIndex);
+            std::array<uint32_t, 8>* boundaryDependencies = nullptr;
+            if (!singleDependency) {
+                if (layout.boundaryDependencies.size() >=
+                    static_cast<size_t>(kNoBoundary)) {
+                    throw std::overflow_error(
+                        "corner batch has too many boundary points");
+                }
+                point.boundaryIndex = static_cast<uint32_t>(
+                    layout.boundaryDependencies.size());
+                layout.boundaryDependencies.emplace_back();
+                boundaryDependencies = &layout.boundaryDependencies.back();
+            }
+            size_t corner = 0;
+            for (int dz = 0; dz <= 1; ++dz) {
+                const int z = dz == 0 ? cube.z0 : cube.z1;
+                for (int dy = 0; dy <= 1; ++dy) {
+                    const int y = dy == 0 ? cube.y0 : cube.y1;
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int x = dx == 0 ? cube.x0 : cube.x1;
+                        const ChunkKey key = singleDependency
+                            ? currentKey
+                            : ChunkKey{
+                                  level,
+                                  currentKey.iz + (z >= currentEnd[0] ? 1 : 0),
+                                  currentKey.iy + (y >= currentEnd[1] ? 1 : 0),
+                                  currentKey.ix + (x >= currentEnd[2] ? 1 : 0)};
+                        const size_t dependencyIndex = singleDependency
+                            ? currentDependencyIndex
+                            : resolveDependency(key);
+                        if (dependencyIndex >
+                            static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                            throw std::overflow_error(
+                                "corner batch has too many chunk dependencies");
+                        }
+                        if (boundaryDependencies != nullptr) {
+                            (*boundaryDependencies)[corner] =
+                                static_cast<uint32_t>(dependencyIndex);
+                        }
+                        const int lz = z - key.iz * layout.chunkShape[0];
+                        const int ly = y - key.iy * layout.chunkShape[1];
+                        const int lx = x - key.ix * layout.chunkShape[2];
+                        const size_t byteOffset =
+                            (static_cast<size_t>(lz) *
+                                 static_cast<size_t>(layout.chunkShape[1]) +
+                             static_cast<size_t>(ly)) *
+                                static_cast<size_t>(layout.chunkShape[2]) +
+                            static_cast<size_t>(lx);
+                        if (byteOffset >
+                            static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                            throw std::overflow_error(
+                                "corner batch chunk exceeds uint32 byte offsets");
+                        }
+                        point.byteOffset[corner] = static_cast<uint32_t>(byteOffset);
+                        ++corner;
+                    }
+                }
+            }
+        }
+    }
+
+    for (size_t volumeIndex = 0; volumeIndex < arrays.size(); ++volumeIndex) {
+        const auto& dependencies = layouts[volumeLayout[volumeIndex]].dependencies;
+        stats.requestedChunks += static_cast<int>(dependencies.size());
+        if (!dependencies.empty())
+            arrays[volumeIndex]->prefetchChunks(dependencies, false);
+    }
+
+    struct PinnedVolume {
+        std::vector<ChunkResult> chunks;
+        std::vector<const std::byte*> data;
+        std::vector<size_t> size;
+    };
+    std::vector<PinnedVolume> pinned(arrays.size());
+    for (size_t volumeIndex = 0; volumeIndex < pinned.size(); ++volumeIndex) {
+        auto& volume = pinned[volumeIndex];
+        const size_t dependencyCount =
+            layouts[volumeLayout[volumeIndex]].dependencies.size();
+        volume.chunks.resize(dependencyCount);
+        volume.data.resize(dependencyCount, nullptr);
+        volume.size.resize(dependencyCount, 0);
+    }
+    size_t volumeIndex = 0;
+    for (IChunkedArray* array : arrays) {
+        const auto& dependencies = layouts[volumeLayout[volumeIndex]].dependencies;
+        for (size_t dependencyIndex = 0;
+             dependencyIndex < dependencies.size();
+             ++dependencyIndex) {
+            const ChunkKey& key = dependencies[dependencyIndex];
+            ChunkResult result = array->getChunkBlocking(
+                key.level, key.iz, key.iy, key.ix);
+            if (result.status == ChunkStatus::Error) {
+                ++stats.errorChunks;
+                throw std::runtime_error(
+                    result.error.empty() ? "corner batch chunk fetch failed" : result.error);
+            }
+            if (result.status == ChunkStatus::MissQueued) {
+                ++stats.errorChunks;
+                throw std::runtime_error(
+                    "corner batch received unresolved chunk after blocking fetch");
+            }
+            if (result.status == ChunkStatus::Missing)
+                ++stats.missingChunks;
+            pinned[volumeIndex].chunks[dependencyIndex] = std::move(result);
+            const auto& stored = pinned[volumeIndex].chunks[dependencyIndex];
+            if (stored.status == ChunkStatus::Data && stored.bytes) {
+                pinned[volumeIndex].data[dependencyIndex] = stored.bytes->data();
+                pinned[volumeIndex].size[dependencyIndex] = stored.bytes->size();
+            }
+        }
+        ++volumeIndex;
+    }
+
+    const size_t requestedWorkers = parallelThreads > 0
+        ? static_cast<size_t>(parallelThreads)
+        : cornerBatchPool().worker_count();
+    const size_t workerCount = std::min({
+        cornerBatchPool().worker_count(), requestedWorkers, levelCoords.size()});
+    const size_t pointsPerWorker =
+        (levelCoords.size() + workerCount - 1) / workerCount;
+    std::vector<std::future<void>> sampleFutures;
+    sampleFutures.reserve(layouts.size() * workerCount);
+    for (size_t layoutIndex = 0; layoutIndex < layouts.size(); ++layoutIndex) {
+        for (size_t worker = 0; worker < workerCount; ++worker) {
+            const size_t begin = worker * pointsPerWorker;
+            const size_t end = std::min(begin + pointsPerWorker, levelCoords.size());
+            if (begin >= end)
+                break;
+            sampleFutures.push_back(cornerBatchPool().submit(
+                [&, layoutIndex, begin, end] {
+        const CornerLayout& layout = layouts[layoutIndex];
+        for (size_t pointIndex = begin; pointIndex < end; ++pointIndex) {
+            if (valid[pointIndex] == 0)
+                continue;
+            const PointCorners& point = layout.points[pointIndex];
+            for (const size_t volumeIndex : layout.volumes) {
+                const PinnedVolume& volume = pinned[volumeIndex];
+                const uint8_t fill = accesses[volumeIndex].fill;
+                if (point.singleDependency()) {
+                    const size_t dependencyIndex = point.dependencyIndex;
+                    const std::byte* data = volume.data[dependencyIndex];
+                    if (data == nullptr) {
+                        values[volumeIndex][pointIndex].fill(fill);
+                        continue;
+                    }
+                    for (size_t corner = 0; corner < 8; ++corner) {
+                        if (point.byteOffset[corner] >= volume.size[dependencyIndex]) {
+                            throw std::runtime_error(
+                                "corner batch decoded chunk has invalid byte extent");
+                        }
+                        values[volumeIndex][pointIndex][corner] =
+                            std::to_integer<uint8_t>(data[point.byteOffset[corner]]);
+                    }
+                    continue;
+                }
+                const auto& boundaryDependencies =
+                    layout.boundaryDependencies[point.boundaryIndex];
+                for (size_t corner = 0; corner < 8; ++corner) {
+                    uint8_t value = fill;
+                    const size_t dependencyIndex = boundaryDependencies[corner];
+                    const std::byte* data = volume.data[dependencyIndex];
+                    if (data != nullptr) {
+                        if (point.byteOffset[corner] >= volume.size[dependencyIndex]) {
+                            throw std::runtime_error(
+                                "corner batch decoded chunk has invalid byte extent");
+                        }
+                        value = std::to_integer<uint8_t>(
+                            data[point.byteOffset[corner]]);
+                    }
+                    values[volumeIndex][pointIndex][corner] = value;
+                }
+            }
+        }
+                }));
+        }
+    }
+    for (auto& future : sampleFutures)
+        future.get();
+    const size_t validPoints = static_cast<size_t>(
+        std::count(valid.begin(), valid.end(), uint8_t{1}));
+    const size_t covered = validPoints * arrays.size() * 8;
+    stats.coveredPixels = static_cast<int>(std::min<size_t>(
+        covered, static_cast<size_t>(std::numeric_limits<int>::max())));
+    return stats;
 }
 
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneFineToCoarse(

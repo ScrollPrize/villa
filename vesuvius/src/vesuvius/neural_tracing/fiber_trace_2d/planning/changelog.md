@@ -1,5 +1,13 @@
 # 2026-07-30
 
+- Added shared requested-level VC3D eight-corner batch sampling for native
+  fiber prediction and Lasagna normal volumes, including mixed physical chunk
+  grids, one decoded cache per physical scalar volume, boundary-aware retained
+  chunk lookup, and caller-side orientation-tensor normal interpolation.
+- Converted native fiber tracing's internal geometry and candidate math to
+  float while retaining double persisted/public coordinate boundaries. The
+  representative quality check currently regresses from 5 to 8 restarts and
+  remains an open acceptance issue.
 - Reduced native `vc_fiber_trace_metric` warm-cache runtime on the remote
   fiber manifest workload from roughly 314s to roughly 86s with profiled
   direct chunk-resolution sampling, bounded deterministic beam pruning, and

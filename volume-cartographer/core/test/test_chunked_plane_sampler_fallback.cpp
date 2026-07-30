@@ -6,6 +6,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -22,10 +23,15 @@ public:
                         vc::render::ChunkStatus level1Status,
                         uint8_t level1Value,
                         std::array<int, 3> level0Shape = {4, 4, 4},
-                        std::array<int, 3> level1Shape = {2, 2, 2})
+                        std::array<int, 3> level1Shape = {2, 2, 2},
+                        std::array<int, 3> level0ChunkShape = {0, 0, 0},
+                        std::array<int, 3> level1ChunkShape = {0, 0, 0})
         : statuses_{level0Status, level1Status}
         , values_{level0Value, level1Value}
         , shapes_{level0Shape, level1Shape}
+        , chunkShapes_{
+              level0ChunkShape[0] > 0 ? level0ChunkShape : level0Shape,
+              level1ChunkShape[0] > 0 ? level1ChunkShape : level1Shape}
     {
     }
 
@@ -38,7 +44,7 @@ public:
 
     std::array<int, 3> chunkShape(int level) const override
     {
-        return shape(level);
+        return chunkShapes_[level];
     }
 
     vc::render::ChunkDtype dtype() const override
@@ -87,7 +93,7 @@ private:
         result.status = statuses_[level];
         result.shape = shape(level);
         if (result.status == vc::render::ChunkStatus::Data) {
-            const auto dims = shape(level);
+            const auto dims = chunkShape(level);
             auto bytes = std::make_shared<std::vector<std::byte>>(
                 std::size_t(dims[0]) * std::size_t(dims[1]) * std::size_t(dims[2]),
                 std::byte{values_[level]});
@@ -115,6 +121,7 @@ private:
     std::array<vc::render::ChunkStatus, 2> statuses_;
     std::array<uint8_t, 2> values_;
     std::array<std::array<int, 3>, 2> shapes_;
+    std::array<std::array<int, 3>, 2> chunkShapes_;
 };
 
 cv::Mat_<cv::Vec3f> singleCoord(const cv::Vec3f& coord)
@@ -305,6 +312,62 @@ TEST_CASE("ChunkedPlaneSampler blocking requested-level rejects unresolved chunk
             array, 0, singleCoord({1.0f, 1.0f, 1.0f}), out, coverage,
             {vc::Sampling::Nearest, 1}),
         std::runtime_error);
+}
+
+TEST_CASE("ChunkedPlaneSampler grouped corner batch shares geometry across arrays")
+{
+    PyramidChunkedArray first(vc::render::ChunkStatus::Data, 17,
+                              vc::render::ChunkStatus::Data, 0);
+    PyramidChunkedArray second(vc::render::ChunkStatus::Data, 93,
+                               vc::render::ChunkStatus::Data, 0);
+    std::vector<vc::render::IChunkedArray*> arrays{&first, &second};
+    std::vector<std::vector<std::array<uint8_t, 8>>> values;
+    std::vector<cv::Vec3f> fractions;
+    std::vector<uint8_t> valid;
+
+    const auto stats =
+        vc::render::ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
+            arrays, 0, {{1.25f, 1.5f, 1.75f}}, values, fractions, valid);
+
+    REQUIRE(values.size() == 2);
+    REQUIRE(values[0].size() == 1);
+    CHECK(std::all_of(values[0][0].begin(), values[0][0].end(),
+                      [](uint8_t value) { return value == 17; }));
+    CHECK(std::all_of(values[1][0].begin(), values[1][0].end(),
+                      [](uint8_t value) { return value == 93; }));
+    REQUIRE(fractions.size() == 1);
+    CHECK(fractions[0][0] == doctest::Approx(0.25f));
+    CHECK(fractions[0][1] == doctest::Approx(0.5f));
+    CHECK(fractions[0][2] == doctest::Approx(0.75f));
+    CHECK(valid == std::vector<uint8_t>{1});
+    CHECK(stats.requestedChunks == 2);
+}
+
+TEST_CASE("ChunkedPlaneSampler grouped corner batch supports mixed chunk grids")
+{
+    PyramidChunkedArray coarseChunks(
+        vc::render::ChunkStatus::Data, 17,
+        vc::render::ChunkStatus::Data, 0,
+        {4, 4, 4}, {2, 2, 2}, {4, 4, 4});
+    PyramidChunkedArray fineChunks(
+        vc::render::ChunkStatus::Data, 93,
+        vc::render::ChunkStatus::Data, 0,
+        {4, 4, 4}, {2, 2, 2}, {2, 2, 2});
+    std::vector<vc::render::IChunkedArray*> arrays{&coarseChunks, &fineChunks};
+    std::vector<std::vector<std::array<uint8_t, 8>>> values;
+    std::vector<cv::Vec3f> fractions;
+    std::vector<uint8_t> valid;
+
+    const auto stats =
+        vc::render::ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
+            arrays, 0, {{0.25f, 0.5f, 0.75f}}, values, fractions, valid);
+
+    CHECK(valid == std::vector<uint8_t>{1});
+    CHECK(std::all_of(values[0][0].begin(), values[0][0].end(),
+                      [](uint8_t value) { return value == 17; }));
+    CHECK(std::all_of(values[1][0].begin(), values[1][0].end(),
+                      [](uint8_t value) { return value == 93; }));
+    CHECK(stats.requestedChunks == 2);
 }
 
 TEST_CASE("ChunkedPlaneSampler can use fallback without queueing or promoting it")

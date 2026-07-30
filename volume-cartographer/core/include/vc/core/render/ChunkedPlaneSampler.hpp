@@ -5,7 +5,9 @@
 
 #include <opencv2/core/mat.hpp>
 
+#include <array>
 #include <cstdint>
+#include <vector>
 
 namespace vc::render {
 
@@ -106,6 +108,21 @@ public:
                                                          cv::Mat_<uint8_t>& out,
                                                          cv::Mat_<uint8_t>& coverage,
                                                          const Options& options = Options());
+
+    // Batch primitive for callers that need to interpolate structured values
+    // themselves. Input coordinates are XYZ voxel coordinates in the requested
+    // level (not logical level-0 coordinates). Geometry/dependencies are built
+    // once, every array must have the same requested-level shape and may use
+    // its own chunk grid. One dependency layout is reused per distinct chunk
+    // shape. values[volume][point] contains corners in dz/dy/dx order.
+    static Stats sampleTrilinearCornersLevelBlockingRequestedLevel(
+        const std::vector<IChunkedArray*>& arrays,
+        int level,
+        const std::vector<cv::Vec3f>& levelCoords,
+        std::vector<std::vector<std::array<uint8_t, 8>>>& values,
+        std::vector<cv::Vec3f>& fractionsXYZ,
+        std::vector<uint8_t>& valid,
+        int parallelThreads = 0);
 
     // Fine-to-coarse fallback. Finer covered pixels are never overwritten by
     // coarser levels.
