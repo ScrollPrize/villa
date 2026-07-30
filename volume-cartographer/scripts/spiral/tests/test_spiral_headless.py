@@ -241,7 +241,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(
             session._run_config["optimizer_num_training_steps"], 30_250)
 
-    def test_interactive_run_extends_horizon_even_when_target_is_within_it(self):
+    def test_interactive_run_preserves_horizon_when_target_is_within_it(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
         session._state = "Ready"
@@ -257,6 +257,48 @@ class ProtocolTests(unittest.TestCase):
 
         session.run(250)
 
+        self.assertEqual(session._idle_actions, [])
+        self.assertEqual(
+            session._run_config["optimizer_num_training_steps"], 30_000)
+
+    def test_interactive_run_preserves_horizon_when_target_equals_it(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Ready"
+        session._completed = 29_750
+        session._pending = 0
+        session._target = 29_750
+        session._configure_run = lambda *_: None
+        session._idle_actions = []
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000,
+        }
+        session._run_config = dict(session.requested_config)
+
+        target = session.run(250)
+
+        self.assertEqual(target, 30_000)
+        self.assertEqual(session._idle_actions, [])
+        self.assertEqual(
+            session._run_config["optimizer_num_training_steps"], 30_000)
+
+    def test_interactive_run_extends_horizon_by_run_count_when_crossed(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Ready"
+        session._completed = 29_751
+        session._pending = 0
+        session._target = 29_751
+        session._configure_run = lambda *_: None
+        session._idle_actions = []
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000,
+        }
+        session._run_config = dict(session.requested_config)
+
+        target = session.run(250)
+
+        self.assertEqual(target, 30_001)
         self.assertEqual(session._idle_actions[0][0], "configure")
         self.assertEqual(
             session._idle_actions[0][1]["optimizer_num_training_steps"],
