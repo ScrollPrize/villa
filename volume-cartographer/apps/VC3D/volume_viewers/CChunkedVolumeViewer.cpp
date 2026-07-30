@@ -1601,11 +1601,17 @@ void CChunkedVolumeViewer::updateScalebarScale()
     // zarr level is sampled, not the physical size of the view.
     if (!_view || !_volume)
         return;
-    double voxel = _volume->voxelSize();
-    if (!(voxel > 0.0) || !(_scale > 0.0f))
+    if (!(_scale > 0.0f))
         return;
-    const double umPerScenePx = voxel / static_cast<double>(_scale);
-    _view->setVoxelSize(umPerScenePx, umPerScenePx);
+    // No positive voxel size in the volume metadata: fall back to voxel units so
+    // the bar still tracks zoom (an early return here would freeze the scalebar
+    // at the view's default µm/px forever).
+    double voxel = _volume->voxelSize();
+    const bool physical = voxel > 0.0;
+    if (!physical)
+        voxel = 1.0;
+    const double unitsPerScenePx = voxel / static_cast<double>(_scale);
+    _view->setVoxelSize(unitsPerScenePx, unitsPerScenePx, physical);
 }
 
 void CChunkedVolumeViewer::resizeFramebuffer()
