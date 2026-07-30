@@ -264,9 +264,10 @@ class _RK4SparseFlowIntegrate(torch.autograd.Function):
 
 class CartesianFlowField(nn.Module):
 
-    def __init__(self, resolution, spatial_scale_factor=6, lr_scale_factor=1.e-1, num_flow_timesteps=1):
+    def __init__(self, resolution, spatial_scale_factor=6, lr_scale_factor=1.e-1, num_flow_timesteps=1, direct_lr=False):
         super().__init__()
         self.num_flow_timesteps = num_flow_timesteps
+        self.direct_lr = direct_lr
         self.flow_scales = [1., lr_scale_factor]
         self.flows = nn.ParameterList([
             nn.Parameter(torch.zeros([num_flow_timesteps, 3, *shape]))
@@ -348,7 +349,7 @@ class CartesianFlowField(nn.Module):
         # integration as one autograd node (see _RK4SparseFlowIntegrate). Only
         # valid for num_flow_timesteps == 1.
         assert self.num_flow_timesteps == 1
-        if (flow_triton.direct_lr_enabled()
+        if (flow_triton.direct_lr_enabled(self.direct_lr)
                 and flow_triton.rk4_triton_available(self.flows[0], self.flows[1])):
             return self._get_direct_integrator()
         low_field, high_field, high_scale, acc = self._prepare_time_invariant_fields()
@@ -477,9 +478,11 @@ class CylindricalFlowField(nn.Module):
     # Note: near r=0 the cylindrical basis is degenerate; ring 0 holds a single cell that is
     # pinned to zero.
 
-    def __init__(self, resolution, spatial_scale_factor=6, lr_scale_factor=1.e-1, num_flow_timesteps=1):
+    def __init__(self, resolution, spatial_scale_factor=6, lr_scale_factor=1.e-1, num_flow_timesteps=1, direct_lr=False):
         # resolution is interpreted as the equivalent cartesian (Z, Y, X) voxel shape; the
-        # cylindrical lattice sizes are derived from it.
+        # cylindrical lattice sizes are derived from it. direct_lr is accepted for
+        # constructor parity with CartesianFlowField and ignored: the ragged
+        # cylindrical lattice is always sampled directly (never upsampled).
         super().__init__()
         self.num_flow_timesteps = num_flow_timesteps
         Z, Y, X = (int(s) for s in resolution)

@@ -467,6 +467,7 @@ class SpiralAndTransform(nn.Module):
                 flow_resolution,
                 lr_scale_factor=config['model_flow_field_high_res_lr_scale_initial'],
                 num_flow_timesteps=config['model_num_flow_timesteps'],
+                direct_lr=config.get('model_flow_field_direct_lr', False),
             )
 
         # num_flow_stages: number of independent stationary flow fields whose integrated
