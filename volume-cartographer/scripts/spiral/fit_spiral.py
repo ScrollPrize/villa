@@ -521,6 +521,34 @@ def get_exponential_lr_at_step(
     return float(initial_lr) * gamma ** completed
 
 
+def get_flow_field_high_res_lr_scale(iteration):
+    """Relative optimizer LR for the high-resolution flow lattices."""
+    initial = cfg['model_flow_field_high_res_lr_scale_initial']
+    final = cfg['model_flow_field_high_res_lr_scale_final']
+    start_step = cfg['model_flow_field_high_res_lr_ramp_start_step']
+    ramp_steps = max(
+        1, int(cfg['model_flow_field_high_res_lr_ramp_steps']))
+    fraction = min(
+        1., max(0., (int(iteration) - int(start_step)) / ramp_steps))
+    return min(1., float(initial) + fraction * (float(final) - float(initial)))
+
+
+def set_optimizer_group_lr_scale(
+        optimiser, lr_scheduler, *, group, reference_group, scale,
+        initial_lr):
+    """Set one parameter group's LR relative to another optimizer group."""
+    scale = float(scale)
+    group_index = next(
+        index for index, candidate in enumerate(optimiser.param_groups)
+        if candidate is group)
+    group['lr_scale'] = scale
+    group['initial_lr'] = float(initial_lr) * scale
+    group['lr'] = float(reference_group['lr']) * scale
+    lr_scheduler.base_lrs[group_index] = group['initial_lr']
+    if len(lr_scheduler._last_lr) == len(optimiser.param_groups):
+        lr_scheduler._last_lr[group_index] = group['lr']
+
+
 def realign_optimizer_lr_schedule(
         optimiser, lr_scheduler, *, initial_lr, final_factor,
         completed_steps, training_horizon, exponential):
@@ -544,8 +572,12 @@ def realign_optimizer_lr_schedule(
                 optimiser, lambda step: 1.)
         aligned_lr = initial_lr
 
-    base_lrs = [initial_lr] * len(optimiser.param_groups)
-    aligned_lrs = [aligned_lr] * len(optimiser.param_groups)
+    lr_scales = [
+        float(group.get('lr_scale', 1.))
+        for group in optimiser.param_groups
+    ]
+    base_lrs = [initial_lr * scale for scale in lr_scales]
+    aligned_lrs = [aligned_lr * scale for scale in lr_scales]
     for group, base_lr, current_lr in zip(
             optimiser.param_groups, base_lrs, aligned_lrs):
         group['initial_lr'] = base_lr
@@ -1621,18 +1653,38 @@ def main(
     # Optimizer and checkpoint helpers
     # ==========================================================================
 
-    # All flow stages' parameters go into the flow param group (stage 0 == .flow_field,
-    # plus any extra_flow_fields when num_flow_stages > 1).
-    flow_field_params = [p for flow_field in spiral_and_transform.flow_fields for p in flow_field.parameters()]
+    # Keep every stage's low- and high-resolution lattices in distinct groups
+    # so the HR learning-rate scale is an optimizer setting, not a multiplier
+    # in the model's forward path.
+    low_res_flow_params = [
+        flow_field.flows[0]
+        for flow_field in spiral_and_transform.flow_fields
+    ]
+    high_res_flow_params = [
+        flow_field.flows[1]
+        for flow_field in spiral_and_transform.flow_fields
+    ]
+    flow_field_params = low_res_flow_params + high_res_flow_params
     gap_expander_params = list(spiral_and_transform.gap_expander_params.parameters())
     linear_params = [spiral_and_transform.linear_logits]
     grouped_ids = {id(p) for p in flow_field_params + gap_expander_params + linear_params}
     other_params = [p for p in spiral_and_transform.parameters() if id(p) not in grouped_ids]
+    initial_high_res_lr_scale = get_flow_field_high_res_lr_scale(0)
     param_groups = [
         {'params': other_params, 'weight_decay': 0.0},
         {'params': linear_params, 'weight_decay': 0.0},
         {'params': gap_expander_params, 'weight_decay': cfg['optimizer_weight_decay_gap_expander']},
-        {'params': flow_field_params, 'weight_decay': cfg['optimizer_weight_decay_flow_field']},
+        {
+            'params': low_res_flow_params,
+            'weight_decay': cfg['optimizer_weight_decay_flow_field'],
+            'lr_scale': 1.,
+        },
+        {
+            'params': high_res_flow_params,
+            'weight_decay': cfg['optimizer_weight_decay_flow_field'],
+            'lr': cfg['optimizer_learning_rate'] * initial_high_res_lr_scale,
+            'lr_scale': initial_high_res_lr_scale,
+        },
     ]
     progress.begin('loading', 'Creating optimizer')
     optimiser = torch.optim.AdamW(param_groups, lr=cfg.optimizer_learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
@@ -1646,6 +1698,24 @@ def main(
         lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimiser, gamma=gamma)
     else:
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lambda step: 1.)
+
+    def apply_high_res_lr_scale(iteration):
+        scale = get_flow_field_high_res_lr_scale(iteration)
+        low_res_group = next(
+            group for group in optimiser.param_groups
+            if any(param is low_res_flow_params[0] for param in group['params']))
+        high_res_group = next(
+            group for group in optimiser.param_groups
+            if any(param is high_res_flow_params[0] for param in group['params']))
+        set_optimizer_group_lr_scale(
+            optimiser,
+            lr_scheduler,
+            group=high_res_group,
+            reference_group=low_res_group,
+            scale=scale,
+            initial_lr=cfg['optimizer_learning_rate'],
+        )
+        return scale
 
     def realign_lr_schedule(completed_steps):
         """Align optimizer/scheduler state to the current absolute horizon."""
@@ -2539,6 +2609,7 @@ def main(
         if interactive_driver is not None and not interactive_driver.wait_for_iteration(iteration):
             break
         step_timer.start('fwd')
+        flow_field_high_res_lr_scale = apply_high_res_lr_scale(iteration)
 
         # The tiny graph paths shared by every transform evaluation this
         # iteration (dr softplus, scaled linear logits, pinned gap logits) are
@@ -2556,7 +2627,9 @@ def main(
         dr_per_winding = shared_transform_leaves[0]
 
         losses = {}
-        log_metrics = {}
+        log_metrics = {
+            'flow_field_high_res_lr_scale': flow_field_high_res_lr_scale,
+        }
 
         def backward_family(weighted_losses):
             """Accumulate one loss family's gradients, then release its graph."""
