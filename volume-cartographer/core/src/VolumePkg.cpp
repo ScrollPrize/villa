@@ -155,6 +155,15 @@ constexpr const char* kDirectRemoteZarrRequired =
     "remote Zarr volume locations must point directly to a .zarr root; "
     "collection listing is not supported";
 
+constexpr std::string_view kLasagnaDerivedPrefix = "vc-lasagna-derived:";
+
+bool hasLasagnaDerivedTag(const std::vector<std::string>& tags)
+{
+    return std::any_of(tags.begin(), tags.end(), [](const auto& tag) {
+        return tag.rfind(kLasagnaDerivedPrefix, 0) == 0;
+    });
+}
+
 std::string validateRemoteVolumeLocation(
     const std::string& location,
     bool requireDirectZarr)
@@ -1232,16 +1241,14 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
     std::set<std::string> incomingLocations;
     std::set<std::string> incomingIds;
     for (const auto& prepared : preparedVolumes) {
-        if (prepared.location.empty() || !prepared.volume || !hasTag(prepared.tags, "vc-lasagna-derived")) {
+        const std::string provenanceTag =
+            std::string(kLasagnaDerivedPrefix) + manifestLocation;
+        if (prepared.location.empty() || !prepared.volume ||
+            !hasTag(prepared.tags, provenanceTag)) {
             throw std::invalid_argument("prepared Lasagna volumes require a derived location, volume, and provenance tag");
         }
         if (!incomingLocations.insert(prepared.location).second || !incomingIds.insert(prepared.volume->id()).second) {
             throw std::invalid_argument("prepared Lasagna volumes contain duplicate identities");
-        }
-        for (const auto& tag : prepared.tags) {
-            if (tag.rfind("vc-lasagna-manifest:", 0) == 0 && std::find(manifestTags.begin(), manifestTags.end(), tag) == manifestTags.end()) {
-                manifestTags.push_back(tag);
-            }
         }
         if (loadedVolumes_.count(prepared.volume->id()) > 0 &&
             std::none_of(volumes_.begin(), volumes_.end(), [&](const auto& entry) { return entry.location == prepared.location; })) {
@@ -1299,57 +1306,37 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
             }
         }
 
-        std::vector<std::string> manifestIdentityTags;
-        std::copy_if(manifestTags.begin(), manifestTags.end(), std::back_inserter(manifestIdentityTags), [](const auto& tag) {
-            return tag.rfind("vc-lasagna-manifest:", 0) == 0;
-        });
-        auto referencesManifest = [&](const std::vector<std::string>& tags) {
-            return std::any_of(manifestIdentityTags.begin(), manifestIdentityTags.end(), [&](const auto& identity) {
-                return hasTag(tags, identity);
-            });
+        const std::string provenanceTag =
+            std::string(kLasagnaDerivedPrefix) + manifestLocation;
+        auto eraseProvenance = [&](std::vector<std::string>& tags) {
+            const auto oldSize = tags.size();
+            tags.erase(std::remove(tags.begin(), tags.end(), provenanceTag),
+                       tags.end());
+            return tags.size() != oldSize;
         };
-        auto eraseManifestReferences = [&](std::vector<std::string>& tags) {
-            tags.erase(
-                std::remove_if(
-                    tags.begin(),
-                    tags.end(),
-                    [&](const auto& tag) {
-                        return std::find(manifestIdentityTags.begin(), manifestIdentityTags.end(), tag) != manifestIdentityTags.end();
-                    }),
-                tags.end());
-        };
-        if (!manifestIdentityTags.empty()) {
-            for (auto entry = volumes_.begin(); entry != volumes_.end();) {
-                if (!hasTag(entry->tags, "vc-lasagna-derived") || !referencesManifest(entry->tags) || incomingLocations.contains(entry->location)) {
-                    ++entry;
-                    continue;
-                }
-                eraseManifestReferences(entry->tags);
-                const bool stillDerived = std::any_of(entry->tags.begin(), entry->tags.end(), [](const auto& tag) {
-                    return tag.rfind("vc-lasagna-manifest:", 0) == 0;
-                });
-                if (stillDerived) {
-                    ++entry;
-                } else {
-                    entry = volumes_.erase(entry);
-                }
-                changed = true;
+        for (auto entry = volumes_.begin(); entry != volumes_.end();) {
+            if (incomingLocations.contains(entry->location) ||
+                !eraseProvenance(entry->tags)) {
+                ++entry;
+                continue;
             }
-            for (auto tags = volumeTagsByID_.begin(); tags != volumeTagsByID_.end();) {
-                if (!hasTag(tags->second, "vc-lasagna-derived") || !referencesManifest(tags->second)) {
-                    ++tags;
-                    continue;
-                }
-                eraseManifestReferences(tags->second);
-                const bool stillDerived = std::any_of(tags->second.begin(), tags->second.end(), [](const auto& tag) {
-                    return tag.rfind("vc-lasagna-manifest:", 0) == 0;
-                });
-                if (stillDerived) {
-                    ++tags;
-                } else {
-                    loadedVolumes_.erase(tags->first);
-                    tags = volumeTagsByID_.erase(tags);
-                }
+            changed = true;
+            if (hasLasagnaDerivedTag(entry->tags))
+                ++entry;
+            else
+                entry = volumes_.erase(entry);
+        }
+        for (auto tags = volumeTagsByID_.begin();
+             tags != volumeTagsByID_.end();) {
+            if (!eraseProvenance(tags->second)) {
+                ++tags;
+                continue;
+            }
+            if (hasLasagnaDerivedTag(tags->second)) {
+                ++tags;
+            } else {
+                loadedVolumes_.erase(tags->first);
+                tags = volumeTagsByID_.erase(tags);
             }
         }
 
@@ -1361,8 +1348,16 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
                 changed = true;
             } else {
                 const auto oldTags = entry->tags;
-                addUniqueTags(entry->tags, prepared.tags);
+                const bool independentlyOwned = !hasLasagnaDerivedTag(entry->tags);
+                for (const auto& tag : prepared.tags) {
+                    if (!independentlyOwned ||
+                        tag.rfind(kLasagnaDerivedPrefix, 0) != 0) {
+                        addUniqueTags(entry->tags, {tag});
+                    }
+                }
                 changed = changed || entry->tags != oldTags;
+                if (independentlyOwned)
+                    continue;
             }
             auto loaded = loadedVolumes_.find(prepared.volume->id());
             if (loaded == loadedVolumes_.end()) {
@@ -1401,15 +1396,11 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
 
 bool VolumePkg::removeEntry(const std::string& location)
 {
-    std::vector<std::string> removedManifestIdentities;
-    if (const auto manifest =
-            std::find_if(lasagnaDatasets_.begin(), lasagnaDatasets_.end(), [&](const auto& entry) { return entry.location == location; });
-        manifest != lasagnaDatasets_.end()) {
-        for (const auto& tag : manifest->tags) {
-            if (tag.rfind("vc-lasagna-manifest:", 0) == 0)
-                removedManifestIdentities.push_back(tag);
-        }
-    }
+    const bool removingLasagna = std::any_of(
+        lasagnaDatasets_.begin(), lasagnaDatasets_.end(),
+        [&](const auto& entry) { return entry.location == location; });
+    const std::string removedProvenance =
+        std::string(kLasagnaDerivedPrefix) + location;
     auto eraseFrom = [&](std::vector<vc::project::Entry>& v) {
         auto it = std::find_if(v.begin(), v.end(), [&](const auto& e) { return e.location == location; });
         if (it == v.end())
@@ -1426,40 +1417,30 @@ bool VolumePkg::removeEntry(const std::string& location)
         removed = true;
     if (eraseFrom(lasagnaDatasets_))
         removed = true;
-    if (!removedManifestIdentities.empty()) {
+    if (removingLasagna) {
         auto removeManifestReferences = [&](std::vector<std::string>& tags) {
             const auto oldSize = tags.size();
-            tags.erase(
-                std::remove_if(tags.begin(), tags.end(), [&](const auto& tag) {
-                    return std::find(removedManifestIdentities.begin(), removedManifestIdentities.end(), tag) != removedManifestIdentities.end();
-                }),
-                tags.end());
+            tags.erase(std::remove(tags.begin(), tags.end(), removedProvenance),
+                       tags.end());
             return tags.size() != oldSize;
         };
-        auto hasManifestReference = [](const std::vector<std::string>& tags) {
-            return std::any_of(tags.begin(), tags.end(), [](const auto& tag) {
-                return tag.rfind("vc-lasagna-manifest:", 0) == 0;
-            });
-        };
         for (auto it = volumes_.begin(); it != volumes_.end();) {
-            if (std::find(it->tags.begin(), it->tags.end(), "vc-lasagna-derived") == it->tags.end() ||
-                !removeManifestReferences(it->tags)) {
+            if (!removeManifestReferences(it->tags)) {
                 ++it;
                 continue;
             }
             removed = true;
-            if (hasManifestReference(it->tags))
+            if (hasLasagnaDerivedTag(it->tags))
                 ++it;
             else
                 it = volumes_.erase(it);
         }
         for (auto tags = volumeTagsByID_.begin(); tags != volumeTagsByID_.end();) {
-            if (std::find(tags->second.begin(), tags->second.end(), "vc-lasagna-derived") == tags->second.end() ||
-                !removeManifestReferences(tags->second)) {
+            if (!removeManifestReferences(tags->second)) {
                 ++tags;
                 continue;
             }
-            if (hasManifestReference(tags->second)) {
+            if (hasLasagnaDerivedTag(tags->second)) {
                 ++tags;
             } else {
                 loadedVolumes_.erase(tags->first);
@@ -1926,8 +1907,7 @@ void VolumePkg::resolveAll()
     for (const auto& [id, volume] : loadedVolumes_) {
         const auto tags = volumeTagsByID_.find(id);
         if (tags == volumeTagsByID_.end() ||
-            std::find(tags->second.begin(), tags->second.end(),
-                      "vc-lasagna-derived") == tags->second.end()) {
+            !hasLasagnaDerivedTag(tags->second)) {
             continue;
         }
         preparedLasagnaVolumes.push_back({id, volume, tags->second});
@@ -1950,7 +1930,8 @@ void VolumePkg::resolveAll()
     std::vector<std::size_t> remoteIndices;
     remoteIndices.reserve(volumes_.size());
     for (std::size_t i = 0; i < volumes_.size(); ++i) {
-        if (vc::project::isLocationRemote(volumes_[i].location)) {
+        if (vc::project::isLocationRemote(volumes_[i].location) &&
+            !hasLasagnaDerivedTag(volumes_[i].tags)) {
             remoteIndices.push_back(i);
         }
     }
@@ -2010,6 +1991,8 @@ void VolumePkg::resolveAll()
 
     for (std::size_t i = 0; i < volumes_.size(); ++i) {
         const auto& entry = volumes_[i];
+        if (hasLasagnaDerivedTag(entry.tags))
+            continue;
         if (!vc::project::isLocationRemote(entry.location)) {
             resolveVolumeEntry(entry);
             continue;
@@ -2079,7 +2062,7 @@ void VolumePkg::resolveDeferredEntries()
 
 void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
 {
-    if (std::find(e.tags.begin(), e.tags.end(), "vc-lasagna-derived") != e.tags.end()) {
+    if (hasLasagnaDerivedTag(e.tags)) {
         // Reconstructed by the Lasagna attachment resolver.
         return;
     }

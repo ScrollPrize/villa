@@ -234,6 +234,32 @@ TEST_CASE("fiber prediction trace scales derive from existing manifest fields")
           doctest::Approx(4.0));
 }
 
+TEST_CASE("fiber trace coordinate adapter round trips base points and physical scale")
+{
+    const vc::fiber_tracer::FiberTraceCoordinateAdapter coordinates(4.0);
+    const std::vector<cv::Vec3d> base{
+        {8.0, 12.0, 16.0},
+        {64.0, 20.0, 4.0},
+    };
+    const auto trace = coordinates.baseToTrace(base);
+    REQUIRE(trace.size() == 2);
+    CHECK(trace[0] == cv::Vec3d(2.0, 3.0, 4.0));
+    CHECK(trace[1] == cv::Vec3d(16.0, 5.0, 1.0));
+    const auto roundTrip = coordinates.traceToBase(trace);
+    CHECK(roundTrip == base);
+    const cv::Vec3d exactStart(8.0000000000001, 12.0, 16.0);
+    const cv::Vec3d exactTarget(63.9999999999999, 20.0, 4.0);
+    const auto segment = coordinates.traceSegmentToBase(
+        trace, exactStart, exactTarget);
+    CHECK(segment.front() == exactStart);
+    CHECK(segment.back() == exactTarget);
+    CHECK(coordinates.traceVoxelSizeUm(2.4) == doctest::Approx(9.6));
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::FiberTraceCoordinateAdapter(0.0),
+        std::invalid_argument);
+    CHECK_THROWS_AS(coordinates.traceVoxelSizeUm(0.0), std::invalid_argument);
+}
+
 TEST_CASE("fiber prediction trace scales use inference scaledown power")
 {
     vc::lasagna::LasagnaDatasetManifest manifest;

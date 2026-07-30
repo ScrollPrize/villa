@@ -19,7 +19,7 @@ namespace vc::core::util
 namespace
 {
 
-constexpr int kSidecarVersion = 1;
+constexpr int kSidecarVersion = 2;
 constexpr std::string_view kSidecarSuffix = ".vc-remote-file.json";
 
 struct InFlight {
@@ -56,7 +56,7 @@ std::filesystem::path checkedDestination(const RemoteFileCacheOptions& options)
     return payload;
 }
 
-bool validCacheHit(const std::filesystem::path& payload, std::string_view identityHex, RemoteFileCacheAccounting accounting)
+bool validCacheHit(const std::filesystem::path& payload, std::string_view source, RemoteFileCacheAccounting accounting)
 {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(payload, ec) || ec)
@@ -67,7 +67,7 @@ bool validCacheHit(const std::filesystem::path& payload, std::string_view identi
     try {
         std::ifstream input(sidecar);
         const auto metadata = nlohmann::json::parse(input);
-        if (metadata.value("version", 0) != kSidecarVersion || metadata.value("source_identity_hex", std::string{}) != identityHex ||
+        if (metadata.value("version", 0) != kSidecarVersion || metadata.value("source", std::string{}) != source ||
             metadata.value("accounting", std::string{}) != (accounting == RemoteFileCacheAccounting::Managed ? "managed" : "unmanaged") ||
             !metadata.contains("size") || !metadata.at("size").is_number_unsigned()) {
             return false;
@@ -93,13 +93,13 @@ void renameReplacing(const std::filesystem::path& source, const std::filesystem:
 }
 
 std::filesystem::path writeTemporarySidecar(
-    const std::filesystem::path& payload, const std::filesystem::path& temporaryPayload, std::string_view identityHex, RemoteFileCacheAccounting accounting)
+    const std::filesystem::path& payload, const std::filesystem::path& temporaryPayload, std::string_view source, RemoteFileCacheAccounting accounting)
 {
     const auto sidecar = sidecarPath(payload);
     const auto tmp = std::filesystem::path(sidecar.string() + ".tmp-" + std::to_string(gTemporarySerial.fetch_add(1)));
     const nlohmann::json metadata{
         {"version", kSidecarVersion},
-        {"source_identity_hex", identityHex},
+        {"source", source},
         {"size", std::filesystem::file_size(temporaryPayload)},
         {"accounting", accounting == RemoteFileCacheAccounting::Managed ? "managed" : "unmanaged"},
     };
@@ -272,43 +272,82 @@ std::string redactedRemoteLocation(std::string_view location)
     return query == std::string_view::npos ? std::string(location) : std::string(location.substr(0, query)) + "?<redacted>";
 }
 
-std::string remoteFileIdentityHex(std::string_view normalizedLocation)
+std::string remoteFileCacheSource(std::string_view sourceLocation)
 {
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(normalizedLocation.size() * 2);
-    for (const unsigned char ch : normalizedLocation) {
-        out.push_back(kHex[ch >> 4]);
-        out.push_back(kHex[ch & 0x0f]);
-    }
-    return out;
+    const auto suffix = sourceLocation.find_first_of("?#");
+    auto source = std::string(sourceLocation.substr(0, suffix));
+    while (!source.empty() && source.back() == '/')
+        source.pop_back();
+    if (source.empty())
+        throw std::invalid_argument("remote file cache source is empty");
+    return source;
 }
 
-std::filesystem::path remoteFileIdentityPath(const std::filesystem::path& base, std::string_view normalizedLocation)
+std::filesystem::path remoteFileCachePath(std::string_view sourceLocation)
 {
-    auto path = base;
-    const auto hex = remoteFileIdentityHex(normalizedLocation);
-    constexpr std::size_t kSegmentChars = 96;
-    for (std::size_t pos = 0; pos < hex.size(); pos += kSegmentChars)
-        path /= hex.substr(pos, std::min(kSegmentChars, hex.size() - pos));
-    return path;
+    const auto source = remoteFileCacheSource(sourceLocation);
+    const auto schemeEnd = source.find("://");
+    if (schemeEnd == std::string::npos || schemeEnd == 0)
+        throw std::invalid_argument("remote file cache source requires a URL scheme");
+
+    auto validComponent = [](std::string_view component) {
+        if (component.empty() || component == "." || component == "..")
+            return false;
+        return std::none_of(component.begin(), component.end(), [](unsigned char ch) {
+            return ch < 0x20 || ch == 0x7f || ch == '<' || ch == '>' ||
+                   ch == ':' || ch == '"' || ch == '\\' || ch == '|' ||
+                   ch == '?' || ch == '*';
+        });
+    };
+    const auto scheme = std::string_view(source).substr(0, schemeEnd);
+    if (!std::all_of(scheme.begin(), scheme.end(), [](unsigned char ch) {
+            return std::isalnum(ch) || ch == '+' || ch == '-' || ch == '.';
+        }) || !validComponent(scheme)) {
+        throw std::invalid_argument("remote file cache source has an invalid scheme");
+    }
+    const auto authorityStart = schemeEnd + 3;
+    const auto pathStart = source.find('/', authorityStart);
+    const auto authority = std::string_view(source).substr(
+        authorityStart,
+        pathStart == std::string::npos ? std::string::npos : pathStart - authorityStart);
+    if (!validComponent(authority))
+        throw std::invalid_argument("remote file cache source has an invalid authority");
+
+    std::filesystem::path result = "remote_sources";
+    result /= scheme;
+    result /= authority;
+    if (pathStart == std::string::npos || pathStart + 1 == source.size())
+        throw std::invalid_argument("remote file cache source requires an object path");
+    std::string_view remaining(source.data() + pathStart + 1,
+                               source.size() - pathStart - 1);
+    while (!remaining.empty()) {
+        const auto slash = remaining.find('/');
+        const auto component = remaining.substr(0, slash);
+        if (!validComponent(component))
+            throw std::invalid_argument("remote file cache source has an invalid path component");
+        result /= component;
+        if (slash == std::string_view::npos)
+            break;
+        remaining.remove_prefix(slash + 1);
+    }
+    return result;
 }
 
 RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const RemoteFileCacheOptions& options)
 {
     const auto payload = checkedDestination(options);
     const auto normalized = normalizeRemoteFileLocation(sourceLocation);
-    const auto identityHex = remoteFileIdentityHex(normalized);
-    if (options.policy == RemoteFileCachePolicy::CacheFirst && validCacheHit(payload, identityHex, options.accounting)) {
+    const auto source = remoteFileCacheSource(sourceLocation);
+    if (options.policy == RemoteFileCachePolicy::CacheFirst && validCacheHit(payload, source, options.accounting)) {
         return makeResult(payload, normalized, true, options.accounting);
     }
 
-    const std::string flightKey = payload.string() + '\n' + identityHex;
+    const std::string flightKey = payload.string() + '\n' + source;
     std::shared_ptr<InFlight> flight;
     bool owner = false;
     {
         std::lock_guard lock(gInFlightMutex);
-        if (options.policy == RemoteFileCachePolicy::CacheFirst && validCacheHit(payload, identityHex, options.accounting)) {
+        if (options.policy == RemoteFileCachePolicy::CacheFirst && validCacheHit(payload, source, options.accounting)) {
             return makeResult(payload, normalized, true, options.accounting);
         }
         auto [it, inserted] = gInFlight.try_emplace(flightKey, std::make_shared<InFlight>());
@@ -320,7 +359,7 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
         flight->finished.wait(lock, [&] { return flight->done; });
         if (flight->error)
             std::rethrow_exception(flight->error);
-        if (!validCacheHit(payload, identityHex, options.accounting))
+        if (!validCacheHit(payload, source, options.accounting))
             throw std::runtime_error("remote file cache publication did not produce a valid entry");
         return makeResult(payload, normalized, true, options.accounting);
     }
@@ -344,7 +383,7 @@ RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const R
                 defaultFetch(sourceLocation, tmp, options.auth);
             if (!std::filesystem::is_regular_file(tmp))
                 throw std::runtime_error("remote file fetcher did not create its temporary file");
-            temporarySidecar = writeTemporarySidecar(payload, tmp, identityHex, options.accounting);
+            temporarySidecar = writeTemporarySidecar(payload, tmp, source, options.accounting);
             if (options.accounting == RemoteFileCacheAccounting::Managed) {
                 if (const auto budget = vc::render::PersistentZarrCacheBudget::findForPath(payload)) {
                     auto reserved = budget->reserveWrite(payload, std::filesystem::file_size(tmp));

@@ -1,5 +1,11 @@
 # 2026-07-30
 
+- Replaced opaque Lasagna project/cache identities with actual local or remote
+  Zarr source paths, readable remote-source cache paths, and path-bearing
+  manifest ownership tags.
+- Corrected VC3D native segment tracing to keep stored fibers in base
+  coordinates while prediction and normal sampling run on the derived sd2
+  trace grid with correctly scaled physical units.
 - Added generic exact-byte arbitrary remote-file caching, persistent direct
   remote Lasagna manifests, and VC3D local/remote manifest attachment with
   canonical role tags and automatically reconciled ordinary 3D project

@@ -43,11 +43,11 @@ struct RemoteFileCacheResult {
 
 [[nodiscard]] std::string normalizeRemoteFileLocation(const std::string& sourceLocation);
 [[nodiscard]] std::string redactedRemoteLocation(std::string_view location);
-[[nodiscard]] std::string remoteFileIdentityHex(std::string_view normalizedLocation);
-
-// Append a collision-free segmented URL identity below base. The identity is
-// hex rather than a digest so collisions cannot alias unrelated remote files.
-[[nodiscard]] std::filesystem::path remoteFileIdentityPath(const std::filesystem::path& base, std::string_view normalizedLocation);
+// Return the persistent, credential-free source name used by cache sidecars.
+[[nodiscard]] std::string remoteFileCacheSource(std::string_view sourceLocation);
+// Mirror a remote source below remote_sources/<scheme>/<authority>/<path>.
+// Components that are unsafe or non-portable as filesystem names are rejected.
+[[nodiscard]] std::filesystem::path remoteFileCachePath(std::string_view sourceLocation);
 
 [[nodiscard]] RemoteFileCacheResult cacheRemoteFile(const std::string& sourceLocation, const RemoteFileCacheOptions& options);
 

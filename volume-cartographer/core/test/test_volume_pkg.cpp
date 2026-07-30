@@ -659,8 +659,8 @@ TEST_CASE("VolumePkg atomically attaches and detaches a Lasagna manifest with de
     auto volume = Volume::New(d / "backing.zarr", create);
 
     VolumePkg::PreparedVolumeAttachment derived{
-        "lasagna-derived://abc",
-        {"vc-lasagna-derived", "vc-lasagna-manifest:manifest-1", "vc-lasagna-group:pred", "vc-lasagna-channel:presence"},
+        (d / "backing.zarr").string(),
+        {"vc-lasagna-derived:fiber.lasagna.json", "vc-lasagna-group:pred", "vc-lasagna-channel:presence"},
         volume,
     };
     auto pkg = VolumePkg::newEmpty();
@@ -669,11 +669,8 @@ TEST_CASE("VolumePkg atomically attaches and detaches a Lasagna manifest with de
     REQUIRE(pkg->volumeEntries().size() == 1);
     CHECK(pkg->hasVolume("lasagna-view"));
     CHECK(pkg->selectedFiberInferenceDataset() == "fiber.lasagna.json");
-    CHECK(
-        std::find(
-            pkg->allLasagnaDatasetEntries().front().tags.begin(),
-            pkg->allLasagnaDatasetEntries().front().tags.end(),
-            "vc-lasagna-manifest:manifest-1") != pkg->allLasagnaDatasetEntries().front().tags.end());
+    CHECK(pkg->allLasagnaDatasetEntries().front().tags ==
+          std::vector<std::string>{"user-tag", "vc-lasagna-fiber"});
 
     CHECK(pkg->removeEntry("fiber.lasagna.json"));
     CHECK(pkg->allLasagnaDatasetEntries().empty());
@@ -698,13 +695,13 @@ TEST_CASE("VolumePkg Lasagna reattachment reconciles roles tags and removed chan
     auto newVolume = Volume::New(d / "new.zarr", create);
 
     const std::vector<VolumePkg::PreparedVolumeAttachment> oldAttachments{{
-        "lasagna-derived://old",
-        {"vc-lasagna-derived", "vc-lasagna-manifest:manifest-1", "vc-lasagna-channel:old"},
+        (d / "old.zarr").string(),
+        {"vc-lasagna-derived:data.lasagna.json", "vc-lasagna-channel:old"},
         oldVolume,
     }};
     const std::vector<VolumePkg::PreparedVolumeAttachment> newAttachments{{
-        "lasagna-derived://new",
-        {"vc-lasagna-derived", "vc-lasagna-manifest:manifest-1", "vc-lasagna-channel:new"},
+        (d / "new.zarr").string(),
+        {"vc-lasagna-derived:data.lasagna.json", "vc-lasagna-channel:new"},
         newVolume,
     }};
 
@@ -722,7 +719,7 @@ TEST_CASE("VolumePkg Lasagna reattachment reconciles roles tags and removed chan
     CHECK(std::find(manifestTags.begin(), manifestTags.end(), "model:old") == manifestTags.end());
     CHECK(std::find(manifestTags.begin(), manifestTags.end(), "model:new") != manifestTags.end());
     REQUIRE(pkg->volumeEntries().size() == 1);
-    CHECK(pkg->volumeEntries().front().location == "lasagna-derived://new");
+    CHECK(pkg->volumeEntries().front().location == (d / "new.zarr").string());
     CHECK_FALSE(pkg->hasVolume("old-channel"));
     CHECK(pkg->hasVolume("new-channel"));
     fs::remove_all(d);
@@ -741,13 +738,13 @@ TEST_CASE("VolumePkg detach preserves a derived volume owned by another manifest
     auto volume = Volume::New(d / "shared.zarr", create);
 
     const VolumePkg::PreparedVolumeAttachment first{
-        "lasagna-derived://shared",
-        {"vc-lasagna-derived", "vc-lasagna-manifest:first", "vc-lasagna-channel:presence"},
+        (d / "shared.zarr").string(),
+        {"vc-lasagna-derived:first.lasagna.json", "vc-lasagna-channel:presence"},
         volume,
     };
     const VolumePkg::PreparedVolumeAttachment second{
-        "lasagna-derived://shared",
-        {"vc-lasagna-derived", "vc-lasagna-manifest:second", "vc-lasagna-channel:presence"},
+        (d / "shared.zarr").string(),
+        {"vc-lasagna-derived:second.lasagna.json", "vc-lasagna-channel:presence"},
         volume,
     };
     auto pkg = VolumePkg::newEmpty();
@@ -757,10 +754,48 @@ TEST_CASE("VolumePkg detach preserves a derived volume owned by another manifest
     REQUIRE(pkg->removeEntry("first.lasagna.json"));
     REQUIRE(pkg->volumeEntries().size() == 1);
     CHECK(pkg->hasVolume("shared-lasagna-view"));
-    CHECK(std::find(pkg->volumeEntries().front().tags.begin(), pkg->volumeEntries().front().tags.end(), "vc-lasagna-manifest:first") ==
+    CHECK(std::find(pkg->volumeEntries().front().tags.begin(), pkg->volumeEntries().front().tags.end(), "vc-lasagna-derived:first.lasagna.json") ==
           pkg->volumeEntries().front().tags.end());
-    CHECK(std::find(pkg->volumeEntries().front().tags.begin(), pkg->volumeEntries().front().tags.end(), "vc-lasagna-manifest:second") !=
+    CHECK(std::find(pkg->volumeEntries().front().tags.begin(), pkg->volumeEntries().front().tags.end(), "vc-lasagna-derived:second.lasagna.json") !=
           pkg->volumeEntries().front().tags.end());
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg detach preserves an independently attached Lasagna source volume")
+{
+    auto d = tmpDir("lasagna_independent_ownership");
+    Volume::ZarrCreateOptions create;
+    create.shapeZYX = {2, 2, 2};
+    create.chunkShapeZYX = {2, 2, 2};
+    create.numLevels = 1;
+    create.uuid = "independent-lasagna-source";
+    create.name = "source";
+    create.compressor.clear();
+    const auto location = (d / "source.zarr").string();
+    auto volume = Volume::New(location, create);
+
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->attachPreparedVolume(location, {}, volume) ==
+            VolumePkg::AttachVolumeResult::Attached);
+    const VolumePkg::PreparedVolumeAttachment derived{
+        location,
+        {"vc-lasagna-derived:data.lasagna.json",
+         "vc-lasagna-channel:presence"},
+        volume,
+    };
+    REQUIRE(pkg->attachPreparedLasagnaDataset(
+                "data.lasagna.json", {}, false, {derived}) ==
+            VolumePkg::AttachLasagnaResult::Attached);
+    REQUIRE(pkg->volumeEntries().size() == 1);
+    CHECK(std::none_of(
+        pkg->volumeEntries().front().tags.begin(),
+        pkg->volumeEntries().front().tags.end(),
+        [](const auto& tag) { return tag.rfind("vc-lasagna-derived:", 0) == 0; }));
+
+    REQUIRE(pkg->removeEntry("data.lasagna.json"));
+    REQUIRE(pkg->volumeEntries().size() == 1);
+    CHECK(pkg->volumeEntries().front().location == location);
+    CHECK(pkg->hasVolume("independent-lasagna-source"));
     fs::remove_all(d);
 }
 

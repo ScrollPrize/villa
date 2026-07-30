@@ -79,7 +79,12 @@ TEST_CASE("Lasagna project preparation exposes a ZYX group as a 3D volume")
     REQUIRE(prepared.size() == 1);
     CHECK(prepared[0].volume->shape() == std::array<int, 3>{2, 2, 2});
     CHECK(prepared[0].volume->voxelSize() == doctest::Approx(4.0));
-    CHECK(prepared[0].location.rfind("lasagna-derived://", 0) == 0);
+    CHECK(prepared[0].location ==
+          fs::absolute(dir / "pred.zarr").lexically_normal().string());
+    CHECK(std::find(
+              prepared[0].tags.begin(), prepared[0].tags.end(),
+              "vc-lasagna-derived:" + manifestPath.string()) !=
+          prepared[0].tags.end());
     CHECK(std::find(prepared[0].tags.begin(), prepared[0].tags.end(), "vc-lasagna-channel:presence") != prepared[0].tags.end());
 
     const auto chunk = prepared[0].volume->chunkedCache()->getChunkBlocking(0, 0, 0, 0);

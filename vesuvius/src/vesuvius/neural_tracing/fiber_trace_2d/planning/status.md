@@ -1,55 +1,49 @@
-# VC3D Lasagna Attachment And Generic Remote File Cache
+# Path-Based Lasagna Volumes And Base-Space Fiber Tracing
 
 ## Planning
 
-- [x] Read the current user request and repository-level instructions.
-- [x] Read `AGENTS.md`, `planning/plan.md`, `planning/specs.md`, existing
-  code-structure documentation, and local development notes.
-- [x] Inspect current VC project schema, Lasagna remote loading/cache behavior,
-  Open Data manifest caching, VC3D menus, and Line Annotation fiber hooks.
+- [x] Read the user request and repository instructions.
+- [x] Re-read the fiber planning process and current active specifications.
+- [x] Trace the encoded project identities to their cache-layout origin.
+- [x] Inspect project attachment, reconciliation, detach, and serialization.
+- [x] Inspect GUI line, trace, prediction, and normal-sampler coordinate paths.
 - [x] Replace `planning/task.md` with the current task.
-- [x] Create `planning/task_plan.md` with implementation, testing, spec, docs,
-  changelog, risk, and follow-up sections.
-- [x] Incorporate user clarification that both explicit
-  `lasagna-remote.json` origins and direct remote-manifest origins remain
-  supported.
-- [x] Incorporate automatic ordinary project-volume attachment for all
-  manifest data while keeping VC3D and generic volume loading strictly 3D.
-- [x] Require one actual ZYX array per attached channel and reject older flat
-  CZYX preprocessing/fit intermediates in VC3D paths.
-- [ ] Obtain an independent agent review of the plan against `task.md`,
-  `specs.md`, and `plan.md` (blocked by the active no-delegation runtime
-  policy; direct consistency audit completed instead).
-- [x] Incorporate direct consistency-audit findings.
-- [x] Obtain user feedback/approval before implementation.
+- [x] Replace `planning/task_plan.md` with implementation, removal, tests,
+  spec, docs, changelog, and risks.
+- [x] Perform a direct consistency review against current code/specs.
+- [ ] Obtain independent agent review (not permitted by the active
+  no-delegation runtime policy unless explicitly requested by the user).
+- [x] Obtain user approval to begin implementation.
 
 ## Implementation
 
-- [x] Extract shared remote URL/fetch/cache identity primitives mechanically.
-- [x] Implement and test the arbitrary remote-file cache.
-- [x] Integrate persistent cached manifests into Lasagna `openLocation()`.
-- [x] Preserve and test explicit-sidecar and direct-origin remote group
-  resolution.
-- [x] Port Open Data Lasagna manifest publication to the generic cache.
-- [x] Canonicalize tagged project Lasagna entries and legacy migration.
-- [x] Implement Lasagna-owned preparation of flat ordinary 3D project volumes.
-- [x] Implement atomic manifest plus derived-volume project attachment.
-- [x] Reuse VC3D remote auth/cache-root plumbing for manifest attachment.
-- [x] Implement local/remote Lasagna project attachment service.
-- [x] Add VC3D menu actions and Detach entries.
-- [x] Update VC3D project Lasagna resolution, including tagged fiber entries.
-- [x] Complete the compatibility call-site audit.
+- [x] Delete the encoded URL identity helper, layout, sidecar field, tests,
+  and documentation without backward compatibility.
+- [x] Implement the readable remote source-path cache layout.
+- [x] Add authoritative human-readable group source-location resolution.
+- [x] Replace synthetic derived-volume locations and encoded provenance with
+  actual local/remote paths.
+- [x] Remove previous-format handling without a decoder or migration path.
+- [x] Update actual-location deduplication, ownership, reconciliation, and
+  detach behavior.
+- [x] Add a shared base/trace coordinate adapter.
+- [x] Prepare distinct trace-scale prediction and normal samplers.
+- [x] Convert GUI segment inputs to trace space and accepted results to base
+  space.
+- [x] Correct trace-voxel physical units and preserve exact endpoints.
 
 ## Validation And Documentation
 
-- [x] Build all focused core, CLI, and VC3D targets.
-- [x] Run focused cache, Lasagna, project, and Open Data tests; validate the Qt
-  attachment integration by compiling VC3D (no focused Qt interaction test was
-  added).
-- [x] Run the applicable broader regression suite.
+- [x] Add and run focused local/remote path and cache-layout tests.
+- [x] Add and run scale-conversion, sampler-space, physical-unit, and splice
+  tests.
+- [x] Build focused core, CLI, and VC3D targets.
+- [x] Run broader applicable regression tests.
+- [ ] Perform the manual VC3D base-volume segment smoke test (requires an
+  interactive GUI session and the user's local project).
 - [x] Update `planning/specs.md`.
-- [x] Add/update implementation documentation.
+- [x] Update project/cache/code-structure documentation.
 - [x] Update `planning/changelog.md`.
-- [x] Record commands, results, findings, and deviations in `task_log.md`.
-- [x] Report remaining risks and the deferred interactive Line Annotation usage
-  test in the final response.
+- [x] Replace `planning/task_log.md` with final commands, results, findings,
+  and deviations.
+- [x] Report limitations or skipped requirements explicitly.

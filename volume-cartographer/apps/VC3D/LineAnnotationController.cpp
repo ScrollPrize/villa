@@ -114,6 +114,10 @@ struct LineAnnotationController::LineAnnotationSession {
     std::shared_ptr<vc::lasagna::LasagnaNormalSampler> normalSampler;
     std::shared_ptr<vc::lasagna::LasagnaDataset> fiberInferenceDataset;
     std::shared_ptr<vc::fiber_tracer::FiberPredictionField> fiberPredictionField;
+    std::string traceNormalDatasetLocation;
+    double fiberTraceToBaseScale = 1.0;
+    std::shared_ptr<vc::lasagna::LasagnaDataset> traceNormalDataset;
+    std::shared_ptr<vc::lasagna::LasagnaNormalSampler> traceNormalSampler;
     TaskState taskState = TaskState::Idle;
     cv::Vec3d seedPoint{0.0, 0.0, 0.0};
     std::string sourceAnnotationSurfaceName;
@@ -6805,12 +6809,8 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         vpkg->addFiberInferenceDatasetEntry(selected);
     }
 
-    const bool scaleChanged =
-        !session.fiberInferenceDataset ||
-        session.fiberInferenceDataset->manifest().workingToBaseScale !=
-            session.workingToBaseScale;
     if (!session.fiberPredictionField ||
-        session.selectedFiberInferenceDatasetLocation != selected || scaleChanged) {
+        session.selectedFiberInferenceDatasetLocation != selected) {
         try {
             vc::lasagna::LasagnaDatasetOpenOptions options;
             options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
@@ -6824,16 +6824,6 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
             const auto traceScales =
                 vc::fiber_tracer::resolveFiberPredictionTraceScales(
                     openedDataset.manifest());
-            if (!approximatelyEqual(traceScales.traceToBaseScale,
-                                    session.workingToBaseScale)) {
-                showError(
-                    tr("Fiber inference trace scale (%1 base voxels) does not "
-                       "match the active Lasagna line scale (%2 base voxels).")
-                        .arg(traceScales.traceToBaseScale, 0, 'g', 12)
-                        .arg(session.workingToBaseScale, 0, 'g', 12),
-                    headless);
-                return false;
-            }
             auto predictionManifest = openedDataset.manifest();
             predictionManifest.workingToBaseScale = traceScales.traceToBaseScale;
             auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
@@ -6841,8 +6831,39 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
             auto field = std::make_shared<vc::fiber_tracer::FiberPredictionField>(*dataset);
             session.fiberInferenceDataset = std::move(dataset);
             session.fiberPredictionField = std::move(field);
+            session.fiberTraceToBaseScale = traceScales.traceToBaseScale;
         } catch (const std::exception& ex) {
             showError(tr("Invalid selected fiber inference dataset: %1")
+                          .arg(QString::fromStdString(ex.what())),
+                      headless);
+            return false;
+        }
+    }
+
+    if (!session.traceNormalDataset || !session.traceNormalSampler ||
+        session.traceNormalDatasetLocation != session.selectedDatasetLocation ||
+        !approximatelyEqual(
+            session.traceNormalDataset->manifest().workingToBaseScale,
+            session.fiberTraceToBaseScale)) {
+        try {
+            vc::lasagna::LasagnaDatasetOpenOptions options;
+            options.workingToBaseScale = session.fiberTraceToBaseScale;
+            options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+            const std::string normalLocation =
+                vc::project::isLocationRemote(session.selectedDatasetLocation)
+                    ? session.selectedDatasetLocation
+                    : vc::project::resolveLocalPath(
+                          session.selectedDatasetLocation,
+                          vpkg->path().parent_path()).string();
+            auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
+                vc::lasagna::LasagnaDataset::openLocation(normalLocation, options));
+            auto sampler =
+                std::make_shared<vc::lasagna::LasagnaNormalSampler>(*dataset);
+            session.traceNormalDataset = std::move(dataset);
+            session.traceNormalSampler = std::move(sampler);
+            session.traceNormalDatasetLocation = session.selectedDatasetLocation;
+        } catch (const std::exception& ex) {
+            showError(tr("Invalid trace-scale Lasagna normal dataset: %1")
                           .arg(QString::fromStdString(ex.what())),
                       headless);
             return false;
@@ -6884,7 +6905,8 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
         !ensureFiberInferenceDatasetForSession(session)) {
         return;
     }
-    if (!session.normalSampler || !session.fiberPredictionField) {
+    if (!session.normalSampler || !session.traceNormalSampler ||
+        !session.fiberPredictionField) {
         showError(tr("Native fiber tracer requires both a Lasagna normal dataset and "
                      "a fiber inference dataset."),
                   session.suppressErrorDialogs);
@@ -6943,7 +6965,9 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
     auto controlPoints = session.controlPoints;
     const auto manifestPath = session.selectedManifestPath;
     auto normalSampler = session.normalSampler;
+    auto traceNormalSampler = session.traceNormalSampler;
     auto predictionField = session.fiberPredictionField;
+    const double traceToBaseScale = session.fiberTraceToBaseScale;
     const size_t startLineIndex = *firstLineIndex;
     const size_t targetLineIndex = *secondLineIndex;
 
@@ -6967,10 +6991,12 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
                                            controlPoints = std::move(controlPoints),
                                            initialLinePoints = std::move(initialLinePoints),
                                            normalSampler,
+                                           traceNormalSampler,
                                            predictionField,
                                            startLineIndex,
                                            targetLineIndex,
-                                           voxelSizeUm]() mutable {
+                                           voxelSizeUm,
+                                           traceToBaseScale]() mutable {
         OptimizationTaskResult task;
         task.manifestPath = manifestPath;
         task.controlPoints = std::move(controlPoints);
@@ -6986,18 +7012,21 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
                 : *seedIt).volumePoint;
         }
         try {
+            const vc::fiber_tracer::FiberTraceCoordinateAdapter coordinates(
+                traceToBaseScale);
             vc::fiber_tracer::FiberTraceSegmentRequest request;
-            request.referenceLine = initialLinePoints;
+            request.referenceLine = coordinates.baseToTrace(initialLinePoints);
             request.startIndex = startLineIndex;
             request.targetIndex = targetLineIndex;
-            request.config.voxelSizeUm = voxelSizeUm;
+            request.config.voxelSizeUm =
+                coordinates.traceVoxelSizeUm(voxelSizeUm);
             request.config.endpointAcceptThresholdUm = 50.0;
             const auto start = Clock::now();
             const vc::fiber_tracer::FiberTraceSegmentResult traced =
                 vc::fiber_tracer::traceFiberSegment(
                     *predictionField,
                     request,
-                    normalSampler.get(),
+                    traceNormalSampler.get(),
                     [](const vc::fiber_tracer::FiberTraceProgress& progress) {
                         if (progress.step == 0 ||
                             !progress.reason.empty() ||
@@ -7028,12 +7057,14 @@ void LineAnnotationController::handleGeneratedFiberTraceSegment(
 
             const size_t left = std::min(startLineIndex, targetLineIndex);
             const size_t right = std::max(startLineIndex, targetLineIndex);
-            std::vector<cv::Vec3d> replacement = traced.fusedLine;
+            std::vector<cv::Vec3d> replacement =
+                coordinates.traceSegmentToBase(
+                    traced.fusedLine,
+                    initialLinePoints[startLineIndex],
+                    initialLinePoints[targetLineIndex]);
             if (startLineIndex > targetLineIndex) {
                 std::reverse(replacement.begin(), replacement.end());
             }
-            replacement.front() = initialLinePoints[left];
-            replacement.back() = initialLinePoints[right];
 
             std::vector<cv::Vec3d> merged;
             merged.reserve(left + replacement.size() +

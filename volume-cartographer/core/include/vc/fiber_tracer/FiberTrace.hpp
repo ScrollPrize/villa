@@ -171,6 +171,24 @@ struct FiberPredictionTraceScales {
     double predictionSpacingInTraceVoxels = 1.0;
 };
 
+struct FiberTraceCoordinateAdapter {
+    explicit FiberTraceCoordinateAdapter(double traceToBaseScale);
+
+    [[nodiscard]] cv::Vec3d baseToTrace(const cv::Vec3d& point) const;
+    [[nodiscard]] cv::Vec3d traceToBase(const cv::Vec3d& point) const;
+    [[nodiscard]] std::vector<cv::Vec3d> baseToTrace(
+        const std::vector<cv::Vec3d>& points) const;
+    [[nodiscard]] std::vector<cv::Vec3d> traceToBase(
+        const std::vector<cv::Vec3d>& points) const;
+    [[nodiscard]] std::vector<cv::Vec3d> traceSegmentToBase(
+        const std::vector<cv::Vec3d>& points,
+        const cv::Vec3d& exactStartBase,
+        const cv::Vec3d& exactTargetBase) const;
+    [[nodiscard]] double traceVoxelSizeUm(double baseVoxelSizeUm) const;
+
+    double traceToBaseScale = 1.0;
+};
+
 struct FiberInput {
     std::filesystem::path path;
     std::vector<cv::Vec3d> linePointsXyzBase;

@@ -12,7 +12,6 @@ namespace utils { class ZarrArray; }
 namespace vc::lasagna {
 
 inline constexpr const char* kLasagnaRemoteMarker = "lasagna-remote.json";
-inline constexpr const char* kCachedLasagnaManifest = "manifest.lasagna.json";
 
 [[nodiscard]] bool isRemoteLasagnaLocation(std::string_view location);
 
@@ -31,6 +30,8 @@ struct MaterializedLasagnaManifest {
 };
 
 [[nodiscard]] MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manifestLocation, const LasagnaDatasetOpenOptions& options);
+[[nodiscard]] std::string lasagnaGroupSourceLocation(
+    const LasagnaChannelGroup& group);
 
 class LasagnaDataset {
 public:

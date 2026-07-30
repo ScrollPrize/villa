@@ -26,18 +26,19 @@ The payload is stored at the caller-selected destination. Its adjacent
 `<payload>.vc-remote-file.json` sidecar records:
 
 - sidecar format version;
-- collision-free hexadecimal identity of the normalized source endpoint;
+- canonical query/fragment-free source location;
 - exact payload size;
 - `managed` or `unmanaged` accounting class.
 
 A cache hit requires both files and matching identity, size, and accounting.
 Downloads use unique temporary files and publish payload plus sidecar by
 rename. A failed refresh restores the previous valid pair. Concurrent requests
-for the same destination and identity are coalesced within one process.
+for the same destination and source are coalesced within one process.
 
-The sidecar never stores the source URL as plaintext. Error and Lasagna
-hit/download diagnostics redact query strings, which may contain signed
-credentials.
+The readable source is stored in plaintext, but query strings and fragments
+are removed before persistence because they may contain signed credentials.
+The full caller-supplied locator is used only for the request. Error and
+Lasagna hit/download diagnostics redact query strings.
 
 ## Disk Accounting
 
@@ -52,15 +53,20 @@ deliberately and keep large data payloads managed.
 
 ## Lasagna Layout
 
-Direct remote Lasagna manifests retain the existing collision-free layout:
+`remoteFileCachePath()` maps a validated remote source to a readable path:
 
 ```text
-<remote-cache-root>/remote_lasagna/url_hex/<segmented-url-hex>/
-  manifest.lasagna.json
-  manifest.lasagna.json.vc-remote-file.json
-  lasagna-remote.json
+<remote-cache-root>/remote_sources/https/example.org/run/file.json
+<remote-cache-root>/remote_sources/s3/bucket/run/file.json
 ```
 
-The marker stores the remote artifact parent used to resolve relative Zarr
-group paths. Existing local manifests with an explicit adjacent
-`lasagna-remote.json` remain supported and authoritative.
+Scheme, authority, and object-path components are mirrored directly. Empty,
+traversing, or platform-invalid components are rejected. Direct remote
+Lasagna manifests use this path for the manifest and its sidecar; relative
+Zarr groups share the readable parent cache directory. Existing local
+manifests with an explicit adjacent `lasagna-remote.json` remain supported and
+its `artifact_url` remains authoritative.
+
+There is no lookup or migration for the earlier development-only cache
+layout. Reopening a remote source populates the readable layout from a cold
+cache.

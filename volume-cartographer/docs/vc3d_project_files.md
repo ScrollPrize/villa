@@ -55,21 +55,36 @@ as an intermediate representation before conversion to separate per-channel
 3D OME-Zarr volumes. Those older Lasagna intermediates are not VC3D project
 volumes and must be converted before their manifest is attached.
 
-Derived entries use `lasagna-derived://<identity>` locations and the following
-provenance tags:
+Derived entries use the resolved Zarr source directly as their location. For
+example, a relative group in the manifest above is stored as:
 
-- `vc-lasagna-derived`;
-- `vc-lasagna-manifest:<hex identity>`;
+```json
+{
+  "location": "s3://bucket/path/presence.zarr",
+  "tags": [
+    "vc-lasagna-derived:s3://bucket/path/predictions.lasagna.json",
+    "vc-lasagna-group:presence",
+    "vc-lasagna-channel:presence",
+    "vc-lasagna-spacing:16"
+  ]
+}
+```
+
+The tags are:
+
+- `vc-lasagna-derived:<manifest location>`;
 - `vc-lasagna-group:<group name>`;
 - `vc-lasagna-channel:<channel name>`;
 - `vc-lasagna-spacing:<scale>`.
 
-These tags identify ownership and exact channel identity. They let reload
-rebuild runtime volume objects without treating the synthetic location as a
-generic source, avoid duplicate entries, replace stale channels when a
-manifest changes, and remove manifest-owned volumes during detach. A derived
-volume is removed only when no other attached manifest still references its
-identity.
+The path-bearing derived tag identifies ownership and the group/channel tags
+describe the view. Reload uses these tags to rebuild the exact-byte Lasagna
+runtime volume rather than opening a remote group through the generic volume
+cache. Repeated references to the same source share one project volume and add
+one derived tag per owning manifest. Detach removes one ownership tag and only
+removes the volume after the last owner is gone. If the source was already an
+independent primary project volume, attachment reuses it without adding an
+ownership tag, so manifest detach cannot remove it.
 
 Project load reconciliation is in-memory until the caller explicitly saves;
 opening a project does not rewrite it solely because runtime derived-volume

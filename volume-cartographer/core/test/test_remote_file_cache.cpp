@@ -175,6 +175,27 @@ TEST_CASE("remote file cache sidecar never stores a raw signed URL")
     (void)vc::core::util::cacheRemoteFile("https://example.test/file?X-Amz-Signature=secret", options);
     const auto sidecar = readBytes(root / "payload.vc-remote-file.json");
     CHECK(sidecar.find("secret") == std::string::npos);
-    CHECK(sidecar.find("example.test") == std::string::npos);
+    CHECK(sidecar.find("https://example.test/file") != std::string::npos);
     fs::remove_all(root);
+}
+
+TEST_CASE("remote file cache mirrors readable source paths")
+{
+    CHECK(vc::core::util::remoteFileCachePath(
+              "https://example.test/bucket/run/file.json?token=secret") ==
+          fs::path("remote_sources/https/example.test/bucket/run/file.json"));
+    CHECK(vc::core::util::remoteFileCachePath(
+              "s3://bucket/run/file.json") ==
+          fs::path("remote_sources/s3/bucket/run/file.json"));
+    CHECK(vc::core::util::remoteFileCacheSource(
+              "s3://bucket/run/file.json?token=secret#fragment") ==
+          "s3://bucket/run/file.json");
+    CHECK_THROWS_AS(
+        vc::core::util::remoteFileCachePath(
+            "https://example.test/run/../file.json"),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        vc::core::util::remoteFileCachePath(
+            "https://example.test/run/bad:name.json"),
+        std::invalid_argument);
 }

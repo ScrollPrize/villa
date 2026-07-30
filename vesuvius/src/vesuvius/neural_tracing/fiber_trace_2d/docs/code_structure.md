@@ -693,11 +693,14 @@ Ownership changed as follows:
   The VC3D line annotation GUI resolves the selected tagged fiber entry and
   exposes a Ctrl-right-click generated-line action, "Optimize segment with
   native fiber tracer", for a CP-to-CP span. The task runs through the existing
-  line-optimization busy state, so line edits are blocked while it runs, and
-  accepted results are spliced back through the existing generated-view/save
-  path. The selected fiber prediction manifest's derived trace scale must match
-  the active Lasagna line session scale before the GUI opens the prediction
-  field.
+  line-optimization busy state, so line edits are blocked while it runs. Fiber
+  lines remain stored in base coordinates. The GUI derives the sd2 trace scale
+  from the prediction manifest, divides the base line into trace coordinates,
+  opens both prediction and regular-normal samplers at that trace scale, and
+  runs the native tracer there. Accepted points are multiplied back to base
+  coordinates, original endpoints are restored exactly, and the final line is
+  rebuilt with the ordinary base-space normal sampler. Trace physical voxel
+  size is `base_voxel_um * trace_to_base`, preserving the endpoint threshold.
 - `volume-cartographer/apps/src/vc_fiber_trace_metric.cpp` is the native
   no-visualization metric runner for precomputed 3D fiber inference products.
   It opens a fiber inference `.lasagna.json`, loads one `vc3d_fiber` JSON,

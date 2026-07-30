@@ -974,9 +974,13 @@
   manifest's trace scale from `source_to_base` and the persisted prediction
   sampling scale from prediction group `scaledown` before opening prediction
   channels. The
-  derived trace scale must match the active Lasagna line session's working
-  scale; otherwise the GUI must fail clearly rather than mixing line, normal,
-  and prediction coordinates.
+  persisted lines and control points remain in base coordinates even when the
+  derived trace scale differs. The GUI must convert base points to trace space,
+  open separate prediction and normal samplers with that trace-to-base scale,
+  run tracing in trace voxels, then convert accepted points back to base space.
+  Original segment endpoints must be restored exactly. Endpoint physical units
+  use `base_voxel_um * trace_to_base`; the ordinary line sampler remains in
+  base space for final reconstruction.
 - The first VC3D GUI action is Ctrl-right-click on a generated line annotation
   CP/segment context menu, then "Optimize segment with native fiber tracer".
   The action traces only the adjacent CP-to-CP span around the clicked line
@@ -1042,8 +1046,11 @@
 - The shared remote-file cache stores one arbitrary file/object per request. It
   supports HTTP, HTTPS, S3, and region-qualified S3 transports plus a custom
   fetch-to-file callback. Cache-first and explicit refresh policies validate a
-  collision-free normalized source identity, byte size, and accounting class
-  from a sidecar. Publication is atomic, concurrent in-process fetches are
+  canonical query-free source location, byte size, and accounting class from a
+  sidecar. Readable cache placement mirrors validated
+  `remote_sources/<scheme>/<authority>/<path>` components; traversal and
+  platform-invalid components are rejected. Publication is atomic,
+  concurrent in-process fetches are
   coalesced, failed refresh preserves the previous entry, and diagnostics must
   redact URL queries. Managed payloads participate in the persistent cache
   budget; unmanaged control files such as Lasagna manifests do not. Recursive
@@ -1062,9 +1069,13 @@
   array. Flat channel-first CZYX arrays are older Lasagna preprocessing/fit
   intermediates and must be converted to per-channel 3D OME-Zarr before VC3D
   attachment. Generic `Volume`, remote-volume loading, project storage, and
-  VC3D remain strictly 3D. Stable manifest/group/channel provenance
-  tags drive deduplication, reload reconciliation, role changes, and detach
-  cleanup. Manifest entry, derived volume entries, and selected-role updates
+  VC3D remain strictly 3D. Each derived volume stores the actual resolved local
+  or remote Zarr source as `location`; cache paths and synthetic identifiers
+  are not project source fields. A `vc-lasagna-derived:<manifest location>`
+  ownership tag plus readable group/channel/spacing tags drives
+  deduplication, reload reconciliation, role changes, and detach cleanup. An
+  independently attached primary volume is reused without an ownership tag and
+  survives manifest detach. Manifest entry, derived volume entries, and selected-role updates
   are committed together or rolled back together; detaching removes a derived
   volume only when no remaining manifest owns it.
 - `vc_fiber_trace_metric` exposes `--remote-cache-dir PATH` and opens both the

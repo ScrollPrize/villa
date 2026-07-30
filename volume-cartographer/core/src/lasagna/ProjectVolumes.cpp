@@ -4,9 +4,9 @@
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/RemoteFileCache.hpp"
 #include "utils/zarr.hpp"
 
+#include <algorithm>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -95,17 +95,48 @@ std::string spacingString(double spacing)
 
 }  // namespace
 
-std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(const LasagnaDataset& dataset)
+std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
+    const LasagnaDataset& dataset,
+    std::string manifestLocation)
 {
     const auto& manifest = dataset.manifest();
-    const auto manifestIdentity =
-        vc::core::util::remoteFileIdentityHex(manifest.manifestLocation.empty() ? manifest.manifestPath.string() : manifest.manifestLocation);
+    if (manifestLocation.empty()) {
+        manifestLocation = manifest.manifestLocation.empty()
+            ? manifest.manifestPath.string()
+            : manifest.manifestLocation;
+    }
+    const std::string provenanceTag =
+        std::string(kLasagnaDerivedVolumeTagPrefix) + manifestLocation;
     std::vector<PreparedLasagnaProjectVolume> prepared;
 
     for (const auto& group : manifest.groups) {
         if (group.channels.size() != 1)
             throw std::runtime_error("Lasagna project group '" + group.name + "' must describe exactly one 3D channel");
         const auto& channel = group.channels.front();
+        const std::string location = lasagnaGroupSourceLocation(group);
+        const double spacing = static_cast<double>(group.scaleFactor()) * manifest.sourceToBase / manifest.workingToBaseScale;
+        const std::string spacingTag =
+            std::string(kLasagnaSpacingTagPrefix) + spacingString(spacing);
+        if (auto existing = std::find_if(
+                prepared.begin(), prepared.end(), [&](const auto& candidate) {
+                    return candidate.location == location;
+                }); existing != prepared.end()) {
+            if (std::find(existing->tags.begin(), existing->tags.end(), spacingTag) ==
+                existing->tags.end()) {
+                throw std::runtime_error(
+                    "Lasagna groups sharing source '" + location +
+                    "' must use one spacing");
+            }
+            for (const auto& tag : {
+                     std::string(kLasagnaGroupTagPrefix) + group.name,
+                     std::string(kLasagnaChannelTagPrefix) + channel}) {
+                if (std::find(existing->tags.begin(), existing->tags.end(), tag) ==
+                    existing->tags.end()) {
+                    existing->tags.push_back(tag);
+                }
+            }
+            continue;
+        }
         auto initialArray = std::make_shared<utils::ZarrArray>(openLasagnaChannelArray(manifest, group, 1));
         auto descriptor = describeChannel(*initialArray, group);
         if (descriptor.dtype == vc::render::ChunkDtype::UInt16) {
@@ -113,10 +144,6 @@ std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(const Las
             descriptor = describeChannel(*initialArray, group);
         }
 
-        const double spacing = static_cast<double>(group.scaleFactor()) * manifest.sourceToBase / manifest.workingToBaseScale;
-        const std::string viewIdentity = manifestIdentity + "|" + group.name + "|" + channel;
-        const std::string viewHex = vc::core::util::remoteFileIdentityHex(viewIdentity);
-        const std::string location = "lasagna-derived://" + viewHex;
         const auto manifestCopy = manifest;
         const auto groupCopy = group;
         const auto sourceFactory = [manifestCopy, groupCopy, descriptor]() mutable {
@@ -135,17 +162,16 @@ std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(const Las
         };
 
         utils::Json metadata = utils::Json::object();
-        metadata["uuid"] = "lasagna-" + viewHex;
+        metadata["uuid"] = "lasagna:" + location;
         metadata["name"] = group.name + ":" + channel;
         metadata["voxelsize"] = spacing;
         prepared.push_back({
             location,
             {
-                std::string(kLasagnaDerivedVolumeTag),
-                std::string(kLasagnaManifestTagPrefix) + manifestIdentity,
+                provenanceTag,
                 std::string(kLasagnaGroupTagPrefix) + group.name,
                 std::string(kLasagnaChannelTagPrefix) + channel,
-                std::string(kLasagnaSpacingTagPrefix) + spacingString(spacing),
+                spacingTag,
             },
             Volume::NewFromPreparedChunkedSource(sourceFactory, metadata),
         });
@@ -166,7 +192,7 @@ std::vector<std::string> reconcileLasagnaProjectVolumes(VolumePkg& package)
                                              : vc::project::resolveLocalPath(entry.location, package.path().parent_path()).string();
             const auto dataset = LasagnaDataset::openLocation(resolved, options);
             std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
-            for (auto& prepared : prepareLasagnaProjectVolumes(dataset)) {
+            for (auto& prepared : prepareLasagnaProjectVolumes(dataset, entry.location)) {
                 volumes.push_back({std::move(prepared.location), std::move(prepared.tags), std::move(prepared.volume)});
             }
             const auto result =

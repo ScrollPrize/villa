@@ -13,8 +13,7 @@ class VolumePkg;
 namespace vc::lasagna
 {
 
-inline constexpr std::string_view kLasagnaDerivedVolumeTag = "vc-lasagna-derived";
-inline constexpr std::string_view kLasagnaManifestTagPrefix = "vc-lasagna-manifest:";
+inline constexpr std::string_view kLasagnaDerivedVolumeTagPrefix = "vc-lasagna-derived:";
 inline constexpr std::string_view kLasagnaGroupTagPrefix = "vc-lasagna-group:";
 inline constexpr std::string_view kLasagnaChannelTagPrefix = "vc-lasagna-channel:";
 inline constexpr std::string_view kLasagnaSpacingTagPrefix = "vc-lasagna-spacing:";
@@ -25,7 +24,9 @@ struct PreparedLasagnaProjectVolume {
     std::shared_ptr<Volume> volume;
 };
 
-[[nodiscard]] std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(const LasagnaDataset& dataset);
+[[nodiscard]] std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
+    const LasagnaDataset& dataset,
+    std::string manifestLocation = {});
 
 // Recreate missing in-memory prepared 3D volumes for manifests already stored
 // in a project. Returns non-fatal per-manifest diagnostics.

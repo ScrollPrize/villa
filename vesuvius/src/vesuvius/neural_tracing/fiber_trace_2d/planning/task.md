@@ -1,185 +1,98 @@
-# VC3D Lasagna Manifest Attachment And Generic Remote File Cache
+# VC3D Path-Based Lasagna Volumes And Base-Space Fiber Tracing
 
 ## User request
 
-VC3D projects must be able to attach local and remote Lasagna manifests from
-the GUI. Attaching a manifest must automatically attach the Zarr volumes it
-references as ordinary primary project volumes. Remote Lasagna manifests must
-be cached persistently so VC3D and the native CLI do not download the manifest
-again on every open.
+Remove the hexadecimal Lasagna identity scheme completely. Project state and
+cache metadata must use actual source locations that a developer can read and
+follow:
 
-The cache used for this must not be Lasagna-manifest-specific. Implement a
-reusable arbitrary remote-file cache which can cache any single file/object
-from the supported remote transports. Lasagna manifest handling is its first
-consumer.
+- `lasagna_datasets[].location` remains the actual local manifest path or
+  remote manifest locator;
+- each automatically attached Lasagna volume uses its actual resolved local
+  Zarr path or remote Zarr locator as its project volume location;
+- Lasagna-derived provenance tags contain the actual local or remote manifest
+  location, not an encoding, hash, cache path, or synthetic source location;
+- remote access continues to use transparent persistent caching without
+  exposing cache identities in project JSON or the GUI.
 
-Project Lasagna entries must distinguish ordinary Lasagna data from learned
-fiber inference data through a tag:
+The encoded representation was unshipped WIP. Do not implement backward
+compatibility, decoding, migration, fallback lookup, or preservation for it.
+Remove the encoder, the encoded cache layout, the encoded sidecar identity,
+the synthetic derived-volume scheme, and their tests/documentation. Projects
+created with that WIP representation must be recreated by reattaching their
+manifests.
 
-- an untagged Lasagna entry is ordinary Lasagna data;
-- a Lasagna entry carrying the reserved fiber tag is fiber inference data.
+Correct native GUI fiber segment tracing so fiber lines remain stored in their
+native base-resolution coordinate system. The default fiber tracer works on
+the sd2 grid, or 0.25x linear resolution (`4` base voxels per trace voxel for
+the current/default manifests). The GUI must:
 
-The current separate `fiber_inference_datasets` project representation should
-be migrated to the tagged `lasagna_datasets` representation without making
-existing project files unloadable.
+1. convert the base-space reference segment into trace coordinates;
+2. let the prediction and normal samplers map trace coordinates into their
+   persisted channel grids;
+3. trace and evaluate the segment in trace coordinates;
+4. convert the accepted fused segment back into base coordinates;
+5. splice and persist only base-coordinate points, keeping original control
+   point coordinates exact.
 
-Add GUI actions for:
+The current requirement that line storage scale equal trace working scale is
+incorrect and must be removed. Physical endpoint thresholds and reported
+errors must retain their existing micrometer meaning after the coordinate
+conversion.
 
-- attaching a local Lasagna manifest;
-- attaching a remote Lasagna manifest.
-
-Both attachment paths must let the user choose ordinary or fiber data, with
-ordinary Lasagna as the default. A successful attachment becomes the selected
-dataset for its role.
-
-## Scope for this task
+## Scope
 
 This task covers:
 
-1. A reusable exact-byte arbitrary remote-file cache in VC core.
-2. Cached remote Lasagna manifest materialization shared by VC3D, the native
-   CLI, and existing Open Data Lasagna preparation where applicable.
-3. Canonical tagged Lasagna entries and legacy project migration.
-4. Local and remote Lasagna attachment actions in VC3D.
-5. Updating existing VC3D Lasagna/fiber dataset resolution to understand the
-   tagged entries and materialized remote manifests.
-6. Automatically attaching manifest-referenced Zarr data as ordinary project
-   volumes while keeping the generic VC volume/runtime contract strictly 3D.
-7. Automated unit/integration coverage, VC3D compilation, and native CLI
-   compilation/smoke validation.
+1. Human-readable local/remote manifest provenance and actual Zarr volume
+   locations in VC project JSON.
+2. Deduplication, reconciliation, detach cleanup, and independent-volume
+   preservation using actual source locations.
+3. Direct-remote, explicit `lasagna-remote.json`, absolute-remote-group, and
+   plain-local manifest source-location resolution.
+4. A readable, path-mirroring remote cache layout and source-path sidecar
+   validation with no hexadecimal identity helper or `url_hex` directory.
+5. Base-to-trace and trace-to-base conversion for the VC3D native fiber
+   segment action.
+6. Trace-scale prediction and normal sampling while retaining the ordinary
+   base-scale normal sampler used to rebuild the stored line.
+7. Focused regression tests, VC3D/core builds, documentation, specifications,
+   task log, and changelog updates.
 
-This task does not change the native fiber tracing algorithm, expose new trace
-controls, or evaluate tracing quality. Interactive use of the attached data in
-VC3D and the Line Annotation native fiber action is a follow-up task after this
-manifest/project plumbing is complete.
+## Out of scope
 
-## Required behavior
-
-### Generic remote-file cache
-
-- Cache arbitrary individual files/objects, independent of file extension or
-  content type.
-- Standard transport support must cover `http://`, `https://`, `s3://`, and
-  `s3+REGION://`. The cache abstraction must permit a caller-provided fetcher
-  so other transports can reuse the same persistence logic.
-- Preserve source bytes exactly. Do not decode, recompress, quantize, or
-  otherwise transform cached files.
-- Default to cache-first behavior: a valid cached file is returned without a
-  network request.
-- Provide an explicit refresh/invalidation mechanism for mutable remote
-  objects.
-- Publish downloads atomically and never treat partial temporary files as
-  cache hits.
-- Coalesce duplicate in-process fetches for the same destination.
-- Validate cache identity and recorded size before declaring a hit.
-- Use the configured persistent remote-cache root and cooperate with its disk
-  accounting for managed payloads. Small control files such as manifests may
-  be marked non-evictable metadata.
-- Never persist credentials or unredacted signed-query diagnostics in cache
-  metadata or logs.
-
-### Lasagna manifest caching
-
-- `LasagnaDataset::openLocation()` must materialize a remote manifest through
-  the generic cache and reuse it on subsequent opens.
-- Preserve the existing local/materialized manifest plus
-  `lasagna-remote.json` format. Its `artifact_url` remains the explicit origin
-  for relative group paths and `manifest_file` must still identify the opened
-  manifest.
-- Also support the simpler direct remote-manifest form used by
-  `vc_fiber_trace_metric`: when the manifest origin is HTTP/S3, resolve its
-  relative group paths against the remote manifest's parent URL and treat the
-  referenced Zarr data as remote.
-- Absolute HTTP/S3 group paths remain independent remote origins. Plain local
-  manifests without a remote sidecar keep local manifest-relative semantics.
-- Preserve the existing `remote_lasagna/url_hex/...` artifact directory
-  identity so existing cached Lasagna Zarr metadata/chunks remain warm.
-- Place/update the Lasagna remote marker beside the materialized manifest so
-  reopening the cached path preserves remote-relative Zarr group semantics.
-- A missing, truncated, or invalid cached manifest must be fetched again once;
-  persistent invalid remote content must still fail clearly.
-- Preserve current S3 region, SigV4/default-credential, public HTTP/S3, and
-  detailed remote failure behavior.
-- VC3D must be able to pass its resolved AWS credentials into the core loader;
-  the CLI must retain its current default credential behavior.
-- The existing `vc_fiber_trace_metric` command line remains compatible. Its
-  fiber and normal remote manifests both gain cache-first reuse automatically.
-
-### Automatic project-volume attachment
-
-- Treat the Lasagna entry and all project volume entries derived from its
-  `groups` object as one attachment transaction.
-- Resolve each distinct group Zarr through the local, explicit-sidecar,
-  direct-remote-origin, or absolute-remote rules above.
-- A Lasagna channel collection is conceptually a multi-channel volume. When it
-  is stored as multiple actual 3D `(Z,Y,X)` Zarr volumes, attach those volumes
-  through the ordinary project-volume path; VC3D does not need to understand
-  their conceptual grouping.
-- VC3D-compatible manifests must reference one actual 3D `(Z,Y,X)` array per
-  named channel. Flat channel-first `(C,Z,Y,X)` arrays belong to an older
-  Lasagna preprocessing/fitting intermediate format and are not attached or
-  sampled by VC3D; convert them to per-channel 3D OME-Zarr first. Do not add
-  general 4D support or channel selectors to `Volume`, `RemoteVolumeSpec`,
-  VC3D, or the generic remote-volume stack.
-- Derived volume entries must carry shared provenance tags identifying the
-  Lasagna manifest, group, and channel where applicable. Use those tags for
-  deduplication, reload reconciliation, display naming, and detach cleanup.
-- Prepare and validate every derived volume before mutating the project. Any
-  missing/incompatible group, channel-count mismatch, volume-ID conflict, or
-  persistence failure rolls back the entire manifest attachment.
-- Use the existing prepared-volume attachment path for the final commit so the
-  new entries behave like manually attached primary volumes in selectors,
-  rendering, caching, and project reload.
-- Do not eagerly download all remote chunks. Attachment opens descriptors and
-  constructs read-through volume views; chunks remain demand-loaded.
-- Detaching a manifest removes volume entries derived only from that manifest.
-  Preserve a derived volume still referenced by another attached manifest or
-  an independently attached entry.
-
-### Project schema
-
-- `lasagna_datasets` is the canonical project collection for both roles.
-- Use one reserved tag constant, initially `vc-lasagna-fiber`, for fiber
-  inference entries. No role tag means ordinary Lasagna.
-- Preserve `selected_lasagna_dataset` and
-  `selected_fiber_inference_dataset` so each role can be selected
-  independently.
-- On load, merge legacy `fiber_inference_datasets` entries into
-  `lasagna_datasets` with the reserved tag. Deduplicate by normalized
-  attachment identity and preserve non-role tags.
-- Save the canonical tagged representation rather than continuing to write a
-  second independent fiber dataset collection.
-- Reclassifying an entry must update its role tag and clear/fix stale selected
-  role fields atomically.
-- Detaching a Lasagna entry must clear either selected role when applicable.
-
-### VC3D attachment
-
-- Add `Attach Lasagna Manifest...` and
-  `Attach Remote Lasagna Manifest...` to the File menu.
-- Local attachment accepts a manifest file; remote attachment accepts a remote
-  file/object locator rather than a directory.
-- Ask for the role through an explicit regular/fiber choice, defaulting to
-  regular.
-- Validate and materialize before mutating the project. Failed attachment must
-  leave project JSON and selections unchanged.
-- A successful attachment includes all ordinary project volumes derived from
-  the manifest; attaching only its JSON entry is incomplete.
-- Remote I/O and parsing must not block the GUI thread.
-- Persist the original portable remote locator in project JSON, not the
-  machine-local cache path.
-- Store the chosen remote-cache root on a project that did not already have
-  one.
-- Show Lasagna entries in the existing Detach UI with their role.
+- Do not serialize cache paths, cache keys, credentials, or signed-query
+  diagnostics into project JSON.
+- Do not add generic 4D volume support.
+- Do not change Trace2CP search/scoring behavior, inference values, or model
+  output encoding.
+- Do not resample or rewrite existing fiber JSON files.
+- Do not add a user-facing trace-scale control in this task; retain the current
+  default inference scaledown power of 2.
 
 ## Correctness constraints
 
-- No numerical behavior or cached Lasagna channel bytes may change.
-- Remote-relative manifest paths must resolve against the remote manifest's
-  parent, never the local cache directory as an origin.
-- Existing `lasagna-remote.json` specifications remain authoritative for their
-  local/materialized manifests and must remain loadable.
-- Local relative paths remain relative to the project/manifest as currently
-  defined.
-- No installation/bootstrap commands are part of this task.
-- Tests must not require network access or real AWS credentials.
+- Actual source location and transparent cached materialization are separate
+  concepts. Project state records the source; runtime loaders choose and reuse
+  the cache.
+- Cache directories mirror normalized remote scheme, authority, and object
+  path components. Authentication query parameters remain runtime-only and
+  are not persisted.
+- A remote relative group path resolves against its authoritative remote
+  manifest/artifact origin, never against the local cached manifest path.
+- A local relative group path resolves against the local manifest directory.
+- One actual ZYX source referenced by multiple manifests appears as one
+  project volume with multiple readable manifest-provenance tags.
+- Detaching one manifest removes only that manifest's provenance. The volume
+  remains if another manifest or an independent manual attachment owns it.
+- Fiber line/control-point storage remains in base coordinates. Trace and
+  prediction coordinates are runtime-only.
+- Default sd2 tracing uses the scale derived from the inference manifest and
+  default inference scaledown power. For the current factor-16 prediction
+  fields this is 4 base voxels per trace voxel.
+- The prediction sampler sees trace coordinates with prediction spacing
+  `prediction_to_base / trace_to_base`; it must not be passed base points or
+  points pre-divided directly into prediction voxels.
+- A trace-space endpoint error is converted to micrometers using the physical
+  size of a trace voxel, not the physical size of a base voxel.
+- Original stored CP endpoints remain bit-exact after a successful splice.

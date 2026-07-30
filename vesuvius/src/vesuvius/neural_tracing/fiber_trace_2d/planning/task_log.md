@@ -1,126 +1,98 @@
-# Task Log: VC3D Lasagna Attachment And Generic Remote File Cache
+# Path-Based Lasagna Volumes And Base-Space Fiber Tracing Task Log
 
-## Findings And Decisions
+## Planning findings
 
-- VC projects already had taggable `lasagna_datasets`, while the first native
-  fiber integration added a separate `fiber_inference_datasets` JSON field.
-  The canonical representation is now one collection with reserved role tag
-  `vc-lasagna-fiber`; untagged entries remain regular Lasagna data.
-- `fiber_inference_datasets` is a legacy project-schema field only. It is read,
-  tagged, merged, and deduplicated for compatibility, but is no longer written.
-  The fiber manifest schema and learned tracer are not classified as legacy.
-- Both supported remote-origin forms remain distinct: an explicit adjacent
-  `lasagna-remote.json` controls a materialized local manifest, while a direct
-  remote manifest resolves relative groups from its own parent URL.
-- Generic `Volume`, remote volume specs, project storage, and VC3D remain
-  strictly 3D. History shows the CZYX path came from the original May 2026
-  Lasagna preprocessing/inference artifact contract, not generic VC volume
-  support. Current inference writers emit separate per-channel 3D OME-Zarr;
-  older flat CZYX preprocessing/fit intermediates require conversion and are
-  rejected by VC3D attachment and normal sampling.
-- Derived manifest/group/channel provenance is project bookkeeping for stable
-  deduplication, reload reconstruction, stale-channel reconciliation, role
-  changes, and detach ownership. It is not generic 4D grouping.
+- The reversible URL/path hex encoder originated in commit `458f19215` for a
+  collision-free, filesystem-safe remote Lasagna cache directory.
+- Commit `26e2d12b2` extracted that cache helper and incorrectly reused it for
+  project provenance and derived-volume locations.
+- Derived identities are currently double encoded because the code builds
+  `hex(hex(manifest_location) + "|group|channel")`.
+- `lasagna_datasets[].location` already retains the authoritative actual
+  manifest source, so encoded project identities are redundant.
+- The user confirmed this identity/cache representation was never shipped and
+  requires complete removal. No decoder, project migration, old-cache lookup,
+  or backward-compatible reader will be implemented.
+- The replacement cache layout will mirror readable remote scheme, authority,
+  and object-path components. Persistent sidecars will validate an actual
+  canonical source path rather than `source_identity_hex`.
+- Lasagna group resolution already distinguishes local paths, direct remote
+  origins, explicit remote sidecars, and absolute remote groups, but it does
+  not expose one authoritative human/project source-location field.
+- The GUI currently rejects a valid base-line/trace-grid difference. It passes
+  base-space line points directly into a prediction field configured for trace
+  coordinates if that rejection is simply removed.
+- Correct GUI tracing needs both point conversion and a separate normal sampler
+  configured for trace coordinates. The ordinary base-space sampler is still
+  needed to rebuild the stored line after converting results back.
+- Endpoint physical conversion must use trace voxel size
+  `base_voxel_um * trace_to_base`.
 
-## Implementation
+## Deviations
 
-- Added a reusable exact-byte arbitrary single-file cache with cache-first and
-  refresh policies, built-in HTTP/S3 transport, custom fetchers, atomic
-  replacement with failed-refresh rollback, sidecar identity/size validation,
-  in-process request coalescing, invalidation, and managed/unmanaged disk
-  accounting.
-- Integrated direct remote Lasagna manifest materialization into
-  `LasagnaDataset::openLocation()`, including cache hit/download diagnostics,
-  one retry for corrupt cached JSON, remote auth propagation, and reuse by
-  `vc_fiber_trace_metric` without CLI changes.
-- Ported Open Data manifest publication to the generic cache.
-- Added canonical tagged project entries, old-field migration, Lasagna-owned
-  3D channel preparation, provenance, atomic manifest-plus-volume attachment,
-  reload reconciliation, role reclassification, and ownership-aware detach.
-- Added VC3D File menu actions for local and remote manifests, regular/fiber
-  role selection, background validation/preparation, atomic GUI-thread commit,
-  and typed Detach entries.
-- Updated Line Annotation resolution to use selected canonical tagged entries,
-  the project cache root, and the original persisted locator for session
-  identity. Tracer scoring and interaction behavior were not changed.
-- Removed CZYX projection from the project-volume adapter, restricted Open Data
-  validation and the VC3D normal sampler to 3D arrays, and migrated affected
-  sampler fixtures to the current per-channel 3D representation. Generic
-  volume and project loading behavior was not changed.
+- Independent agent review required by the local planning process was not run
+  because the active runtime policy prohibits delegation unless the user
+  explicitly requests it. A direct code/spec consistency review was completed.
+- Initial focused builds used the plan's conservative `-j2`. The user requested
+  full machine parallelism, so subsequent builds use `-j32`.
 
 ## Validation
 
-- Configured dependencies were reused; no install or bootstrap command ran.
-- Built with:
+Implemented and validated:
 
-  ```bash
-  cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
-    --target test_remote_file_cache test_lasagna_manifest \
-    test_lasagna_project_volumes test_volume_pkg \
-    test_persistent_zarr_cache_budget test_open_data_manifest VC3D \
-    vc_fiber_trace_metric -j 8
-  ```
+- Remote arbitrary-file sidecars now store a readable, query-free `source` and
+  Lasagna direct-manifest caches mirror
+  `remote_sources/<scheme>/<authority>/<path>`.
+- Lasagna groups retain an authoritative source locator independently of their
+  runtime HTTP endpoint and local cache path.
+- Project derived-volume locations are actual local/remote Zarr paths and use
+  one `vc-lasagna-derived:<manifest location>` ownership tag per manifest.
+- Shared-source reconciliation and detach preserve other manifest owners;
+  independently attached primary volumes receive no automatic ownership tag
+  and survive all manifest detaches.
+- VC3D keeps line/control coordinates in base space, runs prediction and a
+  dedicated normal sampler at the derived trace scale, converts accepted
+  results back to base space, restores endpoints exactly, and uses trace-scale
+  physical voxel size.
 
-  Result: all targets built successfully. The existing Qt code emitted only
-  deprecation warnings.
+Build commands:
 
-- Focused and broader related tests:
+```bash
+cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
+  --target test_remote_file_cache test_lasagna_manifest \
+  test_lasagna_project_volumes test_volume_pkg test_fiber_trace3d -j2
+cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
+  --target test_lasagna_manifest test_open_data_manifest VC3D \
+  vc_fiber_trace_metric -j2
+cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
+  --target test_fiber_trace3d VC3D vc_fiber_trace_metric -j32
+```
 
-  ```bash
-  ctest --test-dir volume-cartographer/build/ci-tests-clang-systemdeps \
-    --output-on-failure \
-    -R '^(test_remote_file_cache|test_lasagna_manifest|test_lasagna_project_volumes|test_volume_pkg|test_persistent_zarr_cache_budget|test_open_data_manifest|test_open_data_volume_prefill|test_zarr_chunk_fetcher|test_volume_pkg_full|test_volume_pkg_more)$'
-  ```
+The final `-j32` build passed. Ninja reported a recoverable pre-existing
+`premature end of file` warning and rebuilt more targets than expected. VC3D
+also emitted existing Qt deprecation warnings in unrelated sources.
 
-  Result: 10/10 passed in 14.82 seconds. An intermediate run exposed that
-  generic project re-resolution discarded a still-shared prepared Lasagna
-  runtime volume after detach. `resolveAll()` now preserves Lasagna-owned 3D
-  runtime objects, and the new shared-ownership detach regression passes.
+Test results:
 
-- CLI surface check:
+- `test_remote_file_cache`: 8 passed.
+- `test_lasagna_manifest`: 14 passed.
+- `test_lasagna_project_volumes`: 4 passed.
+- `test_volume_pkg`: 39 passed.
+- `test_fiber_trace3d`: 26 passed.
+- `test_open_data_manifest`: 32 passed.
+- `vc_fiber_trace_metric --help`: passed.
+- `git diff --check`: passed.
+- Source/doc audit found no stale development-only encoded location or cache
+  symbols in `volume-cartographer` implementation/docs or fiber docs/specs.
 
-  ```bash
-  volume-cartographer/build/ci-tests-clang-systemdeps/bin/vc_fiber_trace_metric --help
-  ```
+Two initial test failures were corrected during the loop: direct manifest
+validation now expects malformed remote sources to fail before fetching, and
+the authoritative group-source helper supports directly parsed local test
+manifests through their resolved `zarrPath`.
 
-  Result: succeeded; `--remote-cache-dir` remains the shared remote-manifest
-  cache option for both fiber and normal manifests.
+## Limitations
 
-- Follow-up CZYX removal validation:
-
-  ```bash
-  cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
-    --target test_lasagna_project_volumes test_lasagna_normal_sampler \
-    test_open_data_manifest -j2
-  volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_lasagna_project_volumes
-  volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_open_data_manifest
-  python -m py_compile lasagna/lasagna_volume.py
-  ```
-
-  Result: all targets compiled; project-volume tests passed 4/4 and Open Data
-  tests passed 32/32. The normal-sampler run passed the new CZYX rejection and
-  migrated 3D cases but still fails two pre-existing assertions expecting 24
-  batch-prefetch reads; the current committed direct sampling path reports 0.
-  That unrelated counter-test mismatch was left unchanged.
-
-## Deviations And Deferred Work
-
-- The active no-delegation runtime policy prevented the nested `AGENTS.md`
-  independent-agent plan review. A direct consistency audit was performed; no
-  conflicting task/spec/plan requirements were found.
-- No focused Qt interaction test was added. Core attachment/reconciliation is
-  covered automatically and the VC3D target compiles; interactive local/remote
-  attachment and Line Annotation tracing remain the explicitly requested next
-  usage-test phase.
-- The planned Qt work was kept in `MenuActionController` with the existing
-  `VolumeAttachmentController` auth/cache methods made reusable, rather than
-  adding a separate one-use Lasagna attachment controller. Validation and
-  preparation remain in core, and all network/descriptor work still runs in
-  the background task.
-- Project-based atlas command-line tools still use local selected-manifest
-  paths and have no remote-cache option. VC3D and `vc_fiber_trace_metric` are
-  locator-aware; extending the separate atlas CLIs remains outside this task.
-- Automatic TTL/ETag refresh, recursive directory caching, cross-process fetch
-  locking, and remote atlas `init_shell_dir` listing/materialization remain out
-  of scope. Cache-first treats a locator as stable until explicit refresh or
-  invalidation.
+- The interactive VC3D smoke test with the user's local project was not run in
+  this non-GUI session. The VC3D target and all relevant noninteractive tests
+  pass, but the attach/save/trace/reopen workflow still needs an interactive
+  check against that dataset.

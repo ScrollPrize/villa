@@ -1707,6 +1707,73 @@ int debugTraceWorkerCount(
 } // namespace testing
 #endif
 
+FiberTraceCoordinateAdapter::FiberTraceCoordinateAdapter(
+    double traceToBaseScaleValue)
+    : traceToBaseScale(traceToBaseScaleValue)
+{
+    if (!(traceToBaseScale > 0.0) || !std::isfinite(traceToBaseScale)) {
+        throw std::invalid_argument(
+            "fiber trace-to-base scale must be positive and finite");
+    }
+}
+
+cv::Vec3d FiberTraceCoordinateAdapter::baseToTrace(
+    const cv::Vec3d& point) const
+{
+    return point / traceToBaseScale;
+}
+
+cv::Vec3d FiberTraceCoordinateAdapter::traceToBase(
+    const cv::Vec3d& point) const
+{
+    return point * traceToBaseScale;
+}
+
+std::vector<cv::Vec3d> FiberTraceCoordinateAdapter::baseToTrace(
+    const std::vector<cv::Vec3d>& points) const
+{
+    std::vector<cv::Vec3d> converted;
+    converted.reserve(points.size());
+    for (const auto& point : points)
+        converted.push_back(baseToTrace(point));
+    return converted;
+}
+
+std::vector<cv::Vec3d> FiberTraceCoordinateAdapter::traceToBase(
+    const std::vector<cv::Vec3d>& points) const
+{
+    std::vector<cv::Vec3d> converted;
+    converted.reserve(points.size());
+    for (const auto& point : points)
+        converted.push_back(traceToBase(point));
+    return converted;
+}
+
+std::vector<cv::Vec3d> FiberTraceCoordinateAdapter::traceSegmentToBase(
+    const std::vector<cv::Vec3d>& points,
+    const cv::Vec3d& exactStartBase,
+    const cv::Vec3d& exactTargetBase) const
+{
+    if (points.size() < 2) {
+        throw std::invalid_argument(
+            "fiber trace segment must contain at least two points");
+    }
+    auto converted = traceToBase(points);
+    converted.front() = exactStartBase;
+    converted.back() = exactTargetBase;
+    return converted;
+}
+
+double FiberTraceCoordinateAdapter::traceVoxelSizeUm(
+    double baseVoxelSizeUm) const
+{
+    if (!(baseVoxelSizeUm > 0.0) || !std::isfinite(baseVoxelSizeUm)) {
+        throw std::invalid_argument(
+            "base voxel size must be positive and finite");
+    }
+    return baseVoxelSizeUm * traceToBaseScale;
+}
+
 FiberPredictionTraceScales resolveFiberPredictionTraceScales(
     const vc::lasagna::LasagnaDatasetManifest& manifest,
     int inferenceScaledownPower)

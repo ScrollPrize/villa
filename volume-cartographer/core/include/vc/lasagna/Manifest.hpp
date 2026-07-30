@@ -25,6 +25,9 @@ struct LasagnaChannelGroup {
     // ordinary datasets and diagnostics.
     std::string relativeZarrKey;
     std::filesystem::path zarrPath;
+    // Authoritative local path or remote locator serialized into VC projects.
+    // Runtime endpoint and cache details remain separate below.
+    std::string sourceLocation;
     // Non-empty when this group is opened through a remote read-through store.
     // remoteZarrBaseUrl is either the manifest artifact root with
     // remoteZarrKey naming the relative Zarr group, or the Zarr root itself
@@ -62,6 +65,8 @@ struct LasagnaDatasetManifest {
     // VC read-through-cache marker, or by LasagnaDataset::openLocation for a
     // direct remote manifest.
     std::string remoteBaseUrl;
+    // Original marker or manifest origin used to form readable project paths.
+    std::string remoteSourceBaseLocation;
     std::filesystem::path remoteCacheRoot;
 
     // Backward-compatible summary for old callers: a Lasagna dataset's

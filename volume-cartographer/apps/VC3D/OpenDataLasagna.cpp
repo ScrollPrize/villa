@@ -543,7 +543,8 @@ int attachOpenDataLasagna(VolumePkg& pkg,
                 const auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
                 std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
                 for (auto& prepared :
-                     vc::lasagna::prepareLasagnaProjectVolumes(dataset)) {
+                     vc::lasagna::prepareLasagnaProjectVolumes(
+                         dataset, manifest.string())) {
                     volumes.push_back({
                         std::move(prepared.location), std::move(prepared.tags),
                         std::move(prepared.volume)});

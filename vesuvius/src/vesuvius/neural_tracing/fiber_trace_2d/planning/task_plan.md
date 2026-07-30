@@ -1,538 +1,429 @@
-# Task Plan: VC3D Lasagna Attachment And Generic Remote File Cache
+# Task Plan: Path-Based Lasagna Volumes And Base-Space Fiber Tracing
 
-## 1. Goal And Task Boundary
+## 1. Goal And Accepted Coordinate Contract
 
-Implement reusable cache-first materialization of arbitrary remote files, use
-it for Lasagna manifests in core/CLI/VC3D, and make tagged local or remote
-Lasagna manifests attachable through VC3D projects together with all ordinary
-project volumes derived from their channel groups.
+Make VC project files describe data with real source locations and make the
+native GUI tracer treat coordinate systems explicitly.
 
-This task stops after the data can be attached, selected, resolved, and opened
-through the shared code paths. It does not alter native Trace2CP search,
-Line Annotation interaction design, trace parameters, or trace quality. A
-follow-up task will exercise the result interactively in VC3D and the Line
-Annotation window.
+The canonical coordinate spaces are:
 
-## 2. Accepted Design Decisions
+- **base/fiber space:** persisted line and control-point coordinates;
+- **trace space:** runtime sd2 tracing grid; with the current/default fiber
+  manifests, one trace voxel spans 4 base voxels;
+- **prediction space:** persisted inference-channel voxels; for the current
+  manifests, one prediction voxel spans 16 base voxels or 4 trace voxels;
+- **normal-channel space:** each regular Lasagna group keeps its own manifest
+  scale and is sampled through the shared runtime coordinate adapter.
 
-### 2.1 Canonical project representation
-
-- Keep one `lasagna_datasets` array.
-- Use the reserved boolean tag `vc-lasagna-fiber` for learned fiber inference
-  data.
-- Treat absence of that tag as ordinary Lasagna data.
-- Keep independent ordinary/fiber selected-location fields.
-- Read and migrate the current `fiber_inference_datasets` field, but stop
-  writing it in newly saved project state.
-
-The tag will be declared once in core and consumed through helper functions;
-callers must not repeat string literals.
-
-### 2.2 Generic file-cache contract
-
-Add a core utility, tentatively:
-
-- `core/include/vc/core/util/RemoteFileCache.hpp`
-- `core/src/RemoteFileCache.cpp`
-
-The utility will cache one exact remote object into a caller-selected path
-under a configured cache root. Its persistence layer will not know about JSON,
-Lasagna, Zarr, or any other file format.
-
-The API will expose:
-
-- a stable source identity;
-- a destination relative to a configured cache root;
-- cache policy (`CacheFirst` and `Refresh`);
-- an optional caller-provided fetch-to-temporary-file function;
-- a standard HTTP/S3 fetch adapter using `RemoteUrl` and `HttpAuth`;
-- a result containing the local path, hit/download status, normalized remote
-  endpoint, and a read lease when the payload is budget-managed;
-- explicit invalidation.
-
-The generic fetch callback writes a cache-owned temporary path. This keeps the
-cache usable by future streaming transports without requiring all files to fit
-in memory. The initial HTTP/S3 adapter may bridge the existing buffered
-`HttpClient` response into that writer, without making buffering part of the
-cache abstraction.
-
-### 2.3 Cache identity and publication
-
-- Reuse/extract the collision-free segmented URL-hex identity currently
-  private to `vc::lasagna::Dataset.cpp`; do not introduce an independent hash
-  convention.
-- Record only identity hex, byte size, schema version, and accounting class in
-  the cache sidecar. Do not store raw signed URLs or credentials.
-- Verify sidecar identity, destination containment, regular-file state, and
-  byte size on a hit.
-- Download into a unique temporary sibling, fsync/close through the existing
-  file-writing conventions where available, then atomically rename and publish
-  the sidecar last.
-- On failure, remove the temporary file and leave any previously valid cache
-  entry intact.
-- Coalesce concurrent in-process requests keyed by normalized destination and
-  source identity. Cross-process first downloads may duplicate work, but
-  atomic publication must prevent partial/corrupt results.
-- Managed arbitrary payloads use the existing persistent cache budget
-  reservation/read-pin mechanism. The budget scanner will recognize generic
-  payload sidecars after restart. Lasagna/Open Data manifests are small control
-  metadata and will be marked unmanaged so their cached path remains stable.
-
-Renaming `PersistentZarrCacheBudget` is not required for this task. Its
-implementation already accounts for remote volume and Lasagna data; only its
-generic sidecar recognition is extended.
-
-### 2.4 Lasagna cache layout compatibility
-
-For a direct remote manifest, compute the same artifact directory currently
-used for its remote Zarr groups:
+For a base point `p_base` and derived `trace_to_base`:
 
 ```text
-<remote-cache-root>/remote_lasagna/url_hex/<segmented-normalized-manifest-url>/
+p_trace = p_base / trace_to_base
+p_base  = p_trace * trace_to_base
+prediction_index = p_trace / (prediction_to_base / trace_to_base)
 ```
 
-Materialize a reserved manifest filename and `lasagna-remote.json` inside that
-directory. Relative Zarr keys therefore continue to use the same directory in
-which existing warm metadata/chunks already reside.
+The implementation must use the derived scales rather than embedding literal
+`4` or `16` in the segment worker. The existing default
+`inference_scaledown_power=2` remains the source of the default 0.25x
+inference/trace relationship.
 
-The generic cache accepts a caller-selected destination specifically so this
-layout and the existing Open Data layout can be retained.
+## 2. Canonical Project Representation
 
-### 2.5 Remote-origin compatibility
+### 2.1 Manifest entries
 
-Support three manifest-origin cases through one resolver without collapsing
-their persisted formats:
+Keep the existing authoritative fields:
 
-1. A plain local manifest resolves relative group Zarr paths from its local
-   parent directory.
-2. A local/materialized manifest with the existing `lasagna-remote.json`
-   sidecar resolves relative groups from the sidecar's `artifact_url`; its
-   `manifest_file` must still identify the opened manifest.
-3. A manifest opened directly from HTTP/S3 derives its group origin from the
-   remote parent URL. Once cached, a generated sidecar records that origin so
-   reopening the materialized file has identical semantics.
+```json
+{
+  "location": "/local/data/fiber.lasagna.json",
+  "tags": ["vc-lasagna-fiber"]
+}
+```
 
-An absolute remote `groups[*].zarr` locator remains its own origin. Resolution
-precedence is therefore: absolute group locator, explicit valid sidecar,
-direct manifest origin, then local manifest parent. Relative keys must be
-normalized and prevented from escaping their origin.
+or:
 
-### 2.6 Derived primary-volume representation
+```json
+{
+  "location": "s3://bucket/run/fiber.lasagna.json",
+  "tags": ["vc-lasagna-fiber"]
+}
+```
 
-Manifest attachment automatically adds its Zarr data to `VolumePkg::volumes`:
+The manifest entry needs no duplicate identity tag: its `location` is already
+the identity. Keep role and unrelated user/Open Data tags only.
 
-- actual `(Z,Y,X)` Zarr volumes produce ordinary volume entries directly;
-- a conceptual multi-channel Lasagna collection stored as multiple actual 3D
-  Zarr volumes is flattened to those ordinary entries before it reaches VC3D;
-- each group must name exactly one channel and reference an actual 3D array;
-  older flat `(C,Z,Y,X)` Lasagna preprocessing/fit intermediates must be
-  converted to per-channel 3D OME-Zarr before attachment.
+### 2.2 Derived ordinary volumes
 
-The generic `Volume`, `RemoteVolumeSpec`, project-volume loader, and VC3D remain
-strictly 3D and receive no general 4D or channel-grouping behavior. The
-Lasagna project adapter and VC3D sampling paths reject actual 4D arrays. Persist a
-Lasagna-derived identity that the Lasagna resolver can reconstruct; do not add
-a generic `#vc-channel` selector or teach VC3D to parse Lasagna groups.
+Replace `lasagna-derived://<encoded identity>` with the actual resolved group
+source:
 
-Every derived entry carries reserved provenance tags for manifest attachment
-identity, group name, and channel name/index. Tags also carry the Lasagna
-spacing/base-scale relationship needed for correct project volume metadata.
-The manifest remains authoritative: reload reconciles derived entries from it,
-and detach removes only entries no longer referenced by another manifest or an
-independent project attachment.
+- local group: absolute normalized Zarr array path, including its OME-Zarr
+  level suffix when present;
+- direct remote relative group: remote manifest parent plus relative group
+  key;
+- explicit-sidecar relative group: sidecar `artifact_url` plus relative group
+  key;
+- absolute remote group: the group's own remote locator.
 
-## 3. Implementation Sequence
+Keep readable bookkeeping tags:
 
-### Phase A: Mechanical extraction of shared remote primitives
+- `vc-lasagna-derived:<actual local manifest path or remote locator>` as the
+  combined provenance, auto-ownership, and reconstruction marker;
+- `vc-lasagna-group:<name>`;
+- `vc-lasagna-channel:<name>`;
+- `vc-lasagna-spacing:<base voxel spacing>`.
 
-1. Move the reusable URL normalization, redaction, collision-free path, and
-   HTTP/S3 fetch diagnostics needed by arbitrary files out of the private
-   Lasagna translation unit into core utility code.
-2. Port `LasagnaDataset` to those shared primitives with no cache behavior
-   change in this mechanical step.
-3. Keep public URL parsing behavior, S3 region resolution, default credential
-   loading, timeouts, and diagnostic text compatible.
-4. Add focused tests before adding cache-first behavior.
+The `volumes[].location` is a source locator, not a cache locator. A derived
+remote entry remains reconstructed by the Lasagna adapter so its exact-byte
+read-through cache behavior is preserved; generic project loading must not
+silently route it through a different lossy cache path.
+
+### 2.3 Source-location API
+
+Add one shared Lasagna helper that returns a group's authoritative source
+location after origin resolution. Do not reconstruct URLs separately in
+project code.
+
+The resolver must retain two distinct values:
+
+- human/project source location in its local, HTTP, or S3 form;
+- runtime fetch endpoint/cache metadata used by `PersistentHttpStore`.
+
+Use the existing remote URL join/normalization APIs for query-safe path joins.
+Do not derive a remote group source from the machine-local cached manifest.
+
+### 2.4 Deduplication and ownership
+
+Normalize actual locations only for comparison; preserve the canonical source
+string for serialization.
+
+- Merge repeated references to the same actual Zarr source into one volume
+  entry.
+- Add one `vc-lasagna-derived:<manifest location>` tag per referencing
+  manifest.
+- Preserve all group/channel tags needed to explain each reference.
+- If the volume existed as an independent manual project entry before a
+  Lasagna attachment, reuse it without adding an auto-ownership tag.
+- Detach removes one provenance tag at a time. Remove the volume entry only
+  when its final `vc-lasagna-derived:<manifest location>` tag is removed.
+- Reconciliation uses manifest paths and actual group locations only.
+
+## 3. Remove The Unshipped Encoded Representation
+
+Delete it rather than migrating it:
+
+1. Delete `remoteFileIdentityHex()` and `remoteFileIdentityPath()` from the
+   public and private implementation.
+2. Delete the `remote_lasagna/url_hex` layout and `source_identity_hex`
+   sidecar field.
+3. Delete synthetic derived-volume location generation and all recognizers or
+   tests for that scheme.
+4. Do not add a decoder, fallback reader, migration branch, or old-cache
+   lookup.
+5. Replace affected tests and fixtures with the path-based representation.
+6. Treat any locally created project containing the WIP schema as disposable;
+   reattach its manifests to recreate it.
+
+The resulting source must contain no implementation or documentation of the
+old encoded identity convention.
+
+## 3.1 Readable transparent cache layout
+
+Map normalized remote object paths into readable filesystem components, for
+example:
+
+```text
+<cache-root>/remote_sources/https/example.org/bucket/run/file.json
+<cache-root>/remote_sources/s3/bucket/run/file.json
+```
+
+The generic file cache still accepts a caller-selected destination. Its
+sidecar records a canonical source path string and size, not an encoded
+identity. Split and validate scheme, authority, and path components; reject
+empty, absolute-escape, `.`/`..`, or platform-invalid components instead of
+encoding an entire locator. Strip query/fragment authentication material from
+the persistent identity and layout while using the full supplied locator only
+for the in-memory request.
+
+## 4. Base-Space GUI Fiber Trace Adapter
+
+### 4.1 Dataset preparation
+
+Keep the regular line-optimization normal sampler configured for the line's
+base storage coordinates. Prepare separate native-trace runtime objects:
+
+- fiber prediction dataset/field configured with
+  `workingToBaseScale=trace_to_base`;
+- regular Lasagna normal dataset/sampler configured with the same
+  `workingToBaseScale=trace_to_base`.
+
+Do not reuse the base-space normal sampler for trace-space points. Cache these
+runtime objects in the line session by selected manifest locations and derived
+trace scale so repeated segment actions do not reopen descriptors.
+
+### 4.2 Remove the incorrect equality requirement
+
+Delete the condition requiring `trace_to_base == line_to_base`. Replace it
+with validation that:
+
+- trace scale is positive and finite;
+- all prediction channels agree on persisted prediction scale;
+- the default inference scaledown relation is valid;
+- both prediction and normal samplers were opened in trace coordinates.
+
+The line storage scale and trace runtime scale are expected to differ.
+
+### 4.3 Segment request conversion
+
+Before launching the background trace:
+
+1. Copy the base-space line and original endpoints.
+2. Divide all reference-line points by `trace_to_base`.
+3. Keep isotropic direction/plane-normal vectors normalized; their orientation
+   does not change under uniform scaling.
+4. Run `traceFiberSegment()` entirely in trace voxels.
+5. Multiply every accepted fused point by `trace_to_base`.
+6. Restore the first and last replacement points from the original base-space
+   line exactly.
+7. Splice the base-space replacement into the base-space line.
+8. Rebuild the final line model with the ordinary base-space normal sampler.
+
+Put the conversion in a small testable core/helper API also usable by future
+GUI/CLI callers. Do not bury independent arithmetic copies in Qt lambdas.
+
+### 4.4 Physical units and metadata
+
+`FiberTraceConfig::voxelSizeUm` must describe one trace voxel while tracing.
+For a base voxel size `base_voxel_um`:
+
+```text
+trace_voxel_um = base_voxel_um * trace_to_base
+```
+
+This keeps the existing 50 um acceptance threshold unchanged. Preserve both
+trace-voxel and micrometer error meaning in results; any value persisted into
+line optimization reporting must be explicitly labeled/converted rather than
+silently changing units.
+
+Trace step, pruning distance, budgets, and other voxel-valued Trace2CP
+parameters remain expressed in trace voxels. They are not multiplied before
+calling the tracer.
+
+## 5. Implementation Sequence
+
+### Phase A: Remove encoded identity and replace the cache layout
+
+1. Delete `remoteFileIdentityHex()`, `remoteFileIdentityPath()`, and every call
+   site.
+2. Replace `source_identity_hex` with a canonical readable source-path field
+   in generic cache sidecars.
+3. Replace `remote_lasagna/url_hex` with the readable hierarchical remote
+   source layout.
+4. Remove old-cache lookup and compatibility tests; a cold cache after this
+   WIP change is accepted.
+5. Keep cache-first validation, atomic publication, refresh, invalidation,
+   authentication, and exact bytes unchanged.
 
 Expected files:
 
 - `volume-cartographer/core/include/vc/core/util/RemoteFileCache.hpp`
 - `volume-cartographer/core/src/RemoteFileCache.cpp`
-- `volume-cartographer/core/CMakeLists.txt`
+- `volume-cartographer/core/src/lasagna/ProjectVolumes.cpp`
+
+### Phase B: Expose authoritative group source locations
+
+1. Extend Lasagna group resolution with one authoritative source-location
+   value/helper.
+2. Populate it for local, direct remote, explicit-sidecar, and absolute remote
+   groups.
+3. Keep runtime HTTP/S3 endpoint, auth, and cache-root fields unchanged.
+4. Add focused resolver tests before changing project serialization.
+
+Expected files:
+
+- `volume-cartographer/core/include/vc/lasagna/Manifest.hpp`
+- `volume-cartographer/core/include/vc/lasagna/Dataset.hpp`
 - `volume-cartographer/core/src/lasagna/Dataset.cpp`
+- `volume-cartographer/core/test/test_lasagna_manifest.cpp`
 
-### Phase B: Implement arbitrary remote-file caching
+### Phase C: Canonical path-based project volumes
 
-1. Implement cache hit validation, unique temporary publication, sidecar
-   publication, refresh, invalidation, and in-process single-flight behavior.
-2. Reject absolute/escaping caller destinations before any file operation.
-3. Add managed/unmanaged accounting and update
-   `PersistentZarrCacheBudget` scanning so managed generic payloads survive
-   process restart accounting and can be evicted without deleting sidecars.
-4. Ensure a sidecar whose payload was evicted is a normal cache miss.
-5. Ensure a failed refresh retains the previous valid file.
-6. Add injectable fetcher tests using arbitrary binary data, including NUL
-   bytes and non-JSON extensions. No test may use the public network.
+1. Prepare volume locations from the authoritative group source location.
+2. Generate `vc-lasagna-derived:<manifest location>` tags from the
+   authoritative `lasagna_datasets` entry location supplied by `VolumePkg`.
+3. Update attachment transaction, deduplication, reconciliation, and detach
+   ownership rules for shared actual locations.
+4. Remove all synthetic location and encoded-tag handling without a migration
+   path.
+5. Confirm reloading remote derived entries reconstructs their Lasagna exact
+   cache-backed runtime volume rather than treating the locator as an unrelated
+   generic volume.
 
-Expected tests/files:
+Expected files:
 
-- new `volume-cartographer/core/test/test_remote_file_cache.cpp`
-- `volume-cartographer/core/test/test_persistent_zarr_cache_budget.cpp`
-- `volume-cartographer/core/test/CMakeLists.txt`
+- `volume-cartographer/core/include/vc/lasagna/ProjectVolumes.hpp`
+- `volume-cartographer/core/src/lasagna/ProjectVolumes.cpp`
+- `volume-cartographer/core/include/vc/core/types/VolumePkg.hpp`
+- `volume-cartographer/core/src/VolumePkg.cpp`
+- `volume-cartographer/core/test/test_lasagna_project_volumes.cpp`
+- `volume-cartographer/core/test/test_volume_pkg.cpp`
 
-### Phase C: Materialize remote Lasagna manifests through the cache
+### Phase D: Add explicit trace coordinate conversion
 
-1. Extend `LasagnaDatasetOpenOptions` with optional resolved remote auth,
-   cache policy, and the test/custom fetch hook needed by the generic cache.
-2. Add a shared Lasagna manifest-materialization function returning the local
-   cached path plus hit/download information.
-3. Change `LasagnaDataset::openLocation()` to:
-   - bypass caching for local paths;
-   - cache/materialize remote files;
-   - write/validate the Lasagna remote marker atomically;
-   - reopen the cached file through the ordinary local parser;
-   - restore the remote manifest identity and parent URL in runtime metadata.
-4. Preserve `LasagnaDataset::open()` support for existing
-   `lasagna-remote.json` sidecars. Keep the sidecar `artifact_url` authoritative
-   rather than inferring an origin from its local cached path.
-5. Centralize group origin resolution using section 2.5 for existing sidecars,
-   direct remote manifests, absolute remote groups, and plain local manifests.
-6. On cached parse/marker failure, invalidate and refetch exactly once. Do not
-   invalidate a valid pre-existing explicit sidecar.
-7. Preserve absolute remote group handling and the existing exact-byte Zarr
-   read-through store.
-8. Keep `vc_fiber_trace_metric` CLI syntax unchanged. Both its fiber and normal
-   `openLocation()` calls inherit the cache behavior.
-9. Add cache hit/miss diagnostics that do not expose signed query strings.
+1. Add a shared/testable base-to-trace conversion helper.
+2. Change GUI inference preparation to retain the derived trace scale without
+   comparing it to base line scale.
+3. Prepare a trace-scale regular normal sampler separately from the base line
+   sampler.
+4. Convert request points into trace space and accepted results back into base
+   space around `traceFiberSegment()`.
+5. Scale physical voxel size for endpoint acceptance/reporting.
+6. Keep endpoint replacement exact and final line reconstruction in base
+   space.
 
-Tests in `test_lasagna_manifest` will cover first fetch, second-open cache hit,
-forced refresh, corrupt/truncated cache recovery, marker semantics, relative
-remote group resolution, query redaction, and unchanged local opening. Test the
-same relative group layout separately through an existing sidecar-backed
-manifest and a direct remote manifest, plus absolute remote groups and path
-traversal rejection.
+Expected files:
 
-### Phase D: Port existing Open Data Lasagna manifest caching
+- `volume-cartographer/core/include/vc/fiber_tracer/FiberTrace.hpp`
+- `volume-cartographer/core/src/fiber_tracer/FiberTrace.cpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationController.cpp`
+- `volume-cartographer/apps/VC3D/LineAnnotationController.hpp`
+- `volume-cartographer/core/test/test_fiber_trace3d.cpp`
 
-1. Keep Open Data's artifact listing/discovery, outer metadata validation,
-   coordinate tags, and existing deterministic cache directory.
-2. Replace its private manifest download/temporary publication with the new
-   generic file cacher once the concrete manifest URL is known.
-3. Preserve its existing marker and validated fast path so already cached Open
-   Data manifests remain reusable without migration or download.
-4. Keep Zarr descriptor/chunk validation behavior unchanged.
+### Phase E: Integration audit
 
-The Open Data catalog's top-level `metadata.json` live-refresh cache is not
-ported in this task: it intentionally has network-first refresh/fallback UI
-semantics rather than immutable cache-first object semantics. This distinction
-will be documented rather than silently treated as generic-cache debt.
+1. Verify local and remote attachment menus persist readable paths.
+2. Verify selected regular/fiber manifest fields remain actual locations.
+3. Verify CLI remote-manifest caching and scale behavior remain unchanged.
+4. Verify ordinary line optimization still uses its base-space normal sampler.
+5. Verify detach/reload does not remove independent volume entries.
 
-### Phase E: Canonicalize project Lasagna entries
+## 6. Testing And Validation
 
-1. Add core tag helpers:
-   - reserved tag constant;
-   - `isFiberLasagnaEntry`;
-   - filtered ordinary/fiber entry access;
-   - role reconciliation for an existing location.
-2. Replace the in-memory independent fiber entry collection with tagged
-   Lasagna entries.
-3. During `fromJson()`:
-   - load canonical `lasagna_datasets`;
-   - load legacy `fiber_inference_datasets` when present;
-   - add the reserved tag;
-   - merge duplicates without discarding user/Open Data tags;
-   - reconcile selected fields.
-4. During `toJson()`, emit only canonical tagged entries while retaining both
-   selection fields.
-5. Make attachment identity comparison handle equivalent local paths and the
-   existing normalized S3/HTTPS identities rather than raw-string duplicates.
-6. Reclassification must be one persisted mutation. Move the role tag, update
-   the selected field for the new role, and clear the old role selection when
-   it names the reclassified entry.
-7. Extend removal/detach behavior and regression tests.
+### 6.1 Project/path tests
 
-Tests in `test_volume_pkg` will cover canonical round trips, legacy migration,
-tag preservation, duplicate merge, both selections, reclassification, removal,
-relative local paths, and remote locator persistence.
+- Local manifest with relative Zarr groups writes actual resolved local paths.
+- Direct HTTP/S3 manifest with relative groups writes actual resolved remote
+  locators while a second open hits the transparent cache.
+- Explicit `lasagna-remote.json` resolves group paths from `artifact_url`.
+- Absolute remote group paths remain unchanged.
+- Project JSON contains only actual manifest/group source paths and readable
+  `vc-lasagna-derived:<manifest location>` provenance.
+- Source and documentation contain no encoded identity helper, `url_hex`,
+  `source_identity_hex`, synthetic derived scheme, decoder, or migration path.
+- Two manifests referencing one Zarr source deduplicate and retain two readable
+  provenance tags.
+- Detaching one manifest preserves the shared volume; detaching the last owner
+  removes only a manifest-owned volume.
+- An independently attached volume survives all manifest detaches.
+- Remote credentials/query diagnostics are not copied into logs or cache
+  metadata beyond the project's explicitly supplied source locator contract.
 
-### Phase F: Prepare ordinary 3D project volumes from Lasagna data
+### 6.2 Scale tests
 
-1. Add a Lasagna-owned preparation API that resolves a manifest and returns a
-   flat list of prepared 3D project volumes. Its public result contains no
-   channel-group or 4D concepts needed by VC3D.
-2. Open actual 3D group Zarr volumes through the existing local/remote 3D
-   volume path and preserve its normal cache behavior.
-3. Require every attachable group to name exactly one channel and reference an
-   actual 3D ZYX array. Reject flat CZYX intermediates with a clear conversion
-   error rather than projecting them inside VC3D.
-4. Add only the minimum generic 3D factory needed to construct a `Volume` from
-   an already prepared 3D chunked source, if the current API cannot accept the
-   Lasagna source. That factory must enforce a 3D shape and contain no
-   channel-axis or Lasagna logic.
-5. Derive canonical primary-volume attachment records from the flat prepared
-   results. Validate channel names/counts inside Lasagna before returning them.
-6. Add reserved provenance/display tags containing a stable manifest identity,
-   group, channel, and Lasagna scale metadata. Keep original user/Open Data
-   tags when the same backing view is reconciled.
-7. Add a `VolumePkg` batch attachment mutation accepting one prepared Lasagna
-   entry plus all prepared `Volume` objects. Preflight duplicate identities and
-   conflicts, insert everything, update selections/cache root, and persist
-   once. Roll back the complete in-memory and autosave state on failure.
-8. Add reference-aware detach/reconciliation: removing a manifest removes its
-   derived entries only when no other manifest provenance or independent
-   attachment remains; loading a project repairs missing/stale derived entries
-   from the authoritative manifest where resolution is available.
+- Manifest `source_to_base=1`, prediction group level 4, default inference
+  power 2 resolves `prediction_to_base=16`, `trace_to_base=4`, and prediction
+  spacing 4 trace voxels.
+- Nontrivial base points round-trip base -> trace -> base within floating-point
+  tolerance; original endpoint objects are restored exactly.
+- Prediction and normal sampler probes at a trace point address the same base
+  location as a direct base-space probe.
+- The GUI/core segment adapter passes a base span of 64 voxels to the tracer as
+  16 trace voxels and returns a fused base-space span with exact endpoints.
+- A one-trace-voxel endpoint error uses `4 * base_voxel_um` in the 50 um
+  acceptance calculation.
+- Repeated segment actions reuse trace-scale datasets and do not rebuild on the
+  expected base/trace scale difference.
+- Existing whole-fiber metric scale tests continue to pass.
 
-Expected focused coverage includes Lasagna 3D-volume preparation and CZYX
-rejection tests plus extensions to `test_volume_pkg` for batch atomicity,
-shared references, reload reconciliation, and detach behavior. Generic volume
-tests must continue to reject actual 4D Zarr arrays.
+### 6.3 Commands
 
-### Phase G: Add shared VC3D remote-data attachment plumbing
-
-1. Extract project-wide remote cache-root selection and AWS credential
-   resolution from `VolumeAttachmentController` into a shared VC3D helper.
-2. Port volume attachment to the helper before using it for Lasagna, avoiding
-   a copied credential/cache prompt implementation.
-3. Add a small Lasagna project attachment service/controller that:
-   - accepts a local or remote locator and role;
-   - opens/materializes and validates it off the GUI thread for remote input;
-   - resolves and prepares every ordinary project volume derived from the
-     manifest using Phase F;
-   - validates ordinary manifests as usable Lasagna normal data;
-   - validates fiber manifests through the existing fiber prediction scale and
-     `presence/nx/ny` contract helpers;
-   - commits the entry, tag, selection, cache root, and all prepared primary
-     volumes through the atomic batch mutation only after validation;
-   - returns structured duplicate/reclassification/error outcomes.
-4. Keep parsing/validation logic in core libraries; the controller owns only
-   Qt scheduling and presentation.
-
-Expected files include new focused VC3D attachment/helper files plus updates
-to `VolumeAttachmentController`, `CMakeLists.txt`, and project refresh paths.
-
-### Phase H: Add VC3D menu actions and project resolution
-
-1. Add File menu actions:
-   - `Attach Lasagna Manifest...`
-   - `Attach Remote Lasagna Manifest...`
-2. Local action uses a manifest file picker. Remote action accepts only a
-   supported remote file locator through the existing browser/auth UI.
-3. Prompt for `Regular Lasagna` or `Fiber inference`, defaulting to regular.
-4. Disable the action while its background attachment is in flight and report
-   status/errors on the GUI thread.
-5. Persist the portable locator, selected role, tag, newly chosen project cache
-   root, and automatically derived ordinary volume entries, then refresh
-   project UI.
-6. Add ordinary/fiber Lasagna rows to Detach and label their role. Detaching a
-   manifest also reconciles its automatically attached project volumes.
-7. Introduce one locator-aware project Lasagna resolver used by VC3D callers.
-   It returns a materialized local manifest path/dataset for local, Open Data,
-   or direct remote entries.
-8. Replace direct local-only selection assumptions in VC3D, including the
-   Line Annotation dataset selection plumbing, with this resolver. Do not
-   change tracing behavior or add tracer controls.
-9. Fiber selection must filter tagged Lasagna entries; ordinary selection must
-   ignore them. Exactly one matching entry may still auto-select as today.
-
-A focused noninteractive Qt test will exercise action presence, role mapping,
-successful local attachment, structured remote completion with a fake fetcher,
-failed-attachment rollback, and detach visibility. Heavy interactive dialogs
-will not be driven in the unit test.
-
-### Phase I: Compatibility audit
-
-Search all consumers of:
-
-- `lasagnaDatasetEntries()`;
-- `fiberInferenceDatasetEntries()`;
-- `selectedLasagnaDatasetPath()`;
-- `selectedFiberInferenceDatasetPath()`;
-- `LasagnaDataset::open()` where the source may now be a project locator.
-
-Update VC3D and relevant native CLI call sites to use canonical role helpers or
-the shared materializer. Remove obsolete fiber collection APIs only after all
-callers and tests are migrated.
-
-Project-based atlas CLIs that have no remote-cache option will continue to
-support local selected manifests. Direct remote selected-manifest support for
-those separate atlas CLIs is outside this task and must be recorded in
-`task_log.md` if the audit confirms they cannot safely inherit a cache root.
-
-## 4. Testing And Validation
-
-### 4.1 Automated tests
-
-Build focused targets without installing dependencies:
+Use the existing configured build tree and focused targets first:
 
 ```bash
-cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target \
-  test_remote_file_cache test_persistent_zarr_cache_budget \
-  test_lasagna_project_volumes \
-  test_lasagna_manifest test_volume_pkg test_open_data_manifest \
-  test_vc3d_lasagna_attachment vc_fiber_trace_metric VC3D -j 8
+cmake --build volume-cartographer/build/ci-tests-clang-systemdeps \
+  --target test_remote_file_cache test_lasagna_manifest \
+  test_lasagna_project_volumes test_volume_pkg test_fiber_trace3d \
+  test_open_data_manifest VC3D vc_fiber_trace_metric -j2
 ```
 
-Run focused tests:
+Run focused binaries/CTest entries with `--output-on-failure`, followed by the
+broader applicable core/VC3D suite if the focused set passes. Run
+`git diff --check`. No network-dependent test is allowed.
 
-```bash
-ctest --test-dir volume-cartographer/build/ci-tests-clang-systemdeps \
-  --output-on-failure \
-  -R '^(test_remote_file_cache|test_persistent_zarr_cache_budget|test_lasagna_project_volumes|test_lasagna_manifest|test_volume_pkg|test_open_data_manifest|test_vc3d_lasagna_attachment)$'
-```
+Perform a manual VC3D smoke test with the supplied project shape:
 
-If the named build directory is unavailable or does not include Qt/VC3D, use
-an already configured test-enabled build directory discovered from its
-`CMakeCache.txt`; do not bootstrap dependencies or create a new environment
-without user approval. Record the exact replacement commands in
-`task_log.md`.
+1. open the project and confirm volume entries show readable source paths;
+2. save and inspect JSON for actual local/remote source locations;
+3. select the base volume and optimize one generated fiber segment;
+4. confirm tracing runs at derived scale 4 and the stored line/control points
+   remain in base coordinates;
+5. reopen the project and confirm the resulting fiber geometry is unchanged.
 
-### 4.2 Required cache assertions
+## 7. Spec Update
 
-- A fake remote fetch counter is `1` after two cache-first opens.
-- Restart-style reconstruction of the cache object still hits the file.
-- Refresh increments the counter and atomically replaces the bytes.
-- Invalid size/sidecar/payload causes one refetch.
-- Concurrent same-file requests publish one complete result.
-- Failed initial fetch leaves no hit; failed refresh preserves the old hit.
-- Managed file accounting and eviction behave correctly; unmanaged Lasagna
-  manifest control files remain present.
-- S3 and HTTP locator normalization select stable identities without storing
-  secrets.
+Update `planning/specs.md` to:
 
-### 4.3 Required project assertions
+- require actual local/remote manifest and group source locations in project
+  JSON;
+- prohibit cache identities, reversible encodings, hashes, and synthetic
+  locations as project source fields;
+- state explicitly that the unshipped encoded representation has no backward
+  compatibility;
+- replace the incorrect trace/line scale equality requirement;
+- define base-space persisted fibers, runtime trace space, prediction spacing,
+  trace-scale normal sampling, result conversion, exact endpoints, and
+  physical-unit conversion.
 
-- Untagged entry is regular; tagged entry is fiber.
-- Legacy fiber arrays load as tagged canonical entries.
-- Saved JSON contains canonical `lasagna_datasets` and no independent legacy
-  array.
-- Duplicate/reclassification behavior preserves unrelated tags.
-- Both selected fields survive save/load and are cleared correctly on role
-  changes/removal.
-- Remote project JSON retains the remote locator, never the cache path.
-- Each actual 3D Zarr volume referenced by Lasagna automatically creates one
-  ordinary project volume entry.
-- Conceptual Lasagna grouping is flattened before VC3D receives the prepared
-  3D volumes.
-- Actual 4D Lasagna backing arrays are rejected by project attachment and the
-  VC3D sampler; older flat intermediates require conversion to per-channel 3D
-  OME-Zarr.
-- Generic project-volume loading continues to reject actual 4D Zarr inputs and
-  contains no Lasagna grouping/channel selector.
-- Automatic volume entries retain manifest/group/channel provenance and
-  canonical local or remote view locators across save/load.
-- Batch attachment is all-or-nothing when any group/channel fails preparation,
-  conflicts by volume ID, or project persistence throws.
-- Detach removes unshared derived volumes and preserves shared or independently
-  attached volumes.
+Replace the old cache-layout specification with the readable source-path
+layout and explicitly remove backward compatibility for the WIP layout.
 
-### 4.4 Required VC3D/CLI assertions
+## 8. Documentation Updates
 
-- VC3D builds with both actions present.
-- A local manifest can be attached for either role.
-- A fake remote manifest attachment performs one fetch and succeeds from cache
-  on repeat.
-- Invalid manifests do not mutate the project.
-- Local, sidecar-backed remote, and direct-remote manifests all automatically
-  attach their resolved ordinary project volumes.
-- `vc_fiber_trace_metric --help`/usage remains compatible.
-- A fixture-level `openLocation()` sequence representing both CLI manifests
-  proves their second opens do not fetch again.
+Update:
 
-No real S3 workload or interactive native fiber trace is required in this
-task. Those are follow-up usage tests.
+- `volume-cartographer/docs/vc3d_project_files.md` with readable local and
+  remote examples plus ownership/deduplication behavior;
+- `volume-cartographer/docs/remote_file_cache.md` with the readable mirrored
+  source layout and actual source-path sidecar metadata;
+- `fiber_trace_2d/docs/code_structure.md` with the base/trace/prediction
+  coordinate adapter and separate normal samplers;
+- planning task log/status throughout implementation.
 
-### 4.5 Broader regression
+## 9. Changelog Update
 
-After focused tests pass, run the full available Volume Cartographer core test
-suite in the selected build directory if its expected runtime is reasonable.
-At minimum run all tests whose names contain `lasagna`, `volume_pkg`,
-`open_data`, `remote`, or `cache`. Record failures and whether they pre-existed.
+Add one completion entry covering:
 
-## 5. Spec Update
+- path-based Lasagna-derived project volumes and removal of encoded identities;
+- base-space VC3D fiber persistence with sd2 runtime tracing and correct
+  physical scale conversion.
 
-Update `planning/specs.md` with a new VC3D/remote-data section specifying:
+## 10. Risks And Guardrails
 
-1. Exact-byte arbitrary single-file cache behavior, supported built-in
-   transports, custom fetcher extensibility, cache-first/refresh semantics,
-   atomicity, identity validation, authentication secrecy, and disk accounting.
-2. Remote Lasagna manifests are persistently materialized and reused by both
-   `LasagnaDataset::openLocation()` callers and `vc_fiber_trace_metric`.
-3. Both explicit `lasagna-remote.json` artifact origins and implicit direct
-   remote-manifest parent origins remain supported, with deterministic
-   relative/absolute group resolution and the existing exact-byte Zarr cache
-   layout.
-4. Canonical `lasagna_datasets` project entries and the
-   `vc-lasagna-fiber` role tag, including default untagged regular semantics
-   and legacy migration.
-5. VC3D local/remote attachment actions and validation-before-commit behavior.
-6. Automatic ordinary 3D project-volume creation for Lasagna data. Each group
-   names one channel in one actual ZYX array; CZYX intermediates are rejected.
-   Generic `Volume`, remote volume loading, and VC3D remain 3D-only. Include
-   provenance, atomic rollback, and detach rules.
-7. This task does not change native tracing numerics or interaction behavior.
+- **Shared-source ownership:** actual-location deduplication can accidentally
+  delete a manually attached volume. Preserve independent ownership explicitly
+  and test it.
+- **Remote origin loss:** materialized manifests must not turn cache paths into
+  project sources. Carry authoritative origin separately and test every origin
+  form.
+- **Signed locators:** source locators are user-provided project data, but
+  diagnostics and cache metadata must still follow existing redaction rules.
+- **Sampler-space mix-up:** using the base normal sampler during trace-space
+  tracing silently samples the wrong location. Maintain separate typed/session
+  fields and integration tests.
+- **Physical threshold regression:** scaling geometry without scaling voxel
+  size changes the 50 um acceptance behavior. Test a nonzero endpoint error.
+- **Endpoint drift:** multiplication back into base space can perturb CPs.
+  Restore endpoints from the original stored points exactly.
+- **Cache path safety:** readable URL mirroring must reject traversal and
+  platform-invalid components without falling back to whole-locator encoding.
+- **Cold cache:** removing the unshipped URL-hex layout intentionally discards
+  compatibility with any WIP cache contents.
 
-Do not remove or weaken the existing remote manifest, scale derivation,
-determinism, or exact-value requirements.
+## 11. Plan Review
 
-## 6. Documentation Updates
-
-1. Add `volume-cartographer/docs/remote_file_cache.md` documenting public API,
-   built-in transports, cache layout/sidecars, cache policies, authentication,
-   accounting classes, and single-file rather than directory semantics.
-2. Add `volume-cartographer/docs/vc3d_project_files.md` documenting project
-   Lasagna entries, the reserved fiber tag, selected fields, legacy migration,
-   local/remote examples, cache-root behavior, derived ordinary volume entries,
-   provenance tags, Lasagna-derived 3D identities, and detach/reconciliation
-   rules.
-3. Update
-   `vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/code_structure.md`
-   so native fiber inference documents the tagged VC3D project integration and
-   shared cached manifest path.
-4. Update any existing Open Data Lasagna comments/docs whose ownership moves
-   to the generic cache.
-
-## 7. Changelog And Task Records
-
-On completion:
-
-- add a dated entry to `planning/changelog.md` covering generic cached remote
-  files and VC3D tagged Lasagna attachment;
-- keep `planning/status.md` current as phases complete;
-- replace/update `planning/task_log.md` with implementation findings,
-  deviations, exact validation commands, and results.
-
-## 8. Risks, Limitations, And Review Checks
-
-- **Stale mutable URLs:** cache-first intentionally treats a locator as stable.
-  Refresh/invalidation exists, but automatic TTL/conditional GET is not part of
-  this task.
-- **Single files only:** prefix/directory recursion is not part of the generic
-  cache. Zarr continues to use its object store.
-- **Cross-process duplication:** atomic publication prevents corruption, but
-  two processes may both perform the first fetch. Cross-process locking is not
-  required unless implementation evidence shows it is necessary.
-- **Old VC3D writers:** newly saved canonical tagged projects may not expose
-  fiber inference entries correctly in older builds that only understand the
-  legacy array. Current code must read old projects; reverse compatibility is
-  documented rather than achieved by writing duplicate authorities.
-- **Remote atlas shell data:** caching a manifest does not make arbitrary
-  manifest-relative directories such as `init_shell_dir` remotely listable.
-  This task supports file manifests and their existing remote Zarr groups, not
-  remote atlas shell directory materialization.
-- **GUI responsiveness:** all remote fetch/parse/descriptor checks must run off
-  the GUI thread.
-- **3D/storage boundary:** project primary volumes, generic remote volume
-  loading, and VC3D remain strictly 3D. Older CZYX Lasagna preprocessing/fit
-  intermediates require explicit conversion to per-channel 3D OME-Zarr. No
-  general 4D `Volume` support or generic channel selector is added.
-- **Derived-entry drift:** project reload and detach must reconcile derived
-  volume entries from the manifest/provenance identity. The manifest is the
-  authority; duplicated raw origin URLs must not become a second authority.
-- **Numerics:** cached bytes and manifest interpretation must remain exact; no
-  volume-cache compression/quantization path may be used.
-
-Independent review must verify this plan against `task.md`, `specs.md`, and
-`plan.md`, with special attention to cache-layout compatibility, migration
-semantics, failure atomicity, and the explicit follow-up boundary for
-interactive Line Annotation testing.
+The plan was checked directly against `task.md`, `planning/specs.md`, the
+current manifest/cache implementation, project attachment/reconciliation code,
+and GUI trace call path. Independent agent review is not performed because the
+active runtime policy prohibits delegation unless the user explicitly requests
+it; this is recorded rather than silently skipped.
