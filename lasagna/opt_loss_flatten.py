@@ -160,13 +160,20 @@ def current_grid_step_stats(res: fit_model.FitResult3D) -> dict[str, float]:
 			uv = res.flatten_map
 			xyz = res.flatten_source_xyz
 			valid = res.flatten_source_valid
-			if uv is None or xyz is None or valid is None:
+			cell_valid = res.flatten_source_cell_valid
+			if uv is None or xyz is None or valid is None or cell_valid is None:
 				return {}
 			if uv.ndim != 3 or xyz.ndim != 3 or int(uv.shape[-1]) != 2 or int(xyz.shape[-1]) != 3:
 				return {}
 			if tuple(uv.shape[:2]) != tuple(xyz.shape[:2]) or tuple(valid.shape) != tuple(uv.shape[:2]):
 				return {}
+			if tuple(cell_valid.shape) != (max(0, int(uv.shape[0]) - 1), max(0, int(uv.shape[1]) - 1)):
+				return {}
 			valid_t = valid.to(device=uv.device, dtype=torch.bool) & torch.isfinite(xyz).all(dim=-1)
+			row_edge_valid, col_edge_valid, diag00_valid, diag01_valid = _retained_source_edge_masks(
+				valid_t,
+				cell_valid.to(device=uv.device, dtype=torch.bool),
+			)
 			parts: list[torch.Tensor] = []
 
 			def _append(delta_xyz: torch.Tensor, delta_uv: torch.Tensor, mask: torch.Tensor) -> None:
@@ -177,19 +184,27 @@ def current_grid_step_stats(res: fit_model.FitResult3D) -> dict[str, float]:
 					parts.append((phys[ok] / uv_len[ok]).reshape(-1))
 
 			if int(uv.shape[0]) > 1:
-				_append(xyz[1:, :] - xyz[:-1, :], uv[1:, :] - uv[:-1, :], valid_t[1:, :] & valid_t[:-1, :])
+				_append(
+					xyz[1:, :] - xyz[:-1, :],
+					uv[1:, :] - uv[:-1, :],
+					row_edge_valid & valid_t[1:, :] & valid_t[:-1, :],
+				)
 			if int(uv.shape[1]) > 1:
-				_append(xyz[:, 1:] - xyz[:, :-1], uv[:, 1:] - uv[:, :-1], valid_t[:, 1:] & valid_t[:, :-1])
+				_append(
+					xyz[:, 1:] - xyz[:, :-1],
+					uv[:, 1:] - uv[:, :-1],
+					col_edge_valid & valid_t[:, 1:] & valid_t[:, :-1],
+				)
 			if int(uv.shape[0]) > 1 and int(uv.shape[1]) > 1:
 				_append(
 					xyz[1:, 1:] - xyz[:-1, :-1],
 					uv[1:, 1:] - uv[:-1, :-1],
-					valid_t[1:, 1:] & valid_t[:-1, :-1],
+					diag00_valid & valid_t[1:, 1:] & valid_t[:-1, :-1],
 				)
 				_append(
 					xyz[1:, :-1] - xyz[:-1, 1:],
 					uv[1:, :-1] - uv[:-1, 1:],
-					valid_t[1:, :-1] & valid_t[:-1, 1:],
+					diag01_valid & valid_t[1:, :-1] & valid_t[:-1, 1:],
 				)
 			if not parts:
 				return {}
@@ -249,6 +264,24 @@ def _forward_source_fields(
 	if tuple(cell_valid.shape) != (max(0, int(uv.shape[0]) - 1), max(0, int(uv.shape[1]) - 1)):
 		raise RuntimeError("forward flatten source cell mask shape does not match UV map")
 	return uv, xyz, vertex_valid.to(dtype=torch.bool), cell_valid.to(dtype=torch.bool)
+
+
+def _retained_source_edge_masks(
+	vertex_valid: torch.Tensor,
+	cell_valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Return topology masks for source edges belonging to retained cells."""
+	h = int(vertex_valid.shape[0])
+	w = int(vertex_valid.shape[1])
+	cell_valid = cell_valid.to(device=vertex_valid.device, dtype=torch.bool)
+	row_edges = torch.zeros(max(0, h - 1), w, device=vertex_valid.device, dtype=torch.bool)
+	col_edges = torch.zeros(h, max(0, w - 1), device=vertex_valid.device, dtype=torch.bool)
+	if h > 1 and w > 1 and int(cell_valid.numel()) > 0:
+		row_edges[:, :-1] |= cell_valid
+		row_edges[:, 1:] |= cell_valid
+		col_edges[:-1, :] |= cell_valid
+		col_edges[1:, :] |= cell_valid
+	return row_edges, col_edges, cell_valid, cell_valid
 
 
 def _identity_vectors(
@@ -414,6 +447,7 @@ def _flatten_forward_combined_core(
 			uv,
 			source_xyz,
 			vertex_valid,
+			cell_valid,
 			domain_step,
 			edge_step_global_scale,
 		)
@@ -482,6 +516,7 @@ def _flatten_edge_step_core(
 	uv: torch.Tensor,
 	xyz: torch.Tensor,
 	vertex_valid: torch.Tensor,
+	cell_valid: torch.Tensor,
 	domain_step: torch.Tensor,
 	global_scale: float,
 ) -> torch.Tensor:
@@ -491,6 +526,10 @@ def _flatten_edge_step_core(
 		vertex_valid.to(device=uv.device, dtype=torch.bool)
 		& torch.isfinite(uv).all(dim=-1)
 		& torch.isfinite(xyz).all(dim=-1)
+	)
+	row_edge_valid, col_edge_valid, diag00_valid, diag01_valid = _retained_source_edge_masks(
+		valid,
+		cell_valid.to(device=uv.device, dtype=torch.bool),
 	)
 	sum_loss = uv.sum() * 0.0
 	sum_weight = uv.new_zeros(())
@@ -531,33 +570,33 @@ def _flatten_edge_step_core(
 
 	if int(uv.shape[0]) > 1:
 		part_ratio, part_ratio_weight = _ratio_contribution(
-			uv[1:, :] - uv[:-1, :],
-			xyz[1:, :] - xyz[:-1, :],
-			valid[1:, :] & valid[:-1, :],
-		)
+				uv[1:, :] - uv[:-1, :],
+				xyz[1:, :] - xyz[:-1, :],
+				row_edge_valid & valid[1:, :] & valid[:-1, :],
+			)
 		sum_ratio = sum_ratio + part_ratio
 		sum_ratio_weight = sum_ratio_weight + part_ratio_weight
 	if int(uv.shape[1]) > 1:
 		part_ratio, part_ratio_weight = _ratio_contribution(
-			uv[:, 1:] - uv[:, :-1],
-			xyz[:, 1:] - xyz[:, :-1],
-			valid[:, 1:] & valid[:, :-1],
-		)
+				uv[:, 1:] - uv[:, :-1],
+				xyz[:, 1:] - xyz[:, :-1],
+				col_edge_valid & valid[:, 1:] & valid[:, :-1],
+			)
 		sum_ratio = sum_ratio + part_ratio
 		sum_ratio_weight = sum_ratio_weight + part_ratio_weight
 	if int(uv.shape[0]) > 1 and int(uv.shape[1]) > 1:
 		part_ratio, part_ratio_weight = _ratio_contribution(
-			uv[1:, 1:] - uv[:-1, :-1],
-			xyz[1:, 1:] - xyz[:-1, :-1],
-			valid[1:, 1:] & valid[:-1, :-1],
-		)
+				uv[1:, 1:] - uv[:-1, :-1],
+				xyz[1:, 1:] - xyz[:-1, :-1],
+				diag00_valid & valid[1:, 1:] & valid[:-1, :-1],
+			)
 		sum_ratio = sum_ratio + part_ratio
 		sum_ratio_weight = sum_ratio_weight + part_ratio_weight
 		part_ratio, part_ratio_weight = _ratio_contribution(
-			uv[1:, :-1] - uv[:-1, 1:],
-			xyz[1:, :-1] - xyz[:-1, 1:],
-			valid[1:, :-1] & valid[:-1, 1:],
-		)
+				uv[1:, :-1] - uv[:-1, 1:],
+				xyz[1:, :-1] - xyz[:-1, 1:],
+				diag01_valid & valid[1:, :-1] & valid[:-1, 1:],
+			)
 		sum_ratio = sum_ratio + part_ratio
 		sum_ratio_weight = sum_ratio_weight + part_ratio_weight
 	current_step = torch.where(
@@ -569,37 +608,37 @@ def _flatten_edge_step_core(
 	target_scale = (1.0 + float(global_scale) * avg_mismatch).clamp_min(1.0e-12)
 	if int(uv.shape[0]) > 1:
 		part_loss, part_weight = _loss_contribution(
-			uv[1:, :] - uv[:-1, :],
-			xyz[1:, :] - xyz[:-1, :],
-			valid[1:, :] & valid[:-1, :],
-			target_scale,
-		)
+				uv[1:, :] - uv[:-1, :],
+				xyz[1:, :] - xyz[:-1, :],
+				row_edge_valid & valid[1:, :] & valid[:-1, :],
+				target_scale,
+			)
 		sum_loss = sum_loss + part_loss
 		sum_weight = sum_weight + part_weight
 	if int(uv.shape[1]) > 1:
 		part_loss, part_weight = _loss_contribution(
-			uv[:, 1:] - uv[:, :-1],
-			xyz[:, 1:] - xyz[:, :-1],
-			valid[:, 1:] & valid[:, :-1],
-			target_scale,
-		)
+				uv[:, 1:] - uv[:, :-1],
+				xyz[:, 1:] - xyz[:, :-1],
+				col_edge_valid & valid[:, 1:] & valid[:, :-1],
+				target_scale,
+			)
 		sum_loss = sum_loss + part_loss
 		sum_weight = sum_weight + part_weight
 	if int(uv.shape[0]) > 1 and int(uv.shape[1]) > 1:
 		part_loss, part_weight = _loss_contribution(
-			uv[1:, 1:] - uv[:-1, :-1],
-			xyz[1:, 1:] - xyz[:-1, :-1],
-			valid[1:, 1:] & valid[:-1, :-1],
-			target_scale,
-		)
+				uv[1:, 1:] - uv[:-1, :-1],
+				xyz[1:, 1:] - xyz[:-1, :-1],
+				diag00_valid & valid[1:, 1:] & valid[:-1, :-1],
+				target_scale,
+			)
 		sum_loss = sum_loss + part_loss
 		sum_weight = sum_weight + part_weight
 		part_loss, part_weight = _loss_contribution(
-			uv[1:, :-1] - uv[:-1, 1:],
-			xyz[1:, :-1] - xyz[:-1, 1:],
-			valid[1:, :-1] & valid[:-1, 1:],
-			target_scale,
-		)
+				uv[1:, :-1] - uv[:-1, 1:],
+				xyz[1:, :-1] - xyz[:-1, 1:],
+				diag01_valid & valid[1:, :-1] & valid[:-1, 1:],
+				target_scale,
+			)
 		sum_loss = sum_loss + part_loss
 		sum_weight = sum_weight + part_weight
 	return torch.where(sum_weight > 0, sum_loss / sum_weight.clamp_min(1.0), sum_loss * 0.0)
@@ -887,7 +926,7 @@ def flatten_edge_step_loss(
 	"""Regularize UV edge lengths against measured physical source edge lengths."""
 	if not _is_forward(res):
 		raise RuntimeError("flatten_edge_step currently requires the forward solver")
-	uv, xyz, vertex_valid, _cell_valid = _forward_source_fields(res)
+	uv, xyz, vertex_valid, cell_valid = _forward_source_fields(res)
 	if res.flatten_target_step is None:
 		domain_step = torch.tensor(float(res.params.mesh_step), device=uv.device, dtype=uv.dtype)
 	else:
@@ -896,6 +935,7 @@ def flatten_edge_step_loss(
 		uv,
 		xyz.to(device=uv.device, dtype=uv.dtype),
 		vertex_valid.to(device=uv.device, dtype=torch.bool),
+		cell_valid.to(device=uv.device, dtype=torch.bool),
 		domain_step,
 		float(_edge_step_global_scale),
 	)
@@ -906,6 +946,10 @@ def flatten_edge_step_loss(
 		vertex_valid.to(device=uv.device, dtype=torch.bool)
 		& torch.isfinite(uv).all(dim=-1)
 		& torch.isfinite(xyz).all(dim=-1)
+	)
+	row_edge_valid, col_edge_valid, diag00_valid, diag01_valid = _retained_source_edge_masks(
+		valid,
+		cell_valid.to(device=uv.device, dtype=torch.bool),
 	)
 	step = domain_step.clamp_min(1.0e-12)
 	sum_ratio = uv.new_zeros(())
@@ -938,34 +982,50 @@ def flatten_edge_step_loss(
 		masks.append(ok.to(dtype=uv.dtype).unsqueeze(0).unsqueeze(1))
 
 	if int(uv.shape[0]) > 1:
-		_ratio(uv[1:, :] - uv[:-1, :], xyz[1:, :] - xyz[:-1, :], valid[1:, :] & valid[:-1, :])
+		_ratio(
+			uv[1:, :] - uv[:-1, :],
+			xyz[1:, :] - xyz[:-1, :],
+			row_edge_valid & valid[1:, :] & valid[:-1, :],
+		)
 	if int(uv.shape[1]) > 1:
-		_ratio(uv[:, 1:] - uv[:, :-1], xyz[:, 1:] - xyz[:, :-1], valid[:, 1:] & valid[:, :-1])
+		_ratio(
+			uv[:, 1:] - uv[:, :-1],
+			xyz[:, 1:] - xyz[:, :-1],
+			col_edge_valid & valid[:, 1:] & valid[:, :-1],
+		)
 	if int(uv.shape[0]) > 1 and int(uv.shape[1]) > 1:
 		_ratio(
 			uv[1:, 1:] - uv[:-1, :-1],
 			xyz[1:, 1:] - xyz[:-1, :-1],
-			valid[1:, 1:] & valid[:-1, :-1],
+			diag00_valid & valid[1:, 1:] & valid[:-1, :-1],
 		)
 		_ratio(
 			uv[1:, :-1] - uv[:-1, 1:],
 			xyz[1:, :-1] - xyz[:-1, 1:],
-			valid[1:, :-1] & valid[:-1, 1:],
+			diag01_valid & valid[1:, :-1] & valid[:-1, 1:],
 		)
 	if int(uv.shape[0]) > 1:
-		_append(uv[1:, :] - uv[:-1, :], xyz[1:, :] - xyz[:-1, :], valid[1:, :] & valid[:-1, :])
+		_append(
+			uv[1:, :] - uv[:-1, :],
+			xyz[1:, :] - xyz[:-1, :],
+			row_edge_valid & valid[1:, :] & valid[:-1, :],
+		)
 	if int(uv.shape[1]) > 1:
-		_append(uv[:, 1:] - uv[:, :-1], xyz[:, 1:] - xyz[:, :-1], valid[:, 1:] & valid[:, :-1])
+		_append(
+			uv[:, 1:] - uv[:, :-1],
+			xyz[:, 1:] - xyz[:, :-1],
+			col_edge_valid & valid[:, 1:] & valid[:, :-1],
+		)
 	if int(uv.shape[0]) > 1 and int(uv.shape[1]) > 1:
 		_append(
 			uv[1:, 1:] - uv[:-1, :-1],
 			xyz[1:, 1:] - xyz[:-1, :-1],
-			valid[1:, 1:] & valid[:-1, :-1],
+			diag00_valid & valid[1:, 1:] & valid[:-1, :-1],
 		)
 		_append(
 			uv[1:, :-1] - uv[:-1, 1:],
 			xyz[1:, :-1] - xyz[:-1, 1:],
-			valid[1:, :-1] & valid[:-1, 1:],
+			diag01_valid & valid[1:, :-1] & valid[:-1, 1:],
 		)
 	if not maps:
 		zero = loss.reshape(1, 1, 1, 1)

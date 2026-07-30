@@ -491,6 +491,27 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertFalse(bool(point_valid[0, 0]))
 		self.assertTrue(bool(point_valid[0, 1]))
 
+	def test_measured_source_step_uses_retained_source_cells(self) -> None:
+		xyz = _flat_grid(3, 3)
+		xyz[2, :, 1] = 1000.0
+		valid = torch.ones(3, 3, dtype=torch.bool)
+		cell_valid = torch.tensor(
+			[
+				[True, True],
+				[False, False],
+			],
+			dtype=torch.bool,
+		)
+
+		step = fit_model.Model3D._measured_flatten_target_step(
+			xyz,
+			valid,
+			fallback=1.0,
+			cell_valid=cell_valid,
+		)
+
+		self.assertAlmostEqual(float(step.detach()), 1.0, places=5)
+
 	def test_identity_flat_regular_grid_has_near_zero_sdir(self) -> None:
 		mdl = _make_flatten_model(_flat_grid(5, 5), mesh_step=1)
 		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
@@ -859,6 +880,30 @@ class FlattenLossTest(unittest.TestCase):
 		loss, _lms, _masks = opt_loss_flatten.flatten_edge_step_loss(res=res)
 
 		self.assertGreater(float(loss.detach()), 0.03)
+
+	def test_edge_step_regularizer_uses_retained_source_cells(self) -> None:
+		xyz = _flat_grid(3, 3)
+		xyz[2, :, 1] = 1000.0
+		mdl = _make_flatten_model(
+			xyz,
+			mesh_step=1,
+			flatten_direction="forward",
+			flatten_output_step=1.0,
+			flatten_output_margin=0.0,
+			flatten_initial_uv_rescale=False,
+		)
+		mdl.flatten_source_cell_valid = torch.tensor(
+			[
+				[True, True],
+				[False, False],
+			],
+			dtype=torch.bool,
+		)
+		res = mdl(fit._dummy_flatten_data(), needs=fit_model.ModelForwardNeeds(flatten=True))
+
+		loss, _lms, _masks = opt_loss_flatten.flatten_edge_step_loss(res=res)
+
+		self.assertLess(float(loss.detach()), 1.0e-6)
 
 	def test_edge_step_global_scale_amplifies_average_mismatch(self) -> None:
 		target_step = 20.0

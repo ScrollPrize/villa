@@ -3021,11 +3021,23 @@ class Model3D(nn.Module):
 		return filtered, stats
 
 	@staticmethod
-	def _measured_flatten_target_step(xyz: torch.Tensor, valid: torch.Tensor, *, fallback: float) -> torch.Tensor:
+	def _measured_flatten_target_step(
+		xyz: torch.Tensor,
+		valid: torch.Tensor,
+		*,
+		fallback: float,
+		cell_valid: torch.Tensor | None = None,
+	) -> torch.Tensor:
 		if xyz.ndim != 3 or int(xyz.shape[-1]) != 3 or int(xyz.shape[0]) < 2 or int(xyz.shape[1]) < 2:
 			return torch.tensor(float(max(1.0e-12, fallback)), device=xyz.device, dtype=xyz.dtype)
 		valid = valid.to(device=xyz.device, dtype=torch.bool) & torch.isfinite(xyz).all(dim=-1)
-		cell_valid = Model3D._source_cell_valid(valid)
+		if cell_valid is None:
+			cell_valid_t = Model3D._source_cell_valid(valid)
+		else:
+			cell_valid_t = cell_valid.to(device=xyz.device, dtype=torch.bool)
+			expected = (max(0, int(xyz.shape[0]) - 1), max(0, int(xyz.shape[1]) - 1))
+			if tuple(cell_valid_t.shape) != expected:
+				raise ValueError(f"cell_valid shape {tuple(cell_valid_t.shape)} does not match source {expected}")
 		lengths: list[torch.Tensor] = []
 
 		def _append(delta: torch.Tensor, mask: torch.Tensor, scale: float = 1.0) -> None:
@@ -3034,11 +3046,29 @@ class Model3D(nn.Module):
 			if bool(ok.any().detach().cpu()):
 				lengths.append(val[ok])
 
-		_append(xyz[1:, :] - xyz[:-1, :], valid[1:, :] & valid[:-1, :])
-		_append(xyz[:, 1:] - xyz[:, :-1], valid[:, 1:] & valid[:, :-1])
+		row_edge_valid = torch.zeros(
+			max(0, int(xyz.shape[0]) - 1),
+			int(xyz.shape[1]),
+			device=xyz.device,
+			dtype=torch.bool,
+		)
+		col_edge_valid = torch.zeros(
+			int(xyz.shape[0]),
+			max(0, int(xyz.shape[1]) - 1),
+			device=xyz.device,
+			dtype=torch.bool,
+		)
+		if int(cell_valid_t.shape[0]) > 0 and int(cell_valid_t.shape[1]) > 0:
+			row_edge_valid[:, :-1] |= cell_valid_t
+			row_edge_valid[:, 1:] |= cell_valid_t
+			col_edge_valid[:-1, :] |= cell_valid_t
+			col_edge_valid[1:, :] |= cell_valid_t
+
+		_append(xyz[1:, :] - xyz[:-1, :], row_edge_valid & valid[1:, :] & valid[:-1, :])
+		_append(xyz[:, 1:] - xyz[:, :-1], col_edge_valid & valid[:, 1:] & valid[:, :-1])
 		sqrt2 = math.sqrt(2.0)
-		_append(xyz[1:, 1:] - xyz[:-1, :-1], cell_valid, sqrt2)
-		_append(xyz[1:, :-1] - xyz[:-1, 1:], cell_valid, sqrt2)
+		_append(xyz[1:, 1:] - xyz[:-1, :-1], cell_valid_t, sqrt2)
+		_append(xyz[1:, :-1] - xyz[:-1, 1:], cell_valid_t, sqrt2)
 		if not lengths:
 			return torch.tensor(float(max(1.0e-12, fallback)), device=xyz.device, dtype=xyz.dtype)
 		return torch.cat(lengths).mean().clamp_min(1.0e-12)
@@ -3414,10 +3444,30 @@ class Model3D(nn.Module):
 			if flatten_output_step is None
 			else float(flatten_output_step)
 		)
+		source_cell_valid = self._source_cell_valid(valid_dev)
+		if bool(flatten_filter_source_angles):
+			source_cell_valid, filter_stats = self._filter_source_cells_by_angle(
+				xyz_dev,
+				source_cell_valid,
+				max_angle_deg=float(flatten_filter_angle_deg),
+				radius=int(flatten_filter_radius),
+			)
+		else:
+			filter_stats = {
+				"enabled": 0.0,
+				"angle_deg": float(flatten_filter_angle_deg),
+				"radius": float(max(0, int(flatten_filter_radius))),
+				"bad_pairs": 0.0,
+				"bad_cells": 0.0,
+				"bad_cells_dilated": 0.0,
+				"cell_valid_before": float(source_cell_valid.to(dtype=torch.float32).sum().detach().cpu()),
+				"cell_valid_after": float(source_cell_valid.to(dtype=torch.float32).sum().detach().cpu()),
+			}
 		measured_source_step = self._measured_flatten_target_step(
 			xyz_dev,
 			valid_dev,
 			fallback=float(mesh_step),
+			cell_valid=source_cell_valid,
 		).detach()
 		direction = self._normalize_flatten_direction(flatten_direction)
 		source_layout_step = float(measured_source_step.detach().cpu())
@@ -3458,26 +3508,7 @@ class Model3D(nn.Module):
 		self.flatten_source_valid = valid_dev
 		self.flatten_identity_y = torch.arange(map_h, device=device, dtype=torch.float32)
 		self.flatten_identity_x = torch.arange(map_w, device=device, dtype=torch.float32)
-		source_cell_valid = self._source_cell_valid(valid_dev)
-		if bool(flatten_filter_source_angles):
-			source_cell_valid, filter_stats = self._filter_source_cells_by_angle(
-				xyz_dev,
-				source_cell_valid,
-				max_angle_deg=float(flatten_filter_angle_deg),
-				radius=int(flatten_filter_radius),
-			)
-			self.flatten_source_filter_stats = filter_stats
-		else:
-			self.flatten_source_filter_stats = {
-				"enabled": 0.0,
-				"angle_deg": float(flatten_filter_angle_deg),
-				"radius": float(max(0, int(flatten_filter_radius))),
-				"bad_pairs": 0.0,
-				"bad_cells": 0.0,
-				"bad_cells_dilated": 0.0,
-				"cell_valid_before": float(source_cell_valid.to(dtype=torch.float32).sum().detach().cpu()),
-				"cell_valid_after": float(source_cell_valid.to(dtype=torch.float32).sum().detach().cpu()),
-			}
+		self.flatten_source_filter_stats = filter_stats
 		self.flatten_source_cell_valid = source_cell_valid
 		self.flatten_source_metric = (
 			self._flatten_source_metric(xyz_dev).detach()

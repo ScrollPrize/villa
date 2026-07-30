@@ -872,12 +872,15 @@ def _renorm_forward_flatten_map_step(model) -> dict[str, float]:
 		uv = model.flatten_map()
 		xyz = getattr(model, "flatten_source_xyz", None)
 		valid = getattr(model, "flatten_source_valid", None)
+		cell_valid = getattr(model, "flatten_source_cell_valid", None)
 		target_t = getattr(model, "flatten_target_step", None)
-		if xyz is None or valid is None or target_t is None:
+		if xyz is None or valid is None or cell_valid is None or target_t is None:
 			return {}
 		if uv.ndim != 3 or xyz.ndim != 3 or int(uv.shape[-1]) != 2 or int(xyz.shape[-1]) != 3:
 			return {}
 		if tuple(uv.shape[:2]) != tuple(xyz.shape[:2]) or tuple(valid.shape) != tuple(uv.shape[:2]):
+			return {}
+		if tuple(cell_valid.shape) != (max(0, int(uv.shape[0]) - 1), max(0, int(uv.shape[1]) - 1)):
 			return {}
 		target_step = float(target_t.detach().cpu())
 		if not math.isfinite(target_step) or target_step <= 0.0:
@@ -886,6 +889,10 @@ def _renorm_forward_flatten_map_step(model) -> dict[str, float]:
 			valid.to(device=uv.device, dtype=torch.bool)
 			& torch.isfinite(uv).all(dim=-1)
 			& torch.isfinite(xyz).all(dim=-1)
+		)
+		row_edge_valid, col_edge_valid, diag00_valid, diag01_valid = opt_loss_flatten._retained_source_edge_masks(
+			valid_t,
+			cell_valid.to(device=uv.device, dtype=torch.bool),
 		)
 		sum_ratio = uv.new_zeros(())
 		sum_weight = uv.new_zeros(())
@@ -900,19 +907,27 @@ def _renorm_forward_flatten_map_step(model) -> dict[str, float]:
 			sum_weight = sum_weight + mask_f.sum()
 
 		if int(uv.shape[0]) > 1:
-			_accumulate(uv[1:, :] - uv[:-1, :], xyz[1:, :] - xyz[:-1, :], valid_t[1:, :] & valid_t[:-1, :])
+			_accumulate(
+				uv[1:, :] - uv[:-1, :],
+				xyz[1:, :] - xyz[:-1, :],
+				row_edge_valid & valid_t[1:, :] & valid_t[:-1, :],
+			)
 		if int(uv.shape[1]) > 1:
-			_accumulate(uv[:, 1:] - uv[:, :-1], xyz[:, 1:] - xyz[:, :-1], valid_t[:, 1:] & valid_t[:, :-1])
+			_accumulate(
+				uv[:, 1:] - uv[:, :-1],
+				xyz[:, 1:] - xyz[:, :-1],
+				col_edge_valid & valid_t[:, 1:] & valid_t[:, :-1],
+			)
 		if int(uv.shape[0]) > 1 and int(uv.shape[1]) > 1:
 			_accumulate(
 				uv[1:, 1:] - uv[:-1, :-1],
 				xyz[1:, 1:] - xyz[:-1, :-1],
-				valid_t[1:, 1:] & valid_t[:-1, :-1],
+				diag00_valid & valid_t[1:, 1:] & valid_t[:-1, :-1],
 			)
 			_accumulate(
 				uv[1:, :-1] - uv[:-1, 1:],
 				xyz[1:, :-1] - xyz[:-1, 1:],
-				valid_t[1:, :-1] & valid_t[:-1, 1:],
+				diag01_valid & valid_t[1:, :-1] & valid_t[:-1, 1:],
 			)
 		if not bool((sum_weight > 0).detach().cpu()):
 			return {}
