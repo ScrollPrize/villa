@@ -1,12 +1,19 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 
 #include "vc/lasagna/ChannelSampler.hpp"
+#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <exception>
 #include <fstream>
+#include <future>
+#include <iterator>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -16,11 +23,22 @@
 
 #include <nlohmann/json.hpp>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace vc::fiber_tracer {
 namespace {
 
 constexpr double kEpsilon = 1.0e-12;
 constexpr double kPi = 3.141592653589793238462643383279502884;
+
+using TraceClock = std::chrono::steady_clock;
+
+[[nodiscard]] double elapsedSeconds(TraceClock::time_point start)
+{
+    return std::chrono::duration<double>(TraceClock::now() - start).count();
+}
 
 [[nodiscard]] double length(const cv::Vec3d& v)
 {
@@ -47,9 +65,21 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
     return std::clamp(value, 0.0, 1.0);
 }
 
+[[nodiscard]] double clampSignedUnit(double value)
+{
+    if (!std::isfinite(value))
+        return 0.0;
+    return std::clamp(value, -1.0, 1.0);
+}
+
 [[nodiscard]] double clampedPositiveDot(const cv::Vec3d& a, const cv::Vec3d& b)
 {
     return clamp01(normalizedOrZero(a).dot(normalizedOrZero(b)));
+}
+
+[[nodiscard]] double angleBetweenUnit(const cv::Vec3d& a, const cv::Vec3d& b)
+{
+    return std::acos(clampSignedUnit(normalizedOrZero(a).dot(normalizedOrZero(b))));
 }
 
 [[nodiscard]] cv::Vec3d alignTo(const cv::Vec3d& direction, const cv::Vec3d& reference)
@@ -103,7 +133,7 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
     return {prefix + "_presence", prefix + "_nx", prefix + "_ny"};
 }
 
-[[nodiscard]] double predictionChannelEffectiveScale(
+[[nodiscard]] const vc::lasagna::LasagnaChannelGroup& predictionChannelGroup(
     const vc::lasagna::LasagnaDatasetManifest& manifest,
     const std::string& channel)
 {
@@ -113,8 +143,16 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
             "fiber inference dataset is missing required channel '" +
             channel + "'");
     }
+    return *group;
+}
+
+[[nodiscard]] double predictionChannelEffectiveScale(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    const std::string& channel)
+{
+    const auto& group = predictionChannelGroup(manifest, channel);
     const double scale =
-        manifest.sourceToBase * static_cast<double>(group->scaleFactor());
+        manifest.sourceToBase * static_cast<double>(group.scaleFactor());
     if (!(scale > 0.0) || !std::isfinite(scale)) {
         throw std::runtime_error(
             "fiber inference channel '" + channel +
@@ -130,35 +168,164 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
     return std::abs(a - b) <= tolerance;
 }
 
-[[nodiscard]] cv::Vec3d arbitraryPerpendicular(const cv::Vec3d& direction)
+[[nodiscard]] std::array<cv::Vec3d, 2> orthonormalBasis(const cv::Vec3d& direction)
 {
-    const cv::Vec3d d = normalizedOr(direction, {1.0, 0.0, 0.0});
-    cv::Vec3d axis = std::abs(d[0]) < 0.8 ? cv::Vec3d{1.0, 0.0, 0.0}
-                                          : cv::Vec3d{0.0, 1.0, 0.0};
-    return normalizedOrZero(axis.cross(d));
+    const cv::Vec3d axis = normalizedOr(direction, {1.0, 0.0, 0.0});
+    std::array<cv::Vec3d, 3> refs = {
+        cv::Vec3d{1.0, 0.0, 0.0},
+        cv::Vec3d{0.0, 1.0, 0.0},
+        cv::Vec3d{0.0, 0.0, 1.0},
+    };
+    size_t refIndex = 0;
+    double bestAbsDot = std::abs(axis.dot(refs[0]));
+    for (size_t index = 1; index < refs.size(); ++index) {
+        const double value = std::abs(axis.dot(refs[index]));
+        if (value < bestAbsDot) {
+            bestAbsDot = value;
+            refIndex = index;
+        }
+    }
+    const cv::Vec3d b0 = normalizedOrZero(axis.cross(refs[refIndex]));
+    const cv::Vec3d b1 = normalizedOrZero(axis.cross(b0));
+    return {b0, b1};
+}
+
+struct ConeOffset {
+    double u = 0.0;
+    double v = 0.0;
+    double radius2 = 0.0;
+    size_t order = 0;
+};
+
+[[nodiscard]] std::vector<ConeOffset> angleStepConeOffsets(
+    double maxAngleDegrees,
+    double angleStepDegrees)
+{
+    const double maxAngle = std::max(0.0, maxAngleDegrees);
+    if (maxAngle <= 0.0)
+        return {{0.0, 0.0, 0.0, 0}};
+    const double step = angleStepDegrees;
+    if (!std::isfinite(step) || step <= 0.0)
+        throw std::invalid_argument("cone angle step must be positive");
+
+    const int maxSteps = static_cast<int>(std::floor(maxAngle / step + 1.0e-6));
+    std::vector<ConeOffset> offsets;
+    bool hasCenter = false;
+    size_t order = 0;
+    for (int vStep = -maxSteps; vStep <= maxSteps; ++vStep) {
+        for (int uStep = -maxSteps; uStep <= maxSteps; ++uStep) {
+            const double uDeg = static_cast<double>(uStep) * step;
+            const double vDeg = static_cast<double>(vStep) * step;
+            const double radius2 = uDeg * uDeg + vDeg * vDeg;
+            if (radius2 > maxAngle * maxAngle + 1.0e-5)
+                continue;
+            if (uDeg == 0.0 && vDeg == 0.0)
+                hasCenter = true;
+            offsets.push_back({uDeg, vDeg, radius2, order++});
+        }
+    }
+    if (!hasCenter)
+        offsets.push_back({0.0, 0.0, 0.0, order++});
+    std::sort(offsets.begin(), offsets.end(), [](const auto& a, const auto& b) {
+        if (a.radius2 != b.radius2)
+            return a.radius2 < b.radius2;
+        if (a.u != b.u)
+            return a.u < b.u;
+        if (a.v != b.v)
+            return a.v < b.v;
+        return a.order < b.order;
+    });
+    for (auto& offset : offsets) {
+        offset.u = std::tan(offset.u * kPi / 180.0);
+        offset.v = std::tan(offset.v * kPi / 180.0);
+    }
+    return offsets;
+}
+
+[[nodiscard]] std::vector<ConeOffset> legacyGridConeOffsets(
+    double maxAngleDegrees,
+    int gridSize)
+{
+    const double maxAngle = std::max(0.0, maxAngleDegrees) * kPi / 180.0;
+    if (gridSize <= 0)
+        throw std::invalid_argument("cone grid size must be positive");
+    if (maxAngle <= 0.0 || gridSize == 1)
+        return {{0.0, 0.0, 0.0, 0}};
+
+    std::vector<ConeOffset> offsets;
+    offsets.reserve(static_cast<size_t>(gridSize) * static_cast<size_t>(gridSize));
+    const double tangentScale = std::tan(maxAngle);
+    size_t centerIndex = 0;
+    double centerRadius2 = std::numeric_limits<double>::infinity();
+    for (int y = 0; y < gridSize; ++y) {
+        const double b = gridSize == 1
+            ? 0.0
+            : -1.0 + 2.0 * static_cast<double>(y) / static_cast<double>(gridSize - 1);
+        for (int x = 0; x < gridSize; ++x) {
+            const double a = gridSize == 1
+                ? 0.0
+                : -1.0 + 2.0 * static_cast<double>(x) / static_cast<double>(gridSize - 1);
+            double diskX = 0.0;
+            double diskY = 0.0;
+            if (a != 0.0 || b != 0.0) {
+                double r = 0.0;
+                double phi = 0.0;
+                if (std::abs(a) > std::abs(b)) {
+                    r = a;
+                    phi = (kPi / 4.0) * b / a;
+                } else {
+                    r = b;
+                    phi = kPi / 2.0 - (kPi / 4.0) * a / b;
+                }
+                diskX = r * std::cos(phi);
+                diskY = r * std::sin(phi);
+            }
+            const double radius2 = diskX * diskX + diskY * diskY;
+            if (radius2 < centerRadius2) {
+                centerRadius2 = radius2;
+                centerIndex = offsets.size();
+            }
+            offsets.push_back({
+                tangentScale * diskX,
+                tangentScale * diskY,
+                radius2,
+                offsets.size(),
+            });
+        }
+    }
+    if (centerIndex < offsets.size() && centerIndex != 0) {
+        const ConeOffset center = offsets[centerIndex];
+        offsets.erase(offsets.begin() + static_cast<std::ptrdiff_t>(centerIndex));
+        offsets.insert(offsets.begin(), center);
+    }
+    return offsets;
+}
+
+[[nodiscard]] std::vector<cv::Vec3d> candidateDirections(
+    const cv::Vec3d& reference,
+    const std::vector<ConeOffset>& offsets)
+{
+    const cv::Vec3d forward = normalizedOr(reference, {1.0, 0.0, 0.0});
+    const auto basis = orthonormalBasis(forward);
+    std::vector<cv::Vec3d> out;
+    out.reserve(offsets.size());
+    for (const auto& offset : offsets)
+        out.push_back(normalizedOr(
+            forward + basis[0] * offset.u + basis[1] * offset.v,
+            forward));
+    if (out.empty())
+        out.push_back(forward);
+    return out;
 }
 
 [[nodiscard]] std::vector<cv::Vec3d> candidateDirections(
     const cv::Vec3d& reference,
     const FiberTraceConfig& config)
 {
-    const cv::Vec3d forward = normalizedOr(reference, {1.0, 0.0, 0.0});
-    const cv::Vec3d axis0 = arbitraryPerpendicular(forward);
-    const cv::Vec3d axis1 = normalizedOrZero(forward.cross(axis0));
-    const double maxAngle = std::max(0.0, config.coneAngleDegrees);
-    const double angleStep = std::max(0.25, config.coneAngleStepDegrees);
-
-    std::vector<cv::Vec3d> out;
-    for (double ay = -maxAngle; ay <= maxAngle + 1.0e-6; ay += angleStep) {
-        for (double ax = -maxAngle; ax <= maxAngle + 1.0e-6; ax += angleStep) {
-            const double tx = std::tan(ax * kPi / 180.0);
-            const double ty = std::tan(ay * kPi / 180.0);
-            out.push_back(normalizedOr(forward + axis0 * tx + axis1 * ty, forward));
-        }
-    }
-    if (out.empty())
-        out.push_back(forward);
-    return out;
+    const auto offsets = config.coneAngleStepDegrees > 0.0
+        ? angleStepConeOffsets(config.coneAngleDegrees, config.coneAngleStepDegrees)
+        : legacyGridConeOffsets(config.coneAngleDegrees, config.coneGridSize);
+    return candidateDirections(reference, offsets);
 }
 
 [[nodiscard]] std::vector<double> arclengths(const std::vector<cv::Vec3d>& points)
@@ -177,8 +344,6 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
     return (point - planePoint).dot(planeNormal);
 }
 
-[[nodiscard]] bool finitePoint(const cv::Vec3d& point);
-
 [[nodiscard]] double endpointPlaneError(
     const cv::Vec3d& point,
     const cv::Vec3d& target,
@@ -186,95 +351,6 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 {
     const cv::Vec3d delta = point - target;
     return length(delta - planeNormal * delta.dot(planeNormal));
-}
-
-[[nodiscard]] std::vector<FiberTargetPlane> normalizeTargetPlanes(
-    const std::vector<FiberTargetPlane>& planes)
-{
-    if (planes.empty()) {
-        throw std::invalid_argument(
-            "fiber trace requires explicit target planes; CP-to-CP chord planes "
-            "are not allowed");
-    }
-    std::vector<FiberTargetPlane> out;
-    out.reserve(planes.size());
-    std::set<std::string> names;
-    for (const auto& plane : planes) {
-        if (!finitePoint(plane.point)) {
-            throw std::invalid_argument(
-                "fiber trace target plane has non-finite point: " + plane.name);
-        }
-        const cv::Vec3d normal = normalizedOrZero(plane.normal);
-        if (length(normal) <= kEpsilon) {
-            throw std::invalid_argument(
-                "fiber trace target plane has degenerate normal: " + plane.name);
-        }
-        if (!names.insert(plane.name).second) {
-            throw std::invalid_argument(
-                "fiber trace target plane names must be unique: " + plane.name);
-        }
-        out.push_back({plane.name, plane.point, normal});
-    }
-    return out;
-}
-
-[[nodiscard]] cv::Vec3d interpolatePlaneCrossing(
-    const cv::Vec3d& start,
-    const cv::Vec3d& end,
-    const FiberTargetPlane& plane)
-{
-    const double d0 = pointToPlaneSigned(start, plane.point, plane.normal);
-    const double d1 = pointToPlaneSigned(end, plane.point, plane.normal);
-    if (d0 == 0.0)
-        return start;
-    const double denom = d0 - d1;
-    if (std::abs(denom) <= kEpsilon)
-        return end;
-    const double t = std::clamp(d0 / denom, 0.0, 1.0);
-    return start * (1.0 - t) + end * t;
-}
-
-[[nodiscard]] std::string missingTargetPlaneReason(
-    const std::string& baseReason,
-    const std::vector<FiberTargetPlane>& planes,
-    const std::vector<bool>& crossed)
-{
-    std::string missing;
-    for (size_t i = 0; i < planes.size(); ++i) {
-        if (i < crossed.size() && crossed[i])
-            continue;
-        if (!missing.empty())
-            missing += ",";
-        missing += planes[i].name;
-    }
-    if (missing.empty())
-        return baseReason;
-    return baseReason + ":missing_target_planes=" + missing;
-}
-
-struct TargetPlaneSelection {
-    std::string name;
-    cv::Vec3d crossing{0.0, 0.0, 0.0};
-    double errorVoxels = std::numeric_limits<double>::infinity();
-    bool valid = false;
-};
-
-[[nodiscard]] TargetPlaneSelection selectBestTargetPlaneCrossing(
-    const std::vector<FiberTargetPlane>& planes,
-    const std::vector<bool>& crossed,
-    const std::vector<cv::Vec3d>& crossings)
-{
-    TargetPlaneSelection best;
-    for (size_t i = 0; i < planes.size(); ++i) {
-        if (i >= crossed.size() || i >= crossings.size() || !crossed[i])
-            continue;
-        const double error =
-            endpointPlaneError(crossings[i], planes[i].point, planes[i].normal);
-        if (error < best.errorVoxels) {
-            best = {planes[i].name, crossings[i], error, true};
-        }
-    }
-    return best;
 }
 
 [[nodiscard]] bool finitePoint(const cv::Vec3d& point)
@@ -393,60 +469,46 @@ struct ScoredDirection {
 };
 
 [[nodiscard]] ScoredDirection bestAlignedPrediction(
-    const FiberPredictionSource& predictions,
-    const cv::Vec3d& point,
-    const cv::Vec3d& referenceDirection)
+    const FiberPredictionSample& sample,
+    const cv::Vec3d& referenceDirection,
+    bool weightByPresence)
 {
-    const auto sample = predictions.sample(point, referenceDirection);
     ScoredDirection best;
     double bestScore = -std::numeric_limits<double>::infinity();
+    const cv::Vec3d reference = normalizedOrZero(referenceDirection);
     for (const auto& option : sample.options) {
         if (!option.valid)
             continue;
         const cv::Vec3d direction = alignTo(option.direction, referenceDirection);
-        const double score = direction.dot(normalizedOrZero(referenceDirection));
+        double score = clamp01(direction.dot(reference));
+        const double presence = clamp01(option.presence);
+        if (weightByPresence)
+            score *= presence;
         if (score > bestScore) {
             bestScore = score;
-            best = {direction, clamp01(option.presence), true};
+            best = {direction, presence, true};
         }
     }
     return best;
 }
 
-[[nodiscard]] std::vector<FiberTargetPlane> targetPlanesForLineIndex(
+[[nodiscard]] ScoredDirection bestAlignedPrediction(
     const FiberPredictionSource& predictions,
-    const std::vector<cv::Vec3d>& line,
-    size_t targetIndex,
-    const cv::Vec3d& inferenceReferenceDirection)
+    const cv::Vec3d& point,
+    const cv::Vec3d& referenceDirection,
+    bool weightByPresence)
 {
-    if (line.empty() || targetIndex >= line.size()) {
-        throw std::invalid_argument("fiber trace target line index is out of range");
-    }
-    const cv::Vec3d target = line[targetIndex];
-    std::vector<FiberTargetPlane> planes;
-    if (targetIndex + 1 < line.size()) {
-        planes.push_back({"line_next", target, line[targetIndex + 1] - target});
-    }
-    if (targetIndex > 0) {
-        planes.push_back({"line_prev", target, line[targetIndex - 1] - target});
-    }
-    if (planes.empty()) {
-        throw std::invalid_argument("fiber trace target has no line-neighbor plane");
-    }
-    const auto prediction = bestAlignedPrediction(
-        predictions, target, inferenceReferenceDirection);
-    if (!prediction.valid) {
-        throw std::invalid_argument(
-            "fiber trace target inferred-direction plane sample is invalid");
-    }
-    planes.push_back({"inferred_direction", target, prediction.direction});
-    return normalizeTargetPlanes(planes);
+    return bestAlignedPrediction(
+        predictions.sample(point, referenceDirection),
+        referenceDirection,
+        weightByPresence);
 }
 
 [[nodiscard]] bool normalAwareSmoothnessEnabled(const FiberTraceConfig& config)
 {
     return config.smoothnessNormalWeight > 0.0 ||
-           config.smoothnessTangentWeight > 0.0;
+           config.smoothnessTangentWeight > 0.0 ||
+           config.cumulativeSmoothnessTangentWeight > 0.0;
 }
 
 void requireNormalSamplerForNormalAwareSmoothness(
@@ -459,68 +521,275 @@ void requireNormalSamplerForNormalAwareSmoothness(
         "Lasagna normal sampler is required for tangent/normal fiber trace smoothness");
 }
 
+void validateTraceConfig(const FiberTraceConfig& config)
+{
+    auto requireFinite = [](double value, const char* name) {
+        if (!std::isfinite(value))
+            throw std::invalid_argument(std::string(name) + " must be finite");
+    };
+    requireFinite(config.stepVoxels, "step voxels");
+    requireFinite(config.coneAngleDegrees, "cone angle degrees");
+    requireFinite(config.coneAngleStepDegrees, "cone angle step degrees");
+    requireFinite(config.beamPruneDistanceVoxels, "beam prune distance");
+    if (config.parallelThreads < 0)
+        throw std::invalid_argument("parallel threads must be non-negative");
+    requireFinite(config.smoothnessWeight, "smoothness weight");
+    requireFinite(config.smoothnessNormalWeight, "smoothness normal weight");
+    requireFinite(config.smoothnessTangentWeight, "smoothness tangent weight");
+    requireFinite(config.smoothnessFreeAngleDegrees, "smoothness free angle");
+    requireFinite(
+        config.cumulativeSmoothnessTangentWeight,
+        "cumulative smoothness tangent weight");
+    requireFinite(config.maxStepFactor, "max step factor");
+    requireFinite(config.fusionGapFactor, "fusion gap factor");
+    requireFinite(config.endpointAcceptThresholdUm, "endpoint accept threshold");
+    requireFinite(config.voxelSizeUm, "voxel size");
+    if (!(config.stepVoxels > 0.0))
+        throw std::invalid_argument("step voxels must be positive");
+    if (config.coneAngleDegrees < 0.0)
+        throw std::invalid_argument("cone angle degrees must be non-negative");
+    if (config.coneGridSize < 1)
+        throw std::invalid_argument("cone grid size must be at least 1");
+    if (config.beamWidth < 1)
+        throw std::invalid_argument("beam width must be at least 1");
+    if (config.beamPruneDistanceVoxels < 0.0)
+        throw std::invalid_argument("beam prune distance must be non-negative");
+    if (config.beamLookaheadSteps < 1)
+        throw std::invalid_argument("beam lookahead steps must be at least 1");
+    if (config.smoothnessWeight < 0.0 ||
+        config.smoothnessNormalWeight < 0.0 ||
+        config.smoothnessTangentWeight < 0.0 ||
+        config.cumulativeSmoothnessTangentWeight < 0.0) {
+        throw std::invalid_argument("smoothness weights must be non-negative");
+    }
+    if (config.smoothnessFreeAngleDegrees < 0.0)
+        throw std::invalid_argument("smoothness free angle must be non-negative");
+    if (config.cumulativeSmoothnessSteps < 1)
+        throw std::invalid_argument("cumulative smoothness steps must be at least 1");
+    if (config.maxStepFactor < 0.0)
+        throw std::invalid_argument("max step factor must be non-negative");
+}
+
+[[nodiscard]] double excessAngleSquared(double angle, double freeAngle)
+{
+    return std::pow(std::max(0.0, angle - freeAngle), 2.0);
+}
+
+[[nodiscard]] double isotropicSmoothnessLoss(
+    const cv::Vec3d& previousStepDirection,
+    const cv::Vec3d& candidateStepDirection,
+    const FiberTraceConfig& config)
+{
+    const double freeAngle = config.smoothnessFreeAngleDegrees * kPi / 180.0;
+    return config.smoothnessWeight *
+           excessAngleSquared(
+               angleBetweenUnit(previousStepDirection, candidateStepDirection),
+               freeAngle);
+}
+
 [[nodiscard]] double smoothnessLoss(
     const cv::Vec3d& previousStepDirection,
     const cv::Vec3d& candidateStepDirection,
     const cv::Vec3d& normal,
-    const FiberTraceConfig& config,
-    bool firstStep)
+    bool normalValid,
+    const FiberTraceConfig& config)
 {
     const cv::Vec3d prev = normalizedOrZero(previousStepDirection);
-    const cv::Vec3d cand = alignTo(candidateStepDirection, prev);
+    const cv::Vec3d cand = normalizedOrZero(candidateStepDirection);
     if (length(prev) <= kEpsilon || length(cand) <= kEpsilon)
         return 0.0;
 
+    const double isotropic = isotropicSmoothnessLoss(prev, cand, config);
     const cv::Vec3d n = normalizedOrZero(normal);
     const double normalWeight = config.smoothnessNormalWeight;
-    const double tangentWeight = firstStep ? 0.0 : config.smoothnessTangentWeight;
-    if (length(n) <= kEpsilon) {
-        return config.smoothnessWeight * (normalWeight + tangentWeight) *
-               (1.0 - clampedPositiveDot(prev, cand));
-    }
+    const double tangentWeight = config.smoothnessTangentWeight;
+    if (!normalValid || length(n) <= kEpsilon)
+        return isotropic;
 
-    const double prevN = prev.dot(n);
-    const double candN = cand.dot(n);
-    const double normalLoss = (candN - prevN) * (candN - prevN);
+    const double prevN = clampSignedUnit(prev.dot(n));
+    const double candN = clampSignedUnit(cand.dot(n));
     const cv::Vec3d prevT = normalizedOrZero(prev - n * prevN);
     const cv::Vec3d candT = normalizedOrZero(cand - n * candN);
-    const double tangentLoss =
-        length(prevT) > kEpsilon && length(candT) > kEpsilon
-            ? 1.0 - clampedPositiveDot(prevT, candT)
-            : 0.0;
-    return config.smoothnessWeight *
-           (normalWeight * normalLoss + tangentWeight * tangentLoss);
+    const bool tangentOk = length(prevT) > kEpsilon && length(candT) > kEpsilon;
+    const double tangentAngle = tangentOk
+        ? angleBetweenUnit(prevT, candT)
+        : angleBetweenUnit(prev, cand);
+    const double normalAngle = std::abs(std::asin(candN) - std::asin(prevN));
+    const double freeAngle = config.smoothnessFreeAngleDegrees * kPi / 180.0;
+    return tangentWeight * excessAngleSquared(tangentAngle, freeAngle) +
+           normalWeight * excessAngleSquared(normalAngle, freeAngle);
+}
+
+[[nodiscard]] double cumulativeTangentSmoothnessLoss(
+    const cv::Vec3d& historyDirection,
+    const cv::Vec3d& candidateStepDirection,
+    const cv::Vec3d& normal,
+    bool normalValid,
+    const FiberTraceConfig& config)
+{
+    const double weight = config.cumulativeSmoothnessTangentWeight;
+    if (!(weight > 0.0))
+        return 0.0;
+    const cv::Vec3d history = normalizedOrZero(historyDirection);
+    const cv::Vec3d cand = normalizedOrZero(candidateStepDirection);
+    const cv::Vec3d n = normalizedOrZero(normal);
+    if (!normalValid ||
+        length(history) <= kEpsilon ||
+        length(cand) <= kEpsilon ||
+        length(n) <= kEpsilon) {
+        return 0.0;
+    }
+    const double historyN = clampSignedUnit(history.dot(n));
+    const double candN = clampSignedUnit(cand.dot(n));
+    const cv::Vec3d historyT = normalizedOrZero(history - n * historyN);
+    const cv::Vec3d candT = normalizedOrZero(cand - n * candN);
+    if (length(historyT) <= kEpsilon || length(candT) <= kEpsilon)
+        return 0.0;
+    const double freeAngle = config.smoothnessFreeAngleDegrees * kPi / 180.0;
+    return weight * excessAngleSquared(angleBetweenUnit(historyT, candT), freeAngle);
+}
+
+[[nodiscard]] cv::Vec3d updateHistoryDirection(
+    const cv::Vec3d& historyDirection,
+    const cv::Vec3d& chosenDirection,
+    int depth,
+    int cumulativeSmoothnessSteps)
+{
+    const cv::Vec3d chosen = normalizedOrZero(chosenDirection);
+    if (depth <= 0 || cumulativeSmoothnessSteps <= 1)
+        return chosen;
+    const double count = static_cast<double>(
+        std::clamp(depth, 1, cumulativeSmoothnessSteps - 1));
+    return normalizedOr(chosen + normalizedOrZero(historyDirection) * count, chosen);
 }
 
 struct BeamState {
-    std::vector<cv::Vec3d> points;
+    struct PathNode {
+        cv::Vec3d point{0.0, 0.0, 0.0};
+        std::shared_ptr<const PathNode> previous;
+        size_t length = 1;
+    };
+
+    std::shared_ptr<const PathNode> path;
     cv::Vec3d previousStepDirection{0.0, 0.0, 0.0};
     cv::Vec3d currentSampleDirection{0.0, 0.0, 0.0};
-    std::vector<bool> targetPlaneCrossed;
-    std::vector<cv::Vec3d> targetPlaneCrossings;
+    cv::Vec3d historyDirection{0.0, 0.0, 0.0};
     double loss = 0.0;
     double tracedLength = 0.0;
+    int depth = 0;
     bool reached = false;
     std::string reason;
 };
 
-[[nodiscard]] double candidateLoss(
-    const FiberPredictionSource& predictions,
-    const vc::lasagna::NormalSampler* normalSampler,
+[[nodiscard]] std::shared_ptr<const BeamState::PathNode> appendBeamPathPoint(
+    std::shared_ptr<const BeamState::PathNode> previous,
+    const cv::Vec3d& point)
+{
+    auto node = std::make_shared<BeamState::PathNode>();
+    node->point = point;
+    node->previous = std::move(previous);
+    node->length = node->previous ? node->previous->length + 1 : 1;
+    return node;
+}
+
+[[nodiscard]] cv::Vec3d beamEndpoint(const BeamState& state)
+{
+    return state.path ? state.path->point : cv::Vec3d{0.0, 0.0, 0.0};
+}
+
+[[nodiscard]] size_t beamPointCount(const BeamState& state)
+{
+    return state.path ? state.path->length : 0;
+}
+
+[[nodiscard]] std::vector<cv::Vec3d> beamPathPoints(const BeamState& state)
+{
+    std::vector<cv::Vec3d> out;
+    out.reserve(beamPointCount(state));
+    for (auto node = state.path; node; node = node->previous)
+        out.push_back(node->point);
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+struct CandidateScore {
+    double loss = std::numeric_limits<double>::infinity();
+    cv::Vec3d selectedCurrentDirection{0.0, 0.0, 0.0};
+    double selectedPresence = 0.0;
+    bool valid = false;
+};
+
+struct CandidateTask {
+    size_t beamIndex = 0;
+    cv::Vec3d direction{0.0, 0.0, 0.0};
+    cv::Vec3d candidatePoint{0.0, 0.0, 0.0};
+};
+
+struct FrontierCandidate {
+    size_t beamIndex = 0;
+    cv::Vec3d point{0.0, 0.0, 0.0};
+    cv::Vec3d previousStepDirection{0.0, 0.0, 0.0};
+    cv::Vec3d currentSampleDirection{0.0, 0.0, 0.0};
+    cv::Vec3d historyDirection{0.0, 0.0, 0.0};
+    double loss = 0.0;
+    double tracedLength = 0.0;
+    int depth = 0;
+    bool reached = false;
+    size_t order = 0;
+};
+
+struct CandidateScoringScratch {
+    std::vector<CandidateScore> scores;
+    std::vector<cv::Vec3d> candidatePoints;
+    std::vector<cv::Vec3d> referenceDirections;
+    std::vector<FiberPredictionSample> predictionSamples;
+    std::vector<vc::lasagna::NormalSampleWithDerivative> normalSamplesWithDerivative;
+    std::vector<vc::lasagna::NormalSample> normalSamples;
+    std::vector<FrontierCandidate> frontierCandidates;
+};
+
+void appendCandidateTasks(
+    std::vector<CandidateTask>& tasks,
+    size_t beamIndex,
+    const BeamState& beam,
+    const std::vector<ConeOffset>& offsets,
+    double step)
+{
+    const cv::Vec3d currentPoint = beamEndpoint(beam);
+    const cv::Vec3d forward = normalizedOr(
+        beam.currentSampleDirection, {1.0, 0.0, 0.0});
+    const auto basis = orthonormalBasis(forward);
+    if (offsets.empty()) {
+        tasks.push_back({beamIndex, forward, currentPoint + forward * step});
+        return;
+    }
+    for (const auto& offset : offsets) {
+        const cv::Vec3d direction = normalizedOr(
+            forward + basis[0] * offset.u + basis[1] * offset.v,
+            forward);
+        tasks.push_back({beamIndex, direction, currentPoint + direction * step});
+    }
+}
+
+[[nodiscard]] CandidateScore candidateLossFromSample(
+    const FiberPredictionSample& candidateSample,
     const BeamState& beam,
     const cv::Vec3d& candidateDirection,
-    const cv::Vec3d& candidatePoint,
-    const FiberTraceConfig& config)
+    const FiberTraceConfig& config,
+    const vc::lasagna::NormalSample* precomputedNormal = nullptr)
 {
-    const auto candidateSample =
-        predictions.sample(candidatePoint, candidateDirection);
-    const bool firstStep = beam.points.size() <= 1;
+    const auto selectedCurrent =
+        bestAlignedPrediction(candidateSample, candidateDirection, true);
+    if (!selectedCurrent.valid)
+        return {};
 
     cv::Vec3d smoothNormal{0.0, 0.0, 0.0};
-    if (normalSampler != nullptr) {
-        const auto normalSample = normalSampler->sampleNormal(candidatePoint);
-        if (normalSample.valid)
-            smoothNormal = normalSample.normal;
+    bool smoothNormalValid = false;
+    if (normalAwareSmoothnessEnabled(config) && precomputedNormal != nullptr) {
+        if (precomputedNormal->valid) {
+            smoothNormal = precomputedNormal->normal;
+            smoothNormalValid = true;
+        }
     }
 
     double bestLoss = std::numeric_limits<double>::infinity();
@@ -532,8 +801,7 @@ struct BeamState {
         const double presence = clamp01(option.presence);
 
         const cv::Vec3d prevStep = normalizedOrZero(beam.previousStepDirection);
-        const cv::Vec3d currentSample =
-            alignTo(beam.currentSampleDirection, candidateDirection);
+        const cv::Vec3d currentSample = normalizedOrZero(beam.currentSampleDirection);
         const cv::Vec3d currentStep = normalizedOrZero(candidateDirection);
 
         double score = presence;
@@ -545,11 +813,476 @@ struct BeamState {
         score *= clampedPositiveDot(currentStep, candidateSampleDirection);
 
         const double loss = (1.0 - score) +
-            smoothnessLoss(prevStep, currentStep, smoothNormal, config, firstStep);
+            smoothnessLoss(prevStep, currentStep, smoothNormal, smoothNormalValid, config) +
+            cumulativeTangentSmoothnessLoss(
+                beam.historyDirection,
+                currentStep,
+                smoothNormal,
+                smoothNormalValid,
+                config);
         if (loss < bestLoss)
             bestLoss = loss;
     }
-    return bestLoss;
+    return {bestLoss, selectedCurrent.direction, selectedCurrent.presence,
+            std::isfinite(bestLoss)};
+}
+
+[[nodiscard]] CandidateScore candidateLoss(
+    const FiberPredictionSource& predictions,
+    const vc::lasagna::NormalSampler* normalSampler,
+    const BeamState& beam,
+    const cv::Vec3d& candidateDirection,
+    const cv::Vec3d& candidatePoint,
+    const FiberTraceConfig& config)
+{
+    const auto candidateSample =
+        predictions.sample(candidatePoint, candidateDirection);
+    vc::lasagna::NormalSample normalSample;
+    const vc::lasagna::NormalSample* normal = nullptr;
+    if (normalAwareSmoothnessEnabled(config) && normalSampler != nullptr) {
+        normalSample = normalSampler->sampleNormal(candidatePoint);
+        normal = &normalSample;
+    }
+    return candidateLossFromSample(
+        candidateSample,
+        beam,
+        candidateDirection,
+        config,
+        normal);
+}
+
+[[nodiscard]] int traceWorkerCount(
+    const FiberPredictionSource& predictions,
+    const vc::lasagna::NormalSampler* normalSampler,
+    const FiberTraceConfig& config,
+    size_t taskCount)
+{
+    if (taskCount < 2 || !predictions.supportsConcurrentSampling())
+        return 1;
+    if (normalSampler != nullptr && !normalSampler->supportsConcurrentSampling())
+        return 1;
+    const int requested = config.parallelThreads;
+    if (requested == 1)
+        return 1;
+#ifdef _OPENMP
+    const int available = requested > 0 ? requested : omp_get_max_threads();
+#else
+    const int available = requested > 0 ? requested : 1;
+#endif
+    return std::clamp(available, 1, static_cast<int>(taskCount));
+}
+
+void sampleCandidateNormals(
+    const vc::lasagna::NormalSampler* normalSampler,
+    const std::vector<cv::Vec3d>& candidatePoints,
+    const FiberTraceConfig& config,
+    int parallelThreads,
+    std::vector<vc::lasagna::NormalSampleWithDerivative>& samples,
+    std::vector<vc::lasagna::NormalSample>& out,
+    FiberTraceProfile* profile)
+{
+    out.clear();
+    if (normalSampler == nullptr ||
+        candidatePoints.empty() ||
+        !normalAwareSmoothnessEnabled(config)) {
+        return;
+    }
+    vc::lasagna::NormalBatchReport report;
+    if (const auto* lasagnaSampler =
+            dynamic_cast<const vc::lasagna::LasagnaNormalSampler*>(normalSampler)) {
+        report = lasagnaSampler->sampleNormalBatch(
+            candidatePoints,
+            false,
+            parallelThreads,
+            samples);
+    } else {
+        report = normalSampler->sampleNormalBatch(candidatePoints, false, samples);
+    }
+    if (profile != nullptr) {
+        profile->normalPrefetchSeconds += report.prefetchMs / 1000.0;
+        profile->normalMaterializeSeconds += report.materializeMs / 1000.0;
+    }
+    out.resize(samples.size());
+    for (size_t index = 0; index < samples.size(); ++index)
+        out[index] = samples[index].sample;
+}
+
+[[nodiscard]] const std::vector<CandidateScore>& scoreCandidateTasks(
+    const FiberPredictionSource& predictions,
+    const vc::lasagna::NormalSampler* normalSampler,
+    const std::vector<BeamState>& beams,
+    const std::vector<CandidateTask>& tasks,
+    const FiberTraceConfig& config,
+    const std::vector<vc::lasagna::NormalSample>& normals,
+    CandidateScoringScratch& scratch,
+    FiberTraceProfile* profile)
+{
+    auto& scores = scratch.scores;
+    scores.clear();
+    scores.resize(tasks.size());
+    if (tasks.empty())
+        return scores;
+    if (profile != nullptr)
+        profile->candidateTasks += tasks.size();
+
+    const int workers = traceWorkerCount(
+        predictions,
+        normalSampler,
+        config,
+        tasks.size());
+    if (workers <= 1) {
+        const auto scoreStart = TraceClock::now();
+        for (size_t index = 0; index < tasks.size(); ++index) {
+            const auto& task = tasks[index];
+            scores[index] = candidateLoss(
+                predictions,
+                normalSampler,
+                beams[task.beamIndex],
+                task.direction,
+                task.candidatePoint,
+                config);
+        }
+        if (profile != nullptr)
+            profile->candidateScoreSeconds += elapsedSeconds(scoreStart);
+        return scores;
+    }
+
+    auto& candidatePoints = scratch.candidatePoints;
+    auto& referenceDirections = scratch.referenceDirections;
+    candidatePoints.clear();
+    referenceDirections.clear();
+    candidatePoints.reserve(tasks.size());
+    referenceDirections.reserve(tasks.size());
+    for (const auto& task : tasks) {
+        candidatePoints.push_back(task.candidatePoint);
+        referenceDirections.push_back(task.direction);
+    }
+    auto& predictionSamples = scratch.predictionSamples;
+    const auto predictionStart = TraceClock::now();
+    if (const auto* field = dynamic_cast<const FiberPredictionField*>(&predictions)) {
+        field->sampleBatch(
+            candidatePoints,
+            referenceDirections,
+            workers,
+            predictionSamples,
+            profile);
+    } else {
+        predictions.sampleBatch(
+            candidatePoints,
+            referenceDirections,
+            workers,
+            predictionSamples);
+    }
+    if (profile != nullptr)
+        profile->predictionBatchSeconds += elapsedSeconds(predictionStart);
+    if (predictionSamples.size() != tasks.size()) {
+        throw std::runtime_error(
+            "fiber prediction batch returned the wrong number of samples");
+    }
+    const auto normalStart = TraceClock::now();
+    sampleCandidateNormals(
+        normalSampler,
+        candidatePoints,
+        config,
+        workers,
+        scratch.normalSamplesWithDerivative,
+        scratch.normalSamples,
+        profile);
+    if (profile != nullptr)
+        profile->normalBatchSeconds += elapsedSeconds(normalStart);
+    const auto& normalsForScoring =
+        normals.empty() ? scratch.normalSamples : normals;
+
+    const auto scoreStart = TraceClock::now();
+    std::atomic<bool> failed{false};
+    std::exception_ptr firstError;
+    auto scoreOne = [&](size_t index) {
+        const auto& task = tasks[index];
+        const vc::lasagna::NormalSample* normal =
+            index < normalsForScoring.size() ? &normalsForScoring[index] : nullptr;
+        scores[index] = candidateLossFromSample(
+            predictionSamples[index],
+            beams[task.beamIndex],
+            task.direction,
+            config,
+            normal);
+    };
+
+#ifdef _OPENMP
+    const auto count = static_cast<std::ptrdiff_t>(tasks.size());
+    #pragma omp parallel for schedule(dynamic, 8) num_threads(workers)
+    for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
+        if (failed.load(std::memory_order_relaxed))
+            continue;
+        try {
+            scoreOne(static_cast<size_t>(rawIndex));
+        } catch (...) {
+            bool expected = false;
+            if (failed.compare_exchange_strong(expected, true)) {
+                #pragma omp critical(fiber_trace_candidate_error)
+                {
+                    if (!firstError)
+                        firstError = std::current_exception();
+                }
+            }
+        }
+    }
+    if (firstError)
+        std::rethrow_exception(firstError);
+#else
+    (void)workers;
+    for (size_t index = 0; index < tasks.size(); ++index)
+        scoreOne(index);
+#endif
+    if (profile != nullptr)
+        profile->candidateScoreSeconds += elapsedSeconds(scoreStart);
+    return scores;
+}
+
+[[nodiscard]] std::optional<cv::Vec3d> interpolatePlaneCrossing(
+    const cv::Vec3d& start,
+    const cv::Vec3d& end,
+    const cv::Vec3d& planePoint,
+    const cv::Vec3d& planeNormal)
+{
+    const double d0 = pointToPlaneSigned(start, planePoint, planeNormal);
+    const double d1 = pointToPlaneSigned(end, planePoint, planeNormal);
+    if (d0 == 0.0)
+        return start;
+    if (d0 * d1 > 0.0)
+        return std::nullopt;
+    const double denom = d0 - d1;
+    if (std::abs(denom) <= kEpsilon)
+        return end;
+    const double t = std::clamp(d0 / denom, 0.0, 1.0);
+    return start * (1.0 - t) + end * t;
+}
+
+[[nodiscard]] FrontierCandidate makeFrontierCandidate(
+    const BeamState& beam,
+    size_t beamIndex,
+    size_t order,
+    const cv::Vec3d& taskDirection,
+    const cv::Vec3d& candidatePoint,
+    const CandidateScore& candidateScore,
+    const cv::Vec3d& target,
+    const cv::Vec3d& targetPlaneNormal,
+    const FiberTraceConfig& config)
+{
+    const cv::Vec3d currentPoint = beamEndpoint(beam);
+    const auto crossing = interpolatePlaneCrossing(
+        currentPoint,
+        candidatePoint,
+        target,
+        targetPlaneNormal);
+    const cv::Vec3d nextPoint = crossing.value_or(candidatePoint);
+    return {
+        beamIndex,
+        nextPoint,
+        taskDirection,
+        candidateScore.selectedCurrentDirection,
+        updateHistoryDirection(
+            beam.historyDirection,
+            taskDirection,
+            beam.depth,
+            config.cumulativeSmoothnessSteps),
+        beam.loss + candidateScore.loss,
+        beam.tracedLength + length(nextPoint - currentPoint),
+        beam.depth + 1,
+        crossing.has_value(),
+        order,
+    };
+}
+
+[[nodiscard]] double beamPruneScore(const BeamState& state)
+{
+    return state.loss + static_cast<double>(state.depth) * 1.0e-12;
+}
+
+[[nodiscard]] bool beamSearchLess(const BeamState& a, const BeamState& b)
+{
+    if (a.loss != b.loss)
+        return a.loss < b.loss;
+    return a.depth < b.depth;
+}
+
+[[nodiscard]] std::vector<BeamState> pruneBeamStates(
+    std::vector<BeamState> states,
+    int beamWidth,
+    double pruneDistanceVoxels)
+{
+    if (states.empty())
+        return {};
+    const size_t keep = static_cast<size_t>(std::max(1, beamWidth));
+    const double distance = std::max(0.0, pruneDistanceVoxels);
+    std::vector<size_t> selected;
+    selected.reserve(std::min(keep, states.size()));
+    std::vector<unsigned char> unavailable(states.size(), 0);
+    const double distance2 = distance * distance;
+
+    while (selected.size() < keep) {
+        std::optional<size_t> best;
+        double bestScore = 0.0;
+        for (size_t index = 0; index < states.size(); ++index) {
+            if (unavailable[index])
+                continue;
+            const double score = beamPruneScore(states[index]);
+            if (!std::isfinite(score))
+                continue;
+            if (distance > 0.0) {
+                const cv::Vec3d point = beamEndpoint(states[index]);
+                bool tooClose = false;
+                for (const size_t existingIndex : selected) {
+                    const cv::Vec3d delta = point - beamEndpoint(states[existingIndex]);
+                    if (delta.dot(delta) < distance2) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                if (tooClose)
+                    continue;
+            }
+            if (!best.has_value() || score < bestScore) {
+                best = index;
+                bestScore = score;
+            }
+        }
+        if (!best.has_value())
+            break;
+        unavailable[*best] = 1;
+        selected.push_back(*best);
+    }
+
+    std::vector<BeamState> out;
+    out.reserve(selected.size());
+    for (const size_t index : selected)
+        out.push_back(std::move(states[index]));
+    if (!out.empty())
+        return out;
+    return {std::move(states.front())};
+}
+
+[[nodiscard]] double frontierPruneScore(const FrontierCandidate& candidate)
+{
+    return candidate.loss + static_cast<double>(candidate.depth) * 1.0e-12;
+}
+
+[[nodiscard]] std::vector<size_t> selectFrontierCandidateIndices(
+    const std::vector<FrontierCandidate>& candidates,
+    int beamWidth,
+    double pruneDistanceVoxels)
+{
+    if (candidates.empty())
+        return {};
+    const size_t keep = static_cast<size_t>(std::max(1, beamWidth));
+    const double distance = std::max(0.0, pruneDistanceVoxels);
+    const double distance2 = distance * distance;
+    std::vector<size_t> selected;
+    selected.reserve(std::min(keep, candidates.size()));
+    std::vector<unsigned char> unavailable(candidates.size(), 0);
+
+    while (selected.size() < keep) {
+        std::optional<size_t> best;
+        double bestScore = 0.0;
+        for (size_t index = 0; index < candidates.size(); ++index) {
+            if (unavailable[index])
+                continue;
+            const double score = frontierPruneScore(candidates[index]);
+            if (!std::isfinite(score))
+                continue;
+            if (distance > 0.0) {
+                bool tooClose = false;
+                for (const size_t existingIndex : selected) {
+                    const cv::Vec3d delta =
+                        candidates[index].point - candidates[existingIndex].point;
+                    if (delta.dot(delta) < distance2) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                if (tooClose)
+                    continue;
+            }
+            if (!best.has_value() || score < bestScore) {
+                best = index;
+                bestScore = score;
+            }
+        }
+        if (!best.has_value())
+            break;
+        unavailable[*best] = 1;
+        selected.push_back(*best);
+    }
+
+    if (selected.empty())
+        selected.push_back(0);
+    return selected;
+}
+
+[[nodiscard]] BeamState beamStateFromFrontierCandidate(
+    const std::vector<BeamState>& parents,
+    const FrontierCandidate& candidate)
+{
+    const BeamState& parent = parents[candidate.beamIndex];
+    BeamState out = parent;
+    out.path = appendBeamPathPoint(parent.path, candidate.point);
+    out.previousStepDirection = candidate.previousStepDirection;
+    out.currentSampleDirection = candidate.currentSampleDirection;
+    out.historyDirection = candidate.historyDirection;
+    out.loss = candidate.loss;
+    out.tracedLength = candidate.tracedLength;
+    out.depth = candidate.depth;
+    out.reached = candidate.reached;
+    out.reason = candidate.reached ? "target_plane" : std::string{};
+    return out;
+}
+
+[[nodiscard]] std::vector<BeamState> pruneFrontierCandidates(
+    const std::vector<FrontierCandidate>& candidates,
+    const std::vector<BeamState>& parents,
+    int beamWidth,
+    double pruneDistanceVoxels)
+{
+    if (candidates.empty())
+        return {};
+    const std::vector<size_t> selected = selectFrontierCandidateIndices(
+        candidates,
+        beamWidth,
+        pruneDistanceVoxels);
+    std::vector<BeamState> out;
+    out.reserve(selected.size());
+    for (const size_t index : selected) {
+        out.push_back(beamStateFromFrontierCandidate(parents, candidates[index]));
+    }
+    return out;
+}
+
+[[nodiscard]] std::optional<size_t> bestReachedFrontierCandidateIndex(
+    const std::vector<FrontierCandidate>& candidates)
+{
+    std::optional<size_t> best;
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        const auto& candidate = candidates[index];
+        if (!candidate.reached)
+            continue;
+        if (!best.has_value() || candidate.loss < candidates[*best].loss)
+            best = index;
+    }
+    return best;
+}
+
+[[nodiscard]] std::optional<size_t> bestReachedStateIndexPythonParity(
+    const std::vector<BeamState>& states)
+{
+    std::optional<size_t> best;
+    for (size_t index = 0; index < states.size(); ++index) {
+        const auto& state = states[index];
+        if (!state.reached)
+            continue;
+        if (!best.has_value() || state.loss < states[*best].loss)
+            best = index;
+    }
+    return best;
 }
 
 [[nodiscard]] FiberTraceOneWayResult traceOneWayCore(
@@ -561,16 +1294,25 @@ struct BeamState {
 {
     const cv::Vec3d start = request.startPoint;
     const cv::Vec3d target = request.targetPoint;
-    const std::vector<FiberTargetPlane> targetPlanes =
-        normalizeTargetPlanes(request.targetPlanes);
+    const cv::Vec3d targetPlaneNormal = normalizedOr(
+        request.targetPlaneNormal,
+        normalizedOr(target - start, {1.0, 0.0, 0.0}));
     const cv::Vec3d referenceStartDirection = normalizedOr(
         request.initialDirection,
         normalizedOr(target - start, {1.0, 0.0, 0.0}));
+    FiberTraceProfile* profile = request.config.profile;
+    if (profile != nullptr)
+        ++profile->oneWayCalls;
+    const auto startSampleStart = TraceClock::now();
     const ScoredDirection startPrediction =
-        bestAlignedPrediction(predictions, start, referenceStartDirection);
-    const cv::Vec3d startDirection = startPrediction.valid
-        ? startPrediction.direction
-        : referenceStartDirection;
+        bestAlignedPrediction(predictions, start, referenceStartDirection, false);
+    if (profile != nullptr)
+        profile->startSampleSeconds += elapsedSeconds(startSampleStart);
+    if (!startPrediction.valid) {
+        throw std::invalid_argument(
+            "fiber trace start point has no valid prediction direction");
+    }
+    const cv::Vec3d startDirection = startPrediction.direction;
 
     const double distance = request.budgetSpanVoxels > 0.0
         ? request.budgetSpanVoxels
@@ -579,126 +1321,212 @@ struct BeamState {
     const int maxSteps = std::max(
         1,
         static_cast<int>(std::ceil(
-            distance * std::max(1.0, request.config.maxStepFactor) / step)));
+            distance * request.config.maxStepFactor / step)));
 
     BeamState initial;
-    initial.points.push_back(start);
+    initial.path = appendBeamPathPoint(nullptr, start);
     initial.previousStepDirection = startDirection;
     initial.currentSampleDirection = startDirection;
-    initial.targetPlaneCrossed.assign(targetPlanes.size(), false);
-    initial.targetPlaneCrossings.assign(targetPlanes.size(), {});
-    for (size_t i = 0; i < targetPlanes.size(); ++i) {
-        if (pointToPlaneSigned(start, targetPlanes[i].point, targetPlanes[i].normal) == 0.0) {
-            initial.targetPlaneCrossed[i] = true;
-            initial.targetPlaneCrossings[i] = start;
-        }
-    }
+    initial.historyDirection = startDirection;
     std::vector<BeamState> beams{std::move(initial)};
+    CandidateScoringScratch scoringScratch;
     std::string reason = "max_step_factor";
 
-    const int lookaheadSteps = std::max(1, request.config.beamLookaheadSteps);
+    const int lookaheadSteps = request.config.beamWidth <= 1
+        ? 1
+        : std::max(1, request.config.beamLookaheadSteps);
+    const auto coneOffsets = request.config.coneAngleStepDegrees > 0.0
+        ? angleStepConeOffsets(
+              request.config.coneAngleDegrees,
+              request.config.coneAngleStepDegrees)
+        : legacyGridConeOffsets(
+              request.config.coneAngleDegrees,
+              request.config.coneGridSize);
+    const size_t candidateCount = std::max<size_t>(1, coneOffsets.size());
     int stepIndex = 0;
     while (stepIndex < maxSteps) {
         std::vector<BeamState> expanded = beams;
         int advanced = 0;
+        bool prunedFinalFrontier = false;
         for (; advanced < lookaheadSteps && stepIndex + advanced < maxSteps; ++advanced) {
-            std::vector<BeamState> nextFrontier;
-            nextFrontier.reserve(expanded.size() * 16);
-            for (const auto& beam : expanded) {
-                if (beam.reached) {
-                    nextFrontier.push_back(beam);
-                    continue;
-                }
-                const auto directions = candidateDirections(
-                    beam.currentSampleDirection, request.config);
-                for (const auto& direction : directions) {
-                    BeamState next = beam;
-                    const cv::Vec3d candidatePoint = beam.points.back() + direction * step;
-                    const double loss = candidateLoss(
-                        predictions,
-                        normalSampler,
-                        beam,
-                        direction,
-                        candidatePoint,
-                        request.config);
-                    if (!std::isfinite(loss))
-                        continue;
-                    next.points.push_back(candidatePoint);
-                    next.tracedLength += step;
-                    next.loss += loss;
-                    next.previousStepDirection = direction;
-                    const auto currentPrediction =
-                        bestAlignedPrediction(predictions, candidatePoint, direction);
-                    next.currentSampleDirection =
-                        currentPrediction.valid ? currentPrediction.direction : direction;
-                    for (size_t i = 0; i < targetPlanes.size(); ++i) {
-                        if (next.targetPlaneCrossed[i])
-                            continue;
-                        const double d0 = pointToPlaneSigned(
-                            beam.points.back(),
-                            targetPlanes[i].point,
-                            targetPlanes[i].normal);
-                        const double d1 = pointToPlaneSigned(
-                            candidatePoint,
-                            targetPlanes[i].point,
-                            targetPlanes[i].normal);
-                        if (d0 == 0.0 || d0 * d1 <= 0.0) {
-                            next.targetPlaneCrossed[i] = true;
-                            next.targetPlaneCrossings[i] = interpolatePlaneCrossing(
-                                beam.points.back(), candidatePoint, targetPlanes[i]);
-                        }
-                    }
-                    next.reached = std::all_of(next.targetPlaneCrossed.begin(),
-                                               next.targetPlaneCrossed.end(),
-                                               [](bool crossed) { return crossed; });
-                    if (next.reached) {
-                        next.reason = "target_plane";
-                        const auto selected = selectBestTargetPlaneCrossing(
-                            targetPlanes,
-                            next.targetPlaneCrossed,
-                            next.targetPlaneCrossings);
-                        if (selected.valid)
-                            next.points.back() = selected.crossing;
-                    }
-                    nextFrontier.push_back(std::move(next));
-                }
+            if (profile != nullptr)
+                ++profile->generations;
+            const auto taskBuildStart = TraceClock::now();
+            std::vector<CandidateTask> tasks;
+            tasks.reserve(expanded.size() * candidateCount);
+            for (size_t beamIndex = 0; beamIndex < expanded.size(); ++beamIndex) {
+                appendCandidateTasks(
+                    tasks,
+                    beamIndex,
+                    expanded[beamIndex],
+                    coneOffsets,
+                    step);
             }
+            if (profile != nullptr)
+                profile->taskBuildSeconds += elapsedSeconds(taskBuildStart);
+
+            const auto& scores = scoreCandidateTasks(
+                predictions,
+                normalSampler,
+                expanded,
+                tasks,
+                request.config,
+                {},
+                scoringScratch,
+                profile);
+
+            const bool finalLookaheadGeneration =
+                advanced + 1 >= lookaheadSteps ||
+                stepIndex + advanced + 1 >= maxSteps;
+            if (finalLookaheadGeneration) {
+                const auto frontierStart = TraceClock::now();
+                auto& frontier = scoringScratch.frontierCandidates;
+                frontier.clear();
+                frontier.reserve(tasks.size());
+                for (size_t taskIndex = 0; taskIndex < tasks.size(); ++taskIndex) {
+                    const auto& task = tasks[taskIndex];
+                    const CandidateScore& candidateScore = scores[taskIndex];
+                    if (!candidateScore.valid || !std::isfinite(candidateScore.loss))
+                        continue;
+                    frontier.push_back(makeFrontierCandidate(
+                        expanded[task.beamIndex],
+                        task.beamIndex,
+                        taskIndex,
+                        task.direction,
+                        task.candidatePoint,
+                        candidateScore,
+                        target,
+                        targetPlaneNormal,
+                        request.config));
+                }
+                if (profile != nullptr)
+                    profile->frontierSeconds += elapsedSeconds(frontierStart);
+                if (frontier.empty()) {
+                    reason = "no_valid_candidates";
+                    expanded.clear();
+                    break;
+                }
+                const auto bestReachedIndex =
+                    bestReachedFrontierCandidateIndex(frontier);
+                if (bestReachedIndex.has_value()) {
+                    const BeamState bestReached = beamStateFromFrontierCandidate(
+                        expanded,
+                        frontier[*bestReachedIndex]);
+                    if (progress) {
+                        FiberTraceProgress event;
+                        event.phase = phase;
+                        event.step = stepIndex + advanced + 1;
+                        event.maxSteps = maxSteps;
+                        event.targetPlaneProgress = 1.0;
+                        event.reason = "target_plane";
+                        progress(event);
+                    }
+                    return {beamPathPoints(bestReached),
+                            true,
+                            bestReached.reason,
+                            static_cast<int>(
+                                beamPointCount(bestReached) > 0
+                                    ? beamPointCount(bestReached) - 1
+                                    : 0)};
+                }
+                const auto pruneStart = TraceClock::now();
+                beams = pruneFrontierCandidates(
+                    frontier,
+                    expanded,
+                    request.config.beamWidth,
+                    request.config.beamPruneDistanceVoxels);
+                if (profile != nullptr)
+                    profile->pruneSeconds += elapsedSeconds(pruneStart);
+                prunedFinalFrontier = true;
+                ++advanced;
+                break;
+            }
+
+            const auto frontierStart = TraceClock::now();
+            std::vector<BeamState> nextFrontier;
+            nextFrontier.reserve(tasks.size());
+            for (size_t taskIndex = 0; taskIndex < tasks.size(); ++taskIndex) {
+                const auto& task = tasks[taskIndex];
+                const CandidateScore& candidateScore = scores[taskIndex];
+                if (!candidateScore.valid || !std::isfinite(candidateScore.loss))
+                    continue;
+                const BeamState& beam = expanded[task.beamIndex];
+                const cv::Vec3d currentPoint = beamEndpoint(beam);
+                const auto crossing = interpolatePlaneCrossing(
+                    currentPoint,
+                    task.candidatePoint,
+                    target,
+                    targetPlaneNormal);
+                const cv::Vec3d nextPoint = crossing.value_or(task.candidatePoint);
+                BeamState next = beam;
+                next.path = appendBeamPathPoint(beam.path, nextPoint);
+                next.tracedLength += length(nextPoint - currentPoint);
+                next.loss += candidateScore.loss;
+                next.previousStepDirection = task.direction;
+                next.currentSampleDirection = candidateScore.selectedCurrentDirection;
+                next.historyDirection = updateHistoryDirection(
+                    beam.historyDirection,
+                    task.direction,
+                    beam.depth,
+                    request.config.cumulativeSmoothnessSteps);
+                next.depth = beam.depth + 1;
+                next.reached = crossing.has_value();
+                if (next.reached) {
+                    next.reason = "target_plane";
+                }
+                nextFrontier.push_back(std::move(next));
+            }
+            if (profile != nullptr)
+                profile->frontierSeconds += elapsedSeconds(frontierStart);
             expanded = std::move(nextFrontier);
             if (expanded.empty()) {
                 reason = "no_valid_candidates";
                 break;
             }
+            const auto bestReachedIndex = bestReachedStateIndexPythonParity(expanded);
+            if (bestReachedIndex.has_value()) {
+                const auto& bestReached = expanded[*bestReachedIndex];
+                if (progress) {
+                    FiberTraceProgress event;
+                    event.phase = phase;
+                    event.step = stepIndex + advanced + 1;
+                    event.maxSteps = maxSteps;
+                    event.targetPlaneProgress = 1.0;
+                    event.reason = "target_plane";
+                    progress(event);
+                }
+                return {beamPathPoints(bestReached), true, bestReached.reason,
+                        static_cast<int>(
+                            beamPointCount(bestReached) > 0
+                                ? beamPointCount(bestReached) - 1
+                                : 0)};
+            }
         }
-        if (expanded.empty())
+        if (expanded.empty() && !prunedFinalFrontier)
             break;
 
-        std::sort(expanded.begin(), expanded.end(), [](const auto& a, const auto& b) {
-            if (a.reached != b.reached)
-                return a.reached > b.reached;
-            if (a.loss != b.loss)
-                return a.loss < b.loss;
-            return a.tracedLength < b.tracedLength;
-        });
-        const size_t keep = static_cast<size_t>(std::max(1, request.config.beamWidth));
-        if (expanded.size() > keep)
-            expanded.resize(keep);
-        beams = std::move(expanded);
+        if (!prunedFinalFrontier) {
+            const auto pruneStart = TraceClock::now();
+            beams = pruneBeamStates(
+                std::move(expanded),
+                request.config.beamWidth,
+                request.config.beamPruneDistanceVoxels);
+            if (profile != nullptr)
+                profile->pruneSeconds += elapsedSeconds(pruneStart);
+        }
         stepIndex += std::max(1, advanced);
 
         if (progress) {
-            const double distanceToTarget = length(beams.front().points.back() - target);
+            const double signedDistance =
+                std::abs(pointToPlaneSigned(beamEndpoint(beams.front()), target, targetPlaneNormal));
             FiberTraceProgress event;
             event.phase = phase;
             event.step = stepIndex;
             event.maxSteps = maxSteps;
             event.targetPlaneProgress =
-                distance > kEpsilon ? 1.0 - std::min(1.0, distanceToTarget / distance) : 1.0;
+                distance > kEpsilon ? 1.0 - std::min(1.0, signedDistance / distance) : 1.0;
             event.reason = beams.front().reached ? beams.front().reason : reason;
             progress(event);
-        }
-        if (beams.front().reached) {
-            reason = beams.front().reason;
-            break;
         }
     }
 
@@ -707,29 +1535,9 @@ struct BeamState {
     }
 
     const auto best = std::min_element(
-        beams.begin(), beams.end(), [](const auto& a, const auto& b) {
-            if (a.reached != b.reached)
-                return a.reached > b.reached;
-            return a.loss < b.loss;
-        });
-    const auto selected = selectBestTargetPlaneCrossing(
-        targetPlanes,
-        best->targetPlaneCrossed,
-        best->targetPlaneCrossings);
-    std::vector<cv::Vec3d> points = best->points;
-    if (best->reached && selected.valid && !points.empty())
-        points.back() = selected.crossing;
-    return {
-        points,
-        best->reached,
-        best->reached
-            ? best->reason
-            : missingTargetPlaneReason(reason, targetPlanes, best->targetPlaneCrossed),
-        static_cast<int>(points.size() > 0 ? points.size() - 1 : 0),
-        selected.valid ? selected.name : std::string{},
-        selected.valid ? selected.crossing : cv::Vec3d{0.0, 0.0, 0.0},
-        selected.valid ? selected.errorVoxels : std::numeric_limits<double>::infinity(),
-    };
+        beams.begin(), beams.end(), beamSearchLess);
+    return {beamPathPoints(*best), best->reached, best->reached ? best->reason : reason,
+            static_cast<int>(beamPointCount(*best) > 0 ? beamPointCount(*best) - 1 : 0)};
 }
 
 [[nodiscard]] std::vector<cv::Vec3d> fuseTraces(
@@ -780,9 +1588,143 @@ struct BeamState {
 
 } // namespace
 
-double inferFiberPredictionWorkingToBaseScale(
-    const vc::lasagna::LasagnaDatasetManifest& manifest)
+#ifdef VC_TESTING
+namespace testing {
+
+namespace {
+
+[[nodiscard]] std::vector<BeamState> debugStatesToBeamStates(
+    const std::vector<BeamDebugState>& states)
 {
+    std::vector<BeamState> out;
+    out.reserve(states.size());
+    for (size_t index = 0; index < states.size(); ++index) {
+        const auto& state = states[index];
+        BeamState beam;
+        beam.path = appendBeamPathPoint(nullptr, state.point);
+        beam.loss = state.loss;
+        beam.depth = state.depth;
+        beam.tracedLength = state.tracedLength;
+        beam.reached = state.reached;
+        beam.reason = std::to_string(index);
+        out.push_back(std::move(beam));
+    }
+    return out;
+}
+
+} // namespace
+
+std::vector<size_t> debugPruneBeamStateIndices(
+    const std::vector<BeamDebugState>& states,
+    int beamWidth,
+    double pruneDistanceVoxels)
+{
+    std::vector<size_t> indices;
+    auto pruned = pruneBeamStates(
+        debugStatesToBeamStates(states),
+        beamWidth,
+        pruneDistanceVoxels);
+    indices.reserve(pruned.size());
+    for (const auto& state : pruned)
+        indices.push_back(static_cast<size_t>(std::stoull(state.reason)));
+    return indices;
+}
+
+std::optional<size_t> debugBestReachedBeamStateIndex(
+    const std::vector<BeamDebugState>& states)
+{
+    const auto beamStates = debugStatesToBeamStates(states);
+    return bestReachedStateIndexPythonParity(beamStates);
+}
+
+namespace {
+
+class DebugPredictionSource final : public FiberPredictionSource {
+public:
+    explicit DebugPredictionSource(bool concurrent)
+        : concurrent_(concurrent)
+    {
+    }
+
+    [[nodiscard]] bool supportsConcurrentSampling() const noexcept override
+    {
+        return concurrent_;
+    }
+
+    [[nodiscard]] FiberPredictionSample sample(
+        const cv::Vec3d&,
+        const cv::Vec3d&) const override
+    {
+        return {};
+    }
+
+private:
+    bool concurrent_ = false;
+};
+
+class DebugNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    explicit DebugNormalSampler(bool concurrent)
+        : concurrent_(concurrent)
+    {
+    }
+
+    [[nodiscard]] bool supportsConcurrentSampling() const noexcept override
+    {
+        return concurrent_;
+    }
+
+    [[nodiscard]] vc::lasagna::NormalSample sampleNormal(
+        const cv::Vec3d&) const override
+    {
+        return {};
+    }
+
+private:
+    bool concurrent_ = false;
+};
+
+} // namespace
+
+int debugTraceWorkerCount(
+    bool predictionConcurrent,
+    bool normalConcurrent,
+    bool hasNormalSampler,
+    int parallelThreads,
+    size_t taskCount)
+{
+    FiberTraceConfig config;
+    config.parallelThreads = parallelThreads;
+    DebugPredictionSource predictions(predictionConcurrent);
+    DebugNormalSampler normals(normalConcurrent);
+    return traceWorkerCount(
+        predictions,
+        hasNormalSampler ? &normals : nullptr,
+        config,
+        taskCount);
+}
+
+} // namespace testing
+#endif
+
+FiberPredictionTraceScales resolveFiberPredictionTraceScales(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    int inferenceScaledownPower)
+{
+    if (inferenceScaledownPower < 0 || inferenceScaledownPower > 30) {
+        throw std::runtime_error(
+            "fiber inference scaledown power must be in [0, 30]");
+    }
+    const double inferenceScaledown =
+        static_cast<double>(1 << inferenceScaledownPower);
+
+    if (!manifest.raw.empty()) {
+        const auto sourceIt = manifest.raw.find("source_to_base");
+        if (sourceIt == manifest.raw.end() || !sourceIt->is_number()) {
+            throw std::runtime_error(
+                "fiber inference manifest must contain numeric source_to_base");
+        }
+    }
     if (!(manifest.sourceToBase > 0.0) || !std::isfinite(manifest.sourceToBase)) {
         throw std::runtime_error(
             "fiber inference manifest source_to_base must be positive and finite");
@@ -794,27 +1736,61 @@ double inferFiberPredictionWorkingToBaseScale(
             "fiber inference dataset must contain presence/nx/ny channels");
     }
 
-    std::optional<double> inferredScale;
+    std::optional<double> predictionToBaseScale;
+    std::optional<double> predictionGroupScaleFactor;
     std::optional<std::string> inferredChannel;
     for (const auto& prefix : prefixes) {
         for (const auto& channel : predictionChannelNames(prefix)) {
+            const auto& group = predictionChannelGroup(manifest, channel);
             const double scale = predictionChannelEffectiveScale(manifest, channel);
-            if (!inferredScale.has_value()) {
-                inferredScale = scale;
+            const double groupScaleFactor =
+                static_cast<double>(group.scaleFactor());
+            if (!predictionToBaseScale.has_value()) {
+                predictionToBaseScale = scale;
+                predictionGroupScaleFactor = groupScaleFactor;
                 inferredChannel = channel;
-                continue;
-            }
-            if (!nearlySameScale(*inferredScale, scale)) {
+            } else if (!nearlySameScale(*predictionToBaseScale, scale)) {
                 throw std::runtime_error(
                     "fiber inference prediction channels must share one effective "
-                    "working-to-base scale; channel '" + channel +
+                    "prediction-to-base scale; channel '" + channel +
                     "' has scale " + std::to_string(scale) + " but channel '" +
                     *inferredChannel + "' has scale " +
-                    std::to_string(*inferredScale));
+                    std::to_string(*predictionToBaseScale));
+            } else if (!nearlySameScale(
+                           *predictionGroupScaleFactor,
+                           groupScaleFactor)) {
+                throw std::runtime_error(
+                    "fiber inference prediction channels must share one "
+                    "manifest group scale factor; channel '" + channel +
+                    "' has factor " +
+                    std::to_string(groupScaleFactor) +
+                    " but channel '" + *inferredChannel +
+                    "' has factor " +
+                    std::to_string(*predictionGroupScaleFactor));
             }
         }
     }
-    return *inferredScale;
+
+    const double traceToBaseScale = *predictionToBaseScale / inferenceScaledown;
+    if (!(traceToBaseScale > 0.0) || !std::isfinite(traceToBaseScale)) {
+        throw std::runtime_error(
+            "fiber inference manifest derived trace scale must be positive and finite");
+    }
+
+    return {
+        traceToBaseScale,
+        *predictionToBaseScale,
+        inferenceScaledown,
+    };
+}
+
+double inferFiberPredictionWorkingToBaseScale(
+    const vc::lasagna::LasagnaDatasetManifest& manifest,
+    int inferenceScaledownPower)
+{
+    return resolveFiberPredictionTraceScales(
+        manifest,
+        inferenceScaledownPower).traceToBaseScale;
 }
 
 class FiberPredictionField::Impl {
@@ -824,6 +1800,22 @@ public:
         vc::lasagna::LasagnaChannelBinding presence;
         vc::lasagna::LasagnaChannelBinding nx;
         vc::lasagna::LasagnaChannelBinding ny;
+    };
+
+    struct PreparedOptionSample {
+        vc::lasagna::LasagnaCubeRequest presence;
+        vc::lasagna::LasagnaCubeRequest nx;
+        vc::lasagna::LasagnaCubeRequest ny;
+    };
+
+    struct OptionChunkMaps {
+        vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap presence;
+        vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap nx;
+        vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap ny;
+    };
+
+    struct OptionSamplingGrid {
+        bool sharedPresenceNxNy = false;
     };
 
     Impl(const vc::lasagna::LasagnaDataset& dataset, size_t maxCachedBytes)
@@ -845,6 +1837,446 @@ public:
                 vc::lasagna::bindLasagnaChannel(manifest, channels[2]),
             });
         }
+        optionGrids_.reserve(options_.size());
+        for (const auto& option : options_) {
+            optionGrids_.push_back({
+                vc::lasagna::sameLasagnaSamplingGrid(option.presence, option.nx) &&
+                vc::lasagna::sameLasagnaSamplingGrid(option.presence, option.ny),
+            });
+        }
+    }
+
+    [[nodiscard]] vc::lasagna::NormalPrefetchReport prefetchSamples(
+        const std::vector<cv::Vec3d>& volumePoints) const
+    {
+        std::vector<vc::lasagna::LasagnaChannelChunkCache::PrefetchRequest> requests;
+        requests.reserve(volumePoints.size() * options_.size() * 24);
+        std::vector<vc::lasagna::LasagnaChannelChunkKey> keys;
+        keys.reserve(volumePoints.size() * 8);
+        for (const auto& point : volumePoints) {
+            for (const auto& option : options_) {
+                keys.clear();
+                vc::lasagna::appendLasagnaInterpolationChunkKeys(
+                    option.presence, point, keys);
+                for (const auto& key : keys)
+                    requests.emplace_back(&option.presence, key);
+                keys.clear();
+                vc::lasagna::appendLasagnaInterpolationChunkKeys(
+                    option.nx, point, keys);
+                for (const auto& key : keys)
+                    requests.emplace_back(&option.nx, key);
+                keys.clear();
+                vc::lasagna::appendLasagnaInterpolationChunkKeys(
+                    option.ny, point, keys);
+                for (const auto& key : keys)
+                    requests.emplace_back(&option.ny, key);
+            }
+        }
+        return cache_->prefetchInterleaved(requests);
+    }
+
+    void sampleBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        const std::vector<cv::Vec3d>& referenceDirections,
+        int parallelThreads,
+        std::vector<FiberPredictionSample>& samples,
+        FiberTraceProfile* profile) const
+    {
+        if (volumePoints.size() != referenceDirections.size()) {
+            throw std::invalid_argument(
+                "fiber prediction batch points and reference directions size mismatch");
+        }
+        samples.clear();
+        samples.resize(volumePoints.size());
+        if (volumePoints.empty())
+            return;
+
+        const size_t optionCount = options_.size();
+        const int workers =
+            std::clamp(parallelThreads, 1, static_cast<int>(volumePoints.size()));
+        const auto directStart = TraceClock::now();
+        auto materializeDirect = [&](
+            size_t pointIndex,
+            std::vector<vc::lasagna::LasagnaLocalChunkResolver>& presenceResolvers,
+            std::vector<vc::lasagna::LasagnaLocalChunkResolver>& nxResolvers,
+            std::vector<vc::lasagna::LasagnaLocalChunkResolver>& nyResolvers) {
+            auto& out = samples[pointIndex];
+            out.options.clear();
+            out.options.reserve(optionCount);
+            for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                const auto& option = options_[optionIndex];
+                auto presenceRequest = vc::lasagna::prepareLasagnaCubeRequest(
+                    option.presence, volumePoints[pointIndex]);
+                vc::lasagna::LasagnaCubeRequest nxRequest;
+                vc::lasagna::LasagnaCubeRequest nyRequest;
+                if (optionGrids_[optionIndex].sharedPresenceNxNy) {
+                    nxRequest = vc::lasagna::cloneLasagnaCubeRequestForBinding(
+                        presenceRequest,
+                        option.nx);
+                    nyRequest = vc::lasagna::cloneLasagnaCubeRequestForBinding(
+                        presenceRequest,
+                        option.ny);
+                } else {
+                    nxRequest = vc::lasagna::prepareLasagnaCubeRequest(
+                        option.nx, volumePoints[pointIndex]);
+                    nyRequest = vc::lasagna::prepareLasagnaCubeRequest(
+                        option.ny, volumePoints[pointIndex]);
+                }
+                presenceResolvers[optionIndex].resolve(presenceRequest);
+                nxResolvers[optionIndex].resolve(nxRequest);
+                nyResolvers[optionIndex].resolve(nyRequest);
+
+                const auto rawPresence =
+                    vc::lasagna::sampleLasagnaChannel(option.presence, presenceRequest);
+                const auto direction =
+                    vc::lasagna::sampleLasagnaCompactAxisTensor(
+                        option.nx, option.ny, nxRequest, nyRequest);
+                if (!rawPresence.has_value() || !direction.has_value()) {
+                    out.options.push_back({});
+                    continue;
+                }
+                out.options.push_back({
+                    alignTo(*direction, referenceDirections[pointIndex]),
+                    clamp01(*rawPresence / 255.0),
+                    true,
+                });
+            }
+        };
+        auto makeResolvers = [&](
+            const auto& bindingSelector) {
+            std::vector<vc::lasagna::LasagnaLocalChunkResolver> resolvers;
+            resolvers.reserve(optionCount);
+            for (const auto& option : options_)
+                resolvers.emplace_back(bindingSelector(option), *cache_);
+            return resolvers;
+        };
+
+        if (workers <= 1) {
+            auto presenceResolvers = makeResolvers([](const Option& option) -> const auto& {
+                return option.presence;
+            });
+            auto nxResolvers = makeResolvers([](const Option& option) -> const auto& {
+                return option.nx;
+            });
+            auto nyResolvers = makeResolvers([](const Option& option) -> const auto& {
+                return option.ny;
+            });
+            for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex) {
+                materializeDirect(
+                    pointIndex,
+                    presenceResolvers,
+                    nxResolvers,
+                    nyResolvers);
+            }
+        } else {
+#ifdef _OPENMP
+            std::atomic<bool> failed{false};
+            std::exception_ptr firstError;
+            const auto count = static_cast<std::ptrdiff_t>(volumePoints.size());
+            #pragma omp parallel num_threads(workers)
+            {
+                auto presenceResolvers = makeResolvers([](const Option& option) -> const auto& {
+                    return option.presence;
+                });
+                auto nxResolvers = makeResolvers([](const Option& option) -> const auto& {
+                    return option.nx;
+                });
+                auto nyResolvers = makeResolvers([](const Option& option) -> const auto& {
+                    return option.ny;
+                });
+                #pragma omp for schedule(static)
+                for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
+                    if (failed.load(std::memory_order_relaxed))
+                        continue;
+                    try {
+                        materializeDirect(
+                            static_cast<size_t>(rawIndex),
+                            presenceResolvers,
+                            nxResolvers,
+                            nyResolvers);
+                    } catch (...) {
+                        bool expected = false;
+                        if (failed.compare_exchange_strong(expected, true)) {
+                            #pragma omp critical(fiber_prediction_direct_error)
+                            {
+                                if (!firstError)
+                                    firstError = std::current_exception();
+                            }
+                        }
+                    }
+                }
+            }
+            if (firstError)
+                std::rethrow_exception(firstError);
+#else
+            std::vector<std::future<void>> futures;
+            futures.reserve(static_cast<size_t>(workers));
+            std::atomic<size_t> next{0};
+            for (int worker = 0; worker < workers; ++worker) {
+                futures.push_back(std::async(std::launch::async, [&]() {
+                    auto presenceResolvers = makeResolvers([](const Option& option) -> const auto& {
+                        return option.presence;
+                    });
+                    auto nxResolvers = makeResolvers([](const Option& option) -> const auto& {
+                        return option.nx;
+                    });
+                    auto nyResolvers = makeResolvers([](const Option& option) -> const auto& {
+                        return option.ny;
+                    });
+                    while (true) {
+                        const size_t pointIndex = next.fetch_add(1);
+                        if (pointIndex >= volumePoints.size())
+                            return;
+                        materializeDirect(
+                            pointIndex,
+                            presenceResolvers,
+                            nxResolvers,
+                            nyResolvers);
+                    }
+                }));
+            }
+            for (auto& future : futures)
+                future.get();
+#endif
+        }
+        if (profile != nullptr)
+            profile->predictionMaterializeSeconds += elapsedSeconds(directStart);
+        return;
+
+        const auto prepareStart = TraceClock::now();
+        std::vector<PreparedOptionSample> prepared(volumePoints.size() * optionCount);
+        std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>> presenceKeys(optionCount);
+        std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>> nxKeys(optionCount);
+        std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>> nyKeys(optionCount);
+        const auto preparePoint = [&](size_t pointIndex,
+                                      std::vector<vc::lasagna::LasagnaChannelChunkKey>* localPresenceKeys,
+                                      std::vector<vc::lasagna::LasagnaChannelChunkKey>* localNxKeys,
+                                      std::vector<vc::lasagna::LasagnaChannelChunkKey>* localNyKeys) {
+            for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                const auto& option = options_[optionIndex];
+                auto& point = prepared[pointIndex * optionCount + optionIndex];
+                point.presence = vc::lasagna::prepareLasagnaCubeRequest(
+                    option.presence, volumePoints[pointIndex]);
+                if (optionGrids_[optionIndex].sharedPresenceNxNy) {
+                    point.nx = vc::lasagna::cloneLasagnaCubeRequestForBinding(
+                        point.presence,
+                        option.nx);
+                    point.ny = vc::lasagna::cloneLasagnaCubeRequestForBinding(
+                        point.presence,
+                        option.ny);
+                } else {
+                    point.nx = vc::lasagna::prepareLasagnaCubeRequest(
+                        option.nx, volumePoints[pointIndex]);
+                    point.ny = vc::lasagna::prepareLasagnaCubeRequest(
+                        option.ny, volumePoints[pointIndex]);
+                }
+                vc::lasagna::appendUniqueLasagnaCubeRequestChunkKeys(
+                    point.presence,
+                    localPresenceKeys[optionIndex]);
+                vc::lasagna::appendUniqueLasagnaCubeRequestChunkKeys(
+                    point.nx,
+                    localNxKeys[optionIndex]);
+                vc::lasagna::appendUniqueLasagnaCubeRequestChunkKeys(
+                    point.ny,
+                    localNyKeys[optionIndex]);
+            }
+        };
+
+#ifdef _OPENMP
+        if (workers > 1) {
+            const size_t workerCount = static_cast<size_t>(workers);
+            std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>>
+                presenceKeysByWorker(workerCount * optionCount);
+            std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>>
+                nxKeysByWorker(workerCount * optionCount);
+            std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>>
+                nyKeysByWorker(workerCount * optionCount);
+            const size_t reservePerWorker =
+                volumePoints.size() / workerCount + 16;
+            for (size_t worker = 0; worker < workerCount; ++worker) {
+                for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                    const size_t slot = worker * optionCount + optionIndex;
+                    presenceKeysByWorker[slot].reserve(reservePerWorker);
+                    nxKeysByWorker[slot].reserve(reservePerWorker);
+                    nyKeysByWorker[slot].reserve(reservePerWorker);
+                }
+            }
+            const auto count = static_cast<std::ptrdiff_t>(volumePoints.size());
+            #pragma omp parallel num_threads(workers)
+            {
+                const size_t worker = static_cast<size_t>(omp_get_thread_num());
+                const size_t slotOffset = worker * optionCount;
+                #pragma omp for schedule(static)
+                for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
+                    preparePoint(
+                        static_cast<size_t>(rawIndex),
+                        presenceKeysByWorker.data() + slotOffset,
+                        nxKeysByWorker.data() + slotOffset,
+                        nyKeysByWorker.data() + slotOffset);
+                }
+                for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                    vc::lasagna::deduplicateLasagnaChunkKeysInPlace(
+                        presenceKeysByWorker[slotOffset + optionIndex]);
+                    vc::lasagna::deduplicateLasagnaChunkKeysInPlace(
+                        nxKeysByWorker[slotOffset + optionIndex]);
+                    vc::lasagna::deduplicateLasagnaChunkKeysInPlace(
+                        nyKeysByWorker[slotOffset + optionIndex]);
+                }
+            }
+            auto mergeKeys = [&](std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>>& out,
+                                 std::vector<std::vector<vc::lasagna::LasagnaChannelChunkKey>>& byWorker) {
+                for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                    size_t total = 0;
+                    for (size_t worker = 0; worker < workerCount; ++worker) {
+                        total += byWorker[worker * optionCount + optionIndex].size();
+                    }
+                    out[optionIndex].reserve(total);
+                    for (size_t worker = 0; worker < workerCount; ++worker) {
+                        auto& local = byWorker[worker * optionCount + optionIndex];
+                        out[optionIndex].insert(
+                            out[optionIndex].end(),
+                            std::make_move_iterator(local.begin()),
+                            std::make_move_iterator(local.end()));
+                    }
+                }
+            };
+            mergeKeys(presenceKeys, presenceKeysByWorker);
+            mergeKeys(nxKeys, nxKeysByWorker);
+            mergeKeys(nyKeys, nyKeysByWorker);
+        } else
+#endif
+        {
+            for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                presenceKeys[optionIndex].reserve(volumePoints.size());
+                nxKeys[optionIndex].reserve(volumePoints.size());
+                nyKeys[optionIndex].reserve(volumePoints.size());
+            }
+            for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex) {
+                preparePoint(
+                    pointIndex,
+                    presenceKeys.data(),
+                    nxKeys.data(),
+                    nyKeys.data());
+            }
+            for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                vc::lasagna::deduplicateLasagnaChunkKeysInPlace(presenceKeys[optionIndex]);
+                vc::lasagna::deduplicateLasagnaChunkKeysInPlace(nxKeys[optionIndex]);
+                vc::lasagna::deduplicateLasagnaChunkKeysInPlace(nyKeys[optionIndex]);
+            }
+        }
+        if (profile != nullptr)
+            profile->predictionPrepareSeconds += elapsedSeconds(prepareStart);
+
+        const auto prefetchStart = TraceClock::now();
+        std::vector<OptionChunkMaps> chunks(optionCount);
+        const size_t readWorkers = vc::lasagna::lasagnaReadWorkersPerChannel();
+        std::vector<std::future<vc::lasagna::NormalPrefetchReport>> prefetches;
+        prefetches.reserve(optionCount * 3);
+        for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+            prefetches.push_back(std::async(std::launch::async, [&, optionIndex]() {
+                const auto& option = options_[optionIndex];
+                return cache_->prefetchResolved(
+                    option.presence,
+                    *option.presence.array,
+                    presenceKeys[optionIndex],
+                    readWorkers,
+                    chunks[optionIndex].presence);
+            }));
+            prefetches.push_back(std::async(std::launch::async, [&, optionIndex]() {
+                const auto& option = options_[optionIndex];
+                return cache_->prefetchResolved(
+                    option.nx,
+                    *option.nx.array,
+                    nxKeys[optionIndex],
+                    readWorkers,
+                    chunks[optionIndex].nx);
+            }));
+            prefetches.push_back(std::async(std::launch::async, [&, optionIndex]() {
+                const auto& option = options_[optionIndex];
+                return cache_->prefetchResolved(
+                    option.ny,
+                    *option.ny.array,
+                    nyKeys[optionIndex],
+                    readWorkers,
+                    chunks[optionIndex].ny);
+            }));
+        }
+        for (auto& future : prefetches)
+            (void)future.get();
+        if (profile != nullptr)
+            profile->predictionPrefetchSeconds += elapsedSeconds(prefetchStart);
+
+        const auto assignStart = TraceClock::now();
+        const auto assignPointChunks = [&](size_t pointIndex) {
+            for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                auto& point = prepared[pointIndex * optionCount + optionIndex];
+                const auto& maps = chunks[optionIndex];
+                vc::lasagna::assignResolvedLasagnaCubeRequestChunks(
+                    point.presence,
+                    maps.presence);
+                vc::lasagna::assignResolvedLasagnaCubeRequestChunks(point.nx, maps.nx);
+                vc::lasagna::assignResolvedLasagnaCubeRequestChunks(point.ny, maps.ny);
+            }
+        };
+
+#ifdef _OPENMP
+        if (workers > 1) {
+            const auto count = static_cast<std::ptrdiff_t>(volumePoints.size());
+            #pragma omp parallel for schedule(static) num_threads(workers)
+            for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex) {
+                assignPointChunks(static_cast<size_t>(rawIndex));
+            }
+        } else
+#endif
+        {
+            for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex) {
+                assignPointChunks(pointIndex);
+            }
+        }
+        if (profile != nullptr)
+            profile->predictionAssignSeconds += elapsedSeconds(assignStart);
+
+        const auto materializeStart = TraceClock::now();
+        auto materializeOne = [&](size_t pointIndex) {
+            auto& out = samples[pointIndex];
+            out.options.clear();
+            out.options.reserve(optionCount);
+            for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
+                const auto& option = options_[optionIndex];
+                const auto& point = prepared[pointIndex * optionCount + optionIndex];
+                const auto rawPresence =
+                    vc::lasagna::sampleLasagnaChannel(option.presence, point.presence);
+                const auto direction =
+                    vc::lasagna::sampleLasagnaCompactAxisTensor(
+                        option.nx, option.ny, point.nx, point.ny);
+                if (!rawPresence.has_value() || !direction.has_value()) {
+                    out.options.push_back({});
+                    continue;
+                }
+                out.options.push_back({
+                    alignTo(*direction, referenceDirections[pointIndex]),
+                    clamp01(*rawPresence / 255.0),
+                    true,
+                });
+            }
+        };
+
+        if (workers <= 1) {
+            for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex)
+                materializeOne(pointIndex);
+        } else {
+#ifdef _OPENMP
+            const auto count = static_cast<std::ptrdiff_t>(volumePoints.size());
+            #pragma omp parallel for schedule(static) num_threads(workers)
+            for (std::ptrdiff_t rawIndex = 0; rawIndex < count; ++rawIndex)
+                materializeOne(static_cast<size_t>(rawIndex));
+#else
+            for (size_t pointIndex = 0; pointIndex < volumePoints.size(); ++pointIndex)
+                materializeOne(pointIndex);
+#endif
+        }
+        if (profile != nullptr)
+            profile->predictionMaterializeSeconds += elapsedSeconds(materializeStart);
     }
 
     [[nodiscard]] FiberPredictionSample sample(
@@ -876,6 +2308,7 @@ public:
 
 private:
     std::vector<Option> options_;
+    std::vector<OptionSamplingGrid> optionGrids_;
     std::shared_ptr<vc::lasagna::LasagnaChannelChunkCache> cache_;
 };
 
@@ -887,6 +2320,41 @@ FiberPredictionField::FiberPredictionField(
 }
 
 FiberPredictionField::~FiberPredictionField() = default;
+
+vc::lasagna::NormalPrefetchReport FiberPredictionField::prefetchSamples(
+    const std::vector<cv::Vec3d>& volumePoints) const
+{
+    return impl_->prefetchSamples(volumePoints);
+}
+
+void FiberPredictionField::sampleBatch(
+    const std::vector<cv::Vec3d>& volumePoints,
+    const std::vector<cv::Vec3d>& referenceDirections,
+    int parallelThreads,
+    std::vector<FiberPredictionSample>& samples) const
+{
+    impl_->sampleBatch(
+        volumePoints,
+        referenceDirections,
+        parallelThreads,
+        samples,
+        nullptr);
+}
+
+void FiberPredictionField::sampleBatch(
+    const std::vector<cv::Vec3d>& volumePoints,
+    const std::vector<cv::Vec3d>& referenceDirections,
+    int parallelThreads,
+    std::vector<FiberPredictionSample>& samples,
+    FiberTraceProfile* profile) const
+{
+    impl_->sampleBatch(
+        volumePoints,
+        referenceDirections,
+        parallelThreads,
+        samples,
+        profile);
+}
 
 FiberPredictionSample FiberPredictionField::sample(
     const cv::Vec3d& volumePoint,
@@ -985,10 +2453,10 @@ FiberTraceOneWayResult traceFiberOneWay(
     if (length(request.targetPoint - request.startPoint) <= kEpsilon) {
         throw std::invalid_argument("fiber trace one-way request endpoints must differ");
     }
-    if (request.targetPlanes.empty()) {
-        throw std::invalid_argument(
-            "fiber trace one-way request requires target planes");
+    if (length(request.targetPlaneNormal) <= kEpsilon) {
+        throw std::invalid_argument("fiber trace one-way request target plane normal is degenerate");
     }
+    validateTraceConfig(request.config);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
     return traceOneWayCore(
         predictions, request, normalSampler, progress, "trace");
@@ -1008,38 +2476,36 @@ FiberTraceSegmentResult traceFiberSegment(
     }
     if (request.startIndex == request.targetIndex)
         throw std::invalid_argument("fiber trace request start and target indices must differ");
+    validateTraceConfig(request.config);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
+
+    FiberTraceSegmentRequest forwardRequest = request;
+    forwardRequest.targetPlaneNormal =
+        normalizedOr(request.targetPlaneNormal.value_or(
+                         request.referenceLine[request.targetIndex] -
+                         request.referenceLine[request.startIndex]),
+                     {1.0, 0.0, 0.0});
+    FiberTraceSegmentRequest reverseRequest = request;
+    reverseRequest.targetPlaneNormal = -*forwardRequest.targetPlaneNormal;
 
     FiberTraceSegmentResult result;
     const cv::Vec3d start = request.referenceLine[request.startIndex];
     const cv::Vec3d target = request.referenceLine[request.targetIndex];
     const double span = length(target - start);
-    const cv::Vec3d forwardInitialDirection =
-        referenceTangentToward(request.referenceLine, request.startIndex, request.targetIndex);
-    const cv::Vec3d reverseInitialDirection =
-        referenceTangentToward(request.referenceLine, request.targetIndex, request.startIndex);
-    const auto forwardTargetPlanes = targetPlanesForLineIndex(
-        predictions,
-        request.referenceLine,
-        request.targetIndex,
-        reverseInitialDirection);
-    const auto reverseTargetPlanes = targetPlanesForLineIndex(
-        predictions,
-        request.referenceLine,
-        request.startIndex,
-        forwardInitialDirection);
     FiberTraceOneWayRequest forwardOneWay;
     forwardOneWay.startPoint = start;
     forwardOneWay.targetPoint = target;
-    forwardOneWay.initialDirection = forwardInitialDirection;
-    forwardOneWay.targetPlanes = forwardTargetPlanes;
+    forwardOneWay.initialDirection =
+        referenceTangentToward(request.referenceLine, request.startIndex, request.targetIndex);
+    forwardOneWay.targetPlaneNormal = *forwardRequest.targetPlaneNormal;
     forwardOneWay.budgetSpanVoxels = span;
     forwardOneWay.config = request.config;
     FiberTraceOneWayRequest reverseOneWay;
     reverseOneWay.startPoint = target;
     reverseOneWay.targetPoint = start;
-    reverseOneWay.initialDirection = reverseInitialDirection;
-    reverseOneWay.targetPlanes = reverseTargetPlanes;
+    reverseOneWay.initialDirection =
+        referenceTangentToward(request.referenceLine, request.targetIndex, request.startIndex);
+    reverseOneWay.targetPlaneNormal = *reverseRequest.targetPlaneNormal;
     reverseOneWay.budgetSpanVoxels = span;
     reverseOneWay.config = request.config;
 
@@ -1056,10 +2522,15 @@ FiberTraceSegmentResult traceFiberSegment(
         result.fusedLine.back() = request.referenceLine[request.targetIndex];
     }
 
-    result.forwardEndpointErrorVoxels =
-        result.forward.selectedTargetPlaneErrorVoxels;
-    result.reverseEndpointErrorVoxels =
-        result.reverse.selectedTargetPlaneErrorVoxels;
+    const cv::Vec3d targetPlaneNormal = *forwardRequest.targetPlaneNormal;
+    if (!result.forward.points.empty()) {
+        result.forwardEndpointErrorVoxels =
+            endpointPlaneError(result.forward.points.back(), target, targetPlaneNormal);
+    }
+    if (!result.reverse.points.empty()) {
+        result.reverseEndpointErrorVoxels =
+            endpointPlaneError(result.reverse.points.back(), start, targetPlaneNormal);
+    }
     result.maxEndpointErrorVoxels = std::max(
         result.forwardEndpointErrorVoxels, result.reverseEndpointErrorVoxels);
     result.maxEndpointErrorUm =
@@ -1107,6 +2578,7 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
         throw std::invalid_argument(
             "whole-fiber metric control-point line-index count mismatch");
     }
+    validateTraceConfig(request.config);
     requireNormalSamplerForNormalAwareSmoothness(request.config, normalSampler);
 
     const auto lineWorking =
@@ -1184,22 +2656,16 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
         const size_t targetCpIndex = cpIndex + 1;
         const cv::Vec3d target = cpWorking[targetCpIndex];
         const cv::Vec3d referenceStart = cpWorking[cpIndex];
+        const cv::Vec3d targetPlaneNormal = normalizedOr(
+            target - referenceStart,
+            normalizedOr(target - currentPoint, {1.0, 0.0, 0.0}));
         const double budgetSpan = length(target - referenceStart);
-        const cv::Vec3d targetReferenceDirection = referenceTangentToward(
-            lineWorking,
-            request.fiber.controlPointLineIndices[targetCpIndex],
-            request.fiber.controlPointLineIndices[cpIndex]);
-        const auto targetPlanes = targetPlanesForLineIndex(
-            predictions,
-            lineWorking,
-            request.fiber.controlPointLineIndices[targetCpIndex],
-            targetReferenceDirection);
 
         FiberTraceOneWayRequest oneWay;
         oneWay.startPoint = currentPoint;
         oneWay.targetPoint = target;
         oneWay.initialDirection = currentDirection;
-        oneWay.targetPlanes = targetPlanes;
+        oneWay.targetPlaneNormal = targetPlaneNormal;
         oneWay.budgetSpanVoxels = budgetSpan;
         oneWay.config = request.config;
 
@@ -1220,11 +2686,7 @@ FiberTraceWholeFiberResult traceWholeFiberMetric(
 
         if (!segment.trace.points.empty()) {
             segment.inPlaneErrorVoxels =
-                segment.trace.selectedTargetPlaneErrorVoxels;
-            segment.selectedTargetPlaneName =
-                segment.trace.selectedTargetPlaneName;
-            segment.selectedTargetPlaneCrossing =
-                segment.trace.selectedTargetPlaneCrossing;
+                endpointPlaneError(segment.trace.points.back(), target, targetPlaneNormal);
         } else {
             segment.inPlaneErrorVoxels = std::numeric_limits<double>::infinity();
         }

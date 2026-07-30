@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <opencv2/core/types.hpp>
@@ -67,6 +68,7 @@ struct LasagnaCubeValues {
 
 struct LasagnaCubeRequest {
     bool valid = false;
+    bool singleChunk = false;
     size_t z0 = 0;
     size_t y0 = 0;
     size_t x0 = 0;
@@ -130,6 +132,29 @@ private:
         LasagnaChannelChunkKeyHash> inFlight_;
 };
 
+class LasagnaLocalChunkResolver {
+public:
+    LasagnaLocalChunkResolver(
+        const LasagnaChannelBinding& binding,
+        const LasagnaChannelChunkCache& cache);
+
+    void resolve(LasagnaCubeRequest& request);
+
+private:
+    [[nodiscard]] std::shared_ptr<const LasagnaCachedChunk> resolveKey(
+        const LasagnaChannelChunkKey& key);
+
+    const LasagnaChannelBinding* binding_ = nullptr;
+    const LasagnaChannelChunkCache* cache_ = nullptr;
+    LasagnaChannelChunkKey lastKey_{};
+    std::shared_ptr<const LasagnaCachedChunk> lastChunk_;
+    bool hasLast_ = false;
+    std::array<LasagnaChannelChunkKey, 16> keys_{};
+    std::array<std::shared_ptr<const LasagnaCachedChunk>, 16> chunks_{};
+    size_t size_ = 0;
+    size_t next_ = 0;
+};
+
 struct LasagnaPreparedCompactPoint {
     LasagnaCubeRequest nx;
     LasagnaCubeRequest ny;
@@ -152,6 +177,25 @@ sharedLasagnaChannelChunkCache(size_t capacityBytes);
 [[nodiscard]] LasagnaCubeRequest prepareLasagnaCubeRequest(
     const LasagnaChannelBinding& binding,
     const cv::Vec3d& volumePoint);
+
+[[nodiscard]] bool sameLasagnaSamplingGrid(
+    const LasagnaChannelBinding& a,
+    const LasagnaChannelBinding& b);
+
+[[nodiscard]] LasagnaCubeRequest cloneLasagnaCubeRequestForBinding(
+    const LasagnaCubeRequest& source,
+    const LasagnaChannelBinding& binding);
+
+void assignResolvedLasagnaCubeRequestChunks(
+    LasagnaCubeRequest& request,
+    const LasagnaChannelChunkCache::ResolvedChunkMap& resolved);
+
+void appendUniqueLasagnaCubeRequestChunkKeys(
+    const LasagnaCubeRequest& request,
+    std::vector<LasagnaChannelChunkKey>& keys);
+
+void deduplicateLasagnaChunkKeysInPlace(
+    std::vector<LasagnaChannelChunkKey>& keys);
 
 void appendLasagnaInterpolationChunkKeys(
     const LasagnaChannelBinding& binding,

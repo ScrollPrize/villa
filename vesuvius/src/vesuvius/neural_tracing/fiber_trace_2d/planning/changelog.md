@@ -1,3 +1,22 @@
+# 2026-07-30
+
+- Reduced native `vc_fiber_trace_metric` warm-cache runtime on the remote
+  fiber manifest workload from roughly 314s to roughly 86s with profiled
+  direct chunk-resolution sampling, bounded deterministic beam pruning, and
+  lightweight final-lookahead frontier records while preserving the measured
+  5-restart result.
+- Added opt-in native C++ Trace2CP parallel candidate scoring through batched
+  persisted prediction materialization, batched Lasagna normals, and
+  `vc_fiber_trace_metric --threads`, while preserving deterministic beam output
+  order.
+- Reduced native Trace2CP beam expansion overhead by keeping internal trace
+  paths parent-linked and caching per-trace cone offsets instead of rebuilding
+  them per beam.
+- Matched native C++ Trace2CP beam pruning/reached-target selection and compact
+  normal principal-axis decoding more closely to the Python tracer, with
+  focused `test_fiber_trace3d` regression coverage for beam order, reached
+  ties, normal eigensolver behavior, and all-pairs candidate loss.
+
 # 2026-07-29
 
 - Native 3D Trace2CP refined/fused/regenerated presence panels now display
@@ -13,6 +32,15 @@
   chord. Python and VC3D native tracers now require target-local line-neighbor
   and inferred-direction planes, wait until all configured planes are crossed,
   and score the lowest in-plane CP crossing error.
+- Added native `vc_fiber_trace_metric --inference-scaledown-power`, defaulting
+  to 2, so existing fiber prediction manifests derive trace scale from the
+  persisted prediction scale without adding manifest fields.
+- Brought the native C++ `vc_fiber_tracer`/`vc_fiber_trace_metric` Trace2CP
+  search controls into parity with the Python native tracer for persisted
+  inference products: circular default cone candidates, presence-weighted
+  current branch choice, angle-squared split smoothness, cumulative tangent
+  smoothness, target-plane crossing interpolation, spatial beam pruning, and
+  matching CLI flags/defaults.
 - Python native 3D Trace2CP now accepts multiple `--fiber-json` paths, runs
   them sequentially with a shared loaded model, writes indexed per-fiber
   summaries/visualizations, and reports an accumulated restart-rate score.

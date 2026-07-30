@@ -34,9 +34,39 @@
   product regions at a scale, never once per product. Each scheduled global
   model tile is inferred at most once even when it feeds several scales or
   products.
-- `OutputProductSpec.scaledown` is base-relative output metadata;
-  `inference_scaledown` is the explicit factor relative to the selected input
-  array used for tile downsampling and ring geometry.
+- `OutputProductSpec.scaledown` is base-relative output metadata. The
+  internal product `inference_scaledown` value is only runner geometry state
+  for tile downsampling and ring layout; it is not serialized into Lasagna
+  manifests.
+- Fiber inference manifests must not add redundant trace-scale aliases such as
+  `trace_to_base_scale`, `prediction_to_base_scale`,
+  `prediction_spacing_in_trace_voxels`, `inference_scaledown_factor`, or
+  per-group `inference_scaledown`. Native consumers require an explicit
+  numeric manifest `source_to_base` and derive persisted prediction sample
+  scale as `source_to_base * 2**group.scaledown`. Native precomputed tracing
+  receives the missing inference-output scaledown relative to trace coordinates
+  as `--inference-scaledown-power` (default `2`), then derives
+  `trace_to_base = prediction_to_base / 2**power` and
+  `prediction_spacing_in_trace_voxels = 2**power`.
+- Native precomputed Trace2CP search must match the Python tracer's beam
+  semantics: pruning is ordered by `cumulative_loss + depth * 1e-12` with
+  original tensor/generation order preserved on ties, spatial pruning uses the
+  squared-distance `>= distance**2` keep rule, and reached-target selection
+  chooses the first reached state with minimum cumulative loss only. Native
+  compact normal interpolation must choose the principal tensor axis with a
+  symmetric eigensolver and then apply the same hint/no-hint sign convention as
+  Python. The active `candidate_substeps=1` candidate loss is the Python
+  all-pairs direction product plus the configured smoothness terms.
+- Native precomputed Trace2CP may score independent beam candidates in
+  parallel only when the prediction source and, if present, the Lasagna normal
+  sampler explicitly advertise concurrent sampling support. Parallel scoring
+  must build candidate tasks in deterministic beam/candidate order, keep
+  persisted Zarr/cache access chunky by preparing interpolation requests and
+  materializing prediction samples as a batch before fine-grained loss scoring,
+  and rebuild the next frontier serially in that same order, so pruning,
+  reached-state selection, and trace output remain deterministic. `--threads 0`
+  is the default and uses the OpenMP default thread count; `--threads 1` must
+  force serial lazy candidate scoring.
 - Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2
   (factor 4 relative to selected input). It is converted to the runner's
   literal factor and does not read or reinterpret tracer config `scaledown`.
@@ -936,6 +966,13 @@
   with the shared `vc_lasagna` compact-channel helper. It must not copy private
   normal-sampler logic, raw-interpolate compact `nx`/`ny` values as ordinary
   directions, or invent a separate remote-cache path.
+- Native GUI fiber prediction must resolve the selected fiber inference
+  manifest's trace scale from `source_to_base` and the persisted prediction
+  sampling scale from prediction group `scaledown` before opening prediction
+  channels. The
+  derived trace scale must match the active Lasagna line session's working
+  scale; otherwise the GUI must fail clearly rather than mixing line, normal,
+  and prediction coordinates.
 - The first VC3D GUI action is Ctrl-right-click on a generated line annotation
   CP/segment context menu, then "Optimize segment with native fiber tracer".
   The action traces only the adjacent CP-to-CP span around the clicked line
@@ -957,18 +994,27 @@
   output. It loads one `vc3d_fiber` JSON, requires exact control-point matches
   in `line_points`, traces one-sided from CP to next CP plane, continues from
   the reached point after success, restarts from the failed CP after failure,
-  and reports restart rate per 1000 manifest-prediction voxels as `err/kvx`.
-  The runner derives its working-to-base scale from the persisted prediction
-  channels in the fiber inference manifest: each required prediction channel's
-  effective scale is `source_to_base * 2**scaledown`, and all `presence`/`nx`/
-  `ny` channels used by the tracer, including prefixed multi-output channel
-  sets, must agree. Missing or scale-mismatched prediction channels are a hard
-  error. The JSON fiber is assumed to already be in the manifest base
-  coordinate system; no command-line fiber rescaling is currently exposed.
-  Default trace-control parameters are `--step-voxels 4.0`, `--beam-width 8`,
-  `--beam-lookahead-steps 2`, `--smoothness-normal-weight 0.1`, and
-  `--smoothness-tangent-weight 10.0`, matching the regular Python Trace2CP
-  defaults except for inference-only options.
+  and reports restart rate per 1000 trace voxels as `err/kvx`.
+  The runner requires an explicit numeric manifest `source_to_base` and a
+  command-line `--inference-scaledown-power`, defaulting to 2. Persisted
+  prediction channel scale is validated as
+  `source_to_base * 2**group.scaledown`; trace coordinate scale is derived as
+  `prediction_to_base / 2**inference_scaledown_power`, and prediction spacing
+  in trace voxels is `2**inference_scaledown_power`. All `presence`/`nx`/`ny`
+  channels used by the tracer, including prefixed multi-output channel sets,
+  must agree on prediction scale. Missing prediction channels or
+  scale-mismatched prediction channels are hard errors. The JSON fiber is
+  assumed to already be in the manifest base coordinate system; no command-line
+  fiber rescaling is currently exposed. Default trace-control parameters are
+  `--step-voxels 4.0`,
+  `--cone-angle-degrees 25.0`, `--cone-angle-step-degrees 5.0`,
+  `--cone-grid-size 25`, `--beam-width 8`,
+  `--beam-prune-distance-voxels 1.0`, `--beam-lookahead-steps 2`,
+  `--smoothness-weight 2.0`, `--smoothness-free-angle-degrees 0.0`,
+  `--smoothness-normal-weight 0.1`, `--smoothness-tangent-weight 10.0`,
+  `--cumulative-smoothness-steps 4`, and
+  `--cumulative-smoothness-tangent-weight 2.0`, matching the regular Python
+  Trace2CP defaults except for inference-only options.
   `vc_fiber_trace_metric` requires an explicit `--normal-manifest` pointing to
   the Lasagna normal manifest used for tangent/normal smoothness. It must not
   try to derive normals from the fiber prediction manifest because the

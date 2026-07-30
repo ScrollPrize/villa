@@ -190,6 +190,9 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberTrace.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna)
+if(VC_TESTING)
+    target_compile_definitions(vc_fiber_tracer PRIVATE VC_TESTING)
+endif()
 
 add_library(vc_tracer
     src/GrowPatch.cpp

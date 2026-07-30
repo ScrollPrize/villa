@@ -45,6 +45,11 @@ public:
         const std::vector<cv::Vec3d>& volumePoints,
         bool withDerivative,
         std::vector<NormalSampleWithDerivative>& samples) const override;
+    [[nodiscard]] NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        bool withDerivative,
+        int parallelThreads,
+        std::vector<NormalSampleWithDerivative>& samples) const;
 
 private:
     class Impl;

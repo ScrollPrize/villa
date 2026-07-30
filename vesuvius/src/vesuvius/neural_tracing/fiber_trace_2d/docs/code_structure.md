@@ -104,6 +104,10 @@ loading.
 - Fiber defaults to `--inference-scaledown-power 2`: filtered factor-4 output,
   or 0.25x per axis relative to the selected input. Power 0 keeps full input
   resolution. This is independent of the tracer/model config's `scaledown`.
+  The emitted `.lasagna.json` uses the existing Lasagna manifest schema only:
+  top-level `source_to_base` plus each prediction group's `scaledown` records
+  the persisted prediction scale relative to base. The manifest does not
+  serialize the selected tracing/input scale separately.
 
 ### Shared 3D tiled runner
 
@@ -121,7 +125,8 @@ The runner traverses the globally anchored model-tile lattice once. Model
 adapters provide preprocessing, model execution, raw product splitting, and
 raw-to-persisted conversion; they do not own traversal, accumulation, resume,
 or flushing. `OutputProductSpec.inference_scaledown` describes a product's
-scale relative to the selected input array, while `scaledown` remains the
+scale relative to the selected input array for runner geometry only; it is not
+serialized into `.lasagna.json`. `scaledown` remains the persisted
 base-relative manifest scale.
 
 Each distinct inference scale has separate raw-product float32 mmap rings and
@@ -679,20 +684,30 @@ Ownership changed as follows:
   generated-line action, "Optimize segment with native fiber tracer", for a
   CP-to-CP span. The task runs through the existing line-optimization busy
   state, so line edits are blocked while it runs, and accepted results are
-  spliced back through the existing generated-view/save path.
+  spliced back through the existing generated-view/save path. The selected
+  fiber prediction manifest's derived trace scale must match the active
+  Lasagna line session scale before the GUI opens the prediction field.
 - `volume-cartographer/apps/src/vc_fiber_trace_metric.cpp` is the native
   no-visualization metric runner for precomputed 3D fiber inference products.
   It opens a fiber inference `.lasagna.json`, loads one `vc3d_fiber` JSON,
   runs one-way CP-to-CP tracing continuously over the full fiber, restarts from
   a CP after failed target-plane hits, and prints `err/kvx` plus optional
   `err/m` when an explicit `--voxel-size-um` is provided. Its tracer working
-  scale is inferred from the fiber inference manifest's persisted prediction
-  channels, using the common `source_to_base * 2**scaledown` scale for
-  `presence`/`nx`/`ny` channel sets. The input fiber JSON is assumed to already
-  be in the manifest base coordinate system. The default trace parameters are
-  `step=4.0`, `beam_width=8`, `beam_lookahead_steps=2`,
-  `smoothness_normal_weight=0.1`, and `smoothness_tangent_weight=10.0`,
-  matching the Python Trace2CP default trace controls. It requires an explicit
+  scale is derived by combining the persisted prediction scale from manifest
+  fields with `--inference-scaledown-power`, which defaults to `2`. Persisted
+  prediction channel scale is validated as `source_to_base * 2**scaledown` for
+  every `presence`/`nx`/`ny` channel set; native tracing then uses
+  `trace_to_base = prediction_to_base / 2**inference_scaledown_power` and
+  `prediction_spacing_in_trace_voxels = 2**inference_scaledown_power`. The
+  input fiber JSON is assumed to already be in the manifest base coordinate
+  system. The default trace parameters are
+  `step=4.0`, `cone_angle=25.0`, `cone_angle_step=5.0`,
+  `cone_grid_size=25`, `beam_width=8`, `beam_prune_distance=1.0`,
+  `beam_lookahead_steps=2`, `smoothness_weight=2.0`,
+  `smoothness_free_angle=0.0`, `smoothness_normal_weight=0.1`,
+  `smoothness_tangent_weight=10.0`, `cumulative_smoothness_steps=4`, and
+  `cumulative_smoothness_tangent_weight=2.0`, matching the Python Trace2CP
+  default trace controls. It requires an explicit
   `--normal-manifest` Lasagna manifest and does not try to read normals from
   the fiber prediction manifest. The CLI is a thin wrapper around
   `vc_fiber_tracer`; it does not run PyTorch, create strips, or implement

@@ -6808,9 +6808,24 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         session.selectedFiberInferenceManifestPath != manifestPath ||
         scaleChanged) {
         try {
+            auto openedDataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+            const auto traceScales =
+                vc::fiber_tracer::resolveFiberPredictionTraceScales(
+                    openedDataset.manifest());
+            if (!approximatelyEqual(traceScales.traceToBaseScale,
+                                    session.workingToBaseScale)) {
+                showError(
+                    tr("Fiber inference trace scale (%1 base voxels) does not "
+                       "match the active Lasagna line scale (%2 base voxels).")
+                        .arg(traceScales.traceToBaseScale, 0, 'g', 12)
+                        .arg(session.workingToBaseScale, 0, 'g', 12),
+                    headless);
+                return false;
+            }
+            auto predictionManifest = openedDataset.manifest();
+            predictionManifest.workingToBaseScale = traceScales.traceToBaseScale;
             auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
-                vc::lasagna::LasagnaDataset::open(
-                    manifestPath, {session.workingToBaseScale}));
+                std::move(predictionManifest));
             auto field = std::make_shared<vc::fiber_tracer::FiberPredictionField>(*dataset);
             session.fiberInferenceDataset = std::move(dataset);
             session.fiberPredictionField = std::move(field);

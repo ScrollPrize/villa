@@ -27,6 +27,7 @@ struct CliOptions {
     std::optional<double> voxelSizeUm;
     double errorThresholdVoxels = 10.0;
     size_t cacheBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+    int inferenceScaledownPower = 2;
     bool quiet = false;
     FiberTraceConfig trace;
 };
@@ -46,14 +47,21 @@ void printUsage(const char* argv0)
         << "  --normal-manifest PATH          required Lasagna normal manifest for tangent/normal smoothness\n"
         << "  --remote-cache-dir PATH         required for remote HTTP/S3 Lasagna manifests\n"
         << "  --voxel-size-um N               base-voxel size in micrometers for err/m output\n"
-        << "  --step-voxels N                 trace step in manifest prediction voxels [4]\n"
+        << "  --inference-scaledown-power N   prediction output scaledown relative to trace voxels, as 2^N [2]\n"
+        << "  --step-voxels N                 trace step in manifest trace voxels [4]\n"
         << "  --cone-angle-degrees N          candidate cone half-angle [25]\n"
         << "  --cone-angle-step-degrees N     candidate cone grid step [5]\n"
+        << "  --cone-grid-size N              legacy square-to-disk grid size when cone step <= 0 [25]\n"
         << "  --beam-width N                  kept beams per step [8]\n"
+        << "  --beam-prune-distance-voxels N  beam endpoint merge radius after lookahead [1]\n"
         << "  --beam-lookahead-steps N        expand this many steps before pruning [2]\n"
+        << "  --threads N                     candidate scoring threads, 0 uses OpenMP default, 1 serial [0]\n"
         << "  --smoothness-weight N           smoothness scale [2]\n"
         << "  --smoothness-normal-weight N    normal-axis smoothness weight [0.1]\n"
         << "  --smoothness-tangent-weight N   tangent-plane smoothness weight [10]\n"
+        << "  --smoothness-free-angle-degrees N free turn before smoothness penalty [0]\n"
+        << "  --cumulative-smoothness-steps N history length for cumulative tangent smoothing [4]\n"
+        << "  --cumulative-smoothness-tangent-weight N cumulative tangent smoothing weight [2]\n"
         << "  --max-step-factor N             max steps as factor of CP span [3]\n"
         << "  --error-threshold-voxels N      restart threshold at target plane [10]\n"
         << "  --cache-gib N                   per-channel chunk-cache budget [8]\n"
@@ -119,6 +127,10 @@ CliOptions parseArgs(int argc, char** argv)
             options.voxelSizeUm =
                 parseDouble(requireValue(i, argc, argv, "voxel-size-um"),
                             "voxel-size-um");
+        } else if (arg == "--inference-scaledown-power") {
+            options.inferenceScaledownPower =
+                parseInt(requireValue(i, argc, argv, "inference-scaledown-power"),
+                         "inference-scaledown-power");
         } else if (arg == "--step-voxels") {
             options.trace.stepVoxels =
                 parseDouble(requireValue(i, argc, argv, "step-voxels"),
@@ -131,14 +143,25 @@ CliOptions parseArgs(int argc, char** argv)
             options.trace.coneAngleStepDegrees =
                 parseDouble(requireValue(i, argc, argv, "cone-angle-step-degrees"),
                             "cone-angle-step-degrees");
+        } else if (arg == "--cone-grid-size") {
+            options.trace.coneGridSize =
+                parseInt(requireValue(i, argc, argv, "cone-grid-size"),
+                         "cone-grid-size");
         } else if (arg == "--beam-width") {
             options.trace.beamWidth =
                 parseInt(requireValue(i, argc, argv, "beam-width"),
                          "beam-width");
+        } else if (arg == "--beam-prune-distance-voxels") {
+            options.trace.beamPruneDistanceVoxels =
+                parseDouble(requireValue(i, argc, argv, "beam-prune-distance-voxels"),
+                            "beam-prune-distance-voxels");
         } else if (arg == "--beam-lookahead-steps") {
             options.trace.beamLookaheadSteps =
                 parseInt(requireValue(i, argc, argv, "beam-lookahead-steps"),
                          "beam-lookahead-steps");
+        } else if (arg == "--threads") {
+            options.trace.parallelThreads =
+                parseInt(requireValue(i, argc, argv, "threads"), "threads");
         } else if (arg == "--smoothness-weight") {
             options.trace.smoothnessWeight =
                 parseDouble(requireValue(i, argc, argv, "smoothness-weight"),
@@ -151,6 +174,22 @@ CliOptions parseArgs(int argc, char** argv)
             options.trace.smoothnessTangentWeight =
                 parseDouble(requireValue(i, argc, argv, "smoothness-tangent-weight"),
                             "smoothness-tangent-weight");
+        } else if (arg == "--smoothness-free-angle-degrees") {
+            options.trace.smoothnessFreeAngleDegrees =
+                parseDouble(requireValue(i, argc, argv, "smoothness-free-angle-degrees"),
+                            "smoothness-free-angle-degrees");
+        } else if (arg == "--cumulative-smoothness-steps") {
+            options.trace.cumulativeSmoothnessSteps =
+                parseInt(requireValue(i, argc, argv, "cumulative-smoothness-steps"),
+                         "cumulative-smoothness-steps");
+        } else if (arg == "--cumulative-smoothness-tangent-weight") {
+            options.trace.cumulativeSmoothnessTangentWeight =
+                parseDouble(requireValue(
+                                i,
+                                argc,
+                                argv,
+                                "cumulative-smoothness-tangent-weight"),
+                            "cumulative-smoothness-tangent-weight");
         } else if (arg == "--max-step-factor") {
             options.trace.maxStepFactor =
                 parseDouble(requireValue(i, argc, argv, "max-step-factor"),
@@ -174,12 +213,32 @@ CliOptions parseArgs(int argc, char** argv)
     }
     if (!(options.trace.stepVoxels > 0.0))
         failOption("--step-voxels must be positive");
+    if (!(options.trace.coneAngleDegrees >= 0.0))
+        failOption("--cone-angle-degrees must be non-negative");
+    if (options.trace.coneGridSize < 1)
+        failOption("--cone-grid-size must be at least 1");
     if (options.trace.beamWidth < 1)
         failOption("--beam-width must be at least 1");
+    if (!(options.trace.beamPruneDistanceVoxels >= 0.0))
+        failOption("--beam-prune-distance-voxels must be non-negative");
     if (options.trace.beamLookaheadSteps < 1)
         failOption("--beam-lookahead-steps must be at least 1");
+    if (options.trace.parallelThreads < 0)
+        failOption("--threads must be non-negative");
+    if (!(options.trace.smoothnessWeight >= 0.0) ||
+        !(options.trace.smoothnessNormalWeight >= 0.0) ||
+        !(options.trace.smoothnessTangentWeight >= 0.0) ||
+        !(options.trace.cumulativeSmoothnessTangentWeight >= 0.0)) {
+        failOption("smoothness weights must be non-negative");
+    }
+    if (!(options.trace.smoothnessFreeAngleDegrees >= 0.0))
+        failOption("--smoothness-free-angle-degrees must be non-negative");
+    if (options.trace.cumulativeSmoothnessSteps < 1)
+        failOption("--cumulative-smoothness-steps must be at least 1");
     if (!(options.errorThresholdVoxels >= 0.0))
         failOption("--error-threshold-voxels must be non-negative");
+    if (options.inferenceScaledownPower < 0 || options.inferenceScaledownPower > 30)
+        failOption("--inference-scaledown-power must be in [0, 30]");
     if (options.normalManifest.empty()) {
         failOption(
             "--normal-manifest is required; pass the Lasagna normal manifest used for "
@@ -233,9 +292,11 @@ int main(int argc, char** argv)
         const auto openedDataset = vc::lasagna::LasagnaDataset::openLocation(
             options.fiberManifest,
             datasetOptions);
-        const double workingToBaseScale =
-            vc::fiber_tracer::inferFiberPredictionWorkingToBaseScale(
-                openedDataset.manifest());
+        const auto traceScales =
+            vc::fiber_tracer::resolveFiberPredictionTraceScales(
+                openedDataset.manifest(),
+                options.inferenceScaledownPower);
+        const double workingToBaseScale = traceScales.traceToBaseScale;
         auto predictionManifest = openedDataset.manifest();
         predictionManifest.workingToBaseScale = workingToBaseScale;
         const vc::lasagna::LasagnaDataset dataset(std::move(predictionManifest));
@@ -264,8 +325,15 @@ int main(int argc, char** argv)
                 << " fiber_json=" << options.fiberJson
                 << " control_points=" << fiber.controlPointsXyzBase.size()
                 << " segments=" << (fiber.controlPointsXyzBase.size() - 1)
-                << " working_to_base_scale=" << workingToBaseScale
-                << " working_to_base_scale_source=manifest"
+                << " derived_trace_to_base=" << traceScales.traceToBaseScale
+                << " derived_prediction_to_base=" << traceScales.predictionToBaseScale
+                << " derived_prediction_spacing_trace_voxels="
+                << traceScales.predictionSpacingInTraceVoxels
+                << " inference_scaledown_power=" << options.inferenceScaledownPower
+                << " threads="
+                << (options.trace.parallelThreads > 0
+                        ? std::to_string(options.trace.parallelThreads)
+                        : std::string("auto"))
                 << " normal_sampler=" << (normalSamplerPtr != nullptr ? "on" : "off")
                 << '\n';
         }
@@ -276,6 +344,8 @@ int main(int argc, char** argv)
         request.errorThresholdVoxels = options.errorThresholdVoxels;
         request.voxelSizeUm = options.voxelSizeUm;
         request.config = options.trace;
+        vc::fiber_tracer::FiberTraceProfile profile;
+        request.config.profile = &profile;
 
         using Clock = std::chrono::steady_clock;
         const auto wallStart = Clock::now();
@@ -360,6 +430,29 @@ int main(int argc, char** argv)
         std::cout << "native_trace2cp_timing trace_wall_s=" << std::fixed
                   << std::setprecision(3) << wallSeconds
                   << " trace_cpu_s=" << cpuSeconds << '\n';
+        std::cout << "native_trace2cp_profile"
+                  << " one_way=" << profile.oneWayCalls
+                  << " generations=" << profile.generations
+                  << " candidates=" << profile.candidateTasks
+                  << " avg_candidates_per_generation="
+                  << (profile.generations > 0
+                          ? static_cast<double>(profile.candidateTasks) /
+                                static_cast<double>(profile.generations)
+                          : 0.0)
+                  << " start_sample_s=" << profile.startSampleSeconds
+                  << " task_build_s=" << profile.taskBuildSeconds
+                  << " prediction_batch_s=" << profile.predictionBatchSeconds
+                  << " prediction_prepare_s=" << profile.predictionPrepareSeconds
+                  << " prediction_prefetch_s=" << profile.predictionPrefetchSeconds
+                  << " prediction_assign_s=" << profile.predictionAssignSeconds
+                  << " prediction_materialize_s=" << profile.predictionMaterializeSeconds
+                  << " normal_batch_s=" << profile.normalBatchSeconds
+                  << " normal_prefetch_s=" << profile.normalPrefetchSeconds
+                  << " normal_materialize_s=" << profile.normalMaterializeSeconds
+                  << " candidate_score_s=" << profile.candidateScoreSeconds
+                  << " frontier_s=" << profile.frontierSeconds
+                  << " prune_s=" << profile.pruneSeconds
+                  << '\n';
         return 0;
     } catch (const std::exception& exc) {
         std::cerr << "vc_fiber_trace_metric error: " << exc.what() << '\n';
