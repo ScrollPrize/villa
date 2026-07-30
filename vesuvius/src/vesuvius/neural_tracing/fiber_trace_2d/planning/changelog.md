@@ -4,6 +4,10 @@
   fiber prediction and Lasagna normal volumes, including mixed physical chunk
   grids, one decoded cache per physical scalar volume, boundary-aware retained
   chunk lookup, and caller-side orientation-tensor normal interpolation.
+- Fused persisted prediction/normal corner decoding into native candidate
+  scoring, eliminating full decoded candidate arrays and reducing the approved
+  warm-cache whole-fiber workload from 37.277s to 27.291s wall time. The
+  measured 8-restart post-float result is unchanged.
 - Converted native fiber tracing's internal geometry and candidate math to
   float while retaining double persisted/public coordinate boundaries. The
   representative quality check currently regresses from 5 to 8 restarts and

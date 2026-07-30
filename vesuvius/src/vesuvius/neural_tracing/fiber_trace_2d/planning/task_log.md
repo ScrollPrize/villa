@@ -126,8 +126,12 @@
   option selection, presence, compact-axis decoding, and loss calculation.
   Validation before measurement: `test_fiber_trace3d` 26 passed,
   `test_chunked_plane_sampler_fallback` 15 passed, and
-  `test_lasagna_normal_sampler` 11 passed. Representative measurement is
-  pending explicit approval.
+  `test_lasagna_normal_sampler` 11 passed. The approved representative run
+  measured 27.291s wall / 768.058s CPU with 8 restarts. Relative to the prior
+  37.277s / 1049.197s run, the separate 7.917s decode stage was eliminated,
+  fused candidate scoring measured 7.606s, frontier construction improved to
+  5.058s, and corner batching measured 9.019s. The performance target of less
+  than 30s is met; the pre-existing 8-versus-5 restart quality issue remains.
 
 ## Open Acceptance Issue
 

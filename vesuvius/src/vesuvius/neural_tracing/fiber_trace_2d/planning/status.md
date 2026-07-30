@@ -13,8 +13,9 @@
 - [x] Run approved representative benchmark and compare trace quality
 - [x] Fuse persisted corner decoding with candidate scoring
 - [x] Add direct-corner scoring coverage and rerun focused native tests
-- [ ] Measure fused decode/scoring on the approved representative workload
-- [ ] Update task log, changelog, and final consistency review
+- [x] Measure fused decode/scoring on the approved representative workload
+- [x] Update task log and changelog
+- [x] Final consistency review
 
 The combined prediction-plus-normal sampler supports the workload's mixed
 chunk grids (64-cubed prediction and 32-cubed normals) while sharing voxel
@@ -38,5 +39,6 @@ restarts, versus the 5-restart pre-float baseline.
 The next revision removes the full decoded prediction/normal sample arrays from
 the persisted fast path and scores candidates directly from the retained corner
 batch. All 26 fiber-trace, 15 strict corner-sampler, and 11 Lasagna normal tests
-pass. Its representative performance and restart result have not yet been
-measured.
+pass. The approved representative run completed in 27.291s wall / 768.058s CPU
+with 8 restarts, meeting the less-than-30s performance target without changing
+the pre-existing post-float restart result.
