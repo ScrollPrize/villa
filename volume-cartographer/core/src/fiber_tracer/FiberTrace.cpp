@@ -1572,9 +1572,10 @@ void sampleCandidateNormals(
 }
 
 [[nodiscard]] TraceTargetPlaneSet makeTraceTargetPlaneSet(
-    const std::vector<FiberTraceTargetPlane>& planes)
+    const std::vector<FiberTraceTargetPlane>& planes,
+    bool allowEmpty = false)
 {
-    if (planes.empty())
+    if (planes.empty() && !allowEmpty)
         throw std::invalid_argument("fiber trace requires at least one target plane");
     if (planes.size() > kMaxTargetPlanes) {
         throw std::invalid_argument(
@@ -2196,11 +2197,13 @@ template <typename LossAt>
     bool reached,
     std::string reason,
     std::optional<float> acceptThresholdVoxels,
-    bool snapTraceToSelectedCrossing)
+    bool snapTraceToSelectedCrossing,
+    std::optional<double> traceLengthLimitVoxels)
 {
     FiberTraceOneWayResult result;
     result.points = beamPathPoints(state);
-    result.reachedTargetPlane = reached;
+    result.reachedTargetPlane = reached && !traceLengthLimitVoxels.has_value();
+    result.reachedTraceLength = reached && traceLengthLimitVoxels.has_value();
     result.reason = reached
         ? std::move(reason)
         : targetPlaneFailureReason(
@@ -2232,6 +2235,25 @@ template <typename LossAt>
         if (snapTraceToSelectedCrossing && !result.points.empty())
             result.points.back() = *result.selectedTargetPlaneCrossing;
     }
+    if (result.reachedTraceLength && result.points.size() >= 2) {
+        const double limit = *traceLengthLimitVoxels;
+        double accumulated = 0.0;
+        for (size_t index = 1; index < result.points.size(); ++index) {
+            const cv::Vec3d segment = result.points[index] - result.points[index - 1];
+            const double segmentLength = length(segment);
+            if (accumulated + segmentLength + kTraceEpsilon < limit) {
+                accumulated += segmentLength;
+                continue;
+            }
+            const double remaining = std::max(0.0, limit - accumulated);
+            if (segmentLength > kEpsilon) {
+                result.points[index] = result.points[index - 1] +
+                    segment * (remaining / segmentLength);
+            }
+            result.points.resize(index + 1);
+            break;
+        }
+    }
     return result;
 }
 
@@ -2240,12 +2262,14 @@ template <typename LossAt>
     const FiberTraceOneWayRequest& request,
     const vc::lasagna::NormalSampler* normalSampler,
     const FiberTraceProgressCallback& progress,
-    std::string phase)
+    std::string phase,
+    std::optional<double> traceLengthLimitVoxels = std::nullopt)
 {
     const TraceVec start = toTraceVec(request.startPoint);
     const TraceVec target = toTraceVec(request.targetPoint);
     const TraceTargetPlaneSet targetPlanes = makeTraceTargetPlaneSet(
-        request.targetPlanes);
+        request.targetPlanes,
+        traceLengthLimitVoxels.has_value());
     std::optional<float> acceptThresholdVoxels;
     if (request.targetPlaneAcceptThresholdVoxels.has_value()) {
         const double threshold = *request.targetPlaneAcceptThresholdVoxels;
@@ -2254,6 +2278,17 @@ template <typename LossAt>
                 "target-plane acceptance threshold must be finite and non-negative");
         }
         acceptThresholdVoxels = static_cast<float>(threshold);
+    }
+    if (traceLengthLimitVoxels.has_value()) {
+        if (!request.targetPlanes.empty()) {
+            throw std::invalid_argument(
+                "fiber trace length completion cannot use target planes");
+        }
+        if (!(*traceLengthLimitVoxels > 0.0) ||
+            !std::isfinite(*traceLengthLimitVoxels)) {
+            throw std::invalid_argument(
+                "fiber trace length limit must be finite and positive");
+        }
     }
     const TraceVec referenceStartDirection = traceNormalizedOr(
         toTraceVec(request.initialDirection),
@@ -2275,14 +2310,19 @@ template <typename LossAt>
     }
     const TraceVec startDirection = startPrediction.direction;
 
-    const float distance = request.budgetSpanVoxels > 0.0
-        ? static_cast<float>(request.budgetSpanVoxels)
-        : traceLength(target - start);
+    const float distance = traceLengthLimitVoxels.has_value()
+        ? static_cast<float>(*traceLengthLimitVoxels)
+        : (request.budgetSpanVoxels > 0.0
+            ? static_cast<float>(request.budgetSpanVoxels)
+            : traceLength(target - start));
     const float step = std::max(1.0e-3f, static_cast<float>(request.config.stepVoxels));
+    const double stepBudget = traceLengthLimitVoxels.has_value()
+        ? *traceLengthLimitVoxels / static_cast<double>(step)
+        : static_cast<double>(distance) * request.config.maxStepFactor /
+            static_cast<double>(step);
     const int maxSteps = std::max(
         1,
-        static_cast<int>(std::ceil(
-            distance * request.config.maxStepFactor / step)));
+        static_cast<int>(std::ceil(stepBudget)));
 
     BeamState initial;
     initial.path = appendBeamPathPoint(nullptr, start);
@@ -2316,10 +2356,13 @@ template <typename LossAt>
             true,
             "target_plane",
             acceptThresholdVoxels,
-            request.snapTraceToSelectedCrossing);
+            request.snapTraceToSelectedCrossing,
+            traceLengthLimitVoxels);
     }
     CandidateScoringScratch scoringScratch;
-    std::string reason = "max_step_factor";
+    std::string reason = traceLengthLimitVoxels.has_value()
+        ? "trace_distance_not_reached"
+        : "max_step_factor";
 
     const int lookaheadSteps = request.config.beamWidth <= 1
         ? 1
@@ -2339,6 +2382,17 @@ template <typename LossAt>
         for (; advanced < lookaheadSteps && stepIndex + advanced < maxSteps; ++advanced) {
             if (profile != nullptr)
                 ++profile->generations;
+            float generationStep = step;
+            if (traceLengthLimitVoxels.has_value()) {
+                const double nominalTracedLength =
+                    static_cast<double>(stepIndex + advanced) *
+                    static_cast<double>(step);
+                generationStep = static_cast<float>(std::min(
+                    static_cast<double>(step),
+                    std::max(
+                        static_cast<double>(kTraceEpsilon),
+                        *traceLengthLimitVoxels - nominalTracedLength)));
+            }
             const bool finalLookaheadGeneration =
                 advanced + 1 >= lookaheadSteps ||
                 stepIndex + advanced + 1 >= maxSteps;
@@ -2358,7 +2412,7 @@ template <typename LossAt>
                         normalSampler,
                         expanded,
                         coneOffsets,
-                        step,
+                        generationStep,
                         targetPlanes,
                         acceptThresholdVoxels,
                         request.config,
@@ -2377,7 +2431,7 @@ template <typename LossAt>
                     scoringScratch.candidatePoints,
                     expanded,
                     coneOffsets,
-                    step);
+                    generationStep);
                 if (profile != nullptr)
                     profile->taskBuildSeconds += elapsedSeconds(taskBuildStart);
                 tasksPtr = &scoringScratch.tasks;
@@ -2451,7 +2505,8 @@ template <typename LossAt>
                         true,
                         bestReached.reason,
                         acceptThresholdVoxels,
-                        request.snapTraceToSelectedCrossing);
+                        request.snapTraceToSelectedCrossing,
+                        traceLengthLimitVoxels);
                 }
                 const auto pruneStart = TraceClock::now();
                 std::vector<size_t> selectedIndices;
@@ -2549,7 +2604,8 @@ template <typename LossAt>
                     true,
                     bestReached.reason,
                     acceptThresholdVoxels,
-                    request.snapTraceToSelectedCrossing);
+                    request.snapTraceToSelectedCrossing,
+                    traceLengthLimitVoxels);
             }
         }
         if (expanded.empty() && !prunedFinalFrontier)
@@ -2568,16 +2624,27 @@ template <typename LossAt>
         stepIndex += std::max(1, advanced);
 
         if (progress) {
-            const float targetDistance = traceLength(beamEndpoint(beams.front()) - target);
             FiberTraceProgress event;
             event.phase = phase;
             event.step = stepIndex;
             event.maxSteps = maxSteps;
-            event.targetPlaneProgress =
-                distance > kTraceEpsilon
+            if (traceLengthLimitVoxels.has_value()) {
+                event.targetPlaneProgress = distance > kTraceEpsilon
+                    ? std::min(1.0f, beams.front().tracedLength / distance)
+                    : 1.0;
+            } else {
+                const float targetDistance =
+                    traceLength(beamEndpoint(beams.front()) - target);
+                event.targetPlaneProgress = distance > kTraceEpsilon
                     ? 1.0 - std::min(1.0f, targetDistance / distance)
                     : 1.0;
-            event.reason = beams.front().reached ? beams.front().reason : reason;
+            }
+            const bool reachedTraceLength = traceLengthLimitVoxels.has_value() &&
+                static_cast<double>(beams.front().tracedLength) + kTraceEpsilon >=
+                    *traceLengthLimitVoxels;
+            event.reason = reachedTraceLength
+                ? "trace_distance"
+                : (beams.front().reached ? beams.front().reason : reason);
             progress(event);
         }
     }
@@ -2589,18 +2656,25 @@ template <typename LossAt>
             false,
             reason,
             acceptThresholdVoxels,
-            request.snapTraceToSelectedCrossing);
+            request.snapTraceToSelectedCrossing,
+            traceLengthLimitVoxels);
     }
 
     const auto best = std::min_element(
         beams.begin(), beams.end(), beamSearchLess);
+    const bool reachedTraceLength = traceLengthLimitVoxels.has_value() &&
+        static_cast<double>(best->tracedLength) + kTraceEpsilon >=
+            *traceLengthLimitVoxels;
+    const bool reached = best->reached || reachedTraceLength;
     return oneWayResultFromState(
         *best,
         targetPlanes,
-        best->reached,
-        best->reached ? best->reason : reason,
+        reached,
+        reachedTraceLength ? "trace_distance" :
+            (best->reached ? best->reason : reason),
         acceptThresholdVoxels,
-        request.snapTraceToSelectedCrossing);
+        request.snapTraceToSelectedCrossing,
+        traceLengthLimitVoxels);
 }
 
 struct ResampledTrace {
@@ -4709,15 +4783,15 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     request.startPoint = startPoint;
     request.targetPoint = startPoint + direction * distanceVoxels;
     request.initialDirection = direction;
-    request.targetPlanes = {{
-        "extrapolation_distance",
-        request.targetPoint,
-        direction,
-    }};
     request.budgetSpanVoxels = distanceVoxels;
     request.config = config;
     return traceOneWayCore(
-        predictions, request, normalSampler, progress, "extrapolation");
+        predictions,
+        request,
+        normalSampler,
+        progress,
+        "extrapolation",
+        distanceVoxels);
 }
 
 FiberTraceSegmentResult traceFiberSegment(

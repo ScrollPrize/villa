@@ -770,14 +770,22 @@ Ownership changed as follows:
   unaffected traced spans and retrace only invalidated adjacency.
 
   Both open tails are first available from Lasagna reinitialization. Fiber mode
-  then calls `traceFiberExtrapolation`, a thin distance-plane request over the
-  shared one-way beam tracer, in trace coordinates. A successful crossing
-  replaces that tail. If all next-step prediction directions are invalid, the
+  then calls `traceFiberExtrapolation` over the shared one-way beam tracer in
+  trace coordinates. Extrapolation passes no target planes: its requested
+  distance is the hard accumulated arc-length budget, independent of
+  `max_step_factor`, and the returned final segment is clipped to the exact
+  length. Successful length completion replaces that tail. If all next-step
+  prediction directions are invalid, the
   shared tracer returns its last valid partial path with
   `no_valid_candidates`; VC3D uses it as a native tail ending at the data edge.
-  Step-budget and other failures retain the Lasagna tail, whose first point is
-  hard-constrained by adjoining native geometry when the outer CP owns a
-  successful native span. The controller
+  A failure before producing an outward step retains the Lasagna tail, whose
+  first point is hard-constrained by adjoining native geometry when the outer
+  CP owns a successful native span. At each actual fallback site, the shared helper calls
+  a typed diagnostic callback with the side, full trace/exception reason,
+  returned point count, and source. `LineAnnotationController` supplies the
+  callback and emits the VC3D command-line warning; completed length traces and
+  accepted data-edge truncations never call it. CP-to-CP tracing continues to
+  use target-local planes and its distance-scaled `max_step_factor` guard. The controller
   applies the combined line, CP metadata, and mode atomically and uses the same
   path for save-time finalization after no-reoptimization edits.
 - `volume-cartographer/apps/src/vc_fiber_trace_metric.cpp` is the native

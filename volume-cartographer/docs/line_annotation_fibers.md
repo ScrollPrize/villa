@@ -55,10 +55,15 @@ switching explicitly to Lasagna mode or reverting a span clears them.
 
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way
-fiber tracer after converting the requested distance to trace voxels; a failed
-native tail keeps its Lasagna fallback. Stored line and control points always
-remain in base coordinates. When the prediction field returns no valid next
-direction at a volume edge, the tracer retains its last valid partial path and
-VC3D stops the native tail there. Step-budget and other failures still keep the
-Lasagna fallback. A retained Lasagna tail adjacent to a successful native span
-uses the same hard continuation direction.
+fiber tracer after converting the requested distance to trace voxels. That
+distance is the complete traced arc-length budget: extrapolation uses no target
+planes, ignores `max_step_factor`, and clips its final step to the exact length.
+Stored line and control points always remain in base coordinates. When the
+prediction field returns no valid next direction at a volume edge, the tracer
+retains its last valid partial path and VC3D stops the native tail there. A
+failure before the first outward step keeps the Lasagna fallback. A retained
+Lasagna tail adjacent to a successful native span uses the same hard
+continuation direction. Each retained fallback emits a terminal warning
+containing `side`, the full `reason`, `trace_points`, and `source`
+(`trace_result` or `exception`). Completed length-based tails and accepted
+data-edge truncation do not emit this warning.

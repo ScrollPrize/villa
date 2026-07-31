@@ -1,64 +1,56 @@
-# Native Diagnostic Refresh And Edge-Truncated Extrapolation Plan
+# Plan: Trace Native Extrapolation By Length
 
-## 1. Diagnostic Refresh
+## Scope
 
-- Keep `setGeneratedBranchOverlayData()` conservative: it may clear stale labels
-  while replacing control geometry.
-- In the controller's central `refreshBranchLineViews()` path, immediately
-  repopulate labels from `generatedSpanAlignmentMetricsForSession()` after the
-  branch/control overlay replacement.
-- Preserve accepted segment metadata when the user presses Reoptimize while
-  already in Lasagna mode so the existing protected-span reinitializer can keep
-  it. Retain metadata clearing on an explicit mode transition to Lasagna.
+- Change the shared C++ one-way tracer so extrapolation has a dedicated
+  trace-length completion condition.
+- Keep CP-to-CP target planes, intersection acceptance, and fusion unchanged.
+- Update VC3D to recognize trace-length completion as successful native
+  extrapolation.
 
-## 2. Partial Extrapolation Retention
+## Implementation
 
-- Preserve the best beam from the last nonempty generation in the shared
-  one-way tracer.
-- When candidate pruning produces an empty frontier, return that last valid
-  beam with `reason=no_valid_candidates` rather than returning the initial CP.
-- Do not mark the requested distance plane as reached.
+1. Add a result flag that distinguishes trace-length completion from
+   target-plane completion.
+2. Pass an optional private trace-length limit through `traceOneWayCore()` and
+   candidate frontier construction.
+3. For trace-length mode, derive the maximum generation count directly from
+   `ceil(distance / step)` and ignore `max_step_factor`.
+4. Mark candidates complete once accumulated traced arc length reaches the
+   limit, and clip the final returned segment to the exact requested length.
+5. Make `traceFiberExtrapolation()` use the length limit with no target planes.
+6. Accept `reachedTraceLength` in the VC3D open-tail replacement path while
+   retaining the existing invalid-direction edge truncation rule.
 
-## 3. VC3D Tail Selection
+## Tests
 
-- Accept a nonempty extrapolation path as native when it reached the distance
-  plane or terminated with `no_valid_candidates`.
-- Convert and splice a retained path of at least two points exactly as for a
-  completed native tail.
-- Continue counting all other incomplete or exceptional results as Lasagna
-  fallback extrapolations.
+- Update the straight extrapolation regression to require trace-length rather
+  than target-plane completion and exact arc length.
+- Add a slanted trace regression whose initial-tangent plane is not reached at
+  the requested length; verify it still stops exactly at that length and that a
+  large `max_step_factor` does not extend the trace.
+- Retain the invalid-direction partial-tail regression.
+- Run `test_fiber_trace3d` and `test_line_annotation_generated_views`.
+- Build production `VC3D` with `-j32`.
 
-## 4. Tests
+## Spec Update
 
-- Add a core tracer regression proving invalid directions after one valid step
-  return the partial path and `no_valid_candidates`.
-- Add a VC3D fiber-mode regression proving one completed tail and one
-  edge-truncated tail are both native and that the truncated endpoint is the
-  last valid sample rather than the Lasagna endpoint.
-- Run `test_fiber_trace3d`, `test_line_annotation_generated_views`, and build
-  `VC3D` with `-j32`.
+- Replace the synthetic extrapolation distance-plane contract with exact traced
+  arc-length termination and state that `max_step_factor` applies only to
+  target-directed tracing.
 
-## 5. Spec Update
+## Docs Updates
 
-- Specify diagnostic repopulation after generated branch refresh and protection
-  of accepted spans during same-mode Reoptimize.
-- Specify `no_valid_candidates` as successful edge truncation for extrapolation
-  only, without changing CP-pair or whole-fiber acceptance.
+- Update `docs/code_structure.md` and
+  `volume-cartographer/docs/line_annotation_fibers.md` to describe length-based
+  extrapolation and edge truncation.
 
-## 6. Docs Update
+## Changelog
 
-- Update the VC3D section of `docs/code_structure.md` and
-  `volume-cartographer/docs/line_annotation_fibers.md` with refresh and
-  edge-truncation behavior.
+- Record the correction from synthetic target-plane extrapolation to a hard
+  trace-length budget.
 
-## 7. Changelog
+## Review
 
-- Add a concise 2026-07-30 bug-fix entry.
-
-## 8. Review Risks
-
-- Do not reinterpret `no_valid_candidates` as success for CP-pair tracing.
-- Do not accept `max_step_factor` as edge truncation.
-- Do not retain stale label geometry after CP edits; repopulate labels from the
-  current session after replacing control overlays.
-- Do not clear accepted metadata on ordinary Reoptimize.
+- Verify the new completion mode cannot alter CP-to-CP target-plane paths.
+- Verify all completion and failure result fields remain unambiguous.

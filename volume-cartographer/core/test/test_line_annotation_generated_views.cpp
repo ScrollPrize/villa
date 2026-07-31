@@ -82,6 +82,24 @@ public:
     }
 };
 
+class FirstStepInvalidFiberModePrediction final
+    : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d& point,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        vc::fiber_tracer::FiberPredictionSample sample;
+        if (std::abs(point[0]) >= 4.0 - 1.0e-6) {
+            sample.options.push_back({});
+            return sample;
+        }
+        const float sign = referenceDirection[0] < 0.0 ? -1.0f : 1.0f;
+        sample.options.push_back({{sign, 0.0f, 0.0f}, 1.0f, true});
+        return sample;
+    }
+};
+
 vc::lasagna::NormalSample normal()
 {
     return {{0.0, 0.0, 1.0}, true, {}};
@@ -1361,11 +1379,65 @@ TEST_CASE("fiber mode truncates extrapolation at an invalid prediction edge")
     CHECK(points.back().position[0] == doctest::Approx(4.0));
 }
 
+TEST_CASE("fiber mode reports no-progress extrapolation fallback reasons")
+{
+    FiberModeNormalSampler normals;
+    FirstStepInvalidFiberModePrediction predictions;
+    std::vector<vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic>
+        extrapolationFallbacks;
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+    };
+    for (int x = -8; x <= 8; x += 4) {
+        request.linePointsBase.push_back(
+            {static_cast<double>(x), 0.0, 0.0});
+    }
+    request.predictions = &predictions;
+    request.baseNormalSampler = &normals;
+    request.traceNormalSampler = &normals;
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.extrapolationFallbackCallback =
+        [&extrapolationFallbacks](const auto& diagnostic) {
+            extrapolationFallbacks.push_back(diagnostic);
+        };
+    request.traceConfig.stepVoxels = 4.0;
+    request.traceConfig.coneAngleDegrees = 0.0;
+    request.traceConfig.beamWidth = 1;
+    request.traceConfig.maxStepFactor = 100.0;
+    request.traceConfig.smoothnessNormalWeight = 0.0;
+    request.traceConfig.smoothnessTangentWeight = 0.0;
+    request.traceConfig.cumulativeSmoothnessTangentWeight = 0.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+
+    CHECK(result.nativeExtrapolations == 0);
+    CHECK(result.lasagnaFallbackExtrapolations == 2);
+    REQUIRE(extrapolationFallbacks.size() == 2);
+    CHECK(extrapolationFallbacks[0].side ==
+          vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic::Side::Left);
+    CHECK(extrapolationFallbacks[1].side ==
+          vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic::Side::Right);
+    for (const auto& diagnostic : extrapolationFallbacks) {
+        CHECK(diagnostic.reason == "no_valid_candidates");
+        CHECK(diagnostic.tracePointCount == 1);
+        CHECK_FALSE(diagnostic.fromException);
+    }
+}
+
 TEST_CASE("fiber mode hard-constrains fallback from stored native geometry")
 {
     FiberModeNormalSampler baseNormals({1.0, 0.0, 0.0});
     FiberModeNormalSampler traceNormals;
     AlwaysInvalidFiberModePrediction predictions;
+    std::vector<vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic>
+        extrapolationFallbacks;
     vc3d::line_annotation::FiberModeOptimizationRequest request;
     request.controlPoints = {
         {2.0, {0.0, 0.0, 0.0}, true, 2},
@@ -1391,6 +1463,10 @@ TEST_CASE("fiber mode hard-constrains fallback from stored native geometry")
     request.baseNormalSampler = &baseNormals;
     request.traceNormalSampler = &traceNormals;
     request.extrapolationDistanceBaseVoxels = 8.0;
+    request.extrapolationFallbackCallback =
+        [&extrapolationFallbacks](const auto& diagnostic) {
+            extrapolationFallbacks.push_back(diagnostic);
+        };
     request.traceConfig.stepVoxels = 4.0;
     request.traceConfig.coneAngleDegrees = 0.0;
     request.traceConfig.beamWidth = 1;
@@ -1407,6 +1483,17 @@ TEST_CASE("fiber mode hard-constrains fallback from stored native geometry")
     REQUIRE(result.nativeSegments == 1);
     REQUIRE(result.lasagnaFallbackSegments == 1);
     REQUIRE(result.lasagnaFallbackExtrapolations == 2);
+    REQUIRE(extrapolationFallbacks.size() == 2);
+    CHECK(extrapolationFallbacks[0].side ==
+          vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic::Side::Left);
+    CHECK(extrapolationFallbacks[1].side ==
+          vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic::Side::Right);
+    for (const auto& diagnostic : extrapolationFallbacks) {
+        CHECK_FALSE(diagnostic.reason.empty());
+        CHECK(diagnostic.reason.find("valid") != std::string::npos);
+        CHECK(diagnostic.tracePointCount == 0);
+        CHECK(diagnostic.fromException);
+    }
     const auto& points = result.optimization.line.points;
     size_t sharedIndex = 0;
     double sharedDistance = std::numeric_limits<double>::infinity();

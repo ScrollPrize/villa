@@ -1,22 +1,22 @@
-# Native Diagnostic Refresh And Edge Extrapolation Status
+# Trace-Length Extrapolation Status
 
 ## Planning
 
-- [x] Reproduce the diagnostic-clearing call sequence by inspection.
-- [x] Locate one-way invalid-candidate termination and VC3D tail fallback.
-- [x] Replace task, plan, status, and task log for the follow-up.
-- [x] Review the plan against the active specs and implementation.
+- [x] Identify the synthetic-plane runaway failure.
+- [x] Replace task, plan, status, and task log.
+- [x] Review scope against CP-to-CP target-plane behavior.
 
 ## Implementation
 
-- [x] Repopulate current span diagnostics after branch-overlay refresh.
-- [x] Preserve accepted spans during same-mode Reoptimize.
-- [x] Retain the last valid one-way path on invalid candidates.
-- [x] Accept invalid-candidate extrapolation as a truncated native tail.
-- [x] Add focused core and VC3D regressions.
+- [x] Add trace-length completion to the shared tracer.
+- [x] Remove target planes and `max_step_factor` from extrapolation.
+- [x] Accept trace-length completion in VC3D.
+- [x] Add focused exact-length regressions.
 
 ## Validation And Documentation
 
-- [x] Run focused tests and build VC3D with `-j32`.
+- [x] Run focused tests with `-j32`.
 - [x] Update specs, docs, changelog, and task log.
-- [x] Review and stage the follow-up with the existing task changes.
+- [x] Build VC3D with `-j32`.
+- [x] Review all task changes.
+- [x] Stage all task changes.

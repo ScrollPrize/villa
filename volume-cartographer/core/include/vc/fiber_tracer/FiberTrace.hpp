@@ -364,6 +364,7 @@ struct FiberTraceOneWayRequest {
 struct FiberTraceOneWayResult {
     std::vector<cv::Vec3d> points;
     bool reachedTargetPlane = false;
+    bool reachedTraceLength = false;
     std::string reason;
     int steps = 0;
     std::vector<FiberTraceTargetPlaneCrossing> targetPlaneCrossings;

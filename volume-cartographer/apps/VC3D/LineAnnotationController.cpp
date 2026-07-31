@@ -7912,6 +7912,20 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
         : vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT;
     request.extrapolationDistanceBaseVoxels =
         static_cast<double>(extrapolationDistanceVx);
+    request.extrapolationFallbackCallback =
+        [](const vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic& diagnostic) {
+            const char* side = diagnostic.side ==
+                    vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic::Side::Left
+                ? "left"
+                : "right";
+            Logger()->warn(
+                "Line annotation native fiber extrapolation fell back to Lasagna: "
+                "side={} reason={} trace_points={} source={}",
+                side,
+                diagnostic.reason,
+                diagnostic.tracePointCount,
+                diagnostic.fromException ? "exception" : "trace_result");
+        };
     const auto discretization = initialLineDiscretization(
         std::max(2, extrapolationDistanceVx * 2));
     request.lasagnaConfig.segmentsPerSide = discretization.segmentsPerSide;

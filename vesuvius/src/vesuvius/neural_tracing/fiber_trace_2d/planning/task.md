@@ -1,23 +1,13 @@
-# Preserve Native Diagnostics And Truncate Extrapolation At Invalid Data
+# Trace Native Extrapolation By Length
 
-## User Report
+VC3D native fiber extrapolation must trace only until the configured
+extrapolation distance is reached.
 
-- Persisted native meeting-error labels appear after loading a fiber but vanish
-  after pressing Reoptimize.
-- Native extrapolation that reaches the volume edge, represented by invalid
-  prediction directions, must stop at its last valid point instead of restoring
-  the Lasagna fallback tail.
-
-## Required Behavior
-
-- Generated branch-overlay refreshes must restore current CP-owned native
-  meeting/failure diagnostics rather than clearing them after reoptimization.
-- Pressing Reoptimize in Lasagna mode must continue to protect existing accepted
-  native spans; only an explicit mode change to Lasagna or per-span revert may
-  clear them.
-- One-way extrapolation must retain its last valid partial path when the next
-  candidate generation has no valid directions.
-- VC3D must treat `no_valid_candidates` extrapolation with a nontrivial retained
-  path as a valid truncated native tail.
-- Other incomplete reasons, including step-budget exhaustion, continue to use
-  the existing Lasagna fallback.
+- Do not use target planes for extrapolation.
+- Do not multiply the extrapolation distance by `max_step_factor`.
+- Treat the requested distance as the hard trace-length/step budget.
+- Clip the final step so the returned polyline has exactly the requested traced
+  arc length.
+- If prediction directions become invalid first, retain the existing partial
+  native edge-truncated tail.
+- Keep target-plane behavior unchanged for CP-to-CP tracing.

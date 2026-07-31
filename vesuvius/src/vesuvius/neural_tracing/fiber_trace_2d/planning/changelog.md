@@ -1,3 +1,12 @@
+# 2026-07-31
+
+- Corrected native VC3D fiber extrapolation to stop at the configured traced
+  arc length, without target planes or a `max_step_factor` multiplier, and to
+  clip the final step to the exact requested distance.
+- Added VC3D terminal warnings whenever native line-annotation tail
+  extrapolation retains its Lasagna fallback, including the side, full
+  trace/exception reason, returned point count, and failure source.
+
 # 2026-07-30
 
 - Preserved native span error labels through Reoptimize/branch refresh and made

@@ -1119,14 +1119,20 @@
   normal-parallel direction.
 - The line-annotation extrapolation control is measured in base voxels and
   applies beyond both outer CPs. Native mode converts that distance to trace
-  voxels and uses the shared one-way tracer with a perpendicular distance
-  plane. Reaching the plane replaces the corresponding Lasagna tail. If the
-  next candidate generation has no valid prediction directions, the one-way
-  tracer retains its last valid path and VC3D uses that path as a native tail
-  truncated at the data edge. Other failures, including step-budget
-  exhaustion, retain the Lasagna tail. This extrapolation-only rule does not
-  change CP-pair or whole-fiber acceptance. A zero distance trims the line to
-  the outer CPs.
+  voxels and uses it as the shared one-way tracer's hard accumulated arc-length
+  budget. Extrapolation has no target planes and does not multiply its budget
+  by `max_step_factor`; it takes `ceil(distance / step)` generations and clips
+  the final segment to the exact requested length. Reaching that length replaces
+  the corresponding Lasagna tail. If the next candidate generation has no
+  valid prediction directions, the one-way tracer retains its last valid path
+  and VC3D uses that path as a native tail truncated at the data edge. A failure
+  before producing one outward step retains the Lasagna tail. Whenever VC3D
+  retains that fallback, it emits a command-line warning with the tail side,
+  the full tracer or exception reason, the returned trace-point count, and the
+  reason source. Completed length-based extrapolation and accepted data-edge
+  truncation do not warn. This extrapolation-only rule does not change CP-pair
+  or whole-fiber target-plane acceptance. A zero distance trims the line to the
+  outer CPs.
 - A fiber with only its initial seed CP still rebuilds both open tails when
   switching modes or changing the extrapolation distance. Changing the
   distance marks the line unoptimized and, when Auto-reoptimize is enabled,

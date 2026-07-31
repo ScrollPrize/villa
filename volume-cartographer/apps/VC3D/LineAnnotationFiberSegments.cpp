@@ -224,8 +224,30 @@ bool usableNativeExtrapolation(
     const vc::fiber_tracer::FiberTraceOneWayResult& traced)
 {
     return traced.points.size() >= 2 &&
-        (traced.reachedTargetPlane ||
+        (traced.reachedTraceLength ||
          traced.reason.starts_with("no_valid_candidates"));
+}
+
+void reportExtrapolationFallback(
+    const FiberModeOptimizationRequest& request,
+    FiberExtrapolationFallbackDiagnostic::Side side,
+    const std::optional<vc::fiber_tracer::FiberTraceOneWayResult>& traced,
+    const std::string& exception)
+{
+    if (!request.extrapolationFallbackCallback)
+        return;
+    FiberExtrapolationFallbackDiagnostic diagnostic;
+    diagnostic.side = side;
+    diagnostic.tracePointCount = traced ? traced->points.size() : 0;
+    diagnostic.fromException = !exception.empty();
+    if (!exception.empty()) {
+        diagnostic.reason = exception;
+    } else if (traced && !traced->reason.empty()) {
+        diagnostic.reason = traced->reason;
+    } else {
+        diagnostic.reason = "native extrapolation returned no failure reason";
+    }
+    request.extrapolationFallbackCallback(diagnostic);
 }
 
 void replaceOpenTailsWithNative(
@@ -272,9 +294,14 @@ void replaceOpenTailsWithNative(
                 request.traceNormalSampler);
         };
         std::optional<vc::fiber_tracer::FiberTraceOneWayResult> left;
+        std::string leftException;
         try {
             left = traceTail(firstControl, firstControl + 1);
-        } catch (const std::exception&) {
+        } catch (const std::exception& ex) {
+            leftException = ex.what();
+            left.reset();
+        } catch (...) {
+            leftException = "unknown native fiber extrapolation exception";
             left.reset();
         }
         if (left && usableNativeExtrapolation(*left)) {
@@ -283,12 +310,22 @@ void replaceOpenTailsWithNative(
             std::reverse(leftTail.begin(), leftTail.end());
             ++output.nativeExtrapolations;
         } else {
+            reportExtrapolationFallback(
+                request,
+                FiberExtrapolationFallbackDiagnostic::Side::Left,
+                left,
+                leftException);
             ++output.lasagnaFallbackExtrapolations;
         }
         std::optional<vc::fiber_tracer::FiberTraceOneWayResult> right;
+        std::string rightException;
         try {
             right = traceTail(lastControl, lastControl - 1);
-        } catch (const std::exception&) {
+        } catch (const std::exception& ex) {
+            rightException = ex.what();
+            right.reset();
+        } catch (...) {
+            rightException = "unknown native fiber extrapolation exception";
             right.reset();
         }
         if (right && usableNativeExtrapolation(*right)) {
@@ -296,6 +333,11 @@ void replaceOpenTailsWithNative(
             rightTail.front() = finalPoints[static_cast<size_t>(lastControl)];
             ++output.nativeExtrapolations;
         } else {
+            reportExtrapolationFallback(
+                request,
+                FiberExtrapolationFallbackDiagnostic::Side::Right,
+                right,
+                rightException);
             ++output.lasagnaFallbackExtrapolations;
         }
     }

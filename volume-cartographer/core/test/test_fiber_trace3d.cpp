@@ -1231,7 +1231,7 @@ TEST_CASE("native whole-fiber tracing keeps the live endpoint past a crossing")
     CHECK(result.segments[0].trace.points.back()[0] == doctest::Approx(8.0));
 }
 
-TEST_CASE("native fiber extrapolation stops on the requested distance plane")
+TEST_CASE("native fiber extrapolation stops at the requested trace length")
 {
     StraightPrediction predictions;
     ConstantNormalSampler normals;
@@ -1252,16 +1252,84 @@ TEST_CASE("native fiber extrapolation stops on the requested distance plane")
         config,
         &normals);
 
-    REQUIRE(result.reachedTargetPlane);
+    CHECK_FALSE(result.reachedTargetPlane);
+    REQUIRE(result.reachedTraceLength);
+    CHECK(result.reason == "trace_distance");
     REQUIRE(result.points.size() >= 2);
     CHECK(result.points.front()[0] == doctest::Approx(3.0));
     CHECK(result.points.back()[0] == doctest::Approx(13.0));
     CHECK(result.points.back()[1] == doctest::Approx(2.0));
-    CHECK(result.selectedTargetPlaneName == "extrapolation_distance");
+    CHECK(result.selectedTargetPlaneName.empty());
+    double tracedLength = 0.0;
+    for (size_t index = 1; index < result.points.size(); ++index)
+        tracedLength += cv::norm(result.points[index] - result.points[index - 1]);
+    CHECK(tracedLength == doctest::Approx(10.0).epsilon(1.0e-9));
     CHECK_THROWS_AS(
         vc::fiber_tracer::traceFiberExtrapolation(
             predictions, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.0, config),
         std::invalid_argument);
+}
+
+TEST_CASE("native fiber extrapolation ignores target planes and max step factor")
+{
+    SlantedPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 4.0;
+    config.coneAngleDegrees = 0.0;
+    config.beamWidth = 1;
+    config.maxStepFactor = 100.0;
+    config.smoothnessNormalWeight = 0.0;
+    config.smoothnessTangentWeight = 0.0;
+    config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result = vc::fiber_tracer::traceFiberExtrapolation(
+        predictions,
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        10.0,
+        config,
+        &normals);
+
+    CHECK_FALSE(result.reachedTargetPlane);
+    REQUIRE(result.reachedTraceLength);
+    CHECK(result.reason == "trace_distance");
+    CHECK(result.steps == 3);
+    REQUIRE(result.points.size() == 4);
+    CHECK(result.selectedTargetPlaneName.empty());
+    CHECK(result.points.back()[0] < 10.0);
+    double tracedLength = 0.0;
+    for (size_t index = 1; index < result.points.size(); ++index)
+        tracedLength += cv::norm(result.points[index] - result.points[index - 1]);
+    CHECK(tracedLength == doctest::Approx(10.0).epsilon(1.0e-9));
+}
+
+TEST_CASE("native fiber extrapolation samples only the remaining final distance")
+{
+    PositiveEdgePrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 4.0;
+    config.coneAngleDegrees = 0.0;
+    config.beamWidth = 1;
+    config.maxStepFactor = 100.0;
+    config.smoothnessNormalWeight = 0.0;
+    config.smoothnessTangentWeight = 0.0;
+    config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result = vc::fiber_tracer::traceFiberExtrapolation(
+        predictions,
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        6.0,
+        config,
+        &normals);
+
+    REQUIRE(result.reachedTraceLength);
+    CHECK(result.reason == "trace_distance");
+    CHECK(result.steps == 2);
+    REQUIRE(result.points.size() == 3);
+    CHECK(result.points.back()[0] == doctest::Approx(6.0).epsilon(1.0e-9));
 }
 
 TEST_CASE("native fiber extrapolation retains its path at invalid directions")
@@ -1286,6 +1354,7 @@ TEST_CASE("native fiber extrapolation retains its path at invalid directions")
         &normals);
 
     CHECK_FALSE(result.reachedTargetPlane);
+    CHECK_FALSE(result.reachedTraceLength);
     CHECK(result.reason.starts_with("no_valid_candidates"));
     REQUIRE(result.points.size() == 2);
     CHECK(result.points.front()[0] == doctest::Approx(0.0));

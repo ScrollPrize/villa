@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -81,6 +83,18 @@ struct StoredControlPoint : cv::Vec3d {
     explicit StoredControlPoint(const cv::Vec3d& position) : cv::Vec3d(position) {}
 };
 
+struct FiberExtrapolationFallbackDiagnostic {
+    enum class Side {
+        Left,
+        Right,
+    };
+
+    Side side = Side::Left;
+    std::string reason;
+    size_t tracePointCount = 0;
+    bool fromException = false;
+};
+
 struct FiberModeOptimizationRequest {
     std::vector<LineControlPoint> controlPoints;
     std::vector<cv::Vec3d> linePointsBase;
@@ -94,6 +108,8 @@ struct FiberModeOptimizationRequest {
     double traceToBaseScale = 1.0;
     double extrapolationDistanceBaseVoxels = 0.0;
     bool retraceAll = false;
+    std::function<void(const FiberExtrapolationFallbackDiagnostic&)>
+        extrapolationFallbackCallback;
 };
 
 struct FiberModeOptimizationResult {
