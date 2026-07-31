@@ -1115,7 +1115,14 @@
   on existing version-1 files defaults to `lasagna`; unknown values are errors.
   The mode is the fiber-wide extrapolation policy and resolves only `global`
   CP-to-CP goals.
-  New interactive fibers default to `native_fiber_trace3d`; this must not
+  New interactive fibers default to `native_fiber_trace3d`; this controls the
+  initial line geometry as well as the GUI and persisted mode. When a selected
+  or uniquely attached fiber-inference dataset is configured, seed placement
+  must use the Lasagna seed solve only as an internal reference-line/tangent
+  baseline and then replace both open tails through the existing single-CP
+  native extrapolator. The intermediate Lasagna line must not be displayed or
+  saved. With no selected or uniquely attached inference dataset, initial
+  creation remains Lasagna and must not force a file picker. This must not
   change the Lasagna compatibility default used while loading older files.
 - Goal resolution starts with the explicit goal or the fiber-wide mode for
   `global`. A global Lasagna/trace span whose Euclidean endpoint distance is

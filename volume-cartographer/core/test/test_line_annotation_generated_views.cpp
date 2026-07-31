@@ -1311,6 +1311,22 @@ TEST_CASE("fiber optimization mode has stable persisted values")
         std::runtime_error);
 }
 
+TEST_CASE("native seed tracing requires native mode and configured inference")
+{
+    using vc3d::line_annotation::FiberOptimizationMode;
+    using vc3d::line_annotation::shouldRunNativeSeedTrace;
+
+    CHECK(shouldRunNativeSeedTrace(
+        FiberOptimizationMode::NativeFiberTrace3d, true, 0));
+    CHECK(shouldRunNativeSeedTrace(
+        FiberOptimizationMode::NativeFiberTrace3d, false, 1));
+    CHECK_FALSE(shouldRunNativeSeedTrace(
+        FiberOptimizationMode::NativeFiberTrace3d, false, 0));
+    CHECK_FALSE(shouldRunNativeSeedTrace(
+        FiberOptimizationMode::NativeFiberTrace3d, false, 2));
+    CHECK_FALSE(shouldRunNativeSeedTrace(FiberOptimizationMode::Lasagna, true, 1));
+}
+
 TEST_CASE("segment interpolation resolution applies short fallback only to global goals")
 {
     using namespace vc3d::line_annotation;

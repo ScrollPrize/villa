@@ -16,6 +16,16 @@
 
 namespace vc3d::line_annotation
 {
+
+bool shouldRunNativeSeedTrace(
+    FiberOptimizationMode mode,
+    bool hasSelectedFiberInferenceDataset,
+    size_t attachedFiberInferenceDatasetCount) noexcept
+{
+    return mode == FiberOptimizationMode::NativeFiberTrace3d &&
+        (hasSelectedFiberInferenceDataset || attachedFiberInferenceDatasetCount == 1);
+}
+
 namespace
 {
 

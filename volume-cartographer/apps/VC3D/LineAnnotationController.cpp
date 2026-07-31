@@ -158,6 +158,7 @@ struct LineAnnotationController::LineAnnotationSession {
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationModeBeforeTask =
         vc3d::line_annotation::kDefaultNewFiberOptimizationMode;
     bool restoreFiberOptimizationModeOnFailure = false;
+    bool nativeSeedTracePending = false;
     std::optional<std::vector<vc3d::line_annotation::LineControlPoint>>
         controlPointsBeforeModeChange;
     std::optional<fs::path> atlasDir;
@@ -5798,6 +5799,31 @@ void LineAnnotationController::handleLineSeed(const std::string& surfaceName,
         return;
     }
 
+    session.nativeSeedTracePending = false;
+    if (session.fiberOptimizationMode ==
+        vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d) {
+        const auto vpkg = _state ? _state->vpkg() : nullptr;
+        const size_t fiberInferenceEntryCount = vpkg
+            ? vpkg->fiberInferenceDatasetEntries().size()
+            : 0;
+        if (vc3d::line_annotation::shouldRunNativeSeedTrace(
+                session.fiberOptimizationMode,
+                vpkg && !vpkg->selectedFiberInferenceDataset().empty(),
+                fiberInferenceEntryCount)) {
+            if (!ensureFiberInferenceDatasetForSession(session)) {
+                return;
+            }
+            session.nativeSeedTracePending = true;
+            Logger()->info(
+                "Line annotation new fiber will run native tracing after seed "
+                "initialization");
+        } else {
+            Logger()->info(
+                "Line annotation new fiber uses Lasagna seed initialization: "
+                "no selected or unique fiber inference dataset is configured");
+        }
+    }
+
     session.initialDirectionMode = directionMode;
     ensureSessionFiberIdentity(session);
     const cv::Vec3d seedPoint(volumePoint[0], volumePoint[1], volumePoint[2]);
@@ -7178,7 +7204,8 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
                                                            bool updateGeneratedViews,
                                                            SessionOptimizationState resultOptimizationState,
                                                            const std::string& eventOverride,
-                                                           bool fireSuccessCallback)
+                                                           bool fireSuccessCallback,
+                                                           bool allowFiberSave)
 {
     if (!task.ok) {
         session.taskState = LineAnnotationSession::TaskState::Failed;
@@ -7248,7 +7275,8 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     }
     refreshBranchLineViews(session.fiberId);
 
-    if (session.deferShowUntilGenerated && pane && pane->dialog && !pane->dialog->isVisible()) {
+    if (updateGeneratedViews && session.deferShowUntilGenerated && pane && pane->dialog &&
+        !pane->dialog->isVisible()) {
         emit lineAnnotationWorkspaceRequested(pane->dialog, tr("Line Annotation"));
         pane->dialog->showWithSavedGeometry();
         pane->dialog->raise();
@@ -7263,7 +7291,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
                    session.optimizationReport.ceresSolveMs,
                    session.optimizationReport.totalMs,
                    session.optimizedLine.points.size());
-    if (pane && !session.suppressFiberSave &&
+    if (allowFiberSave && pane && !session.suppressFiberSave &&
         session.taskState == LineAnnotationSession::TaskState::Succeeded &&
         !session.optimizedLine.points.empty() &&
         !session.controlPoints.empty()) {
@@ -7681,12 +7709,16 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
 
     OptimizationTaskResult task = watcher->result();
     session.watcher = nullptr;
+    const bool chainNativeSeedTrace = session.nativeSeedTracePending &&
+        task.eventName == "seed" && task.ok;
+    session.nativeSeedTracePending = false;
     const bool ok = applyOptimizationTaskResult(session,
                                                std::move(task),
-                                               true,
+                                               !chainNativeSeedTrace,
                                                session.pendingOptimizationState,
                                                {},
-                                               true);
+                                               !chainNativeSeedTrace,
+                                               !chainNativeSeedTrace);
     if (pane->dialog) {
         pane->dialog->setOptimizationBusy(false);
     }
@@ -7708,6 +7740,15 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     } else {
         session.controlPointsBeforeModeChange.reset();
         session.restoreFiberOptimizationModeOnFailure = false;
+        if (chainNativeSeedTrace) {
+            startFiberModeOptimization(session, true);
+            if (session.taskState != LineAnnotationSession::TaskState::Running) {
+                session.taskState = LineAnnotationSession::TaskState::Failed;
+                session.error = "native seed tracing did not start";
+                showError(tr("Could not start native tracing for the new fiber."),
+                          session.suppressErrorDialogs);
+            }
+        }
     }
 }
 

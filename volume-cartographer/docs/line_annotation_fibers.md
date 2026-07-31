@@ -14,7 +14,13 @@ selects extrapolation and resolves CP spans whose persisted `interp_goal` is
 `cspline`, `lasagna`, or `trace`. The actual mode is recomputed from the goal
 whenever the span is dirty, so a previous fallback is retried rather than
 treated as permanent. Newly created fibers default to `native_fiber_trace3d`;
-the Lasagna default for older files with no mode remains unchanged.
+the Lasagna default for older files with no mode remains unchanged. For a new
+native-mode fiber with a selected or uniquely attached fiber-inference
+dataset, seed placement first computes an internal Lasagna reference line and
+then immediately replaces both open tails with the existing single-control-
+point native extrapolator. The reference line is not displayed or saved as the
+finished fiber. If no inference dataset is selected or uniquely attached,
+seed creation remains Lasagna and does not open a dataset picker.
 
 The fallback order is `trace -> lasagna -> cspline` or `lasagna -> cspline`.
 For global Lasagna/trace goals only, endpoint distance below 100 base voxels

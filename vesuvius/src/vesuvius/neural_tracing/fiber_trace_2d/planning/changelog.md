@@ -1,5 +1,9 @@
 # 2026-07-31
 
+- Made native mode effective during new-fiber seed creation: configured fiber
+  inference now chains the internal Lasagna reference solve directly into the
+  existing single-CP native extrapolator without displaying or saving the
+  intermediate Lasagna geometry.
 - Made every v3 fiber reader reject missing or malformed mode/segment metadata
   without repair, completed v3 geometry consumption in Atlas, Lasagna, and
   Spiral, made sync route invalid v3 inputs to manual conflict handling, fixed

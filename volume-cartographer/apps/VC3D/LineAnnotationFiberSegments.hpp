@@ -23,6 +23,11 @@ enum class FiberOptimizationMode {
 inline constexpr FiberOptimizationMode kDefaultNewFiberOptimizationMode =
     FiberOptimizationMode::NativeFiberTrace3d;
 
+[[nodiscard]] bool shouldRunNativeSeedTrace(
+    FiberOptimizationMode mode,
+    bool hasSelectedFiberInferenceDataset,
+    size_t attachedFiberInferenceDatasetCount) noexcept;
+
 enum class SegmentInterpolationGoal {
     Global,
     Cspline,

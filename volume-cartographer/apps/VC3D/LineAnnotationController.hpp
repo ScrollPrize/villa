@@ -468,7 +468,8 @@ private:
                                      bool updateGeneratedViews,
                                      SessionOptimizationState resultOptimizationState,
                                      const std::string& eventOverride = {},
-                                     bool fireSuccessCallback = true);
+                                     bool fireSuccessCallback = true,
+                                     bool allowFiberSave = true);
     void requestFinalizedClose(const std::string& surfaceName);
     void startOptimization(LineAnnotationSession& session,
                            bool fullOptimization = false,
