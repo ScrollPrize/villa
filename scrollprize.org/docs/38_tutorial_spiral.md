@@ -109,7 +109,7 @@ The spiral scripts declare their dependencies in their own [`pyproject.toml`](ht
 Ready-made inputs are published in the [`spiral-input` dataset](data_datasets#spiral-input-2026-07), which lives on the dl.ash2txt.org data server : [Spiral Datasets](https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/) (~90 GB):
 
 ```bash
-rclone copy :http: /home/sean/Desktop/PHercParis4 \
+rclone copy :http: ./spiral_datasets/phercparis4 \
     --http-url https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/ \
     --transfers 32 -P
 ```
