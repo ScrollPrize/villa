@@ -1601,11 +1601,17 @@ void CChunkedVolumeViewer::updateScalebarScale()
     // zarr level is sampled, not the physical size of the view.
     if (!_view || !_volume)
         return;
-    double voxel = _volume->voxelSize();
-    if (!(voxel > 0.0) || !(_scale > 0.0f))
+    if (!(_scale > 0.0f))
         return;
-    const double umPerScenePx = voxel / static_cast<double>(_scale);
-    _view->setVoxelSize(umPerScenePx, umPerScenePx);
+    // No positive voxel size in the volume metadata: fall back to voxel units so
+    // the bar still tracks zoom (an early return here would freeze the scalebar
+    // at the view's default µm/px forever).
+    double voxel = _volume->voxelSize();
+    const bool physical = voxel > 0.0;
+    if (!physical)
+        voxel = 1.0;
+    const double unitsPerScenePx = voxel / static_cast<double>(_scale);
+    _view->setVoxelSize(unitsPerScenePx, unitsPerScenePx, physical);
 }
 
 void CChunkedVolumeViewer::resizeFramebuffer()
@@ -2719,12 +2725,18 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     if (!busy) {
         resizeFramebuffer();
     }
-    const int fbW = !_framebuffer.isNull()
-        ? _framebuffer.width()
-        : (_view && _view->viewport() ? std::max(1, _view->viewport()->width()) : 1);
-    const int fbH = !_framebuffer.isNull()
-        ? _framebuffer.height()
-        : (_view && _view->viewport() ? std::max(1, _view->viewport()->height()) : 1);
+    // Capture the job at the VIEWPORT size, never the displayed framebuffer's:
+    // _framebuffer may hold a stale-size result adopted while the pane was
+    // resizing (renders in flight across a layout change), and sizing new jobs
+    // from it re-captures the stale size on every busy-time submit -- the pane
+    // then ping-pongs between the two sizes for as long as renders keep coming
+    // (visible as the image jittering up/down after a generated-view rebuild).
+    const int fbW = _view && _view->viewport()
+        ? std::max(1, _view->viewport()->width())
+        : (!_framebuffer.isNull() ? _framebuffer.width() : 1);
+    const int fbH = _view && _view->viewport()
+        ? std::max(1, _view->viewport()->height())
+        : (!_framebuffer.isNull() ? _framebuffer.height() : 1);
     auto job = captureRenderJob(reason, caller, surf, fbW, fbH, std::chrono::steady_clock::now());
     if (!job) {
         profile.setDetails("action=skip invalid_job");
@@ -2815,12 +2827,15 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     if (!_pendingRenderJob) {
         auto surf = _surfWeak.lock();
         if (surf && _volume && _chunkArray) {
-            const int fbW = !_framebuffer.isNull()
-                ? _framebuffer.width()
-                : (_view && _view->viewport() ? std::max(1, _view->viewport()->width()) : 1);
-            const int fbH = !_framebuffer.isNull()
-                ? _framebuffer.height()
-                : (_view && _view->viewport() ? std::max(1, _view->viewport()->height()) : 1);
+            // Viewport size, not _framebuffer: the framebuffer was just replaced
+            // by this result, so sizing the staleness check from it would make a
+            // stale-size result always look "equivalent" and never catch up.
+            const int fbW = _view && _view->viewport()
+                ? std::max(1, _view->viewport()->width())
+                : (!_framebuffer.isNull() ? _framebuffer.width() : 1);
+            const int fbH = _view && _view->viewport()
+                ? std::max(1, _view->viewport()->height())
+                : (!_framebuffer.isNull() ? _framebuffer.height() : 1);
             auto latest = captureRenderJob("catch up after stale presentation",
                                            std::source_location::current(),
                                            surf,

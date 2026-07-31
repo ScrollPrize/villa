@@ -31,7 +31,7 @@ class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
         self.truncate_at_step = truncate_at_step
         self._event_dim = event_dim
         self._flow_range_zyx = self.flow_max_corner_zyx - self.flow_min_corner_zyx
-        self.num_flow_timesteps = getattr(flow_field, 'num_flow_timesteps', 1)
+        self.num_flow_timesteps = getattr(flow_field, 'model_num_flow_timesteps', 1)
         # Cached sampler/integrator closure at t=0 for the num_flow_timesteps==1 fast path.
         # Built once per diffeomorphism instance (one per training iteration), shared across
         # forward and inverse calls so per-iteration setup (e.g. trilinear LR->HR upsampling)
@@ -128,7 +128,9 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         needs_grad = self.params.logits.requires_grad and torch.is_grad_enabled()
         cached = self._pinned_scaled_logits
         if cached is None or (needs_grad and not cached.requires_grad):
-            # Pin the 0th logit (i.e. theta=0 on 1th winding) to be zero, to avoid a jump going from winding #0 to #1
+            # Pin the 0th logit (i.e. theta=0 on 1th winding) to be zero, to avoid a jump going from winding #0 to #1.
+            # Keep this in sync with SpiralAndTransform.get_shared_transform_tensors,
+            # which precomputes the same tensor for injection as a detached leaf.
             logits = torch.cat([torch.zeros_like(self.params.logits[..., :1]), self.params.logits[..., 1:]], dim=-1)
             self._pinned_scaled_logits = logits * self.gap_expander_lr_scale
         return self._pinned_scaled_logits
@@ -455,16 +457,16 @@ class SpiralAndTransform(nn.Module):
         self.linear_logits_scale = 40.  # larger value increases effective learning rate
 
         self.umbilicus_transform = UmbilicusTransform(umbilicus_zyx)
-        self.dr_per_winding_logit = nn.Parameter(torch.tensor(config['initial_dr_per_winding'] / self.dr_per_winding_scale, dtype=torch.float32))
+        self.dr_per_winding_logit = nn.Parameter(torch.tensor(config['model_initial_dr_per_winding'] / self.dr_per_winding_scale, dtype=torch.float32))
 
-        flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['flow_voxel_resolution']
-        flow_field_cls = CylindricalFlowField if config['flow_field_type'] == 'cylindrical' else CartesianFlowField
+        flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['model_flow_voxel_resolution']
+        flow_field_cls = CylindricalFlowField if config['model_flow_field_type'] == 'cylindrical' else CartesianFlowField
 
         def make_flow_field():
             return flow_field_cls(
                 flow_resolution,
-                lr_scale_factor=config['flow_field_high_res_lr_scale_initial'],
-                num_flow_timesteps=config['num_flow_timesteps'],
+                num_flow_timesteps=config['model_num_flow_timesteps'],
+                direct_lr=config.get('model_flow_field_direct_lr', False),
             )
 
         # num_flow_stages: number of independent stationary flow fields whose integrated
@@ -472,19 +474,19 @@ class SpiralAndTransform(nn.Module):
         # spiral->slice direction; the inverse applies the stage inverses in reverse order via
         # ComposeTransform.inv). num_flow_stages == 1 is exactly the original single-field
         # behaviour: `flow_field` keeps its name/state_dict keys and `extra_flow_fields` is empty.
-        self.num_flow_stages = int(config.get('num_flow_stages', 1) or 1)
+        self.num_flow_stages = int(config.get('model_num_flow_stages', 1) or 1)
         assert self.num_flow_stages >= 1
         self.flow_field = make_flow_field()
         self.extra_flow_fields = nn.ModuleList([make_flow_field() for _ in range(self.num_flow_stages - 1)])
 
-        self.linear_logits = nn.Parameter(torch.zeros([int(flow_max_corner_zyx[0] - flow_min_corner_zyx[0]) // config['linear_z_resolution'], 2, 2], dtype=torch.float32))
+        self.linear_logits = nn.Parameter(torch.zeros([int(flow_max_corner_zyx[0] - flow_min_corner_zyx[0]) // config['model_linear_z_resolution'], 2, 2], dtype=torch.float32))
 
         self.gap_expander_params = GapExpanderParams(
-            resolution=config['gap_expander_logit_resolution'],
+            resolution=config['model_gap_expander_logit_resolution'],
             min_z=flow_min_corner_zyx[0],
             max_z=flow_max_corner_zyx[0],
-            num_windings=config['gap_expander_num_windings'],
-            dr_per_winding=config['initial_dr_per_winding'],  # this is a nominal (fixed) winding spacing which we only use to calculate the number of logits
+            num_windings=config['model_gap_expander_num_windings'],
+            dr_per_winding=config['model_initial_dr_per_winding'],  # this is a nominal (fixed) winding spacing which we only use to calculate the number of logits
         )
 
     @property
@@ -496,7 +498,7 @@ class SpiralAndTransform(nn.Module):
         # All flow stages, in application order (stage 0 first in the spiral->slice direction).
         return [self.flow_field, *self.extra_flow_fields]
 
-    def _get_transform_parts(self, truncate_at_step=None):
+    def _get_transform_parts(self, truncate_at_step=None, shared=None):
         truncate_frac = None if truncate_at_step is None else truncate_at_step / (self.flow_integration_steps - 1)
         diffeomorphisms = [
             IntegratedFlowDiffeomorphism(flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx, num_steps=self.flow_integration_steps, solver=self.flow_integration_solver, truncate_at_step=truncate_at_step)
@@ -504,12 +506,14 @@ class SpiralAndTransform(nn.Module):
         ]
         gap_expander = GapExpandingTransform(
             self.gap_expander_params,
-            self.get_dr_per_winding(),
+            shared[0] if shared is not None else self.get_dr_per_winding(),
             self.flow_min_corner_zyx[0],
             self.flow_max_corner_zyx[0],
-            self.cfg['gap_expander_lr_scale'],
+            self.cfg['model_gap_expander_lr_scale'],
             truncate_frac,
         )
+        if shared is not None:
+            gap_expander._pinned_scaled_logits = shared[2]
         if self.spiral_outward_sense == 'CW':
             maybe_flip = []
         else:
@@ -518,15 +522,22 @@ class SpiralAndTransform(nn.Module):
             maybe_flip = [pyro.distributions.transforms.AffineTransform(loc=0., scale=torch.tensor([1., 1., -1.], device=self.device))]
         return gap_expander, maybe_flip, diffeomorphisms, truncate_frac
 
-    def get_slice_to_spiral_transform(self, truncate_at_step=None):
-        gap_expander, maybe_flip, diffeomorphisms, truncate_frac = self._get_transform_parts(truncate_at_step)
+    def get_slice_to_spiral_transform(self, truncate_at_step=None, shared=None):
+        # `shared` optionally supplies the (dr_per_winding, scaled_linear_logits,
+        # pinned_scaled_gap_logits) triple from get_shared_transform_tensors(),
+        # typically as detached leaves so many separate loss backwards can run
+        # through one transform instance without retain_graph.
+        gap_expander, maybe_flip, diffeomorphisms, truncate_frac = self._get_transform_parts(truncate_at_step, shared)
+        scaled_linear_logits = (
+            shared[1] if shared is not None
+            else self.linear_logits * self.linear_logits_scale)
         return pyro.distributions.transforms.ComposeTransform([
             gap_expander,
             *maybe_flip,
             # Sequential composition of the integrated stationary flows; ComposeTransform.inv
             # applies the stage inverses in reverse order in the slice->spiral direction.
             *diffeomorphisms,
-            VaryingLinearTransform(self.linear_logits * self.linear_logits_scale, self.flow_min_corner_zyx[0], self.flow_max_corner_zyx[0], truncate_frac),
+            VaryingLinearTransform(scaled_linear_logits, self.flow_min_corner_zyx[0], self.flow_max_corner_zyx[0], truncate_frac),
             self.umbilicus_transform,
         ]).inv
 
@@ -546,6 +557,25 @@ class SpiralAndTransform(nn.Module):
 
     def get_dr_per_winding(self):
         return F.softplus(self.dr_per_winding_logit * self.dr_per_winding_scale)
+
+    def get_shared_transform_tensors(self):
+        """The tiny graph paths every evaluation of one transform instance
+        shares: the dr-per-winding softplus, the scaled linear logits, and the
+        pinned+scaled gap logits (kept in sync with
+        GapExpandingTransform._get_pinned_scaled_logits). The training loop
+        passes detached leaf copies to get_slice_to_spiral_transform(shared=...)
+        so each loss family's backward owns its whole graph and needs no
+        retain_graph, then propagates the accumulated leaf gradients through
+        these outputs once per step."""
+        gap_logits = self.gap_expander_params.logits
+        pinned_scaled_gap_logits = torch.cat(
+            [torch.zeros_like(gap_logits[..., :1]), gap_logits[..., 1:]], dim=-1,
+        ) * self.cfg['model_gap_expander_lr_scale']
+        return (
+            self.get_dr_per_winding(),
+            self.linear_logits * self.linear_logits_scale,
+            pinned_scaled_gap_logits,
+        )
 
     def get_native_log_gaps(self, winding_idx, theta, z):
         """Exact pre-exponentiation log gap for the native gap expander."""

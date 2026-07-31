@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QHash>
+#include <QElapsedTimer>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QSet>
@@ -20,8 +21,10 @@ class QPushButton;
 class QSpinBox;
 class QDoubleSpinBox;
 class QPlainTextEdit;
+class QProgressBar;
 class QSlider;
 class QToolButton;
+class QTimer;
 class SpiralServiceManager;
 class SpiralConfigProfileEditor;
 class QFormLayout;
@@ -56,13 +59,10 @@ private:
     QJsonObject influenceConfig() const;
     QJsonObject sessionAdvancedConfig() const;
     QJsonObject runAdvancedConfig() const;
-    void applyOptionalInputConfig(QJsonObject& config, bool includeSelectionFlags) const;
     void applyTrackSamplingConfig(QJsonObject& config) const;
     void syncTrackSamplingControlsFromAdvanced();
     void writeTrackSamplingControlsToAdvanced();
     void updateTrackSamplingUi();
-    bool optionalInputEnabled(const QString& key) const;
-    void updateOptionalInputUi();
     void applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration);
     void synchronizeSession(const QJsonObject& request,
                             const QJsonObject& status);
@@ -88,7 +88,6 @@ private:
     QHash<QString, QLineEdit*> _paths;
     QHash<QString, QToolButton*> _pathBrowseButtons;
     QHash<QString, QCheckBox*> _visibilityChecks;
-    QHash<QString, QCheckBox*> _optionalInputs;
     QHash<QString, bool> _pathDirectories;
     QDialog* _displayDialog = nullptr;
     QSpinBox* _minimumDisplayedWinding = nullptr;
@@ -114,7 +113,6 @@ private:
     QPushButton* _addPclButton = nullptr;
     QToolButton* _browsePclButton = nullptr;
     QComboBox* _outwardSense = nullptr;
-    QComboBox* _storageBackend = nullptr;
     QCheckBox* _savePngVisualizations = nullptr;
     QCheckBox* _trackLengthBinSampling = nullptr;
     QDoubleSpinBox* _trackShortWeight = nullptr;
@@ -135,8 +133,16 @@ private:
     QPushButton* _stop = nullptr;
     QPushButton* _save = nullptr;
     QPushButton* _downloadCheckpoint = nullptr;
+    QLabel* _checkpointDownloadStatus = nullptr;
+    QProgressBar* _checkpointDownloadProgress = nullptr;
+    QTimer* _checkpointDownloadTimer = nullptr;
+    QElapsedTimer _checkpointDownloadElapsed;
+    QString _checkpointDownloadPhase;
+    qint64 _checkpointBytesReceived = 0;
+    qint64 _checkpointTotalBytes = 0;
     QPushButton* _refill = nullptr;
     QLabel* _state = nullptr;
+    QProgressBar* _previewProgress = nullptr;
     QLabel* _metrics = nullptr;
     QLabel* _warnings = nullptr;
 
@@ -167,6 +173,7 @@ private:
     QJsonObject _attachedAdvancedConfig;
     QJsonObject _defaultAdvancedConfig;
     QSet<QString> _runConfigKeys;
+    QSet<QString> _runMutablePaths;
     qint64 _advancedSessionGeneration = -1;
 
     QString _currentProfileId;
@@ -179,6 +186,9 @@ private:
     bool _sessionRunnable = false;
     bool _remoteMode = false;
     bool _connected = false;
+    bool _previewTransferActive = false;
+    bool _checkpointDownloadActive = false;
+    QString _previewTransferText;
     int _ephemeralCount = 0;
     int _uncommittedCount = 0;
     std::function<void(std::function<void()>)> _sessionExitGuard;

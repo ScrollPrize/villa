@@ -166,7 +166,6 @@ public:
     ~LineAnnotationController() override;
 
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
-    void launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
     void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
                                  const QPointF& scenePoint,
                                  bool replaceOwningAnnotation = true);
@@ -478,6 +477,11 @@ private:
     [[nodiscard]] std::vector<std::filesystem::path> saveGeneratedQuadMeshes(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
     [[nodiscard]] const PaneRecord* paneForSurface(const std::string& surfaceName) const;
+    // "H"/"V" from the manual tag, falling back to the automatic classification;
+    // empty when unknown or the fiber isn't loaded.
+    [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
+    // Pushes the H/V tag and the clickable tag buttons to the pane's dialog.
+    void pushFiberUiState(const PaneRecord& pane) const;
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
@@ -492,6 +496,13 @@ private:
     void loadFibersForCurrentPackage();
     [[nodiscard]] bool validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
                                                 std::vector<std::string>& errors) const;
+    // Fibers merged by the sync tool (scripts/fiber_merge.py) carry a
+    // needs_reoptimization tag; on load VC3D offers to re-fit their lines.
+    // Declining keeps the tag so the next load asks again.
+    void promptReoptimizationForMergedFibers();
+    // fileNames, not runtime ids: ids are densely reassigned on reloads,
+    // which can happen while the prompt's modal spins.
+    void reoptimizeMergedFibers(const std::vector<std::string>& fiberFileNames);
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
     [[nodiscard]] std::filesystem::path fibersRootDir() const;
@@ -695,6 +706,9 @@ private:
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
     bool _errorDialogsSuppressed = false;
+    // Deduplicates the deferred re-optimization prompt across reentrant
+    // fiber (re)loads.
+    bool _reoptimizationPromptPending = false;
     mutable QString _lastSuppressedError;
 
     // Transient (in-memory only) staging state for linking two existing control

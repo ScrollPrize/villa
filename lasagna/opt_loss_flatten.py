@@ -6,7 +6,8 @@ import model as fit_model
 
 
 _sdir_eps = 1.0e-8
-_orient_min_det = 0.0
+_orient_min_det = 1.0e-2
+_order_margin = 0.05
 _diagnostics_enabled = True
 _last_stats: dict[str, float] = {}
 _prev_point_mask: torch.Tensor | None = None
@@ -26,14 +27,18 @@ def configure(
 	*,
 	sdir_eps: float | None = None,
 	orient_min_det: float | None = None,
+	order_margin: float | None = None,
 	diagnostics: bool = True,
 	reset_history: bool = True,
 ) -> None:
-	global _sdir_eps, _orient_min_det, _diagnostics_enabled, _last_stats, _prev_point_mask
+	global _sdir_eps, _orient_min_det, _order_margin
+	global _diagnostics_enabled, _last_stats, _prev_point_mask
 	if sdir_eps is not None:
 		_sdir_eps = max(1.0e-12, float(sdir_eps))
 	if orient_min_det is not None:
 		_orient_min_det = float(orient_min_det)
+	if order_margin is not None:
+		_order_margin = max(0.0, float(order_margin))
 	_diagnostics_enabled = bool(diagnostics)
 	if reset_history or not _diagnostics_enabled:
 		_last_stats = {}
@@ -250,6 +255,7 @@ def _flatten_forward_combined_core(
 	weights: torch.Tensor,
 	eps: float,
 	orient_min_det: float,
+	order_margin: float,
 ) -> torch.Tensor:
 	"""Combined diagnostics-free forward flatten objective.
 
@@ -260,8 +266,12 @@ def _flatten_forward_combined_core(
 	m10 = uv[1:, :-1]
 	m01 = uv[:-1, 1:]
 	m11 = uv[1:, 1:]
-	uy = 0.5 * ((m10 - m00) + (m11 - m01))
-	ux = 0.5 * ((m01 - m00) + (m11 - m10))
+	uy0 = m10 - m00
+	uy1 = m11 - m01
+	ux0 = m01 - m00
+	ux1 = m11 - m10
+	uy = 0.5 * (uy0 + uy1)
+	ux = 0.5 * (ux0 + ux1)
 	c00 = (uy * uy).sum(dim=-1)
 	c01 = (uy * ux).sum(dim=-1)
 	c11 = (ux * ux).sum(dim=-1)
@@ -332,20 +342,50 @@ def _flatten_forward_combined_core(
 	avg_diff = torch.where(avg_weight > 0, avg_diff_candidate, torch.zeros_like(avg_diff_candidate))
 	avg_loss = (avg_diff * avg_diff).sum()
 
+	# The structured surface is a fixed-diagonal triangle mesh. A center-only
+	# quad determinant is the mean of its two triangle determinants, so it can
+	# remain positive while one triangle is flipped. For a bilinear quad their
+	# difference is cross(m10-m01, m11-m10-m01+m00), letting us recover the
+	# smaller triangle determinant with only one extra cross product.
+	bilinear = uy1 - uy0
+	triangle_det_delta = (
+		(m10[..., 0] - m01[..., 0]) * bilinear[..., 1]
+		- (m10[..., 1] - m01[..., 1]) * bilinear[..., 0]
+	)
+	min_triangle_det = det_uv - 0.5 * triangle_det_delta.abs()
 	orient_lm = torch.nan_to_num(
-		torch.relu(orient_min_det - det_uv) ** 2,
+		torch.relu(orient_min_det - min_triangle_det) ** 2,
 		nan=0.0,
 		posinf=1.0e12,
 		neginf=0.0,
 	)
-	orient_active = cell_valid & torch.isfinite(det_uv) & (det_uv < orient_min_det)
+	orient_active = (
+		cell_valid
+		& torch.isfinite(min_triangle_det)
+		& (min_triangle_det < orient_min_det)
+	)
 	orient_loss = (orient_lm * orient_active.to(dtype=uv.dtype)).sum()
+
+	# A positive cell determinant is only a local condition: distant,
+	# individually oriented regions can still pass through one another. Preserve
+	# the structured source grid's row order in output Y and column/winding order
+	# in output X to provide a scalable injectivity barrier for the Spiral chart.
+	order_y_delta = uv[1:, :, 0] - uv[:-1, :, 0]
+	order_x_delta = uv[:, 1:, 1] - uv[:, :-1, 1]
+	order_y_valid = vertex_valid[1:, :] & vertex_valid[:-1, :]
+	order_x_valid = vertex_valid[:, 1:] & vertex_valid[:, :-1]
+	order_y_lm = torch.relu(order_margin - order_y_delta) ** 2
+	order_x_lm = torch.relu(order_margin - order_x_delta) ** 2
+	order_loss = (
+		(order_y_lm * order_y_valid.to(dtype=uv.dtype)).sum()
+		+ (order_x_lm * order_x_valid.to(dtype=uv.dtype)).sum()
+	)
 
 	return (
 		weights[0] * sdir_loss
 		+ weights[1] * map_step_loss
 		+ weights[2] * avg_loss
-		+ weights[3] * orient_loss
+		+ weights[3] * (orient_loss + order_loss)
 	)
 
 
@@ -401,6 +441,7 @@ def flatten_combined_loss(
 		weights.to(device=uv.device, dtype=uv.dtype).reshape(4),
 		float(_sdir_eps),
 		float(_orient_min_det),
+		float(_order_margin),
 	)
 
 
@@ -657,19 +698,45 @@ def _flatten_orient_core(
 	map_yx: torch.Tensor,
 	valid_cells: torch.Tensor,
 	min_det_value: float,
+	valid_vertices: torch.Tensor,
+	order_margin_value: float,
+	order_weight_value: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 	m00 = map_yx[:-1, :-1]
 	m10 = map_yx[1:, :-1]
 	m01 = map_yx[:-1, 1:]
 	m11 = map_yx[1:, 1:]
-	dy = 0.5 * ((m10 - m00) + (m11 - m01))
-	dx = 0.5 * ((m01 - m00) + (m11 - m10))
-	det = dy[..., 0] * dx[..., 1] - dy[..., 1] * dx[..., 0]
+	dy0 = m10 - m00
+	dy1 = m11 - m01
+	dx0 = m01 - m00
+	dx1 = m11 - m10
+	dy = 0.5 * (dy0 + dy1)
+	dx = 0.5 * (dx0 + dx1)
+	center_det = dy[..., 0] * dx[..., 1] - dy[..., 1] * dx[..., 0]
+	bilinear = dy1 - dy0
+	triangle_det_delta = (
+		(m10[..., 0] - m01[..., 0]) * bilinear[..., 1]
+		- (m10[..., 1] - m01[..., 1]) * bilinear[..., 0]
+	)
+	det = center_det - 0.5 * triangle_det_delta.abs()
 	min_det = torch.tensor(min_det_value, device=map_yx.device, dtype=map_yx.dtype)
 	lm = torch.nan_to_num(torch.relu(min_det - det) ** 2, nan=0.0, posinf=1.0e12, neginf=0.0)
 	active = valid_cells & torch.isfinite(det) & (det < min_det)
 	mask = active.to(dtype=lm.dtype)
-	loss = (lm * mask).sum()
+	orient_loss = (lm * mask).sum()
+
+	order_margin = map_yx.new_tensor(order_margin_value)
+	order_y_delta = map_yx[1:, :, 0] - map_yx[:-1, :, 0]
+	order_x_delta = map_yx[:, 1:, 1] - map_yx[:, :-1, 1]
+	order_y_valid = valid_vertices[1:, :] & valid_vertices[:-1, :]
+	order_x_valid = valid_vertices[:, 1:] & valid_vertices[:, :-1]
+	order_y_lm = torch.relu(order_margin - order_y_delta) ** 2
+	order_x_lm = torch.relu(order_margin - order_x_delta) ** 2
+	order_loss = (
+		(order_y_lm * order_y_valid.to(dtype=map_yx.dtype)).sum()
+		+ (order_x_lm * order_x_valid.to(dtype=map_yx.dtype)).sum()
+	)
+	loss = orient_loss + map_yx.new_tensor(order_weight_value) * order_loss
 	return loss, lm, mask, det
 
 
@@ -693,18 +760,29 @@ def flatten_orient_loss(
 		return zero, (), ()
 
 	valid_cells = torch.ones((H - 1, W - 1), device=map_yx.device, dtype=torch.bool)
+	valid_vertices = torch.ones((H, W), device=map_yx.device, dtype=torch.bool)
+	order_weight = 0.0
 	if _is_forward(res):
 		if res.flatten_source_cell_valid is None:
 			raise RuntimeError("forward flatten_orient requires flatten_source_cell_valid")
+		if res.flatten_source_valid is None:
+			raise RuntimeError("forward flatten_orient requires flatten_source_valid")
 		valid_cells = res.flatten_source_cell_valid.to(device=map_yx.device, dtype=torch.bool)
 		if tuple(valid_cells.shape) != (H - 1, W - 1):
 			raise RuntimeError("forward flatten source cell mask shape does not match orient determinant")
+		valid_vertices = res.flatten_source_valid.to(device=map_yx.device, dtype=torch.bool)
+		if tuple(valid_vertices.shape) != (H, W):
+			raise RuntimeError("forward flatten source vertex mask shape does not match flatten map")
+		order_weight = 1.0
 	loss, lm, mask, det = _run_compiled_flatten_core(
 		"orient",
 		_flatten_orient_core,
 		map_yx,
 		valid_cells,
 		float(_orient_min_det),
+		valid_vertices,
+		float(_order_margin),
+		order_weight,
 	)
 
 	if _diagnostics_enabled:
@@ -721,12 +799,26 @@ def flatten_orient_loss(
 				lowdet_frac = 0.0
 				min_det_val = 0.0
 				mean_det_val = 0.0
+			order_y_delta = map_yx[1:, :, 0] - map_yx[:-1, :, 0]
+			order_x_delta = map_yx[:, 1:, 1] - map_yx[:, :-1, 1]
+			order_y_valid = valid_vertices[1:, :] & valid_vertices[:-1, :]
+			order_x_valid = valid_vertices[:, 1:] & valid_vertices[:, :-1]
+			order_y_values = order_y_delta[order_y_valid & torch.isfinite(order_y_delta)]
+			order_x_values = order_x_delta[order_x_valid & torch.isfinite(order_x_delta)]
 			_last_stats = {
 				**_last_stats,
 				"flatten_orient_fold_frac": fold_frac,
 				"flatten_orient_lowdet_frac": lowdet_frac,
 				"flatten_orient_min_det": min_det_val,
 				"flatten_orient_mean_det": mean_det_val,
+				"flatten_order_row_violation_frac": (
+					float((order_y_values < _order_margin).float().mean().detach().cpu())
+					if order_weight and order_y_values.numel() else 0.0
+				),
+				"flatten_order_column_violation_frac": (
+					float((order_x_values < _order_margin).float().mean().detach().cpu())
+					if order_weight and order_x_values.numel() else 0.0
+				),
 			}
 	lms, masks = _diagnostic_maps(lm, mask)
 	return loss, lms, masks

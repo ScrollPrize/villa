@@ -1,17 +1,19 @@
-* @giorgioangel
+* @giorgioangel @pmh47
 
-/crackle-viewer/ @jrudolph
+/deprecated/crackle-viewer/ @jrudolph
+
+/deprecated/vesuvius-c/ @jrudolph
 
 /foundation/ @jrudolph
 
-/ink-detection/ @younader
+/ink-detection/ @erdpx
 
-/scroll-renderer/ @giorgioangel
+/lasagna/ @hendrikschilling
 
-/scrollprize.org/ @skyward7187 @giorgioangel
+/scrollprize.org/ @skyward7187 @giorgioangel @pmh47
 
-/vesuvius/ @jrudolph
+/vesuvius/ @jrudolph @bruniss
 
-/vesuvius-c/ @jrudolph
+/volume-cartographer/ @hendrikschilling
 
-/volume-cartographer/ @hendrikschilling @SuperOptimizer
+/volume-cartographer/scripts/spiral @pmh47
