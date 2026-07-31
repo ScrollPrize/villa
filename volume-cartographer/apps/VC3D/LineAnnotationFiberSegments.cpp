@@ -628,6 +628,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             metadata.failureDetail.clear();
             metadata.lasagnaFailureCode.clear();
             metadata.lasagnaFailureDetail.clear();
+            metadata.normalManifestLocation.clear();
+            metadata.fiberManifestLocation.clear();
             continue;
         }
         const bool wantsTrace = requestedMode == SegmentInterpolationMode::Trace;
@@ -643,6 +645,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             metadata.failureDetail.clear();
             metadata.lasagnaFailureCode.clear();
             metadata.lasagnaFailureDetail.clear();
+            metadata.normalManifestLocation = request.normalManifestLocation;
+            metadata.fiberManifestLocation.clear();
             continue;
         }
 

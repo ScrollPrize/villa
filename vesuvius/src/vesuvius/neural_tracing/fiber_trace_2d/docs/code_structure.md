@@ -728,7 +728,12 @@ Ownership changed as follows:
   version-2 native outcomes are promoted on load; all new saves write version
   3. The C++ strict readers, Python loader, Lasagna probe, Atlas reader, and
   merge validator accept all three versions and strictly validate v3 enums and
-  mode-specific fields.
+  mode-specific fields. `normal_manifest` records the Lasagna source identity
+  and `fiber_manifest` the prediction source identity actually consulted by a
+  span. Controller sessions keep these identities separate from runtime cache
+  paths. `OpenDataLasagna` reconstructs the public root manifest URL from the
+  catalogue artifact URL and cached manifest filename; the catalogue exposes
+  no standalone artifact UUID.
 
   Goal resolution retries from policy each time: trace falls through to
   Lasagna and then cubic spline; Lasagna falls through to cubic spline. Global

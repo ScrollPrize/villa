@@ -1,5 +1,11 @@
 # 2026-07-31
 
+- Persisted the actual Lasagna and fiber-inference manifest identities consulted
+  per interpolation span, using public manifest URLs instead of local cache
+  paths for open-data catalogue Lasagna.
+- Changed newly created VC3D fibers to default their global interpolation and
+  extrapolation mode to the native fiber tracer while retaining Lasagna for
+  older files with no persisted mode.
 - Added `vc3d_fiber` v3 per-span interpolation goals and actual modes, grouped
   cubic-spline interpolation, trace-to-Lasagna-to-spline fallback, the
   global-only 100-base-voxel shortcut, persisted metrics/messages, a checked

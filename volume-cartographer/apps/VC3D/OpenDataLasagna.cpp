@@ -337,12 +337,15 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
             const auto* match = compatibleMatches.front();
             const auto path = vc::project::resolveLocalPath(
                 match->location, pkg.path().parent_path());
+            const auto artifactUrl =
+                tagValue(match->tags, kOpenDataLasagnaArtifactTagPrefix);
             return ResolvedOpenDataLasagna{
                 path,
+                lasagnaSourceManifestLocation(*match),
                 static_cast<double>(std::uint64_t{1} << *activeLevel),
                 sampleId + "/" + volumeId + "@L" +
                     std::to_string(*activeLevel),
-                tagValue(match->tags, kOpenDataLasagnaArtifactTagPrefix),
+                artifactUrl,
                 true};
         }
         if (!tagValue(volumeTags, kOpenDataLasagnaArtifactTagPrefix).empty()) {
@@ -363,10 +366,20 @@ std::optional<ResolvedOpenDataLasagna> resolveForTags(
     const auto dataset = vc::lasagna::LasagnaDataset::openLocation(
         resolvedLocation, options);
     return ResolvedOpenDataLasagna{
-        dataset.manifest().manifestPath, 1.0, {}, {}, false};
+        dataset.manifest().manifestPath, manualLocation, 1.0, {}, {}, false};
 }
 
 } // namespace
+
+std::string lasagnaSourceManifestLocation(const vc::project::Entry& entry)
+{
+    const auto artifactUrl =
+        tagValue(entry.tags, kOpenDataLasagnaArtifactTagPrefix);
+    if (artifactUrl.empty())
+        return entry.location;
+    return joinOpenDataUrl(
+        artifactUrl, std::filesystem::path(entry.location).filename().string());
+}
 
 std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
     const std::string& sampleId,

@@ -12,7 +12,8 @@ selects extrapolation and resolves CP spans whose persisted `interp_goal` is
 `interp_mode` is the actual producer of the stored geometry and is one of
 `cspline`, `lasagna`, or `trace`. The actual mode is recomputed from the goal
 whenever the span is dirty, so a previous fallback is retried rather than
-treated as permanent.
+treated as permanent. Newly created fibers default to `native_fiber_trace3d`;
+the Lasagna default for older files with no mode remains unchanged.
 
 The fallback order is `trace -> lasagna -> cspline` or `lasagna -> cspline`.
 For global Lasagna/trace goals only, endpoint distance below 100 base voxels
@@ -62,7 +63,19 @@ Every segment descriptor stores a compact `msg` and an optional mode-dependent
 `metric`: trace stores minimum meeting-plane error in base voxels, Lasagna
 stores maximum normal-alignment error in degrees, and cubic spline stores no
 metric. Detailed trace and Lasagna failures remain in their mode-specific
-fields. Strip labels prefix the actual mode as `C`, `L`, or `T`, then display
+fields. `normal_manifest` stores the Lasagna manifest location used by the
+span, and `fiber_manifest` stores the fiber-inference manifest location. A
+direct Lasagna span stores only the former; trace stores both because it samples
+Lasagna normals; direct cubic spline stores neither. Fallbacks retain the
+locations consulted by failed higher-priority attempts.
+
+For ordinary project datasets these values are the configured local or remote
+manifest paths. The open-data catalogue has no artifact UUID: it identifies a
+Lasagna artifact by public artifact URL plus sample ID, volume ID, coordinate
+level, optional model ID, and manifest artifact index. Segment metadata stores
+the reconstructed exact public manifest URL, never its local cache path.
+
+Strip labels prefix the actual mode as `C`, `L`, or `T`, then display
 the metric and message. Labels are laid out in viewport pixels, remain visible
 while any part of their span intersects the view, and use a deterministic
 second row when one row cannot avoid overlap. Version-1 and version-2 fibers

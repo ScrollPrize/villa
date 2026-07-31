@@ -327,6 +327,8 @@ TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic 
     CHECK(resolved->manifestBacked);
     CHECK(resolved->workingToBaseScale == doctest::Approx(8.0));
     CHECK(resolved->coordinateSpace == "sample/vol-a@L3");
+    CHECK(resolved->sourceManifestLocation ==
+          "https://example.test/vol-a/data.lasagna.json");
 
     const auto native = resolveLasagnaForCoordinateTags(
         *pkg,
@@ -382,6 +384,7 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
     const auto resolved = resolveLasagnaForCoordinateTags(*pkg, {});
     REQUIRE(resolved.has_value());
     CHECK(resolved->manifestPath == cached.manifest().manifestPath);
+    CHECK(resolved->sourceManifestLocation == location);
     CHECK(fetches == 1);
     std::filesystem::remove_all(root);
 }

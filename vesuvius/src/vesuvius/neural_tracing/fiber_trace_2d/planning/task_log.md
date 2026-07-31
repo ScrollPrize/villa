@@ -1,51 +1,39 @@
-# Per-Segment Interpolation Goals And Cubic-Spline Fallback Task Log
+# Persist Per-Segment Manifest Identities Task Log
+
+## Findings
+
+- Segment metadata already serializes `normal_manifest` and `fiber_manifest`,
+  but direct Lasagna/cubic paths did not consistently populate or clear them.
+- Catalogue Lasagna is opened from a local cache path. Its project tags retain
+  public artifact URL, sample ID, volume ID, coordinate level, and optional
+  model ID. The catalogue provides no standalone artifact UUID.
+- Catalogue preparation guarantees exactly one root `.lasagna.json`, allowing
+  the public manifest URL to be reconstructed deterministically.
 
 ## Implementation
 
-- Added strict version-3 CP-owned descriptors with `interp_goal`, actual
-  `interp_mode`, optional mode-dependent `metric`, compact `msg`, and retained
-  trace/Lasagna diagnostics. VC3D, Atlas, the native readers/probe, Python, and
-  merge validation accept v1/v2/v3; VC3D saves v3.
-- Added the shared `vc::lasagna::interpolateLineControlPoints` core helper.
-  Connected cubic spans use exact CPs, shared internal tangents, optional hard
-  boundary directions, bounded handles, deterministic shape checks, and base
-  spacing resampling without consulting normals or predictions.
-- Reworked the fiber coordinator around per-span goal resolution. Global spans
-  below 100 base voxels select cubic spline; trace falls through to Lasagna and
-  Lasagna candidate failure demotes only that span to cubic spline. Protected
-  trace/cubic/manual spans feed hard endpoint directions to the existing Ceres
-  solve.
-- CP edits now dirty adjacent spans, goal changes dirty the selected span, and
-  global-mode changes dirty global goals. Dirty cubic spans expand through the
-  connected run; unrelated explicit spans stay protected.
-- Replaced the old one-span trace/revert GUI path with a checked interpolation
-  goal submenu. Removed its unreachable controller worker and task-result
-  plumbing.
-- Persisted labels now show actual mode (`C`, `L`, or `T`), metric, and message.
-  Partially visible spans remain labeled; viewport-space packing clamps and
-  pushes labels and uses a deterministic second row when needed.
-
-## Plan Decisions And Deviations
-
-- The plan proposed exporting the private Lasagna span initializer. No copy was
-  made. The coordinator instead calls the already public shared full
-  reinitializer, consumes its precise failed-span index, demotes that one span,
-  and retries. This preserves the single established rollout implementation
-  and its final joint solve with a smaller API change.
-- The cubic geometry helper is normal-independent. VC3D line annotation still
-  opens its selected regular Lasagna dataset for surrounding line models,
-  Lasagna fallbacks, and extrapolation; this task does not create a separate
-  manifest-free line-annotation workflow.
-- Core/generated-view tests cover schema, goal resolution, trace fallback,
-  spline geometry, ownership mutation, and display descriptor generation. The
-  Qt viewport collision layout is build-verified but does not have a dedicated
-  event-driven GUI test harness in the current suite.
+- Added a source manifest location to resolved catalogue Lasagna results. The
+  shared resolver reconstructs the public root `.lasagna.json` URL from the
+  artifact URL tag and cached manifest filename; ordinary entries return their
+  configured project location.
+- Line-annotation sessions now keep Lasagna/fiber source identities separate
+  from runtime cache/opening locations and pass the source identities to the
+  segment coordinator.
+- Direct Lasagna interpolation writes `normal_manifest` and clears stale
+  `fiber_manifest`. Direct/short cubic spline clears both. Trace results and
+  trace fallbacks keep both; later Lasagna-to-spline fallback retains the
+  identities of the attempted datasets.
 
 ## Validation
 
-- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target test_line_annotation_generated_views -j32`
+- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target test_line_annotation_generated_views test_open_data_manifest -j32`
 - `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_line_annotation_generated_views`
-  passed 55 cases.
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/tests/neural_tracing/test_fiber_trace.py volume-cartographer/scripts/tests/test_fiber_merge.py`
-  passed 109 cases.
+  passed 56 cases.
+- `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_open_data_manifest`
+  passed 32 cases. Expected fixture warnings covered unavailable test URLs and
+  deliberately invalid TIFF placeholders.
 - `cmake --build volume-cartographer/build --target VC3D -j32` completed.
+
+## Deviations
+
+- None.

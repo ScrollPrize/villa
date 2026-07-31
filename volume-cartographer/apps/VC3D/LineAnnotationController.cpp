@@ -106,8 +106,10 @@ struct LineAnnotationController::LineAnnotationSession {
 
     std::string surfaceName;
     std::string selectedDatasetLocation;
+    std::string selectedLasagnaManifestIdentity;
     fs::path selectedManifestPath;
     std::string selectedFiberInferenceDatasetLocation;
+    std::string selectedFiberManifestIdentity;
     fs::path selectedFiberInferenceManifestPath;
     double workingToBaseScale = 1.0;
     std::shared_ptr<vc::lasagna::LasagnaDataset> dataset;
@@ -150,9 +152,9 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string fiberManualHvTag;
     std::vector<std::string> fiberTags;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode =
-        vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+        vc3d::line_annotation::kDefaultNewFiberOptimizationMode;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationModeBeforeTask =
-        vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+        vc3d::line_annotation::kDefaultNewFiberOptimizationMode;
     bool restoreFiberOptimizationModeOnFailure = false;
     std::optional<std::vector<vc3d::line_annotation::LineControlPoint>>
         controlPointsBeforeModeChange;
@@ -6045,6 +6047,8 @@ void LineAnnotationController::handleGeneratedControlPointBranch(const std::stri
     linkedSeedRecord->sourceSliceNormal = linkedInitialDirection;
     linkedSeedRecord->initialDirectionMode = InitialDirectionMode::ZInOut;
     linkedSeedRecord->selectedDatasetLocation = parentSession.selectedDatasetLocation;
+    linkedSeedRecord->selectedLasagnaManifestIdentity =
+        parentSession.selectedLasagnaManifestIdentity;
     linkedSeedRecord->selectedManifestPath = parentSession.selectedManifestPath;
     linkedSeedRecord->workingToBaseScale = parentSession.workingToBaseScale;
     linkedSeedRecord->dataset = parentSession.dataset;
@@ -6860,6 +6864,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
 
     auto vpkg = _state->vpkg();
     std::string selected;
+    std::string selectedIdentity;
     fs::path manifestPath;
     double workingToBaseScale = 1.0;
     try {
@@ -6869,6 +6874,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             selected = resolved->manifestBacked
                 ? manifestPath.string()
                 : vpkg->selectedLasagnaDataset();
+            selectedIdentity = resolved->sourceManifestLocation;
             workingToBaseScale = resolved->workingToBaseScale;
         }
     } catch (const std::exception& ex) {
@@ -6880,6 +6886,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
 
     if (selected.empty() && !vpkg->selectedLasagnaDataset().empty()) {
         selected = vpkg->selectedLasagnaDataset();
+        selectedIdentity = selected;
         if (!vc::project::isLocationRemote(selected)) {
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         }
@@ -6908,6 +6915,7 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
             return false;
         }
         selected = *picked;
+        selectedIdentity = selected;
         try {
             auto dataset = std::make_shared<vc::lasagna::LasagnaDataset>(
                 openSelectedDataset(selected));
@@ -6941,6 +6949,9 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     }
 
     session.selectedDatasetLocation = selected;
+    session.selectedLasagnaManifestIdentity = selectedIdentity.empty()
+        ? selected
+        : selectedIdentity;
     session.selectedManifestPath = manifestPath;
     session.workingToBaseScale = workingToBaseScale;
     return true;
@@ -6962,6 +6973,15 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         selected = fiberEntries.front().location;
         vpkg->setSelectedFiberInferenceDataset(selected);
     }
+    std::string selectedIdentity = selected;
+    const auto selectedEntry = std::find_if(
+        fiberEntries.begin(), fiberEntries.end(), [&](const auto& entry) {
+            return entry.location == selected;
+        });
+    if (selectedEntry != fiberEntries.end()) {
+        selectedIdentity =
+            vc3d::opendata::lasagnaSourceManifestLocation(*selectedEntry);
+    }
 
     fs::path manifestPath;
     if (!selected.empty() && !vc::project::isLocationRemote(selected)) {
@@ -6982,6 +7002,7 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
             return false;
         }
         selected = *picked;
+        selectedIdentity = selected;
         if (!vc::project::isLocationRemote(selected))
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
         vpkg->setSelectedFiberInferenceDataset(selected);
@@ -7050,6 +7071,9 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     }
 
     session.selectedFiberInferenceDatasetLocation = selected;
+    session.selectedFiberManifestIdentity = selectedIdentity.empty()
+        ? selected
+        : selectedIdentity;
     session.selectedFiberInferenceManifestPath = manifestPath;
     return true;
 }
@@ -7492,8 +7516,8 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
     request.baseNormalSampler = session.normalSampler.get();
     request.traceNormalSampler = session.traceNormalSampler.get();
     request.traceToBaseScale = session.fiberTraceToBaseScale;
-    request.normalManifestLocation = session.selectedDatasetLocation;
-    request.fiberManifestLocation = session.selectedFiberInferenceDatasetLocation;
+    request.normalManifestLocation = session.selectedLasagnaManifestIdentity;
+    request.fiberManifestLocation = session.selectedFiberManifestIdentity;
     request.globalMode = session.fiberOptimizationMode;
     request.retraceAll = retraceAll;
     request.dirtySegments = std::move(dirtySegments);

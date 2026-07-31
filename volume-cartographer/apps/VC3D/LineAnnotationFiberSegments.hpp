@@ -20,6 +20,9 @@ enum class FiberOptimizationMode {
     NativeFiberTrace3d,
 };
 
+inline constexpr FiberOptimizationMode kDefaultNewFiberOptimizationMode =
+    FiberOptimizationMode::NativeFiberTrace3d;
+
 enum class SegmentInterpolationGoal {
     Global,
     Cspline,

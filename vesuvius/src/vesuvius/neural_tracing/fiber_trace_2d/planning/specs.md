@@ -1064,6 +1064,17 @@
   failure code/detail remain mode-specific. Stale fields are cleared when a
   later retry changes actual mode. Unknown enums, malformed metadata, or a
   descriptor on the final CP are hard errors in every strict reader.
+- `normal_manifest` is the Lasagna manifest identity used for interpolation;
+  `fiber_manifest` is the fiber-inference manifest identity. Direct Lasagna
+  records the Lasagna identity only. Trace records both because the tracer also
+  samples Lasagna normals. Direct/short cubic spline records neither. A
+  fallback retains every identity actually consulted by its rejected attempts.
+  Ordinary project datasets use their configured local or remote manifest
+  location. Catalogue-backed Lasagna uses the exact public remote manifest URL
+  reconstructed from its artifact URL and root manifest filename, never the
+  cache path. The catalogue has no artifact UUID; sample ID, volume ID,
+  coordinate level, optional model ID, and artifact index are auxiliary
+  catalogue identity components.
 - Version-1 and version-2 fibers remain readable. Missing old segment metadata
   becomes goal `global`, actual `lasagna`. An accepted v2 trace becomes actual
   `trace` and is explicit goal `trace` when its old fiber-wide mode was
@@ -1081,6 +1092,8 @@
   `native_fiber_trace3d`. Missing mode metadata on existing version-1/version-2
   files defaults to `lasagna`; unknown values are errors. The mode is the
   fiber-wide extrapolation policy and resolves only `global` CP-to-CP goals.
+  New interactive fibers default to `native_fiber_trace3d`; this must not
+  change the Lasagna compatibility default used while loading older files.
 - Goal resolution starts with the explicit goal or the fiber-wide mode for
   `global`. A global Lasagna/trace span whose Euclidean endpoint distance is
   below 100 base voxels uses `cspline` directly; exactly 100 still attempts the

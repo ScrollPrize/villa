@@ -1304,6 +1304,8 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
 TEST_CASE("fiber optimization mode has stable persisted values")
 {
     using vc3d::line_annotation::FiberOptimizationMode;
+    CHECK(vc3d::line_annotation::kDefaultNewFiberOptimizationMode ==
+          FiberOptimizationMode::NativeFiberTrace3d);
     CHECK(vc3d::line_annotation::fiberOptimizationModeToString(
               FiberOptimizationMode::Lasagna) == "lasagna");
     CHECK(vc3d::line_annotation::fiberOptimizationModeToString(
@@ -1390,11 +1392,19 @@ TEST_CASE("fiber mode falls back only the failed native span")
     CHECK(result.controlPoints[0].segmentToNext.has_value());
     CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
         result.controlPoints[0].segmentToNext));
+    CHECK(result.controlPoints[0].segmentToNext->normalManifestLocation ==
+          "normal.lasagna.json");
+    CHECK(result.controlPoints[0].segmentToNext->fiberManifestLocation ==
+          "fiber.lasagna.json");
     REQUIRE(result.controlPoints[1].segmentToNext.has_value());
     CHECK_FALSE(vc3d::line_annotation::isAcceptedNativeTrace(
         result.controlPoints[1].segmentToNext));
     CHECK(result.controlPoints[1].segmentToNext->failureCode ==
           "trace_exception");
+    CHECK(result.controlPoints[1].segmentToNext->normalManifestLocation ==
+          "normal.lasagna.json");
+    CHECK(result.controlPoints[1].segmentToNext->fiberManifestLocation ==
+          "fiber.lasagna.json");
     CHECK(result.nativeExtrapolations +
               result.lasagnaFallbackExtrapolations == 2);
     CHECK(result.lasagnaFallbackExtrapolations >= 1);
@@ -1416,6 +1426,47 @@ TEST_CASE("fiber mode falls back only the failed native span")
         points[sharedIndex + 1].position - points[sharedIndex].position);
     CHECK(fallbackDirection.dot(cv::Vec3d{1.0, 0.0, 0.0}) ==
           doctest::Approx(1.0).epsilon(1.0e-10));
+}
+
+TEST_CASE("fiber mode records only manifest identities used by direct interpolation")
+{
+    FiberModeNormalSampler normals;
+    const auto optimize = [&](vc3d::line_annotation::SegmentInterpolationGoal goal) {
+        vc3d::line_annotation::FiberModeOptimizationRequest request;
+        request.controlPoints = {
+            {2.0, {0.0, 0.0, 0.0}, true, 2},
+            {6.0, {16.0, 0.0, 0.0}, false, 6},
+        };
+        request.controlPoints.front().segmentToNext.emplace();
+        request.controlPoints.front().segmentToNext->interpGoal = goal;
+        request.controlPoints.front().segmentToNext->normalManifestLocation = "stale-normal";
+        request.controlPoints.front().segmentToNext->fiberManifestLocation = "stale-fiber";
+        for (int x = -8; x <= 24; x += 4)
+            request.linePointsBase.push_back({static_cast<double>(x), 0.0, 0.0});
+        request.baseNormalSampler = &normals;
+        request.normalManifestLocation = "normal.lasagna.json";
+        request.fiberManifestLocation = "fiber.lasagna.json";
+        request.globalMode = vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+        request.lasagnaConfig.segmentsPerSide = 2;
+        request.lasagnaConfig.segmentLength = 4.0;
+        request.lasagnaConfig.maxIterations = 20;
+        request.lasagnaConfig.printSolverProgress = false;
+        return vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+    };
+
+    const auto lasagna = optimize(
+        vc3d::line_annotation::SegmentInterpolationGoal::Lasagna);
+    REQUIRE(lasagna.controlPoints.front().segmentToNext.has_value());
+    CHECK(lasagna.controlPoints.front().segmentToNext->normalManifestLocation ==
+          "normal.lasagna.json");
+    CHECK(lasagna.controlPoints.front().segmentToNext->fiberManifestLocation.empty());
+
+    const auto spline = optimize(
+        vc3d::line_annotation::SegmentInterpolationGoal::Cspline);
+    REQUIRE(spline.controlPoints.front().segmentToNext.has_value());
+    CHECK(spline.controlPoints.front().segmentToNext->normalManifestLocation.empty());
+    CHECK(spline.controlPoints.front().segmentToNext->fiberManifestLocation.empty());
 }
 
 TEST_CASE("fiber mode truncates extrapolation at an invalid prediction edge")
