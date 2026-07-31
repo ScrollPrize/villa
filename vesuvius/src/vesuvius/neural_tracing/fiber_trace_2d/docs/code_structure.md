@@ -735,6 +735,20 @@ Ownership changed as follows:
   catalogue artifact URL and cached manifest filename; the catalogue exposes
   no standalone artifact UUID.
 
+  `volume-cartographer/scripts/vc_sync.py` detects divergent local/S3 files
+  against its last-synced shadow base and delegates valid fiber JSON to
+  `scripts/fiber_merge.py`. For version 3, that merger locates every CP on the
+  ordered dense line, partitions geometry at CPs common to base/local/remote,
+  and compares complete dense-span/descriptor chunks. One-sided or identical
+  changes are copied atomically. Local-only and remote-only runs are combined
+  only across a complete unchanged base span; adjacent, overlapping, or
+  unalignable edits return a manual conflict. `vc_sync` then preserves local,
+  remote, and base copies and asks the user to keep local, keep remote, or
+  skip. The v1/v2 CP-polyline reoptimization fallback is not used for v3.
+  Fiber-wide `optimization_mode` is merged separately with base-aware scalar
+  rules rather than generation precedence. Existing tag, link-reciprocity,
+  and manual-HV-tag merge rules remain unchanged.
+
   Goal resolution retries from policy each time: trace falls through to
   Lasagna and then cubic spline; Lasagna falls through to cubic spline. Global
   spans shorter than 100 base voxels choose cubic spline directly, while

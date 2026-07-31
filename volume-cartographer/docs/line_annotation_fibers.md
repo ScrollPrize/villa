@@ -81,6 +81,31 @@ while any part of their span intersects the view, and use a deterministic
 second row when one row cannot avoid overlap. Version-1 and version-2 fibers
 remain readable; VC3D writes explicit version-3 descriptors on the next save.
 
+## Sync Conflict Handling
+
+`scripts/vc_sync.py` compares local and S3 content with the last successfully
+synced shadow copy. When both versions changed, `scripts/fiber_merge.py`
+performs a three-way merge. Version-3 fibers are divided into complete stored
+span results: each result contains its dense CP-to-CP line slice and the
+starting CP's complete `segment_to_next` descriptor. Geometry and metadata are
+never merged field by field or selected by generation.
+
+A span run changed on only one side is retained verbatim, and identical
+two-sided results converge. Separate local and remote changes can be combined
+only when at least one complete base span between them is unchanged on both
+sides. Adjacent edits, different edits to the same run, overlapping topology
+changes, missing ordered CP/line anchors, and inexact joins are conflicts.
+`optimization_mode` follows the same base-aware policy: one changed side wins,
+equal changes converge, and different two-sided changes conflict.
+
+An ambiguous merge does not modify the fiber. The sync tool stores local,
+remote, and base copies under `.s3sync-conflicts/` and asks whether to keep the
+complete local version, keep the complete remote version, or skip. Existing
+base-aware tag, branch-link, reciprocal-peer, and manual-HV-tag handling runs
+only after geometry merges cleanly. Version-1 and version-2 fibers retain the
+older merge behavior, including the CP-polyline `needs_reoptimization`
+fallback for disjoint geometry edits.
+
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way
 fiber tracer after converting the requested distance to trace voxels. That

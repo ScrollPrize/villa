@@ -1,11 +1,11 @@
-# Persist Per-Segment Manifest Identities Status
+# Preserve Version-3 Fiber Spans During Sync Status
 
-- [x] Capture the requested identity behavior.
-- [x] Inspect segment metadata and open-data catalogue identifiers.
+- [x] Capture the requested conservative conflict semantics.
+- [x] Inspect the existing file-level and fiber-level merge paths.
 - [x] Write and review the implementation plan.
-- [x] Separate runtime locations from persisted source identities.
-- [x] Populate identities according to interpolation attempts.
-- [x] Add focused regressions.
-- [x] Run focused tests and rebuild VC3D with `-j32`.
+- [x] Implement atomic version-3 span/run comparison and reconstruction.
+- [x] Add base-aware `optimization_mode` merging.
+- [x] Add focused v3 merge and conflict regressions.
+- [x] Run the fiber merge and vc_sync helper suites.
 - [x] Update specs, docs, changelog, and task log.
 - [x] Review and stage all task changes.

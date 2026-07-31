@@ -21,7 +21,8 @@ invariants, from LineAnnotationController.cpp / Atlas.cpp:
 
 Merge semantics:
 
-- Same geometry on both sides (the incident case — divergent link edits):
+- Version 1/2 with the same geometry on both sides (the incident case —
+  divergent link edits):
   geometry and derived fields come wholesale from the newer-generation
   side; branches merge with set semantics (additions from both sides
   survive, base-aware deletions, approvals beat both pending and
@@ -34,8 +35,15 @@ Merge semantics:
   merge via diff3 (position-aligned against the base; overlapping edits
   conflict). The optimizer cannot run here, so line_points is set to the
   merged control points verbatim (C1 holds exactly) and the merged fiber
-  is tagged `needs_reoptimization`; VC3D offers to re-fit the line on
-  load.
+  is tagged `needs_reoptimization`; VC3D offers to re-fit the line on load.
+  This legacy rule applies only to version 1/2 fibers.
+- Version 3: dense CP-to-CP slices and their CP-owned segment descriptors
+  are atomic. Independent local/remote changed runs merge only when at
+  least one complete unchanged base span separates them. The selected
+  dense slices are concatenated exactly, so descriptors are never dropped
+  and no placeholder/reoptimization is needed. Overlapping, adjacent, or
+  unalignable changes are manual conflicts. `optimization_mode` uses
+  ordinary base-aware three-way scalar semantics.
 - A link whose anchor control point was deleted by the merged geometry
   makes the whole merge a conflict: links are never silently dropped.
 - After any merge that involves links, the caller must run
@@ -51,6 +59,7 @@ import json
 import math
 
 POS_TOL = 1.0e-6
+LINE_POS_TOL = 1.0e-8
 
 # Matches finiteDirection's epsilon guard: a vector this short has no
 # usable direction.
@@ -225,6 +234,11 @@ def is_fiber_doc(doc):
     version = doc.get('version', 1)
     if version not in (1, 2, 3):
         return False
+    if 'optimization_mode' in doc:
+        mode = doc['optimization_mode']
+        if (not isinstance(mode, str) or
+                mode not in {'lasagna', 'native_fiber_trace3d'}):
+            return False
     line_points = doc.get('line_points')
     if not isinstance(line_points, list) or not all(_finite_point(p)
                                                     for p in line_points):
@@ -479,6 +493,186 @@ def merge_control_points(base, local, remote):
             merged.append(local[l1])
 
     return merged, regions, conflicts
+
+
+def _control_line_indices(doc):
+    """Locate each CP on the dense line with VC3D's ordered 1e-8 rule."""
+    indices = []
+    search_from = 0
+    line = doc['line_points']
+    for control_index, control in enumerate(doc['control_points']):
+        match = next(
+            (line_index for line_index in range(search_from, len(line))
+             if pos_eq(line[line_index], control, tol=LINE_POS_TOL)),
+            None)
+        if match is None:
+            return None, (f"control point {control_index} is not an ordered "
+                          "dense-line point")
+        indices.append(match)
+        search_from = match + 1
+    return indices, None
+
+
+def _v3_chunks(doc, anchor_indices):
+    """Partition a v3 fiber at common CP anchors.
+
+    Each chunk owns all CP descriptors whose following spans lie in the
+    chunk. Its terminal CP contributes position only; its descriptor belongs
+    to the next chunk. Prefix/suffix chunks also carry extrapolated tails.
+    """
+    controls = doc['control_points']
+    if not controls:
+        return None, "version-3 span merge requires at least one control point"
+    line_indices, error = _control_line_indices(doc)
+    if error:
+        return None, error
+
+    bounds = [-1] + list(anchor_indices) + [len(controls)]
+    chunks = []
+    for left, right in zip(bounds[:-1], bounds[1:]):
+        first_control = 0 if left < 0 else left
+        final_control = len(controls) - 1 if right == len(controls) else right
+        line_start = 0 if left < 0 else line_indices[left]
+        line_end = (len(doc['line_points']) - 1
+                    if right == len(controls) else line_indices[right])
+        if final_control < first_control or line_end < line_start:
+            return None, "version-3 anchor partition is not ordered"
+        chunks.append({
+            'start_controls': copy.deepcopy(controls[first_control:final_control]),
+            'end_control': copy.deepcopy(controls[final_control]),
+            'end_position': copy.deepcopy(_cp_position(controls[final_control])),
+            'line_points': copy.deepcopy(doc['line_points'][line_start:line_end + 1]),
+        })
+    return chunks, None
+
+
+def _v3_chunk_equal(a, b):
+    return (a['start_controls'] == b['start_controls'] and
+            a['end_position'] == b['end_position'] and
+            a['line_points'] == b['line_points'])
+
+
+def _base_span_count(left_anchor, right_anchor, control_count):
+    first = 0 if left_anchor < 0 else left_anchor
+    final = control_count - 1 if right_anchor == control_count else right_anchor
+    return max(0, final - first)
+
+
+def merge_v3_span_geometry(base, local, remote):
+    """Conservatively merge complete v3 span results.
+
+    CP topology is aligned through common base anchors. A selected chunk is
+    copied verbatim from one input: its dense geometry and every CP-owned
+    descriptor therefore remain one atomic result. Different local/remote
+    changed chunks require an unchanged base span between them.
+    """
+    base_controls = base['control_points']
+    local_matches = dict(_lcs_matches(base_controls, local['control_points']))
+    remote_matches = dict(_lcs_matches(base_controls, remote['control_points']))
+    base_anchors = [index for index in sorted(local_matches)
+                    if index in remote_matches]
+    local_anchors = [local_matches[index] for index in base_anchors]
+    remote_anchors = [remote_matches[index] for index in base_anchors]
+
+    base_chunks, error = _v3_chunks(base, base_anchors)
+    if error:
+        return None, [f"base fiber: {error}"]
+    local_chunks, error = _v3_chunks(local, local_anchors)
+    if error:
+        return None, [f"local fiber: {error}"]
+    remote_chunks, error = _v3_chunks(remote, remote_anchors)
+    if error:
+        return None, [f"remote fiber: {error}"]
+
+    anchor_bounds = [-1] + base_anchors + [len(base_controls)]
+    owners = []
+    selected = []
+    conflicts = []
+    for index, (base_chunk, local_chunk, remote_chunk) in enumerate(
+            zip(base_chunks, local_chunks, remote_chunks)):
+        local_changed = not _v3_chunk_equal(local_chunk, base_chunk)
+        remote_changed = not _v3_chunk_equal(remote_chunk, base_chunk)
+        if local_changed and remote_changed:
+            if _v3_chunk_equal(local_chunk, remote_chunk):
+                owners.append('both')
+                selected.append(local_chunk)
+            else:
+                left = anchor_bounds[index]
+                right = anchor_bounds[index + 1]
+                conflicts.append(
+                    "version-3 span run changed differently on both sides "
+                    f"between base anchors {left} and {right}")
+                owners.append('conflict')
+                selected.append(base_chunk)
+        elif local_changed:
+            owners.append('local')
+            selected.append(local_chunk)
+        elif remote_changed:
+            owners.append('remote')
+            selected.append(remote_chunk)
+        else:
+            owners.append('none')
+            selected.append(base_chunk)
+    if conflicts:
+        return None, conflicts
+
+    local_only = [i for i, owner in enumerate(owners) if owner == 'local']
+    remote_only = [i for i, owner in enumerate(owners) if owner == 'remote']
+    for local_index in local_only:
+        for remote_index in remote_only:
+            low, high = sorted((local_index, remote_index))
+            separated = any(
+                owners[middle] == 'none' and
+                _base_span_count(anchor_bounds[middle],
+                                 anchor_bounds[middle + 1],
+                                 len(base_controls)) > 0
+                for middle in range(low + 1, high))
+            if not separated:
+                return None, [
+                    "version-3 local and remote span changes are adjacent; "
+                    "an unchanged base span is required between them"
+                ]
+
+    merged_controls = []
+    merged_line = []
+    for index, chunk in enumerate(selected):
+        chunk_line = chunk['line_points']
+        if not chunk_line:
+            return None, [f"version-3 span chunk {index} has no dense line points"]
+        if merged_line:
+            if merged_line[-1] != chunk_line[0]:
+                return None, [
+                    "version-3 selected span runs do not meet at an exact "
+                    f"shared control point before chunk {index}"
+                ]
+            merged_line.extend(copy.deepcopy(chunk_line[1:]))
+        else:
+            merged_line.extend(copy.deepcopy(chunk_line))
+        merged_controls.extend(copy.deepcopy(chunk['start_controls']))
+    merged_controls.append(copy.deepcopy(selected[-1]['end_control']))
+
+    if len(merged_controls) < 1 or len(merged_line) < 1:
+        return None, ["version-3 span merge produced empty geometry"]
+    return {
+        'control_points': merged_controls,
+        'line_points': merged_line,
+        'owners': owners,
+    }, []
+
+
+def merge_v3_optimization_mode(base, local, remote):
+    """Base-aware merge of the user-controlled fiber-wide policy."""
+    base_mode = base.get('optimization_mode', 'lasagna')
+    local_mode = local.get('optimization_mode', 'lasagna')
+    remote_mode = remote.get('optimization_mode', 'lasagna')
+    if local_mode == remote_mode:
+        return local_mode, None
+    if local_mode == base_mode:
+        return remote_mode, None
+    if remote_mode == base_mode:
+        return local_mode, None
+    return None, ("optimization_mode changed differently on both sides "
+                  f"({local_mode!r} vs {remote_mode!r})")
 
 
 def _branches_of(doc):
@@ -824,7 +1018,35 @@ def merge_fibers(base, local, remote):
     stats = dict(branch_stats)
     reoptimize = False
 
-    if geometry_same:
+    if base.get('version', 1) == 3:
+        span_geometry, span_conflicts = merge_v3_span_geometry(
+            base, local, remote)
+        if span_conflicts:
+            result['conflicts'] = span_conflicts
+            return result
+        mode, mode_conflict = merge_v3_optimization_mode(base, local, remote)
+        if mode_conflict:
+            result['conflicts'] = [mode_conflict]
+            return result
+        carrier = span_geometry
+        local_runs = sum(owner == 'local' for owner in span_geometry['owners'])
+        remote_runs = sum(owner == 'remote' for owner in span_geometry['owners'])
+        both_runs = sum(owner == 'both' for owner in span_geometry['owners'])
+        stats['span_runs_local'] = local_runs
+        stats['span_runs_remote'] = remote_runs
+        stats['span_runs_both'] = both_runs
+        stats['geometry_merged'] = bool(local_runs and remote_runs)
+        if local_runs and remote_runs:
+            notes.append("merged separated version-3 span runs without "
+                         "reoptimizing or replacing their descriptors")
+        if not (_seq_eq(carrier['control_points'], newer['control_points']) and
+                _seq_eq(carrier['line_points'], newer['line_points'])):
+            merged_branches, anchor_conflict = _rebind_local_anchors(
+                merged_branches, carrier['control_points'], carrier['line_points'])
+            if anchor_conflict:
+                result['conflicts'] = [anchor_conflict]
+                return result
+    elif geometry_same:
         # The incident case: divergent link/metadata edits over identical
         # geometry. Every entry was VC3D-written against this geometry, so
         # no re-anchoring is needed.
@@ -905,6 +1127,8 @@ def merge_fibers(base, local, remote):
     merged = copy.deepcopy(newer)
     merged['control_points'] = copy.deepcopy(carrier['control_points'])
     merged['line_points'] = copy.deepcopy(carrier['line_points'])
+    if base.get('version', 1) == 3:
+        merged['optimization_mode'] = mode
     if 'hv_classification' in carrier:
         merged['hv_classification'] = copy.deepcopy(carrier['hv_classification'])
     elif not geometry_same and 'hv_classification' in merged:
@@ -1105,6 +1329,10 @@ def summarize(result):
         parts.append("control points: %d local + %d remote region(s)" %
                      (stats.get('cp_regions_local', 0),
                       stats.get('cp_regions_remote', 0)))
+    if stats.get('span_runs_local') or stats.get('span_runs_remote'):
+        parts.append("v3 span runs: %d local + %d remote" %
+                     (stats.get('span_runs_local', 0),
+                      stats.get('span_runs_remote', 0)))
     added = stats.get('links_added_local', 0) + stats.get('links_added_remote', 0)
     if added:
         parts.append(f"links +{added}")

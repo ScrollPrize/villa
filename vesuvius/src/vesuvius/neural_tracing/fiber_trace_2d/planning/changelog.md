@@ -1,5 +1,9 @@
 # 2026-07-31
 
+- Made fiber-aware sync merge version-3 dense span geometry and CP-owned
+  descriptors atomically, preserve separated local/remote edits across an
+  unchanged span, merge the global mode base-aware, and route every adjacent,
+  overlapping, or unalignable result to the existing manual conflict workflow.
 - Persisted the actual Lasagna and fiber-inference manifest identities consulted
   per interpolation span, using public manifest URLs instead of local cache
   paths for open-data catalogue Lasagna.

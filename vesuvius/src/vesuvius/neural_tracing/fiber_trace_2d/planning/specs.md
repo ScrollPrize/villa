@@ -1088,6 +1088,18 @@
   owner's goal on the merged span. Unaffected spans remain protected. Overlay
   refresh and reload must repopulate status directly from the persisted
   descriptors.
+- Fiber-aware sync treats each version-3 CP-to-CP dense line slice and its
+  CP-owned descriptor as one atomic three-way-merge value. A one-sided change
+  is retained verbatim; identical two-sided changes are accepted. Different
+  changes to the same run are conflicts. Local-only and remote-only changed
+  runs may coexist only when at least one complete base span between them is
+  unchanged on both sides. Adjacent changes, overlapping CP topology edits,
+  missing ordered CP/line anchors, or inexact selected-run joins are manual
+  conflicts. Sync must never select a segment from the higher generation,
+  combine descriptor fields from different results, or replace version-3
+  geometry with a CP-only placeholder. `optimization_mode` is merged
+  base-aware: an isolated change wins, equal changes converge, and different
+  two-sided changes conflict. Version-1/version-2 merge behavior is unchanged.
 - Each VC3D fiber has a persisted top-level `optimization_mode`: `lasagna` or
   `native_fiber_trace3d`. Missing mode metadata on existing version-1/version-2
   files defaults to `lasagna`; unknown values are errors. The mode is the
