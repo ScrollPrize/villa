@@ -100,7 +100,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Hraun](https://github.com/SuperOptimizer/Hraun) is a collection of python tools for handling volumetric scroll data by Forrest McDonald.
 
-- [windcheck](https://github.com/joe-carr-data/windcheck) by Josep Carreras. Deterministic self-intersection validator for traced surfaces: finds where a published mesh passes through itself and reports how far apart the two overlapping parts lie along the trace, in each segment's own revolution units. Mesh geometry alone — no labels, no model, no GPU, no volume download. Audited all 179 published segments of five scrolls (228M triangles; 160 self-intersect); the revolution estimate is checked against Scroll 1's published winding counts (31/33 within 20%, median ratio 0.999) and the predicate against FCL in both directions. Emits a per-trace certificate plus a VC3D PointCollections overlay; precomputed results for every segment ship in the repo, and the corpus reproduces from 1.55 GB of hash-pinned inputs in about 90 seconds. Crossings are reported as geometric findings, not proven tracing errors.
+- [windcheck](https://github.com/joe-carr-data/windcheck) by Josep Carreras. Finds where a traced surface passes through itself, from mesh geometry alone, and emits transverse-clean `tifxyz` outputs plus a VC3D overlay.
 
 - [Scroll compression and masking](https://github.com/OliverDaubney/vesuvius_basic_compression) by Olivier Daubney. Script to compress and mask scroll data, greatly reducing storage requirements!
 
