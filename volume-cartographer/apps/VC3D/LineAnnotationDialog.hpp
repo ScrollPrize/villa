@@ -276,11 +276,16 @@ private:
                                      QuadSurface* surface,
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
-    // Fixed top strip: fit-to-width zoom + auto height, recomputed on resize.
-    void updateFixedStripGeometry();
+    // Pushes line length, control dots, and the current-position marker to the
+    // schematic overview bar.
+    void updateOverviewBar();
+    // Ctrl+right-click on an overview-bar control point: synthesize the matching
+    // bottom-strip scene point and route through its context-menu signal so the
+    // controller-supplied menu behaves exactly like an in-viewer click.
+    void forwardOverviewControlContextMenu(double linePosition, QPoint globalPos);
     // "R": one-shot jump of the other panes to the cursor's line position on the
-    // fixed top strip (works regardless of follow mode; leaves it unchanged).
-    void snapPanesToFixedStripCursor();
+    // overview bar (works regardless of follow mode; leaves it unchanged).
+    void snapPanesToOverviewCursor();
     // Pause badge on the bottom strip while mouse-follow is toggled off (Space).
     void updatePauseIndicator();
     // "optimized"/"not optimized" badge in the bottom strip's top-right corner.
@@ -338,9 +343,9 @@ private:
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     QPointer<CChunkedVolumeViewer> _sideCutViewer;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
-    // _stripViewers[0], shown as a fixed-height, non-interactive panel above the
-    // cut views instead of inside the strip splitter.
-    QPointer<CChunkedVolumeViewer> _fixedStripViewer;
+    // Schematic fixed-height bar above the cut views: a straight line with the
+    // control points (LineAnnotationOverviewBar, file-local in the .cpp).
+    QPointer<QWidget> _overviewBar;
     QPointer<QLabel> _pauseIndicator;
     GeneratedViews _generatedViews;
     // Double-precision copy of _generatedViews.linePoints, built once when views are

@@ -7,7 +7,6 @@
 #include "LineAnnotationShiftScroll.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
-#include "elements/ViewerStatsBar.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -19,6 +18,8 @@
 #include <QFont>
 #include <QMenu>
 #include <QMouseEvent>
+#include <QPaintEvent>
+#include <QPainter>
 #include <QGraphicsPathItem>
 #include <QGraphicsRectItem>
 #include <QGraphicsSimpleTextItem>
@@ -287,6 +288,128 @@ cv::Vec3f normalizedOrNan(const cv::Vec3f& vector)
     }
     return vector * (1.0f / n);
 }
+
+constexpr int kOverviewBarHeightPx = 48;
+
+// Schematic overview of the annotation shown above the cut views: a straight
+// line with the control points, replacing the previous volume-rendered top
+// strip (no rendering at all). Fixed height; the annotation compresses
+// horizontally as it grows. Display-only except Ctrl+right-click on a control
+// point, which invokes controlContextRequested with the dot's line position.
+class LineAnnotationOverviewBar final : public QWidget
+{
+public:
+    struct ControlDot {
+        double linePosition = 0.0;
+        QColor color;
+        qreal radius = 4.5;
+    };
+
+    using QWidget::QWidget;
+
+    std::function<void(double, QPoint)> controlContextRequested;
+
+    void setLineData(size_t linePointCount, std::vector<ControlDot> dots)
+    {
+        _linePointCount = linePointCount;
+        _dots = std::move(dots);
+        update();
+    }
+
+    void setCurrentPosition(double position, const QColor& color)
+    {
+        _currentPosition = position;
+        _currentColor = color;
+        update();
+    }
+
+    std::optional<double> linePositionAtLocalX(qreal x) const
+    {
+        const qreal inner = innerWidth();
+        if (_linePointCount < 2 || inner <= 0.0) {
+            return std::nullopt;
+        }
+        const double t =
+            std::clamp((x - kMarginPx) / static_cast<double>(inner), 0.0, 1.0);
+        return t * static_cast<double>(_linePointCount - 1);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter painter(this);
+        painter.fillRect(rect(), Qt::black);
+        if (_linePointCount < 2) {
+            return;
+        }
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        const qreal midY = height() * 0.5;
+        painter.setPen(QPen(QColor(190, 190, 190), 2.0));
+        painter.drawLine(QPointF(kMarginPx, midY),
+                         QPointF(width() - kMarginPx, midY));
+
+        if (std::isfinite(_currentPosition)) {
+            painter.setPen(QPen(_currentColor, 2.0));
+            const qreal x = xForLinePosition(_currentPosition);
+            painter.drawLine(QPointF(x, 4.0), QPointF(x, height() - 4.0));
+        }
+
+        for (const ControlDot& dot : _dots) {
+            if (!std::isfinite(dot.linePosition)) {
+                continue;
+            }
+            const qreal x = xForLinePosition(dot.linePosition);
+            painter.setPen(QPen(dot.color.darker(150), 1.0));
+            painter.setBrush(dot.color);
+            painter.drawEllipse(QPointF(x, midY), dot.radius, dot.radius);
+        }
+    }
+
+    void mousePressEvent(QMouseEvent* event) override
+    {
+        if (event->button() == Qt::RightButton &&
+            event->modifiers().testFlag(Qt::ControlModifier) &&
+            controlContextRequested && _linePointCount >= 2) {
+            constexpr qreal kHitRadiusPx = 8.0;
+            const qreal x = event->position().x();
+            const ControlDot* best = nullptr;
+            qreal bestDistance = kHitRadiusPx;
+            for (const ControlDot& dot : _dots) {
+                if (!std::isfinite(dot.linePosition)) {
+                    continue;
+                }
+                const qreal distance =
+                    std::abs(xForLinePosition(dot.linePosition) - x);
+                if (distance <= bestDistance) {
+                    bestDistance = distance;
+                    best = &dot;
+                }
+            }
+            if (best) {
+                controlContextRequested(best->linePosition,
+                                        event->globalPosition().toPoint());
+            }
+        }
+        event->accept();  // display-only otherwise
+    }
+
+private:
+    static constexpr qreal kMarginPx = 8.0;
+
+    qreal innerWidth() const { return width() - 2.0 * kMarginPx; }
+
+    qreal xForLinePosition(double position) const
+    {
+        const double t = std::clamp(
+            position / static_cast<double>(_linePointCount - 1), 0.0, 1.0);
+        return kMarginPx + static_cast<qreal>(t) * innerWidth();
+    }
+
+    size_t _linePointCount = 0;
+    std::vector<ControlDot> _dots;
+    double _currentPosition = std::numeric_limits<double>::quiet_NaN();
+    QColor _currentColor{0, 245, 255};
+};
 
 } // namespace
 
@@ -837,7 +960,7 @@ bool LineAnnotationDialog::setGeneratedRows(
     // half-destroyed viewer (QPointers only clear once ~QObject runs).
     _panes.clear();
     _stripViewers.clear();
-    _fixedStripViewer = nullptr;
+    _overviewBar = nullptr;
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
     _sideCutViewer = nullptr;
@@ -1002,7 +1125,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     // previous behavior -- destroyed and recreated all four viewers, producing a
     // visible blank/jump on every placement.
     if (_hasGeneratedViews && _currentCutViewer && _sideCutViewer &&
-        _stripViewers.size() == 2 && _stripViewers[0] && _stripViewers[1] &&
+        _stripViewers.size() == 1 && _stripViewers[0] &&
         _generatedViews.currentCutName == views.currentCutName &&
         _generatedViews.sideCutName == views.sideCutName &&
         _generatedViews.lineSurfaceName == views.lineSurfaceName &&
@@ -1046,7 +1169,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         // (onSurfaceChanged does _scene->clear()), deleting the pooled overlay
         // items; drop our cached pointers so the rebuild recreates them.
         clearFastGeneratedOverlayItemRefs();
-        updateFixedStripGeometry();
         updatePauseIndicator();
         updateOptimizationStatusIndicator();
         rebuildGeneratedOverlays();
@@ -1111,10 +1233,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     // Drop all viewer references BEFORE deleting the widgets: destroying a
     // viewer synchronously delivers events (ChildRemoved/Hide/...) through our
     // eventFilter, which must not dereference a half-destroyed viewer via
-    // _fixedStripViewer/_stripViewers (QPointers only clear once ~QObject runs).
+    // _stripViewers/cut viewers (QPointers only clear once ~QObject runs).
     _panes.clear();
     _stripViewers.clear();
-    _fixedStripViewer = nullptr;
+    _overviewBar = nullptr;
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
     _sideCutViewer = nullptr;
@@ -1296,28 +1418,36 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedStripSplitter = stripSplitter;
     outerSplitter->addWidget(stripSplitter);
 
-    const std::pair<std::string, QString> stripSpecs[] = {
-        {views.lineSurfaceName, views.lineSurfaceTitle},
-        {views.lineSideSliceName, views.lineSideSliceTitle},
+    // Schematic overview bar between the button row and the cut views: a
+    // straight line with the control points, no volume rendering at all. Fixed
+    // height; the annotation compresses horizontally as it grows. Registered in
+    // _generatedContainers so the rebuild teardown deletes it like the splitter
+    // containers.
+    auto* overviewBar = new LineAnnotationOverviewBar(centralWidget());
+    overviewBar->setObjectName(QStringLiteral("lineAnnotationOverviewBar"));
+    overviewBar->setFixedHeight(kOverviewBarHeightPx);
+    overviewBar->controlContextRequested = [this](double linePosition,
+                                                  QPoint globalPos) {
+        forwardOverviewControlContextMenu(linePosition, globalPos);
     };
-    int stripIndex = 0;
-    for (const auto& [surfaceName, title] : stripSpecs) {
-        // Strip 0 (the line surface) is shown as a fixed, non-interactive panel
-        // above the cut views; strip 1 keeps its place in the bottom splitter.
-        const bool fixedStrip = stripIndex == 0;
+    _layout->insertWidget(1, overviewBar, 0);
+    _generatedContainers.push_back(overviewBar);
+    _overviewBar = overviewBar;
+
+    {
+        const std::string& surfaceName = views.lineSideSliceName;
         auto* base = _viewerManager->createViewerInWidget(
             surfaceName,
-            fixedStrip ? static_cast<QWidget*>(centralWidget())
-                       : static_cast<QWidget*>(stripSplitter),
+            stripSplitter,
             ViewerManager::ViewerRole::Annotation);
         auto* viewer = base ? qobject_cast<CChunkedVolumeViewer*>(base->asQObject()) : nullptr;
         if (!viewer) {
             return false;
         }
-        viewer->setObjectName(title);
-        const bool haveStripCamera = static_cast<size_t>(stripIndex) < stripCameras.size();
+        viewer->setObjectName(views.lineSideSliceTitle);
+        const bool haveStripCamera = !stripCameras.empty();
         auto stripCamera = haveStripCamera
-            ? stripCameras[static_cast<size_t>(stripIndex)]
+            ? stripCameras.front()
             : generatedPaneCamera(viewer, camera);
         if (!haveStripCamera) {
             if (const auto center =
@@ -1330,34 +1460,12 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     views.initialStripLinePositionRange)) {
                 stripCamera.scale = *focusedScale;
             }
-            if (static_cast<size_t>(stripIndex) < _savedStripZooms.size()) {
-                stripCamera.scale = _savedStripZooms[static_cast<size_t>(stripIndex)];
+            if (!_savedStripZooms.empty()) {
+                stripCamera.scale = _savedStripZooms.front();
             }
         }
         viewer->applyCameraState(stripCamera, false);
         bindPaneInteractions(surfaceName, viewer, false);
-        if (fixedStrip) {
-            // Full-width panel between the button row and the cut views. No
-            // mouse-follow or click connections; eventFilter() swallows all input
-            // except Ctrl+right-click, and updateFixedStripGeometry() (called once
-            // all views exist, and on resize) applies the fit-to-width zoom and
-            // fixed height. Registered in _generatedContainers so the rebuild
-            // teardown deletes it like the splitter containers.
-            _layout->insertWidget(1, viewer, 0);
-            _generatedContainers.push_back(viewer);
-            _fixedStripViewer = viewer;
-            if (auto* statsBar = viewer->findChild<ViewerStatsBar*>()) {
-                statsBar->hide();
-            }
-            if (auto* view = viewer->graphicsView()) {
-                view->setProperty("vc_hide_scalebar", true);
-            }
-            _stripViewers.push_back(viewer);
-            _panes.push_back(Pane{surfaceName, viewer, {}});
-            connectGeneratedOverlayRefresh(viewer);
-            ++stripIndex;
-            continue;
-        }
         connect(viewer,
                 &CChunkedVolumeViewer::sendMouseMoveVolume,
                 this,
@@ -1400,11 +1508,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _stripViewers.push_back(viewer);
         _panes.push_back(Pane{surfaceName, viewer, {}});
         connectGeneratedOverlayRefresh(viewer);
-        ++stripIndex;
     }
 
     stripSplitter->setStretchFactor(0, 1);
-    stripSplitter->setStretchFactor(1, 1);
     outerSplitter->setStretchFactor(0, 2);
     outerSplitter->setStretchFactor(1, 1);
 
@@ -1424,7 +1530,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         outerSplitter->setSizes({23, 7});
     }
 
-    updateFixedStripGeometry();
     updatePauseIndicator();
     updateOptimizationStatusIndicator();
     rebuildGeneratedOverlays();
@@ -1924,7 +2029,7 @@ void LineAnnotationDialog::updatePauseIndicator()
 {
     CChunkedVolumeViewer* bottomStrip = nullptr;
     for (const auto& stripViewer : _stripViewers) {
-        if (stripViewer && stripViewer != _fixedStripViewer) {
+        if (stripViewer) {
             bottomStrip = stripViewer;
             break;
         }
@@ -1957,7 +2062,7 @@ void LineAnnotationDialog::updateOptimizationStatusIndicator()
 {
     CChunkedVolumeViewer* bottomStrip = nullptr;
     for (const auto& stripViewer : _stripViewers) {
-        if (stripViewer && stripViewer != _fixedStripViewer) {
+        if (stripViewer) {
             bottomStrip = stripViewer;
             break;
         }
@@ -2069,7 +2174,7 @@ void LineAnnotationDialog::installGeneratedViewShortcuts()
     bindRotationShortcut(Qt::Key_A, GeneratedCutRotationAxis::Vertical, -kCurrentCutRotationStepRadians);
     bindRotationShortcut(Qt::Key_D, GeneratedCutRotationAxis::Vertical, kCurrentCutRotationStepRadians);
     bindNavigationShortcut(Qt::Key_E, &LineAnnotationDialog::jumpToPreviousControlPoint);
-    bindNavigationShortcut(Qt::Key_R, &LineAnnotationDialog::snapPanesToFixedStripCursor);
+    bindNavigationShortcut(Qt::Key_R, &LineAnnotationDialog::snapPanesToOverviewCursor);
     bindNavigationShortcut(Qt::Key_T, &LineAnnotationDialog::jumpToNextControlPoint);
 
     auto* spaceShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
@@ -2150,9 +2255,7 @@ void LineAnnotationDialog::restoreInitialGeneratedViewerCameras()
         _sideCutViewer->applyCameraState(_initialSideCutCamera, false);
     }
     for (size_t i = 0; i < _stripViewers.size() && i < _initialStripCameras.size(); ++i) {
-        // The fixed top strip's camera is owned by updateFixedStripGeometry();
-        // restoring a stale capture here could shrink it.
-        if (_stripViewers[i] && _stripViewers[i] != _fixedStripViewer) {
+        if (_stripViewers[i]) {
             _stripViewers[i]->applyCameraState(_initialStripCameras[i], false);
         }
     }
@@ -2187,7 +2290,6 @@ void LineAnnotationDialog::resetGeneratedViews()
         }
     }
     restoreInitialGeneratedViewerCameras();
-    updateFixedStripGeometry();
     // _currentCutFollowsStripMouse was reset by direct assignment above; keep the
     // pause badge in sync.
     updatePauseIndicator();
@@ -2251,12 +2353,9 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         if (!viewer) {
             continue;
         }
-        const std::string key = i == 0 ? _generatedViews.lineSurfaceName
-                                       : _generatedViews.lineSideSliceName;
+        const std::string key = _generatedViews.lineSideSliceName;
         GeneratedOverlay strip = staticStripOverlay();
-        if (i == 1) {
-            strip.fiberIntersections = _generatedViews.fiberIntersections;
-        }
+        strip.fiberIntersections = _generatedViews.fiberIntersections;
         applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
     }
 
@@ -2277,6 +2376,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     if (_closing || !_hasGeneratedViews) {
         return;
     }
+
+    // The schematic overview bar tracks the same inputs (control points +
+    // current position) as the dynamic overlays; refresh it on the same cadence.
+    updateOverviewBar();
 
     const auto markerColorForState =
         [](vc3d::line_annotation::GeneratedCurrentLineMarkerState state) {
@@ -2302,10 +2405,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             _fastStripOverlayItems.resize(index + 1);
         }
         auto& entry = _fastStripOverlayItems[index];
-        // No span-alignment labels on the fixed top strip (kept text-free).
-        const size_t spanLabelCount = viewer == _fixedStripViewer
-            ? 0
-            : _generatedViews.spanAlignmentMetrics.size();
+        const size_t spanLabelCount = _generatedViews.spanAlignmentMetrics.size();
         const bool recreate = entry.viewer != viewer ||
                               entry.surfaceName != surfaceName ||
                               !entry.currentLine ||
@@ -2365,8 +2465,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         if (!viewer) {
             continue;
         }
-        const std::string key = i == 0 ? _generatedViews.lineSurfaceName
-                                       : _generatedViews.lineSideSliceName;
+        const std::string key = _generatedViews.lineSideSliceName;
         auto* entry = ensureStripItems(i, viewer, key);
         auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
         if (!entry || !quad) {
@@ -3037,7 +3136,6 @@ void LineAnnotationDialog::resizeEvent(QResizeEvent* event)
     QMainWindow::resizeEvent(event);
     updateOptimizationOverlayGeometry();
     updateFiberNameLabel();
-    updateFixedStripGeometry();
 }
 
 bool LineAnnotationDialog::toggleCurrentCutFollowFromKeyboard()
@@ -3084,39 +3182,6 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
 
 bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
-    // The fixed top strip is display-only: swallow every mouse/wheel interaction
-    // except the Ctrl+right-click context menu (line position snapping is handled
-    // by the "R" shortcut instead of mouse-follow). Check the event type BEFORE
-    // touching the viewer: widget destruction delivers events (ChildRemoved,
-    // Hide, ...) through this filter while the viewer is half-destroyed, and
-    // calling into it then crashes; input events can't arrive at that point.
-    switch (event->type()) {
-    case QEvent::Wheel:
-    case QEvent::MouseMove:
-    case QEvent::MouseButtonDblClick:
-    case QEvent::MouseButtonPress:
-    case QEvent::MouseButtonRelease:
-        if (_fixedStripViewer) {
-            auto* view = _fixedStripViewer->graphicsView();
-            if (view && (watched == view || watched == view->viewport())) {
-                if (event->type() == QEvent::MouseButtonPress ||
-                    event->type() == QEvent::MouseButtonRelease) {
-                    auto* mouseEvent = static_cast<QMouseEvent*>(event);
-                    const bool contextClick =
-                        mouseEvent->button() == Qt::RightButton &&
-                        mouseEvent->modifiers().testFlag(Qt::ControlModifier);
-                    if (!contextClick) {
-                        return true;
-                    }
-                } else {
-                    return true;
-                }
-            }
-        }
-        break;
-    default:
-        break;
-    }
     if (watched == _fiberNameLabel && event->type() == QEvent::Resize) {
         updateFiberNameLabel();
     }
@@ -3138,81 +3203,102 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
     return QMainWindow::eventFilter(watched, event);
 }
 
-void LineAnnotationDialog::updateFixedStripGeometry()
+void LineAnnotationDialog::updateOverviewBar()
 {
-    if (!_fixedStripViewer || !_hasGeneratedViews) {
+    auto* bar = static_cast<LineAnnotationOverviewBar*>(_overviewBar.data());
+    if (!bar || !_hasGeneratedViews) {
         return;
     }
-    auto* quad = dynamic_cast<QuadSurface*>(_fixedStripViewer->currentSurface());
-    if (!quad) {
-        return;
-    }
-    const cv::Size size = quad->size();
-    if (size.width <= 0 || size.height <= 0) {
-        return;
-    }
-    auto* content = centralWidget();
-    const int panelWidth = content ? content->width() : width();
-    constexpr int kFixedStripMarginPx = 8;
-    // Height cap: never zoom in beyond what a reference-length (in vx) annotation
-    // gets at fit-to-width. The strip has one column per line sample, so convert
-    // the vx reference into columns via the line-point spacing. Shorter annotations
-    // render narrower than the panel and stay horizontally centered (surfacePtr
-    // 0,0) with wider side margins.
-    constexpr double kFixedStripReferenceLengthVx = 20000.0;
-    float referenceCols = static_cast<float>(size.width);
-    const double spacingVx =
-        vc3d::line_annotation::medianGeneratedLinePointSpacing(_generatedViews.linePoints);
-    if (std::isfinite(spacingVx) && spacingVx > 1.0e-6) {
-        referenceCols = static_cast<float>(kFixedStripReferenceLengthVx / spacingVx);
-    }
-    const float innerWidth =
-        static_cast<float>(std::max(1, panelWidth - 2 * kFixedStripMarginPx));
-    const float zoom = std::clamp(
-        innerWidth / std::max(static_cast<float>(size.width), referenceCols),
-        0.002f,
-        16.0f);
-    const int panelHeight =
-        static_cast<int>(std::lround(static_cast<double>(size.height) * zoom)) +
-        2 * kFixedStripMarginPx;
-    _fixedStripViewer->setFixedHeight(panelHeight);
 
-    CChunkedVolumeViewer::CameraState camera = _fixedStripViewer->cameraState();
-    camera.surfacePtrX = 0.0f;
-    camera.surfacePtrY = 0.0f;
-    camera.zOffset = 0.0f;
-    camera.zOffsetWorldDir = {0, 0, 0};
-    camera.scale = zoom;
-    _fixedStripViewer->applyCameraState(camera, false);
+    std::vector<LineAnnotationOverviewBar::ControlDot> dots;
+    dots.reserve(_generatedViews.controlPoints.size());
+    for (const auto& control : _generatedViews.controlPoints) {
+        if (!std::isfinite(control.linePosition)) {
+            continue;
+        }
+        LineAnnotationOverviewBar::ControlDot dot;
+        dot.linePosition = control.linePosition;
+        // Same state palette as the cut-view overlays.
+        if (control.isLinkCandidate) {
+            dot.color = QColor(60, 235, 120);
+        } else if (control.hasPendingLinks) {
+            dot.color = QColor(80, 150, 255);
+        } else if (control.hasBranches) {
+            dot.color = QColor(210, 95, 255);
+        } else {
+            dot.color = QColor(255, 230, 0);
+        }
+        dot.radius = control.isSeed ? 6.0 : 4.5;
+        dots.push_back(dot);
+    }
+    bar->setLineData(_generatedViews.linePoints.size(), std::move(dots));
+
+    QColor markerColor(0, 245, 255);
+    switch (currentLineMarkerState()) {
+    case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Allowed:
+        markerColor = QColor(40, 220, 120);
+        break;
+    case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked:
+        markerColor = QColor(255, 70, 70);
+        break;
+    default:
+        break;
+    }
+    bar->setCurrentPosition(_currentLinePosition, markerColor);
 }
 
-void LineAnnotationDialog::snapPanesToFixedStripCursor()
+void LineAnnotationDialog::forwardOverviewControlContextMenu(double linePosition,
+                                                             QPoint globalPos)
 {
-    if (!_hasGeneratedViews || !_fixedStripViewer) {
+    if (!_hasGeneratedViews || _stripViewers.empty()) {
         return;
     }
-    auto* view = _fixedStripViewer->graphicsView();
-    auto* viewport = view ? view->viewport() : nullptr;
-    if (!viewport) {
+    CChunkedVolumeViewer* strip = _stripViewers.front().data();
+    auto* quad = strip ? dynamic_cast<QuadSurface*>(strip->currentSurface()) : nullptr;
+    auto* view = strip ? strip->graphicsView() : nullptr;
+    if (!quad || !view) {
         return;
     }
-    const QPoint viewportPos = viewport->mapFromGlobal(QCursor::pos());
-    if (!viewport->rect().contains(viewportPos)) {
+    const QPointF scenePoint = stripLinePositionToScene(strip, quad, linePosition);
+    if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
         return;
     }
-    const double position =
-        linePositionFromStripScene(_fixedStripViewer, view->mapToScene(viewportPos));
-    if (!std::isfinite(position)) {
+    // Emit the strip view's own context-menu signal: CWindow routes it through
+    // the controller, which supplies link-candidate state and shows the same
+    // menu an in-viewer Ctrl+right-click would. The synthesized scene point
+    // round-trips to the clicked control point's line position, and the menu
+    // pops at the overview-bar cursor via globalPos.
+    QMetaObject::invokeMethod(
+        view,
+        "sendAnnotationContextMenuRequested",
+        Qt::DirectConnection,
+        Q_ARG(QPointF, scenePoint),
+        Q_ARG(QPoint, globalPos),
+        Q_ARG(Qt::KeyboardModifiers, Qt::KeyboardModifiers(Qt::ControlModifier)));
+}
+
+void LineAnnotationDialog::snapPanesToOverviewCursor()
+{
+    auto* bar = static_cast<LineAnnotationOverviewBar*>(_overviewBar.data());
+    if (!_hasGeneratedViews || !bar) {
         return;
     }
-    setCurrentLinePosition(position);
+    const QPoint localPos = bar->mapFromGlobal(QCursor::pos());
+    if (!bar->rect().contains(localPos)) {
+        return;
+    }
+    const auto position = bar->linePositionAtLocalX(localPos.x());
+    if (!position) {
+        return;
+    }
+    setCurrentLinePosition(*position);
     // Recenter the bottom strip on the snapped position (keeping its zoom), so the
     // current-position marker can't end up outside a zoomed-in viewport.
     for (const auto& stripViewer : _stripViewers) {
-        if (!stripViewer || stripViewer == _fixedStripViewer) {
+        if (!stripViewer) {
             continue;
         }
-        if (const auto center = generatedStripSurfaceCenter(stripViewer, position)) {
+        if (const auto center = generatedStripSurfaceCenter(stripViewer, *position)) {
             CChunkedVolumeViewer::CameraState camera = stripViewer->cameraState();
             camera.surfacePtrX = (*center)[0];
             camera.surfacePtrY = (*center)[1];
