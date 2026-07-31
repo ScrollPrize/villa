@@ -961,6 +961,9 @@ bool LineAnnotationDialog::setGeneratedRows(
     _panes.clear();
     _stripViewers.clear();
     _overviewBar = nullptr;
+    _currentCutOverlaySwapPending = false;
+    _sideCutOverlaySwapPending = false;
+    _stripOverlaySwapPending = false;
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
     _sideCutViewer = nullptr;
@@ -1130,6 +1133,15 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _generatedViews.sideCutName == views.sideCutName &&
         _generatedViews.lineSurfaceName == views.lineSurfaceName &&
         _generatedViews.lineSideSliceName == views.lineSideSliceName) {
+        // Snapshot the on-screen view data: each pane keeps drawing its overlays
+        // from this until it adopts a rendered frame of the re-optimized
+        // surfaces (hooks below), so overlays and image update together.
+        _heldGeneratedViews = _generatedViews;
+        _heldControlIndex = _generatedControlIndex;
+        _currentCutOverlaySwapPending = true;
+        _sideCutOverlaySwapPending = true;
+        _stripOverlaySwapPending = true;
+
         const double previousLinePosition = _currentLinePosition;
         _generatedViews = views;
         _linePointsd.clear();
@@ -1169,6 +1181,36 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         // (onSurfaceChanged does _scene->clear()), deleting the pooled overlay
         // items; drop our cached pointers so the rebuild recreates them.
         clearFastGeneratedOverlayItemRefs();
+        // One-shot per pane: swap that pane to the new overlays only once it
+        // has adopted a rendered frame (renderFrameCompleted fires exactly at
+        // frame adoption); until then rebuilds draw from the held views.
+        const auto hookOverlaySwap = [this](CChunkedVolumeViewer* viewer,
+                                            bool LineAnnotationDialog::*pendingFlag) {
+            if (!viewer) {
+                this->*pendingFlag = false;
+                return;
+            }
+            auto connection = std::make_shared<QMetaObject::Connection>();
+            *connection = connect(
+                viewer,
+                &CChunkedVolumeViewer::renderFrameCompleted,
+                this,
+                [this, connection, pendingFlag](std::uint64_t, double) {
+                    QObject::disconnect(*connection);
+                    if (_closing) {
+                        return;
+                    }
+                    this->*pendingFlag = false;
+                    rebuildGeneratedStaticStripOverlays();
+                    rebuildGeneratedDynamicOverlays();
+                });
+        };
+        hookOverlaySwap(_currentCutViewer.data(),
+                        &LineAnnotationDialog::_currentCutOverlaySwapPending);
+        hookOverlaySwap(_sideCutViewer.data(),
+                        &LineAnnotationDialog::_sideCutOverlaySwapPending);
+        hookOverlaySwap(_stripViewers.front().data(),
+                        &LineAnnotationDialog::_stripOverlaySwapPending);
         updatePauseIndicator();
         updateOptimizationStatusIndicator();
         rebuildGeneratedOverlays();
@@ -1237,6 +1279,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _panes.clear();
     _stripViewers.clear();
     _overviewBar = nullptr;
+    _currentCutOverlaySwapPending = false;
+    _sideCutOverlaySwapPending = false;
+    _stripOverlaySwapPending = false;
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
     _sideCutViewer = nullptr;
@@ -2325,18 +2370,21 @@ LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::staticStripOverlay(
     return vc3d::line_annotation::makeGeneratedStaticStripOverlay(_generatedViews);
 }
 
-LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::zSliceOverlay(double linePosition,
-                                                                           bool emphasized,
-                                                                           CChunkedVolumeViewer* viewer,
-                                                                           PlaneSurface* plane) const
+LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::zSliceOverlay(
+    const GeneratedViews& views,
+    const vc3d::line_annotation::GeneratedControlPointLinePositionIndex& controlIndex,
+    double linePosition,
+    bool emphasized,
+    CChunkedVolumeViewer* viewer,
+    PlaneSurface* plane) const
 {
     (void)emphasized;
     return vc3d::line_annotation::makeGeneratedCrossSliceControlOverlayForPlane(
-        _generatedViews,
+        views,
         linePosition,
         viewer,
         plane,
-        &_generatedControlIndex);
+        &controlIndex);
 }
 
 void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
@@ -2354,8 +2402,13 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
             continue;
         }
         const std::string key = _generatedViews.lineSideSliceName;
-        GeneratedOverlay strip = staticStripOverlay();
-        strip.fiberIntersections = _generatedViews.fiberIntersections;
+        // While an in-place update waits for the strip's first re-optimized
+        // frame, keep drawing the pre-update overlay.
+        const GeneratedViews& stripViews =
+            _stripOverlaySwapPending ? _heldGeneratedViews : _generatedViews;
+        GeneratedOverlay strip =
+            vc3d::line_annotation::makeGeneratedStaticStripOverlay(stripViews);
+        strip.fiberIntersections = stripViews.fiberIntersections;
         applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
     }
 
@@ -2577,12 +2630,19 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     if (_sideCutViewer && _generatedViews.sideCutSurface) {
         // Draw the full line on the side view by projecting each line point onto the plane and
         // connecting consecutive points (linear interpolation), in addition to the current-position
-        // marker and nearby control points from the cross-slice overlay.
-        GeneratedOverlay sideOverlay = zSliceOverlay(_currentLinePosition,
+        // marker and nearby control points from the cross-slice overlay. During an in-place
+        // update, draw from the held pre-update views until this pane's new frame lands.
+        const GeneratedViews& sideViews =
+            _sideCutOverlaySwapPending ? _heldGeneratedViews : _generatedViews;
+        const auto& sideIndex =
+            _sideCutOverlaySwapPending ? _heldControlIndex : _generatedControlIndex;
+        GeneratedOverlay sideOverlay = zSliceOverlay(sideViews,
+                                                     sideIndex,
+                                                     _currentLinePosition,
                                                      true,
                                                      _sideCutViewer,
                                                      _generatedViews.sideCutSurface.get());
-        sideOverlay.linePoints = _generatedViews.linePoints;
+        sideOverlay.linePoints = sideViews.linePoints;
         // Highlight the live cursor position on the line. The cross-slice overlay's emphasized
         // marker otherwise sits at the static focus/seed point; override it to the current
         // position so the highlight tracks the cursor as it moves along the line.
@@ -2734,6 +2794,13 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     }
     _fastCurrentCutOverlayItems.centerPoint->setPath(centerPath);
 
+    // During an in-place update, draw from the held pre-update views until this
+    // pane's first re-optimized frame lands.
+    const GeneratedViews& cutViews =
+        _currentCutOverlaySwapPending ? _heldGeneratedViews : _generatedViews;
+    const auto& cutIndex =
+        _currentCutOverlaySwapPending ? _heldControlIndex : _generatedControlIndex;
+
     QPainterPath controlPath;
     QPainterPath seedPath;
     QPainterPath linkCandidatePath;
@@ -2743,9 +2810,9 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
     const double lower = _currentLinePosition - lineRadius;
     const double upper = _currentLinePosition + lineRadius;
-    const auto& indices = _generatedControlIndex.sortedControlIndices;
-    const auto positionForIndex = [this](size_t controlIndex) {
-        return _generatedViews.controlPoints[controlIndex].linePosition;
+    const auto& indices = cutIndex.sortedControlIndices;
+    const auto positionForIndex = [&cutViews](size_t controlIndex) {
+        return cutViews.controlPoints[controlIndex].linePosition;
     };
     const auto lowerIt = std::lower_bound(
         indices.begin(),
@@ -2756,10 +2823,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         });
     for (auto it = lowerIt; it != indices.end(); ++it) {
         const size_t controlIndex = *it;
-        if (controlIndex >= _generatedViews.controlPoints.size()) {
+        if (controlIndex >= cutViews.controlPoints.size()) {
             continue;
         }
-        const auto& control = _generatedViews.controlPoints[controlIndex];
+        const auto& control = cutViews.controlPoints[controlIndex];
         if (!std::isfinite(control.linePosition)) {
             continue;
         }
@@ -2797,14 +2864,14 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath branchLinkFiberIntersectionPath;
     QPainterPath pendingBranchLinkFiberIntersectionPath;
     QPainterPath fiberIntersectionConnectorPath;
-    auto* currentCutPlane = _generatedViews.currentCutSurface.get();
+    auto* currentCutPlane = cutViews.currentCutSurface.get();
     const std::optional<float> intersectionThreshold =
-        (currentCutPlane && !_generatedViews.fiberIntersections.empty())
+        (currentCutPlane && !cutViews.fiberIntersections.empty())
             ? vc3d::line_annotation::generatedCrossSliceControlPointDistanceThreshold(viewer)
             : std::nullopt;
     if (intersectionThreshold) {
         constexpr qreal kIntersectionArm = 7.5;
-        for (const auto& intersection : _generatedViews.fiberIntersections) {
+        for (const auto& intersection : cutViews.fiberIntersections) {
             if (!finitePoint(intersection.point)) {
                 continue;
             }

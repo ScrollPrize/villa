@@ -260,7 +260,9 @@ private:
     void clearControlPointContextPreview(const std::string& surfaceName,
                                          CChunkedVolumeViewer* viewer);
     GeneratedOverlay staticStripOverlay() const;
-    GeneratedOverlay zSliceOverlay(double linePosition,
+    GeneratedOverlay zSliceOverlay(const GeneratedViews& views,
+                                   const vc3d::line_annotation::GeneratedControlPointLinePositionIndex& controlIndex,
+                                   double linePosition,
                                    bool emphasized,
                                    CChunkedVolumeViewer* viewer,
                                    PlaneSurface* plane) const;
@@ -342,6 +344,15 @@ private:
     FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     QPointer<CChunkedVolumeViewer> _sideCutViewer;
+    // In-place updates: keep drawing each pane's overlays from the pre-update
+    // views until THAT pane adopts its first rendered frame of the re-optimized
+    // surfaces (renderFrameCompleted), so a newly placed control point appears
+    // together with the revised image instead of a beat earlier on the stale one.
+    GeneratedViews _heldGeneratedViews;
+    vc3d::line_annotation::GeneratedControlPointLinePositionIndex _heldControlIndex;
+    bool _currentCutOverlaySwapPending = false;
+    bool _sideCutOverlaySwapPending = false;
+    bool _stripOverlaySwapPending = false;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
     // Schematic fixed-height bar above the cut views: a straight line with the
     // control points (LineAnnotationOverviewBar, file-local in the .cpp).
