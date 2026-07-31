@@ -290,7 +290,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Vesuvius AutoResearch](https://github.com/mojomast/vesuvius-autoresearch) by mojomast. Autonomous, evidence-gated experiment search for Vesuvius ink-detection research, with reproducible configs, metric contracts, synthetic demo data, and promotion checks.
 
-- [ScrollGT](https://github.com/jonmarrs/scrollgt) by Jon Marrs. Registered human ground-truth evaluation for the open SOTA surface volumes. Bridges the 2023 hand labels onto the re-flattened geometry, scores predictions with a threshold-swept F1 plus an AP-prevalence-lift anti-gaming gate, and publishes held-out baselines (including its author's own near-chance results) so reading ability can be told apart from agreement with another model's output.
+- [ScrollGT](https://github.com/jonmarrs/scrollgt) by Jon Marrs. Human ground-truth evaluation with anti-gaming floors, over three target families: registered ink pixels on the open SOTA surface volumes (2023 hand labels bridged onto the re-flattened geometry, threshold-swept F1 plus an AP-prevalence-lift gate), PHerc 1667 column-level reading, and fiber connectivity on six hand-traced cubes (expected run length with a merge penalty; scoreable with no GPU, model, or network). Published baselines include its author's own near-chance ink results and its own fiber tracer losing to connected components, so reading ability can be told apart from agreement with another model's output.
 
 - [Vesuvius GP+](https://github.com/jaredlandau/Vesuvius-Grandprize-Winner-Plus) by Jared Landau. Updated version of the Grand Prize Ink Detection script with extra features.
   
