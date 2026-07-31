@@ -26,3 +26,4 @@
 - Show every visible span's metric and message below the strip. Keep a label in
   the viewport while any part of its span remains visible and resolve label
   collisions deterministically by pushing neighboring labels.
+- Prefix each span label with `C`, `L`, or `T` for its actual `interp_mode`.

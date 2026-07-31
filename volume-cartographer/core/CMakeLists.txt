@@ -158,6 +158,7 @@ add_library(vc_lasagna
     src/lasagna/LasagnaNormalSampler.cpp
     src/lasagna/LineViewBuilder.cpp
     src/lasagna/LineOptimizer.cpp
+    src/lasagna/LineSpline.cpp
     src/lasagna/Manifest.cpp
     src/lasagna/MaxflowGraph.cpp
     src/lasagna/ProjectVolumes.cpp

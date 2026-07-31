@@ -702,10 +702,13 @@ Ownership changed as follows:
   VC3D; generic volumes remain 3D-only.
 
   The VC3D line annotation GUI resolves the selected tagged fiber entry and
-  exposes a Ctrl-right-click generated-line action, "Optimize segment with
-  native fiber tracer", for a CP-to-CP span. The task runs through the existing
-  line-optimization busy state, so line edits are blocked while it runs. Fiber
-  lines remain stored in base coordinates. The GUI derives the sd2 trace scale
+  exposes a checked Ctrl-right-click `Interpolation goal` submenu for each
+  CP-to-CP span. `Global`, `Cubic spline`, `Lasagna`, and `Fiber trace` all
+  route through the grouped coordinator in
+  `apps/VC3D/LineAnnotationFiberSegments.cpp`; the earlier one-span
+  trace/revert worker is removed. The task uses the existing line-optimization
+  busy state, so line edits are blocked while it runs. Fiber lines remain
+  stored in base coordinates. For trace spans, the GUI derives the sd2 scale
   from the prediction manifest, divides the base line into trace coordinates,
   opens both prediction and regular-normal samplers at that trace scale, and
   runs the native tracer there. Accepted points are multiplied back to base
@@ -717,47 +720,42 @@ Ownership changed as follows:
   positive base voxel size adds micrometer diagnostics, but is not required for
   tracing and does not affect acceptance.
 
-  Native attempts are persisted in `vc3d_fiber` version 2. Each
-  `control_points` entry is an object containing `position` and optional
-  `segment_to_next`; the starting CP owns the following span's explicit
-  `accepted_native` or `lasagna_fallback` outcome, provenance, effective
-  configuration, and outcome-specific diagnostics. Accepted outcomes store
-  meeting error/ratio/source and protect geometry. Fallback outcomes store only
-  failure code/detail because the rejected native path is discarded; readers
-  ignore meeting fields from earlier fallback records and writers clear them.
-  Fallback outcomes remain available for strip display and are replaced on
-  retry. The final CP cannot own a following segment. VC3D's
-  live and stored CP types keep this metadata attached to the
-  CP while explicit geometry-only adapters feed atlas, slice, and optimizer
-  APIs. Version-1 point arrays load as ordinary unprotected CPs. The shared
-  Python fiber parser, native metric reader, Lasagna probe, and sync/merge
-  validator also parse version 2 strictly.
+  `vc3d_fiber` version 3 persists a general descriptor in each non-final CP's
+  `segment_to_next`. `interp_goal` records `global`/`cspline`/`lasagna`/`trace`;
+  `interp_mode` records the actual `cspline`/`lasagna`/`trace` producer.
+  Mode-dependent `metric`, compact `msg`, trace diagnostics, and Lasagna
+  fallback detail live in the same CP-owned object. Version-1 arrays and
+  version-2 native outcomes are promoted on load; all new saves write version
+  3. The C++ strict readers, Python loader, Lasagna probe, Atlas reader, and
+  merge validator accept all three versions and strictly validate v3 enums and
+  mode-specific fields.
 
-  Lasagna existing-line optimization receives protected dense sample ranges,
-  and full reinitialization directly reuses protected stored spans before its
-  final protected global solve. CP moves invalidate their incoming and
-  outgoing records; insertion/deletion invalidate only changed adjacency.
-  Successful native traces are marked finalized before auto-save. Accepted
-  spans display their persisted meeting error in base voxels below the strip;
-  fallback spans display a compact stable failure reason, with full detail in
-  the tooltip. Branch/control overlay refreshes replace those labels from the
-  current CP metadata immediately, so reoptimization cannot clear the display.
-  Ordinary same-mode Reoptimize preserves accepted records and protected
-  geometry; explicit Lasagna mode transition and successful per-span revert
-  remain the clearing operations. On a traced
-  span, the same Ctrl-right-click menu instead offers `Revert segment to
-  Lasagna optimization`; the worker removes only that span's protection and
-  commits its Lasagna result and metadata removal transactionally.
+  Goal resolution retries from policy each time: trace falls through to
+  Lasagna and then cubic spline; Lasagna falls through to cubic spline. Global
+  spans shorter than 100 base voxels choose cubic spline directly, while
+  explicit goals bypass the shortcut. Trace is attempted independently per
+  span. The coordinator invokes the existing shared Lasagna full
+  reinitializer; its per-span failure index demotes only that span, then the
+  coordinator retries with the new spline run protected. The final Ceres pass
+  protects actual trace/cubic geometry and untouched manual spans.
 
-  The toolbar also exposes a fiber-global `Lasagna`/`Fiber model` mode and an
-  explicit base-voxel extrapolation distance. `optimization_mode` is stored on
-  the fiber; `segment_to_next` remains the outcome/provenance for one
-  interpolation span. Switching mode runs a full background rebuild, including
-  both tails when the new fiber still has only its seed CP. Changing the
-  distance immediately rebuilds the tails when Auto-reoptimize is active.
-  Fiber mode independently traces every required CP span, stitches successes, and
-  sends failures through one shared Lasagna reinitialization with successes
-  protected. Before reinitialization, `LineAnnotationFiberSegments.cpp` derives
+  `core/include/vc/lasagna/LineSpline.hpp` and
+  `core/src/lasagna/LineSpline.cpp` provide the shared normal-independent cubic
+  interpolator. A maximal cubic run is solved together using exact CPs, shared
+  internal tangents, optional hard boundary directions from neighboring dense
+  geometry, bounded handles, deterministic forward/deviation checks, and base
+  spacing resampling. CP movement/insertion/deletion marks adjacent spans dirty;
+  cubic dirty regions expand through their connected run. Global-mode changes
+  initially select only global goals, preserving explicit spans as boundaries.
+
+  The toolbar still exposes fiber-global `Lasagna`/`Fiber model` mode and an
+  explicit base-voxel extrapolation distance. `optimization_mode` selects tail
+  behavior and resolves only `global` span goals. Switching it reoptimizes
+  global spans and rebuilds both tails, including one-seed fibers; explicit
+  segments remain fixed unless a changed boundary makes them part of the dirty
+  dependency region. Changing distance immediately rebuilds tails when
+  Auto-reoptimize is active. Before Lasagna reinitialization,
+  `LineAnnotationFiberSegments.cpp` derives
   each successful native span's two endpoint tangents from the CP and the first
   distinct dense point inward. Every Lasagna span or retained tail on the
   opposite side receives the negated tangent as a hard outgoing direction.
@@ -771,7 +769,13 @@ Ownership changed as follows:
   spans likewise replace generic same-span CP/chord candidates. Normal-plane
   transport resolves a degenerate projection with a deterministic perpendicular
   tangent rather than retaining a normal-parallel input. Ordinary edits reuse
-  unaffected traced spans and retrace only invalidated adjacency.
+  unaffected spans and reoptimize only invalidated adjacency.
+
+  Generated span labels come from the persisted descriptor. `T` shows meeting
+  error in base voxels, `L` shows maximum normal-alignment error in degrees,
+  and `C` has no metric; all modes may show `msg`. The dialog projects both
+  endpoints, keeps partially visible spans labeled, clamps labels into the
+  viewport, and deterministically packs them into one or two rows.
 
   Both open tails are first available from Lasagna reinitialization. Fiber mode
   then calls `traceFiberExtrapolation` over the shared one-way beam tracer in

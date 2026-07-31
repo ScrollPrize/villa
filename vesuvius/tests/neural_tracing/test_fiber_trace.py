@@ -210,6 +210,33 @@ def test_parse_vc3d_fiber_v2_segment_metadata():
     with pytest.raises(ValueError, match="final control point"):
         parse_vc3d_fiber(invalid)
 
+    v3_segment = {
+        key: value for key, value in segment.items() if key != "outcome"
+    }
+    v3_segment.update({
+        "metadata_version": 3,
+        "interp_goal": "global",
+        "interp_mode": "trace",
+        "metric": 2.5,
+        "msg": "trace",
+        "lasagna_failure_code": "",
+        "lasagna_failure_detail": "",
+    })
+    v3 = parse_vc3d_fiber({
+        "type": "vc3d_fiber",
+        "version": 3,
+        "optimization_mode": "native_fiber_trace3d",
+        "line_points": [[1, 2, 3], [4, 5, 6]],
+        "control_points": [
+            {"position": [1, 2, 3], "segment_to_next": v3_segment},
+            {"position": [4, 5, 6]},
+        ],
+    })
+    assert v3.control_point_segments[0] is not None
+    assert v3.control_point_segments[0].interp_goal == "global"
+    assert v3.control_point_segments[0].interp_mode == "trace"
+    assert v3.control_point_segments[0].metric == 2.5
+
 
 def test_tangent_uses_line_points_and_control_point_query():
     fiber = parse_vc3d_fiber(

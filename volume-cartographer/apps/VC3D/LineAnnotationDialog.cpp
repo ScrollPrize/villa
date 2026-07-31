@@ -46,6 +46,7 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <type_traits>
 
 namespace {
 
@@ -161,6 +162,8 @@ bool finitePoint(const cv::Vec3f& point)
 bool shouldShowSpanAlignmentMetric(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
+    if (metric.modeMarker == 'C' || metric.modeMarker == 'L' || metric.modeMarker == 'T')
+        return true;
     using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
     if (metric.kind == Kind::NativeMeetingError) {
         return std::isfinite(metric.meetingErrorBaseVoxels);
@@ -190,43 +193,34 @@ QString spanAlignmentMetricText(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
     using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
+    QString value;
     if (metric.kind == Kind::NativeMeetingError) {
-        if (!std::isfinite(metric.meetingErrorBaseVoxels))
-            return {};
-        return QObject::tr("%1 vx").arg(
-            QString::number(metric.meetingErrorBaseVoxels, 'f', 1));
+        if (std::isfinite(metric.meetingErrorBaseVoxels)) {
+            value = QObject::tr("%1 vx").arg(
+                QString::number(metric.meetingErrorBaseVoxels, 'f', 1));
+        }
+    } else if (metric.kind == Kind::Cspline) {
+        value.clear();
+    } else if (metric.available && std::isfinite(metric.maxErrorDegrees)) {
+        value = QStringLiteral("%1%2")
+            .arg(QString::number(std::llround(metric.maxErrorDegrees)))
+            .arg(QChar(0x00b0));
     }
-    if (metric.kind == Kind::NativeFailure) {
-        if (metric.failureCode == "meeting_error_threshold")
-            return QObject::tr("fiber gap");
-        if (metric.failureCode == "no_trace_plane_intersection")
-            return QObject::tr("fiber no meet");
-        if (metric.failureCode == "invalid_trace_path")
-            return QObject::tr("fiber invalid");
-        if (metric.failureCode == "fusion_failed")
-            return QObject::tr("fiber fusion fail");
-        if (metric.failureCode == "trace_exception")
-            return QObject::tr("fiber error");
-        return QString::fromStdString(metric.failureCode);
-    }
-    if (metric.pending) {
-        return QStringLiteral("...");
-    }
-    if (!metric.error.empty()) {
-        return QStringLiteral("err");
-    }
-    if (!metric.available || !std::isfinite(metric.maxErrorDegrees)) {
-        return {};
-    }
-    return QStringLiteral("%1%2")
-        .arg(QString::number(std::llround(metric.maxErrorDegrees)))
-        .arg(QChar(0x00b0));
+    QString firstLine(QChar(metric.modeMarker));
+    if (!value.isEmpty())
+        firstLine += QStringLiteral(" ") + value;
+    if (!metric.message.empty())
+        return firstLine + QStringLiteral("\n") + QString::fromStdString(metric.message);
+    return firstLine;
 }
 
 QString spanAlignmentMetricToolTip(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
     using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
+    const QString status = metric.message.empty()
+        ? QString{}
+        : QObject::tr("Status: %1. ").arg(QString::fromStdString(metric.message));
     if (metric.kind == Kind::NativeMeetingError) {
         if (!std::isfinite(metric.meetingErrorBaseVoxels))
             return {};
@@ -240,7 +234,7 @@ QString spanAlignmentMetricToolTip(
             tooltip += QObject::tr(". Source: %1")
                 .arg(QString::fromStdString(metric.meetingSource));
         }
-        return tooltip;
+        return status + tooltip;
     }
     if (metric.kind == Kind::NativeFailure) {
         QString tooltip = QObject::tr("Native fiber trace failed: %1")
@@ -253,19 +247,19 @@ QString spanAlignmentMetricToolTip(
             tooltip += QObject::tr(". Closest meeting: %1 base voxels")
                 .arg(QString::number(metric.meetingErrorBaseVoxels, 'f', 2));
         }
-        return tooltip;
+        return status + tooltip;
     }
     if (metric.pending) {
-        return QObject::tr("Sampling Lasagna normals.");
+        return status + QObject::tr("Sampling Lasagna normals.");
     }
     if (!metric.error.empty()) {
-        return QString::fromStdString(metric.error);
+        return status + QString::fromStdString(metric.error);
     }
     if (metric.available && std::isfinite(metric.maxErrorDegrees)) {
-        return QObject::tr("Max normal-alignment error: %1 degrees")
+        return status + QObject::tr("Max normal-alignment error: %1 degrees")
             .arg(QString::number(metric.maxErrorDegrees, 'f', 1));
     }
-    return {};
+    return status;
 }
 
 void installComboEventFilter(QComboBox* combo, QObject* filter)
@@ -1580,17 +1574,14 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                              branchControlPointIndex,
                                                              pending);
     };
-    options.traceFiberSegment = [this, surfaceName](size_t firstControlPointIndex,
-                                                    size_t secondControlPointIndex) {
-        emit generatedFiberTraceSegmentRequested(surfaceName,
-                                                 firstControlPointIndex,
-                                                 secondControlPointIndex);
-    };
-    options.revertFiberSegment = [this, surfaceName](size_t firstControlPointIndex,
-                                                     size_t secondControlPointIndex) {
-        emit generatedFiberTraceSegmentRevertRequested(surfaceName,
-                                                       firstControlPointIndex,
-                                                       secondControlPointIndex);
+    options.setSegmentInterpolationGoal =
+        [this, surfaceName](size_t firstControlPointIndex,
+                            size_t secondControlPointIndex,
+                            std::string goal) {
+        emit generatedSegmentInterpolationGoalRequested(surfaceName,
+                                                        firstControlPointIndex,
+                                                        secondControlPointIndex,
+                                                        goal);
     };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }
@@ -2393,6 +2384,17 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                       viewport &&
                                       viewport->width() > 0 &&
                                       viewport->height() > 0;
+            struct VisibleSpanLabel {
+                std::remove_reference_t<decltype(entry->spanLabels[0])>* items = nullptr;
+                const vc3d::line_annotation::GeneratedSpanAlignmentMetric* metric = nullptr;
+                double preferredLeft = 0.0;
+                double left = 0.0;
+                double width = 0.0;
+                double height = 0.0;
+                int row = 0;
+            };
+            std::vector<VisibleSpanLabel> visibleLabels;
+            const QRect viewportRect = haveViewport ? viewport->rect() : QRect{};
             for (size_t labelIndex = 0; labelIndex < entry->spanLabels.size(); ++labelIndex) {
                 auto& labelItems = entry->spanLabels[labelIndex];
                 auto* background = labelItems.background;
@@ -2410,26 +2412,32 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                 if (!shouldShowSpanAlignmentMetric(metric)) {
                     continue;
                 }
-                const auto centerLinePosition =
-                    vc3d::line_annotation::generatedSpanAlignmentMetricCenterLinePosition(metric);
-                if (!centerLinePosition) {
+                if (!std::isfinite(metric.firstControlLinePosition) ||
+                    !std::isfinite(metric.secondControlLinePosition)) {
                     continue;
                 }
-                const QPointF centerScenePoint =
+                const QPointF firstScenePoint =
                     vc3d::line_annotation::generatedStripLinePositionToScene(
                         viewer,
                         quad,
-                        *centerLinePosition);
-                if (!std::isfinite(centerScenePoint.x()) ||
-                    !std::isfinite(centerScenePoint.y())) {
+                        metric.firstControlLinePosition);
+                const QPointF secondScenePoint =
+                    vc3d::line_annotation::generatedStripLinePositionToScene(
+                        viewer,
+                        quad,
+                        metric.secondControlLinePosition);
+                if (!std::isfinite(firstScenePoint.x()) ||
+                    !std::isfinite(secondScenePoint.x())) {
                     continue;
                 }
-
-                const QRect viewportRect = viewport->rect();
-                const int labelViewportY =
-                    std::max(viewportRect.top(), viewportRect.bottom() - 18);
-                const QPointF labelYScene =
-                    view->mapToScene(QPoint(viewportRect.center().x(), labelViewportY));
+                const double firstX = view->mapFromScene(firstScenePoint).x();
+                const double secondX = view->mapFromScene(secondScenePoint).x();
+                const double visibleFirst = std::max<double>(
+                    viewportRect.left(), std::min(firstX, secondX));
+                const double visibleLast = std::min<double>(
+                    viewportRect.right(), std::max(firstX, secondX));
+                if (visibleLast < visibleFirst)
+                    continue;
                 const QString label = spanAlignmentMetricText(metric);
                 if (label.isEmpty()) {
                     continue;
@@ -2445,16 +2453,70 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                 text->setBrush(QBrush(textColor));
                 text->setToolTip(spanAlignmentMetricToolTip(metric));
                 const QRectF textRect = text->boundingRect();
-                const QPointF textPos(centerScenePoint.x() - textRect.width() * 0.5,
-                                      labelYScene.y() - textRect.height());
-                text->setPos(textPos);
-
                 background->setBrush(QBrush(backgroundColor));
                 background->setRect(textRect.adjusted(-4.0, -2.0, 4.0, 2.0));
-                background->setPos(textPos);
                 background->setToolTip(text->toolTip());
-                background->setVisible(true);
-                text->setVisible(true);
+                const double width = textRect.width() + 8.0;
+                const double preferredCenter = std::clamp(
+                    (firstX + secondX) * 0.5, visibleFirst, visibleLast);
+                visibleLabels.push_back({
+                    &labelItems,
+                    &metric,
+                    std::clamp(preferredCenter - width * 0.5,
+                               static_cast<double>(viewportRect.left()),
+                               std::max(static_cast<double>(viewportRect.left()),
+                                        static_cast<double>(viewportRect.right()) - width)),
+                    0.0,
+                    width,
+                    textRect.height() + 4.0,
+                    0});
+            }
+
+            constexpr double gap = 4.0;
+            double totalWidth = 0.0;
+            for (const auto& label : visibleLabels)
+                totalWidth += label.width;
+            if (!visibleLabels.empty())
+                totalWidth += gap * static_cast<double>(visibleLabels.size() - 1);
+            const bool twoRows = totalWidth > viewportRect.width();
+            if (twoRows) {
+                for (size_t i = 0; i < visibleLabels.size(); ++i)
+                    visibleLabels[i].row = static_cast<int>(i % 2);
+            }
+            for (int row = 0; row < (twoRows ? 2 : 1); ++row) {
+                std::vector<size_t> indices;
+                for (size_t i = 0; i < visibleLabels.size(); ++i) {
+                    if (visibleLabels[i].row == row)
+                        indices.push_back(i);
+                }
+                double next = viewportRect.left();
+                for (size_t index : indices) {
+                    auto& label = visibleLabels[index];
+                    label.left = std::max(label.preferredLeft, next);
+                    next = label.left + label.width + gap;
+                }
+                double right = viewportRect.right();
+                for (auto it = indices.rbegin(); it != indices.rend(); ++it) {
+                    auto& label = visibleLabels[*it];
+                    label.left = std::min(label.left, right - label.width);
+                    label.left = std::max(label.left,
+                                          static_cast<double>(viewportRect.left()));
+                    right = label.left - gap;
+                }
+            }
+            for (auto& label : visibleLabels) {
+                const double viewportY = viewportRect.bottom() - 3.0 -
+                    label.height - label.row * (label.height + gap);
+                const QPointF scenePosition = view->mapToScene(QPoint(
+                    static_cast<int>(std::llround(label.left + 4.0)),
+                    static_cast<int>(std::llround(viewportY + 2.0))));
+                label.items->text->setPos(scenePosition);
+                const QPointF backgroundPosition = view->mapToScene(QPoint(
+                    static_cast<int>(std::llround(label.left)),
+                    static_cast<int>(std::llround(viewportY))));
+                label.items->background->setPos(backgroundPosition);
+                label.items->background->setVisible(true);
+                label.items->text->setVisible(true);
             }
         }
     }

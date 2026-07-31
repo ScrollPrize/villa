@@ -1,26 +1,35 @@
 # VC3D Line Annotation Fibers
 
-VC3D writes line annotations as `vc3d_fiber` JSON. Version 2 stores
+VC3D writes line annotations as `vc3d_fiber` JSON. Version 3 stores
 `control_points` as objects with a required `position` and optional
 `segment_to_next`. Control point `i` owns the metadata for its span to control
 point `i+1`; the final control point cannot contain `segment_to_next`.
 
 The top-level `optimization_mode` is either `lasagna` or
 `native_fiber_trace3d`. Files without this field default to `lasagna`. The mode
-selects the fiber-wide interpolation and extrapolation policy for future edits.
-It does not replace `segment_to_next`, which records the native attempt outcome
-for one concrete span. `accepted_native` means the stored geometry came from
-the native tracer and is protected from normal optimization;
-`lasagna_fallback` retains the failed native attempt's failure code/detail but
-does not protect the Lasagna geometry. Meeting error, ratio, and source are
-stored only for accepted native geometry. Readers ignore those fields on
-fallback records created by earlier builds, and writers clear them.
+selects extrapolation and resolves CP spans whose persisted `interp_goal` is
+`global`. A segment goal is `global`, `cspline`, `lasagna`, or `trace`; its
+`interp_mode` is the actual producer of the stored geometry and is one of
+`cspline`, `lasagna`, or `trace`. The actual mode is recomputed from the goal
+whenever the span is dirty, so a previous fallback is retried rather than
+treated as permanent.
 
-In native mode, VC3D traces changed CP-to-CP spans against the selected fiber
-inference manifest. A rejected or invalid native result falls back only that
-span to the selected Lasagna normal dataset. A later native retry replaces the
-fallback record with its new outcome. Moving a CP or changing adjacency clears
-either outcome on affected spans while preserving unrelated records.
+The fallback order is `trace -> lasagna -> cspline` or `lasagna -> cspline`.
+For global Lasagna/trace goals only, endpoint distance below 100 base voxels
+selects `cspline` immediately; exactly 100 voxels still attempts the global
+mode. Explicit goals never use this shortcut. Adjacent cubic-spline spans are
+interpolated jointly with exact CPs, shared internal tangents, and hard boundary
+directions from neighboring stored geometry. The spline helper uses no normal
+or prediction data.
+
+Trace attempts remain per span. Lasagna candidate failure also demotes only
+that span; other usable Lasagna spans continue into the protected joint Ceres
+refinement. Trace and cubic-spline spans, plus untouched manual spans, are
+fixed during that solve and provide hard endpoint directions. CP edits dirty
+only adjacent spans and expand through connected cubic-spline runs. Changing
+the global mode retries global goals while initially protecting explicit goals.
+Ctrl-right-clicking a generated span opens a checked `Interpolation goal`
+submenu for all four goals.
 
 Each direction continues until it reaches all target-local planes within the
 20-base-voxel endpoint threshold or exhausts its step budget. VC3D then moves
@@ -49,13 +58,15 @@ deterministic perpendicular tangent instead of continuing along the sampled
 normal. This applies at both ends of a fallback span when it lies between
 native spans.
 
-Generated-strip labels use the CP-owned record directly. Accepted native spans
-show their persisted meeting error in base voxels; fallback spans show a
-compact stable failure reason, and the tooltip includes the full stored detail.
-Spans without a native attempt retain the ordinary Lasagna normal-alignment
-display. Reoptimization and branch-overlay refreshes repopulate these labels
-from the current records. Ordinary Reoptimize preserves accepted native spans;
-switching explicitly to Lasagna mode or reverting a span clears them.
+Every segment descriptor stores a compact `msg` and an optional mode-dependent
+`metric`: trace stores minimum meeting-plane error in base voxels, Lasagna
+stores maximum normal-alignment error in degrees, and cubic spline stores no
+metric. Detailed trace and Lasagna failures remain in their mode-specific
+fields. Strip labels prefix the actual mode as `C`, `L`, or `T`, then display
+the metric and message. Labels are laid out in viewport pixels, remain visible
+while any part of their span intersects the view, and use a deterministic
+second row when one row cannot avoid overlap. Version-1 and version-2 fibers
+remain readable; VC3D writes explicit version-3 descriptors on the next save.
 
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way

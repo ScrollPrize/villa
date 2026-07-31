@@ -36,8 +36,9 @@ inline void validateSegmentMetadata(const nlohmann::json& value)
     const int metadataVersion = value.at("metadata_version").get<int>();
     const int tracerVersion = value.at("tracer_version").get<int>();
     const bool previous = metadataVersion == 1 && tracerVersion == 1;
-    const bool current = metadataVersion == 2 && tracerVersion == 2;
-    if (!previous && !current) {
+    const bool version2 = metadataVersion == 2 && tracerVersion == 2;
+    const bool current = metadataVersion == 3 && tracerVersion == 2;
+    if (!previous && !version2 && !current) {
         throw std::runtime_error("unsupported segment_to_next optimizer or version");
     }
     requireExactKeys(
@@ -47,13 +48,20 @@ inline void validateSegmentMetadata(const nlohmann::json& value)
                   "optimizer", "metadata_version", "tracer_version",
                   "normal_manifest", "fiber_manifest", "trace_to_base_scale",
                   "max_endpoint_error_base_voxels", "config"}
-            : std::unordered_set<std::string>{
+            : version2 ? std::unordered_set<std::string>{
                   "optimizer", "metadata_version", "tracer_version", "outcome",
                   "normal_manifest", "fiber_manifest", "trace_to_base_scale",
                   "meeting_error_base_voxels", "meeting_error_ratio",
-                  "meeting_source", "failure_code", "failure_detail", "config"},
+                  "meeting_source", "failure_code", "failure_detail", "config"}
+            : std::unordered_set<std::string>{
+                  "optimizer", "metadata_version", "tracer_version",
+                  "interp_goal", "interp_mode", "metric", "msg",
+                  "normal_manifest", "fiber_manifest", "trace_to_base_scale",
+                  "meeting_error_base_voxels", "meeting_error_ratio",
+                  "meeting_source", "failure_code", "failure_detail",
+                  "lasagna_failure_code", "lasagna_failure_detail", "config"},
         "segment_to_next");
-    if (value.at("normal_manifest").get<std::string>().empty() || value.at("fiber_manifest").get<std::string>().empty()) {
+    if (!current && (value.at("normal_manifest").get<std::string>().empty() || value.at("fiber_manifest").get<std::string>().empty())) {
         throw std::runtime_error("segment_to_next manifest locations must not be empty");
     }
     const double scale = value.at("trace_to_base_scale").get<double>();
@@ -63,7 +71,7 @@ inline void validateSegmentMetadata(const nlohmann::json& value)
         const double error = value.at("max_endpoint_error_base_voxels").get<double>();
         if (!std::isfinite(error) || error < 0.0)
             throw std::runtime_error("segment_to_next endpoint error is invalid");
-    } else {
+    } else if (version2) {
         const std::string outcome = value.at("outcome").get<std::string>();
         if (outcome != "accepted_native" && outcome != "lasagna_fallback")
             throw std::runtime_error("segment_to_next outcome is invalid");
@@ -96,6 +104,48 @@ inline void validateSegmentMetadata(const nlohmann::json& value)
         }
         if (outcome == "lasagna_fallback" && failure.empty())
             throw std::runtime_error("fallback segment_to_next requires failure_code");
+    } else {
+        const std::string goal = value.at("interp_goal").get<std::string>();
+        const std::string mode = value.at("interp_mode").get<std::string>();
+        if (goal != "global" && goal != "cspline" && goal != "lasagna" && goal != "trace")
+            throw std::runtime_error("segment_to_next interpolation goal is invalid");
+        if (mode != "cspline" && mode != "lasagna" && mode != "trace")
+            throw std::runtime_error("segment_to_next interpolation mode is invalid");
+        const auto& metric = value.at("metric");
+        if (!metric.is_null() && (!metric.is_number() ||
+            !std::isfinite(metric.get<double>()) || metric.get<double>() < 0.0)) {
+            throw std::runtime_error("segment_to_next metric is invalid");
+        }
+        if (mode == "cspline" && !metric.is_null())
+            throw std::runtime_error("cspline segment_to_next cannot contain metric");
+        for (const char* key : {"msg", "meeting_source", "failure_code",
+                                "failure_detail", "lasagna_failure_code",
+                                "lasagna_failure_detail"}) {
+            if (!value.at(key).is_string())
+                throw std::runtime_error("segment_to_next diagnostic is not a string");
+        }
+        const bool haveError = !value.at("meeting_error_base_voxels").is_null();
+        const bool haveRatio = !value.at("meeting_error_ratio").is_null();
+        if (mode == "trace") {
+            if (metric.is_null() || !haveError || !haveRatio ||
+                value.at("meeting_source").get<std::string>().empty() ||
+                !value.at("failure_code").get<std::string>().empty() ||
+                !value.at("failure_detail").get<std::string>().empty() ||
+                value.at("normal_manifest").get<std::string>().empty() ||
+                value.at("fiber_manifest").get<std::string>().empty()) {
+                throw std::runtime_error("trace segment_to_next is inconsistent");
+            }
+            const double error = value.at("meeting_error_base_voxels").get<double>();
+            const double ratio = value.at("meeting_error_ratio").get<double>();
+            if (!std::isfinite(error) || error < 0.0 ||
+                !std::isfinite(ratio) || ratio < 0.0) {
+                throw std::runtime_error("trace meeting diagnostics are invalid");
+            }
+        } else if (haveError || haveRatio ||
+                   !value.at("meeting_source").get<std::string>().empty()) {
+            throw std::runtime_error(
+                "non-trace segment_to_next contains meeting diagnostics");
+        }
     }
     const auto& config = value.at("config");
     requireExactKeys(
@@ -158,8 +208,8 @@ inline std::vector<cv::Vec3d> vc3dFiberPointArrayFromJson(const nlohmann::json& 
             points.push_back(detail::pointFromJson(value, context));
             continue;
         }
-        if (version != 2 || !value.is_object()) {
-            throw std::runtime_error(context + " version-2 control point must be an object");
+        if ((version != 2 && version != 3) || !value.is_object()) {
+            throw std::runtime_error(context + " version-2/3 control point must be an object");
         }
         for (const auto& [field, item] : value.items()) {
             (void)item;

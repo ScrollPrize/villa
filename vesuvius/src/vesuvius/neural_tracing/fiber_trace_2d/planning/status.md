@@ -8,19 +8,20 @@
 - [x] Review the plan against the current fiber schema and solver APIs.
 - [x] Confirm distance, per-span Lasagna fallback, and global-mode scope.
 - [x] Add persisted metric/message and visible-span label requirements.
+- [x] Add the compact per-span actual-mode marker requirement.
 
 ## Implementation
 
-- [ ] Generalize persisted segment metadata to goal and actual interpolation modes.
-- [ ] Add the shared joint cubic-spline interpolator.
-- [ ] Add the grouped interpolation/fallback coordinator.
-- [ ] Integrate CP edits, global changes, persistence, and auxiliary readers.
-- [ ] Replace segment trace/revert actions with the goal submenu.
-- [ ] Persist and render per-span metrics/messages with viewport-aware packing.
+- [x] Generalize persisted segment metadata to goal and actual interpolation modes.
+- [x] Add the shared joint cubic-spline interpolator.
+- [x] Add the grouped interpolation/fallback coordinator.
+- [x] Integrate CP edits, global changes, persistence, and auxiliary readers.
+- [x] Replace segment trace/revert actions with the goal submenu.
+- [x] Persist and render per-span metrics/messages with viewport-aware packing.
 
 ## Validation And Documentation
 
-- [ ] Add core spline, coordinator, persistence, and GUI regressions.
-- [ ] Run focused C++ and Python tests and build VC3D with `-j32`.
-- [ ] Update specs, docs, changelog, and task log.
-- [ ] Review and stage all task changes.
+- [x] Add core spline, coordinator, persistence, and generated-view regressions.
+- [x] Run focused C++ and Python tests and build VC3D with `-j32`.
+- [x] Update specs, docs, changelog, and task log.
+- [x] Review and stage all task changes.

@@ -1,5 +1,7 @@
 #include "LineAnnotationFiberSegments.hpp"
 
+#include "vc/lasagna/LineSpline.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -143,10 +145,79 @@ FiberOptimizationMode fiberOptimizationModeFromString(const std::string& value)
     throw std::runtime_error("unsupported fiber optimization mode: " + value);
 }
 
+std::string segmentInterpolationGoalToString(SegmentInterpolationGoal goal)
+{
+    switch (goal) {
+    case SegmentInterpolationGoal::Global: return "global";
+    case SegmentInterpolationGoal::Cspline: return "cspline";
+    case SegmentInterpolationGoal::Lasagna: return "lasagna";
+    case SegmentInterpolationGoal::Trace: return "trace";
+    }
+    throw std::runtime_error("unsupported segment interpolation goal");
+}
+
+SegmentInterpolationGoal segmentInterpolationGoalFromString(const std::string& value)
+{
+    if (value == "global") return SegmentInterpolationGoal::Global;
+    if (value == "cspline") return SegmentInterpolationGoal::Cspline;
+    if (value == "lasagna") return SegmentInterpolationGoal::Lasagna;
+    if (value == "trace") return SegmentInterpolationGoal::Trace;
+    throw std::runtime_error("unsupported segment interpolation goal: " + value);
+}
+
+std::string segmentInterpolationModeToString(SegmentInterpolationMode mode)
+{
+    switch (mode) {
+    case SegmentInterpolationMode::Cspline: return "cspline";
+    case SegmentInterpolationMode::Lasagna: return "lasagna";
+    case SegmentInterpolationMode::Trace: return "trace";
+    }
+    throw std::runtime_error("unsupported segment interpolation mode");
+}
+
+SegmentInterpolationMode segmentInterpolationModeFromString(const std::string& value)
+{
+    if (value == "cspline") return SegmentInterpolationMode::Cspline;
+    if (value == "lasagna") return SegmentInterpolationMode::Lasagna;
+    if (value == "trace") return SegmentInterpolationMode::Trace;
+    throw std::runtime_error("unsupported segment interpolation mode: " + value);
+}
+
+char segmentInterpolationModeMarker(SegmentInterpolationMode mode) noexcept
+{
+    switch (mode) {
+    case SegmentInterpolationMode::Cspline: return 'C';
+    case SegmentInterpolationMode::Lasagna: return 'L';
+    case SegmentInterpolationMode::Trace: return 'T';
+    }
+    return '?';
+}
+
+SegmentInterpolationMode resolveSegmentInterpolationMode(
+    SegmentInterpolationGoal goal,
+    FiberOptimizationMode globalMode,
+    double endpointDistanceBaseVoxels)
+{
+    if (!std::isfinite(endpointDistanceBaseVoxels) ||
+        endpointDistanceBaseVoxels < 0.0) {
+        throw std::invalid_argument("segment endpoint distance must be finite and non-negative");
+    }
+    if (goal == SegmentInterpolationGoal::Cspline ||
+        (goal == SegmentInterpolationGoal::Global &&
+         endpointDistanceBaseVoxels < 100.0)) {
+        return SegmentInterpolationMode::Cspline;
+    }
+    if (goal == SegmentInterpolationGoal::Lasagna ||
+        (goal == SegmentInterpolationGoal::Global &&
+         globalMode == FiberOptimizationMode::Lasagna)) {
+        return SegmentInterpolationMode::Lasagna;
+    }
+    return SegmentInterpolationMode::Trace;
+}
+
 bool isAcceptedNativeTrace(const FiberTraceSegmentMetadata& metadata) noexcept
 {
-    return metadata.outcome ==
-        FiberTraceSegmentMetadata::Outcome::AcceptedNative;
+    return metadata.interpMode == SegmentInterpolationMode::Trace;
 }
 
 bool isAcceptedNativeTrace(
@@ -173,16 +244,37 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataForResult(
     metadata.config.baseVoxelSizeUm.reset();
     metadata.config.profile = nullptr;
     if (result.accepted) {
+        metadata.interpMode = SegmentInterpolationMode::Trace;
         if (std::isfinite(result.meetingErrorBaseVoxels))
             metadata.meetingErrorBaseVoxels = result.meetingErrorBaseVoxels;
         if (std::isfinite(result.meetingErrorRatio))
             metadata.meetingErrorRatio = result.meetingErrorRatio;
         metadata.meetingSource = result.meetingSource;
+        metadata.metric = metadata.meetingErrorBaseVoxels;
+        metadata.message = "trace";
     } else {
+        metadata.interpMode = SegmentInterpolationMode::Lasagna;
         metadata.failureCode = result.reason.empty()
             ? "fusion_failed"
             : result.reason;
         metadata.failureDetail = result.detail;
+        if (metadata.failureCode == "meeting_error_threshold" &&
+            std::isfinite(result.meetingErrorBaseVoxels)) {
+            const double traceLengthBase =
+                result.meetingTraceLengthTraceVoxels * traceToBaseScale;
+            const double ratioThreshold = config.meetingAcceptMaxErrorRatio * traceLengthBase;
+            std::ostringstream message;
+            if (ratioThreshold > config.endpointAcceptThresholdBaseVoxels) {
+                message << "trace gap " << result.meetingErrorRatio * 100.0
+                        << "% exceeds " << config.meetingAcceptMaxErrorRatio * 100.0 << '%';
+            } else {
+                message << "trace gap " << result.meetingErrorBaseVoxels
+                        << " vx exceeds " << config.endpointAcceptThresholdBaseVoxels << " vx";
+            }
+            metadata.message = message.str();
+        } else {
+            metadata.message = "trace: " + metadata.failureCode;
+        }
     }
     return metadata;
 }
@@ -202,8 +294,10 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataForException(
     metadata.config = config;
     metadata.config.baseVoxelSizeUm.reset();
     metadata.config.profile = nullptr;
+    metadata.interpMode = SegmentInterpolationMode::Lasagna;
     metadata.failureCode = "trace_exception";
     metadata.failureDetail = std::move(detail);
+    metadata.message = "trace: trace_exception";
     return metadata;
 }
 
@@ -373,10 +467,9 @@ void replaceOpenTailsWithNative(
 FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     FiberModeOptimizationRequest request)
 {
-    if (!request.predictions || !request.baseNormalSampler ||
-        !request.traceNormalSampler) {
+    if (!request.baseNormalSampler) {
         throw std::invalid_argument(
-            "fiber-mode optimization requires prediction and normal samplers");
+            "fiber-mode optimization requires a base normal sampler");
     }
     if (request.controlPoints.empty() || request.linePointsBase.size() < 2) {
         throw std::invalid_argument(
@@ -396,11 +489,15 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                      [](const LineControlPoint& lhs, const LineControlPoint& rhs) {
                          return lhs.linePosition < rhs.linePosition;
                      });
-    if (request.retraceAll) {
-        for (auto& control : request.controlPoints) {
-            control.segmentToNext.reset();
+    for (size_t index = 0; index + 1 < request.controlPoints.size(); ++index) {
+        if (!request.controlPoints[index].segmentToNext) {
+            FiberTraceSegmentMetadata metadata;
+            metadata.interpMode = SegmentInterpolationMode::Lasagna;
+            metadata.message = "lasagna";
+            request.controlPoints[index].segmentToNext = std::move(metadata);
         }
     }
+    request.controlPoints.back().segmentToNext.reset();
 
     const vc::fiber_tracer::FiberTraceCoordinateAdapter coordinates(
         request.traceToBaseScale);
@@ -441,8 +538,10 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         request.controlPoints.front().optimizedIndex = controlIndex;
         request.controlPoints.front().linePosition =
             static_cast<double>(controlIndex);
-        replaceOpenTailsWithNative(
-            request, coordinates, controlIndex, controlIndex, output);
+        if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
+            replaceOpenTailsWithNative(
+                request, coordinates, controlIndex, controlIndex, output);
+        }
         appendFiberModeReport(output);
         output.controlPoints = std::move(request.controlPoints);
         return output;
@@ -465,15 +564,85 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     }
 
     std::vector<std::vector<cv::Vec3d>> spans(request.controlPoints.size() - 1);
-    std::vector<bool> nativeSpan(spans.size(), false);
+    std::vector<SegmentInterpolationMode> modes(
+        spans.size(), SegmentInterpolationMode::Lasagna);
+    std::vector<bool> attempt(spans.size(), true);
+    if (request.globalGoalsOnly) {
+        for (size_t index = 0; index < spans.size(); ++index) {
+            attempt[index] = request.controlPoints[index].segmentToNext->interpGoal ==
+                SegmentInterpolationGoal::Global;
+        }
+    }
+    if (request.dirtySegments) {
+        std::fill(attempt.begin(), attempt.end(), false);
+        const auto joinsSplineRun = [&](size_t index) {
+            const auto& metadata = *request.controlPoints[index].segmentToNext;
+            return metadata.interpGoal == SegmentInterpolationGoal::Cspline ||
+                   metadata.interpMode == SegmentInterpolationMode::Cspline;
+        };
+        for (const size_t dirty : *request.dirtySegments) {
+            if (dirty >= spans.size())
+                throw std::invalid_argument(
+                    "dirty interpolation segment is out of range");
+            size_t begin = dirty;
+            size_t end = dirty;
+            if (joinsSplineRun(dirty)) {
+                while (begin > 0 && joinsSplineRun(begin - 1))
+                    --begin;
+                while (end + 1 < spans.size() && joinsSplineRun(end + 1))
+                    ++end;
+            }
+            for (size_t index = begin; index <= end; ++index)
+                attempt[index] = true;
+        }
+    }
+    std::vector<bool> fixedSpan(spans.size(), false);
     for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
         auto& owner = request.controlPoints[spanIndex];
         const size_t first = originalControlIndices[spanIndex];
         const size_t last = originalControlIndices[spanIndex + 1];
-        if (isAcceptedNativeTrace(owner.segmentToNext)) {
-            spans[spanIndex] = inclusiveLineSpan(request.linePointsBase, first, last);
-            nativeSpan[spanIndex] = true;
-            ++output.nativeSegments;
+        spans[spanIndex] = inclusiveLineSpan(request.linePointsBase, first, last);
+        auto& metadata = *owner.segmentToNext;
+        const SegmentInterpolationGoal goal = metadata.interpGoal;
+        if (!attempt[spanIndex]) {
+            modes[spanIndex] = metadata.interpMode;
+            fixedSpan[spanIndex] = true;
+            continue;
+        }
+        const SegmentInterpolationMode requestedMode = resolveSegmentInterpolationMode(
+            goal,
+            request.globalMode,
+            pointDistance(owner.volumePoint,
+                          request.controlPoints[spanIndex + 1].volumePoint));
+        if (requestedMode == SegmentInterpolationMode::Cspline) {
+            modes[spanIndex] = SegmentInterpolationMode::Cspline;
+            metadata.interpMode = SegmentInterpolationMode::Cspline;
+            metadata.metric.reset();
+            metadata.message = goal == SegmentInterpolationGoal::Global
+                ? "short span"
+                : "cspline";
+            metadata.meetingErrorBaseVoxels.reset();
+            metadata.meetingErrorRatio.reset();
+            metadata.meetingSource.clear();
+            metadata.failureCode.clear();
+            metadata.failureDetail.clear();
+            metadata.lasagnaFailureCode.clear();
+            metadata.lasagnaFailureDetail.clear();
+            continue;
+        }
+        const bool wantsTrace = requestedMode == SegmentInterpolationMode::Trace;
+        if (!wantsTrace) {
+            modes[spanIndex] = SegmentInterpolationMode::Lasagna;
+            metadata.interpMode = SegmentInterpolationMode::Lasagna;
+            metadata.metric.reset();
+            metadata.message = "lasagna";
+            metadata.meetingErrorBaseVoxels.reset();
+            metadata.meetingErrorRatio.reset();
+            metadata.meetingSource.clear();
+            metadata.failureCode.clear();
+            metadata.failureDetail.clear();
+            metadata.lasagnaFailureCode.clear();
+            metadata.lasagnaFailureDetail.clear();
             continue;
         }
 
@@ -485,6 +654,10 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         std::optional<vc::fiber_tracer::FiberTraceSegmentResult> traced;
         std::string traceException;
         try {
+            if (!request.predictions || !request.traceNormalSampler) {
+                throw std::runtime_error(
+                    "fiber prediction or trace-normal sampler is unavailable");
+            }
             traced = vc::fiber_tracer::traceFiberSegment(
                 *request.predictions,
                 traceRequest,
@@ -511,6 +684,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
                       request.traceToBaseScale,
                       request.traceConfig,
                       std::move(traceException));
+            owner.segmentToNext->interpGoal = goal;
+            modes[spanIndex] = SegmentInterpolationMode::Lasagna;
             ++output.lasagnaFallbackSegments;
             continue;
         }
@@ -525,86 +700,164 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             request.traceToBaseScale,
             request.traceConfig,
             *traced);
-        nativeSpan[spanIndex] = true;
+        owner.segmentToNext->interpGoal = goal;
+        modes[spanIndex] = SegmentInterpolationMode::Trace;
         ++output.nativeSegments;
     }
 
-    std::vector<cv::Vec3d> stitched;
-    stitched.insert(stitched.end(),
-                    request.linePointsBase.begin(),
-                    request.linePointsBase.begin() +
-                        static_cast<std::ptrdiff_t>(originalControlIndices.front()));
-    std::vector<int> controlIndices;
-    controlIndices.reserve(request.controlPoints.size());
-    for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
-        const auto& span = spans[spanIndex];
-        if (spanIndex == 0) {
-            controlIndices.push_back(static_cast<int>(stitched.size()));
-            stitched.insert(stitched.end(), span.begin(), span.end());
-        } else {
-            stitched.insert(stitched.end(), span.begin() + 1, span.end());
+    const auto generateSplineRuns = [&]() {
+        size_t begin = 0;
+        while (begin < spans.size()) {
+            if (modes[begin] != SegmentInterpolationMode::Cspline || fixedSpan[begin]) {
+                ++begin;
+                continue;
+            }
+            size_t end = begin;
+            while (end + 1 < spans.size() &&
+                   modes[end + 1] == SegmentInterpolationMode::Cspline) {
+                if (fixedSpan[end + 1])
+                    break;
+                ++end;
+            }
+            vc::lasagna::LineSplineRequest splineRequest;
+            for (size_t control = begin; control <= end + 1; ++control)
+                splineRequest.controlPoints.push_back(request.controlPoints[control].volumePoint);
+            splineRequest.sampleSpacing = std::max(0.1, request.lasagnaConfig.segmentLength);
+            if (begin > 0 && spans[begin - 1].size() >= 2) {
+                splineRequest.leftDirection =
+                    spans[begin - 1].back() - spans[begin - 1][spans[begin - 1].size() - 2];
+            }
+            if (end + 1 < spans.size() && spans[end + 1].size() >= 2) {
+                splineRequest.rightDirection = spans[end + 1][1] - spans[end + 1][0];
+            }
+            const auto spline = vc::lasagna::interpolateLineControlPoints(splineRequest);
+            for (size_t local = 0; local <= end - begin; ++local) {
+                const int first = spline.controlPointIndices[local];
+                const int last = spline.controlPointIndices[local + 1];
+                spans[begin + local] = {
+                    spline.points.begin() + first,
+                    spline.points.begin() + last + 1};
+                auto& metadata = *request.controlPoints[begin + local].segmentToNext;
+                metadata.interpMode = SegmentInterpolationMode::Cspline;
+                metadata.metric.reset();
+                if (metadata.message.empty())
+                    metadata.message = "cspline";
+            }
+            begin = end + 1;
         }
-        controlIndices.push_back(static_cast<int>(stitched.size()) - 1);
-    }
-    stitched.insert(
-        stitched.end(),
-        request.linePointsBase.begin() +
-            static_cast<std::ptrdiff_t>(originalControlIndices.back() + 1),
-        request.linePointsBase.end());
-    for (size_t index = 0; index < request.controlPoints.size(); ++index) {
-        request.controlPoints[index].optimizedIndex = controlIndices[index];
-        request.controlPoints[index].linePosition =
-            static_cast<double>(controlIndices[index]);
+    };
+
+    const auto stitch = [&]() {
+        std::pair<std::vector<cv::Vec3d>, std::vector<int>> value;
+        auto& [points, indices] = value;
+        points.insert(points.end(), request.linePointsBase.begin(),
+                      request.linePointsBase.begin() +
+                          static_cast<std::ptrdiff_t>(originalControlIndices.front()));
+        indices.reserve(request.controlPoints.size());
+        for (size_t spanIndex = 0; spanIndex < spans.size(); ++spanIndex) {
+            const auto& span = spans[spanIndex];
+            if (span.size() < 2)
+                throw std::runtime_error("interpolation produced an invalid span");
+            if (spanIndex == 0) {
+                indices.push_back(static_cast<int>(points.size()));
+                points.insert(points.end(), span.begin(), span.end());
+            } else {
+                points.insert(points.end(), span.begin() + 1, span.end());
+            }
+            indices.push_back(static_cast<int>(points.size()) - 1);
+        }
+        points.insert(points.end(),
+                      request.linePointsBase.begin() +
+                          static_cast<std::ptrdiff_t>(originalControlIndices.back() + 1),
+                      request.linePointsBase.end());
+        return value;
+    };
+
+    vc::lasagna::LineOptimizer optimizer(*request.baseNormalSampler);
+    vc::lasagna::LineReinitializationOptimizationResult reinitialized;
+    std::vector<int> controlIndices;
+    while (true) {
+        generateSplineRuns();
+        auto [stitched, indices] = stitch();
+        controlIndices = std::move(indices);
+        for (size_t index = 0; index < request.controlPoints.size(); ++index) {
+            request.controlPoints[index].optimizedIndex = controlIndices[index];
+            request.controlPoints[index].linePosition = controlIndices[index];
+        }
+
+        std::vector<std::pair<int, int>> protectedSpans;
+        std::vector<vc::lasagna::LineControlPointHardDirectionConstraint> hardDirections;
+        std::vector<bool> protectedMode(modes.size(), false);
+        for (size_t index = 0; index < modes.size(); ++index) {
+            protectedMode[index] = fixedSpan[index] ||
+                modes[index] != SegmentInterpolationMode::Lasagna;
+        }
+        for (size_t index = 0; index < modes.size(); ++index) {
+            if (!protectedMode[index])
+                continue;
+            protectedSpans.emplace_back(static_cast<int>(index), static_cast<int>(index + 1));
+            const cv::Vec3d leftDirection = normalizedFiberEndpointDirection(
+                request.controlPoints[index].volumePoint, spans[index], true);
+            const cv::Vec3d rightDirection = normalizedFiberEndpointDirection(
+                request.controlPoints[index + 1].volumePoint, spans[index], false);
+            if (index == 0 || !protectedMode[index - 1]) {
+                hardDirections.push_back({static_cast<int>(index),
+                                          vc::lasagna::LineControlPointSide::Before,
+                                          -leftDirection});
+            }
+            if (index + 1 == modes.size() || !protectedMode[index + 1]) {
+                hardDirections.push_back({static_cast<int>(index + 1),
+                                          vc::lasagna::LineControlPointSide::After,
+                                          -rightDirection});
+            }
+        }
+        reinitialized = optimizer.reinitializeAndOptimizeExistingLine(
+            std::move(stitched), optimizerControlPoints(request.controlPoints),
+            controlIndices, controlIndices[controlIndices.size() / 2],
+            request.lasagnaConfig, std::move(protectedSpans),
+            std::move(hardDirections));
+        if (!reinitialized.failed)
+            break;
+        const int failed = reinitialized.failedSegmentIndex;
+        if (failed < 0 || static_cast<size_t>(failed) >= modes.size() ||
+            modes[static_cast<size_t>(failed)] != SegmentInterpolationMode::Lasagna) {
+            throw std::runtime_error("Lasagna interpolation failed structurally: " +
+                                     reinitialized.failureReason);
+        }
+        modes[static_cast<size_t>(failed)] = SegmentInterpolationMode::Cspline;
+        auto& metadata = *request.controlPoints[static_cast<size_t>(failed)].segmentToNext;
+        metadata.interpMode = SegmentInterpolationMode::Cspline;
+        metadata.metric.reset();
+        metadata.lasagnaFailureCode = "no_usable_candidate";
+        metadata.lasagnaFailureDetail = reinitialized.failureReason;
+        if (!metadata.message.empty())
+            metadata.message += " -> ";
+        metadata.message += "lasagna: " + reinitialized.failureReason;
     }
 
-    std::vector<std::pair<int, int>> protectedSpans;
-    std::vector<vc::lasagna::LineControlPointHardDirectionConstraint>
-        hardDirections;
-    for (size_t index = 0; index < nativeSpan.size(); ++index) {
-        if (nativeSpan[index]) {
-            protectedSpans.emplace_back(
-                static_cast<int>(index), static_cast<int>(index + 1));
-            if (spans[index].size() < 2) {
-                throw std::runtime_error(
-                    "native fiber span has fewer than two dense points");
-            }
-            const cv::Vec3d leftIntoNative = normalizedFiberEndpointDirection(
-                request.controlPoints[index].volumePoint,
-                spans[index],
-                true);
-            const cv::Vec3d rightIntoNative = normalizedFiberEndpointDirection(
-                request.controlPoints[index + 1].volumePoint,
-                spans[index],
-                false);
-            if (index == 0 || !nativeSpan[index - 1]) {
-                hardDirections.push_back({
-                    static_cast<int>(index),
-                    vc::lasagna::LineControlPointSide::Before,
-                    -leftIntoNative,
-                });
-            }
-            if (index + 1 == nativeSpan.size() || !nativeSpan[index + 1]) {
-                hardDirections.push_back({
-                    static_cast<int>(index + 1),
-                    vc::lasagna::LineControlPointSide::After,
-                    -rightIntoNative,
-                });
-            }
+    for (size_t spanIndex = 0; spanIndex < modes.size(); ++spanIndex) {
+        auto& metadata = *request.controlPoints[spanIndex].segmentToNext;
+        if (fixedSpan[spanIndex])
+            continue;
+        metadata.interpMode = modes[spanIndex];
+        if (modes[spanIndex] != SegmentInterpolationMode::Lasagna)
+            continue;
+        metadata.outcome = FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
+        metadata.meetingErrorBaseVoxels.reset();
+        metadata.meetingErrorRatio.reset();
+        metadata.meetingSource.clear();
+        metadata.metric.reset();
+        if (spanIndex < reinitialized.spans.size()) {
+            const double alignment = std::clamp(
+                reinitialized.spans[spanIndex].chosenMaxNormalAlignmentAbs, 0.0, 1.0);
+            metadata.metric = std::asin(alignment) * 180.0 / M_PI;
         }
-    }
-    auto optimizerControls = optimizerControlPoints(request.controlPoints);
-    vc::lasagna::LineOptimizer optimizer(*request.baseNormalSampler);
-    auto reinitialized = optimizer.reinitializeAndOptimizeExistingLine(
-        std::move(stitched),
-        std::move(optimizerControls),
-        controlIndices,
-        controlIndices[controlIndices.size() / 2],
-        request.lasagnaConfig,
-        std::move(protectedSpans),
-        std::move(hardDirections));
-    if (reinitialized.failed) {
-        throw std::runtime_error(
-            "Lasagna fallback failed: " + reinitialized.failureReason);
+        if (metadata.message.empty() || metadata.message == "lasagna")
+            metadata.message = "lasagna";
+        else if (metadata.message.find("lasagna") == std::string::npos)
+            metadata.message += " -> lasagna";
+        metadata.lasagnaFailureCode.clear();
+        metadata.lasagnaFailureDetail.clear();
     }
 
     if (reinitialized.fixedPointIndices.size() != request.controlPoints.size()) {
@@ -614,8 +867,10 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     const int firstControl = reinitialized.fixedPointIndices.front();
     const int lastControl = reinitialized.fixedPointIndices.back();
     output.optimization = std::move(reinitialized.optimization);
-    replaceOpenTailsWithNative(
-        request, coordinates, firstControl, lastControl, output);
+    if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d) {
+        replaceOpenTailsWithNative(
+            request, coordinates, firstControl, lastControl, output);
+    }
     appendFiberModeReport(output);
     output.controlPoints = std::move(request.controlPoints);
     return output;
@@ -629,10 +884,10 @@ nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& 
         {"optimizer", kOptimizer},
         {"metadata_version", FiberTraceSegmentMetadata::MetadataVersion},
         {"tracer_version", FiberTraceSegmentMetadata::TracerVersion},
-        {"outcome",
-         acceptedNative
-             ? "accepted_native"
-             : "lasagna_fallback"},
+        {"interp_goal", segmentInterpolationGoalToString(metadata.interpGoal)},
+        {"interp_mode", segmentInterpolationModeToString(metadata.interpMode)},
+        {"metric", metadata.metric ? nlohmann::json(*metadata.metric) : nlohmann::json(nullptr)},
+        {"msg", metadata.message},
         {"normal_manifest", metadata.normalManifestLocation},
         {"fiber_manifest", metadata.fiberManifestLocation},
         {"trace_to_base_scale", metadata.traceToBaseScale},
@@ -645,6 +900,8 @@ nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& 
         {"meeting_source", acceptedNative ? metadata.meetingSource : std::string{}},
         {"failure_code", metadata.failureCode},
         {"failure_detail", metadata.failureDetail},
+        {"lasagna_failure_code", metadata.lasagnaFailureCode},
+        {"lasagna_failure_detail", metadata.lasagnaFailureDetail},
         {"config",
          {
              {"step_voxels", config.stepVoxels},
@@ -680,10 +937,11 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
     const int metadataVersion = json.at("metadata_version").get<int>();
     const int tracerVersion = json.at("tracer_version").get<int>();
     const bool previousVersion = metadataVersion == 1 && tracerVersion == 1;
+    const bool version2 = metadataVersion == 2 && tracerVersion == 2;
     const bool currentVersion =
         metadataVersion == FiberTraceSegmentMetadata::MetadataVersion &&
         tracerVersion == FiberTraceSegmentMetadata::TracerVersion;
-    if (!previousVersion && !currentVersion)
+    if (!previousVersion && !version2 && !currentVersion)
         throw std::runtime_error("unsupported segment_to_next metadata/tracer version");
     if (previousVersion) {
         rejectUnknownKeys(
@@ -692,7 +950,7 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
              "normal_manifest", "fiber_manifest", "trace_to_base_scale",
              "max_endpoint_error_base_voxels", "config"},
             "segment_to_next");
-    } else {
+    } else if (version2) {
         rejectUnknownKeys(
             json,
             {"optimizer", "metadata_version", "tracer_version", "outcome",
@@ -700,26 +958,43 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
              "meeting_error_base_voxels", "meeting_error_ratio",
              "meeting_source", "failure_code", "failure_detail", "config"},
             "segment_to_next");
+    } else {
+        rejectUnknownKeys(
+            json,
+            {"optimizer", "metadata_version", "tracer_version",
+             "interp_goal", "interp_mode", "metric", "msg",
+             "normal_manifest", "fiber_manifest", "trace_to_base_scale",
+             "meeting_error_base_voxels", "meeting_error_ratio",
+             "meeting_source", "failure_code", "failure_detail",
+             "lasagna_failure_code", "lasagna_failure_detail", "config"},
+            "segment_to_next");
     }
 
     FiberTraceSegmentMetadata metadata;
     metadata.normalManifestLocation = json.at("normal_manifest").get<std::string>();
     metadata.fiberManifestLocation = json.at("fiber_manifest").get<std::string>();
-    if (metadata.normalManifestLocation.empty() || metadata.fiberManifestLocation.empty()) {
+    if (!currentVersion &&
+        (metadata.normalManifestLocation.empty() || metadata.fiberManifestLocation.empty())) {
         throw std::runtime_error("segment_to_next manifest locations must not be empty");
     }
     metadata.traceToBaseScale = json.at("trace_to_base_scale").get<double>();
     if (previousVersion) {
+        metadata.interpGoal = SegmentInterpolationGoal::Global;
+        metadata.interpMode = SegmentInterpolationMode::Trace;
         metadata.outcome = FiberTraceSegmentMetadata::Outcome::AcceptedNative;
         metadata.meetingErrorBaseVoxels =
             json.at("max_endpoint_error_base_voxels").get<double>();
         metadata.meetingSource = "legacy_endpoint";
-    } else {
+        metadata.metric = metadata.meetingErrorBaseVoxels;
+        metadata.message = "trace";
+    } else if (version2) {
         const std::string outcome = json.at("outcome").get<std::string>();
         if (outcome == "accepted_native") {
             metadata.outcome = FiberTraceSegmentMetadata::Outcome::AcceptedNative;
+            metadata.interpMode = SegmentInterpolationMode::Trace;
         } else if (outcome == "lasagna_fallback") {
             metadata.outcome = FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
+            metadata.interpMode = SegmentInterpolationMode::Lasagna;
         } else {
             throw std::runtime_error("unsupported segment_to_next outcome");
         }
@@ -736,6 +1011,30 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
         }
         metadata.failureCode = json.at("failure_code").get<std::string>();
         metadata.failureDetail = json.at("failure_detail").get<std::string>();
+        metadata.metric = metadata.meetingErrorBaseVoxels;
+        metadata.message = isAcceptedNativeTrace(metadata)
+            ? "trace"
+            : "trace: " + metadata.failureCode;
+    } else {
+        metadata.interpGoal = segmentInterpolationGoalFromString(
+            json.at("interp_goal").get<std::string>());
+        metadata.interpMode = segmentInterpolationModeFromString(
+            json.at("interp_mode").get<std::string>());
+        metadata.outcome = metadata.interpMode == SegmentInterpolationMode::Trace
+            ? FiberTraceSegmentMetadata::Outcome::AcceptedNative
+            : FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
+        if (!json.at("metric").is_null())
+            metadata.metric = json.at("metric").get<double>();
+        metadata.message = json.at("msg").get<std::string>();
+        if (!json.at("meeting_error_base_voxels").is_null())
+            metadata.meetingErrorBaseVoxels = json.at("meeting_error_base_voxels").get<double>();
+        if (!json.at("meeting_error_ratio").is_null())
+            metadata.meetingErrorRatio = json.at("meeting_error_ratio").get<double>();
+        metadata.meetingSource = json.at("meeting_source").get<std::string>();
+        metadata.failureCode = json.at("failure_code").get<std::string>();
+        metadata.failureDetail = json.at("failure_detail").get<std::string>();
+        metadata.lasagnaFailureCode = json.at("lasagna_failure_code").get<std::string>();
+        metadata.lasagnaFailureDetail = json.at("lasagna_failure_detail").get<std::string>();
     }
 
     const auto& configJson = json.at("config");
@@ -792,7 +1091,9 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
     if (metadata.meetingErrorRatio) {
         requireFiniteNonNegative(*metadata.meetingErrorRatio, "meeting_error_ratio");
     }
-    if (!previousVersion) {
+    if (metadata.metric)
+        requireFiniteNonNegative(*metadata.metric, "metric");
+    if (version2) {
         if (metadata.outcome == FiberTraceSegmentMetadata::Outcome::AcceptedNative) {
             if (!metadata.meetingErrorBaseVoxels || !metadata.meetingErrorRatio ||
                 metadata.meetingSource.empty() || !metadata.failureCode.empty() ||
@@ -806,6 +1107,24 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
             metadata.meetingErrorRatio.has_value()) {
             throw std::runtime_error(
                 "segment_to_next meeting error and ratio must be present together");
+        }
+    }
+    if (currentVersion) {
+        if (metadata.interpMode == SegmentInterpolationMode::Trace) {
+            if (!metadata.metric || !metadata.meetingErrorBaseVoxels ||
+                !metadata.meetingErrorRatio || metadata.meetingSource.empty() ||
+                !metadata.failureCode.empty() || !metadata.failureDetail.empty() ||
+                metadata.normalManifestLocation.empty() ||
+                metadata.fiberManifestLocation.empty()) {
+                throw std::runtime_error("trace segment_to_next is inconsistent");
+            }
+        } else if (metadata.meetingErrorBaseVoxels || metadata.meetingErrorRatio ||
+                   !metadata.meetingSource.empty()) {
+            throw std::runtime_error(
+                "non-trace segment_to_next cannot contain meeting diagnostics");
+        }
+        if (metadata.interpMode == SegmentInterpolationMode::Cspline && metadata.metric) {
+            throw std::runtime_error("cspline segment_to_next cannot contain metric");
         }
     }
     requireFinitePositive(config.stepVoxels, "step_voxels");
@@ -845,8 +1164,8 @@ StoredControlPoint storedControlPointFromJson(const nlohmann::json& json, int fi
     if (fiberVersion == 1) {
         return StoredControlPoint{pointFromJson(json)};
     }
-    if (fiberVersion != 2 || !json.is_object()) {
-        throw std::runtime_error("version-2 control point entries must be objects");
+    if ((fiberVersion != 2 && fiberVersion != 3) || !json.is_object()) {
+        throw std::runtime_error("version-2/3 control point entries must be objects");
     }
     rejectUnknownKeys(json, {"position", "segment_to_next"}, "control point");
     StoredControlPoint control{pointFromJson(json.at("position"))};
@@ -911,10 +1230,10 @@ void invalidateSegmentsAdjacentToControl(std::vector<LineControlPoint>& controls
         return controls[lhs].linePosition < controls[rhs].linePosition;
     });
     const auto found = std::find(order.begin(), order.end(), controlIndex);
-    controls[controlIndex].segmentToNext.reset();
-    if (found != order.begin() && found != order.end()) {
-        controls[*(found - 1)].segmentToNext.reset();
-    }
+    // Goals are CP-owned policy and survive edits. The coordinator always
+    // resolves dirty spans from interpGoal, so dropping the descriptor here
+    // would silently turn an explicit goal back into global.
+    (void)found;
 }
 
 void invalidateSegmentSplitByInsertedControl(std::vector<LineControlPoint>& controls, size_t insertedIndex)
@@ -929,7 +1248,8 @@ void invalidateSegmentSplitByInsertedControl(std::vector<LineControlPoint>& cont
     });
     const auto found = std::find(order.begin(), order.end(), insertedIndex);
     if (found != order.begin() && found != order.end()) {
-        controls[*(found - 1)].segmentToNext.reset();
+        const size_t previous = *(found - 1);
+        controls[insertedIndex].segmentToNext = controls[previous].segmentToNext;
     }
 }
 

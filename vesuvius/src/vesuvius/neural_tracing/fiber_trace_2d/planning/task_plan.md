@@ -169,6 +169,8 @@
    - `cspline`: `metric` is absent.
    Show `msg` for every mode, including the fallback reason chain. The menu
    check state always reflects `interp_goal`, not the actual fallback.
+   Prefix each label with `C`, `L`, or `T`, derived from the actual
+   `interp_mode` rather than the requested goal.
 6. Replace the midpoint-only label placement with viewport-space layout:
    - Project both CP endpoints into the strip viewport and intersect that span
      interval with the visible horizontal interval.

@@ -7,6 +7,7 @@
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
 #include "LineAnnotationFiberSegments.hpp"
+#include "vc/lasagna/LineSpline.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
@@ -1184,9 +1185,12 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     metadata.fiberManifestLocation = "s3://bucket/fibers.lasagna.json";
     metadata.traceToBaseScale = 4.0;
     metadata.config.traceToBaseScale = 4.0;
+    metadata.interpMode = vc3d::line_annotation::SegmentInterpolationMode::Trace;
     metadata.meetingErrorBaseVoxels = 2.5;
     metadata.meetingErrorRatio = 1.25;
     metadata.meetingSource = "forward_moving_plane";
+    metadata.metric = 2.5;
+    metadata.message = "trace";
     control.segmentToNext = metadata;
 
     const auto json = vc3d::line_annotation::storedControlPointToJson(control);
@@ -1209,12 +1213,17 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     legacySegment["metadata_version"] = 1;
     legacySegment["tracer_version"] = 1;
     legacySegment["max_endpoint_error_base_voxels"] = 2.5;
-    legacySegment.erase("outcome");
+    legacySegment.erase("interp_goal");
+    legacySegment.erase("interp_mode");
+    legacySegment.erase("metric");
+    legacySegment.erase("msg");
     legacySegment.erase("meeting_error_base_voxels");
     legacySegment.erase("meeting_error_ratio");
     legacySegment.erase("meeting_source");
     legacySegment.erase("failure_code");
     legacySegment.erase("failure_detail");
+    legacySegment.erase("lasagna_failure_code");
+    legacySegment.erase("lasagna_failure_detail");
     legacySegment["config"]["fusion_gap_factor"] = 2.0;
     legacySegment["config"].erase("meeting_accept_max_error_ratio");
     const auto legacy = vc3d::line_annotation::storedControlPointFromJson(
@@ -1226,6 +1235,8 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     CHECK(*legacy.segmentToNext->meetingErrorBaseVoxels == doctest::Approx(2.5));
 
     metadata.outcome = vc3d::line_annotation::FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
+    metadata.interpMode = vc3d::line_annotation::SegmentInterpolationMode::Lasagna;
+    metadata.metric.reset();
     metadata.failureCode = "no_trace_plane_intersection";
     metadata.failureDetail = "forward=max_step_factor reverse=no_valid_candidates";
     control.segmentToNext = metadata;
@@ -1235,6 +1246,15 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     CHECK(fallbackJson["segment_to_next"]["meeting_source"] == "");
 
     auto earlierFallbackJson = fallbackJson;
+    auto& earlierSegment = earlierFallbackJson["segment_to_next"];
+    earlierSegment["metadata_version"] = 2;
+    earlierSegment["outcome"] = "lasagna_fallback";
+    earlierSegment.erase("interp_goal");
+    earlierSegment.erase("interp_mode");
+    earlierSegment.erase("metric");
+    earlierSegment.erase("msg");
+    earlierSegment.erase("lasagna_failure_code");
+    earlierSegment.erase("lasagna_failure_detail");
     earlierFallbackJson["segment_to_next"]["meeting_error_base_voxels"] = 250.0;
     earlierFallbackJson["segment_to_next"]["meeting_error_ratio"] = 2.5;
     earlierFallbackJson["segment_to_next"]["meeting_source"] =
@@ -1299,6 +1319,27 @@ TEST_CASE("fiber optimization mode has stable persisted values")
         std::runtime_error);
 }
 
+TEST_CASE("segment interpolation resolution applies short fallback only to global goals")
+{
+    using namespace vc3d::line_annotation;
+    CHECK(resolveSegmentInterpolationMode(
+              SegmentInterpolationGoal::Global,
+              FiberOptimizationMode::NativeFiberTrace3d,
+              99.999) == SegmentInterpolationMode::Cspline);
+    CHECK(resolveSegmentInterpolationMode(
+              SegmentInterpolationGoal::Global,
+              FiberOptimizationMode::NativeFiberTrace3d,
+              100.0) == SegmentInterpolationMode::Trace);
+    CHECK(resolveSegmentInterpolationMode(
+              SegmentInterpolationGoal::Trace,
+              FiberOptimizationMode::Lasagna,
+              1.0) == SegmentInterpolationMode::Trace);
+    CHECK(resolveSegmentInterpolationMode(
+              SegmentInterpolationGoal::Lasagna,
+              FiberOptimizationMode::NativeFiberTrace3d,
+              1.0) == SegmentInterpolationMode::Lasagna);
+}
+
 TEST_CASE("fiber mode falls back only the failed native span")
 {
     FiberModeNormalSampler normals;
@@ -1309,6 +1350,12 @@ TEST_CASE("fiber mode falls back only the failed native span")
         {6.0, {16.0, 0.0, 0.0}, false, 6},
         {10.0, {32.0, 0.0, 0.0}, false, 10},
     };
+    request.controlPoints[0].segmentToNext.emplace();
+    request.controlPoints[0].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Trace;
+    request.controlPoints[1].segmentToNext.emplace();
+    request.controlPoints[1].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Trace;
     for (int x = -8; x <= 40; x += 4) {
         request.linePointsBase.push_back(
             {static_cast<double>(x), 0.0, 0.0});
@@ -1467,7 +1514,7 @@ TEST_CASE("fiber mode reports no-progress extrapolation fallback reasons")
     }
 }
 
-TEST_CASE("fiber mode hard-constrains fallback from stored native geometry")
+TEST_CASE("fiber mode retries stored trace results from their goal")
 {
     FiberModeNormalSampler baseNormals({1.0, 0.0, 0.0});
     FiberModeNormalSampler traceNormals;
@@ -1480,7 +1527,14 @@ TEST_CASE("fiber mode hard-constrains fallback from stored native geometry")
         {6.0, {16.0, 0.0, 0.0}, false, 6},
         {10.0, {32.0, 0.0, 0.0}, false, 10},
     };
+    request.controlPoints[0].segmentToNext.emplace();
+    request.controlPoints[0].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Trace;
     request.controlPoints[1].segmentToNext.emplace();
+    request.controlPoints[1].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Trace;
+    request.controlPoints[1].segmentToNext->interpMode =
+        vc3d::line_annotation::SegmentInterpolationMode::Trace;
     request.linePointsBase = {
         {-8.0, 0.0, 0.0},
         {-4.0, 0.0, 0.0},
@@ -1516,61 +1570,21 @@ TEST_CASE("fiber mode hard-constrains fallback from stored native geometry")
         vc3d::line_annotation::optimizeFiberWithNativeFallback(
             std::move(request));
 
-    REQUIRE(result.nativeSegments == 1);
-    REQUIRE(result.lasagnaFallbackSegments == 1);
+    REQUIRE(result.nativeSegments == 0);
+    REQUIRE(result.lasagnaFallbackSegments == 2);
     REQUIRE(result.lasagnaFallbackExtrapolations == 2);
     REQUIRE(extrapolationFallbacks.size() == 2);
-    CHECK(extrapolationFallbacks[0].side ==
-          vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic::Side::Left);
-    CHECK(extrapolationFallbacks[1].side ==
-          vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic::Side::Right);
-    for (const auto& diagnostic : extrapolationFallbacks) {
-        CHECK_FALSE(diagnostic.reason.empty());
-        CHECK(diagnostic.reason.find("valid") != std::string::npos);
-        CHECK(diagnostic.tracePointCount == 0);
-        CHECK(diagnostic.fromException);
+    for (size_t index = 0; index < 2; ++index) {
+        REQUIRE(result.controlPoints[index].segmentToNext.has_value());
+        CHECK(result.controlPoints[index].segmentToNext->interpGoal ==
+              vc3d::line_annotation::SegmentInterpolationGoal::Trace);
+        CHECK(result.controlPoints[index].segmentToNext->interpMode !=
+              vc3d::line_annotation::SegmentInterpolationMode::Trace);
+        CHECK_FALSE(result.controlPoints[index].segmentToNext->failureCode.empty());
     }
-    const auto& points = result.optimization.line.points;
-    size_t sharedIndex = 0;
-    double sharedDistance = std::numeric_limits<double>::infinity();
-    for (size_t index = 0; index < points.size(); ++index) {
-        const double distance = cv::norm(
-            points[index].position - cv::Vec3d{16.0, 0.0, 0.0});
-        if (distance < sharedDistance) {
-            sharedDistance = distance;
-            sharedIndex = index;
-        }
-    }
-    REQUIRE(sharedDistance < 1.0e-9);
-    REQUIRE(sharedIndex > 0);
-    const cv::Vec3d expected =
-        vc3d::fiber_slice::normalizedOrZero({-1.0, -1.0, 0.0});
-    const cv::Vec3d actual = vc3d::fiber_slice::normalizedOrZero(
-        points[sharedIndex - 1].position - points[sharedIndex].position);
-    CHECK(actual.dot(expected) == doctest::Approx(1.0).epsilon(1.0e-10));
-
-    size_t tailControlIndex = 0;
-    double tailControlDistance = std::numeric_limits<double>::infinity();
-    for (size_t index = 0; index < points.size(); ++index) {
-        const double distance = cv::norm(
-            points[index].position - cv::Vec3d{32.0, 0.0, 0.0});
-        if (distance < tailControlDistance) {
-            tailControlDistance = distance;
-            tailControlIndex = index;
-        }
-    }
-    REQUIRE(tailControlDistance < 1.0e-9);
-    REQUIRE(tailControlIndex + 1 < points.size());
-    const cv::Vec3d expectedTail =
-        vc3d::fiber_slice::normalizedOrZero({4.0, -3.0, 0.0});
-    const cv::Vec3d actualTail = vc3d::fiber_slice::normalizedOrZero(
-        points[tailControlIndex + 1].position -
-        points[tailControlIndex].position);
-    CHECK(actualTail.dot(expectedTail) ==
-          doctest::Approx(1.0).epsilon(1.0e-10));
 }
 
-TEST_CASE("fiber segment metadata invalidation follows CP adjacency")
+TEST_CASE("fiber segment goals survive CP edits and copy on split")
 {
     using vc3d::line_annotation::LineControlPoint;
     vc3d::line_annotation::FiberTraceSegmentMetadata metadata;
@@ -1586,11 +1600,64 @@ TEST_CASE("fiber segment metadata invalidation follows CP adjacency")
 
     vc3d::line_annotation::invalidateSegmentsAdjacentToControl(controls, 1);
     CHECK(controls[0].segmentToNext.has_value());
-    CHECK_FALSE(controls[2].segmentToNext.has_value());
+    CHECK(controls[2].segmentToNext.has_value());
     CHECK_FALSE(controls[1].segmentToNext.has_value());
 
     controls[0].segmentToNext = metadata;
     controls.push_back({5.0, {5.0, 0.0, 0.0}, false, 5});
     vc3d::line_annotation::invalidateSegmentSplitByInsertedControl(controls, 3);
-    CHECK_FALSE(controls[0].segmentToNext.has_value());
+    CHECK(controls[0].segmentToNext.has_value());
+    REQUIRE(controls[3].segmentToNext.has_value());
+    CHECK(controls[3].segmentToNext->interpGoal ==
+          controls[0].segmentToNext->interpGoal);
+}
+
+TEST_CASE("line spline jointly interpolates ordered controls")
+{
+    vc::lasagna::LineSplineRequest request;
+    request.controlPoints = {
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {25.0, 5.0, 0.0},
+    };
+    request.sampleSpacing = 2.0;
+    const auto result = vc::lasagna::interpolateLineControlPoints(request);
+    REQUIRE(result.controlPointIndices.size() == 3);
+    CHECK(result.points.front() == request.controlPoints.front());
+    CHECK(result.points[static_cast<size_t>(result.controlPointIndices[1])] ==
+          request.controlPoints[1]);
+    CHECK(result.points.back() == request.controlPoints.back());
+    for (const auto& point : result.points) {
+        CHECK(std::isfinite(point[0]));
+        CHECK(std::isfinite(point[1]));
+        CHECK(std::isfinite(point[2]));
+    }
+}
+
+TEST_CASE("two-point line spline is exactly straight and honors spacing")
+{
+    vc::lasagna::LineSplineRequest request;
+    request.controlPoints = {{1.0, 2.0, 3.0}, {11.0, 2.0, 3.0}};
+    request.sampleSpacing = 2.0;
+    const auto result = vc::lasagna::interpolateLineControlPoints(request);
+    REQUIRE(result.points.size() == 6);
+    for (const auto& point : result.points) {
+        CHECK(point[1] == doctest::Approx(2.0));
+        CHECK(point[2] == doctest::Approx(3.0));
+    }
+}
+
+TEST_CASE("line spline honors hard endpoint directions")
+{
+    vc::lasagna::LineSplineRequest request;
+    request.controlPoints = {{0.0, 0.0, 0.0}, {10.0, 10.0, 0.0}};
+    request.leftDirection = cv::Vec3d{1.0, 0.0, 0.0};
+    request.rightDirection = cv::Vec3d{0.0, 1.0, 0.0};
+    request.sampleSpacing = 0.25;
+    const auto result = vc::lasagna::interpolateLineControlPoints(request);
+    REQUIRE(result.points.size() > 3);
+    const cv::Vec3d first = result.points[1] - result.points[0];
+    const cv::Vec3d last = result.points.back() - result.points[result.points.size() - 2];
+    CHECK(first.dot(cv::Vec3d{1.0, 0.0, 0.0}) / cv::norm(first) > 0.99);
+    CHECK(last.dot(cv::Vec3d{0.0, 1.0, 0.0}) / cv::norm(last) > 0.99);
 }

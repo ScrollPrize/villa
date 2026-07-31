@@ -162,7 +162,7 @@ FiberInput loadFiberInput(const std::filesystem::path& fiberPath)
         throw std::runtime_error("fiber JSON type is not vc3d_fiber");
     }
     const int version = fiber.root.value("version", 0);
-    if (version != 1 && version != 2) {
+    if (version != 1 && version != 2 && version != 3) {
         throw std::runtime_error("unsupported vc3d_fiber version");
     }
 

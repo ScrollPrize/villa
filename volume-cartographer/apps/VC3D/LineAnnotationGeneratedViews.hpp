@@ -55,6 +55,8 @@ struct GeneratedOverlay {
         bool hasPendingLinks = false;
         bool isLinkCandidate = false;
         bool hasTracedSegmentToNext = false;
+        std::string interpolationGoal = "global";
+        char interpolationModeMarker = 'L';
         std::vector<uint64_t> branchIds;
         std::vector<BranchLink> branchLinks;
     };
@@ -132,6 +134,7 @@ struct GeneratedSpanAlignmentMetric {
         LasagnaNormalAlignment,
         NativeMeetingError,
         NativeFailure,
+        Cspline,
     };
 
     int spanIndex = 0;
@@ -151,6 +154,8 @@ struct GeneratedSpanAlignmentMetric {
     std::string meetingSource;
     std::string failureCode;
     std::string failureDetail;
+    char modeMarker = 'L';
+    std::string message;
 };
 
 struct GeneratedViews {
@@ -974,8 +979,7 @@ struct GeneratedControlPointContextMenuOptions {
     std::function<void(size_t, cv::Vec3f)> designateLinkCandidate;
     std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
     std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
-    std::function<void(size_t, size_t)> traceFiberSegment;
-    std::function<void(size_t, size_t)> revertFiberSegment;
+    std::function<void(size_t, size_t, std::string)> setSegmentInterpolationGoal;
 };
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,

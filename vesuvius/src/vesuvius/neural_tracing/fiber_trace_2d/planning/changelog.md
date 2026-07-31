@@ -1,5 +1,9 @@
 # 2026-07-31
 
+- Added `vc3d_fiber` v3 per-span interpolation goals and actual modes, grouped
+  cubic-spline interpolation, trace-to-Lasagna-to-spline fallback, the
+  global-only 100-base-voxel shortcut, persisted metrics/messages, a checked
+  Ctrl-right-click goal selector, and viewport-packed `C`/`L`/`T` span labels.
 - Restricted persisted meeting diagnostics to accepted native spans; fallback
   records now retain only failure code/detail, and all readers ignore stale
   fallback meeting values so earlier project files load cleanly.

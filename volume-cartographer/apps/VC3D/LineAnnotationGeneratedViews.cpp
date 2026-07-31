@@ -13,6 +13,7 @@
 #include <QWidget>
 
 #include <cmath>
+#include <array>
 
 namespace vc3d::line_annotation {
 namespace {
@@ -735,7 +736,7 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             : selectedControl.controlIndex;
 
     std::optional<std::pair<size_t, size_t>> traceSegment;
-    if (options.traceFiberSegment &&
+    if (options.setSegmentInterpolationGoal &&
         (QApplication::keyboardModifiers() & Qt::ControlModifier)) {
         std::vector<const GeneratedOverlay::ControlPointMarker*> sortedControls;
         sortedControls.reserve(options.controlPoints.size());
@@ -778,8 +779,7 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     }
 
     QMenu menu(options.parent);
-    QAction* traceFiberSegmentAction = nullptr;
-    QAction* revertFiberSegmentAction = nullptr;
+    std::vector<std::pair<QAction*, std::string>> interpolationGoalActions;
     if (traceSegment) {
         const auto owner = std::find_if(
             options.controlPoints.begin(),
@@ -787,14 +787,21 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
             [ownerIndex = traceSegment->first](const auto& control) {
                 return control.controlIndex == ownerIndex;
             });
-        const bool traced = owner != options.controlPoints.end() &&
-                            owner->hasTracedSegmentToNext;
-        if (traced && options.revertFiberSegment) {
-            revertFiberSegmentAction = menu.addAction(
-                QWidget::tr("Revert segment to Lasagna optimization"));
-        } else {
-            traceFiberSegmentAction = menu.addAction(
-                QWidget::tr("Optimize segment with native fiber tracer"));
+        const std::string currentGoal = owner != options.controlPoints.end()
+            ? owner->interpolationGoal
+            : "global";
+        QMenu* interpolationMenu = menu.addMenu(QWidget::tr("Interpolation goal"));
+        const std::array<std::pair<const char*, const char*>, 4> goals{{
+            {"Global", "global"},
+            {"Cubic spline", "cspline"},
+            {"Lasagna", "lasagna"},
+            {"Fiber trace", "trace"},
+        }};
+        for (const auto& [label, value] : goals) {
+            QAction* action = interpolationMenu->addAction(QWidget::tr(label));
+            action->setCheckable(true);
+            action->setChecked(currentGoal == value);
+            interpolationGoalActions.push_back({action, value});
         }
     }
     QAction* deleteAction = menu.addAction(QWidget::tr("Delete control point"));
@@ -919,13 +926,12 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         }
         return GeneratedControlPointContextResult::Handled;
     }
-    if (traceFiberSegmentAction && selected == traceFiberSegmentAction) {
-        options.traceFiberSegment(traceSegment->first, traceSegment->second);
-        return GeneratedControlPointContextResult::Handled;
-    }
-    if (revertFiberSegmentAction && selected == revertFiberSegmentAction) {
-        options.revertFiberSegment(traceSegment->first, traceSegment->second);
-        return GeneratedControlPointContextResult::Handled;
+    for (const auto& [action, goal] : interpolationGoalActions) {
+        if (selected == action) {
+            options.setSegmentInterpolationGoal(
+                traceSegment->first, traceSegment->second, goal);
+            return GeneratedControlPointContextResult::Handled;
+        }
     }
     for (const auto& [action, branch] : openBranchActions) {
         if (selected == action && action->isEnabled()) {

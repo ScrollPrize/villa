@@ -89,6 +89,14 @@ _SEGMENT_KEYS_V2 = {
     'meeting_error_base_voxels', 'meeting_error_ratio', 'meeting_source',
     'failure_code', 'failure_detail', 'config',
 }
+_SEGMENT_KEYS_V3 = {
+    'optimizer', 'metadata_version', 'tracer_version',
+    'interp_goal', 'interp_mode', 'metric', 'msg',
+    'normal_manifest', 'fiber_manifest', 'trace_to_base_scale',
+    'meeting_error_base_voxels', 'meeting_error_ratio', 'meeting_source',
+    'failure_code', 'failure_detail', 'lasagna_failure_code',
+    'lasagna_failure_detail', 'config',
+}
 _CONFIG_KEYS_COMMON = {
     'step_voxels', 'cone_angle_degrees', 'cone_angle_step_degrees',
     'cone_grid_size', 'beam_width', 'beam_prune_distance_voxels',
@@ -113,14 +121,17 @@ def _valid_segment(segment):
     elif version == (2, 2):
         segment_keys = _SEGMENT_KEYS_V2
         config_keys = _CONFIG_KEYS_V2
+    elif version == (3, 2):
+        segment_keys = _SEGMENT_KEYS_V3
+        config_keys = _CONFIG_KEYS_V2
     else:
         return False
     if (set(segment) != segment_keys or
             segment.get('optimizer') != 'native_fiber_trace3d' or
             not isinstance(segment.get('normal_manifest'), str) or
-            not segment['normal_manifest'] or
+            (version != (3, 2) and not segment['normal_manifest']) or
             not isinstance(segment.get('fiber_manifest'), str) or
-            not segment['fiber_manifest']):
+            (version != (3, 2) and not segment['fiber_manifest'])):
         return False
     config = segment.get('config')
     numeric = [segment.get('trace_to_base_scale')]
@@ -135,6 +146,33 @@ def _valid_segment(segment):
         error = segment.get('max_endpoint_error_base_voxels')
         return (isinstance(error, (int, float)) and not isinstance(error, bool)
                 and math.isfinite(error) and error >= 0)
+    if version == (3, 2):
+        goal = segment.get('interp_goal')
+        mode = segment.get('interp_mode')
+        metric = segment.get('metric')
+        strings = [segment.get(key) for key in (
+            'msg', 'meeting_source', 'failure_code', 'failure_detail',
+            'lasagna_failure_code', 'lasagna_failure_detail')]
+        if (goal not in {'global', 'cspline', 'lasagna', 'trace'} or
+                mode not in {'cspline', 'lasagna', 'trace'} or
+                not all(isinstance(value, str) for value in strings) or
+                (metric is not None and
+                 (isinstance(metric, bool) or not isinstance(metric, (int, float)) or
+                  not math.isfinite(metric) or metric < 0)) or
+                (mode == 'cspline' and metric is not None)):
+            return False
+        error = segment.get('meeting_error_base_voxels')
+        ratio = segment.get('meeting_error_ratio')
+        if mode == 'trace':
+            return (metric is not None and bool(segment['normal_manifest']) and
+                    bool(segment['fiber_manifest']) and
+                    isinstance(error, (int, float)) and not isinstance(error, bool) and
+                    math.isfinite(error) and error >= 0 and
+                    isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and
+                    math.isfinite(ratio) and ratio >= 0 and
+                    bool(segment['meeting_source']) and
+                    not segment['failure_code'] and not segment['failure_detail'])
+        return error is None and ratio is None and not segment['meeting_source']
     outcome = segment.get('outcome')
     strings = [segment.get('failure_code'), segment.get('failure_detail')]
     if (outcome not in {'accepted_native', 'lasagna_fallback'} or
@@ -185,7 +223,7 @@ def is_fiber_doc(doc):
     if not (isinstance(doc, dict) and doc.get('type') == 'vc3d_fiber'):
         return False
     version = doc.get('version', 1)
-    if version not in (1, 2):
+    if version not in (1, 2, 3):
         return False
     line_points = doc.get('line_points')
     if not isinstance(line_points, list) or not all(_finite_point(p)

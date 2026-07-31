@@ -57,8 +57,6 @@ public:
         std::filesystem::path manifestPath;
         cv::Vec3d seedPoint{0.0, 0.0, 0.0};
         std::vector<vc3d::line_annotation::LineControlPoint> controlPoints;
-        std::optional<std::pair<size_t, vc3d::line_annotation::FiberTraceSegmentMetadata>>
-            segmentMetadataUpdate;
         cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
         InitialDirectionMode initialDirectionMode = InitialDirectionMode::Sideways;
         vc::lasagna::LineOptimizationResult result;
@@ -430,12 +428,10 @@ private:
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
-    void handleGeneratedFiberTraceSegment(const std::string& surfaceName,
-                                          size_t firstControlPointIndex,
-                                          size_t secondControlPointIndex);
-    void handleGeneratedFiberTraceSegmentRevert(const std::string& surfaceName,
-                                                size_t firstControlPointIndex,
-                                                size_t secondControlPointIndex);
+    void handleGeneratedSegmentInterpolationGoal(const std::string& surfaceName,
+                                                 size_t firstControlPointIndex,
+                                                 size_t secondControlPointIndex,
+                                                 const std::string& goal);
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
                                                   size_t controlPointIndex,
                                                   cv::Vec3f volumePoint);
@@ -480,10 +476,14 @@ private:
                            int activeStart = -1,
                            int activeEnd = -1);
     void startFiberModeOptimization(LineAnnotationSession& session,
-                                    bool retraceAll);
+                                    bool retraceAll,
+                                    std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
+                                    bool globalGoalsOnly = false);
     [[nodiscard]] vc3d::line_annotation::FiberModeOptimizationRequest
         makeFiberModeOptimizationRequest(const LineAnnotationSession& session,
-                                         bool retraceAll) const;
+                                         bool retraceAll,
+                                         std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
+                                         bool globalGoalsOnly = false) const;
     void finishOptimization(const std::string& surfaceName);
     bool materializeGeneratedViews(LineAnnotationSession& session);
     bool materializeGeneratedViews(LineAnnotationSession& session,
