@@ -7293,10 +7293,28 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.spanAlignmentMetrics =
         generatedSpanAlignmentMetricsForSession(session);
 
+    // Re-registration replaces planes that live viewers render immediately, and
+    // the dialog only re-poses them to the current line position afterwards.
+    // Seed each new plane with the previous plane's pose (when one exists) so
+    // the surfaceChanged frame is visually continuous instead of flashing the
+    // seed-point view on every control-point placement.
+    const auto carryOverPreviousPose = [this](const std::string& name,
+                                              const std::shared_ptr<PlaneSurface>& plane) {
+        const auto previous =
+            std::dynamic_pointer_cast<PlaneSurface>(_state->surface(name));
+        if (!previous) {
+            return;
+        }
+        plane->setFromNormalAndUp(previous->origin(),
+                                  previous->normal({0.0f, 0.0f, 0.0f}),
+                                  previous->basisY());
+    };
+
     generatedViews.currentCutName = generatedPrefix + "_line_current_cut";
     generatedViews.currentCutSurface = std::make_shared<PlaneSurface>(
         seedPoint,
         cv::Vec3f{1.0f, 0.0f, 0.0f});
+    carryOverPreviousPose(generatedViews.currentCutName, generatedViews.currentCutSurface);
     _state->setSurface(generatedViews.currentCutName, generatedViews.currentCutSurface);
     session.generatedSurfaceNames.push_back(generatedViews.currentCutName);
 
@@ -7304,6 +7322,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.sideCutSurface = std::make_shared<PlaneSurface>(
         seedPoint,
         cv::Vec3f{1.0f, 0.0f, 0.0f});
+    carryOverPreviousPose(generatedViews.sideCutName, generatedViews.sideCutSurface);
     _state->setSurface(generatedViews.sideCutName, generatedViews.sideCutSurface);
     session.generatedSurfaceNames.push_back(generatedViews.sideCutName);
 
