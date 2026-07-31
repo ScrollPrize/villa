@@ -2520,7 +2520,13 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         }
         const std::string key = _generatedViews.lineSideSliceName;
         auto* entry = ensureStripItems(i, viewer, key);
-        auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+        // While this pane's overlay swap is pending, map the current-position
+        // marker (and span labels) through the held pre-update strip surface so
+        // they stay consistent with the stale image instead of jumping a beat
+        // ahead of it.
+        QuadSurface* quad = _stripOverlaySwapPending
+            ? _heldGeneratedViews.lineSideSlice.get()
+            : dynamic_cast<QuadSurface*>(viewer->currentSurface());
         if (!entry || !quad) {
             continue;
         }
@@ -2645,8 +2651,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         sideOverlay.linePoints = sideViews.linePoints;
         // Highlight the live cursor position on the line. The cross-slice overlay's emphasized
         // marker otherwise sits at the static focus/seed point; override it to the current
-        // position so the highlight tracks the cursor as it moves along the line.
-        const cv::Vec3f currentPoint = interpolatedLinePoint(_currentLinePosition);
+        // position so the highlight tracks the cursor as it moves along the line. Use the
+        // (possibly held) sideViews line points so the marker matches the displayed image.
+        const cv::Vec3f currentPoint = vc3d::line_annotation::interpolatedGeneratedLinePoint(
+            sideViews.linePoints, _currentLinePosition);
         if (finitePoint(currentPoint)) {
             sideOverlay.pointMarker = currentPoint;
             sideOverlay.emphasizedPointMarker = true;
