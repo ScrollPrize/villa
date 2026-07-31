@@ -10,6 +10,7 @@
 #include <functional>
 #include <map>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 #include <utility>
@@ -350,9 +351,16 @@ private:
     // together with the revised image instead of a beat earlier on the stale one.
     GeneratedViews _heldGeneratedViews;
     vc3d::line_annotation::GeneratedControlPointLinePositionIndex _heldControlIndex;
+    // Line position the held overlays were drawn at; panes with a pending swap
+    // keep their position markers here until their new frame lands.
+    double _heldLinePosition = 0.0;
     bool _currentCutOverlaySwapPending = false;
     bool _sideCutOverlaySwapPending = false;
     bool _stripOverlaySwapPending = false;
+    // Volume point of the most recent control-point placement click; the next
+    // in-place update moves the current line position onto the control point
+    // nearest to it, so the marker lands on the new point with the new image.
+    std::optional<cv::Vec3f> _pendingPlacementFocus;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
     // Schematic fixed-height bar above the cut views: a straight line with the
     // control points (LineAnnotationOverviewBar, file-local in the .cpp).

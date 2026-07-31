@@ -964,6 +964,7 @@ bool LineAnnotationDialog::setGeneratedRows(
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
     _stripOverlaySwapPending = false;
+    _pendingPlacementFocus.reset();
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
     _sideCutViewer = nullptr;
@@ -1138,6 +1139,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         // surfaces (hooks below), so overlays and image update together.
         _heldGeneratedViews = _generatedViews;
         _heldControlIndex = _generatedControlIndex;
+        _heldLinePosition = _currentLinePosition;
         _currentCutOverlaySwapPending = true;
         _sideCutOverlaySwapPending = true;
         _stripOverlaySwapPending = true;
@@ -1156,8 +1158,24 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                 _generatedViews.controlPoints);
         const double maxLinePosition =
             static_cast<double>(_generatedViews.linePoints.size() - 1);
+        // After a control-point placement, land the current position on the
+        // control point that resulted from the click (positions renumber when
+        // the line is re-optimized, so the old numeric position is ambiguous).
+        double targetLinePosition = previousLinePosition;
+        if (_pendingPlacementFocus) {
+            if (const auto nearest =
+                    vc3d::line_annotation::nearestGeneratedControlPointIndex(
+                        _generatedViews.controlPoints, *_pendingPlacementFocus)) {
+                const double controlPosition =
+                    _generatedViews.controlPoints[*nearest].linePosition;
+                if (std::isfinite(controlPosition)) {
+                    targetLinePosition = controlPosition;
+                }
+            }
+            _pendingPlacementFocus.reset();
+        }
         _currentLinePosition =
-            std::clamp(previousLinePosition, 0.0, maxLinePosition);
+            std::clamp(targetLinePosition, 0.0, maxLinePosition);
         _currentCutNormalOffsetVx = 0.0;
         _sideCutNormalOffsetVx = 0.0;
         _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
@@ -1174,6 +1192,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _sideCutViewer->renderVisible(true, "line annotation views updated");
         for (const auto& stripViewer : _stripViewers) {
             if (stripViewer) {
+                // Bump the strip's geometry epoch too, so the swap hooks below
+                // can tell post-update frames from stale in-flight ones.
+                stripViewer->markSurfaceGeometryChanged();
                 stripViewer->renderVisible(true, "line annotation views updated");
             }
         }
@@ -1181,9 +1202,11 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         // (onSurfaceChanged does _scene->clear()), deleting the pooled overlay
         // items; drop our cached pointers so the rebuild recreates them.
         clearFastGeneratedOverlayItemRefs();
-        // One-shot per pane: swap that pane to the new overlays only once it
-        // has adopted a rendered frame (renderFrameCompleted fires exactly at
-        // frame adoption); until then rebuilds draw from the held views.
+        // Per pane: swap to the new overlays only once the pane DISPLAYS a
+        // frame of the post-update geometry. renderFrameCompleted fires at
+        // every frame adoption, and a render submitted before the placement
+        // can adopt first -- so gate on the displayed frame's geometry epoch
+        // matching the viewer's current one instead of on the first adoption.
         const auto hookOverlaySwap = [this](CChunkedVolumeViewer* viewer,
                                             bool LineAnnotationDialog::*pendingFlag) {
             if (!viewer) {
@@ -1195,11 +1218,16 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                 viewer,
                 &CChunkedVolumeViewer::renderFrameCompleted,
                 this,
-                [this, connection, pendingFlag](std::uint64_t, double) {
-                    QObject::disconnect(*connection);
+                [this, viewer, connection, pendingFlag](std::uint64_t, double) {
                     if (_closing) {
+                        QObject::disconnect(*connection);
                         return;
                     }
+                    if (viewer->displayedSurfaceGeometryEpoch() !=
+                        viewer->surfaceGeometryEpoch()) {
+                        return;  // stale in-flight frame; keep waiting
+                    }
+                    QObject::disconnect(*connection);
                     this->*pendingFlag = false;
                     rebuildGeneratedStaticStripOverlays();
                     rebuildGeneratedDynamicOverlays();
@@ -1282,6 +1310,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
     _stripOverlaySwapPending = false;
+    _pendingPlacementFocus.reset();
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
     _sideCutViewer = nullptr;
@@ -1390,6 +1419,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         return;
                     }
                     setCurrentCutFollowsStripMouse(true);
+                    _pendingPlacementFocus = volumePoint;
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
                                                         _currentLinePosition);
@@ -1444,6 +1474,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         return;
                     }
                     setCurrentCutFollowsStripMouse(true);
+                    _pendingPlacementFocus = volumePoint;
                     emit generatedControlPointRequested(_generatedViews.sideCutName,
                                                         volumePoint,
                                                         _currentLinePosition);
@@ -1545,6 +1576,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                             if (!controlPointPlacementAllowedAt(position)) {
                                 return;
                             }
+                            _pendingPlacementFocus = volumePoint;
                             emit generatedControlPointRequested(surfaceName, volumePoint, position);
                         }
                     }
@@ -2527,6 +2559,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         QuadSurface* quad = _stripOverlaySwapPending
             ? _heldGeneratedViews.lineSideSlice.get()
             : dynamic_cast<QuadSurface*>(viewer->currentSurface());
+        const double stripPosition =
+            _stripOverlaySwapPending ? _heldLinePosition : _currentLinePosition;
         if (!entry || !quad) {
             continue;
         }
@@ -2539,7 +2573,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         const QPointF currentScenePoint =
             vc3d::line_annotation::generatedStripLinePositionToScene(viewer,
                                                                       quad,
-                                                                      _currentLinePosition);
+                                                                      stripPosition);
         auto* view = viewer->graphicsView();
         auto* viewport = view ? view->viewport() : nullptr;
         if (std::isfinite(currentScenePoint.x()) &&
@@ -2642,9 +2676,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             _sideCutOverlaySwapPending ? _heldGeneratedViews : _generatedViews;
         const auto& sideIndex =
             _sideCutOverlaySwapPending ? _heldControlIndex : _generatedControlIndex;
+        const double sidePosition =
+            _sideCutOverlaySwapPending ? _heldLinePosition : _currentLinePosition;
         GeneratedOverlay sideOverlay = zSliceOverlay(sideViews,
                                                      sideIndex,
-                                                     _currentLinePosition,
+                                                     sidePosition,
                                                      true,
                                                      _sideCutViewer,
                                                      _generatedViews.sideCutSurface.get());
@@ -2654,7 +2690,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         // position so the highlight tracks the cursor as it moves along the line. Use the
         // (possibly held) sideViews line points so the marker matches the displayed image.
         const cv::Vec3f currentPoint = vc3d::line_annotation::interpolatedGeneratedLinePoint(
-            sideViews.linePoints, _currentLinePosition);
+            sideViews.linePoints, sidePosition);
         if (finitePoint(currentPoint)) {
             sideOverlay.pointMarker = currentPoint;
             sideOverlay.emphasizedPointMarker = true;
@@ -2790,9 +2826,20 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                  _fastCurrentCutOverlayItems.fiberIntersectionConnectors});
     }
 
+    // During an in-place update, draw from the held pre-update views until this
+    // pane's first re-optimized frame lands.
+    const GeneratedViews& cutViews =
+        _currentCutOverlaySwapPending ? _heldGeneratedViews : _generatedViews;
+    const auto& cutIndex =
+        _currentCutOverlaySwapPending ? _heldControlIndex : _generatedControlIndex;
+    const double cutPosition =
+        _currentCutOverlaySwapPending ? _heldLinePosition : _currentLinePosition;
+
     QPointF centerScenePoint;
     if (normalOffsetActive(_currentCutNormalOffsetVx)) {
-        centerScenePoint = viewer->volumeToScene(interpolatedLinePoint(_currentLinePosition));
+        centerScenePoint = viewer->volumeToScene(
+            vc3d::line_annotation::interpolatedGeneratedLinePoint(
+                cutViews.linePoints, cutPosition));
     } else {
         centerScenePoint = viewer->surfaceCoordsToScene(0.0f, 0.0f);
     }
@@ -2802,13 +2849,6 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     }
     _fastCurrentCutOverlayItems.centerPoint->setPath(centerPath);
 
-    // During an in-place update, draw from the held pre-update views until this
-    // pane's first re-optimized frame lands.
-    const GeneratedViews& cutViews =
-        _currentCutOverlaySwapPending ? _heldGeneratedViews : _generatedViews;
-    const auto& cutIndex =
-        _currentCutOverlaySwapPending ? _heldControlIndex : _generatedControlIndex;
-
     QPainterPath controlPath;
     QPainterPath seedPath;
     QPainterPath linkCandidatePath;
@@ -2816,8 +2856,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath pendingBranchControlPath;
     const double lineRadius =
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
-    const double lower = _currentLinePosition - lineRadius;
-    const double upper = _currentLinePosition + lineRadius;
+    const double lower = cutPosition - lineRadius;
+    const double upper = cutPosition + lineRadius;
     const auto& indices = cutIndex.sortedControlIndices;
     const auto positionForIndex = [&cutViews](size_t controlIndex) {
         return cutViews.controlPoints[controlIndex].linePosition;
