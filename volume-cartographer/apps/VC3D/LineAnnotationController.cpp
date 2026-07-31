@@ -2817,6 +2817,12 @@ void LineAnnotationController::setFiberManualHvTag(uint64_t fiberId, const QStri
         scheduleFiberSave(*it);
     } catch (const std::exception& ex) {
         it->manualHvTag = previousManualTag;
+        for (const auto& pane : _panes) {
+            if (pane.session && pane.session->fiberId == fiberId) {
+                pane.session->fiberManualHvTag = previousManualTag;
+                pushFiberUiState(pane);
+            }
+        }
         showError(tr("Could not save fiber %1: %2")
                       .arg(fiberId)
                       .arg(QString::fromStdString(ex.what())));
@@ -2867,6 +2873,12 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
         scheduleFiberSave(*it);
     } catch (const std::exception& ex) {
         it->tags = previousTags;
+        for (const auto& pane : _panes) {
+            if (pane.session && pane.session->fiberId == fiberId) {
+                pane.session->fiberTags = previousTags;
+                pushFiberUiState(pane);
+            }
+        }
         showError(tr("Could not save fiber %1: %2")
                       .arg(fiberId)
                       .arg(QString::fromStdString(ex.what())));

@@ -2683,7 +2683,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                                      sidePosition,
                                                      true,
                                                      _sideCutViewer,
-                                                     _generatedViews.sideCutSurface.get());
+                                                     sideViews.sideCutSurface.get());
         sideOverlay.linePoints = sideViews.linePoints;
         // Highlight the live cursor position on the line. The cross-slice overlay's emphasized
         // marker otherwise sits at the static focus/seed point; override it to the current
