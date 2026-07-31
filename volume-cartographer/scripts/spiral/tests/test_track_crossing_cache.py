@@ -73,7 +73,7 @@ class TrackCrossingCacheTests(unittest.TestCase):
                 tracks, None, 0.0, 'cpu',
                 sampling_config={
                     'track_crossing_precompute_max': 1,
-                    'max_track_crossing_per_step': 1,
+                    'track_max_track_crossing_per_step': 1,
                 },
                 track_families=families,
                 track_source_ids=source_ids,
@@ -118,7 +118,7 @@ class TrackCrossingCacheTests(unittest.TestCase):
                 tracks, None, 0.0, 'cpu',
                 sampling_config={
                     'track_crossing_precompute_max': 1,
-                    'max_track_crossing_per_step': 1,
+                    'track_max_track_crossing_per_step': 1,
                 },
                 track_families=family_codes,
                 track_source_ids=source_ids,
@@ -152,7 +152,7 @@ class TrackCrossingCacheTests(unittest.TestCase):
                 tracks, None, 0.0, 'cpu',
                 sampling_config={
                     'track_crossing_precompute_max': 1,
-                    'max_track_crossing_per_step': 1,
+                    'track_max_track_crossing_per_step': 1,
                 },
                 track_families=families,
                 track_source_ids=source_ids,
