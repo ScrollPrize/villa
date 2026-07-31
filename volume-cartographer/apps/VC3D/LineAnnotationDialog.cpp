@@ -832,6 +832,15 @@ bool LineAnnotationDialog::setGeneratedRows(
     }
 
     clearGeneratedOverlayRefreshConnections();
+    // Drop all viewer references BEFORE deleting the widgets: destruction
+    // delivers events through our eventFilter, which must not dereference a
+    // half-destroyed viewer (QPointers only clear once ~QObject runs).
+    _panes.clear();
+    _stripViewers.clear();
+    _fixedStripViewer = nullptr;
+    clearFastGeneratedOverlayItemRefs();
+    _currentCutViewer = nullptr;
+    _sideCutViewer = nullptr;
     _suppressPaneClosed = true;
     if (_mdiArea) {
         _layout->removeWidget(_mdiArea);
@@ -839,12 +848,6 @@ bool LineAnnotationDialog::setGeneratedRows(
         _mdiArea = nullptr;
     }
     _suppressPaneClosed = false;
-    _panes.clear();
-    _stripViewers.clear();
-    _fixedStripViewer = nullptr;
-    clearFastGeneratedOverlayItemRefs();
-    _currentCutViewer = nullptr;
-    _sideCutViewer = nullptr;
     _hasGeneratedViews = false;
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
@@ -1038,6 +1041,16 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     }
 
     clearGeneratedOverlayRefreshConnections();
+    // Drop all viewer references BEFORE deleting the widgets: destroying a
+    // viewer synchronously delivers events (ChildRemoved/Hide/...) through our
+    // eventFilter, which must not dereference a half-destroyed viewer via
+    // _fixedStripViewer/_stripViewers (QPointers only clear once ~QObject runs).
+    _panes.clear();
+    _stripViewers.clear();
+    _fixedStripViewer = nullptr;
+    clearFastGeneratedOverlayItemRefs();
+    _currentCutViewer = nullptr;
+    _sideCutViewer = nullptr;
     _suppressPaneClosed = true;
     if (_mdiArea) {
         _layout->removeWidget(_mdiArea);
@@ -1053,12 +1066,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     }
     _generatedContainers.clear();
     _generatedTopWidget = nullptr;
-    _panes.clear();
-    _stripViewers.clear();
-    _fixedStripViewer = nullptr;
-    clearFastGeneratedOverlayItemRefs();
-    _currentCutViewer = nullptr;
-    _sideCutViewer = nullptr;
 
     _generatedViews = views;
     _linePointsd.clear();
@@ -3012,30 +3019,36 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
 {
     // The fixed top strip is display-only: swallow every mouse/wheel interaction
     // except the Ctrl+right-click context menu (line position snapping is handled
-    // by the "R" shortcut instead of mouse-follow).
-    if (_fixedStripViewer) {
-        auto* view = _fixedStripViewer->graphicsView();
-        if (view && (watched == view || watched == view->viewport())) {
-            switch (event->type()) {
-            case QEvent::Wheel:
-            case QEvent::MouseMove:
-            case QEvent::MouseButtonDblClick:
-                return true;
-            case QEvent::MouseButtonPress:
-            case QEvent::MouseButtonRelease: {
-                auto* mouseEvent = static_cast<QMouseEvent*>(event);
-                const bool contextClick =
-                    mouseEvent->button() == Qt::RightButton &&
-                    mouseEvent->modifiers().testFlag(Qt::ControlModifier);
-                if (!contextClick) {
+    // by the "R" shortcut instead of mouse-follow). Check the event type BEFORE
+    // touching the viewer: widget destruction delivers events (ChildRemoved,
+    // Hide, ...) through this filter while the viewer is half-destroyed, and
+    // calling into it then crashes; input events can't arrive at that point.
+    switch (event->type()) {
+    case QEvent::Wheel:
+    case QEvent::MouseMove:
+    case QEvent::MouseButtonDblClick:
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseButtonRelease:
+        if (_fixedStripViewer) {
+            auto* view = _fixedStripViewer->graphicsView();
+            if (view && (watched == view || watched == view->viewport())) {
+                if (event->type() == QEvent::MouseButtonPress ||
+                    event->type() == QEvent::MouseButtonRelease) {
+                    auto* mouseEvent = static_cast<QMouseEvent*>(event);
+                    const bool contextClick =
+                        mouseEvent->button() == Qt::RightButton &&
+                        mouseEvent->modifiers().testFlag(Qt::ControlModifier);
+                    if (!contextClick) {
+                        return true;
+                    }
+                } else {
                     return true;
                 }
-                break;
-            }
-            default:
-                break;
             }
         }
+        break;
+    default:
+        break;
     }
     if (watched == _fiberNameLabel && event->type() == QEvent::Resize) {
         updateFiberNameLabel();
