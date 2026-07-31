@@ -180,6 +180,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Herculaneum Scroll Tools](https://github.com/axiosdevs/herculaneum-scroll-tools) by axiosdevs — CT-consistency QA for the published m7 surface predictions: voxel-exact phantom fractions measured for all 36 samples incl. all 13 grand-prize scrolls (43.3% of positives sit outside the masked CT), with a one-pass `clean` mode ([villa#1114](https://github.com/ScrollPrize/villa/issues/1114)); plus cross-scan registration (2023→2025 rescan, MAD 29 µm), a winding-constraint annotator/verifier in native spiral-input format, and dual-energy high-Z ink-candidate rendering.
 
+- [tifxyz-repair](https://github.com/Nieuwlaar/tifxyz-repair) by Nieuwlaar. Validates and repairs `tifxyz` patch metadata against VC3D's exact loader semantics: detects the stale-bbox corruption of [villa#1272](https://github.com/ScrollPrize/villa/issues/1272) (106 of 4,922 verified PHercParis4 spiral-input patches affected, independently reproducing the issue's counts), rewrites corrected bboxes in place (atomic, `--dry-run`, backups) and ships ready-to-apply boxes for every flagged patch; full-corpus audits certify all 40,782 unverified patches and all 817 published segment meshes clean. Companion PR [#1285](https://github.com/ScrollPrize/villa/pull/1285) stops the corruption at the source.
+
 
 ### 📦 Materials
 
