@@ -161,6 +161,7 @@ struct GeneratedSpanAlignmentMetric {
 struct GeneratedViews {
     std::string lineSurfaceName;
     QString lineSurfaceTitle;
+    std::shared_ptr<QuadSurface> lineSurface;
     std::string lineSideSliceName;
     QString lineSideSliceTitle;
     std::shared_ptr<QuadSurface> lineSideSlice;

@@ -818,6 +818,19 @@ Ownership changed as follows:
   use target-local planes and its distance-scaled `max_step_factor` guard. The controller
   applies the combined line, CP metadata, and mode atomically and uses the same
   path for save-time finalization after no-reoptimization edits.
+
+  `LineAnnotationDialog` owns a non-rendered full-width schematic overview in
+  addition to the four rendered panes. The rendered pane topology is the
+  current cut, side cut, interactive `lineSurface` strip, and interactive
+  `lineSideSlice` strip. Both strip viewers share the same mouse-follow,
+  control-point interaction, camera persistence, current-position overlay, and
+  viewport-packed span-label behavior. In-place surface replacement snapshots
+  the old generated-view data and tracks frame adoption independently for each
+  rendered pane. Each strip continues drawing from the held data until its own
+  displayed surface-geometry epoch reaches the new epoch; one strip completing
+  cannot expose new labels over the other strip's stale image. Viewer and
+  pending-state references are cleared before generated containers are deleted
+  so synchronous teardown events cannot dereference partially destroyed panes.
 - `volume-cartographer/apps/src/vc_fiber_trace_metric.cpp` is the native
   no-visualization metric runner for precomputed 3D fiber inference products.
   It opens a fiber inference `.lasagna.json`, loads one `vc3d_fiber` JSON,

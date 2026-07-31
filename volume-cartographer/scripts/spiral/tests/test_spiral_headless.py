@@ -171,12 +171,27 @@ class ProtocolTests(unittest.TestCase):
             "error": None, "current_iteration": 0, "target_iteration": 0,
         }
         session._events.put(("status", 0, ready))
-        session._events.put(("status", 1, {**ready, "state": "Loading"}))
+        session._events.put(("status", 1, {
+            **ready,
+            "state": "Loading",
+            "progress": {
+                "operation": "loading",
+                "stage_name": "Loading tracks",
+                "detail": None,
+                "step": 2,
+                "total_steps": 10,
+                "unit": "DB keys",
+                "elapsed_seconds": 3.0,
+                "eta_seconds": 12.0,
+            },
+        }))
         deadline = time.time() + 2
         while len(published) < 2 and time.time() < deadline:
             time.sleep(0.01)
         self.assertEqual(published[-1]["state"], "Loading")
-        self.assertEqual(published[-1]["phase"], "Waiting for all GPU workers")
+        self.assertEqual(published[-1]["phase"], "Loading tracks")
+        self.assertIn(
+            "GPU worker 2/2", published[-1]["progress"]["detail"])
 
         session._events.put(("status", 1, ready))
         deadline = time.time() + 2
@@ -201,6 +216,97 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(session._target, 30_250)
         self.assertEqual(session._state, "Running")
 
+    def test_interactive_run_extends_training_horizon_to_target_iteration(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Paused"
+        session._completed = 30_000
+        session._pending = 0
+        session._target = 30_000
+        session._configure_run = lambda *_: None
+        session._idle_actions = []
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000,
+        }
+        session._run_config = dict(session.requested_config)
+
+        target = session.run(250)
+
+        self.assertEqual(target, 30_250)
+        self.assertEqual(session._idle_actions[0][0], "configure")
+        self.assertEqual(
+            session._idle_actions[0][1]["optimizer_num_training_steps"],
+            30_250,
+        )
+        self.assertEqual(
+            session._run_config["optimizer_num_training_steps"], 30_250)
+
+    def test_interactive_run_preserves_horizon_when_target_is_within_it(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Ready"
+        session._completed = 100
+        session._pending = 0
+        session._target = 100
+        session._configure_run = lambda *_: None
+        session._idle_actions = []
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000,
+        }
+        session._run_config = dict(session.requested_config)
+
+        session.run(250)
+
+        self.assertEqual(session._idle_actions, [])
+        self.assertEqual(
+            session._run_config["optimizer_num_training_steps"], 30_000)
+
+    def test_interactive_run_preserves_horizon_when_target_equals_it(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Ready"
+        session._completed = 29_750
+        session._pending = 0
+        session._target = 29_750
+        session._configure_run = lambda *_: None
+        session._idle_actions = []
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000,
+        }
+        session._run_config = dict(session.requested_config)
+
+        target = session.run(250)
+
+        self.assertEqual(target, 30_000)
+        self.assertEqual(session._idle_actions, [])
+        self.assertEqual(
+            session._run_config["optimizer_num_training_steps"], 30_000)
+
+    def test_interactive_run_extends_horizon_by_run_count_when_crossed(self):
+        session = InteractiveFitSession.__new__(InteractiveFitSession)
+        session._condition = threading.Condition()
+        session._state = "Ready"
+        session._completed = 29_751
+        session._pending = 0
+        session._target = 29_751
+        session._configure_run = lambda *_: None
+        session._idle_actions = []
+        session.requested_config = {
+            "optimizer_num_training_steps": 30_000,
+        }
+        session._run_config = dict(session.requested_config)
+
+        target = session.run(250)
+
+        self.assertEqual(target, 30_001)
+        self.assertEqual(session._idle_actions[0][0], "configure")
+        self.assertEqual(
+            session._idle_actions[0][1]["optimizer_num_training_steps"],
+            30_250,
+        )
+        self.assertEqual(
+            session._run_config["optimizer_num_training_steps"], 30_250)
+
     def test_run_queues_influence_config_with_only_pending_inputs(self):
         session = InteractiveFitSession.__new__(InteractiveFitSession)
         session._condition = threading.Condition()
@@ -211,7 +317,7 @@ class ProtocolTests(unittest.TestCase):
         session._incorporate_inputs = lambda *_: None
         session._idle_actions = []
         pending = [{"id": "new-patch"}]
-        influence = {"interactive_influence_theta_frac": 0.25}
+        influence = {"influence_theta_frac": 0.25}
 
         session.run(20, pending_inputs=pending, influence_config=influence)
 
@@ -248,13 +354,13 @@ class ProtocolTests(unittest.TestCase):
         session._configure_run = lambda config: setattr(session, "applied", config)
 
         session._run_configuration({
-            "num_patches_per_step": 101,
+            "sample_count_patches_per_step": 101,
             "loss_weight_patch_radius": 3.5,
             "loss_start_patch_dt": 123,
         })
 
         self.assertEqual(session.applied, {
-            "num_patches_per_step": 101,
+            "sample_count_patches_per_step": 101,
             "loss_weight_patch_radius": 3.5,
             "loss_start_patch_dt": 123,
         })

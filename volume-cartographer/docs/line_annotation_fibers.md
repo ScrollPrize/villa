@@ -32,6 +32,21 @@ the global mode retries global goals while initially protecting explicit goals.
 Ctrl-right-clicking a generated span opens a checked `Interpolation goal`
 submenu for all four goals.
 
+The generated annotation workspace places a compact full-width schematic map
+below the toolbar, followed by the current/side cut views and two stacked
+volume-rendered strips. The first rendered strip is `lineSurface`; the second
+is `lineSideSlice`. The schematic map shows the whole line and control-point
+positions, but does not replace either rendered view. Both rendered strips are
+ordinary interactive viewers: they can be panned, zoomed, and scrolled, drive
+the current cut from mouse position, accept control-point interactions, and
+show the per-span status labels described below. Cameras and splitter sizes
+survive generated-view updates.
+
+The Annotation popup owns Auto-reoptimize, Reinit reoptimization, and Show as
+mesh. The toolbar retains the fiber-global Lasagna/Fiber model selector and the
+base-voxel extrapolation-distance control. Tag pills are edited directly from
+the same toolbar.
+
 Each direction continues until it reaches all target-local planes within the
 20-base-voxel endpoint threshold or exhausts its step budget. VC3D then moves
 locally tangent planes along both complete traces and intersects the opposite

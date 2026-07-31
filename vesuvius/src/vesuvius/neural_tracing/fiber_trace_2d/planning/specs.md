@@ -1154,6 +1154,16 @@
   visible interval, preserve fiber order while packing labels in viewport
   pixels, and use a deterministic second row only when one row cannot fit.
   Detailed failure fields remain available in the tooltip.
+- The VC3D generated line-annotation layout has a separate fixed-height,
+  full-width schematic overview map plus two volume-rendered strip viewers:
+  `lineSurface` followed by `lineSideSlice`. The overview compresses the whole
+  line into its width and is not a replacement for either rendered strip. Both
+  rendered strips remain ordinary interactive viewers with independent pan,
+  zoom, scrolling, camera persistence, control-point interaction, and the
+  per-span mode/metric/message labels above. They must not be converted to the
+  obsolete fixed-height, fit-to-width, non-interactive rendered top strip.
+  During in-place surface replacement, each rendered strip retains its prior
+  overlays until that strip displays a frame for the new surface geometry.
 - Lasagna direction transport must remain in the sampled-normal tangent plane.
   If removing a direction's normal component is degenerate, transport chooses
   a deterministic perpendicular tangent; it must never return the original

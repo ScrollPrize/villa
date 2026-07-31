@@ -1,11 +1,12 @@
-# Remove Unpublished Fiber Version 2 Status
+# Main Line-Annotation GUI Merge Status
 
-- [x] Capture the removal scope and distinguish tracer version 2.
-- [x] Audit all top-level version-2 readers, migrations, tests, and docs.
-- [x] Write and review the implementation plan.
-- [x] Remove C++ version-2 file and segment-schema handling.
-- [x] Remove Python and sync version-2 handling.
-- [x] Replace compatibility tests with rejection coverage.
-- [x] Run focused C++, Python, and sync tests.
+- [x] Capture the clarified merge and rendered-strip requirements.
+- [x] Inspect the textual and semantic merge conflicts.
+- [x] Write and review the implementation plan against the current specs.
+- [x] Resolve toolbar and dialog member conflicts.
+- [x] Combine the schematic map with both interactive rendered strips.
+- [x] Extend in-place frame/overlay synchronization to both rendered strips.
 - [x] Update specs, docs, changelog, and task log.
-- [x] Review and stage all task changes.
+- [x] Build VC3D and focused test targets with 32 threads.
+- [x] Run focused line-annotation tests.
+- [x] Stage and verify the final merge resolution.

@@ -1,5 +1,8 @@
 # 2026-07-31
 
+- Merged the main VC3D line-annotation toolbar, tag, schematic-overview,
+  in-place refresh, and pane-lifecycle work while retaining both interactive
+  rendered fiber strips and their per-span mode/metric/message labels.
 - Removed the unpublished top-level `vc3d_fiber` version 2 and its obsolete
   descriptor migrations from VC3D, shared C++ readers, Python training input,
   and sync validation. Legacy file version 1 and current version 3 remain;

@@ -1,39 +1,75 @@
-# Remove Unpublished Fiber Version 2
+# Main Line-Annotation GUI Merge
 
-## Implementation
+## Discovery
 
-- Restricted VC3D, Atlas, the shared fiber tracer, and the Lasagna line probe
-  to top-level `vc3d_fiber` versions 1 and 3.
-- Kept version-1 numeric control points and version-3 object control points.
-- Removed the VC3D and shared-reader migrations for segment metadata schemas
-  `(1, 1)` and `(2, 2)`; version 3 accepts only the current `(3, 2)` schema.
-- Restricted the Python training reader and sync merger to the same contract.
-- Removed version-2 fallback-diagnostic normalization from sync because v2 is
-  now rejected before merging.
-- Replaced v2 migration tests with explicit file-version and descriptor-schema
-  rejection tests.
-- Updated the format docs, implementation map, specification, and changelog.
+- Started a plain `git merge main` at `fc25b4d1f`.
+- Git merged the controller, settings, viewer lifecycle, and unrelated main
+  changes automatically.
+- Textual conflicts are limited to `LineAnnotationDialog.cpp` and
+  `LineAnnotationDialog.hpp` around toolbar controls and their members.
+- Identified an unmarked semantic conflict: main replaced `lineSurface` with
+  the schematic overview and now assumes one rendered strip, while the target
+  requires the overview plus both rendered strips.
+- Confirmed the desired top-view strip is the branch's ordinary interactive
+  `lineSurface` viewer, not the older fixed-height/fit-to-width implementation.
+
+## Plan Review
+
+- Reviewed the plan against `planning/specs.md`, `planning/plan.md`, the
+  clarified user requirement, and the merged `#1286`/`#1289` lifecycle code.
+- The plan preserves persisted per-span labels and all fiber interpolation
+  behavior while adopting main's toolbar, schematic overview, in-place view
+  refresh, and teardown fixes.
+- Independent subagent review was not used because the active collaboration
+  policy prohibits delegation unless the user explicitly requests subagents;
+  this local review is the only process deviation.
+
+## Implementation Notes
+
+- Resolved the toolbar conflict with main's Annotation popup and action-backed
+  auto-reoptimization while retaining the fiber-global Lasagna/Fiber model
+  combo and extrapolation-distance control.
+- Kept main's intentional removal of the seed-direction and current-cut
+  shift-scroll-mode selectors.
+- Added the rendered `lineSurface` pointer to `GeneratedViews` so held overlays
+  can use the exact prior top-strip geometry during in-place replacement.
+- Kept the schematic overview as a separate full-width widget and restored the
+  two-entry interactive rendered-strip loop in `lineSurface`, `lineSideSlice`
+  order.
+- Restored independent camera state and equal splitter participation for both
+  rendered strips. The outer cut/strip default remains 2:1 so two rendered
+  strips retain useful height.
+- Replaced the one-strip pending flag with per-strip state. Static overlays,
+  current-position markers, and span labels now select held/current geometry
+  and descriptor data independently for each rendered strip.
+- Kept main's surface-epoch gating, placement focus, immediate schematic-map
+  feedback, and clear-viewer-references-before-container-deletion behavior.
+- Kept pause and optimization badges on the bottom `lineSideSlice` viewer.
+- Updated the specification, VC3D fiber documentation, implementation map, and
+  changelog with the merged layout contract.
 
 ## Validation
 
-- `python -m py_compile volume-cartographer/scripts/fiber_merge.py volume-cartographer/scripts/vc_sync.py vesuvius/src/vesuvius/neural_tracing/fiber_trace/fiber_json.py`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src python -m pytest -q vesuvius/tests/neural_tracing/test_fiber_trace.py volume-cartographer/scripts/tests/test_fiber_merge.py volume-cartographer/scripts/tests/test_vc_sync_helpers.py`
-  - 194 passed.
-- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target test_line_annotation_generated_views test_atlas -j32`
+- `git diff --check`
+  - Passed.
+- `git diff --name-only --diff-filter=U`
+  - Empty after staging; both merge conflicts are resolved.
+- Targeted `git diff main --check` over the resolution and documentation files
+  - Passed. The complete cached merge diff still reports trailing whitespace
+    already present in main's new `scripts/spiral/track_graph_testing.py`; the
+    merge resolution leaves that unrelated incoming file unchanged.
+- `cmake --build volume-cartographer/build --target VC3D vc_lasagna_line_probe vc_fiber_trace_metric -j32`
+  - Passed with the existing Qt deprecation/SFINAE warnings.
+- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target test_line_annotation_generated_views -j32`
+  - Passed. Ninja reported and recovered from a premature build-file EOF before
+    CMake regenerated the build.
 - `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_line_annotation_generated_views`
   - 56 test cases passed.
-- `cmake --build volume-cartographer/build --target VC3D vc_lasagna_line_probe vc_fiber_trace_metric -j32`
-  - All production targets built successfully.
+- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target VC3D -j32`
+  - Passed under Clang with existing Qt deprecation warnings.
 
-## Known Test Fixture Failure
+## Deviations And Limitations
 
-- The full `test_atlas` binary still reports three pre-existing pred-snap
-  fixture failures because its Lasagna `nx` channel is not a 3D `(Z,Y,X)`
-  zarr. The target compiles, and the failure is unrelated to fiber file-version
-  parsing.
-
-## Compatibility Decision
-
-- Top-level file version 2 was never published and has no compatibility path.
-- `tracer_version: 2` remains required inside current version-3 segment
-  descriptors; it is a tracer-schema version, not the removed file version.
+- No implementation requirements were simplified or deferred.
+- Interactive visual verification of the final Qt layout was not run in this
+  non-GUI session; both GCC and Clang compiled the complete VC3D target.

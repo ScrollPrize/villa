@@ -4,6 +4,27 @@ Code and helpers to fit a canonical Archimedean spiral to deformed scrolls.
 `spiral_service.py` hosts one persistent interactive fit session over HTTP for
 the VC3D Spiral workspace; `fit_spiral.py` is the underlying fitter.
 
+## Flattening a fitted checkpoint
+
+`flatten_spiral_checkpoint.py` is a standalone, one-shot exporter. It
+reconstructs the combined surface from a fitted checkpoint, launches a private
+Lasagna service, flattens with `flatten_fast_nofilter.json`, writes the final
+TIFXYZ directory, and tears the service down even if the job fails or is
+interrupted:
+
+```sh
+python flatten_spiral_checkpoint.py \
+    /path/to/checkpoint_fitted.ckpt \
+    /path/to/output.tifxyz
+```
+
+The checkpoint format does not embed the fixed umbilicus curve. The script
+looks for `umbilicus.json` in the checkpoint's ancestors, in
+`$SPIRAL_DATASET`, and in the standard local s1 dataset location. For other
+layouts, pass `--umbilicus /path/to/umbilicus.json`. Use `--lasagna-dir` if
+the Lasagna repository is not in its standard sibling or `~/villa` location.
+An existing output path is never overwritten.
+
 ## Spiral service host setup
 
 VC3D connects to a Spiral service in one of three modes, all speaking the same
@@ -40,20 +61,25 @@ uv sync            # creates .venv from pyproject.toml
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e scripts/spiral`.
 
-### Sparse CUDA field cache
+### Resident sparse field pools
 
-Normals, gradient magnitude, and surf-SDT samples use a bounded 32³-chunk
-CUDA LRU backed directly by the source Zarr arrays. The default pool limits
-are 6 GiB for normals, 2 GiB for gradient magnitude, and 16 GiB for SDT;
-each is also capped to a fraction of currently free device memory. Override
-them with `FIT_SPIRAL_SPARSE_NORMAL_CACHE_GB`,
-`FIT_SPIRAL_SPARSE_GRAD_CACHE_GB`, and
-`FIT_SPIRAL_SPARSE_SDT_CACHE_GB`. `FIT_SPIRAL_TENSORSTORE_CACHE_GB`
-controls the host TensorStore cache (2 GiB per field by default).
+Normals, gradient magnitude, and surf-SDT samples are served by fully
+resident device brick pools. Each store's occupied bricks are packed once
+into a flat sidecar next to the source zarr by `pack_resident_pools.py`:
 
-A single gather's distinct chunks must fit its field pool. If it does not,
-the fitter reports the required working-set size and the corresponding
-environment variable instead of growing the cache or risking a CUDA OOM.
+```sh
+python pack_resident_pools.py /path/to/lasagna_inputs \
+    --ct /path/to/<scroll>_ds2.zarr --ct-group 2 --verify 2000
+```
+
+`--ct` zeroes every voxel whose CT voxel reads 0 (the mask region around the
+scroll) so those bricks drop out of the pool and sample as no-data. The
+fitter loads the sidecars restricted to the configured z-ROI in one
+sequential read per channel (for the full s1 ROI: ~33 GiB SDT + ~10 GiB
+normals); after that every gather is pure device indexing with no I/O and no
+eviction. A missing sidecar is a startup error naming the pack command.
+Set `FIT_SPIRAL_RESIDENT_BOUNDS_CHECK=1` to enable per-gather bounds
+assertions when debugging new sampling code.
 
 ### Internet flow (SSH attach)
 
@@ -112,6 +138,12 @@ accept it — VC3D deliberately never auto-trusts host keys.
 
 The fit survives viewer disconnects, laptop sleep, and network drops;
 disconnecting or closing VC3D never terminates a service it did not launch.
+The workspace reports the active loading, optimization, checkpoint, and
+preview stage with elapsed time. Stages with a real work total also show a
+counter and ETA; opaque native or CUDA operations deliberately use an
+indeterminate bar instead of a guessed overall percentage. The same stage
+updates are printed by standalone `fit_spiral.py`, with periodic elapsed-time
+heartbeats when output is captured to a log.
 While connected, the circular-arrow button beside the connection controls
 restarts the remote service and reconnects automatically. The service replaces
 its own process in place, so a containing `tmux` session remains alive and an

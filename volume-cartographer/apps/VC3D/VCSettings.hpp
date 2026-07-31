@@ -324,7 +324,9 @@ namespace line_annotation {
     constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
-    constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes";
+    // "_v2" retires ratios saved before the fixed top strip / smaller bottom
+    // strip layout; old values would override the new default proportions.
+    constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";
     constexpr auto TOP_SPLITTER_SIZES = "lineAnnotation/top_splitter_sizes";
     constexpr auto STRIP_SPLITTER_SIZES = "lineAnnotation/strip_splitter_sizes";
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";

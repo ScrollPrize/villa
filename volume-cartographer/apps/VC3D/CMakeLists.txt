@@ -409,5 +409,6 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/spiral/
     DESTINATION share/volume-cartographer/spiral
     FILES_MATCHING
         PATTERN "*.py"
+        PATTERN "*.json"
         PATTERN "tests" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
