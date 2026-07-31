@@ -1364,6 +1364,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     }
 
     updateFixedStripGeometry();
+    updateStripRenderLevelFloors();
     updatePauseIndicator();
     updateOptimizationStatusIndicator();
     rebuildGeneratedOverlays();
@@ -2216,6 +2217,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     if (_closing || !_hasGeneratedViews) {
         return;
     }
+
+    // Runs after every render/zoom via the overlay-refresh connection, which
+    // keeps the strips' LOD floor tracking user zoom changes.
+    updateStripRenderLevelFloors();
 
     const auto markerColorForState =
         [](vc3d::line_annotation::GeneratedCurrentLineMarkerState state) {
@@ -3138,6 +3143,41 @@ void LineAnnotationDialog::updateFixedStripGeometry()
     camera.zOffsetWorldDir = {0, 0, 0};
     camera.scale = zoom;
     _fixedStripViewer->applyCameraState(camera, false);
+}
+
+void LineAnnotationDialog::updateStripRenderLevelFloors()
+{
+    if (!_hasGeneratedViews) {
+        return;
+    }
+    const double spacingVx =
+        vc3d::line_annotation::medianGeneratedLinePointSpacing(_generatedViews.linePoints);
+    if (!std::isfinite(spacingVx) || spacingVx <= 0.0) {
+        return;
+    }
+    for (const auto& stripViewer : _stripViewers) {
+        if (!stripViewer) {
+            continue;
+        }
+        const float zoom = stripViewer->cameraState().scale;
+        if (!(zoom > 0.0f)) {
+            continue;
+        }
+        // The strip quad has one column per line sample, so the true footprint
+        // is spacingVx volume voxels per screen pixel at zoom 1 -- which the
+        // viewer's zoom-only LOD pick cannot see. Match its 0.5 zoom bias.
+        int minLevel = 0;
+        const double volumeVxPerScreenPx = spacingVx / static_cast<double>(zoom);
+        if (volumeVxPerScreenPx > 1.0) {
+            minLevel = std::clamp(
+                static_cast<int>(std::floor(std::log2(volumeVxPerScreenPx * 0.5))),
+                0,
+                8);
+        }
+        if (stripViewer->property("vc_min_render_level").toInt() != minLevel) {
+            stripViewer->setProperty("vc_min_render_level", minLevel);
+        }
+    }
 }
 
 void LineAnnotationDialog::snapPanesToFixedStripCursor()

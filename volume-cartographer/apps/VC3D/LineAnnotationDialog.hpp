@@ -278,6 +278,9 @@ private:
     bool handleKeyPress(QKeyEvent* event);
     // Fixed top strip: fit-to-width zoom + auto height, recomputed on resize.
     void updateFixedStripGeometry();
+    // Render-LOD floor for the strip viewers, derived from line-sample spacing
+    // and each strip's current zoom (see vc_min_render_level in the viewer).
+    void updateStripRenderLevelFloors();
     // "R": one-shot jump of the other panes to the cursor's line position on the
     // fixed top strip (works regardless of follow mode; leaves it unchanged).
     void snapPanesToFixedStripCursor();

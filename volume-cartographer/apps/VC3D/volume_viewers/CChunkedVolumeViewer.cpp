@@ -1732,6 +1732,12 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
     if (preferSurfaceResolution && !_surfaceCache && level < levelCount - 1)
         level -= kSurfaceResolutionLevelBias;
     level = std::max(level, _maxDisplayedResolution);
+    // Per-viewer LOD floor for quads that sample the volume sparsely (e.g. the
+    // line annotation strips: one column per line sample, several vx apart).
+    // There the screen zoom under-estimates the volume-space footprint by the
+    // sample spacing, and level-0 requests along a long annotation thrash the
+    // chunk cache (endless chunk-ready re-renders).
+    level = std::max(level, property("vc_min_render_level").toInt());
     return std::clamp(level, 0, levelCount - 1);
 }
 
