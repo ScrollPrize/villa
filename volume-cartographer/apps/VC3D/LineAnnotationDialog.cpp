@@ -995,6 +995,69 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         return false;
     }
 
+    // In-place update: every control-point placement re-materializes the views,
+    // and the controller re-registers the new surfaces in CState under the SAME
+    // names before calling us, so the live viewers have already adopted them via
+    // surfaceChanged (view centers preserved). Rebuilding the panes -- the
+    // previous behavior -- destroyed and recreated all four viewers, producing a
+    // visible blank/jump on every placement.
+    if (_hasGeneratedViews && _currentCutViewer && _sideCutViewer &&
+        _stripViewers.size() == 2 && _stripViewers[0] && _stripViewers[1] &&
+        _generatedViews.currentCutName == views.currentCutName &&
+        _generatedViews.sideCutName == views.sideCutName &&
+        _generatedViews.lineSurfaceName == views.lineSurfaceName &&
+        _generatedViews.lineSideSliceName == views.lineSideSliceName) {
+        const double previousLinePosition = _currentLinePosition;
+        _generatedViews = views;
+        _linePointsd.clear();
+        _linePointsd.reserve(_generatedViews.linePoints.size());
+        for (const auto& p : _generatedViews.linePoints) {
+            _linePointsd.emplace_back(p[0], p[1], p[2]);
+        }
+        _sideFitBracket[0] = SideFit{};
+        _sideFitBracket[1] = SideFit{};
+        _generatedControlIndex =
+            vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
+                _generatedViews.controlPoints);
+        const double maxLinePosition =
+            static_cast<double>(_generatedViews.linePoints.size() - 1);
+        _currentLinePosition =
+            std::clamp(previousLinePosition, 0.0, maxLinePosition);
+        _currentCutNormalOffsetVx = 0.0;
+        _sideCutNormalOffsetVx = 0.0;
+        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+        _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+        if (!updatePlaneSurface(_generatedViews.currentCutSurface.get(),
+                                _currentLinePosition) ||
+            !updateSidePlaneSurface(_generatedViews.sideCutSurface.get(),
+                                    _currentLinePosition)) {
+            return false;
+        }
+        _currentCutViewer->markSurfaceGeometryChanged();
+        _currentCutViewer->renderVisible(true, "line annotation views updated");
+        _sideCutViewer->markSurfaceGeometryChanged();
+        _sideCutViewer->renderVisible(true, "line annotation views updated");
+        for (const auto& stripViewer : _stripViewers) {
+            if (stripViewer) {
+                stripViewer->renderVisible(true, "line annotation views updated");
+            }
+        }
+        updateFixedStripGeometry();
+        updatePauseIndicator();
+        updateOptimizationStatusIndicator();
+        rebuildGeneratedOverlays();
+        if (_showAsMeshAction) {
+            _showAsMeshAction->setEnabled(true);
+        }
+        if (_fullOptimizationAction) {
+            _fullOptimizationAction->setEnabled(true);
+        }
+        if (_resetViewsButton) {
+            _resetViewsButton->setEnabled(true);
+        }
+        return true;
+    }
+
     if (_showAsMeshAction) {
         _showAsMeshAction->setEnabled(false);
     }
