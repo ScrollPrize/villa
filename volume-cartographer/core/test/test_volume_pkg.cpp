@@ -777,10 +777,12 @@ TEST_CASE("VolumePkg detach preserves an independently attached Lasagna source v
     auto pkg = VolumePkg::newEmpty();
     REQUIRE(pkg->attachPreparedVolume(location, {}, volume) ==
             VolumePkg::AttachVolumeResult::Attached);
+    create.uuid = "lasagna-prepared-source";
+    auto preparedVolume = Volume::New(d / "prepared.zarr", create);
     const VolumePkg::PreparedVolumeAttachment derived{
         location,
         {"vc-lasagna-derived:data.lasagna.json"},
-        volume,
+        preparedVolume,
     };
     REQUIRE(pkg->attachPreparedLasagnaDataset(
                 "data.lasagna.json", {}, false, {derived}) ==
@@ -795,6 +797,46 @@ TEST_CASE("VolumePkg detach preserves an independently attached Lasagna source v
     REQUIRE(pkg->volumeEntries().size() == 1);
     CHECK(pkg->volumeEntries().front().location == location);
     CHECK(pkg->hasVolume("independent-lasagna-source"));
+    fs::remove_all(d);
+}
+
+TEST_CASE("VolumePkg rejects incompatible independently attached Lasagna source metadata")
+{
+    auto d = tmpDir("lasagna_independent_metadata");
+    Volume::ZarrCreateOptions create;
+    create.shapeZYX = {2, 2, 2};
+    create.chunkShapeZYX = {2, 2, 2};
+    create.numLevels = 1;
+    create.uuid = "independent-source";
+    create.name = "source";
+    create.voxelSize = 1.0;
+    create.compressor.clear();
+    const auto location = (d / "source.zarr").string();
+    auto independent = Volume::New(location, create);
+
+    create.uuid = "lasagna-prepared-source";
+    create.voxelSize = 2.0;
+    auto prepared = Volume::New(d / "prepared.zarr", create);
+
+    auto pkg = VolumePkg::newEmpty();
+    REQUIRE(pkg->attachPreparedVolume(location, {}, independent) ==
+            VolumePkg::AttachVolumeResult::Attached);
+    const VolumePkg::PreparedVolumeAttachment derived{
+        location,
+        {"vc-lasagna-derived:data.lasagna.json"},
+        prepared,
+    };
+
+    CHECK_THROWS_WITH_AS(
+        pkg->attachPreparedLasagnaDataset(
+            "data.lasagna.json", {}, false, {derived}),
+        doctest::Contains("voxel spacing differs"),
+        std::runtime_error);
+    CHECK(pkg->allLasagnaDatasetEntries().empty());
+    REQUIRE(pkg->volumeEntries().size() == 1);
+    CHECK(pkg->volumeEntries().front().location == location);
+    CHECK(pkg->hasVolume("independent-source"));
+    CHECK_FALSE(pkg->hasVolume("lasagna-prepared-source"));
     fs::remove_all(d);
 }
 

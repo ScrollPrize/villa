@@ -110,6 +110,11 @@
 - Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2
   (factor 4 relative to selected input). It is converted to the runner's
   literal factor and does not read or reinterpret tracer config `scaledown`.
+- Model tensor downsampling retains floor-sized interpolation geometry, but
+  persisted OME-Zarr level shapes and exclusive output-region endpoints use
+  ceil division. Odd selected-input dimensions must therefore write their
+  final valid output plane and output chunk rather than leaving the ceil-sized
+  OME edge unwritten.
 - Scaled output uses the shared repeated separable `[1,4,6,4,1]/16`
   blur-plus-2x-decimation path for weighted predictions and weights. Fiber has
   no private resampling, blending, or border implementation.
@@ -1288,7 +1293,12 @@
   detach cleanup. Group, channel, spacing, dtype, and shape remain authoritative
   in the manifest/Zarr descriptor and must not be duplicated in project tags. An
   independently attached primary volume is reused without an ownership tag and
-  survives manifest detach. Manifest entry, derived volume entries, and selected-role updates
+  survives manifest detach only when its resolved source, 3D shape, dtype,
+  fill value, base/present level layout, per-level shapes/chunks, and voxel
+  spacing match the manifest-prepared volume. Runtime UUID equality is not
+  required. Missing or incompatible runtime backing rejects and rolls back the
+  manifest attachment. Manifest entry, derived volume entries, and
+  selected-role updates
   are committed together or rolled back together; detaching removes a derived
   volume only when no remaining manifest owns it.
 - `vc_fiber_trace_metric` exposes `--remote-cache-dir PATH` and opens both the

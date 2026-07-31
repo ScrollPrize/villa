@@ -38,6 +38,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
 from vesuvius.neural_tracing.fiber_trace_3d.infer import (
     _input_scaledown_from_base,
     _resolve_inference_device,
+    _select_and_expand_crop,
     run_fiber_trace_3d_inference,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.prediction import (
@@ -2804,6 +2805,20 @@ def test_3d_fiber_inference_scale_defaults_and_validates_all_axes() -> None:
     assert _input_scaledown_from_base((17, 33, 65), (5, 9, 17)) == 4
     with pytest.raises(ValueError, match="isotropic power-of-two"):
         _input_scaledown_from_base((17, 33, 65), (5, 17, 17))
+
+
+def test_3d_fiber_inference_storage_bounds_include_odd_edge_chunks() -> None:
+    crop, output_region, output_shape = _select_and_expand_crop(
+        input_shape_zyx=(257, 129, 17),
+        crop_xyzwhd_base=None,
+        input_scaledown_from_base=1,
+        output_scaledown_from_input=4,
+        ome_chunk=64,
+    )
+
+    assert crop == (0, 257, 0, 129, 0, 17)
+    assert output_shape == (65, 33, 5)
+    assert output_region == (0, 0, 0, 65, 33, 5)
 
 
 def test_3d_two_branch_positive_supervision_routes_to_best_branch() -> None:

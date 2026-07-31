@@ -1,58 +1,49 @@
-# VC3D Native Tracing For New Fibers
+# CI Repairs For 3D Lasagna And Fiber Inference
 
 ## Findings
 
-- New `LineAnnotationSession` instances and the GUI correctly default to
-  `NativeFiberTrace3d`.
-- Initial seed placement nevertheless called the generic Lasagna
-  `startOptimization` path unconditionally. It did not inspect the global mode
-  or open fiber-inference data.
-- The existing fiber-mode optimizer already supports one control point: it
-  rebuilds a Lasagna baseline and replaces both open tails with native traces.
-  The initial creation path simply never dispatched to it.
-- Applying the initial Lasagna task normally also materializes and saves it, so
-  chaining after ordinary completion would persist a mislabeled intermediate
-  result.
+- The Atlas pred-snap test fixture still wrote the removed packed CZYX Lasagna
+  representation, so strict 3D channel binding failed before Atlas assertions.
+- Fiber inference used floor-sized tensor geometry as the bound for ceil-sized
+  OME pyramid arrays. Odd edge planes could consequently remain unwritten.
+- Independently owned project volume entries skipped both prepared-volume
+  installation and compatibility checks, allowing manifest spacing to be
+  silently replaced by incompatible ordinary-volume metadata.
 
 ## Plan Review
 
-- The plan reuses the existing native single-CP implementation and does not add
-  a second extrapolation algorithm.
-- It preserves Lasagna creation when no fiber inference is configured, while a
-  configured but invalid dataset remains a visible error.
-- The internal Lasagna baseline is applied only as transient session input and
-  is neither displayed nor saved.
+- The plan preserves strict independent 3D channel arrays and does not restore
+  legacy packed-array handling.
+- Tensor downsampling remains unchanged; only persisted storage bounds receive
+  ceil endpoint semantics.
+- Runtime UUID equality is intentionally excluded because prepared Lasagna
+  wrappers and ordinary attachments use different identities for one source.
 - Independent review was not used because delegation is prohibited unless the
   user explicitly requests subagents; the plan was reviewed locally instead.
 
 ## Implementation
 
-- Added a shared, Qt-free seed-dispatch decision that selects native seed
-  tracing only for native global mode plus either a selected inference dataset
-  or exactly one attached inference dataset. Multiple unselected datasets do
-  not force a file picker.
-- Seed placement opens configured fiber inference before mutating the new
-  fiber. A configured but invalid source therefore reports the existing error
-  and does not silently start a Lasagna fiber.
-- Added a session continuation flag. Successful Lasagna seed completion applies
-  its line only as transient input, suppressing generated-view materialization,
-  deferred dialog presentation, success callbacks, and fiber persistence.
-- Completion immediately dispatches the existing single-control-point native
-  optimizer with full retracing. That optimizer reuses the baseline tangent and
-  replaces both open tails using established native extrapolation/fallback
-  semantics.
-- Added command-line information logs for both the native continuation and the
-  explicit no-selected/unique-inference Lasagna path.
-- Updated the specification, VC3D fiber documentation, and changelog.
+- Replaced the Atlas pred-snap fixture's packed four-channel CZYX array with
+  separate 3D `grad_mag`, `nx`, `ny`, and `pred_dt` arrays/groups.
+- Added Fiber inference storage-bound ceil division for full level shapes and
+  absolute exclusive region endpoints without changing shared floor-sized
+  tensor downsampling.
+- Added independently owned volume lookup and compatibility validation before
+  reuse. Validation covers geometry, dtype, fill, scale levels/chunks, and
+  manifest spacing while intentionally allowing distinct UUIDs.
+- Added regressions for a 257-voxel edge crossing a 64-voxel output chunk,
+  compatible distinct-UUID reuse, incompatible-spacing rollback, and the
+  repaired Atlas fixture.
 
 ## Validation
 
-- `cmake --build volume-cartographer/build -j32 --target VC3D`: passed.
-- `cmake --build volume-cartographer/build/ci-coverage-clang-systemdeps -j32
-  --target test_line_annotation_generated_views`: passed.
-- `test_line_annotation_generated_views`: 57 cases passed, including the new
-  selected/unique-dataset dispatch matrix and the existing single-CP native
-  extrapolation/fallback cases.
-- No automated Qt interaction fixture currently places a real GUI seed against
-  an attached inference manifest. The production dispatch and native core are
-  covered separately; an interactive VC3D smoke test remains appropriate.
+- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps -j32
+  --target test_atlas test_volume_pkg`: passed.
+- `ctest --test-dir volume-cartographer/build/ci-tests-clang-systemdeps -R
+  '^(test_atlas|test_volume_pkg|test_lasagna_project_volumes)$'
+  --output-on-failure`: 3/3 passed.
+- Focused Fiber 3D pytest with third-party plugin autoload disabled: 2 passed,
+  180 deselected.
+- Full `test_fiber_trace_3d.py` with third-party plugin autoload disabled: 180
+  passed, 2 skipped.
+- `git diff --check`: passed.

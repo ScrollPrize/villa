@@ -1,5 +1,8 @@
 # 2026-07-31
 
+- Repaired Atlas pred-snap tests for strict per-channel 3D Lasagna arrays,
+  made Fiber 3D inference include ceil-sized odd OME edge planes, and made VC3D
+  reject incompatible independently attached Lasagna source volumes.
 - Made native mode effective during new-fiber seed creation: configured fiber
   inference now chains the internal Lasagna reference solve directly into the
   existing single-CP native extrapolator without displaying or saving the

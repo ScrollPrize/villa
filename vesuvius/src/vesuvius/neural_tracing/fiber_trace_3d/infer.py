@@ -17,7 +17,6 @@ try:
         _cleanup_predict3d_temp_files,
         _crop_xyzwhd_bounds,
         _ds_index,
-        _ds_size,
         run_tiled_inference_3d,
         OmeZarrOutputAdapter,
         write_lasagna_product_manifest,
@@ -30,7 +29,6 @@ except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs
         _cleanup_predict3d_temp_files,
         _crop_xyzwhd_bounds,
         _ds_index,
-        _ds_size,
         run_tiled_inference_3d,
         OmeZarrOutputAdapter,
         write_lasagna_product_manifest,
@@ -80,6 +78,13 @@ def _level_from_scaledown(scaledown: int) -> int:
     if sd <= 0 or sd & (sd - 1):
         raise ValueError(f"scaledown must be an exact positive power of two, got {sd}")
     return sd.bit_length() - 1
+
+
+def _storage_ds_end(value: int, scaledown: int) -> int:
+    """Map a positive exclusive input bound to a ceil-sized storage bound."""
+    value_i = max(0, int(value))
+    scaledown_i = max(1, int(scaledown))
+    return (value_i + scaledown_i - 1) // scaledown_i
 
 
 def _input_scaledown_from_base(
@@ -146,26 +151,22 @@ def _select_and_expand_crop(
 
     sd = max(1, int(output_scaledown_from_input))
     oc = max(1, int(ome_chunk))
-    full_out_shape = (
-        _ds_size(input_shape_zyx[0], sd),
-        _ds_size(input_shape_zyx[1], sd),
-        _ds_size(input_shape_zyx[2], sd),
-    )
+    full_out_shape = tuple(_storage_ds_end(size, sd) for size in input_shape_zyx)
 
     oz0 = (_ds_index(z0, sd) // oc) * oc
     oy0 = (_ds_index(y0, sd) // oc) * oc
     ox0 = (_ds_index(x0, sd) // oc) * oc
     oz1 = min(
         full_out_shape[0],
-        ((_ds_index(z0, sd) + _ds_size(nz, sd) + oc - 1) // oc) * oc,
+        ((_storage_ds_end(z1, sd) + oc - 1) // oc) * oc,
     )
     oy1 = min(
         full_out_shape[1],
-        ((_ds_index(y0, sd) + _ds_size(ny, sd) + oc - 1) // oc) * oc,
+        ((_storage_ds_end(y1, sd) + oc - 1) // oc) * oc,
     )
     ox1 = min(
         full_out_shape[2],
-        ((_ds_index(x0, sd) + _ds_size(nx, sd) + oc - 1) // oc) * oc,
+        ((_storage_ds_end(x1, sd) + oc - 1) // oc) * oc,
     )
 
     z0 = max(0, min(z0, oz0 * sd))
@@ -175,21 +176,20 @@ def _select_and_expand_crop(
     y1 = max(y1, min(input_shape_zyx[1], oy1 * sd))
     x1 = max(x1, min(input_shape_zyx[2], ox1 * sd))
 
-    nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
     oz0 = (_ds_index(z0, sd) // oc) * oc
     oy0 = (_ds_index(y0, sd) // oc) * oc
     ox0 = (_ds_index(x0, sd) // oc) * oc
     oz1 = min(
         full_out_shape[0],
-        ((_ds_index(z0, sd) + _ds_size(nz, sd) + oc - 1) // oc) * oc,
+        ((_storage_ds_end(z1, sd) + oc - 1) // oc) * oc,
     )
     oy1 = min(
         full_out_shape[1],
-        ((_ds_index(y0, sd) + _ds_size(ny, sd) + oc - 1) // oc) * oc,
+        ((_storage_ds_end(y1, sd) + oc - 1) // oc) * oc,
     )
     ox1 = min(
         full_out_shape[2],
-        ((_ds_index(x0, sd) + _ds_size(nx, sd) + oc - 1) // oc) * oc,
+        ((_storage_ds_end(x1, sd) + oc - 1) // oc) * oc,
     )
 
     return (

@@ -1,14 +1,9 @@
-# VC3D Native Tracing For New Fibers
+# CI Repairs For 3D Lasagna And Fiber Inference
 
-- A newly created fiber already defaults to the native fiber tracer in the
-  GUI and persisted global mode. Its initial generated geometry must also use
-  the native tracer when fiber-inference data is configured and usable.
-- Reuse the existing single-control-point native extrapolation path. The
-  Lasagna seed solve may provide its required reference line and tangent, but
-  that intermediate geometry must not be displayed or saved as the completed
-  new fiber.
-- When no fiber-inference dataset is configured, retain the existing Lasagna
-  seed behavior. Do not force a dataset picker merely because the default mode
-  is native tracing.
-- Failures while opening configured fiber-inference data must remain visible;
-  they must not be silently treated as successful native tracing.
+- Update the Atlas pred-snap fixture to the supported Lasagna representation:
+  one 3D ZYX array per channel, with no packed CZYX compatibility.
+- Make Fiber 3D inference cover ceil-sized OME-Zarr edge voxels for odd source
+  dimensions while preserving floor-sized model tensor semantics.
+- Before reusing an independently attached project volume for a Lasagna
+  channel, validate its source geometry, dtype, level/chunk layout, and
+  manifest-authoritative voxel spacing. Reject incompatible reuse atomically.

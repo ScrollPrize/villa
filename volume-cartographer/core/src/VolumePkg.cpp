@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -289,6 +290,41 @@ bool loadedVolumeMatchesLocation(
         loadedPath = fs::absolute(loadedPath);
     return loadedPath.lexically_normal() ==
            absoluteLocalPath(location, projectDirectory);
+}
+
+std::optional<std::string> incompatibleVolumeMetadata(
+    const Volume& existing,
+    const Volume& prepared)
+{
+    if (existing.shape() != prepared.shape())
+        return "3D shape differs";
+    if (existing.dtype() != prepared.dtype())
+        return "dtype differs";
+    if (existing.fillValue() != prepared.fillValue())
+        return "fill value differs";
+    if (existing.baseScaleLevel() != prepared.baseScaleLevel())
+        return "base scale level differs";
+
+    const double existingSpacing = existing.voxelSize();
+    const double preparedSpacing = prepared.voxelSize();
+    const double spacingScale = std::max(
+        {1.0, std::abs(existingSpacing), std::abs(preparedSpacing)});
+    if (!std::isfinite(existingSpacing) || !std::isfinite(preparedSpacing) ||
+        std::abs(existingSpacing - preparedSpacing) > 1.0e-12 * spacingScale) {
+        return "voxel spacing differs";
+    }
+
+    const auto existingLevels = existing.presentScaleLevels();
+    const auto preparedLevels = prepared.presentScaleLevels();
+    if (existingLevels != preparedLevels)
+        return "present scale levels differ";
+    for (const int level : existingLevels) {
+        if (existing.levelShape(level) != prepared.levelShape(level))
+            return "level shape differs";
+        if (existing.chunkShape(level) != prepared.chunkShape(level))
+            return "level chunk shape differs";
+    }
+    return std::nullopt;
 }
 
 std::vector<fs::path> immediateSubdirs(const fs::path& dir)
@@ -1356,8 +1392,37 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
                     }
                 }
                 changed = changed || entry->tags != oldTags;
-                if (independentlyOwned)
+                if (independentlyOwned) {
+                    std::shared_ptr<Volume> existingVolume;
+                    for (const auto& [id, volume] : loadedVolumes_) {
+                        (void)id;
+                        if (!loadedVolumeMatchesLocation(
+                                volume, prepared.location,
+                                path_.parent_path())) {
+                            continue;
+                        }
+                        if (existingVolume && existingVolume != volume) {
+                            throw std::runtime_error(
+                                "Cannot reuse independently attached Lasagna volume '" +
+                                prepared.location +
+                                "': multiple loaded volumes reference the source");
+                        }
+                        existingVolume = volume;
+                    }
+                    if (!existingVolume) {
+                        throw std::runtime_error(
+                            "Cannot reuse independently attached Lasagna volume '" +
+                            prepared.location +
+                            "': its loaded volume is unavailable for compatibility validation");
+                    }
+                    if (const auto mismatch = incompatibleVolumeMetadata(
+                            *existingVolume, *prepared.volume)) {
+                        throw std::runtime_error(
+                            "Cannot reuse independently attached Lasagna volume '" +
+                            prepared.location + "': " + *mismatch);
+                    }
                     continue;
+                }
             }
             auto loaded = loadedVolumes_.find(prepared.volume->id());
             if (loaded == loadedVolumes_.end()) {

@@ -108,6 +108,10 @@ loading.
   top-level `source_to_base` plus each prediction group's `scaledown` records
   the persisted prediction scale relative to base. The manifest does not
   serialize the selected tracing/input scale separately.
+- Model/interpolation tensor sizing remains floor-divided. OME-Zarr storage
+  shapes and crop-region exclusive endpoints instead use ceil division, matching
+  the pyramid creator and ensuring odd edge planes are included in chunk
+  scheduling and writes.
 
 ### Shared 3D tiled runner
 
@@ -699,7 +703,12 @@ Ownership changed as follows:
   referenced channels as flat ordinary 3D project volumes. Each attached group
   names one channel and references one actual ZYX array. Older flat CZYX
   preprocessing/fit intermediates require conversion and are not projected by
-  VC3D; generic volumes remain 3D-only.
+  VC3D; generic volumes remain 3D-only. If that exact source is already attached
+  as an independent primary volume, VC3D preserves its independent ownership
+  only after validating shape, dtype, fill value, level/chunk layout, and
+  manifest-authoritative voxel spacing. UUIDs may differ between the ordinary
+  volume and Lasagna wrapper; incompatible metadata rejects the whole manifest
+  attachment.
 
   The VC3D line annotation GUI resolves the selected tagged fiber entry and
   exposes a checked Ctrl-right-click `Interpolation goal` submenu for each
