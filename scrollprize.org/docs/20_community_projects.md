@@ -180,6 +180,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Herculaneum Scroll Tools](https://github.com/axiosdevs/herculaneum-scroll-tools) by axiosdevs — CT-consistency QA for the published m7 surface predictions: voxel-exact phantom fractions measured for all 36 samples incl. all 13 grand-prize scrolls (43.3% of positives sit outside the masked CT), with a one-pass `clean` mode ([villa#1114](https://github.com/ScrollPrize/villa/issues/1114)); plus cross-scan registration (2023→2025 rescan, MAD 29 µm), a winding-constraint annotator/verifier in native spiral-input format, and dual-energy high-Z ink-candidate rendering.
 
+- [spiral-fit-consumer-gpu](https://github.com/7jycwjmbfn-eng/spiral-fit-consumer-gpu) by Shuhan Yang runs the spiral fitter in this repo on a 12 GB consumer GPU without the native VC extension. Drop-in replacements for the sparse CUDA cache, which otherwise raises before the first step, and for point-to-patch linking, where a measured 41-hour ETA drops to minutes. Both are checked for bitwise-identical output against the originals. Includes a scaling ladder and pool-tuning measurements from one gaming laptop.
+
 
 ### 📦 Materials
 
