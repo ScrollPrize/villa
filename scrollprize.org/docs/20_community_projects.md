@@ -257,6 +257,7 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [3D (volumetric) Ink detection model](https://github.com/ryanchesler/3d-ink-detection) by Ryan Chesler. Ink detection model that works on full scroll data in 3D, without segmentation nor flattening.
 - [Volumetric Ink Detection for Scroll 1, 2, 3, 4](https://dl.ash2txt.org/community-uploads/bruniss/3d%20Ink%20/) by Sean Johnson
+- [Slice: calibrated 3D ink labels + browser viewer](https://github.com/williamshermer-pixel/slice) by William Shermer. Ready-to-run image/label pairs for ink-detection training (zarr; depth resolved per pixel rather than projected across layers, re: #192), each carrying a quality certificate: an ink floor calibrated to a measured 0.2% false-positive rate on known-blank papyrus, and a condition-control AUC separating ink from blank sheet of the *same* preservation. Ships the generator, a QC gate that verifies depth actually varies, per-scroll depth-band and per-scribe hand calibration, and a browser-native viewer that streams the public bucket with no install: [slice-site-alpha.vercel.app](https://slice-site-alpha.vercel.app)
 
 #### ⚙️ Tools
 
