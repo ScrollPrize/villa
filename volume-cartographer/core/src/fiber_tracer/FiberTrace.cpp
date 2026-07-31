@@ -454,47 +454,6 @@ struct ConeOffset {
            std::isfinite(point[2]);
 }
 
-[[nodiscard]] cv::Vec3d pointFromJson(
-    const nlohmann::json& value,
-    const std::filesystem::path& path,
-    const char* key)
-{
-    if (!value.is_array() || value.size() != 3) {
-        throw std::runtime_error(
-            "fiber JSON point in '" + std::string(key) +
-            "' must be a three-element array: " + path.string());
-    }
-    cv::Vec3d point{
-        value.at(0).get<double>(),
-        value.at(1).get<double>(),
-        value.at(2).get<double>(),
-    };
-    if (!finitePoint(point)) {
-        throw std::runtime_error(
-            "fiber JSON point in '" + std::string(key) +
-            "' contains non-finite coordinates: " + path.string());
-    }
-    return point;
-}
-
-[[nodiscard]] std::vector<cv::Vec3d> pointArrayFromJson(
-    const nlohmann::json& root,
-    const std::filesystem::path& path,
-    const char* key)
-{
-    if (!root.contains(key) || !root.at(key).is_array()) {
-        throw std::runtime_error(
-            "fiber JSON is missing array '" + std::string(key) +
-            "': " + path.string());
-    }
-    std::vector<cv::Vec3d> points;
-    points.reserve(root.at(key).size());
-    for (const auto& value : root.at(key)) {
-        points.push_back(pointFromJson(value, path, key));
-    }
-    return points;
-}
-
 [[nodiscard]] bool pointsExactlyEqual(const cv::Vec3d& a, const cv::Vec3d& b)
 {
     return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
@@ -4609,19 +4568,12 @@ FiberInput loadFiberJson(const std::filesystem::path& path)
         throw std::runtime_error("could not open fiber JSON: " + path.string());
     }
     const nlohmann::json root = nlohmann::json::parse(input);
-    if (root.value("type", std::string{}) != "vc3d_fiber") {
-        throw std::runtime_error("fiber JSON type is not vc3d_fiber: " + path.string());
-    }
-    const int version = root.value("version", 0);
-    if (version != 1 && version != 3) {
-        throw std::runtime_error("unsupported vc3d_fiber version: " + path.string());
-    }
+    const auto parsed = parseVc3dFiberJson(root, path.string());
 
     FiberInput fiber;
     fiber.path = path;
-    fiber.linePointsXyzBase = pointArrayFromJson(root, path, "line_points");
-    fiber.controlPointsXyzBase = vc3dFiberPointArrayFromJson(
-        root, "control_points", version, path.string());
+    fiber.linePointsXyzBase = parsed.linePoints;
+    fiber.controlPointsXyzBase = parsed.controlPoints;
     if (fiber.linePointsXyzBase.size() < 2) {
         throw std::runtime_error(
             "fiber JSON needs at least two line_points: " + path.string());

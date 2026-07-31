@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 import zarr
 
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
+from vc3d_fiber_format import legacy_lasagna_segments
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
 from vesuvius.neural_tracing.fiber_trace_2d.loader_support import ZarrChunkRequest
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import (
@@ -252,6 +253,7 @@ def _straight_fiber() -> Vc3dFiber:
         version=1,
         line_points_xyz=points,
         control_points_xyz=points[::4].copy(),
+        control_point_segments=legacy_lasagna_segments(len(points[::4])),
         generation=1,
         metadata={},
     )
@@ -267,6 +269,7 @@ def _centered_fiber() -> Vc3dFiber:
         version=1,
         line_points_xyz=points,
         control_points_xyz=points[8:9].copy(),
+        control_point_segments=legacy_lasagna_segments(1),
         generation=1,
         metadata={},
     )
@@ -375,6 +378,7 @@ def _long_segment_fiber(*, source_format: str | None = None) -> Vc3dFiber:
         version=1,
         line_points_xyz=points,
         control_points_xyz=points[1:2].copy(),
+        control_point_segments=legacy_lasagna_segments(1),
         generation=1,
         metadata={} if source_format is None else {"source_format": source_format},
     )
@@ -4113,6 +4117,7 @@ def _whole_native_trace_record() -> SimpleNamespace:
         version=1,
         line_points_xyz=points,
         control_points_xyz=points.copy(),
+        control_point_segments=legacy_lasagna_segments(len(points)),
         generation=1,
         metadata={},
     )
@@ -4162,6 +4167,7 @@ def test_native_3d_whole_fiber_success_continues_from_live_trace_state() -> None
             version=1,
             line_points_xyz=points,
             control_points_xyz=points.copy(),
+            control_point_segments=legacy_lasagna_segments(len(points)),
             generation=1,
             metadata={},
         ),
@@ -4546,6 +4552,7 @@ def test_native_3d_whole_fiber_trace_last_segment_failure_finishes() -> None:
             version=1,
             line_points_xyz=points,
             control_points_xyz=points.copy(),
+            control_point_segments=legacy_lasagna_segments(len(points)),
             generation=1,
             metadata={},
         ),
@@ -5864,6 +5871,7 @@ def test_native_3d_trace2cp_lasagna_normal_sampler_uses_geometry_record() -> Non
             [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
             dtype=np.float32,
         ),
+        control_point_segments=legacy_lasagna_segments(2),
         generation=1,
         metadata={},
     )
@@ -6176,6 +6184,7 @@ def test_native_3d_trace2cp_fiber_line_tangent_uses_adjacent_segment_not_chord()
             ],
             dtype=np.float32,
         ),
+        control_point_segments=legacy_lasagna_segments(2),
         generation=1,
         metadata={},
     )

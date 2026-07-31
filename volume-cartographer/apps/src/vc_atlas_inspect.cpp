@@ -2,6 +2,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
@@ -135,41 +136,6 @@ double norm(const cv::Vec3d& v)
     return std::sqrt(v.dot(v));
 }
 
-cv::Vec3d pointFromJson(const nlohmann::json& value, const fs::path& path, const char* name)
-{
-    if (!value.is_array() || value.size() != 3) {
-        throw std::runtime_error(std::string(name) + " point must be [x,y,z]: " +
-                                 path.string());
-    }
-    cv::Vec3d point{
-        value.at(0).get<double>(),
-        value.at(1).get<double>(),
-        value.at(2).get<double>(),
-    };
-    if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
-        throw std::runtime_error(std::string(name) + " point contains non-finite value: " +
-                                 path.string());
-    }
-    return point;
-}
-
-std::vector<cv::Vec3d> pointArrayFromJson(const nlohmann::json& root,
-                                          const char* key,
-                                          const fs::path& path)
-{
-    const auto it = root.find(key);
-    if (it == root.end() || !it->is_array()) {
-        throw std::runtime_error("fiber JSON is missing array " + std::string(key) + ": " +
-                                 path.string());
-    }
-    std::vector<cv::Vec3d> points;
-    points.reserve(it->size());
-    for (const auto& point : *it) {
-        points.push_back(pointFromJson(point, path, key));
-    }
-    return points;
-}
-
 vc::atlas::FiberInput loadFiberInput(const vc::atlas::LasagnaAtlasObject& object)
 {
     std::ifstream in(object.fiberPath);
@@ -178,10 +144,12 @@ vc::atlas::FiberInput loadFiberInput(const vc::atlas::LasagnaAtlasObject& object
                                  object.fiberPath.string());
     }
     const nlohmann::json root = nlohmann::json::parse(in);
+    const auto parsed = vc::fiber_tracer::parseVc3dFiberJson(
+        root, object.fiberPath.string());
     vc::atlas::FiberInput input;
     input.fiberPath = object.fiberRelativePath;
-    input.controlPoints = pointArrayFromJson(root, "control_points", object.fiberPath);
-    input.linePoints = pointArrayFromJson(root, "line_points", object.fiberPath);
+    input.controlPoints = parsed.controlPoints;
+    input.linePoints = parsed.linePoints;
     vc::atlas::validateFiberInputControlPoints(input);
     return input;
 }

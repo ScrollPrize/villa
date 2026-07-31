@@ -1217,3 +1217,24 @@ def test_v3_fiber_rejects_obsolete_segment_metadata_versions():
     doc = make_v3_fiber([cp(0), cp(1)])
     doc['control_points'][0]['segment_to_next']['metadata_version'] = 2
     assert not fiber_merge.is_fiber_doc(doc)
+
+
+@pytest.mark.parametrize('mutation', ['missing_mode', 'missing_segment',
+                                      'final_segment', 'nonpositive_scale'])
+def test_v3_fiber_requires_complete_non_repaired_schema(mutation):
+    doc = make_v3_fiber([cp(0), cp(1), cp(2)])
+    if mutation == 'missing_mode':
+        del doc['optimization_mode']
+    elif mutation == 'missing_segment':
+        del doc['control_points'][0]['segment_to_next']
+    elif mutation == 'final_segment':
+        doc['control_points'][-1]['segment_to_next'] = v3_segment()
+    else:
+        doc['control_points'][0]['segment_to_next']['trace_to_base_scale'] = 0
+
+    assert not fiber_merge.is_fiber_doc(doc)
+    good = make_v3_fiber([cp(0), cp(1), cp(2)])
+    result = merge_fibers(doc, good, copy.deepcopy(good))
+    assert not result['ok']
+    assert result['merged'] is None
+    assert result['conflicts']

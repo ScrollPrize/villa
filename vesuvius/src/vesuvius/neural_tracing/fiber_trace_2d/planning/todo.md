@@ -80,7 +80,8 @@
 - [ ] if we follow a differnt dir fiber (turning not parallel) then the local h/v classification should change
 - [ ] can we do a local h/v classification?
 - [ ] if we turn wrong somewhere can we detect this by looking at the fiber normal?
-    
+- [ ] new fiber should not only in the gui default to the new fiber tracer but also actually use it (if available!)
+
 # beam-search
 - [ ] beamsearch
 - [ ] short brute-force lookahead

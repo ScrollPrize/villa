@@ -1,5 +1,7 @@
 #include "LineAnnotationFiberSegments.hpp"
 
+#include "vc/lasagna/NormalAlignment.hpp"
+
 #include "vc/lasagna/LineSpline.hpp"
 
 #include <algorithm>
@@ -852,9 +854,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         metadata.meetingSource.clear();
         metadata.metric.reset();
         if (spanIndex < reinitialized.spans.size()) {
-            const double alignment = std::clamp(
-                reinitialized.spans[spanIndex].chosenMaxNormalAlignmentAbs, 0.0, 1.0);
-            metadata.metric = std::asin(alignment) * 180.0 / M_PI;
+            metadata.metric = vc::lasagna::normalAlignmentMagnitudeErrorDegrees(
+                reinitialized.spans[spanIndex].chosenMaxNormalAlignmentAbs);
         }
         if (metadata.message.empty() || metadata.message == "lasagna")
             metadata.message = "lasagna";

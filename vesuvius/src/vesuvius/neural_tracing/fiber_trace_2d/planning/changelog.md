@@ -1,5 +1,10 @@
 # 2026-07-31
 
+- Made every v3 fiber reader reject missing or malformed mode/segment metadata
+  without repair, completed v3 geometry consumption in Atlas, Lasagna, and
+  Spiral, made sync route invalid v3 inputs to manual conflict handling, fixed
+  NML/direct Python construction, and made Lasagna probe optimization outputs
+  carry coherent regenerated v3 span metadata.
 - Merged the main VC3D line-annotation toolbar, tag, schematic-overview,
   in-place refresh, and pane-lifecycle work while retaining both interactive
   rendered fiber strips and their per-span mode/metric/message labels.

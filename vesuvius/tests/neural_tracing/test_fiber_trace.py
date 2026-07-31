@@ -163,6 +163,7 @@ def test_parse_vc3d_fiber_v3_segment_metadata():
         {
             "type": "vc3d_fiber",
             "version": 3,
+            "optimization_mode": "native_fiber_trace3d",
             "line_points": [[1, 2, 3], [4, 5, 6]],
             "control_points": [
                 {"position": [1, 2, 3], "segment_to_next": segment},
@@ -181,18 +182,41 @@ def test_parse_vc3d_fiber_v3_segment_metadata():
     invalid = {
         "type": "vc3d_fiber",
         "version": 3,
+        "optimization_mode": "native_fiber_trace3d",
         "line_points": [[1, 2, 3], [4, 5, 6]],
-        "control_points": [{"position": [1, 2, 3]},
+        "control_points": [{"position": [1, 2, 3], "segment_to_next": segment},
                            {"position": [4, 5, 6], "segment_to_next": segment}],
     }
     with pytest.raises(ValueError, match="final control point"):
         parse_vc3d_fiber(invalid)
+
+    missing_descriptor = {
+        **invalid,
+        "control_points": [
+            {"position": [1, 2, 3]},
+            {"position": [4, 5, 6]},
+        ],
+    }
+    with pytest.raises(ValueError, match="missing segment_to_next"):
+        parse_vc3d_fiber(missing_descriptor)
+
+    missing_mode = {
+        **invalid,
+        "control_points": [
+            {"position": [1, 2, 3], "segment_to_next": segment},
+            {"position": [4, 5, 6]},
+        ],
+    }
+    missing_mode.pop("optimization_mode")
+    with pytest.raises(ValueError, match="missing optimization_mode"):
+        parse_vc3d_fiber(missing_mode)
 
     obsolete_segment = {**segment, "metadata_version": 2}
     with pytest.raises(ValueError, match="metadata/tracer version"):
         parse_vc3d_fiber({
             "type": "vc3d_fiber",
             "version": 3,
+            "optimization_mode": "native_fiber_trace3d",
             "line_points": [[1, 2, 3], [4, 5, 6]],
             "control_points": [
                 {"position": [1, 2, 3], "segment_to_next": obsolete_segment},

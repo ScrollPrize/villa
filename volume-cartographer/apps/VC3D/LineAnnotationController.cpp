@@ -28,8 +28,10 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
+#include "vc/lasagna/NormalAlignment.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
@@ -641,18 +643,6 @@ double polylineLengthRange(const std::vector<cv::Vec3d>& points,
         }
     }
     return length;
-}
-
-double normalAlignmentErrorDegrees(const cv::Vec3d& tangent,
-                                   const cv::Vec3d& normal)
-{
-    const cv::Vec3d unitTangent = normalizedOrZero(tangent);
-    const cv::Vec3d unitNormal = normalizedOrZero(normal);
-    if (!finiteDirection(unitTangent) || !finiteDirection(unitNormal)) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    const double alignment = std::clamp(std::abs(unitTangent.dot(unitNormal)), 0.0, 1.0);
-    return std::asin(alignment) * 180.0 / M_PI;
 }
 
 cv::Vec3f toVec3f(const cv::Vec3d& v)
@@ -10276,7 +10266,8 @@ LineAnnotationController::calculateAlignmentMetricsForFiber(
                 if (!sample.valid) {
                     continue;
                 }
-                accumulator.add(normalAlignmentErrorDegrees(tangent, sample.normal));
+                accumulator.add(vc::lasagna::normalAlignmentErrorDegrees(
+                    tangent, sample.normal));
             }
         }
         return accumulator;
@@ -11308,20 +11299,14 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
     if (type != "vc3d_fiber") {
         return std::nullopt;
     }
-    const int fiberVersion = root.value("version", 0);
-    if (fiberVersion != 1 && fiberVersion != 3) {
-        throw std::runtime_error("Unsupported vc3d_fiber version");
-    }
+    const auto parsedFiber = vc::fiber_tracer::parseVc3dFiberJson(
+        root, path.empty() ? std::string{"VC3D fiber"} : path.string());
+    const int fiberVersion = parsedFiber.version;
 
     StoredFiber fiber;
-    if (root.contains("optimization_mode")) {
-        if (!root.at("optimization_mode").is_string()) {
-            throw std::runtime_error("optimization_mode must be a string");
-        }
-        fiber.optimizationMode =
-            vc3d::line_annotation::fiberOptimizationModeFromString(
-                root.at("optimization_mode").get<std::string>());
-    }
+    fiber.optimizationMode =
+        vc3d::line_annotation::fiberOptimizationModeFromString(
+            parsedFiber.optimizationMode);
     fiber.generation = std::max<uint64_t>(uint64_t{1}, root.value("generation", uint64_t{1}));
     fiber.username = vc3d::line_annotation::normalizedFiberUsername(
         root.value("username", std::string{"anon"}));
@@ -11357,9 +11342,9 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
         fiber.controlPoints.push_back(
             vc3d::line_annotation::storedControlPointFromJson(point, fiberVersion));
     }
-    for (size_t index = 0; index + 1 < fiber.controlPoints.size(); ++index) {
-        auto& segment = fiber.controlPoints[index].segmentToNext;
-        if (!segment) {
+    if (fiberVersion == 1) {
+        for (size_t index = 0; index + 1 < fiber.controlPoints.size(); ++index) {
+            auto& segment = fiber.controlPoints[index].segmentToNext;
             segment.emplace();
             segment->interpMode = vc3d::line_annotation::SegmentInterpolationMode::Lasagna;
             segment->message = "lasagna";

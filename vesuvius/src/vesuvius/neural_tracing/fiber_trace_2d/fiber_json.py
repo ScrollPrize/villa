@@ -14,6 +14,9 @@ from vesuvius.neural_tracing.fiber_trace.fiber_json import (
     load_vc3d_fiber,
     parse_vc3d_fiber,
 )
+from vc3d_fiber_format import (
+    legacy_lasagna_segments,
+)
 
 
 def _local_name(tag: str) -> str:
@@ -203,6 +206,7 @@ def parse_nml_fibers(obj: ET.ElementTree | ET.Element, *, path: str | Path | Non
                     version=1,
                     line_points_xyz=points,
                     control_points_xyz=points.copy(),
+                    control_point_segments=legacy_lasagna_segments(len(points)),
                     generation=1,
                     metadata={
                         "source_format": "nml",

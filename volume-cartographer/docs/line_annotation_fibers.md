@@ -1,12 +1,13 @@
 # VC3D Line Annotation Fibers
 
 VC3D writes line annotations as `vc3d_fiber` JSON. Version 3 stores
-`control_points` as objects with a required `position` and optional
-`segment_to_next`. Control point `i` owns the metadata for its span to control
-point `i+1`; the final control point cannot contain `segment_to_next`.
+`control_points` as objects with a required `position`. Every non-final control
+point owns a required `segment_to_next` descriptor for its span to control point
+`i+1`; the final control point cannot contain `segment_to_next`.
 
 The top-level `optimization_mode` is either `lasagna` or
-`native_fiber_trace3d`. Files without this field default to `lasagna`. The mode
+`native_fiber_trace3d`. It is required in version 3; only legacy version-1
+files may omit it and default to `lasagna`. The mode
 selects extrapolation and resolves CP spans whose persisted `interp_goal` is
 `global`. A segment goal is `global`, `cspline`, `lasagna`, or `trace`; its
 `interp_mode` is the actual producer of the stored geometry and is one of
@@ -99,6 +100,13 @@ unpublished file version 2 and its pre-v3 descriptor schemas are unsupported.
 This does not affect the current `tracer_version: 2` stored inside a version-3
 segment descriptor.
 
+All v3 readers validate this complete contract before using even geometry-only
+data. VC3D, native CLI tools, Atlas, Lasagna, Spiral, Python training loaders,
+and sync reject a missing mode, a missing non-final descriptor, a descriptor on
+the final CP, malformed config, or inconsistent mode diagnostics. They never
+repair, normalize, tag, or rewrite invalid v3 input. Sync routes it to the
+manual conflict workflow and keeps local, remote, and base files unchanged.
+
 ## Sync Conflict Handling
 
 `scripts/vc_sync.py` compares local and S3 content with the last successfully
@@ -123,6 +131,14 @@ base-aware tag, branch-link, reciprocal-peer, and manual-HV-tag handling runs
 only after geometry merges cleanly. Version-1 fibers retain the older merge
 behavior, including the CP-polyline `needs_reoptimization`
 fallback for disjoint geometry edits.
+
+`vc_lasagna_line_probe --reopt` and `--reinit-reopt` write a coherent new v3
+Lasagna result: exact CP positions and existing goals are retained, actual span
+modes become `lasagna`, the input normal manifest and per-span maximum normal
+alignment error are recorded, trace-only diagnostics are cleared, and geometry
+and descriptors receive one generation update. The probe validates this result
+before atomically replacing its output. Without either optimization flag,
+`--output` copies the validated input without inventing new producer metadata.
 
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way

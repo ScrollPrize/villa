@@ -127,19 +127,39 @@ def _valid_segment(segment):
                not isinstance(value, bool) and math.isfinite(value)
                for value in numeric):
         return False
+    if segment['trace_to_base_scale'] <= 0:
+        return False
     goal = segment.get('interp_goal')
     mode = segment.get('interp_mode')
     metric = segment.get('metric')
     strings = [segment.get(key) for key in (
         'msg', 'meeting_source', 'failure_code', 'failure_detail',
         'lasagna_failure_code', 'lasagna_failure_detail')]
-    if (goal not in {'global', 'cspline', 'lasagna', 'trace'} or
+    if (not isinstance(goal, str) or
+            goal not in {'global', 'cspline', 'lasagna', 'trace'} or
+            not isinstance(mode, str) or
             mode not in {'cspline', 'lasagna', 'trace'} or
             not all(isinstance(value, str) for value in strings) or
             (metric is not None and
              (isinstance(metric, bool) or not isinstance(metric, (int, float)) or
               not math.isfinite(metric) or metric < 0)) or
             (mode == 'cspline' and metric is not None)):
+        return False
+    positive = {
+        'step_voxels', 'cone_angle_degrees', 'cone_angle_step_degrees',
+        'cone_grid_size', 'beam_width', 'beam_prune_distance_voxels',
+        'max_step_factor', 'endpoint_accept_threshold_base_voxels',
+    }
+    non_negative = _CONFIG_KEYS_V3 - positive
+    if (any(config[key] <= 0 for key in positive) or
+            any(config[key] < 0 for key in non_negative)):
+        return False
+    integer_keys = {
+        'cone_grid_size', 'beam_width', 'beam_lookahead_steps',
+        'cumulative_smoothness_steps',
+    }
+    if any(not isinstance(config[key], int) or isinstance(config[key], bool)
+           for key in integer_keys):
         return False
     if not 0 <= config['meeting_accept_max_error_ratio'] <= 1:
         return False
@@ -167,6 +187,8 @@ def is_fiber_doc(doc):
     version = doc.get('version', 1)
     if version not in (1, 3):
         return False
+    if version == 3 and 'optimization_mode' not in doc:
+        return False
     if 'optimization_mode' in doc:
         mode = doc['optimization_mode']
         if (not isinstance(mode, str) or
@@ -189,18 +211,25 @@ def is_fiber_doc(doc):
                     not _finite_point(cp.get('position'))):
                 return False
             segment = cp.get('segment_to_next')
-            if segment is not None:
-                if index + 1 == len(control_points) or not _valid_segment(segment):
+            if index + 1 == len(control_points):
+                if 'segment_to_next' in cp:
                     return False
+            elif 'segment_to_next' not in cp or not _valid_segment(segment):
+                return False
     tags = doc.get('tags', [])
     if not (isinstance(tags, list) and
             all(isinstance(tag, str) for tag in tags)):
         return False  # tags: null is unloadable ("tags must be an array")
     generation = doc.get('generation', 1)
-    if generation is not None and (isinstance(generation, bool) or
-                                   not isinstance(generation, (int, float)) or
-                                   not math.isfinite(generation)):
-        return False
+    if generation is not None:
+        if version == 3:
+            if (isinstance(generation, bool) or
+                    not isinstance(generation, int) or generation < 0):
+                return False
+        elif (isinstance(generation, bool) or
+              not isinstance(generation, (int, float)) or
+              not math.isfinite(generation)):
+            return False
     return True
 
 

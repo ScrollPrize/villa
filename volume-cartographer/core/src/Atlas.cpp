@@ -274,39 +274,16 @@ nlohmann::json readJsonFile(const fs::path& path)
     return nlohmann::json::parse(in);
 }
 
-std::vector<cv::Vec3d> pointArrayFromJson(const nlohmann::json& root,
-                                          const char* key,
-                                          const fs::path& path)
-{
-    const auto it = root.find(key);
-    if (it == root.end() || !it->is_array()) {
-        throw std::runtime_error("fiber JSON is missing array " + std::string(key) +
-                                 ": " + path.string());
-    }
-    std::vector<cv::Vec3d> points;
-    points.reserve(it->size());
-    for (const auto& point : *it) {
-        points.push_back(pointFromJson(point));
-    }
-    return points;
-}
-
 FiberInput loadSourceFiberInput(const fs::path& fiberPath,
                                 const fs::path& fiberRelativePath)
 {
     const auto root = readJsonFile(fiberPath);
-    if (root.value("type", std::string{}) != "vc3d_fiber") {
-        throw std::runtime_error("fiber JSON is not a vc3d_fiber: " + fiberPath.string());
-    }
-    const int version = root.value("version", 0);
-    if (version != 1 && version != 3) {
-        throw std::runtime_error("unsupported vc3d_fiber version in " + fiberPath.string());
-    }
+    const auto parsed = vc::fiber_tracer::parseVc3dFiberJson(
+        root, fiberPath.string());
     FiberInput input;
     input.fiberPath = fiberRelativePath;
-    input.controlPoints = vc::fiber_tracer::vc3dFiberPointArrayFromJson(
-        root, "control_points", version, fiberPath.string());
-    input.linePoints = pointArrayFromJson(root, "line_points", fiberPath);
+    input.controlPoints = parsed.controlPoints;
+    input.linePoints = parsed.linePoints;
     validateFiberInputControlPoints(input);
     return input;
 }

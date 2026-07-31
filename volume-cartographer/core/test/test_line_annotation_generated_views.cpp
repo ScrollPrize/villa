@@ -1240,6 +1240,35 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
         sharedReaderRoot, "control_points", 2, "test fiber"),
         std::runtime_error);
 
+    nlohmann::json strictRoot = sharedReaderRoot;
+    strictRoot["type"] = "vc3d_fiber";
+    strictRoot["version"] = 3;
+    strictRoot["optimization_mode"] = "native_fiber_trace3d";
+    strictRoot["line_points"] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};
+    CHECK_NOTHROW(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber"));
+    auto missingMode = strictRoot;
+    missingMode.erase("optimization_mode");
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::parseVc3dFiberJson(missingMode, "test fiber"),
+        std::runtime_error);
+    auto missingDescriptor = strictRoot;
+    missingDescriptor["control_points"][0].erase("segment_to_next");
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::parseVc3dFiberJson(missingDescriptor, "test fiber"),
+        std::runtime_error);
+    const auto regeneratedLasagna =
+        vc::fiber_tracer::makeLasagnaSegmentMetadataJson(
+            "trace",
+            "s3://bucket/new-normals.lasagna.json",
+            4.0,
+            fallbackJson.at("segment_to_next").at("config"),
+            3.5);
+    CHECK(regeneratedLasagna.at("interp_goal") == "trace");
+    CHECK(regeneratedLasagna.at("interp_mode") == "lasagna");
+    CHECK(regeneratedLasagna.at("metric").get<double>() == doctest::Approx(3.5));
+    CHECK(regeneratedLasagna.at("fiber_manifest") == "");
+    CHECK(regeneratedLasagna.at("meeting_error_base_voxels").is_null());
+
     vc::fiber_tracer::FiberTraceSegmentResult rejectedResult;
     rejectedResult.meetingErrorBaseVoxels = 250.0;
     rejectedResult.meetingErrorRatio = 2.5;

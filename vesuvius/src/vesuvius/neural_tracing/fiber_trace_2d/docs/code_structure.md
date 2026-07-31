@@ -720,7 +720,7 @@ Ownership changed as follows:
   positive base voxel size adds micrometer diagnostics, but is not required for
   tracing and does not affect acceptance.
 
-  `vc3d_fiber` version 3 persists a general descriptor in each non-final CP's
+  `vc3d_fiber` version 3 requires a general descriptor in each non-final CP's
   `segment_to_next`. `interp_goal` records `global`/`cspline`/`lasagna`/`trace`;
   `interp_mode` records the actual `cspline`/`lasagna`/`trace` producer.
   Mode-dependent `metric`, compact `msg`, trace diagnostics, and Lasagna
@@ -729,13 +729,34 @@ Ownership changed as follows:
   version 2 and its pre-v3 descriptors are rejected. The C++ strict readers,
   Python loader, Lasagna probe, Atlas reader, and merge validator accept only
   file versions 1 and 3 and strictly validate v3 enums and mode-specific
-  fields. Version 3's current `tracer_version: 2` remains part of that strict
+  fields. Version 3 also requires a valid top-level `optimization_mode`; no
+  reader synthesizes either field or repairs malformed v3 input. Version 3's
+  current `tracer_version: 2` remains part of that strict
   descriptor schema. `normal_manifest` records the Lasagna source identity
   and `fiber_manifest` the prediction source identity actually consulted by a
   span. Controller sessions keep these identities separate from runtime cache
   paths. `OpenDataLasagna` reconstructs the public root manifest URL from the
   catalogue artifact URL and cached manifest filename; the catalogue exposes
   no standalone artifact UUID.
+
+  C++ format validation is centralized in
+  `core/include/vc/fiber_tracer/FiberJson.hpp`; VC3D, the metric runner,
+  Lasagna probe, Atlas source loader, constraint exporter, and inspector all
+  validate there before applying consumer-specific geometry requirements.
+  Python format validation lives in the dependency-light
+  `vesuvius/src/vc3d_fiber_format` package. The NumPy `Vc3dFiber` wrapper, NML
+  loader, Lasagna atlas, and Spiral use it; Lasagna and Spiral contain only thin
+  monorepo path adapters so their legacy standalone launch commands do not
+  import the training stack. Sync retains its non-throwing boundary validator
+  because it must convert untrusted local/remote/base input into manual
+  conflicts, but enforces the same complete v3 descriptor contract.
+
+  `vc_lasagna_line_probe` validates input through the shared C++ reader. An
+  optimizing output reconstructs every CP-owned descriptor as actual Lasagna,
+  preserves goals, records manifest provenance and per-span normal-alignment
+  metrics, clears trace diagnostics, validates the complete result, and then
+  renames it atomically. A non-optimizing output remains a metadata-preserving
+  copy.
 
   `volume-cartographer/scripts/vc_sync.py` detects divergent local/S3 files
   against its last-synced shadow base and delegates valid fiber JSON to

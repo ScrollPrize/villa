@@ -1051,8 +1051,9 @@
   micrometer diagnostic when it is finite and positive; unavailable physical
   metadata must not block tracing.
 - `vc3d_fiber` version 3 stores every control point as an object with a finite
-  `position` and optional `segment_to_next`. CP `i` owns the descriptor for its
-  following span; the final CP must not contain one. Every new non-final CP
+  `position`. CP `i` owns the required `segment_to_next` descriptor for its
+  following span; every non-final CP must contain one and the final CP must not.
+  Every new non-final CP
   persists `interp_goal` (`global`, `cspline`, `lasagna`, or `trace`) and
   `interp_mode` (`cspline`, `lasagna`, or `trace`). The goal is policy; the mode
   identifies the algorithm that produced the stored dense geometry and must
@@ -1082,6 +1083,14 @@
   are rejected; version 3's current descriptor schema `(3, 2)` remains valid.
   Writers always emit version 3. Fiber coordinate scaling preserves goals,
   actual modes, and diagnostics while scaling base-voxel trace quantities.
+- Every v3 reader validates the complete descriptor sequence and the required
+  top-level `optimization_mode` before consuming geometry, including VC3D,
+  native CLI tools, Atlas/Lasagna/Spiral consumers, Python loaders, and sync.
+  Missing or malformed v3 metadata is a hard format error: readers must not
+  synthesize defaults, normalize fields, tag the file for reoptimization, or
+  rewrite it. Multi-file tools may report and skip the invalid file unchanged.
+  Legacy v1 alone may omit `optimization_mode`, which defaults to `lasagna`,
+  and receives in-memory global/Lasagna span state.
 - Segment descriptors and dense geometry are applied atomically. CP movement
   dirties both adjacent spans while preserving their goals. Insertion copies
   the split owner's goal to both new spans. Interior deletion leaves the left
@@ -1102,9 +1111,10 @@
   two-sided changes conflict. Version-1 merge behavior is unchanged; version 2
   is invalid and is sent to manual conflict handling.
 - Each VC3D fiber has a persisted top-level `optimization_mode`: `lasagna` or
-  `native_fiber_trace3d`. Missing mode metadata on existing version-1
-  files defaults to `lasagna`; unknown values are errors. The mode is the
-  fiber-wide extrapolation policy and resolves only `global` CP-to-CP goals.
+  `native_fiber_trace3d`. It is required for version 3. Missing mode metadata
+  on existing version-1 files defaults to `lasagna`; unknown values are errors.
+  The mode is the fiber-wide extrapolation policy and resolves only `global`
+  CP-to-CP goals.
   New interactive fibers default to `native_fiber_trace3d`; this must not
   change the Lasagna compatibility default used while loading older files.
 - Goal resolution starts with the explicit goal or the fiber-wide mode for
