@@ -20,6 +20,7 @@
 #include <opencv2/core/mat.hpp>
 
 class CState;
+class QAction;
 class QComboBox;
 class QGraphicsPathItem;
 class QGraphicsRectItem;
@@ -31,6 +32,7 @@ class QPoint;
 class QProgressBar;
 class QPushButton;
 class QCloseEvent;
+class QHBoxLayout;
 class QResizeEvent;
 class QTimer;
 class QVariantAnimation;
@@ -46,17 +48,9 @@ class LineAnnotationDialog : public QMainWindow
     Q_OBJECT
 
 public:
-    enum class InitialDirectionMode {
-        Sideways,
-        ZInOut,
-    };
     enum class ReoptimizationMode {
         AutoReoptimize,
         NoOptimization,
-    };
-    enum class ShiftScrollMode {
-        AlongLine,
-        StraightNormal,
     };
     using GeneratedControlPointContextResult =
         vc3d::line_annotation::GeneratedControlPointContextResult;
@@ -120,9 +114,7 @@ public:
         const QPoint& globalPos,
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {});
     const std::vector<Pane>& panes() const { return _panes; }
-    InitialDirectionMode initialDirectionMode() const;
     ReoptimizationMode reoptimizationMode() const;
-    ShiftScrollMode shiftScrollMode() const;
     int initialCenterlineLengthVx() const;
     int maxControlPointDistanceVx() const;
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
@@ -147,6 +139,13 @@ public:
     void setOptimizationBusy(bool busy);
     void setOptimizationStatus(bool optimized);
     void setFiberDisplayName(const QString& name);
+    // "H"/"V" (or empty) shown next to the fiber name in the top-right label.
+    void setFiberHvTag(const QString& tag);
+    // Rebuilds the clickable tag buttons in the top bar. enabled=false while the
+    // fiber hasn't been saved yet (tag edits need a stored fiber).
+    void setFiberTags(const std::vector<std::string>& knownTags,
+                      const std::vector<std::string>& activeTags,
+                      bool enabled);
     void setCloseAfterFinalizationAllowed(bool allowed);
     void setWorkspaceEmbedded(bool embedded);
     bool workspaceEmbedded() const { return _workspaceEmbedded; }
@@ -191,6 +190,7 @@ signals:
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
     void showAsMeshRequested();
     void fullOptimizationRequested();
+    void fiberTagChangeRequested(const QString& tag, bool enabled);
     void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
 
@@ -225,7 +225,6 @@ private:
     void jumpToNextControlPoint();
     void previewClosestControlPoint();
     bool shiftCurrentLinePositionByScrollSteps(int steps);
-    bool shiftCurrentCutPlaneNormalOffsetByScrollSteps(int steps);
     bool shiftSideCutPlaneNormalOffsetByScrollSteps(int steps);
     bool shiftCutPlaneNormalOffsetByScrollSteps(PlaneSurface* plane,
                                                 CChunkedVolumeViewer* viewer,
@@ -234,7 +233,6 @@ private:
                                                 const char* renderReason);
     bool applyCutPlaneNormalOffset(PlaneSurface* plane, double offsetVx) const;
     void resetGeneratedCutNormalOffsets(bool forceRender);
-    void handleShiftScrollModeChanged();
     void setCurrentCutFollowsStripMouse(bool follows);
     void requestGeneratedSideStripIntersections();
     cv::Vec3f branchLinkDirectionForViewer(CChunkedVolumeViewer* viewer,
@@ -278,6 +276,15 @@ private:
                                      QuadSurface* surface,
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
+    // Fixed top strip: fit-to-width zoom + auto height, recomputed on resize.
+    void updateFixedStripGeometry();
+    // "R": one-shot jump of the other panes to the cursor's line position on the
+    // fixed top strip (works regardless of follow mode; leaves it unchanged).
+    void snapPanesToFixedStripCursor();
+    // Pause badge on the bottom strip while mouse-follow is toggled off (Space).
+    void updatePauseIndicator();
+    // "optimized"/"not optimized" badge in the bottom strip's top-right corner.
+    void updateOptimizationStatusIndicator();
     void updateOptimizationOverlayGeometry();
     void updateFiberNameLabel();
     void restoreWindowGeometry();
@@ -287,17 +294,18 @@ private:
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
-    QComboBox* _initialDirectionCombo = nullptr;
-    QComboBox* _reoptimizationCombo = nullptr;
-    QComboBox* _shiftScrollCombo = nullptr;
+    // Checked = auto-reoptimize after each edit; unchecked = no optimization.
+    QAction* _autoReoptimizeAction = nullptr;
+    QAction* _showAsMeshAction = nullptr;
+    QAction* _fullOptimizationAction = nullptr;
     QSpinBox* _initialCenterlineLengthSpin = nullptr;
     QSpinBox* _maxControlPointDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
-    QLabel* _sliceStepLabel = nullptr;
-    QLabel* _optimizationStatusLabel = nullptr;
+    QPointer<QLabel> _optimizationStatusLabel;
+    bool _optimizationStatusOptimized = false;
+    QWidget* _tagRowWidget = nullptr;
+    QHBoxLayout* _tagRowLayout = nullptr;
     QProgressBar* _sideStripIntersectionProgress = nullptr;
-    QPushButton* _showAsMeshButton = nullptr;
-    QPushButton* _fullOptimizationButton = nullptr;
     QPushButton* _resetViewsButton = nullptr;
     QPointer<QWidget> _optimizationOverlay;
     QMdiArea* _mdiArea = nullptr;
@@ -307,6 +315,7 @@ private:
     bool _closing = false;
     bool _workspaceEmbedded = false;
     QString _fiberDisplayName;
+    QString _fiberHvTag;
 
     QWidget* _generatedTopWidget = nullptr;
     std::vector<QPointer<QWidget>> _generatedContainers;
@@ -329,6 +338,10 @@ private:
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     QPointer<CChunkedVolumeViewer> _sideCutViewer;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
+    // _stripViewers[0], shown as a fixed-height, non-interactive panel above the
+    // cut views instead of inside the strip splitter.
+    QPointer<CChunkedVolumeViewer> _fixedStripViewer;
+    QPointer<QLabel> _pauseIndicator;
     GeneratedViews _generatedViews;
     // Double-precision copy of _generatedViews.linePoints, built once when views are
     // generated so the per-cursor-move side plane fit doesn't reconvert the whole polyline.
