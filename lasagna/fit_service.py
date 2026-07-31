@@ -1909,8 +1909,19 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             try:
                 import fit as fit_mod
                 job.set_running("loading", 0, 0, 0.0)
-                fit_mod.main([cfg_path])
-                if isinstance(job_spec, dict) and Path(model_output).is_file():
+
+                def _fit_lifecycle(stage: str, stage_name: str) -> None:
+                    job.set_running(
+                        stage, 0, 0, 0.0, stage_name=stage_name)
+                    _check_cancel()
+
+                fit_mod.main([cfg_path], lifecycle_fn=_fit_lifecycle)
+                if (body.get("embed_job_metadata", True)
+                        and isinstance(job_spec, dict)
+                        and Path(model_output).is_file()):
+                    job.set_running(
+                        "saving", 0, 0, 0.0,
+                        stage_name="Embedding Lasagna job metadata")
                     import torch
                     st = torch.load(str(model_output), map_location="cpu", weights_only=False)
                     if isinstance(st, dict):
@@ -1927,7 +1938,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                 return
 
             save_t0 = time.perf_counter()
-            job.set_running("exporting", 0, 0, 0.0)
+            job.set_running(
+                "exporting", 0, 0, 0.0,
+                stage_name="Exporting flattened preview surface")
             import fit2tifxyz
             export_argv = ["--input", str(model_output), "--output", str(output_dir)]
             if body.get("single_segment"):
@@ -1935,6 +1948,13 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             output_name = body.get("output_name")
             if output_name:
                 export_argv.extend(["--output-name", str(output_name)])
+            if body.get("omit_model", False):
+                export_argv.append("--omit-model")
+            if body.get("export_flatten_map", False):
+                export_argv.extend([
+                    "--flatten-map-output",
+                    str(Path(output_dir) / ".flatten-map.npy"),
+                ])
             print(
                 f"[fit-service] exporting tifxyz: output_name={str(output_name or '').strip()!r} "
                 f"output_dir={output_dir}",
@@ -1952,6 +1972,9 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                 ])
             _check_cancel()
             fit2tifxyz.main(export_argv, cancel_fn=_check_cancel)
+            job.set_running(
+                "finalizing", 0, 0, 0.0,
+                stage_name="Finalizing Lasagna preview export")
             _normalize_single_tifxyz_output(Path(output_dir), str(output_name or ""))
             _check_cancel()
             save_s = time.perf_counter() - save_t0

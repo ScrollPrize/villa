@@ -95,6 +95,10 @@ HASH_MAX_BYTES = 16 * 1024 * 1024
 BASE_DIR_NAME = '.s3sync-base'          # last-synced copies (3-way merge base)
 CONFLICT_DIR_NAME = '.s3sync-conflicts'  # versions preserved before overwrite
 
+# Tag the merge puts on fibers whose line it could not re-fit; mirrored here
+# so hfsync still recognizes them when fiber_merge is unavailable.
+REOPTIMIZE_TAG = getattr(fiber_merge, 'REOPTIMIZE_TAG', 'needs_reoptimization')
+
 class SyncAction(Enum):
     UPLOAD = "upload"
     DOWNLOAD = "download"
@@ -2263,9 +2267,39 @@ def load_hfsync_config(local_dir):
     return config
 
 
+def unpublishable_reason(doc):
+    """Why this parsed JSON must not be published, or None.
+
+    Publishing is outward-facing, so the bar is the one VC3D's loader
+    applies: anything is_fiber_doc rejects would fail to load for whoever
+    downloads it. It also makes `tags` safe to index — a non-list `tags`
+    would otherwise make `tag in tags` a substring test (publishing a
+    fiber tagged 'unreviewed' under the tag 'reviewed') or raise.
+    """
+    if fiber_merge is not None:
+        if not fiber_merge.is_fiber_doc(doc):
+            return "not a loadable vc3d_fiber document"
+        return None
+    # Without fiber_merge, still refuse the shapes that would crash the
+    # run or silently mis-tag a fiber.
+    if not isinstance(doc, dict):
+        return "not a JSON object"
+    tags = doc.get('tags', [])
+    if not (isinstance(tags, list) and all(isinstance(t, str) for t in tags)):
+        return "'tags' is not an array of strings"
+    return None
+
+
 def classify_fibers(local_dir, tag):
-    """Split the directory's fiber JSONs into tagged / untagged / invalid"""
-    tagged, untagged, invalid = [], [], []
+    """Split the directory's fiber JSONs into tagged / untagged / invalid /
+    deferred.
+
+    `deferred` holds fibers that carry the publish tag but are not ready to
+    publish (see REOPTIMIZE_TAG below). Like `invalid`, they are neither
+    uploaded nor removed: a previously published good copy must survive a
+    transient local state.
+    """
+    tagged, untagged, invalid, deferred = [], [], [], []
 
     for name in sorted(os.listdir(local_dir)):
         if name.startswith('.') or not name.endswith('.json'):
@@ -2279,7 +2313,7 @@ def classify_fibers(local_dir, tag):
                 invalid.append((name, "zero-byte file"))
                 continue
             with open(path, 'r') as f:
-                tags = json.load(f).get('tags', [])
+                doc = json.load(f)
         except json.JSONDecodeError as e:
             invalid.append((name, f"unparseable JSON ({e.msg} at line {e.lineno})"))
             continue
@@ -2287,12 +2321,25 @@ def classify_fibers(local_dir, tag):
             invalid.append((name, f"unreadable ({e})"))
             continue
 
-        if tag in tags:
-            tagged.append(name)
-        else:
-            untagged.append(name)
+        problem = unpublishable_reason(doc)
+        if problem:
+            invalid.append((name, problem))
+            continue
 
-    return tagged, untagged, invalid
+        tags = doc.get('tags', [])
+        if tag not in tags:
+            untagged.append(name)
+        elif REOPTIMIZE_TAG in tags:
+            # Sync-merged fibers whose line is still a straight-segment
+            # placeholder between control points; VC3D re-fits them on
+            # load. Publishing one presents unfitted geometry as reviewed.
+            deferred.append(
+                (name, f"carries '{REOPTIMIZE_TAG}' — its line is a "
+                       f"placeholder until VC3D re-fits it"))
+        else:
+            tagged.append(name)
+
+    return tagged, untagged, invalid, deferred
 
 
 def hf_sync(local_dir, dry_run=False):
@@ -2318,11 +2365,14 @@ def hf_sync(local_dir, dry_run=False):
     if dry_run:
         print("--dry-run mode: No changes will be made")
 
-    tagged, untagged, invalid = classify_fibers(local_dir, tag)
+    tagged, untagged, invalid, deferred = classify_fibers(local_dir, tag)
     print(f"\nLocal fibers: {len(tagged)} tagged '{tag}', "
-          f"{len(untagged)} without the tag, {len(invalid)} invalid")
+          f"{len(untagged)} without the tag, {len(invalid)} invalid, "
+          f"{len(deferred)} held back")
     for name, problem in invalid:
         print(f"  ⚠️  Skipping {name}: {problem}")
+    for name, problem in deferred:
+        print(f"  ⏸️  Holding {name}: {problem}")
 
     # Upload (additive): stage tagged files with mtimes preserved so
     # `hf buckets sync` transfers only new or changed ones
@@ -2343,7 +2393,9 @@ def hf_sync(local_dir, dry_run=False):
             shutil.rmtree(staging, ignore_errors=True)
 
     # Removals: only filenames that exist locally WITHOUT the tag and are
-    # present remotely. Files that exist only remotely are never touched.
+    # present remotely. Files that exist only remotely are never touched,
+    # and neither are invalid/held-back ones — a local file we refused to
+    # publish must not take its published predecessor down with it.
     result = subprocess.run([hf_cli, 'buckets', 'list', bucket_path, '-R', '-q'],
                             capture_output=True, text=True)
     if result.returncode != 0:
@@ -2366,12 +2418,14 @@ def hf_sync(local_dir, dry_run=False):
         else:
             print(f"  ❌ Failed to remove {name}: {(rm.stderr or '').strip()}")
 
+    held = f", {len(deferred)} held back" if deferred else ""
     if dry_run:
         print(f"\n--dry-run: {len(tagged)} upload candidates (unchanged files "
-              f"are skipped, see plan above), {len(to_remove)} would be removed")
+              f"are skipped, see plan above), {len(to_remove)} would be "
+              f"removed{held}")
     else:
         print(f"\n✓ Hugging Face sync complete: {len(tagged)} tagged fibers synced, "
-              f"{removed} removed, {len(invalid)} skipped as invalid")
+              f"{removed} removed, {len(invalid)} skipped as invalid{held}")
 
 
 def main():

@@ -6,7 +6,7 @@ import losses
 
 def _configure(monkeypatch, *, stratified=True, weights=None):
     monkeypatch.setattr(losses, 'cfg', {
-        'stratified_pcl_sampling': stratified,
+        'pcl_stratified_pcl_sampling': stratified,
         'pcl_sampling_weights': weights,
     })
 

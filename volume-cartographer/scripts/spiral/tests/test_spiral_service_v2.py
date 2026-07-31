@@ -7,6 +7,7 @@ faked; these tests exercise the service plumbing only.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import io
 import hashlib
 import json
@@ -35,12 +36,14 @@ import spiral_service
 from spiral_service import (ApiError, ArtifactRegistry, ExclusiveFileLock,
                             FileLockUnavailable, ServiceLogBuffer, ServiceState,
                             SpiralServer, _mapped_winding_ids,
+                            _load_flatten_correspondence,
                             _prepare_cleaned_lasagna_surface,
                             _raw_run_diff_rgba, _sample_rgba_through_map,
                             _validate_tifxyz_output_step,
                             load_or_create_api_key, parse_gpu_ids,
                             parse_session_name)
 from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
+from config import Config
 
 
 class FakeSession:
@@ -48,24 +51,32 @@ class FakeSession:
         self.state = "Paused"
         self.run_calls = []
         self.run_config = {
-            "num_patches_per_step": 360,
+            "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "loss_start_patch_dt": 25_000,
             "loss_start_track_dt": 10_000,
-            "save_png_visualizations": False,
+            "output_save_png_visualizations": False,
             "track_length_bin_weights": None,
-            "max_track_crossing_per_step": 0,
+            "track_max_track_crossing_per_step": 0,
             "track_min_sample_spacing": 20.0,
             "track_max_sample_spacing": 60.0,
+            "track_min_walk_steps_per_track": 24,
+            "track_max_walk_steps_per_track": 256,
+            "track_min_walks_per_track": 2,
+            "track_max_walks_per_track": 4,
         }
         self.default_advanced_config = {
-            "learning_rate": 3e-5,
-            "num_patches_per_step": 360,
+            "optimizer_learning_rate": 3e-5,
+            "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "track_crossing_precompute_max": 8,
+            "track_crossing_mode": "track_walk",
+            "track_walk_minimum_cycle_travel": 20.0,
         }
         self.saved = []
         self.closed = False
+        self.path_change_calls = []
+        self.progress = None
 
     def status(self):
         return {
@@ -74,14 +85,16 @@ class FakeSession:
             "error": None, "preview_manifest_path": None, "preview_generation": 0,
             "supports_input_incorporation": True,
             "run_config": dict(self.run_config),
-            "run_config_limits": {"max_track_crossing_per_step": 8},
+            "run_config_limits": {"track_max_track_crossing_per_step": 8},
             "default_advanced_config": dict(self.default_advanced_config),
+            "progress": self.progress,
         }
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None):
+            influence_config=None, run_config=None, path_changes=None):
         self.run_calls.append((count, list(pending_inputs or []), mark_incorporated,
                                dict(influence_config or {}), dict(run_config or {})))
+        self.path_change_calls.append(dict(path_changes or {}))
         self.run_config.update(run_config or {})
         return 5 + count
 
@@ -105,7 +118,49 @@ def _attach_fake_session(state, output_directory, dataset_root=""):
         "verified_patches": str(Path(dataset_root) / "verified_patches") if dataset_root else "",
         "fibers": str(Path(dataset_root) / "fibers") if dataset_root else "",
     })
+    state.session_request = {
+        "paths": state.session_paths.manifest(),
+        "run": {"config": Config().as_dict()},
+    }
+    state.session_revision += 1
     return state.session
+
+
+class ProgressStatusTests(unittest.TestCase):
+    def test_status_propagates_structured_fit_progress(self):
+        state = spiral_service.ServiceState()
+        session = _attach_fake_session(state, "/tmp/spiral-progress-test")
+        session.state = "Loading"
+        session.progress = {
+            "operation": "loading",
+            "stage_name": "Loading tracks",
+            "detail": "12,000 tracks retained",
+            "step": 3,
+            "total_steps": 10,
+            "unit": "DB keys",
+            "elapsed_seconds": 4.5,
+            "eta_seconds": 10.5,
+        }
+
+        status = state.status()
+
+        self.assertEqual(status["progress"], session.progress)
+        self.assertEqual(status["progress"]["stage_name"], "Loading tracks")
+
+    def test_empty_status_has_explicit_null_progress(self):
+        self.assertIsNone(spiral_service.ServiceState().status()["progress"])
+
+
+def _planned_run(state, request):
+    request = dict(request)
+    configuration = Config(request.pop("run_config", {})).as_dict()
+    plan = state.plan_run({
+        "configuration": configuration,
+        "iterations": request.pop("iterations"),
+        "influence": request.pop("influence_config", {}),
+        "expected_session_revision": state.session_revision,
+    })
+    return state.run({"plan_token": plan["plan_token"]})
 
 
 def _digest(data):
@@ -406,6 +461,28 @@ class ArtifactHttpTests(HttpServiceFixture):
         for entry in manifest["files"]:
             self.assertRegex(entry["sha256"], r"^[0-9a-f]{64}$")
 
+    def test_registration_reports_each_hashed_file(self):
+        artifact_root = self.root / "artifact-progress"
+        artifact_root.mkdir()
+        (artifact_root / "manifest.json").write_text("{}")
+        (artifact_root / "first.bin").write_bytes(b"first")
+        (artifact_root / "second.bin").write_bytes(b"second")
+        progress = []
+
+        self.state.artifacts.register_directory(
+            "spiral-preview", "session-1", 2, artifact_root, "manifest.json",
+            progress=lambda current, total, relative: progress.append(
+                (current, total, relative)),
+            hash_workers=2)
+
+        self.assertEqual(
+            progress,
+            [
+                (1, 3, "first.bin"),
+                (2, 3, "manifest.json"),
+                (3, 3, "second.bin"),
+            ])
+
     def test_unknown_artifact_is_not_found_and_pruned_is_gone(self):
         ref, _ = self._register_artifact()
         status, _, _ = self.request("GET", "/artifacts/nonexistent/manifest")
@@ -546,33 +623,20 @@ class DatasetOwnershipTests(unittest.TestCase):
                              "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(caught.exception.status, 400)
 
-    def test_dataset_request_omits_disabled_optional_inputs(self):
-        config = {
-            "use_verified_patches": False,
-            "use_unverified_patches": False,
-            "use_normals": False,
-            "use_surf_sdt": False,
-            "use_tracks": False,
-            "use_gradient_magnitude": False,
-            "use_fibers": False,
-        }
+    def test_dataset_request_uses_resolved_paths_without_input_toggles(self):
         request = self.state._dataset_session_request({
-            "run": {"z_begin": 0, "z_end": 10, "config": config},
+            "run": {"z_begin": 0, "z_end": 10},
         })
-        for field in ("verified_patches", "unverified_patches", "normal_x",
-                      "normal_y", "surf_sdt", "tracks_dbm",
-                      "gradient_magnitude", "fibers"):
-            self.assertEqual(request["paths"][field], "")
+        self.assertEqual(
+            request["paths"]["verified_patches"],
+            str(self.root / "verified_patches"))
+        self.assertEqual(request["paths"]["unverified_patches"], "")
 
     def test_status_advertises_canonical_active_session_request(self):
         config = {
-            "use_verified_patches": True,
-            "use_unverified_patches": False,
-            "use_normals": False,
-            "use_surf_sdt": False,
-            "use_tracks": False,
-            "use_gradient_magnitude": False,
-            "use_fibers": False,
+            "dense_spacing_mode": "grad_mag",
+            "loss_weight_dense_spacing": 0,
+            "loss_weight_dense_normals": 0,
             "loss_weight_shell_outer": 0,
             "loss_weight_shell_patch_radius": 0,
             "loss_weight_patch_radius": 7.5,
@@ -612,13 +676,9 @@ class DatasetOwnershipTests(unittest.TestCase):
                 "z_begin": 0,
                 "z_end": 10,
                 "config": {
-                    "use_verified_patches": False,
-                    "use_unverified_patches": False,
-                    "use_normals": False,
-                    "use_surf_sdt": False,
-                    "use_tracks": False,
-                    "use_gradient_magnitude": False,
-                    "use_fibers": False,
+                    "dense_spacing_mode": "grad_mag",
+                    "loss_weight_dense_spacing": 0,
+                    "loss_weight_dense_normals": 0,
                     "loss_weight_shell_outer": 0,
                     "loss_weight_shell_patch_radius": 0,
                 },
@@ -690,7 +750,7 @@ class UploadTests(unittest.TestCase):
         self.assertIn(".spiral-ephemeral", str(published))
         status = self.state.status()
         self.assertEqual(status["ephemeral_inputs"][0]["id"], "patch-1")
-        self.assertEqual(status["default_advanced_config"]["learning_rate"], 3e-5)
+        self.assertEqual(status["default_advanced_config"]["optimizer_learning_rate"], 3e-5)
         self.assertNotEqual(status["default_advanced_config"], status["run_config"])
         # Finalize is idempotent.
         self.assertEqual(self.state.finalize_upload(upload_id)["input"]["id"],
@@ -741,7 +801,7 @@ class UploadTests(unittest.TestCase):
         upload_id = _upload_input(self.state, "pcl", "drawn-1", PCL_FILES,
                                   role="drawn_control_points")
         self.state.finalize_upload(upload_id)
-        self.state.run({"iterations": 2})
+        _planned_run(self.state, {"iterations": 2})
         _, pending, _, _, _ = session.run_calls[-1]
         self.assertEqual([(record["id"], record["role"]) for record in pending],
                          [("drawn-1", "drawn_control_points")])
@@ -776,7 +836,7 @@ class UploadTests(unittest.TestCase):
         session = self._session()
         upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
         self.state.finalize_upload(upload_id)
-        self.state.run({"iterations": 10})
+        _planned_run(self.state, {"iterations": 10})
         count, pending, mark, influence, _ = session.run_calls[-1]
         self.assertEqual(count, 10)
         self.assertEqual([record["id"] for record in pending], ["fiber-1"])
@@ -785,93 +845,121 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(self.state.status()["ephemeral_inputs"][0]["state"],
                          "incorporated")
         # A later run does not re-incorporate.
-        self.state.run({"iterations": 5})
+        _planned_run(self.state, {"iterations": 5})
         self.assertEqual(session.run_calls[-1][1], [])
 
     def test_run_passes_and_validates_transient_influence_config(self):
         session = self._session()
         influence = {
-            "interactive_influence_enabled": True,
-            "interactive_influence_z": 1200,
-            "interactive_influence_windings": 2.5,
-            "interactive_influence_theta_frac": 0.2,
-            "interactive_influence_disable_dt_frac": 0.4,
-            "interactive_influence_sigma": 0.25,
-            "interactive_influence_footprint_points": 512,
-            "interactive_influence_anchor_lattice_points": 2000,
-            "interactive_influence_anchor_geometry_points": 1000,
-            "interactive_influence_anchor_samples_per_step": 128,
-            "interactive_influence_anchor_ramp_power": 3.0,
+            "influence_enabled": True,
+            "influence_z": 1200,
+            "influence_windings": 2.5,
+            "influence_theta_frac": 0.2,
+            "influence_disable_dt_frac": 0.4,
+            "influence_sigma": 0.25,
+            "sample_count_influence_footprint_points": 512,
+            "sample_count_influence_anchor_lattice_points": 2000,
+            "sample_count_influence_anchor_geometry_points": 1000,
+            "sample_count_influence_anchor_samples_per_step": 128,
+            "influence_anchor_ramp_power": 3.0,
             "loss_weight_anchor": 15.0,
         }
-        self.state.run({"iterations": 10, "influence_config": influence})
+        _planned_run(self.state, {"iterations": 10, "influence_config": influence})
         self.assertEqual(session.run_calls[-1][3], influence)
 
         with self.assertRaises(ApiError) as caught:
-            self.state.run({"iterations": 10, "influence_config": {
-                "interactive_influence_theta_frac": 1.5,
+            _planned_run(self.state, {"iterations": 10, "influence_config": {
+                "influence_theta_frac": 1.5,
             }})
         self.assertEqual(caught.exception.status, 400)
 
     def test_run_passes_and_validates_mutable_training_config(self):
         session = self._session()
         config = {
-            "num_patches_per_step": 240,
+            "sample_count_patches_per_step": 240,
             "loss_weight_patch_radius": 3.5,
             "loss_start_track_dt": None,
-            "save_png_visualizations": True,
+            "output_save_png_visualizations": True,
             "track_length_bin_weights": [0.2, 0.3, 0.5],
-            "max_track_crossing_per_step": 3,
+            "track_max_track_crossing_per_step": 3,
             "track_min_sample_spacing": 12.0,
             "track_max_sample_spacing": 32.0,
+            "track_min_walk_steps_per_track": 18,
+            "track_max_walk_steps_per_track": 96,
+            "track_max_walks_per_track": 5,
         }
 
-        response = self.state.run({"iterations": 10, "run_config": config})
+        response = _planned_run(self.state, {"iterations": 10, "run_config": config})
 
         self.assertEqual(session.run_calls[-1][4], config)
-        self.assertEqual(response["run_config"]["num_patches_per_step"], 240)
+        self.assertEqual(response["run_config"]["sample_count_patches_per_step"], 240)
 
-        with self.assertRaisesRegex(ApiError, "non-mutable"):
-            self.state.run({"iterations": 10, "run_config": {
-                "learning_rate": 1e-4,
+        with self.assertRaisesRegex(ApiError, "Start New Fit"):
+            _planned_run(self.state, {"iterations": 10, "run_config": {
+                "model_num_flow_stages": 2,
             }})
-        with self.assertRaisesRegex(ApiError, "at least 1"):
-            self.state.run({"iterations": 10, "run_config": {
-                "num_patches_per_step": 0,
+        with self.assertRaisesRegex(ValueError, "Invalid value"):
+            _planned_run(self.state, {"iterations": 10, "run_config": {
+                "output_save_png_visualizations": 1,
             }})
-        with self.assertRaisesRegex(ApiError, "must be boolean"):
-            self.state.run({"iterations": 10, "run_config": {
-                "save_png_visualizations": 1,
-            }})
-        with self.assertRaisesRegex(ApiError, "three finite non-negative"):
-            self.state.run({"iterations": 10, "run_config": {
+        with self.assertRaisesRegex(ValueError, "vector length"):
+            _planned_run(self.state, {"iterations": 10, "run_config": {
                 "track_length_bin_weights": [1, 2],
-            }})
-        with self.assertRaisesRegex(ApiError, "prepared limit"):
-            self.state.run({"iterations": 10, "run_config": {
-                "max_track_crossing_per_step": 9,
-            }})
-        with self.assertRaisesRegex(ApiError, "finite positive"):
-            self.state.run({"iterations": 10, "run_config": {
-                "track_min_sample_spacing": 0,
-            }})
-        with self.assertRaisesRegex(ApiError, "must be <="):
-            self.state.run({"iterations": 10, "run_config": {
-                "track_min_sample_spacing": 33,
             }})
 
     def test_run_accepts_advertised_zero_count_for_disabled_input(self):
         session = self._session()
-        session.run_config["dense_attachment_num_points"] = 0
+        session.run_config["sample_count_dense_attachment_points"] = 0
 
-        response = self.state.run({"iterations": 10, "run_config": {
-            "dense_attachment_num_points": 0,
+        response = _planned_run(self.state, {"iterations": 10, "run_config": {
+            "sample_count_dense_attachment_points": 0,
         }})
 
         self.assertEqual(session.run_calls[-1][4], {
-            "dense_attachment_num_points": 0,
+            "sample_count_dense_attachment_points": 0,
         })
-        self.assertEqual(response["run_config"]["dense_attachment_num_points"], 0)
+        self.assertEqual(response["run_config"]["sample_count_dense_attachment_points"], 0)
+
+    def test_outer_shell_path_is_a_shell_only_run_change(self):
+        session = self._session()
+        shell = self.dataset / "outer_shell_v2"
+        shell.mkdir()
+        inputs = self.state.session_paths.manifest()
+        inputs["outer_shell"] = str(shell)
+        plan = self.state.plan_run({
+            "configuration": Config().as_dict(),
+            "iterations": 3,
+            "inputs": inputs,
+            "expected_session_revision": self.state.session_revision,
+        })
+
+        self.assertFalse(plan["session_reload_required"])
+        self.assertEqual(plan["affected_prepared_inputs"], ["shell"])
+        self.assertEqual(plan["input_changes"][0]["runtime_impact"],
+                         "shell_reload")
+        self.state.run({"plan_token": plan["plan_token"]})
+        self.assertEqual(session.path_change_calls[-1], {
+            "outer_shell": str(shell),
+        })
+
+    def test_non_shell_path_and_patch_erosion_still_require_reload(self):
+        self._session()
+        inputs = self.state.session_paths.manifest()
+        inputs["verified_patches"] = str(self.dataset / "other-patches")
+        configuration = Config({
+            "patch_erode_patches": (
+                Config().patch_erode_patches + 1),
+        }).as_dict()
+        plan = self.state.plan_run({
+            "configuration": configuration,
+            "iterations": 3,
+            "inputs": inputs,
+            "expected_session_revision": self.state.session_revision,
+        })
+
+        self.assertTrue(plan["session_reload_required"])
+        with self.assertRaisesRegex(ApiError, "reloading fit inputs"):
+            self.state.run({"plan_token": plan["plan_token"]})
 
     def test_new_session_does_not_see_previous_ephemeral_inputs(self):
         self._session()
@@ -1284,7 +1372,7 @@ class CommitTests(unittest.TestCase):
         self.assertTrue(staged.exists())
         with self.assertRaisesRegex(ApiError, "already committed"):
             self.state.commit_inputs()
-        self.state.run({"iterations": 3})
+        _planned_run(self.state, {"iterations": 3})
         _, pending, mark, _, _ = self.session.run_calls[-1]
         self.assertEqual([entry["id"] for entry in pending], ["patch-9"])
         # Once incorporated, a committed record is done and leaves the list.
@@ -1298,12 +1386,12 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(response["removed"], "fiber-9")
         self.assertEqual(self.state.status()["ephemeral_inputs"], [])
         self.assertFalse(staged.exists())
-        self.state.run({"iterations": 1})
+        _planned_run(self.state, {"iterations": 1})
         self.assertEqual(self.session.run_calls[-1][1], [])
 
     def test_remove_incorporated_input_is_rejected(self):
         self._finalize("patch", "patch-9", PATCH_FILES)
-        self.state.run({"iterations": 1})
+        _planned_run(self.state, {"iterations": 1})
         _, pending, mark, _, _ = self.session.run_calls[-1]
         mark(pending)
         with self.assertRaises(ApiError) as caught:
@@ -1425,6 +1513,55 @@ class MappedPreviewArtifactTests(unittest.TestCase):
         np.testing.assert_array_equal(mapped[0, 0], [200, 0, 0, 255])
         np.testing.assert_allclose(mapped[0, 1], [100, 0, 100, 255], atol=1)
         np.testing.assert_array_equal(mapped[0, 2], [0, 0, 0, 0])
+
+    def test_threaded_loss_overlay_matches_sequential_bytes(self):
+        rng = np.random.default_rng(20260730)
+        source = rng.integers(0, 256, size=(17, 23, 4), dtype=np.uint8)
+        source_yx = np.stack([
+            rng.uniform(-1.0, 17.5, size=(13, 19)),
+            rng.uniform(-1.0, 23.5, size=(13, 19)),
+        ], axis=-1).astype(np.float32)
+        output_valid = rng.random((13, 19)) > 0.2
+
+        sequential = _sample_rgba_through_map(
+            source, source_yx, output_valid)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            threaded = _sample_rgba_through_map(
+                source, source_yx, output_valid, executor=executor)
+
+        np.testing.assert_array_equal(threaded, sequential)
+
+    def test_winding_bounds_union_duplicate_disjoint_ranges(self):
+        manifest = {
+            "winding_ids": [7, 9, 7],
+            "winding_column_ranges": [[0, 2], [2, 4], [4, 6]],
+        }
+        source_yx = np.asarray([[
+            [0, 0], [0, 2], [0, 5], [0, 3],
+        ]], dtype=np.float32)
+        result, bounds = _mapped_winding_ids(
+            manifest, (1, 6), source_yx, np.ones((1, 4), dtype=bool))
+
+        np.testing.assert_array_equal(result, [[7, 9, 7, 9]])
+        self.assertEqual(bounds, [
+            {
+                "winding": 7, "row_begin": 0, "row_end": 1,
+                "column_begin": 0, "column_end": 3,
+            },
+            {
+                "winding": 9, "row_begin": 0, "row_end": 1,
+                "column_begin": 1, "column_end": 4,
+            },
+        ])
+
+    def test_flatten_correspondence_prefers_npy_sidecar(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            map_path = Path(temporary) / "flatten-map.npy"
+            expected = np.arange(24, dtype=np.float32).reshape(3, 4, 2)
+            np.save(map_path, expected, allow_pickle=False)
+            actual = _load_flatten_correspondence(
+                Path(temporary) / "missing.pt", map_path)
+            np.testing.assert_array_equal(actual, expected)
 
     @staticmethod
     def _write_surface(path, xyz):

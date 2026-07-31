@@ -47,6 +47,10 @@ CVolumeViewerView::ScaleBarLabel CVolumeViewerView::formatScaleBarLength(double 
 void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
 {
     QGraphicsView::drawForeground(p, sceneRect);
+    if (property("vc_hide_scalebar").toBool()) {
+        drawTiltHandle(p);
+        return;
+    }
     const double dpr = devicePixelRatioF();
     const double m11 = transform().m11();
     const int vpW = viewport()->width();
@@ -54,12 +58,14 @@ void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
 
     // Recompute cached scalebar only when inputs change
     if (_cachedM11 != m11 || _cachedDpr != dpr || _cachedVpW != vpW ||
-        _cachedVpH != vpH || _cachedVx != m_vx || _scalebarCacheDirty) {
+        _cachedVpH != vpH || _cachedVx != m_vx ||
+        _cachedPhysicalUnits != m_physicalUnits || _scalebarCacheDirty) {
         _cachedM11 = m11;
         _cachedDpr = dpr;
         _cachedVpW = vpW;
         _cachedVpH = vpH;
         _cachedVx = m_vx;
+        _cachedPhysicalUnits = m_physicalUnits;
         _scalebarCacheDirty = false;
 
         _cachedFont = p->font();
@@ -72,7 +78,9 @@ void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
         double barUm = chooseNiceLength(wUm / 4.0);
         _cachedBarPx = barUm * pxPerUm;
 
-        _cachedBarLabel = formatScaleBarLength(barUm).text;
+        _cachedBarLabel = m_physicalUnits
+            ? formatScaleBarLength(barUm).text
+            : QString::number(barUm) + QStringLiteral(" vx");
     }
 
     p->save();

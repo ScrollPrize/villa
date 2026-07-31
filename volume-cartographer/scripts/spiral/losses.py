@@ -93,7 +93,7 @@ def _choose_pcl_indices(sampling_strata, num_to_sample):
     # stratified_pcl_sampling switch selects equal group shares or uniform sampling
     # over the combined pool.
     weighted = cfg['pcl_sampling_weights'] is not None
-    if not weighted and not cfg['stratified_pcl_sampling']:
+    if not weighted and not cfg['pcl_stratified_pcl_sampling']:
         return np.random.choice(sampling_strata['all'], num_to_sample, replace=False)
     strata = sampling_strata['strata']
     weights = sampling_strata['weights'] if weighted else np.ones(
@@ -120,7 +120,7 @@ def get_shell_outer_loss(shell_map, slice_to_spiral_transform, dr_per_winding, o
     if shell_map is None or outer_winding_idx is None:
         return zero, {}
 
-    num_samples = max(1, int(cfg['shell_num_samples']))
+    num_samples = max(1, int(cfg['sample_count_shell_samples']))
     huber_delta = torch.as_tensor(cfg['shell_huber_delta'], device=device, dtype=torch.float32)
 
     outer_spiral = canonical_winding_samples([outer_winding_idx], num_samples, dr_per_winding, device, z_begin, z_end)[0]
@@ -357,8 +357,11 @@ def _build_patch_ijs(patches, patch_indices, num_points_per_direction, rng):
 
 def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
                         num_points_per_direction, patch_atlas=None):
-    # Returns (combined_ijs_gpu (2,N,P,2), patch_indices_gpu (N,)). With
-    # prefetch enabled the batch was assembled and uploaded for this step
+    # Returns (combined_ijs_gpu (2,N,P,2), patch_indices_gpu (N,),
+    # slice_zyxs_gpu (2,N,P,3)). The atlas is host-resident and the ijs are
+    # born on the CPU, so the bilinear gather runs here at batch-build time
+    # and only the interpolated points are uploaded. With prefetch enabled the
+    # batch - sampling, gather, and uploads - was assembled for this step
     # during the previous one, and next step's batch is scheduled now.
     if num_to_sample <= 0:
         raise ValueError('Expected at least one patch index')
@@ -377,10 +380,15 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
         else:
             ijs_np = _build_patch_ijs(
                 patches, patch_indices, num_points_per_direction, rng)
-        ijs_gpu = torch.from_numpy(ijs_np).cuda(non_blocking=True)
-        idx_gpu = torch.from_numpy(
-            np.ascontiguousarray(patch_indices, dtype=np.int64)).cuda(non_blocking=True)
-        return ijs_gpu, idx_gpu
+        ijs_cpu = torch.from_numpy(ijs_np)
+        idx_cpu = torch.from_numpy(
+            np.ascontiguousarray(patch_indices, dtype=np.int64))
+        _, N, P, _ = ijs_cpu.shape
+        slice_zyxs_gpu = patch_atlas.lookup(
+            idx_cpu[None, :, None].expand(2, N, P), ijs_cpu)
+        ijs_gpu = ijs_cpu.cuda(non_blocking=True)
+        idx_gpu = idx_cpu.cuda(non_blocking=True)
+        return ijs_gpu, idx_gpu, slice_zyxs_gpu
 
     if prefetch.prefetch_enabled() and torch.cuda.is_available():
         pf = prefetch.get_prefetcher()
@@ -390,22 +398,14 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
     return build(prefetch.LegacyNumpyRandom)
 
 
-def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, batch, extra_zyxs=None, num_points_per_patch=None):
+def _sample_patch_tracks(slice_to_spiral_transform, dr_per_winding, patches, patch_atlas, batch, extra_zyxs=None):
     # For each patch, take one row and one column in straight mode, or two
     # geodesic paths in dijkstra mode. Either representation is a contiguous
     # walk, so unwrapping can stitch theta=0 crossings between samples.
 
-    if num_points_per_patch is None:
-        num_points_per_patch = cfg['num_points_per_patch']
-    num_points_per_direction = num_points_per_patch // 2
-
-    # Batched bilinear interp on GPU: ijs are guaranteed to fall on valid quads by the
-    # strip sampler (it draws i0/j0 from `_sampling_valid_quad_*`), so we
-    # skip the per-call validity check used by patch.ij_to_zyx.
-    combined_ijs_gpu, patch_indices_gpu = batch
-    N = combined_ijs_gpu.shape[1]
-    patch_idx_per_sample = patch_indices_gpu[None, :, None].expand(2, N, num_points_per_direction)
-    all_slice_zyxs = patch_atlas.lookup(patch_idx_per_sample, combined_ijs_gpu)
+    # The bilinear atlas gather already ran on the CPU at batch-build time
+    # (see _sample_patch_batch); the batch carries the interpolated points.
+    combined_ijs_gpu, patch_indices_gpu, all_slice_zyxs = batch
 
     # When the caller has extra points (umbilicus, shell, ...), pack them into the same
     # forward ODE call to amortise the per-call overhead.
@@ -564,7 +564,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
 
     n_umb = umbilicus_zyx.shape[0]
     if shell_valid_zyxs is not None:
-        num_shell_samples = min(int(cfg['shell_num_samples']), shell_valid_zyxs.shape[0])
+        num_shell_samples = min(int(cfg['sample_count_shell_samples']), shell_valid_zyxs.shape[0])
         sample_idx = torch.randint(shell_valid_zyxs.shape[0], (num_shell_samples,), device=shell_valid_zyxs.device)
         extra_zyxs = torch.cat([umbilicus_zyx, shell_valid_zyxs[sample_idx]], dim=0)
     else:
@@ -582,7 +582,7 @@ def get_patch_and_umbilicus_losses(slice_to_spiral_transform, dr_per_winding, nu
         num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
         batch = _sample_patch_batch(
             'verified_patches', patches, patch_sampling_probabilities,
-            num_patches_to_sample, cfg['num_points_per_patch'] // 2,
+            num_patches_to_sample, cfg['sample_count_points_per_patch'] // 2,
             patch_atlas)
 
         (
@@ -657,7 +657,7 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
     num_patches_to_sample = max(num_patches_for_radius, num_patches_for_dt) if compute_dt else num_patches_for_radius
     batch = _sample_patch_batch(
         'unverified_patches', patches, patch_sampling_probabilities,
-        num_patches_to_sample, cfg['unverified_num_points_per_patch'] // 2,
+        num_patches_to_sample, cfg['sample_count_unverified_points_per_patch'] // 2,
         patch_atlas)
 
     (
@@ -674,7 +674,6 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
         patches,
         patch_atlas,
         batch,
-        num_points_per_patch=cfg['unverified_num_points_per_patch'],
     )
 
     return _patch_radius_and_dt_losses(
@@ -682,8 +681,8 @@ def get_unverified_patch_losses(slice_to_spiral_transform, dr_per_winding, num_p
         all_slice_zyxs, all_spiral_zyxs, all_theta, all_shifted_radii,
         all_crossing_adjustments,
         num_patches_for_radius, num_patches_for_dt, compute_dt, dt_max_winding,
-        cfg['unverified_patch_radius_loss_margin'], cfg['unverified_patch_radius_loss_inv'], cfg['unverified_patch_radius_within_norm_p'],
-        cfg['unverified_patch_dt_loss_margin'], cfg['unverified_patch_dt_norm_p'], cfg['unverified_patch_dt_within_patch_norm_p'],
+        cfg['patch_unverified_patch_radius_loss_margin'], cfg['patch_unverified_patch_radius_loss_inv'], cfg['patch_unverified_patch_radius_within_norm_p'],
+        cfg['patch_unverified_patch_dt_loss_margin'], cfg['patch_unverified_patch_dt_norm_p'], cfg['patch_unverified_patch_dt_within_patch_norm_p'],
         patch_indices=batch[1], sample_ijs=sample_ijs, dt_target_cache=dt_target_cache,
         diagnostic_prefix='unverified_patch',
     )
@@ -865,7 +864,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # points (adjacent mode) or the PCL chain between them (non-adjacent mode)
     # crosses theta=0, adjust the expected delta by that branch-cut jump.
 
-    num_points_per_strip = cfg['num_points_per_patch'] // 2
+    num_points_per_strip = cfg['sample_count_points_per_patch'] // 2
     num_strips_per_pcl = 4
     num_strips_per_pair = 2 * num_strips_per_pcl  # 8
 
@@ -877,7 +876,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # sampling_strata indexes into point_collections and already excludes single-point
     # pcls (possible only for winding_is_absolute pcls), which can't form a cross-patch
     # pair; see the build_pcl_sampling_strata call in fit_spiral.main.
-    num_pcls_per_step = min(cfg['rel_winding_num_pcls'], len(sampling_strata['all']))
+    num_pcls_per_step = min(cfg['sample_count_relative_winding_pcls'], len(sampling_strata['all']))
     if num_pcls_per_step <= 0:
         return torch.zeros([], device='cuda')
     selected_idxs = _choose_pcl_indices(sampling_strata, num_pcls_per_step)
@@ -886,7 +885,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     for pcl in selected_pcls:
         sorted_pcl_points = None
         sorted_pcl_point_idx = None
-        if not cfg['rel_winding_adjacent_patches_only']:
+        if not cfg['pcl_rel_winding_adjacent_patches_only']:
             sorted_pcl_points = [
                 point for _, point in sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
             ]
@@ -895,14 +894,14 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         # Pair patches either only with their immediate neighbour in the pcl's
         # patch ordering (first-seen order; built in main()),
         # or with every other patch.
-        if cfg['rel_winding_adjacent_patches_only']:
+        if cfg['pcl_rel_winding_adjacent_patches_only']:
             cross_pairs = [(p1, p2) for p1, p2 in zip(pcl['points_by_patch'], list(pcl['points_by_patch'])[1:])]
         else:
             cross_pairs = list(itertools.combinations(pcl['points_by_patch'], r=2))
         if not cross_pairs:
             continue
 
-        num_pairs_for_pcl = min(len(cross_pairs), cfg['rel_winding_num_patch_pairs_per_pcl'])
+        num_pairs_for_pcl = min(len(cross_pairs), cfg['sample_count_relative_winding_patch_pairs_per_pcl'])
         if num_pairs_for_pcl <= 0:
             continue
         chosen = np.random.choice(len(cross_pairs), num_pairs_for_pcl, replace=False)
@@ -917,7 +916,7 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             i1, j1 = int(p1['on_patch']['ij'][0]), int(p1['on_patch']['ij'][1])
             i2, j2 = int(p2['on_patch']['ij'][0]), int(p2['on_patch']['ij'][1])
 
-            if cfg['rel_winding_adjacent_patches_only']:
+            if cfg['pcl_rel_winding_adjacent_patches_only']:
                 pcl_chain = [p1, p2]
             else:
                 idx1, idx2 = sorted_pcl_point_idx[id(p1)], sorted_pcl_point_idx[id(p2)]
@@ -959,16 +958,16 @@ def get_patch_rel_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             flat_ijs[base + num_strips_per_pcl + s] = strip
         flat_pids.extend([pid1] * num_strips_per_pcl + [pid2] * num_strips_per_pcl)
 
-    # Batched GPU bilinear interp across all strips.
+    # Batched bilinear gather on the host-resident atlas; only the
+    # interpolated points are uploaded.
     patch_idx_per_strip_np = np.fromiter(
         (patch_atlas.id_to_idx[pid] for pid in flat_pids),
         dtype=np.int64,
         count=total_strips,
     )
-    patch_idx_per_strip_gpu = torch.from_numpy(patch_idx_per_strip_np).cuda(non_blocking=True)
-    ijs_gpu = torch.from_numpy(flat_ijs).cuda(non_blocking=True)
-    patch_idx_per_sample = patch_idx_per_strip_gpu[:, None].expand(total_strips, num_points_per_strip)
-    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, ijs_gpu)
+    patch_idx_per_strip = torch.from_numpy(patch_idx_per_strip_np)
+    patch_idx_per_sample = patch_idx_per_strip[:, None].expand(total_strips, num_points_per_strip)
+    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, torch.from_numpy(flat_ijs))
 
     # Mask out strip samples whose z falls outside [z_begin - margin, z_end + margin).
     # Computed before unwrapping but applied after, since _unwrap_track_shifted_radii
@@ -1038,7 +1037,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     # the point's target. Each L starts at the annotated point, so its unwrapped
     # shifted-radius keeps the true absolute scale at the anchor.
 
-    num_points_per_strip = cfg['num_points_per_patch'] // 2
+    num_points_per_strip = cfg['sample_count_points_per_patch'] // 2
     num_strips_per_point = 4
 
     # Each entry: (ls, pid, winding_annotation) where ls is a list of 4 L-shape ij strips.
@@ -1046,7 +1045,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
     strip_requests = []
 
     abs_pcls = [pcl for pcl in point_collections if pcl.get('metadata', {}).get('winding_is_absolute', False)]
-    num_pcls_per_step = min(cfg['abs_winding_num_pcls'], len(abs_pcls))
+    num_pcls_per_step = min(cfg['sample_count_absolute_winding_pcls'], len(abs_pcls))
     if num_pcls_per_step <= 0:
         return torch.zeros([], device='cuda')
     selected_idxs = np.random.choice(len(abs_pcls), num_pcls_per_step, replace=False)
@@ -1057,7 +1056,7 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
         attached = [p for pts in pcl['points_by_patch'].values() for p in pts]
         if not attached:
             continue
-        num_points_for_pcl = min(len(attached), cfg['abs_winding_num_points_per_pcl'])
+        num_points_for_pcl = min(len(attached), cfg['sample_count_absolute_winding_points_per_pcl'])
         chosen = np.random.choice(len(attached), num_points_for_pcl, replace=False)
         for idx in chosen:
             p = attached[idx]
@@ -1088,16 +1087,16 @@ def get_patch_abs_winding_loss(slice_to_spiral_transform, dr_per_winding, patche
             flat_ijs[base + s] = strip
         flat_pids.extend([pid] * num_strips_per_point)
 
-    # Batched GPU bilinear interp across all strips.
+    # Batched bilinear gather on the host-resident atlas; only the
+    # interpolated points are uploaded.
     patch_idx_per_strip_np = np.fromiter(
         (patch_atlas.id_to_idx[pid] for pid in flat_pids),
         dtype=np.int64,
         count=total_strips,
     )
-    patch_idx_per_strip_gpu = torch.from_numpy(patch_idx_per_strip_np).cuda(non_blocking=True)
-    ijs_gpu = torch.from_numpy(flat_ijs).cuda(non_blocking=True)
-    patch_idx_per_sample = patch_idx_per_strip_gpu[:, None].expand(total_strips, num_points_per_strip)
-    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, ijs_gpu)
+    patch_idx_per_strip = torch.from_numpy(patch_idx_per_strip_np)
+    patch_idx_per_sample = patch_idx_per_strip[:, None].expand(total_strips, num_points_per_strip)
+    flat_zyxs = patch_atlas.lookup(patch_idx_per_sample, torch.from_numpy(flat_ijs))
 
     # Mask out strip samples whose z falls outside [z_begin - margin, z_end + margin).
     # Computed before unwrapping but applied after, since _unwrap_track_shifted_radii
@@ -1282,8 +1281,8 @@ def iter_lasagna_losses(slice_to_spiral_transform, dr_per_winding, lasagna_volum
 
     # Build both sparse requests before touching the shared CUDA cache.
     if compute_spacing:
-        density_decode = cfg['grad_mag_factor'] / cfg['grad_mag_encode_scale'] * lasagna_scale
-        num_steps = int(cfg['spacing_integration_steps'])
+        density_decode = cfg['dense_grad_mag_factor'] / cfg['dense_grad_mag_encode_scale'] * lasagna_scale
+        num_steps = int(cfg['dense_spacing_integration_steps'])
         step_frac = (torch.arange(num_steps, device=device).float() + 0.5) / num_steps
         integration_zyx = scroll_inner[:, None, :] + step_frac[None, :, None] * scroll_displacement[:, None, :]
         int_idx = (integration_zyx.detach() / lasagna_scale).round().long()
@@ -1499,7 +1498,7 @@ def get_symmetric_dirichlet_loss(slice_to_spiral_transform, dr_per_winding, oute
     if outer_winding_idx is None:
         return torch.zeros([], device=device)
     if epsilon is None:
-        epsilon = cfg['sym_dirichlet_finite_difference_epsilon']
+        epsilon = cfg['model_sym_dirichlet_finite_difference_epsilon']
 
     spiral_zyx, e1, e2 = sample_spiral_surface_frame(dr_per_winding, outer_winding_idx, num_points)
 

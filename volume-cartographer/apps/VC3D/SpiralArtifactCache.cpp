@@ -55,6 +55,10 @@ struct SpiralArtifactCache::FetchJob
     QJsonObject manifest;
     QString entryPoint;
     QList<QJsonObject> pendingFiles;
+    int totalFiles = 0;
+    int filesComplete = 0;
+    qint64 totalBytes = 0;
+    qint64 bytesComplete = 0;
     QString partialDir;
     QString finalDir;
     FetchCallback done;
@@ -199,7 +203,11 @@ void SpiralArtifactCache::fetchArtifact(const QString& sessionId, const QString&
                 && isDeferredPreviewFile(entry.value(QStringLiteral("name")).toString()))
                 continue;
             job->pendingFiles.push_back(entry);
+            job->totalBytes += entry.value(QStringLiteral("size")).toInteger();
         }
+        job->totalFiles = job->pendingFiles.size();
+        emit fetchProgress(job->artifactId, QStringLiteral("starting"), QString(),
+                           0, job->totalFiles, 0, job->totalBytes);
         if (!QDir().mkpath(job->partialDir)) {
             finishJob(job, tr("Could not create the artifact cache directory"));
             return;
@@ -351,6 +359,9 @@ void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
             finishJob(job, tr("Could not publish the artifact cache directory"));
             return;
         }
+        emit fetchProgress(job->artifactId, QStringLiteral("finished"), QString(),
+                           job->filesComplete, job->totalFiles,
+                           job->bytesComplete, job->totalBytes);
         job->done(QDir(job->finalDir).filePath(job->entryPoint), {}, false);
         return;
     }
@@ -373,6 +384,9 @@ void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
             existing = 0;
         }
     }
+    emit fetchProgress(job->artifactId, QStringLiteral("downloading"), name,
+                       job->filesComplete, job->totalFiles,
+                       job->bytesComplete + existing, job->totalBytes);
 
     auto file = std::make_shared<QFile>(targetPath);
     if (!file->open(existing > 0 ? (QIODevice::WriteOnly | QIODevice::Append)
@@ -387,21 +401,36 @@ void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
         request.setRawHeader("Range", QStringLiteral("bytes=%1-").arg(existing).toUtf8());
     QNetworkReply* reply = existing == declaredSize ? nullptr : _network->get(request);
 
-    auto verifyAndContinue = [this, job, name, declaredSize, declaredSha, targetPath]() {
+    auto streamedDigest = std::make_shared<QString>();
+    auto verifyAndContinue = [this, job, name, declaredSize, declaredSha,
+                              targetPath, streamedDigest]() {
+        emit fetchProgress(job->artifactId, QStringLiteral("verifying"), name,
+                           job->filesComplete, job->totalFiles,
+                           job->bytesComplete + declaredSize, job->totalBytes);
         auto* watcher = new QFutureWatcher<QString>(this);
-        connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, job]() {
+        connect(watcher, &QFutureWatcher<QString>::finished, this,
+                [this, watcher, job, name, declaredSize]() {
             const QString error = watcher->result();
             watcher->deleteLater();
             if (job->generation != _generation) return;
             if (!error.isEmpty()) { finishJob(job, error); return; }
+            ++job->filesComplete;
+            job->bytesComplete += declaredSize;
+            emit fetchProgress(job->artifactId, QStringLiteral("downloaded"), name,
+                               job->filesComplete, job->totalFiles,
+                               job->bytesComplete, job->totalBytes);
             startNextFile(job);
         });
-        watcher->setFuture(QtConcurrent::run([name, declaredSize, declaredSha, targetPath]() -> QString {
+        watcher->setFuture(QtConcurrent::run(
+            [name, declaredSize, declaredSha, targetPath,
+             streamedDigest]() -> QString {
             const qint64 actualSize = QFileInfo(targetPath).size();
             if (actualSize != declaredSize)
                 return tr("Artifact file %1 has %2 bytes; the manifest declares %3")
                     .arg(name).arg(actualSize).arg(declaredSize);
-            const QString actualSha = hashFileSha256(targetPath);
+            const QString actualSha = streamedDigest->isEmpty()
+                ? hashFileSha256(targetPath)
+                : *streamedDigest;
             if (actualSha != declaredSha)
                 return tr("Artifact file %1 failed its SHA-256 digest check").arg(name);
             return {};
@@ -410,12 +439,29 @@ void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
 
     if (!reply) { verifyAndContinue(); return; }
 
-    connect(reply, &QNetworkReply::readyRead, this, [reply, file]() {
-        file->write(reply->readAll());
+    auto streamHash = existing == 0
+        ? std::make_shared<QCryptographicHash>(QCryptographicHash::Sha256)
+        : std::shared_ptr<QCryptographicHash>();
+    connect(reply, &QNetworkReply::readyRead, this,
+            [reply, file, streamHash]() {
+        const QByteArray bytes = reply->readAll();
+        if (streamHash) streamHash->addData(bytes);
+        file->write(bytes);
     });
+    connect(reply, &QNetworkReply::downloadProgress, this,
+            [this, job, name, existing](qint64 received, qint64) {
+                emit fetchProgress(
+                    job->artifactId, QStringLiteral("downloading"), name,
+                    job->filesComplete, job->totalFiles,
+                    job->bytesComplete + existing + qMax<qint64>(0, received),
+                    job->totalBytes);
+            });
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, file, job, name, verifyAndContinue]() {
-                file->write(reply->readAll());
+            [this, reply, file, job, name, verifyAndContinue,
+             streamHash, streamedDigest]() {
+                const QByteArray bytes = reply->readAll();
+                if (streamHash) streamHash->addData(bytes);
+                file->write(bytes);
                 file->close();
                 const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
                 const bool ok = reply->error() == QNetworkReply::NoError
@@ -429,6 +475,9 @@ void SpiralArtifactCache::startNextFile(const std::shared_ptr<FetchJob>& job)
                     finishJob(job, tr("Downloading artifact file %1 failed: %2").arg(name, errorText));
                     return;
                 }
+                if (streamHash)
+                    *streamedDigest =
+                        QString::fromLatin1(streamHash->result().toHex());
                 verifyAndContinue();
             });
 }
@@ -437,6 +486,9 @@ void SpiralArtifactCache::finishJob(const std::shared_ptr<FetchJob>& job,
                                     const QString& error, bool gone)
 {
     // Keep the partial directory: verified complete files resume a later fetch.
+    emit fetchProgress(job->artifactId, QStringLiteral("failed"), QString(),
+                       job->filesComplete, job->totalFiles,
+                       job->bytesComplete, job->totalBytes);
     job->done({}, error, gone);
 }
 

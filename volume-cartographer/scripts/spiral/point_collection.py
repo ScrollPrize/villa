@@ -75,6 +75,11 @@ def load_point_collection(filename: str) -> Optional[Dict[int, Dict[str, Any]]]:
         print(f"Loaded point collection with {len(collections)} collections ({total_points} points)")
         return collections
 
+    except FileNotFoundError:
+        # Default configs list optional annotation files (e.g.
+        # drawn_control_points.json) that may not exist in a dataset.
+        print(f"WARNING: point collection file not found, skipping: {filename}")
+        return None
     except Exception as e:
         print(f"Error loading point collection from {filename}: {e}")
         return None

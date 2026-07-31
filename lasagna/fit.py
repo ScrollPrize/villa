@@ -1290,6 +1290,7 @@ def _run_flatten_mode(
 	opt_cfg: cli_opt.OptConfig,
 	progress_enabled: bool,
 	out_dir: str | None,
+	lifecycle_fn=None,
 ) -> int:
 	ext_surfaces_cfg = cfg.get("external_surfaces", None)
 	if not isinstance(ext_surfaces_cfg, list) or len(ext_surfaces_cfg) != 1:
@@ -1414,6 +1415,8 @@ def _run_flatten_mode(
 		seed_xyz=None,
 		out_dir=out_dir,
 	)
+	if lifecycle_fn is not None:
+		lifecycle_fn("saving", "Saving optimized flatten model")
 
 	if device.type == "cuda":
 		peak_gb = torch.cuda.max_memory_allocated(device) / 2**30
@@ -1441,7 +1444,7 @@ def _run_flatten_mode(
 	return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, lifecycle_fn=None) -> int:
 	if argv is None:
 		argv = sys.argv[1:]
 
@@ -1490,6 +1493,7 @@ def main(argv: list[str] | None = None) -> int:
 			opt_cfg=opt_cfg,
 			progress_enabled=progress_enabled,
 			out_dir=_out_dir,
+			lifecycle_fn=lifecycle_fn,
 		)
 
 	data_cfg = cli_data.from_args(args)
@@ -2420,6 +2424,8 @@ def main(argv: list[str] | None = None) -> int:
 		require_snap_surf_map_state=(model_init == "model" and self_map_init != "off"),
 	)
 	_stage_done("optimizer", _t)
+	if lifecycle_fn is not None:
+		lifecycle_fn("saving", "Saving optimized Lasagna model")
 
 	if device.type == "cuda":
 		peak_gb = torch.cuda.max_memory_allocated(device) / 2**30

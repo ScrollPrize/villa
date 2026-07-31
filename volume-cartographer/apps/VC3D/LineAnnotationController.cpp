@@ -1583,6 +1583,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
 
 LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     fs::path manifestPath,
+    double workingToBaseScale,
     std::vector<vc::lasagna::LineControlPoint> controlPoints,
     std::vector<cv::Vec3d> initialLinePoints,
     cv::Vec3d sourceSliceNormal,
@@ -1593,7 +1594,8 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     int activeEnd)
 {
     vc::lasagna::LasagnaDataset dataset =
-        vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaDataset::open(
+            manifestPath, {workingToBaseScale});
     vc::lasagna::LasagnaNormalSampler sampler(dataset);
     return optimizeLineWithSampler(std::move(manifestPath),
                                    std::move(controlPoints),
@@ -1744,25 +1746,6 @@ LineAnnotationController::LineAnnotationController(CState* state,
     , _datasetPicker([this](QWidget* parent, const fs::path& startDir) {
         return pickDataset(parent, startDir);
     })
-    , _optimizationTaskFactory([](fs::path manifestPath,
-                                  std::vector<vc::lasagna::LineControlPoint> controlPoints,
-                                  std::vector<cv::Vec3d> initialLinePoints,
-                                  cv::Vec3d sourceSliceNormal,
-                                  InitialDirectionMode directionMode,
-                                  int initialCenterlineLengthVx,
-                                  bool forceFullOptimization,
-                                  int activeStart,
-                                  int activeEnd) {
-        return optimizeLineFromManifest(std::move(manifestPath),
-                                        std::move(controlPoints),
-                                        std::move(initialLinePoints),
-                                        sourceSliceNormal,
-                                        directionMode,
-                                        initialCenterlineLengthVx,
-                                        forceFullOptimization,
-                                        activeStart,
-                                        activeEnd);
-    })
 {
     if (_state) {
         connect(_state,
@@ -1834,47 +1817,6 @@ bool LineAnnotationController::canLaunchFromViewer(const CChunkedVolumeViewer* v
                                             surfaceName) !=
                                       pane.session->generatedSurfaceNames.end();
                        });
-}
-
-void LineAnnotationController::launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& /*scenePoint*/)
-{
-    if (!canLaunchFromViewer(viewer)) {
-        return;
-    }
-
-    auto camera = viewer->cameraState();
-    SourceKind sourceKind = SourceKind::Plane;
-    std::shared_ptr<Surface> sourceSurface;
-    cv::Vec3d sourceSliceNormal{
-        camera.zOffsetWorldDir[0],
-        camera.zOffsetWorldDir[1],
-        camera.zOffsetWorldDir[2],
-    };
-
-    if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
-        auto clone = std::make_shared<PlaneSurface>(*plane);
-        const cv::Vec3f normal = plane->normal({0, 0, 0});
-        sourceSliceNormal = {normal[0], normal[1], normal[2]};
-        if (std::isfinite(normal[0]) && std::isfinite(normal[1]) &&
-            std::isfinite(normal[2]) && cv::norm(normal) > 0.0f) {
-            clone->setOrigin(plane->origin() + normal * viewer->normalOffset());
-        }
-        camera.zOffset = 0.0f;
-        camera.zOffsetWorldDir = {0, 0, 0};
-        sourceSurface = clone;
-    } else {
-        sourceKind = SourceKind::Segmentation;
-        sourceSurface = _state->surface("segmentation");
-    }
-
-    auto session = std::make_shared<LineAnnotationSession>();
-    const std::string surfaceName = nextSurfaceName();
-    (void)launchSession(sourceKind,
-                        surfaceName,
-                        std::move(sourceSurface),
-                        camera,
-                        sourceSliceNormal,
-                        std::move(session));
 }
 
 void LineAnnotationController::launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
@@ -2010,6 +1952,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         : cv::Vec3d{0.0, 0.0, 1.0};
 
     _panes.push_back(PaneRecord{_nextPaneId - 1, sourceKind, surfaceName, dialog, session});
+    pushFiberUiState(_panes.back());
     connect(dialog, &LineAnnotationDialog::paneClosed, this, [this](const std::string& name) {
         cleanupSurfaceName(name);
     });
@@ -2022,14 +1965,18 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     connect(dialog,
             &LineAnnotationDialog::lineSeedRequested,
             this,
-            [this, dialog](const std::string& name, cv::Vec3f volumePoint, QPointF) {
-                InitialDirectionMode mode = InitialDirectionMode::Sideways;
-                if (dialog) {
-                    mode = dialog->initialDirectionMode() == LineAnnotationDialog::InitialDirectionMode::ZInOut
-                        ? InitialDirectionMode::ZInOut
-                        : InitialDirectionMode::Sideways;
+            [this](const std::string& name, cv::Vec3f volumePoint, QPointF) {
+                handleLineSeed(name, volumePoint, InitialDirectionMode::ZInOut);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::fiberTagChangeRequested,
+            this,
+            [this, surfaceName](const QString& tag, bool enabled) {
+                auto* pane = paneForSurface(surfaceName);
+                if (!pane || !pane->session || pane->session->fiberId == 0) {
+                    return;
                 }
-                handleLineSeed(name, volumePoint, mode);
+                setFiberTag(pane->session->fiberId, tag, enabled);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointRequested,
@@ -2870,6 +2817,12 @@ void LineAnnotationController::setFiberManualHvTag(uint64_t fiberId, const QStri
         scheduleFiberSave(*it);
     } catch (const std::exception& ex) {
         it->manualHvTag = previousManualTag;
+        for (const auto& pane : _panes) {
+            if (pane.session && pane.session->fiberId == fiberId) {
+                pane.session->fiberManualHvTag = previousManualTag;
+                pushFiberUiState(pane);
+            }
+        }
         showError(tr("Could not save fiber %1: %2")
                       .arg(fiberId)
                       .arg(QString::fromStdString(ex.what())));
@@ -2879,6 +2832,7 @@ void LineAnnotationController::setFiberManualHvTag(uint64_t fiberId, const QStri
     for (const auto& pane : _panes) {
         if (pane.session && pane.session->fiberId == fiberId) {
             pane.session->fiberManualHvTag = manualTag;
+            pushFiberUiState(pane);
         }
     }
     emitFiberSummaries();
@@ -2919,6 +2873,12 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
         scheduleFiberSave(*it);
     } catch (const std::exception& ex) {
         it->tags = previousTags;
+        for (const auto& pane : _panes) {
+            if (pane.session && pane.session->fiberId == fiberId) {
+                pane.session->fiberTags = previousTags;
+                pushFiberUiState(pane);
+            }
+        }
         showError(tr("Could not save fiber %1: %2")
                       .arg(fiberId)
                       .arg(QString::fromStdString(ex.what())));
@@ -2928,9 +2888,45 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
     for (const auto& pane : _panes) {
         if (pane.session && pane.session->fiberId == fiberId) {
             pane.session->fiberTags = it->tags;
+            pushFiberUiState(pane);
         }
     }
     emitFiberSummaries();
+}
+
+QString LineAnnotationController::fiberHvDirectionTag(uint64_t fiberId) const
+{
+    const auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
+        return fiber.id == fiberId;
+    });
+    if (it == _fibers.end()) {
+        return {};
+    }
+    if (it->manualHvTag == "H" || it->manualHvTag == "V") {
+        return QString::fromStdString(it->manualHvTag);
+    }
+    const std::string automaticTag =
+        vc3d::line_annotation::fiberHvTagToString(it->hvClassification.automaticTag);
+    if (automaticTag == "H" || automaticTag == "V") {
+        return QString::fromStdString(automaticTag);
+    }
+    return {};
+}
+
+void LineAnnotationController::pushFiberUiState(const PaneRecord& pane) const
+{
+    if (!pane.dialog || !pane.session) {
+        return;
+    }
+    const uint64_t fiberId = pane.session->fiberId;
+    pane.dialog->setFiberHvTag(fiberHvDirectionTag(fiberId));
+    const auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
+        return fiber.id == fiberId;
+    });
+    const bool loaded = fiberId != 0 && it != _fibers.end();
+    pane.dialog->setFiberTags(knownFiberTags(),
+                              loaded ? it->tags : pane.session->fiberTags,
+                              loaded);
 }
 
 void LineAnnotationController::recalculateFiberHvClassification(uint64_t fiberId)
@@ -2954,6 +2950,11 @@ void LineAnnotationController::recalculateFiberHvClassification(uint64_t fiberId
                       .arg(fiberId)
                       .arg(QString::fromStdString(ex.what())));
         return;
+    }
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session->fiberId == fiberId) {
+            pushFiberUiState(pane);
+        }
     }
     emitFiberSummaries();
 }
@@ -6999,6 +7000,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
             });
 
     const auto manifestPath = session.selectedManifestPath;
+    const double workingToBaseScale = session.workingToBaseScale;
     auto factory = _optimizationTaskFactory;
     auto controlPoints = session.controlPoints;
     std::vector<cv::Vec3d> initialLinePoints;
@@ -7024,6 +7026,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            forceFullOptimization,
                                            activeStart,
                                            activeEnd,
+                                           workingToBaseScale,
                                            dataset,
                                            normalSampler]() mutable {
         if (factory) {
@@ -7051,6 +7054,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            *normalSampler);
         }
         return optimizeLineFromManifest(manifestPath,
+                                        workingToBaseScale,
                                         std::move(controlPoints),
                                         std::move(initialLinePoints),
                                         sourceSliceNormal,
@@ -7301,10 +7305,28 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.spanAlignmentMetrics =
         generatedSpanAlignmentMetricsForSession(session);
 
+    // Re-registration replaces planes that live viewers render immediately, and
+    // the dialog only re-poses them to the current line position afterwards.
+    // Seed each new plane with the previous plane's pose (when one exists) so
+    // the surfaceChanged frame is visually continuous instead of flashing the
+    // seed-point view on every control-point placement.
+    const auto carryOverPreviousPose = [this](const std::string& name,
+                                              const std::shared_ptr<PlaneSurface>& plane) {
+        const auto previous =
+            std::dynamic_pointer_cast<PlaneSurface>(_state->surface(name));
+        if (!previous) {
+            return;
+        }
+        plane->setFromNormalAndUp(previous->origin(),
+                                  previous->normal({0.0f, 0.0f, 0.0f}),
+                                  previous->basisY());
+    };
+
     generatedViews.currentCutName = generatedPrefix + "_line_current_cut";
     generatedViews.currentCutSurface = std::make_shared<PlaneSurface>(
         seedPoint,
         cv::Vec3f{1.0f, 0.0f, 0.0f});
+    carryOverPreviousPose(generatedViews.currentCutName, generatedViews.currentCutSurface);
     _state->setSurface(generatedViews.currentCutName, generatedViews.currentCutSurface);
     session.generatedSurfaceNames.push_back(generatedViews.currentCutName);
 
@@ -7312,6 +7334,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.sideCutSurface = std::make_shared<PlaneSurface>(
         seedPoint,
         cv::Vec3f{1.0f, 0.0f, 0.0f});
+    carryOverPreviousPose(generatedViews.sideCutName, generatedViews.sideCutSurface);
     _state->setSurface(generatedViews.sideCutName, generatedViews.sideCutSurface);
     session.generatedSurfaceNames.push_back(generatedViews.sideCutName);
 
@@ -7645,6 +7668,7 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
                                         activeEnd);
     }
     return optimizeLineFromManifest(std::move(manifestPath),
+                                    1.0,
                                     std::move(controlPoints),
                                     std::move(initialLinePoints),
                                     sourceSliceNormal,
@@ -10042,6 +10066,11 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         }
         invalidateFiberAlignmentMetrics(savedFiberId, true);
         addKnownFiberTags(session.fiberTags);
+        for (const auto& pane : _panes) {
+            if (pane.session && pane.session->fiberId == savedFiberId) {
+                pushFiberUiState(pane);
+            }
+        }
         emitFiberSummaries();
         refreshBranchLineViews(savedFiberId);
     } catch (const std::exception& ex) {

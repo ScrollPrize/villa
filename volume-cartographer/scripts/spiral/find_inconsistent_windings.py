@@ -160,12 +160,12 @@ def install_globals(checkpoint, patches_dir, pcl_paths, filter_z_begin, filter_z
     user-supplied patches/pcls/filter-z-range so its loaders behave identically.
     Returns the checkpoint's model z-range, which shapes the transform's flow
     field independently of the filtering z-range."""
-    cfg = dict(fs.default_config)
+    cfg = fs.Config().as_dict()
     cfg.update(checkpoint['cfg'])
     # This tool IS the patch graph — a checkpoint trained supervision-free
     # (disable_patches, e.g. the 2026-07-17 normals-only baseline) must not
     # stop the loaders from reading the patches it wants to analyse.
-    cfg['disable_patches'] = False
+    cfg['input_disable_patches'] = False
     fs.cfg = cfg
     fs.verified_patches_path = patches_dir
     # Attachment is over the verified patch set only, so skip the (slow, unrelated)
@@ -196,13 +196,13 @@ def build_transform(checkpoint, model_z_begin, model_z_end):
         np.concatenate([all_zs[:, None], umbilicus_fn(all_zs)], axis=-1).astype(np.float32)
     ).to(device)
 
-    r = cfg['flow_bounds_radius']
-    flow_min_corner = torch.tensor([model_z_begin - cfg['flow_bounds_z_margin'], -r, -r], dtype=torch.int64, device=device)
-    flow_max_corner = torch.tensor([model_z_end + cfg['flow_bounds_z_margin'], r, r], dtype=torch.int64, device=device)
+    r = cfg['model_flow_bounds_radius']
+    flow_min_corner = torch.tensor([model_z_begin - cfg['model_flow_bounds_z_margin'], -r, -r], dtype=torch.int64, device=device)
+    flow_max_corner = torch.tensor([model_z_end + cfg['model_flow_bounds_z_margin'], r, r], dtype=torch.int64, device=device)
 
     model = fs.SpiralAndTransform(
-        flow_integration_steps=cfg['num_flow_integration_steps'],
-        flow_integration_solver=cfg['flow_integration_solver'],
+        flow_integration_steps=cfg['model_num_flow_integration_steps'],
+        flow_integration_solver=cfg['model_flow_integration_solver'],
         umbilicus_zyx=umbilicus_zyx,
         flow_min_corner_zyx=flow_min_corner,
         flow_max_corner_zyx=flow_max_corner,
@@ -212,13 +212,6 @@ def build_transform(checkpoint, model_z_begin, model_z_end):
     model.to(device)
     model.load_state_dict(checkpoint['spiral_and_transform'])
     model.eval()
-    # The high-res flow fields are stored "pre-scale": at forward time the hr params
-    # are multiplied by flow_scales[1], which training ramps (identically for every
-    # stage when num_flow_stages > 1) and which is NOT part of the state_dict. A
-    # fully-fitted checkpoint ends the ramp at its 'final' value, so pin every
-    # stage's scale to that to reproduce the saved transform.
-    for flow_field in model.flow_fields:
-        flow_field.flow_scales[1] = cfg['flow_field_high_res_lr_scale_final']
 
     transform = model.get_slice_to_spiral_transform()
     dr_per_winding = model.get_dr_per_winding()
