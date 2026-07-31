@@ -683,6 +683,28 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
 | `--chunk-yx` | 32 | Output zarr chunk size for Y and X |
 | `--calibrate-norm` | off | Calibrate InstanceNorm before inference |
 
+### predict3d resume and chunk completeness
+
+`predict3d` writes each logical output as its own OME-Zarr group. Resume is
+based on the presence of those output chunks. Fine inference is complete when
+the `cos` chunk exists. Coarse inference is complete only when the sibling
+`grad_mag`, `nx`, and `ny` chunks all exist; if one sibling is missing, the
+coarse chunk is recomputed and the missing sibling chunks are written.
+
+`pred_dt` is intentionally independent from model inference. Missing
+`pred_dt` chunks schedule only distance-transform generation from the supplied
+prediction zarr and do not make existing `cos`/`grad_mag`/`nx`/`ny` chunks
+incomplete.
+
+Output chunks and model tile origins are global and crop-independent. A crop
+chooses which full OME-Zarr chunks are produced, but the tile support for any
+shared chunk is the same as in a full-volume run.
+
+Output chunk writes use unique temporary paths followed by atomic rename. Stale
+predict3d temp paths in the output directory are removed on startup/resume and
+after a normal finish; pid-bearing temp paths owned by other live predict3d
+processes are left alone.
+
 ### Lasagna volume format (.lasagna.json)
 
 Output is a JSON manifest describing channel groups, each stored in a separate zarr:

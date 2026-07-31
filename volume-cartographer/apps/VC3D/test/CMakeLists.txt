@@ -9,6 +9,23 @@
 # in, keeping the test fast and self-contained.
 find_package(Qt6 REQUIRED COMPONENTS Core Test Widgets)
 
+add_executable(test_spiral_reload_comparison
+    test_spiral_reload_comparison.cpp)
+
+set_target_properties(test_spiral_reload_comparison PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_spiral_reload_comparison PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_spiral_reload_comparison PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME spiral_reload_comparison COMMAND test_spiral_reload_comparison)
+set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS
+    test_spiral_reload_comparison)
+
 add_executable(test_seeding_batch_tracker
     test_seeding_batch_tracker.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/SeedingBatchTracker.cpp)
