@@ -109,7 +109,7 @@ def test_parse_vc3d_fiber_validates_and_preserves_xyz_order():
                 "control_points": [[1, 2, 3]],
             }
         )
-    with pytest.raises(ValueError, match="version-2 control points"):
+    with pytest.raises(ValueError, match="versions 1 and 3"):
         parse_vc3d_fiber(
             {
                 "type": "vc3d_fiber",
@@ -120,12 +120,15 @@ def test_parse_vc3d_fiber_validates_and_preserves_xyz_order():
         )
 
 
-def test_parse_vc3d_fiber_v2_segment_metadata():
+def test_parse_vc3d_fiber_v3_segment_metadata():
     segment = {
         "optimizer": "native_fiber_trace3d",
-        "metadata_version": 2,
+        "metadata_version": 3,
         "tracer_version": 2,
-        "outcome": "accepted_native",
+        "interp_goal": "global",
+        "interp_mode": "trace",
+        "metric": 2.5,
+        "msg": "trace",
         "normal_manifest": "s3://bucket/normals.lasagna.json",
         "fiber_manifest": "s3://bucket/fibers.lasagna.json",
         "trace_to_base_scale": 4.0,
@@ -134,6 +137,8 @@ def test_parse_vc3d_fiber_v2_segment_metadata():
         "meeting_source": "forward_moving_plane",
         "failure_code": "",
         "failure_detail": "",
+        "lasagna_failure_code": "",
+        "lasagna_failure_detail": "",
         "config": {
             "step_voxels": 4.0,
             "cone_angle_degrees": 25.0,
@@ -157,7 +162,7 @@ def test_parse_vc3d_fiber_v2_segment_metadata():
     fiber = parse_vc3d_fiber(
         {
             "type": "vc3d_fiber",
-            "version": 2,
+            "version": 3,
             "line_points": [[1, 2, 3], [4, 5, 6]],
             "control_points": [
                 {"position": [1, 2, 3], "segment_to_next": segment},
@@ -173,36 +178,9 @@ def test_parse_vc3d_fiber_v2_segment_metadata():
     assert fiber.control_point_segments[0].meeting_error_ratio == 1.25
     assert fiber.control_point_segments[1] is None
 
-    fallback_segment = {
-        **segment,
-        "outcome": "lasagna_fallback",
-        "meeting_error_base_voxels": 250.0,
-        "meeting_error_ratio": 2.5,
-        "meeting_source": "discarded_native_meeting",
-        "failure_code": "no_trace_plane_intersection",
-        "failure_detail": "forward=max_step_factor reverse=no_valid_candidates",
-    }
-    fallback_fiber = parse_vc3d_fiber(
-        {
-            "type": "vc3d_fiber",
-            "version": 2,
-            "line_points": [[1, 2, 3], [4, 5, 6]],
-            "control_points": [
-                {"position": [1, 2, 3], "segment_to_next": fallback_segment},
-                {"position": [4, 5, 6]},
-            ],
-        }
-    )
-    assert fallback_fiber.control_point_segments[0] is not None
-    assert fallback_fiber.control_point_segments[0].outcome == "lasagna_fallback"
-    assert fallback_fiber.control_point_segments[0].meeting_error_base_voxels is None
-    assert fallback_fiber.control_point_segments[0].meeting_error_ratio is None
-    assert fallback_fiber.control_point_segments[0].meeting_source == ""
-    assert fallback_fiber.control_point_segments[0].failure_code == "no_trace_plane_intersection"
-
     invalid = {
         "type": "vc3d_fiber",
-        "version": 2,
+        "version": 3,
         "line_points": [[1, 2, 3], [4, 5, 6]],
         "control_points": [{"position": [1, 2, 3]},
                            {"position": [4, 5, 6], "segment_to_next": segment}],
@@ -210,25 +188,25 @@ def test_parse_vc3d_fiber_v2_segment_metadata():
     with pytest.raises(ValueError, match="final control point"):
         parse_vc3d_fiber(invalid)
 
-    v3_segment = {
-        key: value for key, value in segment.items() if key != "outcome"
-    }
-    v3_segment.update({
-        "metadata_version": 3,
-        "interp_goal": "global",
-        "interp_mode": "trace",
-        "metric": 2.5,
-        "msg": "trace",
-        "lasagna_failure_code": "",
-        "lasagna_failure_detail": "",
-    })
+    obsolete_segment = {**segment, "metadata_version": 2}
+    with pytest.raises(ValueError, match="metadata/tracer version"):
+        parse_vc3d_fiber({
+            "type": "vc3d_fiber",
+            "version": 3,
+            "line_points": [[1, 2, 3], [4, 5, 6]],
+            "control_points": [
+                {"position": [1, 2, 3], "segment_to_next": obsolete_segment},
+                {"position": [4, 5, 6]},
+            ],
+        })
+
     v3 = parse_vc3d_fiber({
         "type": "vc3d_fiber",
         "version": 3,
         "optimization_mode": "native_fiber_trace3d",
         "line_points": [[1, 2, 3], [4, 5, 6]],
         "control_points": [
-            {"position": [1, 2, 3], "segment_to_next": v3_segment},
+            {"position": [1, 2, 3], "segment_to_next": segment},
             {"position": [4, 5, 6]},
         ],
     })

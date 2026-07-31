@@ -724,11 +724,13 @@ Ownership changed as follows:
   `segment_to_next`. `interp_goal` records `global`/`cspline`/`lasagna`/`trace`;
   `interp_mode` records the actual `cspline`/`lasagna`/`trace` producer.
   Mode-dependent `metric`, compact `msg`, trace diagnostics, and Lasagna
-  fallback detail live in the same CP-owned object. Version-1 arrays and
-  version-2 native outcomes are promoted on load; all new saves write version
-  3. The C++ strict readers, Python loader, Lasagna probe, Atlas reader, and
-  merge validator accept all three versions and strictly validate v3 enums and
-  mode-specific fields. `normal_manifest` records the Lasagna source identity
+  fallback detail live in the same CP-owned object. Version-1 arrays load as
+  global Lasagna spans; all new saves write version 3. The unpublished file
+  version 2 and its pre-v3 descriptors are rejected. The C++ strict readers,
+  Python loader, Lasagna probe, Atlas reader, and merge validator accept only
+  file versions 1 and 3 and strictly validate v3 enums and mode-specific
+  fields. Version 3's current `tracer_version: 2` remains part of that strict
+  descriptor schema. `normal_manifest` records the Lasagna source identity
   and `fiber_manifest` the prediction source identity actually consulted by a
   span. Controller sessions keep these identities separate from runtime cache
   paths. `OpenDataLasagna` reconstructs the public root manifest URL from the
@@ -744,7 +746,7 @@ Ownership changed as follows:
   only across a complete unchanged base span; adjacent, overlapping, or
   unalignable edits return a manual conflict. `vc_sync` then preserves local,
   remote, and base copies and asks the user to keep local, keep remote, or
-  skip. The v1/v2 CP-polyline reoptimization fallback is not used for v3.
+  skip. The v1 CP-polyline reoptimization fallback is not used for v3.
   Fiber-wide `optimization_mode` is merged separately with base-aware scalar
   rules rather than generation precedence. Existing tag, link-reciprocity,
   and manual-HV-tag merge rules remain unchanged.

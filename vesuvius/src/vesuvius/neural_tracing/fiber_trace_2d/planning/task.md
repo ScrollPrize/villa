@@ -1,10 +1,10 @@
-# Preserve Version-3 Fiber Spans During Sync
+# Remove Unpublished Fiber Version 2
 
-- Extend the fiber-aware three-way sync merge for `vc3d_fiber` version 3.
-- Treat each CP-to-CP dense line slice and its `segment_to_next` descriptor as
-  one atomic stored result.
-- Merge independent changes only when unchanged base spans separate them.
-- Never choose one side's per-span goal or result merely from generation.
-- Reject ambiguous changes through the existing manual conflict workflow.
-- Merge the top-level `optimization_mode` with base-aware scalar semantics.
-- Preserve version-1 and version-2 merge behavior.
+- Remove support for top-level `vc3d_fiber` version 2 because it was never
+  published.
+- Keep legacy version 1 numeric control-point files readable.
+- Keep version 3 as the only object-control-point and segment-descriptor file
+  format.
+- Remove the obsolete pre-v3 segment metadata schemas and migrations.
+- Do not confuse the removed file version with version 3's current
+  `tracer_version: 2` field.

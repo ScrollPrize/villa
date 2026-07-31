@@ -21,7 +21,7 @@ invariants, from LineAnnotationController.cpp / Atlas.cpp:
 
 Merge semantics:
 
-- Version 1/2 with the same geometry on both sides (the incident case —
+- Version 1 with the same geometry on both sides (the incident case —
   divergent link edits):
   geometry and derived fields come wholesale from the newer-generation
   side; branches merge with set semantics (additions from both sides
@@ -36,7 +36,7 @@ Merge semantics:
   conflict). The optimizer cannot run here, so line_points is set to the
   merged control points verbatim (C1 holds exactly) and the merged fiber
   is tagged `needs_reoptimization`; VC3D offers to re-fit the line on load.
-  This legacy rule applies only to version 1/2 fibers.
+  This legacy rule applies only to version 1 fibers.
 - Version 3: dense CP-to-CP slices and their CP-owned segment descriptors
   are atomic. Independent local/remote changed runs merge only when at
   least one complete unchanged base span separates them. The selected
@@ -87,17 +87,6 @@ def _finite_point(p):
         return False
 
 
-_SEGMENT_KEYS_V1 = {
-    'optimizer', 'metadata_version', 'tracer_version', 'normal_manifest',
-    'fiber_manifest', 'trace_to_base_scale',
-    'max_endpoint_error_base_voxels', 'config',
-}
-_SEGMENT_KEYS_V2 = {
-    'optimizer', 'metadata_version', 'tracer_version', 'outcome',
-    'normal_manifest', 'fiber_manifest', 'trace_to_base_scale',
-    'meeting_error_base_voxels', 'meeting_error_ratio', 'meeting_source',
-    'failure_code', 'failure_detail', 'config',
-}
 _SEGMENT_KEYS_V3 = {
     'optimizer', 'metadata_version', 'tracer_version',
     'interp_goal', 'interp_mode', 'metric', 'msg',
@@ -116,112 +105,56 @@ _CONFIG_KEYS_COMMON = {
     'max_step_factor',
     'endpoint_accept_threshold_base_voxels',
 }
-_CONFIG_KEYS_V1 = _CONFIG_KEYS_COMMON | {'fusion_gap_factor'}
-_CONFIG_KEYS_V2 = _CONFIG_KEYS_COMMON | {'meeting_accept_max_error_ratio'}
+_CONFIG_KEYS_V3 = _CONFIG_KEYS_COMMON | {'meeting_accept_max_error_ratio'}
 
 
 def _valid_segment(segment):
     if not isinstance(segment, dict):
         return False
-    version = (segment.get('metadata_version'), segment.get('tracer_version'))
-    if version == (1, 1):
-        segment_keys = _SEGMENT_KEYS_V1
-        config_keys = _CONFIG_KEYS_V1
-    elif version == (2, 2):
-        segment_keys = _SEGMENT_KEYS_V2
-        config_keys = _CONFIG_KEYS_V2
-    elif version == (3, 2):
-        segment_keys = _SEGMENT_KEYS_V3
-        config_keys = _CONFIG_KEYS_V2
-    else:
+    if (segment.get('metadata_version'), segment.get('tracer_version')) != (3, 2):
         return False
-    if (set(segment) != segment_keys or
+    if (set(segment) != _SEGMENT_KEYS_V3 or
             segment.get('optimizer') != 'native_fiber_trace3d' or
             not isinstance(segment.get('normal_manifest'), str) or
-            (version != (3, 2) and not segment['normal_manifest']) or
-            not isinstance(segment.get('fiber_manifest'), str) or
-            (version != (3, 2) and not segment['fiber_manifest'])):
+            not isinstance(segment.get('fiber_manifest'), str)):
         return False
     config = segment.get('config')
     numeric = [segment.get('trace_to_base_scale')]
-    if not isinstance(config, dict) or set(config) != config_keys:
+    if not isinstance(config, dict) or set(config) != _CONFIG_KEYS_V3:
         return False
     numeric.extend(config.values())
     if not all(isinstance(value, (int, float)) and
                not isinstance(value, bool) and math.isfinite(value)
                for value in numeric):
         return False
-    if version == (1, 1):
-        error = segment.get('max_endpoint_error_base_voxels')
-        return (isinstance(error, (int, float)) and not isinstance(error, bool)
-                and math.isfinite(error) and error >= 0)
-    if version == (3, 2):
-        goal = segment.get('interp_goal')
-        mode = segment.get('interp_mode')
-        metric = segment.get('metric')
-        strings = [segment.get(key) for key in (
-            'msg', 'meeting_source', 'failure_code', 'failure_detail',
-            'lasagna_failure_code', 'lasagna_failure_detail')]
-        if (goal not in {'global', 'cspline', 'lasagna', 'trace'} or
-                mode not in {'cspline', 'lasagna', 'trace'} or
-                not all(isinstance(value, str) for value in strings) or
-                (metric is not None and
-                 (isinstance(metric, bool) or not isinstance(metric, (int, float)) or
-                  not math.isfinite(metric) or metric < 0)) or
-                (mode == 'cspline' and metric is not None)):
-            return False
-        error = segment.get('meeting_error_base_voxels')
-        ratio = segment.get('meeting_error_ratio')
-        if mode == 'trace':
-            return (metric is not None and bool(segment['normal_manifest']) and
-                    bool(segment['fiber_manifest']) and
-                    isinstance(error, (int, float)) and not isinstance(error, bool) and
-                    math.isfinite(error) and error >= 0 and
-                    isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and
-                    math.isfinite(ratio) and ratio >= 0 and
-                    bool(segment['meeting_source']) and
-                    not segment['failure_code'] and not segment['failure_detail'])
-        return error is None and ratio is None and not segment['meeting_source']
-    outcome = segment.get('outcome')
-    strings = [segment.get('failure_code'), segment.get('failure_detail')]
-    if (outcome not in {'accepted_native', 'lasagna_fallback'} or
-            not all(isinstance(value, str) for value in strings)):
+    goal = segment.get('interp_goal')
+    mode = segment.get('interp_mode')
+    metric = segment.get('metric')
+    strings = [segment.get(key) for key in (
+        'msg', 'meeting_source', 'failure_code', 'failure_detail',
+        'lasagna_failure_code', 'lasagna_failure_detail')]
+    if (goal not in {'global', 'cspline', 'lasagna', 'trace'} or
+            mode not in {'cspline', 'lasagna', 'trace'} or
+            not all(isinstance(value, str) for value in strings) or
+            (metric is not None and
+             (isinstance(metric, bool) or not isinstance(metric, (int, float)) or
+              not math.isfinite(metric) or metric < 0)) or
+            (mode == 'cspline' and metric is not None)):
         return False
     if not 0 <= config['meeting_accept_max_error_ratio'] <= 1:
         return False
-    if outcome == 'accepted_native':
-        error = segment.get('meeting_error_base_voxels')
-        ratio = segment.get('meeting_error_ratio')
-        return (isinstance(error, (int, float)) and
-                not isinstance(error, bool) and math.isfinite(error) and
-                error >= 0 and isinstance(ratio, (int, float)) and
-                not isinstance(ratio, bool) and math.isfinite(ratio) and
-                ratio >= 0 and isinstance(segment.get('meeting_source'), str) and
+    error = segment.get('meeting_error_base_voxels')
+    ratio = segment.get('meeting_error_ratio')
+    if mode == 'trace':
+        return (metric is not None and bool(segment['normal_manifest']) and
+                bool(segment['fiber_manifest']) and
+                isinstance(error, (int, float)) and not isinstance(error, bool) and
+                math.isfinite(error) and error >= 0 and
+                isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and
+                math.isfinite(ratio) and ratio >= 0 and
                 bool(segment['meeting_source']) and
                 not segment['failure_code'] and not segment['failure_detail'])
-    return bool(segment['failure_code'])
-
-
-def _clear_fallback_meeting_diagnostics(doc):
-    """Canonicalize discarded native diagnostics before writing a fiber."""
-    changed = False
-    if doc.get('version', 1) != 2:
-        return changed
-    for control in doc.get('control_points', []):
-        if not isinstance(control, dict):
-            continue
-        segment = control.get('segment_to_next')
-        if (not isinstance(segment, dict) or
-                segment.get('outcome') != 'lasagna_fallback'):
-            continue
-        for key, value in (
-                ('meeting_error_base_voxels', None),
-                ('meeting_error_ratio', None),
-                ('meeting_source', '')):
-            if segment.get(key) != value:
-                segment[key] = value
-                changed = True
-    return changed
+    return error is None and ratio is None and not segment['meeting_source']
 
 
 def is_fiber_doc(doc):
@@ -232,7 +165,7 @@ def is_fiber_doc(doc):
     if not (isinstance(doc, dict) and doc.get('type') == 'vc3d_fiber'):
         return False
     version = doc.get('version', 1)
-    if version not in (1, 2, 3):
+    if version not in (1, 3):
         return False
     if 'optimization_mode' in doc:
         mode = doc['optimization_mode']
@@ -978,7 +911,6 @@ def merge_fibers(base, local, remote):
 
     if local == remote or remote == base:
         merged = copy.deepcopy(local)
-        _clear_fallback_meeting_diagnostics(merged)
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(local),
                       notes=(["remote side unchanged; kept local"]
@@ -987,7 +919,6 @@ def merge_fibers(base, local, remote):
         return result
     if local == base:
         merged = copy.deepcopy(remote)
-        _clear_fallback_meeting_diagnostics(merged)
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(remote),
                       notes=["local side unchanged; took remote"])
@@ -1152,7 +1083,6 @@ def merge_fibers(base, local, remote):
         result['conflicts'] = [manual_tag_conflict]
         return result
 
-    _clear_fallback_meeting_diagnostics(merged)
     stats['reoptimize'] = reoptimize
     result['peer_files'] = sorted(
         {_branch_target(entry) for entry in links_to_any(merged)} |
@@ -1183,9 +1113,6 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
     if not is_fiber_doc(a) or not is_fiber_doc(b):
         out['conflicts'].append(f"{a_name} or {b_name} is not a vc3d_fiber document")
         return out
-    out['a_changed'] = _clear_fallback_meeting_diagnostics(a)
-    out['b_changed'] = _clear_fallback_meeting_diagnostics(b)
-
     a_cps, a_line = a['control_points'], a['line_points']
     b_cps, b_line = b['control_points'], b['line_points']
     a_entries = links_to(a, b_name)

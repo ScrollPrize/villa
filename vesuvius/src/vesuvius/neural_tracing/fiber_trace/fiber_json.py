@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -82,31 +82,6 @@ def _parse_points(
     return points.astype(np.float32, copy=False)
 
 
-_SEGMENT_KEYS_V1 = {
-    "optimizer",
-    "metadata_version",
-    "tracer_version",
-    "normal_manifest",
-    "fiber_manifest",
-    "trace_to_base_scale",
-    "max_endpoint_error_base_voxels",
-    "config",
-}
-_SEGMENT_KEYS_V2 = {
-    "optimizer",
-    "metadata_version",
-    "tracer_version",
-    "outcome",
-    "normal_manifest",
-    "fiber_manifest",
-    "trace_to_base_scale",
-    "meeting_error_base_voxels",
-    "meeting_error_ratio",
-    "meeting_source",
-    "failure_code",
-    "failure_detail",
-    "config",
-}
 _SEGMENT_KEYS_V3 = {
     "optimizer",
     "metadata_version",
@@ -145,8 +120,7 @@ _CONFIG_KEYS_COMMON = {
     "max_step_factor",
     "endpoint_accept_threshold_base_voxels",
 }
-_CONFIG_KEYS_V1 = _CONFIG_KEYS_COMMON | {"fusion_gap_factor"}
-_CONFIG_KEYS_V2 = _CONFIG_KEYS_COMMON | {"meeting_accept_max_error_ratio"}
+_CONFIG_KEYS_V3 = _CONFIG_KEYS_COMMON | {"meeting_accept_max_error_ratio"}
 
 
 def _parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
@@ -155,133 +129,58 @@ def _parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
     if raw["optimizer"] != "native_fiber_trace3d":
         raise ValueError(f"unsupported segment_to_next optimizer: {raw['optimizer']!r}")
     version = (raw.get("metadata_version"), raw.get("tracer_version"))
-    if version == (1, 1):
-        segment_keys = _SEGMENT_KEYS_V1
-        config_keys = _CONFIG_KEYS_V1
-    elif version == (2, 2):
-        segment_keys = _SEGMENT_KEYS_V2
-        config_keys = _CONFIG_KEYS_V2
-    elif version == (3, 2):
-        segment_keys = _SEGMENT_KEYS_V3
-        config_keys = _CONFIG_KEYS_V2
-    else:
+    if version != (3, 2):
         raise ValueError("unsupported segment_to_next metadata/tracer version")
-    if set(raw) != segment_keys:
+    if set(raw) != _SEGMENT_KEYS_V3:
         raise ValueError("segment_to_next has missing or unknown fields")
     config = raw["config"]
-    if not isinstance(config, dict) or set(config) != config_keys:
+    if not isinstance(config, dict) or set(config) != _CONFIG_KEYS_V3:
         raise ValueError("segment_to_next config has missing or unknown fields")
     normal_manifest = raw["normal_manifest"]
     fiber_manifest = raw["fiber_manifest"]
-    if not isinstance(normal_manifest, str) or (version != (3, 2) and not normal_manifest):
+    if not isinstance(normal_manifest, str):
         raise ValueError("segment_to_next normal_manifest must be a string")
-    if not isinstance(fiber_manifest, str) or (version != (3, 2) and not fiber_manifest):
+    if not isinstance(fiber_manifest, str):
         raise ValueError("segment_to_next fiber_manifest must be a string")
     trace_scale = float(raw["trace_to_base_scale"])
     if not math.isfinite(trace_scale) or trace_scale <= 0:
         raise ValueError("segment_to_next trace_to_base_scale must be positive")
-    if version == (1, 1):
-        interp_goal = "global"
-        interp_mode = "trace"
-        metric: float | None = None
-        msg = "trace"
-        lasagna_failure_code = ""
-        lasagna_failure_detail = ""
+    interp_goal = raw["interp_goal"]
+    interp_mode = raw["interp_mode"]
+    if interp_goal not in {"global", "cspline", "lasagna", "trace"}:
+        raise ValueError("segment_to_next interp_goal is invalid")
+    if interp_mode not in {"cspline", "lasagna", "trace"}:
+        raise ValueError("segment_to_next interp_mode is invalid")
+    metric = None if raw["metric"] is None else float(raw["metric"])
+    if metric is not None and (not math.isfinite(metric) or metric < 0):
+        raise ValueError("segment_to_next metric must be non-negative")
+    if interp_mode == "cspline" and metric is not None:
+        raise ValueError("cspline segment_to_next cannot contain metric")
+    msg = raw["msg"]
+    failure_code = raw["failure_code"]
+    failure_detail = raw["failure_detail"]
+    lasagna_failure_code = raw["lasagna_failure_code"]
+    lasagna_failure_detail = raw["lasagna_failure_detail"]
+    if not all(isinstance(value, str) for value in (
+        msg, failure_code, failure_detail,
+        lasagna_failure_code, lasagna_failure_detail,
+    )):
+        raise ValueError("segment_to_next diagnostics must be strings")
+    raw_error = raw["meeting_error_base_voxels"]
+    raw_ratio = raw["meeting_error_ratio"]
+    meeting_error = None if raw_error is None else float(raw_error)
+    meeting_ratio = None if raw_ratio is None else float(raw_ratio)
+    meeting_source = raw["meeting_source"]
+    if interp_mode == "trace":
+        if (meeting_error is None or meeting_ratio is None or not meeting_source or
+            metric is None or failure_code or failure_detail or
+            not normal_manifest or not fiber_manifest):
+            raise ValueError("trace segment_to_next is inconsistent")
         outcome = "accepted_native"
-        meeting_error: float | None = float(raw["max_endpoint_error_base_voxels"])
-        meeting_ratio: float | None = None
-        meeting_source = "legacy_endpoint"
-        failure_code = ""
-        failure_detail = ""
-        if not math.isfinite(meeting_error) or meeting_error < 0:
-            raise ValueError("segment_to_next endpoint error must be non-negative")
-        metric = meeting_error
-    elif version == (2, 2):
-        interp_goal = "global"
-        outcome = raw["outcome"]
-        if outcome not in {"accepted_native", "lasagna_fallback"}:
-            raise ValueError("segment_to_next outcome is invalid")
-        failure_code = raw["failure_code"]
-        failure_detail = raw["failure_detail"]
-        if not all(
-            isinstance(value, str) for value in (failure_code, failure_detail)
-        ):
-            raise ValueError("segment_to_next failure diagnostics must be strings")
-        if outcome == "accepted_native":
-            interp_mode = "trace"
-            raw_error = raw["meeting_error_base_voxels"]
-            raw_ratio = raw["meeting_error_ratio"]
-            if (raw_error is None) != (raw_ratio is None):
-                raise ValueError("segment_to_next meeting diagnostics are inconsistent")
-            meeting_error = None if raw_error is None else float(raw_error)
-            meeting_ratio = None if raw_ratio is None else float(raw_ratio)
-            if meeting_error is not None and (
-                not math.isfinite(meeting_error) or meeting_error < 0
-            ):
-                raise ValueError("segment_to_next meeting error must be non-negative")
-            if meeting_ratio is not None and (
-                not math.isfinite(meeting_ratio) or meeting_ratio < 0
-            ):
-                raise ValueError("segment_to_next meeting ratio must be non-negative")
-            meeting_source = raw["meeting_source"]
-            if not isinstance(meeting_source, str):
-                raise ValueError("segment_to_next meeting source must be a string")
-            if (
-                meeting_error is None
-                or meeting_ratio is None
-                or not meeting_source
-                or failure_code
-                or failure_detail
-            ):
-                raise ValueError("accepted segment_to_next outcome is inconsistent")
-        else:
-            interp_mode = "lasagna"
-            meeting_error = None
-            meeting_ratio = None
-            meeting_source = ""
-            if not failure_code:
-                raise ValueError("fallback segment_to_next requires failure_code")
-        metric = meeting_error
-        msg = "trace" if interp_mode == "trace" else f"trace: {failure_code}"
-        lasagna_failure_code = ""
-        lasagna_failure_detail = ""
     else:
-        interp_goal = raw["interp_goal"]
-        interp_mode = raw["interp_mode"]
-        if interp_goal not in {"global", "cspline", "lasagna", "trace"}:
-            raise ValueError("segment_to_next interp_goal is invalid")
-        if interp_mode not in {"cspline", "lasagna", "trace"}:
-            raise ValueError("segment_to_next interp_mode is invalid")
-        metric = None if raw["metric"] is None else float(raw["metric"])
-        if metric is not None and (not math.isfinite(metric) or metric < 0):
-            raise ValueError("segment_to_next metric must be non-negative")
-        if interp_mode == "cspline" and metric is not None:
-            raise ValueError("cspline segment_to_next cannot contain metric")
-        msg = raw["msg"]
-        failure_code = raw["failure_code"]
-        failure_detail = raw["failure_detail"]
-        lasagna_failure_code = raw["lasagna_failure_code"]
-        lasagna_failure_detail = raw["lasagna_failure_detail"]
-        if not all(isinstance(value, str) for value in (
-            msg, failure_code, failure_detail,
-            lasagna_failure_code, lasagna_failure_detail,
-        )):
-            raise ValueError("segment_to_next diagnostics must be strings")
-        raw_error = raw["meeting_error_base_voxels"]
-        raw_ratio = raw["meeting_error_ratio"]
-        meeting_error = None if raw_error is None else float(raw_error)
-        meeting_ratio = None if raw_ratio is None else float(raw_ratio)
-        meeting_source = raw["meeting_source"]
-        if interp_mode == "trace":
-            if (meeting_error is None or meeting_ratio is None or not meeting_source or
-                metric is None or failure_code or failure_detail or
-                not normal_manifest or not fiber_manifest):
-                raise ValueError("trace segment_to_next is inconsistent")
-            outcome = "accepted_native"
-        else:
-            if meeting_error is not None or meeting_ratio is not None or meeting_source:
-                raise ValueError("non-trace segment contains meeting diagnostics")
-            outcome = "lasagna_fallback"
+        if meeting_error is not None or meeting_ratio is not None or meeting_source:
+            raise ValueError("non-trace segment contains meeting diagnostics")
+        outcome = "lasagna_fallback"
     normalized_config: dict[str, float | int] = {}
     integer_keys = {
         "cone_grid_size",
@@ -289,7 +188,7 @@ def _parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
         "beam_lookahead_steps",
         "cumulative_smoothness_steps",
     }
-    for key in config_keys:
+    for key in _CONFIG_KEYS_V3:
         value = config[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"segment_to_next config {key} must be numeric")
@@ -300,7 +199,7 @@ def _parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
         raise ValueError("segment_to_next grid and beam sizes must be positive")
     if normalized_config["beam_lookahead_steps"] < 0 or normalized_config["cumulative_smoothness_steps"] < 0:
         raise ValueError("segment_to_next step counts must be non-negative")
-    if version != (1, 1) and not 0 <= normalized_config["meeting_accept_max_error_ratio"] <= 1:
+    if not 0 <= normalized_config["meeting_accept_max_error_ratio"] <= 1:
         raise ValueError("segment_to_next meeting_accept_max_error_ratio must be in [0, 1]")
     return FiberTraceSegmentMetadata(
         interp_goal=interp_goal,
@@ -334,9 +233,9 @@ def _parse_control_points(
     segments: list[FiberTraceSegmentMetadata | None] = []
     for index, control in enumerate(raw):
         if not isinstance(control, dict) or not set(control) <= {"position", "segment_to_next"}:
-            raise ValueError("version-2 control points and version-3 control points must contain only position and segment_to_next")
+            raise ValueError("version-3 control points must contain only position and segment_to_next")
         if "position" not in control:
-            raise ValueError("version-2 control point or version-3 control point is missing position")
+            raise ValueError("version-3 control point is missing position")
         positions.append(control["position"])
         segment = control.get("segment_to_next")
         if segment is not None and index + 1 == len(raw):
@@ -360,8 +259,8 @@ def parse_vc3d_fiber(
         )
 
     version = int(obj.get("version", 1))
-    if version not in {1, 2, 3}:
-        raise ValueError(f"only vc3d_fiber versions 1, 2 and 3 are supported, got {version}")
+    if version not in {1, 3}:
+        raise ValueError(f"only vc3d_fiber versions 1 and 3 are supported, got {version}")
 
     line_points = _parse_points(
         obj.get("line_points"), key="line_points", path=fiber_path, min_count=2
@@ -369,36 +268,28 @@ def parse_vc3d_fiber(
     control_points, control_point_segments = _parse_control_points(
         obj.get("control_points"), version=version, path=fiber_path
     )
-    if version < 3:
-        global_mode = obj.get("optimization_mode", "lasagna")
-        migrated_segments: list[FiberTraceSegmentMetadata | None] = []
-        for index, segment in enumerate(control_point_segments):
-            if index + 1 == len(control_point_segments):
-                migrated_segments.append(None)
-            elif segment is None:
-                migrated_segments.append(FiberTraceSegmentMetadata(
-                    interp_goal="global",
-                    interp_mode="lasagna",
-                    metric=None,
-                    msg="lasagna",
-                    outcome="lasagna_fallback",
-                    normal_manifest="",
-                    fiber_manifest="",
-                    trace_to_base_scale=1.0,
-                    meeting_error_base_voxels=None,
-                    meeting_error_ratio=None,
-                    meeting_source="",
-                    failure_code="",
-                    failure_detail="",
-                    lasagna_failure_code="",
-                    lasagna_failure_detail="",
-                    config={},
-                ))
-            elif segment.interp_mode == "trace" and global_mode == "lasagna":
-                migrated_segments.append(replace(segment, interp_goal="trace"))
-            else:
-                migrated_segments.append(segment)
-        control_point_segments = tuple(migrated_segments)
+    if version == 1:
+        control_point_segments = tuple(
+            None if index + 1 == len(control_point_segments) else FiberTraceSegmentMetadata(
+                interp_goal="global",
+                interp_mode="lasagna",
+                metric=None,
+                msg="lasagna",
+                outcome="lasagna_fallback",
+                normal_manifest="",
+                fiber_manifest="",
+                trace_to_base_scale=1.0,
+                meeting_error_base_voxels=None,
+                meeting_error_ratio=None,
+                meeting_source="",
+                failure_code="",
+                failure_detail="",
+                lasagna_failure_code="",
+                lasagna_failure_detail="",
+                config={},
+            )
+            for index in range(len(control_point_segments))
+        )
     generation = int(obj.get("generation", 1))
 
     metadata = {

@@ -447,42 +447,9 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     writeText(volpkgRoot / "fibers" / "1.json",
               R"({
   "type": "vc3d_fiber",
-  "version": 2,
+  "version": 1,
   "line_points": [[1, 2, 3], [2, 2, 3]],
-  "control_points": [
-    {
-      "position": [1, 2, 3],
-      "segment_to_next": {
-        "optimizer": "native_fiber_trace3d",
-        "metadata_version": 1,
-        "tracer_version": 1,
-        "normal_manifest": "normal.lasagna.json",
-        "fiber_manifest": "fiber.lasagna.json",
-        "trace_to_base_scale": 4,
-        "max_endpoint_error_base_voxels": 1,
-        "config": {
-          "step_voxels": 1,
-          "cone_angle_degrees": 45,
-          "cone_angle_step_degrees": 5,
-          "cone_grid_size": 9,
-          "beam_width": 16,
-          "beam_prune_distance_voxels": 2,
-          "beam_lookahead_steps": 3,
-          "smoothness_weight": 1,
-          "smoothness_normal_weight": 1,
-          "smoothness_tangent_weight": 1,
-          "smoothness_free_angle_degrees": 10,
-          "cumulative_smoothness_steps": 3,
-          "cumulative_smoothness_tangent_weight": 1,
-          "initial_free_angle_degrees": 10,
-          "max_step_factor": 2,
-          "fusion_gap_factor": 2,
-          "endpoint_accept_threshold_base_voxels": 20
-        }
-      }
-    },
-    {"position": [2, 2, 3]}
-  ]
+  "control_points": [[1, 2, 3], [2, 2, 3]]
 })");
 
     vc::atlas::Atlas atlas;

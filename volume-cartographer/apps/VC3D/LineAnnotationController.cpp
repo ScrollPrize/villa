@@ -11266,7 +11266,7 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
         return std::nullopt;
     }
     const int fiberVersion = root.value("version", 0);
-    if (fiberVersion != 1 && fiberVersion != 2 && fiberVersion != 3) {
+    if (fiberVersion != 1 && fiberVersion != 3) {
         throw std::runtime_error("Unsupported vc3d_fiber version");
     }
 
@@ -11320,11 +11320,6 @@ std::optional<LineAnnotationController::StoredFiber> LineAnnotationController::l
             segment.emplace();
             segment->interpMode = vc3d::line_annotation::SegmentInterpolationMode::Lasagna;
             segment->message = "lasagna";
-        } else if (fiberVersion == 2 &&
-                   vc3d::line_annotation::isAcceptedNativeTrace(*segment) &&
-                   fiber.optimizationMode ==
-                       vc3d::line_annotation::FiberOptimizationMode::Lasagna) {
-            segment->interpGoal = vc3d::line_annotation::SegmentInterpolationGoal::Trace;
         }
     }
     vc3d::line_annotation::validateStoredControlPoints(fiber.controlPoints);

@@ -1194,7 +1194,7 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     control.segmentToNext = metadata;
 
     const auto json = vc3d::line_annotation::storedControlPointToJson(control);
-    const auto parsed = vc3d::line_annotation::storedControlPointFromJson(json, 2);
+    const auto parsed = vc3d::line_annotation::storedControlPointFromJson(json, 3);
     REQUIRE(parsed.segmentToNext.has_value());
     CHECK(parsed[0] == doctest::Approx(1.0));
     CHECK(parsed.segmentToNext->normalManifestLocation ==
@@ -1208,31 +1208,14 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
         parsed.segmentToNext));
 
-    auto legacyJson = json;
-    auto& legacySegment = legacyJson["segment_to_next"];
-    legacySegment["metadata_version"] = 1;
-    legacySegment["tracer_version"] = 1;
-    legacySegment["max_endpoint_error_base_voxels"] = 2.5;
-    legacySegment.erase("interp_goal");
-    legacySegment.erase("interp_mode");
-    legacySegment.erase("metric");
-    legacySegment.erase("msg");
-    legacySegment.erase("meeting_error_base_voxels");
-    legacySegment.erase("meeting_error_ratio");
-    legacySegment.erase("meeting_source");
-    legacySegment.erase("failure_code");
-    legacySegment.erase("failure_detail");
-    legacySegment.erase("lasagna_failure_code");
-    legacySegment.erase("lasagna_failure_detail");
-    legacySegment["config"]["fusion_gap_factor"] = 2.0;
-    legacySegment["config"].erase("meeting_accept_max_error_ratio");
-    const auto legacy = vc3d::line_annotation::storedControlPointFromJson(
-        legacyJson, 2);
-    REQUIRE(legacy.segmentToNext.has_value());
-    CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
-        legacy.segmentToNext));
-    REQUIRE(legacy.segmentToNext->meetingErrorBaseVoxels.has_value());
-    CHECK(*legacy.segmentToNext->meetingErrorBaseVoxels == doctest::Approx(2.5));
+    auto obsoleteMetadataJson = json;
+    obsoleteMetadataJson["segment_to_next"]["metadata_version"] = 2;
+    CHECK_THROWS_AS(
+        vc3d::line_annotation::storedControlPointFromJson(obsoleteMetadataJson, 3),
+        std::runtime_error);
+    CHECK_THROWS_AS(
+        vc3d::line_annotation::storedControlPointFromJson(json, 2),
+        std::runtime_error);
 
     metadata.outcome = vc3d::line_annotation::FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
     metadata.interpMode = vc3d::line_annotation::SegmentInterpolationMode::Lasagna;
@@ -1245,39 +1228,17 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     CHECK(fallbackJson["segment_to_next"]["meeting_error_ratio"].is_null());
     CHECK(fallbackJson["segment_to_next"]["meeting_source"] == "");
 
-    auto earlierFallbackJson = fallbackJson;
-    auto& earlierSegment = earlierFallbackJson["segment_to_next"];
-    earlierSegment["metadata_version"] = 2;
-    earlierSegment["outcome"] = "lasagna_fallback";
-    earlierSegment.erase("interp_goal");
-    earlierSegment.erase("interp_mode");
-    earlierSegment.erase("metric");
-    earlierSegment.erase("msg");
-    earlierSegment.erase("lasagna_failure_code");
-    earlierSegment.erase("lasagna_failure_detail");
-    earlierFallbackJson["segment_to_next"]["meeting_error_base_voxels"] = 250.0;
-    earlierFallbackJson["segment_to_next"]["meeting_error_ratio"] = 2.5;
-    earlierFallbackJson["segment_to_next"]["meeting_source"] =
-        "discarded_native_meeting";
-    const auto fallback = vc3d::line_annotation::storedControlPointFromJson(
-        earlierFallbackJson, 2);
-    REQUIRE(fallback.segmentToNext.has_value());
-    CHECK_FALSE(vc3d::line_annotation::isAcceptedNativeTrace(
-        fallback.segmentToNext));
-    CHECK_FALSE(fallback.segmentToNext->meetingErrorBaseVoxels.has_value());
-    CHECK_FALSE(fallback.segmentToNext->meetingErrorRatio.has_value());
-    CHECK(fallback.segmentToNext->meetingSource.empty());
-    CHECK(fallback.segmentToNext->failureCode ==
-          "no_trace_plane_intersection");
-
     const nlohmann::json sharedReaderRoot = {
         {"control_points",
          nlohmann::json::array({
-             earlierFallbackJson,
+             fallbackJson,
              nlohmann::json{{"position", {4.0, 5.0, 6.0}}},
          })}};
     CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
-        sharedReaderRoot, "control_points", 2, "test fiber"));
+        sharedReaderRoot, "control_points", 3, "test fiber"));
+    CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        sharedReaderRoot, "control_points", 2, "test fiber"),
+        std::runtime_error);
 
     vc::fiber_tracer::FiberTraceSegmentResult rejectedResult;
     rejectedResult.meetingErrorBaseVoxels = 250.0;

@@ -1,5 +1,9 @@
 # 2026-07-31
 
+- Removed the unpublished top-level `vc3d_fiber` version 2 and its obsolete
+  descriptor migrations from VC3D, shared C++ readers, Python training input,
+  and sync validation. Legacy file version 1 and current version 3 remain;
+  version 3's `tracer_version: 2` is unchanged.
 - Made fiber-aware sync merge version-3 dense span geometry and CP-owned
   descriptors atomically, preserve separated local/remote edits across an
   unchanged span, merge the global mode base-aware, and route every adjacent,

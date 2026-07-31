@@ -940,112 +940,50 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
     }
     const int metadataVersion = json.at("metadata_version").get<int>();
     const int tracerVersion = json.at("tracer_version").get<int>();
-    const bool previousVersion = metadataVersion == 1 && tracerVersion == 1;
-    const bool version2 = metadataVersion == 2 && tracerVersion == 2;
     const bool currentVersion =
         metadataVersion == FiberTraceSegmentMetadata::MetadataVersion &&
         tracerVersion == FiberTraceSegmentMetadata::TracerVersion;
-    if (!previousVersion && !version2 && !currentVersion)
+    if (!currentVersion)
         throw std::runtime_error("unsupported segment_to_next metadata/tracer version");
-    if (previousVersion) {
-        rejectUnknownKeys(
-            json,
-            {"optimizer", "metadata_version", "tracer_version",
-             "normal_manifest", "fiber_manifest", "trace_to_base_scale",
-             "max_endpoint_error_base_voxels", "config"},
-            "segment_to_next");
-    } else if (version2) {
-        rejectUnknownKeys(
-            json,
-            {"optimizer", "metadata_version", "tracer_version", "outcome",
-             "normal_manifest", "fiber_manifest", "trace_to_base_scale",
-             "meeting_error_base_voxels", "meeting_error_ratio",
-             "meeting_source", "failure_code", "failure_detail", "config"},
-            "segment_to_next");
-    } else {
-        rejectUnknownKeys(
-            json,
-            {"optimizer", "metadata_version", "tracer_version",
-             "interp_goal", "interp_mode", "metric", "msg",
-             "normal_manifest", "fiber_manifest", "trace_to_base_scale",
-             "meeting_error_base_voxels", "meeting_error_ratio",
-             "meeting_source", "failure_code", "failure_detail",
-             "lasagna_failure_code", "lasagna_failure_detail", "config"},
-            "segment_to_next");
-    }
+    rejectUnknownKeys(
+        json,
+        {"optimizer", "metadata_version", "tracer_version",
+         "interp_goal", "interp_mode", "metric", "msg",
+         "normal_manifest", "fiber_manifest", "trace_to_base_scale",
+         "meeting_error_base_voxels", "meeting_error_ratio",
+         "meeting_source", "failure_code", "failure_detail",
+         "lasagna_failure_code", "lasagna_failure_detail", "config"},
+        "segment_to_next");
 
     FiberTraceSegmentMetadata metadata;
     metadata.normalManifestLocation = json.at("normal_manifest").get<std::string>();
     metadata.fiberManifestLocation = json.at("fiber_manifest").get<std::string>();
-    if (!currentVersion &&
-        (metadata.normalManifestLocation.empty() || metadata.fiberManifestLocation.empty())) {
-        throw std::runtime_error("segment_to_next manifest locations must not be empty");
-    }
     metadata.traceToBaseScale = json.at("trace_to_base_scale").get<double>();
-    if (previousVersion) {
-        metadata.interpGoal = SegmentInterpolationGoal::Global;
-        metadata.interpMode = SegmentInterpolationMode::Trace;
-        metadata.outcome = FiberTraceSegmentMetadata::Outcome::AcceptedNative;
-        metadata.meetingErrorBaseVoxels =
-            json.at("max_endpoint_error_base_voxels").get<double>();
-        metadata.meetingSource = "legacy_endpoint";
-        metadata.metric = metadata.meetingErrorBaseVoxels;
-        metadata.message = "trace";
-    } else if (version2) {
-        const std::string outcome = json.at("outcome").get<std::string>();
-        if (outcome == "accepted_native") {
-            metadata.outcome = FiberTraceSegmentMetadata::Outcome::AcceptedNative;
-            metadata.interpMode = SegmentInterpolationMode::Trace;
-        } else if (outcome == "lasagna_fallback") {
-            metadata.outcome = FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
-            metadata.interpMode = SegmentInterpolationMode::Lasagna;
-        } else {
-            throw std::runtime_error("unsupported segment_to_next outcome");
-        }
-        if (isAcceptedNativeTrace(metadata)) {
-            if (!json.at("meeting_error_base_voxels").is_null()) {
-                metadata.meetingErrorBaseVoxels =
-                    json.at("meeting_error_base_voxels").get<double>();
-            }
-            if (!json.at("meeting_error_ratio").is_null()) {
-                metadata.meetingErrorRatio =
-                    json.at("meeting_error_ratio").get<double>();
-            }
-            metadata.meetingSource = json.at("meeting_source").get<std::string>();
-        }
-        metadata.failureCode = json.at("failure_code").get<std::string>();
-        metadata.failureDetail = json.at("failure_detail").get<std::string>();
-        metadata.metric = metadata.meetingErrorBaseVoxels;
-        metadata.message = isAcceptedNativeTrace(metadata)
-            ? "trace"
-            : "trace: " + metadata.failureCode;
-    } else {
-        metadata.interpGoal = segmentInterpolationGoalFromString(
-            json.at("interp_goal").get<std::string>());
-        metadata.interpMode = segmentInterpolationModeFromString(
-            json.at("interp_mode").get<std::string>());
-        metadata.outcome = metadata.interpMode == SegmentInterpolationMode::Trace
-            ? FiberTraceSegmentMetadata::Outcome::AcceptedNative
-            : FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
-        if (!json.at("metric").is_null())
-            metadata.metric = json.at("metric").get<double>();
-        metadata.message = json.at("msg").get<std::string>();
-        if (!json.at("meeting_error_base_voxels").is_null())
-            metadata.meetingErrorBaseVoxels = json.at("meeting_error_base_voxels").get<double>();
-        if (!json.at("meeting_error_ratio").is_null())
-            metadata.meetingErrorRatio = json.at("meeting_error_ratio").get<double>();
-        metadata.meetingSource = json.at("meeting_source").get<std::string>();
-        metadata.failureCode = json.at("failure_code").get<std::string>();
-        metadata.failureDetail = json.at("failure_detail").get<std::string>();
-        metadata.lasagnaFailureCode = json.at("lasagna_failure_code").get<std::string>();
-        metadata.lasagnaFailureDetail = json.at("lasagna_failure_detail").get<std::string>();
-    }
+    metadata.interpGoal = segmentInterpolationGoalFromString(
+        json.at("interp_goal").get<std::string>());
+    metadata.interpMode = segmentInterpolationModeFromString(
+        json.at("interp_mode").get<std::string>());
+    metadata.outcome = metadata.interpMode == SegmentInterpolationMode::Trace
+        ? FiberTraceSegmentMetadata::Outcome::AcceptedNative
+        : FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
+    if (!json.at("metric").is_null())
+        metadata.metric = json.at("metric").get<double>();
+    metadata.message = json.at("msg").get<std::string>();
+    if (!json.at("meeting_error_base_voxels").is_null())
+        metadata.meetingErrorBaseVoxels = json.at("meeting_error_base_voxels").get<double>();
+    if (!json.at("meeting_error_ratio").is_null())
+        metadata.meetingErrorRatio = json.at("meeting_error_ratio").get<double>();
+    metadata.meetingSource = json.at("meeting_source").get<std::string>();
+    metadata.failureCode = json.at("failure_code").get<std::string>();
+    metadata.failureDetail = json.at("failure_detail").get<std::string>();
+    metadata.lasagnaFailureCode = json.at("lasagna_failure_code").get<std::string>();
+    metadata.lasagnaFailureDetail = json.at("lasagna_failure_detail").get<std::string>();
 
     const auto& configJson = json.at("config");
     if (!configJson.is_object()) {
         throw std::runtime_error("segment_to_next config must be an object");
     }
-    std::unordered_set<std::string> configKeys{
+    const std::unordered_set<std::string> configKeys{
          "step_voxels",
          "cone_angle_degrees",
          "cone_angle_step_degrees",
@@ -1061,10 +999,8 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
          "cumulative_smoothness_tangent_weight",
          "initial_free_angle_degrees",
          "max_step_factor",
+         "meeting_accept_max_error_ratio",
          "endpoint_accept_threshold_base_voxels"};
-    configKeys.insert(previousVersion
-        ? "fusion_gap_factor"
-        : "meeting_accept_max_error_ratio");
     rejectUnknownKeys(configJson, configKeys, "segment_to_next config");
     auto& config = metadata.config;
     config.stepVoxels = configJson.at("step_voxels").get<double>();
@@ -1082,10 +1018,8 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
     config.cumulativeSmoothnessTangentWeight = configJson.at("cumulative_smoothness_tangent_weight").get<double>();
     config.initialFreeAngleDegrees = configJson.at("initial_free_angle_degrees").get<double>();
     config.maxStepFactor = configJson.at("max_step_factor").get<double>();
-    if (!previousVersion) {
-        config.meetingAcceptMaxErrorRatio =
-            configJson.at("meeting_accept_max_error_ratio").get<double>();
-    }
+    config.meetingAcceptMaxErrorRatio =
+        configJson.at("meeting_accept_max_error_ratio").get<double>();
     config.endpointAcceptThresholdBaseVoxels = configJson.at("endpoint_accept_threshold_base_voxels").get<double>();
     config.traceToBaseScale = metadata.traceToBaseScale;
 
@@ -1097,39 +1031,21 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
     }
     if (metadata.metric)
         requireFiniteNonNegative(*metadata.metric, "metric");
-    if (version2) {
-        if (metadata.outcome == FiberTraceSegmentMetadata::Outcome::AcceptedNative) {
-            if (!metadata.meetingErrorBaseVoxels || !metadata.meetingErrorRatio ||
-                metadata.meetingSource.empty() || !metadata.failureCode.empty() ||
-                !metadata.failureDetail.empty()) {
-                throw std::runtime_error("accepted segment_to_next outcome is inconsistent");
-            }
-        } else if (metadata.failureCode.empty()) {
-            throw std::runtime_error("fallback segment_to_next requires a failure_code");
+    if (metadata.interpMode == SegmentInterpolationMode::Trace) {
+        if (!metadata.metric || !metadata.meetingErrorBaseVoxels ||
+            !metadata.meetingErrorRatio || metadata.meetingSource.empty() ||
+            !metadata.failureCode.empty() || !metadata.failureDetail.empty() ||
+            metadata.normalManifestLocation.empty() ||
+            metadata.fiberManifestLocation.empty()) {
+            throw std::runtime_error("trace segment_to_next is inconsistent");
         }
-        if (metadata.meetingErrorBaseVoxels.has_value() !=
-            metadata.meetingErrorRatio.has_value()) {
-            throw std::runtime_error(
-                "segment_to_next meeting error and ratio must be present together");
-        }
+    } else if (metadata.meetingErrorBaseVoxels || metadata.meetingErrorRatio ||
+               !metadata.meetingSource.empty()) {
+        throw std::runtime_error(
+            "non-trace segment_to_next cannot contain meeting diagnostics");
     }
-    if (currentVersion) {
-        if (metadata.interpMode == SegmentInterpolationMode::Trace) {
-            if (!metadata.metric || !metadata.meetingErrorBaseVoxels ||
-                !metadata.meetingErrorRatio || metadata.meetingSource.empty() ||
-                !metadata.failureCode.empty() || !metadata.failureDetail.empty() ||
-                metadata.normalManifestLocation.empty() ||
-                metadata.fiberManifestLocation.empty()) {
-                throw std::runtime_error("trace segment_to_next is inconsistent");
-            }
-        } else if (metadata.meetingErrorBaseVoxels || metadata.meetingErrorRatio ||
-                   !metadata.meetingSource.empty()) {
-            throw std::runtime_error(
-                "non-trace segment_to_next cannot contain meeting diagnostics");
-        }
-        if (metadata.interpMode == SegmentInterpolationMode::Cspline && metadata.metric) {
-            throw std::runtime_error("cspline segment_to_next cannot contain metric");
-        }
+    if (metadata.interpMode == SegmentInterpolationMode::Cspline && metadata.metric) {
+        throw std::runtime_error("cspline segment_to_next cannot contain metric");
     }
     requireFinitePositive(config.stepVoxels, "step_voxels");
     requireFinitePositive(config.coneAngleDegrees, "cone_angle_degrees");
@@ -1168,8 +1084,8 @@ StoredControlPoint storedControlPointFromJson(const nlohmann::json& json, int fi
     if (fiberVersion == 1) {
         return StoredControlPoint{pointFromJson(json)};
     }
-    if ((fiberVersion != 2 && fiberVersion != 3) || !json.is_object()) {
-        throw std::runtime_error("version-2/3 control point entries must be objects");
+    if (fiberVersion != 3 || !json.is_object()) {
+        throw std::runtime_error("version-3 control point entries must be objects");
     }
     rejectUnknownKeys(json, {"position", "segment_to_next"}, "control point");
     StoredControlPoint control{pointFromJson(json.at("position"))};

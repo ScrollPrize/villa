@@ -1075,13 +1075,13 @@
   cache path. The catalogue has no artifact UUID; sample ID, volume ID,
   coordinate level, optional model ID, and artifact index are auxiliary
   catalogue identity components.
-- Version-1 and version-2 fibers remain readable. Missing old segment metadata
-  becomes goal `global`, actual `lasagna`. An accepted v2 trace becomes actual
-  `trace` and is explicit goal `trace` when its old fiber-wide mode was
-  Lasagna; otherwise its goal is `global`. A v2 trace fallback becomes goal
-  `global`, actual `lasagna`, preserving its trace failure. Writers always emit
-  version 3. Fiber coordinate scaling preserves goals, actual modes, and
-  diagnostics while scaling base-voxel trace quantities.
+- Legacy version-1 fibers remain readable and their numeric CP-to-CP spans load
+  as goal `global`, actual `lasagna`. Version 3 is the only supported object-CP
+  format and the only format carrying segment descriptors. The unpublished
+  top-level file version 2 and metadata/tracer schemas `(1, 1)` and `(2, 2)`
+  are rejected; version 3's current descriptor schema `(3, 2)` remains valid.
+  Writers always emit version 3. Fiber coordinate scaling preserves goals,
+  actual modes, and diagnostics while scaling base-voxel trace quantities.
 - Segment descriptors and dense geometry are applied atomically. CP movement
   dirties both adjacent spans while preserving their goals. Insertion copies
   the split owner's goal to both new spans. Interior deletion leaves the left
@@ -1099,9 +1099,10 @@
   combine descriptor fields from different results, or replace version-3
   geometry with a CP-only placeholder. `optimization_mode` is merged
   base-aware: an isolated change wins, equal changes converge, and different
-  two-sided changes conflict. Version-1/version-2 merge behavior is unchanged.
+  two-sided changes conflict. Version-1 merge behavior is unchanged; version 2
+  is invalid and is sent to manual conflict handling.
 - Each VC3D fiber has a persisted top-level `optimization_mode`: `lasagna` or
-  `native_fiber_trace3d`. Missing mode metadata on existing version-1/version-2
+  `native_fiber_trace3d`. Missing mode metadata on existing version-1
   files defaults to `lasagna`; unknown values are errors. The mode is the
   fiber-wide extrapolation policy and resolves only `global` CP-to-CP goals.
   New interactive fibers default to `native_fiber_trace3d`; this must not

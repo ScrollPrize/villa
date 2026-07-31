@@ -1,39 +1,39 @@
-# Preserve Version-3 Fiber Spans During Sync
+# Remove Unpublished Fiber Version 2
 
 ## Implementation
 
-- Kept `vc_sync.py` file conflict detection, shadow bases, conflict copies,
-  confirmation, and manual local/remote/skip resolution unchanged.
-- Added a version-3-only anchored chunk merge in `scripts/fiber_merge.py`.
-  Every chunk carries its complete dense line slice plus every CP descriptor
-  for spans starting inside the chunk.
-- Added ordered 1e-8 CP-to-line lookup matching VC3D's load invariant.
-- Added conservative ownership resolution: one-sided and identical changes
-  pass; different same-run changes fail; local-only and remote-only runs need
-  at least one unchanged base span between them.
-- Reconstructed clean results only by exact dense-slice concatenation. Version
-  3 never uses the CP-polyline placeholder and never drops descriptors.
-- Added base-aware merging and strict validation for `optimization_mode`.
-- Left version-1/version-2 geometry merge behavior unchanged.
-
-## Plan Review
-
-- Included extrapolated prefix/suffix tails in the anchored partition so the
-  entire persisted line, not only CP-to-CP interiors, is merged.
-- Kept descriptors on their starting CP; a chunk's terminal CP contributes
-  position only because its descriptor belongs to the next chunk.
-- Required exact selected-chunk joins after tolerant base alignment. Any
-  tolerance-only mismatch becomes a manual conflict rather than being snapped.
+- Restricted VC3D, Atlas, the shared fiber tracer, and the Lasagna line probe
+  to top-level `vc3d_fiber` versions 1 and 3.
+- Kept version-1 numeric control points and version-3 object control points.
+- Removed the VC3D and shared-reader migrations for segment metadata schemas
+  `(1, 1)` and `(2, 2)`; version 3 accepts only the current `(3, 2)` schema.
+- Restricted the Python training reader and sync merger to the same contract.
+- Removed version-2 fallback-diagnostic normalization from sync because v2 is
+  now rejected before merging.
+- Replaced v2 migration tests with explicit file-version and descriptor-schema
+  rejection tests.
+- Updated the format docs, implementation map, specification, and changelog.
 
 ## Validation
 
-- `python -m py_compile volume-cartographer/scripts/fiber_merge.py volume-cartographer/scripts/vc_sync.py`
-- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q volume-cartographer/scripts/tests/test_fiber_merge.py volume-cartographer/scripts/tests/test_vc_sync_helpers.py`
-  - 142 passed.
+- `python -m py_compile volume-cartographer/scripts/fiber_merge.py volume-cartographer/scripts/vc_sync.py vesuvius/src/vesuvius/neural_tracing/fiber_trace/fiber_json.py`
+- `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src python -m pytest -q vesuvius/tests/neural_tracing/test_fiber_trace.py volume-cartographer/scripts/tests/test_fiber_merge.py volume-cartographer/scripts/tests/test_vc_sync_helpers.py`
+  - 194 passed.
+- `cmake --build volume-cartographer/build/ci-tests-clang-systemdeps --target test_line_annotation_generated_views test_atlas -j32`
+- `volume-cartographer/build/ci-tests-clang-systemdeps/bin/test_line_annotation_generated_views`
+  - 56 test cases passed.
+- `cmake --build volume-cartographer/build --target VC3D vc_lasagna_line_probe vc_fiber_trace_metric -j32`
+  - All production targets built successfully.
 
-## Deviations
+## Known Test Fixture Failure
 
-- The plan received a separate primary-agent review rather than the subagent
-  review requested by the nested workflow because the active agent policy
-  forbids spawning subagents unless the user explicitly requests delegation.
-  There was no functional deviation.
+- The full `test_atlas` binary still reports three pre-existing pred-snap
+  fixture failures because its Lasagna `nx` channel is not a 3D `(Z,Y,X)`
+  zarr. The target compiles, and the failure is unrelated to fiber file-version
+  parsing.
+
+## Compatibility Decision
+
+- Top-level file version 2 was never published and has no compatibility path.
+- `tracer_version: 2` remains required inside current version-3 segment
+  descriptors; it is a tracer-schema version, not the removed file version.

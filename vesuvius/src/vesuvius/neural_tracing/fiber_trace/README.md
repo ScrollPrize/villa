@@ -9,8 +9,9 @@ Lasagna/Vesuvius convention decisions, and the current implementation status.
 
 ## Data Schema
 
-Training records accept legacy `vc3d_fiber` versions 1 and 2 and the current
-version 3 CP-owned segment schema. Version 3 is written by VC3D:
+Training records accept legacy `vc3d_fiber` version 1 and the current version 3
+CP-owned segment schema. The unpublished file version 2 is unsupported. Version
+3 is written by VC3D:
 
 ```json
 {
@@ -19,7 +20,9 @@ version 3 CP-owned segment schema. Version 3 is written by VC3D:
   "line_points": [[x, y, z], "..."],
   "control_points": [
     {"position": [x, y, z], "segment_to_next": {
-      "version": 3,
+      "optimizer": "native_fiber_trace3d",
+      "metadata_version": 3,
+      "tracer_version": 2,
       "interp_goal": "global",
       "interp_mode": "lasagna",
       "metric": 3.2,
@@ -35,8 +38,9 @@ returns the strictly validated optional segment metadata. `interp_goal`
 records the requested `global`/`cspline`/`lasagna`/`trace` policy, while
 `interp_mode` records the actual `cspline`/`lasagna`/`trace` geometry producer.
 `metric` is mode-dependent and `msg` is persisted display/debug status.
-Version-1 numeric CP arrays and version-2 trace outcomes are promoted to these
-fields when loaded.
+Version-1 numeric CP arrays load as global Lasagna spans. The current
+`tracer_version: 2` is part of the version-3 segment schema and is unrelated to
+the removed top-level file version.
 
 The JSON points are interpreted in VC3D `x, y, z` order and remain `xyz`
 through all geometry calculations. Volume crops, masks, zarr reads, and tensor

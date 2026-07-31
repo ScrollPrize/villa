@@ -78,8 +78,11 @@ the reconstructed exact public manifest URL, never its local cache path.
 Strip labels prefix the actual mode as `C`, `L`, or `T`, then display
 the metric and message. Labels are laid out in viewport pixels, remain visible
 while any part of their span intersects the view, and use a deterministic
-second row when one row cannot avoid overlap. Version-1 and version-2 fibers
-remain readable; VC3D writes explicit version-3 descriptors on the next save.
+second row when one row cannot avoid overlap. Legacy version-1 fibers remain
+readable and acquire explicit version-3 descriptors on the next save. The
+unpublished file version 2 and its pre-v3 descriptor schemas are unsupported.
+This does not affect the current `tracer_version: 2` stored inside a version-3
+segment descriptor.
 
 ## Sync Conflict Handling
 
@@ -102,8 +105,8 @@ An ambiguous merge does not modify the fiber. The sync tool stores local,
 remote, and base copies under `.s3sync-conflicts/` and asks whether to keep the
 complete local version, keep the complete remote version, or skip. Existing
 base-aware tag, branch-link, reciprocal-peer, and manual-HV-tag handling runs
-only after geometry merges cleanly. Version-1 and version-2 fibers retain the
-older merge behavior, including the CP-polyline `needs_reoptimization`
+only after geometry merges cleanly. Version-1 fibers retain the older merge
+behavior, including the CP-polyline `needs_reoptimization`
 fallback for disjoint geometry edits.
 
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
