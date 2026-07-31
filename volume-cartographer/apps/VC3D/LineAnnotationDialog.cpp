@@ -1042,6 +1042,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                 stripViewer->renderVisible(true, "line annotation views updated");
             }
         }
+        // Adopting the re-registered surfaces cleared each viewer's scene
+        // (onSurfaceChanged does _scene->clear()), deleting the pooled overlay
+        // items; drop our cached pointers so the rebuild recreates them.
+        clearFastGeneratedOverlayItemRefs();
         updateFixedStripGeometry();
         updatePauseIndicator();
         updateOptimizationStatusIndicator();
