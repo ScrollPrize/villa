@@ -948,7 +948,13 @@ void LineAnnotationDialog::connectGeneratedOverlayRefresh(CChunkedVolumeViewer* 
                     return;
                 }
                 _generatedOverlayRefreshQueued = false;
-                rebuildGeneratedOverlays();
+                // This fires after every rendered frame (overlaysUpdated), which
+                // runs continuously while tiles stream in. Only re-project the
+                // overlays; do NOT re-request side-strip intersections here —
+                // that handler snapshots every fiber and hashes the whole strip
+                // grid per call, and the data it depends on only changes via the
+                // explicit setGenerated*() paths, which already re-request.
+                rebuildGeneratedOverlays(false);
             });
         }));
 }
@@ -3108,9 +3114,24 @@ void LineAnnotationDialog::updateFixedStripGeometry()
     const int panelHeight =
         static_cast<int>(std::lround(static_cast<double>(size.height) * zoom)) +
         2 * kFixedStripMarginPx;
-    _fixedStripViewer->setFixedHeight(panelHeight);
+    // No-op guards: this runs on every dialog resize, and applyCameraState kicks
+    // a render + overlaysUpdated (which feeds the per-frame overlay-refresh
+    // path); don't re-apply an unchanged height or camera.
+    if (_fixedStripViewer->minimumHeight() != panelHeight ||
+        _fixedStripViewer->maximumHeight() != panelHeight) {
+        _fixedStripViewer->setFixedHeight(panelHeight);
+    }
 
-    CChunkedVolumeViewer::CameraState camera = _fixedStripViewer->cameraState();
+    const CChunkedVolumeViewer::CameraState current = _fixedStripViewer->cameraState();
+    const bool cameraUpToDate =
+        std::abs(current.scale - zoom) <= zoom * 1.0e-4f &&
+        current.surfacePtrX == 0.0f &&
+        current.surfacePtrY == 0.0f &&
+        current.zOffset == 0.0f;
+    if (cameraUpToDate) {
+        return;
+    }
+    CChunkedVolumeViewer::CameraState camera = current;
     camera.surfacePtrX = 0.0f;
     camera.surfacePtrY = 0.0f;
     camera.zOffset = 0.0f;
