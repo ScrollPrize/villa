@@ -237,6 +237,44 @@ TEST_CASE("save recomputes bbox after post-load point mutation (#1272)")
     }
 }
 
+TEST_CASE("save_meta recomputes bbox after post-load point mutation (#1272)")
+{
+    TmpVolpkg pkg("bbox_recompute_meta");
+
+    cv::Mat_<cv::Vec3f> pts(32, 32);
+    for (int r = 0; r < pts.rows; ++r)
+        for (int c = 0; c < pts.cols; ++c)
+            pts(r, c) = cv::Vec3f(static_cast<float>(c),
+                                  static_cast<float>(r),
+                                  100.f);
+
+    {
+        QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
+        surf.path = pkg.segDir;
+        surf.id = pkg.segName;
+        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+    }
+
+    // Same staleness hazard as the save() case, but reached through
+    // save_meta(), which rewrites meta.json without touching the TIFFs.
+    {
+        QuadSurface loaded(pkg.segDir);
+        loaded.ensureLoaded();
+        (*loaded.rawPointsPtr())(5, 5) = cv::Vec3f(400.f, 450.f, 500.f);
+        loaded.save_meta();
+    }
+
+    {
+        QuadSurface reloaded(pkg.segDir);
+        REQUIRE(reloaded.meta.contains("bbox"));
+        const auto& bb = reloaded.meta["bbox"];
+        CHECK(bb[1][0].get_float() == doctest::Approx(400.f));
+        CHECK(bb[1][1].get_float() == doctest::Approx(450.f));
+        CHECK(bb[1][2].get_float() == doctest::Approx(500.f));
+        CHECK(bb[0][2].get_float() == doctest::Approx(100.f));
+    }
+}
+
 TEST_CASE("stale .tmp file in segment dir does not break reload")
 {
     TmpVolpkg pkg("stale_tmp");
