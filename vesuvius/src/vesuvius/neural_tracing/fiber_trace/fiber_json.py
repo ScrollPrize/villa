@@ -164,38 +164,44 @@ def _parse_segment_metadata(raw: Any) -> FiberTraceSegmentMetadata:
         outcome = raw["outcome"]
         if outcome not in {"accepted_native", "lasagna_fallback"}:
             raise ValueError("segment_to_next outcome is invalid")
-        raw_error = raw["meeting_error_base_voxels"]
-        raw_ratio = raw["meeting_error_ratio"]
-        if (raw_error is None) != (raw_ratio is None):
-            raise ValueError("segment_to_next meeting diagnostics are inconsistent")
-        meeting_error = None if raw_error is None else float(raw_error)
-        meeting_ratio = None if raw_ratio is None else float(raw_ratio)
-        if meeting_error is not None and (
-            not math.isfinite(meeting_error) or meeting_error < 0
-        ):
-            raise ValueError("segment_to_next meeting error must be non-negative")
-        if meeting_ratio is not None and (
-            not math.isfinite(meeting_ratio) or not 0 <= meeting_ratio <= 1
-        ):
-            raise ValueError("segment_to_next meeting ratio must be in [0, 1]")
-        meeting_source = raw["meeting_source"]
         failure_code = raw["failure_code"]
         failure_detail = raw["failure_detail"]
         if not all(
-            isinstance(value, str)
-            for value in (meeting_source, failure_code, failure_detail)
+            isinstance(value, str) for value in (failure_code, failure_detail)
         ):
-            raise ValueError("segment_to_next diagnostic strings must be strings")
-        if outcome == "accepted_native" and (
-            meeting_error is None
-            or meeting_ratio is None
-            or not meeting_source
-            or failure_code
-            or failure_detail
-        ):
-            raise ValueError("accepted segment_to_next outcome is inconsistent")
-        if outcome == "lasagna_fallback" and not failure_code:
-            raise ValueError("fallback segment_to_next requires failure_code")
+            raise ValueError("segment_to_next failure diagnostics must be strings")
+        if outcome == "accepted_native":
+            raw_error = raw["meeting_error_base_voxels"]
+            raw_ratio = raw["meeting_error_ratio"]
+            if (raw_error is None) != (raw_ratio is None):
+                raise ValueError("segment_to_next meeting diagnostics are inconsistent")
+            meeting_error = None if raw_error is None else float(raw_error)
+            meeting_ratio = None if raw_ratio is None else float(raw_ratio)
+            if meeting_error is not None and (
+                not math.isfinite(meeting_error) or meeting_error < 0
+            ):
+                raise ValueError("segment_to_next meeting error must be non-negative")
+            if meeting_ratio is not None and (
+                not math.isfinite(meeting_ratio) or meeting_ratio < 0
+            ):
+                raise ValueError("segment_to_next meeting ratio must be non-negative")
+            meeting_source = raw["meeting_source"]
+            if not isinstance(meeting_source, str):
+                raise ValueError("segment_to_next meeting source must be a string")
+            if (
+                meeting_error is None
+                or meeting_ratio is None
+                or not meeting_source
+                or failure_code
+                or failure_detail
+            ):
+                raise ValueError("accepted segment_to_next outcome is inconsistent")
+        else:
+            meeting_error = None
+            meeting_ratio = None
+            meeting_source = ""
+            if not failure_code:
+                raise ValueError("fallback segment_to_next requires failure_code")
     normalized_config: dict[str, float | int] = {}
     integer_keys = {
         "cone_grid_size",

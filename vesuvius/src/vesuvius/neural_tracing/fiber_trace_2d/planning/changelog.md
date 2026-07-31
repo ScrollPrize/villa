@@ -1,8 +1,13 @@
 # 2026-07-31
 
-- Corrected native VC3D fiber extrapolation to stop at the configured traced
-  arc length, without target planes or a `max_step_factor` multiplier, and to
-  clip the final step to the exact requested distance.
+- Restricted persisted meeting diagnostics to accepted native spans; fallback
+  records now retain only failure code/detail, and all readers ignore stale
+  fallback meeting values so earlier project files load cleanly.
+- Made native VC3D fiber extrapolation completion depend only on its nominal
+  `ceil(distance / step)` generation budget, without target planes,
+  `max_step_factor`, or measured arc-length acceptance.
+- Added a 10-base-voxel floor to native CP-pair meeting acceptance, which now
+  uses `max(10 base voxels, 10% of combined partial traced length)`.
 - Added VC3D terminal warnings whenever native line-annotation tail
   extrapolation retains its Lasagna fallback, including the side, full
   trace/exception reason, returned point count, and failure source.

@@ -2235,25 +2235,6 @@ template <typename LossAt>
         if (snapTraceToSelectedCrossing && !result.points.empty())
             result.points.back() = *result.selectedTargetPlaneCrossing;
     }
-    if (result.reachedTraceLength && result.points.size() >= 2) {
-        const double limit = *traceLengthLimitVoxels;
-        double accumulated = 0.0;
-        for (size_t index = 1; index < result.points.size(); ++index) {
-            const cv::Vec3d segment = result.points[index] - result.points[index - 1];
-            const double segmentLength = length(segment);
-            if (accumulated + segmentLength + kTraceEpsilon < limit) {
-                accumulated += segmentLength;
-                continue;
-            }
-            const double remaining = std::max(0.0, limit - accumulated);
-            if (segmentLength > kEpsilon) {
-                result.points[index] = result.points[index - 1] +
-                    segment * (remaining / segmentLength);
-            }
-            result.points.resize(index + 1);
-            break;
-        }
-    }
     return result;
 }
 
@@ -2629,8 +2610,11 @@ template <typename LossAt>
             event.step = stepIndex;
             event.maxSteps = maxSteps;
             if (traceLengthLimitVoxels.has_value()) {
-                event.targetPlaneProgress = distance > kTraceEpsilon
-                    ? std::min(1.0f, beams.front().tracedLength / distance)
+                event.targetPlaneProgress = maxSteps > 0
+                    ? std::min(
+                          1.0,
+                          static_cast<double>(stepIndex) /
+                              static_cast<double>(maxSteps))
                     : 1.0;
             } else {
                 const float targetDistance =
@@ -2640,8 +2624,7 @@ template <typename LossAt>
                     : 1.0;
             }
             const bool reachedTraceLength = traceLengthLimitVoxels.has_value() &&
-                static_cast<double>(beams.front().tracedLength) + kTraceEpsilon >=
-                    *traceLengthLimitVoxels;
+                stepIndex >= maxSteps;
             event.reason = reachedTraceLength
                 ? "trace_distance"
                 : (beams.front().reached ? beams.front().reason : reason);
@@ -2663,8 +2646,7 @@ template <typename LossAt>
     const auto best = std::min_element(
         beams.begin(), beams.end(), beamSearchLess);
     const bool reachedTraceLength = traceLengthLimitVoxels.has_value() &&
-        static_cast<double>(best->tracedLength) + kTraceEpsilon >=
-            *traceLengthLimitVoxels;
+        stepIndex >= maxSteps;
     const bool reached = best->reached || reachedTraceLength;
     return oneWayResultFromState(
         *best,
@@ -3126,11 +3108,20 @@ struct TraceMeetingFusion {
     }
     result.fusedLine.front() = forward.points.front();
     result.fusedLine.back() = reverse.points.front();
-    if (!(result.errorRatio <= config.meetingAcceptMaxErrorRatio)) {
-        result.reason = "meeting_error_ratio";
+    const double errorBaseVoxels =
+        result.errorTraceVoxels * config.traceToBaseScale;
+    const double traceLengthBaseVoxels =
+        result.traceLengthTraceVoxels * config.traceToBaseScale;
+    const double acceptThresholdBaseVoxels = std::max(
+        10.0,
+        config.meetingAcceptMaxErrorRatio * traceLengthBaseVoxels);
+    if (!(errorBaseVoxels <= acceptThresholdBaseVoxels)) {
+        result.reason = "meeting_error_threshold";
         std::ostringstream detail;
-        detail << "ratio=" << result.errorRatio
-               << " threshold=" << config.meetingAcceptMaxErrorRatio
+        detail << "error_base_voxels=" << errorBaseVoxels
+               << " threshold_base_voxels=" << acceptThresholdBaseVoxels
+               << " ratio=" << result.errorRatio
+               << " ratio_threshold=" << config.meetingAcceptMaxErrorRatio
                << " source=" << result.source;
         result.detail = detail.str();
         return result;

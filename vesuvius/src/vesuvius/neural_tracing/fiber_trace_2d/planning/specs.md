@@ -1045,8 +1045,9 @@
   target-local planes are reached within `20` base voxels or their step budgets
   are exhausted, then applies the symmetric moving-plane meeting search. At
   the default sd2 trace scale the endpoint threshold is `5` trace voxels. A
-  fused span is accepted when the selected meeting error is at most 10% of its
-  combined partial traced length. `Volume::voxelSize()` is used only to add a
+  fused span is accepted when the selected meeting error in base voxels is at
+  most `max(10, 10% of its combined partial traced length)`. The ratio remains
+  a stored/displayed diagnostic. `Volume::voxelSize()` is used only to add a
   micrometer diagnostic when it is finite and positive; unavailable physical
   metadata must not block tracing.
 - `vc3d_fiber` version 2 stores every control point as an object with a finite
@@ -1055,10 +1056,14 @@
   fiber-traced metadata uses optimizer `native_fiber_trace3d`, metadata/tracer
   schema versions, normal and fiber manifest source locations, trace-to-base
   scale, all effective geometry/acceptance trace settings, an explicit
-  `accepted_native` or `lasagna_fallback` outcome, optional meeting error in
-  base voxels and ratio, meeting source, and stable failure code/detail. Only
-  `accepted_native` protects its span; a fallback outcome remains attached for
-  display and is replaced by the next native retry. Version-1 array-valued CPs
+  `accepted_native` or `lasagna_fallback` outcome and stable outcome-specific
+  diagnostics. Accepted native spans persist meeting error in base voxels,
+  unbounded non-negative error ratio, and meeting source. Lasagna fallbacks
+  persist only failure code/detail because their stored geometry is not the
+  rejected native path; readers ignore any meeting values written into earlier
+  fallback records. Only `accepted_native` protects its span; a fallback
+  outcome remains attached for display and is replaced by the next native
+  retry. Version-1 array-valued CPs
   remain readable as
   unprotected geometry; writers emit version 2. Unknown or malformed v2
   metadata is a hard error in VC3D, Python, native metric/probe, and sync/merge
@@ -1119,11 +1124,12 @@
   normal-parallel direction.
 - The line-annotation extrapolation control is measured in base voxels and
   applies beyond both outer CPs. Native mode converts that distance to trace
-  voxels and uses it as the shared one-way tracer's hard accumulated arc-length
-  budget. Extrapolation has no target planes and does not multiply its budget
-  by `max_step_factor`; it takes `ceil(distance / step)` generations and clips
-  the final segment to the exact requested length. Reaching that length replaces
-  the corresponding Lasagna tail. If the next candidate generation has no
+  voxels and derives a hard nominal generation budget from it. Extrapolation
+  has no target planes and does not multiply its budget by `max_step_factor`;
+  it takes `ceil(distance / step)` generations, with the final generation using
+  the remaining nominal distance. Completing those generations is success;
+  accumulated measured arc length is not a termination or acceptance input.
+  Successful completion replaces the corresponding Lasagna tail. If the next candidate generation has no
   valid prediction directions, the one-way tracer retains its last valid path
   and VC3D uses that path as a native tail truncated at the data edge. A failure
   before producing one outward step retains the Lasagna tail. Whenever VC3D

@@ -136,26 +136,45 @@ def _valid_segment(segment):
         return (isinstance(error, (int, float)) and not isinstance(error, bool)
                 and math.isfinite(error) and error >= 0)
     outcome = segment.get('outcome')
-    error = segment.get('meeting_error_base_voxels')
-    ratio = segment.get('meeting_error_ratio')
-    strings = [segment.get('meeting_source'), segment.get('failure_code'),
-               segment.get('failure_detail')]
+    strings = [segment.get('failure_code'), segment.get('failure_detail')]
     if (outcome not in {'accepted_native', 'lasagna_fallback'} or
-            not all(isinstance(value, str) for value in strings) or
-            (error is None) != (ratio is None)):
-        return False
-    if error is not None and not (
-            isinstance(error, (int, float)) and not isinstance(error, bool) and
-            math.isfinite(error) and error >= 0 and
-            isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and
-            math.isfinite(ratio) and 0 <= ratio <= 1):
+            not all(isinstance(value, str) for value in strings)):
         return False
     if not 0 <= config['meeting_accept_max_error_ratio'] <= 1:
         return False
     if outcome == 'accepted_native':
-        return (error is not None and bool(segment['meeting_source']) and
+        error = segment.get('meeting_error_base_voxels')
+        ratio = segment.get('meeting_error_ratio')
+        return (isinstance(error, (int, float)) and
+                not isinstance(error, bool) and math.isfinite(error) and
+                error >= 0 and isinstance(ratio, (int, float)) and
+                not isinstance(ratio, bool) and math.isfinite(ratio) and
+                ratio >= 0 and isinstance(segment.get('meeting_source'), str) and
+                bool(segment['meeting_source']) and
                 not segment['failure_code'] and not segment['failure_detail'])
     return bool(segment['failure_code'])
+
+
+def _clear_fallback_meeting_diagnostics(doc):
+    """Canonicalize discarded native diagnostics before writing a fiber."""
+    changed = False
+    if doc.get('version', 1) != 2:
+        return changed
+    for control in doc.get('control_points', []):
+        if not isinstance(control, dict):
+            continue
+        segment = control.get('segment_to_next')
+        if (not isinstance(segment, dict) or
+                segment.get('outcome') != 'lasagna_fallback'):
+            continue
+        for key, value in (
+                ('meeting_error_base_voxels', None),
+                ('meeting_error_ratio', None),
+                ('meeting_source', '')):
+            if segment.get(key) != value:
+                segment[key] = value
+                changed = True
+    return changed
 
 
 def is_fiber_doc(doc):
@@ -726,14 +745,18 @@ def merge_fibers(base, local, remote):
                       {_branch_target(entry) for entry in links_to_any(base)})
 
     if local == remote or remote == base:
-        result.update(ok=True, merged=copy.deepcopy(local),
+        merged = copy.deepcopy(local)
+        _clear_fallback_meeting_diagnostics(merged)
+        result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(local),
                       notes=(["remote side unchanged; kept local"]
                              if remote == base and local != remote else
                              ["both sides identical"]))
         return result
     if local == base:
-        result.update(ok=True, merged=copy.deepcopy(remote),
+        merged = copy.deepcopy(remote)
+        _clear_fallback_meeting_diagnostics(merged)
+        result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(remote),
                       notes=["local side unchanged; took remote"])
         return result
@@ -867,6 +890,7 @@ def merge_fibers(base, local, remote):
         result['conflicts'] = [manual_tag_conflict]
         return result
 
+    _clear_fallback_meeting_diagnostics(merged)
     stats['reoptimize'] = reoptimize
     result['peer_files'] = sorted(
         {_branch_target(entry) for entry in links_to_any(merged)} |
@@ -897,6 +921,8 @@ def refresh_pair_links(a_doc, b_doc, a_name, b_name, base_doc=None):
     if not is_fiber_doc(a) or not is_fiber_doc(b):
         out['conflicts'].append(f"{a_name} or {b_name} is not a vc3d_fiber document")
         return out
+    out['a_changed'] = _clear_fallback_meeting_diagnostics(a)
+    out['b_changed'] = _clear_fallback_meeting_diagnostics(b)
 
     a_cps, a_line = a['control_points'], a['line_points']
     b_cps, b_line = b['control_points'], b['line_points']

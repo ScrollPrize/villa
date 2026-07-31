@@ -67,19 +67,27 @@ inline void validateSegmentMetadata(const nlohmann::json& value)
         const std::string outcome = value.at("outcome").get<std::string>();
         if (outcome != "accepted_native" && outcome != "lasagna_fallback")
             throw std::runtime_error("segment_to_next outcome is invalid");
-        const bool haveError = !value.at("meeting_error_base_voxels").is_null();
-        const bool haveRatio = !value.at("meeting_error_ratio").is_null();
-        if (haveError != haveRatio)
-            throw std::runtime_error("segment_to_next meeting diagnostics are inconsistent");
-        if (haveError) {
-            const double error = value.at("meeting_error_base_voxels").get<double>();
-            const double ratio = value.at("meeting_error_ratio").get<double>();
-            if (!std::isfinite(error) || error < 0.0 ||
-                !std::isfinite(ratio) || ratio < 0.0 || ratio > 1.0) {
-                throw std::runtime_error("segment_to_next meeting diagnostics are invalid");
+        bool haveError = false;
+        std::string source;
+        if (outcome == "accepted_native") {
+            haveError = !value.at("meeting_error_base_voxels").is_null();
+            const bool haveRatio = !value.at("meeting_error_ratio").is_null();
+            if (haveError != haveRatio) {
+                throw std::runtime_error(
+                    "segment_to_next meeting diagnostics are inconsistent");
             }
+            if (haveError) {
+                const double error =
+                    value.at("meeting_error_base_voxels").get<double>();
+                const double ratio = value.at("meeting_error_ratio").get<double>();
+                if (!std::isfinite(error) || error < 0.0 ||
+                    !std::isfinite(ratio) || ratio < 0.0) {
+                    throw std::runtime_error(
+                        "segment_to_next meeting diagnostics are invalid");
+                }
+            }
+            source = value.at("meeting_source").get<std::string>();
         }
-        const std::string source = value.at("meeting_source").get<std::string>();
         const std::string failure = value.at("failure_code").get<std::string>();
         const std::string detail = value.at("failure_detail").get<std::string>();
         if (outcome == "accepted_native" &&

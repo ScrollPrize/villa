@@ -1,60 +1,58 @@
-# Task Log: Trace Native Extrapolation By Length
+# Task Log: Lasagna-Fallback Segment Metadata Cleanup
 
 ## 2026-07-31 - Findings
 
-- `traceFiberExtrapolation()` currently creates a synthetic
-  `extrapolation_distance` plane normal to the initial outward direction.
-- `traceOneWayCore()` gives that request
-  `ceil(distance * max_step_factor / step)` generations.
-- A curved fiber can trace many times the requested extrapolation length without
-  crossing the initial-direction plane. The observed 1,876-point fallback is a
-  real runaway to that inflated budget, not only a misleading warning.
-- `BeamState` already records accumulated `tracedLength`, so exact length
-  completion can share the existing beam search without a parallel tracer.
+- `meeting_error_ratio` is an observed diagnostic computed as meeting gap over
+  combined partial trace length. It can validly exceed one for a failed native
+  attempt.
+- The loader incorrectly applied an at-most-one constraint to this observed
+  diagnostic. Only the configured `meeting_accept_max_error_ratio` is a bounded
+  acceptance fraction.
+- Rejected native meeting diagnostics describe the discarded native fusion,
+  while the stored segment geometry is the Lasagna fallback. Failure code and
+  detail are the appropriate persisted diagnostics for that outcome.
 
 ## Review
 
-- The length limit will be a private `traceOneWayCore()` mode used only by
-  `traceFiberExtrapolation()`; public CP-to-CP requests continue to use their
-  existing target planes and `max_step_factor` budget.
+- Accepted native segments continue to own their meeting diagnostics and use
+  them for strip display; fallback segments continue to own failure code/detail.
+- Segment protection depends on `outcome`, not on meeting diagnostics.
 - No separate review agent is used because higher-priority collaboration
   instructions prohibit delegation unless explicitly requested. The plan was
-  reviewed directly against the shared tracer and current extrapolation specs.
+  reviewed directly against the current specs and implementation.
 
 ## Deviations
 
-- The first test run showed that `makeTraceTargetPlaneSet()` rejected the empty
-  set before the private length mode could run. It now permits empty planes only
-  when `traceOneWayCore()` was explicitly given a trace-length limit; public
-  target-directed calls still reject missing planes.
+- None.
 
 ## Implementation
 
-- Added `reachedTraceLength` to distinguish exact trace-budget completion from
-  `reachedTargetPlane`.
-- Added a private optional length limit to `traceOneWayCore()`. In that mode the
-  generation budget is `ceil(distance / step)` and does not use
-  `maxStepFactor`.
-- Reused `BeamState::tracedLength` to recognize completion and clipped the last
-  returned polyline segment to the requested double-precision length.
-- Removed the synthetic `extrapolation_distance` plane from
-  `traceFiberExtrapolation()` and made VC3D accept `reachedTraceLength`.
-- Kept partial `no_valid_candidates` paths as native volume-edge truncations;
-  no-progress failures still retain Lasagna and emit the diagnostic warning.
+- Native trace result conversion now retains meeting error/ratio/source only
+  for accepted results. Rejected attempts retain failure code/detail.
+- VC3D serialization forcibly clears fallback meeting diagnostics, and VC3D
+  loading skips those JSON values before type/range validation.
+- The shared native C++ validator and Python parser apply the same
+  outcome-specific rule. The observed accepted ratio is non-negative but not
+  capped; the configured acceptance ratio remains capped at one.
+- The sync/merge validator accepts earlier fallback records without inspecting
+  their meeting values, and every merge/link-refresh output canonicalizes those
+  fields to null/null/empty source.
+- Specs and implementation docs now distinguish accepted meeting diagnostics
+  from fallback failure diagnostics.
 
 ## Validation
 
-- `test_fiber_trace3d`: all 44 cases passed.
-- `test_line_annotation_generated_views`: all 51 cases passed.
-- The slanted extrapolation regression sets `maxStepFactor=100`, does not cross
-  the old initial-direction plane within the request, and still returns exactly
-  three steps with 10 trace voxels of arc length.
-- A boundary regression verifies a 6-voxel request with a 4-voxel standard step
-  samples its second candidate at 6 rather than 8, so data invalid beyond the
-  requested endpoint cannot cause a false edge truncation.
-- Built the production `VC3D` target with `-j32`; only the existing Qt
-  incomplete-type/SFINAE warnings were emitted.
-- `git diff --check` passed. Whole-file `clang-format --dry-run` is not a useful
-  gate in this checkout because the existing touched files produce thousands of
-  format violations unrelated to this change; changed lines were reviewed
-  directly against their surrounding style.
+- `test_line_annotation_generated_views`: all 51 cases passed after a `-j32`
+  build. Coverage includes VC3D construction/serialization/loading and the
+  shared native C++ reader.
+- `vesuvius/tests/neural_tracing/test_fiber_trace.py`: all 52 cases passed with
+  repository-local imports and third-party pytest plugin autoload disabled.
+- `volume-cartographer/scripts/tests/test_fiber_merge.py`: all 57 cases passed
+  with third-party pytest plugin autoload disabled.
+- `python -m py_compile` passed for both changed Python modules.
+- Built production `VC3D` with `-j32` successfully.
+- `git diff --check` passed. Final review confirmed fallback meeting fields are
+  skipped before parsing in every reader and cleared by both writing paths,
+  while accepted diagnostics and fallback failure reasons remain intact.
+- All tracked task changes were staged; unrelated untracked artifacts were not
+  touched.

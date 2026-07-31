@@ -1,56 +1,46 @@
-# Plan: Trace Native Extrapolation By Length
+# Plan: Lasagna-Fallback Segment Metadata Cleanup
 
-## Scope
+## Metadata Construction
 
-- Change the shared C++ one-way tracer so extrapolation has a dedicated
-  trace-length completion condition.
-- Keep CP-to-CP target planes, intersection acceptance, and fusion unchanged.
-- Update VC3D to recognize trace-length completion as successful native
-  extrapolation.
+1. Populate meeting error, ratio, and source only when the native trace result
+   is accepted and its fused path becomes the stored segment geometry.
+2. Keep failure code/detail for rejected native attempts that retain Lasagna.
 
-## Implementation
+## Persistence And Loading
 
-1. Add a result flag that distinguishes trace-length completion from
-   target-plane completion.
-2. Pass an optional private trace-length limit through `traceOneWayCore()` and
-   candidate frontier construction.
-3. For trace-length mode, derive the maximum generation count directly from
-   `ceil(distance / step)` and ignore `max_step_factor`.
-4. Mark candidates complete once accumulated traced arc length reaches the
-   limit, and clip the final returned segment to the exact requested length.
-5. Make `traceFiberExtrapolation()` use the length limit with no target planes.
-6. Accept `reachedTraceLength` in the VC3D open-tail replacement path while
-   retaining the existing invalid-direction edge truncation rule.
+1. Serialize native meeting diagnostics only for `accepted_native`; write null
+   errors and an empty source for `lasagna_fallback` even if an in-memory caller
+   supplies stale values.
+2. Parse meeting diagnostics only for `accepted_native`; ignore their JSON
+   values entirely for `lasagna_fallback` so earlier fallback records load.
+3. Keep the configured acceptance ratio validation separate from the observed
+   meeting ratio diagnostic.
 
 ## Tests
 
-- Update the straight extrapolation regression to require trace-length rather
-  than target-plane completion and exact arc length.
-- Add a slanted trace regression whose initial-tangent plane is not reached at
-  the requested length; verify it still stops exactly at that length and that a
-  large `max_step_factor` does not extend the trace.
-- Retain the invalid-direction partial-tail regression.
-- Run `test_fiber_trace3d` and `test_line_annotation_generated_views`.
-- Build production `VC3D` with `-j32`.
+- Verify accepted native diagnostics round-trip, including an observed ratio
+  above one.
+- Verify fallback serialization clears stale diagnostics.
+- Verify a fallback record containing legacy meeting values and an over-one
+  ratio loads while retaining only its failure reason.
+- Run `test_line_annotation_generated_views` and build `VC3D` with `-j32`.
 
 ## Spec Update
 
-- Replace the synthetic extrapolation distance-plane contract with exact traced
-  arc-length termination and state that `max_step_factor` applies only to
-  target-directed tracing.
+- Restrict persisted meeting diagnostics to accepted native segments and state
+  that fallback loaders ignore discarded native meeting values.
 
 ## Docs Updates
 
-- Update `docs/code_structure.md` and
-  `volume-cartographer/docs/line_annotation_fibers.md` to describe length-based
-  extrapolation and edge truncation.
+- Clarify the accepted/fallback metadata split in the line-annotation and code
+  structure documentation.
 
 ## Changelog
 
-- Record the correction from synthetic target-plane extrapolation to a hard
-  trace-length budget.
+- Record the fallback metadata cleanup and existing-project load fix.
 
 ## Review
 
-- Verify the new completion mode cannot alter CP-to-CP target-plane paths.
-- Verify all completion and failure result fields remain unambiguous.
+- Verify accepted span display and protection retain meeting diagnostics.
+- Verify fallback display retains stable failure code/detail.
+- Verify no native trace geometry or acceptance behavior changes.

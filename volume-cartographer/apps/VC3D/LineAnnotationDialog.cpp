@@ -197,8 +197,8 @@ QString spanAlignmentMetricText(
             QString::number(metric.meetingErrorBaseVoxels, 'f', 1));
     }
     if (metric.kind == Kind::NativeFailure) {
-        if (metric.failureCode == "meeting_error_ratio")
-            return QObject::tr("fiber >10%");
+        if (metric.failureCode == "meeting_error_threshold")
+            return QObject::tr("fiber gap");
         if (metric.failureCode == "no_trace_plane_intersection")
             return QObject::tr("fiber no meet");
         if (metric.failureCode == "invalid_trace_path")

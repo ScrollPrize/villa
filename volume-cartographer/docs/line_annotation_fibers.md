@@ -11,8 +11,10 @@ selects the fiber-wide interpolation and extrapolation policy for future edits.
 It does not replace `segment_to_next`, which records the native attempt outcome
 for one concrete span. `accepted_native` means the stored geometry came from
 the native tracer and is protected from normal optimization;
-`lasagna_fallback` retains diagnostics for a failed native attempt but does not
-protect the Lasagna geometry.
+`lasagna_fallback` retains the failed native attempt's failure code/detail but
+does not protect the Lasagna geometry. Meeting error, ratio, and source are
+stored only for accepted native geometry. Readers ignore those fields on
+fallback records created by earlier builds, and writers clear them.
 
 In native mode, VC3D traces changed CP-to-CP spans against the selected fiber
 inference manifest. A rejected or invalid native result falls back only that
@@ -24,10 +26,12 @@ Each direction continues until it reaches all target-local planes within the
 20-base-voxel endpoint threshold or exhausts its step budget. VC3D then moves
 locally tangent planes along both complete traces and intersects the opposite
 trace. It selects the smallest meeting error and accepts it when the error is
-at most 10% of the combined partial traced length. This can succeed even when
-neither direction reached its endpoint planes. The accepted partial traces are
-warped by arc-length fraction to their shared midpoint, concatenated, and
-resampled, with the original CP endpoints restored exactly.
+at most `max(10 base voxels, 10% of the combined partial traced length)`. This
+can succeed even when neither direction reached its endpoint planes. The
+accepted partial traces are warped by arc-length fraction to their shared
+midpoint, concatenated, and resampled, with the original CP endpoints restored
+exactly. Rejected spans display the generic `fiber gap` failure label because
+the threshold is no longer ratio-only.
 
 Successful native spans are fixed
 during the fallback solve. At each native-adjacent control point, VC3D derives
@@ -56,8 +60,10 @@ switching explicitly to Lasagna mode or reverting a span clears them.
 The line-annotation extrapolation control is in base voxels. Lasagna mode grows
 normal-based tails. Native mode attempts each tail with the shared one-way
 fiber tracer after converting the requested distance to trace voxels. That
-distance is the complete traced arc-length budget: extrapolation uses no target
-planes, ignores `max_step_factor`, and clips its final step to the exact length.
+distance defines `ceil(distance / nominal step)` generations: extrapolation
+uses no target planes, ignores `max_step_factor`, and uses the remaining nominal
+distance for its final generation. Completing the planned generations is
+success; accumulated measured arc length is not consulted.
 Stored line and control points always remain in base coordinates. When the
 prediction field returns no valid next direction at a volume edge, the tracer
 retains its last valid partial path and VC3D stops the native tail there. A

@@ -1,17 +1,16 @@
-# Trace-Length Extrapolation Status
+# Lasagna-Fallback Segment Metadata Cleanup Status
 
 ## Planning
 
-- [x] Identify the synthetic-plane runaway failure.
+- [x] Trace the load failure and persistence path.
 - [x] Replace task, plan, status, and task log.
-- [x] Review scope against CP-to-CP target-plane behavior.
+- [x] Review scope against segment display and protection behavior.
 
 ## Implementation
 
-- [x] Add trace-length completion to the shared tracer.
-- [x] Remove target planes and `max_step_factor` from extrapolation.
-- [x] Accept trace-length completion in VC3D.
-- [x] Add focused exact-length regressions.
+- [x] Restrict meeting diagnostics to accepted native metadata.
+- [x] Ignore old fallback meeting diagnostics on load.
+- [x] Add focused persistence regressions.
 
 ## Validation And Documentation
 

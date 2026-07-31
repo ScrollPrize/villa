@@ -130,7 +130,7 @@ def test_parse_vc3d_fiber_v2_segment_metadata():
         "fiber_manifest": "s3://bucket/fibers.lasagna.json",
         "trace_to_base_scale": 4.0,
         "meeting_error_base_voxels": 2.5,
-        "meeting_error_ratio": 0.025,
+        "meeting_error_ratio": 1.25,
         "meeting_source": "forward_moving_plane",
         "failure_code": "",
         "failure_detail": "",
@@ -170,15 +170,15 @@ def test_parse_vc3d_fiber_v2_segment_metadata():
     assert fiber.control_point_segments[0].trace_to_base_scale == 4.0
     assert fiber.control_point_segments[0].outcome == "accepted_native"
     assert fiber.control_point_segments[0].meeting_error_base_voxels == 2.5
-    assert fiber.control_point_segments[0].meeting_error_ratio == 0.025
+    assert fiber.control_point_segments[0].meeting_error_ratio == 1.25
     assert fiber.control_point_segments[1] is None
 
     fallback_segment = {
         **segment,
         "outcome": "lasagna_fallback",
-        "meeting_error_base_voxels": None,
-        "meeting_error_ratio": None,
-        "meeting_source": "",
+        "meeting_error_base_voxels": 250.0,
+        "meeting_error_ratio": 2.5,
+        "meeting_source": "discarded_native_meeting",
         "failure_code": "no_trace_plane_intersection",
         "failure_detail": "forward=max_step_factor reverse=no_valid_candidates",
     }
@@ -195,6 +195,9 @@ def test_parse_vc3d_fiber_v2_segment_metadata():
     )
     assert fallback_fiber.control_point_segments[0] is not None
     assert fallback_fiber.control_point_segments[0].outcome == "lasagna_fallback"
+    assert fallback_fiber.control_point_segments[0].meeting_error_base_voxels is None
+    assert fallback_fiber.control_point_segments[0].meeting_error_ratio is None
+    assert fallback_fiber.control_point_segments[0].meeting_source == ""
     assert fallback_fiber.control_point_segments[0].failure_code == "no_trace_plane_intersection"
 
     invalid = {

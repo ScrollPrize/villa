@@ -1100,7 +1100,7 @@ TEST_CASE("native fiber segment uses moving-plane fusion after endpoint misses")
     CHECK(recovered.meetingSource.find("moving_plane") != std::string::npos);
 }
 
-TEST_CASE("native fiber moving-plane fusion uses traced-length ratio and base scale")
+TEST_CASE("native fiber moving-plane fusion uses base floor and traced-length ratio")
 {
     vc::fiber_tracer::FiberTraceConfig config;
     config.stepVoxels = 2.0;
@@ -1132,12 +1132,30 @@ TEST_CASE("native fiber moving-plane fusion uses traced-length ratio and base sc
     }
 
     config.meetingAcceptMaxErrorRatio = 0.09;
-    const auto rejected = vc::fiber_tracer::testing::debugFuseTraceSegment(
+    const auto acceptedByFloor = vc::fiber_tracer::testing::debugFuseTraceSegment(
         forward, reverse, config);
+    CHECK(acceptedByFloor.accepted);
+    CHECK(acceptedByFloor.meetingErrorBaseVoxels == doctest::Approx(4.0));
+    CHECK(acceptedByFloor.meetingErrorRatio == doctest::Approx(0.1));
+
+    const auto rejected = vc::fiber_tracer::testing::debugFuseTraceSegment(
+        forward,
+        {{10.0, 3.0, 0.0}, {0.0, 3.0, 0.0}},
+        config);
     CHECK_FALSE(rejected.accepted);
-    CHECK(rejected.reason == "meeting_error_ratio");
-    CHECK(rejected.meetingErrorBaseVoxels == doctest::Approx(4.0));
-    CHECK(rejected.meetingErrorRatio == doctest::Approx(0.1));
+    CHECK(rejected.reason == "meeting_error_threshold");
+    CHECK(rejected.meetingErrorBaseVoxels == doctest::Approx(12.0));
+    CHECK(rejected.meetingErrorRatio == doctest::Approx(0.3));
+
+    config.traceToBaseScale = 1.0;
+    config.meetingAcceptMaxErrorRatio = 0.1;
+    const auto acceptedByRatio = vc::fiber_tracer::testing::debugFuseTraceSegment(
+        {{0.0, 0.0, 0.0}, {200.0, 0.0, 0.0}},
+        {{200.0, 15.0, 0.0}, {0.0, 15.0, 0.0}},
+        config);
+    CHECK(acceptedByRatio.accepted);
+    CHECK(acceptedByRatio.meetingErrorBaseVoxels == doctest::Approx(15.0));
+    CHECK(acceptedByRatio.meetingErrorRatio == doctest::Approx(0.075));
 }
 
 TEST_CASE("native fiber moving-plane fusion reports no intersection")
@@ -1260,10 +1278,6 @@ TEST_CASE("native fiber extrapolation stops at the requested trace length")
     CHECK(result.points.back()[0] == doctest::Approx(13.0));
     CHECK(result.points.back()[1] == doctest::Approx(2.0));
     CHECK(result.selectedTargetPlaneName.empty());
-    double tracedLength = 0.0;
-    for (size_t index = 1; index < result.points.size(); ++index)
-        tracedLength += cv::norm(result.points[index] - result.points[index - 1]);
-    CHECK(tracedLength == doctest::Approx(10.0).epsilon(1.0e-9));
     CHECK_THROWS_AS(
         vc::fiber_tracer::traceFiberExtrapolation(
             predictions, {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, 0.0, config),
@@ -1298,10 +1312,33 @@ TEST_CASE("native fiber extrapolation ignores target planes and max step factor"
     REQUIRE(result.points.size() == 4);
     CHECK(result.selectedTargetPlaneName.empty());
     CHECK(result.points.back()[0] < 10.0);
-    double tracedLength = 0.0;
-    for (size_t index = 1; index < result.points.size(); ++index)
-        tracedLength += cv::norm(result.points[index] - result.points[index - 1]);
-    CHECK(tracedLength == doctest::Approx(10.0).epsilon(1.0e-9));
+}
+
+TEST_CASE("native fiber extrapolation completion uses nominal generation count")
+{
+    SlantedPrediction predictions;
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 4.0;
+    config.coneAngleDegrees = 0.0;
+    config.beamWidth = 1;
+    config.maxStepFactor = 100.0;
+    config.smoothnessNormalWeight = 0.0;
+    config.smoothnessTangentWeight = 0.0;
+    config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    const auto result = vc::fiber_tracer::traceFiberExtrapolation(
+        predictions,
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        2500.0,
+        config,
+        &normals);
+
+    REQUIRE(result.reachedTraceLength);
+    CHECK(result.reason == "trace_distance");
+    CHECK(result.steps == 625);
+    CHECK(result.points.size() == 626);
 }
 
 TEST_CASE("native fiber extrapolation samples only the remaining final distance")
@@ -1359,4 +1396,41 @@ TEST_CASE("native fiber extrapolation retains its path at invalid directions")
     REQUIRE(result.points.size() == 2);
     CHECK(result.points.front()[0] == doctest::Approx(0.0));
     CHECK(result.points.back()[0] == doctest::Approx(4.0));
+}
+
+TEST_CASE("native fiber extrapolation fails at invalid start or first step")
+{
+    ConstantNormalSampler normals;
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.stepVoxels = 4.0;
+    config.coneAngleDegrees = 0.0;
+    config.beamWidth = 1;
+    config.smoothnessNormalWeight = 0.0;
+    config.smoothnessTangentWeight = 0.0;
+    config.cumulativeSmoothnessTangentWeight = 0.0;
+
+    InvalidStartPrediction invalidStart;
+    CHECK_THROWS_WITH_AS(
+        vc::fiber_tracer::traceFiberExtrapolation(
+            invalidStart,
+            {0.0, 0.0, 0.0},
+            {1.0, 0.0, 0.0},
+            12.0,
+            config,
+            &normals),
+        doctest::Contains("start point has no valid prediction direction"),
+        std::invalid_argument);
+
+    PositiveEdgePrediction invalidFirstStep;
+    const auto result = vc::fiber_tracer::traceFiberExtrapolation(
+        invalidFirstStep,
+        {4.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        12.0,
+        config,
+        &normals);
+    CHECK_FALSE(result.reachedTraceLength);
+    CHECK(result.reason == "no_valid_candidates");
+    REQUIRE(result.points.size() == 1);
+    CHECK(result.points.front()[0] == doctest::Approx(4.0));
 }

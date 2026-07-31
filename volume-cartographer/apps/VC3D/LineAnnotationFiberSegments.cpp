@@ -172,12 +172,13 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataForResult(
     metadata.config = config;
     metadata.config.baseVoxelSizeUm.reset();
     metadata.config.profile = nullptr;
-    if (std::isfinite(result.meetingErrorBaseVoxels))
-        metadata.meetingErrorBaseVoxels = result.meetingErrorBaseVoxels;
-    if (std::isfinite(result.meetingErrorRatio))
-        metadata.meetingErrorRatio = result.meetingErrorRatio;
-    metadata.meetingSource = result.meetingSource;
-    if (!result.accepted) {
+    if (result.accepted) {
+        if (std::isfinite(result.meetingErrorBaseVoxels))
+            metadata.meetingErrorBaseVoxels = result.meetingErrorBaseVoxels;
+        if (std::isfinite(result.meetingErrorRatio))
+            metadata.meetingErrorRatio = result.meetingErrorRatio;
+        metadata.meetingSource = result.meetingSource;
+    } else {
         metadata.failureCode = result.reason.empty()
             ? "fusion_failed"
             : result.reason;
@@ -623,24 +624,25 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
 nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& metadata)
 {
     const auto& config = metadata.config;
+    const bool acceptedNative = isAcceptedNativeTrace(metadata);
     nlohmann::json json = {
         {"optimizer", kOptimizer},
         {"metadata_version", FiberTraceSegmentMetadata::MetadataVersion},
         {"tracer_version", FiberTraceSegmentMetadata::TracerVersion},
         {"outcome",
-         metadata.outcome == FiberTraceSegmentMetadata::Outcome::AcceptedNative
+         acceptedNative
              ? "accepted_native"
              : "lasagna_fallback"},
         {"normal_manifest", metadata.normalManifestLocation},
         {"fiber_manifest", metadata.fiberManifestLocation},
         {"trace_to_base_scale", metadata.traceToBaseScale},
-        {"meeting_error_base_voxels", metadata.meetingErrorBaseVoxels
+        {"meeting_error_base_voxels", acceptedNative && metadata.meetingErrorBaseVoxels
              ? nlohmann::json(*metadata.meetingErrorBaseVoxels)
              : nlohmann::json(nullptr)},
-        {"meeting_error_ratio", metadata.meetingErrorRatio
+        {"meeting_error_ratio", acceptedNative && metadata.meetingErrorRatio
              ? nlohmann::json(*metadata.meetingErrorRatio)
              : nlohmann::json(nullptr)},
-        {"meeting_source", metadata.meetingSource},
+        {"meeting_source", acceptedNative ? metadata.meetingSource : std::string{}},
         {"failure_code", metadata.failureCode},
         {"failure_detail", metadata.failureDetail},
         {"config",
@@ -721,15 +723,17 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
         } else {
             throw std::runtime_error("unsupported segment_to_next outcome");
         }
-        if (!json.at("meeting_error_base_voxels").is_null()) {
-            metadata.meetingErrorBaseVoxels =
-                json.at("meeting_error_base_voxels").get<double>();
+        if (isAcceptedNativeTrace(metadata)) {
+            if (!json.at("meeting_error_base_voxels").is_null()) {
+                metadata.meetingErrorBaseVoxels =
+                    json.at("meeting_error_base_voxels").get<double>();
+            }
+            if (!json.at("meeting_error_ratio").is_null()) {
+                metadata.meetingErrorRatio =
+                    json.at("meeting_error_ratio").get<double>();
+            }
+            metadata.meetingSource = json.at("meeting_source").get<std::string>();
         }
-        if (!json.at("meeting_error_ratio").is_null()) {
-            metadata.meetingErrorRatio =
-                json.at("meeting_error_ratio").get<double>();
-        }
-        metadata.meetingSource = json.at("meeting_source").get<std::string>();
         metadata.failureCode = json.at("failure_code").get<std::string>();
         metadata.failureDetail = json.at("failure_detail").get<std::string>();
     }
@@ -788,8 +792,6 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
     if (metadata.meetingErrorRatio) {
         requireFiniteNonNegative(*metadata.meetingErrorRatio, "meeting_error_ratio");
     }
-    if (metadata.meetingErrorRatio && *metadata.meetingErrorRatio > 1.0)
-        throw std::runtime_error("meeting_error_ratio must be at most one");
     if (!previousVersion) {
         if (metadata.outcome == FiberTraceSegmentMetadata::Outcome::AcceptedNative) {
             if (!metadata.meetingErrorBaseVoxels || !metadata.meetingErrorRatio ||

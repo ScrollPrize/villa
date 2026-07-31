@@ -468,8 +468,9 @@ Ownership changed as follows:
   moves a local tangent plane along each resampled path and intersects the
   other path, adds endpoint-plane candidates, and selects the smallest raw
   meeting error with deterministic progress/index tie breaking. The pair is
-  accepted when that error is at most 10% of the combined partial traced arc,
-  including when neither one-way trace reached its endpoint planes. Both
+  accepted when its base-voxel error is at most
+  `max(10, meetingAcceptMaxErrorRatio * combined partial traced arc)`, including
+  when neither one-way trace reached its endpoint planes. Both
   partial traces are cut at their interpolated meeting positions, warped to
   their midpoint by cumulative arc-length fraction, concatenated, and
   arc-length-resampled. Result diagnostics expose meeting error in trace and
@@ -711,18 +712,21 @@ Ownership changed as follows:
   coordinates, original endpoints are restored exactly, and the final line is
   rebuilt with the ordinary base-space normal sampler. The `20`-base-voxel
   endpoint threshold controls how long each one-way trace continues; at sd2 it
-  is `5` trace voxels. Final CP-pair acceptance uses a meeting-error limit of
-  10% of the combined partial traced length. A finite positive base voxel size
-  adds micrometer diagnostics, but is not required for tracing and does not
-  affect acceptance.
+  is `5` trace voxels. Final CP-pair acceptance uses a base-voxel meeting-error
+  limit of `max(10, 10% of the combined partial traced length)`. A finite
+  positive base voxel size adds micrometer diagnostics, but is not required for
+  tracing and does not affect acceptance.
 
   Native attempts are persisted in `vc3d_fiber` version 2. Each
   `control_points` entry is an object containing `position` and optional
   `segment_to_next`; the starting CP owns the following span's explicit
   `accepted_native` or `lasagna_fallback` outcome, provenance, effective
-  configuration, and meeting/failure diagnostics. Only accepted outcomes
-  protect geometry; fallback outcomes remain available for strip display and
-  are replaced on retry. The final CP cannot own a following segment. VC3D's
+  configuration, and outcome-specific diagnostics. Accepted outcomes store
+  meeting error/ratio/source and protect geometry. Fallback outcomes store only
+  failure code/detail because the rejected native path is discarded; readers
+  ignore meeting fields from earlier fallback records and writers clear them.
+  Fallback outcomes remain available for strip display and are replaced on
+  retry. The final CP cannot own a following segment. VC3D's
   live and stored CP types keep this metadata attached to the
   CP while explicit geometry-only adapters feed atlas, slice, and optimizer
   APIs. Version-1 point arrays load as ordinary unprotected CPs. The shared
@@ -772,9 +776,10 @@ Ownership changed as follows:
   Both open tails are first available from Lasagna reinitialization. Fiber mode
   then calls `traceFiberExtrapolation` over the shared one-way beam tracer in
   trace coordinates. Extrapolation passes no target planes: its requested
-  distance is the hard accumulated arc-length budget, independent of
-  `max_step_factor`, and the returned final segment is clipped to the exact
-  length. Successful length completion replaces that tail. If all next-step
+  distance produces `ceil(distance / nominal step)` generations, independent
+  of `max_step_factor`, and the final generation uses the nominal remainder.
+  Exhausting that generation count is successful without measuring accumulated
+  arc length. Successful completion replaces that tail. If all next-step
   prediction directions are invalid, the
   shared tracer returns its last valid partial path with
   `no_valid_candidates`; VC3D uses it as a native tail ending at the data edge.

@@ -1053,15 +1053,22 @@ def test_v2_control_point_objects_are_valid_and_preserved():
     fallback = copy.deepcopy(segment)
     fallback.update({
         'outcome': 'lasagna_fallback',
-        'meeting_error_base_voxels': None,
-        'meeting_error_ratio': None,
-        'meeting_source': '',
+        'meeting_error_base_voxels': 250.0,
+        'meeting_error_ratio': 2.5,
+        'meeting_source': 'discarded_native_meeting',
         'failure_code': 'no_trace_plane_intersection',
         'failure_detail': 'forward=max_step_factor',
     })
     fallback_doc = copy.deepcopy(doc)
     fallback_doc['control_points'][0]['segment_to_next'] = fallback
     assert fiber_merge.is_fiber_doc(fallback_doc)
+    fallback_result = merge_fibers(
+        fallback_doc, copy.deepcopy(fallback_doc), copy.deepcopy(fallback_doc))
+    assert fallback_result['ok']
+    normalized = fallback_result['merged']['control_points'][0]['segment_to_next']
+    assert normalized['meeting_error_base_voxels'] is None
+    assert normalized['meeting_error_ratio'] is None
+    assert normalized['meeting_source'] == ''
 
     invalid = copy.deepcopy(doc)
     invalid['control_points'][-1]['segment_to_next'] = segment

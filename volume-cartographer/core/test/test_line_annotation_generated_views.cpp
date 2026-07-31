@@ -9,6 +9,7 @@
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
@@ -1184,7 +1185,7 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     metadata.traceToBaseScale = 4.0;
     metadata.config.traceToBaseScale = 4.0;
     metadata.meetingErrorBaseVoxels = 2.5;
-    metadata.meetingErrorRatio = 0.025;
+    metadata.meetingErrorRatio = 1.25;
     metadata.meetingSource = "forward_moving_plane";
     control.segmentToNext = metadata;
 
@@ -1198,7 +1199,7 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     REQUIRE(parsed.segmentToNext->meetingErrorBaseVoxels.has_value());
     REQUIRE(parsed.segmentToNext->meetingErrorRatio.has_value());
     CHECK(*parsed.segmentToNext->meetingErrorBaseVoxels == doctest::Approx(2.5));
-    CHECK(*parsed.segmentToNext->meetingErrorRatio == doctest::Approx(0.025));
+    CHECK(*parsed.segmentToNext->meetingErrorRatio == doctest::Approx(1.25));
     CHECK(parsed.segmentToNext->meetingSource == "forward_moving_plane");
     CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
         parsed.segmentToNext));
@@ -1225,20 +1226,55 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     CHECK(*legacy.segmentToNext->meetingErrorBaseVoxels == doctest::Approx(2.5));
 
     metadata.outcome = vc3d::line_annotation::FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
-    metadata.meetingErrorBaseVoxels.reset();
-    metadata.meetingErrorRatio.reset();
-    metadata.meetingSource.clear();
     metadata.failureCode = "no_trace_plane_intersection";
     metadata.failureDetail = "forward=max_step_factor reverse=no_valid_candidates";
     control.segmentToNext = metadata;
     const auto fallbackJson = vc3d::line_annotation::storedControlPointToJson(control);
+    CHECK(fallbackJson["segment_to_next"]["meeting_error_base_voxels"].is_null());
+    CHECK(fallbackJson["segment_to_next"]["meeting_error_ratio"].is_null());
+    CHECK(fallbackJson["segment_to_next"]["meeting_source"] == "");
+
+    auto earlierFallbackJson = fallbackJson;
+    earlierFallbackJson["segment_to_next"]["meeting_error_base_voxels"] = 250.0;
+    earlierFallbackJson["segment_to_next"]["meeting_error_ratio"] = 2.5;
+    earlierFallbackJson["segment_to_next"]["meeting_source"] =
+        "discarded_native_meeting";
     const auto fallback = vc3d::line_annotation::storedControlPointFromJson(
-        fallbackJson, 2);
+        earlierFallbackJson, 2);
     REQUIRE(fallback.segmentToNext.has_value());
     CHECK_FALSE(vc3d::line_annotation::isAcceptedNativeTrace(
         fallback.segmentToNext));
+    CHECK_FALSE(fallback.segmentToNext->meetingErrorBaseVoxels.has_value());
+    CHECK_FALSE(fallback.segmentToNext->meetingErrorRatio.has_value());
+    CHECK(fallback.segmentToNext->meetingSource.empty());
     CHECK(fallback.segmentToNext->failureCode ==
           "no_trace_plane_intersection");
+
+    const nlohmann::json sharedReaderRoot = {
+        {"control_points",
+         nlohmann::json::array({
+             earlierFallbackJson,
+             nlohmann::json{{"position", {4.0, 5.0, 6.0}}},
+         })}};
+    CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        sharedReaderRoot, "control_points", 2, "test fiber"));
+
+    vc::fiber_tracer::FiberTraceSegmentResult rejectedResult;
+    rejectedResult.meetingErrorBaseVoxels = 250.0;
+    rejectedResult.meetingErrorRatio = 2.5;
+    rejectedResult.meetingSource = "discarded_native_meeting";
+    rejectedResult.reason = "meeting_error_threshold";
+    const auto rejectedMetadata =
+        vc3d::line_annotation::fiberTraceSegmentMetadataForResult(
+            metadata.normalManifestLocation,
+            metadata.fiberManifestLocation,
+            metadata.traceToBaseScale,
+            metadata.config,
+            rejectedResult);
+    CHECK_FALSE(rejectedMetadata.meetingErrorBaseVoxels.has_value());
+    CHECK_FALSE(rejectedMetadata.meetingErrorRatio.has_value());
+    CHECK(rejectedMetadata.meetingSource.empty());
+    CHECK(rejectedMetadata.failureCode == "meeting_error_threshold");
 
     std::vector<vc3d::line_annotation::StoredControlPoint> invalid{parsed};
     CHECK_THROWS_AS(vc3d::line_annotation::validateStoredControlPoints(invalid),
