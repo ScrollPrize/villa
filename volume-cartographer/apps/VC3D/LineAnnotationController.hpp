@@ -166,7 +166,6 @@ public:
     ~LineAnnotationController() override;
 
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
-    void launchFromViewer(CChunkedVolumeViewer* viewer, const QPointF& scenePoint);
     void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
                                  const QPointF& scenePoint,
                                  bool replaceOwningAnnotation = true);
@@ -478,6 +477,11 @@ private:
     [[nodiscard]] std::vector<std::filesystem::path> saveGeneratedQuadMeshes(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
     [[nodiscard]] const PaneRecord* paneForSurface(const std::string& surfaceName) const;
+    // "H"/"V" from the manual tag, falling back to the automatic classification;
+    // empty when unknown or the fiber isn't loaded.
+    [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
+    // Pushes the H/V tag and the clickable tag buttons to the pane's dialog.
+    void pushFiberUiState(const PaneRecord& pane) const;
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,

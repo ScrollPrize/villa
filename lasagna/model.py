@@ -3284,11 +3284,11 @@ class Model3D(nn.Module):
 
 		total = int(out_h) * int(out_w)
 		chunk = max(1, int(chunk_points))
-		if use_cuda and chunk < (1 << 20):
-			# Peak GPU memory scales with chunk * k through the candidate edge and
-			# barycentric tensors. If k_candidates grows large or OOMs appear,
-			# lower this cap.
-			chunk = 1 << 20
+		# if use_cuda and chunk < (1 << 20):
+		# 	# Peak GPU memory scales with chunk * k through the candidate edge and
+		# 	# barycentric tensors. If k_candidates grows large or OOMs appear,
+		# 	# lower this cap.
+		# 	chunk = 1 << 20
 		for start in range(0, total, chunk):
 			stop = min(total, start + chunk)
 			flat_idx = np.arange(start, stop, dtype=np.int64)

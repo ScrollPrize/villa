@@ -331,7 +331,7 @@ class RK4FusedIntegratorTests(unittest.TestCase):
     @staticmethod
     def _make_flow(seed):
         torch.manual_seed(seed)
-        flow = CartesianFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6, lr_scale_factor=0.2)
+        flow = CartesianFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6)
         with torch.no_grad():
             flow.flows[0].normal_(std=0.1)
             flow.flows[1].normal_(std=0.1)
@@ -387,7 +387,7 @@ class RK4FusedIntegratorTests(unittest.TestCase):
 class CachedSamplerGradModeUpgradeTests(unittest.TestCase):
     def test_no_grad_first_call_does_not_poison_field_gradients(self):
         torch.manual_seed(11)
-        flow = CartesianFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6, lr_scale_factor=0.2)
+        flow = CartesianFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6)
         with torch.no_grad():
             flow.flows[0].normal_(std=0.05)
             flow.flows[1].normal_(std=0.05)

@@ -315,6 +315,9 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Scroll pretraining](https://github.com/younader/VesuviusPretraining) by Youssef Nader. Youssef’s original idea for pretraining on the scrolls and finetuning on the fragments, which led him to winning the First Letters Prize.
 
 - [pre-trained DINOv2 models](https://github.com/SergeyPnev/dinov2-vesuvius) by Sergei Pnev. Self-supervised model pre-trained on scrolls 1-5 with predictions.
+
+- [Ink detection validation harness](https://github.com/khj1222/vesuvius-challenge) by khj1222. The ink-detection tutorial trains with no held-out data, so improvements cannot be told apart from noise. This generates a `_validation_mask` for a labeled segment by holding out whole annotated regions (splitting by pixels cuts letters in half), scores predictions inside it (threshold sweep, DRD / pseudo-F-measure, per-region breakdown), sweeps checkpoints, and runs k-fold. Also includes a native-Windows walkthrough of the tutorial.
+
 #### 📦 Materials
 
 - [Scroll 1 Ink Labels](https://discord.com/channels/1079907749569237093/1223849912467460116). Nicola Bodill produced more accurate labels for ink detection based on the prediction of the Grand Prize winner model
