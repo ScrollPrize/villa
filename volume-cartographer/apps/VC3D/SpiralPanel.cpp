@@ -27,6 +27,7 @@
 #include <QListWidgetItem>
 #include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSettings>
@@ -35,6 +36,7 @@
 #include <QSlider>
 #include <QStyle>
 #include <QToolButton>
+#include <QTimer>
 #include <QUuid>
 #include <QVBoxLayout>
 
@@ -176,33 +178,6 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* pathsForm = new QFormLayout(pathsContents);
     pathsGroup->contentLayout()->addWidget(pathsContents);
 
-    auto* optionalInputs = new QWidget(pathsContents);
-    auto* optionalGrid = new QGridLayout(optionalInputs);
-    optionalGrid->setContentsMargins(0, 0, 0, 0);
-    optionalGrid->setHorizontalSpacing(12);
-    optionalGrid->setVerticalSpacing(2);
-    const auto optionalSpecs = std::initializer_list<std::pair<const char*, const char*>>{
-        {"verified_patches", "Verified"}, {"unverified_patches", "Unverified"},
-        {"normals", "Normals"}, {"surf_sdt", "SDT"},
-        {"tracks_dbm", "Tracks"}, {"gradient_magnitude", "Grad mag"},
-        {"fibers", "Fibers"},
-    };
-    int optionalIndex = 0;
-    for (const auto& spec : optionalSpecs) {
-        const QString key = QString::fromLatin1(spec.first);
-        auto* check = new QCheckBox(tr(spec.second), optionalInputs);
-        check->setObjectName(QStringLiteral("spiralUse_") + key);
-        check->setChecked(true);
-        check->setToolTip(tr("Include this dataset input and its associated losses and sampling"));
-        _optionalInputs.insert(key, check);
-        optionalGrid->addWidget(check, optionalIndex / 4, optionalIndex % 4);
-        ++optionalIndex;
-        connect(check, &QCheckBox::toggled, this, [this](bool) {
-            updateOptionalInputUi();
-            refreshReloadRequired();
-        });
-    }
-    pathsForm->addRow(tr("Use inputs"), optionalInputs);
     addPathRow(pathsForm, "dataset_root", tr("Dataset root"), true);
     _refill = new QPushButton(tr("Refill from Dataset Root"), pathsContents);
     pathsForm->addRow(_refill);
@@ -293,6 +268,12 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
            "primary track. Applies on the next Run; zero disables crossing-pair "
            "sampling. The upper bound is prepared when the session loads."));
     pathsForm->addRow(tr("Max crossings / sampled track"), _maxTrackCrossings);
+    for (QWidget* field : {static_cast<QWidget*>(_trackLengthBinSampling),
+                           trackWeights,
+                           static_cast<QWidget*>(_maxTrackCrossings)}) {
+        field->hide();
+        if (QWidget* label = pathsForm->labelForField(field)) label->hide();
+    }
     updateTrackSamplingUi();
 
     addPathRow(pathsForm, "verified_patches", tr("Verified patches"), true);
@@ -313,12 +294,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _lasagnaScale = new QSpinBox(lasagnaContents);
     _lasagnaScale->setRange(1, 1024);
     _lasagnaScale->setValue(4);
-    _storageBackend = new QComboBox(lasagnaContents);
-    _storageBackend->addItem(tr("Sparse CUDA LRU"), QStringLiteral("sparse_cuda"));
     addPathRow(lasagnaForm, "cache_directory", tr("Cache directory"), true);
     lasagnaForm->addRow(tr("Zarr group"), _lasagnaGroup);
     lasagnaForm->addRow(tr("Coordinate scale"), _lasagnaScale);
-    lasagnaForm->addRow(tr("Storage backend"), _storageBackend);
 
     auto* outputGroup = makeSection(tr("Fit and output"),
                                     QStringLiteral("spiralFitOutputGroup"),
@@ -338,6 +316,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     _renderVolumeScale = new QSpinBox(outputContents); _renderVolumeScale->setRange(1, 4096); _renderVolumeScale->setValue(16);
     _savePngVisualizations = new QCheckBox(tr("Save diagnostic PNG visualizations"), outputContents);
     _savePngVisualizations->setChecked(false);
+    _savePngVisualizations->hide();
     _influenceEnabled = new QCheckBox(tr("Localize fit around added inputs"), outputContents);
     _influenceEnabled->setChecked(false);
     _influenceEnabled->setToolTip(tr("Restrict optimization to a region around each input added to "
@@ -538,7 +517,7 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     auto* runLayout = new QVBoxLayout(runContents);
     runGroup->contentLayout()->addWidget(runContents);
     auto* controls = new QHBoxLayout;
-    _load = new QPushButton(tr("Load/Reload Inputs"), runContents);
+    _load = new QPushButton(tr("Start Fit"), runContents);
     _load->setEnabled(false);
     _iterations = new QSpinBox(runContents); _iterations->setRange(1, 1000000); _iterations->setValue(100);
     _run = new QPushButton(tr("Run"), runContents);
@@ -555,6 +534,47 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     checkpointControls->addWidget(_downloadCheckpoint);
     checkpointControls->addStretch(1);
     runLayout->addLayout(checkpointControls);
+    _checkpointDownloadStatus = new QLabel(runContents);
+    _checkpointDownloadStatus->setVisible(false);
+    _checkpointDownloadProgress = new QProgressBar(runContents);
+    _checkpointDownloadProgress->setVisible(false);
+    runLayout->addWidget(_checkpointDownloadStatus);
+    runLayout->addWidget(_checkpointDownloadProgress);
+    _checkpointDownloadTimer = new QTimer(this);
+    _checkpointDownloadTimer->setInterval(1000);
+    auto refreshCheckpointDownload = [this]() {
+        const qint64 seconds = _checkpointDownloadElapsed.isValid()
+            ? _checkpointDownloadElapsed.elapsed() / 1000 : 0;
+        const QString elapsed = seconds < 60
+            ? tr("%1s").arg(seconds)
+            : tr("%1m %2s").arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0'));
+        QString phase;
+        if (_checkpointDownloadPhase == QStringLiteral("creating"))
+            phase = tr("Creating checkpoint on service");
+        else if (_checkpointDownloadPhase == QStringLiteral("verifying"))
+            phase = tr("Verifying checkpoint");
+        else if (_checkpointDownloadPhase == QStringLiteral("copying"))
+            phase = tr("Saving checkpoint");
+        else
+            phase = tr("Downloading checkpoint");
+        _checkpointDownloadStatus->setText(
+            tr("%1 — elapsed %2").arg(phase, elapsed));
+        if (_checkpointTotalBytes > 0) {
+            _checkpointDownloadProgress->setRange(0, 1000);
+            _checkpointDownloadProgress->setValue(static_cast<int>(
+                qBound<qint64>(qint64{0}, _checkpointBytesReceived * 1000
+                                  / _checkpointTotalBytes, qint64{1000})));
+            _checkpointDownloadProgress->setFormat(
+                tr("%1 / %2 MiB")
+                    .arg(_checkpointBytesReceived / (1024 * 1024))
+                    .arg(_checkpointTotalBytes / (1024 * 1024)));
+        } else {
+            _checkpointDownloadProgress->setRange(0, 0);
+            _checkpointDownloadProgress->setFormat(QString());
+        }
+    };
+    connect(_checkpointDownloadTimer, &QTimer::timeout, this,
+            refreshCheckpointDownload);
 
     auto* ephemeralLabel = new QLabel(tr("Inputs added to the running fit:"), runContents);
     _ephemeralList = new QListWidget(runContents);
@@ -580,10 +600,17 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
     runLayout->addWidget(_commitHint);
 
     _state = new QLabel(tr("Service disconnected"), runContents);
+    _previewProgress = new QProgressBar(runContents);
+    _previewProgress->setObjectName(QStringLiteral("spiralPreviewProgress"));
+    _previewProgress->setTextVisible(true);
+    _previewProgress->setVisible(false);
     _metrics = new QLabel(runContents);
     _warnings = new QLabel(runContents); _warnings->setWordWrap(true);
     _warnings->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    runLayout->addWidget(_state); runLayout->addWidget(_metrics); runLayout->addWidget(_warnings);
+    runLayout->addWidget(_state);
+    runLayout->addWidget(_previewProgress);
+    runLayout->addWidget(_metrics);
+    runLayout->addWidget(_warnings);
     layout->addStretch(1);
     scroll->setWidget(contents);
     rootLayout->addWidget(scroll);
@@ -649,9 +676,24 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
                 // Connection must succeed before dataset resolution or fit
                 // controls are enabled.
                 _load->setEnabled(_connected);
-                if (!_connected) { _run->setEnabled(false); _stop->setEnabled(false);
-                                   _save->setEnabled(false); _downloadCheckpoint->setEnabled(false);
-                                   _removeInput->setEnabled(false); }
+                if (!_connected) {
+                    _run->setEnabled(false);
+                    _stop->setEnabled(false);
+                    _save->setEnabled(false);
+                    _downloadCheckpoint->setEnabled(false);
+                    _removeInput->setEnabled(false);
+                    if (_checkpointDownloadActive) {
+                        _checkpointDownloadActive = false;
+                        _checkpointDownloadTimer->stop();
+                        const qint64 seconds =
+                            _checkpointDownloadElapsed.elapsed() / 1000;
+                        _checkpointDownloadProgress->setVisible(false);
+                        _checkpointDownloadStatus->setText(
+                            tr("Checkpoint download interrupted after %1m %2s")
+                                .arg(seconds / 60)
+                                .arg(seconds % 60, 2, 10, QLatin1Char('0')));
+                    }
+                }
                 if (state == CS::Starting || state == CS::Connecting) {
                     _hasSession = false;
                     _loadedSessionRequest = {};
@@ -672,7 +714,71 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             applyResolution(value, _remoteMode || !_hasManualEdits);
         _pendingDatasetRoot.clear();
     });
+    connect(_service, &SpiralServiceManager::configurationCatalogChanged,
+            _advancedProfiles, &SpiralConfigProfileEditor::setCatalog);
+    connect(_service, &SpiralServiceManager::configurationCatalogChanged,
+            this, [this](const QJsonObject& catalog) {
+                _runMutablePaths.clear();
+                const QJsonObject paths =
+                    catalog.value(QStringLiteral("schema")).toObject()
+                        .value(QStringLiteral("paths")).toObject();
+                for (auto it = paths.begin(); it != paths.end(); ++it) {
+                    const QString impact =
+                        it.value().toObject()
+                            .value(QStringLiteral("runtime_impact")).toString();
+                    if (impact == QStringLiteral("run_boundary")
+                        || impact == QStringLiteral("shell_reload"))
+                        _runMutablePaths.insert(it.key());
+                }
+                refreshReloadRequired();
+            });
+    connect(_service, &SpiralServiceManager::configurationReviewRequested,
+            _advancedProfiles, &SpiralConfigProfileEditor::showWindow);
     connect(_service, &SpiralServiceManager::sessionStatusChanged, this, &SpiralPanel::updateStatus);
+    connect(_service, &SpiralServiceManager::previewTransferProgress, this,
+            [this](const QString& phase, const QString& fileName,
+                   int filesComplete, int totalFiles,
+                   qint64 bytesReceived, qint64 totalBytes) {
+                _previewTransferActive =
+                    phase != QStringLiteral("finished")
+                    && phase != QStringLiteral("failed");
+                const QString action =
+                    phase == QStringLiteral("verifying")
+                        ? tr("Verifying preview")
+                        : phase == QStringLiteral("failed")
+                            ? tr("Preview download failed")
+                        : phase == QStringLiteral("finished")
+                            ? tr("Installing preview")
+                            : tr("Downloading preview");
+                _previewTransferText = fileName.isEmpty()
+                    ? action
+                    : tr("%1 (%2/%3): %4")
+                          .arg(action)
+                          .arg(qMin(filesComplete + 1, totalFiles))
+                          .arg(totalFiles)
+                          .arg(fileName);
+                _previewProgress->setVisible(
+                    phase != QStringLiteral("failed"));
+                if (totalBytes > 0) {
+                    _previewProgress->setRange(0, 1000);
+                    _previewProgress->setValue(static_cast<int>(
+                        qBound<qint64>(
+                            qint64{0}, bytesReceived * 1000 / totalBytes,
+                            qint64{1000})));
+                    _previewProgress->setFormat(
+                        tr("%1 / %2 MiB")
+                            .arg(bytesReceived / (1024 * 1024))
+                            .arg(totalBytes / (1024 * 1024)));
+                } else {
+                    _previewProgress->setRange(0, 0);
+                }
+            });
+    connect(_service, &SpiralServiceManager::previewAvailable, this,
+            [this](const QString&, qint64) {
+                _previewTransferActive = false;
+                _previewTransferText.clear();
+                _previewProgress->setVisible(false);
+            });
     connect(_service, &SpiralServiceManager::sessionSynchronized,
             this, &SpiralPanel::synchronizeSession);
     connect(_service, &SpiralServiceManager::errorOccurred, this, [this](const QString& error) {
@@ -686,10 +792,35 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::checkpointDownloadFinished, this,
             [this](const QString& path, const QString& error) {
-                if (error.isEmpty())
+                _checkpointDownloadTimer->stop();
+                _checkpointDownloadActive = false;
+                const qint64 seconds = _checkpointDownloadElapsed.elapsed() / 1000;
+                _checkpointDownloadProgress->setRange(0, 1000);
+                if (error.isEmpty()) {
+                    _checkpointDownloadProgress->setValue(1000);
+                    _checkpointDownloadProgress->setFormat(tr("Complete"));
+                    _checkpointDownloadStatus->setText(
+                        tr("Checkpoint download complete — %1m %2s")
+                            .arg(seconds / 60)
+                            .arg(seconds % 60, 2, 10, QLatin1Char('0')));
                     _warnings->setText(tr("Checkpoint downloaded to %1").arg(path));
-                else
+                } else {
+                    _checkpointDownloadProgress->setVisible(false);
+                    _checkpointDownloadStatus->setText(
+                        tr("Checkpoint download failed after %1m %2s")
+                            .arg(seconds / 60)
+                            .arg(seconds % 60, 2, 10, QLatin1Char('0')));
                     _warnings->setText(tr("Checkpoint download failed: %1").arg(error));
+                }
+                _downloadCheckpoint->setEnabled(_connected && _sessionRunnable);
+            });
+    connect(_service, &SpiralServiceManager::checkpointDownloadProgress, this,
+            [this, refreshCheckpointDownload](const QString& phase,
+                                              qint64 received, qint64 total) {
+                _checkpointDownloadPhase = phase;
+                _checkpointBytesReceived = received;
+                _checkpointTotalBytes = total;
+                refreshCheckpointDownload();
             });
     connect(_service, &SpiralServiceManager::inputUploadFinished, this,
             [this](const QString& inputId, const QString& error) {
@@ -733,7 +864,8 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         persist();
         emit pythonOutputRequested();
         _service->runIterations(_iterations->value(), influenceConfig(),
-                                runAdvancedConfig());
+                                runAdvancedConfig(),
+                                sessionRequest().value(QStringLiteral("paths")).toObject());
     });
     connect(_stop, &QPushButton::clicked, _service, &SpiralServiceManager::stopAfterIteration);
     connect(_save, &QPushButton::clicked, this, [this]() {
@@ -753,7 +885,16 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
             QDir::home().filePath(QStringLiteral("spiral_checkpoint.ckpt")),
             tr("Checkpoint (*.ckpt)"));
         if (path.isEmpty()) return;
-        _warnings->setText(tr("Downloading checkpoint… this can take a few minutes."));
+        _downloadCheckpoint->setEnabled(false);
+        _checkpointDownloadActive = true;
+        _checkpointDownloadPhase = QStringLiteral("creating");
+        _checkpointBytesReceived = 0;
+        _checkpointTotalBytes = 0;
+        _checkpointDownloadElapsed.start();
+        _checkpointDownloadStatus->setVisible(true);
+        _checkpointDownloadProgress->setVisible(true);
+        _checkpointDownloadTimer->start();
+        _warnings->setText(tr("Preparing checkpoint download…"));
         _service->downloadCheckpoint(path);
     });
     connect(_commitInputs, &QPushButton::clicked, this, [this]() {
@@ -789,23 +930,9 @@ SpiralPanel::SpiralPanel(SpiralServiceManager* service, QWidget* parent)
         connect(edit, &QLineEdit::textEdited, this, [this](const QString&) { refreshReloadRequired(); });
     connect(_outwardSense, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int) { refreshReloadRequired(); });
-    connect(_storageBackend, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this](int) { refreshReloadRequired(); });
     connect(_savePngVisualizations, &QCheckBox::toggled, this,
             [this](bool) { refreshReloadRequired(); });
-    connect(_trackLengthBinSampling, &QCheckBox::toggled, this, [this](bool) {
-        updateTrackSamplingUi();
-        writeTrackSamplingControlsToAdvanced();
-    });
-    for (QDoubleSpinBox* spin : {_trackShortWeight, _trackMediumWeight,
-                                 _trackLongWeight}) {
-        connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
-                [this](double) { writeTrackSamplingControlsToAdvanced(); });
-    }
-    connect(_maxTrackCrossings, qOverload<int>(&QSpinBox::valueChanged), this,
-            [this](int) { writeTrackSamplingControlsToAdvanced(); });
     connect(_advancedProfiles, &SpiralConfigProfileEditor::textChanged, this, [this]() {
-        syncTrackSamplingControlsFromAdvanced();
         refreshReloadRequired();
     });
 
@@ -1043,7 +1170,6 @@ void SpiralPanel::setRemoteMode(bool remote)
         for (QLineEdit* edit : {_paths["dataset_root"], _paths["umbilicus"]})
             edit->setToolTip(tr("Service-host path, owned by the service"));
     }
-    updateOptionalInputUi();
 }
 
 QLineEdit* SpiralPanel::addPathRow(QFormLayout* form, const QString& key, const QString& label, bool directory)
@@ -1152,13 +1278,8 @@ void SpiralPanel::applyResolution(const QJsonObject& resolution, bool force)
 QJsonObject SpiralPanel::sessionRequest() const
 {
     QJsonObject paths;
-    for (auto it = _paths.begin(); it != _paths.end(); ++it) {
-        QString optionalKey = it.key();
-        if (optionalKey == QStringLiteral("normal_x")
-            || optionalKey == QStringLiteral("normal_y"))
-            optionalKey = QStringLiteral("normals");
-        paths[it.key()] = optionalInputEnabled(optionalKey) ? it.value()->text() : QString();
-    }
+    for (auto it = _paths.begin(); it != _paths.end(); ++it)
+        paths[it.key()] = it.value()->text();
     QJsonArray pcls;
     for (int row = 0; row < _pclList->count(); ++row) {
         const QListWidgetItem* item = _pclList->item(row);
@@ -1168,12 +1289,11 @@ QJsonObject SpiralPanel::sessionRequest() const
     }
     paths["pcls"] = pcls;
     QJsonObject config = sessionAdvancedConfig();
-    config[QStringLiteral("save_png_visualizations")] = _savePngVisualizations->isChecked();
     QJsonObject run{{"z_begin", _zBegin->value()}, {"z_end", _zEnd->value()},
                     {"scroll_name", _scrollName->text()}, {"outward_sense", _outwardSense->currentText()},
                     {"voxel_size_um", _voxelSize->value()}, {"lasagna_group", _lasagnaGroup->text()},
                     {"lasagna_scale", _lasagnaScale->value()},
-                    {"storage_backend", _storageBackend->currentData().toString()},
+                    {"storage_backend", QStringLiteral("sparse_cuda")},
                     {"legacy_checkpoint_step", _legacyCheckpointStep->value()},
                     {"run_tag", _runTag->text()},
                     {"render_volume_scale", _renderVolumeScale->value()},
@@ -1196,21 +1316,21 @@ QJsonObject SpiralPanel::influenceConfig() const
     if (advanced.isObject()) {
         const QJsonObject all = advanced.object();
         for (auto it = all.begin(); it != all.end(); ++it) {
-            if (it.key().startsWith(QStringLiteral("interactive_influence_"))
+            if (it.key().startsWith(QStringLiteral("influence_"))
                 || it.key() == QStringLiteral("loss_weight_anchor"))
                 config[it.key()] = it.value();
         }
     }
-    config[QStringLiteral("interactive_influence_enabled")] =
+    config[QStringLiteral("influence_enabled")] =
         _influenceEnabled->isChecked();
-    config[QStringLiteral("interactive_influence_disable_dt_frac")] =
+    config[QStringLiteral("influence_disable_dt_frac")] =
         _influenceDisableDtPct->value() / 100.0;
     if (_influenceEnabled->isChecked()) {
-        config[QStringLiteral("interactive_influence_z")] =
+        config[QStringLiteral("influence_z")] =
             static_cast<double>(_influenceZ->value());
-        config[QStringLiteral("interactive_influence_windings")] =
+        config[QStringLiteral("influence_windings")] =
             _influenceWindings->value();
-        config[QStringLiteral("interactive_influence_theta_frac")] =
+        config[QStringLiteral("influence_theta_frac")] =
             _influenceThetaPct->value() / 100.0;
         config[QStringLiteral("loss_weight_anchor")] =
             _influenceAnchorWeight->value();
@@ -1240,13 +1360,12 @@ QJsonObject SpiralPanel::sessionAdvancedConfig() const
         config = advanced.object();
     }
     for (auto it = config.begin(); it != config.end();) {
-        if (it.key().startsWith(QStringLiteral("interactive_influence_"))
+        if (it.key().startsWith(QStringLiteral("influence_"))
             || it.key() == QStringLiteral("loss_weight_anchor"))
             it = config.erase(it);
         else
             ++it;
     }
-    applyOptionalInputConfig(config, true);
     return config;
 }
 
@@ -1254,35 +1373,16 @@ QJsonObject SpiralPanel::runAdvancedConfig() const
 {
     const QJsonDocument advanced =
         QJsonDocument::fromJson(_advanced->toPlainText().toUtf8());
-    QJsonObject config;
-    if (!advanced.isObject()) return config;
-    const QJsonObject all = advanced.object();
-    for (const QString& key : _runConfigKeys) {
-        if (all.contains(key)) config.insert(key, all.value(key));
-    }
-    // Optional-input gating needs the session-scoped spacing mode even though
-    // that key itself is not mutable at a Run boundary. It is removed again
-    // below before the request is sent.
-    const QString spacingModeKey = QStringLiteral("dense_spacing_mode");
-    if (all.contains(spacingModeKey))
-        config.insert(spacingModeKey, all.value(spacingModeKey));
-    if (_runConfigKeys.contains(QStringLiteral("save_png_visualizations")))
-        config[QStringLiteral("save_png_visualizations")] =
-            _savePngVisualizations->isChecked();
-    applyOptionalInputConfig(config, false);
+    if (!advanced.isObject()) return {};
+    QJsonObject config = advanced.object();
     for (auto it = config.begin(); it != config.end();) {
-        if (!_runConfigKeys.contains(it.key()))
+        if (it.key().startsWith(QStringLiteral("influence_"))
+            || it.key() == QStringLiteral("loss_weight_anchor"))
             it = config.erase(it);
         else
             ++it;
     }
     return config;
-}
-
-bool SpiralPanel::optionalInputEnabled(const QString& key) const
-{
-    const auto it = _optionalInputs.constFind(key);
-    return it == _optionalInputs.cend() || it.value()->isChecked();
 }
 
 void SpiralPanel::applyTrackSamplingConfig(QJsonObject& config) const
@@ -1296,7 +1396,7 @@ void SpiralPanel::applyTrackSamplingConfig(QJsonObject& config) const
     } else {
         config[QStringLiteral("track_length_bin_weights")] = QJsonValue::Null;
     }
-    config[QStringLiteral("max_track_crossing_per_step")] =
+    config[QStringLiteral("track_max_track_crossing_per_step")] =
         _maxTrackCrossings->value();
 }
 
@@ -1330,7 +1430,7 @@ void SpiralPanel::syncTrackSamplingControlsFromAdvanced()
     }
 
     const QJsonValue crossings =
-        config.value(QStringLiteral("max_track_crossing_per_step"));
+        config.value(QStringLiteral("track_max_track_crossing_per_step"));
     {
         const QSignalBlocker blocker(_maxTrackCrossings);
         const int preparedMaximum = config
@@ -1359,88 +1459,13 @@ void SpiralPanel::writeTrackSamplingControlsToAdvanced()
 
 void SpiralPanel::updateTrackSamplingUi()
 {
-    const bool tracksEnabled = optionalInputEnabled(QStringLiteral("tracks_dbm"));
+    const bool tracksEnabled =
+        !_paths.value(QStringLiteral("tracks_dbm"))->text().trimmed().isEmpty();
     _trackLengthBinSampling->setEnabled(tracksEnabled);
     _trackShortWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
     _trackMediumWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
     _trackLongWeight->setEnabled(tracksEnabled && _trackLengthBinSampling->isChecked());
     _maxTrackCrossings->setEnabled(tracksEnabled);
-}
-
-void SpiralPanel::applyOptionalInputConfig(QJsonObject& config,
-                                            bool includeSelectionFlags) const
-{
-    const bool verified = optionalInputEnabled(QStringLiteral("verified_patches"));
-    const bool unverified = optionalInputEnabled(QStringLiteral("unverified_patches"));
-    const bool normals = optionalInputEnabled(QStringLiteral("normals"));
-    const bool sdt = optionalInputEnabled(QStringLiteral("surf_sdt"));
-    const bool tracks = optionalInputEnabled(QStringLiteral("tracks_dbm"));
-    const bool gradMag = optionalInputEnabled(QStringLiteral("gradient_magnitude"));
-    const bool fibers = optionalInputEnabled(QStringLiteral("fibers"));
-
-    if (includeSelectionFlags) {
-        config[QStringLiteral("use_verified_patches")] = verified;
-        config[QStringLiteral("use_unverified_patches")] = unverified;
-        config[QStringLiteral("use_normals")] = normals;
-        config[QStringLiteral("use_surf_sdt")] = sdt;
-        config[QStringLiteral("use_tracks")] = tracks;
-        config[QStringLiteral("use_gradient_magnitude")] = gradMag;
-        config[QStringLiteral("use_fibers")] = fibers;
-    }
-
-    auto zero = [&config](std::initializer_list<const char*> keys) {
-        for (const char* key : keys) config[QString::fromLatin1(key)] = 0;
-    };
-    if (!verified) {
-        zero({"loss_weight_patch_radius", "loss_weight_patch_dt",
-              "loss_weight_umbilicus", "loss_weight_shell_patch_radius",
-              "num_patches_per_step", "num_patches_per_step_for_dt",
-              "num_points_per_patch"});
-    }
-    if (!unverified) {
-        zero({"loss_weight_unverified_patch_radius", "loss_weight_unverified_patch_dt",
-              "unverified_num_patches_per_step",
-              "unverified_num_patches_per_step_for_dt",
-              "unverified_num_points_per_patch"});
-    }
-    if (!normals)
-        zero({"loss_weight_dense_normals", "dense_normals_num_points"});
-    if (!tracks) {
-        zero({"loss_weight_track_radius", "loss_weight_track_dt",
-              "track_num_per_step", "track_num_points_per_step"});
-    }
-    if (!fibers) {
-        zero({"loss_weight_unattached_pcl_radius", "loss_weight_unattached_pcl_dt",
-              "unattached_pcl_num_per_step", "unattached_pcl_num_points_per_step"});
-    }
-
-    const QString spacingMode =
-        config.value(QStringLiteral("dense_spacing_mode")).toString(QStringLiteral("phase"));
-    if (!sdt || !normals) {
-        zero({"loss_weight_dense_spacing_count", "loss_weight_dense_spacing_density",
-              "loss_weight_dense_attachment",
-              "dense_spacing_count_extra_pairs", "dense_spacing_density_extra_pairs",
-              "dense_attachment_num_points"});
-        if (spacingMode == QStringLiteral("phase"))
-            zero({"loss_weight_dense_spacing", "dense_spacing_num_pairs"});
-    }
-    if (!gradMag && spacingMode == QStringLiteral("grad_mag"))
-        zero({"loss_weight_dense_spacing", "dense_spacing_num_pairs"});
-}
-
-void SpiralPanel::updateOptionalInputUi()
-{
-    for (auto it = _paths.begin(); it != _paths.end(); ++it) {
-        QString optionalKey = it.key();
-        if (optionalKey == QStringLiteral("normal_x")
-            || optionalKey == QStringLiteral("normal_y"))
-            optionalKey = QStringLiteral("normals");
-        const bool enabled = optionalInputEnabled(optionalKey);
-        it.value()->setEnabled(enabled);
-        if (_pathBrowseButtons.contains(it.key()))
-            _pathBrowseButtons[it.key()]->setEnabled(enabled);
-    }
-    updateTrackSamplingUi();
 }
 
 void SpiralPanel::applySessionRunConfig(const QJsonObject& config, qint64 sessionGeneration)
@@ -1458,12 +1483,13 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
         request.value(QStringLiteral("paths")).toObject();
     const QJsonObject run =
         request.value(QStringLiteral("run")).toObject();
-    const QJsonObject requestedConfig =
-        run.value(QStringLiteral("config")).toObject();
     const QJsonObject activeRunConfig =
         status.value(QStringLiteral("run_config")).toObject();
-    const QJsonObject defaultConfig =
-        status.value(QStringLiteral("default_advanced_config")).toObject();
+    QJsonObject defaultConfig =
+        status.value(QStringLiteral("applied_config")).toObject();
+    if (defaultConfig.isEmpty())
+        defaultConfig =
+            status.value(QStringLiteral("default_advanced_config")).toObject();
     const QJsonObject effectiveConfig =
         vc3d::effectiveSpiralSessionConfig(
             request, defaultConfig, activeRunConfig);
@@ -1473,20 +1499,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         it.value()->setText(paths.value(it.key()).toString());
-
-    const QHash<QString, QString> selectionFlags{
-        {QStringLiteral("verified_patches"), QStringLiteral("use_verified_patches")},
-        {QStringLiteral("unverified_patches"), QStringLiteral("use_unverified_patches")},
-        {QStringLiteral("normals"), QStringLiteral("use_normals")},
-        {QStringLiteral("surf_sdt"), QStringLiteral("use_surf_sdt")},
-        {QStringLiteral("tracks_dbm"), QStringLiteral("use_tracks")},
-        {QStringLiteral("gradient_magnitude"), QStringLiteral("use_gradient_magnitude")},
-        {QStringLiteral("fibers"), QStringLiteral("use_fibers")},
-    };
-    for (auto it = selectionFlags.begin(); it != selectionFlags.end(); ++it) {
-        _optionalInputs.value(it.key())->setChecked(
-            requestedConfig.value(it.value()).toBool(true));
-    }
 
     _pclList->clear();
     for (const QJsonValue& value : paths.value(QStringLiteral("pcls")).toArray()) {
@@ -1509,9 +1521,6 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
         run.value(QStringLiteral("lasagna_group")).toString(_lasagnaGroup->text()));
     _lasagnaScale->setValue(
         run.value(QStringLiteral("lasagna_scale")).toInt(_lasagnaScale->value()));
-    const int backend = _storageBackend->findData(
-        run.value(QStringLiteral("storage_backend")).toString());
-    if (backend >= 0) _storageBackend->setCurrentIndex(backend);
     _legacyCheckpointStep->setValue(
         run.value(QStringLiteral("legacy_checkpoint_step"))
             .toInt(_legacyCheckpointStep->value()));
@@ -1526,21 +1535,21 @@ void SpiralPanel::synchronizeSession(const QJsonObject& request,
     _advancedProfiles->setSessionDefault(effectiveConfig);
     _advancedProfiles->showSessionDefault();
     _savePngVisualizations->setChecked(
-        effectiveConfig.value(QStringLiteral("save_png_visualizations"))
+        effectiveConfig.value(QStringLiteral("output_save_png_visualizations"))
             .toBool(false));
     syncTrackSamplingControlsFromAdvanced();
     if (!activeRunConfig.isEmpty())
         applySessionRunConfig(activeRunConfig, sessionGeneration);
     else
         _advancedSessionGeneration = -1;
-    updateOptionalInputUi();
+    updateTrackSamplingUi();
     _applyingResolution = false;
 
     _hasManualEdits = false;
     _hasSession = true;
     // Reload comparisons use the panel's adopted representation. The host
-    // request is canonical and sparse, whereas the form expands defaults and
-    // applies optional-input gating; both describe the same resident fit.
+    // request is canonical and sparse, whereas the form expands the active
+    // session defaults; both describe the same resident fit.
     _loadedSessionRequest = sessionRequest();
     _reloadRequired = false;
     for (auto it = _visibilityChecks.begin(); it != _visibilityChecks.end(); ++it)
@@ -1551,11 +1560,16 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
 {
     const qint64 sessionGeneration =
         status.value(QStringLiteral("session_generation")).toInteger(-1);
+    _load->setText(status.value(QStringLiteral("session_id")).toString().isEmpty()
+                       ? tr("Start Fit") : tr("New Fit"));
     const QJsonObject runConfig = status.value(QStringLiteral("run_config")).toObject();
     const QJsonObject runConfigLimits =
         status.value(QStringLiteral("run_config_limits")).toObject();
-    const QJsonObject defaultConfig =
-        status.value(QStringLiteral("default_advanced_config")).toObject();
+    QJsonObject defaultConfig =
+        status.value(QStringLiteral("applied_config")).toObject();
+    if (defaultConfig.isEmpty())
+        defaultConfig =
+            status.value(QStringLiteral("default_advanced_config")).toObject();
     if (sessionGeneration >= 0 && sessionGeneration != _advancedSessionGeneration
         && !runConfig.isEmpty()) {
         const bool completingSynchronization =
@@ -1570,7 +1584,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         _advancedProfiles->showSessionDefault();
         _savePngVisualizations->setChecked(
             effectiveConfig
-                .value(QStringLiteral("save_png_visualizations"))
+                .value(QStringLiteral("output_save_png_visualizations"))
                 .toBool(false));
         syncTrackSamplingControlsFromAdvanced();
         _applyingResolution = false;
@@ -1580,7 +1594,7 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         refreshReloadRequired();
     }
     const QJsonValue crossingLimit =
-        runConfigLimits.value(QStringLiteral("max_track_crossing_per_step"));
+        runConfigLimits.value(QStringLiteral("track_max_track_crossing_per_step"));
     if (crossingLimit.isDouble()) {
         const QSignalBlocker blocker(_maxTrackCrossings);
         _maxTrackCrossings->setMaximum(qMax(0, crossingLimit.toInt()));
@@ -1595,10 +1609,84 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
         _advancedSessionGeneration = -1;
         _runConfigKeys.clear();
     }
-    QString stateText = tr("Session: %1 — %2 — iteration %3/%4")
-        .arg(state, status.value("phase").toString())
-        .arg(status.value("current_iteration").toInteger())
-        .arg(status.value("target_iteration").toInteger());
+    const QJsonObject progress =
+        status.value(QStringLiteral("progress")).toObject();
+    QString stateText = progress.isEmpty()
+        ? tr("Session: %1 — %2")
+              .arg(state, status.value("phase").toString())
+        : tr("Session: %1").arg(state);
+    if (state == QStringLiteral("Running"))
+        stateText += tr(" — iteration %1/%2")
+            .arg(status.value("current_iteration").toInteger())
+            .arg(status.value("target_iteration").toInteger());
+    const QJsonObject previewPublish =
+        status.value(QStringLiteral("preview_publish")).toObject();
+    if (_previewTransferActive && !_previewTransferText.isEmpty()) {
+        stateText += QStringLiteral("\n") + _previewTransferText;
+    } else if (!progress.isEmpty()) {
+        const qint64 step =
+            progress.value(QStringLiteral("step")).toInteger(-1);
+        const qint64 total =
+            progress.value(QStringLiteral("total_steps")).toInteger(-1);
+        const QString unit =
+            progress.value(QStringLiteral("unit")).toString();
+        const QString detail =
+            progress.value(QStringLiteral("detail")).toString();
+        const double elapsed =
+            progress.value(QStringLiteral("elapsed_seconds")).toDouble();
+        const QJsonValue etaValue =
+            progress.value(QStringLiteral("eta_seconds"));
+        const auto durationText = [](double value) {
+            const qint64 seconds = qMax<qint64>(
+                0, qRound64(value));
+            if (seconds < 60)
+                return QObject::tr("%1s").arg(seconds);
+            const qint64 minutes = seconds / 60;
+            if (minutes < 60)
+                return QObject::tr("%1m %2s")
+                    .arg(minutes).arg(seconds % 60, 2, 10, QLatin1Char('0'));
+            return QObject::tr("%1h %2m")
+                .arg(minutes / 60)
+                .arg(minutes % 60, 2, 10, QLatin1Char('0'));
+        };
+        QString progressText =
+            progress.value(QStringLiteral("stage_name")).toString();
+        if (!detail.isEmpty())
+            progressText += QStringLiteral(" — ") + detail;
+        progressText += tr(" — elapsed %1").arg(durationText(elapsed));
+        if (etaValue.isDouble())
+            progressText += tr(" — ETA %1")
+                .arg(durationText(etaValue.toDouble()));
+        stateText += QStringLiteral("\n") + progressText;
+        _previewProgress->setVisible(true);
+        if (total > 0) {
+            _previewProgress->setRange(0, 1000);
+            _previewProgress->setValue(static_cast<int>(
+                qBound<qint64>(
+                    qint64{0}, step * 1000 / total, qint64{1000})));
+            QString format = tr("%1 / %2").arg(step).arg(total);
+            if (!unit.isEmpty())
+                format += QStringLiteral(" ") + unit;
+            _previewProgress->setFormat(format);
+        } else {
+            _previewProgress->setRange(0, 0);
+        }
+    } else if (!previewPublish.isEmpty()) {
+        const int step = previewPublish.value(QStringLiteral("step")).toInt();
+        const int total =
+            previewPublish.value(QStringLiteral("total_steps")).toInt();
+        _previewProgress->setVisible(true);
+        if (total > 0) {
+            _previewProgress->setRange(0, total);
+            _previewProgress->setValue(qBound(0, step, total));
+            _previewProgress->setFormat(
+                tr("%1 / %2").arg(step).arg(total));
+        } else {
+            _previewProgress->setRange(0, 0);
+        }
+    } else {
+        _previewProgress->setVisible(false);
+    }
     // Status polls arrive every second; without this the reload-required
     // notice set by refreshReloadRequired() vanishes immediately, leaving an
     // unexplained disabled Run button.
@@ -1626,7 +1714,8 @@ void SpiralPanel::updateStatus(const QJsonObject& status)
     _run->setEnabled(_connected && runnable && !_reloadRequired);
     _stop->setEnabled(state == "Running");
     _save->setEnabled(_connected && runnable);
-    _downloadCheckpoint->setEnabled(_connected && runnable);
+    _downloadCheckpoint->setEnabled(
+        _connected && runnable && !_checkpointDownloadActive);
 
     // Ephemeral inputs added to the running fit.
     const QJsonArray ephemeral = status.value(QStringLiteral("ephemeral_inputs")).toArray();
@@ -1685,7 +1774,8 @@ QJsonObject SpiralPanel::normalizedReloadRequest(QJsonObject request) const
     // Run-mutable settings are excluded because they can be applied at the
     // next Run boundary without rebuilding the resident session.
     return vc3d::normalizedSpiralReloadRequest(
-        std::move(request), _defaultAdvancedConfig, _runConfigKeys);
+        std::move(request), _defaultAdvancedConfig, _runConfigKeys,
+        _runMutablePaths);
 }
 
 void SpiralPanel::refreshReloadRequired()
@@ -1693,41 +1783,6 @@ void SpiralPanel::refreshReloadRequired()
     if (!_hasSession || _applyingResolution || _loadedSessionRequest.isEmpty()) return;
 
     QJsonObject current = sessionRequest();
-
-    // A loaded input may be disabled at a Run boundary by forcing its mutable
-    // loss weights and sample counts to zero. Re-enabling an input that was not
-    // loaded, or changing its path, still requires rebuilding the session.
-    QJsonObject currentRun = current.value(QStringLiteral("run")).toObject();
-    QJsonObject currentConfig = currentRun.value(QStringLiteral("config")).toObject();
-    const QJsonObject loadedRun =
-        _loadedSessionRequest.value(QStringLiteral("run")).toObject();
-    const QJsonObject loadedConfig =
-        loadedRun.value(QStringLiteral("config")).toObject();
-    QJsonObject currentPaths = current.value(QStringLiteral("paths")).toObject();
-    const QJsonObject loadedPaths =
-        _loadedSessionRequest.value(QStringLiteral("paths")).toObject();
-    const QHash<QString, QStringList> optionalInputs{
-        {QStringLiteral("use_verified_patches"), {QStringLiteral("verified_patches")}},
-        {QStringLiteral("use_unverified_patches"), {QStringLiteral("unverified_patches")}},
-        {QStringLiteral("use_normals"), {QStringLiteral("normal_x"), QStringLiteral("normal_y")}},
-        {QStringLiteral("use_surf_sdt"), {QStringLiteral("surf_sdt")}},
-        {QStringLiteral("use_tracks"), {QStringLiteral("tracks_dbm")}},
-        {QStringLiteral("use_gradient_magnitude"), {QStringLiteral("gradient_magnitude")}},
-        {QStringLiteral("use_fibers"), {QStringLiteral("fibers")}},
-    };
-    for (auto it = optionalInputs.begin(); it != optionalInputs.end(); ++it) {
-        const QString& flag = it.key();
-        const bool loaded = loadedConfig.value(flag).toBool(true);
-        const bool enabled = currentConfig.value(flag).toBool(true);
-        if (!loaded || enabled) continue;
-        currentConfig[flag] = true;
-        for (const QString& pathKey : it.value()) {
-            currentPaths[pathKey] = loadedPaths.value(pathKey);
-        }
-    }
-    currentRun[QStringLiteral("config")] = currentConfig;
-    current[QStringLiteral("run")] = currentRun;
-    current[QStringLiteral("paths")] = currentPaths;
 
     const bool wasReloadRequired = _reloadRequired;
     _reloadRequired = normalizedReloadRequest(current)
@@ -1745,9 +1800,6 @@ void SpiralPanel::persist() const
     const QString prefix = formSettingsPrefix();
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         settings.setValue(prefix + QStringLiteral("paths/") + it.key(), it.value()->text());
-    for (auto it = _optionalInputs.begin(); it != _optionalInputs.end(); ++it)
-        settings.setValue(prefix + QStringLiteral("use_inputs/") + it.key(),
-                          it.value()->isChecked());
     QJsonArray pcls;
     for (int row = 0; row < _pclList->count(); ++row) {
         const QListWidgetItem* item = _pclList->item(row);
@@ -1764,11 +1816,11 @@ void SpiralPanel::persist() const
     settings.setValue(prefix + "voxel_size_um", _voxelSize->value());
     settings.setValue(prefix + "lasagna_group", _lasagnaGroup->text());
     settings.setValue(prefix + "lasagna_scale", _lasagnaScale->value());
-    settings.setValue(prefix + "storage_backend", _storageBackend->currentData().toString());
+    settings.setValue(prefix + "storage_backend", QStringLiteral("sparse_cuda"));
     settings.setValue(prefix + "legacy_checkpoint_step", _legacyCheckpointStep->value());
     settings.setValue(prefix + "run_tag", _runTag->text());
     settings.setValue(prefix + "render_volume_scale", _renderVolumeScale->value());
-    settings.setValue(prefix + "save_png_visualizations", _savePngVisualizations->isChecked());
+    settings.setValue(prefix + "output_save_png_visualizations", _savePngVisualizations->isChecked());
     settings.setValue(prefix + "influence_enabled", _influenceEnabled->isChecked());
     settings.setValue(prefix + "influence_z", _influenceZ->value());
     settings.setValue(prefix + "influence_windings", _influenceWindings->value());
@@ -1795,9 +1847,6 @@ void SpiralPanel::restore()
     _applyingResolution = true;
     for (auto it = _paths.begin(); it != _paths.end(); ++it)
         it.value()->setText(settings.value(pathsPrefix + it.key()).toString());
-    for (auto it = _optionalInputs.begin(); it != _optionalInputs.end(); ++it)
-        it.value()->setChecked(settings.value(
-            valuePrefix + QStringLiteral("use_inputs/") + it.key(), true).toBool());
     _pclList->clear();
     const QByteArray savedPcls = settings.value(valuePrefix + QStringLiteral("pcls")).toByteArray();
     const QJsonDocument pclDocument = QJsonDocument::fromJson(savedPcls);
@@ -1826,14 +1875,11 @@ void SpiralPanel::restore()
     _voxelSize->setValue(settings.value(valuePrefix + "voxel_size_um", 9.6).toDouble());
     _lasagnaGroup->setText(settings.value(valuePrefix + "lasagna_group", "4").toString());
     _lasagnaScale->setValue(settings.value(valuePrefix + "lasagna_scale", 4).toInt());
-    const int backend = _storageBackend->findData(
-        settings.value(valuePrefix + "storage_backend", "sparse_cuda").toString());
-    if (backend >= 0) _storageBackend->setCurrentIndex(backend);
     _legacyCheckpointStep->setValue(settings.value(valuePrefix + "legacy_checkpoint_step", 0).toInt());
     _runTag->setText(settings.value(valuePrefix + "run_tag").toString());
     _renderVolumeScale->setValue(settings.value(valuePrefix + "render_volume_scale", 16).toInt());
     _savePngVisualizations->setChecked(
-        settings.value(valuePrefix + "save_png_visualizations", false).toBool());
+        settings.value(valuePrefix + "output_save_png_visualizations", false).toBool());
     _influenceEnabled->setChecked(settings.value(valuePrefix + "influence_enabled", false).toBool());
     _influenceZ->setValue(settings.value(valuePrefix + "influence_z", 3000).toInt());
     _influenceWindings->setValue(settings.value(valuePrefix + "influence_windings", 5.0).toDouble());
@@ -1853,5 +1899,5 @@ void SpiralPanel::restore()
     _loadedSessionRequest = {};
     _attachedAdvancedConfig = {};
     _defaultAdvancedConfig = {};
-    updateOptionalInputUi();
+    updateTrackSamplingUi();
 }

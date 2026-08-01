@@ -12,6 +12,8 @@ import numpy as np
 import torch
 import zarr
 
+import tiled_predict3d as shared_predict3d
+
 
 common_stub = types.ModuleType("common")
 common_stub.load_unet = None
@@ -23,19 +25,31 @@ train_stub.build_model = None
 sys.modules.setdefault("train_unet_3d", train_stub)
 
 from preprocess_cos_omezarr import (
-	_RollingZBand,
+	LasagnaCosPredict3DAdapter,
+	ModelAdapter,
+	OmeZarrOutputAdapter,
+	OutputAdapter,
+	OutputChannelSpec,
+	OutputProductSpec,
+	PYRAMID_POLICY_CUSTOM,
+	PYRAMID_POLICY_NONE,
+	PYRAMID_POLICY_SCALAR,
+	_CircularZBand,
+	_plan_circular_z_depth,
 	_atomic_zarr_write,
 	_canonical_local_tile_positions,
 	_canonical_tile_positions_for_output_region,
 	_cleanup_predict3d_temp_files,
 	_create_omezarr,
 	_grad_mag_factor_from_input_sd,
-	_infer_tiled_3d,
+	run_tiled_inference_3d,
 	_omezarr_chunk_exists,
 	_omezarr_chunk_group_complete,
 	_predict3d_overall_eta,
+	cli_main,
 	run_preprocess_3d,
 )
+import preprocess_cos_omezarr as preprocess_wrapper
 from omezarr_pyramid import (
 	_make_downsample_work,
 	_write_level_block,
@@ -100,7 +114,287 @@ class _OnesPredict3dModel:
 		)
 
 
+class _FakeModelAdapter:
+	@property
+	def output_products(self):
+		return (
+			OutputProductSpec(
+				name="fiber_option0",
+				level=2,
+				scaledown=4,
+				channels=("dir0_z", "dir1_z", "dir0_y", "dir1_y", "dir0_x", "dir1_x", "presence"),
+				chunk_size=32,
+			),
+		)
+
+	def load_model(self, *, device: torch.device):
+		return object()
+
+	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
+		return tile
+
+	def product_tensors_from_output(self, raw_output):
+		return {self.output_products[0].name: raw_output}
+
+	def finalize_product_slab(self, product, raw_slab):
+		return {channel.name: raw_slab[index] for index, channel in enumerate(product.channels)}
+
+
+class _FakeOutputAdapter:
+	def product_chunk_complete(self, product: OutputProductSpec, *, chunk_origin_zyx):
+		return False
+
+	def write_product_chunk(self, product: OutputProductSpec, *, chunk_origin_zyx, data):
+		pass
+
+	def update_metadata(self, products):
+		pass
+
+
+class _SpyPredict3dAdapter:
+	def __init__(self):
+		self.calls = 0
+
+	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
+		self.calls += 1
+		return model(tile)
+
+
+class _IdentityProductAdapter:
+	def __init__(self, product: OutputProductSpec):
+		self._products = (product,)
+		self.calls = 0
+
+	@property
+	def output_products(self):
+		return self._products
+
+	def load_model(self, *, device: torch.device):
+		return object()
+
+	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
+		self.calls += 1
+		_ = model
+		return tile
+
+	def product_tensors_from_output(self, raw_output):
+		return {self._products[0].name: raw_output}
+
+
+class _RaisingProductAdapter(_IdentityProductAdapter):
+	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
+		self.calls += 1
+		_ = model, tile, device
+		raise AssertionError("resume should skip completed product chunks")
+
+
 class PreprocessCosOmezarrTests(unittest.TestCase):
+	def test_predict3d_shared_helpers_are_reexported_for_compatibility(self):
+		self.assertIs(preprocess_wrapper.OutputProductSpec, shared_predict3d.OutputProductSpec)
+		self.assertIs(preprocess_wrapper.OutputChannelSpec, shared_predict3d.OutputChannelSpec)
+		self.assertIs(preprocess_wrapper.OmeZarrOutputAdapter, shared_predict3d.OmeZarrOutputAdapter)
+		self.assertIs(preprocess_wrapper.ModelAdapter, shared_predict3d.ModelAdapter)
+		self.assertIs(preprocess_wrapper.OutputAdapter, shared_predict3d.OutputAdapter)
+		self.assertIs(preprocess_wrapper.run_tiled_inference_3d, shared_predict3d.run_tiled_inference_3d)
+		self.assertFalse(hasattr(shared_predict3d, "_infer_tiled_3d"))
+		self.assertIs(
+			preprocess_wrapper._canonical_tile_positions_for_output_region,
+			shared_predict3d._canonical_tile_positions_for_output_region,
+		)
+		self.assertIs(
+			preprocess_wrapper._cleanup_predict3d_temp_files,
+			shared_predict3d._cleanup_predict3d_temp_files,
+		)
+
+	def test_output_product_spec_normalizes_and_validates_bundle(self):
+		spec = OutputProductSpec(
+			name="fiber_option0",
+			level=2,
+			scaledown=4,
+			channels=(
+				"dir0_z",
+				OutputChannelSpec("dir1_z", relative_path="option0/dir1_z.ome.zarr"),
+				"dir0_y",
+				"dir1_y",
+				"dir0_x",
+				"dir1_x",
+				"presence",
+			),
+			chunk_size=32,
+			dtype="uint8",
+			value_range=(0, 255),
+			pyramid_policy=PYRAMID_POLICY_NONE,
+		)
+
+		self.assertEqual(spec.channel_count, 7)
+		self.assertEqual(
+			spec.channel_names,
+			("dir0_z", "dir1_z", "dir0_y", "dir1_y", "dir0_x", "dir1_x", "presence"),
+		)
+		self.assertEqual(spec.dtype, np.dtype("uint8"))
+		self.assertEqual(spec.value_range, (0.0, 255.0))
+
+		with self.assertRaises(ValueError):
+			OutputProductSpec(
+				name="bad",
+				level=0,
+				scaledown=1,
+				channels=("presence", "presence"),
+				chunk_size=32,
+			)
+		with self.assertRaises(ValueError):
+			OutputProductSpec(
+				name="bad",
+				level=0,
+				scaledown=0,
+				channels=("presence",),
+				chunk_size=32,
+			)
+
+	def test_product_manifest_does_not_write_trace_scale_aliases(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			output_path = root / "fiber.lasagna.json"
+			product = OutputProductSpec(
+				name="fiber_option_000",
+				level=4,
+				scaledown=16,
+				inference_scaledown=4,
+				channels=(
+					OutputChannelSpec("presence", relative_path=str(root / "presence.ome.zarr")),
+					OutputChannelSpec("nx", relative_path=str(root / "nx.ome.zarr")),
+					OutputChannelSpec("ny", relative_path=str(root / "ny.ome.zarr")),
+				),
+				chunk_size=64,
+			)
+
+			shared_predict3d.write_lasagna_product_manifest(
+				output_path=output_path,
+				products=(product,),
+				base_shape_zyx=(64, 64, 64),
+			)
+
+			raw = json.loads(output_path.read_text(encoding="utf-8"))
+			self.assertNotIn("trace_to_base_scale", raw)
+			self.assertNotIn("prediction_to_base_scale", raw)
+			self.assertNotIn("prediction_spacing_in_trace_voxels", raw)
+			self.assertNotIn("inference_scaledown_factor", raw)
+			self.assertEqual(raw["groups"]["presence"]["scaledown"], 4)
+			self.assertNotIn("inference_scaledown", raw["groups"]["presence"])
+			self.assertNotIn("inference_scaledown", raw["groups"]["nx"])
+			self.assertNotIn("inference_scaledown", raw["groups"]["ny"])
+
+			from lasagna_volume import LasagnaVolume
+
+			loaded = LasagnaVolume.load(output_path)
+			self.assertEqual(loaded.groups["presence"].scaledown, 4)
+
+	def test_predict3d_adapter_protocols_are_runtime_checkable(self):
+		self.assertIsInstance(_FakeModelAdapter(), ModelAdapter)
+		self.assertIsInstance(_FakeOutputAdapter(), OutputAdapter)
+
+	def test_lasagna_predict3d_adapter_schema_keeps_current_products(self):
+		adapter = LasagnaCosPredict3DAdapter(
+			checkpoint="model.pt",
+			tile_size=64,
+			device_name="cpu",
+			cos_product=OutputProductSpec(
+				name=LasagnaCosPredict3DAdapter.COS_PRODUCT,
+				level=1,
+				scaledown=2,
+				channels=(OutputChannelSpec("cos", relative_path="cos.ome.zarr"),),
+				chunk_size=32,
+				pyramid_policy=PYRAMID_POLICY_SCALAR,
+			),
+			normal_product=OutputProductSpec(
+				name=LasagnaCosPredict3DAdapter.NORMAL_PRODUCT,
+				level=2,
+				scaledown=4,
+				channels=(
+					OutputChannelSpec("grad_mag", relative_path="grad_mag.ome.zarr"),
+					OutputChannelSpec("nx", relative_path="nx.ome.zarr"),
+					OutputChannelSpec("ny", relative_path="ny.ome.zarr"),
+				),
+				chunk_size=32,
+				pyramid_policy=PYRAMID_POLICY_CUSTOM,
+			),
+			pred_dt_product=OutputProductSpec(
+				name=LasagnaCosPredict3DAdapter.PRED_DT_PRODUCT,
+				level=1,
+				scaledown=2,
+				channels=(OutputChannelSpec("pred_dt", relative_path="pred_dt.ome.zarr"),),
+				chunk_size=32,
+				pyramid_policy=PYRAMID_POLICY_SCALAR,
+			),
+		)
+
+		self.assertIsInstance(adapter, ModelAdapter)
+		self.assertEqual(
+			[product.name for product in adapter.model_output_products],
+			[
+				LasagnaCosPredict3DAdapter.COS_PRODUCT,
+				LasagnaCosPredict3DAdapter.NORMAL_PRODUCT,
+			],
+		)
+		self.assertEqual(
+			adapter.normal_product.channel_names,
+			("grad_mag", "nx", "ny"),
+		)
+		self.assertEqual(
+			[product.name for product in adapter.derived_output_products],
+			[LasagnaCosPredict3DAdapter.PRED_DT_PRODUCT],
+		)
+
+	def test_lasagna_output_adapter_requires_complete_normal_bundle(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			paths = {
+				name: str(root / f"{name}.ome.zarr")
+				for name in ("grad_mag", "nx", "ny")
+			}
+			for path in paths.values():
+				_create_omezarr(path, (16, 16, 16), 0, 1, 16, "test")
+
+			product = OutputProductSpec(
+				name=LasagnaCosPredict3DAdapter.NORMAL_PRODUCT,
+				level=0,
+				scaledown=1,
+				channels=(
+					OutputChannelSpec("grad_mag", relative_path=paths["grad_mag"]),
+					OutputChannelSpec("nx", relative_path=paths["nx"]),
+					OutputChannelSpec("ny", relative_path=paths["ny"]),
+				),
+				chunk_size=16,
+			)
+			adapter = OmeZarrOutputAdapter(products=(product,), n_levels=1)
+			block = np.ones((16, 16, 16), dtype=np.uint8)
+
+			self.assertIsInstance(adapter, OutputAdapter)
+			self.assertFalse(
+				adapter.product_chunk_complete(product, chunk_origin_zyx=(0, 0, 0))
+			)
+			adapter.write_product_chunk(
+				product,
+				chunk_origin_zyx=(0, 0, 0),
+				data={"grad_mag": block},
+			)
+			self.assertTrue(
+				adapter.channel_chunk_exists(
+					product, "grad_mag", chunk_origin_zyx=(0, 0, 0)
+				)
+			)
+			self.assertFalse(
+				adapter.product_chunk_complete(product, chunk_origin_zyx=(0, 0, 0))
+			)
+			adapter.write_product_chunk(
+				product,
+				chunk_origin_zyx=(0, 0, 0),
+				data={"nx": block, "ny": block},
+			)
+			self.assertTrue(
+				adapter.product_chunk_complete(product, chunk_origin_zyx=(0, 0, 0))
+			)
+
 	def _run_predict3d_until_model_build(
 		self,
 		*,
@@ -132,6 +426,62 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 						ome_chunk=4,
 					)
 
+	def test_predict3d_cli_dispatch_preserves_legacy_args(self):
+		args = [
+			"predict3d",
+			"--input", "in.zarr",
+			"--output", "out.lasagna.json",
+			"--unet-checkpoint", "model.pt",
+			"--tile-size", "64",
+			"--overlap", "8",
+			"--border", "4",
+			"--cos-scaledown", "2",
+			"--scaledown", "4",
+			"--source-to-base", "3.5",
+			"--crop", "1", "2", "3", "4", "5", "6",
+			"--pred-dt", "pred.zarr",
+			"--device", "cpu",
+			"--chunk-z", "16",
+			"--chunk-yx", "24",
+			"--edt-chunk-depth", "40",
+			"--edt-chunk-yx", "48",
+			"--calibrate-norm",
+			"--base-ref", "base.zarr",
+			"--base-scale", "1",
+			"--levels", "3",
+			"--ome-chunk", "32",
+			"--no-download",
+		]
+		with mock.patch("builtins.open", side_effect=PermissionError):
+			with mock.patch("preprocess_cos_omezarr._auto_download") as auto_download:
+				with mock.patch("preprocess_cos_omezarr.run_preprocess_3d") as run:
+					self.assertEqual(cli_main(args), 0)
+
+		auto_download.assert_not_called()
+		run.assert_called_once()
+		kwargs = run.call_args.kwargs
+		self.assertEqual(kwargs["input_path"], "in.zarr")
+		self.assertEqual(kwargs["output_path"], "out.lasagna.json")
+		self.assertEqual(kwargs["unet3d_checkpoint"], "model.pt")
+		self.assertEqual(kwargs["device"], "cpu")
+		self.assertEqual(kwargs["crop_xyzwhd"], (1, 2, 3, 4, 5, 6))
+		self.assertEqual(kwargs["tile_size"], 64)
+		self.assertEqual(kwargs["overlap"], 8)
+		self.assertEqual(kwargs["border"], 4)
+		self.assertEqual(kwargs["cos_scaledown"], 2)
+		self.assertEqual(kwargs["scaledown"], 4)
+		self.assertEqual(kwargs["source_to_base"], 3.5)
+		self.assertEqual(kwargs["pred_dt_path"], "pred.zarr")
+		self.assertEqual(kwargs["chunk_z"], 16)
+		self.assertEqual(kwargs["chunk_yx"], 24)
+		self.assertEqual(kwargs["edt_chunk_depth"], 40)
+		self.assertEqual(kwargs["edt_chunk_yx"], 48)
+		self.assertTrue(kwargs["calibrate_norm"])
+		self.assertEqual(kwargs["base_ref"], "base.zarr")
+		self.assertEqual(kwargs["base_scale"], 1)
+		self.assertEqual(kwargs["n_levels"], 3)
+		self.assertEqual(kwargs["ome_chunk"], 64)
+
 	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
 		progress = {
 			"tiles_total": 100,
@@ -145,49 +495,6 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		}
 
 		self.assertEqual(_predict3d_overall_eta(progress), " | overall eta 02:50")
-
-	def test_predict3d_tile_eta_uses_processed_tiles_not_runtime_skips(self):
-		with tempfile.TemporaryDirectory() as td:
-			root = Path(td)
-			input_path = _write_zarr_array(root / "input.zarr", (8, 8, 8))
-			arr = zarr.open(str(input_path), mode="r")
-			progress = {
-				"finalized_base_z": 0,
-				"finalized_cos_base_z": 0,
-				"finalized_other_base_z": 0,
-				"finalized_base_z_total": 8,
-			}
-			skip_state = {"calls": 0}
-
-			def _is_tile_done(*_args):
-				skip_state["calls"] += 1
-				return skip_state["calls"] <= 3
-
-			times = iter([0, 10, 14, 20, 24, 30, 34, 40, 44, 50, 54, 60])
-			stdout = io.StringIO()
-			with mock.patch("preprocess_cos_omezarr.time.time", side_effect=lambda: next(times)):
-				with mock.patch("sys.stdout", stdout):
-					_infer_tiled_3d(
-						_ConstantPredict3dModel(),
-						arr,
-						crop_slices=(0, 8, 0, 8, 0, 8),
-						device=torch.device("cpu"),
-						tile_size=4,
-						overlap=0,
-						border=0,
-						cos_scaledown=1,
-						other_scaledown=1,
-						tmp_dir=str(root),
-						output_sigmoid=False,
-						on_z_complete=lambda *_args: None,
-						progress=progress,
-						is_tile_done=_is_tile_done,
-					)
-
-			out = stdout.getvalue()
-			self.assertIn("4/8 tiles", out)
-			self.assertIn("eta 00:16 avg=4000ms/tile", out)
-			self.assertIn("final_z=0/8", out)
 
 	def test_predict3d_status_reports_finalized_z_after_band_flush(self):
 		with tempfile.TemporaryDirectory() as td:
@@ -204,25 +511,24 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					"build_model",
 					return_value=(_ConstantPredict3dModel(), None, None, False),
 				):
-					with mock.patch("preprocess_cos_omezarr._build_omezarr_pyramid"):
-						with mock.patch("preprocess_cos_omezarr.build_normal_omezarr_pyramid"):
-							with mock.patch("sys.stdout", stdout):
-								run_preprocess_3d(
-									input_path=str(input_path),
-									output_path=str(output_path),
-									unet3d_checkpoint=str(root / "missing_model.pt"),
-									device="cpu",
-									crop_xyzwhd=None,
-									tile_size=4,
-									overlap=0,
-									border=0,
-									cos_scaledown=1,
-									scaledown=1,
-									source_to_base=1.0,
-									base_ref=str(input_path),
-									n_levels=2,
-									ome_chunk=4,
-								)
+					with mock.patch("preprocess_cos_omezarr.build_product_omezarr_pyramids"):
+						with mock.patch("sys.stdout", stdout):
+							run_preprocess_3d(
+								input_path=str(input_path),
+								output_path=str(output_path),
+								unet3d_checkpoint=str(root / "missing_model.pt"),
+								device="cpu",
+								crop_xyzwhd=None,
+								tile_size=4,
+								overlap=0,
+								border=0,
+								cos_scaledown=1,
+								scaledown=1,
+								source_to_base=1.0,
+								base_ref=str(input_path),
+								n_levels=2,
+								ome_chunk=4,
+							)
 
 			out = stdout.getvalue()
 			self.assertIn(
@@ -281,8 +587,8 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			def _invalidate(*_args, **_kwargs):
 				events.append("invalidate")
 
-			with mock.patch("preprocess_cos_omezarr.os.replace", side_effect=_replace):
-				with mock.patch("preprocess_cos_omezarr._invalidate_pyramid_chunks", side_effect=_invalidate):
+			with mock.patch(f"{_atomic_zarr_write.__module__}.os.replace", side_effect=_replace):
+				with mock.patch(f"{_atomic_zarr_write.__module__}._invalidate_pyramid_chunks", side_effect=_invalidate):
 					_atomic_zarr_write(path, 0, 0, 0, 0, 16, 16, 16, block, 16, n_levels=2)
 
 			self.assertEqual(events[:2], ["invalidate", "replace"])
@@ -468,7 +774,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 	def test_rolling_z_band_discards_without_cross_channel_release(self):
 		with tempfile.TemporaryDirectory() as td:
-			band = _RollingZBand(
+			band = _CircularZBand(
 				name="test", channel_count=2, z_size=4, y_size=2, x_size=2,
 				tmp_dir=td, prefix="unit_",
 			)
@@ -482,7 +788,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 	def test_rolling_z_band_sparse_ranges_read_as_zero(self):
 		with tempfile.TemporaryDirectory() as td:
-			band = _RollingZBand(
+			band = _CircularZBand(
 				name="test", channel_count=1, z_size=6, y_size=2, x_size=2,
 				tmp_dir=td, prefix="unit_",
 			)
@@ -512,27 +818,89 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			)
 			band.cleanup()
 
-	def test_rolling_z_band_discard_releases_and_rejects_revisit(self):
+	def test_circular_z_band_wraps_and_rejects_unflushed_overwrite(self):
 		with tempfile.TemporaryDirectory() as td:
-			band = _RollingZBand(
-				name="test", channel_count=1, z_size=6, y_size=2, x_size=2,
-				tmp_dir=td, prefix="unit_",
+			band = _CircularZBand(
+				name="test", channel_count=1, z_size=12, y_size=2, x_size=2,
+				tmp_dir=td, prefix="unit_", ring_depth=4,
 			)
-			band.add(0, 4, 6, 0, 2, 0, 2, np.full((2, 2, 2), 9, dtype=np.float32))
-			with mock.patch("preprocess_cos_omezarr._release_memmap_pages") as release:
-				band.discard_before(4)
-			release.assert_called_once()
-			self.assertEqual((release.call_args.args[1], release.call_args.args[2]), (0, 4))
-			self.assertEqual(band.origin_z, 4)
+			band.add(0, 0, 4, 0, 2, 0, 2, np.full((4, 2, 2), 9, dtype=np.float32))
+			with self.assertRaises(ValueError):
+				band.add(0, 4, 5, 0, 2, 0, 2, np.ones((1, 2, 2), dtype=np.float32))
+			band.clear(0, 2, 0, 2, 0, 2)
+			band.discard_before(2)
+			band.add(0, 4, 6, 0, 2, 0, 2, np.full((2, 2, 2), 7, dtype=np.float32))
 			np.testing.assert_array_equal(
-				band.view(0, 4, 6),
-				np.full((2, 2, 2), 9, dtype=np.float32),
+				band.read(0, 4, 6, 0, 2, 0, 2),
+				np.full((2, 2, 2), 7, dtype=np.float32),
 			)
 			with self.assertRaises(ValueError):
-				band.view(0, 3, 4)
-			with self.assertRaises(ValueError):
-				band.add(0, 3, 4, 0, 2, 0, 2, np.ones((1, 2, 2), dtype=np.float32))
+				band.read(0, 0, 1, 0, 2, 0, 2)
+			paths = list(Path(td).glob(".predict3d_*.tmp"))
+			self.assertEqual(len(paths), 1)
+			self.assertEqual(paths[0].stat().st_size, 4 * 2 * 2 * 4)
 			band.cleanup()
+
+	def test_circular_depth_is_independent_of_full_output_z(self):
+		kwargs = dict(
+			z_positions=(0, 192, 384, 576), tile_size=256, scaledown=1,
+			chunk_size=32, output_begin=32, output_end=800,
+		)
+		self.assertEqual(
+			_plan_circular_z_depth(z_size=832, **kwargs),
+			_plan_circular_z_depth(z_size=8_000_032, **kwargs),
+		)
+
+	def test_shared_runner_infers_multiscale_products_once_per_tile(self):
+		fine = OutputProductSpec(
+			name="fine", level=0, scaledown=1, inference_scaledown=1,
+			channels=("fine",), chunk_size=2,
+		)
+		coarse = OutputProductSpec(
+			name="coarse", level=1, scaledown=2, inference_scaledown=2,
+			channels=("coarse",), chunk_size=2,
+		)
+
+		class Adapter:
+			calls = 0
+
+			def run_tile_inference(self, model, tile, *, device):
+				self.calls += 1
+				return tile
+
+			def product_tensors_from_output(self, output):
+				return {"fine": output, "coarse": output}
+
+			def finalize_product_slab(self, product, raw):
+				return {product.channels[0].name: raw[0]}
+
+		class Output:
+			def __init__(self):
+				self.complete = set()
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return (product.name, chunk_origin_zyx) in self.complete
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.complete.add((product.name, chunk_origin_zyx))
+				self.assert_data = data
+
+		adapter = Adapter()
+		output = Output()
+		with tempfile.TemporaryDirectory() as td:
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				run_tiled_inference_3d(
+					object(), np.ones((8, 8, 8), dtype=np.uint8),
+					crop_slices=(0, 8, 0, 8, 0, 8), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=output,
+					products=(fine, coarse),
+					output_regions_zyx={"fine": (0, 0, 0, 8, 8, 8), "coarse": (0, 0, 0, 4, 4, 4)},
+					full_output_shapes_zyx={"fine": (8, 8, 8), "coarse": (4, 4, 4)},
+					tile_size=4, overlap=0, border=0, tmp_dir=td,
+				)
+		self.assertEqual(adapter.calls, 8)
+		self.assertEqual(len([key for key in output.complete if key[0] == "fine"]), 64)
+		self.assertEqual(len([key for key in output.complete if key[0] == "coarse"]), 8)
 
 	def test_predict3d_sparse_skipped_z_prefix_flushes_later_suffix(self):
 		with tempfile.TemporaryDirectory() as td:
@@ -551,25 +919,24 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					"build_model",
 					return_value=(_OnesPredict3dModel(), None, None, False),
 				):
-					with mock.patch("preprocess_cos_omezarr._build_omezarr_pyramid"):
-						with mock.patch("preprocess_cos_omezarr.build_normal_omezarr_pyramid"):
-							with mock.patch("sys.stdout", stdout):
-								run_preprocess_3d(
-									input_path=str(input_path),
-									output_path=str(output_path),
-									unet3d_checkpoint=str(root / "missing_model.pt"),
-									device="cpu",
-									crop_xyzwhd=None,
-									tile_size=4,
-									overlap=0,
-									border=0,
-									cos_scaledown=1,
-									scaledown=1,
-									source_to_base=1.0,
-									base_ref=str(input_path),
-									n_levels=2,
-									ome_chunk=4,
-								)
+					with mock.patch("preprocess_cos_omezarr.build_product_omezarr_pyramids"):
+						with mock.patch("sys.stdout", stdout):
+							run_preprocess_3d(
+								input_path=str(input_path),
+								output_path=str(output_path),
+								unet3d_checkpoint=str(root / "missing_model.pt"),
+								device="cpu",
+								crop_xyzwhd=None,
+								tile_size=4,
+								overlap=0,
+								border=0,
+								cos_scaledown=1,
+								scaledown=1,
+								source_to_base=1.0,
+								base_ref=str(input_path),
+								n_levels=2,
+								ome_chunk=4,
+							)
 
 			cos_path = str(root / "vol_cos.ome.zarr")
 			gm_path = str(root / "vol_grad_mag.ome.zarr")
@@ -583,6 +950,48 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			out = stdout.getvalue()
 			self.assertIn("final_z=4/8", out)
 			self.assertIn("final_z=8/8", out)
+
+	def test_shared_runner_does_not_clear_or_write_unsupported_xy_chunks(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		adapter = _IdentityProductAdapter(product)
+
+		class Output:
+			def __init__(self):
+				self.written = []
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.written.append(chunk_origin_zyx)
+
+		output = Output()
+		clear_calls = []
+		original_clear = _CircularZBand.clear
+
+		def spy_clear(band, *args):
+			clear_calls.append((band.name, args))
+			return original_clear(band, *args)
+
+		with tempfile.TemporaryDirectory() as td:
+			input_path = Path(td) / "input.zarr"
+			arr = zarr.open(str(input_path), mode="w", shape=(4, 8, 8), chunks=(4, 4, 4), dtype="uint8")
+			arr[0:4, 0:4, 0:4] = 1
+			with mock.patch.object(_CircularZBand, "clear", new=spy_clear):
+				run_tiled_inference_3d(
+					object(), zarr.open(str(input_path), mode="r"),
+					crop_slices=(0, 4, 0, 8, 0, 8), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=output, products=(product,),
+					output_regions_zyx={"identity": (0, 0, 0, 4, 8, 8)},
+					full_output_shapes_zyx={"identity": (4, 8, 8)},
+					input_zarr_path=str(input_path), tile_size=4, overlap=0, border=0,
+					tmp_dir=td,
+				)
+		self.assertEqual(output.written, [(0, 0, 0)])
+		self.assertEqual([name for name, _ in clear_calls], ["acc_identity", "weight_sd1"])
 
 	def test_canonical_tile_positions_do_not_shift_with_crop_origin(self):
 		kwargs = {
@@ -618,6 +1027,86 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		)
 		self.assertEqual(a, b)
 		self.assertIn(96, a)
+
+	def test_shared_product_runner_is_crop_composable_and_resumable(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = root / "input.zarr"
+			arr = zarr.open(
+				str(input_path),
+				mode="w",
+				shape=(16, 16, 16),
+				chunks=(4, 4, 4),
+				dtype=np.uint8,
+			)
+			zz, yy, xx = np.indices((16, 16, 16), dtype=np.int32)
+			arr[:] = ((zz * 17 + yy * 5 + xx * 3) % 251).astype(np.uint8)
+
+			def _run_product_crop(
+				output_root: Path,
+				*,
+				crop_slices: tuple[int, int, int, int, int, int],
+				output_region_zyx: tuple[int, int, int, int, int, int],
+				adapter_cls=_IdentityProductAdapter,
+			):
+				channel_path = output_root / "identity.ome.zarr"
+				product = OutputProductSpec(
+					name="identity",
+					level=0,
+					scaledown=1,
+					channels=(
+						OutputChannelSpec("value", relative_path=str(channel_path)),
+					),
+					chunk_size=4,
+				)
+				if not channel_path.exists():
+					_create_omezarr(str(channel_path), (16, 16, 16), 0, 1, 4, "value")
+				model_adapter = adapter_cls(product)
+				output_adapter = OmeZarrOutputAdapter(products=(product,), n_levels=1)
+				run_tiled_inference_3d(
+					model_adapter.load_model(device=torch.device("cpu")),
+					zarr.open(str(input_path), mode="r"),
+					crop_slices=crop_slices,
+					device=torch.device("cpu"),
+					model_adapter=model_adapter,
+					output_adapter=output_adapter,
+					products=model_adapter.output_products,
+					output_regions_zyx={product.name: output_region_zyx},
+					full_output_shapes_zyx={product.name: (16, 16, 16)},
+					input_zarr_path=str(input_path),
+					tile_size=8,
+					overlap=4,
+					border=0,
+					tmp_dir=str(root),
+					temp_prefix=f"{output_root.name}_",
+				)
+				return model_adapter, zarr.open(str(channel_path / "0"), mode="r")
+
+			full_adapter, full_arr = _run_product_crop(
+				root / "out_full",
+				crop_slices=(0, 16, 0, 16, 0, 16),
+				output_region_zyx=(0, 0, 0, 16, 16, 16),
+			)
+			crop_adapter, crop_arr = _run_product_crop(
+				root / "out_crop",
+				crop_slices=(4, 12, 4, 12, 4, 12),
+				output_region_zyx=(4, 4, 4, 12, 12, 12),
+			)
+
+			self.assertGreater(full_adapter.calls, 0)
+			self.assertGreater(crop_adapter.calls, 0)
+			np.testing.assert_array_equal(
+				np.asarray(full_arr[4:8, 4:8, 4:8]),
+				np.asarray(crop_arr[4:8, 4:8, 4:8]),
+			)
+
+			resume_adapter, _ = _run_product_crop(
+				root / "out_full",
+				crop_slices=(0, 16, 0, 16, 0, 16),
+				output_region_zyx=(0, 0, 0, 16, 16, 16),
+				adapter_cls=_RaisingProductAdapter,
+			)
+			self.assertEqual(resume_adapter.calls, 0)
 
 	def test_predict3d_early_manifest_removes_stale_pred_dt_and_preserves_metadata(self):
 		with tempfile.TemporaryDirectory() as td:

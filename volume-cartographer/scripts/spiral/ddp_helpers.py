@@ -81,7 +81,7 @@ def allreduce_grads_(params):
         p.grad.div_(world_size)
 
 
-def split_counts_across_ranks(config, count_keys, split_key='distributed_split_batch'):
+def split_counts_across_ranks(config, count_keys, split_key='optimizer_distributed_split_batch'):
     world_size = get_world_size()
     if world_size == 1 or not config[split_key]:
         return 1

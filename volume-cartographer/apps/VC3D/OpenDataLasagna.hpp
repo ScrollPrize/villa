@@ -8,6 +8,7 @@
 #include <vector>
 
 class VolumePkg;
+namespace vc::project { struct Entry; }
 
 namespace vc3d::opendata {
 
@@ -35,11 +36,17 @@ struct OpenDataLasagnaInfo {
 
 struct ResolvedOpenDataLasagna {
     std::filesystem::path manifestPath;
+    std::string sourceManifestLocation;
     double workingToBaseScale = 1.0;
     std::string coordinateSpace;
     std::string artifactUrl;
     bool manifestBacked = false;
 };
+
+// Returns the public manifest URL for a catalogue-backed entry and the stored
+// project location for an ordinary entry.
+[[nodiscard]] std::string lasagnaSourceManifestLocation(
+    const vc::project::Entry& entry);
 
 [[nodiscard]] std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
     const std::string& sampleId,

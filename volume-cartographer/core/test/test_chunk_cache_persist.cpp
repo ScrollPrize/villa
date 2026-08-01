@@ -165,24 +165,22 @@ TEST_CASE("Missing chunk with persistent cache writes an .empty marker")
         auto c = makeCache(f, persist);
         auto r = waitForResolved(*c, 0, 0, 0, 0);
         CHECK(r.status == ChunkStatus::Missing);
-        (void)waitForStats(*c, [](const ChunkCache::Stats& s) {
-            return !s.persistentCacheScanInFlight && s.persistentCacheBytes >= 1;
-        });
+        c->waitForPersistentWrites();
     }
-    // After cache destruction, the persistent dir should contain an .empty
-    // file somewhere under level_0/.
+    // After cache destruction, the persistent dir should contain a zero-byte
+    // .empty file somewhere under level_0/.
     bool foundEmpty = false;
+    fs::path emptyPath;
     for (auto it = fs::recursive_directory_iterator(persist);
          it != fs::recursive_directory_iterator(); ++it) {
         if (it->path().extension() == ".empty") {
             foundEmpty = true;
+            emptyPath = it->path();
             break;
         }
     }
-    // The write happens async after Missing resolves; tolerate it not being
-    // present yet — just check the directory exists.
-    (void)foundEmpty;
-    CHECK(fs::exists(persist));
+    REQUIRE(foundEmpty);
+    CHECK(fs::file_size(emptyPath) == 0);
     fs::remove_all(persist);
 }
 
@@ -194,7 +192,6 @@ TEST_CASE("Reopen cache: persistent .empty marker short-circuits to Missing")
     fs::create_directories(target);
     {
         std::ofstream f(target / "0.empty");
-        f << "\n";
     }
 
     auto f = std::make_shared<CountingFetcher>();

@@ -7,6 +7,7 @@
 #include <opencv2/calib3d.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <random>
 
 //somehow opencvs functions are pretty slow
@@ -61,6 +62,9 @@ cv::Vec3f grid_normal_int(const cv::Mat_<cv::Vec3f> &points, int row, int col)
 cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc)
 {
     const cv::Vec3f qnan(NAN, NAN, NAN);
+    if (points.rows < 4 || points.cols < 4)
+        return qnan;
+
     // loc is (x, y) in grid coords; rows=y, cols=x.
     float fx = loc[0], fy = loc[1];
     // Clamp to [1, cols-3] x [1, rows-3] so +/-1 neighbors + bilinear cell fit.
@@ -126,14 +130,18 @@ static E at_int_impl(const cv::Mat_<E> &points, const cv::Vec2f& p)
 template<typename T, int C>
 static bool loc_valid_impl(const cv::Mat_<cv::Vec<T,C>> &m, const cv::Vec2d &l)
 {
-    if (l[0] == -1)
+    if (m.rows < 2 || m.cols < 2 ||
+        !std::isfinite(l[0]) || !std::isfinite(l[1]))
         return false;
 
-    cv::Rect bounds = {0, 0, m.rows-2,m.cols-2};
-    cv::Vec2i li = {static_cast<int>(floor(l[0])), static_cast<int>(floor(l[1]))};
-
-    if (!bounds.contains(cv::Point(li)))
+    if (l[0] < 0.0 || l[0] >= static_cast<double>(m.rows - 1) ||
+        l[1] < 0.0 || l[1] >= static_cast<double>(m.cols - 1))
         return false;
+
+    cv::Vec2i li = {
+        static_cast<int>(std::floor(l[0])),
+        static_cast<int>(std::floor(l[1]))
+    };
 
     if (m(li[0],li[1])[0] == -1)
         return false;
@@ -148,14 +156,18 @@ static bool loc_valid_impl(const cv::Mat_<cv::Vec<T,C>> &m, const cv::Vec2d &l)
 
 static bool loc_valid_scalar(const cv::Mat_<float> &m, const cv::Vec2d &l)
 {
-    if (l[0] == -1)
+    if (m.rows < 2 || m.cols < 2 ||
+        !std::isfinite(l[0]) || !std::isfinite(l[1]))
         return false;
 
-    cv::Rect bounds = {0, 0, m.rows-2,m.cols-2};
-    cv::Vec2i li = {static_cast<int>(floor(l[0])), static_cast<int>(floor(l[1]))};
-
-    if (!bounds.contains(cv::Point(li)))
+    if (l[0] < 0.0 || l[0] >= static_cast<double>(m.rows - 1) ||
+        l[1] < 0.0 || l[1] >= static_cast<double>(m.cols - 1))
         return false;
+
+    cv::Vec2i li = {
+        static_cast<int>(std::floor(l[0])),
+        static_cast<int>(std::floor(l[1]))
+    };
 
     if (m(li[0],li[1]) == -1)
         return false;

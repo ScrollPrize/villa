@@ -101,21 +101,18 @@ struct WalkIndex {
     std::vector<int32_t> partners;
     std::vector<int32_t> self_local;
     std::vector<int32_t> partner_local;
+    std::vector<double> positions;
     std::vector<int32_t> reciprocal;
-    std::vector<int32_t> component;
-    std::vector<uint8_t> eligible;
     std::vector<int32_t> track_lengths;
-    bool loop_consistency = false;
-    uint64_t cyclic_components = 0;
 
     size_t track_count() const { return track_lengths.size(); }
     size_t crossing_count() const { return partners.size(); }
     size_t memory_bytes() const {
         return offsets.capacity() * sizeof(int64_t)
             + (partners.capacity() + self_local.capacity()
-               + partner_local.capacity() + component.capacity()
-               + reciprocal.capacity() + track_lengths.capacity()) * sizeof(int32_t)
-            + eligible.capacity() * sizeof(uint8_t);
+               + partner_local.capacity() + reciprocal.capacity()
+               + track_lengths.capacity()) * sizeof(int32_t)
+            + positions.capacity() * sizeof(double);
     }
 };
 
@@ -1543,8 +1540,8 @@ CrossingKey canonical_crossing(
 
 WalkIndex* prepare_walk_index(
     Int64Vector offsets, Int32Vector partners, Int32Vector self_local,
-    Int32Vector partner_local, Int32Vector track_lengths,
-    bool require_loop_consistency)
+    Int32Vector partner_local, Float64Vector positions,
+    Int32Vector track_lengths)
 {
     const size_t tracks = track_lengths.shape(0);
     if (offsets.shape(0) != tracks + 1 || offsets(0) != 0)
@@ -1552,7 +1549,8 @@ WalkIndex* prepare_walk_index(
     const int64_t records64 = offsets(tracks);
     if (records64 < 0 || partners.shape(0) != static_cast<size_t>(records64)
         || self_local.shape(0) != static_cast<size_t>(records64)
-        || partner_local.shape(0) != static_cast<size_t>(records64))
+        || partner_local.shape(0) != static_cast<size_t>(records64)
+        || positions.shape(0) != static_cast<size_t>(records64))
         throw std::runtime_error("walk crossing arrays are not parallel");
     const size_t records = static_cast<size_t>(records64);
 
@@ -1562,12 +1560,11 @@ WalkIndex* prepare_walk_index(
     index->self_local.assign(self_local.data(), self_local.data() + records);
     index->partner_local.assign(
         partner_local.data(), partner_local.data() + records);
+    index->positions.assign(
+        positions.data(), positions.data() + records);
     index->track_lengths.assign(
         track_lengths.data(), track_lengths.data() + tracks);
     index->reciprocal.assign(records, -1);
-    index->component.assign(records, -1);
-    index->eligible.assign(records, require_loop_consistency ? 0 : 1);
-    index->loop_consistency = require_loop_consistency;
 
     std::unordered_map<CrossingKey, int32_t, CrossingKeyHash> vertex_by_key;
     vertex_by_key.reserve(records / 2 + 1);
@@ -1599,137 +1596,30 @@ WalkIndex* prepare_walk_index(
         index->reciprocal[members[1]] = members[0];
     }
 
-    if (!require_loop_consistency)
-        return index.release();
-
-    struct RailHalf { int32_t to, edge; };
-    std::vector<std::vector<RailHalf>> graph(vertex_records.size());
-    int32_t edge_count = 0;
-    std::vector<int32_t> ordered;
-    for (size_t track = 0; track < tracks; ++track) {
-        ordered.clear();
-        for (int64_t record = index->offsets[track];
-             record < index->offsets[track + 1]; ++record)
-            ordered.push_back(static_cast<int32_t>(record));
-        std::sort(ordered.begin(), ordered.end(), [&](int32_t a, int32_t b) {
-            return std::tie(index->self_local[a], index->partners[a])
-                 < std::tie(index->self_local[b], index->partners[b]);
-        });
-        for (size_t slot = 1; slot < ordered.size(); ++slot) {
-            const int32_t a = record_vertex[ordered[slot - 1]];
-            const int32_t b = record_vertex[ordered[slot]];
-            if (a == b)
-                continue;
-            graph[a].push_back({b, edge_count});
-            graph[b].push_back({a, edge_count});
-            ++edge_count;
-        }
-    }
-
-    // Iterative Tarjan traversal: this avoids one native stack frame per
-    // crossing on the very large production cache.
-    const int32_t vertices = static_cast<int32_t>(graph.size());
-    std::vector<int32_t> discovery(vertices, -1), low(vertices), parent(vertices, -1);
-    std::vector<int32_t> parent_edge(vertices, -1), cursor(vertices, 0);
-    std::vector<uint8_t> bridge(static_cast<size_t>(edge_count), 0);
-    std::vector<int32_t> stack;
-    int32_t clock = 0;
-    for (int32_t root = 0; root < vertices; ++root) {
-        if (discovery[root] >= 0)
-            continue;
-        discovery[root] = low[root] = clock++;
-        stack.push_back(root);
-        while (!stack.empty()) {
-            const int32_t vertex = stack.back();
-            if (cursor[vertex] < static_cast<int32_t>(graph[vertex].size())) {
-                const RailHalf half = graph[vertex][cursor[vertex]++];
-                if (half.edge == parent_edge[vertex])
-                    continue;
-                if (discovery[half.to] < 0) {
-                    parent[half.to] = vertex;
-                    parent_edge[half.to] = half.edge;
-                    discovery[half.to] = low[half.to] = clock++;
-                    stack.push_back(half.to);
-                } else {
-                    low[vertex] = std::min(low[vertex], discovery[half.to]);
-                }
-                continue;
-            }
-            stack.pop_back();
-            if (parent[vertex] >= 0) {
-                const int32_t up = parent[vertex];
-                low[up] = std::min(low[up], low[vertex]);
-                if (low[vertex] > discovery[up])
-                    bridge[parent_edge[vertex]] = 1;
-            }
-        }
-    }
-
-    std::vector<int32_t> vertex_component(vertices, -1);
-    std::vector<uint8_t> cyclic;
-    for (int32_t root = 0; root < vertices; ++root) {
-        if (vertex_component[root] >= 0)
-            continue;
-        const int32_t component = static_cast<int32_t>(cyclic.size());
-        int64_t component_vertices = 0;
-        int64_t half_edges = 0;
-        vertex_component[root] = component;
-        stack.push_back(root);
-        while (!stack.empty()) {
-            const int32_t vertex = stack.back();
-            stack.pop_back();
-            ++component_vertices;
-            for (const RailHalf half : graph[vertex]) {
-                if (bridge[half.edge])
-                    continue;
-                ++half_edges;
-                if (vertex_component[half.to] < 0) {
-                    vertex_component[half.to] = component;
-                    stack.push_back(half.to);
-                }
-            }
-        }
-        cyclic.push_back(
-            component_vertices > 1 && half_edges / 2 >= component_vertices);
-    }
-    index->cyclic_components = std::accumulate(
-        cyclic.begin(), cyclic.end(), uint64_t{0});
-    for (size_t record = 0; record < records; ++record) {
-        const int32_t component = vertex_component[record_vertex[record]];
-        index->component[record] = component;
-        index->eligible[record] = cyclic[component];
-    }
     return index.release();
 }
 
 nb::dict walk_index_stats(const WalkIndex& index)
 {
-    uint64_t eligible_records = std::accumulate(
-        index.eligible.begin(), index.eligible.end(), uint64_t{0});
     uint64_t eligible_tracks = 0;
     for (size_t track = 0; track < index.track_count(); ++track) {
-        bool any = false;
-        for (int64_t record = index.offsets[track];
-             record < index.offsets[track + 1]; ++record)
-            any = any || index.eligible[record];
-        eligible_tracks += any;
+        eligible_tracks += index.offsets[track + 1] > index.offsets[track];
     }
     nb::dict result;
     result["tracks"] = index.track_count();
     result["directed_crossings"] = index.crossing_count();
     result["eligible_tracks"] = eligible_tracks;
-    result["eligible_directed_crossings"] = eligible_records;
-    result["cyclic_components"] = index.cyclic_components;
+    result["eligible_directed_crossings"] = index.crossing_count();
     result["memory_bytes"] = index.memory_bytes();
-    result["loop_consistency"] = index.loop_consistency;
+    result["root_return_gate"] = true;
     return result;
 }
 
 WalkIndex* prepare_cached_walk_index(
     UInt64Vector cached_source_ids, Int64Vector cached_offsets,
     Int32Vector cached_partners, Int32Vector cached_self_local,
-    Int32Vector cached_partner_local, UInt64Vector selected_source_ids,
-    Int32Vector track_lengths, bool require_loop_consistency)
+    Int32Vector cached_partner_local, Float64Vector cached_positions,
+    UInt64Vector selected_source_ids, Int32Vector track_lengths)
 {
     const size_t cached_tracks = cached_source_ids.shape(0);
     const size_t selected_tracks = selected_source_ids.shape(0);
@@ -1741,7 +1631,8 @@ WalkIndex* prepare_cached_walk_index(
     if (cached_records < 0
         || cached_partners.shape(0) != static_cast<size_t>(cached_records)
         || cached_self_local.shape(0) != static_cast<size_t>(cached_records)
-        || cached_partner_local.shape(0) != static_cast<size_t>(cached_records))
+        || cached_partner_local.shape(0) != static_cast<size_t>(cached_records)
+        || cached_positions.shape(0) != static_cast<size_t>(cached_records))
         throw std::runtime_error("cached walk crossing arrays are not parallel");
 
     std::vector<int32_t> selected_rows(selected_tracks);
@@ -1760,6 +1651,7 @@ WalkIndex* prepare_cached_walk_index(
     }
     std::vector<int64_t> offsets(selected_tracks + 1, 0);
     std::vector<int32_t> partners, self_local, partner_local;
+    std::vector<double> positions;
     for (size_t local = 0; local < selected_tracks; ++local) {
         const int32_t row = selected_rows[local];
         for (int64_t record = cached_offsets(row);
@@ -1774,6 +1666,7 @@ WalkIndex* prepare_cached_walk_index(
             partners.push_back(partner);
             self_local.push_back(cached_self_local(record));
             partner_local.push_back(cached_partner_local(record));
+            positions.push_back(cached_positions(record));
         }
         offsets[local + 1] = static_cast<int64_t>(partners.size());
     }
@@ -1782,9 +1675,10 @@ WalkIndex* prepare_cached_walk_index(
     Int32Vector self_view(self_local.data(), {self_local.size()});
     Int32Vector partner_local_view(
         partner_local.data(), {partner_local.size()});
+    Float64Vector position_view(positions.data(), {positions.size()});
     return prepare_walk_index(
         offset_view, partner_view, self_view, partner_local_view,
-        track_lengths, require_loop_consistency);
+        position_view, track_lengths);
 }
 
 nb::dict walk_index_crossings(const WalkIndex& index)
@@ -1798,29 +1692,152 @@ nb::dict walk_index_crossings(const WalkIndex& index)
         std::vector<int32_t>(index.self_local.begin(), index.self_local.end()));
     result["partner_local"] = own_1d(std::vector<int32_t>(
         index.partner_local.begin(), index.partner_local.end()));
+    result["positions"] = own_1d(std::vector<double>(
+        index.positions.begin(), index.positions.end()));
     return result;
 }
 
+struct RootNeighbors {
+    RootNeighbors(const WalkIndex& index, int32_t root)
+    {
+        const int64_t begin = index.offsets[root];
+        const int64_t end = index.offsets[root + 1];
+        if (begin == end)
+            return;
+        source_begin = index.partners.data() + begin;
+        source_end = index.partners.data() + end;
+        source_sorted = std::is_sorted(source_begin, source_end);
+        for (const int32_t* neighbor = source_begin;
+             neighbor != source_end; ++neighbor)
+            filter |= uint64_t{1} << filter_slot(*neighbor);
+        if (!source_sorted) {
+            sorted.assign(source_begin, source_end);
+            std::sort(sorted.begin(), sorted.end());
+        }
+    }
+
+    bool contains(int32_t track) const
+    {
+        if (!(filter & (uint64_t{1} << filter_slot(track))))
+            return false;
+        if (source_sorted)
+            return std::binary_search(source_begin, source_end, track);
+        return std::binary_search(sorted.begin(), sorted.end(), track);
+    }
+
+    static uint32_t filter_slot(int32_t track)
+    {
+        return (static_cast<uint32_t>(track) * UINT32_C(0x9e3779b1)) >> 26;
+    }
+
+    const int32_t* source_begin = nullptr;
+    const int32_t* source_end = nullptr;
+    bool source_sorted = true;
+    uint64_t filter = 0;
+    std::vector<int32_t> sorted;
+};
+
+bool bounded_path_to_root(
+    const WalkIndex& index, int32_t current, int remaining_edges,
+    const RootNeighbors& root_neighbors, std::vector<int32_t>& forbidden)
+{
+    // Every successful bounded search ends with an edge onto the root.
+    // Resolve that final, most frequently tested edge from the root's small
+    // sorted neighbor set instead of rescanning each frontier track.
+    if (root_neighbors.contains(current))
+        return true;
+    if (remaining_edges <= 1)
+        return false;
+    if (remaining_edges == 2) {
+        for (int64_t record = index.offsets[current];
+             record < index.offsets[current + 1]; ++record) {
+            const int32_t next = index.partners[record];
+            if (std::find(forbidden.begin(), forbidden.end(), next)
+                    == forbidden.end()
+                && root_neighbors.contains(next))
+                return true;
+        }
+        return false;
+    }
+    for (int64_t record = index.offsets[current];
+         record < index.offsets[current + 1]; ++record) {
+        const int32_t next = index.partners[record];
+        if (std::find(forbidden.begin(), forbidden.end(), next)
+            != forbidden.end())
+            continue;
+        forbidden.push_back(next);
+        const bool found = bounded_path_to_root(
+            index, next, remaining_edges - 1, root_neighbors, forbidden);
+        forbidden.pop_back();
+        if (found)
+            return true;
+    }
+    return false;
+}
+
+bool transition_can_return_to_root(
+    const WalkIndex& index, int32_t current, int32_t record,
+    int32_t root, int remaining_new_tracks,
+    double minimum_candidate_travel,
+    const std::vector<int32_t>& visited,
+    const RootNeighbors& root_neighbors)
+{
+    const int32_t candidate = index.partners[record];
+    if (std::find(visited.begin(), visited.end(), candidate) != visited.end())
+        return false;
+    const int32_t reciprocal = index.reciprocal[record];
+    if (reciprocal < 0)
+        return false;
+    const double entry_position = index.positions[reciprocal];
+    std::vector<int32_t> forbidden = visited;
+    forbidden.push_back(candidate);
+    for (int64_t exit = index.offsets[candidate];
+         exit < index.offsets[candidate + 1]; ++exit) {
+        const int32_t exit_partner = index.partners[exit];
+        if (exit_partner == current)
+            continue;
+        if (std::abs(index.positions[exit] - entry_position)
+            < minimum_candidate_travel)
+            continue;
+        if (exit_partner == root)
+            return true;
+        if (remaining_new_tracks <= 0
+            || std::find(forbidden.begin(), forbidden.end(), exit_partner)
+                != forbidden.end())
+            continue;
+        forbidden.push_back(exit_partner);
+        const bool found = bounded_path_to_root(
+            index, exit_partner, remaining_new_tracks,
+            root_neighbors, forbidden);
+        forbidden.pop_back();
+        if (found)
+            return true;
+    }
+    return false;
+}
+
 bool draw_walk(
-    const WalkIndex& index, int32_t primary, int target_points, int hops,
-    int minimum_steps, int maximum_steps, uint64_t seed,
-    int32_t* output_tracks, int32_t* output_records)
+    const WalkIndex& index, int32_t primary, int target_points,
+    int minimum_hops, int maximum_hops, int minimum_steps,
+    int maximum_steps, double minimum_candidate_travel, uint64_t seed,
+    int32_t* output_tracks, int32_t* output_records, int32_t& output_hops)
 {
     if (primary < 0 || static_cast<size_t>(primary) >= index.track_count())
         return false;
     std::mt19937_64 random(seed);
     std::vector<int32_t> visited;
-    visited.reserve(static_cast<size_t>(hops) + 1);
+    visited.reserve(static_cast<size_t>(maximum_hops) + 1);
     visited.push_back(primary);
+    const RootNeighbors root_neighbors(index, primary);
     output_tracks[0] = primary;
     int32_t current = primary;
     int32_t current_local = -1;
-    int32_t starting_component = -1;
-
-    for (int hop = 0; hop < hops; ++hop) {
-        std::vector<int32_t> candidates;
+    double current_entry_position = 0.0;
+    int completed_hops = 0;
+    for (int hop = 0; hop < maximum_hops; ++hop) {
         const int64_t begin = index.offsets[current];
         const int64_t end = index.offsets[current + 1];
+        int32_t record = -1;
         if (hop == 0) {
             const int points = std::max(1, target_points);
             std::uniform_int_distribution<int> target_draw(0, points - 1);
@@ -1828,116 +1845,163 @@ bool draw_walk(
             const int32_t target = points == 1 ? 0 : static_cast<int32_t>(
                 std::llround(static_cast<double>(target_slot)
                     * (index.track_lengths[current] - 1) / (points - 1)));
-            int32_t best = -1;
-            int64_t best_distance = std::numeric_limits<int64_t>::max();
-            for (int64_t record = begin; record < end; ++record) {
-                if (!index.eligible[record])
+            std::vector<int32_t> candidates;
+            candidates.reserve(static_cast<size_t>(end - begin));
+            for (int64_t candidate_record = begin;
+                 candidate_record < end; ++candidate_record) {
+                const int32_t next = index.partners[candidate_record];
+                if (index.reciprocal[candidate_record] < 0
+                    || std::find(visited.begin(), visited.end(), next)
+                        != visited.end())
                     continue;
-                const int64_t distance = std::abs(
-                    static_cast<int64_t>(index.self_local[record]) - target);
-                if (distance < best_distance) {
-                    best = static_cast<int32_t>(record);
-                    best_distance = distance;
-                }
+                candidates.push_back(static_cast<int32_t>(candidate_record));
             }
-            if (best < 0)
-                return false;
-            candidates.push_back(best);
+            std::sort(candidates.begin(), candidates.end(),
+                      [&](int32_t a, int32_t b) {
+                const int64_t a_distance = std::abs(
+                    static_cast<int64_t>(index.self_local[a]) - target);
+                const int64_t b_distance = std::abs(
+                    static_cast<int64_t>(index.self_local[b]) - target);
+                return std::tie(a_distance, a) < std::tie(b_distance, b);
+            });
+            if (!candidates.empty())
+                record = candidates.front();
         } else {
             std::vector<int32_t> by_direction[2];
-            for (int64_t record = begin; record < end; ++record) {
-                if (!index.eligible[record])
+            for (int64_t candidate_record = begin;
+                 candidate_record < end; ++candidate_record) {
+                const int32_t next = index.partners[candidate_record];
+                if (index.reciprocal[candidate_record] < 0
+                    || std::find(visited.begin(), visited.end(), next)
+                        != visited.end())
                     continue;
-                if (index.loop_consistency
-                    && index.component[record] != starting_component)
-                    continue;
-                const int delta = index.self_local[record] - current_local;
+                const int delta =
+                    index.self_local[candidate_record] - current_local;
                 const int distance = std::abs(delta);
-                if (distance >= minimum_steps && distance <= maximum_steps)
-                    by_direction[delta > 0].push_back(
-                        static_cast<int32_t>(record));
+                if (distance < minimum_steps || distance > maximum_steps)
+                    continue;
+                if (std::abs(
+                        index.positions[candidate_record]
+                        - current_entry_position)
+                    < minimum_candidate_travel)
+                    continue;
+                by_direction[delta > 0].push_back(
+                    static_cast<int32_t>(candidate_record));
             }
             std::vector<int> directions;
             if (!by_direction[0].empty()) directions.push_back(0);
             if (!by_direction[1].empty()) directions.push_back(1);
-            if (directions.empty())
-                return false;
-            std::uniform_int_distribution<size_t> direction_draw(
-                0, directions.size() - 1);
-            const int direction = directions[direction_draw(random)];
-            const int endpoint_distance = direction
-                ? index.track_lengths[current] - 1 - current_local
-                : current_local;
-            const int upper = std::min(maximum_steps, endpoint_distance);
-            if (upper < minimum_steps)
-                return false;
-            std::uniform_int_distribution<int> distance_draw(
-                minimum_steps, upper);
-            const int desired = distance_draw(random);
-            int32_t best = -1;
-            int best_error = std::numeric_limits<int>::max();
-            for (int32_t record : by_direction[direction]) {
-                const int distance = std::abs(
-                    index.self_local[record] - current_local);
-                const int error = std::abs(distance - desired);
-                if (error < best_error) {
-                    best = record;
-                    best_error = error;
-                }
+            std::shuffle(directions.begin(), directions.end(), random);
+            for (const int direction : directions) {
+                const int endpoint_distance = direction
+                    ? index.track_lengths[current] - 1 - current_local
+                    : current_local;
+                const int upper = std::min(maximum_steps, endpoint_distance);
+                if (upper < minimum_steps)
+                    continue;
+                std::uniform_int_distribution<int> distance_draw(
+                    minimum_steps, upper);
+                const int desired = distance_draw(random);
+                auto& candidates = by_direction[direction];
+                std::sort(candidates.begin(), candidates.end(),
+                          [&](int32_t a, int32_t b) {
+                    const int a_error = std::abs(
+                        std::abs(index.self_local[a] - current_local) - desired);
+                    const int b_error = std::abs(
+                        std::abs(index.self_local[b] - current_local) - desired);
+                    return std::tie(a_error, a) < std::tie(b_error, b);
+                });
+                if (!candidates.empty())
+                    record = candidates.front();
+                if (record >= 0)
+                    break;
             }
-            if (best < 0)
-                return false;
-            candidates.push_back(best);
         }
 
-        const int32_t record = candidates.front();
+        if (record < 0)
+            break;
         const int32_t next = index.partners[record];
-        if (std::find(visited.begin(), visited.end(), next) != visited.end())
-            return false;
-        if (hop == 0)
-            starting_component = index.component[record];
         output_records[2 * hop] = record;
         output_records[2 * hop + 1] = index.reciprocal[record];
         output_tracks[hop + 1] = next;
         visited.push_back(next);
         current = next;
         current_local = index.partner_local[record];
+        current_entry_position =
+            index.positions[index.reciprocal[record]];
+        completed_hops = hop + 1;
     }
-    return true;
+
+    // The actual suffix of a simple proposed walk witnesses the return path
+    // for every internal transition. Certify only the final transition of
+    // each possible prefix, longest first; its closure completes all earlier
+    // witnesses within their larger remaining-hop budgets.
+    output_hops = 0;
+    std::vector<int32_t> prefix_visited;
+    prefix_visited.reserve(static_cast<size_t>(completed_hops));
+    for (int prefix_hops = completed_hops;
+         prefix_hops >= minimum_hops; --prefix_hops) {
+        prefix_visited.assign(
+            output_tracks, output_tracks + prefix_hops);
+        const int32_t final_record =
+            output_records[2 * (prefix_hops - 1)];
+        if (transition_can_return_to_root(
+                index, output_tracks[prefix_hops - 1], final_record,
+                primary, maximum_hops - prefix_hops,
+                minimum_candidate_travel, prefix_visited, root_neighbors)) {
+            output_hops = prefix_hops;
+            break;
+        }
+    }
+    return output_hops != 0;
 }
 
 nb::dict sample_walks(
     const WalkIndex& index, Int32Vector primary_candidates,
-    UInt64Vector seeds, int groups, int target_points, int hops,
-    int minimum_steps, int maximum_steps)
+    UInt64Vector seeds, int groups, int target_points,
+    int minimum_hops, int maximum_hops,
+    int minimum_steps, int maximum_steps, double minimum_candidate_travel)
 {
-    if (groups < 0 || target_points < 1 || hops < 1
-        || minimum_steps < 1 || maximum_steps < minimum_steps)
+    if (groups < 0 || target_points < 1 || minimum_hops < 1
+        || maximum_hops < minimum_hops
+        || minimum_steps < 1 || maximum_steps < minimum_steps
+        || !std::isfinite(minimum_candidate_travel)
+        || minimum_candidate_travel < 0.0)
         throw std::runtime_error("invalid track-walk sampling parameters");
     if (seeds.shape(0) != primary_candidates.shape(0))
         throw std::runtime_error("walk candidates and seeds must be parallel");
-    std::vector<int32_t> tracks(static_cast<size_t>(groups) * (hops + 1), -1);
-    std::vector<int32_t> records(static_cast<size_t>(groups) * hops * 2, -1);
+    std::vector<int32_t> tracks(
+        static_cast<size_t>(groups) * (maximum_hops + 1), -1);
+    std::vector<int32_t> records(
+        static_cast<size_t>(groups) * maximum_hops * 2, -1);
+    std::vector<int32_t> walk_hops(static_cast<size_t>(groups), 0);
     int produced = 0;
     uint64_t rejected = 0;
     for (size_t attempt = 0;
          attempt < primary_candidates.shape(0) && produced < groups; ++attempt) {
         if (draw_walk(
-                index, primary_candidates(attempt), target_points, hops,
-                minimum_steps, maximum_steps, seeds(attempt),
-                tracks.data() + static_cast<size_t>(produced) * (hops + 1),
-                records.data() + static_cast<size_t>(produced) * hops * 2))
+                index, primary_candidates(attempt), target_points,
+                minimum_hops, maximum_hops,
+                minimum_steps, maximum_steps, minimum_candidate_travel,
+                seeds(attempt),
+                tracks.data()
+                    + static_cast<size_t>(produced) * (maximum_hops + 1),
+                records.data()
+                    + static_cast<size_t>(produced) * maximum_hops * 2,
+                walk_hops[produced]))
             ++produced;
         else
             ++rejected;
     }
-    tracks.resize(static_cast<size_t>(produced) * (hops + 1));
-    records.resize(static_cast<size_t>(produced) * hops * 2);
+    tracks.resize(static_cast<size_t>(produced) * (maximum_hops + 1));
+    records.resize(static_cast<size_t>(produced) * maximum_hops * 2);
+    walk_hops.resize(static_cast<size_t>(produced));
     nb::dict result;
     result["tracks"] = own_2d(
-        std::move(tracks), static_cast<size_t>(produced), hops + 1);
+        std::move(tracks), static_cast<size_t>(produced), maximum_hops + 1);
     result["records"] = own_2d(
-        std::move(records), static_cast<size_t>(produced), hops * 2);
+        std::move(records), static_cast<size_t>(produced), maximum_hops * 2);
+    result["walk_hops"] = own_1d(std::move(walk_hops));
     result["produced"] = produced;
     result["rejected_candidates"] = rejected;
     result["attempted_candidates"] = primary_candidates.shape(0);
@@ -1946,11 +2010,16 @@ nb::dict sample_walks(
 
 nb::dict sample_walks_adaptive(
     const WalkIndex& index, Float64Vector primary_probabilities,
-    uint64_t seed, int groups, int target_points, int hops,
-    int minimum_steps, int maximum_steps, int maximum_attempts)
+    uint64_t seed, int groups, int target_points,
+    int minimum_hops, int maximum_hops,
+    int minimum_steps, int maximum_steps, double minimum_candidate_travel,
+    int maximum_attempts)
 {
-    if (groups < 0 || target_points < 1 || hops < 1
+    if (groups < 0 || target_points < 1 || minimum_hops < 1
+        || maximum_hops < minimum_hops
         || minimum_steps < 1 || maximum_steps < minimum_steps
+        || !std::isfinite(minimum_candidate_travel)
+        || minimum_candidate_travel < 0.0
         || maximum_attempts < groups)
         throw std::runtime_error("invalid adaptive track-walk sampling parameters");
     if (index.track_count() == 0 && groups > 0)
@@ -1978,9 +2047,10 @@ nb::dict sample_walks_adaptive(
     }
 
     std::vector<int32_t> tracks(
-        static_cast<size_t>(groups) * (hops + 1), -1);
+        static_cast<size_t>(groups) * (maximum_hops + 1), -1);
     std::vector<int32_t> records(
-        static_cast<size_t>(groups) * hops * 2, -1);
+        static_cast<size_t>(groups) * maximum_hops * 2, -1);
+    std::vector<int32_t> walk_hops(static_cast<size_t>(groups), 0);
     int produced = 0;
     int attempted = 0;
     {
@@ -1992,28 +2062,95 @@ nb::dict sample_walks_adaptive(
                 static_cast<int32_t>(index.track_count()) - int32_t{1}));
         std::discrete_distribution<int32_t> weighted_primary(
             weights.begin(), weights.end());
+        const int batch_capacity = std::min(
+            maximum_attempts, std::max(1024, groups * 2));
+        std::vector<int32_t> batch_primaries(
+            static_cast<size_t>(batch_capacity));
+        std::vector<uint64_t> batch_seeds(
+            static_cast<size_t>(batch_capacity));
+        std::vector<uint8_t> batch_success(
+            static_cast<size_t>(batch_capacity), 0);
+        std::vector<int32_t> batch_tracks(
+            static_cast<size_t>(batch_capacity) * (maximum_hops + 1), -1);
+        std::vector<int32_t> batch_records(
+            static_cast<size_t>(batch_capacity) * maximum_hops * 2, -1);
+        std::vector<int32_t> batch_hops(
+            static_cast<size_t>(batch_capacity), 0);
+        int next_batch_size = batch_capacity;
         while (attempted < maximum_attempts && produced < groups) {
-            const int32_t primary = weights.empty()
-                ? uniform_primary(random) : weighted_primary(random);
-            const uint64_t walk_seed = random();
-            ++attempted;
-            if (draw_walk(
-                    index, primary, target_points, hops,
-                    minimum_steps, maximum_steps, walk_seed,
+            const int batch_size = std::min(
+                next_batch_size, maximum_attempts - attempted);
+            for (int candidate = 0; candidate < batch_size; ++candidate) {
+                batch_primaries[candidate] = weights.empty()
+                    ? uniform_primary(random) : weighted_primary(random);
+                batch_seeds[candidate] = random();
+                batch_success[candidate] = 0;
+                batch_hops[candidate] = 0;
+            }
+#pragma omp parallel for schedule(dynamic, 16)
+            for (int candidate = 0; candidate < batch_size; ++candidate) {
+                batch_success[candidate] = draw_walk(
+                    index, batch_primaries[candidate], target_points,
+                    minimum_hops, maximum_hops,
+                    minimum_steps, maximum_steps, minimum_candidate_travel,
+                    batch_seeds[candidate],
+                    batch_tracks.data()
+                        + static_cast<size_t>(candidate)
+                            * (maximum_hops + 1),
+                    batch_records.data()
+                        + static_cast<size_t>(candidate)
+                            * maximum_hops * 2,
+                    batch_hops[candidate]);
+            }
+            int considered = 0;
+            for (; considered < batch_size && produced < groups; ++considered) {
+                if (!batch_success[considered])
+                    continue;
+                std::copy_n(
+                    batch_tracks.data()
+                        + static_cast<size_t>(considered)
+                            * (maximum_hops + 1),
+                    maximum_hops + 1,
                     tracks.data()
-                        + static_cast<size_t>(produced) * (hops + 1),
+                        + static_cast<size_t>(produced)
+                            * (maximum_hops + 1));
+                std::copy_n(
+                    batch_records.data()
+                        + static_cast<size_t>(considered)
+                            * maximum_hops * 2,
+                    maximum_hops * 2,
                     records.data()
-                        + static_cast<size_t>(produced) * hops * 2))
+                        + static_cast<size_t>(produced)
+                            * maximum_hops * 2);
+                walk_hops[produced] = batch_hops[considered];
                 ++produced;
+            }
+            attempted += considered;
+            if (produced < groups && produced > 0) {
+                const int remaining = groups - produced;
+                const double attempts_per_success =
+                    static_cast<double>(attempted) / produced;
+                const double predicted = std::ceil(
+                    remaining * attempts_per_success);
+                next_batch_size = std::clamp(
+                    static_cast<int>(std::min(
+                        predicted, static_cast<double>(batch_capacity))),
+                    std::min(1024, maximum_attempts - attempted),
+                    batch_capacity);
+            }
         }
     }
-    tracks.resize(static_cast<size_t>(produced) * (hops + 1));
-    records.resize(static_cast<size_t>(produced) * hops * 2);
+    tracks.resize(
+        static_cast<size_t>(produced) * (maximum_hops + 1));
+    records.resize(
+        static_cast<size_t>(produced) * maximum_hops * 2);
+    walk_hops.resize(static_cast<size_t>(produced));
     nb::dict result;
     result["tracks"] = own_2d(
-        std::move(tracks), static_cast<size_t>(produced), hops + 1);
+        std::move(tracks), static_cast<size_t>(produced), maximum_hops + 1);
     result["records"] = own_2d(
-        std::move(records), static_cast<size_t>(produced), hops * 2);
+        std::move(records), static_cast<size_t>(produced), maximum_hops * 2);
+    result["walk_hops"] = own_1d(std::move(walk_hops));
     result["produced"] = produced;
     result["rejected_candidates"] = attempted - produced;
     result["attempted_candidates"] = attempted;
@@ -2089,28 +2226,31 @@ NB_MODULE(track_crossings, module)
         "prepare_walk_index", &prepare_walk_index,
         nb::rv_policy::take_ownership,
         nb::arg("offsets"), nb::arg("partners"), nb::arg("self_local"),
-        nb::arg("partner_local"), nb::arg("track_lengths"),
-        nb::arg("require_loop_consistency") = false);
+        nb::arg("partner_local"), nb::arg("positions"),
+        nb::arg("track_lengths"));
     module.def("walk_index_stats", &walk_index_stats, nb::arg("index"));
     module.def(
         "prepare_cached_walk_index", &prepare_cached_walk_index,
         nb::rv_policy::take_ownership,
         nb::arg("cached_source_ids"), nb::arg("cached_offsets"),
         nb::arg("cached_partners"), nb::arg("cached_self_local"),
-        nb::arg("cached_partner_local"), nb::arg("selected_source_ids"),
-        nb::arg("track_lengths"),
-        nb::arg("require_loop_consistency") = false);
+        nb::arg("cached_partner_local"), nb::arg("cached_positions"),
+        nb::arg("selected_source_ids"), nb::arg("track_lengths"));
     module.def(
         "walk_index_crossings", &walk_index_crossings, nb::arg("index"));
     module.def(
         "sample_walks", &sample_walks,
         nb::arg("index"), nb::arg("primary_candidates"), nb::arg("seeds"),
-        nb::arg("groups"), nb::arg("target_points"), nb::arg("hops"),
-        nb::arg("minimum_steps"), nb::arg("maximum_steps"));
+        nb::arg("groups"), nb::arg("target_points"),
+        nb::arg("minimum_hops"), nb::arg("maximum_hops"),
+        nb::arg("minimum_steps"), nb::arg("maximum_steps"),
+        nb::arg("minimum_candidate_travel"));
     module.def(
         "sample_walks_adaptive", &sample_walks_adaptive,
         nb::arg("index"), nb::arg("primary_probabilities"), nb::arg("seed"),
-        nb::arg("groups"), nb::arg("target_points"), nb::arg("hops"),
+        nb::arg("groups"), nb::arg("target_points"),
+        nb::arg("minimum_hops"), nb::arg("maximum_hops"),
         nb::arg("minimum_steps"), nb::arg("maximum_steps"),
+        nb::arg("minimum_candidate_travel"),
         nb::arg("maximum_attempts"));
 }

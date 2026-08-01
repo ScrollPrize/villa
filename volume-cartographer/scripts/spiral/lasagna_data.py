@@ -1,8 +1,27 @@
+import json
 import os
 
 import numpy as np
 import torch
 import zarr
+
+from pack_resident_pools import sidecar_path
+
+
+def _require_sidecar(zarr_path, group, *, pair=False, label):
+    """Resolve a store's resident-pool sidecar or fail with the pack command."""
+    sidecar = sidecar_path(zarr_path, group, pair=pair)
+    if not os.path.exists(os.path.join(sidecar, 'meta.json')):
+        raise RuntimeError(
+            f'{label}: resident-pool sidecar {sidecar!r} not found; build it '
+            f'with pack_resident_pools.py (pointed at the lasagna_inputs '
+            f'folder, with --ct for CT masking)')
+    return sidecar
+
+
+def _read_sidecar_meta(sidecar):
+    with open(os.path.join(sidecar, 'meta.json')) as f:
+        return json.load(f)
 
 
 def prepare_lasagna_volume(
@@ -22,8 +41,13 @@ def prepare_lasagna_volume(
     yx_bounds_working=None,
     interior_fn=None,
     paged_chunk=64,
+    progress=None,
 ):
-    """Open normals/grad-magnitude as bounded sparse CUDA caches."""
+    """Open normals/grad-magnitude as fully-resident sparse brick pools.
+
+    The pools load from ``pack_resident_pools.py`` sidecars next to the
+    source zarrs; there is no other loading path.
+    """
     if not use_normals and not use_spacing:
         return None
     if storage_backend != 'sparse_cuda':
@@ -38,34 +62,39 @@ def prepare_lasagna_volume(
     if use_spacing and not grad_mag_zarr_path:
         raise RuntimeError('dense spacing loss is enabled, but grad_mag zarr path is not set')
 
-    print(f'loading lasagna zarrs group {normal_zarr_group}')
-    nx_array = ny_array = grad_mag_array = None
+    group = str(normal_zarr_group)
+    print(f'loading lasagna resident pools, group {group}')
+    normal_sidecar = grad_sidecar = None
     reference_shape = None
     if use_normals:
-        nx_root = zarr.open(normal_nx_zarr_path, mode='r')
-        ny_root = zarr.open(normal_ny_zarr_path, mode='r')
-        nx_array = nx_root[normal_zarr_group]
-        ny_array = ny_root[normal_zarr_group]
-        if nx_array.shape != ny_array.shape:
-            raise ValueError(f'nx/ny normal zarr shapes differ: {nx_array.shape} vs {ny_array.shape}')
-        if nx_array.dtype != np.dtype('uint8') or ny_array.dtype != np.dtype('uint8'):
-            raise ValueError(
-                f'nx/ny normal zarrs must use the production uint8 encoding; '
-                f'got {nx_array.dtype} and {ny_array.dtype}')
-        reference_shape = nx_array.shape
+        normal_sidecar = _require_sidecar(
+            normal_nx_zarr_path, group, pair=True, label='lasagna normals')
+        normal_meta = _read_sidecar_meta(normal_sidecar)
+        reference_shape = tuple(normal_meta['array_shape'])
+        expected_pair = [
+            os.path.basename(str(normal_nx_zarr_path).rstrip('/')) + '/' + group,
+            os.path.basename(str(normal_ny_zarr_path).rstrip('/')) + '/' + group,
+        ]
+        if normal_meta.get('channel_names') != expected_pair:
+            print(f'WARNING: normal sidecar channels '
+                  f'{normal_meta.get("channel_names")} do not match the '
+                  f'configured nx/ny stores {expected_pair}')
     if use_spacing:
-        grad_mag_root = zarr.open(grad_mag_zarr_path, mode='r')
-        grad_mag_array = grad_mag_root[normal_zarr_group]
+        grad_sidecar = _require_sidecar(
+            grad_mag_zarr_path, group, label='lasagna grad_mag')
+        grad_meta = _read_sidecar_meta(grad_sidecar)
         if reference_shape is None:
-            reference_shape = grad_mag_array.shape
-        elif grad_mag_array.shape != reference_shape:
-            raise ValueError(f'grad_mag zarr shape {grad_mag_array.shape} differs from dense normal shape {reference_shape}')
+            reference_shape = tuple(grad_meta['array_shape'])
+        elif tuple(grad_meta['array_shape']) != reference_shape:
+            raise ValueError(
+                f'grad_mag sidecar shape {grad_meta["array_shape"]} differs '
+                f'from dense normal shape {reference_shape}')
 
     if scroll_zarr is not None:
         expected_shape = tuple(np.ceil(np.array(scroll_zarr.shape, dtype=np.float64) / lasagna_scale).astype(np.int64))
         if tuple(reference_shape) != expected_shape:
             print(
-                f'WARNING: lasagna zarr shape {reference_shape} does not match '
+                f'WARNING: lasagna store shape {reference_shape} does not match '
                 f'ceil(scroll_zarr.shape / lasagna_scale) {expected_shape}'
             )
 
@@ -73,38 +102,49 @@ def prepare_lasagna_volume(
     z_lo = max(0, int(np.floor(z_begin / lasagna_scale)))
     z_hi = min(z_size, int(np.ceil(z_end / lasagna_scale)))
     if z_hi <= z_lo:
-        raise RuntimeError(f'lasagna z-ROI [{z_lo}, {z_hi}) is empty (zarr z size {z_size})')
+        raise RuntimeError(f'lasagna z-ROI [{z_lo}, {z_hi}) is empty (store z size {z_size})')
 
     roi_shape = (z_hi - z_lo, reference_shape[1], reference_shape[2])
-    from sparse_cuda_cache import (
-        BoundedSparseCudaCache,
-        SparseLasagnaStore,
-        cache_budget_bytes,
-    )
+    from sparse_cuda_cache import ResidentBrickPool, SparseLasagnaStore
     device = torch.device('cuda')
-    group = str(normal_zarr_group)
     normal_cache = None
     if use_normals:
-        normal_cache = BoundedSparseCudaCache(
-            source_paths=[
-                os.path.join(normal_nx_zarr_path, group),
-                os.path.join(normal_ny_zarr_path, group),
-            ],
-            shape_zyx=tuple(int(v) for v in reference_shape),
+        if progress is not None:
+            progress.begin(
+                'loading', 'Loading normal volumes onto GPU',
+                step=0, total_steps=0, unit='bricks')
+        normal_cache = ResidentBrickPool(
+            normal_sidecar,
             origin_zyx=(z_lo, 0, 0),
-            budget_bytes=cache_budget_bytes('normals', device),
+            z_roi=(z_lo, z_hi),
             device=device,
             label='lasagna normals',
+            expected_channels=2,
+            progress_callback=(
+                (lambda current, total, detail: progress.update(
+                    current, total_steps=total, detail=detail))
+                if progress is not None else None
+            ),
         )
     grad_cache = None
     if use_spacing:
-        grad_cache = BoundedSparseCudaCache(
-            source_paths=[os.path.join(grad_mag_zarr_path, group)],
-            shape_zyx=tuple(int(v) for v in reference_shape),
+        if progress is not None:
+            progress.begin(
+                'loading', 'Loading gradient volume onto GPU',
+                step=0, total_steps=0, unit='bricks')
+        grad_cache = ResidentBrickPool(
+            grad_sidecar,
             origin_zyx=(z_lo, 0, 0),
-            budget_bytes=cache_budget_bytes('grad_mag', device),
+            z_roi=(z_lo, z_hi),
             device=device,
             label='lasagna grad_mag',
+            expected_channels=1,
+            expected_shape_zyx=reference_shape,
+            progress_callback=(
+                (lambda current, total, detail: progress.update(
+                    current, total_steps=total, detail=detail))
+                if progress is not None else None
+            ),
         )
     return {
         'backend': 'sparse_cuda',
@@ -161,6 +201,7 @@ def prepare_surf_sdt_volume(
     yx_bounds_working=None,
     interior_fn=None,
     paged_chunk=64,
+    progress=None,
 ):
     """Resolve and validate a surf-SDT store as a sparse CUDA input.
 
@@ -248,20 +289,27 @@ def prepare_surf_sdt_volume(
     }
 
     shape = (z_hi - z_lo, int(array.shape[1]), int(array.shape[2]))
-    from sparse_cuda_cache import (
-        BoundedSparseCudaCache,
-        SparseScalarStore,
-        cache_budget_bytes,
-    )
-    device = torch.device('cuda')
-    cache = BoundedSparseCudaCache(
-        source_paths=[os.path.join(sdt_zarr_path, group_name)],
-        shape_zyx=tuple(int(v) for v in array.shape),
+    from sparse_cuda_cache import ResidentBrickPool, SparseScalarStore
+    sidecar = _require_sidecar(sdt_zarr_path, group_name, label='surf_sdt')
+    if progress is not None:
+        progress.begin(
+            'loading', 'Loading surface-distance volume onto GPU',
+            step=0, total_steps=0, unit='bricks')
+    cache = ResidentBrickPool(
+        sidecar,
         origin_zyx=(z_lo, 0, 0),
-        budget_bytes=cache_budget_bytes('sdt', device),
-        device=device,
+        z_roi=(z_lo, z_hi),
+        device=torch.device('cuda'),
         label='surf_sdt',
+        expected_channels=1,
+        expected_shape_zyx=tuple(int(v) for v in array.shape),
+        progress_callback=(
+            (lambda current, total, detail: progress.update(
+                current, total_steps=total, detail=detail))
+            if progress is not None else None
+        ),
     )
+    fingerprint['respool_ct_mask'] = cache.meta.get('ct_mask')
     common = {
         'kind': volume_kind,
         'backend': 'sparse_cuda',
