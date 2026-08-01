@@ -164,9 +164,9 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
     - Unet trained on affinity labels using pytorch_connectomics and experiments with watershed
 - [Gabor Filter for surface prediction](https://www.kaggle.com/code/bluetriad/scroll4-gaborfilters/notebook?scriptVersionId=265957590) by Ayush Mishra
   
-- [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
-    - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput.
+- [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends - now with parameterization and GPU acceleration!
 
+    - [GPU-accelerated MLS projection for ScrollFiesta](https://github.com/pscamillo/scrollfiesta_public/blob/cuda-mls/BENCHMARKS.md) by pscamillo — OpenMP + CUDA FP32 acceleration, byte-identical, ~6x throughput. (Note: GPU acceleration through CubeCL is now part of the main ScrollFiesta repository)
 
 - [Scroll-specific augmentations](https://github.com/ScrollPrize/villa/pull/997) by pscamillo. GPU-native training augmentations modeling real scroll/CT distortions: Squeeze ([#997](https://github.com/ScrollPrize/villa/pull/997)), Decohesion + Warp ([#999](https://github.com/ScrollPrize/villa/pull/999)), Ring ([#1020](https://github.com/ScrollPrize/villa/pull/1020)), Streak ([#1021](https://github.com/ScrollPrize/villa/pull/1021)), Warp edge-padding fix ([#1025](https://github.com/ScrollPrize/villa/pull/1025)) (#201), each validated with ablation + benchmark.
 
@@ -182,6 +182,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [spiral-fit-consumer-gpu](https://github.com/7jycwjmbfn-eng/spiral-fit-consumer-gpu) by Shuhan Yang runs the spiral fitter in this repo on a 12 GB consumer GPU without the native VC extension. Drop-in replacements for the sparse CUDA cache, which otherwise raises before the first step, and for point-to-patch linking, where a measured 41-hour ETA drops to minutes. Both are checked for bitwise-identical output against the originals. Includes a scaling ladder and pool-tuning measurements from one gaming laptop.
 
+
+- [TIFXYZ Doctor](https://github.com/aviad12g/tifxyz-doctor) by Aviad Cohen — deterministic QA and triage for TIFXYZ surface grids, with sparse overlays and reproducible corpus/reader checks. v0.2 adds an overlap-component-isolated benchmark on 709 official human-reviewed PHercParis4 `same_wrap` patches; its frozen cue localizes abrupt synthetic normal-offset steps while byte-identical null controls and the reported gradual-transition miss rate bound the claim.
 
 ### 📦 Materials
 
@@ -317,6 +319,9 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Scroll pretraining](https://github.com/younader/VesuviusPretraining) by Youssef Nader. Youssef’s original idea for pretraining on the scrolls and finetuning on the fragments, which led him to winning the First Letters Prize.
 
 - [pre-trained DINOv2 models](https://github.com/SergeyPnev/dinov2-vesuvius) by Sergei Pnev. Self-supervised model pre-trained on scrolls 1-5 with predictions.
+
+- [Ink detection validation harness](https://github.com/khj1222/vesuvius-challenge) by khj1222. The ink-detection tutorial trains with no held-out data, so improvements cannot be told apart from noise. This generates a `_validation_mask` for a labeled segment by holding out whole annotated regions (splitting by pixels cuts letters in half), scores predictions inside it (threshold sweep, DRD / pseudo-F-measure, per-region breakdown), sweeps checkpoints, and runs k-fold. Also includes a native-Windows walkthrough of the tutorial.
+
 #### 📦 Materials
 
 - [Scroll 1 Ink Labels](https://discord.com/channels/1079907749569237093/1223849912467460116). Nicola Bodill produced more accurate labels for ink detection based on the prediction of the Grand Prize winner model

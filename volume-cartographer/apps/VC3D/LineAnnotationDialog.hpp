@@ -10,11 +10,13 @@
 #include <functional>
 #include <map>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 #include <utility>
 
 #include "LineAnnotationGeneratedViews.hpp"
+#include "LineAnnotationFiberSegments.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include <opencv2/core/mat.hpp>
@@ -116,7 +118,10 @@ public:
     const std::vector<Pane>& panes() const { return _panes; }
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
+    int extrapolationDistanceVx() const;
     int maxControlPointDistanceVx() const;
+    vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
+    void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
     void setGeneratedBranchLinks(std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks);
@@ -124,7 +129,8 @@ public:
         std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
         std::vector<std::vector<cv::Vec3f>> branchLinePoints,
         std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
-        bool requestSideStripIntersections = true);
+        bool requestSideStripIntersections = true,
+        std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics = {});
     void setGeneratedFiberIntersectionMarkers(
         std::vector<GeneratedOverlay::FiberIntersectionMarker> markers);
     void setGeneratedSideStripIntersectionBusy(bool busy);
@@ -185,6 +191,10 @@ signals:
                                                          uint64_t branchFiberId,
                                                          int branchControlPointIndex,
                                                          bool pending);
+    void generatedSegmentInterpolationGoalRequested(const std::string& surfaceName,
+                                                    size_t firstControlPointIndex,
+                                                    size_t secondControlPointIndex,
+                                                    const std::string& goal);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
@@ -193,6 +203,9 @@ signals:
     void fiberTagChangeRequested(const QString& tag, bool enabled);
     void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
+    void fiberOptimizationModeChanged(
+        vc3d::line_annotation::FiberOptimizationMode mode);
+    void extrapolationDistanceChanged(int distanceVx);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -260,7 +273,9 @@ private:
     void clearControlPointContextPreview(const std::string& surfaceName,
                                          CChunkedVolumeViewer* viewer);
     GeneratedOverlay staticStripOverlay() const;
-    GeneratedOverlay zSliceOverlay(double linePosition,
+    GeneratedOverlay zSliceOverlay(const GeneratedViews& views,
+                                   const vc3d::line_annotation::GeneratedControlPointLinePositionIndex& controlIndex,
+                                   double linePosition,
                                    bool emphasized,
                                    CChunkedVolumeViewer* viewer,
                                    PlaneSurface* plane) const;
@@ -276,11 +291,16 @@ private:
                                      QuadSurface* surface,
                                      double linePosition) const;
     bool handleKeyPress(QKeyEvent* event);
-    // Fixed top strip: fit-to-width zoom + auto height, recomputed on resize.
-    void updateFixedStripGeometry();
+    // Pushes line length, control dots, and the current-position marker to the
+    // schematic overview bar.
+    void updateOverviewBar();
+    // Ctrl+right-click on an overview-bar control point: synthesize the matching
+    // bottom-strip scene point and route through its context-menu signal so the
+    // controller-supplied menu behaves exactly like an in-viewer click.
+    void forwardOverviewControlContextMenu(double linePosition, QPoint globalPos);
     // "R": one-shot jump of the other panes to the cursor's line position on the
-    // fixed top strip (works regardless of follow mode; leaves it unchanged).
-    void snapPanesToFixedStripCursor();
+    // overview bar (works regardless of follow mode; leaves it unchanged).
+    void snapPanesToOverviewCursor();
     // Pause badge on the bottom strip while mouse-follow is toggled off (Space).
     void updatePauseIndicator();
     // "optimized"/"not optimized" badge in the bottom strip's top-right corner.
@@ -294,11 +314,13 @@ private:
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
+    QComboBox* _fiberOptimizationCombo = nullptr;
     // Checked = auto-reoptimize after each edit; unchecked = no optimization.
     QAction* _autoReoptimizeAction = nullptr;
     QAction* _showAsMeshAction = nullptr;
     QAction* _fullOptimizationAction = nullptr;
     QSpinBox* _initialCenterlineLengthSpin = nullptr;
+    QSpinBox* _extrapolationDistanceSpin = nullptr;
     QSpinBox* _maxControlPointDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
@@ -337,10 +359,26 @@ private:
     FastCurrentCutOverlayItems _fastCurrentCutOverlayItems;
     QPointer<CChunkedVolumeViewer> _currentCutViewer;
     QPointer<CChunkedVolumeViewer> _sideCutViewer;
+    // In-place updates: keep drawing each pane's overlays from the pre-update
+    // views until THAT pane adopts its first rendered frame of the re-optimized
+    // surfaces (renderFrameCompleted), so a newly placed control point appears
+    // together with the revised image instead of a beat earlier on the stale one.
+    GeneratedViews _heldGeneratedViews;
+    vc3d::line_annotation::GeneratedControlPointLinePositionIndex _heldControlIndex;
+    // Line position the held overlays were drawn at; panes with a pending swap
+    // keep their position markers here until their new frame lands.
+    double _heldLinePosition = 0.0;
+    bool _currentCutOverlaySwapPending = false;
+    bool _sideCutOverlaySwapPending = false;
+    std::vector<bool> _stripOverlaySwapPending;
+    // Volume point of the most recent control-point placement click; the next
+    // in-place update moves the current line position onto the control point
+    // nearest to it, so the marker lands on the new point with the new image.
+    std::optional<cv::Vec3f> _pendingPlacementFocus;
     std::vector<QPointer<CChunkedVolumeViewer>> _stripViewers;
-    // _stripViewers[0], shown as a fixed-height, non-interactive panel above the
-    // cut views instead of inside the strip splitter.
-    QPointer<CChunkedVolumeViewer> _fixedStripViewer;
+    // Schematic fixed-height bar above the cut views: a straight line with the
+    // control points (LineAnnotationOverviewBar, file-local in the .cpp).
+    QPointer<QWidget> _overviewBar;
     QPointer<QLabel> _pauseIndicator;
     GeneratedViews _generatedViews;
     // Double-precision copy of _generatedViews.linePoints, built once when views are
