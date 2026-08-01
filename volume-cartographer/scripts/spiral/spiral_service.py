@@ -43,6 +43,9 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 import numpy as np
 from PIL import Image
 import scipy.ndimage
+from vc3d_fiber_format_adapter import (
+    parse_vc3d_fiber_format,
+)
 
 from fit_session import (API_VERSION, PclRole, parse_session_request,
                          resolve_dataset_root, validate_checkpoint_container,
@@ -625,6 +628,13 @@ def _validate_upload_content(kind, role, directory):
         if not isinstance(document, dict) or document.get("type") != "vc3d_fiber":
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "Fiber uploads must be JSON documents with type 'vc3d_fiber'")
+        if document.get("version", 1) == 1:
+            return
+        try:
+            parse_vc3d_fiber_format(document)
+        except ValueError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           f"Invalid fiber upload: {exc}") from exc
         return
     if kind == "pcl":
         if not isinstance(document, dict) \

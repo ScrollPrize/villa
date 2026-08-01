@@ -205,6 +205,8 @@ vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
@@ -212,7 +214,7 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${line_annotation_vccollection_moc}
             ${line_annotation_cstate_moc}
-    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_fiber_slice_geometry
@@ -223,6 +225,9 @@ vc_add_test(NAME test_fiber_slice_geometry
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_fiber_trace3d
+    LIBS doctest::doctest vc_fiber_tracer
+    DEFS VC_TESTING)
 
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
@@ -419,6 +424,8 @@ vc_add_test(NAME test_quadsurface_basics)
 vc_add_test(NAME test_load_json)
 
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_lasagna_project_volumes LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_remote_file_cache)
 
 vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp

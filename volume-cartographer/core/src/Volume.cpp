@@ -72,8 +72,7 @@ std::string deriveRemoteVolumeName(const std::string& url)
 }
 
 std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl,
-                                                    const vc::HttpAuth& auth,
-                                                    bool discoverPublicSamplePixelSize)
+                                                    const vc::HttpAuth& auth)
 {
     const auto numberFromObject = [](const utils::Json& obj,
                                      std::initializer_list<const char*> keys) -> std::optional<double> {
@@ -141,7 +140,7 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl
                 hasVoxelSize = true;
             }
         }
-        if (!hasVoxelSize && discoverPublicSamplePixelSize) {
+        if (!hasVoxelSize) {
             const utils::Json* current = &json;
             for (const char* key : {"scan", "tomo", "acquisition", "detector"}) {
                 if (!current->is_object() || !current->contains(key)) {
@@ -1396,8 +1395,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
 
     std::optional<double> nativeRemoteVoxelSize;
     try {
-        if (auto remoteMeta = loadRemoteVolumeMetadata(
-                remoteUrl, auth, spec.baseScaleLevel > 0)) {
+        if (auto remoteMeta = loadRemoteVolumeMetadata(remoteUrl, auth)) {
             if (remoteMeta->contains("voxelsize") &&
                 (*remoteMeta)["voxelsize"].is_number()) {
                 const double value = (*remoteMeta)["voxelsize"].get_double();
@@ -1453,6 +1451,47 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     }
 
     return vol;
+}
+
+std::shared_ptr<Volume> Volume::NewFromPreparedChunkedSource(std::function<vc::render::OpenedChunkedZarr()> sourceFactory, const utils::Json& metadata)
+{
+    if (!sourceFactory)
+        throw std::invalid_argument("prepared 3D volume source factory is required");
+    auto opened = sourceFactory();
+    if (opened.fetchers.empty() || opened.shapes.empty() || opened.fetchers.size() != opened.shapes.size() ||
+        opened.chunkShapes.size() != opened.shapes.size() || opened.storageChunkShapes.size() != opened.shapes.size()) {
+        throw std::invalid_argument("prepared 3D volume source is incomplete");
+    }
+    for (std::size_t level = 0; level < opened.shapes.size(); ++level) {
+        const auto& shape = opened.shapes[level];
+        const auto& chunks = opened.chunkShapes[level];
+        if (!opened.fetchers[level] || shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0 || chunks[0] <= 0 || chunks[1] <= 0 || chunks[2] <= 0) {
+            throw std::invalid_argument("prepared 3D volume source has an invalid level");
+        }
+    }
+    if (!metadata.is_object() || !metadata.contains("uuid") || !metadata["uuid"].is_string() || metadata["uuid"].get_string().empty()) {
+        throw std::invalid_argument("prepared 3D volume metadata requires a uuid");
+    }
+
+    auto volume = std::make_shared<Volume>(std::filesystem::path{}, RemoteConstructTag{});
+    volume->metadata_ = metadata;
+    volume->metadata_["type"] = "vol";
+    volume->metadata_["format"] = "zarr";
+    const auto first = opened.shapes.front();
+    volume->_slices = first[0];
+    volume->_height = first[1];
+    volume->_width = first[2];
+    volume->metadata_["slices"] = first[0];
+    volume->metadata_["height"] = first[1];
+    volume->metadata_["width"] = first[2];
+    volume->zarrLevelShapes_ = opened.shapes;
+    volume->zarrLevelChunkShapes_ = opened.chunkShapes;
+    volume->zarrLevelStorageChunkShapes_ = opened.storageChunkShapes;
+    volume->zarrDtype_ = opened.dtype;
+    volume->zarrFillValue_ = opened.fillValue;
+    volume->remoteNumScales_ = opened.shapes.size();
+    volume->preparedSourceFactory_ = std::move(sourceFactory);
+    return volume;
 }
 
 std::filesystem::path Volume::remotePersistentCachePath() const
@@ -1635,11 +1674,17 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
         options.persistentCacheBudgetRoot = remoteCacheRoot_;
     }
 
-    vc::render::OpenedChunkedZarr opened = isRemote_
-        ? (baseScaleLevel_ > 0
-               ? vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_, baseScaleLevel_)
-               : vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_))
-        : vc::render::openLocalZarrPyramid(path_);
+    vc::render::OpenedChunkedZarr opened;
+    if (preparedSourceFactory_) {
+        opened = preparedSourceFactory_();
+    } else if (isRemote_) {
+        opened = baseScaleLevel_ > 0
+            ? vc::render::openHttpZarrPyramid(
+                  remoteUrl_, remoteAuth_, baseScaleLevel_)
+            : vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_);
+    } else {
+        opened = vc::render::openLocalZarrPyramid(path_);
+    }
 
     if (opened.fetchers.empty()) {
         return nullptr;
