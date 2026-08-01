@@ -186,6 +186,29 @@ TEST_CASE("lookup_int returns interpolated value for in-bounds loc")
     CHECK(v[1] == doctest::Approx(2.0));
 }
 
+TEST_CASE("lookup_int accepts the final complete quad")
+{
+    auto pts = makePlanarGrid(5, 7);
+    QuadSurface qs(pts, cv::Vec2f(1, 1));
+    SurfTrackerData d;
+    d.loc(&qs, cv::Vec2i(0, 0)) = cv::Vec2d(3.5, 5.5);
+    const auto v = d.lookup_int(&qs, cv::Vec2i(0, 0));
+    CHECK(v[0] == doctest::Approx(5.5));
+    CHECK(v[1] == doctest::Approx(3.5));
+    CHECK(d.valid_int(&qs, cv::Vec2i(0, 0)));
+}
+
+TEST_CASE("lookup_int rejects a sentinel in the final complete quad")
+{
+    auto pts = makePlanarGrid(5, 7);
+    pts(4, 6) = cv::Vec3f(-1.f, -1.f, -1.f);
+    QuadSurface qs(pts, cv::Vec2f(1, 1));
+    SurfTrackerData d;
+    d.loc(&qs, cv::Vec2i(0, 0)) = cv::Vec2d(3.5, 5.5);
+    CHECK(d.lookup_int(&qs, cv::Vec2i(0, 0)) == cv::Vec3d(-1, -1, -1));
+    CHECK_FALSE(d.valid_int(&qs, cv::Vec2i(0, 0)));
+}
+
 TEST_CASE("valid_int: missing key → false; sentinel → false; OOB → false; valid → true")
 {
     auto pts = makePlanarGrid(8, 8);
@@ -218,6 +241,25 @@ TEST_CASE("lookup_int_loc static: sentinel and OOB short-circuits")
     CHECK(SurfTrackerData::lookup_int_loc(&qs, cv::Vec2f(1e6, 1e6)) == cv::Vec3d(-1, -1, -1));
     auto v = SurfTrackerData::lookup_int_loc(&qs, cv::Vec2f(2, 3));
     CHECK(v[0] != -1);
+}
+
+TEST_CASE("lookup_int_loc accepts the final complete quad")
+{
+    auto pts = makePlanarGrid(5, 7);
+    QuadSurface qs(pts, cv::Vec2f(1, 1));
+    const auto v = SurfTrackerData::lookup_int_loc(&qs, cv::Vec2f(3.5f, 5.5f));
+    CHECK(v[0] == doctest::Approx(5.5));
+    CHECK(v[1] == doctest::Approx(3.5));
+}
+
+TEST_CASE("lookup_int_loc rejects a sentinel in the final complete quad")
+{
+    auto pts = makePlanarGrid(5, 7);
+    pts(4, 6) = cv::Vec3f(-1.f, -1.f, -1.f);
+    QuadSurface qs(pts, cv::Vec2f(1, 1));
+    CHECK(
+        SurfTrackerData::lookup_int_loc(&qs, cv::Vec2f(3.5f, 5.5f))
+        == cv::Vec3d(-1, -1, -1));
 }
 
 TEST_CASE("flip_x mirrors x coords around x0")
