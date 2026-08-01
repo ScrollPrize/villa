@@ -9,6 +9,8 @@ import pytest
 import torch
 import zarr
 
+from tests.zarr_utils import create_v2_group_array
+
 import vesuvius.neural_tracing.fiber_trace.dataset as fiber_dataset
 import vesuvius.neural_tracing.fiber_trace.train as fiber_train
 from vesuvius.neural_tracing.fiber_trace.dataset import (
@@ -1512,36 +1514,30 @@ def _prefetch_zarr_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> di
     base_root = tmp_path / "base.ome.zarr"
     grad_root = tmp_path / "grad_mag.ome.zarr"
     normal_root = tmp_path / "normal.ome.zarr"
-    base = zarr.open(
-        str(base_root),
-        mode="w",
-        path="0",
+    base = create_v2_group_array(
+        base_root,
+        "0",
         shape=(16, 16, 16),
         chunks=(8, 8, 8),
         dtype="u1",
-        dimension_separator="/",
     )
     base[:] = np.arange(16 * 16 * 16, dtype=np.uint16).reshape(16, 16, 16) % 255
     setattr(base.store, "_url", "s3://example/base.ome.zarr")
     setattr(base.store, "_cache_dir", str(tmp_path / "cache" / "base"))
-    grad = zarr.open(
-        str(grad_root),
-        mode="w",
-        path="0",
+    grad = create_v2_group_array(
+        grad_root,
+        "0",
         shape=(16, 16, 16),
         chunks=(8, 8, 8),
         dtype="u1",
-        dimension_separator="/",
     )
     grad[:] = 1
-    normals = zarr.open(
-        str(normal_root),
-        mode="w",
-        path="0",
+    normals = create_v2_group_array(
+        normal_root,
+        "0",
         shape=(2, 16, 16, 16),
         chunks=(1, 8, 8, 8),
         dtype="u1",
-        dimension_separator="/",
     )
     normals[:] = 128
 

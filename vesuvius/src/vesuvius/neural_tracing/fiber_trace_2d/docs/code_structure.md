@@ -1034,6 +1034,10 @@ The important behavior is:
 - Contains small Zarr-array helpers used by the fallback/manual sampling path.
 - Computes chunk requests for explicit trilinear coordinate samples.
 - Provides `sample_array_trilinear` for fake/local-array tests.
+- Uses the shared `vesuvius.neural_tracing.zarr_support` compatibility boundary
+  for store-relative chunk keys. That boundary uses Zarr 2's array/store APIs
+  or Zarr 3's metadata encoder and synchronous store API while preserving the
+  same v2 slash-separated cache keys and raw bytes.
 
 `sampling.py`
 

@@ -12,6 +12,8 @@ import pytest
 import torch
 import zarr
 
+from tests.zarr_utils import create_v2_group_array
+
 import vesuvius.neural_tracing.fiber_trace_2d.augmentation as augment_module
 import vesuvius.neural_tracing.fiber_trace_2d.loader as loader_module
 import vesuvius.neural_tracing.fiber_trace_2d.runner as runner_module
@@ -234,13 +236,12 @@ def _write_nml(path: Path, *, things: list[dict[str, object]]) -> Path:
 
 
 def _write_zarr(path: Path) -> Path:
-    root = zarr.open_group(str(path), mode="w")
-    arr = root.create_dataset(
+    arr = create_v2_group_array(
+        path,
         "0",
         shape=(48, 48, 48),
         chunks=(16, 16, 16),
         dtype="float32",
-        compressor=None,
     )
     z, y, x = np.indices(arr.shape, dtype=np.float32)
     arr[:] = z * 10000.0 + y * 100.0 + x
@@ -249,13 +250,12 @@ def _write_zarr(path: Path) -> Path:
 
 def _write_lasagna_manifest(tmp_path: Path) -> Path:
     normals_path = tmp_path / "normals.zarr"
-    root = zarr.open_group(str(normals_path), mode="w")
-    arr = root.create_dataset(
+    arr = create_v2_group_array(
+        normals_path,
         "0",
         shape=(3, 48, 48, 48),
         chunks=(1, 16, 16, 16),
         dtype="uint8",
-        compressor=None,
     )
     arr[0, :, :, :] = 1
     arr[1, :, :, :] = 128

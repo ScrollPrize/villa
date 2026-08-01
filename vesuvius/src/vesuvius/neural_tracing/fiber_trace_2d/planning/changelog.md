@@ -1,3 +1,10 @@
+# 2026-08-01
+
+- Fixed Vesuvius Python CI collection by exposing the monorepo's shared
+  `lasagna` source namespace and triggering the workflow for Lasagna changes;
+  repaired the Zarr 3.2.1 matrix with explicit cross-version v2 fixtures and
+  shared Zarr 2/3 chunk-key and raw-store access.
+
 # 2026-07-31
 
 - Repaired Atlas pred-snap tests for strict per-channel 3D Lasagna arrays,

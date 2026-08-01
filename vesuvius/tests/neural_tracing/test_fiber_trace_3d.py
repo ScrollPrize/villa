@@ -15,6 +15,8 @@ import torch
 from torch.utils.data import DataLoader
 import zarr
 
+from tests.zarr_utils import create_v2_array
+
 from vesuvius.neural_tracing.fiber_trace.fiber_json import Vc3dFiber
 from vc3d_fiber_format import legacy_lasagna_segments
 from vesuvius.neural_tracing.fiber_trace_2d.strip_geometry import FiberStripFrame
@@ -2723,9 +2725,8 @@ def test_3d_fiber_output_adapter_requires_all_option_channels(tmp_path: Path) ->
 
 def test_3d_fiber_infer_writes_lasagna_presence_normal_products(tmp_path: Path) -> None:
     input_path = tmp_path / "input.zarr"
-    arr = zarr.open(
-        str(input_path),
-        mode="w",
+    arr = create_v2_array(
+        input_path,
         shape=(8, 8, 8),
         chunks=(4, 4, 4),
         dtype=np.uint8,

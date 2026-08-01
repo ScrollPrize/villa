@@ -1607,6 +1607,9 @@
 - Prefetch data downloads are written to unique temporary files in the final cache directory and then atomically renamed to the VC3D-provided final cache path.
 - VC3D also writes persistent-cache `.empty` markers as zero-byte files and reads them by existence.
 - Prefetch performs global chunk deduplication by store identity and chunk key before network work.
+- Python Zarr prefetch must preserve store-relative v2 chunk keys and raw chunk
+  bytes under both supported Zarr 2 and Zarr 3 APIs; version-specific key and
+  store access belongs in one shared helper rather than individual loaders.
 - Prefetch runs parallel dependency producers plus bounded chunk download workers; download worker count is controlled by `prefetch_workers` without an additional hard-coded cap, and dependency/sampler producer count is controlled by `prefetch_sampler_workers`.
 - During prefetch, PyTorch CPU intra-op threads are temporarily forced to `1`
   while dependency producers run, then restored. This prevents each producer

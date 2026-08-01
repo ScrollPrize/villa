@@ -23,6 +23,7 @@ from vesuvius.neural_tracing.fiber_trace.dataset import (
     FiberTraceDebugTableState,
     ZarrChunkRequest,
 )
+from vesuvius.neural_tracing.zarr_support import read_zarr_store_bytes
 from vesuvius.neural_tracing.fiber_trace.labels import (
     IGNORE_ID,
     IGNORE_INDEX,
@@ -1161,11 +1162,9 @@ def _dedupe_chunk_requests(
 def _fetch_prefetch_chunk(request: ZarrChunkRequest) -> tuple[str, int, float]:
     start = time.perf_counter()
     try:
-        data = request.store[request.key]
+        data = read_zarr_store_bytes(request.store, request.key)
     except KeyError:
         return "missing", 0, (time.perf_counter() - start) * 1000.0
-    if not isinstance(data, (bytes, bytearray, memoryview)):
-        data = bytes(data)
     return "ok", len(data), (time.perf_counter() - start) * 1000.0
 
 

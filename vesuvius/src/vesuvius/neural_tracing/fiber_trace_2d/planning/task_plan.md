@@ -1,52 +1,40 @@
-# Plan: CI Repairs For 3D Lasagna And Fiber Inference
+# Plan: Vesuvius Python CI Compatibility
 
-## Atlas Fixture
+## Workflow
 
-1. Replace the packed four-channel CZYX pred-snap fixture with four independent
-   uint8 ZYX arrays and manifest groups.
-2. Keep production channel binding strict; do not restore packed-array
-   projection or other 4D handling.
+1. Retain the committed `lasagna/**` workflow trigger and repository-root
+   `PYTHONPATH` test environment.
+2. Classify every failure in the Zarr 3.2.1 job log by shared root cause.
 
-## Fiber Inference Bounds
+## Zarr Compatibility
 
-1. Keep shared `_ds_size` floor behavior for model/interpolation tensor sizes.
-2. Add storage-coordinate ceil division for full OME level shapes and absolute
-   output-region endpoints.
-3. Add an odd-dimension regression that crosses an output-chunk boundary and
-   verifies the last storage plane is included.
-
-## Project Volume Reuse
-
-1. Locate the loaded independently owned volume backing an incoming Lasagna
-   channel location.
-2. Accept reuse only when shape, dtype, fill value, base level, present levels,
-   per-level shapes/chunks, and manifest-authoritative spacing match.
-3. Do not require UUID equality: the Lasagna prepared wrapper has an intentional
-   runtime identity distinct from an ordinary attachment of the same source.
-4. Throw on missing or incompatible runtime backing so the existing attachment
-   rollback restores project state.
-5. Add tests for compatible independent ownership and incompatible spacing.
+1. Add one test helper that creates explicit v2 arrays/groups with
+   slash-separated chunk keys through the appropriate Zarr 2 or Zarr 3 API.
+2. Port the affected Fiber, Fiber 2D, and Fiber 3D fixtures to the helper.
+3. Add one runtime helper for store-relative chunk-key encoding and raw store
+   reads across both Zarr APIs.
+4. Make both Fiber prefetch implementations use the shared key encoder, and
+   make the older prefetch reader use the shared raw-byte operation.
 
 ## Tests And Validation
 
-1. Build `test_atlas` and `test_volume_pkg` with 32 jobs.
-2. Run both C++ test binaries through CTest.
-3. Run focused Fiber 3D inference tests, including the odd-edge regression.
+1. Run focused regressions under Zarr 2.18.7 and 3.2.1.
+2. Run all three modules named in the CI failures under each Zarr version.
+3. Attempt the complete CI test selection and report local dependency blockers
+   rather than treating them as product failures.
 4. Run `git diff --check`.
 
 ## Spec Update
 
-- Clarify that OME storage shapes and region endpoints use ceil pyramid
-  geometry even though model tensor downsampling remains floor-sized.
-- State that VC3D Lasagna project channels are independent 3D ZYX volumes and
-  independently attached source reuse requires metadata compatibility.
+- Require cache/prefetch chunk keys and raw store reads to work under both
+  supported Zarr library versions without changing the persisted v2 layout.
 
 ## Docs Updates
 
-- Document odd-edge OME output bounds and compatible independent-volume reuse
-  in the code-structure documentation.
+- Document the shared Zarr compatibility helper in `docs/code_structure.md`.
+- Record matrix reproduction and this host's asyncio limitation in
+  `planning/local_development.md`.
 
 ## Changelog
 
-- Record the CI fixture repair, odd-edge inference coverage, and validated
-  Lasagna source-volume reuse.
+- Record the CI import and Zarr matrix compatibility fixes.

@@ -1,9 +1,12 @@
-# CI Repairs For 3D Lasagna And Fiber Inference
+# Vesuvius Python CI Compatibility
 
-- Update the Atlas pred-snap fixture to the supported Lasagna representation:
-  one 3D ZYX array per channel, with no packed CZYX compatibility.
-- Make Fiber 3D inference cover ceil-sized OME-Zarr edge voxels for odd source
-  dimensions while preserving floor-sized model tensor semantics.
-- Before reusing an independently attached project volume for a Lasagna
-  channel, validate its source geometry, dtype, level/chunk layout, and
-  manifest-authoritative voxel spacing. Reject incompatible reuse atomically.
+- The Vesuvius Python CI job runs from `vesuvius/`, but the fiber tracing tests
+  import shared modules through the sibling top-level `lasagna` namespace.
+- Keep the previously applied workflow import-path and trigger fix.
+- Fix the Zarr 3.2.1 matrix failures in `/tmp/job-logs.txt` without breaking
+  Zarr 2.18.7.
+- Test fixtures that model v2 OME-Zarr input must create v2 metadata and
+  slash-separated chunk keys through APIs supported by both Zarr versions.
+- Runtime prefetch must generate the same store-relative chunk keys and read
+  raw store bytes through either supported Zarr store API.
+- Do not duplicate Lasagna helpers or add fallback implementations.

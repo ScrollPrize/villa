@@ -7,6 +7,7 @@ from typing import Any, Callable
 import numpy as np
 
 from vesuvius.neural_tracing.fiber_trace.dataset import _SpatialChannelView
+from vesuvius.neural_tracing.zarr_support import zarr_chunk_key
 
 
 @dataclass(frozen=True)
@@ -53,15 +54,12 @@ def is_remote_cached_store(store: Any) -> bool:
 
 
 def chunk_key(array: Any, chunk_zyx: tuple[int, int, int]) -> str | None:
-    key_fn = getattr(array, "_chunk_key", None)
-    if not callable(key_fn):
-        return None
     shape = tuple(int(v) for v in getattr(array, "shape", ()))
     chunks = tuple(int(v) for v in getattr(array, "chunks", ()))
     if len(shape) == 3:
-        return str(key_fn(chunk_zyx))
+        return zarr_chunk_key(array, chunk_zyx)
     if len(shape) == 4 and len(chunks) == 4:
-        return str(key_fn((0,) + chunk_zyx))
+        return zarr_chunk_key(array, (0,) + chunk_zyx)
     return None
 
 

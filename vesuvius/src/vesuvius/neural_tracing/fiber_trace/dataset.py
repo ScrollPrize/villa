@@ -29,6 +29,7 @@ from vesuvius.neural_tracing.datasets.common import (
     end_zarr_cache_trace,
     open_zarr as _common_open_zarr,
 )
+from vesuvius.neural_tracing.zarr_support import zarr_chunk_key
 
 
 @dataclass(frozen=True)
@@ -582,8 +583,7 @@ def _chunk_requests_for_bbox(
 
     chunks = _array_chunks_zyx(spatial_array)
     store = getattr(zarr_array, "store", None)
-    chunk_key_fn = getattr(zarr_array, "_chunk_key", None)
-    if chunks is None or store is None or not callable(chunk_key_fn):
+    if chunks is None or store is None:
         return []
     if not _is_remote_cached_store(store):
         return []
@@ -613,11 +613,14 @@ def _chunk_requests_for_bbox(
                     coords = spatial_coords
                 else:
                     continue
+                key = zarr_chunk_key(zarr_array, coords)
+                if key is None:
+                    continue
                 requests.append(
                     ZarrChunkRequest(
                         store=store,
                         store_identity=store_identity,
-                        key=str(chunk_key_fn(coords)),
+                        key=key,
                         label=str(label),
                     )
                 )
