@@ -1396,8 +1396,13 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
 
     std::optional<double> nativeRemoteVoxelSize;
     try {
+        // The samplePixelSize fallback is the only voxel-size source for the
+        // public Open Data volumes (their metadata.json carries it solely as
+        // scan.tomo.acquisition.detector.samplePixelSize). Gating it on a
+        // base-scale selector left native-resolution remote volumes with
+        // voxelsize 0, so area computations downstream collapsed to zero.
         if (auto remoteMeta = loadRemoteVolumeMetadata(
-                remoteUrl, auth, spec.baseScaleLevel > 0)) {
+                remoteUrl, auth, /*discoverPublicSamplePixelSize=*/true)) {
             if (remoteMeta->contains("voxelsize") &&
                 (*remoteMeta)["voxelsize"].is_number()) {
                 const double value = (*remoteMeta)["voxelsize"].get_double();
