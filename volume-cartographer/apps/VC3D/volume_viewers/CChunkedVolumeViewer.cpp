@@ -2992,7 +2992,10 @@ void CChunkedVolumeViewer::setOverlayWindow(float low, float high)
         return;
     }
     _overlayWindowLow = std::clamp(low, 0.0f, 255.0f);
-    _overlayWindowHigh = std::clamp(high, _overlayWindowLow + 1.0f, 255.0f);
+    _overlayWindowHigh = std::clamp(high, 0.0f, 255.0f);
+    if (_overlayWindowHigh <= _overlayWindowLow) {
+        _overlayWindowHigh = std::min(255.0f, _overlayWindowLow + 1.0f);
+    }
     submitRender("overlay window changed");
 }
 

@@ -1,12 +1,11 @@
-# Vesuvius Python CI Compatibility
+# VC3D GitHub CI Acceleration
 
-- The Vesuvius Python CI job runs from `vesuvius/`, but the fiber tracing tests
-  import shared modules through the sibling top-level `lasagna` namespace.
-- Keep the previously applied workflow import-path and trigger fix.
-- Fix the Zarr 3.2.1 matrix failures in `/tmp/job-logs.txt` without breaking
-  Zarr 2.18.7.
-- Test fixtures that model v2 OME-Zarr input must create v2 metadata and
-  slash-separated chunk keys through APIs supported by both Zarr versions.
-- Runtime prefetch must generate the same store-relative chunk keys and read
-  raw store bytes through either supported Zarr store API.
-- Do not duplicate Lasagna helpers or add fallback implementations.
+- Reduce the wall time of the Volume Cartographer GitHub pull-request CI,
+  ideally to less than one minute.
+- Treat this as an interactive investigation: measure each proposed build and
+  workflow change locally in the exact GitHub CI container before adopting it.
+- Preserve compile coverage for every configured target, even when a target is
+  not executed by the test job. Compile coverage may live in separate jobs.
+- Preserve numerical behavior and portability requirements.
+- Record commands, inputs, cache state, timings, successes, failures, and
+  workflow findings in `planning/task_log.md` as the investigation proceeds.
