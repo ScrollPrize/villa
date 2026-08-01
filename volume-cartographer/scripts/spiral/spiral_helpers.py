@@ -50,8 +50,8 @@ def scale_counts_for_z_range(
 
 
 SAMPLING_COUNT_FLOORS = {
-    'dense_spacing_num_pairs': 8_000,
-    'dense_spacing_density_extra_pairs': 16_000,
+    'sample_count_dense_spacing_pairs': 8_000,
+    'sample_count_dense_spacing_density_extra_pairs': 16_000,
 }
 
 
@@ -110,7 +110,7 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
             'fiber_tags': data.get('tags', []),
             'hv_classification': data.get('hv_classification', {}),
             'input_coordinate_scale': coordinate_scale,
-            'fiber_min_point_spacing': min_point_spacing,
+            'pcl_fiber_min_point_spacing': min_point_spacing,
             'fiber_original_num_points': original_num_points,
         },
         'color': color,
@@ -429,12 +429,13 @@ def resolve_outer_winding_idx_and_notes(cfg, shell_active, infer_outer_winding_i
             f'= {idx} for the dense and regularisation losses')
     if idx is not None:
         min_gap = idx + 3
-        if cfg['gap_expander_num_windings'] < min_gap:
+        gap_windings = cfg['model_gap_expander_num_windings']
+        if gap_windings < min_gap:
             notes.append(
                 f'WARNING: shell_outer_winding_idx {idx} requires '
-                f'gap_expander_num_windings >= {min_gap}, got '
-                f'gap_expander_num_windings {cfg["gap_expander_num_windings"]}; '
-                'increase gap_expander_num_windings or lower '
+                f'model_gap_expander_num_windings >= {min_gap}, got '
+                f'model_gap_expander_num_windings {gap_windings}; '
+                'increase model_gap_expander_num_windings or lower '
                 'shell_outer_winding_idx')
     return idx, notes
 
@@ -472,7 +473,7 @@ def _warn_if_inputs_exceed_flow_bounds(
     flow_field_radius,
     cfg,
 ):
-    gap_expander_num_windings = cfg['gap_expander_num_windings']
+    gap_expander_num_windings = cfg['model_gap_expander_num_windings']
 
     over_radius_patches = []
     over_winding_patches = []
@@ -727,6 +728,7 @@ def save_mesh(
     tracks=(),
     run_tag=None,
     name='mesh',
+    progress=None,
 ):
     (min_winding_idx, max_winding_idx), _, _ = compute_winding_range_and_input_extents(
         slice_to_spiral_transform,
@@ -743,7 +745,7 @@ def save_mesh(
         max_winding_idx = min(max_winding_idx, cfg['shell_outer_winding_idx'])
     print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
     grid_spacing = cfg['output_step_size']
-    z_margin = cfg['flow_bounds_z_margin']
+    z_margin = cfg['model_flow_bounds_z_margin']
     spiral_yxs_by_winding = get_spiral_yxs(max_winding_idx, dr_per_winding, grid_spacing, group_by_winding=True)
     num_thetas_by_winding = [len(yxs_for_winding) for yxs_for_winding in spiral_yxs_by_winding]
     spiral_yxs = torch.cat(spiral_yxs_by_winding, dim=0)
@@ -753,8 +755,17 @@ def save_mesh(
     chunk = 65536
     flat_spiral_zyxs = spiral_zyxs.reshape(-1, 3)
     scroll_pieces = []
-    for start in range(0, flat_spiral_zyxs.shape[0], chunk):
+    transform_chunk_total = (
+        flat_spiral_zyxs.shape[0] + chunk - 1) // chunk
+    if progress is not None:
+        progress.begin(
+            'finalizing', 'Transforming final mesh',
+            step=0, total_steps=transform_chunk_total, unit='chunks')
+    for chunk_number, start in enumerate(
+            range(0, flat_spiral_zyxs.shape[0], chunk), start=1):
         scroll_pieces.append(slice_to_spiral_transform.inv(flat_spiral_zyxs[start : start + chunk]))
+        if progress is not None:
+            progress.update(chunk_number)
     scroll_zyxs = torch.cat(scroll_pieces, dim=0).reshape(*spiral_zyxs.shape)
 
     out_of_roi = (scroll_zyxs[..., 0] < z_begin) | (scroll_zyxs[..., 0] >= z_end)
@@ -784,9 +795,18 @@ def save_mesh(
     tag_suffix = f'_{run_tag}' if run_tag else ''
     out_dir = f'{out_path}/meshes/{name}{tag_suffix}'
     os.makedirs(out_dir, exist_ok=True)
+    output_total = 2 * len(num_thetas_by_winding)
+    output_done = 0
+    if progress is not None:
+        progress.begin(
+            'finalizing', 'Writing final mesh windings',
+            step=0, total_steps=output_total, unit='windings')
     for uuid_suffix, variant_zyxs in [('', scroll_zyxs), ('_spliced', spliced_scroll_zyxs)]:
         offset = 0
-        for winding_idx, num_thetas in enumerate(tqdm(num_thetas_by_winding, desc=f'saving winding patches ({name}{uuid_suffix})')):
+        for winding_idx, num_thetas in enumerate(tqdm(
+                num_thetas_by_winding,
+                desc=f'saving winding patches ({name}{uuid_suffix})',
+                disable=progress is not None)):
             if num_thetas >= 2 and winding_idx >= min_winding_idx:
                 winding_slice = variant_zyxs[:, offset:offset + num_thetas]
                 invalid_mask = (winding_slice == -1.0).all(dim=-1).cpu().numpy()
@@ -801,6 +821,10 @@ def save_mesh(
                     source=f'fit_spiral {name}{uuid_suffix}',
                 )
             offset += num_thetas
+            output_done += 1
+            if progress is not None:
+                progress.update(
+                    output_done, detail=f'winding {winding_idx}{uuid_suffix}')
 
 
 @torch.inference_mode()
@@ -818,6 +842,7 @@ def save_combined_preview(
     tracks=(),
     *,
     surface_id,
+    progress=None,
 ):
     """Write the authoritative connected preview used by VC3D and Lasagna."""
     (_, derived_upper), _, _ = compute_winding_range_and_input_extents(
@@ -845,7 +870,7 @@ def save_combined_preview(
         )
 
     grid_spacing = int(cfg['output_step_size'])
-    z_margin = int(cfg['flow_bounds_z_margin'])
+    z_margin = int(cfg['model_flow_bounds_z_margin'])
     spiral_yxs_by_winding = get_spiral_yxs(
         last_winding + 1,
         dr_per_winding,
@@ -861,7 +886,13 @@ def save_combined_preview(
         device=dr_per_winding.device,
     )
     winding_grids = {}
-    for winding in range(first_winding, last_winding + 1):
+    total_windings = last_winding - first_winding + 1
+    if progress is not None:
+        progress.begin(
+            'exporting_preview', 'Transforming preview windings',
+            step=0, total_steps=total_windings, unit='windings')
+    for winding_number, winding in enumerate(
+            range(first_winding, last_winding + 1), start=1):
         yxs = spiral_yxs_by_winding[winding]
         if yxs.shape[0] < 2:
             raise RuntimeError(f'Preview winding {winding} has fewer than two theta samples')
@@ -877,7 +908,13 @@ def save_combined_preview(
         outside = (scroll[..., 0] < z_begin) | (scroll[..., 0] >= z_end)
         scroll[outside] = -1.0
         winding_grids[winding] = scroll.cpu().numpy().astype(np.float32)
+        if progress is not None:
+            progress.update(winding_number, detail=f'winding {winding}')
 
+    if progress is not None:
+        progress.begin(
+            'exporting_preview', 'Writing preview surface',
+            detail=f'{total_windings} windings')
     manifest = save_combined_tifxyz(
         winding_grids,
         generation_path,

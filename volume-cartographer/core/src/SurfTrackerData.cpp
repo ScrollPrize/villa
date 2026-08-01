@@ -1,6 +1,6 @@
 #include "SurfTrackerData.hpp"
+#include "vc/core/util/Geometry.hpp"
 
-#include <cmath>
 #include <iostream>
 #include <stdexcept>
 
@@ -136,16 +136,11 @@ cv::Vec3d SurfTrackerData::lookup_int(QuadSurface *sm, const cv::Vec2i& p)
     if (!_data.contains(id))
         throw std::runtime_error("error, lookup failed!");
     cv::Vec2d l = loc(sm, p);
-    if (l[0] == -1)
+    const auto points = sm->rawPoints();
+    if (!loc_valid(points, l))
         return {-1, -1, -1};
-    else {
-        cv::Rect bounds = {0, 0, sm->rawPoints().rows - 2, sm->rawPoints().cols - 2};
-        cv::Vec2i li = {static_cast<int>(floor(l[0])), static_cast<int>(floor(l[1]))};
-        if (bounds.contains(cv::Point(li)))
-            return at_int_inv(sm->rawPoints(), l);
-        else
-            return {-1, -1, -1};
-    }
+
+    return at_int_inv(points, l);
 }
 
 bool SurfTrackerData::valid_int(QuadSurface *sm, const cv::Vec2i& p)
@@ -154,39 +149,21 @@ bool SurfTrackerData::valid_int(QuadSurface *sm, const cv::Vec2i& p)
     if (!_data.contains(id))
         return false;
     cv::Vec2d l = loc(sm, p);
-    if (l[0] == -1)
-        return false;
-    else {
-        cv::Rect bounds = {0, 0, sm->rawPoints().rows - 2, sm->rawPoints().cols - 2};
-        cv::Vec2i li = {static_cast<int>(floor(l[0])), static_cast<int>(floor(l[1]))};
-        if (bounds.contains(cv::Point(li)))
-        {
-            if (sm->rawPoints()(li[0], li[1])[0] == -1)
-                return false;
-            if (sm->rawPoints()(li[0] + 1, li[1])[0] == -1)
-                return false;
-            if (sm->rawPoints()(li[0], li[1] + 1)[0] == -1)
-                return false;
-            if (sm->rawPoints()(li[0] + 1, li[1] + 1)[0] == -1)
-                return false;
-            return true;
-        }
-        else
-            return false;
-    }
+    const auto points = sm->rawPoints();
+    return loc_valid(points, l);
 }
 
 cv::Vec3d SurfTrackerData::lookup_int_loc(QuadSurface *sm, const cv::Vec2f& l)
 {
-    if (l[0] == -1)
+    const cv::Vec2d loc{
+        static_cast<double>(l[0]),
+        static_cast<double>(l[1])
+    };
+    const auto points = sm->rawPoints();
+    if (!loc_valid(points, loc))
         return {-1, -1, -1};
-    else {
-        cv::Rect bounds = {0, 0, sm->rawPoints().rows - 2, sm->rawPoints().cols - 2};
-        if (bounds.contains(cv::Point(l)))
-            return at_int_inv(sm->rawPoints(), l);
-        else
-            return {-1, -1, -1};
-    }
+
+    return at_int_inv(points, l);
 }
 
 void SurfTrackerData::flip_x(int x0)

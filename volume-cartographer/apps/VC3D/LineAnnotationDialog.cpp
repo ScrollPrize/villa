@@ -10,15 +10,20 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include <QAbstractItemView>
+#include <QAction>
 #include <QBrush>
 #include <QCloseEvent>
-#include <QComboBox>
+#include <QCursor>
 #include <QEvent>
 #include <QFont>
+#include <QMenu>
+#include <QMouseEvent>
+#include <QPaintEvent>
+#include <QPainter>
 #include <QGraphicsPathItem>
 #include <QGraphicsRectItem>
 #include <QGraphicsSimpleTextItem>
+#include <QInputDialog>
 #include <QKeyEvent>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -37,6 +42,7 @@
 #include <QSpinBox>
 #include <QVariant>
 #include <QTimer>
+#include <QToolButton>
 #include <QVariantAnimation>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -206,17 +212,6 @@ QString spanAlignmentMetricToolTip(
     return {};
 }
 
-void installComboEventFilter(QComboBox* combo, QObject* filter)
-{
-    if (!combo || !filter) {
-        return;
-    }
-    combo->installEventFilter(filter);
-    if (auto* popupView = combo->view()) {
-        popupView->installEventFilter(filter);
-    }
-}
-
 QVariantList splitterSizesToVariantList(const QList<int>& sizes)
 {
     QVariantList values;
@@ -294,6 +289,128 @@ cv::Vec3f normalizedOrNan(const cv::Vec3f& vector)
     return vector * (1.0f / n);
 }
 
+constexpr int kOverviewBarHeightPx = 48;
+
+// Schematic overview of the annotation shown above the cut views: a straight
+// line with the control points, replacing the previous volume-rendered top
+// strip (no rendering at all). Fixed height; the annotation compresses
+// horizontally as it grows. Display-only except Ctrl+right-click on a control
+// point, which invokes controlContextRequested with the dot's line position.
+class LineAnnotationOverviewBar final : public QWidget
+{
+public:
+    struct ControlDot {
+        double linePosition = 0.0;
+        QColor color;
+        qreal radius = 4.5;
+    };
+
+    using QWidget::QWidget;
+
+    std::function<void(double, QPoint)> controlContextRequested;
+
+    void setLineData(size_t linePointCount, std::vector<ControlDot> dots)
+    {
+        _linePointCount = linePointCount;
+        _dots = std::move(dots);
+        update();
+    }
+
+    void setCurrentPosition(double position, const QColor& color)
+    {
+        _currentPosition = position;
+        _currentColor = color;
+        update();
+    }
+
+    std::optional<double> linePositionAtLocalX(qreal x) const
+    {
+        const qreal inner = innerWidth();
+        if (_linePointCount < 2 || inner <= 0.0) {
+            return std::nullopt;
+        }
+        const double t =
+            std::clamp((x - kMarginPx) / static_cast<double>(inner), 0.0, 1.0);
+        return t * static_cast<double>(_linePointCount - 1);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter painter(this);
+        painter.fillRect(rect(), Qt::black);
+        if (_linePointCount < 2) {
+            return;
+        }
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        const qreal midY = height() * 0.5;
+        painter.setPen(QPen(QColor(190, 190, 190), 2.0));
+        painter.drawLine(QPointF(kMarginPx, midY),
+                         QPointF(width() - kMarginPx, midY));
+
+        if (std::isfinite(_currentPosition)) {
+            painter.setPen(QPen(_currentColor, 2.0));
+            const qreal x = xForLinePosition(_currentPosition);
+            painter.drawLine(QPointF(x, 4.0), QPointF(x, height() - 4.0));
+        }
+
+        for (const ControlDot& dot : _dots) {
+            if (!std::isfinite(dot.linePosition)) {
+                continue;
+            }
+            const qreal x = xForLinePosition(dot.linePosition);
+            painter.setPen(QPen(dot.color.darker(150), 1.0));
+            painter.setBrush(dot.color);
+            painter.drawEllipse(QPointF(x, midY), dot.radius, dot.radius);
+        }
+    }
+
+    void mousePressEvent(QMouseEvent* event) override
+    {
+        if (event->button() == Qt::RightButton &&
+            event->modifiers().testFlag(Qt::ControlModifier) &&
+            controlContextRequested && _linePointCount >= 2) {
+            constexpr qreal kHitRadiusPx = 8.0;
+            const qreal x = event->position().x();
+            const ControlDot* best = nullptr;
+            qreal bestDistance = kHitRadiusPx;
+            for (const ControlDot& dot : _dots) {
+                if (!std::isfinite(dot.linePosition)) {
+                    continue;
+                }
+                const qreal distance =
+                    std::abs(xForLinePosition(dot.linePosition) - x);
+                if (distance <= bestDistance) {
+                    bestDistance = distance;
+                    best = &dot;
+                }
+            }
+            if (best) {
+                controlContextRequested(best->linePosition,
+                                        event->globalPosition().toPoint());
+            }
+        }
+        event->accept();  // display-only otherwise
+    }
+
+private:
+    static constexpr qreal kMarginPx = 8.0;
+
+    qreal innerWidth() const { return width() - 2.0 * kMarginPx; }
+
+    qreal xForLinePosition(double position) const
+    {
+        const double t = std::clamp(
+            position / static_cast<double>(_linePointCount - 1), 0.0, 1.0);
+        return kMarginPx + static_cast<qreal>(t) * innerWidth();
+    }
+
+    size_t _linePointCount = 0;
+    std::vector<ControlDot> _dots;
+    double _currentPosition = std::numeric_limits<double>::quiet_NaN();
+    QColor _currentColor{0, 245, 255};
+};
+
 } // namespace
 
 LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
@@ -318,46 +435,49 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     auto* buttonLayout = new QHBoxLayout(buttonRow);
     buttonLayout->setContentsMargins(6, 6, 6, 6);
     buttonLayout->setSpacing(6);
-    _initialDirectionCombo = new QComboBox(buttonRow);
-    _initialDirectionCombo->addItem(tr("sideways"), static_cast<int>(InitialDirectionMode::Sideways));
-    _initialDirectionCombo->addItem(tr("z (in/out)"), static_cast<int>(InitialDirectionMode::ZInOut));
-    _initialDirectionCombo->setCurrentIndex(1);
-    installComboEventFilter(_initialDirectionCombo, this);
-    buttonLayout->addWidget(_initialDirectionCombo);
-    _reoptimizationCombo = new QComboBox(buttonRow);
-    _reoptimizationCombo->addItem(tr("auto-reopt"),
-                                  static_cast<int>(ReoptimizationMode::AutoReoptimize));
-    _reoptimizationCombo->addItem(tr("no optimization"),
-                                  static_cast<int>(ReoptimizationMode::NoOptimization));
-    _reoptimizationCombo->setCurrentIndex(0);
-    installComboEventFilter(_reoptimizationCombo, this);
-    buttonLayout->addWidget(_reoptimizationCombo);
-    connect(_reoptimizationCombo,
-            qOverload<int>(&QComboBox::currentIndexChanged),
-            this,
-            [this](int) {
-                emit reoptimizationModeChanged(reoptimizationMode());
-            });
-    _shiftScrollCombo = new QComboBox(buttonRow);
-    _shiftScrollCombo->addItem(tr("along-line"),
-                               static_cast<int>(ShiftScrollMode::AlongLine));
-    _shiftScrollCombo->addItem(tr("straight"),
-                               static_cast<int>(ShiftScrollMode::StraightNormal));
-    _shiftScrollCombo->setCurrentIndex(0);
-    installComboEventFilter(_shiftScrollCombo, this);
-    buttonLayout->addWidget(_shiftScrollCombo);
-    connect(_shiftScrollCombo,
-            qOverload<int>(&QComboBox::currentIndexChanged),
-            this,
-            [this](int) {
-                handleShiftScrollModeChanged();
-            });
+
+    // Popup menu on a toolbutton rather than a QMenuBar: the dialog can be
+    // embedded as a workspace tab, where its own menu bar would stack under
+    // the main window's.
+    auto* annotationMenuButton = new QToolButton(buttonRow);
+    annotationMenuButton->setObjectName(QStringLiteral("lineAnnotationMenuButton"));
+    annotationMenuButton->setText(tr("Annotation"));
+    annotationMenuButton->setPopupMode(QToolButton::InstantPopup);
+    annotationMenuButton->installEventFilter(this);
+    auto* annotationMenu = new QMenu(annotationMenuButton);
+    annotationMenu->setToolTipsVisible(true);
+    _autoReoptimizeAction = annotationMenu->addAction(tr("Auto-reoptimize"));
+    _autoReoptimizeAction->setCheckable(true);
+    _autoReoptimizeAction->setChecked(true);
+    _autoReoptimizeAction->setToolTip(
+        tr("Checked: re-optimize the line after every control-point edit.\n"
+           "Unchecked: no optimization until \"Reinit reoptimization\" or close."));
+    connect(_autoReoptimizeAction, &QAction::toggled, this, [this](bool checked) {
+        emit reoptimizationModeChanged(checked ? ReoptimizationMode::AutoReoptimize
+                                               : ReoptimizationMode::NoOptimization);
+    });
+    annotationMenu->addSeparator();
+    _fullOptimizationAction = annotationMenu->addAction(tr("Reinit reoptimization"));
+    _fullOptimizationAction->setEnabled(false);
+    connect(_fullOptimizationAction, &QAction::triggered, this, [this]() {
+        emit fullOptimizationRequested();
+    });
+    _showAsMeshAction = annotationMenu->addAction(tr("Show as mesh"));
+    _showAsMeshAction->setEnabled(false);
+    connect(_showAsMeshAction, &QAction::triggered, this, [this]() {
+        emit showAsMeshRequested();
+    });
+    annotationMenuButton->setMenu(annotationMenu);
+    buttonLayout->addWidget(annotationMenuButton);
+
+    auto* centerlineLengthLabel = new QLabel(tr("Length"), buttonRow);
+    centerlineLengthLabel->installEventFilter(this);
+    buttonLayout->addWidget(centerlineLengthLabel);
     _initialCenterlineLengthSpin = new QSpinBox(buttonRow);
     _initialCenterlineLengthSpin->setObjectName(
         QStringLiteral("lineAnnotationInitialCenterlineLengthSpinBox"));
     _initialCenterlineLengthSpin->setRange(100, 1000000);
     _initialCenterlineLengthSpin->setSingleStep(100);
-    _initialCenterlineLengthSpin->setPrefix(tr("Length "));
     _initialCenterlineLengthSpin->setSuffix(tr(" vx"));
     _initialCenterlineLengthSpin->setToolTip(
         tr("Total length of a newly generated centerline, split equally around the seed."));
@@ -411,31 +531,28 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
             buttonLayout->addWidget(volumeSelector);
         }
     }
-    _sliceStepLabel = new QLabel(this);
-    _sliceStepLabel->setText(tr("Z sens: %1").arg(_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0, 0, 'f', 1));
-    _sliceStepLabel->setToolTip(tr("Z-scroll sensitivity. Use Shift+G / Shift+H to adjust."));
-    _sliceStepLabel->installEventFilter(this);
-    buttonLayout->addWidget(_sliceStepLabel);
-    if (_viewerManager) {
-        connect(_viewerManager, &ViewerManager::zScrollSensitivityChanged, this, [this](double sensitivity) {
-            if (_sliceStepLabel) {
-                _sliceStepLabel->setText(tr("Z sens: %1").arg(sensitivity, 0, 'f', 1));
-            }
-        });
-    }
-    _optimizationStatusLabel = new QLabel(tr("not optimized"), buttonRow);
-    _optimizationStatusLabel->installEventFilter(this);
-    buttonLayout->addWidget(_optimizationStatusLabel);
-    _sideStripIntersectionProgress = new QProgressBar(buttonRow);
-    _sideStripIntersectionProgress->setObjectName(QStringLiteral("lineAnnotationSideStripIntersectionProgress"));
-    _sideStripIntersectionProgress->setRange(0, 1);
-    _sideStripIntersectionProgress->setValue(0);
-    _sideStripIntersectionProgress->setTextVisible(true);
-    _sideStripIntersectionProgress->setFormat(tr("strip intersections: 0"));
-    _sideStripIntersectionProgress->setMinimumWidth(260);
-    _sideStripIntersectionProgress->setVisible(false);
-    _sideStripIntersectionProgress->installEventFilter(this);
-    buttonLayout->addWidget(_sideStripIntersectionProgress);
+    auto* tagsLabel = new QLabel(tr("Tags:"), buttonRow);
+    tagsLabel->installEventFilter(this);
+    buttonLayout->addWidget(tagsLabel);
+    _tagRowWidget = new QWidget(buttonRow);
+    _tagRowWidget->installEventFilter(this);
+    _tagRowWidget->setStyleSheet(QStringLiteral(
+        "QToolButton#lineAnnotationTagButton {"
+        " border: 1px solid rgba(128, 128, 128, 140); border-radius: 9px;"
+        " padding: 2px 10px; background: transparent; }"
+        "QToolButton#lineAnnotationTagButton:checked {"
+        " background-color: rgb(0, 190, 210); border-color: rgb(0, 190, 210);"
+        " color: black; font-weight: 600; }"
+        "QToolButton#lineAnnotationTagButton:disabled {"
+        " border-color: rgba(128, 128, 128, 70); }"));
+    _tagRowLayout = new QHBoxLayout(_tagRowWidget);
+    _tagRowLayout->setContentsMargins(0, 0, 0, 0);
+    _tagRowLayout->setSpacing(4);
+    buttonLayout->addWidget(_tagRowWidget);
+    setFiberTags({}, {}, false);
+    // The side-strip intersection query still runs (it feeds the fiber-
+    // intersection X markers); we just no longer show a progress indicator.
+    // _sideStripIntersectionProgress stays null and its setters no-op.
     _fiberNameLabel = new QLabel(buttonRow);
     _fiberNameLabel->setObjectName(QStringLiteral("lineAnnotationFiberNameLabel"));
     _fiberNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -443,26 +560,12 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberNameLabel->setMinimumWidth(0);
     _fiberNameLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     _fiberNameLabel->installEventFilter(this);
-    _showAsMeshButton = new QPushButton(tr("show as mesh"), buttonRow);
-    _showAsMeshButton->setEnabled(false);
-    _showAsMeshButton->installEventFilter(this);
-    buttonLayout->addWidget(_showAsMeshButton);
-    _fullOptimizationButton = new QPushButton(tr("reinit reopt"), buttonRow);
-    _fullOptimizationButton->setEnabled(false);
-    _fullOptimizationButton->installEventFilter(this);
-    buttonLayout->addWidget(_fullOptimizationButton);
     _resetViewsButton = new QPushButton(tr("Reset views"), buttonRow);
     _resetViewsButton->setEnabled(false);
     _resetViewsButton->installEventFilter(this);
     buttonLayout->addWidget(_resetViewsButton);
     buttonLayout->addWidget(_fiberNameLabel, 1);
     _layout->addWidget(buttonRow, 0);
-    connect(_showAsMeshButton, &QPushButton::clicked, this, [this]() {
-        emit showAsMeshRequested();
-    });
-    connect(_fullOptimizationButton, &QPushButton::clicked, this, [this]() {
-        emit fullOptimizationRequested();
-    });
     connect(_resetViewsButton, &QPushButton::clicked, this, [this]() {
         resetGeneratedViews();
     });
@@ -489,20 +592,12 @@ void LineAnnotationDialog::showWithSavedGeometry()
     }
 }
 
-LineAnnotationDialog::InitialDirectionMode LineAnnotationDialog::initialDirectionMode() const
-{
-    if (!_initialDirectionCombo) {
-        return InitialDirectionMode::Sideways;
-    }
-    return static_cast<InitialDirectionMode>(_initialDirectionCombo->currentData().toInt());
-}
-
 LineAnnotationDialog::ReoptimizationMode LineAnnotationDialog::reoptimizationMode() const
 {
-    if (!_reoptimizationCombo) {
-        return ReoptimizationMode::AutoReoptimize;
+    if (_autoReoptimizeAction && !_autoReoptimizeAction->isChecked()) {
+        return ReoptimizationMode::NoOptimization;
     }
-    return static_cast<ReoptimizationMode>(_reoptimizationCombo->currentData().toInt());
+    return ReoptimizationMode::AutoReoptimize;
 }
 
 int LineAnnotationDialog::initialCenterlineLengthVx() const
@@ -510,14 +605,6 @@ int LineAnnotationDialog::initialCenterlineLengthVx() const
     return _initialCenterlineLengthSpin
         ? _initialCenterlineLengthSpin->value()
         : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
-}
-
-LineAnnotationDialog::ShiftScrollMode LineAnnotationDialog::shiftScrollMode() const
-{
-    if (!_shiftScrollCombo) {
-        return ShiftScrollMode::AlongLine;
-    }
-    return static_cast<ShiftScrollMode>(_shiftScrollCombo->currentData().toInt());
 }
 
 int LineAnnotationDialog::maxControlPointDistanceVx() const
@@ -702,16 +789,82 @@ void LineAnnotationDialog::setOptimizationBusy(bool busy)
 
 void LineAnnotationDialog::setOptimizationStatus(bool optimized)
 {
-    if (!_optimizationStatusLabel) {
-        return;
-    }
-    _optimizationStatusLabel->setText(optimized ? tr("optimized") : tr("not optimized"));
+    _optimizationStatusOptimized = optimized;
+    updateOptimizationStatusIndicator();
 }
 
 void LineAnnotationDialog::setFiberDisplayName(const QString& name)
 {
     _fiberDisplayName = name;
     updateFiberNameLabel();
+}
+
+void LineAnnotationDialog::setFiberHvTag(const QString& tag)
+{
+    _fiberHvTag = tag.trimmed();
+    updateFiberNameLabel();
+}
+
+void LineAnnotationDialog::setFiberTags(const std::vector<std::string>& knownTags,
+                                        const std::vector<std::string>& activeTags,
+                                        bool enabled)
+{
+    if (!_tagRowWidget || !_tagRowLayout) {
+        return;
+    }
+    while (auto* item = _tagRowLayout->takeAt(0)) {
+        // deleteLater, not delete: a rebuild can be triggered from a slot chain
+        // that started in one of these buttons' own signals.
+        if (auto* widget = item->widget()) {
+            widget->hide();
+            widget->deleteLater();
+        }
+        delete item;
+    }
+
+    const QString disabledToolTip =
+        tr("Tags become editable once the fiber has been saved.");
+    for (const auto& tag : knownTags) {
+        const QString tagText = QString::fromStdString(tag);
+        const bool active = std::find(activeTags.begin(), activeTags.end(), tag) !=
+                            activeTags.end();
+        auto* button = new QToolButton(_tagRowWidget);
+        button->setObjectName(QStringLiteral("lineAnnotationTagButton"));
+        button->setText(active ? QStringLiteral("✓ ") + tagText : tagText);
+        button->setCheckable(true);
+        button->setChecked(active);
+        button->setEnabled(enabled);
+        button->setToolTip(enabled
+            ? tr("Toggle tag \"%1\" on the current fiber").arg(tagText)
+            : disabledToolTip);
+        button->installEventFilter(this);
+        connect(button, &QToolButton::toggled, this, [this, tagText](bool checked) {
+            // Deferred: the handler rebuilds this row, which must not delete the
+            // button while its own toggled signal is still on the stack.
+            QTimer::singleShot(0, this, [this, tagText, checked]() {
+                emit fiberTagChangeRequested(tagText, checked);
+            });
+        });
+        _tagRowLayout->addWidget(button);
+    }
+
+    auto* addButton = new QToolButton(_tagRowWidget);
+    addButton->setObjectName(QStringLiteral("lineAnnotationAddTagButton"));
+    addButton->setText(QStringLiteral("+"));
+    addButton->setEnabled(enabled);
+    addButton->setToolTip(enabled ? tr("Add a new tag to the current fiber")
+                                  : disabledToolTip);
+    addButton->installEventFilter(this);
+    connect(addButton, &QToolButton::clicked, this, [this]() {
+        const QString tag =
+            QInputDialog::getText(this, tr("New tag"), tr("Tag name:")).trimmed();
+        if (!tag.isEmpty()) {
+            QTimer::singleShot(0, this, [this, tag]() {
+                emit fiberTagChangeRequested(tag, true);
+            });
+        }
+    });
+    _tagRowLayout->addWidget(addButton);
 }
 
 void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)
@@ -791,17 +944,30 @@ bool LineAnnotationDialog::setGeneratedRows(
         return false;
     }
 
-    if (_showAsMeshButton) {
-        _showAsMeshButton->setEnabled(false);
+    if (_showAsMeshAction) {
+        _showAsMeshAction->setEnabled(false);
     }
-    if (_fullOptimizationButton) {
-        _fullOptimizationButton->setEnabled(false);
+    if (_fullOptimizationAction) {
+        _fullOptimizationAction->setEnabled(false);
     }
     if (_resetViewsButton) {
         _resetViewsButton->setEnabled(false);
     }
 
     clearGeneratedOverlayRefreshConnections();
+    // Drop all viewer references BEFORE deleting the widgets: destruction
+    // delivers events through our eventFilter, which must not dereference a
+    // half-destroyed viewer (QPointers only clear once ~QObject runs).
+    _panes.clear();
+    _stripViewers.clear();
+    _overviewBar = nullptr;
+    _currentCutOverlaySwapPending = false;
+    _sideCutOverlaySwapPending = false;
+    _stripOverlaySwapPending = false;
+    _pendingPlacementFocus.reset();
+    clearFastGeneratedOverlayItemRefs();
+    _currentCutViewer = nullptr;
+    _sideCutViewer = nullptr;
     _suppressPaneClosed = true;
     if (_mdiArea) {
         _layout->removeWidget(_mdiArea);
@@ -809,11 +975,6 @@ bool LineAnnotationDialog::setGeneratedRows(
         _mdiArea = nullptr;
     }
     _suppressPaneClosed = false;
-    _panes.clear();
-    _stripViewers.clear();
-    clearFastGeneratedOverlayItemRefs();
-    _currentCutViewer = nullptr;
-    _sideCutViewer = nullptr;
     _hasGeneratedViews = false;
     _currentCutManualRotation = cv::Matx33f::eye();
     _currentCutManualRotationActive = false;
@@ -859,11 +1020,11 @@ bool LineAnnotationDialog::setGeneratedRows(
         }
     }
     const bool ok = !_panes.empty();
-    if (_showAsMeshButton) {
-        _showAsMeshButton->setEnabled(ok);
+    if (_showAsMeshAction) {
+        _showAsMeshAction->setEnabled(ok);
     }
-    if (_fullOptimizationButton) {
-        _fullOptimizationButton->setEnabled(ok);
+    if (_fullOptimizationAction) {
+        _fullOptimizationAction->setEnabled(ok);
     }
     return ok;
 }
@@ -961,11 +1122,143 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         return false;
     }
 
-    if (_showAsMeshButton) {
-        _showAsMeshButton->setEnabled(false);
+    // In-place update: every control-point placement re-materializes the views,
+    // and the controller re-registers the new surfaces in CState under the SAME
+    // names before calling us, so the live viewers have already adopted them via
+    // surfaceChanged (view centers preserved). Rebuilding the panes -- the
+    // previous behavior -- destroyed and recreated all four viewers, producing a
+    // visible blank/jump on every placement.
+    if (_hasGeneratedViews && _currentCutViewer && _sideCutViewer &&
+        _stripViewers.size() == 1 && _stripViewers[0] &&
+        _generatedViews.currentCutName == views.currentCutName &&
+        _generatedViews.sideCutName == views.sideCutName &&
+        _generatedViews.lineSurfaceName == views.lineSurfaceName &&
+        _generatedViews.lineSideSliceName == views.lineSideSliceName) {
+        // Snapshot the on-screen view data: each pane keeps drawing its overlays
+        // from this until it adopts a rendered frame of the re-optimized
+        // surfaces (hooks below), so overlays and image update together.
+        _heldGeneratedViews = _generatedViews;
+        _heldControlIndex = _generatedControlIndex;
+        _heldLinePosition = _currentLinePosition;
+        _currentCutOverlaySwapPending = true;
+        _sideCutOverlaySwapPending = true;
+        _stripOverlaySwapPending = true;
+
+        const double previousLinePosition = _currentLinePosition;
+        _generatedViews = views;
+        _linePointsd.clear();
+        _linePointsd.reserve(_generatedViews.linePoints.size());
+        for (const auto& p : _generatedViews.linePoints) {
+            _linePointsd.emplace_back(p[0], p[1], p[2]);
+        }
+        _sideFitBracket[0] = SideFit{};
+        _sideFitBracket[1] = SideFit{};
+        _generatedControlIndex =
+            vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
+                _generatedViews.controlPoints);
+        const double maxLinePosition =
+            static_cast<double>(_generatedViews.linePoints.size() - 1);
+        // After a control-point placement, land the current position on the
+        // control point that resulted from the click (positions renumber when
+        // the line is re-optimized, so the old numeric position is ambiguous).
+        double targetLinePosition = previousLinePosition;
+        if (_pendingPlacementFocus) {
+            if (const auto nearest =
+                    vc3d::line_annotation::nearestGeneratedControlPointIndex(
+                        _generatedViews.controlPoints, *_pendingPlacementFocus)) {
+                const double controlPosition =
+                    _generatedViews.controlPoints[*nearest].linePosition;
+                if (std::isfinite(controlPosition)) {
+                    targetLinePosition = controlPosition;
+                }
+            }
+            _pendingPlacementFocus.reset();
+        }
+        _currentLinePosition =
+            std::clamp(targetLinePosition, 0.0, maxLinePosition);
+        _currentCutNormalOffsetVx = 0.0;
+        _sideCutNormalOffsetVx = 0.0;
+        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+        _sideCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
+        if (!updatePlaneSurface(_generatedViews.currentCutSurface.get(),
+                                _currentLinePosition) ||
+            !updateSidePlaneSurface(_generatedViews.sideCutSurface.get(),
+                                    _currentLinePosition)) {
+            return false;
+        }
+        _currentCutViewer->markSurfaceGeometryChanged();
+        _currentCutViewer->renderVisible(true, "line annotation views updated");
+        _sideCutViewer->markSurfaceGeometryChanged();
+        _sideCutViewer->renderVisible(true, "line annotation views updated");
+        for (const auto& stripViewer : _stripViewers) {
+            if (stripViewer) {
+                // Bump the strip's geometry epoch too, so the swap hooks below
+                // can tell post-update frames from stale in-flight ones.
+                stripViewer->markSurfaceGeometryChanged();
+                stripViewer->renderVisible(true, "line annotation views updated");
+            }
+        }
+        // Adopting the re-registered surfaces cleared each viewer's scene
+        // (onSurfaceChanged does _scene->clear()), deleting the pooled overlay
+        // items; drop our cached pointers so the rebuild recreates them.
+        clearFastGeneratedOverlayItemRefs();
+        // Per pane: swap to the new overlays only once the pane DISPLAYS a
+        // frame of the post-update geometry. renderFrameCompleted fires at
+        // every frame adoption, and a render submitted before the placement
+        // can adopt first -- so gate on the displayed frame's geometry epoch
+        // matching the viewer's current one instead of on the first adoption.
+        const auto hookOverlaySwap = [this](CChunkedVolumeViewer* viewer,
+                                            bool LineAnnotationDialog::*pendingFlag) {
+            if (!viewer) {
+                this->*pendingFlag = false;
+                return;
+            }
+            auto connection = std::make_shared<QMetaObject::Connection>();
+            *connection = connect(
+                viewer,
+                &CChunkedVolumeViewer::renderFrameCompleted,
+                this,
+                [this, viewer, connection, pendingFlag](std::uint64_t, double) {
+                    if (_closing) {
+                        QObject::disconnect(*connection);
+                        return;
+                    }
+                    if (viewer->displayedSurfaceGeometryEpoch() !=
+                        viewer->surfaceGeometryEpoch()) {
+                        return;  // stale in-flight frame; keep waiting
+                    }
+                    QObject::disconnect(*connection);
+                    this->*pendingFlag = false;
+                    rebuildGeneratedStaticStripOverlays();
+                    rebuildGeneratedDynamicOverlays();
+                });
+        };
+        hookOverlaySwap(_currentCutViewer.data(),
+                        &LineAnnotationDialog::_currentCutOverlaySwapPending);
+        hookOverlaySwap(_sideCutViewer.data(),
+                        &LineAnnotationDialog::_sideCutOverlaySwapPending);
+        hookOverlaySwap(_stripViewers.front().data(),
+                        &LineAnnotationDialog::_stripOverlaySwapPending);
+        updatePauseIndicator();
+        updateOptimizationStatusIndicator();
+        rebuildGeneratedOverlays();
+        if (_showAsMeshAction) {
+            _showAsMeshAction->setEnabled(true);
+        }
+        if (_fullOptimizationAction) {
+            _fullOptimizationAction->setEnabled(true);
+        }
+        if (_resetViewsButton) {
+            _resetViewsButton->setEnabled(true);
+        }
+        return true;
     }
-    if (_fullOptimizationButton) {
-        _fullOptimizationButton->setEnabled(false);
+
+    if (_showAsMeshAction) {
+        _showAsMeshAction->setEnabled(false);
+    }
+    if (_fullOptimizationAction) {
+        _fullOptimizationAction->setEnabled(false);
     }
     if (_resetViewsButton) {
         _resetViewsButton->setEnabled(false);
@@ -1007,6 +1300,20 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     }
 
     clearGeneratedOverlayRefreshConnections();
+    // Drop all viewer references BEFORE deleting the widgets: destroying a
+    // viewer synchronously delivers events (ChildRemoved/Hide/...) through our
+    // eventFilter, which must not dereference a half-destroyed viewer via
+    // _stripViewers/cut viewers (QPointers only clear once ~QObject runs).
+    _panes.clear();
+    _stripViewers.clear();
+    _overviewBar = nullptr;
+    _currentCutOverlaySwapPending = false;
+    _sideCutOverlaySwapPending = false;
+    _stripOverlaySwapPending = false;
+    _pendingPlacementFocus.reset();
+    clearFastGeneratedOverlayItemRefs();
+    _currentCutViewer = nullptr;
+    _sideCutViewer = nullptr;
     _suppressPaneClosed = true;
     if (_mdiArea) {
         _layout->removeWidget(_mdiArea);
@@ -1022,11 +1329,6 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     }
     _generatedContainers.clear();
     _generatedTopWidget = nullptr;
-    _panes.clear();
-    _stripViewers.clear();
-    clearFastGeneratedOverlayItemRefs();
-    _currentCutViewer = nullptr;
-    _sideCutViewer = nullptr;
 
     _generatedViews = views;
     _linePointsd.clear();
@@ -1096,11 +1398,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         currentViewer->centerOnVolumePoint(_generatedViews.focusPoint, false);
     }
     currentViewer->setShiftScrollOverride(
-        [this](int steps, QPointF, Qt::KeyboardModifiers modifiers) {
-            (void)modifiers;
-            if (shiftScrollMode() == ShiftScrollMode::StraightNormal) {
-                return shiftCurrentCutPlaneNormalOffsetByScrollSteps(steps);
-            }
+        [this](int steps, QPointF, Qt::KeyboardModifiers) {
+            // Always step along the line; the cut plane never leaves it.
             return shiftCurrentLinePositionByScrollSteps(steps);
         });
     bindPaneInteractions(views.currentCutName, currentViewer, false);
@@ -1120,6 +1419,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         return;
                     }
                     setCurrentCutFollowsStripMouse(true);
+                    _pendingPlacementFocus = volumePoint;
                     emit generatedControlPointRequested(_generatedViews.currentCutName,
                                                         volumePoint,
                                                         _currentLinePosition);
@@ -1174,6 +1474,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         return;
                     }
                     setCurrentCutFollowsStripMouse(true);
+                    _pendingPlacementFocus = volumePoint;
                     emit generatedControlPointRequested(_generatedViews.sideCutName,
                                                         volumePoint,
                                                         _currentLinePosition);
@@ -1193,12 +1494,24 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedStripSplitter = stripSplitter;
     outerSplitter->addWidget(stripSplitter);
 
-    const std::pair<std::string, QString> stripSpecs[] = {
-        {views.lineSurfaceName, views.lineSurfaceTitle},
-        {views.lineSideSliceName, views.lineSideSliceTitle},
+    // Schematic overview bar between the button row and the cut views: a
+    // straight line with the control points, no volume rendering at all. Fixed
+    // height; the annotation compresses horizontally as it grows. Registered in
+    // _generatedContainers so the rebuild teardown deletes it like the splitter
+    // containers.
+    auto* overviewBar = new LineAnnotationOverviewBar(centralWidget());
+    overviewBar->setObjectName(QStringLiteral("lineAnnotationOverviewBar"));
+    overviewBar->setFixedHeight(kOverviewBarHeightPx);
+    overviewBar->controlContextRequested = [this](double linePosition,
+                                                  QPoint globalPos) {
+        forwardOverviewControlContextMenu(linePosition, globalPos);
     };
-    int stripIndex = 0;
-    for (const auto& [surfaceName, title] : stripSpecs) {
+    _layout->insertWidget(1, overviewBar, 0);
+    _generatedContainers.push_back(overviewBar);
+    _overviewBar = overviewBar;
+
+    {
+        const std::string& surfaceName = views.lineSideSliceName;
         auto* base = _viewerManager->createViewerInWidget(
             surfaceName,
             stripSplitter,
@@ -1207,10 +1520,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         if (!viewer) {
             return false;
         }
-        viewer->setObjectName(title);
-        const bool haveStripCamera = static_cast<size_t>(stripIndex) < stripCameras.size();
+        viewer->setObjectName(views.lineSideSliceTitle);
+        const bool haveStripCamera = !stripCameras.empty();
         auto stripCamera = haveStripCamera
-            ? stripCameras[static_cast<size_t>(stripIndex)]
+            ? stripCameras.front()
             : generatedPaneCamera(viewer, camera);
         if (!haveStripCamera) {
             if (const auto center =
@@ -1223,8 +1536,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     views.initialStripLinePositionRange)) {
                 stripCamera.scale = *focusedScale;
             }
-            if (static_cast<size_t>(stripIndex) < _savedStripZooms.size()) {
-                stripCamera.scale = _savedStripZooms[static_cast<size_t>(stripIndex)];
+            if (!_savedStripZooms.empty()) {
+                stripCamera.scale = _savedStripZooms.front();
             }
         }
         viewer->applyCameraState(stripCamera, false);
@@ -1263,6 +1576,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                             if (!controlPointPlacementAllowedAt(position)) {
                                 return;
                             }
+                            _pendingPlacementFocus = volumePoint;
                             emit generatedControlPointRequested(surfaceName, volumePoint, position);
                         }
                     }
@@ -1271,11 +1585,9 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _stripViewers.push_back(viewer);
         _panes.push_back(Pane{surfaceName, viewer, {}});
         connectGeneratedOverlayRefresh(viewer);
-        ++stripIndex;
     }
 
     stripSplitter->setStretchFactor(0, 1);
-    stripSplitter->setStretchFactor(1, 1);
     outerSplitter->setStretchFactor(0, 2);
     outerSplitter->setStretchFactor(1, 1);
 
@@ -1290,15 +1602,19 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (_savedOuterSplitterSizes.size() == outerSplitter->count()) {
         outerSplitter->setSizes(_savedOuterSplitterSizes);
     } else {
-        outerSplitter->setSizes({2, 1});
+        // Bottom strip gets ~23% (the old 1/3 reduced by ~30%); the difference
+        // goes to the cut views.
+        outerSplitter->setSizes({23, 7});
     }
 
+    updatePauseIndicator();
+    updateOptimizationStatusIndicator();
     rebuildGeneratedOverlays();
-    if (_showAsMeshButton) {
-        _showAsMeshButton->setEnabled(true);
+    if (_showAsMeshAction) {
+        _showAsMeshAction->setEnabled(true);
     }
-    if (_fullOptimizationButton) {
-        _fullOptimizationButton->setEnabled(true);
+    if (_fullOptimizationAction) {
+        _fullOptimizationAction->setEnabled(true);
     }
     captureInitialGeneratedViewState();
     if (_resetViewsButton) {
@@ -1656,15 +1972,6 @@ void LineAnnotationDialog::previewClosestControlPoint()
     });
 }
 
-bool LineAnnotationDialog::shiftCurrentCutPlaneNormalOffsetByScrollSteps(int steps)
-{
-    return shiftCutPlaneNormalOffsetByScrollSteps(_generatedViews.currentCutSurface.get(),
-                                                  _currentCutViewer,
-                                                  steps,
-                                                  _currentCutNormalOffsetVx,
-                                                  "line annotation current cut normal offset");
-}
-
 bool LineAnnotationDialog::shiftSideCutPlaneNormalOffsetByScrollSteps(int steps)
 {
     return shiftCutPlaneNormalOffsetByScrollSteps(_generatedViews.sideCutSurface.get(),
@@ -1779,36 +2086,6 @@ void LineAnnotationDialog::resetGeneratedCutNormalOffsets(bool forceRender)
     }
 }
 
-void LineAnnotationDialog::handleShiftScrollModeChanged()
-{
-    if (shiftScrollMode() != ShiftScrollMode::AlongLine) {
-        return;
-    }
-
-    const bool wasFollowing = _currentCutFollowsStripMouse;
-    setCurrentCutFollowsStripMouse(true);
-    if (!wasFollowing) {
-        return;
-    }
-
-    const bool currentHadOffset = normalOffsetActive(_currentCutNormalOffsetVx);
-    _currentCutNormalOffsetVx = 0.0;
-    if (_currentCutViewer) {
-        _currentCutViewer->setProperty("vc_custom_normal_offset_vx", 0.0);
-    }
-    if (!currentHadOffset || !_generatedViews.currentCutSurface) {
-        return;
-    }
-    if (!updatePlaneSurface(_generatedViews.currentCutSurface.get(), _currentLinePosition)) {
-        return;
-    }
-    if (_currentCutViewer) {
-        _currentCutViewer->markSurfaceGeometryChanged();
-        _currentCutViewer->renderVisible(true, "line annotation current cut along-line mode");
-    }
-    rebuildGeneratedDynamicOverlays();
-}
-
 void LineAnnotationDialog::setCutFollowEnabled(bool enabled)
 {
     // Programmatic twin of the private toggle.
@@ -1822,6 +2099,77 @@ void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
     if (follows && !wasFollowing) {
         resetGeneratedCutNormalOffsets(true);
     }
+    updatePauseIndicator();
+}
+
+void LineAnnotationDialog::updatePauseIndicator()
+{
+    CChunkedVolumeViewer* bottomStrip = nullptr;
+    for (const auto& stripViewer : _stripViewers) {
+        if (stripViewer) {
+            bottomStrip = stripViewer;
+            break;
+        }
+    }
+    if (!bottomStrip) {
+        if (_pauseIndicator) {
+            _pauseIndicator->hide();
+        }
+        return;
+    }
+    if (!_pauseIndicator || _pauseIndicator->parentWidget() != bottomStrip) {
+        delete _pauseIndicator;
+        auto* indicator = new QLabel(bottomStrip);
+        indicator->setObjectName(QStringLiteral("lineAnnotationPauseIndicator"));
+        indicator->setText(QStringLiteral("❚❚"));
+        indicator->setStyleSheet(QStringLiteral(
+            "QLabel { color: rgb(0, 245, 255); background-color: rgba(20, 20, 20, 160); "
+            "border-radius: 6px; padding: 6px 14px; font-size: 32px; font-weight: bold; }"));
+        indicator->setAttribute(Qt::WA_TransparentForMouseEvents);
+        indicator->adjustSize();
+        _pauseIndicator = indicator;
+    }
+    _pauseIndicator->move(
+        std::max(0, (bottomStrip->width() - _pauseIndicator->width()) / 2), 10);
+    _pauseIndicator->setVisible(!_currentCutFollowsStripMouse);
+    _pauseIndicator->raise();
+}
+
+void LineAnnotationDialog::updateOptimizationStatusIndicator()
+{
+    CChunkedVolumeViewer* bottomStrip = nullptr;
+    for (const auto& stripViewer : _stripViewers) {
+        if (stripViewer) {
+            bottomStrip = stripViewer;
+            break;
+        }
+    }
+    if (!bottomStrip) {
+        if (_optimizationStatusLabel) {
+            _optimizationStatusLabel->hide();
+        }
+        return;
+    }
+    if (!_optimizationStatusLabel ||
+        _optimizationStatusLabel->parentWidget() != bottomStrip) {
+        delete _optimizationStatusLabel;
+        auto* label = new QLabel(bottomStrip);
+        label->setObjectName(QStringLiteral("lineAnnotationOptimizationStatusLabel"));
+        label->setAttribute(Qt::WA_TransparentForMouseEvents);
+        _optimizationStatusLabel = label;
+    }
+    _optimizationStatusLabel->setText(
+        _optimizationStatusOptimized ? tr("optimized") : tr("not optimized"));
+    _optimizationStatusLabel->setStyleSheet(QStringLiteral(
+        "QLabel { color: %1; background-color: rgba(20, 20, 20, 160); "
+        "border-radius: 4px; padding: 2px 8px; font-weight: bold; }")
+        .arg(_optimizationStatusOptimized ? QStringLiteral("rgb(40, 220, 120)")
+                                          : QStringLiteral("rgb(255, 80, 80)")));
+    _optimizationStatusLabel->adjustSize();
+    _optimizationStatusLabel->move(
+        std::max(0, bottomStrip->width() - _optimizationStatusLabel->width() - 10), 10);
+    _optimizationStatusLabel->show();
+    _optimizationStatusLabel->raise();
 }
 
 void LineAnnotationDialog::requestGeneratedSideStripIntersections()
@@ -1903,7 +2251,7 @@ void LineAnnotationDialog::installGeneratedViewShortcuts()
     bindRotationShortcut(Qt::Key_A, GeneratedCutRotationAxis::Vertical, -kCurrentCutRotationStepRadians);
     bindRotationShortcut(Qt::Key_D, GeneratedCutRotationAxis::Vertical, kCurrentCutRotationStepRadians);
     bindNavigationShortcut(Qt::Key_E, &LineAnnotationDialog::jumpToPreviousControlPoint);
-    bindNavigationShortcut(Qt::Key_R, &LineAnnotationDialog::previewClosestControlPoint);
+    bindNavigationShortcut(Qt::Key_R, &LineAnnotationDialog::snapPanesToOverviewCursor);
     bindNavigationShortcut(Qt::Key_T, &LineAnnotationDialog::jumpToNextControlPoint);
 
     auto* spaceShortcut = new QShortcut(QKeySequence(Qt::Key_Space), this);
@@ -2019,6 +2367,9 @@ void LineAnnotationDialog::resetGeneratedViews()
         }
     }
     restoreInitialGeneratedViewerCameras();
+    // _currentCutFollowsStripMouse was reset by direct assignment above; keep the
+    // pause badge in sync.
+    updatePauseIndicator();
     if (_currentCutViewer) {
         _currentCutViewer->renderVisible(true, "line annotation reset current cut");
     }
@@ -2051,18 +2402,21 @@ LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::staticStripOverlay(
     return vc3d::line_annotation::makeGeneratedStaticStripOverlay(_generatedViews);
 }
 
-LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::zSliceOverlay(double linePosition,
-                                                                           bool emphasized,
-                                                                           CChunkedVolumeViewer* viewer,
-                                                                           PlaneSurface* plane) const
+LineAnnotationDialog::GeneratedOverlay LineAnnotationDialog::zSliceOverlay(
+    const GeneratedViews& views,
+    const vc3d::line_annotation::GeneratedControlPointLinePositionIndex& controlIndex,
+    double linePosition,
+    bool emphasized,
+    CChunkedVolumeViewer* viewer,
+    PlaneSurface* plane) const
 {
     (void)emphasized;
     return vc3d::line_annotation::makeGeneratedCrossSliceControlOverlayForPlane(
-        _generatedViews,
+        views,
         linePosition,
         viewer,
         plane,
-        &_generatedControlIndex);
+        &controlIndex);
 }
 
 void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
@@ -2079,12 +2433,14 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         if (!viewer) {
             continue;
         }
-        const std::string key = i == 0 ? _generatedViews.lineSurfaceName
-                                       : _generatedViews.lineSideSliceName;
-        GeneratedOverlay strip = staticStripOverlay();
-        if (i == 1) {
-            strip.fiberIntersections = _generatedViews.fiberIntersections;
-        }
+        const std::string key = _generatedViews.lineSideSliceName;
+        // While an in-place update waits for the strip's first re-optimized
+        // frame, keep drawing the pre-update overlay.
+        const GeneratedViews& stripViews =
+            _stripOverlaySwapPending ? _heldGeneratedViews : _generatedViews;
+        GeneratedOverlay strip =
+            vc3d::line_annotation::makeGeneratedStaticStripOverlay(stripViews);
+        strip.fiberIntersections = stripViews.fiberIntersections;
         applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
     }
 
@@ -2105,6 +2461,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     if (_closing || !_hasGeneratedViews) {
         return;
     }
+
+    // The schematic overview bar tracks the same inputs (control points +
+    // current position) as the dynamic overlays; refresh it on the same cadence.
+    updateOverviewBar();
 
     const auto markerColorForState =
         [](vc3d::line_annotation::GeneratedCurrentLineMarkerState state) {
@@ -2190,10 +2550,17 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         if (!viewer) {
             continue;
         }
-        const std::string key = i == 0 ? _generatedViews.lineSurfaceName
-                                       : _generatedViews.lineSideSliceName;
+        const std::string key = _generatedViews.lineSideSliceName;
         auto* entry = ensureStripItems(i, viewer, key);
-        auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+        // While this pane's overlay swap is pending, map the current-position
+        // marker (and span labels) through the held pre-update strip surface so
+        // they stay consistent with the stale image instead of jumping a beat
+        // ahead of it.
+        QuadSurface* quad = _stripOverlaySwapPending
+            ? _heldGeneratedViews.lineSideSlice.get()
+            : dynamic_cast<QuadSurface*>(viewer->currentSurface());
+        const double stripPosition =
+            _stripOverlaySwapPending ? _heldLinePosition : _currentLinePosition;
         if (!entry || !quad) {
             continue;
         }
@@ -2206,7 +2573,7 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         const QPointF currentScenePoint =
             vc3d::line_annotation::generatedStripLinePositionToScene(viewer,
                                                                       quad,
-                                                                      _currentLinePosition);
+                                                                      stripPosition);
         auto* view = viewer->graphicsView();
         auto* viewport = view ? view->viewport() : nullptr;
         if (std::isfinite(currentScenePoint.x()) &&
@@ -2303,16 +2670,27 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     if (_sideCutViewer && _generatedViews.sideCutSurface) {
         // Draw the full line on the side view by projecting each line point onto the plane and
         // connecting consecutive points (linear interpolation), in addition to the current-position
-        // marker and nearby control points from the cross-slice overlay.
-        GeneratedOverlay sideOverlay = zSliceOverlay(_currentLinePosition,
+        // marker and nearby control points from the cross-slice overlay. During an in-place
+        // update, draw from the held pre-update views until this pane's new frame lands.
+        const GeneratedViews& sideViews =
+            _sideCutOverlaySwapPending ? _heldGeneratedViews : _generatedViews;
+        const auto& sideIndex =
+            _sideCutOverlaySwapPending ? _heldControlIndex : _generatedControlIndex;
+        const double sidePosition =
+            _sideCutOverlaySwapPending ? _heldLinePosition : _currentLinePosition;
+        GeneratedOverlay sideOverlay = zSliceOverlay(sideViews,
+                                                     sideIndex,
+                                                     sidePosition,
                                                      true,
                                                      _sideCutViewer,
-                                                     _generatedViews.sideCutSurface.get());
-        sideOverlay.linePoints = _generatedViews.linePoints;
+                                                     sideViews.sideCutSurface.get());
+        sideOverlay.linePoints = sideViews.linePoints;
         // Highlight the live cursor position on the line. The cross-slice overlay's emphasized
         // marker otherwise sits at the static focus/seed point; override it to the current
-        // position so the highlight tracks the cursor as it moves along the line.
-        const cv::Vec3f currentPoint = interpolatedLinePoint(_currentLinePosition);
+        // position so the highlight tracks the cursor as it moves along the line. Use the
+        // (possibly held) sideViews line points so the marker matches the displayed image.
+        const cv::Vec3f currentPoint = vc3d::line_annotation::interpolatedGeneratedLinePoint(
+            sideViews.linePoints, sidePosition);
         if (finitePoint(currentPoint)) {
             sideOverlay.pointMarker = currentPoint;
             sideOverlay.emphasizedPointMarker = true;
@@ -2448,9 +2826,20 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                  _fastCurrentCutOverlayItems.fiberIntersectionConnectors});
     }
 
+    // During an in-place update, draw from the held pre-update views until this
+    // pane's first re-optimized frame lands.
+    const GeneratedViews& cutViews =
+        _currentCutOverlaySwapPending ? _heldGeneratedViews : _generatedViews;
+    const auto& cutIndex =
+        _currentCutOverlaySwapPending ? _heldControlIndex : _generatedControlIndex;
+    const double cutPosition =
+        _currentCutOverlaySwapPending ? _heldLinePosition : _currentLinePosition;
+
     QPointF centerScenePoint;
     if (normalOffsetActive(_currentCutNormalOffsetVx)) {
-        centerScenePoint = viewer->volumeToScene(interpolatedLinePoint(_currentLinePosition));
+        centerScenePoint = viewer->volumeToScene(
+            vc3d::line_annotation::interpolatedGeneratedLinePoint(
+                cutViews.linePoints, cutPosition));
     } else {
         centerScenePoint = viewer->surfaceCoordsToScene(0.0f, 0.0f);
     }
@@ -2467,11 +2856,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath pendingBranchControlPath;
     const double lineRadius =
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
-    const double lower = _currentLinePosition - lineRadius;
-    const double upper = _currentLinePosition + lineRadius;
-    const auto& indices = _generatedControlIndex.sortedControlIndices;
-    const auto positionForIndex = [this](size_t controlIndex) {
-        return _generatedViews.controlPoints[controlIndex].linePosition;
+    const double lower = cutPosition - lineRadius;
+    const double upper = cutPosition + lineRadius;
+    const auto& indices = cutIndex.sortedControlIndices;
+    const auto positionForIndex = [&cutViews](size_t controlIndex) {
+        return cutViews.controlPoints[controlIndex].linePosition;
     };
     const auto lowerIt = std::lower_bound(
         indices.begin(),
@@ -2482,10 +2871,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         });
     for (auto it = lowerIt; it != indices.end(); ++it) {
         const size_t controlIndex = *it;
-        if (controlIndex >= _generatedViews.controlPoints.size()) {
+        if (controlIndex >= cutViews.controlPoints.size()) {
             continue;
         }
-        const auto& control = _generatedViews.controlPoints[controlIndex];
+        const auto& control = cutViews.controlPoints[controlIndex];
         if (!std::isfinite(control.linePosition)) {
             continue;
         }
@@ -2523,14 +2912,14 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath branchLinkFiberIntersectionPath;
     QPainterPath pendingBranchLinkFiberIntersectionPath;
     QPainterPath fiberIntersectionConnectorPath;
-    auto* currentCutPlane = _generatedViews.currentCutSurface.get();
+    auto* currentCutPlane = cutViews.currentCutSurface.get();
     const std::optional<float> intersectionThreshold =
-        (currentCutPlane && !_generatedViews.fiberIntersections.empty())
+        (currentCutPlane && !cutViews.fiberIntersections.empty())
             ? vc3d::line_annotation::generatedCrossSliceControlPointDistanceThreshold(viewer)
             : std::nullopt;
     if (intersectionThreshold) {
         constexpr qreal kIntersectionArm = 7.5;
-        for (const auto& intersection : _generatedViews.fiberIntersections) {
+        for (const auto& intersection : cutViews.fiberIntersections) {
             if (!finitePoint(intersection.point)) {
                 continue;
             }
@@ -2911,6 +3300,15 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
     if (watched == _fiberNameLabel && event->type() == QEvent::Resize) {
         updateFiberNameLabel();
     }
+    if (_pauseIndicator && watched == _pauseIndicator->parentWidget() &&
+        event->type() == QEvent::Resize) {
+        updatePauseIndicator();
+    }
+    if (_optimizationStatusLabel &&
+        watched == _optimizationStatusLabel->parentWidget() &&
+        event->type() == QEvent::Resize) {
+        updateOptimizationStatusIndicator();
+    }
     if (event->type() == QEvent::KeyPress) {
         auto* keyEvent = static_cast<QKeyEvent*>(event);
         if (handleKeyPress(keyEvent)) {
@@ -2918,6 +3316,110 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
         }
     }
     return QMainWindow::eventFilter(watched, event);
+}
+
+void LineAnnotationDialog::updateOverviewBar()
+{
+    auto* bar = static_cast<LineAnnotationOverviewBar*>(_overviewBar.data());
+    if (!bar || !_hasGeneratedViews) {
+        return;
+    }
+
+    std::vector<LineAnnotationOverviewBar::ControlDot> dots;
+    dots.reserve(_generatedViews.controlPoints.size());
+    for (const auto& control : _generatedViews.controlPoints) {
+        if (!std::isfinite(control.linePosition)) {
+            continue;
+        }
+        LineAnnotationOverviewBar::ControlDot dot;
+        dot.linePosition = control.linePosition;
+        // Same state palette as the cut-view overlays.
+        if (control.isLinkCandidate) {
+            dot.color = QColor(60, 235, 120);
+        } else if (control.hasPendingLinks) {
+            dot.color = QColor(80, 150, 255);
+        } else if (control.hasBranches) {
+            dot.color = QColor(210, 95, 255);
+        } else {
+            dot.color = QColor(255, 230, 0);
+        }
+        dot.radius = control.isSeed ? 6.0 : 4.5;
+        dots.push_back(dot);
+    }
+    bar->setLineData(_generatedViews.linePoints.size(), std::move(dots));
+
+    QColor markerColor(0, 245, 255);
+    switch (currentLineMarkerState()) {
+    case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Allowed:
+        markerColor = QColor(40, 220, 120);
+        break;
+    case vc3d::line_annotation::GeneratedCurrentLineMarkerState::Blocked:
+        markerColor = QColor(255, 70, 70);
+        break;
+    default:
+        break;
+    }
+    bar->setCurrentPosition(_currentLinePosition, markerColor);
+}
+
+void LineAnnotationDialog::forwardOverviewControlContextMenu(double linePosition,
+                                                             QPoint globalPos)
+{
+    if (!_hasGeneratedViews || _stripViewers.empty()) {
+        return;
+    }
+    CChunkedVolumeViewer* strip = _stripViewers.front().data();
+    auto* quad = strip ? dynamic_cast<QuadSurface*>(strip->currentSurface()) : nullptr;
+    auto* view = strip ? strip->graphicsView() : nullptr;
+    if (!quad || !view) {
+        return;
+    }
+    const QPointF scenePoint = stripLinePositionToScene(strip, quad, linePosition);
+    if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
+        return;
+    }
+    // Emit the strip view's own context-menu signal: CWindow routes it through
+    // the controller, which supplies link-candidate state and shows the same
+    // menu an in-viewer Ctrl+right-click would. The synthesized scene point
+    // round-trips to the clicked control point's line position, and the menu
+    // pops at the overview-bar cursor via globalPos.
+    QMetaObject::invokeMethod(
+        view,
+        "sendAnnotationContextMenuRequested",
+        Qt::DirectConnection,
+        Q_ARG(QPointF, scenePoint),
+        Q_ARG(QPoint, globalPos),
+        Q_ARG(Qt::KeyboardModifiers, Qt::KeyboardModifiers(Qt::ControlModifier)));
+}
+
+void LineAnnotationDialog::snapPanesToOverviewCursor()
+{
+    auto* bar = static_cast<LineAnnotationOverviewBar*>(_overviewBar.data());
+    if (!_hasGeneratedViews || !bar) {
+        return;
+    }
+    const QPoint localPos = bar->mapFromGlobal(QCursor::pos());
+    if (!bar->rect().contains(localPos)) {
+        return;
+    }
+    const auto position = bar->linePositionAtLocalX(localPos.x());
+    if (!position) {
+        return;
+    }
+    setCurrentLinePosition(*position);
+    // Recenter the bottom strip on the snapped position (keeping its zoom), so the
+    // current-position marker can't end up outside a zoomed-in viewport.
+    for (const auto& stripViewer : _stripViewers) {
+        if (!stripViewer) {
+            continue;
+        }
+        if (const auto center = generatedStripSurfaceCenter(stripViewer, *position)) {
+            CChunkedVolumeViewer::CameraState camera = stripViewer->cameraState();
+            camera.surfacePtrX = (*center)[0];
+            camera.surfacePtrY = (*center)[1];
+            stripViewer->applyCameraState(camera, false);
+        }
+    }
 }
 
 void LineAnnotationDialog::updateOptimizationOverlayGeometry()
@@ -2944,11 +3446,15 @@ void LineAnnotationDialog::updateFiberNameLabel()
         return;
     }
 
-    _fiberNameLabel->setText(vc3d::adaptFiberNameToWidth(
-        fullName,
-        _fiberNameLabel->fontMetrics(),
-        _fiberNameLabel->contentsRect().width()));
-    _fiberNameLabel->setToolTip(fullName);
+    const QString hvSuffix = _fiberHvTag.isEmpty()
+        ? QString()
+        : QStringLiteral("  [%1]").arg(_fiberHvTag);
+    const QFontMetrics metrics = _fiberNameLabel->fontMetrics();
+    const int nameWidth = _fiberNameLabel->contentsRect().width() -
+        (hvSuffix.isEmpty() ? 0 : metrics.horizontalAdvance(hvSuffix));
+    _fiberNameLabel->setText(
+        vc3d::adaptFiberNameToWidth(fullName, metrics, nameWidth) + hvSuffix);
+    _fiberNameLabel->setToolTip(fullName + hvSuffix);
 }
 
 void LineAnnotationDialog::restoreWindowGeometry()

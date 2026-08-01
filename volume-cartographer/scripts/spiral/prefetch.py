@@ -1,8 +1,9 @@
 """One-step-ahead prefetch of per-step CPU batch assembly.
 
-The training loop's per-step CPU work (numpy patch-strip sampling, the track
-point gather, and their host->device uploads) otherwise runs serially while
-the GPU is idle: the track gather even forces a device sync. Prefetching runs
+The training loop's per-step CPU work (numpy patch-strip sampling, the
+bilinear gather on the host-resident patch atlas, the track point gather, and
+their host->device uploads) otherwise runs serially while the GPU is idle:
+the track gather even forces a device sync. Prefetching runs
 the *next* step's sampling on a worker thread while the GPU chews on the
 current step.
 
