@@ -237,9 +237,9 @@ TEST_CASE("save recomputes bbox after post-load point mutation (#1272)")
     }
 }
 
-TEST_CASE("save_meta recomputes bbox after post-load point mutation (#1272)")
+TEST_CASE("save_meta does not publish bounds for unsaved geometry (#1272)")
 {
-    TmpVolpkg pkg("bbox_recompute_meta");
+    TmpVolpkg pkg("bbox_meta_only");
 
     cv::Mat_<cv::Vec3f> pts(32, 32);
     for (int r = 0; r < pts.rows; ++r)
@@ -255,12 +255,19 @@ TEST_CASE("save_meta recomputes bbox after post-load point mutation (#1272)")
         surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
     }
 
-    // Same staleness hazard as the save() case, but reached through
-    // save_meta(), which rewrites meta.json without touching the TIFFs.
+    // save_meta() rewrites meta.json only; the x/y/z TIFFs keep the geometry
+    // written above. An in-memory edit that shrinks the surface must not be
+    // published as the bbox, or the recorded box would under-cover the
+    // geometry still on disk and bbox-prefiltered queries would drop it.
     {
         QuadSurface loaded(pkg.segDir);
         loaded.ensureLoaded();
-        (*loaded.rawPointsPtr())(5, 5) = cv::Vec3f(400.f, 450.f, 500.f);
+        for (int r = 0; r < 32; ++r)
+            for (int c = 16; c < 32; ++c)
+                (*loaded.rawPointsPtr())(r, c) = cv::Vec3f(-1.f, -1.f, -1.f);
+        auto tags = utils::Json::array();
+        tags.push_back(utils::Json("approved"));
+        loaded.meta["tags"] = tags;
         loaded.save_meta();
     }
 
@@ -268,10 +275,12 @@ TEST_CASE("save_meta recomputes bbox after post-load point mutation (#1272)")
         QuadSurface reloaded(pkg.segDir);
         REQUIRE(reloaded.meta.contains("bbox"));
         const auto& bb = reloaded.meta["bbox"];
-        CHECK(bb[1][0].get_float() == doctest::Approx(400.f));
-        CHECK(bb[1][1].get_float() == doctest::Approx(450.f));
-        CHECK(bb[1][2].get_float() == doctest::Approx(500.f));
-        CHECK(bb[0][2].get_float() == doctest::Approx(100.f));
+        // Still the persisted extent (x up to 31), not the shrunken one (15).
+        CHECK(bb[1][0].get_float() == doctest::Approx(31.f));
+        CHECK(bb[1][1].get_float() == doctest::Approx(31.f));
+        CHECK(bb[1][2].get_float() == doctest::Approx(100.f));
+        // The metadata-only edit itself was persisted.
+        REQUIRE(reloaded.meta.contains("tags"));
     }
 }
 

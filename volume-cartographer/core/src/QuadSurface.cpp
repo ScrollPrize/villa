@@ -2111,9 +2111,13 @@ void QuadSurface::save_meta()
     }
 
     {
-        // Same staleness hazard as in save(): recompute the bbox from the
-        // current points instead of trusting the load-time cache (#1272).
-        _bbox = {{-1, -1, -1}, {-1, -1, -1}};
+        // NB: deliberately no bbox recompute here, unlike save(). save_meta()
+        // rewrites meta.json only and leaves the x/y/z TIFFs untouched, so
+        // recomputing from the in-memory grid would describe geometry that
+        // was never persisted. For a surface with unsaved inward edits that
+        // would write an under-covering bbox, i.e. exactly the #1272 failure
+        // this change set exists to prevent. The bbox is refreshed where the
+        // geometry itself is written.
         auto lo = utils::Json::array();
         lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
         auto hi = utils::Json::array();
