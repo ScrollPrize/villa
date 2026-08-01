@@ -1,40 +1,56 @@
-# Plan: Vesuvius Python CI Compatibility
+# Plan: VC3D GitHub CI Acceleration
 
-## Workflow
+## Measurement
 
-1. Retain the committed `lasagna/**` workflow trigger and repository-root
-   `PYTHONPATH` test environment.
-2. Classify every failure in the Zarr 3.2.1 job log by shared root cause.
+1. Establish the current four-core cold-build, test, and VC3D smoke baseline
+   in the exact GitHub CI dependency image.
+2. Benchmark a clean `QuickBuild` (`-O1`, PCH, no LTO) `ninja all -j4` build
+   with the same image and source tree.
+3. Run all registered tests and the VC3D offscreen smoke test on the candidate
+   build before considering it usable for test execution.
+4. Use build logs and Ninja timing data to identify the remaining critical
+   path, then test one isolated change at a time.
 
-## Zarr Compatibility
+## Workflow Design
 
-1. Add one test helper that creates explicit v2 arrays/groups with
-   slash-separated chunk keys through the appropriate Zarr 2 or Zarr 3 API.
-2. Port the affected Fiber, Fiber 2D, and Fiber 3D fixtures to the helper.
-3. Add one runtime helper for store-relative chunk-key encoding and raw store
-   reads across both Zarr APIs.
-4. Make both Fiber prefetch implementations use the shared key encoder, and
-   make the older prefetch reader use the shared raw-byte operation.
+1. Separate the requirement to compile every configured target from the
+   requirement to execute tests.
+2. Split Clang QuickBuild coverage into independently scheduled base-test,
+   specialized-test, VC3D, CLI, and Flatboi target closures.
+3. Use configure-time registration checks so new tests and CLI targets cannot
+   silently escape all shards.
+4. Retain network tests in GitHub CI while excluding them only from local
+   performance comparisons.
+5. Preserve sccache across workflow runs and measure warm behavior from the
+   first pushed workflow runs.
+6. Record that the fast pull-request workflow replaces the previous GCC and
+   Clang Release/LTO matrix with Clang-only QuickBuild coverage. A production
+   GCC/Release gate, if required, belongs outside the sub-minute feedback path.
 
 ## Tests And Validation
 
-1. Run focused regressions under Zarr 2.18.7 and 3.2.1.
-2. Run all three modules named in the CI failures under each Zarr version.
-3. Attempt the complete CI test selection and report local dependency blockers
-   rather than treating them as product failures.
-4. Run `git diff --check`.
+1. Compare clean builds with identical four-CPU limits and `-j4` Ninja
+   parallelism.
+2. Record configure time, build time, test time, smoke-test time, target/build
+   edge count, and cache state.
+3. Require all registered CTest tests and the VC3D offscreen smoke test to pass
+   for each candidate test configuration.
+4. Confirm that the combined Clang shards build every configured tool, test,
+   benchmark, and application target represented by the selected options.
+5. Validate the workflow YAML and run `git diff --check` before publishing.
 
 ## Spec Update
 
-- Require cache/prefetch chunk keys and raw store reads to work under both
-  supported Zarr library versions without changing the persisted v2 layout.
+- No product behavior specification change is currently expected. If CI
+  coverage contracts become durable project requirements, document them in
+  the developer/CI documentation rather than the fiber algorithm spec.
 
 ## Docs Updates
 
-- Document the shared Zarr compatibility helper in `docs/code_structure.md`.
-- Record matrix reproduction and this host's asyncio limitation in
-  `planning/local_development.md`.
+- Document the final local reproduction command, CI job responsibilities, and
+  cache behavior in the relevant Volume Cartographer developer documentation.
 
 ## Changelog
 
-- Record the CI import and Zarr matrix compatibility fixes.
+- Add a changelog entry only when workflow or build-system changes are adopted;
+  measurement-only iterations remain in `planning/task_log.md`.

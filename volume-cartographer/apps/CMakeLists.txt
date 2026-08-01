@@ -248,6 +248,34 @@ target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
 add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
 target_link_libraries(vc_zarr_recompress vc_core Blosc::blosc)
 
+# Stable compile-coverage entry point for CI. Keep every command-line
+# executable here so the CLI shard cannot silently omit a newly added tool.
+set(VC_CLI_TARGETS
+    vc_render_video vc_render_tifxyz vc_objrefine vc_grow_seg_from_seed
+    vc_seg_add_overlap vc_grow_seg_from_segments vc_tifxyz2obj vc_obj_uv_lift
+    vc_tifxyz2zarr_sparse vc_add_ignore_label vc_obj2tifxyz
+    vc_obj2tifxyz_legacy vc_flatten vc_tifxyz_inp_mask vc_tifxyz_trim
+    vc_straighten vc_cut_windings vc_tifxyz_winding vc_calc_surface_metrics
+    vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph
+    vc_atlas_inspect vc_atlas_constraints_export vc_atlas_pred_snap_rebuild
+    vc_tifxyz_gengt vc_diffuse_winding vc_tifxyz_mmap_prepare
+    vc_create_segment_mask vc_merge_tifxyz vc_merge_patch vc_visualize
+    vc_volpkg_convert vc_transform_geom vc_gen_normalgrids vc_ngrids
+    vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning vc_tifxyz vc_project_tifxyz
+    vc_zarr_to_tiff vc_zarr_recompress)
+get_property(_vc_apps_directory_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+list(FILTER _vc_apps_directory_targets INCLUDE REGEX "^vc_")
+set(_vc_expected_cli_targets ${VC_CLI_TARGETS})
+list(SORT _vc_apps_directory_targets)
+list(SORT _vc_expected_cli_targets)
+if(NOT _vc_apps_directory_targets STREQUAL _vc_expected_cli_targets)
+    message(FATAL_ERROR
+        "VC_CLI_TARGETS must contain every CLI executable.\n"
+        "Actual: ${_vc_apps_directory_targets}\n"
+        "Registered: ${_vc_expected_cli_targets}")
+endif()
+add_custom_target(vc_cli_all DEPENDS ${VC_CLI_TARGETS})
+
 # Reuse the neutral common PCH on the CLI apps that link vc_core.
 # vc_obj_uv_lift and vc_tifxyz_mmap_prepare are omitted — they don't link vc_core (no shared
 # include paths), so REUSE_FROM would fail to compile against them.
