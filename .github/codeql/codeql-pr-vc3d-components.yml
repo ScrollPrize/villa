@@ -1,0 +1,10 @@
+name: VC CodeQL PR VC3D components shard
+
+paths:
+  - 'volume-cartographer/apps/VC3D/agent_bridge'
+  - 'volume-cartographer/apps/VC3D/elements'
+  - 'volume-cartographer/apps/VC3D/overlays'
+  - 'volume-cartographer/apps/VC3D/segmentation'
+  - 'volume-cartographer/apps/VC3D/test'
+  - 'volume-cartographer/apps/VC3D/viewer_controls'
+  - 'volume-cartographer/apps/VC3D/volume_viewers'
