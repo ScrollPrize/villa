@@ -101,6 +101,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Hraun](https://github.com/SuperOptimizer/Hraun) is a collection of python tools for handling volumetric scroll data by Forrest McDonald.
 
+- [windcheck](https://github.com/joe-carr-data/windcheck) by Josep Carreras. Finds where a traced surface passes through itself, from mesh geometry alone, and emits transverse-clean `tifxyz` outputs plus a VC3D overlay.
+
 - [Scroll compression and masking](https://github.com/OliverDaubney/vesuvius_basic_compression) by Olivier Daubney. Script to compress and mask scroll data, greatly reducing storage requirements!
 
 - [Mesh merging](https://github.com/schillij95/ThaumatoAnakalyptor/blob/main/ThaumatoAnakalyptor/mesh_merger.py) by Julian Schilliger. Merges multiple overlapping meshes into one continuous mesh. Flattening not included.
