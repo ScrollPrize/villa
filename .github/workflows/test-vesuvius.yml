@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'vesuvius/**'
+      - 'lasagna/**'
       - '.github/workflows/test-vesuvius.yml'
 
 jobs:
@@ -63,4 +64,6 @@ jobs:
         run: uv pip install "zarr==${{ matrix.zarr }}"
 
       - name: Run tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: uv run --no-sync pytest tests -m "not slow and not network"

@@ -4,7 +4,11 @@
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <latch>
+#include <limits>
+#include <memory>
 #include <queue>
+#include <stdexcept>
 #include <vector>
 #include <cstddef>
 #include <cstdint>
@@ -74,6 +78,69 @@ public:
             queue_.emplace(std::forward<F>(func));
         }
         cv_.notify_one();
+    }
+
+    // Enqueue a fixed indexed batch with one queue lock and one completion wait.
+    // The caller must not be one of this pool's workers.
+    template <typename F>
+    void run_indexed_batch(std::size_t task_count, F&& func) {
+        if (task_count == 0)
+            return;
+        if (task_count > static_cast<std::size_t>(
+                std::numeric_limits<std::ptrdiff_t>::max())) {
+            throw std::overflow_error("thread-pool batch is too large");
+        }
+
+        using Function = std::decay_t<F>;
+        struct BatchState {
+            BatchState(std::size_t count, F&& input)
+                : done(static_cast<std::ptrdiff_t>(count))
+                , function(std::forward<F>(input))
+            {
+            }
+
+            void run(std::size_t index) noexcept {
+                try {
+                    function(index);
+                } catch (...) {
+                    std::lock_guard lock(error_mutex);
+                    if (!error)
+                        error = std::current_exception();
+                }
+                done.count_down();
+            }
+
+            std::latch done;
+            Function function;
+            std::mutex error_mutex;
+            std::exception_ptr error;
+        };
+
+        auto state = std::make_shared<BatchState>(
+            task_count, std::forward<F>(func));
+        std::size_t queued = 0;
+        std::exception_ptr enqueue_error;
+        {
+            std::lock_guard lock(mu_);
+            try {
+                for (; queued < task_count; ++queued) {
+                    queue_.emplace([state, index = queued] {
+                        state->run(index);
+                    });
+                }
+            } catch (...) {
+                enqueue_error = std::current_exception();
+            }
+        }
+        if (queued != task_count) {
+            state->done.count_down(static_cast<std::ptrdiff_t>(task_count - queued));
+        }
+        cv_.notify_all();
+        state->done.wait();
+        if (enqueue_error)
+            std::rethrow_exception(enqueue_error);
+        if (state->error)
+            std::rethrow_exception(state->error);
     }
 
     [[nodiscard]] std::size_t worker_count() const noexcept {

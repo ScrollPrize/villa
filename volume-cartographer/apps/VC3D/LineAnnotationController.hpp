@@ -23,6 +23,7 @@
 #include <opencv2/core/mat.hpp>
 
 #include "LineAnnotationFiberClassification.hpp"
+#include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
@@ -55,7 +56,7 @@ public:
         bool ok = false;
         std::filesystem::path manifestPath;
         cv::Vec3d seedPoint{0.0, 0.0, 0.0};
-        std::vector<vc::lasagna::LineControlPoint> controlPoints;
+        std::vector<vc3d::line_annotation::LineControlPoint> controlPoints;
         cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
         InitialDirectionMode initialDirectionMode = InitialDirectionMode::Sideways;
         vc::lasagna::LineOptimizationResult result;
@@ -150,7 +151,7 @@ public:
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
     using OptimizationTaskFactory =
         std::function<OptimizationTaskResult(std::filesystem::path,
-                                             std::vector<vc::lasagna::LineControlPoint>,
+                                             std::vector<vc3d::line_annotation::LineControlPoint>,
                                              std::vector<cv::Vec3d>,
                                              cv::Vec3d,
                                              InitialDirectionMode,
@@ -303,7 +304,7 @@ private:
         uint64_t sequence = 0;
         std::string fileName;
         uint64_t generation = 1;
-        std::vector<cv::Vec3d> controlPoints;
+        std::vector<vc3d::line_annotation::StoredControlPoint> controlPoints;
         std::vector<cv::Vec3d> linePoints;
         // Stored snapshots only. Live-session branch metadata must be converted
         // through storedFiberFromSession()/saveSessionAsFiber() so the central
@@ -312,6 +313,8 @@ private:
         vc3d::line_annotation::FiberHvClassification hvClassification;
         std::string manualHvTag;
         std::vector<std::string> tags;
+        vc3d::line_annotation::FiberOptimizationMode optimizationMode =
+            vc3d::line_annotation::FiberOptimizationMode::Lasagna;
         bool needsSave = false;
     };
 
@@ -424,6 +427,10 @@ private:
     void handleGeneratedPredSnapPoint(const std::string& surfaceName,
                                       cv::Vec3f volumePoint);
     void handleGeneratedSideStripIntersectionQuery(const std::string& surfaceName);
+    void handleGeneratedSegmentInterpolationGoal(const std::string& surfaceName,
+                                                 size_t firstControlPointIndex,
+                                                 size_t secondControlPointIndex,
+                                                 const std::string& goal);
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,
                                                   size_t controlPointIndex,
                                                   cv::Vec3f volumePoint);
@@ -449,6 +456,7 @@ private:
             std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers,
             const std::vector<FiberBranchRef>& branches) const;
     bool ensureDatasetForSession(LineAnnotationSession& session);
+    bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session);
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
                                                   bool fireSuccessCallback);
@@ -460,12 +468,22 @@ private:
                                      bool updateGeneratedViews,
                                      SessionOptimizationState resultOptimizationState,
                                      const std::string& eventOverride = {},
-                                     bool fireSuccessCallback = true);
+                                     bool fireSuccessCallback = true,
+                                     bool allowFiberSave = true);
     void requestFinalizedClose(const std::string& surfaceName);
     void startOptimization(LineAnnotationSession& session,
                            bool fullOptimization = false,
                            int activeStart = -1,
                            int activeEnd = -1);
+    void startFiberModeOptimization(LineAnnotationSession& session,
+                                    bool retraceAll,
+                                    std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
+                                    bool globalGoalsOnly = false);
+    [[nodiscard]] vc3d::line_annotation::FiberModeOptimizationRequest
+        makeFiberModeOptimizationRequest(const LineAnnotationSession& session,
+                                         bool retraceAll,
+                                         std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
+                                         bool globalGoalsOnly = false) const;
     void finishOptimization(const std::string& surfaceName);
     bool materializeGeneratedViews(LineAnnotationSession& session);
     bool materializeGeneratedViews(LineAnnotationSession& session,
@@ -485,7 +503,7 @@ private:
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
-                                                             std::vector<vc::lasagna::LineControlPoint> controlPoints,
+                                                             std::vector<vc3d::line_annotation::LineControlPoint> controlPoints,
                                                              std::vector<cv::Vec3d> initialLinePoints,
                                                              cv::Vec3d sourceSliceNormal,
                                                              InitialDirectionMode directionMode,
@@ -548,7 +566,7 @@ private:
     // changed, then schedule saves for returned linked fibers as needed.
     BranchMetadataSyncResult syncLinkedBranchMetadataAfterFiberModification(
         LineAnnotationSession& session,
-        const std::vector<vc::lasagna::LineControlPoint>* previousControlPoints = nullptr,
+        const std::vector<vc3d::line_annotation::LineControlPoint>* previousControlPoints = nullptr,
         const std::vector<FiberBranchRef>* previousBranches = nullptr);
     void scheduleBranchMetadataSaves(const std::vector<uint64_t>& fiberIds,
                                      uint64_t excludedFiberId = 0);

@@ -141,8 +141,15 @@ private:
 class ZarrChunkFetcher final : public IChunkFetcher {
 public:
     explicit ZarrChunkFetcher(utils::ZarrArray array)
-        : array_(std::make_unique<utils::ZarrArray>(std::move(array)))
+        : ZarrChunkFetcher(std::make_shared<utils::ZarrArray>(std::move(array)))
     {
+    }
+
+    explicit ZarrChunkFetcher(std::shared_ptr<utils::ZarrArray> array)
+        : array_(std::move(array))
+    {
+        if (!array_)
+            throw std::invalid_argument("streaming zarr fetcher requires an array");
         // Source encodings already compact enough to persist verbatim,
         // avoiding a decode+re-encode round trip on the cache writer.
         if (array_->stores_chunks_with_codec("c3d"))
@@ -202,6 +209,20 @@ public:
         return persistEncodedExtension_.empty() ? ".bin" : persistEncodedExtension_;
     }
 
+    std::optional<std::string> sourceChunkKey(const ChunkKey& key) const override
+    {
+        const std::array<std::size_t, 3> indices{
+            static_cast<std::size_t>(key.iz),
+            static_cast<std::size_t>(key.iy),
+            static_cast<std::size_t>(key.ix)};
+        return array_->chunk_store_key(indices);
+    }
+
+    bool sourcePayloadMatchesPersistentCache(const ChunkKey&) const override
+    {
+        return persistEncodedExtension_.empty() && array_->direct_chunk_payload_is_decoded_bytes();
+    }
+
     ChunkFetchResult decodePersistentBytes(
         const ChunkKey&,
         std::vector<std::byte> bytes) const override
@@ -226,7 +247,7 @@ public:
     }
 
 private:
-    std::unique_ptr<utils::ZarrArray> array_;
+    std::shared_ptr<utils::ZarrArray> array_;
     std::string persistEncodedExtension_;
 };
 
@@ -763,6 +784,39 @@ std::unique_ptr<ChunkCache> createChunkCache(
         std::move(opened.fetchers),
         opened.fillValue,
         opened.dtype,
+        std::move(options));
+}
+
+std::unique_ptr<ChunkCache> createChunkCache(
+    std::shared_ptr<utils::ZarrArray> array,
+    ChunkCache::Options options)
+{
+    if (!array)
+        throw std::invalid_argument("cannot create a chunk cache for a null Zarr array");
+
+    const auto& meta = array->metadata();
+    ChunkDtype dtype = ChunkDtype::UInt8;
+    if (meta.dtype == utils::ZarrDtype::uint16) {
+        dtype = ChunkDtype::UInt16;
+    } else if (meta.dtype != utils::ZarrDtype::uint8) {
+        throw std::runtime_error(
+            "streaming zarr cache currently supports uint8 and uint16 only");
+    }
+
+    std::vector<std::size_t> chunkShape = meta.chunks;
+    if (meta.shard_config)
+        chunkShape = meta.shard_config->sub_chunks;
+    std::vector<ChunkCache::LevelInfo> levels{
+        {toArray3(meta.shape, "shape"),
+         toArray3(chunkShape, "chunk shape"),
+         IChunkedArray::LevelTransform{}}};
+    std::vector<std::shared_ptr<IChunkFetcher>> fetchers;
+    fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array)));
+    return std::make_unique<ChunkCache>(
+        std::move(levels),
+        std::move(fetchers),
+        meta.fill_value.value_or(0.0),
+        dtype,
         std::move(options));
 }
 

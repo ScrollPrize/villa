@@ -34,6 +34,52 @@ else:
     OffsetByteRequest = RangeByteRequest = SuffixByteRequest = ()
 
 
+@dataclass
+class ZarrCacheTraceStats:
+    cache_hits: int = 0
+    downloads: int = 0
+    negative_hits: int = 0
+    missing: int = 0
+    cache_hit_bytes: int = 0
+    download_bytes: int = 0
+    cache_hit_ms: float = 0.0
+    download_ms: float = 0.0
+    missing_ms: float = 0.0
+
+
+_CACHE_TRACE_LOCAL = threading.local()
+
+
+def begin_zarr_cache_trace() -> None:
+    _CACHE_TRACE_LOCAL.stats = ZarrCacheTraceStats()
+
+
+def end_zarr_cache_trace() -> ZarrCacheTraceStats:
+    stats = getattr(_CACHE_TRACE_LOCAL, "stats", None)
+    _CACHE_TRACE_LOCAL.stats = None
+    return stats if isinstance(stats, ZarrCacheTraceStats) else ZarrCacheTraceStats()
+
+
+def _record_zarr_cache_event(kind: str, *, byte_count: int = 0, elapsed_ms: float = 0.0) -> None:
+    stats = getattr(_CACHE_TRACE_LOCAL, "stats", None)
+    if not isinstance(stats, ZarrCacheTraceStats):
+        return
+    if kind == "cache_hit":
+        stats.cache_hits += 1
+        stats.cache_hit_bytes += int(byte_count)
+        stats.cache_hit_ms += float(elapsed_ms)
+    elif kind == "download":
+        stats.downloads += 1
+        stats.download_bytes += int(byte_count)
+        stats.download_ms += float(elapsed_ms)
+    elif kind == "negative_hit":
+        stats.negative_hits += 1
+        stats.missing_ms += float(elapsed_ms)
+    elif kind == "missing":
+        stats.missing += 1
+        stats.missing_ms += float(elapsed_ms)
+
+
 class OfflineCacheMiss(Exception):
     """Raised when a zarr chunk fetch is attempted in offline mode but the
     chunk is not present in the local _DiskCacheStore cache (neither as data
@@ -96,6 +142,7 @@ class _DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         self._url = url
         self._offline = offline
         self._retry_budget_seconds = float(retry_budget_seconds)
+        self._url = str(url)
         # Namespace cache by the normalized remote URL to prevent cross-dataset
         # chunk-key collisions. Zarr chunk keys are relative paths inside one
         # store (e.g. "c/0/1/2"), so without a per-URL prefix every dataset
@@ -198,7 +245,7 @@ class _DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         return prototype.buffer.from_bytes(data)
 
     async def get(self, key, prototype, byte_range=None):
-
+        start = time.perf_counter()
         cached = os.path.join(self._cache_dir, key)
         marker = cached + self._NEGATIVE_MARKER_SUFFIX
 
@@ -206,12 +253,22 @@ class _DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
         if os.path.isfile(cached):
             try:
                 with open(cached, 'rb') as f:
-                    return self._buffer_from_cached_bytes(f.read(), prototype, byte_range)
+                    data = f.read()
+                _record_zarr_cache_event(
+                    "cache_hit",
+                    byte_count=len(data),
+                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
+                )
+                return self._buffer_from_cached_bytes(data, prototype, byte_range)
             except FileNotFoundError:
                 # Raced with a concurrent replace; fall through to re-fetch.
                 pass
         # Negative cache hit → known-missing, skip the remote round-trip.
         if os.path.isfile(marker):
+            _record_zarr_cache_event(
+                "negative_hit",
+                elapsed_ms=(time.perf_counter() - start) * 1000.0,
+            )
             return None
 
         if self._offline:
@@ -229,10 +286,23 @@ class _DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
                 self._atomic_write_bytes(marker, b"")
             except OSError:
                 pass
+            _record_zarr_cache_event(
+                "missing",
+                elapsed_ms=(time.perf_counter() - start) * 1000.0,
+            )
             return None
 
         if byte_range is None:
-            self._atomic_write_bytes(cached, result.to_bytes())
+            data = result.to_bytes()
+            self._atomic_write_bytes(cached, data)
+            byte_count = len(data)
+        else:
+            byte_count = len(result.to_bytes())
+        _record_zarr_cache_event(
+            "download",
+            byte_count=byte_count,
+            elapsed_ms=(time.perf_counter() - start) * 1000.0,
+        )
         return result
 
     async def exists(self, key):
@@ -354,16 +424,30 @@ class _DiskCacheStoreV2(MutableMapping):
                 delay = min(delay * 2.0, 60.0)
 
     def __getitem__(self, key):
+        start = time.perf_counter()
         cached = os.path.join(self._cache_dir, key)
         marker = cached + self._NEGATIVE_MARKER_SUFFIX
 
-        try:
-            with open(cached, 'rb') as f:
-                return f.read()
-        except FileNotFoundError:
-            pass
-
+        # Positive cache hit.
+        if os.path.isfile(cached):
+            try:
+                with open(cached, 'rb') as f:
+                    data = f.read()
+                _record_zarr_cache_event(
+                    "cache_hit",
+                    byte_count=len(data),
+                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
+                )
+                return data
+            except FileNotFoundError:
+                # Raced with a concurrent replace; fall through to re-fetch.
+                pass
+        # Negative cache hit → known-missing, skip the remote round-trip.
         if os.path.isfile(marker):
+            _record_zarr_cache_event(
+                "negative_hit",
+                elapsed_ms=(time.perf_counter() - start) * 1000.0,
+            )
             raise KeyError(key)
         if self._offline:
             raise OfflineCacheMiss(
@@ -378,11 +462,26 @@ class _DiskCacheStoreV2(MutableMapping):
                 self._atomic_write_bytes(marker, b"")
             except OSError:
                 pass
+            _record_zarr_cache_event(
+                "missing",
+                elapsed_ms=(time.perf_counter() - start) * 1000.0,
+            )
             raise
 
-        data = bytes(result)
-        self._atomic_write_bytes(cached, data)
-        return data
+        result = bytes(result)
+        self._atomic_write_bytes(cached, result)
+        _record_zarr_cache_event(
+            "download",
+            byte_count=len(result),
+            elapsed_ms=(time.perf_counter() - start) * 1000.0,
+        )
+        return result
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
     def __contains__(self, key):
         cached = os.path.join(self._cache_dir, key)
