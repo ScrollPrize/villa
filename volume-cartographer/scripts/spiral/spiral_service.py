@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
 import json
@@ -42,15 +43,17 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 import numpy as np
 from PIL import Image
 import scipy.ndimage
+from vc3d_fiber_format_adapter import (
+    parse_vc3d_fiber_format,
+)
 
-from fit_session import (API_VERSION, PclRole, RUN_MUTABLE_BOOLEAN_KEYS,
-                         RUN_MUTABLE_SAMPLING_KEYS,
-                         parse_session_request,
+from fit_session import (API_VERSION, PclRole, parse_session_request,
                          resolve_dataset_root, validate_checkpoint_container,
                          validate_session_request)
+from config import Config
 
 
-SERVICE_VERSION = "6.0.0"
+SERVICE_VERSION = "6.1.0"
 MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DEDUPLICATED_COMMANDS = 256
 TRANSFER_CHUNK_BYTES = 1024 * 1024
@@ -203,17 +206,17 @@ def _validate_run_influence_config(value):
         raise ApiError(HTTPStatus.BAD_REQUEST,
                        "influence_config must be a JSON object")
     allowed = {
-        "interactive_influence_enabled",
-        "interactive_influence_z",
-        "interactive_influence_windings",
-        "interactive_influence_theta_frac",
-        "interactive_influence_disable_dt_frac",
-        "interactive_influence_sigma",
-        "interactive_influence_footprint_points",
-        "interactive_influence_anchor_lattice_points",
-        "interactive_influence_anchor_geometry_points",
-        "interactive_influence_anchor_samples_per_step",
-        "interactive_influence_anchor_ramp_power",
+        "influence_enabled",
+        "influence_z",
+        "influence_windings",
+        "influence_theta_frac",
+        "influence_disable_dt_frac",
+        "influence_sigma",
+        "sample_count_influence_footprint_points",
+        "sample_count_influence_anchor_lattice_points",
+        "sample_count_influence_anchor_geometry_points",
+        "sample_count_influence_anchor_samples_per_step",
+        "influence_anchor_ramp_power",
         "loss_weight_anchor",
     }
     unknown = sorted(set(value) - allowed)
@@ -221,23 +224,23 @@ def _validate_run_influence_config(value):
         raise ApiError(HTTPStatus.BAD_REQUEST,
                        f"Unknown influence configuration keys: {unknown}")
     result = {}
-    if "interactive_influence_enabled" in value:
-        enabled = value["interactive_influence_enabled"]
+    if "influence_enabled" in value:
+        enabled = value["influence_enabled"]
         if not isinstance(enabled, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "interactive_influence_enabled must be boolean")
-        result["interactive_influence_enabled"] = enabled
+        result["influence_enabled"] = enabled
     ranges = {
-        "interactive_influence_z": (1.0, 1_000_000.0),
-        "interactive_influence_windings": (0.1, 100.0),
-        "interactive_influence_theta_frac": (0.01, 1.0),
-        "interactive_influence_disable_dt_frac": (0.0, 1.0),
-        "interactive_influence_sigma": (0.000001, 10.0),
-        "interactive_influence_footprint_points": (1.0, 1_000_000.0),
-        "interactive_influence_anchor_lattice_points": (1.0, 1_000_000.0),
-        "interactive_influence_anchor_geometry_points": (1.0, 100_000.0),
-        "interactive_influence_anchor_samples_per_step": (1.0, 1_000_000.0),
-        "interactive_influence_anchor_ramp_power": (0.000001, 100.0),
+        "influence_z": (1.0, 1_000_000.0),
+        "influence_windings": (0.1, 100.0),
+        "influence_theta_frac": (0.01, 1.0),
+        "influence_disable_dt_frac": (0.0, 1.0),
+        "influence_sigma": (0.000001, 10.0),
+        "sample_count_influence_footprint_points": (1.0, 1_000_000.0),
+        "sample_count_influence_anchor_lattice_points": (1.0, 1_000_000.0),
+        "sample_count_influence_anchor_geometry_points": (1.0, 100_000.0),
+        "sample_count_influence_anchor_samples_per_step": (1.0, 1_000_000.0),
+        "influence_anchor_ramp_power": (0.000001, 100.0),
         "loss_weight_anchor": (0.0, 10_000.0),
     }
     for key, (minimum, maximum) in ranges.items():
@@ -252,123 +255,15 @@ def _validate_run_influence_config(value):
                            f"{key} must be between {minimum} and {maximum}")
         result[key] = number
     integer_keys = {
-        "interactive_influence_footprint_points",
-        "interactive_influence_anchor_lattice_points",
-        "interactive_influence_anchor_geometry_points",
-        "interactive_influence_anchor_samples_per_step",
+        "sample_count_influence_footprint_points",
+        "sample_count_influence_anchor_lattice_points",
+        "sample_count_influence_anchor_geometry_points",
+        "sample_count_influence_anchor_samples_per_step",
     }
     for key in integer_keys & result.keys():
         if not result[key].is_integer():
             raise ApiError(HTTPStatus.BAD_REQUEST, f"{key} must be an integer")
         result[key] = int(result[key])
-    return result
-
-
-def _validate_run_config(value, current, limits=None):
-    """Validate settings which the resident fitter can change between Runs."""
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       "run_config must be a JSON object")
-    current = current if isinstance(current, dict) else {}
-    limits = limits if isinstance(limits, dict) else {}
-    unknown = sorted(set(value) - set(current))
-    if unknown:
-        raise ApiError(HTTPStatus.BAD_REQUEST,
-                       f"Unknown or non-mutable Run configuration keys: {unknown}")
-
-    result = {}
-    for key, item in value.items():
-        if key == "track_length_bin_weights":
-            if item is None:
-                result[key] = None
-                continue
-            if (not isinstance(item, list) or len(item) != 3
-                    or any(isinstance(weight, bool)
-                           or not isinstance(weight, (int, float))
-                           or not math.isfinite(float(weight))
-                           or float(weight) < 0 for weight in item)
-                    or sum(float(weight) for weight in item) <= 0):
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    f"{key} must be null or three finite non-negative weights "
-                    "with a positive sum")
-            result[key] = [float(weight) for weight in item]
-            continue
-        if key == "max_track_crossing_per_step":
-            if (isinstance(item, bool) or not isinstance(item, (int, float))
-                    or not math.isfinite(float(item))
-                    or not float(item).is_integer() or int(item) < 0):
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               f"{key} must be a non-negative integer")
-            maximum = limits.get(key)
-            if (not isinstance(maximum, bool)
-                    and isinstance(maximum, (int, float))
-                    and int(item) > int(maximum)):
-                raise ApiError(
-                    HTTPStatus.BAD_REQUEST,
-                    f"{key} cannot exceed this session's prepared limit ({int(maximum)})")
-            result[key] = int(item)
-            continue
-        if key in ("track_min_sample_spacing", "track_max_sample_spacing"):
-            if (isinstance(item, bool) or not isinstance(item, (int, float))
-                    or not math.isfinite(float(item)) or float(item) <= 0):
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               f"{key} must be a finite positive number")
-            result[key] = float(item)
-            continue
-        if key in RUN_MUTABLE_BOOLEAN_KEYS:
-            if not isinstance(item, bool):
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               f"{key} must be boolean")
-            result[key] = item
-            continue
-        if key.startswith("loss_start_") and item is None:
-            if key == "loss_start_patch_dt":
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               "loss_start_patch_dt cannot be null")
-            result[key] = None
-            continue
-        if isinstance(item, bool) or not isinstance(item, (int, float)):
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"{key} must be numeric")
-        number = float(item)
-        if not math.isfinite(number) or number < 0:
-            raise ApiError(HTTPStatus.BAD_REQUEST,
-                           f"{key} must be a finite non-negative number")
-        if key in RUN_MUTABLE_SAMPLING_KEYS or key.startswith("loss_start_"):
-            if not number.is_integer():
-                raise ApiError(HTTPStatus.BAD_REQUEST,
-                               f"{key} must be an integer")
-            number = int(number)
-            if key in RUN_MUTABLE_SAMPLING_KEYS and number < 1:
-                # Disabled optional inputs have their loss weights and sample
-                # counts forced to zero when the session is loaded.  VC3D
-                # round-trips those advertised active values on every Run.
-                # Permit that unchanged disabled value, while still rejecting
-                # attempts to turn an active sampler off by setting its count
-                # to zero at a Run boundary.
-                current_value = current.get(key)
-                current_is_zero = (
-                    not isinstance(current_value, bool)
-                    and isinstance(current_value, (int, float))
-                    and float(current_value) == 0.0
-                )
-                if number != 0 or not current_is_zero:
-                    raise ApiError(HTTPStatus.BAD_REQUEST,
-                                   f"{key} must be at least 1")
-        result[key] = number
-    effective = dict(current)
-    effective.update(result)
-    minimum = effective.get("track_min_sample_spacing")
-    maximum = effective.get("track_max_sample_spacing")
-    if (not isinstance(minimum, bool) and isinstance(minimum, (int, float))
-            and not isinstance(maximum, bool) and isinstance(maximum, (int, float))
-            and float(minimum) > float(maximum)):
-        raise ApiError(
-            HTTPStatus.BAD_REQUEST,
-            "track_min_sample_spacing must be <= track_max_sample_spacing")
     return result
 
 
@@ -541,21 +436,34 @@ class ArtifactRegistry:
         self._pruned_ids = OrderedDict()
 
     def register_directory(self, kind, session_id, generation, root,
-                           entry_point, *, delete_root_on_prune=False):
+                           entry_point, *, delete_root_on_prune=False,
+                           progress=None, hash_workers=1):
         root = Path(root).resolve(strict=True)
-        files = {}
+        paths = []
         for directory, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames.sort()
             for filename in sorted(filenames):
                 path = Path(directory) / filename
                 if path.is_symlink() or not path.is_file():
                     continue
-                relative = path.relative_to(root).as_posix()
-                files[relative] = {"size": path.stat().st_size,
-                                   "sha256": _sha256_file(path)}
-                if len(files) > MAX_ARTIFACT_FILES:
+                paths.append(path)
+                if len(paths) > MAX_ARTIFACT_FILES:
                     raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR,
                                    "Artifact has too many files to register")
+
+        def digest(path):
+            return path, path.stat().st_size, _sha256_file(path)
+
+        files = {}
+        workers = max(1, min(int(hash_workers), len(paths) or 1))
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="spiral-artifact-hash") as executor:
+            for index, (path, size, sha256) in enumerate(
+                    executor.map(digest, paths), start=1):
+                relative = path.relative_to(root).as_posix()
+                files[relative] = {"size": size, "sha256": sha256}
+                if progress is not None:
+                    progress(index, len(paths), relative)
         if entry_point not in files:
             raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR,
                            f"Artifact entry point {entry_point!r} was not found")
@@ -720,6 +628,13 @@ def _validate_upload_content(kind, role, directory):
         if not isinstance(document, dict) or document.get("type") != "vc3d_fiber":
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "Fiber uploads must be JSON documents with type 'vc3d_fiber'")
+        if document.get("version", 1) == 1:
+            return
+        try:
+            parse_vc3d_fiber_format(document)
+        except ValueError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           f"Invalid fiber upload: {exc}") from exc
         return
     if kind == "pcl":
         if not isinstance(document, dict) \
@@ -948,8 +863,21 @@ def _validate_tifxyz_output_step(metadata, expected_step):
     return values
 
 
-def _load_flatten_correspondence(checkpoint_path):
+def _load_flatten_correspondence(checkpoint_path=None, map_path=None):
     """Read Lasagna's flattened-output -> Spiral-source grid map."""
+    if map_path is not None and Path(map_path).is_file():
+        mapping = np.load(str(map_path), mmap_mode="r", allow_pickle=False)
+        mapping = np.asarray(mapping, dtype=np.float32)
+        if mapping.ndim != 3 or mapping.shape[-1] != 2:
+            raise RuntimeError(
+                "Lasagna output-to-source map must have shape (rows, columns, 2)")
+        if not np.isfinite(mapping).all():
+            raise RuntimeError(
+                "Lasagna output-to-source map contains non-finite values")
+        return mapping
+
+    if checkpoint_path is None:
+        raise RuntimeError("Lasagna produced no flatten correspondence")
     import torch
 
     state = torch.load(
@@ -969,7 +897,8 @@ def _load_flatten_correspondence(checkpoint_path):
     return mapping
 
 
-def _sample_rgba_through_map(source_rgba, source_yx, output_valid):
+def _sample_rgba_through_map(source_rgba, source_yx, output_valid, *,
+                             executor=None):
     """Bilinearly warp RGBA using premultiplied alpha."""
     source = np.asarray(source_rgba, dtype=np.float32) / 255.0
     if source.ndim != 3 or source.shape[-1] != 4:
@@ -977,15 +906,21 @@ def _sample_rgba_through_map(source_rgba, source_yx, output_valid):
     alpha = source[..., 3]
     premultiplied = source[..., :3] * alpha[..., None]
     coordinates = [source_yx[..., 0], source_yx[..., 1]]
-    sampled_alpha = scipy.ndimage.map_coordinates(
-        alpha, coordinates, order=1, mode="constant", cval=0.0,
-        prefilter=False)
-    sampled_rgb = np.stack([
-        scipy.ndimage.map_coordinates(
-            premultiplied[..., channel], coordinates,
-            order=1, mode="constant", cval=0.0, prefilter=False)
-        for channel in range(3)
-    ], axis=-1)
+
+    def sample(channel):
+        values = alpha if channel == 3 else premultiplied[..., channel]
+        return scipy.ndimage.map_coordinates(
+            values, coordinates, order=1, mode="constant", cval=0.0,
+            prefilter=False)
+
+    if executor is None:
+        sampled = [sample(channel) for channel in range(4)]
+    else:
+        # Each channel is independent and scipy releases the GIL here.  Mapping
+        # them concurrently preserves the exact interpolation and output bytes.
+        sampled = list(executor.map(sample, range(4)))
+    sampled_alpha = sampled[3]
+    sampled_rgb = np.stack(sampled[:3], axis=-1)
     nonzero = sampled_alpha > 1.0e-8
     sampled_rgb[nonzero] /= sampled_alpha[nonzero, None]
     sampled_rgb[~nonzero] = 0.0
@@ -1007,14 +942,18 @@ def _mapped_winding_ids(source_manifest, source_shape, source_yx,
     if (not isinstance(ranges, list) or not isinstance(windings, list)
             or len(ranges) != len(windings) or not ranges):
         raise RuntimeError("Spiral source preview has no winding mapping")
-    source_labels = np.full(source_shape, -1, dtype=np.int32)
+    winding_values = sorted({int(winding) for winding in windings})
+    winding_to_dense = {
+        winding: index + 1 for index, winding in enumerate(winding_values)
+    }
+    source_labels = np.zeros(source_shape, dtype=np.int32)
     for bounds, winding in zip(ranges, windings):
         if not isinstance(bounds, list) or len(bounds) != 2:
             raise RuntimeError("Malformed Spiral winding column range")
         begin, end = int(bounds[0]), int(bounds[1])
         if begin < 0 or end <= begin or end > source_shape[1]:
             raise RuntimeError("Spiral winding column range is out of bounds")
-        source_labels[:, begin:end] = int(winding)
+        source_labels[:, begin:end] = winding_to_dense[int(winding)]
 
     rows = np.rint(source_yx[..., 0]).astype(np.int64)
     columns = np.rint(source_yx[..., 1]).astype(np.int64)
@@ -1023,30 +962,39 @@ def _mapped_winding_ids(source_manifest, source_shape, source_yx,
         & (rows >= 0) & (rows < source_shape[0])
         & (columns >= 0) & (columns < source_shape[1])
     )
-    result = np.full(output_valid.shape, -1, dtype=np.int32)
-    result[in_bounds] = source_labels[rows[in_bounds], columns[in_bounds]]
-    result[~output_valid] = -1
-
+    dense_result = np.zeros(output_valid.shape, dtype=np.int32)
+    dense_result[in_bounds] = source_labels[
+        rows[in_bounds], columns[in_bounds]]
     bounds = []
-    for winding in sorted(int(value) for value in np.unique(result)
-                          if int(value) >= 0):
-        yy, xx = np.nonzero(result == winding)
+    objects = scipy.ndimage.find_objects(
+        dense_result, max_label=len(winding_values))
+    for dense_label, slices in enumerate(objects, start=1):
+        if slices is None:
+            continue
+        row_slice, column_slice = slices
+        winding = winding_values[dense_label - 1]
         bounds.append({
             "winding": winding,
-            "row_begin": int(yy.min()),
-            "row_end": int(yy.max()) + 1,
-            "column_begin": int(xx.min()),
-            "column_end": int(xx.max()) + 1,
+            "row_begin": int(row_slice.start),
+            "row_end": int(row_slice.stop),
+            "column_begin": int(column_slice.start),
+            "column_end": int(column_slice.stop),
         })
     if not bounds:
         raise RuntimeError("Lasagna correspondence mapped no preview windings")
+    lookup = np.asarray([-1, *winding_values], dtype=np.int32)
+    result = lookup[dense_result]
     return result, bounds
 
 
-def _raw_run_diff_rgba(previous_manifest, current_manifest):
+def _raw_run_diff_rgba(previous_manifest, current_manifest, *,
+                       current_surface_data=None):
     """Build a current-source-grid displacement overlay by winding identity."""
-    current_surface = Path(current_manifest["surface_path"])
-    current_xyz, current_valid = _surface_xyz(current_surface)
+    if current_surface_data is None:
+        current_surface = Path(current_manifest["surface_path"])
+        current_xyz, current_valid = _surface_xyz(current_surface)
+    else:
+        current_xyz, current_valid = current_surface_data
     rgba = np.zeros((*current_valid.shape, 4), dtype=np.uint8)
     if previous_manifest is None:
         return rgba, 0
@@ -1183,9 +1131,14 @@ class ServiceState:
         self._publishing_preview_generation = 0
         self._preview_artifact = None
         self._preview_publish = None
+        self._preview_progress_started = None
         self._preview_publish_error = None
         self._preview_process = None
         self._previous_raw_preview_manifest = None
+        self.config_catalog = Config.catalog()
+        self.session_revision = 0
+        self.run_plans = {}
+        self.pending_revision_target = None
 
     # ------------------------------------------------------------------
     # Status and health
@@ -1200,6 +1153,7 @@ class ServiceState:
             "session_id": self.session_id,
             "service_generation": self.service_generation,
             "session_generation": self.session_generation,
+            "session_revision": self.session_revision,
             "command_generation": self.command_generation,
             "generation": self.status_generation,
             "session_replacement_in_progress": self.replacing,
@@ -1230,7 +1184,9 @@ class ServiceState:
                 "state": "Empty", "phase": "No session", "current_iteration": 0,
                 "target_iteration": 0, "latest_metrics": {}, "warnings": [],
                 "error": None, "preview_manifest_path": None, "preview_generation": 0,
+                "progress": None,
             })
+            response.setdefault("progress", None)
             response["session_request"] = self.session_request
             response["preview_artifact"] = self._preview_artifact
             response["preview_publish"] = (
@@ -1242,6 +1198,36 @@ class ServiceState:
                     self._preview_publish.get("stage_name") or "").strip()
                 if stage_name:
                     response["phase"] = stage_name
+                    step = self._preview_publish.get("step")
+                    total = self._preview_publish.get("total_steps")
+                    elapsed = (
+                        max(
+                            0.0,
+                            time.monotonic()
+                            - self._preview_progress_started)
+                        if self._preview_progress_started is not None
+                        else 0.0)
+                    eta = None
+                    if (step is not None and total is not None
+                            and int(step) > 0 and int(total) > int(step)
+                            and elapsed >= 2.0):
+                        eta = elapsed * (
+                            int(total) - int(step)) / int(step)
+                    elif (step is not None and total is not None
+                          and int(total) > 0
+                          and int(step) >= int(total)):
+                        eta = 0.0
+                    response["progress"] = {
+                        "operation": "publishing_preview",
+                        "stage_name": stage_name,
+                        "detail": None,
+                        "step": int(step) if step is not None else None,
+                        "total_steps": (
+                            int(total) if total is not None else None),
+                        "unit": "steps",
+                        "elapsed_seconds": elapsed,
+                        "eta_seconds": eta,
+                    }
             response["ephemeral_inputs"] = [
                 {"id": record["id"], "kind": record["kind"],
                  "role": record.get("role"), "state": record["state"],
@@ -1265,6 +1251,9 @@ class ServiceState:
             "cuda_ready": None if not self.session else self.session.status()["state"] != "Error",
         })
         return response
+
+    def configuration_catalog(self):
+        return {**self._base(), **self.config_catalog}
 
     def dataset(self):
         if self.dataset_resolution is None:
@@ -1337,25 +1326,6 @@ class ServiceState:
                                [{"field": "tracks_dbm", "message": "Not a service-advertised candidate"}])
             paths["tracks_dbm"] = str(Path(tracks).resolve(strict=False))
 
-        # A dataset-owned service resolves conventional paths itself, but the
-        # client still controls which optional sources belong to this session.
-        # Clear disabled paths so the manifest and worker agree that they were
-        # not loaded.
-        config = (request.get("run") or {}).get("config") or {}
-        selected_paths = {
-            "use_verified_patches": ("verified_patches",),
-            "use_unverified_patches": ("unverified_patches",),
-            "use_normals": ("normal_x", "normal_y"),
-            "use_surf_sdt": ("surf_sdt",),
-            "use_tracks": ("tracks_dbm",),
-            "use_gradient_magnitude": ("gradient_magnitude",),
-            "use_fibers": ("fibers",),
-        }
-        for flag, field_names in selected_paths.items():
-            if not bool(config.get(flag, True)):
-                for field_name in field_names:
-                    paths[field_name] = ""
-
         return {**request, "paths": paths}
 
     def load(self, request):
@@ -1403,6 +1373,8 @@ class ServiceState:
                     "run": run.manifest(),
                     "preview": preview.manifest(),
                 }
+                self.session_revision += 1
+                self.run_plans.clear()
                 self._reset_session_scope()
                 try:
                     self.session = create_session(
@@ -1430,6 +1402,7 @@ class ServiceState:
         self._publishing_preview_generation = 0
         self._preview_artifact = None
         self._preview_publish = None
+        self._preview_progress_started = None
         self._preview_publish_error = None
         self._previous_raw_preview_manifest = None
         if previous_raw:
@@ -1445,6 +1418,21 @@ class ServiceState:
             print(f"SPIRAL_ARTIFACT_ERROR {type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)
         with self.lock:
+            applied_manifest = status.get("input_manifest")
+            if (self.session_paths is not None
+                    and isinstance(applied_manifest, dict)
+                    and applied_manifest != self.session_paths.manifest()):
+                self.session_paths = SpiralInputPaths.from_mapping(
+                    applied_manifest)
+                if self.session_request is not None:
+                    self.session_request["paths"] = \
+                        self.session_paths.manifest()
+            if (self.pending_revision_target is not None
+                    and status.get("state") in {"Ready", "Paused"}
+                    and int(status.get("current_iteration") or 0)
+                    >= self.pending_revision_target):
+                self.session_revision += 1
+                self.pending_revision_target = None
             self.status_generation += 1
 
     def _maybe_register_artifacts(self, status):
@@ -1465,10 +1453,33 @@ class ServiceState:
         try:
             published_manifest = self._publish_flattened_preview(
                 session_id, preview_generation, Path(preview_manifest))
+
+            def indexing_progress(current, total, relative):
+                self._update_preview_publish(
+                    preview_generation, state="indexing",
+                    stage_name=(
+                        f"Indexing preview files ({current}/{total}): "
+                        f"{relative}"),
+                    step=current, total_steps=total,
+                    overall_progress=(
+                        float(current) / float(total) if total else 1.0))
+
+            indexing_started = time.perf_counter()
+            self._update_preview_publish(
+                preview_generation, state="indexing",
+                stage_name="Indexing preview files",
+                step=0, total_steps=0, overall_progress=0.0)
             ref = self.artifacts.register_directory(
                 "spiral-preview", session_id, preview_generation,
                 published_manifest.parent, published_manifest.name,
-                delete_root_on_prune=True)
+                delete_root_on_prune=True, progress=indexing_progress,
+                hash_workers=4)
+            print(
+                "SPIRAL_PREVIEW_TIMING "
+                f"generation={preview_generation} "
+                "stage='Indexing preview files' "
+                f"seconds={time.perf_counter() - indexing_started:.6f}",
+                flush=True)
             with self.lock:
                 if self.session_id == session_id:
                     self._preview_artifact = ref
@@ -1500,6 +1511,7 @@ class ServiceState:
                     if self._publishing_preview_generation == preview_generation:
                         self._publishing_preview_generation = 0
                     self._preview_publish = None
+                    self._preview_progress_started = None
                     self.status_generation += 1
 
     def _update_preview_publish(self, generation, **values):
@@ -1507,18 +1519,33 @@ class ServiceState:
             if self._publishing_preview_generation != generation:
                 return
             current = dict(self._preview_publish or {})
+            next_stage = values.get("stage_name", current.get("stage_name"))
+            if next_stage != current.get("stage_name"):
+                self._preview_progress_started = time.monotonic()
             current.update(values)
             current["generation"] = generation
             self._preview_publish = current
             self.status_generation += 1
+
     def run(self, request):
+        token = request.get("plan_token")
+        with self.lock:
+            plan = self.run_plans.pop(token, None)
+        if not plan or plan["expires"] < time.monotonic():
+            raise ApiError(HTTPStatus.CONFLICT, "Run plan is missing or expired")
+        if plan["revision"] != self.session_revision:
+            raise ApiError(HTTPStatus.CONFLICT, "Run plan is stale")
+        if plan["new_fit_required"]:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "This plan requires Start New Fit")
+        if plan["session_reload_required"]:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "This plan requires reloading fit inputs")
         session = self._require_session()
         status = session.status()
         influence_config = _validate_run_influence_config(
-            request.get("influence_config"))
-        run_config = _validate_run_config(
-            request.get("run_config"), status.get("run_config"),
-            status.get("run_config_limits"))
+            plan["influence"])
+        run_config = plan["configuration_changes"]
         with self.lock:
             pending = [record for record in self.ephemeral_records
                        if record["state"] == "pending"]
@@ -1539,14 +1566,136 @@ class ServiceState:
                                     and record["state"] == "incorporated")]
                     self.status_generation += 1
 
-        target = session.run(int(request.get("iterations", 0)),
-                             pending_inputs=pending,
-                             mark_incorporated=mark_incorporated,
-                             influence_config=influence_config,
-                             run_config=run_config)
         with self.lock:
+            self.pending_revision_target = (
+                int(status.get("current_iteration") or 0) + plan["iterations"])
+        try:
+            run_arguments = {
+                "pending_inputs": pending,
+                "mark_incorporated": mark_incorporated,
+                "influence_config": influence_config,
+                "run_config": run_config,
+            }
+            if plan["path_changes"]:
+                run_arguments["path_changes"] = plan["path_changes"]
+            target = session.run(plan["iterations"], **run_arguments)
+        except BaseException:
+            with self.lock:
+                self.pending_revision_target = None
+            raise
+        with self.lock:
+            self.run_plans.clear()
             self.status_generation += 1
         return {**self.status(), "accepted": True, "target_iteration": target}
+
+    def plan_run(self, request):
+        session = self._require_session()
+        if session.status().get("state") not in {"Ready", "Paused"}:
+            raise ApiError(HTTPStatus.CONFLICT,
+                           "Run planning requires a paused session")
+        expected = request.get("expected_session_revision")
+        if expected != self.session_revision:
+            raise ApiError(HTTPStatus.CONFLICT, "Session revision is stale")
+        configuration = request.get("configuration")
+        if not isinstance(configuration, dict) or \
+                set(configuration) != set(self.config_catalog["defaults"]):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "Run planning requires a complete configuration")
+        try:
+            configuration = Config(configuration).as_dict()
+        except ValueError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        iterations = int(request.get("iterations", 0))
+        if iterations < 1:
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "iterations must be at least 1")
+        current = session.status().get("applied_config")
+        if current is None:
+            current = Config(
+                (self.session_request.get("run") or {}).get("config") or {}
+            ).as_dict()
+        changes = {
+            key: value for key, value in configuration.items()
+            if current.get(key) != value
+        }
+        fields = self.config_catalog["schema"]["fields"]
+        impacts = {fields[key]["runtime_impact"] for key in changes}
+        dependencies = sorted({
+            dependency for key in changes
+            for dependency in fields[key]["dependencies"]
+        })
+        current_manifest = self.session_paths.manifest()
+        input_manifest = request.get("inputs")
+        if input_manifest is None:
+            input_manifest = current_manifest
+        if not isinstance(input_manifest, dict):
+            raise ApiError(HTTPStatus.BAD_REQUEST,
+                           "inputs must be a path manifest object")
+        path_changes = {
+            key: input_manifest.get(key)
+            for key in set(current_manifest) | set(input_manifest)
+            if input_manifest.get(key) != current_manifest.get(key)
+        }
+        path_specs = self.config_catalog["schema"].get("paths", {})
+        input_changes = []
+        for key, value in sorted(path_changes.items()):
+            spec = path_specs.get(key)
+            impact = (
+                spec["runtime_impact"] if spec is not None
+                else "prepared_input_rebuild")
+            impacts.add(impact)
+            dependencies.extend(
+                spec.get("dependencies", []) if spec is not None else [
+                    "dense_stores", "patch_pcl", "tracks", "shell",
+                    "preview_output",
+                ])
+            input_changes.append({
+                "key": key,
+                "before": current_manifest.get(key),
+                "after": value,
+                "runtime_impact": impact,
+            })
+        if "outer_shell" in path_changes:
+            outer_shell = str(path_changes["outer_shell"] or "").strip()
+            if not outer_shell or not Path(outer_shell).is_dir():
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "Outer shell path is not a readable directory",
+                    [{"field": "outer_shell",
+                      "message": "Path is not a directory"}])
+        dependencies = sorted(set(dependencies))
+        token = secrets.token_urlsafe(24)
+        new_fit = "new_fit" in impacts
+        session_reload_required = "prepared_input_rebuild" in impacts
+        plan = {
+            "revision": self.session_revision,
+            "expires": time.monotonic() + 60.0,
+            "iterations": iterations,
+            "influence": request.get("influence") or {},
+            "configuration_changes": changes,
+            "path_changes": path_changes,
+            "changes": [
+                {"key": key, "before": current.get(key), "after": value,
+                 "runtime_impact": fields[key]["runtime_impact"]}
+                for key, value in changes.items()
+            ],
+            "affected_prepared_inputs": dependencies,
+            "model_state_preserved": not new_fit,
+            "optimizer_state_preserved": not new_fit,
+            "new_fit_required": new_fit,
+            "session_reload_required": session_reload_required,
+            "input_changed": bool(path_changes),
+            "input_changes": input_changes,
+        }
+        with self.lock:
+            self.run_plans[token] = plan
+        return {
+            **self._base(), "plan_token": token,
+            "expires_in_seconds": 60,
+            **{key: value for key, value in plan.items()
+               if key not in {"expires", "configuration_changes", "path_changes",
+                              "iterations", "influence", "revision"}},
+        }
 
     def stop(self):
         self._require_session().stop()
@@ -1623,6 +1772,23 @@ class ServiceState:
             self, session_id, generation, preview_manifest_path):
         process = None
         publish_root = None
+        timing_stage = None
+        timing_started = time.perf_counter()
+
+        def start_stage(state, stage_name, **values):
+            nonlocal timing_stage, timing_started
+            now = time.perf_counter()
+            if timing_stage is not None:
+                print(
+                    "SPIRAL_PREVIEW_TIMING "
+                    f"generation={generation} stage={timing_stage!r} "
+                    f"seconds={now - timing_started:.6f}",
+                    flush=True)
+            timing_stage = stage_name
+            timing_started = now
+            self._update_preview_publish(
+                generation, state=state, stage_name=stage_name, **values)
+
         try:
             fit_service = _find_lasagna_service()
             config_path = fit_service.parent / "configs" / "flatten_fast_nofilter.json"
@@ -1668,9 +1834,8 @@ class ServiceState:
             with tempfile.TemporaryDirectory(prefix="spiral_lasagna_") as temporary:
                 temporary = Path(temporary)
                 object_store = temporary / "objects"
-                self._update_preview_publish(
-                    generation, state="preparing",
-                    stage_name="Preparing Lasagna input surface",
+                start_stage(
+                    "preparing", "Preparing Lasagna input surface",
                     output_step_vx=LASAGNA_PREVIEW_OUTPUT_STEP_VX)
                 metadata = json.loads(
                     (surface_path / "meta.json").read_text(encoding="utf-8"))
@@ -1713,6 +1878,12 @@ class ServiceState:
                         if match:
                             port_holder["port"] = int(match.group(1))
                             ready.set()
+                        if "[fit] peak GPU memory:" in text:
+                            self._update_preview_publish(
+                                generation, state="saving",
+                                stage_name="Saving optimized flatten model",
+                                step=0, total_steps=0,
+                                overall_progress=0.0)
 
                 relay = threading.Thread(
                     target=relay_output, name="spiral-lasagna-log",
@@ -1736,6 +1907,9 @@ class ServiceState:
                     "output_name": surface_id,
                     "output_dir": str(publish_root),
                     "model_output": str(model_output),
+                    "embed_job_metadata": False,
+                    "omit_model": True,
+                    "export_flatten_map": True,
                     "source": "Spiral host service",
                 }
                 accepted = _fit_service_json(
@@ -1744,6 +1918,9 @@ class ServiceState:
                 if not fit_job_id:
                     raise RuntimeError(
                         "Temporary Lasagna service returned no job id")
+                start_stage(
+                    "running", "Flattening preview surface",
+                    step=0, total_steps=0, overall_progress=0.0)
 
                 while True:
                     with self.lock:
@@ -1777,18 +1954,23 @@ class ServiceState:
                 if not flattened_metadata_path.is_file():
                     raise RuntimeError(
                         "Lasagna reported success but produced no tifxyz output")
-                self._update_preview_publish(
-                    generation, state="mapping",
-                    stage_name="Mapping Spiral preview artifacts")
-
-                correspondence = _load_flatten_correspondence(model_output)
+                flatten_map_output = publish_root / ".flatten-map.npy"
+                start_stage(
+                    "loading", "Loading flattened preview output",
+                    step=0, total_steps=0, overall_progress=0.0)
+                correspondence = _load_flatten_correspondence(
+                    model_output, flatten_map_output)
                 flattened_xyz, flattened_valid = _surface_xyz(flattened_surface)
                 if correspondence.shape[:2] != flattened_xyz.shape[:2]:
                     raise RuntimeError(
                         "Lasagna correspondence dimensions do not match "
                         "the flattened surface")
+                source_xyz, source_valid = _surface_xyz(surface_path)
+                start_stage(
+                    "mapping", "Mapping preview winding membership",
+                    step=0, total_steps=0, overall_progress=0.0)
                 winding_ids, winding_bounds = _mapped_winding_ids(
-                    manifest, _surface_xyz(surface_path)[0].shape[:2],
+                    manifest, source_xyz.shape[:2],
                     correspondence, flattened_valid)
                 winding_map_name = "winding-ids.tif"
                 # OpenCV/Qt do not portably decode signed-int TIFF samples.
@@ -1801,37 +1983,65 @@ class ServiceState:
                 mapped_loss_maps = []
                 loss_output = publish_root / "loss-maps"
                 loss_output.mkdir(exist_ok=True)
-                for entry in manifest.get("loss_maps", []):
-                    if not isinstance(entry, dict):
-                        continue
-                    relative = str(entry.get("path") or "")
-                    source_overlay = preview_manifest_path.parent / relative
-                    if not source_overlay.is_file():
-                        continue
-                    with Image.open(source_overlay) as image:
-                        source_rgba = np.asarray(
-                            image.convert("RGBA"), dtype=np.uint8)
-                    mapped = _sample_rgba_through_map(
-                        source_rgba, correspondence, flattened_valid)
-                    destination = loss_output / Path(relative).name
-                    Image.fromarray(mapped, mode="RGBA").save(destination)
-                    mapped_entry = dict(entry)
-                    mapped_entry["path"] = (
-                        Path("loss-maps") / destination.name).as_posix()
-                    mapped_entry["supported_pixels"] = int(
-                        np.count_nonzero(mapped[..., 3]))
-                    mapped_loss_maps.append(mapped_entry)
+                loss_entries = [
+                    entry for entry in manifest.get("loss_maps", [])
+                    if isinstance(entry, dict)
+                    and (preview_manifest_path.parent
+                         / str(entry.get("path") or "")).is_file()
+                ]
+                remap_total = len(loss_entries)
+                start_stage(
+                    "mapping", (
+                        f"Remapping preview loss maps (0/{remap_total})"
+                        if remap_total else "No preview loss maps to remap"),
+                    step=0, total_steps=remap_total,
+                    overall_progress=0.0)
+                with ThreadPoolExecutor(
+                        max_workers=4,
+                        thread_name_prefix="spiral-overlay-channel") as remap_executor:
+                    for loss_index, entry in enumerate(loss_entries, start=1):
+                        relative = str(entry.get("path") or "")
+                        self._update_preview_publish(
+                            generation, state="mapping",
+                            stage_name=(
+                                f"Remapping preview loss maps "
+                                f"({loss_index}/{remap_total}): "
+                                f"{Path(relative).name}"),
+                            step=loss_index - 1, total_steps=remap_total,
+                            overall_progress=(
+                                float(loss_index - 1) / float(remap_total)
+                                if remap_total else 1.0))
+                        source_overlay = preview_manifest_path.parent / relative
+                        with Image.open(source_overlay) as image:
+                            source_rgba = np.asarray(
+                                image.convert("RGBA"), dtype=np.uint8)
+                        mapped = _sample_rgba_through_map(
+                            source_rgba, correspondence, flattened_valid,
+                            executor=remap_executor)
+                        destination = loss_output / Path(relative).name
+                        Image.fromarray(mapped, mode="RGBA").save(destination)
+                        mapped_entry = dict(entry)
+                        mapped_entry["path"] = (
+                            Path("loss-maps") / destination.name).as_posix()
+                        mapped_entry["supported_pixels"] = int(
+                            np.count_nonzero(mapped[..., 3]))
+                        mapped_loss_maps.append(mapped_entry)
 
-                previous_manifest = None
-                with self.lock:
-                    previous_path = self._previous_raw_preview_manifest
-                if previous_path and Path(previous_path).is_file():
-                    previous_manifest = json.loads(
-                        Path(previous_path).read_text(encoding="utf-8"))
-                raw_diff, changed_pixels = _raw_run_diff_rgba(
-                    previous_manifest, manifest)
-                mapped_diff = _sample_rgba_through_map(
-                    raw_diff, correspondence, flattened_valid)
+                    start_stage(
+                        "mapping", "Building preview run difference",
+                        step=0, total_steps=0, overall_progress=0.0)
+                    previous_manifest = None
+                    with self.lock:
+                        previous_path = self._previous_raw_preview_manifest
+                    if previous_path and Path(previous_path).is_file():
+                        previous_manifest = json.loads(
+                            Path(previous_path).read_text(encoding="utf-8"))
+                    raw_diff, changed_pixels = _raw_run_diff_rgba(
+                        previous_manifest, manifest,
+                        current_surface_data=(source_xyz, source_valid))
+                    mapped_diff = _sample_rgba_through_map(
+                        raw_diff, correspondence, flattened_valid,
+                        executor=remap_executor)
                 run_diff = None
                 if changed_pixels:
                     run_diff_name = "run-diff.png"
@@ -1844,6 +2054,9 @@ class ServiceState:
                             np.count_nonzero(mapped_diff[..., 3])),
                     }
 
+                start_stage(
+                    "finalizing", "Finalizing preview metadata",
+                    step=0, total_steps=0, overall_progress=0.0)
                 flattened_metadata = json.loads(
                     flattened_metadata_path.read_text(encoding="utf-8"))
                 _validate_tifxyz_output_step(
@@ -1890,7 +2103,12 @@ class ServiceState:
                     json.dumps(published, indent=2) + "\n",
                     encoding="utf-8")
 
+                # These are transient transport files.  The interactive Spiral
+                # preview never exposes a Lasagna model to VC3D.
+                del correspondence
                 model_output.unlink(missing_ok=True)
+                flatten_map_output.unlink(missing_ok=True)
+                (flattened_surface / "model.pt").unlink(missing_ok=True)
                 os.replace(publish_root, final_root)
                 publish_root = None
 
@@ -1900,9 +2118,9 @@ class ServiceState:
                         preview_manifest_path)
                 if old_raw and old_raw != str(preview_manifest_path):
                     shutil.rmtree(Path(old_raw).parent, ignore_errors=True)
-                self._update_preview_publish(
-                    generation, state="finished", stage_name="Finished",
-                    overall_progress=1.0)
+                start_stage(
+                    "finalizing", "Preparing preview artifact index",
+                    step=0, total_steps=0, overall_progress=0.0)
                 return final_root / "manifest.json"
         finally:
             _stop_process_group(process)
@@ -2549,6 +2767,8 @@ class SpiralHandler(BaseHTTPRequestHandler):
         if self.command == "GET":
             if path == "/health":
                 return state.health()
+            if path == "/configuration":
+                return state.configuration_catalog()
             if path == "/session/status":
                 return state.status()
             if path == "/logs":
@@ -2613,6 +2833,8 @@ class SpiralHandler(BaseHTTPRequestHandler):
                 return state.begin_upload(body)
             if path == "/session/load":
                 return state.deduplicated(command_id, lambda: state.load(body))
+            if path == "/session/run/plan":
+                return state.plan_run(body)
             if path == "/session/run":
                 return state.deduplicated(command_id, lambda: state.run(body))
             if path == "/session/stop":

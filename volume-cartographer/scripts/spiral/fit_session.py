@@ -16,113 +16,17 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 import zipfile
 
+from config import Config
 
 
-# Version 11 makes preview artifacts host-published Lasagna flatten results
-# with correspondence-mapped winding, loss-map, and run-diff metadata.
-API_VERSION = 11
-
-
-# Counts which describe how many training objects/points are sampled per
-# optimizer step. The service exposes the post-scaling values actually used by
-# the resident fitter, and Run-scoped edits set those active values directly.
-RUN_MUTABLE_SAMPLING_KEYS = frozenset({
-    "num_patches_per_step",
-    "num_patches_per_step_for_dt",
-    "num_points_per_patch",
-    "unverified_num_patches_per_step",
-    "unverified_num_patches_per_step_for_dt",
-    "unverified_num_points_per_patch",
-    "rel_winding_num_pcls",
-    "rel_winding_num_patch_pairs_per_pcl",
-    "abs_winding_num_pcls",
-    "abs_winding_num_points_per_pcl",
-    "unattached_pcl_num_per_step",
-    "unattached_pcl_num_points_per_step",
-    "track_num_per_step",
-    "track_num_points_per_step",
-    "dense_normals_num_points",
-    "dense_spacing_num_pairs",
-    "dense_spacing_density_extra_pairs",
-    "dense_attachment_num_points",
-    "min_spacing_independent_samples",
-    "regularisation_num_points",
-    "shell_num_samples",
-})
-
-
-RUN_MUTABLE_BOOLEAN_KEYS = frozenset({
-    "save_png_visualizations",
-})
-
-
-RUN_MUTABLE_TRACK_POLICY_KEYS = frozenset({
-    "track_length_bin_weights",
-    "max_track_crossing_per_step",
-    "track_min_sample_spacing",
-    "track_max_sample_spacing",
-})
-
-
-def is_run_mutable_config_key(key: str) -> bool:
-    """Return whether an advanced setting may change at a Run boundary."""
-    return (
-        key in RUN_MUTABLE_SAMPLING_KEYS
-        or key in RUN_MUTABLE_BOOLEAN_KEYS
-        or key in RUN_MUTABLE_TRACK_POLICY_KEYS
-        or (key.startswith("loss_weight_") and key != "loss_weight_anchor")
-        or key.startswith("loss_start_")
-    )
+# Version 15 adds structured, stage-local operation progress.
+API_VERSION = 15
 
 
 def run_mutable_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Select the Run-scoped editor fields from a complete fitter config."""
-    return {
-        key: value for key, value in config.items()
-        if is_run_mutable_config_key(key)
-    }
-
-
-def apply_optional_input_selection(config: dict[str, Any]) -> dict[str, Any]:
-    """Force losses and sample counts off for session-disabled inputs."""
-    def zero(*keys: str) -> None:
-        for key in keys:
-            config[key] = 0
-
-    if not bool(config.get("use_verified_patches", True)):
-        zero("loss_weight_patch_radius", "loss_weight_patch_dt",
-             "loss_weight_umbilicus", "loss_weight_shell_patch_radius",
-             "num_patches_per_step", "num_patches_per_step_for_dt",
-             "num_points_per_patch")
-    if not bool(config.get("use_unverified_patches", True)):
-        zero("loss_weight_unverified_patch_radius",
-             "loss_weight_unverified_patch_dt",
-             "unverified_num_patches_per_step",
-             "unverified_num_patches_per_step_for_dt",
-             "unverified_num_points_per_patch")
-    normals = bool(config.get("use_normals", True))
-    sdt = bool(config.get("use_surf_sdt", True))
-    if not normals:
-        zero("loss_weight_dense_normals", "dense_normals_num_points")
-    if not bool(config.get("use_tracks", True)):
-        zero("loss_weight_track_radius", "loss_weight_track_dt",
-             "track_num_per_step", "track_num_points_per_step")
-    if not bool(config.get("use_fibers", True)):
-        zero("loss_weight_unattached_pcl_radius", "loss_weight_unattached_pcl_dt",
-             "unattached_pcl_num_per_step", "unattached_pcl_num_points_per_step")
-
-    spacing_mode = str(config.get("dense_spacing_mode", "phase"))
-    if not sdt or not normals:
-        zero("loss_weight_dense_spacing_count",
-             "loss_weight_dense_spacing_density",
-             "loss_weight_dense_attachment", "dense_spacing_count_extra_pairs",
-             "dense_spacing_density_extra_pairs", "dense_attachment_num_points")
-        if spacing_mode == "phase":
-            zero("loss_weight_dense_spacing", "dense_spacing_num_pairs")
-    if (not bool(config.get("use_gradient_magnitude", True))
-            and spacing_mode == "grad_mag"):
-        zero("loss_weight_dense_spacing", "dense_spacing_num_pairs")
-    return config
+    fields = Config.catalog()["schema"]["fields"]
+    return {key: value for key, value in config.items()
+            if fields[key]["runtime_impact"] in {"run_boundary", "shell_reload"}}
 
 
 class PclRole(str, Enum):
@@ -199,7 +103,7 @@ class SpiralRunConfig:
     voxel_size_um: float = 9.6
     lasagna_group: str = "4"
     lasagna_scale: int = 4
-    storage_backend: str = "auto"
+    storage_backend: str = "sparse_cuda"
     legacy_checkpoint_step: int = 0
     run_tag: str = ""
     render_volume_scale: int = 16
@@ -215,7 +119,7 @@ class SpiralRunConfig:
             voxel_size_um=float(value.get("voxel_size_um", 9.6)),
             lasagna_group=str(value.get("lasagna_group", "4")),
             lasagna_scale=int(value.get("lasagna_scale", 4)),
-            storage_backend=str(value.get("storage_backend", "auto")).lower(),
+            storage_backend=str(value.get("storage_backend", "sparse_cuda")).lower(),
             legacy_checkpoint_step=int(value.get("legacy_checkpoint_step", 0)),
             run_tag=str(value.get("run_tag", "")),
             render_volume_scale=int(value.get("render_volume_scale", 16)),
@@ -444,14 +348,12 @@ def validate_session_request(
             errors.append({"field": field_name, "message": "Directory is not readable"})
 
     require_file(paths.umbilicus, "umbilicus", json_file=True)
-    disable_patches = bool(run.config.get("disable_patches", False))
-    use_verified = bool(run.config.get("use_verified_patches", True)) and not disable_patches
-    use_unverified = bool(run.config.get("use_unverified_patches", True)) and not disable_patches
-    optional_dir(paths.verified_patches, "verified_patches", required=use_verified)
-    if use_unverified:
+    disable_patches = bool(run.config.get("input_disable_patches", False))
+    optional_dir(paths.verified_patches, "verified_patches",
+                 required=not disable_patches)
+    if not disable_patches:
         optional_dir(paths.unverified_patches, "unverified_patches")
-    if bool(run.config.get("use_fibers", True)):
-        optional_dir(paths.fibers, "fibers")
+    optional_dir(paths.fibers, "fibers")
 
     shell_enabled = (
         float(run.config.get("loss_weight_shell_outer", 1.0)) > 0
@@ -459,8 +361,7 @@ def validate_session_request(
     )
     optional_dir(paths.outer_shell, "outer_shell", required=shell_enabled)
 
-    if (bool(run.config.get("use_tracks", True)) and paths.tracks_dbm
-            and not resolve_logical_dbm(paths.tracks_dbm)):
+    if paths.tracks_dbm and not resolve_logical_dbm(paths.tracks_dbm):
         errors.append({"field": "tracks_dbm", "message": "DBM logical base or backing file was not found"})
 
     for index, spec in enumerate(paths.pcls):
@@ -482,15 +383,11 @@ def validate_session_request(
                        "message": "Must be phase or grad_mag"})
         spacing_mode = None
 
-    normals_selected = bool(run.config.get("use_normals", True))
-    sdt_selected = bool(run.config.get("use_surf_sdt", True))
-    grad_mag_selected = bool(run.config.get("use_gradient_magnitude", True))
-    use_normals = (normals_selected
-                   and float(run.config.get("loss_weight_dense_normals", 100.0)) > 0)
+    use_normals = float(
+        run.config.get("loss_weight_dense_normals", 100.0)) > 0
     spacing_enabled = float(run.config.get("loss_weight_dense_spacing", 12.0)) > 0
-    use_phase = spacing_mode == "phase" and normals_selected and sdt_selected
-    use_grad_mag = (
-        spacing_mode == "grad_mag" and spacing_enabled and grad_mag_selected)
+    use_phase = spacing_mode == "phase"
+    use_grad_mag = spacing_mode == "grad_mag" and spacing_enabled
     # The phase bundle requires its core inputs (SDT for phase, count, and
     # attachment; both normal channels for band incidence handling) even when
     # individual sub-weights are zero, so run-mutable weights can be raised
@@ -510,8 +407,11 @@ def validate_session_request(
         errors.append({"field": "outward_sense", "message": "Must be CW or ACW"})
     if run.lasagna_scale <= 0:
         errors.append({"field": "lasagna_scale", "message": "Must be positive"})
-    if run.storage_backend not in {"auto", "mmap", "dense_cuda"}:
-        errors.append({"field": "storage_backend", "message": "Must be auto, mmap, or dense_cuda"})
+    if run.storage_backend != "sparse_cuda":
+        errors.append({
+            "field": "storage_backend",
+            "message": "Only sparse_cuda is supported",
+        })
 
     if not paths.output_directory:
         errors.append({"field": "output_directory", "message": "Output directory is required"})

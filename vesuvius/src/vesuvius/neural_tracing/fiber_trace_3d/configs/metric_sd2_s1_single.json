@@ -1,0 +1,21 @@
+{
+  "seed": 0,
+  "image_normalization": "zscore",
+  "volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/vesuvius_fiber_trace_zarr_cache",
+  "model_3d": {
+    "conditioned_decoder_enabled": false,
+    "output_channels": 7,
+    "direction_branch_count": 1,
+    "unet_depth": 5
+  },
+  "training": {
+    "mixed_precision": "bf16"
+  },
+  "datasets": [
+    {
+      "base_volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+      "base_volume_scale": 2,
+      "lasagna_manifest_path": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/lasagna3d_inf/las008_s1_full/las_008.lasagna.json"
+    }
+  ]
+}
