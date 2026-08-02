@@ -6,6 +6,7 @@
 #include "vc/lasagna/ProjectVolumes.hpp"
 #include "utils/zarr.hpp"
 
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -23,21 +24,28 @@ fs::path temporaryDirectory()
     return path;
 }
 
-void createZyx(const fs::path& path, unsigned char firstValue)
+void createZyx(const fs::path& path,
+               std::array<std::size_t, 3> shape,
+               unsigned char firstValue)
 {
     utils::ZarrMetadata metadata;
     metadata.version = utils::ZarrVersion::v2;
-    metadata.shape = {2, 2, 2};
-    metadata.chunks = {2, 2, 2};
+    metadata.shape = {shape[0], shape[1], shape[2]};
+    metadata.chunks = {shape[0], shape[1], shape[2]};
     metadata.dtype = utils::ZarrDtype::uint8;
     metadata.compressor_id.clear();
     metadata.fill_value = 0.0;
     auto array = utils::ZarrArray::create(path, metadata);
-    std::vector<std::byte> bytes(8);
+    std::vector<std::byte> bytes(shape[0] * shape[1] * shape[2]);
     for (std::size_t i = 0; i < bytes.size(); ++i)
         bytes[i] = static_cast<std::byte>(firstValue + i);
     const std::array<std::size_t, 3> key{0, 0, 0};
     array.write_chunk(key, bytes);
+}
+
+void createZyx(const fs::path& path, unsigned char firstValue)
+{
+    createZyx(path, {2, 2, 2}, firstValue);
 }
 
 void createCzyx(const fs::path& path)
@@ -77,7 +85,10 @@ TEST_CASE("Lasagna project preparation exposes a ZYX group as a 3D volume")
     const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
     const auto prepared = vc::lasagna::prepareLasagnaProjectVolumes(dataset);
     REQUIRE(prepared.size() == 1);
-    CHECK(prepared[0].volume->shape() == std::array<int, 3>{2, 2, 2});
+    CHECK(prepared[0].volume->shape() == std::array<int, 3>{4, 4, 4});
+    CHECK_FALSE(prepared[0].volume->hasScaleLevel(0));
+    CHECK(prepared[0].volume->hasScaleLevel(1));
+    CHECK(prepared[0].volume->levelShape(1) == std::array<int, 3>{2, 2, 2});
     CHECK(prepared[0].volume->voxelSize() == doctest::Approx(4.0));
     CHECK(prepared[0].location ==
           fs::absolute(dir / "pred.zarr").lexically_normal().string());
@@ -88,12 +99,52 @@ TEST_CASE("Lasagna project preparation exposes a ZYX group as a 3D volume")
     CHECK(prepared[0].tags == std::vector<std::string>{
           "vc-lasagna-derived:" + manifestPath.string()});
 
-    const auto chunk = prepared[0].volume->chunkedCache()->getChunkBlocking(0, 0, 0, 0);
+    const auto chunk = prepared[0].volume->chunkedCache()->getChunkBlocking(1, 0, 0, 0);
     REQUIRE(chunk.status == vc::render::ChunkStatus::Data);
     REQUIRE(chunk.bytes);
     REQUIRE(chunk.bytes->size() == 8);
     for (std::size_t i = 0; i < 8; ++i)
         CHECK(static_cast<unsigned char>((*chunk.bytes)[i]) == 100 + i);
+    fs::remove_all(dir);
+}
+
+TEST_CASE("Lasagna project preparation preserves manifest base shape for scaled groups")
+{
+    const auto dir = temporaryDirectory();
+    createZyx(dir / "pred.zarr", {2, 3, 3}, 50);
+    const auto manifestPath = dir / "data.lasagna.json";
+    {
+        std::ofstream manifest(manifestPath);
+        manifest << R"({
+          "version":2,
+          "source_to_base":1.0,
+          "base_shape_zyx":[8,10,12],
+          "groups":{
+            "pred":{
+              "zarr":"pred.zarr",
+              "scaledown":2,
+              "channels":["presence"]
+            }
+          }
+        })";
+    }
+
+    const auto dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+    const auto prepared = vc::lasagna::prepareLasagnaProjectVolumes(dataset);
+    REQUIRE(prepared.size() == 1);
+    const auto& volume = prepared[0].volume;
+    CHECK(volume->shape() == std::array<int, 3>{8, 10, 12});
+    CHECK(volume->shapeXyz() == std::array<int, 3>{12, 10, 8});
+    CHECK_FALSE(volume->hasScaleLevel(0));
+    CHECK_FALSE(volume->hasScaleLevel(1));
+    CHECK(volume->hasScaleLevel(2));
+    CHECK(volume->levelShape(2) == std::array<int, 3>{2, 3, 3});
+
+    const auto chunk = volume->chunkedCache()->getChunkBlocking(2, 0, 0, 0);
+    REQUIRE(chunk.status == vc::render::ChunkStatus::Data);
+    REQUIRE(chunk.bytes);
+    REQUIRE(chunk.bytes->size() == 18);
+    CHECK(static_cast<unsigned char>((*chunk.bytes)[0]) == 50);
     fs::remove_all(dir);
 }
 

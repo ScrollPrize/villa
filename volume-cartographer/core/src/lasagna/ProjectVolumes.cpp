@@ -7,6 +7,7 @@
 #include "utils/zarr.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 
@@ -18,15 +19,16 @@ namespace
 class LasagnaChannelChunkFetcher final : public vc::render::IChunkFetcher
 {
 public:
-    explicit LasagnaChannelChunkFetcher(std::shared_ptr<utils::ZarrArray> array)
-        : array_(std::move(array))
+    LasagnaChannelChunkFetcher(int level, std::shared_ptr<utils::ZarrArray> array)
+        : level_(level),
+          array_(std::move(array))
     {
     }
 
     vc::render::ChunkFetchResult fetch(const vc::render::ChunkKey& key) override
     {
         vc::render::ChunkFetchResult result;
-        if (key.level != 0 || key.iz < 0 || key.iy < 0 || key.ix < 0) {
+        if (key.level != level_ || key.iz < 0 || key.iy < 0 || key.ix < 0) {
             result.status = vc::render::ChunkFetchStatus::Missing;
             return result;
         }
@@ -52,6 +54,7 @@ public:
     }
 
 private:
+    int level_ = 0;
     std::shared_ptr<utils::ZarrArray> array_;
 };
 
@@ -82,6 +85,14 @@ ChannelDescriptor describeChannel(const utils::ZarrArray& array, const LasagnaCh
     descriptor.shapeZYX = {static_cast<int>(meta.shape[0]), static_cast<int>(meta.shape[1]), static_cast<int>(meta.shape[2])};
     descriptor.chunksZYX = {static_cast<int>(meta.chunks[0]), static_cast<int>(meta.chunks[1]), static_cast<int>(meta.chunks[2])};
     return descriptor;
+}
+
+vc::render::IChunkedArray::LevelTransform dyadicTransform(int level)
+{
+    vc::render::IChunkedArray::LevelTransform transform;
+    const double invScale = 1.0 / static_cast<double>(std::uint64_t{1} << level);
+    transform.scaleFromLevel0 = {invScale, invScale, invScale};
+    return transform;
 }
 
 }  // namespace
@@ -130,12 +141,25 @@ std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
             const auto bytes = descriptor.dtype == vc::render::ChunkDtype::UInt16 ? std::size_t{2} : std::size_t{1};
             auto array = std::make_shared<utils::ZarrArray>(openLasagnaChannelArray(manifestCopy, groupCopy, bytes));
             vc::render::OpenedChunkedZarr opened;
-            opened.shapes.push_back(descriptor.shapeZYX);
-            opened.chunkShapes.push_back(descriptor.chunksZYX);
-            opened.storageChunkShapes.push_back(descriptor.chunksZYX);
-            opened.transforms.push_back({});
-            opened.fetchers.push_back(std::make_shared<LasagnaChannelChunkFetcher>(std::move(array)));
-            opened.fillValues.push_back(descriptor.fillValue);
+            const int level = groupCopy.scaledown;
+            const std::size_t count = static_cast<std::size_t>(level) + 1;
+            opened.levelNumbers.resize(count);
+            opened.shapes.resize(count, {0, 0, 0});
+            opened.chunkShapes.resize(count, {1, 1, 1});
+            opened.storageChunkShapes.resize(count, {1, 1, 1});
+            opened.transforms.resize(count);
+            opened.fetchers.resize(count);
+            opened.fillValues.resize(count, descriptor.fillValue);
+            for (int i = 0; i <= level; ++i) {
+                opened.levelNumbers[static_cast<std::size_t>(i)] = i;
+                opened.transforms[static_cast<std::size_t>(i)] = dyadicTransform(i);
+            }
+            const auto index = static_cast<std::size_t>(level);
+            opened.shapes[index] = descriptor.shapeZYX;
+            opened.chunkShapes[index] = descriptor.chunksZYX;
+            opened.storageChunkShapes[index] = descriptor.chunksZYX;
+            opened.fetchers[index] =
+                std::make_shared<LasagnaChannelChunkFetcher>(level, std::move(array));
             opened.fillValue = descriptor.fillValue;
             opened.dtype = descriptor.dtype;
             return opened;
@@ -145,6 +169,11 @@ std::vector<PreparedLasagnaProjectVolume> prepareLasagnaProjectVolumes(
         metadata["uuid"] = "lasagna:" + location;
         metadata["name"] = group.name + ":" + channel;
         metadata["voxelsize"] = spacing;
+        if (manifest.baseShapeZYX) {
+            metadata["slices"] = static_cast<int>((*manifest.baseShapeZYX)[0]);
+            metadata["height"] = static_cast<int>((*manifest.baseShapeZYX)[1]);
+            metadata["width"] = static_cast<int>((*manifest.baseShapeZYX)[2]);
+        }
         prepared.push_back({
             location,
             {provenanceTag},
