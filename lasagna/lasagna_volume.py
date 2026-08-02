@@ -21,10 +21,10 @@ LASAGNA_VOLUME_VERSION = 2
 
 @dataclass
 class ChannelGroup:
-	"""One zarr array containing one or more channels at a common resolution."""
+	"""One channel array, or an older flat CZYX preprocessing/fit group."""
 	zarr_path: str          # relative to the .lasagna.json file
 	scaledown: int          # OME-Zarr pyramid level; actual factor = 2**scaledown
-	channels: list[str]     # ordered; index = position in CZYX zarr
+	channels: list[str]     # current: one 3D channel; older CZYX: channel order
 
 	@property
 	def sd_fac(self) -> int:

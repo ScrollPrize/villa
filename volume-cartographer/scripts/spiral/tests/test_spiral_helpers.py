@@ -151,7 +151,7 @@ class ResolveOuterWindingIdxWiringTests(unittest.TestCase):
 
     def _cfg(self, idx, gap=200):
         return {'shell_outer_winding_idx': idx,
-                'gap_expander_num_windings': gap}
+                'model_gap_expander_num_windings': gap}
 
     def test_configured_index_survives_a_shell_less_run(self):
         idx, notes = resolve_outer_winding_idx_and_notes(
@@ -186,7 +186,7 @@ class ResolveOuterWindingIdxWiringTests(unittest.TestCase):
             self._cfg(130, gap=130), shell_active=False,
             infer_outer_winding_idx=self.fail)
         self.assertEqual(idx, 130)
-        self.assertTrue(any('gap_expander_num_windings >= 133' in n
+        self.assertTrue(any('model_gap_expander_num_windings >= 133' in n
                             for n in notes))
 
 

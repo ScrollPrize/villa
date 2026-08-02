@@ -650,6 +650,14 @@ accumulators → chunked normal estimation from 3×2 direction channels → uint
 encoding → zarr output. Input tiles are read lazily from zarr (no full-crop
 load). Uses CUDA by default when available.
 
+The generic tiled mechanics live in `lasagna/tiled_predict3d.py`: canonical
+global tile positions, crop-independent output chunk selection, rolling
+z-band scratch, output-chunk resume, temp cleanup, progress, and atomic chunk
+writes. `preprocess_cos_omezarr.py predict3d` is the Lasagna adapter/wrapper
+for cos, `grad_mag/nx/ny`, optional `pred_dt`, `.lasagna.json` metadata, and
+Lasagna pyramid generation. The wrapper CLI and output semantics stay
+compatible with earlier `predict3d` runs.
+
 #### Basic usage
 
 ```bash
@@ -729,6 +737,11 @@ All chunk writes go through unique temporary paths and are installed with
 atomic rename. On startup/resume and on normal finish, stale predict3d temp
 paths in the output directory are removed; pid-bearing temp paths owned by
 other live predict3d processes are left alone.
+
+The shared runner treats each logical product independently. For Lasagna,
+`cos` is a single-channel fine product, `grad_mag/nx/ny` is one coherent
+coarse model product, and `pred_dt` is a derived product. Fiber inference uses
+the same mechanics but different adapters and output semantics.
 
 The process sets `oom_score_adj=1000` so the OOM killer targets it before the
 parent session.

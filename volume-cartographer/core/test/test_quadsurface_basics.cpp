@@ -273,6 +273,33 @@ TEST_CASE("valid/coord/normal on an in-memory grid")
     CHECK(std::isfinite(n[0]));
 }
 
+TEST_CASE("valid and coord include the final complete quad")
+{
+    auto pts = makePlanarGrid(3, 4);
+    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
+    const cv::Vec2d surface = qs.gridToSurface({2.5, 1.5});
+    const cv::Vec3f ptr(
+        static_cast<float>(surface[0]),
+        static_cast<float>(surface[1]),
+        0.0f);
+
+    CHECK(qs.valid(ptr));
+    const cv::Vec3f point = qs.coord(ptr);
+    CHECK(point[0] == doctest::Approx(2.5f));
+    CHECK(point[1] == doctest::Approx(1.5f));
+    CHECK(point[2] == doctest::Approx(50.0f));
+
+    pts(2, 3) = cv::Vec3f(-1.f, -1.f, -1.f);
+    QuadSurface invalid(pts, cv::Vec2f(1.f, 1.f));
+    const cv::Vec2d invalidSurface = invalid.gridToSurface({2.5, 1.5});
+    const cv::Vec3f invalidPtr(
+        static_cast<float>(invalidSurface[0]),
+        static_cast<float>(invalidSurface[1]),
+        0.0f);
+    CHECK_FALSE(invalid.valid(invalidPtr));
+    CHECK(invalid.coord(invalidPtr) == cv::Vec3f(-1.f, -1.f, -1.f));
+}
+
 TEST_CASE("move adds offset to ptr")
 {
     auto pts = makePlanarGrid(4, 4);

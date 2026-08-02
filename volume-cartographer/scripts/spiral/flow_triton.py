@@ -38,14 +38,19 @@ def rk4_triton_available(*tensors):
     )
 
 
-def direct_lr_enabled():
+def direct_lr_enabled(default=False):
     # Sample the LR flow lattice directly at query points instead of
     # upsampling it to HR resolution every step. Same function except within
     # HR cells that straddle an LR grid plane (the upsample linearises there);
     # kills the F.interpolate forward+backward and its full-resolution
     # transient. Off by default because it slightly changes the effective
-    # interpolant.
-    return os.environ.get('FIT_SPIRAL_DIRECT_LR', '0') == '1'
+    # interpolant. Normally set via the model_flow_field_direct_lr config key
+    # (threaded through as `default`); FIT_SPIRAL_DIRECT_LR, when set,
+    # overrides the config.
+    value = os.environ.get('FIT_SPIRAL_DIRECT_LR')
+    if value is None:
+        return bool(default)
+    return value == '1'
 
 
 _PERM_STRIDE = 4096

@@ -54,6 +54,9 @@ struct GeneratedOverlay {
         bool hasBranches = false;
         bool hasPendingLinks = false;
         bool isLinkCandidate = false;
+        bool hasTracedSegmentToNext = false;
+        std::string interpolationGoal = "global";
+        char interpolationModeMarker = 'L';
         std::vector<uint64_t> branchIds;
         std::vector<BranchLink> branchLinks;
     };
@@ -127,6 +130,13 @@ struct GeneratedOverlay {
 };
 
 struct GeneratedSpanAlignmentMetric {
+    enum class Kind {
+        LasagnaNormalAlignment,
+        NativeMeetingError,
+        NativeFailure,
+        Cspline,
+    };
+
     int spanIndex = 0;
     int firstControlIndex = 0;
     int secondControlIndex = 0;
@@ -136,11 +146,22 @@ struct GeneratedSpanAlignmentMetric {
     bool available = false;
     bool pending = false;
     std::string error;
+    Kind kind = Kind::LasagnaNormalAlignment;
+    double meetingErrorBaseVoxels =
+        std::numeric_limits<double>::quiet_NaN();
+    double meetingErrorRatio =
+        std::numeric_limits<double>::quiet_NaN();
+    std::string meetingSource;
+    std::string failureCode;
+    std::string failureDetail;
+    char modeMarker = 'L';
+    std::string message;
 };
 
 struct GeneratedViews {
     std::string lineSurfaceName;
     QString lineSurfaceTitle;
+    std::shared_ptr<QuadSurface> lineSurface;
     std::string lineSideSliceName;
     QString lineSideSliceTitle;
     std::shared_ptr<QuadSurface> lineSideSlice;
@@ -167,6 +188,20 @@ struct GeneratedViews {
     std::vector<GeneratedOverlay::FiberIntersectionMarker> fiberIntersections;
     std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics;
 };
+
+inline void replaceGeneratedBranchOverlayData(
+    GeneratedViews& views,
+    std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
+    std::vector<std::vector<cv::Vec3f>> branchLinePoints,
+    std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
+    std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics)
+{
+    views.controlPoints = std::move(controlPoints);
+    views.branchLinePoints = std::move(branchLinePoints);
+    views.branchLinks = std::move(branchLinks);
+    views.fiberIntersections.clear();
+    views.spanAlignmentMetrics = std::move(spanAlignmentMetrics);
+}
 
 struct GeneratedControlPointLinePositionIndex {
     std::vector<size_t> sortedControlIndices;
@@ -945,6 +980,7 @@ struct GeneratedControlPointContextMenuOptions {
     std::function<void(size_t, cv::Vec3f)> designateLinkCandidate;
     std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
     std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
+    std::function<void(size_t, size_t, std::string)> setSegmentInterpolationGoal;
 };
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,

@@ -208,6 +208,12 @@ High-ROI improvements that are usually safe across projects:
 - hoist invariants out of loops
 - add early-outs that are logically equivalent
 
+Do not copy an existing implementation into a new module just because the
+existing code is private to another translation unit or package. Extract the
+shared behavior into a reusable helper/library first, then make both callers use
+that shared implementation. If extraction is genuinely impossible in the current
+task, treat that as an explicit deviation and report it before proceeding.
+
 ### 4.3 Document anything that affects developer workflow
 If you add:
 - new scripts

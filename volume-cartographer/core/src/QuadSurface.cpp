@@ -815,8 +815,7 @@ cv::Vec3f QuadSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset) cons
     const_cast<QuadSurface*>(this)->ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
 
-    cv::Rect bounds = {0,0,_points->cols-2,_points->rows-2};
-    if (!bounds.contains(cv::Point(p[0],p[1])))
+    if (!loc_valid_xy(*_points, {p[0], p[1]}))
         return {-1,-1,-1};
 
     return at_int((*_points), {p[0],p[1]});

@@ -7,6 +7,8 @@
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -434,6 +436,31 @@ void ChunkCache::removeChunkReadyListener(ChunkReadyCallbackId id)
     auto state = state_;
     std::lock_guard lock(state->mutex_);
     state->callbacks_.erase(id);
+}
+
+ChunkCache::PersistentChunkDependency ChunkCache::persistentChunkDependency(
+    int level,
+    int iz,
+    int iy,
+    int ix) const
+{
+    auto state = state_;
+    const ChunkKey key{level, iz, iy, ix};
+    PersistentChunkDependency result;
+    result.key = key;
+    if (!state->options_.persistentCachePath || !isValidKey(*state, key))
+        return result;
+
+    const auto& fetcher = state->fetchers_.at(static_cast<std::size_t>(key.level));
+    result.valid = static_cast<bool>(fetcher);
+    if (!result.valid)
+        return result;
+    result.sourceChunkKey = fetcher->sourceChunkKey(key);
+    result.persistentPath = persistentPath(*state, key);
+    result.persistentEmptyPath = persistentEmptyPath(*state, key);
+    result.persistentExtension = fetcher->persistentCacheExtension(key);
+    result.sourcePayloadMatchesPersistentCache = fetcher->sourcePayloadMatchesPersistentCache(key);
+    return result;
 }
 
 ChunkCache::Stats ChunkCache::stats() const
@@ -1153,7 +1180,7 @@ bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
 
     const auto path = persistentEmptyPath(state, key);
     auto reservation = state.persistentBudget_
-        ? state.persistentBudget_->reserveWrite(path, 1)
+        ? state.persistentBudget_->reserveWrite(path, 0)
         : PersistentZarrCacheBudget::WriteReservation{};
     if (state.persistentBudget_ && !reservation)
         return false;
@@ -1167,7 +1194,6 @@ bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
         std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
         if (!file)
             return false;
-        file.put('\n');
         if (!file) {
             file.close();
             std::filesystem::remove(tmp, ec);
@@ -1191,7 +1217,7 @@ bool ChunkCache::writePersistentEmpty(State& state, const ChunkKey& key)
         reservation.commit();
         return false;
     }
-    const auto newSize = regularFileSize(path).value_or(std::size_t{1});
+    const auto newSize = regularFileSize(path).value_or(std::size_t{0});
     addPersistentCacheBytesDelta(
         state,
         static_cast<std::int64_t>(newSize) - static_cast<std::int64_t>(oldSize));

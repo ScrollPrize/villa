@@ -28,11 +28,11 @@ public:
 };
 
 struct resId_hash {
-    static size_t operator()(resId_t id);
+    size_t operator()(const resId_t& id) const;
 };
 
 struct SurfPoint_hash {
-    static size_t operator()(SurfPoint p);
+    size_t operator()(const SurfPoint& p) const;
 };
 
 // Surface tracking data for loss functions.
