@@ -1270,12 +1270,17 @@ def _plan_circular_z_depth(
 	sd = max(1, int(scaledown))
 	oc = max(1, int(chunk_size))
 	ts_out = int(tile_size) // sd
-	oldest = 0
+	# Runtime keeps the chunk-aligned flush frontier separate from the physical
+	# ring origin.  In particular, ``flushed`` begins at output_begin while the
+	# ring still owns the prefix from logical plane zero until a later frontier
+	# actually advances and calls discard_before().
+	origin = 0
+	flushed = int(output_begin)
 	max_live = 1
 	positions = tuple(int(v) for v in z_positions)
 	for index, tz in enumerate(positions):
 		az0, az1, _, _ = _downscaled_tile_clip(tz, sd, ts_out, int(z_size))
-		max_live = max(max_live, az1 - oldest)
+		max_live = max(max_live, az1 - origin)
 		next_tz = positions[index + 1] if index + 1 < len(positions) else int(z_size) * sd
 		complete = next_tz // sd
 		if complete >= int(output_end):
@@ -1284,7 +1289,9 @@ def _plan_circular_z_depth(
 			flush_to = int(output_begin) + (
 				max(0, complete - int(output_begin)) // oc
 			) * oc
-		oldest = max(oldest, flush_to)
+		if flush_to > flushed:
+			flushed = flush_to
+			origin = flush_to
 	return min(int(z_size), max(1, int(max_live)))
 
 

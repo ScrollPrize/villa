@@ -851,6 +851,58 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			_plan_circular_z_depth(z_size=8_000_032, **kwargs),
 		)
 
+	def test_circular_depth_keeps_prefix_until_flush_frontier_advances(self):
+		self.assertEqual(
+			_plan_circular_z_depth(
+				z_positions=(-64, 96, 256, 416),
+				tile_size=256,
+				scaledown=4,
+				z_size=592,
+				chunk_size=64,
+				output_begin=8,
+				output_end=584,
+			),
+			128,
+		)
+
+	def test_shared_runner_ring_survives_initial_noop_flushes(self):
+		product = OutputProductSpec(
+			name="identity", level=2, scaledown=4, inference_scaledown=4,
+			channels=("value",), chunk_size=4,
+		)
+		adapter = _IdentityProductAdapter(product)
+
+		class Output:
+			def __init__(self):
+				self.written = []
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.written.append(chunk_origin_zyx)
+
+		with tempfile.TemporaryDirectory() as td:
+			input_path = Path(td) / "input.zarr"
+			arr = zarr.open(
+				str(input_path), mode="w", shape=(24, 24, 24),
+				chunks=(8, 8, 8), dtype="uint8",
+			)
+			arr[:] = 1
+			output = Output()
+			run_tiled_inference_3d(
+				object(), zarr.open(str(input_path), mode="r"),
+				crop_slices=(4, 20, 0, 16, 0, 16), device=torch.device("cpu"),
+				model_adapter=adapter, output_adapter=output, products=(product,),
+				output_regions_zyx={"identity": (1, 0, 0, 5, 4, 4)},
+				full_output_shapes_zyx={"identity": (6, 6, 6)},
+				input_zarr_path=str(input_path), tile_size=16, overlap=8, border=4,
+				tmp_dir=td,
+			)
+
+		self.assertGreater(adapter.calls, 0)
+		self.assertGreater(len(output.written), 0)
+
 	def test_shared_runner_infers_multiscale_products_once_per_tile(self):
 		fine = OutputProductSpec(
 			name="fine", level=0, scaledown=1, inference_scaledown=1,
