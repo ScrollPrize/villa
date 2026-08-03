@@ -394,6 +394,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Improving scroll alignment with image registration](https://github.com/Paul-G2/VesuviusScrollAlignment) Scripts and a report showing how image registration can improve the alignment of scroll volumes scanned at different energies and resolutions, by Paul Geiger
 
+- [Helena](https://github.com/LimeGS/helena-framework) by Leonel Wainer. Orchestration and evidence layer for the volume -> surface -> ink -> page pipeline. It reimplements none of it: VC3D, ScrollFiesta, the flatteners and the ink models sit behind stable adapters, while Helena pools GPUs behind one queue and pins every checkpoint and artifact by hash, keeping geometry, CT support, model response and human review separate.
+
 ### 📦 Materials
 
 - [CT scanning campfire scrolls](https://dl.ash2txt.org/community-uploads/waynewaynehello/) Ahron Wayne replicated the carbonization process of a papyrus scroll and scanned it with his personal CT scanner
