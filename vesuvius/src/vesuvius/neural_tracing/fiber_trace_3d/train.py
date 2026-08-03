@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import math
 import multiprocessing as mp
 import os
 import re
+import signal
+import socket
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -94,6 +97,176 @@ class _DistributedConfig:
     is_main: bool
     backend: str
     device: torch.device
+
+
+class _TrainingHangDiagnostics:
+    """Best-effort persistent diagnostics for long rank-local stalls."""
+
+    def __init__(
+        self,
+        run_dir: Path,
+        *,
+        rank: int,
+        device: torch.device,
+        watchdog_seconds: float = 480.0,
+        automatic_watchdog: bool = False,
+    ) -> None:
+        self.rank = int(rank)
+        self.device = device
+        self.watchdog_seconds = float(watchdog_seconds)
+        self.automatic_watchdog = bool(automatic_watchdog)
+        self.path = Path(run_dir) / f"hang_diagnostics_rank_{self.rank}.log"
+        self._file: Any | None = None
+        self._watchdog_armed = False
+        self._signal_registered = False
+        self._closed = False
+        try:
+            self._file = self.path.open("a", encoding="utf-8", buffering=1)
+            self.marker(
+                "diagnostics-start",
+                pid=os.getpid(),
+                host=socket.gethostname(),
+                watchdog_seconds=self.watchdog_seconds,
+                automatic=int(self.automatic_watchdog),
+            )
+            dump_signal = getattr(signal, "SIGUSR2", None)
+            if dump_signal is not None:
+                try:
+                    faulthandler.register(
+                        dump_signal,
+                        file=self._file,
+                        all_threads=True,
+                        chain=False,
+                    )
+                    self._signal_registered = True
+                    self.marker("manual-dump-registered", signal="SIGUSR2")
+                except (OSError, RuntimeError, ValueError):
+                    self.marker("manual-dump-unavailable", signal="SIGUSR2")
+        except (OSError, RuntimeError, ValueError):
+            self._file = None
+
+    def _resource_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "rss_mib": "unavailable",
+            "threads": "unavailable",
+            "fds": "unavailable",
+        }
+        try:
+            status: dict[str, str] = {}
+            with Path("/proc/self/status").open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    key, separator, value = line.partition(":")
+                    if separator:
+                        status[key] = value.strip()
+            rss_tokens = status.get("VmRSS", "").split()
+            if rss_tokens:
+                fields["rss_mib"] = f"{int(rss_tokens[0]) / 1024.0:.1f}"
+            if status.get("Threads"):
+                fields["threads"] = int(status["Threads"])
+        except (OSError, ValueError):
+            pass
+        try:
+            fields["fds"] = sum(1 for _ in Path("/proc/self/fd").iterdir())
+        except OSError:
+            pass
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            try:
+                fields["cuda_allocated_mib"] = (
+                    f"{torch.cuda.memory_allocated(self.device) / (1024.0 ** 2):.1f}"
+                )
+                fields["cuda_reserved_mib"] = (
+                    f"{torch.cuda.memory_reserved(self.device) / (1024.0 ** 2):.1f}"
+                )
+            except (RuntimeError, ValueError):
+                fields["cuda_allocated_mib"] = "unavailable"
+                fields["cuda_reserved_mib"] = "unavailable"
+        return fields
+
+    def marker(self, phase: str, **fields: Any) -> None:
+        if self._file is None or self._closed:
+            return
+        try:
+            record = {
+                "time_utc": datetime.now().astimezone().isoformat(),
+                "monotonic": f"{time.monotonic():.6f}",
+                "rank": self.rank,
+                "phase": str(phase),
+                **self._resource_fields(),
+                **fields,
+            }
+            self._file.write(" ".join(f"{key}={value}" for key, value in record.items()) + "\n")
+            self._file.flush()
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+    def arm_test_watchdog(self, step: int) -> None:
+        if (
+            not self.automatic_watchdog
+            or self._file is None
+            or self._closed
+            or self.watchdog_seconds <= 0.0
+        ):
+            return
+        self.cancel_test_watchdog(step=step, reason="rearm")
+        try:
+            faulthandler.dump_traceback_later(
+                self.watchdog_seconds,
+                repeat=False,
+                file=self._file,
+                exit=False,
+            )
+            self._watchdog_armed = True
+            self.marker("test-watchdog-arm", step=int(step), timeout_s=self.watchdog_seconds)
+        except (OSError, RuntimeError, ValueError):
+            self.marker("test-watchdog-unavailable", step=int(step))
+
+    def cancel_test_watchdog(self, *, step: int | None = None, reason: str = "complete") -> None:
+        if not self._watchdog_armed:
+            return
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except (OSError, RuntimeError, ValueError):
+            pass
+        self._watchdog_armed = False
+        self.marker("test-watchdog-cancel", step=step, reason=reason)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.cancel_test_watchdog(reason="close")
+        if self._signal_registered:
+            dump_signal = getattr(signal, "SIGUSR2", None)
+            if dump_signal is not None:
+                try:
+                    faulthandler.unregister(dump_signal)
+                except (OSError, RuntimeError, ValueError):
+                    pass
+            self._signal_registered = False
+        self.marker("diagnostics-close")
+        self._closed = True
+        if self._file is not None:
+            try:
+                self._file.close()
+            except OSError:
+                pass
+            self._file = None
+
+
+def _diagnostic_cuda_synchronize(
+    diagnostics: _TrainingHangDiagnostics | None,
+    *,
+    phase: str,
+    step: int,
+    device: torch.device,
+    **fields: Any,
+) -> None:
+    if device.type != "cuda":
+        return
+    if diagnostics is not None:
+        diagnostics.marker(f"{phase}-begin", step=step, **fields)
+    torch.cuda.synchronize(device)
+    if diagnostics is not None:
+        diagnostics.marker(f"{phase}-end", step=step, **fields)
 
 
 def _load_raw_config(path: str | Path) -> dict[str, Any]:
@@ -1564,32 +1737,107 @@ def evaluate_dense_loss(
     presence_weight: float,
     conditioned_loss_options: dict[str, float] | None = None,
     mixed_precision: _MixedPrecisionConfig | None = None,
+    diagnostics: _TrainingHangDiagnostics | None = None,
+    diagnostic_step: int = 0,
 ) -> dict[str, float]:
     model.eval()
     total_rows: list[dict[str, float]] = []
     consumed = 0
+    batch_index = 0
     while consumed < sample_count:
+        batch_started = time.monotonic()
+        if diagnostics is not None:
+            diagnostics.marker(
+                "dense-test-load-begin",
+                step=diagnostic_step,
+                batch=batch_index,
+                consumed=consumed,
+                sample_count=sample_count,
+            )
         batch = loader.load_batch(
             start_sample_index + consumed,
             sample_mode=sample_mode,
             sample_index_limit=sample_index_limit,
             device=device,
         )
+        if diagnostics is not None:
+            diagnostics.marker(
+                "dense-test-load-end",
+                step=diagnostic_step,
+                batch=batch_index,
+                consumed=consumed,
+                elapsed_s=f"{time.monotonic() - batch_started:.3f}",
+            )
+            diagnostics.marker(
+                "dense-test-targets-begin",
+                step=diagnostic_step,
+                batch=batch_index,
+                consumed=consumed,
+            )
+        targets_started = time.monotonic()
         batch = materialize_targets(batch, loader.config)
+        if diagnostics is not None:
+            diagnostics.marker(
+                "dense-test-targets-end",
+                step=diagnostic_step,
+                batch=batch_index,
+                consumed=consumed,
+                elapsed_s=f"{time.monotonic() - targets_started:.3f}",
+            )
         take = min(int(batch.volume.shape[0]), sample_count - consumed)
         if take < int(batch.volume.shape[0]):
             batch = _slice_batch(batch, 0, take)
+        if diagnostics is not None:
+            diagnostics.marker(
+                "dense-test-forward-begin",
+                step=diagnostic_step,
+                batch=batch_index,
+                consumed=consumed,
+                take=take,
+            )
+        forward_started = time.monotonic()
         with _autocast_context(mixed_precision):
-            rows = _forward_loss(
+            loss_tensors = _forward_loss_tensors(
                 model,
                 batch,
                 direction_weight=direction_weight,
                 presence_weight=presence_weight,
                 conditioned_loss_options=conditioned_loss_options,
-                backward=False,
+                training_loss=False,
+            )
+        _diagnostic_cuda_synchronize(
+            diagnostics,
+            phase="dense-test-cuda-sync",
+            step=diagnostic_step,
+            device=device,
+            batch=batch_index,
+            consumed=consumed,
+        )
+        if diagnostics is not None:
+            diagnostics.marker(
+                "dense-test-forward-end",
+                step=diagnostic_step,
+                batch=batch_index,
+                consumed=consumed,
+                elapsed_s=f"{time.monotonic() - forward_started:.3f}",
+            )
+            diagnostics.marker(
+                "dense-test-to-cpu-begin",
+                step=diagnostic_step,
+                batch=batch_index,
+                consumed=consumed,
+            )
+        rows = _losses_to_float_dict(loss_tensors)
+        if diagnostics is not None:
+            diagnostics.marker(
+                "dense-test-to-cpu-end",
+                step=diagnostic_step,
+                batch=batch_index,
+                consumed=consumed,
             )
         total_rows.append(rows)
         consumed += take
+        batch_index += 1
     model.train()
     if not total_rows:
         return {
@@ -1779,6 +2027,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     _distributed_init(distributed)
     device = distributed.device
     writer = None
+    diagnostics: _TrainingHangDiagnostics | None = None
     train_dataloader = None
     train_iterator = None
     loader = FiberTrace3DLoader(loader_config)
@@ -1840,6 +2089,24 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         raw_config,
         date_str_override=str(run_datestr),
     )
+    watchdog_seconds = float(training.get("test_watchdog_seconds", 480.0))
+    if watchdog_seconds <= 0.0 or watchdog_seconds >= 600.0:
+        raise ValueError("training.test_watchdog_seconds must be > 0 and < 600")
+    diagnostics = _TrainingHangDiagnostics(
+        run_dir,
+        rank=distributed.rank,
+        device=device,
+        watchdog_seconds=watchdog_seconds,
+        automatic_watchdog=distributed.is_main,
+    )
+    if distributed.is_main:
+        print(
+            "fiber_trace_3d diagnostics: "
+            f"pid={os.getpid()} log={diagnostics.path} "
+            f"test_watchdog_seconds={watchdog_seconds:g} "
+            "manual_dump='kill -USR2 <pid>'",
+            flush=True,
+        )
     _distributed_barrier(distributed)
     effective_config = _json_safe(raw_config)
     if resume_checkpoint is not None:
@@ -1990,48 +2257,67 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         )
 
     def run_configured_tests(step: int) -> tuple[float | None, str | None]:
-        metric: float | None = None
-        metric_name: str | None = None
-        if test_loader is not None and test_interval > 0:
-            test_losses = evaluate_dense_loss(
-                raw_model,
-                test_loader,
+        assert diagnostics is not None
+        diagnostics.arm_test_watchdog(step)
+        diagnostics.marker("test-routine-begin", step=step)
+        try:
+            _diagnostic_cuda_synchronize(
+                diagnostics,
+                phase="test-entry-cuda-sync",
+                step=step,
                 device=device,
-                start_sample_index=test_start_sample_index,
-                sample_count=test_control_points,
-                sample_mode=test_sample_mode,
-                direction_weight=direction_weight,
-                presence_weight=presence_weight,
-                conditioned_loss_options=conditioned_loss_options,
-                mixed_precision=mixed_precision,
             )
-            metric = float(test_losses["total"])
-            metric_name = "test/loss_total"
-            print(
-                f"test step={step} loss_total={test_losses['total']:.6f} "
-                f"loss_direction={test_losses['direction']:.6f} "
-                f"loss_presence={test_losses['presence']:.6f} "
-                f"angle_mean_deg={test_losses['angle_mean_deg']:.2f} "
-                f"branch0={test_losses['branch0_fraction']:.3f} "
-                f"branch1={test_losses['branch1_fraction']:.3f} "
-                f"selected_score={test_losses['selected_score_mean']:.3f}",
-                flush=True,
-            )
-            if writer is not None:
-                writer.add_scalar("test/loss_total", test_losses["total"], step)
-                writer.add_scalar("test/loss_direction", test_losses["direction"], step)
-                writer.add_scalar("test/loss_presence", test_losses["presence"], step)
-                writer.add_scalar("test/angle_mean_deg", test_losses["angle_mean_deg"], step)
-                writer.add_scalar("test/branch0_fraction", test_losses["branch0_fraction"], step)
-                writer.add_scalar("test/branch1_fraction", test_losses["branch1_fraction"], step)
-                writer.add_scalar("test/selected_score_mean", test_losses["selected_score_mean"], step)
-                if test_sample_vis_interval > 0 and step % test_sample_vis_interval == 0:
+            metric: float | None = None
+            metric_name: str | None = None
+            if test_loader is not None and test_interval > 0:
+                test_losses = evaluate_dense_loss(
+                    raw_model,
+                    test_loader,
+                    device=device,
+                    start_sample_index=test_start_sample_index,
+                    sample_count=test_control_points,
+                    sample_mode=test_sample_mode,
+                    direction_weight=direction_weight,
+                    presence_weight=presence_weight,
+                    conditioned_loss_options=conditioned_loss_options,
+                    mixed_precision=mixed_precision,
+                    diagnostics=diagnostics,
+                    diagnostic_step=step,
+                )
+                metric = float(test_losses["total"])
+                metric_name = "test/loss_total"
+                print(
+                    f"test step={step} loss_total={test_losses['total']:.6f} "
+                    f"loss_direction={test_losses['direction']:.6f} "
+                    f"loss_presence={test_losses['presence']:.6f} "
+                    f"angle_mean_deg={test_losses['angle_mean_deg']:.2f} "
+                    f"branch0={test_losses['branch0_fraction']:.3f} "
+                    f"branch1={test_losses['branch1_fraction']:.3f} "
+                    f"selected_score={test_losses['selected_score_mean']:.3f}",
+                    flush=True,
+                )
+                if writer is not None:
+                    diagnostics.marker("test-tensorboard-scalars-begin", step=step)
+                    writer.add_scalar("test/loss_total", test_losses["total"], step)
+                    writer.add_scalar("test/loss_direction", test_losses["direction"], step)
+                    writer.add_scalar("test/loss_presence", test_losses["presence"], step)
+                    writer.add_scalar("test/angle_mean_deg", test_losses["angle_mean_deg"], step)
+                    writer.add_scalar("test/branch0_fraction", test_losses["branch0_fraction"], step)
+                    writer.add_scalar("test/branch1_fraction", test_losses["branch1_fraction"], step)
+                    writer.add_scalar("test/selected_score_mean", test_losses["selected_score_mean"], step)
+                    diagnostics.marker("test-tensorboard-scalars-end", step=step)
+                if writer is not None and test_sample_vis_interval > 0 and step % test_sample_vis_interval == 0:
+                    diagnostics.marker("test-visualization-load-begin", step=step)
                     vis_batch = test_loader.load_batch(
                         test_start_sample_index,
                         sample_mode=test_sample_mode,
                         device=device,
                     )
+                    diagnostics.marker("test-visualization-load-end", step=step)
+                    diagnostics.marker("test-visualization-targets-begin", step=step)
                     vis_batch = materialize_targets(vis_batch, test_loader.config)
+                    diagnostics.marker("test-visualization-targets-end", step=step)
+                    diagnostics.marker("test-visualization-forward-image-begin", step=step)
                     _write_3d_sample_sheet(
                         writer,
                         "test_sample_3d/principal_slices",
@@ -2040,38 +2326,53 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                         step,
                         sample_count=test_sample_vis_count,
                         mixed_precision=mixed_precision,
+                        diagnostics=diagnostics,
                     )
-        if trace2cp_loader is not None and test_interval > 0:
-            trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
-                raw_model,
-                trace2cp_loader,
-                image_normalization=loader.config.image_normalization,
-                cfg=trace2cp_cfg,
-                device=device,
-                mixed_precision=mixed_precision,
-            )
-            print(
-                f"test_trace2cp step={step} trace2cp_error={trace2cp_metric.error_mean:.6f} "
-                f"raw_y_error_mean_px={trace2cp_metric.raw_y_error_mean_px:.3f} "
-                f"segments={trace2cp_metric.segments} skipped={trace2cp_metric.skipped_segments}",
-                flush=True,
-            )
-            if writer is not None:
-                writer.add_scalar("test/trace2cp_error", trace2cp_metric.error_mean, step)
-                writer.add_scalar(
-                    "test/trace2cp_raw_y_error_mean_px",
-                    trace2cp_metric.raw_y_error_mean_px,
-                    step,
+                    diagnostics.marker("test-visualization-forward-image-end", step=step)
+            if trace2cp_loader is not None and test_interval > 0:
+                diagnostics.marker("test-trace2cp-begin", step=step)
+                trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
+                    raw_model,
+                    trace2cp_loader,
+                    image_normalization=loader.config.image_normalization,
+                    cfg=trace2cp_cfg,
+                    device=device,
+                    mixed_precision=mixed_precision,
                 )
-                writer.add_scalar("test/trace2cp_segments", trace2cp_metric.segments, step)
-                writer.add_scalar(
-                    "test/trace2cp_skipped_segments",
-                    trace2cp_metric.skipped_segments,
-                    step,
+                _diagnostic_cuda_synchronize(
+                    diagnostics,
+                    phase="test-trace2cp-cuda-sync",
+                    step=step,
+                    device=device,
                 )
-        if writer is not None and metric is not None:
-            writer.flush()
-        return metric, metric_name
+                diagnostics.marker("test-trace2cp-end", step=step)
+                print(
+                    f"test_trace2cp step={step} trace2cp_error={trace2cp_metric.error_mean:.6f} "
+                    f"raw_y_error_mean_px={trace2cp_metric.raw_y_error_mean_px:.3f} "
+                    f"segments={trace2cp_metric.segments} skipped={trace2cp_metric.skipped_segments}",
+                    flush=True,
+                )
+                if writer is not None:
+                    writer.add_scalar("test/trace2cp_error", trace2cp_metric.error_mean, step)
+                    writer.add_scalar(
+                        "test/trace2cp_raw_y_error_mean_px",
+                        trace2cp_metric.raw_y_error_mean_px,
+                        step,
+                    )
+                    writer.add_scalar("test/trace2cp_segments", trace2cp_metric.segments, step)
+                    writer.add_scalar(
+                        "test/trace2cp_skipped_segments",
+                        trace2cp_metric.skipped_segments,
+                        step,
+                    )
+            if writer is not None and metric is not None:
+                diagnostics.marker("test-tensorboard-flush-begin", step=step)
+                writer.flush()
+                diagnostics.marker("test-tensorboard-flush-end", step=step)
+            diagnostics.marker("test-routine-end", step=step)
+            return metric, metric_name
+        finally:
+            diagnostics.cancel_test_watchdog(step=step)
 
     initial_metric, initial_metric_name = (
         run_configured_tests(start_step) if distributed.is_main else (None, None)
@@ -2248,6 +2549,8 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         if writer is not None:
             writer.flush()
             writer.close()
+        if diagnostics is not None:
+            diagnostics.close()
         _distributed_cleanup(distributed)
 
 
@@ -3162,6 +3465,7 @@ def _write_3d_sample_sheet(
     *,
     sample_count: int = 1,
     mixed_precision: _MixedPrecisionConfig | None = None,
+    diagnostics: _TrainingHangDiagnostics | None = None,
 ) -> None:
     was_training = bool(model.training)
     model.eval()
@@ -3176,14 +3480,31 @@ def _write_3d_sample_sheet(
             else:
                 vis_output = model(batch.volume[:take])
         vis_output = vis_output.float()
+    if diagnostics is not None:
+        diagnostics.marker("sample-sheet-forward-complete", step=step, tag=tag)
+    _diagnostic_cuda_synchronize(
+        diagnostics,
+        phase="sample-sheet-cuda-sync",
+        step=step,
+        device=batch.volume.device,
+        tag=tag,
+    )
     if was_training:
         model.train()
+    if diagnostics is not None:
+        diagnostics.marker("sample-sheet-render-begin", step=step, tag=tag)
+    sheet = _make_train_sample_3d_contact_sheet(batch, vis_output, sample_count=take)
+    if diagnostics is not None:
+        diagnostics.marker("sample-sheet-render-end", step=step, tag=tag)
+        diagnostics.marker("sample-sheet-add-image-begin", step=step, tag=tag)
     writer.add_image(
         tag,
-        _make_train_sample_3d_contact_sheet(batch, vis_output, sample_count=take),
+        sheet,
         int(step),
         dataformats="HWC",
     )
+    if diagnostics is not None:
+        diagnostics.marker("sample-sheet-add-image-end", step=step, tag=tag)
 
 
 def _draw_trace2cp_3d_panel(
