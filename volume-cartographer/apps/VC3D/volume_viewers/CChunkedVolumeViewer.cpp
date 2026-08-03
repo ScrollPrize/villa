@@ -116,10 +116,12 @@ struct IntersectionStyle {
     QRgb color = 0;
     int z = kIntersectionZ;
     int widthQ = 0;
+    bool dashed = false;
 
     bool operator==(const IntersectionStyle& other) const
     {
-        return color == other.color && z == other.z && widthQ == other.widthQ;
+        return color == other.color && z == other.z && widthQ == other.widthQ &&
+               dashed == other.dashed;
     }
 };
 
@@ -129,6 +131,7 @@ struct IntersectionStyleHash {
         size_t h = std::hash<QRgb>{}(style.color);
         h ^= std::hash<int>{}(style.z) + 0x9e3779b9u + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(style.widthQ) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(style.dashed) + 0x9e3779b9u + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -3170,6 +3173,7 @@ void CChunkedVolumeViewer::adjustSurfaceOffset(float delta)
     _genCacheDirty = true;
     submitRender("surface offset changed");
     updateStatusLabel();
+    notifyNormalOffsetChanged();
 }
 
 void CChunkedVolumeViewer::resetSurfaceOffsets()
@@ -3180,6 +3184,19 @@ void CChunkedVolumeViewer::resetSurfaceOffsets()
     _zOffWorldDir = {0, 0, 0};
     _genCacheDirty = true;
     submitRender("surface offsets reset");
+    notifyNormalOffsetChanged();
+}
+
+// Plane viewers draw a dashed copy of the segmentation intersection displaced
+// by the flattened viewer's normal offset; refresh them when that offset moves.
+void CChunkedVolumeViewer::notifyNormalOffsetChanged()
+{
+    if (!_viewerManager || _viewerManager->segmentationViewer() != this)
+        return;
+    _viewerManager->forEachBaseViewer([this](VolumeViewerBase* v) {
+        if (v && v != this)
+            v->scheduleIntersectionRender("segmentation normal offset changed");
+    });
 }
 
 void CChunkedVolumeViewer::fitSurfaceInView()
@@ -3349,6 +3366,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
             _zOff += static_cast<float>(steps) * _zScrollSensitivity;
             _genCacheDirty = true;
             submitRender("z offset mouse wheel");
+            notifyNormalOffsetChanged();
         }
         refreshCursorPositionAt(scenePoint);
     } else if (modifiers & Qt::ControlModifier) {
@@ -4251,11 +4269,20 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
 
     QPointF scenePos;
     if (auto* plane = dynamic_cast<PlaneSurface*>(currentSurface())) {
+        // The flattened viewer's cursor point includes its normal offset, which
+        // pushes it off-plane by up to that amount; widen the depth band so the
+        // crosshair still lands on the dashed offset intersection line.
+        float tolerance = _linkedCursorViewTolerance;
+        if (auto* segViewer =
+                _viewerManager ? _viewerManager->segmentationViewer() : nullptr;
+            segViewer && segViewer != this) {
+            tolerance += std::abs(segViewer->normalOffset());
+        }
         const cv::Vec3f projected = plane->project(*point, 1.0f, 1.0f);
         if (!std::isfinite(projected[0]) ||
             !std::isfinite(projected[1]) ||
             !std::isfinite(projected[2]) ||
-            std::abs(projected[2] - _zOff) > _linkedCursorViewTolerance) {
+            std::abs(projected[2] - _zOff) > tolerance) {
             hideCrosshair();
             return;
         }
@@ -5236,6 +5263,15 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         return;
     }
 
+    // Normal offset of the flattened segmentation viewer: plane viewers draw a
+    // dashed copy of the active segment's intersection displaced by this amount
+    // so the mirrored crosshair (which maps through the offset) stays on a line.
+    float segNormalOffset = 0.0f;
+    if (auto* segViewer = _viewerManager->segmentationViewer();
+        segViewer && segViewer != this) {
+        segNormalOffset = segViewer->normalOffset();
+    }
+
     const std::uint64_t surfacesVersion = _state->surfacesVersion();
     if (!_resolvedIntersectTargets.valid ||
         _resolvedIntersectTargets.activeSeg != activeSeg.get() ||
@@ -5358,6 +5394,7 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
     for (const auto& id : _highlightedSurfaceIds)
         hh ^= std::hash<std::string>{}(id) + 0x9e3779b9u + (hh << 6) + (hh >> 2);
     fp.highlightedSurfaceHash = hh;
+    fp.segNormalOffsetQ = int(std::lround(segNormalOffset * 1000.0f));
     fp.cameraHash = (std::hash<int>{}(_framebuffer.width()) + 0x9e3779b9u) ^
                     (std::hash<int>{}(_framebuffer.height()) << 1);
     fp.valid = true;
@@ -5406,6 +5443,7 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
                a.targetGenerationHash == b.targetGenerationHash &&
                a.activeSegHash == b.activeSegHash &&
                a.highlightedSurfaceHash == b.highlightedSurfaceHash &&
+               a.segNormalOffsetQ == b.segNormalOffsetQ &&
                a.cameraHash == b.cameraHash;
     };
     if (geometryCacheValid && !_intersectionItems.empty() &&
@@ -5646,6 +5684,16 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             int(std::lround(std::max(0.0f, penWidth) * 1000.0f)),
         };
         groupedColors[style] = baseColor;
+        // Dotted copy of the active segment's line, displaced along the surface
+        // normal by the flattened viewer's offset: it marks where that viewer's
+        // mirrored crosshair lands, so cross-referencing works off-surface too.
+        const bool drawOffsetCopy =
+            target == activeSeg && std::abs(segNormalOffset) > 1e-3f;
+        IntersectionStyle offsetStyle;
+        if (drawOffsetCopy) {
+            offsetStyle = IntersectionStyle{style.color, style.z, style.widthQ, true};
+            groupedColors[offsetStyle] = baseColor;
+        }
         for (const auto& seg : segments) {
             QPointF a = planeToScene(seg.world[0]);
             QPointF b = planeToScene(seg.world[1]);
@@ -5655,6 +5703,19 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             groupedPaths[style].lineTo(b);
             if (target == activeSeg) {
                 addApprovalMaskIntersection(seg, opacity, penWidth);
+            }
+            if (drawOffsetCopy) {
+                const cv::Vec3f n0 = target->normal(seg.surfaceParams[0]);
+                const cv::Vec3f n1 = target->normal(seg.surfaceParams[1]);
+                if (!std::isfinite(n0[0]) || !std::isfinite(n0[1]) || !std::isfinite(n0[2]) ||
+                    !std::isfinite(n1[0]) || !std::isfinite(n1[1]) || !std::isfinite(n1[2]))
+                    continue;
+                const QPointF oa = planeToScene(seg.world[0] + n0 * segNormalOffset);
+                const QPointF ob = planeToScene(seg.world[1] + n1 * segNormalOffset);
+                if (!isFinitePoint(oa) || !isFinitePoint(ob))
+                    continue;
+                groupedPaths[offsetStyle].moveTo(oa);
+                groupedPaths[offsetStyle].lineTo(ob);
             }
         }
     }
@@ -5688,6 +5749,10 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         pen.setCosmetic(true);
+        if (style.dashed) {
+            pen.setStyle(Qt::DotLine);
+            pen.setCapStyle(Qt::FlatCap);
+        }
         item->setTransform(QTransform());
         item->setPath(path);
         item->setPen(pen);
