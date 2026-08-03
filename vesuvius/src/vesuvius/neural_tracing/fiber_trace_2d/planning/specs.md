@@ -24,6 +24,11 @@
   Ring depth is derived from the actual canonical Z tile positions, nonzero
   tile support, flush opportunities, and output chunk alignment. Mmap shape and
   logical file size must be independent of full output Z.
+- Ring planning keeps the chunk-aligned `flushed` frontier separate from the
+  physical ring origin and follows runtime write-before-post-row-flush order.
+  The initial prefix from logical plane zero remains live when a computed
+  frontier merely equals `output_begin`; only a strictly advancing runtime
+  flush releases it.
 - Completed output is normalized, finalized, written, and cleared one globally
   anchored output chunk at a time. Denominator and wrap scratch are bounded by
   one output chunk; no full-XY or full-band normalization/finalization
@@ -127,6 +132,11 @@
   and untouched chunks produce neither output chunks nor mmap zero-writes.
   Only dirty product and shared-weight regions are flushed and cleared before
   circular-slot reuse.
+- Sparse source support is evaluated on the global output lattice: each global
+  output-chunk footprint is clipped to the product's full output shape and only
+  then mapped into selected-input coordinates. Crop-local padded ring
+  dimensions must never clip this global footprint. Products sharing an
+  inference-scale accumulator must share the same full output shape.
 - Output products are independently resumable. For Lasagna, missing `pred_dt`
   chunks schedule only derived distance-transform generation; they must not
   schedule neural model inference when `cos` and `grad_mag/nx/ny` chunks are
@@ -454,8 +464,21 @@
   Checkpoints are saved by rank 0 from the unwrapped model so snapshot keys do
   not receive a DDP `module.` prefix.
 - DDP side effects are rank-0-only: TensorBoard, stdout progress, checkpoints,
-  dense test evaluation, Trace2CP metrics, and train/test visualization. Scalar
-  training losses are averaged across ranks before rank-0 logging.
+  Trace2CP metrics, and train/test visualization. Dense test model evaluation
+  is deterministically distributed across all ranks; scalar training losses
+  are averaged across ranks before rank-0 logging.
+- Dense DDP tests partition global batch IDs as `rank, rank + WORLD_SIZE, ...`.
+  The configured test start is a literal sample offset, including when it is
+  not batch-aligned; every global batch is evaluated exactly once and only the
+  final global batch is sliced. Per-batch float metric rows are gathered to
+  rank 0, restored to global batch order, and combined with the historical
+  unweighted Python per-batch mean so metric and best-snapshot semantics remain
+  unchanged. Ranks with no assigned batch still enter the gather.
+- Each rank retains a separate persistent test DataLoader worker pool using the
+  same worker count, prefetch factor, worker device, and multiprocessing context
+  as training. Rank 0 reuses its already evaluated global batch zero for the
+  test sample sheet instead of synchronously loading it again. The train and
+  test pools coexist and are both released before distributed teardown.
 - Normal 3D training also supports `--resume <snapshot.pt>`. The CLI path
   overrides config resume keys, restores model and optimizer state, writes a
   fresh timestamped run directory, and records the effective resume path in
@@ -581,6 +604,18 @@
   as CP-centered volume blocks. For Trace2CP evaluation, dense 3D inference is
   run over tiled axis-aligned blocks covering the requested 2D strip
   coordinates plus configured context, then sampled/projected back to 2D.
+- Configured test execution must be guarded on rank 0 by a persistent
+  pre-NCCL-timeout watchdog. By default it appends an all-thread traceback to
+  the run's rank-0 diagnostic log after 480 seconds, before the 600-second DDP
+  process-group timeout. Per-batch load, target, forward, CUDA synchronization,
+  CPU conversion, visualization, Trace2CP, and TensorBoard phases must leave
+  flushed markers. Diagnostics are best-effort and must not change evaluation,
+  visualization, TensorBoard, snapshot, or training numerics.
+- Rank 0 prints `test_timing step=... total_seconds=...` for the complete test
+  routine through distributed dense evaluation, visualization, and Trace2CP,
+  excluding the subsequent TensorBoard flush, and logs the same duration as
+  `timing/test_total_seconds`. Rank-0-only post-dense phases must remain below
+  the process-group timeout while other ranks wait at the result broadcast.
 - When a 3D config defines `test_datasets` and `test_trace2cp_enabled` is
   false, test evaluation runs ordinary 3D sparse direction/presence loss on the
   held-out CP-centered 3D samples. It must not require Trace2CP geometry or

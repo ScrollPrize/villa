@@ -1,5 +1,18 @@
+# 2026-08-02
+
+- Fixed cropped shared 3D inference treating globally positioned output chunks
+  as unsupported when their origins exceeded the crop-local accumulator shape.
+- Fixed circular accumulator depth underplanning across initial chunk-aligned
+  no-op flushes in cropped, downscaled shared inference.
+- Distributed dense Fiber 3D tests deterministically across DDP ranks with
+  persistent process-worker prefetch, exact ordered metric reconstruction, and
+  stdout/TensorBoard total-test timing.
+
 # 2026-08-01
 
+- Added persistent per-rank Fiber 3D training diagnostics and an eight-minute
+  rank-0 test watchdog with per-batch phase/resource markers and manual
+  `SIGUSR2` stack dumps.
 - Fixed Vesuvius Python CI collection by exposing the monorepo's shared
   `lasagna` source namespace and triggering the workflow for Lasagna changes;
   repaired the Zarr 3.2.1 matrix with explicit cross-version v2 fixtures and

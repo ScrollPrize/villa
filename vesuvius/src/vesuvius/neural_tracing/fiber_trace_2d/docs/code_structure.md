@@ -145,11 +145,17 @@ border predictions never contribute.
 A logical Z plane maps to
 `physical_z = logical_z % ring_depth`; generation checks prevent an unflushed
 plane from being overwritten. Ring depth is planned from actual canonical tile
-positions and chunk-aligned flush frontiers, so backing size is
+positions and chunk-aligned flush frontiers. Planning mirrors runtime order:
+each Z row writes before its post-row flush, and the physical ring origin stays
+at zero until a frontier advances beyond the initial output boundary. Thus a
+no-op flush cannot prematurely reduce planned capacity. Backing size is
 `(raw_channels + 1) * ring_depth * working_y * working_x * 4` bytes and does
 not depend on full volume depth. Candidate output chunks are lazily checked
-against their direct local Zarr-v2 input footprint. Unsupported chunks stay
-absent in output and scratch. Flushes visit only contribution-dirty chunks,
+against their direct local Zarr-v2 input footprint. Their global output bounds
+are clipped against the full output volume before conversion to selected-input
+coordinates; crop-local ring dimensions are not source-support bounds.
+Unsupported chunks stay absent in output and scratch. Flushes visit only
+contribution-dirty chunks,
 normalize with chunk-sized denominator scratch, atomically write coherent
 channel bundles, clear only dirty regions, and only then release their logical
 Z generations. Progress reports dirty/written/unsupported/resumed chunks and
@@ -520,9 +526,28 @@ Ownership changed as follows:
   disjoint deterministic training-stream slice, and `training.loader_workers`
   is also per rank. CUDA DDP converts
   `BatchNorm3d` modules to `SyncBatchNorm` automatically; single-process
-  training keeps regular `BatchNorm3d`. TensorBoard, stdout progress,
-  checkpoints, dense tests, Trace2CP metrics, and sample sheets are written
-  only by rank 0, and snapshots are saved without DDP `module.` key prefixes.
+  training keeps regular `BatchNorm3d`. Dense test batches are partitioned
+  deterministically across every rank by global batch ID. TensorBoard, stdout
+  progress, checkpoints, Trace2CP metrics, and sample sheets remain rank-0-only,
+  and snapshots are saved without DDP `module.` key prefixes.
+  Each rank retains a second process-worker DataLoader for tests with the same
+  worker/prefetch settings as training. Gathered per-batch metric rows are
+  sorted back into global order on rank 0 before applying the historical
+  unweighted batch mean. Rank 0 reuses evaluated global batch zero for the test
+  sample sheet. Test completion prints `test_timing ... total_seconds=...` and
+  logs `timing/test_total_seconds` to TensorBoard.
+  Every rank writes an append-only
+  `<run_dir>/hang_diagnostics_rank_<rank>.log`. Rank 0 guards the complete
+  configured-test routine with an automatic traceback dump after eight minutes
+  (`training.test_watchdog_seconds`, default `480`, required to be below the
+  600-second process-group timeout). Dense-test batch loading, target creation,
+  forward/CUDA synchronization, CPU loss conversion, test visualization,
+  Trace2CP, and TensorBoard flush have flushed phase markers with process and
+  CUDA-memory counters. Diagnostics do not alter training-step synchronization
+  or results.
+  On platforms with `SIGUSR2`, `kill -USR2 <pid>` appends an immediate
+  all-thread Python traceback to that rank's file; find rank 0 with
+  `ps -eo pid,cmd | grep 'fiber_trace_3d.train'`.
   `--prefetch`, `--benchmark`, and `--trace2cp-vis` remain single-process
   modes and reject `WORLD_SIZE > 1`.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
@@ -620,11 +645,13 @@ Ownership changed as follows:
   debugging.
 - `batch_size` is the actual CP-patch batch passed through the 3D U-Net. The
   trainer does not internally micro-batch.
-- Normal training and `--benchmark --load-only` use
+- Normal training, distributed dense tests, and `--benchmark --load-only` use
   `torch.utils.data.DataLoader` process workers when
   `training.loader_workers > 0`. Each worker lazily constructs its own
   `FiberTrace3DLoader` and VC3D coordinate sampler, and each DataLoader item is
   a complete `FiberTrace3DBatch` keyed by deterministic batch index.
+  Training and test DataLoaders retain separate persistent worker pools on each
+  rank so test prefetch is reusable across step 0 and every test interval.
 - Public 3D loader calls may still accept `sample_index` for compatibility, but
   its semantics are `stream_index`. `sample_index_limit` derives bounded
   `data_index` CP/data selection from that stream index; augmentation seeding

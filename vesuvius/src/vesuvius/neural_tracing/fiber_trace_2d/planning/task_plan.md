@@ -1,56 +1,51 @@
-# Plan: VC3D GitHub CI Acceleration
+# Plan: Deterministic Distributed Dense Evaluation
 
-## Measurement
+## Implementation
 
-1. Establish the current four-core cold-build, test, and VC3D smoke baseline
-   in the exact GitHub CI dependency image.
-2. Benchmark a clean `QuickBuild` (`-O1`, PCH, no LTO) `ninja all -j4` build
-   with the same image and source tree.
-3. Run all registered tests and the VC3D offscreen smoke test on the candidate
-   build before considering it usable for test execution.
-4. Use build logs and Ninja timing data to identify the remaining critical
-   path, then test one isolated change at a time.
+1. Extend the existing `_FiberTrace3DBatchDataset`/`_make_batch_dataloader`
+   indexing with an explicit sample offset so test batches can retain their
+   configured global sample indices while ranks independently select global
+   batch indices `rank, rank + world_size, ...`.
+2. Construct one persistent prefetched test DataLoader per rank using the same
+   worker count, prefetch factor, worker device, and multiprocessing context as
+   training. Reuse it across test intervals.
+3. Run dense evaluation on every DDP rank. Each global test batch is evaluated
+   exactly once, including one correctly sliced final partial batch. Gather
+   tiny `(global_batch_index, metric_row)` records to rank 0, restore global
+   order, and apply the previous Python-float unweighted per-batch mean exactly.
+4. Keep stdout, TensorBoard, sample visualization, Trace2CP, best-checkpoint
+   selection, and snapshot writes rank-0-only. Non-main ranks wait at the
+   existing post-test metric broadcasts after contributing dense metrics.
+5. Measure the full configured-test wall time on rank 0 through dense testing,
+   rank-0 visualization, and Trace2CP (excluding the final TensorBoard flush),
+   print `test_timing step=... total_seconds=...`, and write
+   `timing/test_total_seconds`. Retain detailed diagnostics.
+6. Keep the test worker pool alive across intervals and clean it up before DDP
+   teardown. Report that train and test each retain their configured worker
+   pool. Rank-0-only post-dense phases remain required to finish within the
+   process-group timeout; diagnostics continue to cover them.
 
-## Workflow Design
+## Testing
 
-1. Separate the requirement to compile every configured target from the
-   requirement to execute tests.
-2. Split Clang QuickBuild coverage into independently scheduled base-test,
-   specialized-test, VC3D, CLI, and Flatboi target closures.
-3. Use configure-time registration checks so new tests and CLI targets cannot
-   silently escape all shards.
-4. Retain network tests in GitHub CI while excluding them only from local
-   performance comparisons.
-5. Preserve sccache across workflow runs and measure warm behavior from the
-   first pushed workflow runs.
-6. Record that the fast pull-request workflow replaces the previous GCC and
-   Clang Release/LTO matrix with Clang-only QuickBuild coverage. A production
-   GCC/Release gate, if required, belongs outside the sub-minute feedback path.
+- Unit-test deterministic disjoint global-batch assignment, non-batch-aligned
+  sample offsets, zero-work ranks, full coverage, and final partial sizing.
+- Unit-test offset-aware DataLoader indexing and globally ordered gathered-row
+  reconstruction against serial batch-mean semantics.
+- Exercise single-process fallback so non-DDP training remains compatible.
+- Run focused Fiber 3D tests, Python compilation, and diff checks. A real
+  eight-GPU timing measurement is not feasible inside the agent test run; the
+  new stdout/TensorBoard timing will measure the next user training test.
 
-## Tests And Validation
+## Spec update
 
-1. Compare clean builds with identical four-CPU limits and `-j4` Ninja
-   parallelism.
-2. Record configure time, build time, test time, smoke-test time, target/build
-   edge count, and cache state.
-3. Require all registered CTest tests and the VC3D offscreen smoke test to pass
-   for each candidate test configuration.
-4. Confirm that the combined Clang shards build every configured tool, test,
-   benchmark, and application target represented by the selected options.
-5. Validate the workflow YAML and run `git diff --check` before publishing.
+Specify deterministic DDP test sharding, exact batch-mean reduction,
+persistent prefetch workers, rank-0-only side effects, and test timing output.
 
-## Spec Update
+## Docs update
 
-- No product behavior specification change is currently expected. If CI
-  coverage contracts become durable project requirements, document them in
-  the developer/CI documentation rather than the fiber algorithm spec.
-
-## Docs Updates
-
-- Document the final local reproduction command, CI job responsibilities, and
-  cache behavior in the relevant Volume Cartographer developer documentation.
+Document dense-test ownership, sharding/indexing, worker reuse, reduction, and
+the stdout/TensorBoard timing field.
 
 ## Changelog
 
-- Add a changelog entry only when workflow or build-system changes are adopted;
-  measurement-only iterations remain in `planning/task_log.md`.
+Record distributed prefetched dense evaluation and explicit test timing.
