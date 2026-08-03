@@ -692,6 +692,10 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
 | `--crop-xyzwhd` | Process only a sub-region: `x y z w h d` in fullres input coordinates. |
 | `--pred-dt` | Path to a surface prediction zarr. Adds a `pred_dt` distance-to-surface channel to the output. |
 | `--device` | Compute device (default: `cuda` if available, otherwise `cpu`). |
+| `--devices` | Multi-GPU selection: `all` visible GPUs or a comma-separated subset such as `cuda:0,cuda:2`. Cannot be combined with `--device`. |
+| `--prefetch-workers` | CPU/Zarr tile readers. `0` selects a bounded automatic count. |
+| `--slots-per-gpu` | Fixed shared-memory input/result pipeline slots per GPU (default 2). |
+| `--download-workers` | Parallel automatic S3 chunk transfers (default 64); independent of inference and pyramid workers. |
 | `--chunk-z` | Zarr chunk size along Z in the output (default 32). |
 | `--chunk-yx` | Zarr chunk size along Y and X in the output (default 32). |
 
@@ -712,6 +716,13 @@ The active accumulator is a rolling z band backed by separate numpy memmap files
 per logical accumulator channel. Completed z bands are normalized, written as
 full OME-Zarr chunks, and discarded before the next bands are processed. Input
 tiles are read lazily from the zarr — the full crop is never loaded into RAM.
+
+Multi-GPU inference keeps only the independent axis lattices and generates
+their Cartesian tile stream on demand. CPU readers, persistent per-GPU model
+workers, and the ordered accumulator/writer overlap through fixed shared-memory
+slots. Worker results can finish out of order, but they are accumulated in the
+same canonical order as serial inference; only the coordinator writes Zarr or
+advances the rolling Z ring.
 
 | Component            | RAM usage (2000³ crop, sd=4) |
 |----------------------|-----------------------------|

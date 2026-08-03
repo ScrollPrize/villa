@@ -1,43 +1,48 @@
-# Plan: Opt-In Fiber 3D Hang Diagnostics
+# Plan: robust auto-download cache and worker control
 
 ## Implementation
 
-1. Add `training.test_hang_diagnostics_enabled`, defaulting to `false`, and a
-   `--test-hang-diagnostics` normal-training CLI flag. The effective setting is
-   config OR CLI so either explicit request enables diagnostics.
-2. Give `_TrainingHangDiagnostics` an enabled/no-op mode. When disabled it must
-   not open `hang_diagnostics_rank_*.log`, register `SIGUSR2`, arm a
-   `faulthandler` timer, collect resource fields, or perform diagnostic CUDA
-   synchronizations.
-3. Validate `training.test_watchdog_seconds` only when diagnostics are enabled;
-   preserve the existing 480-second default and `<600` constraint when active.
-4. Print the effective enabled/disabled state at startup and record CLI/effective
-   state in TensorBoard's effective config. Preserve all existing diagnostic
-   markers and cleanup when enabled.
-5. Strictly require the config setting to be a JSON boolean and reject the
-   training-only CLI flag when combined with prefetch, benchmark, or Trace2CP
-   visualization modes.
+1. Treat `.noremote.json` as an advisory cache:
+   - accept only a JSON list of string chunk keys;
+   - on empty, truncated, malformed, unreadable, or schema-invalid data, print
+     one actionable warning and continue with an empty set;
+   - never suppress a real remote check based on corrupt cache data.
+2. Save every per-level cache, including an empty set, using a uniquely named
+   temporary file in the same directory followed by `os.replace`. Clean up the
+   temporary file on failure and warn without failing the completed download.
+   Snapshot mutable key sets under the Stats lock first. This prevents
+   interruption from exposing a partially written cache and clears stale keys.
+3. Add positive `download_workers` validation to downloader CLI/programmatic
+   entrypoints, the shared auto-download helper, and both inference APIs, then
+   Lasagna compatibility wrapper. Validate it is positive and pass it to the
+   existing downloader `workers=` argument.
+4. Add `--download-workers` to Fiber 3D and Lasagna predict3d. Keep default 64;
+   `--no-download` makes it unused. Do not conflate it with
+   `--prefetch-workers`, `--slots-per-gpu`, or `--pyramid-workers`.
 
-## Testing
+## Tests
 
-- Add a regression proving disabled diagnostics create no file and do not arm
-  watchdog/signal state, query resources, or synchronize CUDA.
-- Retain and run enabled automatic-watchdog, cancellation, re-arm, and manual
-  dump tests.
-- Test config default/config opt-in/CLI opt-in resolution and CLI forwarding.
-- Test invalid config types and enabled-only watchdog timeout validation.
-- Run focused tests where available, Python compilation, and diff checks.
+- Empty, malformed, and schema-invalid cache files load as empty with warning.
+- Valid cache files retain their keys.
+- Cache saves are atomic, leave no temporary file, and write empty lists.
+  Inject write/dump/replace failures and verify the old target remains valid,
+  temp cleanup occurs, and the advisory failure only warns.
+- Both CLIs forward `--download-workers`; auto-download passes it to the
+  programmatic downloader for both input and optional pred-dt. Defaults remain
+  64, `--no-download` calls no downloader, and invalid values are always
+  rejected.
+- Run focused downloader/CLI tests, syntax compilation, and diff checks.
 
 ## Spec update
 
-Change diagnostics from unconditional to explicit opt-in and define both
-activation mechanisms and disabled side-effect guarantees.
+Add advisory/atomic negative-cache semantics and the distinct 64-worker
+auto-download control to `planning/specs.md`.
 
-## Docs update
+## Docs updates
 
-Document the config key, CLI flag, default disabled state, output files, and
-timeout behavior.
+Document `--download-workers` in Fiber code structure, Lasagna README, and 3D
+inference options.
 
-## Changelog
+## Changelog/task log
 
-Record that Fiber 3D hang diagnostics are now opt-in.
+Add a dated changelog entry and record validation/deviations in task log.

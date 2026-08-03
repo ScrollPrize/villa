@@ -197,6 +197,26 @@ manifest, fixed-depth circular Z accumulation, chunk-resume, and OME-Zarr pyrami
 behavior; product-specific Lasagna logic remains in
 `preprocess_cos_omezarr.py`.
 
+Whole-volume predict3d can use every visible CUDA device through the shared
+runner:
+
+```bash
+lasagna-preprocess predict3d ... --devices all
+```
+
+Use a subset with `--devices cuda:0,cuda:2`. Input chunks are fetched by a
+bounded CPU prefetch stage outside GPU workers, and input/result transport uses
+fixed reusable shared-memory slots. The tile Cartesian product is generated
+lazily. `--slots-per-gpu` (default 2) controls the bounded pipeline window and
+memory footprint; `--prefetch-workers 0` selects the automatic bounded reader
+count. Existing `--device` selects the serial path and cannot be combined with
+`--devices`.
+
+Automatic S3 chunk fetching defaults to 64 transfer threads. Set it separately
+from inference prefetch with, for example, `--download-workers 256`. Interrupted
+or malformed `.dl_cache/*.noremote.json` files are advisory: they are ignored
+with a warning and rewritten atomically rather than aborting inference.
+
 ### Multi-axis processing
 
 The `--axis` flag controls which dimension is sliced through:

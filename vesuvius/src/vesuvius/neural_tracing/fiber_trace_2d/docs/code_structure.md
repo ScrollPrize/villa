@@ -99,8 +99,14 @@ loading.
   atomic chunk writes.
 - Common tiled arguments are `--input`, `--output`, `--checkpoint`,
   `--tile-size`, `--overlap`, `--border`, `--inference-scaledown-power`, `--crop`,
-  `--device`, `--no-download`, `--levels`, `--ome-chunk`, and
+  `--device`, `--devices`, `--download-workers`, `--no-download`, `--levels`, `--ome-chunk`, and
   `--pyramid-workers`.
+- Use all visible GPUs with `--devices all`, or select a subset such as
+  `--devices cuda:0,cuda:2`. `--device` retains the single-device/CPU path and
+  cannot be combined with `--devices`.
+- `--download-workers` controls parallel automatic S3 chunk transfers and
+  defaults to 64. It is separate from CPU tile `--prefetch-workers`, GPU
+  `--slots-per-gpu`, and output `--pyramid-workers`.
 - Fiber defaults to `--inference-scaledown-power 2`: filtered factor-4 output,
   or 0.25x per axis relative to the selected input. Power 0 keeps full input
   resolution. This is independent of the tracer/model config's `scaledown`.
@@ -132,6 +138,18 @@ or flushing. `OutputProductSpec.inference_scaledown` describes a product's
 scale relative to the selected input array for runner geometry only; it is not
 serialized into `.lasagna.json`. `scaledown` remains the persisted
 base-relative manifest scale.
+
+For multi-GPU execution, the runner lazily advances the same nested Z/Y/X
+lattice and never creates its Cartesian job list. A bounded CPU reader pool
+fills reusable shared-memory input slots while one persistent spawned process
+per GPU performs normalization, model inference, weighting, and filtered
+scaledown. Weighted results use separate fixed shared-memory slots; process
+queues carry descriptors only. Results may complete out of order, but the
+coordinator commits them in canonical order and flushes a Z row only after all
+of that row's inference and skip events commit. Consequently the coordinator
+remains the sole owner of the circular rings, resume checks, progress, and Zarr
+writes. `--slots-per-gpu` controls the bounded look-ahead/result memory and
+`--prefetch-workers` controls CPU/Zarr readers.
 
 Each distinct inference scale has separate raw-product float32 mmap rings and
 one shared geometric weight ring. Fiber and Lasagna use the same repeated

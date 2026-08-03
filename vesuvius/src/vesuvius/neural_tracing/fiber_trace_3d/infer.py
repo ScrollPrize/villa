@@ -18,6 +18,7 @@ try:
         _crop_xyzwhd_bounds,
         _ds_index,
         run_tiled_inference_3d,
+        resolve_inference_devices,
         OmeZarrOutputAdapter,
         write_lasagna_product_manifest,
     )
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs
         _crop_xyzwhd_bounds,
         _ds_index,
         run_tiled_inference_3d,
+        resolve_inference_devices,
         OmeZarrOutputAdapter,
         write_lasagna_product_manifest,
     )
@@ -205,7 +207,8 @@ def run_fiber_trace_3d_inference(
     input_path: str,
     output_path: str | Path,
     checkpoint: str | Path | None,
-    device: str | None = "auto",
+    device: str | None = None,
+    devices: str | tuple[str, ...] | None = None,
     crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
     tile_size: int | None = None,
     overlap: int = 16,
@@ -218,7 +221,12 @@ def run_fiber_trace_3d_inference(
     ome_chunk: int = 64,
     pyramid_workers: int = 0,
     recurrent_steps: int | None = None,
+    prefetch_workers: int = 0,
+    slots_per_gpu: int = 2,
+    download_workers: int = 64,
 ) -> None:
+    if int(download_workers) <= 0:
+        raise ValueError("download_workers must be a positive integer")
     config = _load_config(config_path)
     tile_size_i = _tile_size_from_config(config, tile_size)
     output_manifest = Path(output_path)
@@ -230,7 +238,7 @@ def run_fiber_trace_3d_inference(
         raise ValueError("output .lasagna.json path must have a non-empty stem")
 
     if not no_download:
-        _auto_download(input_path, crop_xyzwhd)
+        _auto_download(input_path, crop_xyzwhd, download_workers=int(download_workers))
 
     a_in = zarr.open(str(input_path), mode="r")
     if not hasattr(a_in, "shape"):
@@ -264,7 +272,8 @@ def run_fiber_trace_3d_inference(
     z0, z1, y0, y1, x0, x1 = crop_slices
     oz0, oy0, ox0, oz1, oy1, ox1 = output_region
 
-    torch_device = _resolve_inference_device(device)
+    resolved_devices = resolve_inference_devices(device=device, devices=devices)
+    torch_device = resolved_devices[0]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     removed = _cleanup_predict3d_temp_files(output_dir, f"{json_stem}_")
@@ -313,17 +322,21 @@ def run_fiber_trace_3d_inference(
         f"inference_scaledown_power={power} inference_factor={output_sd_input} "
         f"effective_base_factor={effective_output_sd} "
         f"level={output_level} products={len(predict_adapter.output_products)} "
-        f"device={torch_device}",
+        f"devices={','.join(str(value) for value in resolved_devices)}",
         flush=True,
     )
 
     t0 = time.time()
-    print(
-        f"[fiber_trace_3d:infer] loading checkpoint={checkpoint} device={torch_device}",
-        flush=True,
-    )
-    model = predict_adapter.load_model(device=torch_device)
-    print("[fiber_trace_3d:infer] model loaded; starting tiled inference", flush=True)
+    model = None
+    if len(resolved_devices) == 1:
+        print(
+            f"[fiber_trace_3d:infer] loading checkpoint={checkpoint} device={torch_device}",
+            flush=True,
+        )
+        model = predict_adapter.load_model(device=torch_device)
+        print("[fiber_trace_3d:infer] model loaded; starting tiled inference", flush=True)
+    else:
+        print("[fiber_trace_3d:infer] starting persistent multi-GPU workers", flush=True)
     progress = {
         "t0": time.time(),
         "finalized_base_z": int(oz0 * effective_output_sd),
@@ -347,6 +360,9 @@ def run_fiber_trace_3d_inference(
         tmp_dir=str(output_dir),
         progress=progress,
         temp_prefix=f"{json_stem}_",
+        devices=resolved_devices,
+        prefetch_workers=int(prefetch_workers),
+        slots_per_gpu=int(slots_per_gpu),
     )
     del model
     if torch_device.type == "cuda":
@@ -404,8 +420,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--device",
-        default="auto",
+        default=None,
         help='Device: "auto" selects CUDA when available, otherwise CPU.',
+    )
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help='Multi-GPU selection: "all" or comma-separated CUDA devices.',
+    )
+    parser.add_argument(
+        "--prefetch-workers", type=int, default=0,
+        help="CPU/Zarr tile reader threads; 0 chooses a bounded automatic count.",
+    )
+    parser.add_argument(
+        "--slots-per-gpu", type=int, default=2,
+        help="Bounded shared-memory input/result slots per GPU.",
+    )
+    parser.add_argument(
+        "--download-workers", type=int, default=64,
+        help="Parallel S3 chunk download threads used by automatic download.",
     )
     parser.add_argument(
         "--base-ref",
@@ -439,6 +472,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Conditioned recurrent inference steps; each step is stored as one option.",
     )
     args = parser.parse_args(argv)
+    if int(args.download_workers) <= 0:
+        parser.error("--download-workers must be a positive integer")
 
     run_fiber_trace_3d_inference(
         config_path=args.config,
@@ -446,6 +481,7 @@ def main(argv: list[str] | None = None) -> int:
         output_path=args.output,
         checkpoint=args.checkpoint,
         device=args.device,
+        devices=args.devices,
         crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
         tile_size=args.tile_size,
         overlap=int(args.overlap),
@@ -458,6 +494,9 @@ def main(argv: list[str] | None = None) -> int:
         ome_chunk=int(args.ome_chunk),
         pyramid_workers=int(args.pyramid_workers),
         recurrent_steps=args.recurrent_steps,
+        prefetch_workers=int(args.prefetch_workers),
+        slots_per_gpu=int(args.slots_per_gpu),
+        download_workers=int(args.download_workers),
     )
     return 0
 

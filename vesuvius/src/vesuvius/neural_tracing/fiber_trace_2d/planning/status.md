@@ -1,8 +1,11 @@
-# Status: Opt-In Fiber 3D Hang Diagnostics
+# Status: robust auto-download cache and worker control
 
-- [x] Inspect current diagnostics lifecycle and CLI.
-- [x] Write implementation/test/spec/docs plan.
-- [x] Independently review plan.
-- [x] Implement config/CLI opt-in and disabled no-op lifecycle.
-- [x] Add tests and run available validation.
-- [x] Update specs, docs, changelog, status, and task log.
+- [x] Record task requirements.
+- [x] Inspect cache persistence and auto-download call paths.
+- [x] Write implementation/test/docs/spec plan.
+- [x] Obtain and incorporate independent plan review.
+- [x] Implement atomic tolerant cache persistence.
+- [x] Add downloader-worker plumbing to both inference CLIs.
+- [x] Add and run regression tests.
+- [x] Update specs, docs, changelog, and task log.
+- [ ] Commit the completed changes.

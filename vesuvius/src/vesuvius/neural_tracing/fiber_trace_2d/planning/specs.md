@@ -112,6 +112,42 @@
   determinism remain required, and performance changes must report the
   representative whole-fiber restart metric so numeric changes cannot silently
   degrade trace quality.
+- Multi-GPU tiled inference exists only in the shared runner and is therefore
+  identical for Lasagna predict3d and Fiber 3D inference. It uses one
+  persistent spawn-context model worker per selected CUDA device, without DDP
+  or GPU collectives.
+- The canonical tile stream materializes only independent Z/Y/X axis lattices
+  (O(Z+Y+X)), never their Cartesian product. Filtering, CPU/Zarr prefetch, GPU
+  execution, result completion, and ordered commit use fixed bounded windows.
+- Zarr reads happen outside GPU workers. Input tiles and weighted/downscaled
+  results use coordinator-owned reusable shared memory; multiprocessing queues
+  carry descriptors only. Input/result memory is strictly slot-bounded and
+  existing input dtype conversion semantics are preserved.
+- Input slots cannot be reused until H2D completion, and results cannot be
+  published until D2H completion. The coordinator alone unlinks shared memory;
+  workers only attach and close it.
+- GPU results may finish out of order, but accumulation remains in canonical
+  tile order. A Z row flushes only after all preceding canonical events,
+  including skips, commit. The coordinator solely owns circular accumulators,
+  resume state, progress, and output writes.
+- Sparse/resume-complete work is rejected before prefetch. Workers calculate
+  only the union of raw products required by incomplete output chunks; the
+  coordinator retains chunk masks and adds shared geometric weight once.
+- Worker exceptions, hard exits, CUDA failures, interrupts, and coordinator
+  errors cancel prefetch, stop workers, and close shared resources rather than
+  waiting indefinitely.
+- `--devices all` selects all visible CUDA devices and a comma-separated list
+  selects a subset. Existing singular `--device` and CPU behavior remain
+  supported; conflicting or invalid selections fail before model construction.
+- Automatic OME-Zarr download uses `--download-workers` independently of
+  inference prefetch, GPU slots, and pyramid workers. It defaults to 64 and
+  must be positive even when automatic download is disabled.
+- `.dl_cache/<level>.noremote.json` is advisory only. Missing, unreadable,
+  malformed, or schema-invalid cache data warns and behaves as an empty set;
+  it must never abort inference or suppress remote validation. Saves snapshot
+  Stats under lock, include empty sets, and use same-directory unique temporary
+  files plus atomic replace. Save failures warn, retain the previous valid
+  target when possible, clean temporary files, and do not fail the download.
 - Fiber whole-volume inference's `--inference-scaledown-power` defaults to 2
   (factor 4 relative to selected input). It is converted to the runner's
   literal factor and does not read or reinterpret tracer config `scaledown`.

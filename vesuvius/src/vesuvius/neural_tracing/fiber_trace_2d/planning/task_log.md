@@ -1,39 +1,35 @@
-# Task Log: Opt-In Fiber 3D Hang Diagnostics
+# Task log: robust auto-download cache and worker control
 
 ## Findings
 
-- The existing diagnostics object was created on every rank and immediately
-  opened a per-rank file and registered `SIGUSR2`.
-- Diagnostic CUDA synchronization was unconditional for CUDA tests even if no
-  file was available, so merely suppressing file creation would not have made
-  disabled mode side-effect-free.
-- Independent review required strict JSON-boolean validation, enabled-only
-  timeout validation, explicit effective-config fields, and rejection of the
-  normal-training flag in auxiliary modes.
-
-## Implementation
-
-- `training.test_hang_diagnostics_enabled` now defaults to `false`; normal
-  training can also enable diagnostics with `--test-hang-diagnostics`.
-- Disabled `_TrainingHangDiagnostics` is a no-op object: it opens no file,
-  registers/cancels no signal or timer, polls no resources, and causes
-  `_diagnostic_cuda_synchronize` to return before a GPU barrier.
-- The config key must be a JSON boolean. Config and CLI activation are ORed and
-  their config/CLI/effective values are recorded in TensorBoard's effective
-  config. Rank 0 prints the effective state at startup.
-- `training.test_watchdog_seconds` retains its 480-second default and validation
-  only when diagnostics are active. Invalid/irrelevant values are ignored while
-  disabled.
-- Prefetch, benchmark, and Trace2CP visualization reject the diagnostics flag.
+- `_load_noremote` directly called `json.load`; an empty file therefore raised
+  `JSONDecodeError` before downloading began.
+- `_save_noremote` wrote directly to the final cache path, allowing interruption
+  to expose a truncated file. It also skipped empty sets, retaining stale keys.
+- The underlying downloader already supports `--workers` and programmatic
+  `workers=` with a default of 64, but automatic inference downloads did not
+  expose or forward it.
 
 ## Validation
 
-- A direct no-op lifecycle smoke test mocked file-global faulthandler calls and
-  CUDA synchronization; disabled mode invoked none and created no log.
-- Resolver smoke coverage passed for default, config, CLI, invalid type, and
-  disabled invalid-timeout behavior.
-- The auxiliary-mode CLI rejection path passed.
-- Added pytest regressions for the disabled lifecycle and resolution rules;
-  existing subprocess enabled-watchdog/manual-dump tests remain intact.
-- Python compilation and `git diff --check` passed. The environment still lacks
-  pytest, so the pytest suite was not executed and no dependency was installed.
+- Focused `unittest` coverage passed for shared input/pred-dt worker forwarding
+  and predict3d CLI forwarding.
+- A direct regression smoke test verified recovery from an empty cache,
+  preservation of the old cache and temporary-file cleanup on replace failure,
+  atomic empty-cache writes, locked snapshot-by-value semantics, and rejection
+  of zero downloader workers.
+- Python compilation and `git diff --check` passed for the changed Python files.
+- The active virtual environment does not contain `pytest`, so the new pytest
+  regression module could not be run through pytest without an unrequested
+  dependency installation.
+
+## Plan review
+
+- Cache save errors will warn and remain non-fatal, matching advisory read
+  semantics; temporary files are still cleaned and old targets retained.
+- Negative-key mappings will be snapshotted under the Stats lock before save.
+- Tests will inject load and every atomic-save failure class and validate worker
+  counts at downloader, wrapper, programmatic API, and CLI boundaries.
+- Unique temporary names prevent malformed final files but do not merge
+  concurrent independent downloader processes; last-writer-wins is acceptable
+  for this advisory, revalidated cache and is recorded as a limitation.

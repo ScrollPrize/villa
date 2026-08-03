@@ -43,6 +43,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.infer import (
     _select_and_expand_crop,
     run_fiber_trace_3d_inference,
 )
+from vesuvius.neural_tracing.fiber_trace_3d import infer as fiber_infer_module
 from vesuvius.neural_tracing.fiber_trace_3d.prediction import (
     decode_grouped_direction_presence,
     direction_branch_count_from_channels,
@@ -367,6 +368,27 @@ def test_inference_device_defaults_to_available_cuda(monkeypatch: pytest.MonkeyP
     assert _resolve_inference_device(None) == torch.device("cpu")
     assert _resolve_inference_device("auto") == torch.device("cpu")
     assert _resolve_inference_device("cpu") == torch.device("cpu")
+
+
+def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(fiber_infer_module, "run_fiber_trace_3d_inference", fake_run)
+    result = fiber_infer_module.main([
+        "config.json", "--input", "input.zarr", "--output", "fiber.lasagna.json",
+        "--checkpoint", "model.pt", "--devices", "all",
+        "--prefetch-workers", "5", "--slots-per-gpu", "3",
+        "--download-workers", "77",
+    ])
+    assert result == 0
+    assert captured["device"] is None
+    assert captured["devices"] == "all"
+    assert captured["prefetch_workers"] == 5
+    assert captured["slots_per_gpu"] == 3
+    assert captured["download_workers"] == 77
 
 
 class _NativeTraceTestPredictionAdapter:

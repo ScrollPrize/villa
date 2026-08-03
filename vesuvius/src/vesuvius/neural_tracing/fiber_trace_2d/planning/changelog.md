@@ -1,5 +1,10 @@
 # 2026-08-03
 
+- Made downloader negative-remote caches tolerant and atomic, and exposed the
+  automatic S3 transfer worker count in Fiber and Lasagna inference CLIs.
+- Added shared bounded streaming multi-GPU whole-volume inference for Lasagna
+  and Fiber 3D, with separate CPU/Zarr prefetch, persistent per-device workers,
+  shared-memory input/results, and canonical single-writer accumulation.
 - Made Fiber 3D per-rank hang logs, manual dumps, test watchdog, resource
   polling, and diagnostic CUDA synchronization explicitly opt-in through config
   or CLI.

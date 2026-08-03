@@ -43,6 +43,7 @@ from preprocess_cos_omezarr import (
 	_create_omezarr,
 	_grad_mag_factor_from_input_sd,
 	run_tiled_inference_3d,
+	resolve_inference_devices,
 	_omezarr_chunk_exists,
 	_omezarr_chunk_group_complete,
 	_predict3d_overall_eta,
@@ -58,6 +59,7 @@ from omezarr_pyramid import (
 	downsample_normal_pair_chunk_worker,
 	downsample_scalar_chunk_worker,
 )
+from lasagna.tests.predict3d_spawn_helpers import SpawnHardExitAdapter, SpawnIdentityAdapter
 
 
 class _StopAfterManifest(Exception):
@@ -189,6 +191,198 @@ class _RaisingProductAdapter(_IdentityProductAdapter):
 
 
 class PreprocessCosOmezarrTests(unittest.TestCase):
+	def test_shared_multi_gpu_device_resolution(self):
+		self.assertEqual(
+			resolve_inference_devices(device=None, cuda_available=False, cuda_count=0),
+			(torch.device("cpu"),),
+		)
+		self.assertEqual(
+			resolve_inference_devices(devices="all", cuda_available=True, cuda_count=3),
+			(torch.device("cuda:0"), torch.device("cuda:1"), torch.device("cuda:2")),
+		)
+		self.assertEqual(
+			resolve_inference_devices(devices="cuda,cuda:2", cuda_available=True, cuda_count=3),
+			(torch.device("cuda:0"), torch.device("cuda:2")),
+		)
+		with self.assertRaisesRegex(ValueError, "either --device or --devices"):
+			resolve_inference_devices(device="cuda", devices="all", cuda_available=True, cuda_count=2)
+		with self.assertRaisesRegex(ValueError, "duplicate"):
+			resolve_inference_devices(devices="cuda,cuda:0", cuda_available=True, cuda_count=2)
+
+	def test_shared_auto_download_forwards_workers_to_input_and_pred_dt(self):
+		with mock.patch.object(shared_predict3d, "_download_one_path") as download_one:
+			shared_predict3d._auto_download(
+				"input.zarr/1", (1, 2, 3, 4, 5, 6), "pred.zarr/1", download_workers=321,
+			)
+		self.assertEqual(download_one.call_args_list, [
+			mock.call("input.zarr/1", (1, 2, 3, 4, 5, 6), 321),
+			mock.call("pred.zarr/1", (1, 2, 3, 4, 5, 6), 321),
+		])
+		with self.assertRaisesRegex(ValueError, "positive integer"):
+			shared_predict3d._auto_download("input.zarr", None, download_workers=0)
+
+	def test_shared_tile_events_are_lazy_and_mark_row_flushes(self):
+		events = shared_predict3d._iter_canonical_tile_events((0, 4), (0, 4), (0, 4), 8)
+		self.assertNotIsInstance(events, (list, tuple))
+		self.assertEqual(next(events), (0, 0, 0, False, 4))
+		self.assertEqual(next(events), (0, 0, 4, False, 4))
+		self.assertEqual(next(events), (0, 4, 0, False, 4))
+		self.assertEqual(next(events), (0, 4, 4, True, 4))
+		self.assertEqual(next(events), (4, 0, 0, False, 8))
+
+	def test_shared_result_layout_is_packed_without_queue_payloads(self):
+		layouts, total = shared_predict3d._packed_layouts((
+			("product:a", (7, 16, 16, 16), np.float32),
+			("weight:4", (16, 16, 16), np.float32),
+		))
+		self.assertEqual(layouts[0].offset, 0)
+		self.assertGreaterEqual(layouts[1].offset, layouts[0].nbytes)
+		self.assertGreaterEqual(total, layouts[1].offset + layouts[1].nbytes)
+		self.assertEqual(total % 64, 0)
+
+	def test_lasagna_calibrated_worker_prepares_instance_norm_buffers(self):
+		cos = OutputProductSpec(name="cos", level=0, scaledown=1, channels=("cos",), chunk_size=4)
+		normal = OutputProductSpec(
+			name="normal", level=0, scaledown=1,
+			channels=("grad_mag", "nx", "ny"), accumulator_channel_count=7,
+			chunk_size=4,
+		)
+		adapter = LasagnaCosPredict3DAdapter(
+			checkpoint="unused.pt", tile_size=4, device_name="cpu",
+			cos_product=cos, normal_product=normal,
+		)
+		adapter.calibrated_instance_norm = True
+		layer = torch.nn.InstanceNorm3d(3, track_running_stats=False)
+		adapter.prepare_model_for_state_load(layer, {}, device=torch.device("cpu"))
+		self.assertTrue(layer.track_running_stats)
+		self.assertEqual(tuple(layer.running_mean.shape), (3,))
+		self.assertEqual(tuple(layer.running_var.shape), (3,))
+
+	def test_shared_worker_uses_descriptor_queues_and_shared_results(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		input_layouts, input_bytes = shared_predict3d._packed_layouts((("input", (4, 4, 4), np.uint8),))
+		result_layouts, result_bytes = shared_predict3d._packed_layouts((
+			("product:identity", (1, 4, 4, 4), np.float32),
+			("weight:1", (4, 4, 4), np.float32),
+		))
+		input_shm = shared_predict3d.shared_memory.SharedMemory(create=True, size=input_bytes)
+		result_shm = shared_predict3d.shared_memory.SharedMemory(create=True, size=result_bytes)
+		ctx = shared_predict3d.mp.get_context("spawn")
+		work_queue = ctx.Queue(maxsize=1)
+		result_queue = ctx.Queue(maxsize=4)
+		input_specs = (shared_predict3d._SharedSlotSpec(input_shm.name, input_bytes, input_layouts),)
+		result_specs = (shared_predict3d._SharedSlotSpec(result_shm.name, result_bytes, result_layouts),)
+		process = ctx.Process(
+			target=shared_predict3d._multi_gpu_worker_main,
+			args=(0, "cpu", SpawnIdentityAdapter(product), {"gain": torch.tensor(2.0)}, 4,
+				np.ones(4, dtype=np.float32), {"identity": 1}, input_specs,
+				result_specs, work_queue, result_queue),
+		)
+		try:
+			shared_predict3d._slot_array(input_shm, input_layouts[0])[:] = 255
+			process.start()
+			work_queue.put((0, (0, 0, 0), 0, 0, ("identity",)))
+			messages = [result_queue.get(timeout=20), result_queue.get(timeout=20)]
+			self.assertEqual([message[0] for message in messages], ["input_released", "result"])
+			layouts = {layout.name: layout for layout in result_layouts}
+			np.testing.assert_array_equal(
+				shared_predict3d._slot_array(result_shm, layouts["product:identity"]),
+				np.full((1, 4, 4, 4), 2.0, dtype=np.float32),
+			)
+			np.testing.assert_array_equal(
+				shared_predict3d._slot_array(result_shm, layouts["weight:1"]),
+				np.ones((4, 4, 4), dtype=np.float32),
+			)
+		finally:
+			try:
+				work_queue.put_nowait(None)
+			except Exception:
+				pass
+			process.join(timeout=10)
+			if process.is_alive():
+				process.terminate()
+				process.join(timeout=10)
+			work_queue.close()
+			result_queue.close()
+			input_shm.close()
+			input_shm.unlink()
+			result_shm.close()
+			result_shm.unlink()
+
+	def test_shared_parallel_pipeline_matches_serial_output_exactly(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Output:
+			def __init__(self):
+				self.chunks = {}
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.chunks[chunk_origin_zyx] = np.array(data["value"], copy=True)
+
+		volume = (np.arange(8 * 4 * 4, dtype=np.uint16) * np.uint16(257)).reshape(8, 4, 4)
+		serial_output = Output()
+		parallel_output = Output()
+		common = dict(
+			crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+			products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+			full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+			overlap=0, border=0,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				serial_adapter = _IdentityProductAdapter(product)
+				run_tiled_inference_3d(
+					serial_adapter.load_model(device=torch.device("cpu")), volume,
+					model_adapter=serial_adapter, output_adapter=serial_output,
+					tmp_dir=td, **common,
+				)
+				parallel_adapter = SpawnIdentityAdapter(product, delay_zero_origin=True)
+				run_tiled_inference_3d(
+					None, volume, model_adapter=parallel_adapter,
+					output_adapter=parallel_output, tmp_dir=td,
+					devices=(torch.device("cpu"), torch.device("cpu")),
+					slots_per_gpu=1, prefetch_workers=2, **common,
+				)
+		self.assertEqual(set(serial_output.chunks), set(parallel_output.chunks))
+		for origin in serial_output.chunks:
+			np.testing.assert_array_equal(serial_output.chunks[origin], parallel_output.chunks[origin])
+
+	def test_shared_parallel_pipeline_detects_hard_worker_exit(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Output:
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				raise AssertionError("a crashed worker must not produce output")
+
+		with tempfile.TemporaryDirectory() as td:
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				with self.assertRaisesRegex(RuntimeError, "exited unexpectedly with code 23"):
+					run_tiled_inference_3d(
+						None, np.ones((4, 4, 4), dtype=np.uint8),
+						crop_slices=(0, 4, 0, 4, 0, 4), device=torch.device("cpu"),
+						model_adapter=SpawnHardExitAdapter(product), output_adapter=Output(),
+						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 4, 4, 4)},
+						full_output_shapes_zyx={"identity": (4, 4, 4)}, tile_size=4,
+						overlap=0, border=0, tmp_dir=td,
+						devices=(torch.device("cpu"), torch.device("cpu")),
+						slots_per_gpu=1, prefetch_workers=1,
+					)
+
 	def test_predict3d_shared_helpers_are_reexported_for_compatibility(self):
 		self.assertIs(preprocess_wrapper.OutputProductSpec, shared_predict3d.OutputProductSpec)
 		self.assertIs(preprocess_wrapper.OutputChannelSpec, shared_predict3d.OutputChannelSpec)
@@ -464,6 +658,10 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["output_path"], "out.lasagna.json")
 		self.assertEqual(kwargs["unet3d_checkpoint"], "model.pt")
 		self.assertEqual(kwargs["device"], "cpu")
+		self.assertIsNone(kwargs["devices"])
+		self.assertEqual(kwargs["prefetch_workers"], 0)
+		self.assertEqual(kwargs["slots_per_gpu"], 2)
+		self.assertEqual(kwargs["download_workers"], 64)
 		self.assertEqual(kwargs["crop_xyzwhd"], (1, 2, 3, 4, 5, 6))
 		self.assertEqual(kwargs["tile_size"], 64)
 		self.assertEqual(kwargs["overlap"], 8)
@@ -481,6 +679,24 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["base_scale"], 1)
 		self.assertEqual(kwargs["n_levels"], 3)
 		self.assertEqual(kwargs["ome_chunk"], 64)
+
+	def test_predict3d_cli_forwards_shared_multi_gpu_pipeline_options(self):
+		args = [
+			"predict3d", "--input", "in.zarr", "--output", "out.lasagna.json",
+			"--unet-checkpoint", "model.pt", "--tile-size", "64",
+			"--devices", "cuda:0,cuda:2", "--prefetch-workers", "6",
+			"--slots-per-gpu", "3", "--no-download",
+			"--download-workers", "123",
+		]
+		with mock.patch("builtins.open", side_effect=PermissionError):
+			with mock.patch("preprocess_cos_omezarr.run_preprocess_3d") as run:
+				self.assertEqual(cli_main(args), 0)
+		kwargs = run.call_args.kwargs
+		self.assertIsNone(kwargs["device"])
+		self.assertEqual(kwargs["devices"], "cuda:0,cuda:2")
+		self.assertEqual(kwargs["prefetch_workers"], 6)
+		self.assertEqual(kwargs["slots_per_gpu"], 3)
+		self.assertEqual(kwargs["download_workers"], 123)
 
 	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
 		progress = {

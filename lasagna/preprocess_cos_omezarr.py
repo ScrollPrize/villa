@@ -64,6 +64,7 @@ try:
 		_format_eta,
 		_get_input_meta,
 		run_tiled_inference_3d,
+		resolve_inference_devices,
 		_invalidate_pyramid_chunks,
 		_input_has_chunks,
 		_iter_chunk_origins_for_region,
@@ -111,6 +112,7 @@ except ImportError:
 		_format_eta,
 		_get_input_meta,
 		run_tiled_inference_3d,
+		resolve_inference_devices,
 		_invalidate_pyramid_chunks,
 		_input_has_chunks,
 		_iter_chunk_origins_for_region,
@@ -204,6 +206,7 @@ class LasagnaCosPredict3DAdapter:
 		self.norm_type = None
 		self.upsample_mode = None
 		self.output_sigmoid = True
+		self.calibrated_instance_norm = False
 
 	@property
 	def model_output_products(self) -> tuple[OutputProductSpec, ...]:
@@ -235,6 +238,18 @@ class LasagnaCosPredict3DAdapter:
 		self.output_sigmoid = bool(output_sigmoid)
 		model.eval()
 		return model
+
+	def prepare_model_for_state_load(self, model, state, *, device: torch.device) -> None:
+		"""Restore InstanceNorm buffer structure before calibrated-state loading."""
+		if not self.calibrated_instance_norm:
+			return
+		for module in model.modules():
+			if not isinstance(module, torch.nn.InstanceNorm3d):
+				continue
+			module.track_running_stats = True
+			module.num_batches_tracked = torch.tensor(0, dtype=torch.long, device=device)
+			module.running_mean = torch.zeros(module.num_features, device=device)
+			module.running_var = torch.ones(module.num_features, device=device)
 
 	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
 		with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
@@ -1368,6 +1383,7 @@ def _find_zarr_group_root(path: str) -> Path | None:
 def _download_one_path(
 	zarr_path: str,
 	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
+	download_workers: int = 64,
 ) -> None:
 	"""Download chunks for a single zarr path from its S3 source.
 
@@ -1431,6 +1447,7 @@ def _download_one_path(
 		bbox_xyzxyz=bbox,
 		anon=anon,
 		region=region,
+		workers=int(download_workers),
 	)
 	if ret != 0:
 		raise RuntimeError(f"download from {source_uri} failed (exit {ret})")
@@ -1440,15 +1457,18 @@ def _auto_download(
 	input_path: str,
 	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
 	pred_dt_path: str | None,
+	download_workers: int = 64,
 ) -> None:
 	"""Auto-download input and pred-dt data from S3.
 
 	Each path is resolved independently to its own zarr group root —
 	they may come from different S3 sources.
 	"""
-	_download_one_path(input_path, crop_xyzwhd)
+	if int(download_workers) <= 0:
+		raise ValueError("download_workers must be a positive integer")
+	_download_one_path(input_path, crop_xyzwhd, int(download_workers))
 	if pred_dt_path:
-		_download_one_path(pred_dt_path, crop_xyzwhd)
+		_download_one_path(pred_dt_path, crop_xyzwhd, int(download_workers))
 	print("[predict3d] all downloads complete", flush=True)
 
 
@@ -1557,6 +1577,10 @@ def run_preprocess_3d(
 	base_scale: int | None = None,
 	n_levels: int = 5,
 	ome_chunk: int = 64,
+	devices: str | tuple[str, ...] | None = None,
+	prefetch_workers: int = 0,
+	slots_per_gpu: int = 2,
+	download_workers: int = 64,
 ) -> None:
 	"""Run 3D UNet inference and write .lasagna.json with OME-Zarr pyramids.
 
@@ -1577,6 +1601,8 @@ def run_preprocess_3d(
 			)
 		tile_size = int(_ckpt_meta["patch_size"])
 		print(f"[predict3d] tile_size={tile_size} from checkpoint metadata", flush=True)
+	if int(download_workers) <= 0:
+		raise ValueError("download_workers must be a positive integer")
 
 	if not output_path.endswith(".lasagna.json"):
 		raise ValueError(f"output must be .lasagna.json, got: {output_path}")
@@ -1618,15 +1644,15 @@ def run_preprocess_3d(
 			f"  base crop={crop_xyzwhd} → input crop={crop_input} (input_sd={input_sd})"
 		)
 
-	if device is None:
-		device = "cuda" if torch.cuda.is_available() else "cpu"
-	torch_device = torch.device(device)
+	resolved_devices = resolve_inference_devices(device=device, devices=devices)
+	torch_device = resolved_devices[0]
 
 	print(
 		f"[predict3d] input={input_path} shape={sh} input_sd={input_sd}\n"
 		f"  base_shape={base_shape_zyx} base_crop={crop_xyzwhd}\n"
 		f"  input_crop=({x0},{y0},{z0},{nx_dim},{ny},{nz}) "
-		f"cos_scaledown={cos_scaledown} scaledown={scaledown}",
+		f"cos_scaledown={cos_scaledown} scaledown={scaledown} "
+		f"devices={','.join(str(value) for value in resolved_devices)}",
 		flush=True,
 	)
 
@@ -1843,17 +1869,24 @@ def run_preprocess_3d(
 	if _gpu_ctx is not None:
 		_gpu_ctx.__enter__()
 
-	# --- Build model ---
-	model = predict_adapter.load_model(device=torch_device)
-	_output_sigmoid = predict_adapter.output_sigmoid
-
+	# Serial owns a loaded model. Multi-GPU workers construct their own model;
+	# calibration, when requested, is transferred as an explicit CPU state dict.
+	model = None
+	calibrated_state = None
+	if len(resolved_devices) == 1 or calibrate_norm:
+		model = predict_adapter.load_model(device=torch_device)
 	if calibrate_norm:
 		_calibrate_instance_norm(
-			model, a_in,
-			crop_slices=(z0, z1, y0, y1, x0, x1),
-			device=torch_device,
-			tile_size=tile_size,
+			model, a_in, crop_slices=(z0, z1, y0, y1, x0, x1),
+			device=torch_device, tile_size=tile_size,
 		)
+		if len(resolved_devices) > 1:
+			predict_adapter.calibrated_instance_norm = True
+			model.to("cpu")
+			calibrated_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+			del model
+			model = None
+			torch.cuda.empty_cache()
 
 	# The neural path is owned entirely by the shared multi-scale runner.  The
 	# prediction distance transform remains an independent external-source stage.
@@ -1898,6 +1931,10 @@ def run_preprocess_3d(
 			tmp_dir=out_dir,
 			progress=_progress,
 			temp_prefix=prefix,
+			devices=resolved_devices,
+			model_state=calibrated_state,
+			prefetch_workers=int(prefetch_workers),
+			slots_per_gpu=int(slots_per_gpu),
 		)
 	except BaseException:
 		if _gpu_ctx is not None:
@@ -2676,6 +2713,14 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		metavar=("X", "Y", "Z", "W", "H", "D"), help="Crop region: x y z w h d.")
 	p.add_argument("--pred-dt", default=None, help="Prediction zarr for distance-to-surface channel.")
 	p.add_argument("--device", default=None, help='Device, e.g. "cuda" or "cpu" (default: cuda if available).')
+	p.add_argument("--devices", default=None,
+		help='Multi-GPU selection: "all" or comma-separated CUDA devices, e.g. "cuda:0,cuda:1".')
+	p.add_argument("--prefetch-workers", type=int, default=0,
+		help="CPU/Zarr tile reader threads; 0 chooses a bounded automatic count.")
+	p.add_argument("--slots-per-gpu", type=int, default=2,
+		help="Bounded shared-memory input/result slots per GPU.")
+	p.add_argument("--download-workers", type=int, default=64,
+		help="Parallel S3 chunk download threads used by automatic download.")
 	p.add_argument("--chunk-z", type=int, default=32, help="Output zarr chunk size along Z.")
 	p.add_argument("--chunk-yx", type=int, default=32, help="Output zarr chunk size for Y and X.")
 	p.add_argument("--edt-chunk-depth", type=int, default=256, help="EDT chunk depth in Z (default 256).")
@@ -2697,12 +2742,15 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	p.add_argument("--ome-chunk", type=int, default=64,
 		help="Chunk size for OME-Zarr output levels (default 64).")
 	args = p.parse_args(argv)
+	if int(args.download_workers) <= 0:
+		p.error("--download-workers must be a positive integer")
 
 	if not args.no_download:
 		_auto_download(
 			input_path=str(args.input),
 			crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
 			pred_dt_path=str(args.pred_dt) if args.pred_dt else None,
+			download_workers=int(args.download_workers),
 		)
 
 	run_preprocess_3d(
@@ -2710,6 +2758,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		output_path=str(args.output),
 		unet3d_checkpoint=str(args.unet_checkpoint),
 		device=args.device,
+		devices=args.devices,
 		crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
 		tile_size=int(args.tile_size) if args.tile_size is not None else None,
 		overlap=int(args.overlap),
@@ -2727,6 +2776,9 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		base_scale=args.base_scale,
 		n_levels=int(args.levels),
 		ome_chunk=int(args.ome_chunk),
+		prefetch_workers=int(args.prefetch_workers),
+		slots_per_gpu=int(args.slots_per_gpu),
+		download_workers=int(args.download_workers),
 	)
 	return 0
 

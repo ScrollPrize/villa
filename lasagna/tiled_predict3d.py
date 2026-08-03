@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import atexit
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import json
+import multiprocessing as mp
+from multiprocessing import shared_memory
 import os
 from pathlib import Path
+import queue
 import shutil
 import sys
 import tempfile
 import threading
 import time
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Iterable, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 import uuid
 
 import numpy as np
@@ -36,6 +40,55 @@ ChunkOriginZYX = tuple[int, int, int]
 RegionZYX = tuple[int, int, int, int, int, int]
 TileOriginZYX = tuple[int, int, int]
 ProductTileOutput = Mapping[str, np.ndarray]
+
+
+def resolve_inference_devices(
+	*,
+	device: str | torch.device | None = None,
+	devices: str | Sequence[str | torch.device] | None = None,
+	cuda_available: bool | None = None,
+	cuda_count: int | None = None,
+) -> tuple[torch.device, ...]:
+	"""Resolve legacy singular or explicit plural inference device selection."""
+	if device is not None and devices is not None:
+		raise ValueError("pass either --device or --devices, not both")
+	available = torch.cuda.is_available() if cuda_available is None else bool(cuda_available)
+	count = torch.cuda.device_count() if cuda_count is None else int(cuda_count)
+	if devices is None:
+		requested = "auto" if device is None else str(device).strip().lower()
+		if requested == "auto":
+			return (torch.device("cuda:0" if available and count > 0 else "cpu"),)
+		resolved = torch.device(requested)
+		if resolved.type == "cuda":
+			index = 0 if resolved.index is None else int(resolved.index)
+			if not available or index < 0 or index >= count:
+				raise ValueError(f"CUDA device cuda:{index} is unavailable (visible count={count})")
+			resolved = torch.device(f"cuda:{index}")
+		return (resolved,)
+	if isinstance(devices, str):
+		raw = devices.strip().lower()
+		if raw == "all":
+			if not available or count <= 0:
+				raise ValueError("--devices all requires at least one visible CUDA device")
+			return tuple(torch.device(f"cuda:{index}") for index in range(count))
+		tokens = tuple(part.strip() for part in raw.split(",") if part.strip())
+	else:
+		tokens = tuple(str(part).strip().lower() for part in devices)
+	if not tokens:
+		raise ValueError("--devices must be 'all' or a non-empty comma-separated CUDA list")
+	resolved_devices = []
+	for token in tokens:
+		resolved = torch.device(token)
+		if resolved.type != "cuda":
+			raise ValueError("multi-device inference supports CUDA devices only")
+		index = 0 if resolved.index is None else int(resolved.index)
+		if not available or index < 0 or index >= count:
+			raise ValueError(f"CUDA device cuda:{index} is unavailable (visible count={count})")
+		resolved_devices.append(torch.device(f"cuda:{index}"))
+	keys = tuple(str(value) for value in resolved_devices)
+	if len(set(keys)) != len(keys):
+		raise ValueError(f"duplicate inference devices are not allowed: {keys}")
+	return tuple(resolved_devices)
 
 PYRAMID_POLICY_NONE = "none"
 PYRAMID_POLICY_SCALAR = "scalar"
@@ -391,6 +444,7 @@ def _input_has_chunks(zarr_path: str, z0: int, z1: int, y0: int, y1: int,
 def _download_one_path(
 	zarr_path: str,
 	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
+	download_workers: int = 64,
 ) -> None:
 	"""Download chunks for one zarr path from the S3 source in _download metadata."""
 	import sys as _sys
@@ -448,6 +502,7 @@ def _download_one_path(
 		bbox_xyzxyz=bbox,
 		anon=anon,
 		region=region,
+		workers=int(download_workers),
 	)
 	if ret != 0:
 		raise RuntimeError(f"download from {source_uri} failed (exit {ret})")
@@ -457,11 +512,14 @@ def _auto_download(
 	input_path: str,
 	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
 	pred_dt_path: str | None = None,
+	download_workers: int = 64,
 ) -> None:
 	"""Auto-download input and optional pred-dt data from S3 metadata."""
-	_download_one_path(input_path, crop_xyzwhd)
+	if int(download_workers) <= 0:
+		raise ValueError("download_workers must be a positive integer")
+	_download_one_path(input_path, crop_xyzwhd, int(download_workers))
 	if pred_dt_path:
-		_download_one_path(pred_dt_path, crop_xyzwhd)
+		_download_one_path(pred_dt_path, crop_xyzwhd, int(download_workers))
 	print("[predict3d] all downloads complete", flush=True)
 
 
@@ -1515,6 +1573,164 @@ def _read_tile_zarr(
 	return chunk
 
 
+@dataclass(frozen=True)
+class _SharedArrayLayout:
+	name: str
+	offset: int
+	shape: tuple[int, ...]
+	dtype: str
+
+	@property
+	def nbytes(self) -> int:
+		return int(np.prod(self.shape, dtype=np.int64)) * np.dtype(self.dtype).itemsize
+
+
+@dataclass(frozen=True)
+class _SharedSlotSpec:
+	shm_name: str
+	nbytes: int
+	layouts: tuple[_SharedArrayLayout, ...]
+
+
+def _packed_layouts(entries: Iterable[tuple[str, tuple[int, ...], Any]]) -> tuple[tuple[_SharedArrayLayout, ...], int]:
+	layouts = []
+	offset = 0
+	for name, shape, dtype in entries:
+		offset = ((offset + 63) // 64) * 64
+		layout = _SharedArrayLayout(str(name), offset, tuple(int(v) for v in shape), np.dtype(dtype).str)
+		layouts.append(layout)
+		offset += layout.nbytes
+	return tuple(layouts), max(1, ((offset + 63) // 64) * 64)
+
+
+def _slot_array(shm: shared_memory.SharedMemory, layout: _SharedArrayLayout) -> np.ndarray:
+	return np.ndarray(layout.shape, dtype=np.dtype(layout.dtype), buffer=shm.buf, offset=layout.offset)
+
+
+def _attach_shared_memory(name: str) -> shared_memory.SharedMemory:
+	try:
+		return shared_memory.SharedMemory(name=name, create=False, track=False)
+	except TypeError:  # Python < 3.13
+		return shared_memory.SharedMemory(name=name, create=False)
+
+
+def _create_shared_slots(count: int, size: int) -> list[shared_memory.SharedMemory]:
+	created = []
+	try:
+		for _ in range(int(count)):
+			created.append(shared_memory.SharedMemory(create=True, size=int(size)))
+		return created
+	except BaseException:
+		for shm in created:
+			shm.close()
+			shm.unlink()
+		raise
+
+
+def _limit_native_worker_threads():
+	for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+		os.environ[name] = "1"
+	try:
+		torch.set_num_threads(1)
+		torch.set_num_interop_threads(1)
+	except RuntimeError:
+		pass
+	try:
+		from threadpoolctl import threadpool_limits
+		return threadpool_limits(limits=1)
+	except ImportError:
+		return None
+
+
+def _multi_gpu_worker_main(
+	worker_index: int,
+	device_text: str,
+	model_adapter: ModelAdapter,
+	model_state: Mapping[str, torch.Tensor] | None,
+	tile_size: int,
+	blend_ramp: np.ndarray,
+	product_scales: Mapping[str, int],
+	input_specs: tuple[_SharedSlotSpec, ...],
+	result_specs: tuple[_SharedSlotSpec, ...],
+	work_queue,
+	result_queue,
+) -> None:
+	"""Persistent spawned GPU worker; queues carry descriptors only."""
+	_native_limits = _limit_native_worker_threads()
+	device = torch.device(device_text)
+	if device.type == "cuda":
+		torch.cuda.set_device(device)
+	inputs = [_attach_shared_memory(spec.shm_name) for spec in input_specs]
+	results = [_attach_shared_memory(spec.shm_name) for spec in result_specs]
+	try:
+		model = model_adapter.load_model(device=device)
+		if model_state is not None:
+			prepare_state_load = getattr(model_adapter, "prepare_model_for_state_load", None)
+			if prepare_state_load is not None:
+				prepare_state_load(model, model_state, device=device)
+			model.load_state_dict(model_state, strict=True)
+		model.eval()
+		ramp_t = torch.as_tensor(blend_ramp, dtype=torch.float32, device=device)
+		w_full = ramp_t[:, None, None] * ramp_t[None, :, None] * ramp_t[None, None, :]
+		weights_by_scale = {
+			sd: (_pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0) if sd > 1 else w_full)
+			for sd in sorted(set(int(value) for value in product_scales.values()))
+		}
+		while True:
+			task = work_queue.get()
+			if task is None:
+				break
+			seq, coord, input_slot, result_slot, needed_names = task
+			started = time.perf_counter()
+			try:
+				input_layout = input_specs[input_slot].layouts[0]
+				tile_np = _slot_array(inputs[input_slot], input_layout)
+				if tile_np.dtype == np.uint16:
+					prepared = (tile_np // 257).astype(np.uint8).astype(np.float32) / 255.0
+				else:
+					prepared = tile_np.astype(np.float32) / 255.0
+				tile = torch.from_numpy(prepared).unsqueeze(0).unsqueeze(0).to(device)
+				# The synchronous copy above makes the input slot reusable before model work.
+				result_queue.put(("input_released", seq, input_slot, worker_index))
+				preprocess = getattr(model_adapter, "preprocess_tile", None)
+				if preprocess is not None:
+					tile = preprocess(tile, torch.ones_like(tile, dtype=torch.bool))
+				with torch.inference_mode():
+					raw_output = model_adapter.run_tile_inference(model, tile, device=device)
+				tensors = model_adapter.product_tensors_from_output(raw_output)
+				layouts = {layout.name: layout for layout in result_specs[result_slot].layouts}
+				needed_scales = sorted({int(product_scales[name]) for name in needed_names})
+				for sd in needed_scales:
+					weight = weights_by_scale[sd]
+					_slot_array(results[result_slot], layouts[f"weight:{sd}"])[:] = weight.detach().cpu().numpy()
+				for name in needed_names:
+					sd = int(product_scales[name])
+					weighted = tensors[name][0] * w_full
+					if sd > 1:
+						weighted = _pyrdown3d(weighted, factor=sd)
+					_slot_array(results[result_slot], layouts[f"product:{name}"])[:] = weighted.detach().cpu().numpy()
+				if device.type == "cuda":
+					torch.cuda.synchronize(device)
+				result_queue.put(("result", seq, coord, result_slot, tuple(needed_names), worker_index, time.perf_counter() - started))
+			except BaseException as exc:
+				result_queue.put(("error", seq, coord, worker_index, type(exc).__name__, str(exc)))
+				break
+	finally:
+		for shm in inputs + results:
+			shm.close()
+
+
+def _iter_canonical_tile_events(
+	z_positions: Sequence[int], y_positions: Sequence[int], x_positions: Sequence[int], Zp: int,
+) -> Iterator[tuple[int, int, int, bool, int]]:
+	"""Yield coordinates lazily plus the next safe row-flush frontier."""
+	for iz, tz in enumerate(z_positions):
+		next_tz = int(z_positions[iz + 1]) if iz + 1 < len(z_positions) else int(Zp)
+		for iy, ty in enumerate(y_positions):
+			for ix, tx in enumerate(x_positions):
+				yield int(tz), int(ty), int(tx), iy == len(y_positions) - 1 and ix == len(x_positions) - 1, next_tz
+
+
 def run_tiled_inference_3d(
 	model,
 	zarr_arr,
@@ -1534,6 +1750,10 @@ def run_tiled_inference_3d(
 	tmp_dir: str | None = None,
 	progress: dict | None = None,
 	temp_prefix: str = "",
+	devices: Sequence[torch.device] | None = None,
+	model_state: Mapping[str, torch.Tensor] | None = None,
+	prefetch_workers: int = 0,
+	slots_per_gpu: int = 2,
 ) -> None:
 	"""Authoritative one-pass, multi-scale tiled inference engine."""
 	products = tuple(products)
@@ -1544,6 +1764,16 @@ def run_tiled_inference_3d(
 	nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
 	pad = max(0, int(border))
 	stride = max(1, int(tile_size) - int(overlap))
+	resolved_devices = tuple(devices or (device,))
+	parallel = len(resolved_devices) > 1
+	if parallel and model is not None:
+		raise ValueError("parallel tiled inference loads models in workers; pass model=None")
+	if not parallel and model is None:
+		raise ValueError("single-device tiled inference requires a loaded model")
+	if int(slots_per_gpu) <= 0:
+		raise ValueError("slots_per_gpu must be > 0")
+	if int(prefetch_workers) < 0:
+		raise ValueError("prefetch_workers must be >= 0")
 	scales = {
 		p.name: max(1, int(p.inference_scaledown or 1))
 		for p in products
@@ -1601,12 +1831,15 @@ def run_tiled_inference_3d(
 		return ramp
 
 	r = _blend_ramp(int(tile_size))
-	w_full = torch.from_numpy(r[:, None, None] * r[None, :, None] * r[None, None, :]).to(device)
-	w_by_scale = {
-		sd: (_pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0).cpu().numpy()
-			 if sd > 1 else w_full.cpu().numpy())
-		for sd in sorted(set(scales.values()))
-	}
+	w_full = None
+	w_by_scale = None
+	if not parallel:
+		w_full = torch.from_numpy(r[:, None, None] * r[None, :, None] * r[None, None, :]).to(device)
+		w_by_scale = {
+			sd: (_pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0).cpu().numpy()
+				 if sd > 1 else w_full.cpu().numpy())
+			for sd in sorted(set(scales.values()))
+		}
 	groups: dict[int, dict[str, Any]] = {}
 	for sd in sorted(set(scales.values())):
 		group_products = tuple(p for p in products if scales[p.name] == sd)
@@ -1704,14 +1937,15 @@ def run_tiled_inference_3d(
 				g["unsupported_origins"].add(origin)
 		return needed
 
-	def _tile_work(tz: int, ty: int, tx: int) -> bool:
+	def _tile_work(tz: int, ty: int, tx: int) -> tuple[str, ...]:
 		bounds = (
 			max(0, tz + z0 - pad), min(volume_shape[0], tz + z0 - pad + tile_size),
 			max(0, ty + y0 - pad), min(volume_shape[1], ty + y0 - pad + tile_size),
 			max(0, tx + x0 - pad), min(volume_shape[2], tx + x0 - pad + tile_size),
 		)
 		if not _input_has_chunks(input_dir, *bounds):
-			return False
+			return ()
+		needed_names: set[str] = set()
 		for sd, g in groups.items():
 			Zo, Yo, Xo = g["shape"]
 			ts = tile_size // sd
@@ -1723,11 +1957,14 @@ def run_tiled_inference_3d(
 				max(oy0, oy0 + clips[1][0] - b), min(oy1, oy0 + clips[1][1] - b),
 				max(ox0, ox0 + clips[2][0] - b), min(ox1, ox0 + clips[2][1] - b),
 			)
-			if _needed_chunks(sd, g, reg):
-				return True
-		return False
+			for missing in _needed_chunks(sd, g, reg).values():
+				needed_names.update(product.name for product in missing)
+		return tuple(sorted(needed_names))
 
-	def _accumulate_group(sd: int, g: dict[str, Any], tensors: Mapping[str, torch.Tensor], tz: int, ty: int, tx: int) -> None:
+	def _accumulate_group(
+		sd: int, g: dict[str, Any], product_np: Mapping[str, np.ndarray],
+		weight_np: np.ndarray, tz: int, ty: int, tx: int,
+	) -> None:
 		Zo, Yo, Xo = g["shape"]
 		ts = tile_size // sd
 		clips = [_downscaled_tile_clip(v, sd, ts, size) for v, size in zip((tz, ty, tx), (Zo, Yo, Xo))]
@@ -1744,13 +1981,6 @@ def run_tiled_inference_3d(
 		incomplete_by_chunk = _needed_chunks(sd, g, reg)
 		if not incomplete_by_chunk:
 			return
-		product_np: dict[str, np.ndarray] = {}
-		for product in {p for ps in incomplete_by_chunk.values() for p in ps}:
-			tensor = tensors[product.name][0] * w_full
-			if sd > 1:
-				tensor = _pyrdown3d(tensor, factor=sd)
-			product_np[product.name] = tensor.detach().cpu().numpy()
-		weight_np = w_by_scale[sd]
 		for origin, missing in incomplete_by_chunk.items():
 			cz, cy, cx = origin
 			gz0, gy0, gx0 = max(reg[0], cz), max(reg[2], cy), max(reg[4], cx)
@@ -1860,49 +2090,272 @@ def run_tiled_inference_3d(
 		progress.update(tiles_total=total, tiles_done=0, tiles_processed=0, tiles_skipped=0, tile_time_sum=0.0, tiles_remaining_est=total)
 	print(_predict3d_progress_line(progress) if progress is not None else f"[predict3d] 0/{total} tiles", flush=True)
 	try:
-		for iz, tz in enumerate(z_positions):
-			for ty in y_positions:
-				for tx in x_positions:
-					if not _tile_work(tz, ty, tx):
-						done += 1; skipped += 1
-						if progress is not None:
-							progress.update(tiles_done=done, tiles_processed=processed, tiles_skipped=skipped, tile_time_sum=tile_time, tiles_remaining_est=total-done)
-						continue
-					tile_t0 = time.time()
-					tile_np = _read_tile_zarr(zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad)
-					if tile_np.dtype == np.uint16:
-						tile_np = (tile_np // 257).astype(np.uint8)
-					tile = torch.from_numpy(tile_np.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
-					preprocess = getattr(model_adapter, "preprocess_tile", None)
-					if preprocess is not None:
-						tile = preprocess(tile, torch.ones_like(tile, dtype=torch.bool))
-					with torch.inference_mode():
-						raw_output = model_adapter.run_tile_inference(model, tile, device=device)
-					diagnostic = raw_output.get("output") if isinstance(raw_output, dict) else raw_output
-					if isinstance(diagnostic, torch.Tensor):
-						nan_count = int(torch.isnan(diagnostic).sum().item())
-						if nan_count or processed == 0:
-							print(
-								f"[predict3d] tile pos=({tz},{ty},{tx}) "
-								f"input=({float(tile.min()):.4f},{float(tile.max()):.4f}) "
-								f"raw=({float(diagnostic.min()):.4f},{float(diagnostic.max()):.4f}) "
-								f"nan={nan_count}/{diagnostic.numel()} dtype={diagnostic.dtype}",
-								flush=True,
-							)
-					tensors = model_adapter.product_tensors_from_output(raw_output)
-					for sd, g in groups.items():
-						_accumulate_group(sd, g, tensors, tz, ty, tx)
-					done += 1; processed += 1; tile_time += time.time() - tile_t0
-					if progress is not None:
-						progress.update(tiles_done=done, tiles_processed=processed, tiles_skipped=skipped, tile_time_sum=tile_time, tiles_remaining_est=total-done)
-					status = _predict3d_progress_line(progress) if progress is not None else f"[predict3d] {done}/{total} tiles"
-					if sys.stdout.isatty():
-						print(f"\r{status}  ", end="", flush=True)
-					elif done == total or done % max(1, len(y_positions) * len(x_positions)) == 0:
-						print(status, flush=True)
-			next_tz = z_positions[iz + 1] if iz + 1 < len(z_positions) else Zp
-			for sd, g in groups.items():
-				_flush_group(sd, g, next_tz)
+		def _record_commit(*, was_processed: bool, elapsed: float, row_end: bool, next_tz: int) -> None:
+			nonlocal done, processed, skipped, tile_time
+			done += 1
+			if was_processed:
+				processed += 1
+				# Parallel ETA is based on observed committed throughput, not the
+				# sum of overlapping per-GPU durations (which would overestimate by
+				# approximately the worker count).
+				tile_time = time.time() - t0 if parallel else tile_time + float(elapsed)
+			else:
+				skipped += 1
+			if progress is not None:
+				progress.update(tiles_done=done, tiles_processed=processed, tiles_skipped=skipped, tile_time_sum=tile_time, tiles_remaining_est=total-done)
+			status = _predict3d_progress_line(progress) if progress is not None else f"[predict3d] {done}/{total} tiles"
+			if was_processed and sys.stdout.isatty():
+				print(f"\r{status}  ", end="", flush=True)
+			elif done == total or (row_end and done % max(1, len(y_positions) * len(x_positions)) == 0):
+				print(status, flush=True)
+			if row_end:
+				for sd, group in groups.items():
+					_flush_group(sd, group, next_tz)
+
+		if not parallel:
+			assert w_full is not None and w_by_scale is not None
+			for tz, ty, tx, row_end, next_tz in _iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp):
+				needed_names = _tile_work(tz, ty, tx)
+				if not needed_names:
+					_record_commit(was_processed=False, elapsed=0.0, row_end=row_end, next_tz=next_tz)
+					continue
+				tile_t0 = time.time()
+				tile_np = _read_tile_zarr(zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad)
+				if tile_np.dtype == np.uint16:
+					tile_np = (tile_np // 257).astype(np.uint8)
+				tile = torch.from_numpy(tile_np.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+				preprocess = getattr(model_adapter, "preprocess_tile", None)
+				if preprocess is not None:
+					tile = preprocess(tile, torch.ones_like(tile, dtype=torch.bool))
+				with torch.inference_mode():
+					raw_output = model_adapter.run_tile_inference(model, tile, device=device)
+				diagnostic = raw_output.get("output") if isinstance(raw_output, dict) else raw_output
+				if isinstance(diagnostic, torch.Tensor):
+					nan_count = int(torch.isnan(diagnostic).sum().item())
+					if nan_count or processed == 0:
+						print(
+							f"[predict3d] tile pos=({tz},{ty},{tx}) input=({float(tile.min()):.4f},{float(tile.max()):.4f}) "
+							f"raw=({float(diagnostic.min()):.4f},{float(diagnostic.max()):.4f}) "
+							f"nan={nan_count}/{diagnostic.numel()} dtype={diagnostic.dtype}", flush=True,
+						)
+				tensors = model_adapter.product_tensors_from_output(raw_output)
+				prepared_products = {}
+				for name in needed_names:
+					sd = scales[name]
+					weighted = tensors[name][0] * w_full
+					if sd > 1:
+						weighted = _pyrdown3d(weighted, factor=sd)
+					prepared_products[name] = weighted.detach().cpu().numpy()
+				for sd, group in groups.items():
+					_accumulate_group(sd, group, prepared_products, w_by_scale[sd], tz, ty, tx)
+				_record_commit(was_processed=True, elapsed=time.time() - tile_t0, row_end=row_end, next_tz=next_tz)
+		else:
+			_slot_count = len(resolved_devices) * int(slots_per_gpu)
+			_input_layouts, input_bytes = _packed_layouts((("input", (tile_size, tile_size, tile_size), np.dtype(zarr_arr.dtype)),))
+			_result_entries = []
+			for product in products:
+				sd = scales[product.name]
+				ts = tile_size // sd
+				_result_entries.append((f"product:{product.name}", (product.raw_channel_count, ts, ts, ts), np.float32))
+			for sd in sorted(set(scales.values())):
+				ts = tile_size // sd
+				_result_entries.append((f"weight:{sd}", (ts, ts, ts), np.float32))
+			_result_layouts, result_bytes = _packed_layouts(_result_entries)
+			input_shms = _create_shared_slots(_slot_count, input_bytes)
+			try:
+				result_shms = _create_shared_slots(_slot_count, result_bytes)
+			except BaseException:
+				for shm in input_shms:
+					shm.close()
+					shm.unlink()
+				raise
+			input_specs = tuple(_SharedSlotSpec(shm.name, input_bytes, _input_layouts) for shm in input_shms)
+			result_specs = tuple(_SharedSlotSpec(shm.name, result_bytes, _result_layouts) for shm in result_shms)
+			print(
+				f"[predict3d] multi-device devices={','.join(str(v) for v in resolved_devices)} slots={_slot_count} "
+				f"input_shared={_slot_count * input_bytes / 1024**3:.2f}GiB result_shared={_slot_count * result_bytes / 1024**3:.2f}GiB",
+				flush=True,
+			)
+			ctx = mp.get_context("spawn")
+			result_queue = ctx.Queue(maxsize=max(4, _slot_count * 3))
+			work_queues = [ctx.Queue(maxsize=int(slots_per_gpu)) for _ in resolved_devices]
+			worker_state = None
+			if model_state is not None:
+				worker_state = {}
+				for key, value in model_state.items():
+					shared_value = value.detach().cpu().contiguous()
+					shared_value.share_memory_()
+					worker_state[key] = shared_value
+			workers = [
+				ctx.Process(
+					target=_multi_gpu_worker_main,
+					args=(index, str(worker_device), model_adapter, worker_state, tile_size, r, scales, input_specs, result_specs, work_queues[index], result_queue),
+					name=f"predict3d-{worker_device}", daemon=True,
+				)
+				for index, worker_device in enumerate(resolved_devices)
+			]
+			started_workers = []
+			try:
+				for worker in workers:
+					worker.start()
+					started_workers.append(worker)
+			except BaseException:
+				for worker in started_workers:
+					if worker.is_alive():
+						worker.terminate()
+					worker.join(timeout=5.0)
+				for work_queue in work_queues:
+					work_queue.close()
+				result_queue.close()
+				for shm in input_shms + result_shms:
+					shm.close()
+					shm.unlink()
+				raise
+			reader_count = int(prefetch_workers) if int(prefetch_workers) > 0 else min(_slot_count, max(1, len(resolved_devices) * 2))
+			executor = ThreadPoolExecutor(max_workers=reader_count, thread_name_prefix="predict3d-read")
+			free_inputs = list(range(_slot_count - 1, -1, -1))
+			free_results = list(range(_slot_count - 1, -1, -1))
+			events: dict[int, dict[str, Any]] = {}
+			futures: dict[Future, int] = {}
+			event_iter = iter(_iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp))
+			source_done = False
+			next_sequence = next_commit = 0
+			next_worker = 0
+			gpu_counts = [0 for _ in workers]
+			gpu_time_sums = [0.0 for _ in workers]
+			commit_time = 0.0
+			read_time = 0.0
+
+			def _read_slot(slot_index: int, coord: TileOriginZYX) -> float:
+				started = time.perf_counter()
+				arr = _read_tile_zarr(zarr_arr, volume_shape, (z0, y0, x0), *coord, tile_size, pad)
+				np.copyto(_slot_array(input_shms[slot_index], _input_layouts[0]), arr, casting="no")
+				return time.perf_counter() - started
+
+			try:
+				while not source_done or events:
+					made_progress = False
+					while not source_done and len(events) < _slot_count:
+						try:
+							tz, ty, tx, row_end, next_tz = next(event_iter)
+						except StopIteration:
+							source_done = True
+							break
+						needed_names = _tile_work(tz, ty, tx)
+						event = dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, needed=needed_names)
+						if not needed_names:
+							event["status"] = "done_skip"
+						elif free_results:
+							event["result_slot"] = free_results.pop()
+							event["status"] = "waiting_read"
+						else:
+							break
+						events[next_sequence] = event
+						next_sequence += 1
+						made_progress = True
+					for seq, event in events.items():
+						if event["status"] != "waiting_read" or not free_inputs:
+							continue
+						input_slot = free_inputs.pop()
+						event["input_slot"] = input_slot
+						future = executor.submit(_read_slot, input_slot, event["coord"])
+						event["status"] = "reading"
+						futures[future] = seq
+						made_progress = True
+					for future, seq in list(futures.items()):
+						if not future.done():
+							continue
+						del futures[future]
+						read_time += float(future.result())
+						events[seq]["status"] = "ready"
+						made_progress = True
+					for seq, event in events.items():
+						if event["status"] != "ready":
+							continue
+						placed = False
+						for attempt in range(len(workers)):
+							worker_index = (next_worker + attempt) % len(workers)
+							try:
+								work_queues[worker_index].put_nowait((seq, event["coord"], event["input_slot"], event["result_slot"], event["needed"]))
+							except queue.Full:
+								continue
+							event["status"] = "assigned"
+							event["worker"] = worker_index
+							next_worker = (worker_index + 1) % len(workers)
+							placed = True
+							made_progress = True
+							break
+						if not placed:
+							break
+					while True:
+						try:
+							message = result_queue.get_nowait()
+						except queue.Empty:
+							break
+						made_progress = True
+						if message[0] == "input_released":
+							free_inputs.append(int(message[2]))
+						elif message[0] == "result":
+							_, seq, _coord, _slot, _names, worker_index, elapsed = message
+							events[int(seq)]["status"] = "done_result"
+							events[int(seq)]["gpu_elapsed"] = float(elapsed)
+							gpu_counts[int(worker_index)] += 1
+							gpu_time_sums[int(worker_index)] += float(elapsed)
+						elif message[0] == "error":
+							_, seq, coord, worker_index, kind, detail = message
+							raise RuntimeError(f"multi-GPU worker {worker_index} failed at tile {coord} seq={seq}: {kind}: {detail}")
+					commit_started = time.perf_counter()
+					while next_commit in events and events[next_commit]["status"] in ("done_skip", "done_result"):
+						event = events.pop(next_commit)
+						if event["status"] == "done_skip":
+							_record_commit(was_processed=False, elapsed=0.0, row_end=event["row_end"], next_tz=event["next_tz"])
+						else:
+							layouts = {layout.name: layout for layout in result_specs[event["result_slot"]].layouts}
+							result_shm = result_shms[event["result_slot"]]
+							prepared = {name: _slot_array(result_shm, layouts[f"product:{name}"]) for name in event["needed"]}
+							for sd, group in groups.items():
+								weight = _slot_array(result_shm, layouts[f"weight:{sd}"])
+								_accumulate_group(sd, group, prepared, weight, *event["coord"])
+							free_results.append(event["result_slot"])
+							_record_commit(was_processed=True, elapsed=event["gpu_elapsed"], row_end=event["row_end"], next_tz=event["next_tz"])
+						next_commit += 1
+						made_progress = True
+					commit_time += time.perf_counter() - commit_started
+					for index, worker in enumerate(workers):
+						if not worker.is_alive() and worker.exitcode is not None:
+							raise RuntimeError(f"multi-GPU worker {index} exited unexpectedly with code {worker.exitcode}")
+					if not made_progress:
+						try:
+							message = result_queue.get(timeout=0.05)
+							# Requeue one descriptor for the normal drain path.
+							result_queue.put(message)
+						except queue.Empty:
+							pass
+				print(
+					f"[predict3d] multi-device stats read_sum={read_time:.1f}s commit_sum={commit_time:.1f}s "
+					+ " ".join(
+						f"gpu{index}_tiles={count} gpu{index}_sum={gpu_time_sums[index]:.1f}s"
+						for index, count in enumerate(gpu_counts)
+					), flush=True,
+				)
+			finally:
+				executor.shutdown(wait=True, cancel_futures=True)
+				for work_queue in work_queues:
+					try:
+						work_queue.put_nowait(None)
+					except queue.Full:
+						pass
+				for worker in workers:
+					worker.join(timeout=5.0)
+					if worker.is_alive():
+						worker.terminate()
+						worker.join(timeout=5.0)
+				for work_queue in work_queues:
+					work_queue.close()
+				result_queue.close()
+				for shm in input_shms + result_shms:
+					shm.close()
+					shm.unlink()
 		print(f"[predict3d] inference done in {time.time()-t0:.1f}s ({processed} processed, {skipped} skipped)", flush=True)
 	finally:
 		for g in groups.values():
