@@ -45,6 +45,11 @@ RegionZYX = tuple[int, int, int, int, int, int]
 TileOriginZYX = tuple[int, int, int]
 ProductTileOutput = Mapping[str, np.ndarray]
 DEFAULT_FLUSH_WORKERS = min(64, max(1, os.cpu_count() or 1))
+DEFAULT_INPUT_READER = "tensorstore"
+DEFAULT_PREFETCH_TILES_PER_GPU = 4
+DEFAULT_INPUT_CACHE_BYTES = 4 << 30
+DEFAULT_INPUT_IO_THREADS = 16
+DEFAULT_INPUT_COPY_THREADS = 4
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,20 @@ class _FlushProcessTask:
 	products: tuple[Any, ...]
 	accumulators: tuple[tuple[str, _MmapBandDescriptor], ...]
 	weight: _MmapBandDescriptor
+
+
+@dataclass(frozen=True)
+class _TileReadSpec:
+	slices_zyx: tuple[slice, slice, slice] | None
+	pad_width_zyx: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+	tile_size: int
+
+
+@dataclass
+class _TensorStoreReadTask:
+	future: Any | None
+	spec: _TileReadSpec
+	submitted_at: float
 
 
 def resolve_inference_devices(
@@ -1610,15 +1629,13 @@ class _CircularZBand:
 		self.origin_z = self.z_size
 
 
-def _read_tile_zarr(
-	zarr_arr,
+def _tile_read_spec(
 	volume_shape: tuple[int, int, int],
 	crop_offset: tuple[int, int, int],
 	tz: int, ty: int, tx: int,
-	tile_size: int | None,
+	tile_size: int,
 	border: int,
-) -> np.ndarray:
-	"""Read a single tile from zarr, using reflect-padding only at volume boundaries."""
+) -> _TileReadSpec:
 	Zv, Yv, Xv = volume_shape
 	oz, oy, ox = crop_offset
 
@@ -1637,23 +1654,99 @@ def _read_tile_zarr(
 	ry1 = min(Yv, src_y1)
 	rx1 = min(Xv, src_x1)
 
-	if rz1 <= rz0 or ry1 <= ry0 or rx1 <= rx0:
-		return np.zeros((tile_size, tile_size, tile_size), dtype=np.uint8)
-
-	chunk = np.asarray(zarr_arr[rz0:rz1, ry0:ry1, rx0:rx1])
-
 	pad_before = (rz0 - src_z0, ry0 - src_y0, rx0 - src_x0)
 	pad_after = (src_z1 - rz1, src_y1 - ry1, src_x1 - rx1)
-	needs_pad = any(p > 0 for p in pad_before + pad_after)
-	if needs_pad:
-		chunk = np.pad(
-			chunk,
-			[(pad_before[0], pad_after[0]),
-			 (pad_before[1], pad_after[1]),
-			 (pad_before[2], pad_after[2])],
-			mode="reflect",
-		)
+	return _TileReadSpec(
+		slices_zyx=(
+			None if rz1 <= rz0 or ry1 <= ry0 or rx1 <= rx0
+			else (slice(rz0, rz1), slice(ry0, ry1), slice(rx0, rx1))
+		),
+		pad_width_zyx=(
+			(pad_before[0], pad_after[0]),
+			(pad_before[1], pad_after[1]),
+			(pad_before[2], pad_after[2]),
+		),
+		tile_size=int(tile_size),
+	)
+
+
+def _finalize_tile_read(raw: Any | None, spec: _TileReadSpec) -> np.ndarray:
+	if spec.slices_zyx is None:
+		# Preserve the historical fully-outside dtype behavior.
+		return np.zeros((spec.tile_size, spec.tile_size, spec.tile_size), dtype=np.uint8)
+	chunk = np.asarray(raw)
+	if any(value > 0 for pair in spec.pad_width_zyx for value in pair):
+		chunk = np.pad(chunk, spec.pad_width_zyx, mode="reflect")
 	return chunk
+
+
+def _read_tile_zarr(
+	zarr_arr,
+	volume_shape: tuple[int, int, int],
+	crop_offset: tuple[int, int, int],
+	tz: int, ty: int, tx: int,
+	tile_size: int | None,
+	border: int,
+) -> np.ndarray:
+	"""Read a single tile from zarr, using reflect-padding only at volume boundaries."""
+	spec = _tile_read_spec(
+		volume_shape, crop_offset, tz, ty, tx, int(tile_size), border,
+	)
+	raw = None if spec.slices_zyx is None else zarr_arr[spec.slices_zyx]
+	return _finalize_tile_read(raw, spec)
+
+
+class _TensorStoreTileReader:
+	"""Bounded asynchronous local Zarr-v2 bounding-box reader."""
+
+	def __init__(
+		self, path: str, *, cache_bytes: int, file_io_threads: int,
+		data_copy_threads: int,
+	) -> None:
+		level_path = Path(str(path).rstrip("/"))
+		if not (level_path / ".zarray").is_file():
+			raise ValueError(
+				"TensorStore inference input must be a local Zarr-v2 array path "
+				f"containing .zarray, got: {path}"
+			)
+		try:
+			from tensorstore_omezarr import TensorStoreConfig, open_tensorstore, tensorstore_context
+		except ImportError:
+			from lasagna.tensorstore_omezarr import TensorStoreConfig, open_tensorstore, tensorstore_context
+		cfg = TensorStoreConfig(
+			cache_pool_bytes=int(cache_bytes), file_io_threads=int(file_io_threads),
+			data_copy_threads=int(data_copy_threads),
+		)
+		self.context = tensorstore_context(cfg)
+		self.store = open_tensorstore(level_path, self.context, read=True, write=False)
+
+	def submit(
+		self, *, volume_shape: tuple[int, int, int], crop_offset: tuple[int, int, int],
+		coord: TileOriginZYX, tile_size: int, border: int,
+	) -> _TensorStoreReadTask:
+		spec = _tile_read_spec(volume_shape, crop_offset, *coord, tile_size, border)
+		future = None if spec.slices_zyx is None else self.store[spec.slices_zyx].read()
+		return _TensorStoreReadTask(future=future, spec=spec, submitted_at=time.perf_counter())
+
+	@staticmethod
+	def done(task: _TensorStoreReadTask) -> bool:
+		return task.future is None or bool(task.future.done())
+
+	@staticmethod
+	def result(task: _TensorStoreReadTask) -> tuple[np.ndarray, float]:
+		raw = None if task.future is None else task.future.result()
+		return _finalize_tile_read(raw, task.spec), time.perf_counter() - task.submitted_at
+
+	@staticmethod
+	def cancel(tasks: Iterable[_TensorStoreReadTask]) -> None:
+		pending = tuple(task for task in tasks if task.future is not None)
+		for task in pending:
+			task.future.cancel()
+		for task in pending:
+			try:
+				task.future.result()
+			except BaseException:
+				pass
 
 
 @dataclass(frozen=True)
@@ -1943,6 +2036,11 @@ def run_tiled_inference_3d(
 	prefetch_workers: int = 0,
 	slots_per_gpu: int = 2,
 	flush_workers: int = 0,
+	input_reader: str = "python-zarr",
+	prefetch_tiles_per_gpu: int = DEFAULT_PREFETCH_TILES_PER_GPU,
+	input_cache_bytes: int = DEFAULT_INPUT_CACHE_BYTES,
+	input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
+	input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
 ) -> None:
 	"""Authoritative one-pass, multi-scale tiled inference engine."""
 	products = tuple(products)
@@ -1965,6 +2063,19 @@ def run_tiled_inference_3d(
 		raise ValueError("prefetch_workers must be >= 0")
 	if int(flush_workers) < 0:
 		raise ValueError("flush_workers must be >= 0")
+	input_reader = str(input_reader).strip().lower()
+	if input_reader not in {"tensorstore", "python-zarr"}:
+		raise ValueError("input_reader must be 'tensorstore' or 'python-zarr'")
+	if int(prefetch_tiles_per_gpu) <= 0:
+		raise ValueError("prefetch_tiles_per_gpu must be > 0")
+	if int(input_cache_bytes) < 0:
+		raise ValueError("input_cache_bytes must be >= 0")
+	if int(input_io_threads) <= 0:
+		raise ValueError("input_io_threads must be > 0")
+	if int(input_copy_threads) <= 0:
+		raise ValueError("input_copy_threads must be > 0")
+	if input_reader == "tensorstore" and input_zarr_path is None:
+		raise ValueError("TensorStore input requires input_zarr_path")
 	scales = {
 		p.name: max(1, int(p.inference_scaledown or 1))
 		for p in products
@@ -2537,44 +2648,116 @@ def run_tiled_inference_3d(
 		if not parallel:
 			_start_flush_workers()
 			assert w_full is not None and w_by_scale is not None
-			for tz, ty, tx, row_end, next_tz in _iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp):
-				_pump_pending_flush(block=False)
-				needed_names = _tile_work(tz, ty, tx)
-				if not needed_names:
-					_record_commit(was_processed=False, elapsed=0.0, row_end=row_end, next_tz=next_tz)
-					continue
-				tile_t0 = time.time()
-				tile_np = _read_tile_zarr(zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad)
-				if tile_np.dtype == np.uint16:
-					tile_np = (tile_np // 257).astype(np.uint8)
-				tile = torch.from_numpy(tile_np.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
-				preprocess = getattr(model_adapter, "preprocess_tile", None)
-				if preprocess is not None:
-					tile = preprocess(tile, torch.ones_like(tile, dtype=torch.bool))
-				with torch.inference_mode():
-					raw_output = model_adapter.run_tile_inference(model, tile, device=device)
-				diagnostic = raw_output.get("output") if isinstance(raw_output, dict) else raw_output
-				if isinstance(diagnostic, torch.Tensor):
-					nan_count = int(torch.isnan(diagnostic).sum().item())
-					if nan_count or processed == 0:
-						print(
-							f"[predict3d] tile pos=({tz},{ty},{tx}) input=({float(tile.min()):.4f},{float(tile.max()):.4f}) "
-							f"raw=({float(diagnostic.min()):.4f},{float(diagnostic.max()):.4f}) "
-							f"nan={nan_count}/{diagnostic.numel()} dtype={diagnostic.dtype}", flush=True,
+			serial_reader = None
+			serial_pending: deque[dict[str, Any]] = deque()
+			serial_source = iter(_iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp))
+			serial_source_done = False
+			serial_read_sum = 0.0
+			serial_read_bytes = 0
+			serial_ready_highwater = 0
+			if input_reader == "tensorstore":
+				serial_reader = _TensorStoreTileReader(
+					str(input_zarr_path), cache_bytes=int(input_cache_bytes),
+					file_io_threads=int(input_io_threads), data_copy_threads=int(input_copy_threads),
+				)
+				print(
+					f"[predict3d] input reader=tensorstore prefetch_window={int(prefetch_tiles_per_gpu)} "
+					f"cache={int(input_cache_bytes)/1024**3:.2f}GiB io_threads={int(input_io_threads)} "
+					f"copy_threads={int(input_copy_threads)}", flush=True,
+				)
+
+			def _next_serial_event() -> dict[str, Any] | None:
+				nonlocal serial_source_done, serial_ready_highwater
+				if serial_reader is None:
+					try:
+						tz, ty, tx, row_end, next_tz = next(serial_source)
+					except StopIteration:
+						return None
+					needed = _tile_work(tz, ty, tx)
+					tile_np = None if not needed else _read_tile_zarr(
+						zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad,
+					)
+					return dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, needed=needed, tile=tile_np)
+				while not serial_source_done and len(serial_pending) < int(prefetch_tiles_per_gpu):
+					try:
+						tz, ty, tx, row_end, next_tz = next(serial_source)
+					except StopIteration:
+						serial_source_done = True
+						break
+					needed = _tile_work(tz, ty, tx)
+					event = dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, needed=needed)
+					if needed:
+						event["read_task"] = serial_reader.submit(
+							volume_shape=volume_shape, crop_offset=(z0, y0, x0), coord=(tz, ty, tx),
+							tile_size=tile_size, border=pad,
 						)
-				tensors = model_adapter.product_tensors_from_output(raw_output)
-				prepared_products = {}
-				for name in needed_names:
-					sd = scales[name]
-					weighted = tensors[name][0] * w_full
-					if sd > 1:
-						weighted = _pyrdown3d(weighted, factor=sd)
-					prepared_products[name] = weighted.detach().cpu().numpy()
-				for sd, group in groups.items():
-					_accumulate_group(sd, group, prepared_products, w_by_scale[sd], tz, ty, tx)
-				_record_commit(was_processed=True, elapsed=time.time() - tile_t0, row_end=row_end, next_tz=next_tz)
+					serial_pending.append(event)
+				serial_ready_highwater = max(
+					serial_ready_highwater,
+					sum(1 for event in serial_pending if event.get("read_task") is not None and serial_reader.done(event["read_task"])),
+				)
+				return serial_pending.popleft() if serial_pending else None
+
+			try:
+				while True:
+					event = _next_serial_event()
+					if event is None:
+						break
+					tz, ty, tx = event["coord"]
+					row_end, next_tz, needed_names = event["row_end"], event["next_tz"], event["needed"]
+					_pump_pending_flush(block=False)
+					if not needed_names:
+						_record_commit(was_processed=False, elapsed=0.0, row_end=row_end, next_tz=next_tz)
+						continue
+					tile_t0 = time.time()
+					if serial_reader is None:
+						tile_np = event["tile"]
+					else:
+						tile_np, read_elapsed = serial_reader.result(event["read_task"])
+						serial_read_sum += float(read_elapsed)
+						serial_read_bytes += int(tile_np.nbytes)
+					if tile_np.dtype == np.uint16:
+						tile_np = (tile_np // 257).astype(np.uint8)
+					tile = torch.from_numpy(tile_np.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+					preprocess = getattr(model_adapter, "preprocess_tile", None)
+					if preprocess is not None:
+						tile = preprocess(tile, torch.ones_like(tile, dtype=torch.bool))
+					with torch.inference_mode():
+						raw_output = model_adapter.run_tile_inference(model, tile, device=device)
+					diagnostic = raw_output.get("output") if isinstance(raw_output, dict) else raw_output
+					if isinstance(diagnostic, torch.Tensor):
+						nan_count = int(torch.isnan(diagnostic).sum().item())
+						if nan_count or processed == 0:
+							print(
+								f"[predict3d] tile pos=({tz},{ty},{tx}) input=({float(tile.min()):.4f},{float(tile.max()):.4f}) "
+								f"raw=({float(diagnostic.min()):.4f},{float(diagnostic.max()):.4f}) "
+								f"nan={nan_count}/{diagnostic.numel()} dtype={diagnostic.dtype}", flush=True,
+							)
+					tensors = model_adapter.product_tensors_from_output(raw_output)
+					prepared_products = {}
+					for name in needed_names:
+						sd = scales[name]
+						weighted = tensors[name][0] * w_full
+						if sd > 1:
+							weighted = _pyrdown3d(weighted, factor=sd)
+						prepared_products[name] = weighted.detach().cpu().numpy()
+					for sd, group in groups.items():
+						_accumulate_group(sd, group, prepared_products, w_by_scale[sd], tz, ty, tx)
+					_record_commit(was_processed=True, elapsed=time.time() - tile_t0, row_end=row_end, next_tz=next_tz)
+			finally:
+				if serial_reader is not None:
+					serial_reader.cancel(
+						event["read_task"] for event in serial_pending if event.get("read_task") is not None
+					)
+			if serial_reader is not None:
+				print(
+					f"[predict3d] input stats backend=tensorstore reads={processed} "
+					f"bytes={serial_read_bytes} read_sum={serial_read_sum:.2f}s "
+					f"ready_highwater={serial_ready_highwater}", flush=True,
+				)
 		else:
 			_slot_count = len(resolved_devices) * int(slots_per_gpu)
+			_prefetch_window = len(resolved_devices) * int(prefetch_tiles_per_gpu)
 			_input_layouts, input_bytes = _packed_layouts((("input", (tile_size, tile_size, tile_size), np.dtype(zarr_arr.dtype)),))
 			_result_entries = []
 			for product in products:
@@ -2597,7 +2780,8 @@ def run_tiled_inference_3d(
 			result_specs = tuple(_SharedSlotSpec(shm.name, result_bytes, _result_layouts) for shm in result_shms)
 			print(
 				f"[predict3d] multi-device devices={','.join(str(v) for v in resolved_devices)} slots={_slot_count} "
-				f"input_shared={_slot_count * input_bytes / 1024**3:.2f}GiB result_shared={_slot_count * result_bytes / 1024**3:.2f}GiB",
+				f"prefetch_window={_prefetch_window} input_shared={_slot_count * input_bytes / 1024**3:.2f}GiB "
+				f"result_shared={_slot_count * result_bytes / 1024**3:.2f}GiB",
 				flush=True,
 			)
 			ctx = mp.get_context("spawn")
@@ -2631,18 +2815,55 @@ def run_tiled_inference_3d(
 					worker.join(timeout=5.0)
 				for work_queue in work_queues:
 					work_queue.close()
+					work_queue.join_thread()
 				result_queue.close()
+				result_queue.join_thread()
 				for shm in input_shms + result_shms:
 					shm.close()
 					shm.unlink()
-					raise
+				raise
 			_start_flush_workers()
 			reader_count = int(prefetch_workers) if int(prefetch_workers) > 0 else min(_slot_count, max(1, len(resolved_devices) * 2))
-			executor = ThreadPoolExecutor(max_workers=reader_count, thread_name_prefix="predict3d-read")
+			executor = None
+			tensorstore_reader = None
+			try:
+				if input_reader == "tensorstore":
+					tensorstore_reader = _TensorStoreTileReader(
+						str(input_zarr_path), cache_bytes=int(input_cache_bytes),
+						file_io_threads=int(input_io_threads), data_copy_threads=int(input_copy_threads),
+					)
+				else:
+					executor = ThreadPoolExecutor(max_workers=reader_count, thread_name_prefix="predict3d-read")
+			except BaseException:
+				for work_queue in work_queues:
+					try:
+						work_queue.put_nowait(None)
+					except queue.Full:
+						pass
+				for worker in workers:
+					worker.join(timeout=5.0)
+					if worker.is_alive():
+						worker.terminate()
+						worker.join(timeout=5.0)
+				for work_queue in work_queues:
+					work_queue.close()
+					work_queue.join_thread()
+				result_queue.close()
+				result_queue.join_thread()
+				for shm in input_shms + result_shms:
+					shm.close()
+					shm.unlink()
+				raise
+			print(
+				f"[predict3d] input reader={input_reader} prefetch_window={_prefetch_window} "
+				f"cache={int(input_cache_bytes)/1024**3:.2f}GiB io_threads={int(input_io_threads)} "
+				f"copy_threads={int(input_copy_threads)}"
+				+ (f" fallback_threads={reader_count}" if input_reader == "python-zarr" else ""), flush=True,
+			)
 			free_inputs = list(range(_slot_count - 1, -1, -1))
 			free_results = list(range(_slot_count - 1, -1, -1))
 			events: dict[int, dict[str, Any]] = {}
-			futures: dict[Future, int] = {}
+			futures: dict[Any, int] = {}
 			event_iter = iter(_iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp))
 			source_done = False
 			next_sequence = next_commit = 0
@@ -2651,18 +2872,43 @@ def run_tiled_inference_3d(
 			gpu_time_sums = [0.0 for _ in workers]
 			commit_time = 0.0
 			read_time = 0.0
+			read_bytes = 0
+			read_submitted = 0
+			read_completed = 0
+			read_live_highwater = 0
+			read_ready_highwater = 0
+			input_copy_time = 0.0
+			input_starve_time = 0.0
+			starve_started: float | None = None
 
-			def _read_slot(slot_index: int, coord: TileOriginZYX) -> float:
+			def _read_coord(coord: TileOriginZYX) -> tuple[np.ndarray, float]:
 				started = time.perf_counter()
 				arr = _read_tile_zarr(zarr_arr, volume_shape, (z0, y0, x0), *coord, tile_size, pad)
-				np.copyto(_slot_array(input_shms[slot_index], _input_layouts[0]), arr, casting="no")
-				return time.perf_counter() - started
+				return arr, time.perf_counter() - started
+
+			def _handle_gpu_message(message: tuple[Any, ...]) -> None:
+				if message[0] == "input_released":
+					free_inputs.append(int(message[2]))
+				elif message[0] == "result":
+					_, seq, _coord, _slot, _names, worker_index, elapsed = message
+					events[int(seq)]["status"] = "done_result"
+					events[int(seq)]["gpu_elapsed"] = float(elapsed)
+					gpu_counts[int(worker_index)] += 1
+					gpu_time_sums[int(worker_index)] += float(elapsed)
+				elif message[0] == "error":
+					_, seq, coord, worker_index, kind, detail = message
+					raise RuntimeError(
+						f"multi-GPU worker {worker_index} failed at tile {coord} "
+						f"seq={seq}: {kind}: {detail}"
+					)
+				else:
+					raise RuntimeError(f"unknown multi-GPU worker message: {message}")
 
 			try:
 				while not source_done or events:
 					_pump_pending_flush(block=False)
 					made_progress = False
-					while not source_done and len(events) < _slot_count:
+					while not source_done and len(events) < _prefetch_window:
 						try:
 							tz, ty, tx, row_end, next_tz = next(event_iter)
 						except StopIteration:
@@ -2672,65 +2918,85 @@ def run_tiled_inference_3d(
 						event = dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, needed=needed_names)
 						if not needed_names:
 							event["status"] = "done_skip"
-						elif free_results:
-							event["result_slot"] = free_results.pop()
-							event["status"] = "waiting_read"
 						else:
-							break
+							event["status"] = "reading"
+							if tensorstore_reader is not None:
+								task = tensorstore_reader.submit(
+									volume_shape=volume_shape, crop_offset=(z0, y0, x0),
+									coord=(tz, ty, tx), tile_size=tile_size, border=pad,
+								)
+								event["read_task"] = task
+								futures[id(task)] = next_sequence
+							else:
+								future = executor.submit(_read_coord, (tz, ty, tx))
+								event["read_task"] = future
+								futures[future] = next_sequence
+							read_submitted += 1
 						events[next_sequence] = event
 						next_sequence += 1
 						made_progress = True
-					for seq, event in events.items():
-						if event["status"] != "waiting_read" or not free_inputs:
+					read_live_highwater = max(read_live_highwater, len(futures))
+					for future_key, seq in list(futures.items()):
+						event = events[seq]
+						task = event["read_task"]
+						is_done = tensorstore_reader.done(task) if tensorstore_reader is not None else task.done()
+						if not is_done:
 							continue
-						input_slot = free_inputs.pop()
-						event["input_slot"] = input_slot
-						future = executor.submit(_read_slot, input_slot, event["coord"])
-						event["status"] = "reading"
-						futures[future] = seq
+						del futures[future_key]
+						if tensorstore_reader is not None:
+							arr, elapsed = tensorstore_reader.result(task)
+						else:
+							arr, elapsed = task.result()
+						read_time += float(elapsed)
+						read_bytes += int(arr.nbytes)
+						read_completed += 1
+						event["tile"] = arr
+						event["status"] = "ready"
 						made_progress = True
-					for future, seq in list(futures.items()):
-						if not future.done():
-							continue
-						del futures[future]
-						read_time += float(future.result())
-						events[seq]["status"] = "ready"
-						made_progress = True
+					read_ready_highwater = max(
+						read_ready_highwater, sum(1 for event in events.values() if event["status"] == "ready")
+					)
 					for seq, event in events.items():
-						if event["status"] != "ready":
+						if event["status"] != "ready" or not free_inputs or not free_results:
 							continue
-						placed = False
+						worker_index = None
 						for attempt in range(len(workers)):
-							worker_index = (next_worker + attempt) % len(workers)
-							try:
-								work_queues[worker_index].put_nowait((seq, event["coord"], event["input_slot"], event["result_slot"], event["needed"]))
-							except queue.Full:
-								continue
-							event["status"] = "assigned"
-							event["worker"] = worker_index
-							next_worker = (worker_index + 1) % len(workers)
-							placed = True
-							made_progress = True
+							candidate = (next_worker + attempt) % len(workers)
+							if not work_queues[candidate].full():
+								worker_index = candidate
+								break
+						if worker_index is None:
 							break
-						if not placed:
-							break
+						input_slot = free_inputs.pop()
+						result_slot = free_results.pop()
+						copy_started = time.perf_counter()
+						np.copyto(
+							_slot_array(input_shms[input_slot], _input_layouts[0]),
+							event["tile"], casting="no",
+						)
+						input_copy_time += time.perf_counter() - copy_started
+						try:
+							work_queues[worker_index].put_nowait((
+								seq, event["coord"], input_slot, result_slot, event["needed"],
+							))
+						except queue.Full:
+							free_inputs.append(input_slot)
+							free_results.append(result_slot)
+							continue
+						event.pop("tile", None)
+						event["input_slot"] = input_slot
+						event["result_slot"] = result_slot
+						event["status"] = "assigned"
+						event["worker"] = worker_index
+						next_worker = (worker_index + 1) % len(workers)
+						made_progress = True
 					while True:
 						try:
 							message = result_queue.get_nowait()
 						except queue.Empty:
 							break
 						made_progress = True
-						if message[0] == "input_released":
-							free_inputs.append(int(message[2]))
-						elif message[0] == "result":
-							_, seq, _coord, _slot, _names, worker_index, elapsed = message
-							events[int(seq)]["status"] = "done_result"
-							events[int(seq)]["gpu_elapsed"] = float(elapsed)
-							gpu_counts[int(worker_index)] += 1
-							gpu_time_sums[int(worker_index)] += float(elapsed)
-						elif message[0] == "error":
-							_, seq, coord, worker_index, kind, detail = message
-							raise RuntimeError(f"multi-GPU worker {worker_index} failed at tile {coord} seq={seq}: {kind}: {detail}")
+						_handle_gpu_message(message)
 					commit_started = time.perf_counter()
 					while next_commit in events and events[next_commit]["status"] in ("done_skip", "done_result"):
 						event = events.pop(next_commit)
@@ -2748,25 +3014,48 @@ def run_tiled_inference_3d(
 						next_commit += 1
 						made_progress = True
 					commit_time += time.perf_counter() - commit_started
+					can_accept_input = bool(free_inputs and free_results) and any(
+						not work_queue.full() for work_queue in work_queues
+					)
+					has_ready_input = any(event["status"] == "ready" for event in events.values())
+					has_pending_input = any(event["status"] == "reading" for event in events.values())
+					if can_accept_input and not has_ready_input and has_pending_input:
+						if starve_started is None:
+							starve_started = time.perf_counter()
+					elif starve_started is not None:
+						input_starve_time += time.perf_counter() - starve_started
+						starve_started = None
 					for index, worker in enumerate(workers):
 						if not worker.is_alive() and worker.exitcode is not None:
 							raise RuntimeError(f"multi-GPU worker {index} exited unexpectedly with code {worker.exitcode}")
 					if not made_progress:
 						try:
 							message = result_queue.get(timeout=0.05)
-							# Requeue one descriptor for the normal drain path.
-							result_queue.put(message)
 						except queue.Empty:
 							pass
+						else:
+							_handle_gpu_message(message)
+				if starve_started is not None:
+					input_starve_time += time.perf_counter() - starve_started
 				print(
-					f"[predict3d] multi-device stats read_sum={read_time:.1f}s commit_sum={commit_time:.1f}s "
+					f"[predict3d] multi-device stats input_backend={input_reader} "
+					f"reads={read_completed}/{read_submitted} read_bytes={read_bytes} read_sum={read_time:.1f}s "
+					f"ready_highwater={read_ready_highwater} live_highwater={read_live_highwater} "
+					f"copy_sum={input_copy_time:.1f}s input_starve={input_starve_time:.1f}s "
+					f"commit_sum={commit_time:.1f}s "
 					+ " ".join(
 						f"gpu{index}_tiles={count} gpu{index}_sum={gpu_time_sums[index]:.1f}s"
 						for index, count in enumerate(gpu_counts)
 					), flush=True,
 				)
 			finally:
-				executor.shutdown(wait=True, cancel_futures=True)
+				if tensorstore_reader is not None:
+					tensorstore_reader.cancel(
+						event["read_task"] for event in events.values()
+						if event.get("status") == "reading" and event.get("read_task") is not None
+					)
+				if executor is not None:
+					executor.shutdown(wait=True, cancel_futures=True)
 				for work_queue in work_queues:
 					try:
 						work_queue.put_nowait(None)
@@ -2779,7 +3068,9 @@ def run_tiled_inference_3d(
 						worker.join(timeout=5.0)
 				for work_queue in work_queues:
 					work_queue.close()
+					work_queue.join_thread()
 				result_queue.close()
+				result_queue.join_thread()
 				for shm in input_shms + result_shms:
 					shm.close()
 					shm.unlink()

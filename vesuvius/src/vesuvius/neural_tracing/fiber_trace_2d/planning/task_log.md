@@ -1,69 +1,70 @@
-# Task log: process-parallel rolling-mmap flush
+# Task log: TensorStore whole-volume inference prefetch
 
 ## Findings
 
-- Representative eight-GPU crop: synchronous flush completed neural inference
-  in 178.8 s; one background Python thread took 305.4 s, a 126.6 s / 70.8%
-  regression. The thread did not parallelize chunks and could contend for the
-  GIL, memory bandwidth, and process-global native thread settings.
-- `_CircularZBand` already exposes a filesystem-backed mmap per accumulator
-  channel. Spawned workers can reopen these by path and reconstruct wrapped
-  logical reads without copying a band or sharing Python objects.
-- Fiber and Lasagna model adapters store picklable configuration/product data;
-  their finalizers are CPU/NumPy operations. `OmeZarrOutputAdapter` stores
-  product/path metadata and atomic writes target distinct chunk files.
-- A process worker needs only one output chunk's denominator/raw/finalized
-  arrays. RAM therefore scales with flush worker count, not band or volume Z.
-- GPU worker processes must start before the flush pool, and the flush pool
-  before reader threads, to keep portable spawn lifecycle deterministic.
+- Shared whole-volume inference currently opens input with Python `zarr.open`
+  and reads each tile with one `np.asarray(array[z0:z1,y0:y1,x0:x1])` call.
+- Multi-GPU mode uses at most `devices * slots_per_gpu` total events. With eight
+  GPUs and two slots this means active GPU/result work and read-ahead share only
+  sixteen events; there is usually about one extra tile per busy GPU.
+- The existing `lasagna.tensorstore_omezarr` module provides proven local Zarr
+  driver/context construction with explicit cache, file-I/O, and data-copy
+  concurrency controls. TensorStore `.read()` returns pollable asynchronous
+  futures and preserves source dtype.
+- Prefetch-array memory is dtype dependent: one 256-cubed uint8 tile is 16 MiB,
+  uint16 is 32 MiB, and an eight-byte dtype is 128 MiB. With four tiles per
+  eight GPUs the completed/outstanding-array bound is therefore 0.5, 1, or
+  4 GiB respectively, separate from shared slots and TensorStore cache.
 
-## Plan review
+## Review, implementation, and validation
 
-- Use explicit spawned processes with bounded task/result queues and a
-  coordinator-pumped `2 * workers` IPC window; executor/pool feeder threads and
-  eager whole-batch submission are prohibited.
-- Zero workers must restore the old immediate-release planner and lifecycle,
-  providing a genuine synchronous baseline. The normal automatic default is
-  the available CPU count capped at 64 processes.
-- Mmap descriptors are absolute path-only metadata; coordinator validates
-  frozen generations, workers open read-only mappings, and no forced mmap flush
-  occurs.
-- Production adapters are spawn-pickle validated before traversal. Flush
-  processes receive no model weights/tensors and never initialize CUDA.
-- Batch/task IDs, exit-code polling, bounded queue pumping, and ordered shutdown
-  cover Python errors, hard exits, result backpressure, and interrupts without
-  releasing frozen slots.
-- Each task exclusively owns all dirty products for one scale/chunk origin.
-  Concurrent coarse-pyramid invalidation must be race tolerant.
+Independent review required and incorporated: context construction must follow
+all child starts; single-device inference also needs bounded read-ahead; every
+outstanding read counts as a full-tile memory allocation; backend failures are
+explicit rather than silent fallback; slicing oddities, local Zarr-v2
+eligibility, cancellation/drain, diagnostic wall metrics, spawn portability,
+and real controlled before/after measurements must be covered.
 
-## Implementation and validation
+## Implementation
 
-- Replaced the flush `ThreadPoolExecutor` with explicit persistent spawn
-  processes. Bounded queues carry immutable task/path descriptors; workers
-  cache read-only memmaps and never receive ndarray payloads.
-- Added whole-batch completion gating, generation validation, task/batch result
-  validation, hard-exit polling, process-first shutdown, and mmap cleanup.
-- Added `--flush-workers` to both front ends (available CPU count capped at 64
-  by default); zero preserves the synchronous immediate-release planner.
-- Focused `unittest` coverage passed for process overlap, two-worker distinct
-  execution, task failure, hard exit, mmap cleanup, planner sizing, serial vs
-  multi-GPU exactness, and Lasagna CLI forwarding. The two-worker controlled
-  test processed four 0.1 s writes across two distinct PIDs with 0.40 s
-  aggregate worker work. Spawn startup dominated its 1.6-1.7 s flush wall
-  time, as expected for this intentionally tiny test.
-- Python compilation passed for the shared runner, both front ends, and touched
-  tests. Fiber `--help` exposes the new option. The environment lacks pytest,
-  so the pytest-based Fiber forwarding test was compiled but not executed.
-- A pre-existing Lasagna legacy CLI assertion expects `ome_chunk=64` despite
-  explicitly passing `--ome-chunk 32`; that unrelated assertion still fails.
-  The full test-module run also stalled in an existing Zarr-heavy test, so
-  validation used named focused cases.
-- Representative eight-GPU post-change timing remains to be collected on the
-  user's full-volume workload. The known baselines are 178.8 s synchronous and
-  305.4 s for the removed Python-thread version.
-- Corrected spawn-time native thread limiting by reusing the pyramid worker's
-  `_single_threaded_native_runtime()` around both GPU-worker and flush-worker
-  `Process.start()` calls. Limiting only inside a spawned worker is too late:
-  spawn re-imports the main module, including NumPy/OpenBLAS, before invoking
-  the worker target. Parent environment and runtime limits are restored after
-  startup.
+- Added exact shared clipped-bbox/read-finalization helpers and a lazy
+  `_TensorStoreTileReader` using the existing `TensorStoreConfig`, context, and
+  local Zarr-v2 opener. TensorStore import/open failures are explicit.
+- Fiber and Lasagna front ends default to TensorStore with four prefetch tiles
+  per selected GPU, 4 GiB cache, 16 file-I/O threads, and four copy/decode
+  threads. Python Zarr remains explicit fallback.
+- Multi-GPU read events are bounded independently of the two GPU/result slots
+  per GPU. Reads do not reserve shared slots; ready arrays enter shared memory
+  only when both slot types and a GPU queue are available. Single-device mode
+  maintains the same bounded future window while model forwards run.
+- Added backend/read byte and latency totals, live/ready high-water marks, copy
+  time, and input-starvation time. Removed the coordinator's GPU-result
+  get-and-requeue operation so it handles the descriptor directly.
+- Queue feeder threads are now closed and joined on normal completion and
+  startup failures, preventing the shared inference queues from being reported
+  as leaked multiprocessing semaphores at interpreter shutdown.
+- Added a reusable reader benchmark script with warmups and mean/p50/p95/min/max
+  output.
+
+## Validation and limitations
+
+- Compilation passed for the shared runner, both front ends, benchmark helper,
+  and touched tests. `git diff --check` passes.
+- Five focused tests passed in 5.39 s: TensorStore/Python-Zarr bbox equivalence
+  with reflect padding, serial output equivalence, spawned multi-device output
+  equivalence, the existing serial/multi-device exactness test, and Lasagna CLI
+  forwarding. TensorStore exercised little-endian uint16 and real Zarr-v2 raw
+  chunks.
+- Fiber CLI help exposes every new option; its pytest forwarding test compiles,
+  but pytest is absent from the active venv.
+- The benchmark command against the representative 2.2 TiB local level was
+  attempted with 16 tiles, one warmup, and three iterations. In this sandbox,
+  Python Zarr `zarr.open` stalled before printing metadata (even tiny newly
+  created Zarr arrays exhibit this sandbox-only stall), so no honest controlled
+  before/after timing could be collected here. The benchmark script and normal
+  input metrics are ready for the user's unsandboxed run. This is an explicit
+  deviation from the requested performance protocol.
+- Fully-outside reads preserve historical uint8-zero behavior by construction.
+  Size-one reflect-axis error behavior follows the shared NumPy finalizer but
+  does not yet have a dedicated test. Import/open/read-error and interrupt
+  cancellation paths are implemented but not exhaustively fault-injected.

@@ -6,6 +6,7 @@ del _os
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 import os
 from pathlib import Path
 import shutil
@@ -39,6 +40,11 @@ import zarr
 try:
 	from tiled_predict3d import (
 		DEFAULT_FLUSH_WORKERS,
+		DEFAULT_INPUT_CACHE_BYTES,
+		DEFAULT_INPUT_COPY_THREADS,
+		DEFAULT_INPUT_IO_THREADS,
+		DEFAULT_INPUT_READER,
+		DEFAULT_PREFETCH_TILES_PER_GPU,
 		ModelAdapter,
 		OmeZarrOutputAdapter,
 		OutputAdapter,
@@ -50,6 +56,7 @@ try:
 		PYRAMID_POLICY_SCALAR,
 		VALID_PYRAMID_POLICIES,
 		_CircularZBand,
+		_TensorStoreTileReader,
 		_plan_circular_z_depth,
 		_atomic_zarr_write,
 		build_product_omezarr_pyramids,
@@ -88,6 +95,11 @@ try:
 except ImportError:
 	from lasagna.tiled_predict3d import (
 		DEFAULT_FLUSH_WORKERS,
+		DEFAULT_INPUT_CACHE_BYTES,
+		DEFAULT_INPUT_COPY_THREADS,
+		DEFAULT_INPUT_IO_THREADS,
+		DEFAULT_INPUT_READER,
+		DEFAULT_PREFETCH_TILES_PER_GPU,
 		ModelAdapter,
 		OmeZarrOutputAdapter,
 		OutputAdapter,
@@ -99,6 +111,7 @@ except ImportError:
 		PYRAMID_POLICY_SCALAR,
 		VALID_PYRAMID_POLICIES,
 		_CircularZBand,
+		_TensorStoreTileReader,
 		_plan_circular_z_depth,
 		_atomic_zarr_write,
 		build_product_omezarr_pyramids,
@@ -1583,6 +1596,11 @@ def run_preprocess_3d(
 	prefetch_workers: int = 0,
 	slots_per_gpu: int = 2,
 	flush_workers: int = DEFAULT_FLUSH_WORKERS,
+	input_reader: str = DEFAULT_INPUT_READER,
+	prefetch_tiles_per_gpu: int = DEFAULT_PREFETCH_TILES_PER_GPU,
+	input_cache_gib: float = DEFAULT_INPUT_CACHE_BYTES / float(1 << 30),
+	input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
+	input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
 	download_workers: int = 64,
 ) -> None:
 	"""Run 3D UNet inference and write .lasagna.json with OME-Zarr pyramids.
@@ -1608,6 +1626,10 @@ def run_preprocess_3d(
 		raise ValueError("download_workers must be a positive integer")
 	if int(flush_workers) < 0:
 		raise ValueError("flush_workers must be >= 0")
+	if not math.isfinite(float(input_cache_gib)) or float(input_cache_gib) < 0:
+		raise ValueError("input_cache_gib must be finite and >= 0")
+	if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0 or int(input_copy_threads) <= 0:
+		raise ValueError("prefetch_tiles_per_gpu and TensorStore thread counts must be > 0")
 
 	if not output_path.endswith(".lasagna.json"):
 		raise ValueError(f"output must be .lasagna.json, got: {output_path}")
@@ -1941,6 +1963,11 @@ def run_preprocess_3d(
 			prefetch_workers=int(prefetch_workers),
 			slots_per_gpu=int(slots_per_gpu),
 			flush_workers=int(flush_workers),
+			input_reader=str(input_reader),
+			prefetch_tiles_per_gpu=int(prefetch_tiles_per_gpu),
+			input_cache_bytes=int(float(input_cache_gib) * (1 << 30)),
+			input_io_threads=int(input_io_threads),
+			input_copy_threads=int(input_copy_threads),
 		)
 	except BaseException:
 		if _gpu_ctx is not None:
@@ -2727,6 +2754,16 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		help="Bounded shared-memory input/result slots per GPU.")
 	p.add_argument("--flush-workers", type=int, default=DEFAULT_FLUSH_WORKERS,
 		help="Spawned OME-Zarr flush processes (default: min(CPU count, 64)); 0 uses the synchronous baseline.")
+	p.add_argument("--input-reader", choices=("tensorstore", "python-zarr"), default=DEFAULT_INPUT_READER,
+		help="Inference tile reader backend (default: tensorstore).")
+	p.add_argument("--prefetch-tiles-per-gpu", type=int, default=DEFAULT_PREFETCH_TILES_PER_GPU,
+		help="Bounded input read-ahead tiles per selected GPU (default: 4).")
+	p.add_argument("--input-cache-gib", type=float, default=DEFAULT_INPUT_CACHE_BYTES / float(1 << 30),
+		help="TensorStore cache budget in GiB (default: 4).")
+	p.add_argument("--input-io-threads", type=int, default=DEFAULT_INPUT_IO_THREADS,
+		help="TensorStore file I/O concurrency (default: 16).")
+	p.add_argument("--input-copy-threads", type=int, default=DEFAULT_INPUT_COPY_THREADS,
+		help="TensorStore decode/data-copy concurrency (default: 4).")
 	p.add_argument("--download-workers", type=int, default=64,
 		help="Parallel S3 chunk download threads used by automatic download.")
 	p.add_argument("--chunk-z", type=int, default=32, help="Output zarr chunk size along Z.")
@@ -2754,6 +2791,14 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		p.error("--download-workers must be a positive integer")
 	if int(args.flush_workers) < 0:
 		p.error("--flush-workers must be >= 0")
+	if int(args.prefetch_tiles_per_gpu) <= 0:
+		p.error("--prefetch-tiles-per-gpu must be > 0")
+	if not math.isfinite(float(args.input_cache_gib)) or float(args.input_cache_gib) < 0:
+		p.error("--input-cache-gib must be finite and >= 0")
+	if int(args.input_io_threads) <= 0:
+		p.error("--input-io-threads must be > 0")
+	if int(args.input_copy_threads) <= 0:
+		p.error("--input-copy-threads must be > 0")
 
 	if not args.no_download:
 		_auto_download(
@@ -2789,6 +2834,11 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		prefetch_workers=int(args.prefetch_workers),
 		slots_per_gpu=int(args.slots_per_gpu),
 		flush_workers=int(args.flush_workers),
+		input_reader=str(args.input_reader),
+		prefetch_tiles_per_gpu=int(args.prefetch_tiles_per_gpu),
+		input_cache_gib=float(args.input_cache_gib),
+		input_io_threads=int(args.input_io_threads),
+		input_copy_threads=int(args.input_copy_threads),
 		download_workers=int(args.download_workers),
 	)
 	return 0

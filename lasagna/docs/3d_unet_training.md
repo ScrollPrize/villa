@@ -718,11 +718,16 @@ full OME-Zarr chunks, and discarded before the next bands are processed. Input
 tiles are read lazily from the zarr — the full crop is never loaded into RAM.
 
 Multi-GPU inference keeps only the independent axis lattices and generates
-their Cartesian tile stream on demand. CPU readers, persistent per-GPU model
-workers, and the ordered accumulator/writer overlap through fixed shared-memory
-slots. Worker results can finish out of order, but they are accumulated in the
-same canonical order as serial inference; only the coordinator writes Zarr or
-advances the rolling Z ring.
+their Cartesian tile stream on demand. Asynchronous TensorStore bounding-box
+reads use a separate bounded read-ahead window while persistent per-GPU model
+workers use fixed shared-memory input/result slots. Completed input arrays are
+copied into shared memory only when a GPU queue and both slot types are
+available, then released. Worker results can finish out of order, but they are
+accumulated in the same canonical order as serial inference; only the
+coordinator writes Zarr or advances the rolling Z ring. The conservative input
+memory bound is the read-ahead window times one padded tile, plus TensorStore's
+cache and the shared-memory slots. `--input-reader python-zarr` retains the old
+threaded reader for comparison.
 
 Output flushing also overlaps inference. One enlarged but still fixed-depth
 mmap ring retains at most one finalized interval while the following Z row is

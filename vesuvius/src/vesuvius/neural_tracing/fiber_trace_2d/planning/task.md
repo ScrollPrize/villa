@@ -1,19 +1,19 @@
-# Task: process-parallel rolling-mmap flush
+# Task: TensorStore whole-volume inference prefetch
 
-Replace the shared 3D inference runner's Python background flush thread. The
-threaded implementation regressed a representative eight-GPU crop from 178.8 s
-to 305.4 s and can contend with the coordinator through the GIL and
-process-global native-library state.
+Replace the shared Fiber/Lasagna whole-volume inference input reader with a
+TensorStore-backed asynchronous bounding-box reader and decouple read-ahead
+capacity from GPU/result slots.
 
-Implement a persistent spawn-process flush pool shared by Lasagna and Fiber:
+Requirements:
 
-- workers reopen the existing rolling accumulator mmap files and receive only
-  immutable chunk descriptors, never chunk arrays;
-- distinct finalized output chunks are normalized, finalized, compressed, and
-  written in parallel processes with independent GILs;
-- retain the single enlarged mmap ring, one frozen flush batch, completion-
-  gated reuse/progress, bounded one-chunk-per-worker RAM, canonical numerical
-  semantics, sparse/resume behavior, and atomic output writes;
-- expose a bounded worker count and an explicit synchronous baseline mode;
-- remove Python threading from the flush path and preserve portable spawn
-  behavior on Ubuntu/macOS and amd64/arm64.
+- both Fiber and Lasagna must use the same implementation in
+  `lasagna.tiled_predict3d`;
+- TensorStore must asynchronously read/decode upcoming tiles while GPUs infer;
+- tile coordinates remain lazily generated rather than materialized globally;
+- prefetch depth, TensorStore I/O concurrency, and cache memory are bounded and
+  configurable independently of GPU result slots;
+- preserve exact input slicing, dtype conversion, reflect-border padding,
+  canonical commit order, resume semantics, and numerical output;
+- retain a Python-Zarr fallback for diagnosis/portability;
+- measure the reader and end-to-end pipeline before/after on controlled input
+  and leave representative eight-GPU measurement hooks in normal logging.

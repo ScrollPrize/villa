@@ -204,13 +204,17 @@ runner:
 lasagna-preprocess predict3d ... --devices all
 ```
 
-Use a subset with `--devices cuda:0,cuda:2`. Input chunks are fetched by a
-bounded CPU prefetch stage outside GPU workers, and input/result transport uses
-fixed reusable shared-memory slots. The tile Cartesian product is generated
-lazily. `--slots-per-gpu` (default 2) controls the bounded pipeline window and
-memory footprint; `--prefetch-workers 0` selects the automatic bounded reader
-count. Existing `--device` selects the serial path and cannot be combined with
-`--devices`.
+Use a subset with `--devices cuda:0,cuda:2`. Input tiles default to asynchronous
+TensorStore bounding-box reads outside GPU workers. The tile Cartesian product
+is generated lazily and read-ahead is bounded independently from reusable GPU
+shared-memory slots. `--slots-per-gpu` (default 2) controls GPU input/result
+buffers; `--prefetch-tiles-per-gpu` (default 4) controls outstanding/ready input
+tiles. TensorStore defaults to a 4 GiB cache, 16 file-I/O threads, and 4
+decode/copy threads, configurable with `--input-cache-gib`,
+`--input-io-threads`, and `--input-copy-threads`. Use
+`--input-reader python-zarr` for the old backend; `--prefetch-workers` controls
+only its reader threads. Existing `--device` selects single-device inference,
+which also maintains bounded TensorStore read-ahead during GPU forwards.
 
 The same shared runner overlaps output flushing with subsequent inference using
 one enlarged circular mmap ring and persistent spawned writer processes. Each

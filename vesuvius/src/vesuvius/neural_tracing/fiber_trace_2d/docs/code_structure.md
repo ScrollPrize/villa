@@ -140,16 +140,21 @@ serialized into `.lasagna.json`. `scaledown` remains the persisted
 base-relative manifest scale.
 
 For multi-GPU execution, the runner lazily advances the same nested Z/Y/X
-lattice and never creates its Cartesian job list. A bounded CPU reader pool
-fills reusable shared-memory input slots while one persistent spawned process
-per GPU performs normalization, model inference, weighting, and filtered
-scaledown. Weighted results use separate fixed shared-memory slots; process
-queues carry descriptors only. Results may complete out of order, but the
+lattice and never creates its Cartesian job list. By default one shared
+TensorStore Zarr driver asynchronously reads bounding boxes into an independent
+bounded prefetch window. A ready tile is copied into reusable shared memory only
+when an input slot, result slot, and GPU queue are available. One persistent
+spawned process per GPU performs normalization, model inference, weighting, and
+filtered scaledown. Weighted results use separate fixed shared-memory slots;
+process queues carry descriptors only. Results may complete out of order, but the
 coordinator commits them in canonical order and flushes a Z row only after all
 of that row's inference and skip events commit. Consequently the coordinator
 remains the sole owner of the circular rings, resume checks, progress, and Zarr
-write scheduling. `--slots-per-gpu` controls the bounded look-ahead/result memory and
-`--prefetch-workers` controls CPU/Zarr readers.
+write scheduling. `--slots-per-gpu` controls GPU shared-memory depth;
+`--prefetch-tiles-per-gpu` independently controls outstanding/ready reads.
+TensorStore cache/file-I/O/copy concurrency are explicit. The `python-zarr`
+fallback uses `--prefetch-workers`. Single-device inference submits the same
+bounded canonical TensorStore future window before synchronous model forwards.
 
 Each distinct inference scale has separate raw-product float32 mmap rings and
 one shared geometric weight ring. Fiber and Lasagna use the same repeated

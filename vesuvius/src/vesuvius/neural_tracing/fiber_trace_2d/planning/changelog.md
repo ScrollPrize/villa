@@ -264,3 +264,10 @@
   eight-GPU inference phase from 178.8 s to 305.4 s.
 - Reused the pyramid pool's pre-spawn native-runtime guard so NumPy/OpenBLAS is
   single-threaded during child module import, including for GPU workers.
+# 2026-08-03: TensorStore whole-volume inference prefetch
+
+- Shared Fiber/Lasagna inference now defaults to asynchronous TensorStore Zarr
+  bbox reads with read-ahead capacity independent of GPU/result slots.
+- Added bounded cache/I/O/copy and per-GPU prefetch controls, single-device
+  read-ahead, Python-Zarr fallback, exact reader-equivalence tests, and input
+  starvation/high-water diagnostics.

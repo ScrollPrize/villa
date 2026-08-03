@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import time
 from typing import Any
@@ -12,6 +13,11 @@ import zarr
 try:
     from lasagna.tiled_predict3d import (
         DEFAULT_FLUSH_WORKERS,
+        DEFAULT_INPUT_CACHE_BYTES,
+        DEFAULT_INPUT_COPY_THREADS,
+        DEFAULT_INPUT_IO_THREADS,
+        DEFAULT_INPUT_READER,
+        DEFAULT_PREFETCH_TILES_PER_GPU,
         _auto_download,
         build_product_omezarr_pyramids,
         create_product_omezarr_groups,
@@ -26,6 +32,11 @@ try:
 except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
     from tiled_predict3d import (
         DEFAULT_FLUSH_WORKERS,
+        DEFAULT_INPUT_CACHE_BYTES,
+        DEFAULT_INPUT_COPY_THREADS,
+        DEFAULT_INPUT_IO_THREADS,
+        DEFAULT_INPUT_READER,
+        DEFAULT_PREFETCH_TILES_PER_GPU,
         _auto_download,
         build_product_omezarr_pyramids,
         create_product_omezarr_groups,
@@ -226,12 +237,21 @@ def run_fiber_trace_3d_inference(
     prefetch_workers: int = 0,
     slots_per_gpu: int = 2,
     flush_workers: int = DEFAULT_FLUSH_WORKERS,
+    input_reader: str = DEFAULT_INPUT_READER,
+    prefetch_tiles_per_gpu: int = DEFAULT_PREFETCH_TILES_PER_GPU,
+    input_cache_gib: float = DEFAULT_INPUT_CACHE_BYTES / float(1 << 30),
+    input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
+    input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
     download_workers: int = 64,
 ) -> None:
     if int(download_workers) <= 0:
         raise ValueError("download_workers must be a positive integer")
     if int(flush_workers) < 0:
         raise ValueError("flush_workers must be >= 0")
+    if not math.isfinite(float(input_cache_gib)) or float(input_cache_gib) < 0:
+        raise ValueError("input_cache_gib must be finite and >= 0")
+    if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0 or int(input_copy_threads) <= 0:
+        raise ValueError("prefetch_tiles_per_gpu and TensorStore thread counts must be > 0")
     config = _load_config(config_path)
     tile_size_i = _tile_size_from_config(config, tile_size)
     output_manifest = Path(output_path)
@@ -369,6 +389,11 @@ def run_fiber_trace_3d_inference(
         prefetch_workers=int(prefetch_workers),
         slots_per_gpu=int(slots_per_gpu),
         flush_workers=int(flush_workers),
+        input_reader=str(input_reader),
+        prefetch_tiles_per_gpu=int(prefetch_tiles_per_gpu),
+        input_cache_bytes=int(float(input_cache_gib) * (1 << 30)),
+        input_io_threads=int(input_io_threads),
+        input_copy_threads=int(input_copy_threads),
     )
     del model
     if torch_device.type == "cuda":
@@ -447,6 +472,26 @@ def main(argv: list[str] | None = None) -> int:
         help="Spawned OME-Zarr flush processes (default: min(CPU count, 64)); 0 uses the synchronous baseline.",
     )
     parser.add_argument(
+        "--input-reader", choices=("tensorstore", "python-zarr"), default=DEFAULT_INPUT_READER,
+        help="Inference tile reader backend (default: tensorstore).",
+    )
+    parser.add_argument(
+        "--prefetch-tiles-per-gpu", type=int, default=DEFAULT_PREFETCH_TILES_PER_GPU,
+        help="Bounded input read-ahead tiles per selected GPU (default: 4).",
+    )
+    parser.add_argument(
+        "--input-cache-gib", type=float, default=DEFAULT_INPUT_CACHE_BYTES / float(1 << 30),
+        help="TensorStore cache budget in GiB (default: 4).",
+    )
+    parser.add_argument(
+        "--input-io-threads", type=int, default=DEFAULT_INPUT_IO_THREADS,
+        help="TensorStore file I/O concurrency (default: 16).",
+    )
+    parser.add_argument(
+        "--input-copy-threads", type=int, default=DEFAULT_INPUT_COPY_THREADS,
+        help="TensorStore decode/data-copy concurrency (default: 4).",
+    )
+    parser.add_argument(
         "--download-workers", type=int, default=64,
         help="Parallel S3 chunk download threads used by automatic download.",
     )
@@ -486,6 +531,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--download-workers must be a positive integer")
     if int(args.flush_workers) < 0:
         parser.error("--flush-workers must be >= 0")
+    if int(args.prefetch_tiles_per_gpu) <= 0:
+        parser.error("--prefetch-tiles-per-gpu must be > 0")
+    if not math.isfinite(float(args.input_cache_gib)) or float(args.input_cache_gib) < 0:
+        parser.error("--input-cache-gib must be finite and >= 0")
+    if int(args.input_io_threads) <= 0:
+        parser.error("--input-io-threads must be > 0")
+    if int(args.input_copy_threads) <= 0:
+        parser.error("--input-copy-threads must be > 0")
 
     run_fiber_trace_3d_inference(
         config_path=args.config,
@@ -509,6 +562,11 @@ def main(argv: list[str] | None = None) -> int:
         prefetch_workers=int(args.prefetch_workers),
         slots_per_gpu=int(args.slots_per_gpu),
         flush_workers=int(args.flush_workers),
+        input_reader=str(args.input_reader),
+        prefetch_tiles_per_gpu=int(args.prefetch_tiles_per_gpu),
+        input_cache_gib=float(args.input_cache_gib),
+        input_io_threads=int(args.input_io_threads),
+        input_copy_threads=int(args.input_copy_threads),
         download_workers=int(args.download_workers),
     )
     return 0

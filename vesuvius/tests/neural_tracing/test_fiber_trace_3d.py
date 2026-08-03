@@ -382,6 +382,9 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
         "--checkpoint", "model.pt", "--devices", "all",
         "--prefetch-workers", "5", "--slots-per-gpu", "3",
 		"--flush-workers", "6",
+        "--input-reader", "python-zarr", "--prefetch-tiles-per-gpu", "7",
+        "--input-cache-gib", "2.5", "--input-io-threads", "11",
+        "--input-copy-threads", "3",
         "--download-workers", "77",
     ])
     assert result == 0
@@ -390,6 +393,11 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
     assert captured["prefetch_workers"] == 5
     assert captured["slots_per_gpu"] == 3
     assert captured["flush_workers"] == 6
+    assert captured["input_reader"] == "python-zarr"
+    assert captured["prefetch_tiles_per_gpu"] == 7
+    assert captured["input_cache_gib"] == 2.5
+    assert captured["input_io_threads"] == 11
+    assert captured["input_copy_threads"] == 3
     assert captured["download_workers"] == 77
 
 

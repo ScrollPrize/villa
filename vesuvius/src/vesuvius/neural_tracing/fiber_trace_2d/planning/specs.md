@@ -134,10 +134,19 @@
 - The canonical tile stream materializes only independent Z/Y/X axis lattices
   (O(Z+Y+X)), never their Cartesian product. Filtering, CPU/Zarr prefetch, GPU
   execution, result completion, and ordered commit use fixed bounded windows.
-- Zarr reads happen outside GPU workers. Input tiles and weighted/downscaled
-  results use coordinator-owned reusable shared memory; multiprocessing queues
-  carry descriptors only. Input/result memory is strictly slot-bounded and
-  existing input dtype conversion semantics are preserved.
+- Input reads happen outside GPU workers. The default local Zarr-v2 backend is
+  one asynchronously polled TensorStore driver/context created only after all
+  spawned GPU/flush workers start. `python-zarr` is an explicit fallback.
+  Resume/skipped work is rejected before read submission. The lazy prefetch
+  window is `prefetch_tiles_per_gpu * selected_device_count` (CPU/single-device
+  counts as one) and is independent of GPU shared-memory slots.
+- Every outstanding TensorStore read may own a full padded input tile. Input
+  memory is bounded by that window times tile bytes, plus the separately bounded
+  TensorStore cache, existing input/result shared memory, and request/cache
+  overhead. A ready tile enters shared memory only when input/result slots and a
+  GPU queue are available. Existing clipped bounds, source dtype, uint16
+  conversion timing, fully-outside uint8 behavior, and NumPy reflect-padding
+  semantics are preserved exactly.
 - Input slots cannot be reused until H2D completion, and results cannot be
   published until D2H completion. The coordinator alone unlinks shared memory;
   workers only attach and close it.

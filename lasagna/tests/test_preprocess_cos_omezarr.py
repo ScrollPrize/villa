@@ -37,6 +37,8 @@ from preprocess_cos_omezarr import (
 	PYRAMID_POLICY_NONE,
 	PYRAMID_POLICY_SCALAR,
 	_CircularZBand,
+	_TensorStoreTileReader,
+	_read_tile_zarr,
 	_plan_circular_z_depth,
 	_atomic_zarr_write,
 	_canonical_local_tile_positions,
@@ -197,6 +199,84 @@ class _RaisingProductAdapter(_IdentityProductAdapter):
 
 
 class PreprocessCosOmezarrTests(unittest.TestCase):
+	def test_tensorstore_tile_reader_matches_python_zarr_with_reflect_padding(self):
+		with tempfile.TemporaryDirectory() as td:
+			path = Path(td) / "input.zarr"
+			path.mkdir()
+			data = np.arange(8 * 8 * 8, dtype=np.dtype("<u2")).reshape(8, 8, 8)
+			(path / ".zarray").write_text(json.dumps({
+				"zarr_format": 2, "shape": [8, 8, 8], "chunks": [4, 4, 4],
+				"dtype": "<u2", "compressor": None, "fill_value": 0,
+				"order": "C", "filters": None, "dimension_separator": ".",
+			}))
+			for zc in range(2):
+				for yc in range(2):
+					for xc in range(2):
+						block = data[zc*4:(zc+1)*4, yc*4:(yc+1)*4, xc*4:(xc+1)*4]
+						(path / f"{zc}.{yc}.{xc}").write_bytes(block.tobytes(order="C"))
+			reader = _TensorStoreTileReader(
+				str(path), cache_bytes=1 << 20, file_io_threads=2, data_copy_threads=1,
+			)
+			for coord in ((0, 0, 0), (-2, -1, -3), (4, 5, 6)):
+				with self.subTest(coord=coord):
+					expected = _read_tile_zarr(data, data.shape, (0, 0, 0), *coord, 4, 1)
+					task = reader.submit(
+						volume_shape=data.shape, crop_offset=(0, 0, 0), coord=coord,
+						tile_size=4, border=1,
+					)
+					actual, _elapsed = reader.result(task)
+					np.testing.assert_array_equal(actual, expected)
+
+	def test_tensorstore_serial_prefetch_matches_python_zarr_inference(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Output:
+			def __init__(self):
+				self.chunks = {}
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.chunks[chunk_origin_zyx] = np.array(data["value"], copy=True)
+
+		with tempfile.TemporaryDirectory() as td:
+			path = Path(td) / "input.zarr"
+			path.mkdir()
+			data = (np.arange(8 * 4 * 4, dtype=np.uint16) * np.uint16(257)).reshape(8, 4, 4)
+			(path / ".zarray").write_text(json.dumps({
+				"zarr_format": 2, "shape": [8, 4, 4], "chunks": [4, 4, 4],
+				"dtype": "<u2", "compressor": None, "fill_value": 0,
+				"order": "C", "filters": None, "dimension_separator": ".",
+			}))
+			for zc in range(2):
+				(path / f"{zc}.0.0").write_bytes(data[zc*4:(zc+1)*4].tobytes(order="C"))
+			common = dict(
+				crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+				products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+				full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+				overlap=0, border=0, tmp_dir=td,
+			)
+			outputs = []
+			for backend in ("python-zarr", "tensorstore"):
+				adapter = _IdentityProductAdapter(product)
+				output = Output()
+				with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+					run_tiled_inference_3d(
+						adapter.load_model(device=torch.device("cpu")), data,
+						model_adapter=adapter, output_adapter=output,
+						input_zarr_path=str(path), input_reader=backend,
+						prefetch_tiles_per_gpu=2, input_cache_bytes=1 << 20,
+						input_io_threads=2, input_copy_threads=1, **common,
+					)
+				outputs.append(output.chunks)
+			self.assertEqual(set(outputs[0]), set(outputs[1]))
+			for origin in outputs[0]:
+				np.testing.assert_array_equal(outputs[0][origin], outputs[1][origin])
+
 	def test_shared_multi_gpu_device_resolution(self):
 		self.assertEqual(
 			resolve_inference_devices(device=None, cuda_available=False, cuda_count=0),
@@ -361,6 +441,54 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(set(serial_output.chunks), set(parallel_output.chunks))
 		for origin in serial_output.chunks:
 			np.testing.assert_array_equal(serial_output.chunks[origin], parallel_output.chunks[origin])
+
+	def test_shared_parallel_tensorstore_pipeline_matches_python_zarr_exactly(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Output:
+			def __init__(self):
+				self.chunks = {}
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.chunks[chunk_origin_zyx] = np.array(data["value"], copy=True)
+
+		volume = (np.arange(8 * 4 * 4, dtype=np.uint16) * np.uint16(257)).reshape(8, 4, 4)
+		with tempfile.TemporaryDirectory() as td:
+			path = Path(td) / "input.zarr"
+			path.mkdir()
+			(path / ".zarray").write_text(json.dumps({
+				"zarr_format": 2, "shape": [8, 4, 4], "chunks": [4, 4, 4],
+				"dtype": "<u2", "compressor": None, "fill_value": 0,
+				"order": "C", "filters": None, "dimension_separator": ".",
+			}))
+			for zc in range(2):
+				(path / f"{zc}.0.0").write_bytes(volume[zc*4:(zc+1)*4].tobytes(order="C"))
+			outputs = []
+			for backend in ("python-zarr", "tensorstore"):
+				output = Output()
+				adapter = SpawnIdentityAdapter(product)
+				with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+					run_tiled_inference_3d(
+						None, volume, crop_slices=(0, 8, 0, 4, 0, 4),
+						device=torch.device("cpu"), model_adapter=adapter, output_adapter=output,
+						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+						overlap=0, border=0, tmp_dir=td,
+						devices=(torch.device("cpu"), torch.device("cpu")), slots_per_gpu=1,
+						input_zarr_path=str(path), input_reader=backend,
+						prefetch_tiles_per_gpu=2, input_cache_bytes=1 << 20,
+						input_io_threads=2, input_copy_threads=1,
+					)
+				outputs.append(output.chunks)
+			self.assertEqual(set(outputs[0]), set(outputs[1]))
+			for origin in outputs[0]:
+				np.testing.assert_array_equal(outputs[0][origin], outputs[1][origin])
 
 	def test_shared_parallel_pipeline_detects_hard_worker_exit(self):
 		product = OutputProductSpec(
@@ -668,6 +796,11 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["prefetch_workers"], 0)
 		self.assertEqual(kwargs["slots_per_gpu"], 2)
 		self.assertEqual(kwargs["flush_workers"], DEFAULT_FLUSH_WORKERS)
+		self.assertEqual(kwargs["input_reader"], "tensorstore")
+		self.assertEqual(kwargs["prefetch_tiles_per_gpu"], 4)
+		self.assertEqual(kwargs["input_cache_gib"], 4.0)
+		self.assertEqual(kwargs["input_io_threads"], 16)
+		self.assertEqual(kwargs["input_copy_threads"], 4)
 		self.assertEqual(kwargs["download_workers"], 64)
 		self.assertEqual(kwargs["crop_xyzwhd"], (1, 2, 3, 4, 5, 6))
 		self.assertEqual(kwargs["tile_size"], 64)
@@ -694,6 +827,9 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			"--devices", "cuda:0,cuda:2", "--prefetch-workers", "6",
 			"--slots-per-gpu", "3", "--no-download",
 			"--flush-workers", "6",
+			"--input-reader", "python-zarr", "--prefetch-tiles-per-gpu", "7",
+			"--input-cache-gib", "2.5", "--input-io-threads", "11",
+			"--input-copy-threads", "3",
 			"--download-workers", "123",
 		]
 		with mock.patch("builtins.open", side_effect=PermissionError):
@@ -705,6 +841,11 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["prefetch_workers"], 6)
 		self.assertEqual(kwargs["slots_per_gpu"], 3)
 		self.assertEqual(kwargs["flush_workers"], 6)
+		self.assertEqual(kwargs["input_reader"], "python-zarr")
+		self.assertEqual(kwargs["prefetch_tiles_per_gpu"], 7)
+		self.assertEqual(kwargs["input_cache_gib"], 2.5)
+		self.assertEqual(kwargs["input_io_threads"], 11)
+		self.assertEqual(kwargs["input_copy_threads"], 3)
 		self.assertEqual(kwargs["download_workers"], 123)
 
 	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
