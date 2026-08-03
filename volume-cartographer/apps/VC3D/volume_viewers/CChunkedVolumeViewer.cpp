@@ -1469,12 +1469,14 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
             quad->ensureLoaded();
             if (const cv::Mat_<cv::Vec3f>* points = quad->rawPointsPtr();
                 points && !points->empty()) {
+                // Surface-UV (nominal) bounds of the grid: gridToSurface maps
+                // grid -> grid/scale - center.
                 const cv::Vec3f center = quad->center();
                 const cv::Vec2f gridScale = quad->scale();
-                const float minU = -center[0] * gridScale[0];
-                const float minV = -center[1] * gridScale[1];
-                const float maxU = static_cast<float>(points->cols - 1) - center[0] * gridScale[0];
-                const float maxV = static_cast<float>(points->rows - 1) - center[1] * gridScale[1];
+                const float minU = -center[0];
+                const float minV = -center[1];
+                const float maxU = static_cast<float>(points->cols - 1) / gridScale[0] - center[0];
+                const float maxV = static_cast<float>(points->rows - 1) / gridScale[1] - center[1];
                 if (maxU > minU && maxV > minV) {
                     if (!std::isfinite(_surfacePtrX) || !std::isfinite(_surfacePtrY)) {
                         _surfacePtrX = (minU + maxU) * 0.5f;
@@ -3223,12 +3225,14 @@ void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
             quad->ensureLoaded();
             if (const cv::Mat_<cv::Vec3f>* points = quad->rawPointsPtr();
                 points && !points->empty()) {
+                // Surface-UV (nominal) bounds of the grid: gridToSurface maps
+                // grid -> grid/scale - center.
                 const cv::Vec3f center = quad->center();
                 const cv::Vec2f gridScale = quad->scale();
-                minU = -center[0] * gridScale[0];
-                minV = -center[1] * gridScale[1];
-                maxU = static_cast<float>(points->cols - 1) - center[0] * gridScale[0];
-                maxV = static_cast<float>(points->rows - 1) - center[1] * gridScale[1];
+                minU = -center[0];
+                minV = -center[1];
+                maxU = static_cast<float>(points->cols - 1) / gridScale[0] - center[0];
+                maxV = static_cast<float>(points->rows - 1) / gridScale[1] - center[1];
                 haveBounds = maxU > minU && maxV > minV;
             }
         } catch (const std::exception& e) {

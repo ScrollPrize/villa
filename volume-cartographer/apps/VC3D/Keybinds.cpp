@@ -114,6 +114,14 @@ const ShortcutDef ResetView{
     "m",
     QKeySequence::Open
 };
+const ShortcutDef ZoomToFit{
+    "zoom_to_fit",
+    kSectionViewerControls,
+    "Zoom to fit segment (flattened segmentation viewer)",
+    ShortcutKind::Text,
+    "Ctrl+0",
+    QKeySequence::Open
+};
 const ShortcutDef WorldOffsetZPos{
     "world_offset_z_pos",
     kSectionViewerControls,
@@ -497,6 +505,7 @@ QString buildKeybindsHelpText()
         { kSectionViewerControls, shortcuts::ZoomIn.description, HelpKeyType::Shortcut, &shortcuts::ZoomIn, nullptr, nullptr },
         { kSectionViewerControls, shortcuts::ZoomOut.description, HelpKeyType::Shortcut, &shortcuts::ZoomOut, nullptr, nullptr },
         { kSectionViewerControls, shortcuts::ResetView.description, HelpKeyType::Shortcut, &shortcuts::ResetView, nullptr, nullptr },
+        { kSectionViewerControls, shortcuts::ZoomToFit.description, HelpKeyType::Shortcut, &shortcuts::ZoomToFit, nullptr, nullptr },
         { kSectionViewerControls, shortcuts::WorldOffsetZPos.description, HelpKeyType::Shortcut, &shortcuts::WorldOffsetZPos, nullptr, nullptr },
         { kSectionViewerControls, shortcuts::WorldOffsetZNeg.description, HelpKeyType::Shortcut, &shortcuts::WorldOffsetZNeg, nullptr, nullptr },
         { kSectionViewerControls, "Pan view", HelpKeyType::Literal, nullptr, nullptr, "Arrow Keys" },

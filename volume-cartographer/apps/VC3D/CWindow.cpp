@@ -3164,6 +3164,17 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     });
 
+    // Zoom-to-fit shortcut (Ctrl+0): fit the current segment in the flattened
+    // segmentation viewer, adjusting pan and zoom to its full extent.
+    fZoomToFitShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomToFit), this);
+    fZoomToFitShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fZoomToFitShortcut, &QShortcut::activated, [this]() {
+        VolumeViewerBase* viewer = _viewerManager ? _viewerManager->segmentationViewer() : nullptr;
+        if (viewer) {
+            viewer->resetViewForCurrentContent(true);
+        }
+    });
+
     // Z offset: Ctrl+. = +Z (further/deeper), Ctrl+, = -Z (closer)
     fWorldOffsetZPosShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZPos), this);
     fWorldOffsetZPosShortcut->setContext(Qt::ApplicationShortcut);
