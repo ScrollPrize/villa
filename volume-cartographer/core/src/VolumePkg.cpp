@@ -1328,7 +1328,7 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         }
 
         if (updateSelection && fiberInference) {
-            if (selectedFiberInferenceDataset_ != manifestLocation) {
+            if (!selectedFiberInferenceDataset_) {
                 selectedFiberInferenceDataset_ = manifestLocation;
                 changed = true;
             }
@@ -1337,7 +1337,7 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
                 changed = true;
             }
         } else if (updateSelection) {
-            if (selectedLasagnaDataset_ != manifestLocation) {
+            if (!selectedLasagnaDataset_) {
                 selectedLasagnaDataset_ = manifestLocation;
                 changed = true;
             }

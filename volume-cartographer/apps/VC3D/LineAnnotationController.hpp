@@ -457,6 +457,10 @@ private:
             const std::vector<FiberBranchRef>& branches) const;
     bool ensureDatasetForSession(LineAnnotationSession& session);
     bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session);
+    void refreshLineAnnotationDatasetMenus() const;
+    void refreshLineAnnotationDatasetMenu(LineAnnotationDialog* dialog) const;
+    void handleLasagnaDatasetSelectionChanged(const std::string& location);
+    void handleFiberInferenceDatasetSelectionChanged(const std::string& location);
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
     bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
                                                   bool fireSuccessCallback);
