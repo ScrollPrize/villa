@@ -1455,6 +1455,50 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
             }
         }
     }
+
+    // Safety net: whatever branch ran above, the (possibly preserved) pan can
+    // land entirely off the new segment's extent — e.g. the user had zoomed
+    // deep into a large segment and switched to a small one, leaving the
+    // viewport in a region the new quad doesn't cover (all black). If the
+    // viewport no longer intersects the segment's UV bounds, pan the view
+    // center to the nearest point of those bounds. Zoom and the focus POI are
+    // deliberately left untouched.
+    if (!isEditUpdate && isSegmentationQuadSurface && _view) {
+        auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+        try {
+            quad->ensureLoaded();
+            if (const cv::Mat_<cv::Vec3f>* points = quad->rawPointsPtr();
+                points && !points->empty()) {
+                const cv::Vec3f center = quad->center();
+                const cv::Vec2f gridScale = quad->scale();
+                const float minU = -center[0] * gridScale[0];
+                const float minV = -center[1] * gridScale[1];
+                const float maxU = static_cast<float>(points->cols - 1) - center[0] * gridScale[0];
+                const float maxV = static_cast<float>(points->rows - 1) - center[1] * gridScale[1];
+                if (maxU > minU && maxV > minV) {
+                    if (!std::isfinite(_surfacePtrX) || !std::isfinite(_surfacePtrY)) {
+                        _surfacePtrX = (minU + maxU) * 0.5f;
+                        _surfacePtrY = (minV + maxV) * 0.5f;
+                    } else {
+                        const QSize viewportSize = _view->viewport()->size();
+                        const float scale = std::max(_scale, kMinScale);
+                        const float halfW = 0.5f * static_cast<float>(viewportSize.width()) / scale;
+                        const float halfH = 0.5f * static_cast<float>(viewportSize.height()) / scale;
+                        const bool viewportTouchesSegment =
+                            _surfacePtrX + halfW > minU && _surfacePtrX - halfW < maxU &&
+                            _surfacePtrY + halfH > minV && _surfacePtrY - halfH < maxV;
+                        if (!viewportTouchesSegment) {
+                            _surfacePtrX = std::clamp(_surfacePtrX, minU, maxU);
+                            _surfacePtrY = std::clamp(_surfacePtrY, minV, maxV);
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            qWarning() << "Could not keep segment visible after surface change:" << e.what();
+        }
+    }
+
     updateFocusMarker();
     // A new preview generation installs a new surface pointer, which retires
     // the tiles built for the previous one.
