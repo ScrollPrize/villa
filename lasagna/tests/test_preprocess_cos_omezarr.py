@@ -199,6 +199,15 @@ class _RaisingProductAdapter(_IdentityProductAdapter):
 
 
 class PreprocessCosOmezarrTests(unittest.TestCase):
+	def test_input_tile_cpu_conversion_preserves_uint8_and_uint16_mapping(self):
+		u8 = np.array([0, 1, 127, 255], dtype=np.uint8).reshape(1, 2, 2)
+		actual_u8 = shared_predict3d._input_tile_to_device(u8, torch.device("cpu")).numpy()[0, 0]
+		np.testing.assert_array_equal(actual_u8, u8.astype(np.float32) / 255.0)
+		u16 = np.array([0, 256, 257, 65534, 65535], dtype=np.uint16).reshape(1, 1, 5)
+		actual_u16 = shared_predict3d._input_tile_to_device(u16, torch.device("cpu")).numpy()[0, 0]
+		expected_u16 = (u16 // 257).astype(np.uint8).astype(np.float32) / 255.0
+		np.testing.assert_array_equal(actual_u16, expected_u16)
+
 	def test_tensorstore_tile_reader_matches_python_zarr_with_reflect_padding(self):
 		with tempfile.TemporaryDirectory() as td:
 			path = Path(td) / "input.zarr"
@@ -489,6 +498,39 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			self.assertEqual(set(outputs[0]), set(outputs[1]))
 			for origin in outputs[0]:
 				np.testing.assert_array_equal(outputs[0][origin], outputs[1][origin])
+
+	def test_shared_parallel_pipeline_profile_reports_bounded_stage_aggregates(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Output:
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				pass
+
+		with tempfile.TemporaryDirectory() as td:
+			stream = io.StringIO()
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				with mock.patch("sys.stdout", stream):
+					run_tiled_inference_3d(
+						None, np.ones((8, 4, 4), dtype=np.uint8),
+						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+						model_adapter=SpawnIdentityAdapter(product), output_adapter=Output(),
+						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+						overlap=0, border=0, tmp_dir=td,
+						devices=(torch.device("cpu"), torch.device("cpu")),
+						slots_per_gpu=1, prefetch_workers=2, profile_pipeline=True,
+					)
+			text = stream.getvalue()
+		self.assertIn("[predict3d:profile] loader reads=2", text)
+		self.assertIn("effective_request_concurrency=", text)
+		self.assertIn("cpu_convert_wall_s=", text)
+		self.assertIn("result_receive_lag_sum=", text)
 
 	def test_shared_parallel_pipeline_detects_hard_worker_exit(self):
 		product = OutputProductSpec(
@@ -830,6 +872,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			"--input-reader", "python-zarr", "--prefetch-tiles-per-gpu", "7",
 			"--input-cache-gib", "2.5", "--input-io-threads", "11",
 			"--input-copy-threads", "3",
+			"--profile-pipeline",
 			"--download-workers", "123",
 		]
 		with mock.patch("builtins.open", side_effect=PermissionError):
@@ -846,6 +889,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["input_cache_gib"], 2.5)
 		self.assertEqual(kwargs["input_io_threads"], 11)
 		self.assertEqual(kwargs["input_copy_threads"], 3)
+		self.assertTrue(kwargs["profile_pipeline"])
 		self.assertEqual(kwargs["download_workers"], 123)
 
 	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):

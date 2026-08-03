@@ -127,6 +127,76 @@ def _resolve_inference_device(device: str | None) -> torch.device:
     return torch.device(requested)
 
 
+def _checkpoint_mixed_precision_policy(checkpoint: str | Path | None) -> Any:
+    if checkpoint is None:
+        return None
+    payload = torch.load(str(checkpoint), map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        return None
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        return None
+    training = config.get("training")
+    if not isinstance(training, dict):
+        return None
+    return training.get("mixed_precision")
+
+
+def _resolve_inference_precision(
+    requested: str,
+    *,
+    checkpoint: str | Path | None,
+    devices: tuple[torch.device, ...],
+) -> tuple[str, str]:
+    from vesuvius.neural_tracing.fiber_trace_3d.train import (
+        _mixed_precision_config_from_training,
+        _normalize_mixed_precision_mode,
+    )
+
+    request = str(requested).strip().lower()
+    derived = request == "auto"
+    source = "cli"
+    if derived:
+        raw = _checkpoint_mixed_precision_policy(checkpoint)
+        source = "checkpoint"
+        if raw is None:
+            return "off", "checkpoint-missing"
+        try:
+            mode = _normalize_mixed_precision_mode(raw)
+        except ValueError as exc:
+            print(f"[fiber_trace_3d:infer] WARNING: invalid checkpoint mixed precision ({exc}); using fp32", flush=True)
+            return "off", "checkpoint-invalid"
+        if mode == "auto":
+            print(
+                "[fiber_trace_3d:infer] WARNING: checkpoint mixed_precision='auto' does not record "
+                "the historically resolved dtype; using fp32",
+                flush=True,
+            )
+            return "off", "checkpoint-ambiguous"
+    else:
+        mode = _normalize_mixed_precision_mode(request)
+
+    if mode == "auto":
+        mode = "off"
+    try:
+        for selected in devices:
+            if selected.type == "cuda":
+                with torch.cuda.device(selected):
+                    _mixed_precision_config_from_training({"mixed_precision": mode}, selected)
+            else:
+                _mixed_precision_config_from_training({"mixed_precision": mode}, selected)
+    except ValueError as exc:
+        if not derived:
+            raise
+        print(
+            f"[fiber_trace_3d:infer] WARNING: checkpoint precision {mode!r} is unsupported "
+            f"on selected devices ({exc}); using fp32",
+            flush=True,
+        )
+        return "off", "checkpoint-unsupported"
+    return mode, source
+
+
 def _select_and_expand_crop(
     *,
     input_shape_zyx: tuple[int, int, int],
@@ -243,6 +313,8 @@ def run_fiber_trace_3d_inference(
     input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
     input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
     download_workers: int = 64,
+    profile_pipeline: bool = False,
+    inference_precision: str = "auto",
 ) -> None:
     if int(download_workers) <= 0:
         raise ValueError("download_workers must be a positive integer")
@@ -299,6 +371,19 @@ def run_fiber_trace_3d_inference(
 
     resolved_devices = resolve_inference_devices(device=device, devices=devices)
     torch_device = resolved_devices[0]
+
+    precision_mode, precision_source = _resolve_inference_precision(
+        inference_precision, checkpoint=checkpoint, devices=resolved_devices,
+    )
+    config = dict(config)
+    effective_training = dict(config.get("training", {}))
+    effective_training["mixed_precision"] = precision_mode
+    config["training"] = effective_training
+    print(
+        f"[fiber_trace_3d:infer] inference_precision="
+        f"{'fp32' if precision_mode == 'off' else precision_mode} source={precision_source}",
+        flush=True,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     removed = _cleanup_predict3d_temp_files(output_dir, f"{json_stem}_")
@@ -394,6 +479,7 @@ def run_fiber_trace_3d_inference(
         input_cache_bytes=int(float(input_cache_gib) * (1 << 30)),
         input_io_threads=int(input_io_threads),
         input_copy_threads=int(input_copy_threads),
+        profile_pipeline=bool(profile_pipeline),
     )
     del model
     if torch_device.type == "cuda":
@@ -492,6 +578,14 @@ def main(argv: list[str] | None = None) -> int:
         help="TensorStore decode/data-copy concurrency (default: 4).",
     )
     parser.add_argument(
+        "--profile-pipeline", action="store_true",
+        help="Print detailed loader, CPU preparation, CUDA, transfer, and coordinator stage timings.",
+    )
+    parser.add_argument(
+        "--inference-precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto",
+        help="Model autocast precision; auto uses checkpoint training metadata (default: auto).",
+    )
+    parser.add_argument(
         "--download-workers", type=int, default=64,
         help="Parallel S3 chunk download threads used by automatic download.",
     )
@@ -567,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
         input_cache_gib=float(args.input_cache_gib),
         input_io_threads=int(args.input_io_threads),
         input_copy_threads=int(args.input_copy_threads),
+        profile_pipeline=bool(args.profile_pipeline),
+        inference_precision=str(args.inference_precision),
         download_workers=int(args.download_workers),
     )
     return 0

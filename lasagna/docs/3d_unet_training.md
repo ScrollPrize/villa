@@ -729,6 +729,15 @@ memory bound is the read-ahead window times one padded tile, plus TensorStore's
 cache and the shared-memory slots. `--input-reader python-zarr` retains the old
 threaded reader for comparison.
 
+`--profile-pipeline` enables fixed-memory multi-device diagnostics. Historical
+`gpuN_sum` spans CPU dtype conversion through output D2H; the detailed report
+separates those stages and directly reports reader service-time sum, read-active
+wall span, throughput, effective outstanding-request concurrency,
+completion-to-collection lag, and GPU input
+idle time. Per-worker sums are concurrent service totals, not wall time.
+CUDA workers transfer compact integer input and report compact-H2D separately
+from FP32 CUDA conversion; CPU execution preserves the historical conversion.
+
 Output flushing also overlaps inference. One enlarged but still fixed-depth
 mmap ring retains at most one finalized interval while the following Z row is
 accumulated into disjoint slots. Persistent spawn-process workers reopen that

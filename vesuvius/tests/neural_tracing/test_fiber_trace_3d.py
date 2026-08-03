@@ -39,6 +39,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import (
 )
 from vesuvius.neural_tracing.fiber_trace_3d.infer import (
     _input_scaledown_from_base,
+    _resolve_inference_precision,
     _resolve_inference_device,
     _select_and_expand_crop,
     run_fiber_trace_3d_inference,
@@ -370,6 +371,31 @@ def test_inference_device_defaults_to_available_cuda(monkeypatch: pytest.MonkeyP
     assert _resolve_inference_device("cpu") == torch.device("cpu")
 
 
+def test_inference_precision_auto_uses_checkpoint_policy(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "snapshot.pt"
+    torch.save({"config": {"training": {"mixed_precision": "bf16"}}}, checkpoint)
+    assert _resolve_inference_precision(
+        "auto", checkpoint=checkpoint, devices=(torch.device("cpu"),)
+    ) == ("bf16", "checkpoint")
+
+
+def test_inference_precision_auto_legacy_and_unsupported_fall_back(tmp_path: Path) -> None:
+    ambiguous = tmp_path / "ambiguous.pt"
+    torch.save({"config": {"training": {"mixed_precision": "auto"}}}, ambiguous)
+    assert _resolve_inference_precision(
+        "auto", checkpoint=ambiguous, devices=(torch.device("cpu"),)
+    ) == ("off", "checkpoint-ambiguous")
+    fp16 = tmp_path / "fp16.pt"
+    torch.save({"config": {"training": {"mixed_precision": "fp16"}}}, fp16)
+    assert _resolve_inference_precision(
+        "auto", checkpoint=fp16, devices=(torch.device("cpu"),)
+    ) == ("off", "checkpoint-unsupported")
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        _resolve_inference_precision(
+            "fp16", checkpoint=None, devices=(torch.device("cpu"),)
+        )
+
+
 def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
@@ -385,6 +411,8 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
         "--input-reader", "python-zarr", "--prefetch-tiles-per-gpu", "7",
         "--input-cache-gib", "2.5", "--input-io-threads", "11",
         "--input-copy-threads", "3",
+        "--profile-pipeline",
+        "--inference-precision", "bf16",
         "--download-workers", "77",
     ])
     assert result == 0
@@ -398,6 +426,8 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
     assert captured["input_cache_gib"] == 2.5
     assert captured["input_io_threads"] == 11
     assert captured["input_copy_threads"] == 3
+    assert captured["profile_pipeline"] is True
+    assert captured["inference_precision"] == "bf16"
     assert captured["download_workers"] == 77
 
 

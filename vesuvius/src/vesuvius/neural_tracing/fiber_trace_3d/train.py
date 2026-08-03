@@ -513,11 +513,7 @@ def _wrap_distributed_model(
     return DistributedDataParallel(model)
 
 
-def _mixed_precision_config_from_training(
-    training: dict[str, Any],
-    device: torch.device,
-) -> _MixedPrecisionConfig:
-    raw = training.get("mixed_precision", "off")
+def _normalize_mixed_precision_mode(raw: Any) -> str:
     if isinstance(raw, bool):
         mode = "bf16" if raw else "off"
     else:
@@ -545,6 +541,14 @@ def _mixed_precision_config_from_training(
             "training.mixed_precision must be one of off, bf16, fp16, auto; "
             f"got {raw!r}"
         )
+    return mode
+
+
+def _mixed_precision_config_from_training(
+    training: dict[str, Any],
+    device: torch.device,
+) -> _MixedPrecisionConfig:
+    mode = _normalize_mixed_precision_mode(training.get("mixed_precision", "off"))
     device_type = str(device.type)
     if mode == "auto":
         if device_type == "cuda":

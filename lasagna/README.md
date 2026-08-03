@@ -216,6 +216,20 @@ decode/copy threads, configurable with `--input-cache-gib`,
 only its reader threads. Existing `--device` selects single-device inference,
 which also maintains bounded TensorStore read-ahead during GPU forwards.
 
+Add `--profile-pipeline` to a multi-device run for bounded loader/worker
+diagnostics. It reports backend read service, active wall span, throughput and
+effective outstanding-request concurrency, completion polling and ready-queue delay, shared-memory copy, CPU
+conversion, compact integer H2D, CUDA conversion, adapter preprocessing, model inference, output/D2H, result
+receipt, and commit time. Stage sums overlap across tiles/workers and are not
+elapsed wall time. CUDA events add diagnostic overhead, so disable the flag for
+final throughput measurements.
+
+CUDA inference transfers source `uint8`/`uint16` tiles without CPU float
+expansion and performs the historical normalization on-device in FP32. The CPU
+fallback retains the NumPy conversion path. Model-specific AMP remains owned by
+the model adapter; shared weighting, pyramid filtering, D2H results, and
+accumulation remain FP32.
+
 The same shared runner overlaps output flushing with subsequent inference using
 one enlarged circular mmap ring and persistent spawned writer processes. Each
 worker reopens the frozen mmap read-only and handles one output chunk, so no

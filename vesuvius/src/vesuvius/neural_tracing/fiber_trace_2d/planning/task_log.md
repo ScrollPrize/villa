@@ -1,70 +1,60 @@
-# Task log: TensorStore whole-volume inference prefetch
+# Task log: CUDA conversion and checkpoint AMP inference
 
-## Findings
+## Initial findings
 
-- Shared whole-volume inference currently opens input with Python `zarr.open`
-  and reads each tile with one `np.asarray(array[z0:z1,y0:y1,x0:x1])` call.
-- Multi-GPU mode uses at most `devices * slots_per_gpu` total events. With eight
-  GPUs and two slots this means active GPU/result work and read-ahead share only
-  sixteen events; there is usually about one extra tile per busy GPU.
-- The existing `lasagna.tensorstore_omezarr` module provides proven local Zarr
-  driver/context construction with explicit cache, file-I/O, and data-copy
-  concurrency controls. TensorStore `.read()` returns pollable asynchronous
-  futures and preserves source dtype.
-- Prefetch-array memory is dtype dependent: one 256-cubed uint8 tile is 16 MiB,
-  uint16 is 32 MiB, and an eight-byte dtype is 128 MiB. With four tiles per
-  eight GPUs the completed/outstanding-array bound is therefore 0.5, 1, or
-  4 GiB respectively, separate from shared slots and TensorStore cache.
+- The measured checkpoint contains `config.training.mixed_precision = "bf16"`;
+  it does not request fp16.
+- The current spawned worker expands every uint8 tile to float32 on one CPU
+  core, then transfers four times as many bytes. Profiling measured about
+  358 ms CPU conversion and 62 ms float32 H2D per 512-cubed tile.
+- Existing `gpuN_sum` and the new profiler cover this path; the profiler must be
+  updated to distinguish compact H2D from CUDA conversion.
+- Fiber's inference adapter already calls training's mixed-precision resolver
+  and autocast context, but uses the inference JSON config. The implementation
+  will resolve checkpoint/CLI precision into that adapter config rather than
+  nesting another autocast scope in the shared runner.
 
-## Review, implementation, and validation
+## Plan review
 
-Independent review required and incorporated: context construction must follow
-all child starts; single-device inference also needs bounded read-ahead; every
-outstanding read counts as a full-tile memory allocation; backend failures are
-explicit rather than silent fallback; slicing oddities, local Zarr-v2
-eligibility, cancellation/drain, diagnostic wall metrics, spawn portability,
-and real controlled before/after measurements must be covered.
+Independent review required compact H2D in serial and spawned paths, FP32
+normalization/preprocessing/output arithmetic, explicit uint16 CUDA floor
+semantics, all-device precision validation, safe checkpoint-auto fallback,
+explicit-override errors, boundary tests, and accurate profiling. The plan was
+updated accordingly. Checkpoint metadata describes training policy rather than
+the state-dict dtype; a saved `auto` value is historically ambiguous.
 
 ## Implementation
 
-- Added exact shared clipped-bbox/read-finalization helpers and a lazy
-  `_TensorStoreTileReader` using the existing `TensorStoreConfig`, context, and
-  local Zarr-v2 opener. TensorStore import/open failures are explicit.
-- Fiber and Lasagna front ends default to TensorStore with four prefetch tiles
-  per selected GPU, 4 GiB cache, 16 file-I/O threads, and four copy/decode
-  threads. Python Zarr remains explicit fallback.
-- Multi-GPU read events are bounded independently of the two GPU/result slots
-  per GPU. Reads do not reserve shared slots; ready arrays enter shared memory
-  only when both slot types and a GPU queue are available. Single-device mode
-  maintains the same bounded future window while model forwards run.
-- Added backend/read byte and latency totals, live/ready high-water marks, copy
-  time, and input-starvation time. Removed the coordinator's GPU-result
-  get-and-requeue operation so it handles the descriptor directly.
-- Queue feeder threads are now closed and joined on normal completion and
-  startup failures, preventing the shared inference queues from being reported
-  as leaked multiprocessing semaphores at interpreter shutdown.
-- Added a reusable reader benchmark script with warmups and mean/p50/p95/min/max
-  output.
+- Shared serial CUDA and persistent multi-GPU workers now transfer source
+  uint8/uint16 tensors before FP32 expansion. UInt16 uses CUDA int32 floor
+  division by 257, matching the old mapping; CPU fallback is unchanged.
+- Profiling separates `compact_h2d_*` and `cuda_convert_*` from adapter/model
+  stages. Input slots are released after the synchronous pageable compact H2D,
+  before CUDA conversion and model work.
+- Fiber `--inference-precision` defaults to `auto`, reads checkpoint
+  `config.training.mixed_precision`, validates every selected device using the
+  training resolver, and injects the resolved policy into the adapter config.
+  The measured checkpoint resolves to BF16. Missing/off metadata uses FP32;
+  invalid, ambiguous saved `auto`, or unsupported derived modes warn and use
+  FP32; unsupported explicit modes fail.
+- Training mixed-precision alias parsing was factored into
+  `_normalize_mixed_precision_mode`, retaining existing behavior and allowing
+  inference resolution to share it. Existing Fiber adapter autocast remains
+  model-only and returns FP32 before shared output arithmetic.
 
 ## Validation and limitations
 
-- Compilation passed for the shared runner, both front ends, benchmark helper,
-  and touched tests. `git diff --check` passes.
-- Five focused tests passed in 5.39 s: TensorStore/Python-Zarr bbox equivalence
-  with reflect padding, serial output equivalence, spawned multi-device output
-  equivalence, the existing serial/multi-device exactness test, and Lasagna CLI
-  forwarding. TensorStore exercised little-endian uint16 and real Zarr-v2 raw
-  chunks.
-- Fiber CLI help exposes every new option; its pytest forwarding test compiles,
-  but pytest is absent from the active venv.
-- The benchmark command against the representative 2.2 TiB local level was
-  attempted with 16 tiles, one warmup, and three iterations. In this sandbox,
-  Python Zarr `zarr.open` stalled before printing metadata (even tiny newly
-  created Zarr arrays exhibit this sandbox-only stall), so no honest controlled
-  before/after timing could be collected here. The benchmark script and normal
-  input metrics are ready for the user's unsandboxed run. This is an explicit
-  deviation from the requested performance protocol.
-- Fully-outside reads preserve historical uint8-zero behavior by construction.
-  Size-one reflect-axis error behavior follows the shared NumPy finalizer but
-  does not yet have a dedicated test. Import/open/read-error and interrupt
-  cancellation paths are implemented but not exhaustively fault-injected.
+- Compilation and `git diff --check` pass.
+- Four focused shared-runner tests passed in 6.84 seconds: uint8/uint16 CPU
+  boundary mapping, serial/parallel exactness, TensorStore/Python-Zarr
+  exactness, and profiling schema.
+- Direct precision-resolution smoke checks passed for checkpoint BF16 and CLI
+  FP32. Fiber pytest coverage was added for checkpoint BF16, ambiguous `auto`,
+  unsupported derived FP16, explicit unsupported FP16, and CLI forwarding, but
+  pytest is not installed in the active venv.
+- CUDA is hidden in the sandbox (`torch.cuda.is_available() == False`), so the
+  CUDA uint16 boundary test and real BF16 inference/performance measurement
+  must be exercised by the user's next GPU run. No speedup is claimed yet.
+- AMP inference is intentionally not bitwise equivalent to FP32. Normalization,
+  adapter preprocessing, output conversion, weighting, filtering, D2H, and
+  accumulation remain FP32; only the Fiber model forward uses checkpoint AMP.

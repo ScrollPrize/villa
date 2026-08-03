@@ -156,6 +156,30 @@ TensorStore cache/file-I/O/copy concurrency are explicit. The `python-zarr`
 fallback uses `--prefetch-workers`. Single-device inference submits the same
 bounded canonical TensorStore future window before synchronous model forwards.
 
+The shared multi-device runner's opt-in `--profile-pipeline` diagnostics use
+streaming aggregates and callbacks bounded by that prefetch window. They report
+read service/active span/throughput/effective outstanding-request concurrency,
+completion and ready delays,
+shared-memory copy, worker CPU conversion, H2D, mixed adapter preprocessing,
+model inference, output/D2H, result receipt, and commit. CUDA events are
+recorded on the inference stream and read after the existing terminal sync.
+With profiling disabled, no callbacks or CUDA events are created and workers
+retain the legacy result message.
+
+CUDA workers copy the source uint8/uint16 tile before expanding it. UInt16 uses
+the historical floor division by 257, then normalization is performed in CUDA
+FP32 before adapter preprocessing. Fiber model autocast remains scoped inside
+`FiberTrace3DPredictAdapter.run_tile_inference`; its output is restored to FP32
+before shared product transformation, weighting, scaledown, and D2H.
+
+Fiber CLI `--inference-precision auto` reads the checkpoint's saved
+`config.training.mixed_precision` policy. Literal `bf16`/`fp16` policies are
+validated on every selected device; missing/off metadata uses FP32, while
+invalid, unsupported, or historically ambiguous saved `auto` policy warns and
+falls back to FP32. Explicit `fp32`, `bf16`, or `fp16` overrides take priority
+and unsupported explicit modes fail. This metadata records training policy,
+not the dtype of checkpoint parameter tensors.
+
 Each distinct inference scale has separate raw-product float32 mmap rings and
 one shared geometric weight ring. Fiber and Lasagna use the same repeated
 separable `[1,4,6,4,1]/16` blur plus 2x decimation for both weighted

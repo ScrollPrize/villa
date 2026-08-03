@@ -1,88 +1,52 @@
-# Plan: TensorStore whole-volume inference prefetch
+# Plan: CUDA conversion and checkpoint AMP inference
 
 ## Implementation
 
-1. Add a shared input-reader abstraction to `lasagna.tiled_predict3d` with
-   `tensorstore` and `python-zarr` backends. Open one TensorStore Zarr driver
-   and one bounded context per inference run after child-process startup. Keep
-   ordinary Python Zarr open for metadata, shape, support/resume checks, and as
-   an explicit fallback.
-   TensorStore import/open failures are explicit errors when that backend is
-   selected; never silently change backends. Construct its context only after
-   all GPU and flush children start because TensorStore starts native threads.
-2. Split tile reading into exact clipped source bounds plus a shared finalizer
-   that preserves current NumPy dtype and reflect-padding semantics. TensorStore
-   submits `.read()` futures for clipped bounding boxes; the coordinator polls
-   them without blocking and materializes only within a bounded prefetch window.
-   Python-Zarr fallback uses the existing reader executor through the same
-   event state machine. One-device inference also keeps a bounded canonical
-   future window so TensorStore reads progress during synchronous GPU forwards.
-3. Decouple prefetch events from reusable GPU input/result shared-memory slots.
-   Lazily generate at most `prefetch_tiles_per_gpu * device_count` canonical
-   events, default four per GPU. Completed TensorStore arrays wait in that
-   bounded window. Copy a ready tile into shared memory only when an input slot,
-   result slot, and GPU queue are available; release its temporary array
-   immediately after the copy. Preserve two GPU/result slots per GPU by default.
-   CPU/single-device mode counts as one device. Reject resume/skipped work before
-   submission and never mutate coordinator state from TensorStore callbacks.
-4. Expose shared/front-end controls:
-   `--input-reader {tensorstore,python-zarr}` (TensorStore default),
-   `--prefetch-tiles-per-gpu` (default 4),
-   `--input-cache-gib` (finite, nonnegative; default 4),
-   `--input-io-threads` (positive; default 16), and
-   `--input-copy-threads` (positive; default 4). Keep `--prefetch-workers` for the
-   Python-Zarr fallback and reject non-positive/negative values consistently.
-   Serial inference uses the same selected reader synchronously without a deep
-   queue.
-5. Preserve bounded memory. Conservative peak is prefetch-window times padded
-   input-tile bytes (every outstanding read may own a full result), plus the
-   TensorStore cache, existing input/result shared memory, and request/cache
-   overhead. Cancel all futures on failure/interrupt and wait/drain them before
-   releasing referenced state. TensorStore is eligible only for local Zarr-v2
-   filesystem array paths; unsupported/custom arrays fail clearly unless the
-   caller explicitly selects Python Zarr. Do not create the full Cartesian list.
-6. Extend normal statistics with input backend, submitted/completed reads,
-   maximum live/ready reads, materialization/copy time, aggregate read latency,
-   bytes/throughput, ready-queue high-water, GPU starvation/wait-for-input,
-   submission-to-ready latency, and configured cache/I/O/copy concurrency.
-   Keep existing GPU and commit metrics.
+1. Change both shared spawned and serial CUDA paths to construct a tensor view over the
+   compact shared uint8/uint16 tile, transfer that dtype to its CUDA device, and
+   normalize on CUDA to float32 with exactly the existing `/255` semantics
+   (`uint16 -> int32`, floor divide by 257, then float32 normalization). Keep
+   the CPU-device fallback's current NumPy semantics exact.
+2. Keep AMP owned by the Fiber adapter, which already reuses training's
+   `_mixed_precision_config_from_training` and `_autocast_context`; do not add a
+   nested shared autocast scope. Normalization and adapter preprocessing remain
+   CUDA FP32, autocast covers model forward only, and adapter output is restored
+   to FP32 before product transformation, weighting, downsampling, and D2H.
+3. In Fiber inference, add `--inference-precision {auto,fp32,fp16,bf16}`.
+   `auto` reads `checkpoint.config.training.mixed_precision`, normalizes known
+   aliases, and falls back to fp32 when absent/disabled. Validate CUDA/device
+   support through the existing training helper, inject the resolved setting
+   into the adapter's effective config, and print its source and mode. Auto mode
+   treats missing/off/invalid/legacy `auto` metadata as FP32 (warning for
+   invalid/ambiguous values); unsupported checkpoint-derived AMP warns and
+   falls back to FP32, while unsupported explicit overrides fail. Validate all
+   selected devices, not only the first.
+4. Update profiling stage names so compact H2D and CUDA conversion are measured
+   separately; preserve the disabled profiling path.
 
-## Tests and measurement
+## Tests
 
-- Compare TensorStore and Python-Zarr tiles byte-for-byte for interior,
-  partial-border, fully outside, endian uint16, and size-one border axes while
-  preserving existing NumPy reflect behavior (including errors).
-- Compare complete serial and multi-device inference outputs exactly across
-  both reader backends, including skipped/resumed tiles and canonical
-  out-of-order completion.
-- Prove lazy bounded read-ahead: a controlled reader may never exceed the
-  configured event window, reads advance while GPU workers are busy, and GPU
-  slots do not cap the prefetch window.
-- Test TensorStore import/open/read errors, future errors, interrupts, explicit
-  fallback, local-Zarr eligibility, validation, cleanup, child-before-context
-  startup order, and both CLI forwarding paths.
-- Run compilation, focused shared/front-end tests, diff checks, and repeated
-  Python-Zarr versus TensorStore benchmarks on the same local Zarr. Report
-  command, shape/chunks/dtype/crop/tile/overlap, warmups, iterations, and
-  mean/p50/p95 or min/median/max for raw reader throughput and controlled
-  end-to-end inference. Sweep prefetch depth, I/O concurrency, and cache before
-  leaving the user's representative eight-GPU run as authoritative validation.
+- Exact uint8 and uint16 conversion equivalence, including uint16 boundaries
+  0/256/257/65534/65535, on CPU and CUDA when available.
+- Fiber checkpoint precision resolution for bf16/fp16/disabled/missing/invalid.
+- Fiber CLI forwarding and shared CUDA conversion coverage through both
+  frontends' existing shared-runner tests. Verify preprocessing and product
+  arithmetic remain FP32 under AMP.
+- Existing exact serial/multi-device regression suite, compilation, and diff
+  hygiene. Record that AMP output equality is not expected to be bitwise FP32.
 
 ## Spec update
 
-Replace CPU/Zarr-reader language with the shared asynchronous TensorStore
-bbox-reader contract, independent bounded prefetch and GPU-slot windows,
-fallback behavior, exact padding/dtype guarantees, cache/concurrency controls,
-and failure cleanup.
+Specify compact integer H2D, on-device normalization, checkpoint-derived Fiber
+AMP defaults, explicit overrides, existing adapter AMP ownership, FP32
+accumulation, and fallback/error rules.
 
-## Docs updates
+## Documentation update
 
-Update `fiber_trace_2d/docs/code_structure.md`, `lasagna/README.md`, and
-`lasagna/docs/3d_unet_training.md` with the new pipeline, memory accounting,
-CLI controls, metrics, and backend fallback.
+Document precision resolution, the inspected checkpoint's BF16 result, compact
+transfer, profiling interpretation, and numerical implications.
 
-## Changelog and task log
+## Changelog and workflow records
 
-Record the TensorStore reader integration, measured controlled results,
-validation commands, deviations/limitations, and the need for a representative
-eight-GPU rerun.
+Update changelog, status, and task log with review, tests, measurements, and
+limitations. Do not claim performance improvement without a comparable run.

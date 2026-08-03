@@ -150,6 +150,17 @@
 - Input slots cannot be reused until H2D completion, and results cannot be
   published until D2H completion. The coordinator alone unlinks shared memory;
   workers only attach and close it.
+- CUDA input transfer preserves compact uint8/uint16 source dtype. UInt16 is
+  converted through int32 floor division by 257; normalization and adapter
+  preprocessing are CUDA FP32. CPU fallback preserves historical NumPy
+  conversion. Fiber model autocast follows checkpoint training-policy metadata
+  by default, with explicit precision override and all-device validation;
+  shared product arithmetic, filtering, D2H, and accumulation remain FP32.
+- Opt-in multi-device pipeline profiling uses bounded streaming aggregates,
+  preserves the disabled worker/message path, distinguishes summed concurrent
+  service from wall span, and directly reports reader throughput and effective
+  outstanding-request concurrency, queue delays, CPU conversion,
+  CUDA/transfer/model/output, and commit stages.
 - GPU results may finish out of order, but accumulation remains in canonical
   tile order. A Z row flushes only after all preceding canonical events,
   including skips, commit. The coordinator solely owns circular accumulators,

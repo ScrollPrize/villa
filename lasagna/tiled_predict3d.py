@@ -113,6 +113,7 @@ class _TensorStoreReadTask:
 	future: Any | None
 	spec: _TileReadSpec
 	submitted_at: float
+	completed_at: float | None = None
 
 
 def resolve_inference_devices(
@@ -1696,6 +1697,22 @@ def _read_tile_zarr(
 	return _finalize_tile_read(raw, spec)
 
 
+def _input_tile_to_device(tile_np: np.ndarray, device: torch.device) -> torch.Tensor:
+	"""Transfer compact integer input and reproduce historical FP32 normalization."""
+	if tile_np.dtype not in (np.dtype(np.uint8), np.dtype(np.uint16)):
+		raise TypeError(f"predict3d input must be uint8 or uint16, got {tile_np.dtype}")
+	if device.type != "cuda":
+		if tile_np.dtype == np.uint16:
+			prepared = (tile_np // 257).astype(np.uint8).astype(np.float32) / 255.0
+		else:
+			prepared = tile_np.astype(np.float32) / 255.0
+		return torch.from_numpy(prepared).unsqueeze(0).unsqueeze(0).to(device)
+	compact = torch.from_numpy(tile_np).unsqueeze(0).unsqueeze(0).to(device)
+	if compact.dtype == torch.uint16:
+		return torch.div(compact.to(torch.int32), 257, rounding_mode="floor").to(torch.float32).div_(255.0)
+	return compact.to(torch.float32).div_(255.0)
+
+
 class _TensorStoreTileReader:
 	"""Bounded asynchronous local Zarr-v2 bounding-box reader."""
 
@@ -1722,11 +1739,17 @@ class _TensorStoreTileReader:
 
 	def submit(
 		self, *, volume_shape: tuple[int, int, int], crop_offset: tuple[int, int, int],
-		coord: TileOriginZYX, tile_size: int, border: int,
+		coord: TileOriginZYX, tile_size: int, border: int, profile: bool = False,
 	) -> _TensorStoreReadTask:
 		spec = _tile_read_spec(volume_shape, crop_offset, *coord, tile_size, border)
 		future = None if spec.slices_zyx is None else self.store[spec.slices_zyx].read()
-		return _TensorStoreReadTask(future=future, spec=spec, submitted_at=time.perf_counter())
+		task = _TensorStoreReadTask(future=future, spec=spec, submitted_at=time.perf_counter())
+		if profile:
+			if future is None:
+				task.completed_at = task.submitted_at
+			else:
+				future.add_done_callback(lambda _future: setattr(task, "completed_at", time.perf_counter()))
+		return task
 
 	@staticmethod
 	def done(task: _TensorStoreReadTask) -> bool:
@@ -1935,6 +1958,7 @@ def _multi_gpu_worker_main(
 	result_specs: tuple[_SharedSlotSpec, ...],
 	work_queue,
 	result_queue,
+	profile_pipeline: bool = False,
 ) -> None:
 	"""Persistent spawned GPU worker; queues carry descriptors only."""
 	_native_limits = _limit_native_worker_threads()
@@ -1964,20 +1988,64 @@ def _multi_gpu_worker_main(
 			seq, coord, input_slot, result_slot, needed_names = task
 			started = time.perf_counter()
 			try:
+				profile = {} if profile_pipeline else None
 				input_layout = input_specs[input_slot].layouts[0]
 				tile_np = _slot_array(inputs[input_slot], input_layout)
-				if tile_np.dtype == np.uint16:
-					prepared = (tile_np // 257).astype(np.uint8).astype(np.float32) / 255.0
+				cuda_events = {}
+				if profile is not None and device.type == "cuda":
+					for name in ("h2d", "cuda_convert", "adapter_preprocess", "model_inference", "output"):
+						cuda_events[name] = (
+							torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True),
+						)
+				if device.type == "cuda":
+					source = torch.from_numpy(tile_np).unsqueeze(0).unsqueeze(0)
+					if cuda_events:
+						cuda_events["h2d"][0].record()
+					stage_started = time.perf_counter()
+					compact = source.to(device)
+					if profile is not None:
+						profile["compact_h2d_wall_s"] = time.perf_counter() - stage_started
+						cuda_events["h2d"][1].record()
+					# Pageable shared-memory H2D is synchronous, so this slot is now reusable.
+					result_queue.put(("input_released", seq, input_slot, worker_index))
+					if cuda_events:
+						cuda_events["cuda_convert"][0].record()
+					stage_started = time.perf_counter()
+					if compact.dtype == torch.uint16:
+						tile = torch.div(compact.to(torch.int32), 257, rounding_mode="floor").to(torch.float32).div_(255.0)
+					elif compact.dtype == torch.uint8:
+						tile = compact.to(torch.float32).div_(255.0)
+					else:
+						raise TypeError(f"predict3d input must be uint8 or uint16, got {tile_np.dtype}")
+					if profile is not None:
+						profile["cuda_convert_submit_wall_s"] = time.perf_counter() - stage_started
+						cuda_events["cuda_convert"][1].record()
 				else:
-					prepared = tile_np.astype(np.float32) / 255.0
-				tile = torch.from_numpy(prepared).unsqueeze(0).unsqueeze(0).to(device)
-				# The synchronous copy above makes the input slot reusable before model work.
-				result_queue.put(("input_released", seq, input_slot, worker_index))
+					stage_started = time.perf_counter()
+					tile = _input_tile_to_device(tile_np, device)
+					if profile is not None:
+						profile["cpu_convert_wall_s"] = time.perf_counter() - stage_started
+					result_queue.put(("input_released", seq, input_slot, worker_index))
 				preprocess = getattr(model_adapter, "preprocess_tile", None)
+				if cuda_events:
+					cuda_events["adapter_preprocess"][0].record()
+				stage_started = time.perf_counter()
 				if preprocess is not None:
 					tile = preprocess(tile, torch.ones_like(tile, dtype=torch.bool))
+				if profile is not None:
+					profile["adapter_preprocess_wall_s"] = time.perf_counter() - stage_started
+					if cuda_events:
+						cuda_events["adapter_preprocess"][1].record()
+						cuda_events["model_inference"][0].record()
+				stage_started = time.perf_counter()
 				with torch.inference_mode():
 					raw_output = model_adapter.run_tile_inference(model, tile, device=device)
+				if profile is not None:
+					profile["model_inference_submit_wall_s"] = time.perf_counter() - stage_started
+					if cuda_events:
+						cuda_events["model_inference"][1].record()
+						cuda_events["output"][0].record()
+				stage_started = time.perf_counter()
 				tensors = model_adapter.product_tensors_from_output(raw_output)
 				layouts = {layout.name: layout for layout in result_specs[result_slot].layouts}
 				needed_scales = sorted({int(product_scales[name]) for name in needed_names})
@@ -1990,9 +2058,25 @@ def _multi_gpu_worker_main(
 					if sd > 1:
 						weighted = _pyrdown3d(weighted, factor=sd)
 					_slot_array(results[result_slot], layouts[f"product:{name}"])[:] = weighted.detach().cpu().numpy()
+				if profile is not None:
+					profile["output_and_d2h_wall_s"] = time.perf_counter() - stage_started
+					if cuda_events:
+						cuda_events["output"][1].record()
+				sync_started = time.perf_counter()
 				if device.type == "cuda":
 					torch.cuda.synchronize(device)
-				result_queue.put(("result", seq, coord, result_slot, tuple(needed_names), worker_index, time.perf_counter() - started))
+				finished = time.perf_counter()
+				if profile is not None:
+					profile["terminal_sync_wall_s"] = finished - sync_started
+					profile["worker_total_wall_s"] = finished - started
+					for name, (event_start, event_end) in cuda_events.items():
+						profile[f"{name}_cuda_s"] = event_start.elapsed_time(event_end) / 1000.0
+					result_queue.put((
+						"result", seq, coord, result_slot, tuple(needed_names), worker_index,
+						finished - started, profile, finished,
+					))
+				else:
+					result_queue.put(("result", seq, coord, result_slot, tuple(needed_names), worker_index, finished - started))
 			except BaseException as exc:
 				result_queue.put(("error", seq, coord, worker_index, type(exc).__name__, str(exc)))
 				break
@@ -2041,6 +2125,7 @@ def run_tiled_inference_3d(
 	input_cache_bytes: int = DEFAULT_INPUT_CACHE_BYTES,
 	input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
 	input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
+	profile_pipeline: bool = False,
 ) -> None:
 	"""Authoritative one-pass, multi-scale tiled inference engine."""
 	products = tuple(products)
@@ -2716,9 +2801,7 @@ def run_tiled_inference_3d(
 						tile_np, read_elapsed = serial_reader.result(event["read_task"])
 						serial_read_sum += float(read_elapsed)
 						serial_read_bytes += int(tile_np.nbytes)
-					if tile_np.dtype == np.uint16:
-						tile_np = (tile_np // 257).astype(np.uint8)
-					tile = torch.from_numpy(tile_np.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+					tile = _input_tile_to_device(tile_np, device)
 					preprocess = getattr(model_adapter, "preprocess_tile", None)
 					if preprocess is not None:
 						tile = preprocess(tile, torch.ones_like(tile, dtype=torch.bool))
@@ -2797,7 +2880,11 @@ def run_tiled_inference_3d(
 			workers = [
 				ctx.Process(
 					target=_multi_gpu_worker_main,
-					args=(index, str(worker_device), model_adapter, worker_state, tile_size, r, scales, input_specs, result_specs, work_queues[index], result_queue),
+					args=(
+						index, str(worker_device), model_adapter, worker_state, tile_size, r,
+						scales, input_specs, result_specs, work_queues[index], result_queue,
+						bool(profile_pipeline),
+					),
 					name=f"predict3d-{worker_device}", daemon=True,
 				)
 				for index, worker_device in enumerate(resolved_devices)
@@ -2880,6 +2967,17 @@ def run_tiled_inference_3d(
 			input_copy_time = 0.0
 			input_starve_time = 0.0
 			starve_started: float | None = None
+			pipeline_profile = None
+			if profile_pipeline:
+				pipeline_profile = {
+					"read_service_sum_s": 0.0, "read_service_max_s": 0.0,
+					"read_collect_lag_sum_s": 0.0, "read_collect_lag_max_s": 0.0,
+					"read_first_submitted_at": None, "read_last_completed_at": None,
+					"ready_to_assign_sum_s": 0.0, "ready_to_assign_max_s": 0.0,
+					"result_receive_lag_sum_s": 0.0, "result_receive_lag_max_s": 0.0,
+					"worker_stage_sums": [dict() for _ in workers],
+					"worker_stage_max": [dict() for _ in workers],
+				}
 
 			def _read_coord(coord: TileOriginZYX) -> tuple[np.ndarray, float]:
 				started = time.perf_counter()
@@ -2890,11 +2988,24 @@ def run_tiled_inference_3d(
 				if message[0] == "input_released":
 					free_inputs.append(int(message[2]))
 				elif message[0] == "result":
-					_, seq, _coord, _slot, _names, worker_index, elapsed = message
+					_, seq, _coord, _slot, _names, worker_index, elapsed, *profile_tail = message
 					events[int(seq)]["status"] = "done_result"
 					events[int(seq)]["gpu_elapsed"] = float(elapsed)
 					gpu_counts[int(worker_index)] += 1
 					gpu_time_sums[int(worker_index)] += float(elapsed)
+					if pipeline_profile is not None:
+						stage_values, worker_finished_at = profile_tail
+						received_at = time.perf_counter()
+						lag = max(0.0, received_at - float(worker_finished_at))
+						pipeline_profile["result_receive_lag_sum_s"] += lag
+						pipeline_profile["result_receive_lag_max_s"] = max(
+							pipeline_profile["result_receive_lag_max_s"], lag,
+						)
+						sums = pipeline_profile["worker_stage_sums"][int(worker_index)]
+						maxima = pipeline_profile["worker_stage_max"][int(worker_index)]
+						for name, value in stage_values.items():
+							sums[name] = sums.get(name, 0.0) + float(value)
+							maxima[name] = max(maxima.get(name, 0.0), float(value))
 				elif message[0] == "error":
 					_, seq, coord, worker_index, kind, detail = message
 					raise RuntimeError(
@@ -2924,11 +3035,17 @@ def run_tiled_inference_3d(
 								task = tensorstore_reader.submit(
 									volume_shape=volume_shape, crop_offset=(z0, y0, x0),
 									coord=(tz, ty, tx), tile_size=tile_size, border=pad,
+									profile=bool(profile_pipeline),
 								)
 								event["read_task"] = task
 								futures[id(task)] = next_sequence
 							else:
+								event["read_submitted_at"] = time.perf_counter()
 								future = executor.submit(_read_coord, (tz, ty, tx))
+								if profile_pipeline:
+									future.add_done_callback(
+										lambda _future, current=event: current.__setitem__("read_completed_at", time.perf_counter())
+									)
 								event["read_task"] = future
 								futures[future] = next_sequence
 							read_submitted += 1
@@ -2945,8 +3062,26 @@ def run_tiled_inference_3d(
 						del futures[future_key]
 						if tensorstore_reader is not None:
 							arr, elapsed = tensorstore_reader.result(task)
+							submitted_at = task.submitted_at
+							completed_at = task.completed_at
 						else:
 							arr, elapsed = task.result()
+							submitted_at = event.get("read_submitted_at")
+							completed_at = event.get("read_completed_at")
+						collected_at = time.perf_counter()
+						if pipeline_profile is not None and submitted_at is not None:
+							completed_at = collected_at if completed_at is None else float(completed_at)
+							service = max(0.0, completed_at - float(submitted_at))
+							lag = max(0.0, collected_at - completed_at)
+							pipeline_profile["read_service_sum_s"] += service
+							pipeline_profile["read_service_max_s"] = max(pipeline_profile["read_service_max_s"], service)
+							pipeline_profile["read_collect_lag_sum_s"] += lag
+							pipeline_profile["read_collect_lag_max_s"] = max(pipeline_profile["read_collect_lag_max_s"], lag)
+							first = pipeline_profile["read_first_submitted_at"]
+							last = pipeline_profile["read_last_completed_at"]
+							pipeline_profile["read_first_submitted_at"] = float(submitted_at) if first is None else min(first, float(submitted_at))
+							pipeline_profile["read_last_completed_at"] = completed_at if last is None else max(last, completed_at)
+							event["read_completed_at"] = completed_at
 						read_time += float(elapsed)
 						read_bytes += int(arr.nbytes)
 						read_completed += 1
@@ -2969,6 +3104,10 @@ def run_tiled_inference_3d(
 							break
 						input_slot = free_inputs.pop()
 						result_slot = free_results.pop()
+						if pipeline_profile is not None and event.get("read_completed_at") is not None:
+							ready_wait = max(0.0, time.perf_counter() - float(event["read_completed_at"]))
+							pipeline_profile["ready_to_assign_sum_s"] += ready_wait
+							pipeline_profile["ready_to_assign_max_s"] = max(pipeline_profile["ready_to_assign_max_s"], ready_wait)
 						copy_started = time.perf_counter()
 						np.copyto(
 							_slot_array(input_shms[input_slot], _input_layouts[0]),
@@ -3048,6 +3187,41 @@ def run_tiled_inference_3d(
 						for index, count in enumerate(gpu_counts)
 					), flush=True,
 				)
+				if pipeline_profile is not None:
+					first = pipeline_profile["read_first_submitted_at"]
+					last = pipeline_profile["read_last_completed_at"]
+					read_span = 0.0 if first is None or last is None else max(0.0, last - first)
+					concurrency = pipeline_profile["read_service_sum_s"] / read_span if read_span > 0 else 0.0
+					throughput_gib_s = read_bytes / float(1 << 30) / read_span if read_span > 0 else 0.0
+					count = max(1, read_completed)
+					print(
+						f"[predict3d:profile] loader reads={read_completed} bytes={read_bytes} "
+						f"service_sum={pipeline_profile['read_service_sum_s']:.3f}s "
+						f"active_span={read_span:.3f}s throughput={throughput_gib_s:.3f}GiB/s "
+						f"effective_request_concurrency={concurrency:.2f} "
+						f"service_mean={pipeline_profile['read_service_sum_s']/count:.4f}s "
+						f"service_max={pipeline_profile['read_service_max_s']:.4f}s "
+						f"collect_lag_mean={pipeline_profile['read_collect_lag_sum_s']/count:.4f}s "
+						f"collect_lag_max={pipeline_profile['read_collect_lag_max_s']:.4f}s "
+						f"ready_wait_mean={pipeline_profile['ready_to_assign_sum_s']/count:.4f}s "
+						f"ready_wait_max={pipeline_profile['ready_to_assign_max_s']:.4f}s "
+						f"live_highwater={read_live_highwater} ready_highwater={read_ready_highwater}",
+						flush=True,
+					)
+					for worker_index, sums in enumerate(pipeline_profile["worker_stage_sums"]):
+						worker_count = max(1, gpu_counts[worker_index])
+						stages = " ".join(
+							f"{name}={value:.3f}s(mean={value/worker_count:.4f},max={pipeline_profile['worker_stage_max'][worker_index][name]:.4f})"
+							for name, value in sorted(sums.items())
+						)
+						print(f"[predict3d:profile] worker={worker_index} tiles={gpu_counts[worker_index]} {stages}", flush=True)
+					print(
+						f"[predict3d:profile] coordinator copy_sum={input_copy_time:.3f}s "
+						f"input_idle={input_starve_time:.3f}s commit_sum={commit_time:.3f}s "
+						f"result_receive_lag_sum={pipeline_profile['result_receive_lag_sum_s']:.3f}s "
+						f"result_receive_lag_max={pipeline_profile['result_receive_lag_max_s']:.4f}s",
+						flush=True,
+					)
 			finally:
 				if tensorstore_reader is not None:
 					tensorstore_reader.cancel(

@@ -1602,6 +1602,7 @@ def run_preprocess_3d(
 	input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
 	input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
 	download_workers: int = 64,
+	profile_pipeline: bool = False,
 ) -> None:
 	"""Run 3D UNet inference and write .lasagna.json with OME-Zarr pyramids.
 
@@ -1968,6 +1969,7 @@ def run_preprocess_3d(
 			input_cache_bytes=int(float(input_cache_gib) * (1 << 30)),
 			input_io_threads=int(input_io_threads),
 			input_copy_threads=int(input_copy_threads),
+			profile_pipeline=bool(profile_pipeline),
 		)
 	except BaseException:
 		if _gpu_ctx is not None:
@@ -2764,6 +2766,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		help="TensorStore file I/O concurrency (default: 16).")
 	p.add_argument("--input-copy-threads", type=int, default=DEFAULT_INPUT_COPY_THREADS,
 		help="TensorStore decode/data-copy concurrency (default: 4).")
+	p.add_argument("--profile-pipeline", action="store_true",
+		help="Print detailed loader, CPU preparation, CUDA, transfer, and coordinator stage timings.")
 	p.add_argument("--download-workers", type=int, default=64,
 		help="Parallel S3 chunk download threads used by automatic download.")
 	p.add_argument("--chunk-z", type=int, default=32, help="Output zarr chunk size along Z.")
@@ -2839,6 +2843,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		input_cache_gib=float(args.input_cache_gib),
 		input_io_threads=int(args.input_io_threads),
 		input_copy_threads=int(args.input_copy_threads),
+		profile_pipeline=bool(args.profile_pipeline),
 		download_workers=int(args.download_workers),
 	)
 	return 0

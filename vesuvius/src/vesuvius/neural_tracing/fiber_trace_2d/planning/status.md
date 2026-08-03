@@ -1,10 +1,9 @@
-# Status: TensorStore whole-volume inference prefetch
+# Status: CUDA conversion and checkpoint AMP inference
 
-- [x] Capture task and current Python-Zarr pipeline.
+- [x] Capture task and inspect checkpoint precision metadata.
 - [x] Write implementation/test/spec/docs plan.
 - [x] Obtain and incorporate independent plan review.
-- [x] Implement shared TensorStore reader and bounded deep prefetch.
-- [x] Add Fiber and Lasagna CLI controls.
-- [x] Add exactness, boundedness, failure, and forwarding tests.
-- [x] Run focused validation and controlled measurement attempt.
+- [x] Implement compact H2D and CUDA normalization.
+- [x] Implement and expose checkpoint-derived AMP inference.
+- [x] Run focused exactness/precision/CLI tests.
 - [x] Update specs, docs, changelog, and task log.

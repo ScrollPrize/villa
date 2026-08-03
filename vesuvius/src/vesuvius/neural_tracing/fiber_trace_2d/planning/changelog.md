@@ -1,5 +1,9 @@
 # 2026-08-03
 
+- Moved shared inference integer-to-FP32 normalization onto CUDA after compact
+  H2D and made Fiber model autocast default to checkpoint training policy.
+- Added opt-in shared Fiber/Lasagna multi-device loader and worker stage
+  profiling with direct reader-concurrency diagnostics.
 - Overlapped shared Lasagna/Fiber output flushing with inference using one
   enlarged bounded circular mmap and one runner-wide asynchronous flush,
   without band-sized RAM snapshots or overlap copies.
