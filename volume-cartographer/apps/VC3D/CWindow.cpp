@@ -2626,6 +2626,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             return _fiberController &&
                    _fiberController->handleVolumeClick(volLoc, normal, surf, button, modifiers);
         });
+    connect(_viewerManager.get(), &ViewerManager::surfaceActivationRequested,
+            this, [this](const std::string& surfaceId) {
+                if (_surfacePanel) {
+                    _surfacePanel->activateSurfaceById(surfaceId);
+                }
+            });
     connect(_viewerManager.get(), &ViewerManager::sharedCacheStatsChanged,
             this, &CWindow::onSharedCacheStatsChanged);
 
