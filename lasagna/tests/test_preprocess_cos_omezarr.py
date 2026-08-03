@@ -27,6 +27,7 @@ sys.modules.setdefault("train_unet_3d", train_stub)
 
 from preprocess_cos_omezarr import (
 	LasagnaCosPredict3DAdapter,
+	DEFAULT_FLUSH_WORKERS,
 	ModelAdapter,
 	OmeZarrOutputAdapter,
 	OutputAdapter,
@@ -60,7 +61,11 @@ from omezarr_pyramid import (
 	downsample_normal_pair_chunk_worker,
 	downsample_scalar_chunk_worker,
 )
-from lasagna.tests.predict3d_spawn_helpers import SpawnHardExitAdapter, SpawnIdentityAdapter
+from lasagna.tests.predict3d_spawn_helpers import (
+	SpawnFileOutputAdapter,
+	SpawnHardExitAdapter,
+	SpawnIdentityAdapter,
+)
 
 
 class _StopAfterManifest(Exception):
@@ -662,6 +667,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertIsNone(kwargs["devices"])
 		self.assertEqual(kwargs["prefetch_workers"], 0)
 		self.assertEqual(kwargs["slots_per_gpu"], 2)
+		self.assertEqual(kwargs["flush_workers"], DEFAULT_FLUSH_WORKERS)
 		self.assertEqual(kwargs["download_workers"], 64)
 		self.assertEqual(kwargs["crop_xyzwhd"], (1, 2, 3, 4, 5, 6))
 		self.assertEqual(kwargs["tile_size"], 64)
@@ -687,6 +693,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			"--unet-checkpoint", "model.pt", "--tile-size", "64",
 			"--devices", "cuda:0,cuda:2", "--prefetch-workers", "6",
 			"--slots-per-gpu", "3", "--no-download",
+			"--flush-workers", "6",
 			"--download-workers", "123",
 		]
 		with mock.patch("builtins.open", side_effect=PermissionError):
@@ -697,6 +704,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["devices"], "cuda:0,cuda:2")
 		self.assertEqual(kwargs["prefetch_workers"], 6)
 		self.assertEqual(kwargs["slots_per_gpu"], 3)
+		self.assertEqual(kwargs["flush_workers"], 6)
 		self.assertEqual(kwargs["download_workers"], 123)
 
 	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
@@ -1106,68 +1114,86 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			channels=("value",), chunk_size=4,
 		)
 		progress = {}
-		next_band_started = threading.Event()
-
-		class Adapter:
-			calls = 0
-
-			def run_tile_inference(self, model, tile, *, device):
-				self.calls += 1
-				if self.calls >= 2:
-					next_band_started.set()
-				return tile
-
-			def product_tensors_from_output(self, output):
-				return {"identity": output}
-
-			def finalize_product_slab(self, product, raw):
-				return {"value": raw[0].copy()}
-
-		class Output:
-			def __init__(self):
-				self.complete = set()
-				self.active = 0
-				self.max_active = 0
-				self.progress_during_first_write = None
-				self.lock = threading.Lock()
-
-			def product_chunk_complete(self, product, *, chunk_origin_zyx):
-				return chunk_origin_zyx in self.complete
-
-			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
-				with self.lock:
-					self.active += 1
-					self.max_active = max(self.max_active, self.active)
-				try:
-					if chunk_origin_zyx[0] == 0:
-						self.progress_during_first_write = progress.get("finalized_base_z", 0)
-						if not next_band_started.wait(timeout=2.0):
-							raise AssertionError("next Z band did not start while first flush was blocked")
-					self.complete.add(chunk_origin_zyx)
-				finally:
-					with self.lock:
-						self.active -= 1
-
-		adapter = Adapter()
-		output = Output()
 		with tempfile.TemporaryDirectory() as td:
+			marker = str(Path(td) / "next-band-started")
+			adapter = SpawnIdentityAdapter(product, marker_on_second_call=marker)
+			output = SpawnFileOutputAdapter(td, wait_for_marker=marker)
 			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
 				run_tiled_inference_3d(
-					object(), np.ones((12, 4, 4), dtype=np.uint8),
+					adapter.load_model(device=torch.device("cpu")), np.ones((12, 4, 4), dtype=np.uint8),
 					crop_slices=(0, 12, 0, 4, 0, 4), device=torch.device("cpu"),
 					model_adapter=adapter, output_adapter=output, products=(product,),
 					output_regions_zyx={"identity": (0, 0, 0, 12, 4, 4)},
 					full_output_shapes_zyx={"identity": (12, 4, 4)},
 					output_scaledown_base=1, tile_size=4, overlap=0, border=0,
-					tmp_dir=td, progress=progress,
+					tmp_dir=td, progress=progress, flush_workers=1,
 				)
 			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
+			self.assertEqual(
+				{path.stem.removeprefix("chunk_") for path in Path(td).glob("chunk_*.npy")},
+				{"0_0_0", "4_0_0", "8_0_0"},
+			)
 
 		self.assertEqual(adapter.calls, 3)
-		self.assertEqual(output.max_active, 1)
-		self.assertEqual(output.progress_during_first_write, 0)
 		self.assertEqual(progress["finalized_base_z"], 12)
-		self.assertEqual(output.complete, {(0, 0, 0), (4, 0, 0), (8, 0, 0)})
+
+	def test_shared_runner_propagates_process_flush_failure_and_cleans_mmaps(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			adapter = SpawnIdentityAdapter(product)
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				with self.assertRaisesRegex(RuntimeError, "forced process flush failure"):
+					run_tiled_inference_3d(
+						adapter.load_model(device=torch.device("cpu")), np.ones((8, 4, 4), dtype=np.uint8),
+						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+						model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, fail=True),
+						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+						overlap=0, border=0, tmp_dir=td, flush_workers=1,
+					)
+			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
+
+	def test_shared_runner_detects_hard_process_flush_exit_and_cleans_mmaps(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			adapter = SpawnIdentityAdapter(product)
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				with self.assertRaisesRegex(RuntimeError, "flush worker 0 exited unexpectedly with code 24"):
+					run_tiled_inference_3d(
+						adapter.load_model(device=torch.device("cpu")), np.ones((8, 4, 4), dtype=np.uint8),
+						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+						model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, hard_exit=True),
+						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+						overlap=0, border=0, tmp_dir=td, flush_workers=1,
+					)
+			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
+
+	def test_shared_runner_flushes_distinct_chunks_in_multiple_processes(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			adapter = SpawnIdentityAdapter(product)
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				run_tiled_inference_3d(
+					adapter.load_model(device=torch.device("cpu")), np.ones((4, 8, 8), dtype=np.uint8),
+					crop_slices=(0, 4, 0, 8, 0, 8), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, delay_s=0.1),
+					products=(product,), output_regions_zyx={"identity": (0, 0, 0, 4, 8, 8)},
+					full_output_shapes_zyx={"identity": (4, 8, 8)}, tile_size=4,
+					overlap=0, border=0, tmp_dir=td, flush_workers=2,
+				)
+			pids = {path.read_text() for path in Path(td).glob("chunk_*.pid")}
+			self.assertEqual(len(list(Path(td).glob("chunk_*.npy"))), 4)
+			self.assertEqual(len(pids), 2)
 
 	def test_shared_runner_propagates_async_flush_failure_and_cleans_mmaps(self):
 		product = OutputProductSpec(

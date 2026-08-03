@@ -1,82 +1,69 @@
-# Task log: asynchronous rolling-accumulator flush
+# Task log: process-parallel rolling-mmap flush
 
 ## Findings
 
-- The current accumulator is already a bounded circular mmap band; it never
-  allocates full logical output Z.
-- `_record_commit` calls `_flush_group` synchronously at every canonical Z-row
-  frontier. `_flush_group` reads, normalizes, finalizes, writes, clears, and
-  releases before ordered result commit can continue.
-- Multi-GPU workers can run briefly during a flush, but the coordinator stops
-  recycling result slots and the bounded result window eventually stalls all
-  devices.
-- The current physical depth planner assumes immediate post-row flush and
-  release. Async operation therefore requires capacity for one retained frozen
-  interval in addition to the subsequent active write span.
-- `_CircularZBand.read` already bounds temporary allocation to one requested
-  output chunk. A background flush can preserve that bound while reading the
-  frozen mmap directly; no band snapshot is required.
+- Representative eight-GPU crop: synchronous flush completed neural inference
+  in 178.8 s; one background Python thread took 305.4 s, a 126.6 s / 70.8%
+  regression. The thread did not parallelize chunks and could contend for the
+  GIL, memory bandwidth, and process-global native thread settings.
+- `_CircularZBand` already exposes a filesystem-backed mmap per accumulator
+  channel. Spawned workers can reopen these by path and reconstruct wrapped
+  logical reads without copying a band or sharing Python objects.
+- Fiber and Lasagna model adapters store picklable configuration/product data;
+  their finalizers are CPU/NumPy operations. `OmeZarrOutputAdapter` stores
+  product/path metadata and atomic writes target distinct chunk files.
+- A process worker needs only one output chunk's denominator/raw/finalized
+  arrays. RAM therefore scales with flush worker count, not band or volume Z.
+- GPU worker processes must start before the flush pool, and the flush pool
+  before reader threads, to keep portable spawn lifecycle deterministic.
 
 ## Plan review
 
-- Capacity planning will simulate the precise runtime schedule rather than
-  conservatively but unjustifiably doubling the existing depth.
-- One flush future is runner-wide and combines every scale group advancing at
-  a row frontier.
-- Submitted, completed, and released frontiers are separate; progress and slot
-  reuse occur only after successful join.
-- Coordinator-detached immutable activity descriptors prevent the worker from
-  mutating live scheduling state. Exact dirty regions clear only after success.
-- Every exit path must join the non-cancellable reader thread before mmap
-  cleanup, while preserving an earlier coordinator exception.
-- Tests and docs must cover per-chunk allocation bounds, adapter concurrency,
-  exact persisted output/chunk presence, partial writes and rerun, final drain,
-  progress timing, exhaustive planner agreement, and controlled overlap timing.
+- Use explicit spawned processes with bounded task/result queues and a
+  coordinator-pumped `2 * workers` IPC window; executor/pool feeder threads and
+  eager whole-batch submission are prohibited.
+- Zero workers must restore the old immediate-release planner and lifecycle,
+  providing a genuine synchronous baseline. The normal automatic default is
+  the available CPU count capped at 64 processes.
+- Mmap descriptors are absolute path-only metadata; coordinator validates
+  frozen generations, workers open read-only mappings, and no forced mmap flush
+  occurs.
+- Production adapters are spawn-pickle validated before traversal. Flush
+  processes receive no model weights/tensors and never initialize CUDA.
+- Batch/task IDs, exit-code polling, bounded queue pumping, and ordered shutdown
+  cover Python errors, hard exits, result backpressure, and interrupts without
+  releasing frozen slots.
+- Each task exclusively owns all dirty products for one scale/chunk origin.
+  Concurrent coarse-pyramid invalidation must be race tolerant.
 
 ## Implementation and validation
 
-- `_plan_circular_z_depth` now simulates one retained submitted interval and
-  releases it only at the following advancing frontier. The real 256/32/96
-  geometry with 64-voxel chunks is covered at inference factors 1, 2, and 4.
-- The coordinator submits one combined, single-threaded flush future for every
-  scale group advancing at a row. Activity is detached before submission;
-  completion alone clears dirty rectangles, discards ring generations, updates
-  counters/progress, and prints completion.
-- Flush jobs carry descriptors and read/finalize/write one chunk at a time
-  directly from the frozen mmap. No band-sized arrays or second mmap were
-  introduced.
-- Normal completion drains the final interval. Error/interrupt cleanup waits
-  for the non-cancellable future before closing mmap files and preserves an
-  existing coordinator exception with any shutdown failure as a note.
-- Added aggregate `flush stats work=... wait=...` output and a final progress
-  row after the final async completion.
-
-## Validation results
-
-- Focused overlap test blocked the first output write until inference entered
-  the following Z band; it verified one active writer, unchanged `final_z`
-  during the blocked write, exact three-chunk completion, and mmap cleanup.
-- Forced background write failure reached the caller and left no mmap temp
-  files after the reader had stopped.
-- Multi-scale shared-runner testing submitted both scales in one flush and
-  passed. Spawned two-worker output remained byte-exact against serial output;
-  hard worker-exit handling still passed.
-- Planner independence, initial-prefix, realistic 256/32/96 scale geometry,
-  compilation, and diff checks passed.
-- Controlled timing used five 4-voxel Z bands, 50 ms model delay and 50 ms
-  output delay per band, three repetitions. Runtime was 0.313/0.304/0.305 s
-  (mean 0.307 s) versus a 0.500 s serialized delay floor, demonstrating actual
-  overlap in the synthetic workload.
-
-## Deviations and limitations
-
-- Representative whole-volume eight-GPU throughput was not measured because
-  that dataset/runtime was not available to the agent test environment. The
-  controlled benchmark establishes overlap but not production speedup.
-- Several pre-existing Zarr-v3-backed tests intermittently stalled inside
-  `zarr.open`'s global async I/O loop before entering the shared runner. They
-  were terminated and are not counted as validation; array-backed shared-runner
-  tests, including serial/spawn exactness, completed normally.
-- The test environment has no pytest installation; validation used the existing
-  unittest entry points and direct compile/diff checks without installing new
-  dependencies.
+- Replaced the flush `ThreadPoolExecutor` with explicit persistent spawn
+  processes. Bounded queues carry immutable task/path descriptors; workers
+  cache read-only memmaps and never receive ndarray payloads.
+- Added whole-batch completion gating, generation validation, task/batch result
+  validation, hard-exit polling, process-first shutdown, and mmap cleanup.
+- Added `--flush-workers` to both front ends (available CPU count capped at 64
+  by default); zero preserves the synchronous immediate-release planner.
+- Focused `unittest` coverage passed for process overlap, two-worker distinct
+  execution, task failure, hard exit, mmap cleanup, planner sizing, serial vs
+  multi-GPU exactness, and Lasagna CLI forwarding. The two-worker controlled
+  test processed four 0.1 s writes across two distinct PIDs with 0.40 s
+  aggregate worker work. Spawn startup dominated its 1.6-1.7 s flush wall
+  time, as expected for this intentionally tiny test.
+- Python compilation passed for the shared runner, both front ends, and touched
+  tests. Fiber `--help` exposes the new option. The environment lacks pytest,
+  so the pytest-based Fiber forwarding test was compiled but not executed.
+- A pre-existing Lasagna legacy CLI assertion expects `ome_chunk=64` despite
+  explicitly passing `--ome-chunk 32`; that unrelated assertion still fails.
+  The full test-module run also stalled in an existing Zarr-heavy test, so
+  validation used named focused cases.
+- Representative eight-GPU post-change timing remains to be collected on the
+  user's full-volume workload. The known baselines are 178.8 s synchronous and
+  305.4 s for the removed Python-thread version.
+- Corrected spawn-time native thread limiting by reusing the pyramid worker's
+  `_single_threaded_native_runtime()` around both GPU-worker and flush-worker
+  `Process.start()` calls. Limiting only inside a spawned worker is too late:
+  spawn re-imports the main module, including NumPy/OpenBLAS, before invoking
+  the worker target. Parent environment and runtime limits are restored after
+  startup.

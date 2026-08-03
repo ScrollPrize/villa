@@ -213,10 +213,15 @@ count. Existing `--device` selects the serial path and cannot be combined with
 `--devices`.
 
 The same shared runner overlaps output flushing with subsequent inference using
-one enlarged circular mmap ring and one background flush. It retains no
-band-sized RAM snapshot and queues no second flush; if output processing falls
-behind, the next frontier waits for the current flush. The final
-`flush stats work=... wait=...` line makes that backpressure visible.
+one enlarged circular mmap ring and persistent spawned writer processes. Each
+worker reopens the frozen mmap read-only and handles one output chunk, so no
+band-sized RAM snapshot crosses process boundaries and each worker has an
+independent Python GIL. `--flush-workers` defaults to the available CPU count
+capped at 64; use
+`--flush-workers 0` for the synchronous, immediate-release A/B baseline. Only
+one flush batch may be outstanding, so the next frontier waits if writers fall
+behind. The final `flush stats workers=... chunks=... work_sum=... wait=...`
+line reports that backpressure.
 
 Automatic S3 chunk fetching defaults to 64 transfer threads. Set it separately
 from inference prefetch with, for example, `--download-workers 256`. Interrupted

@@ -381,6 +381,7 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
         "config.json", "--input", "input.zarr", "--output", "fiber.lasagna.json",
         "--checkpoint", "model.pt", "--devices", "all",
         "--prefetch-workers", "5", "--slots-per-gpu", "3",
+		"--flush-workers", "6",
         "--download-workers", "77",
     ])
     assert result == 0
@@ -388,6 +389,7 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
     assert captured["devices"] == "all"
     assert captured["prefetch_workers"] == 5
     assert captured["slots_per_gpu"] == 3
+    assert captured["flush_workers"] == 6
     assert captured["download_workers"] == 77
 
 

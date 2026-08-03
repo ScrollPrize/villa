@@ -251,3 +251,16 @@
 - Replaced full-Z predict3d scratch mappings with fixed-depth circular mmap
   rings and consolidated Lasagna/Fiber neural inference onto one multi-scale,
   chunk-flushing runner.
+# 2026-08-03: process-parallel shared inference flush
+
+- Replaced the single Python flush thread with bounded persistent spawn workers
+  that read frozen rolling-accumulator mmaps by absolute path.
+- Added shared `flush_workers` control and `--flush-workers` to Fiber and
+  Lasagna inference (automatic CPU-count default capped at 64, synchronous
+  baseline 0).
+- Added process failure/hard-exit cleanup, overlap, multi-process execution,
+  and CLI forwarding coverage.
+- Motivation: the prior threaded implementation regressed the representative
+  eight-GPU inference phase from 178.8 s to 305.4 s.
+- Reused the pyramid pool's pre-spawn native-runtime guard so NumPy/OpenBLAS is
+  single-threaded during child module import, including for GPU workers.

@@ -164,14 +164,18 @@ A logical Z plane maps to
 `physical_z = logical_z % ring_depth`; generation checks prevent an unflushed
 plane from being overwritten. Ring depth is planned from actual canonical tile
 positions and chunk-aligned flush frontiers. Planning mirrors runtime order:
-each Z row writes before its post-row flush. One runner-wide background flush
-may retain the preceding finalized interval while the next row accumulates.
+each Z row writes before its post-row flush. One runner-wide flush batch handled
+by persistent spawn-process workers may retain the preceding finalized
+interval while the next row accumulates.
 The planner simulates that exact write, join/release, submit, next-write order,
 so the enlarged ring has disjoint physical slots without copying live overlap
 or finalized bands. At the following advancing frontier the coordinator waits
 if necessary, then clears/releases the completed interval before submitting
 another; storage slowdown creates bounded backpressure rather than additional
-queued bands. Backing size is
+queued bands. Workers receive only mmap-path/chunk descriptors, reopen mappings
+read-only, and allocate one chunk of temporary arrays each. The CLI default is
+the available CPU count capped at 64 workers; zero is the synchronous
+immediate-release baseline. Backing size is
 `(raw_channels + 1) * ring_depth * working_y * working_x * 4` bytes and does
 not depend on full volume depth. Candidate output chunks are lazily checked
 against their direct local Zarr-v2 input footprint. Their global output bounds

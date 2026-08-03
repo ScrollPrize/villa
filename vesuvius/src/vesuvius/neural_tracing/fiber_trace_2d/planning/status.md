@@ -1,10 +1,11 @@
-# Status: asynchronous rolling-accumulator flush
+# Status: process-parallel rolling-mmap flush
 
-- [x] Record the requested task.
-- [x] Inspect the current ring, flush, and multi-GPU coordinator paths.
-- [x] Write the implementation/test/spec/docs plan.
+- [x] Record task and measured thread regression.
+- [x] Inspect adapter picklability, mmap backing, and shared runner lifecycle.
+- [x] Write implementation/test/spec/docs plan.
 - [x] Obtain and incorporate independent plan review.
-- [x] Implement bounded one-flush overlap over the existing mmap ring.
-- [x] Add exactness, overlap, backpressure, failure, and planner tests.
-- [x] Run focused validation and inspect performance evidence.
-- [x] Update specs, documentation, changelog, and task log.
+- [x] Implement persistent process-parallel descriptor flush.
+- [x] Add CLI controls to Fiber and Lasagna.
+- [x] Add exactness, overlap, parallelism, failure, and forwarding tests.
+- [x] Run focused validation and controlled timing.
+- [x] Update specs, docs, changelog, and task log.

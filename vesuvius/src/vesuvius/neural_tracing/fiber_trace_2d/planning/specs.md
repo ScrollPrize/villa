@@ -2430,3 +2430,16 @@
 - Tests use fake/local arrays and monkeypatched readers where possible and must not require network access.
 - `docs/code_structure.md` documents the current implemented module structure, data flow, config shape, runner outputs, and local workflow caveats; `planning/specs.md` remains the normative behavior source.
 - Future changes that affect public config, data flow, sampling, caching, augmentation, runner outputs, tests, or local workflow must update both the relevant specs and code docs.
+# Process-parallel 3D flush
+
+- Fiber and Lasagna inference use the same shared rolling-mmap flush engine.
+- Positive `flush_workers` use persistent spawn processes with bounded
+  descriptor-only queues. Workers read frozen mmap regions directly and own
+  distinct scale/chunk writes; ndarray payloads never cross IPC.
+- Exactly one frozen batch may overlap the following inference band. Ring reuse
+  and `final_z` advancement require successful completion of the entire batch.
+- Each worker limits native CPU libraries to one thread and allocates at most
+  one chunk's denominator/raw/finalized arrays.
+- `flush_workers=0` is the synchronous baseline and uses immediate ring release;
+  both inference CLIs default to the available CPU count capped at 64 process
+  workers.

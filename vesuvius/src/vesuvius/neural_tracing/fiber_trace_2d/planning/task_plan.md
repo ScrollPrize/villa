@@ -1,90 +1,85 @@
-# Plan: asynchronous flush over one enlarged mmap ring
+# Plan: process-parallel rolling-mmap flush
 
 ## Implementation
 
-1. Separate flush preparation/completion from the existing synchronous
-   `_flush_group` operation. The coordinator will identify and detach the
-   finalized dirty-chunk activity in canonical order, freeze that logical Z
-   interval, and submit exactly one background flush job that reads the
-   accumulator mmap directly one output chunk at a time.
-2. Retain the existing single `_CircularZBand` per product/weight. Extend ring
-   planning by simulating the exact runtime order: accumulate the whole current
-   canonical Z row; at an advancing frontier complete/release the prior flush;
-   submit the current finalized interval without advancing the origin; then
-   accumulate the following row while that interval remains frozen. Capacity
-   is the maximum write end minus oldest unreleased origin under that schedule,
-   not an assumed doubling. Do not copy live overlap, finalized bands, or whole
-   mmap regions. Keep physical capacity bounded and independent of full Z.
-3. Permit only one runner-wide flush job at a time, including across distinct
-   inference-scale groups. At each row frontier, prepare every advancing group,
-   join the previous combined job once, then submit one combined job. This is
-   the bounded backpressure point when storage cannot keep up.
-4. Track submitted/frozen, completed/written, and released/origin frontiers
-   separately. The coordinator detaches an immutable canonically sorted list
-   of chunk activity before submission. The worker may read only those frozen
-   mmap regions and write their unique output chunks; it must not inspect or
-   mutate live activity/resume/support state, clear/discard slots, update
-   counters, or update progress. On successful join, the coordinator clears
-   the exact detached dirty rectangles, discards generations, advances the
-   released and completed frontiers, and applies returned counts/timing in that
-   order. On failure it performs none of those release mutations.
-5. Drain the final job before metadata/pyramid creation and during normal
-   completion. Because a Python thread cannot be cancelled safely, every error
-   and interrupt path must wait for an active flush reader before mmap cleanup.
-   Preserve an original coordinator exception if flush shutdown also fails and
-   attach/report the flush error as secondary context. A repeated interrupt
-   must not race mmap close/unlink against the reader. Limit native worker
-   threading to one so finalization/compression does not fan out unexpectedly.
-6. Preserve per-output-chunk RAM bounds: `_CircularZBand.read`, `np.stack`, and
-   finalized channel arrays may exist for only the chunk currently written;
-   jobs contain descriptors, never decoded chunks or finalized arrays. Record
-   separate flush work and coordinator wait timing so overlap and residual
-   backpressure are visible.
-7. Treat asynchronous adapter use as a shared-runner contract: output
-   completeness checks may overlap distinct-chunk writes, while model inference
-   may overlap stateless product finalization. Document it and keep the shipped
-   filesystem/output and model adapters safe for these disjoint operations.
+1. Replace `ThreadPoolExecutor` flush execution with explicit persistent
+   spawn-context `Process` workers and bounded task/result queues. Do not use
+   `ProcessPoolExecutor`/`Pool` feeder machinery. Start GPU workers first, then
+   flush workers, then CPU tile reader threads. Serial inference starts flush
+   workers before traversal/read activity. Partial startup terminates and joins
+   only successfully started children and closes queues.
+2. Describe each `_CircularZBand` by immutable absolute mmap path, dtype,
+   shape, ring-depth, and channel metadata. Flush
+   tasks contain scale, product/chunk bounds, logical-to-physical Z mapping,
+   raw/weight mmap descriptors, and product identity only. Workers lazily open
+   and cache read-only memmaps by path. No NumPy array or decoded/finalized
+   chunk crosses a multiprocessing queue.
+3. Validate production adapter pickling before traversal and initialize each
+   worker with picklable model/output adapters; fail early and clearly for an
+   unsupported custom adapter. Keep native
+   BLAS/OpenMP/PyTorch CPU threading at one for the worker lifetime without
+   changing the coordinator process. Each task reads one frozen chunk,
+   normalizes/finalizes its dirty products, and atomically writes only that
+   globally unique output chunk.
+4. Preserve one runner-wide frozen batch across all inference scales. Keep its
+   descriptors in coordinator memory but pump at most `2 * workers` through
+   IPC. Pump opportunistically in serial and multi-GPU loops; at the following
+   frontier block-pump until every result arrives. Each task exclusively owns
+   one scale/chunk origin and all dirty products sharing its denominator. Empty
+   intervals still advance frontiers. Validate frozen generation ownership
+   before enqueue, collect the full batch before clearing/releasing any
+   rectangle, and never force `memmap.flush()`.
+5. Add `flush_workers` to the shared API and `--flush-workers` to both CLIs.
+   Positive values select that many persistent processes; normal CLI default is
+   the available CPU count capped at 64. Zero selects the exact old synchronous flush
+   path, including its immediate-release planner, for repeatable A/B baselines.
+   Reject negatives and keep scheduling bounded to one frozen batch.
+6. Associate batch/task IDs with results and poll child exit codes even when no
+   result arrives. On task error or hard exit stop enqueueing, terminate/join
+   all workers, cancel queue join threads where necessary, then clean queues
+   before mmap cleanup. Never clear/reuse the frozen interval or advance
+   `final_z`. Preserve a primary coordinator/interrupt exception and attach
+   shutdown failures as secondary notes.
+7. Report flush process count, aggregate worker work, coordinator wait, chunks,
+   and throughput. Remove the threaded `threadpoolctl` context entirely.
 
 ## Tests
 
-- Add a deterministic slow output adapter test proving inference begins
-  accumulating the next Z band while the previous band write is blocked.
-- Assert only one flush is active and the next flush frontier waits for it.
-- Compare synchronous-reference and asynchronous outputs exactly for wrapped
-  rings, multiple products/scales, sparse unsupported chunks, and resume.
-- Inject a background write/finalization failure and assert it reaches the
-  caller before frozen slots are reused; verify cleanup completes.
-- Assert planned mmap depth remains independent of full Z and exactly matches
-  an exhaustive small-lattice simulation of one-flush lag. Cover the real
-  tile-size 256, border 32, overlap 96 and supported scale/chunk combinations.
-- Compare persisted channel bytes and chunk presence across sync-reference and
-  async runs covering wraparound with a frozen interval, shared-weight products,
-  multiple scales in one combined job, partial edges, unsupported chunks,
-  independently resumed sibling products, and final end-of-stream drain.
-- Assert final-Z progress, written/cleared counters, and completion messages do
-  not advance while a flush is blocked and advance exactly once on join.
-- Inject a partial coherent-product write failure and verify the frozen region
-  is retained through shutdown and a rerun detects/rebuilds the incomplete
-  product through existing atomic output semantics.
-- Run focused shared-runner tests, both frontend forwarding/smoke tests, Python
-  compilation, and diff checks. Measure repeated fixed synthetic workloads with
-  controlled write delay before/after overlap and report elapsed/work/wait
-  timing; explicitly note that representative whole-volume throughput remains
-  unmeasured in the test workspace.
+- Assert tasks and pool queues contain descriptors/paths only, never ndarrays.
+- Spawn process workers against real temporary mmap files and verify direct
+  wrapped logical-Z reads, exact persisted bytes, distinct-process execution,
+  and one-chunk allocation bounds.
+- Compare `flush_workers=0`, one process, and multiple processes for exact
+  output bytes/chunk presence across wraparound, multiple products sharing a
+  weight, multiple scales, partial edges, sparse unsupported chunks, resume,
+  and final drain.
+- Use controlled per-chunk delay to prove the process pool both overlaps the
+  next inference band and parallelizes chunk flushes. Measure repeated sync,
+  one-process, and multi-process timings.
+- Inject task exceptions, partial coherent-product writes, hard worker exits,
+  and interrupts; verify error propagation, no premature ring release, mmap
+  cleanup after worker shutdown, and resumable incomplete output.
+- Verify CLI/default/zero/positive validation and forwarding for both Fiber and
+  Lasagna. Run focused shared/front-end tests, compilation, and diff checks.
+- Cover bounded task/result backpressure, empty and undersubscribed batches,
+  sequential wrapped batches, pool startup failure, actual production-adapter
+  spawn pickling, and tolerant concurrent invalidation of shared coarser
+  pyramid chunks.
 
 ## Spec update
 
-Update `planning/specs.md` to specify one enlarged circular mmap ring, at most
-one frozen asynchronous flush interval, direct mmap chunk reads, completion-
-gated reuse/progress, and the prohibition on band-sized RAM snapshots.
+Replace thread-flush language with persistent spawn-process workers, mmap-path
+descriptors, one-chunk-per-worker bounds, default/zero worker semantics,
+process-local native thread limits, and batch completion/failure guarantees.
 
 ## Docs updates
 
-Update `docs/code_structure.md` to describe the shared asynchronous flush
-pipeline, its bounded backpressure, timing output, and failure semantics.
+Update `docs/code_structure.md`, Lasagna README, and 3D inference documentation
+with process-pool architecture, `--flush-workers`, memory scaling, A/B baseline
+mode, metrics, and failure behavior.
 
 ## Changelog and task log
 
-Add a dated changelog entry. Record plan-review findings, implementation
-details, validation commands/results, performance evidence available from
-synthetic timing, and every deviation or limitation in `planning/task_log.md`.
+Record the measured thread regression, reviewed design, implementation,
+validation commands/results, controlled timing, representative benchmark still
+required after implementation, and all deviations/limitations.

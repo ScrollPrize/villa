@@ -11,6 +11,7 @@ import zarr
 
 try:
     from lasagna.tiled_predict3d import (
+        DEFAULT_FLUSH_WORKERS,
         _auto_download,
         build_product_omezarr_pyramids,
         create_product_omezarr_groups,
@@ -24,6 +25,7 @@ try:
     )
 except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
     from tiled_predict3d import (
+        DEFAULT_FLUSH_WORKERS,
         _auto_download,
         build_product_omezarr_pyramids,
         create_product_omezarr_groups,
@@ -223,10 +225,13 @@ def run_fiber_trace_3d_inference(
     recurrent_steps: int | None = None,
     prefetch_workers: int = 0,
     slots_per_gpu: int = 2,
+    flush_workers: int = DEFAULT_FLUSH_WORKERS,
     download_workers: int = 64,
 ) -> None:
     if int(download_workers) <= 0:
         raise ValueError("download_workers must be a positive integer")
+    if int(flush_workers) < 0:
+        raise ValueError("flush_workers must be >= 0")
     config = _load_config(config_path)
     tile_size_i = _tile_size_from_config(config, tile_size)
     output_manifest = Path(output_path)
@@ -363,6 +368,7 @@ def run_fiber_trace_3d_inference(
         devices=resolved_devices,
         prefetch_workers=int(prefetch_workers),
         slots_per_gpu=int(slots_per_gpu),
+        flush_workers=int(flush_workers),
     )
     del model
     if torch_device.type == "cuda":
@@ -437,6 +443,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Bounded shared-memory input/result slots per GPU.",
     )
     parser.add_argument(
+        "--flush-workers", type=int, default=DEFAULT_FLUSH_WORKERS,
+        help="Spawned OME-Zarr flush processes (default: min(CPU count, 64)); 0 uses the synchronous baseline.",
+    )
+    parser.add_argument(
         "--download-workers", type=int, default=64,
         help="Parallel S3 chunk download threads used by automatic download.",
     )
@@ -474,6 +484,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if int(args.download_workers) <= 0:
         parser.error("--download-workers must be a positive integer")
+    if int(args.flush_workers) < 0:
+        parser.error("--flush-workers must be >= 0")
 
     run_fiber_trace_3d_inference(
         config_path=args.config,
@@ -496,6 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         recurrent_steps=args.recurrent_steps,
         prefetch_workers=int(args.prefetch_workers),
         slots_per_gpu=int(args.slots_per_gpu),
+        flush_workers=int(args.flush_workers),
         download_workers=int(args.download_workers),
     )
     return 0

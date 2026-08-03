@@ -1,18 +1,19 @@
-# Task: overlap rolling-accumulator flush with inference
+# Task: process-parallel rolling-mmap flush
 
-The shared 3D tiled inference runner currently performs each finalized Z-band
-flush synchronously. With multi-GPU inference this blocks ordered result commit,
-result-slot recycling, and eventually all GPU workers.
+Replace the shared 3D inference runner's Python background flush thread. The
+threaded implementation regressed a representative eight-GPU crop from 178.8 s
+to 305.4 s and can contend with the coordinator through the GIL and
+process-global native-library state.
 
-Implement asynchronous flush overlap in the shared runner used by both Lasagna
-and Fiber inference:
+Implement a persistent spawn-process flush pool shared by Lasagna and Fiber:
 
-- retain one circular mmap accumulator rather than copying bands;
-- enlarge its bounded physical Z capacity so one finalized/frozen band can be
-  flushed while the next band continues accumulating in disjoint slots;
-- allow at most one flush operation in flight;
-- before beginning the next flush, wait for the previous flush, release its
-  slots, and propagate any error;
-- do not introduce a band-sized RAM snapshot or full-volume scratch;
-- preserve canonical accumulation order, output bytes, sparse/resume behavior,
-  progress semantics, cleanup, and the common Lasagna/Fiber implementation.
+- workers reopen the existing rolling accumulator mmap files and receive only
+  immutable chunk descriptors, never chunk arrays;
+- distinct finalized output chunks are normalized, finalized, compressed, and
+  written in parallel processes with independent GILs;
+- retain the single enlarged mmap ring, one frozen flush batch, completion-
+  gated reuse/progress, bounded one-chunk-per-worker RAM, canonical numerical
+  semantics, sparse/resume behavior, and atomic output writes;
+- expose a bounded worker count and an explicit synchronous baseline mode;
+- remove Python threading from the flush path and preserve portable spawn
+  behavior on Ubuntu/macOS and amd64/arm64.

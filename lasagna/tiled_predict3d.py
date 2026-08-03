@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import json
@@ -8,6 +9,7 @@ import multiprocessing as mp
 from multiprocessing import shared_memory
 import os
 from pathlib import Path
+import pickle
 import queue
 import shutil
 import sys
@@ -24,12 +26,14 @@ import zarr
 
 try:
 	from omezarr_pyramid import (
+		_single_threaded_native_runtime,
 		build_normal_omezarr_pyramid,
 		build_scalar_omezarr_pyramid,
 		set_pyramid_metadata,
 	)
 except ImportError:
 	from lasagna.omezarr_pyramid import (
+		_single_threaded_native_runtime,
 		build_normal_omezarr_pyramid,
 		build_scalar_omezarr_pyramid,
 		set_pyramid_metadata,
@@ -40,6 +44,7 @@ ChunkOriginZYX = tuple[int, int, int]
 RegionZYX = tuple[int, int, int, int, int, int]
 TileOriginZYX = tuple[int, int, int]
 ProductTileOutput = Mapping[str, np.ndarray]
+DEFAULT_FLUSH_WORKERS = min(64, max(1, os.cpu_count() or 1))
 
 
 @dataclass(frozen=True)
@@ -60,8 +65,35 @@ class _FlushGroupDescriptor:
 	oc: int
 	region: RegionZYX
 	products: tuple[Any, ...]
-	accumulators: tuple[tuple[str, Any], ...]
-	weight: Any
+	accumulators: tuple[tuple[str, "_MmapBandDescriptor"], ...]
+	weight: "_MmapBandDescriptor"
+
+
+@dataclass(frozen=True)
+class _MmapBandDescriptor:
+	paths: tuple[str, ...]
+	shape_zyx: tuple[int, int, int]
+	dtype: str = "float32"
+
+	@property
+	def ring_depth(self) -> int:
+		return int(self.shape_zyx[0])
+
+
+@dataclass(frozen=True)
+class _FlushProcessTask:
+	batch_id: int
+	task_id: int
+	sd: int
+	origin: ChunkOriginZYX
+	dirty_products: tuple[str, ...]
+	weight_dirty: bool
+	b: int
+	oc: int
+	region: RegionZYX
+	products: tuple[Any, ...]
+	accumulators: tuple[tuple[str, _MmapBandDescriptor], ...]
+	weight: _MmapBandDescriptor
 
 
 def resolve_inference_devices(
@@ -1345,6 +1377,7 @@ def _plan_circular_z_depth(
 	chunk_size: int,
 	output_begin: int,
 	output_end: int,
+	retain_one_flush: bool = True,
 ) -> int:
 	"""Compute capacity for one frozen async flush plus the following Z row."""
 	sd = max(1, int(scaledown))
@@ -1377,7 +1410,11 @@ def _plan_circular_z_depth(
 			if pending_to is not None:
 				origin = pending_to
 			submitted = flush_to
-			pending_to = flush_to
+			if retain_one_flush:
+				pending_to = flush_to
+			else:
+				origin = flush_to
+				pending_to = None
 	return min(int(z_size), max(1, int(max_live)))
 
 
@@ -1444,6 +1481,24 @@ class _CircularZBand:
 	@property
 	def end_z(self) -> int:
 		return self.z_size
+
+	def mmap_descriptor(self) -> _MmapBandDescriptor:
+		paths = tuple(
+			str(Path(str(getattr(arr, "_lasagna_tmp_path"))).resolve())
+			for arr in self._arrays
+		)
+		return _MmapBandDescriptor(
+			paths=paths,
+			shape_zyx=(self.ring_depth, self.y_size, self.x_size),
+		)
+
+	def validate_frozen(self, z0: int, z1: int) -> None:
+		for logical_z in range(int(z0), int(z1)):
+			generation = int(self._generation[logical_z % self.ring_depth])
+			if generation not in (-1, logical_z):
+				raise ValueError(
+					f"{self.name} cannot freeze logical z={logical_z}; slot contains z={generation}"
+				)
 
 	def ensure(self, z0: int, z1: int) -> None:
 		z0 = int(z0)
@@ -1670,6 +1725,111 @@ def _limit_native_worker_threads():
 		return None
 
 
+def _read_mmap_band_chunk(
+	descriptor: _MmapBandDescriptor,
+	channel: int,
+	z0: int, z1: int, y0: int, y1: int, x0: int, x1: int,
+	cache: dict[str, np.memmap],
+) -> np.ndarray:
+	path = descriptor.paths[int(channel)]
+	arr = cache.get(path)
+	if arr is None:
+		arr = np.memmap(
+			path, dtype=np.dtype(descriptor.dtype), mode="r",
+			shape=descriptor.shape_zyx,
+		)
+		cache[path] = arr
+	out = np.zeros((z1-z0, y1-y0, x1-x0), dtype=np.float32)
+	offset = 0
+	logical = int(z0)
+	while logical < int(z1):
+		physical = logical % descriptor.ring_depth
+		length = min(int(z1) - logical, descriptor.ring_depth - physical)
+		out[offset:offset+length] = arr[physical:physical+length, y0:y1, x0:x1]
+		offset += length
+		logical += length
+	return out
+
+
+def _execute_flush_process_task(
+	task: _FlushProcessTask,
+	model_adapter: Any,
+	output_adapter: Any,
+	cache: dict[str, np.memmap],
+) -> tuple[int, int, int, float]:
+	started = time.perf_counter()
+	oz0, oy0, ox0, oz1, oy1, ox1 = task.region
+	gz, gy, gx = task.origin
+	lz0, ly0, lx0 = task.b + gz - oz0, task.b + gy - oy0, task.b + gx - ox0
+	lz1 = min(lz0 + task.oc, task.b + oz1 - oz0)
+	ly1 = min(ly0 + task.oc, task.b + oy1 - oy0)
+	lx1 = min(lx0 + task.oc, task.b + ox1 - ox0)
+	written = 0
+	if task.weight_dirty:
+		denom = _read_mmap_band_chunk(task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, cache)
+		if np.any(denom > 0.0):
+			np.maximum(denom, 1.0e-7, out=denom)
+			products = {product.name: product for product in task.products}
+			accumulators = dict(task.accumulators)
+			for name in task.dirty_products:
+				product = products[name]
+				raw = np.stack([
+					_read_mmap_band_chunk(
+						accumulators[name], ch, lz0, lz1, ly0, ly1, lx0, lx1, cache,
+					)
+					for ch in range(product.raw_channel_count)
+				])
+				raw /= denom[None]
+				finalizer = getattr(model_adapter, "finalize_product_slab", None)
+				if finalizer is None:
+					persisted = {
+						channel.name: np.clip(raw[i] * 255.0, 0.0, 255.0).astype(product.dtype)
+						for i, channel in enumerate(product.channels)
+					}
+				else:
+					persisted = finalizer(product, raw)
+				output_adapter.write_product_chunk(
+					product, chunk_origin_zyx=task.origin,
+					data={channel.name: persisted[channel.name] for channel in product.channels},
+				)
+				written += 1
+				del raw, persisted
+		del denom
+	return task.batch_id, task.task_id, written, time.perf_counter() - started
+
+
+def _flush_process_main(
+	worker_index: int,
+	model_adapter: Any,
+	output_adapter: Any,
+	task_queue,
+	result_queue,
+) -> None:
+	_native_limits = _limit_native_worker_threads()
+	cache: dict[str, np.memmap] = {}
+	try:
+		while True:
+			task = task_queue.get()
+			if task is None:
+				break
+			try:
+				batch_id, task_id, written, elapsed = _execute_flush_process_task(
+					task, model_adapter, output_adapter, cache,
+				)
+				result_queue.put(("result", batch_id, task_id, worker_index, written, elapsed))
+			except BaseException as exc:
+				result_queue.put((
+					"error", task.batch_id, task.task_id, worker_index,
+					type(exc).__name__, str(exc),
+				))
+				break
+	finally:
+		for arr in cache.values():
+			mmap_obj = getattr(arr, "_mmap", None)
+			if mmap_obj is not None:
+				mmap_obj.close()
+
+
 def _multi_gpu_worker_main(
 	worker_index: int,
 	device_text: str,
@@ -1782,6 +1942,7 @@ def run_tiled_inference_3d(
 	model_state: Mapping[str, torch.Tensor] | None = None,
 	prefetch_workers: int = 0,
 	slots_per_gpu: int = 2,
+	flush_workers: int = 0,
 ) -> None:
 	"""Authoritative one-pass, multi-scale tiled inference engine."""
 	products = tuple(products)
@@ -1802,6 +1963,8 @@ def run_tiled_inference_3d(
 		raise ValueError("slots_per_gpu must be > 0")
 	if int(prefetch_workers) < 0:
 		raise ValueError("prefetch_workers must be >= 0")
+	if int(flush_workers) < 0:
+		raise ValueError("flush_workers must be >= 0")
 	scales = {
 		p.name: max(1, int(p.inference_scaledown or 1))
 		for p in products
@@ -1893,6 +2056,7 @@ def run_tiled_inference_3d(
 		depth = _plan_circular_z_depth(
 			z_positions=z_positions, tile_size=tile_size, scaledown=sd,
 			z_size=Zo, chunk_size=oc, output_begin=b, output_end=b + (oz1 - oz0),
+			retain_one_flush=int(flush_workers) > 0,
 		)
 		acc = {
 			p.name: _CircularZBand(
@@ -2053,11 +2217,19 @@ def run_tiled_inference_3d(
 		chunks = []
 		for origin in eligible:
 			activity = g["activity"].pop(origin)
-			chunks.append(_FlushChunkDescriptor(
+			chunk = _FlushChunkDescriptor(
 				origin=origin,
 				weight_dirty=bool(activity["weight_dirty"]),
 				dirty_products=tuple(sorted(str(name) for name in activity["dirty_products"])),
-			))
+			)
+			gz, gy, gx = origin
+			lz0, ly0, lx0 = b + gz - oz0, b + gy - oy0, b + gx - ox0
+			lz1 = min(lz0 + oc, b + oz1 - oz0)
+			if chunk.weight_dirty:
+				g["weight"].validate_frozen(lz0, lz1)
+			for name in chunk.dirty_products:
+				g["acc"][name].validate_frozen(lz0, lz1)
+			chunks.append(chunk)
 		g["submitted"] = int(flush_to)
 		print(
 			f"[predict3d] flush sd={sd} z=[{oz0 + flush_from - b},{oz0 + flush_to - b}) "
@@ -2068,94 +2240,195 @@ def run_tiled_inference_3d(
 			sd=int(sd), flush_from=int(flush_from), flush_to=int(flush_to),
 			chunks=tuple(chunks), submitted_at=time.perf_counter(), b=int(b),
 			oc=int(oc), region=g["region"], products=tuple(g["products"]),
-			accumulators=tuple(sorted(g["acc"].items())), weight=g["weight"],
+			accumulators=tuple(
+				(name, band.mmap_descriptor()) for name, band in sorted(g["acc"].items())
+			),
+			weight=g["weight"].mmap_descriptor(),
 		)
 
-	def _run_flush_batch(plans: tuple[_FlushGroupDescriptor, ...]) -> tuple[dict[str, Any], ...]:
-		limits = None
-		try:
-			from threadpoolctl import threadpool_limits
-			limits = threadpool_limits(limits=1)
-			limits.__enter__()
-		except ImportError:
-			limits = None
-		started = time.perf_counter()
-		results = []
-		try:
-			for plan in plans:
-				sd, b, oc = plan.sd, plan.b, plan.oc
-				oz0, oy0, ox0, oz1, oy1, ox1 = plan.region
-				by_name = {p.name: p for p in plan.products}
-				accumulators = dict(plan.accumulators)
-				written = 0
-				for index, chunk in enumerate(plan.chunks, 1):
-					origin = chunk.origin
-					gz, gy, gx = origin
-					lz0, ly0, lx0 = b + gz - oz0, b + gy - oy0, b + gx - ox0
-					lz1 = min(lz0 + oc, b + oz1 - oz0)
-					ly1 = min(ly0 + oc, b + oy1 - oy0)
-					lx1 = min(lx0 + oc, b + ox1 - ox0)
-					if chunk.weight_dirty:
-						denom = plan.weight.read(0, lz0, lz1, ly0, ly1, lx0, lx1)
-						if np.any(denom > 0.0):
-							np.maximum(denom, 1.0e-7, out=denom)
-							for name in chunk.dirty_products:
-								product = by_name[name]
-								raw = np.stack([
-									accumulators[name].read(ch, lz0, lz1, ly0, ly1, lx0, lx1)
-									for ch in range(product.raw_channel_count)
-								])
-								raw /= denom[None]
-								finalizer = getattr(model_adapter, "finalize_product_slab", None)
-								if finalizer is None:
-									persisted = {
-										channel.name: np.clip(raw[i] * 255.0, 0.0, 255.0).astype(product.dtype)
-										for i, channel in enumerate(product.channels)
-									}
-								else:
-									persisted = finalizer(product, raw)
-								output_adapter.write_product_chunk(
-									product, chunk_origin_zyx=origin,
-									data={c.name: persisted[c.name] for c in product.channels},
-								)
-								written += 1
-								del raw, persisted
-						del denom
-					if index == len(plan.chunks) or index % 64 == 0:
-						print(
-							f"[predict3d] flush sd={sd} chunks={index}/{len(plan.chunks)} "
-							f"written={written}", flush=True,
-						)
-				results.append({"plan": plan, "written": written})
-			work_s = time.perf_counter() - started
-			return tuple({**result, "batch_work_s": work_s} for result in results)
-		finally:
-			if limits is not None:
-				limits.__exit__(None, None, None)
-
-	flush_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="predict3d-flush")
-	pending_flush: Future | None = None
+	flush_ctx = mp.get_context("spawn")
+	flush_task_queue = None
+	flush_result_queue = None
+	flush_processes: list[Any] = []
+	pending_flush: dict[str, Any] | None = None
+	flush_batch_id = 0
 	flush_work_total = 0.0
 	flush_wait_total = 0.0
+	flush_chunks_total = 0
+	flush_started_at: float | None = None
+
+	def _start_flush_workers() -> None:
+		nonlocal flush_task_queue, flush_result_queue, flush_processes
+		if int(flush_workers) <= 0 or flush_processes:
+			return
+		try:
+			pickle.dumps((model_adapter, output_adapter))
+		except BaseException as exc:
+			raise TypeError(
+				"process-parallel flush requires spawn-picklable model/output adapters; "
+				"use flush_workers=0 for the synchronous baseline"
+			) from exc
+		window = max(1, 2 * int(flush_workers))
+		flush_task_queue = flush_ctx.Queue(maxsize=window)
+		flush_result_queue = flush_ctx.Queue(maxsize=window)
+		started = []
+		try:
+			with _single_threaded_native_runtime():
+				for index in range(int(flush_workers)):
+					process = flush_ctx.Process(
+						target=_flush_process_main,
+						args=(index, model_adapter, output_adapter, flush_task_queue, flush_result_queue),
+						name=f"predict3d-flush-{index}", daemon=True,
+					)
+					process.start()
+					started.append(process)
+		except BaseException:
+			for process in started:
+				if process.is_alive():
+					process.terminate()
+				process.join(timeout=5.0)
+			flush_task_queue.close()
+			flush_result_queue.close()
+			raise
+		flush_processes = started
+		print(
+			f"[predict3d] flush processes={len(flush_processes)} ipc_window={window} "
+			"native_threads_per_worker=1", flush=True,
+		)
+
+	def _check_flush_workers() -> None:
+		if int(flush_workers) <= 0:
+			return
+		for index, process in enumerate(flush_processes):
+			if not process.is_alive() and process.exitcode is not None:
+				raise RuntimeError(
+					f"flush worker {index} exited unexpectedly with code {process.exitcode}"
+				)
+
+	def _make_flush_tasks(
+		plans: tuple[_FlushGroupDescriptor, ...], batch_id: int,
+	) -> deque[_FlushProcessTask]:
+		tasks: deque[_FlushProcessTask] = deque()
+		for plan in plans:
+			for chunk in plan.chunks:
+				tasks.append(_FlushProcessTask(
+					batch_id=batch_id, task_id=len(tasks), sd=plan.sd,
+					origin=chunk.origin, dirty_products=chunk.dirty_products,
+					weight_dirty=chunk.weight_dirty, b=plan.b, oc=plan.oc,
+					region=plan.region, products=plan.products,
+					accumulators=plan.accumulators, weight=plan.weight,
+				))
+		return tasks
+
+	def _handle_flush_message(message: tuple[Any, ...]) -> None:
+		if pending_flush is None:
+			raise RuntimeError(f"flush result arrived without a pending batch: {message}")
+		if int(message[1]) != int(pending_flush["batch_id"]):
+			raise RuntimeError(f"unexpected flush batch result: {message}")
+		task_id = int(message[2])
+		if task_id not in pending_flush["inflight"]:
+			raise RuntimeError(f"unexpected or duplicate flush task result: {message}")
+		pending_flush["inflight"].remove(task_id)
+		if message[0] == "error":
+			raise RuntimeError(
+				f"flush worker {message[3]} failed task {task_id}: {message[4]}: {message[5]}"
+			)
+		if message[0] != "result":
+			raise RuntimeError(f"unknown flush worker message: {message}")
+		pending_flush["completed"] += 1
+		pending_flush["written_by_sd"][pending_flush["task_sd"][task_id]] += int(message[4])
+		pending_flush["work_s"] += float(message[5])
+
+	def _pump_pending_flush(*, block: bool) -> bool:
+		if pending_flush is None:
+			return True
+		if int(flush_workers) <= 0:
+			return True
+		made_progress = False
+		window = max(1, 2 * int(flush_workers))
+		while pending_flush["tasks"] and len(pending_flush["inflight"]) < window:
+			task = pending_flush["tasks"][0]
+			try:
+				flush_task_queue.put_nowait(task)
+			except queue.Full:
+				break
+			pending_flush["tasks"].popleft()
+			pending_flush["inflight"].add(task.task_id)
+			made_progress = True
+		while True:
+			try:
+				message = flush_result_queue.get_nowait()
+			except queue.Empty:
+				break
+			made_progress = True
+			_handle_flush_message(message)
+		if block and not made_progress and (pending_flush["tasks"] or pending_flush["inflight"]):
+			try:
+				message = flush_result_queue.get(timeout=0.05)
+			except queue.Empty:
+				_check_flush_workers()
+			else:
+				_handle_flush_message(message)
+		return not pending_flush["tasks"] and not pending_flush["inflight"]
+
+	def _shutdown_flush_workers(*, terminate: bool) -> None:
+		nonlocal flush_processes, flush_task_queue, flush_result_queue
+		if not flush_processes:
+			return
+		if terminate:
+			for process in flush_processes:
+				if process.is_alive():
+					process.terminate()
+		else:
+			for _process in flush_processes:
+				flush_task_queue.put(None)
+		for process in flush_processes:
+			process.join(timeout=10.0)
+			if process.is_alive():
+				process.terminate()
+				process.join(timeout=5.0)
+		if terminate:
+			flush_task_queue.cancel_join_thread()
+			flush_result_queue.cancel_join_thread()
+		flush_task_queue.close()
+		flush_result_queue.close()
+		if not terminate:
+			flush_task_queue.join_thread()
+			flush_result_queue.join_thread()
+		flush_processes = []
+		flush_task_queue = None
+		flush_result_queue = None
 
 	def _complete_pending_flush() -> None:
-		nonlocal pending_flush, flush_work_total, flush_wait_total
+		nonlocal pending_flush, flush_work_total, flush_wait_total, flush_chunks_total
 		if pending_flush is None:
 			return
 		wait_started = time.perf_counter()
-		try:
-			results = pending_flush.result()
-		except KeyboardInterrupt:
-			raise
-		except BaseException:
-			pending_flush = None
-			raise
+		if int(flush_workers) > 0:
+			while not _pump_pending_flush(block=True):
+				pass
+		else:
+			cache: dict[str, np.memmap] = {}
+			try:
+				for task in tuple(pending_flush["tasks"]):
+					_batch, task_id, written, elapsed = _execute_flush_process_task(
+						task, model_adapter, output_adapter, cache,
+					)
+					pending_flush["completed"] += 1
+					pending_flush["written_by_sd"][task.sd] += int(written)
+					pending_flush["work_s"] += float(elapsed)
+				pending_flush["tasks"].clear()
+			finally:
+				for arr in cache.values():
+					mmap_obj = getattr(arr, "_mmap", None)
+					if mmap_obj is not None:
+						mmap_obj.close()
 		flush_wait_total += time.perf_counter() - wait_started
+		flush_work_total += float(pending_flush["work_s"])
+		flush_chunks_total += int(pending_flush["completed"])
+		completed_batch = pending_flush
 		pending_flush = None
-		if results:
-			flush_work_total += float(results[0]["batch_work_s"])
-		for result in results:
-			plan = result["plan"]
+		for plan in completed_batch["plans"]:
 			sd, g = plan.sd, groups[plan.sd]
 			b, oc = g["b"], g["oc"]
 			oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
@@ -2194,7 +2467,8 @@ def run_tiled_inference_3d(
 				)
 			print(
 				f"[predict3d] flush complete sd={sd} z={oz0 + plan.flush_to - b} "
-				f"dirty_chunks={len(plan.chunks)} products_written={result['written']} "
+				f"dirty_chunks={len(plan.chunks)} "
+				f"products_written={completed_batch['written_by_sd'][sd]} "
 				f"unsupported={len(g['unsupported_origins'])} resume={len(g['resume_origins'])} "
 				f"touched={g['touched_bytes'] / 1024**2:.2f}MiB "
 				f"cleared={g['cleared_bytes'] / 1024**2:.2f}MiB "
@@ -2203,7 +2477,7 @@ def run_tiled_inference_3d(
 			)
 
 	def _advance_flushes(complete_padded: int) -> None:
-		nonlocal pending_flush
+		nonlocal pending_flush, flush_batch_id, flush_started_at
 		targets = {
 			sd: _flush_target(sd, g, complete_padded)
 			for sd, g in groups.items()
@@ -2216,7 +2490,20 @@ def run_tiled_inference_3d(
 			for sd in sorted(groups)
 			if targets[sd] > int(groups[sd]["submitted"])
 		)
-		pending_flush = flush_executor.submit(_run_flush_batch, plans)
+		flush_batch_id += 1
+		if flush_started_at is None:
+			flush_started_at = time.perf_counter()
+		tasks = _make_flush_tasks(plans, flush_batch_id)
+		pending_flush = {
+			"batch_id": flush_batch_id, "plans": plans, "tasks": tasks,
+			"inflight": set(), "completed": 0, "work_s": 0.0,
+			"written_by_sd": {sd: 0 for sd in groups},
+			"task_sd": {task.task_id: task.sd for task in tasks},
+		}
+		if int(flush_workers) <= 0:
+			_complete_pending_flush()
+		else:
+			_pump_pending_flush(block=False)
 
 	total = len(z_positions) * len(y_positions) * len(x_positions)
 	done = processed = skipped = 0
@@ -2248,8 +2535,10 @@ def run_tiled_inference_3d(
 				_advance_flushes(next_tz)
 
 		if not parallel:
+			_start_flush_workers()
 			assert w_full is not None and w_by_scale is not None
 			for tz, ty, tx, row_end, next_tz in _iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp):
+				_pump_pending_flush(block=False)
 				needed_names = _tile_work(tz, ty, tx)
 				if not needed_names:
 					_record_commit(was_processed=False, elapsed=0.0, row_end=row_end, next_tz=next_tz)
@@ -2331,9 +2620,10 @@ def run_tiled_inference_3d(
 			]
 			started_workers = []
 			try:
-				for worker in workers:
-					worker.start()
-					started_workers.append(worker)
+				with _single_threaded_native_runtime():
+					for worker in workers:
+						worker.start()
+						started_workers.append(worker)
 			except BaseException:
 				for worker in started_workers:
 					if worker.is_alive():
@@ -2345,7 +2635,8 @@ def run_tiled_inference_3d(
 				for shm in input_shms + result_shms:
 					shm.close()
 					shm.unlink()
-				raise
+					raise
+			_start_flush_workers()
 			reader_count = int(prefetch_workers) if int(prefetch_workers) > 0 else min(_slot_count, max(1, len(resolved_devices) * 2))
 			executor = ThreadPoolExecutor(max_workers=reader_count, thread_name_prefix="predict3d-read")
 			free_inputs = list(range(_slot_count - 1, -1, -1))
@@ -2369,6 +2660,7 @@ def run_tiled_inference_3d(
 
 			try:
 				while not source_done or events:
+					_pump_pending_flush(block=False)
 					made_progress = False
 					while not source_done and len(events) < _slot_count:
 						try:
@@ -2492,31 +2784,23 @@ def run_tiled_inference_3d(
 					shm.close()
 					shm.unlink()
 		_complete_pending_flush()
-		flush_executor.shutdown(wait=True, cancel_futures=False)
+		_shutdown_flush_workers(terminate=False)
 		if progress is not None:
 			print(_predict3d_progress_line(progress), flush=True)
+		flush_wall = 0.0 if flush_started_at is None else time.perf_counter() - flush_started_at
+		flush_rate = 0.0 if flush_wall <= 0.0 else flush_chunks_total / flush_wall
 		print(
-			f"[predict3d] flush stats work={flush_work_total:.2f}s wait={flush_wait_total:.2f}s",
+			f"[predict3d] flush stats workers={int(flush_workers)} chunks={flush_chunks_total} "
+			f"work_sum={flush_work_total:.2f}s wait={flush_wait_total:.2f}s "
+			f"wall={flush_wall:.2f}s rate={flush_rate:.2f}chunks/s",
 			flush=True,
 		)
 		print(f"[predict3d] inference done in {time.time()-t0:.1f}s ({processed} processed, {skipped} skipped)", flush=True)
 	finally:
 		active_error = sys.exc_info()[1]
 		flush_cleanup_error: BaseException | None = None
-		while pending_flush is not None:
-			try:
-				_complete_pending_flush()
-			except KeyboardInterrupt as exc:
-				# A Python thread cannot be cancelled while it reads the mmap. Keep
-				# waiting before cleanup even when shutdown is interrupted again.
-				if flush_cleanup_error is None:
-					flush_cleanup_error = exc
-			except BaseException as exc:
-				pending_flush = None
-				if flush_cleanup_error is None:
-					flush_cleanup_error = exc
 		try:
-			flush_executor.shutdown(wait=True, cancel_futures=False)
+			_shutdown_flush_workers(terminate=active_error is not None or pending_flush is not None)
 		except BaseException as exc:
 			if flush_cleanup_error is None:
 				flush_cleanup_error = exc

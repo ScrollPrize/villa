@@ -726,12 +726,15 @@ advances the rolling Z ring.
 
 Output flushing also overlaps inference. One enlarged but still fixed-depth
 mmap ring retains at most one finalized interval while the following Z row is
-accumulated into disjoint slots. A single background flusher reads that frozen
-interval one output chunk at a time; it does not copy a band into RAM or a
-second mmap. At the next flush frontier the coordinator waits if needed,
-clears/releases the completed interval, and submits the next. The final status
-reports aggregate `flush stats work=... wait=...`; wait is the portion that
-still blocked inference because output processing did not keep up.
+accumulated into disjoint slots. Persistent spawn-process workers reopen that
+frozen interval read-only and normalize/finalize/write distinct output chunks
+in parallel, without copying a band through IPC. Their task/result queues are
+bounded and each worker allocates at most one chunk's temporary arrays. At the
+next flush frontier the coordinator waits if needed, clears/releases the whole
+completed interval, and submits the next. `--flush-workers` defaults to the
+available CPU count capped at 64; zero restores synchronous flushing and the
+smaller immediate-release ring for A/B measurements. Final status reports
+workers, chunks, aggregate worker time, and coordinator wait.
 
 | Component            | RAM usage (2000³ crop, sd=4) |
 |----------------------|-----------------------------|
