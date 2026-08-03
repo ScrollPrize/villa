@@ -187,6 +187,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [TIFXYZ Doctor](https://github.com/aviad12g/tifxyz-doctor) by Aviad Cohen — deterministic QA and triage for TIFXYZ surface grids, with sparse overlays and reproducible corpus/reader checks. v0.2 adds an overlap-component-isolated benchmark on 709 official human-reviewed PHercParis4 `same_wrap` patches; its frozen cue localizes abrupt synthetic normal-offset steps while byte-identical null controls and the reported gradual-transition miss rate bound the claim.
 
+- [spiralcheck](https://github.com/Nicodol/spiralcheck) by Nicolas Dolegieviez. Held-out evaluation for whole-scroll spiral fits: scores a finished run from its output meshes alone (CPU-only, no checkpoint, producer-agnostic) against verified patches withheld from that fit, and measures geometrically how much of the withheld evidence actually sits within touching distance of the fit's real inputs — on PHerc. Paris 4, 54.8% of a naive name-level split leaked that way, which no hash-level check can see. Also ships ground-truth-free winding-order checks around the umbilicus, a planted-defect matrix with computed null-control bounds, and `spiralcheck demo`, which runs the whole pipeline on a synthetic scroll with planted defects and needs no data.
+
 ### 📦 Materials
 
 #### 🌟 Highlighted
