@@ -412,3 +412,13 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/spiral/
         PATTERN "*.json"
         PATTERN "tests" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
+
+set(_vc3d_fiber_format_src
+    "${CMAKE_SOURCE_DIR}/../vesuvius/src/vc3d_fiber_format")
+if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
+    install(DIRECTORY "${_vc3d_fiber_format_src}"
+        DESTINATION share/volume-cartographer/spiral
+        FILES_MATCHING
+            PATTERN "*.py"
+            PATTERN "__pycache__" EXCLUDE)
+endif()

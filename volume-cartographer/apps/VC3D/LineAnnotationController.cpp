@@ -49,6 +49,7 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QFileInfo>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -307,6 +308,26 @@ QString fiberDisplayNameFromFileName(const std::string& fileName)
 {
     const QString stem = vc3d::displayStemForFiberFile(QString::fromStdString(fileName));
     return stem.isEmpty() ? QObject::tr("unsaved fiber") : stem;
+}
+
+std::string datasetEntryMenuLabel(const vc::project::Entry& entry)
+{
+    QString label;
+    if (!vc::project::isLocationRemote(entry.location)) {
+        label = QFileInfo(QString::fromStdString(entry.location)).fileName();
+    }
+    if (label.isEmpty()) {
+        label = QString::fromStdString(entry.location);
+    }
+    for (const auto& tag : entry.tags) {
+        if (tag.rfind("model:", 0) == 0 ||
+            tag.rfind("source:", 0) == 0 ||
+            tag.rfind("name:", 0) == 0) {
+            label += QStringLiteral(" (%1)").arg(QString::fromStdString(tag));
+            break;
+        }
+    }
+    return label.toStdString();
 }
 
 std::optional<FiberJsonPathOptions> showFiberJsonPathDialog(QWidget* parent,
@@ -1961,6 +1982,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     auto* dialog = new LineAnnotationDialog(_viewerManager, _volumeSelectorFactory, nullptr);
     dialog->setFiberDisplayName(fiberDisplayNameFromFileName(session->fiberFileName));
     dialog->setFiberOptimizationMode(session->fiberOptimizationMode);
+    refreshLineAnnotationDatasetMenu(dialog);
     if (!dialog->addPane(surfaceName, tr("Line Annotation Slice"), camera)) {
         dialog->deleteLater();
         _state->setSurface(surfaceName, nullptr);
@@ -1998,6 +2020,18 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                     return;
                 }
                 setFiberTag(pane->session->fiberId, tag, enabled);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::lasagnaDatasetSelectionChanged,
+            this,
+            [this](const std::string& location) {
+                handleLasagnaDatasetSelectionChanged(location);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::fiberInferenceDatasetSelectionChanged,
+            this,
+            [this](const std::string& location) {
+                handleFiberInferenceDatasetSelectionChanged(location);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointRequested,
@@ -6901,28 +6935,37 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     std::string selectedIdentity;
     fs::path manifestPath;
     double workingToBaseScale = 1.0;
-    try {
-        if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
-                *vpkg, _state->currentVolumeId())) {
-            manifestPath = resolved->manifestPath;
-            selected = resolved->manifestBacked
-                ? manifestPath.string()
-                : vpkg->selectedLasagnaDataset();
-            selectedIdentity = resolved->sourceManifestLocation;
-            workingToBaseScale = resolved->workingToBaseScale;
-        }
-    } catch (const std::exception& ex) {
-        showError(tr("Cannot resolve Lasagna for the active volume: %1")
-                      .arg(QString::fromStdString(ex.what())),
-                  headless);
-        return false;
-    }
-
-    if (selected.empty() && !vpkg->selectedLasagnaDataset().empty()) {
+    if (!vpkg->selectedLasagnaDataset().empty()) {
         selected = vpkg->selectedLasagnaDataset();
         selectedIdentity = selected;
+        const auto entries = vpkg->lasagnaDatasetEntries();
+        const auto selectedEntry = std::find_if(
+            entries.begin(), entries.end(), [&](const auto& entry) {
+                return entry.location == selected;
+            });
+        if (selectedEntry != entries.end()) {
+            selectedIdentity =
+                vc3d::opendata::lasagnaSourceManifestLocation(*selectedEntry);
+        }
         if (!vc::project::isLocationRemote(selected)) {
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
+        }
+    } else {
+        try {
+            if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
+                    *vpkg, _state->currentVolumeId())) {
+                manifestPath = resolved->manifestPath;
+                selected = resolved->manifestBacked
+                    ? manifestPath.string()
+                    : vpkg->selectedLasagnaDataset();
+                selectedIdentity = resolved->sourceManifestLocation;
+                workingToBaseScale = resolved->workingToBaseScale;
+            }
+        } catch (const std::exception& ex) {
+            showError(tr("Cannot resolve Lasagna for the active volume: %1")
+                          .arg(QString::fromStdString(ex.what())),
+                      headless);
+            return false;
         }
     }
     auto openSelectedDataset = [&](const std::string& location) {
@@ -6989,6 +7032,113 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     session.selectedManifestPath = manifestPath;
     session.workingToBaseScale = workingToBaseScale;
     return true;
+}
+
+void LineAnnotationController::refreshLineAnnotationDatasetMenus() const
+{
+    for (const auto& pane : _panes) {
+        if (pane.dialog) {
+            refreshLineAnnotationDatasetMenu(pane.dialog);
+        }
+    }
+}
+
+void LineAnnotationController::refreshLineAnnotationDatasetMenu(
+    LineAnnotationDialog* dialog) const
+{
+    if (!dialog || !_state || !_state->vpkg()) {
+        return;
+    }
+    auto vpkg = _state->vpkg();
+    std::vector<std::pair<std::string, std::string>> lasagnaOptions;
+    for (const auto& entry : vpkg->lasagnaDatasetEntries()) {
+        lasagnaOptions.emplace_back(entry.location, datasetEntryMenuLabel(entry));
+    }
+    std::vector<std::pair<std::string, std::string>> fiberOptions;
+    for (const auto& entry : vpkg->fiberInferenceDatasetEntries()) {
+        fiberOptions.emplace_back(entry.location, datasetEntryMenuLabel(entry));
+    }
+    dialog->setLasagnaDatasetOptions(
+        std::move(lasagnaOptions),
+        vpkg->selectedLasagnaDataset());
+    dialog->setFiberInferenceDatasetOptions(
+        std::move(fiberOptions),
+        vpkg->selectedFiberInferenceDataset());
+}
+
+void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
+    const std::string& location)
+{
+    if (!_state || !_state->vpkg() || location.empty()) {
+        return;
+    }
+    for (const auto& pane : _panes) {
+        if (pane.session &&
+            pane.session->taskState == LineAnnotationSession::TaskState::Running) {
+            showError(tr("Line optimization is already running."),
+                      pane.session->suppressErrorDialogs);
+            refreshLineAnnotationDatasetMenus();
+            return;
+        }
+    }
+
+    auto vpkg = _state->vpkg();
+    if (vpkg->selectedLasagnaDataset() == location) {
+        return;
+    }
+    vpkg->setSelectedLasagnaDataset(location);
+    for (const auto& pane : _panes) {
+        if (!pane.session) {
+            continue;
+        }
+        auto& session = *pane.session;
+        session.dataset.reset();
+        session.normalSampler.reset();
+        session.traceNormalDataset.reset();
+        session.traceNormalSampler.reset();
+        session.selectedDatasetLocation.clear();
+        session.traceNormalDatasetLocation.clear();
+        if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
+            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        }
+    }
+    refreshLineAnnotationDatasetMenus();
+}
+
+void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
+    const std::string& location)
+{
+    if (!_state || !_state->vpkg() || location.empty()) {
+        return;
+    }
+    for (const auto& pane : _panes) {
+        if (pane.session &&
+            pane.session->taskState == LineAnnotationSession::TaskState::Running) {
+            showError(tr("Line optimization is already running."),
+                      pane.session->suppressErrorDialogs);
+            refreshLineAnnotationDatasetMenus();
+            return;
+        }
+    }
+
+    auto vpkg = _state->vpkg();
+    if (vpkg->selectedFiberInferenceDataset() == location) {
+        return;
+    }
+    vpkg->setSelectedFiberInferenceDataset(location);
+    for (const auto& pane : _panes) {
+        if (!pane.session) {
+            continue;
+        }
+        auto& session = *pane.session;
+        session.fiberInferenceDataset.reset();
+        session.fiberPredictionField.reset();
+        session.selectedFiberInferenceDatasetLocation.clear();
+        if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
+            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        }
+    }
+    refreshLineAnnotationDatasetMenus();
 }
 
 bool LineAnnotationController::ensureFiberInferenceDatasetForSession(

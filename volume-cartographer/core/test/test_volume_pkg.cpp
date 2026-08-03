@@ -679,6 +679,31 @@ TEST_CASE("VolumePkg atomically attaches and detaches a Lasagna manifest with de
     fs::remove_all(d);
 }
 
+TEST_CASE("VolumePkg Lasagna attach fills but does not replace selected datasets")
+{
+    auto pkg = VolumePkg::newEmpty();
+
+    REQUIRE(pkg->attachPreparedLasagnaDataset(
+                "first.lasagna.json", {}, false, {}) ==
+            VolumePkg::AttachLasagnaResult::Attached);
+    CHECK(pkg->selectedLasagnaDataset() == "first.lasagna.json");
+
+    REQUIRE(pkg->attachPreparedLasagnaDataset(
+                "second.lasagna.json", {}, false, {}) ==
+            VolumePkg::AttachLasagnaResult::Attached);
+    CHECK(pkg->selectedLasagnaDataset() == "first.lasagna.json");
+
+    REQUIRE(pkg->attachPreparedLasagnaDataset(
+                "fiber-a.lasagna.json", {}, true, {}) ==
+            VolumePkg::AttachLasagnaResult::Attached);
+    CHECK(pkg->selectedFiberInferenceDataset() == "fiber-a.lasagna.json");
+
+    REQUIRE(pkg->attachPreparedLasagnaDataset(
+                "fiber-b.lasagna.json", {}, true, {}) ==
+            VolumePkg::AttachLasagnaResult::Attached);
+    CHECK(pkg->selectedFiberInferenceDataset() == "fiber-a.lasagna.json");
+}
+
 TEST_CASE("VolumePkg Lasagna reattachment reconciles roles tags and removed channels")
 {
     auto d = tmpDir("lasagna_batch_reconcile");

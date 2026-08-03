@@ -35,8 +35,10 @@ class QProgressBar;
 class QPushButton;
 class QCloseEvent;
 class QHBoxLayout;
+class QMenu;
 class QResizeEvent;
 class QTimer;
+class QToolButton;
 class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
@@ -122,6 +124,12 @@ public:
     int maxControlPointDistanceVx() const;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
     void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
+    void setLasagnaDatasetOptions(
+        std::vector<std::pair<std::string, std::string>> options,
+        const std::string& selectedLocation);
+    void setFiberInferenceDatasetOptions(
+        std::vector<std::pair<std::string, std::string>> options,
+        const std::string& selectedLocation);
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
     void setGeneratedBranchLinks(std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks);
@@ -205,6 +213,8 @@ signals:
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
     void fiberOptimizationModeChanged(
         vc3d::line_annotation::FiberOptimizationMode mode);
+    void lasagnaDatasetSelectionChanged(const std::string& location);
+    void fiberInferenceDatasetSelectionChanged(const std::string& location);
     void extrapolationDistanceChanged(int distanceVx);
 
 protected:
@@ -307,6 +317,7 @@ private:
     void updateOptimizationStatusIndicator();
     void updateOptimizationOverlayGeometry();
     void updateFiberNameLabel();
+    void rebuildDatasetMenus();
     void restoreWindowGeometry();
     void saveWindowGeometry() const;
     void restoreGeneratedViewStateSettings();
@@ -315,6 +326,13 @@ private:
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
     QComboBox* _fiberOptimizationCombo = nullptr;
+    QToolButton* _datasetMenuButton = nullptr;
+    QMenu* _lasagnaDatasetMenu = nullptr;
+    QMenu* _fiberInferenceDatasetMenu = nullptr;
+    std::vector<std::pair<std::string, std::string>> _lasagnaDatasetOptions;
+    std::vector<std::pair<std::string, std::string>> _fiberInferenceDatasetOptions;
+    std::string _selectedLasagnaDatasetLocation;
+    std::string _selectedFiberInferenceDatasetLocation;
     // Checked = auto-reoptimize after each edit; unchecked = no optimization.
     QAction* _autoReoptimizeAction = nullptr;
     QAction* _showAsMeshAction = nullptr;

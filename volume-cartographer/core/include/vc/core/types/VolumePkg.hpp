@@ -282,7 +282,6 @@ private:
     [[nodiscard]] utils::Json toJson() const;
     void fromJson(const utils::Json& j);
 
-    static std::filesystem::path autosaveRoot_;
     static std::optional<std::string> loadFirstSegmentationDir_;
 
     mutable std::mutex segmentsMutex_;

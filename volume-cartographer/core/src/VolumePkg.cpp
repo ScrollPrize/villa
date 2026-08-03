@@ -41,7 +41,6 @@
 
 namespace fs = std::filesystem;
 
-std::filesystem::path VolumePkg::autosaveRoot_;
 std::optional<std::string> VolumePkg::loadFirstSegmentationDir_{};
 
 namespace vc::project {
@@ -446,6 +445,12 @@ fs::path defaultAutosaveRoot()
 #endif
 }
 
+fs::path& autosaveRootStorage()
+{
+    static fs::path root;
+    return root;
+}
+
 void atomicWriteString(const fs::path& target, const std::string& text)
 {
     fs::create_directories(target.parent_path());
@@ -590,8 +595,8 @@ VolumePkg::~VolumePkg()
     segmentsChangedCb_ = nullptr;
 }
 
-void VolumePkg::setAutosaveRoot(const fs::path& dir) { autosaveRoot_ = dir; }
-fs::path VolumePkg::autosaveRoot() { return autosaveRoot_; }
+void VolumePkg::setAutosaveRoot(const fs::path& dir) { autosaveRootStorage() = dir; }
+fs::path VolumePkg::autosaveRoot() { return autosaveRootStorage(); }
 
 void VolumePkg::setLoadFirstSegmentationDirectory(const std::string& dirName)
 {
@@ -1323,7 +1328,7 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         }
 
         if (updateSelection && fiberInference) {
-            if (selectedFiberInferenceDataset_ != manifestLocation) {
+            if (!selectedFiberInferenceDataset_) {
                 selectedFiberInferenceDataset_ = manifestLocation;
                 changed = true;
             }
@@ -1332,7 +1337,7 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
                 changed = true;
             }
         } else if (updateSelection) {
-            if (selectedLasagnaDataset_ != manifestLocation) {
+            if (!selectedLasagnaDataset_) {
                 selectedLasagnaDataset_ = manifestLocation;
                 changed = true;
             }
