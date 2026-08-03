@@ -604,13 +604,16 @@
   as CP-centered volume blocks. For Trace2CP evaluation, dense 3D inference is
   run over tiled axis-aligned blocks covering the requested 2D strip
   coordinates plus configured context, then sampled/projected back to 2D.
-- Configured test execution must be guarded on rank 0 by a persistent
-  pre-NCCL-timeout watchdog. By default it appends an all-thread traceback to
-  the run's rank-0 diagnostic log after 480 seconds, before the 600-second DDP
-  process-group timeout. Per-batch load, target, forward, CUDA synchronization,
-  CPU conversion, visualization, Trace2CP, and TensorBoard phases must leave
-  flushed markers. Diagnostics are best-effort and must not change evaluation,
-  visualization, TensorBoard, snapshot, or training numerics.
+- Hang diagnostics are disabled by default. Setting the JSON boolean
+  `training.test_hang_diagnostics_enabled: true` or passing
+  `--test-hang-diagnostics` during normal training enables append-only per-rank
+  diagnostic logs, `SIGUSR2` manual dumps, detailed test phase markers, and a
+  rank-0 pre-NCCL-timeout watchdog. The watchdog defaults to 480 seconds through
+  `training.test_watchdog_seconds`, which must be positive and below the
+  600-second process-group timeout when diagnostics are enabled. Disabled mode
+  creates no files or handlers, arms no timer, polls no resources, and performs
+  no diagnostic CUDA synchronization. The CLI flag is invalid in auxiliary
+  prefetch, benchmark, and Trace2CP visualization modes.
 - Rank 0 prints `test_timing step=... total_seconds=...` for the complete test
   routine through distributed dense evaluation, visualization, and Trace2CP,
   excluding the subsequent TensorBoard flush, and logs the same duration as

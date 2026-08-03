@@ -1,57 +1,39 @@
-# Task Log: Distributed Prefetched Fiber 3D Dense Tests
+# Task Log: Opt-In Fiber 3D Hang Diagnostics
 
-## Findings and baseline
+## Findings
 
-- Watchdog diagnostics proved step 95800 spent 662.742 seconds in 16 serial
-  rank-0 dense-test `load_batch` calls and only 1.194 seconds in GPU forwards.
-  NCCL timed out at 600 seconds while rank 0 continued making loader progress.
-- The preceding step 95700 spent 532.544 seconds in dense-test loads and
-  588.176 seconds in the complete configured-test routine, already close to the
-  process-group timeout.
-- Training uses persistent process-worker DataLoader prefetch, while dense
-  testing previously bypassed it and synchronously loaded all 123 samples on
-  rank 0.
-- Independent review required global-batch sharding, literal non-aligned sample
-  offsets, exact historical per-batch metric order/weighting, all-rank initial
-  and interval collective participation, and explicit worker-pool ownership.
+- The existing diagnostics object was created on every rank and immediately
+  opened a per-rank file and registered `SIGUSR2`.
+- Diagnostic CUDA synchronization was unconditional for CUDA tests even if no
+  file was available, so merely suppressing file creation would not have made
+  disabled mode side-effect-free.
+- Independent review required strict JSON-boolean validation, enabled-only
+  timeout validation, explicit effective-config fields, and rejection of the
+  normal-training flag in auxiliary modes.
 
 ## Implementation
 
-- Every rank now builds the held-out loader and retains a test DataLoader using
-  the same worker/prefetch/device/context settings as training.
-- Global test batch IDs are deterministically assigned as
-  `rank, rank + WORLD_SIZE, ...`; the configured start is applied as a literal
-  sample offset and only the global final batch is sliced.
-- Ranks gather `(global_batch_index, float_metric_row)` records. Rank 0 restores
-  global order and applies the prior unweighted Python per-batch mean, avoiding
-  a floating-point reduction-order change to best-checkpoint selection.
-- All ranks enter both step-0 and interval dense tests. TensorBoard, stdout,
-  visualization, Trace2CP, and snapshots remain rank-0-only. Rank 0 reuses its
-  already evaluated global batch zero for visualization.
-- Rank 0 prints `test_timing step=... total_seconds=...` and logs
-  `timing/test_total_seconds` before the configured-test TensorBoard flush.
+- `training.test_hang_diagnostics_enabled` now defaults to `false`; normal
+  training can also enable diagnostics with `--test-hang-diagnostics`.
+- Disabled `_TrainingHangDiagnostics` is a no-op object: it opens no file,
+  registers/cancels no signal or timer, polls no resources, and causes
+  `_diagnostic_cuda_synchronize` to return before a GPU barrier.
+- The config key must be a JSON boolean. Config and CLI activation are ORed and
+  their config/CLI/effective values are recorded in TensorBoard's effective
+  config. Rank 0 prints the effective state at startup.
+- `training.test_watchdog_seconds` retains its 480-second default and validation
+  only when diagnostics are active. Invalid/irrelevant values are ignored while
+  disabled.
+- Prefetch, benchmark, and Trace2CP visualization reject the diagnostics flag.
 
 ## Validation
 
-- Python compilation and `git diff --check` pass.
-- A direct helper smoke test covered 123 samples over eight ranks, exact
-  disjoint global-batch coverage, final partial sizing, ordered metric means,
-  and the stdout/TensorBoard timing helper.
-- Added pytest coverage for non-batch-aligned offsets, `N < batch_size`,
-  non-divisible counts, zero-work ranks, mocked gathered-row ordering, and
-  timing output/scalar logging.
-- The existing `.venv_las` does not contain pytest, so the pytest cases could
-  not be executed without installing a dependency. No install was performed.
-- A real two-rank Gloo smoke could not initialize because the sandbox forbids
-  local transport sockets (`Operation not permitted`). The helper-level mocked
-  collective test remains in the suite.
-- No eight-GPU training run was started. The next user run will provide the
-  required after-change wall time in stdout and TensorBoard; no measured
-  speedup is claimed yet.
-
-## Known limitation
-
-- Rank-0-only visualization and Trace2CP run after distributed dense evaluation
-  while other ranks wait for the final result broadcast. Diagnostics still
-  cover these phases, and they must remain below the 600-second process-group
-  timeout. They were not the bottleneck in the captured failure.
+- A direct no-op lifecycle smoke test mocked file-global faulthandler calls and
+  CUDA synchronization; disabled mode invoked none and created no log.
+- Resolver smoke coverage passed for default, config, CLI, invalid type, and
+  disabled invalid-timeout behavior.
+- The auxiliary-mode CLI rejection path passed.
+- Added pytest regressions for the disabled lifecycle and resolution rules;
+  existing subprocess enabled-watchdog/manual-dump tests remain intact.
+- Python compilation and `git diff --check` passed. The environment still lacks
+  pytest, so the pytest suite was not executed and no dependency was installed.

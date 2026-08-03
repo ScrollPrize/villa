@@ -513,7 +513,8 @@ Ownership changed as follows:
   ```
 
 - Supports `--prefetch`, `--prefetch-steps`, `--benchmark`, `--load-only`,
-  `--resume`, and `--trace2cp-vis`.
+  `--resume`, `--trace2cp-vis`, and the normal-training-only
+  `--test-hang-diagnostics` flag.
 - Multi-GPU training uses the standard `torchrun` launch environment and does
   not require config changes:
 
@@ -536,20 +537,23 @@ Ownership changed as follows:
   unweighted batch mean. Rank 0 reuses evaluated global batch zero for the test
   sample sheet. Test completion prints `test_timing ... total_seconds=...` and
   logs `timing/test_total_seconds` to TensorBoard.
-  Every rank writes an append-only
-  `<run_dir>/hang_diagnostics_rank_<rank>.log`. Rank 0 guards the complete
-  configured-test routine with an automatic traceback dump after eight minutes
-  (`training.test_watchdog_seconds`, default `480`, required to be below the
-  600-second process-group timeout). Dense-test batch loading, target creation,
-  forward/CUDA synchronization, CPU loss conversion, test visualization,
-  Trace2CP, and TensorBoard flush have flushed phase markers with process and
-  CUDA-memory counters. Diagnostics do not alter training-step synchronization
-  or results.
+  Hang diagnostics are disabled by default. Enable them explicitly with the
+  JSON boolean `training.test_hang_diagnostics_enabled: true` or the normal
+  training flag `--test-hang-diagnostics`. When enabled, every rank writes an
+  append-only `<run_dir>/hang_diagnostics_rank_<rank>.log`; rank 0 guards the
+  complete configured-test routine with an automatic traceback dump after
+  eight minutes (`training.test_watchdog_seconds`, default `480`, required to
+  be below the 600-second process-group timeout). Dense-test batch loading,
+  target creation, forward/CUDA synchronization, CPU loss conversion, test
+  visualization, Trace2CP, and TensorBoard flush have flushed phase markers
+  with process and CUDA-memory counters. Disabled mode creates no log, handler,
+  timer, resource polling, or diagnostic CUDA synchronization.
   On platforms with `SIGUSR2`, `kill -USR2 <pid>` appends an immediate
   all-thread Python traceback to that rank's file; find rank 0 with
   `ps -eo pid,cmd | grep 'fiber_trace_3d.train'`.
   `--prefetch`, `--benchmark`, and `--trace2cp-vis` remain single-process
-  modes and reject `WORLD_SIZE > 1`.
+  modes and reject `WORLD_SIZE > 1`; they also reject
+  `--test-hang-diagnostics` because it is a normal-training option.
 - Writes snapshots to `<run_path>/<run_name>_<datestr>/snapshots/current.pt`
   and `best.pt`. `training.kept_snapshot_interval` additionally keeps numbered
   snapshots as `snapshots/step_<iteration>.pt` and defaults to `10000`.

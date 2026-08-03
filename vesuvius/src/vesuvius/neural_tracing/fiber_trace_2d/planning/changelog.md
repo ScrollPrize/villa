@@ -1,3 +1,9 @@
+# 2026-08-03
+
+- Made Fiber 3D per-rank hang logs, manual dumps, test watchdog, resource
+  polling, and diagnostic CUDA synchronization explicitly opt-in through config
+  or CLI.
+
 # 2026-08-02
 
 - Fixed cropped shared 3D inference treating globally positioned output chunks

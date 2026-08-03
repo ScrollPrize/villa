@@ -130,6 +130,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _TrainingHangDiagnostics,
+    _diagnostic_cuda_synchronize,
     _autocast_context,
     _conditioned_perpendicular_queries,
     _safe_probability_bce,
@@ -160,6 +161,81 @@ def _run_hang_diagnostics_subprocess(tmp_path: Path, body: str) -> subprocess.Co
         timeout=10,
         check=False,
     )
+
+
+def test_training_hang_diagnostics_disabled_has_no_side_effects(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def record(name):
+        return lambda *args, **kwargs: calls.append((name, args, kwargs))
+
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.register", record("register"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.unregister", record("unregister"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.dump_traceback_later", record("dump"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.cancel_dump_traceback_later", record("cancel"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.torch.cuda.synchronize", record("sync"))
+
+    diagnostics = _TrainingHangDiagnostics(
+        tmp_path,
+        rank=0,
+        device=torch.device("cuda", 0),
+        automatic_watchdog=True,
+        enabled=False,
+    )
+    diagnostics.marker("ignored")
+    diagnostics.arm_test_watchdog(10)
+    _diagnostic_cuda_synchronize(
+        diagnostics,
+        phase="ignored-sync",
+        step=10,
+        device=torch.device("cuda", 0),
+    )
+    diagnostics.close()
+
+    assert calls == []
+    assert not (tmp_path / "hang_diagnostics_rank_0.log").exists()
+
+
+@pytest.mark.parametrize(
+    ("training", "cli_enabled", "expected"),
+    [
+        ({}, False, (False, False, False)),
+        ({"test_hang_diagnostics_enabled": True}, False, (True, False, True)),
+        ({"test_hang_diagnostics_enabled": False}, True, (False, True, True)),
+    ],
+)
+def test_training_hang_diagnostics_enable_resolution(training, cli_enabled, expected) -> None:
+    assert _resolve_test_hang_diagnostics_enabled(
+        training,
+        cli_enabled=cli_enabled,
+    ) == expected
+
+
+def test_training_hang_diagnostics_config_requires_json_boolean() -> None:
+    with pytest.raises(ValueError, match="must be a JSON boolean"):
+        _resolve_test_hang_diagnostics_enabled(
+            {"test_hang_diagnostics_enabled": "false"},
+            cli_enabled=False,
+        )
+
+
+def test_training_watchdog_timeout_is_validated_only_when_enabled() -> None:
+    assert _resolve_test_watchdog_seconds(
+        {"test_watchdog_seconds": "invalid"},
+        diagnostics_enabled=False,
+    ) == 480.0
+    with pytest.raises(ValueError):
+        _resolve_test_watchdog_seconds(
+            {"test_watchdog_seconds": 600},
+            diagnostics_enabled=True,
+        )
+    assert _resolve_test_watchdog_seconds(
+        {"test_watchdog_seconds": 123},
+        diagnostics_enabled=True,
+    ) == 123.0
 
 
 def test_training_hang_watchdog_dumps_and_can_be_rearmed(tmp_path: Path) -> None:
@@ -227,6 +303,8 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _distributed_training_sample_index,
     _mean_dense_test_rows,
     _report_test_timing,
+    _resolve_test_hang_diagnostics_enabled,
+    _resolve_test_watchdog_seconds,
     _resolve_dense_test_selection,
     _resolve_prefetch_sample_count,
     _require_single_process_cli_mode,

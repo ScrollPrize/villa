@@ -111,16 +111,20 @@ class _TrainingHangDiagnostics:
         device: torch.device,
         watchdog_seconds: float = 480.0,
         automatic_watchdog: bool = False,
+        enabled: bool = True,
     ) -> None:
         self.rank = int(rank)
         self.device = device
         self.watchdog_seconds = float(watchdog_seconds)
         self.automatic_watchdog = bool(automatic_watchdog)
+        self.enabled = bool(enabled)
         self.path = Path(run_dir) / f"hang_diagnostics_rank_{self.rank}.log"
         self._file: Any | None = None
         self._watchdog_armed = False
         self._signal_registered = False
         self._closed = False
+        if not self.enabled:
+            return
         try:
             self._file = self.path.open("a", encoding="utf-8", buffering=1)
             self.marker(
@@ -147,6 +151,8 @@ class _TrainingHangDiagnostics:
             self._file = None
 
     def _resource_fields(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {}
         fields: dict[str, Any] = {
             "rss_mib": "unavailable",
             "threads": "unavailable",
@@ -261,13 +267,37 @@ def _diagnostic_cuda_synchronize(
     device: torch.device,
     **fields: Any,
 ) -> None:
-    if device.type != "cuda":
+    if diagnostics is None or not diagnostics.enabled or device.type != "cuda":
         return
-    if diagnostics is not None:
-        diagnostics.marker(f"{phase}-begin", step=step, **fields)
+    diagnostics.marker(f"{phase}-begin", step=step, **fields)
     torch.cuda.synchronize(device)
-    if diagnostics is not None:
-        diagnostics.marker(f"{phase}-end", step=step, **fields)
+    diagnostics.marker(f"{phase}-end", step=step, **fields)
+
+
+def _resolve_test_hang_diagnostics_enabled(
+    training: dict[str, Any],
+    *,
+    cli_enabled: bool,
+) -> tuple[bool, bool, bool]:
+    config_value = training.get("test_hang_diagnostics_enabled", False)
+    if not isinstance(config_value, bool):
+        raise ValueError("training.test_hang_diagnostics_enabled must be a JSON boolean")
+    cli_value = bool(cli_enabled)
+    return bool(config_value), cli_value, bool(config_value or cli_value)
+
+
+def _resolve_test_watchdog_seconds(
+    training: dict[str, Any],
+    *,
+    diagnostics_enabled: bool,
+) -> float:
+    default_seconds = 480.0
+    if not diagnostics_enabled:
+        return default_seconds
+    seconds = float(training.get("test_watchdog_seconds", default_seconds))
+    if seconds <= 0.0 or seconds >= 600.0:
+        raise ValueError("training.test_watchdog_seconds must be > 0 and < 600")
+    return seconds
 
 
 def _load_raw_config(path: str | Path) -> dict[str, Any]:
@@ -2112,10 +2142,23 @@ def _forward_loss(
     return _losses_to_float_dict(losses)
 
 
-def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | None = None) -> None:
+def run_training(
+    config_path: str | Path,
+    *,
+    resume_checkpoint: str | Path | None = None,
+    test_hang_diagnostics: bool = False,
+) -> None:
     raw_config = _load_raw_config(config_path)
     loader_config = load_config(config_path)
     training = dict(raw_config.get("training", {}))
+    (
+        test_hang_diagnostics_config,
+        test_hang_diagnostics_cli,
+        test_hang_diagnostics_enabled,
+    ) = _resolve_test_hang_diagnostics_enabled(
+        training,
+        cli_enabled=test_hang_diagnostics,
+    )
     base_device = _device_from_training(training)
     distributed = _distributed_config_from_env(base_device)
     _distributed_init(distributed)
@@ -2180,26 +2223,39 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
         raw_config,
         date_str_override=str(run_datestr),
     )
-    watchdog_seconds = float(training.get("test_watchdog_seconds", 480.0))
-    if watchdog_seconds <= 0.0 or watchdog_seconds >= 600.0:
-        raise ValueError("training.test_watchdog_seconds must be > 0 and < 600")
+    watchdog_seconds = _resolve_test_watchdog_seconds(
+        training,
+        diagnostics_enabled=test_hang_diagnostics_enabled,
+    )
     diagnostics = _TrainingHangDiagnostics(
         run_dir,
         rank=distributed.rank,
         device=device,
         watchdog_seconds=watchdog_seconds,
         automatic_watchdog=distributed.is_main,
+        enabled=test_hang_diagnostics_enabled,
     )
     if distributed.is_main:
-        print(
-            "fiber_trace_3d diagnostics: "
-            f"pid={os.getpid()} log={diagnostics.path} "
-            f"test_watchdog_seconds={watchdog_seconds:g} "
-            "manual_dump='kill -USR2 <pid>'",
-            flush=True,
-        )
+        if test_hang_diagnostics_enabled:
+            print(
+                "fiber_trace_3d diagnostics: enabled=true "
+                f"pid={os.getpid()} log={diagnostics.path} "
+                f"test_watchdog_seconds={watchdog_seconds:g} "
+                "manual_dump='kill -USR2 <pid>'",
+                flush=True,
+            )
+        else:
+            print("fiber_trace_3d diagnostics: enabled=false", flush=True)
     _distributed_barrier(distributed)
     effective_config = _json_safe(raw_config)
+    effective_training = effective_config.setdefault("training", {})
+    effective_training["test_hang_diagnostics_enabled_config"] = (
+        test_hang_diagnostics_config
+    )
+    effective_training["test_hang_diagnostics_enabled_cli"] = test_hang_diagnostics_cli
+    effective_training["test_hang_diagnostics_enabled_effective"] = (
+        test_hang_diagnostics_enabled
+    )
     if resume_checkpoint is not None:
         effective_config.setdefault("training", {})["resume_cli"] = str(resume_checkpoint)
         effective_config.setdefault("training", {})["resume_effective"] = str(resume)
@@ -4377,7 +4433,15 @@ def main() -> None:
     parser.add_argument("--trace2cp-step-px", type=float, default=None)
     parser.add_argument("--trace2cp-rf-margin-px", type=float, default=None)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument(
+        "--test-hang-diagnostics",
+        action="store_true",
+        help="write per-rank hang diagnostics and arm the rank-0 test watchdog",
+    )
     args = parser.parse_args()
+    auxiliary_mode = args.prefetch or args.trace2cp_vis or args.benchmark
+    if args.test_hang_diagnostics and auxiliary_mode:
+        raise SystemExit("--test-hang-diagnostics is supported only for normal training")
     if args.prefetch:
         _require_single_process_cli_mode("--prefetch")
         run_prefetch(
@@ -4408,7 +4472,11 @@ def main() -> None:
             batches=int(args.benchmark_batches),
         )
     else:
-        run_training(args.config, resume_checkpoint=args.resume)
+        run_training(
+            args.config,
+            resume_checkpoint=args.resume,
+            test_hang_diagnostics=bool(args.test_hang_diagnostics),
+        )
 
 
 if __name__ == "__main__":
