@@ -129,12 +129,77 @@ from vesuvius.neural_tracing.fiber_trace_3d.trace2cp_tool import (
     trace_native_3d_whole_fiber,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
+    _TrainingHangDiagnostics,
     _autocast_context,
     _conditioned_perpendicular_queries,
     _safe_probability_bce,
     compute_conditioned_losses,
     compute_losses,
 )
+
+
+def _run_hang_diagnostics_subprocess(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(source_root), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+    script = (
+        "import os, signal, time\n"
+        "from pathlib import Path\n"
+        "import torch\n"
+        "from vesuvius.neural_tracing.fiber_trace_3d.train import _TrainingHangDiagnostics\n"
+        f"run_dir = Path({str(tmp_path)!r})\n"
+        + body
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def test_training_hang_watchdog_dumps_and_can_be_rearmed(tmp_path: Path) -> None:
+    result = _run_hang_diagnostics_subprocess(
+        tmp_path,
+        "d = _TrainingHangDiagnostics(run_dir, rank=0, device=torch.device('cpu'), "
+        "watchdog_seconds=0.1, automatic_watchdog=True)\n"
+        "d.arm_test_watchdog(12)\n"
+        "time.sleep(0.25)\n"
+        "d.arm_test_watchdog(13)\n"
+        "d.cancel_test_watchdog(step=13)\n"
+        "d.close()\n",
+    )
+    assert result.returncode == 0, result.stderr
+    text = (tmp_path / "hang_diagnostics_rank_0.log").read_text(encoding="utf-8")
+    assert "Timeout" in text
+    assert "test-watchdog-arm" in text
+    assert "step=13" in text
+    assert "test-watchdog-cancel" in text
+
+
+def test_training_hang_watchdog_cancel_and_manual_dump(tmp_path: Path) -> None:
+    result = _run_hang_diagnostics_subprocess(
+        tmp_path,
+        "d = _TrainingHangDiagnostics(run_dir, rank=0, device=torch.device('cpu'), "
+        "watchdog_seconds=0.1, automatic_watchdog=True)\n"
+        "d.marker('unit-phase', step=7)\n"
+        "d.arm_test_watchdog(7)\n"
+        "d.cancel_test_watchdog(step=7)\n"
+        "time.sleep(0.2)\n"
+        "sig = getattr(signal, 'SIGUSR2', None)\n"
+        "if sig is not None: os.kill(os.getpid(), sig); time.sleep(0.05)\n"
+        "d.close()\n",
+    )
+    assert result.returncode == 0, result.stderr
+    text = (tmp_path / "hang_diagnostics_rank_0.log").read_text(encoding="utf-8")
+    assert "phase=unit-phase" in text
+    assert "Timeout" not in text
+    if hasattr(signal, "SIGUSR2"):
+        assert "Current thread" in text
 from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _FiberTrace3DBatchDataset,
     _DistributedConfig,
@@ -155,15 +220,20 @@ from vesuvius.neural_tracing.fiber_trace_3d.train import (
     _mixed_precision_config_from_training,
     _oblique_line_presence_for_display,
     _distributed_config_from_env,
+    _distributed_gather_dense_test_rows,
     _distributed_should_use_sync_batchnorm,
+    _distributed_test_batch_indices,
     _distributed_training_batch_index,
     _distributed_training_sample_index,
+    _mean_dense_test_rows,
+    _report_test_timing,
     _resolve_dense_test_selection,
     _resolve_prefetch_sample_count,
     _require_single_process_cli_mode,
     _save_snapshot,
     _select_branch_by_chunked_min_fraction,
     _training_sample_index_limit,
+    _test_batch_take,
     _validate_snapshot_intervals,
     _write_3d_sample_sheet,
 )
@@ -929,6 +999,103 @@ def test_3d_batch_dataset_strides_batch_indices_for_distributed_ranks() -> None:
 
     assert torch.equal(first.stream_indices, torch.tensor([2, 3], dtype=torch.long))
     assert torch.equal(second.stream_indices, torch.tensor([8, 9], dtype=torch.long))
+
+
+def test_3d_batch_dataset_applies_non_aligned_sample_offset_before_stride() -> None:
+    config = _loader(augment_enabled=False).config
+    dataset = _FiberTrace3DBatchDataset(
+        config,
+        start_batch_index=1,
+        batch_index_stride=3,
+        sample_index_offset=5,
+        batch_count=2,
+        sample_mode="random",
+        worker_device="cpu",
+    )
+
+    assert torch.equal(dataset[0].stream_indices, torch.tensor([7, 8], dtype=torch.long))
+    assert torch.equal(dataset[1].stream_indices, torch.tensor([13, 14], dtype=torch.long))
+
+
+@pytest.mark.parametrize(
+    ("sample_count", "batch_size", "world_size"),
+    [(3, 8, 8), (123, 8, 8), (16, 8, 3), (0, 8, 4)],
+)
+def test_3d_distributed_test_batches_are_disjoint_and_complete(
+    sample_count: int,
+    batch_size: int,
+    world_size: int,
+) -> None:
+    assignments = []
+    for rank in range(world_size):
+        config = _DistributedConfig(
+            enabled=world_size > 1,
+            rank=rank,
+            local_rank=rank,
+            world_size=world_size,
+            is_main=rank == 0,
+            backend="gloo",
+            device=torch.device("cpu"),
+        )
+        assignments.extend(
+            _distributed_test_batch_indices(
+                sample_count=sample_count,
+                batch_size=batch_size,
+                config=config,
+            )
+        )
+    expected_count = math.ceil(sample_count / batch_size)
+    assert sorted(assignments) == list(range(expected_count))
+    assert len(assignments) == len(set(assignments))
+    if expected_count:
+        assert sum(
+            _test_batch_take(
+                sample_count=sample_count,
+                batch_size=batch_size,
+                global_batch_index=index,
+            )
+            for index in range(expected_count)
+        ) == sample_count
+
+
+def test_3d_gathered_test_rows_restore_serial_global_batch_mean(monkeypatch) -> None:
+    rows_by_rank = [
+        [(0, {"total": 1.0, "direction": 10.0}), (2, {"total": 3.0, "direction": 30.0})],
+        [(1, {"total": 2.0, "direction": 20.0})],
+    ]
+    config = _DistributedConfig(
+        enabled=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        is_main=True,
+        backend="gloo",
+        device=torch.device("cpu"),
+    )
+
+    def fake_gather_object(local_rows, gathered, *, dst):
+        assert local_rows == rows_by_rank[0]
+        assert dst == 0
+        gathered[:] = rows_by_rank
+
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.dist.gather_object", fake_gather_object)
+    gathered = _distributed_gather_dense_test_rows(rows_by_rank[0], config)
+    assert [index for index, _row in sorted(gathered)] == [0, 1, 2]
+    assert _mean_dense_test_rows(gathered) == {"total": 2.0, "direction": 20.0}
+
+
+def test_3d_test_timing_prints_and_logs_tensorboard_scalar(capsys) -> None:
+    class Writer:
+        def __init__(self):
+            self.scalars = []
+
+        def add_scalar(self, tag, value, step):
+            self.scalars.append((tag, value, step))
+
+    writer = Writer()
+    _report_test_timing(step=1200, total_seconds=12.3456, writer=writer)
+    assert capsys.readouterr().out == "test_timing step=1200 total_seconds=12.346\n"
+    assert writer.scalars == [("timing/test_total_seconds", 12.3456, 1200)]
 
 
 def test_3d_distributed_config_defaults_to_single_process() -> None:

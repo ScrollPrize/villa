@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -29,6 +29,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DLoader,
     _normalize_image,
     _read_raw_block,
+    config_from_mapping,
     load_config,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
@@ -1723,8 +1724,64 @@ def _evaluate_trace2cp_metric_fixed_set_3d(
     )
 
 
+def _distributed_test_batch_indices(
+    *,
+    sample_count: int,
+    batch_size: int,
+    config: _DistributedConfig,
+) -> tuple[int, ...]:
+    if int(sample_count) < 0:
+        raise ValueError("sample_count must be >= 0")
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be > 0")
+    batch_count = (int(sample_count) + int(batch_size) - 1) // int(batch_size)
+    return tuple(range(int(config.rank), batch_count, int(config.world_size)))
+
+
+def _test_batch_take(*, sample_count: int, batch_size: int, global_batch_index: int) -> int:
+    remaining = int(sample_count) - int(global_batch_index) * int(batch_size)
+    if remaining <= 0:
+        return 0
+    return min(int(batch_size), remaining)
+
+
+def _mean_dense_test_rows(
+    indexed_rows: Sequence[tuple[int, dict[str, float]]],
+) -> dict[str, float]:
+    ordered = sorted(indexed_rows, key=lambda item: int(item[0]))
+    if not ordered:
+        return {
+            "total": math.inf,
+            "direction": math.inf,
+            "presence": math.inf,
+            "angle_mean_deg": math.inf,
+            "branch0_fraction": math.inf,
+            "branch1_fraction": math.inf,
+            "selected_score_mean": math.inf,
+        }
+    rows = [row for _batch_index, row in ordered]
+    return {
+        key: float(sum(row[key] for row in rows) / len(rows))
+        for key in rows[0]
+    }
+
+
+def _distributed_gather_dense_test_rows(
+    local_rows: list[tuple[int, dict[str, float]]],
+    config: _DistributedConfig,
+) -> list[tuple[int, dict[str, float]]]:
+    if not config.enabled:
+        return list(local_rows)
+    gathered: list[Any] | None = [None] * int(config.world_size) if config.is_main else None
+    dist.gather_object(local_rows, gathered, dst=0)
+    if not config.is_main:
+        return []
+    assert gathered is not None
+    return [item for rank_rows in gathered for item in rank_rows]
+
+
 @torch.no_grad()
-def evaluate_dense_loss(
+def _evaluate_dense_loss_rows(
     model: torch.nn.Module,
     loader: FiberTrace3DLoader,
     *,
@@ -1739,39 +1796,55 @@ def evaluate_dense_loss(
     mixed_precision: _MixedPrecisionConfig | None = None,
     diagnostics: _TrainingHangDiagnostics | None = None,
     diagnostic_step: int = 0,
-) -> dict[str, float]:
+    global_batch_indices: Sequence[int] | None = None,
+    batch_iterator: Any | None = None,
+    captured_batches: dict[int, FiberTrace3DBatch] | None = None,
+) -> list[tuple[int, dict[str, float]]]:
     model.eval()
-    total_rows: list[dict[str, float]] = []
-    consumed = 0
-    batch_index = 0
-    while consumed < sample_count:
+    batch_size = int(loader.config.batch_size)
+    if global_batch_indices is None:
+        global_batch_indices = range((int(sample_count) + batch_size - 1) // batch_size)
+    indexed_rows: list[tuple[int, dict[str, float]]] = []
+    for local_batch_index, global_batch_index_raw in enumerate(global_batch_indices):
+        global_batch_index = int(global_batch_index_raw)
+        consumed = global_batch_index * batch_size
+        if consumed >= int(sample_count):
+            raise ValueError(
+                f"global test batch {global_batch_index} begins beyond sample_count={sample_count}"
+            )
         batch_started = time.monotonic()
         if diagnostics is not None:
             diagnostics.marker(
                 "dense-test-load-begin",
                 step=diagnostic_step,
-                batch=batch_index,
+                batch=global_batch_index,
+                local_batch=local_batch_index,
                 consumed=consumed,
                 sample_count=sample_count,
             )
-        batch = loader.load_batch(
-            start_sample_index + consumed,
-            sample_mode=sample_mode,
-            sample_index_limit=sample_index_limit,
-            device=device,
-        )
+        if batch_iterator is None:
+            batch = loader.load_batch(
+                start_sample_index + consumed,
+                sample_mode=sample_mode,
+                sample_index_limit=sample_index_limit,
+                device=device,
+            )
+        else:
+            batch = next(batch_iterator).to(device)
         if diagnostics is not None:
             diagnostics.marker(
                 "dense-test-load-end",
                 step=diagnostic_step,
-                batch=batch_index,
+                batch=global_batch_index,
+                local_batch=local_batch_index,
                 consumed=consumed,
                 elapsed_s=f"{time.monotonic() - batch_started:.3f}",
             )
             diagnostics.marker(
                 "dense-test-targets-begin",
                 step=diagnostic_step,
-                batch=batch_index,
+                batch=global_batch_index,
+                local_batch=local_batch_index,
                 consumed=consumed,
             )
         targets_started = time.monotonic()
@@ -1780,18 +1853,31 @@ def evaluate_dense_loss(
             diagnostics.marker(
                 "dense-test-targets-end",
                 step=diagnostic_step,
-                batch=batch_index,
+                batch=global_batch_index,
+                local_batch=local_batch_index,
                 consumed=consumed,
                 elapsed_s=f"{time.monotonic() - targets_started:.3f}",
             )
-        take = min(int(batch.volume.shape[0]), sample_count - consumed)
+        take = _test_batch_take(
+            sample_count=sample_count,
+            batch_size=batch_size,
+            global_batch_index=global_batch_index,
+        )
+        if int(batch.volume.shape[0]) < take:
+            raise ValueError(
+                f"test batch {global_batch_index} has {int(batch.volume.shape[0])} samples; "
+                f"expected at least {take}"
+            )
         if take < int(batch.volume.shape[0]):
             batch = _slice_batch(batch, 0, take)
+        if captured_batches is not None and global_batch_index == 0:
+            captured_batches[global_batch_index] = batch
         if diagnostics is not None:
             diagnostics.marker(
                 "dense-test-forward-begin",
                 step=diagnostic_step,
-                batch=batch_index,
+                batch=global_batch_index,
+                local_batch=local_batch_index,
                 consumed=consumed,
                 take=take,
             )
@@ -1810,21 +1896,23 @@ def evaluate_dense_loss(
             phase="dense-test-cuda-sync",
             step=diagnostic_step,
             device=device,
-            batch=batch_index,
+            batch=global_batch_index,
             consumed=consumed,
         )
         if diagnostics is not None:
             diagnostics.marker(
                 "dense-test-forward-end",
                 step=diagnostic_step,
-                batch=batch_index,
+                batch=global_batch_index,
+                local_batch=local_batch_index,
                 consumed=consumed,
                 elapsed_s=f"{time.monotonic() - forward_started:.3f}",
             )
             diagnostics.marker(
                 "dense-test-to-cpu-begin",
                 step=diagnostic_step,
-                batch=batch_index,
+                batch=global_batch_index,
+                local_batch=local_batch_index,
                 consumed=consumed,
             )
         rows = _losses_to_float_dict(loss_tensors)
@@ -1832,27 +1920,33 @@ def evaluate_dense_loss(
             diagnostics.marker(
                 "dense-test-to-cpu-end",
                 step=diagnostic_step,
-                batch=batch_index,
+                batch=global_batch_index,
+                local_batch=local_batch_index,
                 consumed=consumed,
             )
-        total_rows.append(rows)
-        consumed += take
-        batch_index += 1
+        indexed_rows.append((global_batch_index, rows))
     model.train()
-    if not total_rows:
-        return {
-            "total": math.inf,
-            "direction": math.inf,
-            "presence": math.inf,
-            "angle_mean_deg": math.inf,
-            "branch0_fraction": math.inf,
-            "branch1_fraction": math.inf,
-            "selected_score_mean": math.inf,
-        }
-    return {
-        key: float(sum(row[key] for row in total_rows) / len(total_rows))
-        for key in total_rows[0]
-    }
+    return indexed_rows
+
+
+@torch.no_grad()
+def evaluate_dense_loss(
+    model: torch.nn.Module,
+    loader: FiberTrace3DLoader,
+    **kwargs: Any,
+) -> dict[str, float]:
+    return _mean_dense_test_rows(_evaluate_dense_loss_rows(model, loader, **kwargs))
+
+
+def _report_test_timing(
+    *, step: int, total_seconds: float, writer: Any | None,
+) -> None:
+    print(
+        f"test_timing step={int(step)} total_seconds={float(total_seconds):.3f}",
+        flush=True,
+    )
+    if writer is not None:
+        writer.add_scalar("timing/test_total_seconds", float(total_seconds), int(step))
 
 
 def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3DBatch:
@@ -2030,19 +2124,16 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     diagnostics: _TrainingHangDiagnostics | None = None
     train_dataloader = None
     train_iterator = None
+    test_dataloader = None
     loader = FiberTrace3DLoader(loader_config)
     test_loader = None
-    if distributed.is_main and raw_config.get("test_datasets"):
+    if raw_config.get("test_datasets"):
         test_raw = _make_test_loader_raw_config(raw_config, training)
-        tmp_path = Path("/tmp") / f"fiber_trace_3d_test_{int(time.time() * 1000)}.json"
-        tmp_path.write_text(json.dumps(_json_safe(test_raw)), encoding="utf-8")
-        try:
-            test_loader = FiberTrace3DLoader(load_config(tmp_path))
-        finally:
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
+        test_config = config_from_mapping(
+            test_raw,
+            config_dir=Path(config_path).resolve().parent,
+        )
+        test_loader = FiberTrace3DLoader(test_config)
     trace2cp_cfg = _trace2cp_3d_config(raw_config)
     trace2cp_loader = (
         _make_trace2cp_geometry_loader(raw_config, trace2cp_cfg)
@@ -2220,6 +2311,26 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
     loader_prefetch_factor = _loader_prefetch_factor(raw_config)
     loader_worker_device = _loader_worker_device(raw_config)
     loader_context = _loader_multiprocessing_context(raw_config)
+    test_batch_indices = (
+        _distributed_test_batch_indices(
+            sample_count=test_control_points,
+            batch_size=test_loader.config.batch_size,
+            config=distributed,
+        )
+        if test_loader is not None and test_interval > 0
+        else ()
+    )
+    if test_loader is not None and test_interval > 0:
+        test_dataloader = _make_batch_dataloader(
+            test_loader.config,
+            raw_config=raw_config,
+            start_batch_index=distributed.rank,
+            batch_index_stride=distributed.world_size,
+            sample_index_offset=test_start_sample_index,
+            batch_count=len(test_batch_indices),
+            sample_index_limit=None,
+            sample_mode=test_sample_mode,
+        )
     best_metric = math.inf
 
     if distributed.is_main:
@@ -2236,6 +2347,9 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             f"loader_workers={loader_workers} loader_prefetch_factor={loader_prefetch_factor} "
             f"loader_worker_device={loader_worker_device} "
             f"loader_multiprocessing_context={loader_context or 'default'} "
+            f"test_loader_workers={loader_workers if test_loader is not None else 0} "
+            f"test_global_batches={math.ceil(test_control_points / test_loader.config.batch_size) if test_loader is not None else 0} "
+            f"test_batches_per_rank={len(test_batch_indices)} "
             f"optimizer_lr={effective_optimizer['param_group_lrs']} "
             f"optimizer_weight_decay={effective_optimizer['param_group_weight_decays']} "
             f"mixed_precision={effective_precision['mode']} "
@@ -2258,6 +2372,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
 
     def run_configured_tests(step: int) -> tuple[float | None, str | None]:
         assert diagnostics is not None
+        test_started = time.monotonic()
         diagnostics.arm_test_watchdog(step)
         diagnostics.marker("test-routine-begin", step=step)
         try:
@@ -2269,8 +2384,10 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             )
             metric: float | None = None
             metric_name: str | None = None
+            captured_test_batches: dict[int, FiberTrace3DBatch] = {}
             if test_loader is not None and test_interval > 0:
-                test_losses = evaluate_dense_loss(
+                dense_iterator = iter(test_dataloader) if test_dataloader is not None else None
+                local_rows = _evaluate_dense_loss_rows(
                     raw_model,
                     test_loader,
                     device=device,
@@ -2283,40 +2400,45 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                     mixed_precision=mixed_precision,
                     diagnostics=diagnostics,
                     diagnostic_step=step,
+                    global_batch_indices=test_batch_indices,
+                    batch_iterator=dense_iterator,
+                    captured_batches=captured_test_batches if distributed.is_main else None,
                 )
-                metric = float(test_losses["total"])
-                metric_name = "test/loss_total"
-                print(
-                    f"test step={step} loss_total={test_losses['total']:.6f} "
-                    f"loss_direction={test_losses['direction']:.6f} "
-                    f"loss_presence={test_losses['presence']:.6f} "
-                    f"angle_mean_deg={test_losses['angle_mean_deg']:.2f} "
-                    f"branch0={test_losses['branch0_fraction']:.3f} "
-                    f"branch1={test_losses['branch1_fraction']:.3f} "
-                    f"selected_score={test_losses['selected_score_mean']:.3f}",
-                    flush=True,
-                )
-                if writer is not None:
-                    diagnostics.marker("test-tensorboard-scalars-begin", step=step)
-                    writer.add_scalar("test/loss_total", test_losses["total"], step)
-                    writer.add_scalar("test/loss_direction", test_losses["direction"], step)
-                    writer.add_scalar("test/loss_presence", test_losses["presence"], step)
-                    writer.add_scalar("test/angle_mean_deg", test_losses["angle_mean_deg"], step)
-                    writer.add_scalar("test/branch0_fraction", test_losses["branch0_fraction"], step)
-                    writer.add_scalar("test/branch1_fraction", test_losses["branch1_fraction"], step)
-                    writer.add_scalar("test/selected_score_mean", test_losses["selected_score_mean"], step)
-                    diagnostics.marker("test-tensorboard-scalars-end", step=step)
-                if writer is not None and test_sample_vis_interval > 0 and step % test_sample_vis_interval == 0:
-                    diagnostics.marker("test-visualization-load-begin", step=step)
-                    vis_batch = test_loader.load_batch(
-                        test_start_sample_index,
-                        sample_mode=test_sample_mode,
-                        device=device,
+                gathered_rows = _distributed_gather_dense_test_rows(local_rows, distributed)
+                if distributed.is_main:
+                    test_losses = _mean_dense_test_rows(gathered_rows)
+                    metric = float(test_losses["total"])
+                    metric_name = "test/loss_total"
+                    print(
+                        f"test step={step} loss_total={test_losses['total']:.6f} "
+                        f"loss_direction={test_losses['direction']:.6f} "
+                        f"loss_presence={test_losses['presence']:.6f} "
+                        f"angle_mean_deg={test_losses['angle_mean_deg']:.2f} "
+                        f"branch0={test_losses['branch0_fraction']:.3f} "
+                        f"branch1={test_losses['branch1_fraction']:.3f} "
+                        f"selected_score={test_losses['selected_score_mean']:.3f}",
+                        flush=True,
                     )
-                    diagnostics.marker("test-visualization-load-end", step=step)
-                    diagnostics.marker("test-visualization-targets-begin", step=step)
-                    vis_batch = materialize_targets(vis_batch, test_loader.config)
-                    diagnostics.marker("test-visualization-targets-end", step=step)
+                    if writer is not None:
+                        diagnostics.marker("test-tensorboard-scalars-begin", step=step)
+                        writer.add_scalar("test/loss_total", test_losses["total"], step)
+                        writer.add_scalar("test/loss_direction", test_losses["direction"], step)
+                        writer.add_scalar("test/loss_presence", test_losses["presence"], step)
+                        writer.add_scalar("test/angle_mean_deg", test_losses["angle_mean_deg"], step)
+                        writer.add_scalar("test/branch0_fraction", test_losses["branch0_fraction"], step)
+                        writer.add_scalar("test/branch1_fraction", test_losses["branch1_fraction"], step)
+                        writer.add_scalar("test/selected_score_mean", test_losses["selected_score_mean"], step)
+                        diagnostics.marker("test-tensorboard-scalars-end", step=step)
+                if (
+                    distributed.is_main
+                    and writer is not None
+                    and test_sample_vis_interval > 0
+                    and step % test_sample_vis_interval == 0
+                ):
+                    vis_batch = captured_test_batches.get(0)
+                    if vis_batch is None:
+                        raise RuntimeError("rank 0 did not retain global test batch 0 for visualization")
+                    diagnostics.marker("test-visualization-reuse-batch", step=step, batch=0)
                     diagnostics.marker("test-visualization-forward-image-begin", step=step)
                     _write_3d_sample_sheet(
                         writer,
@@ -2329,7 +2451,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                         diagnostics=diagnostics,
                     )
                     diagnostics.marker("test-visualization-forward-image-end", step=step)
-            if trace2cp_loader is not None and test_interval > 0:
+            if distributed.is_main and trace2cp_loader is not None and test_interval > 0:
                 diagnostics.marker("test-trace2cp-begin", step=step)
                 trace2cp_metric = _evaluate_trace2cp_metric_fixed_set_3d(
                     raw_model,
@@ -2365,18 +2487,27 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                         trace2cp_metric.skipped_segments,
                         step,
                     )
+            test_elapsed_seconds = time.monotonic() - test_started
+            if distributed.is_main:
+                _report_test_timing(
+                    step=step,
+                    total_seconds=test_elapsed_seconds,
+                    writer=writer,
+                )
             if writer is not None and metric is not None:
                 diagnostics.marker("test-tensorboard-flush-begin", step=step)
                 writer.flush()
                 diagnostics.marker("test-tensorboard-flush-end", step=step)
-            diagnostics.marker("test-routine-end", step=step)
+            diagnostics.marker(
+                "test-routine-end",
+                step=step,
+                elapsed_s=f"{test_elapsed_seconds:.3f}",
+            )
             return metric, metric_name
         finally:
             diagnostics.cancel_test_watchdog(step=step)
 
-    initial_metric, initial_metric_name = (
-        run_configured_tests(start_step) if distributed.is_main else (None, None)
-    )
+    initial_metric, initial_metric_name = run_configured_tests(start_step)
     initial_metric = _distributed_broadcast_object(initial_metric, distributed)
     initial_metric_name = _distributed_broadcast_object(initial_metric_name, distributed)
     if initial_metric is not None and initial_metric_name is not None:
@@ -2492,9 +2623,7 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
             test_metric = None
             test_metric_name = None
             if test_interval > 0 and step % test_interval == 0:
-                test_metric, test_metric_name = (
-                    run_configured_tests(step) if distributed.is_main else (None, None)
-                )
+                test_metric, test_metric_name = run_configured_tests(step)
                 test_metric = _distributed_broadcast_object(test_metric, distributed)
                 test_metric_name = _distributed_broadcast_object(test_metric_name, distributed)
 
@@ -2543,6 +2672,8 @@ def run_training(config_path: str | Path, *, resume_checkpoint: str | Path | Non
                     )
                 _distributed_barrier(distributed)
     finally:
+        if test_dataloader is not None:
+            test_dataloader = None
         if train_dataloader is not None:
             train_iterator = None
             train_dataloader = None
@@ -3760,6 +3891,7 @@ class _FiberTrace3DBatchDataset(Dataset):
         start_batch_index: int,
         batch_count: int | None,
         batch_index_stride: int = 1,
+        sample_index_offset: int = 0,
         sample_index_limit: int | None = None,
         sample_mode: str,
         worker_device: str | torch.device = "cpu",
@@ -3770,6 +3902,9 @@ class _FiberTrace3DBatchDataset(Dataset):
         self.batch_index_stride = int(batch_index_stride)
         if self.batch_index_stride <= 0:
             raise ValueError("batch_index_stride must be > 0")
+        self.sample_index_offset = int(sample_index_offset)
+        if self.sample_index_offset < 0:
+            raise ValueError("sample_index_offset must be >= 0")
         self.batch_count = None if batch_count is None else int(batch_count)
         self.sample_index_limit = 0 if sample_index_limit is None else int(sample_index_limit)
         if self.sample_index_limit < 0:
@@ -3803,7 +3938,7 @@ class _FiberTrace3DBatchDataset(Dataset):
         item_cpu_start = time.process_time()
         loader = self._get_loader()
         batch_index = self.start_batch_index + int(index) * self.batch_index_stride
-        sample_index = batch_index * int(loader.config.batch_size)
+        sample_index = self.sample_index_offset + batch_index * int(loader.config.batch_size)
         worker_device = torch.device(self.worker_device)
         batch = loader.load_batch(
             sample_index,
@@ -3891,6 +4026,7 @@ def _make_batch_dataloader(
     start_batch_index: int,
     batch_count: int | None,
     batch_index_stride: int = 1,
+    sample_index_offset: int = 0,
     sample_index_limit: int | None = None,
     sample_mode: str,
     profile: bool = False,
@@ -3902,6 +4038,7 @@ def _make_batch_dataloader(
         config_source,
         start_batch_index=int(start_batch_index),
         batch_index_stride=int(batch_index_stride),
+        sample_index_offset=int(sample_index_offset),
         batch_count=None if batch_count is None else int(batch_count),
         sample_index_limit=sample_index_limit,
         sample_mode=sample_mode,
