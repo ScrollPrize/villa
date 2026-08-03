@@ -1,5 +1,8 @@
 # 2026-08-03
 
+- Overlapped shared Lasagna/Fiber output flushing with inference using one
+  enlarged bounded circular mmap and one runner-wide asynchronous flush,
+  without band-sized RAM snapshots or overlap copies.
 - Made downloader negative-remote caches tolerant and atomic, and exposed the
   automatic S3 transfer worker count in Fiber and Lasagna inference CLIs.
 - Added shared bounded streaming multi-GPU whole-volume inference for Lasagna

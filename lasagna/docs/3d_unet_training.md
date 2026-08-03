@@ -724,10 +724,19 @@ slots. Worker results can finish out of order, but they are accumulated in the
 same canonical order as serial inference; only the coordinator writes Zarr or
 advances the rolling Z ring.
 
+Output flushing also overlaps inference. One enlarged but still fixed-depth
+mmap ring retains at most one finalized interval while the following Z row is
+accumulated into disjoint slots. A single background flusher reads that frozen
+interval one output chunk at a time; it does not copy a band into RAM or a
+second mmap. At the next flush frontier the coordinator waits if needed,
+clears/releases the completed interval, and submits the next. The final status
+reports aggregate `flush stats work=... wait=...`; wait is the portion that
+still blocked inference because output processing did not keep up.
+
 | Component            | RAM usage (2000³ crop, sd=4) |
 |----------------------|-----------------------------|
 | Input                | ~0 (lazy zarr reads)         |
-| Rolling accumulator  | active z-band only           |
+| Rolling accumulator  | active band + one frozen flush interval (mmap) |
 | Post-processing      | ~0.5 GiB (Z-chunked)         |
 | **Total**            | bounded by active band       |
 

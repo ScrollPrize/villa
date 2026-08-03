@@ -1,11 +1,10 @@
-# Status: robust auto-download cache and worker control
+# Status: asynchronous rolling-accumulator flush
 
-- [x] Record task requirements.
-- [x] Inspect cache persistence and auto-download call paths.
-- [x] Write implementation/test/docs/spec plan.
+- [x] Record the requested task.
+- [x] Inspect the current ring, flush, and multi-GPU coordinator paths.
+- [x] Write the implementation/test/spec/docs plan.
 - [x] Obtain and incorporate independent plan review.
-- [x] Implement atomic tolerant cache persistence.
-- [x] Add downloader-worker plumbing to both inference CLIs.
-- [x] Add and run regression tests.
-- [x] Update specs, docs, changelog, and task log.
-- [ ] Commit the completed changes.
+- [x] Implement bounded one-flush overlap over the existing mmap ring.
+- [x] Add exactness, overlap, backpressure, failure, and planner tests.
+- [x] Run focused validation and inspect performance evidence.
+- [x] Update specs, documentation, changelog, and task log.

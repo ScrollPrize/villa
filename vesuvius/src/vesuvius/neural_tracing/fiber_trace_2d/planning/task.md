@@ -1,11 +1,18 @@
-# Task: robust auto-download cache and worker control
+# Task: overlap rolling-accumulator flush with inference
 
-Fix Fiber/Lasagna automatic OME-Zarr download failing when an interrupted
-download leaves an empty or malformed `.dl_cache/<level>.noremote.json` file.
-The negative-remote cache is advisory and corruption must not abort inference.
+The shared 3D tiled inference runner currently performs each finalized Z-band
+flush synchronously. With multi-GPU inference this blocks ordered result commit,
+result-slot recycling, and eventually all GPU workers.
 
-Also expose a CLI option that controls the downloader's parallel transfer
-worker count independently of inference prefetch and pyramid workers. Preserve
-the downloader's current default of 64 workers.
+Implement asynchronous flush overlap in the shared runner used by both Lasagna
+and Fiber inference:
 
-Validate the fix, document the option, and commit the completed changes.
+- retain one circular mmap accumulator rather than copying bands;
+- enlarge its bounded physical Z capacity so one finalized/frozen band can be
+  flushed while the next band continues accumulating in disjoint slots;
+- allow at most one flush operation in flight;
+- before beginning the next flush, wait for the previous flush, release its
+  slots, and propagate any error;
+- do not introduce a band-sized RAM snapshot or full-volume scratch;
+- preserve canonical accumulation order, output bytes, sparse/resume behavior,
+  progress semantics, cleanup, and the common Lasagna/Fiber implementation.

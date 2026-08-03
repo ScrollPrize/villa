@@ -42,6 +42,28 @@ TileOriginZYX = tuple[int, int, int]
 ProductTileOutput = Mapping[str, np.ndarray]
 
 
+@dataclass(frozen=True)
+class _FlushChunkDescriptor:
+	origin: ChunkOriginZYX
+	weight_dirty: bool
+	dirty_products: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _FlushGroupDescriptor:
+	sd: int
+	flush_from: int
+	flush_to: int
+	chunks: tuple[_FlushChunkDescriptor, ...]
+	submitted_at: float
+	b: int
+	oc: int
+	region: RegionZYX
+	products: tuple[Any, ...]
+	accumulators: tuple[tuple[str, Any], ...]
+	weight: Any
+
+
 def resolve_inference_devices(
 	*,
 	device: str | torch.device | None = None,
@@ -1324,7 +1346,7 @@ def _plan_circular_z_depth(
 	output_begin: int,
 	output_end: int,
 ) -> int:
-	"""Compute capacity from actual row writes and chunk-aligned flush frontiers."""
+	"""Compute capacity for one frozen async flush plus the following Z row."""
 	sd = max(1, int(scaledown))
 	oc = max(1, int(chunk_size))
 	ts_out = int(tile_size) // sd
@@ -1333,7 +1355,8 @@ def _plan_circular_z_depth(
 	# ring still owns the prefix from logical plane zero until a later frontier
 	# actually advances and calls discard_before().
 	origin = 0
-	flushed = int(output_begin)
+	submitted = int(output_begin)
+	pending_to: int | None = None
 	max_live = 1
 	positions = tuple(int(v) for v in z_positions)
 	for index, tz in enumerate(positions):
@@ -1347,9 +1370,14 @@ def _plan_circular_z_depth(
 			flush_to = int(output_begin) + (
 				max(0, complete - int(output_begin)) // oc
 			) * oc
-		if flush_to > flushed:
-			flushed = flush_to
-			origin = flush_to
+		if flush_to > submitted:
+			# Runtime joins and releases the previous interval only at the next
+			# advancing frontier.  The row above was therefore accumulated while
+			# that previous interval still occupied the ring.
+			if pending_to is not None:
+				origin = pending_to
+			submitted = flush_to
+			pending_to = flush_to
 	return min(int(z_size), max(1, int(max_live)))
 
 
@@ -1887,7 +1915,8 @@ def run_tiled_inference_3d(
 		groups[sd] = dict(
 			products=group_products, oc=oc, shape=(Zo, Yo, Xo),
 			full_shape=full_shape, region=region,
-			b=b, depth=depth, acc=acc, weight=weight, flushed=b,
+			b=b, depth=depth, acc=acc, weight=weight,
+			submitted=b, completed=b, released=0,
 			activity={}, support_cache={}, unsupported_origins=set(),
 			resume_origins=set(), touched_bytes=0, cleared_bytes=0,
 		)
@@ -2006,81 +2035,188 @@ def run_tiled_inference_3d(
 				g["touched_bytes"] += product.raw_channel_count * voxels * 4
 				activity["dirty_products"].add(product.name)
 
-	def _flush_group(sd: int, g: dict[str, Any], complete_padded: int) -> None:
+	def _flush_target(sd: int, g: dict[str, Any], complete_padded: int) -> int:
 		complete = int(complete_padded) // sd
 		b, oc = g["b"], g["oc"]
-		oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
+		oz0, _oy0, _ox0, oz1, _oy1, _ox1 = g["region"]
 		end = b + oz1 - oz0
-		flush_from = max(int(g["flushed"]), b)
-		flush_to = end if complete >= end else b + (max(0, complete - b) // oc) * oc
-		if flush_to <= flush_from:
-			return
+		return end if complete >= end else b + (max(0, complete - b) // oc) * oc
+
+	def _prepare_flush_group(sd: int, g: dict[str, Any], flush_to: int) -> _FlushGroupDescriptor:
+		b, oc = g["b"], g["oc"]
+		oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
+		flush_from = max(int(g["submitted"]), b)
 		eligible = sorted(
 			origin for origin in g["activity"]
 			if flush_from <= b + int(origin[0]) - oz0 < flush_to
 		)
-		flush_t0 = time.time()
+		chunks = []
+		for origin in eligible:
+			activity = g["activity"].pop(origin)
+			chunks.append(_FlushChunkDescriptor(
+				origin=origin,
+				weight_dirty=bool(activity["weight_dirty"]),
+				dirty_products=tuple(sorted(str(name) for name in activity["dirty_products"])),
+			))
+		g["submitted"] = int(flush_to)
 		print(
 			f"[predict3d] flush sd={sd} z=[{oz0 + flush_from - b},{oz0 + flush_to - b}) "
 			f"dirty_chunks={len(eligible)}",
 			flush=True,
 		)
-		written = 0
-		cleared_bytes = 0
-		by_name = {p.name: p for p in g["products"]}
-		for index, origin in enumerate(eligible, 1):
-			activity = g["activity"].pop(origin)
-			gz, gy, gx = origin
-			lz0, ly0, lx0 = b + gz - oz0, b + gy - oy0, b + gx - ox0
-			lz1 = min(lz0 + oc, b + oz1 - oz0)
-			ly1 = min(ly0 + oc, b + oy1 - oy0)
-			lx1 = min(lx0 + oc, b + ox1 - ox0)
-			if activity["weight_dirty"]:
-				denom = g["weight"].read(0, lz0, lz1, ly0, ly1, lx0, lx1)
-				if np.any(denom > 0.0):
-					np.maximum(denom, 1.0e-7, out=denom)
-					for name in sorted(activity["dirty_products"]):
-						product = by_name[name]
-						raw = np.stack([g["acc"][name].read(ch, lz0, lz1, ly0, ly1, lx0, lx1) for ch in range(product.raw_channel_count)])
-						raw /= denom[None]
-						finalizer = getattr(model_adapter, "finalize_product_slab", None)
-						if finalizer is None:
-							persisted = {channel.name: np.clip(raw[i] * 255.0, 0.0, 255.0).astype(product.dtype) for i, channel in enumerate(product.channels)}
-						else:
-							persisted = finalizer(product, raw)
-						output_adapter.write_product_chunk(product, chunk_origin_zyx=origin, data={c.name: persisted[c.name] for c in product.channels})
-						g["acc"][name].clear(lz0, lz1, ly0, ly1, lx0, lx1)
-						cleared_bytes += product.raw_channel_count * (lz1-lz0) * (ly1-ly0) * (lx1-lx0) * 4
-						written += 1
-				g["weight"].clear(lz0, lz1, ly0, ly1, lx0, lx1)
-				cleared_bytes += (lz1-lz0) * (ly1-ly0) * (lx1-lx0) * 4
-			if index == len(eligible) or index % 64 == 0:
-				print(f"[predict3d] flush sd={sd} chunks={index}/{len(eligible)} written={written}", flush=True)
-		g["cleared_bytes"] += cleared_bytes
-		for acc in g["acc"].values():
-			acc.discard_before(flush_to)
-		g["weight"].discard_before(flush_to)
-		g["flushed"] = flush_to
-		if progress is not None:
-			if isinstance(output_scaledown_base, Mapping):
-				base_sd = min(int(output_scaledown_base[p.name]) for p in g["products"])
-			elif output_scaledown_base is None:
-				base_sd = sd
-			else:
-				base_sd = int(output_scaledown_base)
-			progress[f"finalized_base_z_sd{sd}"] = (oz0 + flush_to - b) * base_sd
-			progress["finalized_base_z"] = min(
-				int(progress.get(f"finalized_base_z_sd{group_sd}", progress.get("finalized_base_z", 0)))
-				for group_sd in groups
-			)
-		print(
-			f"[predict3d] flush complete sd={sd} z={oz0 + flush_to - b} "
-			f"dirty_chunks={len(eligible)} products_written={written} "
-			f"unsupported={len(g['unsupported_origins'])} resume={len(g['resume_origins'])} "
-			f"touched={g['touched_bytes'] / 1024**2:.2f}MiB "
-			f"cleared={g['cleared_bytes'] / 1024**2:.2f}MiB elapsed={time.time()-flush_t0:.2f}s",
-			flush=True,
+		return _FlushGroupDescriptor(
+			sd=int(sd), flush_from=int(flush_from), flush_to=int(flush_to),
+			chunks=tuple(chunks), submitted_at=time.perf_counter(), b=int(b),
+			oc=int(oc), region=g["region"], products=tuple(g["products"]),
+			accumulators=tuple(sorted(g["acc"].items())), weight=g["weight"],
 		)
+
+	def _run_flush_batch(plans: tuple[_FlushGroupDescriptor, ...]) -> tuple[dict[str, Any], ...]:
+		limits = None
+		try:
+			from threadpoolctl import threadpool_limits
+			limits = threadpool_limits(limits=1)
+			limits.__enter__()
+		except ImportError:
+			limits = None
+		started = time.perf_counter()
+		results = []
+		try:
+			for plan in plans:
+				sd, b, oc = plan.sd, plan.b, plan.oc
+				oz0, oy0, ox0, oz1, oy1, ox1 = plan.region
+				by_name = {p.name: p for p in plan.products}
+				accumulators = dict(plan.accumulators)
+				written = 0
+				for index, chunk in enumerate(plan.chunks, 1):
+					origin = chunk.origin
+					gz, gy, gx = origin
+					lz0, ly0, lx0 = b + gz - oz0, b + gy - oy0, b + gx - ox0
+					lz1 = min(lz0 + oc, b + oz1 - oz0)
+					ly1 = min(ly0 + oc, b + oy1 - oy0)
+					lx1 = min(lx0 + oc, b + ox1 - ox0)
+					if chunk.weight_dirty:
+						denom = plan.weight.read(0, lz0, lz1, ly0, ly1, lx0, lx1)
+						if np.any(denom > 0.0):
+							np.maximum(denom, 1.0e-7, out=denom)
+							for name in chunk.dirty_products:
+								product = by_name[name]
+								raw = np.stack([
+									accumulators[name].read(ch, lz0, lz1, ly0, ly1, lx0, lx1)
+									for ch in range(product.raw_channel_count)
+								])
+								raw /= denom[None]
+								finalizer = getattr(model_adapter, "finalize_product_slab", None)
+								if finalizer is None:
+									persisted = {
+										channel.name: np.clip(raw[i] * 255.0, 0.0, 255.0).astype(product.dtype)
+										for i, channel in enumerate(product.channels)
+									}
+								else:
+									persisted = finalizer(product, raw)
+								output_adapter.write_product_chunk(
+									product, chunk_origin_zyx=origin,
+									data={c.name: persisted[c.name] for c in product.channels},
+								)
+								written += 1
+								del raw, persisted
+						del denom
+					if index == len(plan.chunks) or index % 64 == 0:
+						print(
+							f"[predict3d] flush sd={sd} chunks={index}/{len(plan.chunks)} "
+							f"written={written}", flush=True,
+						)
+				results.append({"plan": plan, "written": written})
+			work_s = time.perf_counter() - started
+			return tuple({**result, "batch_work_s": work_s} for result in results)
+		finally:
+			if limits is not None:
+				limits.__exit__(None, None, None)
+
+	flush_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="predict3d-flush")
+	pending_flush: Future | None = None
+	flush_work_total = 0.0
+	flush_wait_total = 0.0
+
+	def _complete_pending_flush() -> None:
+		nonlocal pending_flush, flush_work_total, flush_wait_total
+		if pending_flush is None:
+			return
+		wait_started = time.perf_counter()
+		try:
+			results = pending_flush.result()
+		except KeyboardInterrupt:
+			raise
+		except BaseException:
+			pending_flush = None
+			raise
+		flush_wait_total += time.perf_counter() - wait_started
+		pending_flush = None
+		if results:
+			flush_work_total += float(results[0]["batch_work_s"])
+		for result in results:
+			plan = result["plan"]
+			sd, g = plan.sd, groups[plan.sd]
+			b, oc = g["b"], g["oc"]
+			oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
+			cleared_bytes = 0
+			by_name = {p.name: p for p in g["products"]}
+			for chunk in plan.chunks:
+				origin = chunk.origin
+				gz, gy, gx = origin
+				lz0, ly0, lx0 = b + gz - oz0, b + gy - oy0, b + gx - ox0
+				lz1 = min(lz0 + oc, b + oz1 - oz0)
+				ly1 = min(ly0 + oc, b + oy1 - oy0)
+				lx1 = min(lx0 + oc, b + ox1 - ox0)
+				voxels = (lz1-lz0) * (ly1-ly0) * (lx1-lx0)
+				for name in chunk.dirty_products:
+					g["acc"][name].clear(lz0, lz1, ly0, ly1, lx0, lx1)
+					cleared_bytes += by_name[name].raw_channel_count * voxels * 4
+				if chunk.weight_dirty:
+					g["weight"].clear(lz0, lz1, ly0, ly1, lx0, lx1)
+					cleared_bytes += voxels * 4
+			g["cleared_bytes"] += cleared_bytes
+			for acc in g["acc"].values():
+				acc.discard_before(plan.flush_to)
+			g["weight"].discard_before(plan.flush_to)
+			g["released"] = g["completed"] = int(plan.flush_to)
+			if progress is not None:
+				if isinstance(output_scaledown_base, Mapping):
+					base_sd = min(int(output_scaledown_base[p.name]) for p in g["products"])
+				elif output_scaledown_base is None:
+					base_sd = sd
+				else:
+					base_sd = int(output_scaledown_base)
+				progress[f"finalized_base_z_sd{sd}"] = (oz0 + plan.flush_to - b) * base_sd
+				progress["finalized_base_z"] = min(
+					int(progress.get(f"finalized_base_z_sd{group_sd}", progress.get("finalized_base_z", 0)))
+					for group_sd in groups
+				)
+			print(
+				f"[predict3d] flush complete sd={sd} z={oz0 + plan.flush_to - b} "
+				f"dirty_chunks={len(plan.chunks)} products_written={result['written']} "
+				f"unsupported={len(g['unsupported_origins'])} resume={len(g['resume_origins'])} "
+				f"touched={g['touched_bytes'] / 1024**2:.2f}MiB "
+				f"cleared={g['cleared_bytes'] / 1024**2:.2f}MiB "
+				f"elapsed={time.perf_counter()-plan.submitted_at:.2f}s",
+				flush=True,
+			)
+
+	def _advance_flushes(complete_padded: int) -> None:
+		nonlocal pending_flush
+		targets = {
+			sd: _flush_target(sd, g, complete_padded)
+			for sd, g in groups.items()
+		}
+		if not any(targets[sd] > int(groups[sd]["submitted"]) for sd in groups):
+			return
+		_complete_pending_flush()
+		plans = tuple(
+			_prepare_flush_group(sd, groups[sd], targets[sd])
+			for sd in sorted(groups)
+			if targets[sd] > int(groups[sd]["submitted"])
+		)
+		pending_flush = flush_executor.submit(_run_flush_batch, plans)
 
 	total = len(z_positions) * len(y_positions) * len(x_positions)
 	done = processed = skipped = 0
@@ -2109,8 +2245,7 @@ def run_tiled_inference_3d(
 			elif done == total or (row_end and done % max(1, len(y_positions) * len(x_positions)) == 0):
 				print(status, flush=True)
 			if row_end:
-				for sd, group in groups.items():
-					_flush_group(sd, group, next_tz)
+				_advance_flushes(next_tz)
 
 		if not parallel:
 			assert w_full is not None and w_by_scale is not None
@@ -2356,9 +2491,41 @@ def run_tiled_inference_3d(
 				for shm in input_shms + result_shms:
 					shm.close()
 					shm.unlink()
+		_complete_pending_flush()
+		flush_executor.shutdown(wait=True, cancel_futures=False)
+		if progress is not None:
+			print(_predict3d_progress_line(progress), flush=True)
+		print(
+			f"[predict3d] flush stats work={flush_work_total:.2f}s wait={flush_wait_total:.2f}s",
+			flush=True,
+		)
 		print(f"[predict3d] inference done in {time.time()-t0:.1f}s ({processed} processed, {skipped} skipped)", flush=True)
 	finally:
+		active_error = sys.exc_info()[1]
+		flush_cleanup_error: BaseException | None = None
+		while pending_flush is not None:
+			try:
+				_complete_pending_flush()
+			except KeyboardInterrupt as exc:
+				# A Python thread cannot be cancelled while it reads the mmap. Keep
+				# waiting before cleanup even when shutdown is interrupted again.
+				if flush_cleanup_error is None:
+					flush_cleanup_error = exc
+			except BaseException as exc:
+				pending_flush = None
+				if flush_cleanup_error is None:
+					flush_cleanup_error = exc
+		try:
+			flush_executor.shutdown(wait=True, cancel_futures=False)
+		except BaseException as exc:
+			if flush_cleanup_error is None:
+				flush_cleanup_error = exc
 		for g in groups.values():
 			for acc in g["acc"].values():
 				acc.cleanup()
 			g["weight"].cleanup()
+		if flush_cleanup_error is not None:
+			if active_error is not None:
+				active_error.add_note(f"secondary asynchronous flush shutdown error: {flush_cleanup_error!r}")
+			else:
+				raise flush_cleanup_error

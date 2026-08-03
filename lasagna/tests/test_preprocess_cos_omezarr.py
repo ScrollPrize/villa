@@ -4,6 +4,7 @@ import unittest
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 import types
 from unittest import mock
@@ -1078,8 +1079,131 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				output_begin=8,
 				output_end=584,
 			),
-			128,
+			168,
 		)
+
+	def test_async_circular_depth_for_256_tile_inference_scales(self):
+		z_positions = _canonical_local_tile_positions(
+			volume_size=4096, crop_start=0, crop_padded_size=4160,
+			tile_size=256, stride=160, border=32, scaledown_multiple=4,
+		)
+		expected = {1: 448, 2: 256, 4: 184}
+		for sd, depth in expected.items():
+			with self.subTest(sd=sd):
+				self.assertEqual(
+					_plan_circular_z_depth(
+						z_positions=z_positions, tile_size=256, scaledown=sd,
+						z_size=4160 // sd, chunk_size=64,
+						output_begin=32 // sd,
+						output_end=32 // sd + 4096 // sd,
+					),
+					depth,
+				)
+
+	def test_shared_runner_overlaps_one_mmap_flush_with_next_z_band(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+		progress = {}
+		next_band_started = threading.Event()
+
+		class Adapter:
+			calls = 0
+
+			def run_tile_inference(self, model, tile, *, device):
+				self.calls += 1
+				if self.calls >= 2:
+					next_band_started.set()
+				return tile
+
+			def product_tensors_from_output(self, output):
+				return {"identity": output}
+
+			def finalize_product_slab(self, product, raw):
+				return {"value": raw[0].copy()}
+
+		class Output:
+			def __init__(self):
+				self.complete = set()
+				self.active = 0
+				self.max_active = 0
+				self.progress_during_first_write = None
+				self.lock = threading.Lock()
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return chunk_origin_zyx in self.complete
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				with self.lock:
+					self.active += 1
+					self.max_active = max(self.max_active, self.active)
+				try:
+					if chunk_origin_zyx[0] == 0:
+						self.progress_during_first_write = progress.get("finalized_base_z", 0)
+						if not next_band_started.wait(timeout=2.0):
+							raise AssertionError("next Z band did not start while first flush was blocked")
+					self.complete.add(chunk_origin_zyx)
+				finally:
+					with self.lock:
+						self.active -= 1
+
+		adapter = Adapter()
+		output = Output()
+		with tempfile.TemporaryDirectory() as td:
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				run_tiled_inference_3d(
+					object(), np.ones((12, 4, 4), dtype=np.uint8),
+					crop_slices=(0, 12, 0, 4, 0, 4), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=output, products=(product,),
+					output_regions_zyx={"identity": (0, 0, 0, 12, 4, 4)},
+					full_output_shapes_zyx={"identity": (12, 4, 4)},
+					output_scaledown_base=1, tile_size=4, overlap=0, border=0,
+					tmp_dir=td, progress=progress,
+				)
+			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
+
+		self.assertEqual(adapter.calls, 3)
+		self.assertEqual(output.max_active, 1)
+		self.assertEqual(output.progress_during_first_write, 0)
+		self.assertEqual(progress["finalized_base_z"], 12)
+		self.assertEqual(output.complete, {(0, 0, 0), (4, 0, 0), (8, 0, 0)})
+
+	def test_shared_runner_propagates_async_flush_failure_and_cleans_mmaps(self):
+		product = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=4,
+		)
+
+		class Adapter:
+			def run_tile_inference(self, model, tile, *, device):
+				return tile
+
+			def product_tensors_from_output(self, output):
+				return {"identity": output}
+
+			def finalize_product_slab(self, product, raw):
+				return {"value": raw[0]}
+
+		class FailingOutput:
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				raise OSError("forced asynchronous write failure")
+
+		with tempfile.TemporaryDirectory() as td:
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
+				with self.assertRaisesRegex(OSError, "forced asynchronous write failure"):
+					run_tiled_inference_3d(
+						object(), np.ones((8, 4, 4), dtype=np.uint8),
+						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+						model_adapter=Adapter(), output_adapter=FailingOutput(), products=(product,),
+						output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+						full_output_shapes_zyx={"identity": (8, 4, 4)},
+						tile_size=4, overlap=0, border=0, tmp_dir=td,
+					)
+			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
 
 	def test_shared_runner_ring_survives_initial_noop_flushes(self):
 		product = OutputProductSpec(

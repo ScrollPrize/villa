@@ -148,7 +148,7 @@ queues carry descriptors only. Results may complete out of order, but the
 coordinator commits them in canonical order and flushes a Z row only after all
 of that row's inference and skip events commit. Consequently the coordinator
 remains the sole owner of the circular rings, resume checks, progress, and Zarr
-writes. `--slots-per-gpu` controls the bounded look-ahead/result memory and
+write scheduling. `--slots-per-gpu` controls the bounded look-ahead/result memory and
 `--prefetch-workers` controls CPU/Zarr readers.
 
 Each distinct inference scale has separate raw-product float32 mmap rings and
@@ -164,9 +164,14 @@ A logical Z plane maps to
 `physical_z = logical_z % ring_depth`; generation checks prevent an unflushed
 plane from being overwritten. Ring depth is planned from actual canonical tile
 positions and chunk-aligned flush frontiers. Planning mirrors runtime order:
-each Z row writes before its post-row flush, and the physical ring origin stays
-at zero until a frontier advances beyond the initial output boundary. Thus a
-no-op flush cannot prematurely reduce planned capacity. Backing size is
+each Z row writes before its post-row flush. One runner-wide background flush
+may retain the preceding finalized interval while the next row accumulates.
+The planner simulates that exact write, join/release, submit, next-write order,
+so the enlarged ring has disjoint physical slots without copying live overlap
+or finalized bands. At the following advancing frontier the coordinator waits
+if necessary, then clears/releases the completed interval before submitting
+another; storage slowdown creates bounded backpressure rather than additional
+queued bands. Backing size is
 `(raw_channels + 1) * ring_depth * working_y * working_x * 4` bytes and does
 not depend on full volume depth. Candidate output chunks are lazily checked
 against their direct local Zarr-v2 input footprint. Their global output bounds
@@ -177,7 +182,16 @@ contribution-dirty chunks,
 normalize with chunk-sized denominator scratch, atomically write coherent
 channel bundles, clear only dirty regions, and only then release their logical
 Z generations. Progress reports dirty/written/unsupported/resumed chunks and
-actual scratch bytes touched and cleared.
+actual scratch bytes touched and cleared. `flush stats work=... wait=...`
+separates total background work from coordinator backpressure. Submitted work
+does not advance `final_z`; completion does. Jobs contain immutable chunk
+descriptors rather than decoded arrays, and shutdown waits for an active mmap
+reader before closing scratch files.
+
+While a flush runs, output completeness checks can inspect future disjoint
+chunks and model inference can overlap product finalization. The shipped
+adapters keep these operations stateless or filesystem-disjoint; custom shared
+runner adapters must provide the same concurrency safety.
 
 Fiber and Lasagna OME-Zarr outputs default to 64x64x64 chunks;
 `--ome-chunk` remains an override.

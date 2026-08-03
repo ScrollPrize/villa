@@ -29,6 +29,21 @@
   The initial prefix from logical plane zero remains live when a computed
   frontier merely equals `output_begin`; only a strictly advancing runtime
   flush releases it.
+- Flush overlaps inference through the same circular mmap, enlarged only for
+  the exact maximum span produced by one frozen finalized interval plus the
+  following active canonical Z row. There is one runner-wide flush future,
+  including across inference scales. No live overlap, finalized band, or full
+  mmap region is copied to another mmap or a band-sized RAM buffer.
+- Submitted/frozen, completed/written, and released/origin frontiers are
+  distinct. At the next advancing frontier the coordinator waits for the
+  previous combined flush, clears its exact dirty rectangles, releases its
+  generations, and only then submits the next combined interval. User-visible
+  finalized Z advances only after successful output writes.
+- The flush worker receives immutable chunk descriptors and reads frozen mmap
+  regions one output chunk at a time. Temporary denominator, stacked raw, and
+  finalized channel arrays remain bounded by one output chunk. A failed flush
+  never clears or reuses its frozen slots, and all exit paths wait for the
+  non-cancellable reader thread before mmap cleanup.
 - Completed output is normalized, finalized, written, and cleared one globally
   anchored output chunk at a time. Denominator and wrap scratch are bounded by
   one output chunk; no full-XY or full-band normalization/finalization
@@ -130,6 +145,9 @@
   tile order. A Z row flushes only after all preceding canonical events,
   including skips, commit. The coordinator solely owns circular accumulators,
   resume state, progress, and output writes.
+- Output adapters must permit completeness checks for future, disjoint chunks
+  while the flush worker writes a frozen chunk. Model adapters must permit
+  inference to overlap their stateless raw-product finalization callback.
 - Sparse/resume-complete work is rejected before prefetch. Workers calculate
   only the union of raw products required by incomplete output chunks; the
   coordinator retains chunk masks and adds shared geometric weight once.

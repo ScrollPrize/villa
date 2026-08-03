@@ -212,6 +212,12 @@ memory footprint; `--prefetch-workers 0` selects the automatic bounded reader
 count. Existing `--device` selects the serial path and cannot be combined with
 `--devices`.
 
+The same shared runner overlaps output flushing with subsequent inference using
+one enlarged circular mmap ring and one background flush. It retains no
+band-sized RAM snapshot and queues no second flush; if output processing falls
+behind, the next frontier waits for the current flush. The final
+`flush stats work=... wait=...` line makes that backpressure visible.
+
 Automatic S3 chunk fetching defaults to 64 transfer threads. Set it separately
 from inference prefetch with, for example, `--download-workers 256`. Interrupted
 or malformed `.dl_cache/*.noremote.json` files are advisory: they are ignored
