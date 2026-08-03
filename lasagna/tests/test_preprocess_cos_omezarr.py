@@ -993,6 +993,81 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(output.written, [(0, 0, 0)])
 		self.assertEqual([name for name, _ in clear_calls], ["acc_identity", "weight_sd1"])
 
+	def test_shared_runner_supports_global_crop_beyond_local_ring_at_sd4(self):
+		product = OutputProductSpec(
+			name="identity", level=2, scaledown=4, inference_scaledown=4,
+			channels=("value",), chunk_size=2,
+		)
+		adapter = _IdentityProductAdapter(product)
+
+		class Output:
+			def __init__(self):
+				self.written = []
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.written.append(chunk_origin_zyx)
+
+		with tempfile.TemporaryDirectory() as td:
+			input_path = Path(td) / "input.zarr"
+			arr = zarr.open(
+				str(input_path), mode="w", shape=(16, 16, 16),
+				chunks=(8, 8, 8), dtype="uint8",
+			)
+			arr[8:16, 8:16, 8:16] = 1
+			output = Output()
+			run_tiled_inference_3d(
+				object(), zarr.open(str(input_path), mode="r"),
+				crop_slices=(8, 16, 8, 16, 8, 16), device=torch.device("cpu"),
+				model_adapter=adapter, output_adapter=output, products=(product,),
+				output_regions_zyx={"identity": (2, 2, 2, 4, 4, 4)},
+				full_output_shapes_zyx={"identity": (4, 4, 4)},
+				input_zarr_path=str(input_path), tile_size=8, overlap=0, border=0,
+				tmp_dir=td,
+			)
+
+		self.assertGreater(adapter.calls, 0)
+		self.assertEqual(output.written, [(2, 2, 2)])
+
+	def test_shared_runner_skips_absent_global_crop_source_at_sd4(self):
+		product = OutputProductSpec(
+			name="identity", level=2, scaledown=4, inference_scaledown=4,
+			channels=("value",), chunk_size=2,
+		)
+		adapter = _IdentityProductAdapter(product)
+
+		class Output:
+			def __init__(self):
+				self.written = []
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.written.append(chunk_origin_zyx)
+
+		with tempfile.TemporaryDirectory() as td:
+			input_path = Path(td) / "input.zarr"
+			zarr.open(
+				str(input_path), mode="w", shape=(16, 16, 16),
+				chunks=(8, 8, 8), dtype="uint8",
+			)
+			output = Output()
+			run_tiled_inference_3d(
+				object(), zarr.open(str(input_path), mode="r"),
+				crop_slices=(8, 16, 8, 16, 8, 16), device=torch.device("cpu"),
+				model_adapter=adapter, output_adapter=output, products=(product,),
+				output_regions_zyx={"identity": (2, 2, 2, 4, 4, 4)},
+				full_output_shapes_zyx={"identity": (4, 4, 4)},
+				input_zarr_path=str(input_path), tile_size=8, overlap=0, border=0,
+				tmp_dir=td,
+			)
+
+		self.assertEqual(adapter.calls, 0)
+		self.assertEqual(output.written, [])
+
 	def test_canonical_tile_positions_do_not_shift_with_crop_origin(self):
 		kwargs = {
 			"volume_size": 512,

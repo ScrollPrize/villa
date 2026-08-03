@@ -1613,6 +1613,13 @@ def run_tiled_inference_3d(
 		if len(set(regions.values())) != 1:
 			raise ValueError(f"products at inference scale {sd} must share output_region_zyx")
 		region = next(iter(regions.values()))
+		full_shapes = {
+			p.name: tuple(int(v) for v in full_output_shapes_zyx[p.name])
+			for p in group_products
+		}
+		if len(set(full_shapes.values())) != 1:
+			raise ValueError(f"products at inference scale {sd} must share full_output_shapes_zyx")
+		full_shape = next(iter(full_shapes.values()))
 		oz0, oy0, ox0, oz1, oy1, ox1 = region
 		b = pad // sd
 		depth = _plan_circular_z_depth(
@@ -1638,7 +1645,8 @@ def run_tiled_inference_3d(
 			flush=True,
 		)
 		groups[sd] = dict(
-			products=group_products, oc=oc, shape=(Zo, Yo, Xo), region=region,
+			products=group_products, oc=oc, shape=(Zo, Yo, Xo),
+			full_shape=full_shape, region=region,
 			b=b, depth=depth, acc=acc, weight=weight, flushed=b,
 			activity={}, support_cache={}, unsupported_origins=set(),
 			resume_origins=set(), touched_bytes=0, cleared_bytes=0,
@@ -1659,7 +1667,11 @@ def run_tiled_inference_3d(
 		"""
 		cache = g["support_cache"]
 		if origin not in cache:
-			shape = g["shape"]
+			# ``origin`` is in the global output lattice, whereas ``g['shape']``
+			# describes only this crop's padded rolling accumulator.  Clip against
+			# the full output volume before mapping the footprint to selected-input
+			# coordinates.
+			shape = g["full_shape"]
 			ends = tuple(min(int(shape[i]), int(origin[i]) + int(g["oc"])) for i in range(3))
 			bounds = (
 				max(0, int(origin[0]) * sd), min(volume_shape[0], int(ends[0]) * sd),
@@ -1670,7 +1682,7 @@ def run_tiled_inference_3d(
 		return bool(cache[origin])
 
 	def _needed_chunks(sd: int, g: dict[str, Any], reg: RegionZYX) -> dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]]:
-		shape = tuple(int(v) for v in full_output_shapes_zyx[g["products"][0].name])
+		shape = g["full_shape"]
 		needed: dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]] = {}
 		for origin in _iter_chunk_origins_for_region(*reg, g["oc"], shape):
 			missing = tuple(
