@@ -570,7 +570,18 @@ bool PointCollections::saveToJSON(const std::string& filename) const
         return false;
     }
     o << j.dump(4);
+    o.flush();
+    // A full disk or quota failure surfaces here, not at open(); without
+    // this check the write is reported successful and the file is truncated.
+    if (!o.good()) {
+        std::cerr << "Failed while writing: " << filename << std::endl;
+        return false;
+    }
     o.close();
+    if (o.fail()) {
+        std::cerr << "Failed to finish writing: " << filename << std::endl;
+        return false;
+    }
     return true;
 }
 

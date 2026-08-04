@@ -468,6 +468,13 @@ vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
 # with the command-line tool so the tested code is the shipped code).
 vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
 
+# End-to-end CLI contract for the same tool: exit codes, report
+# serialization, collection envelope. Needs the binary built first.
+vc_add_test(NAME test_tifxyz_selfcross_cli
+    LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+    DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
+add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
 
 vc_add_test(NAME test_remote_url)

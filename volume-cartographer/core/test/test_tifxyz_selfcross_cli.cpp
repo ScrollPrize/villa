@@ -173,6 +173,13 @@ TEST_CASE("bad arguments and unwritable outputs exit 1, not 0")
         CHECK(run_cli({surf.string(), "-o", "/dev/full"}) == 1);
         CHECK(run_cli({surf.string(), "-o", out,
                        "--collection", "/nonexistent-dir/c.json"}) == 1);
+        // Mid-write failure on the COLLECTION path: needs the surface to
+        // actually have crossing sites, and saveToJSON to check its stream
+        // rather than only the open.
+        const fs::path xsurf = tmp.path / "x.tifxyz";
+        write_tifxyz(xsurf, true);
+        CHECK(run_cli({xsurf.string(), "-o", out,
+                       "--collection", "/dev/full"}) == 1);
     }
 }
 
