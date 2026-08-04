@@ -35,12 +35,16 @@ DEFAULT_URL = ('https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/
 def main(url, position, crop_half, voxel_um, out_png):
     cz, cy, cx = position
     group = zarr.open_group(url, mode='r')
-    levels = sorted(int(k) for k in group.array_keys())
-    coarse = levels[min(3, len(levels) - 1)]
-    ds = 2 ** coarse
+    # An HTTP store cannot list directories, so array_keys() comes back empty
+    # for remote volumes; the OME-Zarr multiscales metadata is the reliable
+    # way to enumerate resolution levels (and their downsample factors).
+    datasets = group.attrs['multiscales'][0]['datasets']
+    coarse_entry = datasets[min(3, len(datasets) - 1)]
+    ds = round(coarse_entry['coordinateTransformations'][0]['scale'][0])
 
-    crop = group['0'][cz, cy - crop_half:cy + crop_half, cx - crop_half:cx + crop_half]
-    overview = group[str(coarse)][cz // ds, :, :]
+    crop = group[datasets[0]['path']][
+        cz, cy - crop_half:cy + crop_half, cx - crop_half:cx + crop_half]
+    overview = group[coarse_entry['path']][cz // ds, :, :]
     click.echo(f'native crop {crop.shape} {crop.dtype}; ds{ds} overview {overview.shape}')
 
     fg = crop[crop > 0]
