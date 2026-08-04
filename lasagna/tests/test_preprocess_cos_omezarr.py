@@ -28,6 +28,7 @@ sys.modules.setdefault("train_unet_3d", train_stub)
 from preprocess_cos_omezarr import (
 	LasagnaCosPredict3DAdapter,
 	DEFAULT_FLUSH_WORKERS,
+	DEFAULT_ACCUMULATOR_WORKERS,
 	ModelAdapter,
 	OmeZarrOutputAdapter,
 	OutputAdapter,
@@ -199,6 +200,37 @@ class _RaisingProductAdapter(_IdentityProductAdapter):
 
 
 class PreprocessCosOmezarrTests(unittest.TestCase):
+	def test_native_accumulator_matches_numpy_for_half_float_and_strides(self):
+		module = shared_predict3d._accumulator_native_module()
+		if not module:
+			self.skipTest("optional accumulator_add extension is not built")
+		rng = np.random.default_rng(712)
+		for dtype in (np.float16, np.float32):
+			base = np.zeros((5, 9, 43), dtype=dtype)
+			destination = base[1:4, 1:8:2, 2:39]
+			destination[:] = rng.standard_normal(destination.shape).astype(dtype)
+			source = (rng.standard_normal(destination.shape) * 0.125).astype(np.float32)
+			reference = np.array(destination, copy=True)
+			np.add(reference, source, out=reference, casting="unsafe")
+			for backend in ("scalar", "auto"):
+				actual_base = base.copy()
+				actual = actual_base[1:4, 1:8:2, 2:39]
+				module.add_inplace(actual, source, backend)
+				np.testing.assert_array_equal(actual, reference)
+		self.assertIn(module.backend(), {"scalar", "avx512"})
+		# Exercise every binary16 input, including subnormals, infinities and
+		# NaNs; finite values must match NumPy bit-for-bit for one add.
+		all_half = np.arange(65536, dtype=np.uint16).view(np.float16).reshape(1, 256, 256)
+		increment = np.full(all_half.shape, 0.00031, dtype=np.float32)
+		with np.errstate(invalid="ignore", over="ignore"):
+			reference = np.add(all_half, increment, out=np.empty_like(all_half), casting="unsafe")
+		for backend in ("scalar", "auto"):
+			actual = all_half.copy()
+			module.add_inplace(actual, increment, backend)
+			finite = np.isfinite(reference)
+			np.testing.assert_array_equal(actual[finite], reference[finite])
+			np.testing.assert_array_equal(np.isnan(actual), np.isnan(reference))
+
 	def test_input_tile_cpu_conversion_preserves_uint8_and_uint16_mapping(self):
 		u8 = np.array([0, 1, 127, 255], dtype=np.uint8).reshape(1, 2, 2)
 		actual_u8 = shared_predict3d._input_tile_to_device(u8, torch.device("cpu")).numpy()[0, 0]
@@ -430,7 +462,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
 			products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
 			full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
-			overlap=0, border=0,
+			overlap=0, border=0, product_accumulator_dtype="float16",
 		)
 		with tempfile.TemporaryDirectory() as td:
 			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
@@ -445,7 +477,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					None, volume, model_adapter=parallel_adapter,
 					output_adapter=parallel_output, tmp_dir=td,
 					devices=(torch.device("cpu"), torch.device("cpu")),
-					slots_per_gpu=1, prefetch_workers=2, **common,
+					slots_per_gpu=1, prefetch_workers=2, accumulator_workers=2, **common,
 				)
 		self.assertEqual(set(serial_output.chunks), set(parallel_output.chunks))
 		for origin in serial_output.chunks:
@@ -838,6 +870,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["prefetch_workers"], 0)
 		self.assertEqual(kwargs["slots_per_gpu"], 2)
 		self.assertEqual(kwargs["flush_workers"], DEFAULT_FLUSH_WORKERS)
+		self.assertEqual(kwargs["accumulator_workers"], DEFAULT_ACCUMULATOR_WORKERS)
 		self.assertEqual(kwargs["input_reader"], "tensorstore")
 		self.assertEqual(kwargs["prefetch_tiles_per_gpu"], 4)
 		self.assertEqual(kwargs["input_cache_gib"], 4.0)
@@ -869,10 +902,12 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			"--devices", "cuda:0,cuda:2", "--prefetch-workers", "6",
 			"--slots-per-gpu", "3", "--no-download",
 			"--flush-workers", "6",
+			"--accumulator-workers", "9",
 			"--input-reader", "python-zarr", "--prefetch-tiles-per-gpu", "7",
 			"--input-cache-gib", "2.5", "--input-io-threads", "11",
 			"--input-copy-threads", "3",
 			"--profile-pipeline",
+			"--product-accumulator-dtype", "float32",
 			"--download-workers", "123",
 		]
 		with mock.patch("builtins.open", side_effect=PermissionError):
@@ -884,12 +919,14 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["prefetch_workers"], 6)
 		self.assertEqual(kwargs["slots_per_gpu"], 3)
 		self.assertEqual(kwargs["flush_workers"], 6)
+		self.assertEqual(kwargs["accumulator_workers"], 9)
 		self.assertEqual(kwargs["input_reader"], "python-zarr")
 		self.assertEqual(kwargs["prefetch_tiles_per_gpu"], 7)
 		self.assertEqual(kwargs["input_cache_gib"], 2.5)
 		self.assertEqual(kwargs["input_io_threads"], 11)
 		self.assertEqual(kwargs["input_copy_threads"], 3)
 		self.assertTrue(kwargs["profile_pipeline"])
+		self.assertEqual(kwargs["product_accumulator_dtype"], "float32")
 		self.assertEqual(kwargs["download_workers"], 123)
 
 	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
@@ -1195,6 +1232,42 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			np.testing.assert_array_equal(band.view(1, 2, 4), np.full((2, 2, 2), 5, dtype=np.float32))
 			band.cleanup()
 			self.assertEqual([p for p in Path(td).iterdir() if p.name.startswith(".predict3d_")], [])
+
+	def test_float16_product_band_widens_and_validates_storage_dtype(self):
+		with tempfile.TemporaryDirectory() as td:
+			band = _CircularZBand(
+				name="product", channel_count=1, z_size=4, y_size=2, x_size=2,
+				tmp_dir=td, prefix="unit_", dtype=np.float16,
+			)
+			values = np.array([1.0, -0.75, 2.0 ** -14, 2.0 ** -20], dtype=np.float32).reshape(1, 2, 2)
+			expected = np.zeros((4, 2, 2), dtype=np.float32)
+			for _ in range(8):
+				data = np.broadcast_to(values, (4, 2, 2))
+				band.add(0, 0, 4, 0, 2, 0, 2, data)
+				expected += data
+			actual = band.read(0, 0, 4, 0, 2, 0, 2)
+			self.assertEqual(actual.dtype, np.float32)
+			self.assertTrue(np.all(np.isfinite(actual)))
+			np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=1e-6)
+			descriptor = band.mmap_descriptor()
+			self.assertEqual(descriptor.dtype, "float16")
+			self.assertEqual(Path(descriptor.paths[0]).stat().st_size, 4 * 2 * 2 * 2)
+			cache = {}
+			try:
+				widened = shared_predict3d._read_mmap_band_chunk(descriptor, 0, 0, 4, 0, 2, 0, 2, cache)
+				self.assertEqual(widened.dtype, np.float32)
+				np.testing.assert_array_equal(widened, actual)
+			finally:
+				for array in cache.values():
+					array._mmap.close()
+			band.cleanup()
+
+		with tempfile.TemporaryDirectory() as td:
+			with self.assertRaisesRegex(ValueError, "float16 or float32"):
+				_CircularZBand(
+					name="bad", channel_count=1, z_size=1, y_size=1, x_size=1,
+					tmp_dir=td, prefix="unit_", dtype=np.float64,
+				)
 
 	def test_rolling_z_band_sparse_ranges_read_as_zero(self):
 		with tempfile.TemporaryDirectory() as td:

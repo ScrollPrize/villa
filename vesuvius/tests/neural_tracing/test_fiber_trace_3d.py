@@ -408,11 +408,13 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
         "--checkpoint", "model.pt", "--devices", "all",
         "--prefetch-workers", "5", "--slots-per-gpu", "3",
 		"--flush-workers", "6",
+        "--accumulator-workers", "9",
         "--input-reader", "python-zarr", "--prefetch-tiles-per-gpu", "7",
         "--input-cache-gib", "2.5", "--input-io-threads", "11",
         "--input-copy-threads", "3",
         "--profile-pipeline",
         "--inference-precision", "bf16",
+        "--product-accumulator-dtype", "float32",
         "--download-workers", "77",
     ])
     assert result == 0
@@ -421,6 +423,7 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
     assert captured["prefetch_workers"] == 5
     assert captured["slots_per_gpu"] == 3
     assert captured["flush_workers"] == 6
+    assert captured["accumulator_workers"] == 9
     assert captured["input_reader"] == "python-zarr"
     assert captured["prefetch_tiles_per_gpu"] == 7
     assert captured["input_cache_gib"] == 2.5
@@ -428,6 +431,7 @@ def test_fiber_inference_cli_forwards_shared_multi_gpu_pipeline(monkeypatch: pyt
     assert captured["input_copy_threads"] == 3
     assert captured["profile_pipeline"] is True
     assert captured["inference_precision"] == "bf16"
+    assert captured["product_accumulator_dtype"] == "float32"
     assert captured["download_workers"] == 77
 
 

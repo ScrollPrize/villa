@@ -750,6 +750,12 @@ available CPU count capped at 64; zero restores synchronous flushing and the
 smaller immediate-release ring for A/B measurements. Final status reports
 workers, chunks, aggregate worker time, and coordinator wait.
 
+Raw product rings default to float16, halving ring backing. Persistent
+accumulator processes use the native runtime-dispatched AVX-512 kernel on
+supported x86 hosts and a portable fallback elsewhere. Use
+`--product-accumulator-dtype float32` when float32 accumulation is required.
+The shared weight denominator and per-chunk flush arithmetic remain float32.
+
 | Component            | RAM usage (2000³ crop, sd=4) |
 |----------------------|-----------------------------|
 | Input                | ~0 (lazy zarr reads)         |

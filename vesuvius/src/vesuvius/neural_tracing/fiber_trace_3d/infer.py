@@ -12,7 +12,7 @@ import zarr
 
 try:
     from lasagna.tiled_predict3d import (
-        DEFAULT_FLUSH_WORKERS,
+        DEFAULT_FLUSH_WORKERS, DEFAULT_ACCUMULATOR_WORKERS,
         DEFAULT_INPUT_CACHE_BYTES,
         DEFAULT_INPUT_COPY_THREADS,
         DEFAULT_INPUT_IO_THREADS,
@@ -31,7 +31,7 @@ try:
     )
 except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
     from tiled_predict3d import (
-        DEFAULT_FLUSH_WORKERS,
+        DEFAULT_FLUSH_WORKERS, DEFAULT_ACCUMULATOR_WORKERS,
         DEFAULT_INPUT_CACHE_BYTES,
         DEFAULT_INPUT_COPY_THREADS,
         DEFAULT_INPUT_IO_THREADS,
@@ -307,6 +307,7 @@ def run_fiber_trace_3d_inference(
     prefetch_workers: int = 0,
     slots_per_gpu: int = 2,
     flush_workers: int = DEFAULT_FLUSH_WORKERS,
+    accumulator_workers: int = DEFAULT_ACCUMULATOR_WORKERS,
     input_reader: str = DEFAULT_INPUT_READER,
     prefetch_tiles_per_gpu: int = DEFAULT_PREFETCH_TILES_PER_GPU,
     input_cache_gib: float = DEFAULT_INPUT_CACHE_BYTES / float(1 << 30),
@@ -315,11 +316,14 @@ def run_fiber_trace_3d_inference(
     download_workers: int = 64,
     profile_pipeline: bool = False,
     inference_precision: str = "auto",
+    product_accumulator_dtype: str = "float16",
 ) -> None:
     if int(download_workers) <= 0:
         raise ValueError("download_workers must be a positive integer")
     if int(flush_workers) < 0:
         raise ValueError("flush_workers must be >= 0")
+    if int(accumulator_workers) < 0:
+        raise ValueError("accumulator_workers must be >= 0")
     if not math.isfinite(float(input_cache_gib)) or float(input_cache_gib) < 0:
         raise ValueError("input_cache_gib must be finite and >= 0")
     if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0 or int(input_copy_threads) <= 0:
@@ -480,6 +484,8 @@ def run_fiber_trace_3d_inference(
         input_io_threads=int(input_io_threads),
         input_copy_threads=int(input_copy_threads),
         profile_pipeline=bool(profile_pipeline),
+        product_accumulator_dtype=str(product_accumulator_dtype),
+        accumulator_workers=int(accumulator_workers),
     )
     del model
     if torch_device.type == "cuda":
@@ -586,6 +592,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Model autocast precision; auto uses checkpoint training metadata (default: auto).",
     )
     parser.add_argument(
+        "--product-accumulator-dtype", choices=("float16", "float32"), default="float16",
+        help="Raw product ring dtype; float16 halves product backing (default: float16).",
+    )
+    parser.add_argument(
+        "--accumulator-workers", type=int, default=DEFAULT_ACCUMULATOR_WORKERS,
+        help="Spawned chunk accumulation processes (default: min(CPU count, 32)); 0 is synchronous.",
+    )
+    parser.add_argument(
         "--download-workers", type=int, default=64,
         help="Parallel S3 chunk download threads used by automatic download.",
     )
@@ -625,6 +639,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--download-workers must be a positive integer")
     if int(args.flush_workers) < 0:
         parser.error("--flush-workers must be >= 0")
+    if int(args.accumulator_workers) < 0:
+        parser.error("--accumulator-workers must be >= 0")
     if int(args.prefetch_tiles_per_gpu) <= 0:
         parser.error("--prefetch-tiles-per-gpu must be > 0")
     if not math.isfinite(float(args.input_cache_gib)) or float(args.input_cache_gib) < 0:
@@ -656,6 +672,7 @@ def main(argv: list[str] | None = None) -> int:
         prefetch_workers=int(args.prefetch_workers),
         slots_per_gpu=int(args.slots_per_gpu),
         flush_workers=int(args.flush_workers),
+        accumulator_workers=int(args.accumulator_workers),
         input_reader=str(args.input_reader),
         prefetch_tiles_per_gpu=int(args.prefetch_tiles_per_gpu),
         input_cache_gib=float(args.input_cache_gib),
@@ -663,6 +680,7 @@ def main(argv: list[str] | None = None) -> int:
         input_copy_threads=int(args.input_copy_threads),
         profile_pipeline=bool(args.profile_pipeline),
         inference_precision=str(args.inference_precision),
+        product_accumulator_dtype=str(args.product_accumulator_dtype),
         download_workers=int(args.download_workers),
     )
     return 0

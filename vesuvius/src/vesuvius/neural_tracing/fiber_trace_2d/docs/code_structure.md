@@ -180,8 +180,13 @@ falls back to FP32. Explicit `fp32`, `bf16`, or `fp16` overrides take priority
 and unsupported explicit modes fail. This metadata records training policy,
 not the dtype of checkpoint parameter tensors.
 
-Each distinct inference scale has separate raw-product float32 mmap rings and
-one shared geometric weight ring. Fiber and Lasagna use the same repeated
+Each distinct inference scale has separate raw-product float32 mmap rings by
+default and one shared float32 geometric weight ring. Experimental
+`--product-accumulator-dtype float16` halves product backing but measured much
+slower with NumPy CPU accumulation on the target machine. Flush
+workers widen each bounded chunk before normalization; FP16 reduces ring
+backing/mmap traffic, not float32 chunk-temporary RAM. Unbounded custom products
+should use float32. Fiber and Lasagna use the same repeated
 separable `[1,4,6,4,1]/16` blur plus 2x decimation for both weighted
 predictions and weights. Predictions are weighted before filtering and then
 normalized by the filtered denominator, so power 2 is not stride-4 sampling.
@@ -2464,6 +2469,30 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=vesuvius/src:. pytest -q vesuvius/te
 ```
 
 The tests are expected to use fake/local data and not require network access.
+
+## Shared 3D accumulator pipeline
+
+`lasagna/tiled_predict3d.py` owns accumulation for both Lasagna and Fiber 3D
+inference. Multi-device runs send chunk-bounded descriptors to persistent
+spawned processes; result tensors stay in the existing shared-memory slots and
+accumulators stay in the rolling mmap. No tile-sized arrays are serialized
+through multiprocessing queues.
+
+`--accumulator-workers` controls process count (default `min(CPU count, 32)`;
+zero selects the synchronous diagnostic baseline). Each spatial output chunk
+has a deterministic worker owner and FIFO ordering. Startup and completion
+logs report backend, task rate, summed work, queue wait, and wall time.
+
+Product accumulators default to float16 and weights remain float32. The
+`accumulator_add` extension uses runtime AVX-512F+F16C dispatch on matching x86
+hosts and otherwise uses a portable scalar path; installation builds both this
+extension and `monotone_norm`. Use `--product-accumulator-dtype float32` for the
+higher-memory float32 result.
+
+The native kernel requires contiguous X rows but supports arbitrary Y/Z
+strides, unaligned rows, ring-wrap pieces, and scalar tails. It releases the
+GIL, although production parallelism comes from processes rather than Python
+threads.
 
 ## Local Caveats
 

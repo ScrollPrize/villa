@@ -1,52 +1,84 @@
-# Plan: CUDA conversion and checkpoint AMP inference
+# Plan: parallel native accumulation
 
-## Implementation
+## Mechanical refactor
 
-1. Change both shared spawned and serial CUDA paths to construct a tensor view over the
-   compact shared uint8/uint16 tile, transfer that dtype to its CUDA device, and
-   normalize on CUDA to float32 with exactly the existing `/255` semantics
-   (`uint16 -> int32`, floor divide by 257, then float32 normalization). Keep
-   the CPU-device fallback's current NumPy semantics exact.
-2. Keep AMP owned by the Fiber adapter, which already reuses training's
-   `_mixed_precision_config_from_training` and `_autocast_context`; do not add a
-   nested shared autocast scope. Normalization and adapter preprocessing remain
-   CUDA FP32, autocast covers model forward only, and adapter output is restored
-   to FP32 before product transformation, weighting, downsampling, and D2H.
-3. In Fiber inference, add `--inference-precision {auto,fp32,fp16,bf16}`.
-   `auto` reads `checkpoint.config.training.mixed_precision`, normalizes known
-   aliases, and falls back to fp32 when absent/disabled. Validate CUDA/device
-   support through the existing training helper, inject the resolved setting
-   into the adapter's effective config, and print its source and mode. Auto mode
-   treats missing/off/invalid/legacy `auto` metadata as FP32 (warning for
-   invalid/ambiguous values); unsupported checkpoint-derived AMP warns and
-   falls back to FP32, while unsupported explicit overrides fail. Validate all
-   selected devices, not only the first.
-4. Update profiling stage names so compact H2D and CUDA conversion are measured
-   separately; preserve the disabled profiling path.
+1. Separate current `_accumulate_group` into coordinator-side chunk planning
+   and an execution primitive. Preserve exact clipping, resume masks, shared
+   weight semantics, product selection, activity accounting, and canonical
+   ordering. Validate this synchronous refactor before enabling processes.
+2. Describe an accumulation task entirely with bounded descriptors: tile/result
+   slot, scale, global chunk origin, logical ring destination slices, result
+   source slices, product names, weight/product mmap descriptors, and task IDs.
 
-## Tests
+## Native kernel
 
-- Exact uint8 and uint16 conversion equivalence, including uint16 boundaries
-  0/256/257/65534/65535, on CPU and CUDA when available.
-- Fiber checkpoint precision resolution for bf16/fp16/disabled/missing/invalid.
-- Fiber CLI forwarding and shared CUDA conversion coverage through both
-  frontends' existing shared-runner tests. Verify preprocessing and product
-  arithmetic remain FP32 under AMP.
-- Existing exact serial/multi-device regression suite, compilation, and diff
-  hygiene. Record that AMP output equality is not expected to be bitwise FP32.
+3. Add a pybind11 `accumulator_add` extension and package it with Lasagna. It
+   accepts strided 3D float16/float32 destination views and float32 source
+   views, releases the GIL, and performs in-place add with the same per-add
+   rounding implied by destination dtype.
+4. On GCC/Clang x86, compile an isolated target-attributed AVX-512F+F16C row
+   kernel that converts half to float32, adds float32, and rounds-to-nearest-even
+   back to half; F16C is not treated as half arithmetic. Runtime-dispatch only
+   when matching CPU support is present. Keep the module
+   baseline free of global `-mavx512*` flags. Provide portable IEEE-half scalar
+   conversion/add and float32 scalar/vector-friendly fallback for macOS,
+   arm64, older x86, unsupported compilers, and missing extension. Report the
+   selected backend once; never fail inference merely because SIMD is absent.
 
-## Spec update
+## Process pipeline
 
-Specify compact integer H2D, on-device normalization, checkpoint-derived Fiber
-AMP defaults, explicit overrides, existing adapter AMP ownership, FP32
-accumulation, and fallback/error rules.
+5. Add persistent spawn-context accumulator workers after GPU workers and
+   before TensorStore context creation. Workers attach existing result shared
+   slots, lazily reopen accumulator mmaps, set native libraries to one thread,
+   and invoke the native primitive. Queues carry descriptors only.
+6. Deterministically map `(scale, chunk_z, chunk_y, chunk_x)` to one worker with
+   a stable integer formula (never Python hash) and one bounded FIFO per worker.
+   The coordinator dispatches tiles canonically, calls ring `ensure` before
+   dispatch, and only that owner updates a chunk, preserving per-chunk order
+   without locks or races. Weight and all missing products for one chunk form
+   one task.
+7. Split dispatch from canonical completion. Reference-count every GPU result
+   slot by its accumulation tasks; release it only after all acknowledgements.
+   Consume completed events canonically before progress/row flush. Do not allow
+   dispatch to reserve more rolling Z generations than the existing active-row
+   plus frozen-flush capacity. Flush waits only for tasks that precede its
+   frontier by construction.
+   Queue submission is nonblocking and pumps acknowledgements under backpressure.
+   Activity becomes committed only after successful acknowledgements; failures
+   invalidate the event and cannot expose provisional data to flush.
+8. Add `--accumulator-workers` to both frontends and shared API: default
+   `min(cpu_count, 32)`, zero restores synchronous accumulation. Keep queues and
+   outstanding tasks bounded by result slots and a small per-worker window.
+   Add startup, throughput, queue-wait, work-sum, and backend diagnostics.
+9. On errors/interrupts, stop GPU assignment, drain/cancel no new work,
+   terminate accumulator workers if necessary, then stop flush workers and
+   clean queues/shared memory/mmaps without semaphore leaks or hangs.
+   Worker mmap/shared-memory caches close on every exit; normal sentinels,
+   timeout escalation, termination, and queue feeder joins are explicit.
 
-## Documentation update
+## Testing and measurement
 
-Document precision resolution, the inspected checkpoint's BF16 result, compact
-transfer, profiling interpretation, and numerical implications.
+10. Native tests: exhaustive/representative half boundaries, subnormals,
+    signed cancellation, overflow/NaN/Inf behavior, arbitrary row strides,
+    float32 exactness, backend reporting, portable fallback, and native-vs-
+    NumPy per-add results. Require contiguous X rows for SIMD, support unaligned
+    rows/YZ strides/wrap pieces/tails, validate writable/nonoverlapping buffers,
+    and expose forceable scalar/SIMD selection. Compile without global ISA flags.
+11. Pipeline tests: synchronous mechanical equivalence, deterministic chunk
+    ownership/order, multi-process speed/concurrency, result-slot lifetime,
+    rolling wrap, sparse/resume, multi-product shared weight, async flush
+    overlap, worker exception/hard-exit/interrupt cleanup, and serial plus
+    multi-device Fiber/Lasagna output comparisons for FP16 and FP32.
+12. Benchmark native-kernel throughput separately from process-pipeline
+    throughput using identical fixtures for NumPy FP16/FP32, native scalar/SIMD, and
+    1/8/32 accumulation workers. Report command, CPU, backing, iterations,
+    mean/median/min/max, effective task concurrency, and end-to-end controlled
+    crop if the environment permits. Do not claim speedup without results.
 
-## Changelog and workflow records
+## Specs/docs/changelog/workflow
 
-Update changelog, status, and task log with review, tests, measurements, and
-limitations. Do not claim performance improvement without a comparable run.
+13. Update specs for deterministic process-owned chunks, native runtime
+    dispatch/portable fallback, slot/frontier lifecycle, boundedness, numerical
+    behavior, and CLI defaults. Document architecture, tuning, installation,
+    diagnostics, limitations, and benchmarking. Update status, task log, and
+    changelog, explicitly recording any deferred test or platform limitation.

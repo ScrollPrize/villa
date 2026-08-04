@@ -1,5 +1,8 @@
 # 2026-08-03
 
+- Added experimental float16 shared raw-product accumulator rings while
+  retaining the measured-faster float32 default, float32 weights, and float32
+  flush arithmetic.
 - Moved shared inference integer-to-FP32 normalization onto CUDA after compact
   H2D and made Fiber model autocast default to checkpoint training policy.
 - Added opt-in shared Fiber/Lasagna multi-device loader and worker stage
@@ -275,3 +278,13 @@
 - Added bounded cache/I/O/copy and per-GPU prefetch controls, single-device
   read-ahead, Python-Zarr fallback, exact reader-equivalence tests, and input
   starvation/high-water diagnostics.
+
+# 2026-08-03: process-parallel native accumulation
+
+- Added deterministic process-owned chunk accumulation shared by Fiber and
+  Lasagna multi-device inference, with bounded queues and retained result-slot
+  lifetimes.
+- Added a portable native accumulator extension with runtime AVX-512F+F16C
+  dispatch and restored float16 product rings as the default.
+- Added `--accumulator-workers`, backend/throughput diagnostics, native
+  numerical coverage, and process-vs-synchronous output coverage.

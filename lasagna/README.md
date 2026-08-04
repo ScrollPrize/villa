@@ -241,6 +241,19 @@ one flush batch may be outstanding, so the next frontier waits if writers fall
 behind. The final `flush stats workers=... chunks=... work_sum=... wait=...`
 line reports that backpressure.
 
+Raw product rings default to float16, intentionally permitting small rounding
+differences while halving product-ring backing. The shared geometric weight
+ring and flush normalization remain float32; pass
+`--product-accumulator-dtype float32` when float32 accumulation is required.
+
+On multi-device runs, chunk accumulation is itself process-parallel. Persistent
+workers add directly from retained result shared-memory slots into the rolling
+mmap, with deterministic per-chunk ownership and FIFO update order.
+`--accumulator-workers` defaults to the CPU count capped at 32; zero restores
+the synchronous A/B baseline. The native `accumulator_add` module runtime-
+dispatches an AVX-512F+F16C row kernel where available and uses a portable
+fallback elsewhere; the package is never globally compiled for AVX-512.
+
 Automatic S3 chunk fetching defaults to 64 transfer threads. Set it separately
 from inference prefetch with, for example, `--download-workers 256`. Interrupted
 or malformed `.dl_cache/*.noremote.json` files are advisory: they are ignored

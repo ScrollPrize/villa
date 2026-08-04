@@ -19,8 +19,12 @@
 - Resume state is durable output chunks only. Done markers are not allowed.
   Scratch mmap/temporary files are not resume state and may be deleted on
   startup/resume or finish.
-- Neural accumulation uses a fixed-depth circular float32 mmap per raw product
-  and one geometric weight mmap per distinct source-relative inference scale.
+- Neural accumulation uses a fixed-depth circular mmap per raw product,
+  float32 by default and optionally float16 for memory-constrained experiments, and one
+  float32 geometric weight mmap per distinct source-relative inference scale.
+  Flush reads widen bounded product chunks to float32 before normalization and
+  finalization. FP16 assumes finite, model-bounded raw products; unbounded
+  custom adapters must select float32 to avoid overflow.
   Ring depth is derived from the actual canonical Z tile positions, nonzero
   tile support, flush opportunities, and output chunk alignment. Mmap shape and
   logical file size must be independent of full output Z.
@@ -275,6 +279,23 @@
   `fiber_trace_3d_inference.json`, no raw seven-channel persisted bundle, no
   directory-style `--output`, no duplicate fiber output adapter, and no public
   exports for removed V0 symbols.
+- Shared multi-device Fiber/Lasagna inference accumulates output chunks in
+  persistent spawned CPU processes. A stable integer mapping gives each
+  `(scale, chunk_z, chunk_y, chunk_x)` exactly one FIFO owner, so overlapping
+  tile updates need no locks and retain canonical per-chunk order. GPU result
+  slots remain live until every referenced accumulation task acknowledges.
+- Accumulation queues are bounded and a new Z row cannot reserve circular-ring
+  generations until the preceding row is committed. Flush frontiers therefore
+  observe only acknowledged tasks and retain the rolling-memory bound.
+- Product rings default to float16 while the shared weight ring remains
+  float32. Each product update widens the stored half to float32, adds the
+  float32 tile contribution, and rounds to nearest-even back to binary16.
+  This reduced-precision accumulation is explicitly not bitwise equivalent to
+  float32; `--product-accumulator-dtype float32` restores float32 accumulation.
+- The optional native accumulator extension must retain a portable scalar
+  implementation. On supported x86 GCC/Clang builds it may runtime-dispatch to
+  an isolated AVX-512F+F16C kernel; the package must not require AVX-512
+  globally and unsupported CPUs/platforms must continue through the fallback.
 
 ## 3D CP-Centered Fiber Model Variant
 

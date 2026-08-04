@@ -39,7 +39,7 @@ import zarr
 
 try:
 	from tiled_predict3d import (
-		DEFAULT_FLUSH_WORKERS,
+		DEFAULT_FLUSH_WORKERS, DEFAULT_ACCUMULATOR_WORKERS,
 		DEFAULT_INPUT_CACHE_BYTES,
 		DEFAULT_INPUT_COPY_THREADS,
 		DEFAULT_INPUT_IO_THREADS,
@@ -94,7 +94,7 @@ try:
 	)
 except ImportError:
 	from lasagna.tiled_predict3d import (
-		DEFAULT_FLUSH_WORKERS,
+		DEFAULT_FLUSH_WORKERS, DEFAULT_ACCUMULATOR_WORKERS,
 		DEFAULT_INPUT_CACHE_BYTES,
 		DEFAULT_INPUT_COPY_THREADS,
 		DEFAULT_INPUT_IO_THREADS,
@@ -1596,6 +1596,7 @@ def run_preprocess_3d(
 	prefetch_workers: int = 0,
 	slots_per_gpu: int = 2,
 	flush_workers: int = DEFAULT_FLUSH_WORKERS,
+	accumulator_workers: int = DEFAULT_ACCUMULATOR_WORKERS,
 	input_reader: str = DEFAULT_INPUT_READER,
 	prefetch_tiles_per_gpu: int = DEFAULT_PREFETCH_TILES_PER_GPU,
 	input_cache_gib: float = DEFAULT_INPUT_CACHE_BYTES / float(1 << 30),
@@ -1603,6 +1604,7 @@ def run_preprocess_3d(
 	input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
 	download_workers: int = 64,
 	profile_pipeline: bool = False,
+	product_accumulator_dtype: str = "float16",
 ) -> None:
 	"""Run 3D UNet inference and write .lasagna.json with OME-Zarr pyramids.
 
@@ -1627,6 +1629,8 @@ def run_preprocess_3d(
 		raise ValueError("download_workers must be a positive integer")
 	if int(flush_workers) < 0:
 		raise ValueError("flush_workers must be >= 0")
+	if int(accumulator_workers) < 0:
+		raise ValueError("accumulator_workers must be >= 0")
 	if not math.isfinite(float(input_cache_gib)) or float(input_cache_gib) < 0:
 		raise ValueError("input_cache_gib must be finite and >= 0")
 	if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0 or int(input_copy_threads) <= 0:
@@ -1970,6 +1974,8 @@ def run_preprocess_3d(
 			input_io_threads=int(input_io_threads),
 			input_copy_threads=int(input_copy_threads),
 			profile_pipeline=bool(profile_pipeline),
+			product_accumulator_dtype=str(product_accumulator_dtype),
+			accumulator_workers=int(accumulator_workers),
 		)
 	except BaseException:
 		if _gpu_ctx is not None:
@@ -2768,6 +2774,10 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		help="TensorStore decode/data-copy concurrency (default: 4).")
 	p.add_argument("--profile-pipeline", action="store_true",
 		help="Print detailed loader, CPU preparation, CUDA, transfer, and coordinator stage timings.")
+	p.add_argument("--product-accumulator-dtype", choices=("float16", "float32"), default="float16",
+		help="Raw product ring dtype; float16 halves product backing (default: float16).")
+	p.add_argument("--accumulator-workers", type=int, default=DEFAULT_ACCUMULATOR_WORKERS,
+		help="Spawned chunk accumulation processes (default: min(CPU count, 32)); 0 is synchronous.")
 	p.add_argument("--download-workers", type=int, default=64,
 		help="Parallel S3 chunk download threads used by automatic download.")
 	p.add_argument("--chunk-z", type=int, default=32, help="Output zarr chunk size along Z.")
@@ -2795,6 +2805,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		p.error("--download-workers must be a positive integer")
 	if int(args.flush_workers) < 0:
 		p.error("--flush-workers must be >= 0")
+	if int(args.accumulator_workers) < 0:
+		p.error("--accumulator-workers must be >= 0")
 	if int(args.prefetch_tiles_per_gpu) <= 0:
 		p.error("--prefetch-tiles-per-gpu must be > 0")
 	if not math.isfinite(float(args.input_cache_gib)) or float(args.input_cache_gib) < 0:
@@ -2838,12 +2850,14 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		prefetch_workers=int(args.prefetch_workers),
 		slots_per_gpu=int(args.slots_per_gpu),
 		flush_workers=int(args.flush_workers),
+		accumulator_workers=int(args.accumulator_workers),
 		input_reader=str(args.input_reader),
 		prefetch_tiles_per_gpu=int(args.prefetch_tiles_per_gpu),
 		input_cache_gib=float(args.input_cache_gib),
 		input_io_threads=int(args.input_io_threads),
 		input_copy_threads=int(args.input_copy_threads),
 		profile_pipeline=bool(args.profile_pipeline),
+		product_accumulator_dtype=str(args.product_accumulator_dtype),
 		download_workers=int(args.download_workers),
 	)
 	return 0

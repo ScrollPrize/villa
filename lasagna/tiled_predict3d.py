@@ -3,7 +3,7 @@ from __future__ import annotations
 import atexit
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import multiprocessing as mp
 from multiprocessing import shared_memory
@@ -50,6 +50,7 @@ DEFAULT_PREFETCH_TILES_PER_GPU = 4
 DEFAULT_INPUT_CACHE_BYTES = 4 << 30
 DEFAULT_INPUT_IO_THREADS = 16
 DEFAULT_INPUT_COPY_THREADS = 4
+DEFAULT_ACCUMULATOR_WORKERS = min(32, max(1, os.cpu_count() or 1))
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,21 @@ class _FlushProcessTask:
 	oc: int
 	region: RegionZYX
 	products: tuple[Any, ...]
+	accumulators: tuple[tuple[str, _MmapBandDescriptor], ...]
+	weight: _MmapBandDescriptor
+
+
+@dataclass(frozen=True)
+class _AccumulateProcessTask:
+	task_id: int
+	event_seq: int
+	result_slot: int
+	result_spec: "_SharedSlotSpec"
+	sd: int
+	origin: ChunkOriginZYX
+	destination: tuple[int, int, int, int, int, int]
+	source: tuple[int, int, int, int, int, int]
+	dirty_products: tuple[str, ...]
 	accumulators: tuple[tuple[str, _MmapBandDescriptor], ...]
 	weight: _MmapBandDescriptor
 
@@ -1452,6 +1468,7 @@ class _CircularZBand:
 		tmp_dir: str | None,
 		prefix: str,
 		ring_depth: int | None = None,
+		dtype: str | np.dtype = np.float32,
 	) -> None:
 		self.name = str(name)
 		self.channel_count = int(channel_count)
@@ -1465,6 +1482,9 @@ class _CircularZBand:
 		self.layout = _CircularZLayout(self.ring_depth, self.y_size, self.x_size)
 		self.tmp_dir = tmp_dir
 		self.prefix = str(prefix)
+		self.dtype = np.dtype(dtype)
+		if self.dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+			raise ValueError(f"circular accumulator dtype must be float16 or float32, got {self.dtype}")
 		self.origin_z = 0
 		self._generation = np.full(self.ring_depth, -1, dtype=np.int64)
 		self._arrays = [self._new_array(ch) for ch in range(self.channel_count)]
@@ -1480,7 +1500,7 @@ class _CircularZBand:
 				max(0, self.ring_depth)
 				* max(0, self.y_size)
 				* max(0, self.x_size)
-				* np.dtype(np.float32).itemsize
+				* self.dtype.itemsize
 			)
 			os.ftruncate(fd, logical_bytes)
 		except Exception:
@@ -1490,7 +1510,7 @@ class _CircularZBand:
 		os.close(fd)
 		mm = np.memmap(
 			path,
-			dtype=np.float32,
+			dtype=self.dtype,
 			mode="r+",
 			shape=(self.ring_depth, self.y_size, self.x_size),
 		)
@@ -1510,6 +1530,7 @@ class _CircularZBand:
 		return _MmapBandDescriptor(
 			paths=paths,
 			shape_zyx=(self.ring_depth, self.y_size, self.x_size),
+			dtype=self.dtype.name,
 		)
 
 	def validate_frozen(self, z0: int, z1: int) -> None:
@@ -1565,9 +1586,10 @@ class _CircularZBand:
 		self.ensure(z0, z1)
 		data_offset = 0
 		for physical_z, _logical_z, length in self.layout.split(z0, z1):
-			self._arrays[int(ch)][physical_z:physical_z + length, y0:y1, x0:x1] += data[
-				data_offset:data_offset + length
-			]
+			_add_accumulator_view(
+				self._arrays[int(ch)][physical_z:physical_z + length, y0:y1, x0:x1],
+				data[data_offset:data_offset + length],
+			)
 			data_offset += length
 
 	def read(
@@ -1867,6 +1889,110 @@ def _read_mmap_band_chunk(
 	return out
 
 
+_ACCUMULATOR_NATIVE = None
+
+
+def _accumulator_native_module():
+	global _ACCUMULATOR_NATIVE
+	if _ACCUMULATOR_NATIVE is None:
+		try:
+			import accumulator_add as module
+		except ImportError:
+			module = False
+		_ACCUMULATOR_NATIVE = module
+	return _ACCUMULATOR_NATIVE
+
+
+def _add_accumulator_view(destination: np.ndarray, source: np.ndarray) -> str:
+	"""Add float32 source into an f16/f32 destination, using native code when installed."""
+	module = _accumulator_native_module()
+	if module:
+		module.add_inplace(destination, source)
+		return str(module.backend())
+	# NumPy is the portable no-extension fallback.  For float16 destinations it
+	# has the required per-add rounding semantics, albeit without the fast kernel.
+	np.add(destination, source, out=destination, casting="unsafe")
+	return "numpy"
+
+
+def _add_mmap_band_chunk(
+	descriptor: _MmapBandDescriptor,
+	channel: int,
+	z0: int, z1: int, y0: int, y1: int, x0: int, x1: int,
+	source: np.ndarray,
+	cache: dict[str, np.memmap],
+) -> str:
+	path = descriptor.paths[int(channel)]
+	arr = cache.get(path)
+	if arr is None:
+		arr = np.memmap(path, dtype=np.dtype(descriptor.dtype), mode="r+", shape=descriptor.shape_zyx)
+		cache[path] = arr
+	offset = 0
+	logical = int(z0)
+	backend = "numpy"
+	while logical < int(z1):
+		physical = logical % descriptor.ring_depth
+		length = min(int(z1) - logical, descriptor.ring_depth - physical)
+		backend = _add_accumulator_view(
+			arr[physical:physical + length, y0:y1, x0:x1],
+			source[offset:offset + length],
+		)
+		offset += length
+		logical += length
+	return backend
+
+
+def _stable_accumulator_owner(sd: int, origin: ChunkOriginZYX, worker_count: int) -> int:
+	"""Stable spatial ownership; unlike hash(), this is invariant across processes."""
+	z, y, x = (int(value) for value in origin)
+	value = int(sd) * 73856093 + z * 19349663 + y * 83492791 + x * 2654435761
+	return int(value % int(worker_count))
+
+
+def _accumulate_process_main(worker_index: int, task_queue, result_queue) -> None:
+	_native_limits = _limit_native_worker_threads()
+	shms: dict[str, shared_memory.SharedMemory] = {}
+	mmaps: dict[str, np.memmap] = {}
+	try:
+		while True:
+			task = task_queue.get()
+			if task is None:
+				break
+			started = time.perf_counter()
+			try:
+				shm = shms.get(task.result_spec.shm_name)
+				if shm is None:
+					shm = _attach_shared_memory(task.result_spec.shm_name)
+					shms[task.result_spec.shm_name] = shm
+				layouts = {layout.name: layout for layout in task.result_spec.layouts}
+				lz0, lz1, ly0, ly1, lx0, lx1 = task.destination
+				pz0, pz1, py0, py1, px0, px1 = task.source
+				weight = _slot_array(shm, layouts[f"weight:{task.sd}"])[pz0:pz1, py0:py1, px0:px1]
+				backend = _add_mmap_band_chunk(
+					task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, weight, mmaps,
+				)
+				accumulators = dict(task.accumulators)
+				for name in task.dirty_products:
+					product = _slot_array(shm, layouts[f"product:{name}"])
+					for channel in range(int(product.shape[0])):
+						backend = _add_mmap_band_chunk(
+							accumulators[name], channel,
+							lz0, lz1, ly0, ly1, lx0, lx1,
+							product[channel, pz0:pz1, py0:py1, px0:px1], mmaps,
+						)
+				result_queue.put(("result", task.task_id, task.event_seq, worker_index, backend, time.perf_counter() - started))
+			except BaseException as exc:
+				result_queue.put(("error", task.task_id, task.event_seq, worker_index, type(exc).__name__, str(exc)))
+				break
+	finally:
+		for arr in mmaps.values():
+			mmap_obj = getattr(arr, "_mmap", None)
+			if mmap_obj is not None:
+				mmap_obj.close()
+		for shm in shms.values():
+			shm.close()
+
+
 def _execute_flush_process_task(
 	task: _FlushProcessTask,
 	model_adapter: Any,
@@ -2126,6 +2252,8 @@ def run_tiled_inference_3d(
 	input_io_threads: int = DEFAULT_INPUT_IO_THREADS,
 	input_copy_threads: int = DEFAULT_INPUT_COPY_THREADS,
 	profile_pipeline: bool = False,
+	product_accumulator_dtype: str | np.dtype = "float16",
+	accumulator_workers: int = 0,
 ) -> None:
 	"""Authoritative one-pass, multi-scale tiled inference engine."""
 	products = tuple(products)
@@ -2148,6 +2276,8 @@ def run_tiled_inference_3d(
 		raise ValueError("prefetch_workers must be >= 0")
 	if int(flush_workers) < 0:
 		raise ValueError("flush_workers must be >= 0")
+	if int(accumulator_workers) < 0:
+		raise ValueError("accumulator_workers must be >= 0")
 	input_reader = str(input_reader).strip().lower()
 	if input_reader not in {"tensorstore", "python-zarr"}:
 		raise ValueError("input_reader must be 'tensorstore' or 'python-zarr'")
@@ -2159,6 +2289,12 @@ def run_tiled_inference_3d(
 		raise ValueError("input_io_threads must be > 0")
 	if int(input_copy_threads) <= 0:
 		raise ValueError("input_copy_threads must be > 0")
+	product_accumulator_dtype = np.dtype(product_accumulator_dtype)
+	if product_accumulator_dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+		raise ValueError(
+			"product_accumulator_dtype must be float16 or float32, "
+			f"got {product_accumulator_dtype}"
+		)
 	if input_reader == "tensorstore" and input_zarr_path is None:
 		raise ValueError("TensorStore input requires input_zarr_path")
 	scales = {
@@ -2258,18 +2394,22 @@ def run_tiled_inference_3d(
 			p.name: _CircularZBand(
 				name=f"acc_{p.name}", channel_count=p.raw_channel_count,
 				z_size=Zo, y_size=Yo, x_size=Xo, tmp_dir=tmp_dir,
-				prefix=temp_prefix, ring_depth=depth,
+				prefix=temp_prefix, ring_depth=depth, dtype=product_accumulator_dtype,
 			)
 			for p in group_products
 		}
 		weight = _CircularZBand(
 			name=f"weight_sd{sd}", channel_count=1, z_size=Zo, y_size=Yo, x_size=Xo,
-			tmp_dir=tmp_dir, prefix=temp_prefix, ring_depth=depth,
+			tmp_dir=tmp_dir, prefix=temp_prefix, ring_depth=depth, dtype=np.float32,
 		)
-		bytes_total = (1 + sum(p.raw_channel_count for p in group_products)) * depth * Yo * Xo * 4
+		product_bytes = sum(p.raw_channel_count for p in group_products) * depth * Yo * Xo * product_accumulator_dtype.itemsize
+		weight_bytes = depth * Yo * Xo * np.dtype(np.float32).itemsize
+		bytes_total = product_bytes + weight_bytes
 		print(
 			f"[predict3d] ring sd={sd} zyx=({depth},{Yo},{Xo}) logical_z={Zo} "
-			f"products={len(group_products)} backing={bytes_total / 1024**3:.2f}GiB",
+			f"products={len(group_products)} product_dtype={product_accumulator_dtype.name} "
+			f"weight_dtype=float32 product_backing={product_bytes / 1024**3:.2f}GiB "
+			f"weight_backing={weight_bytes / 1024**3:.2f}GiB backing={bytes_total / 1024**3:.2f}GiB",
 			flush=True,
 		)
 		groups[sd] = dict(
@@ -2392,8 +2532,58 @@ def run_tiled_inference_3d(
 				arr = product_np[product.name]
 				for ch in range(product.raw_channel_count):
 					g["acc"][product.name].add(ch, lz0, lz1, ly0, ly1, lx0, lx1, arr[ch, pz0:pz1, py0:py1, px0:px1])
-				g["touched_bytes"] += product.raw_channel_count * voxels * 4
+				g["touched_bytes"] += product.raw_channel_count * voxels * g["acc"][product.name].dtype.itemsize
 				activity["dirty_products"].add(product.name)
+
+	def _plan_accumulate_tasks(
+		sd: int, g: dict[str, Any], result_slot: int, result_spec: _SharedSlotSpec,
+		result_shm: shared_memory.SharedMemory, tz: int, ty: int, tx: int,
+	) -> list[tuple[_AccumulateProcessTask, dict[str, Any]]]:
+		"""Plan disjoint chunk-owner work while retaining coordinator ring metadata."""
+		layouts = {layout.name: layout for layout in result_spec.layouts}
+		weight_np = _slot_array(result_shm, layouts[f"weight:{sd}"])
+		Zo, Yo, Xo = g["shape"]
+		ts = tile_size // sd
+		clips = [_downscaled_tile_clip(v, sd, ts, size) for v, size in zip((tz, ty, tx), (Zo, Yo, Xo))]
+		(az0, az1, sz0, sz1), (ay0, ay1, sy0, sy1), (ax0, ax1, sx0, sx1) = clips
+		if az1 <= az0 or ay1 <= ay0 or ax1 <= ax0:
+			return []
+		oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
+		b, oc = g["b"], g["oc"]
+		reg = (
+			max(oz0, oz0 + az0 - b), min(oz1, oz0 + az1 - b),
+			max(oy0, oy0 + ay0 - b), min(oy1, oy0 + ay1 - b),
+			max(ox0, ox0 + ax0 - b), min(ox1, ox0 + ax1 - b),
+		)
+		planned = []
+		for origin, missing in _needed_chunks(sd, g, reg).items():
+			cz, cy, cx = origin
+			gz0, gy0, gx0 = max(reg[0], cz), max(reg[2], cy), max(reg[4], cx)
+			gz1, gy1, gx1 = min(reg[1], cz + oc), min(reg[3], cy + oc), min(reg[5], cx + oc)
+			lz0, ly0, lx0 = b + gz0 - oz0, b + gy0 - oy0, b + gx0 - ox0
+			lz1, ly1, lx1 = b + gz1 - oz0, b + gy1 - oy0, b + gx1 - ox0
+			pz0, py0, px0 = sz0 + lz0 - az0, sy0 + ly0 - ay0, sx0 + lx0 - ax0
+			pz1, py1, px1 = pz0 + lz1 - lz0, py0 + ly1 - ly0, px0 + lx1 - lx0
+			if not np.any(weight_np[pz0:pz1, py0:py1, px0:px1] > 0.0):
+				continue
+			# Only the coordinator mutates generation/frontier metadata.
+			g["weight"].ensure(lz0, lz1)
+			for product in missing:
+				g["acc"][product.name].ensure(lz0, lz1)
+			products_here = tuple(product.name for product in missing)
+			task = _AccumulateProcessTask(
+				task_id=-1, event_seq=-1, result_slot=int(result_slot), result_spec=result_spec,
+				sd=int(sd), origin=origin,
+				destination=(lz0, lz1, ly0, ly1, lx0, lx1),
+				source=(pz0, pz1, py0, py1, px0, px1),
+				dirty_products=products_here,
+				accumulators=tuple((name, g["acc"][name].mmap_descriptor()) for name in products_here),
+				weight=g["weight"].mmap_descriptor(),
+			)
+			voxels = (lz1-lz0) * (ly1-ly0) * (lx1-lx0)
+			metadata = {"group": g, "origin": origin, "products": products_here, "voxels": voxels}
+			planned.append((task, metadata))
+		return planned
 
 	def _flush_target(sd: int, g: dict[str, Any], complete_padded: int) -> int:
 		complete = int(complete_padded) // sd
@@ -2640,7 +2830,7 @@ def run_tiled_inference_3d(
 				voxels = (lz1-lz0) * (ly1-ly0) * (lx1-lx0)
 				for name in chunk.dirty_products:
 					g["acc"][name].clear(lz0, lz1, ly0, ly1, lx0, lx1)
-					cleared_bytes += by_name[name].raw_channel_count * voxels * 4
+					cleared_bytes += by_name[name].raw_channel_count * voxels * g["acc"][name].dtype.itemsize
 				if chunk.weight_dirty:
 					g["weight"].clear(lz0, lz1, ly0, ly1, lx0, lx1)
 					cleared_bytes += voxels * 4
@@ -2870,6 +3060,9 @@ def run_tiled_inference_3d(
 			ctx = mp.get_context("spawn")
 			result_queue = ctx.Queue(maxsize=max(4, _slot_count * 3))
 			work_queues = [ctx.Queue(maxsize=int(slots_per_gpu)) for _ in resolved_devices]
+			accum_result_queue = None
+			accum_queues: list[Any] = []
+			accum_processes: list[Any] = []
 			worker_state = None
 			if model_state is not None:
 				worker_state = {}
@@ -2910,6 +3103,31 @@ def run_tiled_inference_3d(
 					shm.unlink()
 				raise
 			_start_flush_workers()
+			if int(accumulator_workers) > 0:
+				accum_result_queue = ctx.Queue(maxsize=max(4, _slot_count * 4))
+				accum_queues = [ctx.Queue(maxsize=2) for _ in range(int(accumulator_workers))]
+				try:
+					with _single_threaded_native_runtime():
+						for index, task_queue in enumerate(accum_queues):
+							process = ctx.Process(
+								target=_accumulate_process_main,
+								args=(index, task_queue, accum_result_queue),
+								name=f"predict3d-accumulate-{index}", daemon=True,
+							)
+							process.start()
+							accum_processes.append(process)
+				except BaseException:
+					for process in accum_processes:
+						if process.is_alive():
+							process.terminate()
+						process.join(timeout=5.0)
+					raise
+				module = _accumulator_native_module()
+				backend = str(module.backend()) if module else "numpy"
+				print(
+					f"[predict3d] accumulator processes={len(accum_processes)} "
+					f"queue_depth=2 native_threads_per_worker=1 backend={backend}", flush=True,
+				)
 			reader_count = int(prefetch_workers) if int(prefetch_workers) > 0 else min(_slot_count, max(1, len(resolved_devices) * 2))
 			executor = None
 			tensorstore_reader = None
@@ -2953,11 +3171,18 @@ def run_tiled_inference_3d(
 			futures: dict[Any, int] = {}
 			event_iter = iter(_iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp))
 			source_done = False
-			next_sequence = next_commit = 0
+			next_sequence = next_commit = next_accum_dispatch = 0
+			accum_dispatch_z: int | None = None
 			next_worker = 0
 			gpu_counts = [0 for _ in workers]
 			gpu_time_sums = [0.0 for _ in workers]
 			commit_time = 0.0
+			accum_task_id = 0
+			accum_pending: dict[int, dict[str, Any]] = {}
+			accum_work_sum = 0.0
+			accum_queue_wait = 0.0
+			accum_started_at: float | None = None
+			accum_backends: set[str] = set()
 			read_time = 0.0
 			read_bytes = 0
 			read_submitted = 0
@@ -3015,10 +3240,90 @@ def run_tiled_inference_3d(
 				else:
 					raise RuntimeError(f"unknown multi-GPU worker message: {message}")
 
+			def _handle_accum_message(message: tuple[Any, ...]) -> None:
+				nonlocal accum_work_sum
+				task_id = int(message[1])
+				metadata = accum_pending.pop(task_id, None)
+				if metadata is None:
+					raise RuntimeError(f"unexpected or duplicate accumulator result: {message}")
+				if message[0] == "error":
+					raise RuntimeError(
+						f"accumulator worker {message[3]} failed task {task_id}: {message[4]}: {message[5]}"
+					)
+				if message[0] != "result":
+					raise RuntimeError(f"unknown accumulator worker message: {message}")
+				accum_backends.add(str(message[4]))
+				accum_work_sum += float(message[5])
+				g = metadata["group"]
+				origin = metadata["origin"]
+				activity = g["activity"].setdefault(origin, {"weight_dirty": False, "dirty_products": set()})
+				activity["weight_dirty"] = True
+				activity["dirty_products"].update(metadata["products"])
+				voxels = int(metadata["voxels"])
+				g["touched_bytes"] += voxels * 4
+				for name in metadata["products"]:
+					g["touched_bytes"] += g["acc"][name].channel_count * voxels * g["acc"][name].dtype.itemsize
+				event = events[int(message[2])]
+				event["accum_remaining"] -= 1
+				if event["accum_remaining"] == 0:
+					free_results.append(event["result_slot"])
+					event["status"] = "done_accum"
+
+			def _pump_accumulator_results() -> bool:
+				if accum_result_queue is None:
+					return False
+				progressed = False
+				while True:
+					try:
+						message = accum_result_queue.get_nowait()
+					except queue.Empty:
+						break
+					_handle_accum_message(message)
+					progressed = True
+				return progressed
+
+			def _dispatch_accumulator_event(seq: int, event: dict[str, Any]) -> None:
+				nonlocal accum_task_id, accum_queue_wait, accum_started_at
+				result_slot = int(event["result_slot"])
+				plans = []
+				for sd, group in groups.items():
+					plans.extend(_plan_accumulate_tasks(
+						sd, group, result_slot, result_specs[result_slot], result_shms[result_slot], *event["coord"],
+					))
+				if not plans:
+					free_results.append(result_slot)
+					event["status"] = "done_accum"
+					return
+				event["accum_remaining"] = len(plans)
+				event["status"] = "accumulating"
+				if accum_started_at is None:
+					accum_started_at = time.perf_counter()
+				for task_template, metadata in plans:
+					task = replace(task_template, task_id=accum_task_id, event_seq=int(seq))
+					accum_pending[accum_task_id] = metadata
+					owner = _stable_accumulator_owner(task.sd, task.origin, len(accum_queues))
+					wait_started = time.perf_counter()
+					while True:
+						try:
+							accum_queues[owner].put(task, timeout=0.01)
+							break
+						except queue.Full:
+							_pump_accumulator_results()
+							for index, process in enumerate(accum_processes):
+								if not process.is_alive() and process.exitcode is not None:
+									raise RuntimeError(f"accumulator worker {index} exited with code {process.exitcode}")
+					accum_queue_wait += time.perf_counter() - wait_started
+					accum_task_id += 1
+
 			try:
 				while not source_done or events:
 					_pump_pending_flush(block=False)
-					made_progress = False
+					made_progress = _pump_accumulator_results()
+					for index, process in enumerate(accum_processes):
+						if not process.is_alive() and process.exitcode is not None:
+							raise RuntimeError(
+								f"accumulator worker {index} exited unexpectedly with code {process.exitcode}"
+							)
 					while not source_done and len(events) < _prefetch_window:
 						try:
 							tz, ty, tx, row_end, next_tz = next(event_iter)
@@ -3136,11 +3441,26 @@ def run_tiled_inference_3d(
 							break
 						made_progress = True
 						_handle_gpu_message(message)
-					commit_started = time.perf_counter()
-					while next_commit in events and events[next_commit]["status"] in ("done_skip", "done_result"):
-						event = events.pop(next_commit)
+					_pump_accumulator_results()
+					# Dispatch completed GPU results canonically.  A new Z row waits
+					# for prior accumulation acknowledgements so ring generations and
+					# flush frontiers remain bounded exactly as in the serial path.
+					while next_accum_dispatch in events:
+						event = events[next_accum_dispatch]
 						if event["status"] == "done_skip":
-							_record_commit(was_processed=False, elapsed=0.0, row_end=event["row_end"], next_tz=event["next_tz"])
+							next_accum_dispatch += 1
+							made_progress = True
+							continue
+						if event["status"] != "done_result":
+							break
+						current_z = int(event["coord"][0])
+						if (
+							accum_dispatch_z is not None and current_z != accum_dispatch_z
+							and next_commit < next_accum_dispatch
+						):
+							break
+						if int(accumulator_workers) > 0:
+							_dispatch_accumulator_event(next_accum_dispatch, event)
 						else:
 							layouts = {layout.name: layout for layout in result_specs[event["result_slot"]].layouts}
 							result_shm = result_shms[event["result_slot"]]
@@ -3149,6 +3469,16 @@ def run_tiled_inference_3d(
 								weight = _slot_array(result_shm, layouts[f"weight:{sd}"])
 								_accumulate_group(sd, group, prepared, weight, *event["coord"])
 							free_results.append(event["result_slot"])
+							event["status"] = "done_accum"
+						accum_dispatch_z = current_z
+						next_accum_dispatch += 1
+						made_progress = True
+					commit_started = time.perf_counter()
+					while next_commit in events and events[next_commit]["status"] in ("done_skip", "done_accum"):
+						event = events.pop(next_commit)
+						if event["status"] == "done_skip":
+							_record_commit(was_processed=False, elapsed=0.0, row_end=event["row_end"], next_tz=event["next_tz"])
+						else:
 							_record_commit(was_processed=True, elapsed=event["gpu_elapsed"], row_end=event["row_end"], next_tz=event["next_tz"])
 						next_commit += 1
 						made_progress = True
@@ -3176,6 +3506,15 @@ def run_tiled_inference_3d(
 							_handle_gpu_message(message)
 				if starve_started is not None:
 					input_starve_time += time.perf_counter() - starve_started
+				accum_wall = 0.0 if accum_started_at is None else time.perf_counter() - accum_started_at
+				accum_rate = 0.0 if accum_wall <= 0.0 else accum_task_id / accum_wall
+				print(
+					f"[predict3d] accumulator stats workers={len(accum_processes)} tasks={accum_task_id} "
+					f"work_sum={accum_work_sum:.2f}s queue_wait={accum_queue_wait:.2f}s "
+					f"wall={accum_wall:.2f}s rate={accum_rate:.2f}tasks/s "
+					f"backends={','.join(sorted(accum_backends)) or ('native-sync' if not accum_processes else 'none')}",
+					flush=True,
+				)
 				print(
 					f"[predict3d] multi-device stats input_backend={input_reader} "
 					f"reads={read_completed}/{read_submitted} read_bytes={read_bytes} read_sum={read_time:.1f}s "
@@ -3230,6 +3569,22 @@ def run_tiled_inference_3d(
 					)
 				if executor is not None:
 					executor.shutdown(wait=True, cancel_futures=True)
+				for task_queue in accum_queues:
+					try:
+						task_queue.put_nowait(None)
+					except queue.Full:
+						pass
+				for process in accum_processes:
+					process.join(timeout=10.0)
+					if process.is_alive():
+						process.terminate()
+						process.join(timeout=5.0)
+				for task_queue in accum_queues:
+					task_queue.close()
+					task_queue.join_thread()
+				if accum_result_queue is not None:
+					accum_result_queue.close()
+					accum_result_queue.join_thread()
 				for work_queue in work_queues:
 					try:
 						work_queue.put_nowait(None)
