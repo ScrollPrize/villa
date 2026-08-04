@@ -20,6 +20,7 @@
 #include <opencv2/core/mat.hpp>
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -28,7 +29,11 @@ using vc_selfcross::CensusCounts;
 using vc_selfcross::census;
 using vc_selfcross::COPLANAR;
 using vc_selfcross::GRAZING;
+using vc_selfcross::NONE;
 using vc_selfcross::TRANSVERSE;
+using vc_selfcross::Tri;
+using vc_selfcross::Vec3;
+using vc_selfcross::tri_tri;
 
 namespace {
 
@@ -166,6 +171,28 @@ TEST_CASE("adjacency exclusion is honoured and reported pairs are canonical")
     }
 }
 
+TEST_CASE("disjoint triangles near each other's infinite plane are not "
+          "grazing")
+{
+    // Two nearly coplanar right triangles whose bounding boxes overlap at a
+    // corner while the triangles themselves stay ~2.7 apart. Every vertex
+    // of one lies within plane tolerance of the OTHER's infinite plane, but
+    // proximity to an infinite plane says nothing about touching: reporting
+    // this as grazing inflates the count with pairs that are simply
+    // disjoint. The verdict must be no contact at all.
+    Tri a{{0, 0, 5}, {4, 0, 5}, {0, 4, 5}, 0, 0, 0};
+    Tri b{{3.9, 3.9, 5.000004}, {8, 3.9, 5.000008}, {3.9, 8, 5.000008},
+          10, 10, 0};
+    CHECK(tri_tri(a, b).verdict == NONE);
+
+    // ...while the same pair moved into genuine contact IS reported: slide
+    // b so its corner vertex sits on a's interior.
+    Tri c{{1.0, 1.0, 5.000004}, {8, 1.0, 5.000008}, {1.0, 8, 5.000008},
+          10, 10, 0};
+    auto r = tri_tri(a, c);
+    CHECK(r.verdict != NONE);
+}
+
 TEST_CASE("results do not depend on thread count or broad-phase cell size")
 {
     // A pair can share several broad-phase cells; it is owned by exactly
@@ -198,6 +225,82 @@ TEST_CASE("results do not depend on thread count or broad-phase cell size")
         CHECK(r.counts.coplanar == ref.counts.coplanar);
         CHECK(r.counts.grazing == ref.counts.grazing);
     }
+}
+
+TEST_CASE("sub-tolerance contacts are found at every cell size")
+{
+    // The narrow phase accepts pairs whose boxes come within TOUCH_TOL, so
+    // the broad phase must bucket expanded boxes -- otherwise a pair
+    // separated by less than the tolerance can straddle a bucket boundary
+    // at one cell size and share a bucket at another, and the counts move
+    // with --cell. Two flat sheets 5e-5 apart -- inside the plane tolerance
+    // at this magnitude, so every pair classifies (as coplanar), and inside
+    // the gap a bucket boundary could fall into. The counts must agree
+    // across cell sizes, and the fixture is offset in x so geometry sits
+    // near bucket boundaries at the default size.
+    cv::Mat_<cv::Vec3f> P = blank(8 + GAP + 8, 10);
+    for (int v = 0; v < 8; ++v)
+        for (int u = 0; u < 10; ++u) {
+            P(v, u) = cv::Vec3f(4.f * u + 39.9f, 4.f * v, 5.f);
+            P(8 + GAP + v, u) = cv::Vec3f(4.f * u + 39.9f, 4.f * v,
+                                          5.f + 5e-5f);
+        }
+    Run ref = run(P, 0, 40.0);
+    CHECK(ref.counts.coplanar + ref.counts.grazing > 0u);
+    for (double cell : {5.0, 39.95, 100.0, 400.0}) {
+        Run r = run(P, 0, cell);
+        CHECK(r.counts.transverse == ref.counts.transverse);
+        CHECK(r.counts.coplanar == ref.counts.coplanar);
+        CHECK(r.counts.grazing == ref.counts.grazing);
+    }
+}
+
+TEST_CASE("a cell size far below the surface's extent is refused, not "
+          "undefined")
+{
+    // Positive and finite is not enough: span/cell can overflow the index
+    // arithmetic, and each triangle's bucket loop can turn astronomical.
+    // The refusal must fire on the DOUBLE quotient, before any integer
+    // conversion, so the denormal-smallest cell is the probe that matters.
+    cv::Mat_<cv::Vec3f> P = blank(6, 6);
+    put_plane(P, 0, 6, 6, 5.0);
+    std::vector<Contact> out;
+    CHECK_THROWS_AS(census(P, 0, 1e-7, 1, 60.0, 1, out),
+                    std::invalid_argument);
+    CHECK_THROWS_AS(census(P, 0, std::numeric_limits<double>::min(), 1,
+                           60.0, 1, out),
+                    std::invalid_argument);
+    CHECK_THROWS_AS(census(P, 0, std::numeric_limits<double>::denorm_min(),
+                           1, 60.0, 1, out),
+                    std::invalid_argument);
+}
+
+TEST_CASE("degenerate triangles obey the same distance-gated grazing rule")
+{
+    // A zero-area triangle cannot be classified by plane signs, but that
+    // alone is not contact: two collapsed triangles with overlapping boxes
+    // can be far apart. Grazing still requires coming within the touch
+    // tolerance; genuine touching still reports.
+    const Tri seg_far{{0, 0, 5}, {8, 0, 5}, {4, 0, 5}, 0, 0, 0};
+    const Tri seg_near{{0, 4, 5}, {8, 4, 5}, {4, 4, 5}, 9, 9, 0};
+    // collapsed vs collapsed, boxes overlap in x/z, 4 apart in y
+    CHECK(tri_tri(seg_far, seg_near).verdict == NONE);
+
+    // a collapsed triangle genuinely touching a proper one
+    const Tri plane{{0, 0, 5}, {8, 0, 5}, {0, 8, 5}, 0, 0, 0};
+    const Tri seg_touch{{1, 1, 5}, {3, 1, 5}, {2, 1, 5}, 9, 9, 0};
+    CHECK(tri_tri(plane, seg_touch).verdict == GRAZING);
+
+    // two coincident collapsed triangles
+    const Tri seg_a{{0, 0, 5}, {8, 0, 5}, {4, 0, 5}, 0, 0, 0};
+    const Tri seg_b{{0, 0, 5}, {8, 0, 5}, {4, 0, 5}, 9, 9, 0};
+    CHECK(tri_tri(seg_a, seg_b).verdict == GRAZING);
+
+    // a collapsed triangle beyond the proper one's hypotenuse (x + y = 8):
+    // boxes overlap, but the nearest segment point (4,6) sits 1.41 from the
+    // triangle -- comfortably outside the touch tolerance
+    const Tri seg_off{{4, 6, 5}, {8, 6, 5}, {6, 6, 5}, 9, 9, 0};
+    CHECK(tri_tri(plane, seg_off).verdict == NONE);
 }
 
 TEST_CASE("quads spanning a grid discontinuity are dropped, not censused")

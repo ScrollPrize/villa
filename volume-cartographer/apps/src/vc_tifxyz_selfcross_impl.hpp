@@ -110,6 +110,112 @@ inline bool tri2d_overlap(const Vec3 tri1[3], const Vec3 tri2[3], const Vec3& n)
     return true;
 }
 
+// Minimum distance between two triangles, geometrically complete in
+// floating-point arithmetic: vertex-face and edge-edge candidates, plus an
+// edge-through-face test so a piercing pair reports distance zero. Used to
+// keep "grazing" honest -- a vertex near the other triangle's INFINITE
+// plane says nothing about the triangles touching, so a grazing verdict is
+// only reported when the triangles come within the touch tolerance of each
+// other. A degenerate (zero-area) triangle is its own boundary, so its
+// distance is covered by the edge-edge terms; vertex-face and piercing
+// terms are skipped when their target is degenerate, because the
+// closest-point barycentric denominator vanishes there.
+inline double point_triangle_dist(const Vec3& p, const Vec3& a,
+                                  const Vec3& b, const Vec3& c) {
+    // Ericson, Real-Time Collision Detection, 5.1.5.
+    Vec3 ab = b - a, ac = c - a, ap = p - a;
+    double d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return norm(ap);
+    Vec3 bp = p - b;
+    double d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return norm(bp);
+    double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+        double v = d1 / (d1 - d3);
+        return norm(ap - ab * v);
+    }
+    Vec3 cp = p - c;
+    double d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return norm(cp);
+    double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+        double w = d2 / (d2 - d6);
+        return norm(ap - ac * w);
+    }
+    double va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
+        double w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return norm(p - (b + (c - b) * w));
+    }
+    double denom = 1.0 / (va + vb + vc);
+    double v = vb * denom, w = vc * denom;
+    return norm(p - (a + ab * v + ac * w));
+}
+
+inline double segment_segment_dist(const Vec3& p1, const Vec3& q1,
+                                   const Vec3& p2, const Vec3& q2) {
+    // Ericson 5.1.9, with degenerate segments handled by clamping.
+    Vec3 d1 = q1 - p1, d2 = q2 - p2, r = p1 - p2;
+    double a = dot(d1, d1), e = dot(d2, d2), f = dot(d2, r);
+    double s = 0.0, t = 0.0;
+    if (a <= 1e-18 && e <= 1e-18) return norm(r);
+    if (a <= 1e-18) {
+        t = std::min(1.0, std::max(0.0, f / e));
+    } else {
+        double c = dot(d1, r);
+        if (e <= 1e-18) {
+            s = std::min(1.0, std::max(0.0, -c / a));
+        } else {
+            double b = dot(d1, d2), denom = a * e - b * b;
+            s = denom > 1e-18
+                ? std::min(1.0, std::max(0.0, (b * f - c * e) / denom)) : 0.0;
+            t = (b * s + f) / e;
+            if (t < 0.0) {
+                t = 0.0; s = std::min(1.0, std::max(0.0, -c / a));
+            } else if (t > 1.0) {
+                t = 1.0; s = std::min(1.0, std::max(0.0, (b - c) / a));
+            }
+        }
+    }
+    return norm((p1 + d1 * s) - (p2 + d2 * t));
+}
+
+inline bool edge_pierces_triangle(const Vec3& p, const Vec3& q,
+                                  const Vec3& a, const Vec3& b,
+                                  const Vec3& c) {
+    Vec3 n = cross(b - a, c - a);
+    double dp = dot(n, p - a), dq = dot(n, q - a);
+    if (dp * dq >= 0.0) return false;         // endpoints not on both sides
+    Vec3 x = p + (q - p) * (dp / (dp - dq));  // crossing point in the plane
+    // inside iff x is on the inner side of all three edges
+    if (dot(cross(b - a, x - a), n) < 0.0) return false;
+    if (dot(cross(c - b, x - b), n) < 0.0) return false;
+    if (dot(cross(a - c, x - c), n) < 0.0) return false;
+    return true;
+}
+
+inline double tri_tri_min_dist(const Vec3 p1[3], const Vec3 p2[3],
+                               bool deg1 = false, bool deg2 = false) {
+    for (int i = 0; i < 3; ++i) {
+        if (!deg2 && edge_pierces_triangle(p1[i], p1[(i + 1) % 3],
+                                           p2[0], p2[1], p2[2])) return 0.0;
+        if (!deg1 && edge_pierces_triangle(p2[i], p2[(i + 1) % 3],
+                                           p1[0], p1[1], p1[2])) return 0.0;
+    }
+    double m = 1e300;
+    for (int i = 0; i < 3; ++i) {
+        if (!deg2)
+            m = std::min(m, point_triangle_dist(p1[i], p2[0], p2[1], p2[2]));
+        if (!deg1)
+            m = std::min(m, point_triangle_dist(p2[i], p1[0], p1[1], p1[2]));
+    }
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            m = std::min(m, segment_segment_dist(
+                p1[i], p1[(i + 1) % 3], p2[j], p2[(j + 1) % 3]));
+    return m;
+}
+
 inline TriTriResult tri_tri(const Tri& T1, const Tri& T2) {
     const Vec3 p1[3] = {T1.a, T1.b, T1.c};
     const Vec3 p2[3] = {T2.a, T2.b, T2.c};
@@ -139,7 +245,15 @@ inline TriTriResult tri_tri(const Tri& T1, const Tri& T2) {
     double l2 = norm(n2);
     Vec3 n1 = cross(p1[1] - p1[0], p1[2] - p1[0]);
     double l1 = norm(n1);
-    if (l1 < 1e-12 || l2 < 1e-12) return {GRAZING, 0.0, 0.0, {}};   // degenerate
+    if (l1 < 1e-12 || l2 < 1e-12) {
+        // A degenerate (zero-area) triangle cannot be classified by plane
+        // signs, but that alone does not make it a contact: two collapsed
+        // triangles with overlapping boxes can be well separated. Grazing
+        // still requires the pair to come within the touch tolerance.
+        return tri_tri_min_dist(p1, p2, l1 < 1e-12, l2 < 1e-12) <= TOUCH_TOL
+            ? TriTriResult{GRAZING, 0.0, 0.0, {}}
+            : TriTriResult{NONE, 0.0, 0.0, {}};
+    }
     n1 = n1 * (1.0 / l1);
     n2 = n2 * (1.0 / l2);
 
@@ -173,7 +287,16 @@ inline TriTriResult tri_tri(const Tri& T1, const Tri& T2) {
     if (coplanar)
         return tri2d_overlap(p1, p2, n1) ? TriTriResult{COPLANAR, 0.0, ang, {}}
                                          : TriTriResult{NONE, 0.0, ang, {}};
-    if (graze) return {GRAZING, 0.0, ang, {}};
+    if (graze) {
+        // The flag only says a vertex sits near the other triangle's
+        // INFINITE plane, which is compatible with the triangles being far
+        // apart. Grazing is a statement about the data's resolution, so it
+        // is only reported when the triangles actually come within the
+        // touch tolerance of each other; otherwise they are disjoint.
+        return tri_tri_min_dist(p1, p2) <= TOUCH_TOL
+            ? TriTriResult{GRAZING, 0.0, ang, {}}
+            : TriTriResult{NONE, 0.0, ang, {}};
+    }
 
     Vec3 D = cross(n1, n2);
     double ax = std::fabs(D.x), ay = std::fabs(D.y), az = std::fabs(D.z);
@@ -209,8 +332,10 @@ inline TriTriResult tri_tri(const Tri& T1, const Tri& T2) {
 
     double a0, a1, b0, b1;
     Vec3 A0, A1, B0, B1;
-    if (!interval(p1, d1, a0, a1, A0, A1)) return {GRAZING, 0.0, ang, {}};
-    if (!interval(p2, d2, b0, b1, B0, B1)) return {GRAZING, 0.0, ang, {}};
+    if (!interval(p1, d1, a0, a1, A0, A1) || !interval(p2, d2, b0, b1, B0, B1))
+        return tri_tri_min_dist(p1, p2) <= TOUCH_TOL
+            ? TriTriResult{GRAZING, 0.0, ang, {}}
+            : TriTriResult{NONE, 0.0, ang, {}};
 
     // The overlap is a projection onto one axis, shorter than the true shared
     // segment by the direction cosine; dividing restores Euclidean length,
@@ -255,10 +380,10 @@ inline bool valid_point(const cv::Vec3f& p) {
 // pair can share several broad-phase cells, and testing it in each would
 // count it once per thread that happens to visit one -- the count would move
 // with scheduling. Instead every pair is owned by exactly one cell, the one
-// containing the minimum corner of the two bounding boxes' overlap, and is
-// tested only there. No shared state, and the answer does not depend on
-// thread count. Results are sorted before returning, so equal inputs give
-// byte-equal outputs.
+// containing the minimum corner of the two tolerance-expanded bounding
+// boxes' overlap, and is tested only there. No shared state, so the answer
+// depends on neither thread count nor cell size. Results are sorted before
+// returning, so equal inputs give byte-equal outputs.
 inline CensusCounts census(const cv::Mat_<cv::Vec3f>& P, int diagonal,
                            double cell, int exclude, double maxedge,
                            int nthreads, std::vector<Contact>& out)
@@ -312,6 +437,15 @@ inline CensusCounts census(const cv::Mat_<cv::Vec3f>& P, int diagonal,
     if (tris.empty()) return counts;
 
     // Uniform-grid broad phase.
+    //
+    // Every bucket range is expanded by the touch tolerance the narrow phase
+    // honours: tri_tri accepts pairs whose boxes come within TOUCH_TOL, so
+    // bucketing unexpanded boxes would let a sub-tolerance pair fall into
+    // different cells near a bucket boundary and never meet -- and whether
+    // that happened would depend on where the boundaries fall, i.e. on
+    // --cell. With the expansion, any pair the narrow phase could accept
+    // shares at least one bucket at every cell size, and the owner-cell rule
+    // below picks exactly one of them, so counts are independent of --cell.
     Vec3 lo{1e30, 1e30, 1e30}, hi{-1e30, -1e30, -1e30};
     for (const Tri& t : tris) {
         for (const Vec3& p : {t.a, t.b, t.c}) {
@@ -320,10 +454,28 @@ inline CensusCounts census(const cv::Mat_<cv::Vec3f>& P, int diagonal,
             lo.z = std::min(lo.z, p.z); hi.z = std::max(hi.z, p.z);
         }
     }
-    const int nx = std::max(1, (int)((hi.x - lo.x) / cell) + 1);
-    const int ny = std::max(1, (int)((hi.y - lo.y) / cell) + 1);
-    auto cellIdx = [&](int i, int j, int k) {
-        return ((size_t)k * ny + j) * nx + i;
+    // Index origin below every expanded box, so coordinates are nonnegative
+    // and float-to-int truncation equals floor everywhere.
+    const Vec3 org{lo.x - TOUCH_TOL, lo.y - TOUCH_TOL, lo.z - TOUCH_TOL};
+    // A finite positive cell can still be small enough that span/cell
+    // overflows the index type or turns each triangle's bucket loop
+    // astronomical. Both are refused with instructions, not undefined --
+    // and the check happens on the DOUBLE quotient, before any conversion
+    // to integer, because the conversion itself is what overflows.
+    constexpr double MAX_AXIS_CELLS = double(int64_t(1) << 21);
+    for (double span : {hi.x - org.x, hi.y - org.y, hi.z - org.z}) {
+        const double q = (span + TOUCH_TOL) / cell;
+        if (!std::isfinite(q) || q >= MAX_AXIS_CELLS)
+            throw std::invalid_argument(
+                "selfcross: cell size is too small for this surface's "
+                "extent (more than 2^21 broad-phase cells on one axis); "
+                "increase cell");
+    }
+    auto axisIdx = [&](double x, double o) { return (int64_t)((x - o) / cell); };
+    const int64_t nx = axisIdx(hi.x + TOUCH_TOL, org.x) + 1;
+    const int64_t ny = axisIdx(hi.y + TOUCH_TOL, org.y) + 1;
+    auto cellIdx = [&](int64_t i, int64_t j, int64_t k) {
+        return ((size_t)k * (size_t)ny + (size_t)j) * (size_t)nx + (size_t)i;
     };
     std::unordered_map<size_t, std::vector<uint32_t>> buckets;
     buckets.reserve(tris.size());
@@ -335,12 +487,23 @@ inline CensusCounts census(const cv::Mat_<cv::Vec3f>& P, int diagonal,
         double ty1 = std::max({t.a.y, t.b.y, t.c.y});
         double tz0 = std::min({t.a.z, t.b.z, t.c.z});
         double tz1 = std::max({t.a.z, t.b.z, t.c.z});
-        int i0 = (int)((tx0 - lo.x) / cell), i1 = (int)((tx1 - lo.x) / cell);
-        int j0 = (int)((ty0 - lo.y) / cell), j1 = (int)((ty1 - lo.y) / cell);
-        int k0 = (int)((tz0 - lo.z) / cell), k1 = (int)((tz1 - lo.z) / cell);
-        for (int k = k0; k <= k1; ++k)
-            for (int j = j0; j <= j1; ++j)
-                for (int i = i0; i <= i1; ++i)
+        int64_t i0 = axisIdx(tx0 - TOUCH_TOL, org.x);
+        int64_t i1 = axisIdx(tx1 + TOUCH_TOL, org.x);
+        int64_t j0 = axisIdx(ty0 - TOUCH_TOL, org.y);
+        int64_t j1 = axisIdx(ty1 + TOUCH_TOL, org.y);
+        int64_t k0 = axisIdx(tz0 - TOUCH_TOL, org.z);
+        int64_t k1 = axisIdx(tz1 + TOUCH_TOL, org.z);
+        // In double, not int64: three per-axis spans near the 2^21 cap
+        // would overflow a signed multiply before the comparison.
+        const double span = double(i1 - i0 + 1) * double(j1 - j0 + 1)
+                          * double(k1 - k0 + 1);
+        if (span > 2'000'000.0)
+            throw std::invalid_argument(
+                "selfcross: a triangle spans over 2e6 broad-phase cells; "
+                "increase cell (or use maxedge to drop degenerate quads)");
+        for (int64_t k = k0; k <= k1; ++k)
+            for (int64_t j = j0; j <= j1; ++j)
+                for (int64_t i = i0; i <= i1; ++i)
                     buckets[cellIdx(i, j, k)].push_back(ti);
     }
     std::vector<std::pair<size_t, const std::vector<uint32_t>*>> cells;
@@ -351,14 +514,18 @@ inline CensusCounts census(const cv::Mat_<cv::Vec3f>& P, int diagonal,
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
     auto ownerCell = [&](const Tri& A, const Tri& B) {
+        // The minimum corner of the two EXPANDED boxes' overlap. Whenever
+        // the expanded boxes overlap on every axis, this corner lies inside
+        // both triangles' inserted ranges (truncation is monotone), so both
+        // bucketed the owning cell and the pair is tested exactly once.
         double ox = std::max(std::min({A.a.x, A.b.x, A.c.x}),
-                             std::min({B.a.x, B.b.x, B.c.x}));
+                             std::min({B.a.x, B.b.x, B.c.x})) - TOUCH_TOL;
         double oy = std::max(std::min({A.a.y, A.b.y, A.c.y}),
-                             std::min({B.a.y, B.b.y, B.c.y}));
+                             std::min({B.a.y, B.b.y, B.c.y})) - TOUCH_TOL;
         double oz = std::max(std::min({A.a.z, A.b.z, A.c.z}),
-                             std::min({B.a.z, B.b.z, B.c.z}));
-        return cellIdx((int)((ox - lo.x) / cell), (int)((oy - lo.y) / cell),
-                       (int)((oz - lo.z) / cell));
+                             std::min({B.a.z, B.b.z, B.c.z})) - TOUCH_TOL;
+        return cellIdx(axisIdx(ox, org.x), axisIdx(oy, org.y),
+                       axisIdx(oz, org.z));
     };
 
     std::vector<std::vector<Contact>> perThread(nthreads);

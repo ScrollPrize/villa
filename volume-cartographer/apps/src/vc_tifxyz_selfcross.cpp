@@ -13,9 +13,10 @@
 //   coplanar    (near) coplanar with overlapping projections -- two sheets
 //               pressed flat look like this, so it is reported, not counted
 //               as a crossing
-//   grazing     a vertex or edge sits within tolerance of the other plane,
-//               so the sign data the interval test relies on is not
-//               trustworthy; reported separately rather than guessed at
+//   grazing     the sign or interval data the test relies on is numerically
+//               ambiguous AND the triangles come within the touch tolerance
+//               of each other; ambiguity about a pair that never comes near
+//               contact is not reported at all
 //
 // Adjacency is excluded by grid index: quads within --exclude cells of each
 // other in both v and u share vertices, and their triangles sharing space is
@@ -45,6 +46,7 @@
 #include <boost/program_options.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -79,7 +81,9 @@ int main(int argc, char** argv)
          "built across a grid discontinuity crosses everything it passes "
          "through. 0 disables")
         ("cell", po::value<double>()->default_value(40.0),
-         "Broad-phase cell size (voxels); affects speed only")
+         "Broad-phase cell size (voxels); affects speed, never contact "
+         "verdicts or counts (bucket ranges are expanded by the touch "
+         "tolerance)")
         ("threads", po::value<int>()->default_value(0),
          "Worker threads; 0 = hardware concurrency")
         ("max-collection-points", po::value<int>()->default_value(10000),
@@ -127,9 +131,12 @@ int main(int argc, char** argv)
                   << std::endl;
         return 1;
     }
-    if (maxedge < 0) {
-        std::cerr << "Error: --maxedge must be >= 0, with 0 disabling the "
-                     "filter (got " << maxedge << ")" << std::endl;
+    if (maxedge < 0 || !std::isfinite(maxedge)) {
+        // NaN fails both < 0 and > 0, which would silently disable the
+        // filter rather than complain.
+        std::cerr << "Error: --maxedge must be a finite number >= 0, with 0 "
+                     "disabling the filter (got " << maxedge << ")"
+                  << std::endl;
         return 1;
     }
 
@@ -151,8 +158,13 @@ int main(int argc, char** argv)
     std::vector<Contact> contacts[2];
     CensusCounts counts[2];
     for (int d = 0; d < 2; ++d) {
-        counts[d] = vc_selfcross::census(P, d, cell, exclude, maxedge,
-                                         nthreads, contacts[d]);
+        try {
+            counts[d] = vc_selfcross::census(P, d, cell, exclude, maxedge,
+                                             nthreads, contacts[d]);
+        } catch (const std::invalid_argument& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+            return 1;
+        }
         std::cerr << "diagonal " << d << ": " << counts[d].triangles
                   << " triangles, " << counts[d].pairs_tested
                   << " pairs tested, " << counts[d].transverse
@@ -179,6 +191,9 @@ int main(int argc, char** argv)
     utils::Json params = utils::Json::object();
     params["exclude"] = exclude;
     params["maxedge"] = maxedge;
+    // Recorded for provenance even though contact counts are independent of
+    // it: pairs_tested legitimately varies with the broad-phase cell size.
+    params["cell"] = cell;
     params["touch_tolerance"] = vc_selfcross::TOUCH_TOL;
     params["diagonals"] = utils::Json::array();
     params["diagonals"].push_back(0);
@@ -234,7 +249,21 @@ int main(int argc, char** argv)
         return 1;
     }
     o << report.dump(4);
+    o.flush();
+    // A full disk or quota failure surfaces here, not at open(). Claiming
+    // "Report written" and exiting 0 on a failed write would defeat the one
+    // job a report-only tool has.
+    if (!o.good()) {
+        std::cerr << "Error: failed while writing " << output_path
+                  << std::endl;
+        return 1;
+    }
     o.close();
+    if (o.fail()) {
+        std::cerr << "Error: failed to finish writing " << output_path
+                  << std::endl;
+        return 1;
+    }
     std::cout << "Report written to " << output_path << std::endl;
 
     if (vm.count("collection")) {
