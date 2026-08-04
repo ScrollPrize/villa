@@ -852,10 +852,14 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     _surfacePtrX = state.surfacePtrX;
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
+    const bool zOffChanged = _zOff != state.zOffset;
     _zOff = state.zOffset;
     _zOffWorldDir = state.zOffsetWorldDir;
     recalcPyramidLevel();
     _genCacheDirty = true;
+    if (zOffChanged) {
+        notifyNormalOffsetChanged();
+    }
     if (forceRender) {
         renderVisible(true, "annotation camera state applied");
     } else {
@@ -3267,8 +3271,12 @@ void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
                                maxV - minV,
                                viewportSize.width(),
                                viewportSize.height());
+    const bool zOffChanged = _zOff != 0.0f;
     _zOff = 0.0f;
     _zOffWorldDir = {0, 0, 0};
+    if (zOffChanged) {
+        notifyNormalOffsetChanged();
+    }
     recalcPyramidLevel();
     _genCacheDirty = true;
     updateFocusMarker();
