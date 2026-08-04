@@ -319,6 +319,7 @@ private:
         std::source_location caller = std::source_location::current());
     void updateStatusLabel();
     void notifyNormalOffsetChanged();
+    void setZOffset(float value);
     void rebuildChunkArray();
     void clearDisplayedFramebuffer();
     void syncCameraTransform();

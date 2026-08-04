@@ -852,14 +852,10 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     _surfacePtrX = state.surfacePtrX;
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
-    const bool zOffChanged = _zOff != state.zOffset;
-    _zOff = state.zOffset;
+    setZOffset(state.zOffset);
     _zOffWorldDir = state.zOffsetWorldDir;
     recalcPyramidLevel();
     _genCacheDirty = true;
-    if (zOffChanged) {
-        notifyNormalOffsetChanged();
-    }
     if (forceRender) {
         renderVisible(true, "annotation camera state applied");
     } else {
@@ -877,6 +873,8 @@ void CChunkedVolumeViewer::applyCameraStateForReplayRepaint(const CameraState& s
     _surfacePtrX = state.surfacePtrX;
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
+    // Raw assignment, not setZOffset(): offscreen replay must not schedule
+    // intersection renders in the other viewers.
     _zOff = state.zOffset;
     _zOffWorldDir = state.zOffsetWorldDir;
     recalcPyramidLevel();
@@ -1428,7 +1426,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         if (_resetViewOnSurfaceChange) {
             (void)setSegmentationPointerFromFocus();
         }
-        _zOff = 0.0f;
+        setZOffset(0.0f);
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
         if (_resetViewOnSurfaceChange) {
@@ -1438,7 +1436,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         _initializedFirstSegmentationSurface = true;
     } else if (!isEditUpdate && _resetViewOnSurfaceChange && isSegmentationQuadSurface) {
         (void)setSegmentationPointerFromFocus();
-        _zOff = 0.0f;
+        setZOffset(0.0f);
         const int n = _chunkArray ? _chunkArray->numLevels()
                                   : (_volume ? static_cast<int>(_volume->numScales()) : 1);
         _scale = scaleForSurfaceRenderStartLevel(kInitialSegmentationSurfaceLevel, n);
@@ -3173,21 +3171,31 @@ void CChunkedVolumeViewer::adjustSurfaceOffset(float delta)
         const auto [w, h, d] = _volume->shapeXyz();
         maxZ = static_cast<float>(std::max({w, h, d}));
     }
-    _zOff = std::clamp(_zOff + delta, -maxZ, maxZ);
+    setZOffset(std::clamp(_zOff + delta, -maxZ, maxZ));
     _genCacheDirty = true;
     submitRender("surface offset changed");
     updateStatusLabel();
-    notifyNormalOffsetChanged();
 }
 
 void CChunkedVolumeViewer::resetSurfaceOffsets()
 {
     _surfacePtrX = 0.0f;
     _surfacePtrY = 0.0f;
-    _zOff = 0.0f;
+    setZOffset(0.0f);
     _zOffWorldDir = {0, 0, 0};
     _genCacheDirty = true;
     submitRender("surface offsets reset");
+}
+
+// Sets the normal offset, refreshing dependent overlays when it changes. Use
+// this instead of assigning _zOff directly unless the notification must be
+// suppressed (e.g. offscreen replay repaints).
+void CChunkedVolumeViewer::setZOffset(float value)
+{
+    if (_zOff == value) {
+        return;
+    }
+    _zOff = value;
     notifyNormalOffsetChanged();
 }
 
@@ -3271,12 +3279,8 @@ void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
                                maxV - minV,
                                viewportSize.width(),
                                viewportSize.height());
-    const bool zOffChanged = _zOff != 0.0f;
-    _zOff = 0.0f;
+    setZOffset(0.0f);
     _zOffWorldDir = {0, 0, 0};
-    if (zOffChanged) {
-        notifyNormalOffsetChanged();
-    }
     recalcPyramidLevel();
     _genCacheDirty = true;
     updateFocusMarker();
@@ -3358,7 +3362,7 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
                 const float delta = static_cast<float>(steps) * _zScrollSensitivity;
                 auto shiftedPlane = std::make_shared<PlaneSurface>(*plane);
                 shiftedPlane->setOrigin(plane->origin() + normal * (delta + _zOff));
-                _zOff = 0.0f;
+                setZOffset(0.0f);
                 _zOffWorldDir = {0, 0, 0};
                 if (_state) {
                     _state->setSurface(_surfName, shiftedPlane, false, true);
@@ -3371,10 +3375,9 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
                 }
             }
         } else {
-            _zOff += static_cast<float>(steps) * _zScrollSensitivity;
+            setZOffset(_zOff + static_cast<float>(steps) * _zScrollSensitivity);
             _genCacheDirty = true;
             submitRender("z offset mouse wheel");
-            notifyNormalOffsetChanged();
         }
         refreshCursorPositionAt(scenePoint);
     } else if (modifiers & Qt::ControlModifier) {
