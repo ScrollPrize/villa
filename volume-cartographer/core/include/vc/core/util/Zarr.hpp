@@ -85,14 +85,17 @@ void createPyramidDatasets(const std::filesystem::path& outFile,
                            int compressionLevel = -1,
                            const std::string& dimensionSeparator = ".");
 
-// Write OME-Zarr .zattrs multiscales JSON.
+// Write OME-Zarr .zattrs multiscales JSON. The declared scale is per-axis:
+// Z = baseVoxelSize * sliceStep, Y/X = baseVoxelSize / pixelsPerVoxel
+// (baseVoxelSize describes one source voxel at the rendered level).
 void writeZarrAttrs(const std::filesystem::path& outFile,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
                     double baseVoxelSize = 1.0,
-                    const std::string& voxelUnit = "");
+                    const std::string& voxelUnit = "",
+                    double pixelsPerVoxel = 1.0);
 
 // Write a dense uint8 ZYX subregion into a freshly created dataset via
 // writeChunk(). Chunks overlapping the region are materialized; untouched
