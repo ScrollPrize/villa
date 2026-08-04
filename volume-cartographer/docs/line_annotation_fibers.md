@@ -54,6 +54,37 @@ mesh. The toolbar retains the fiber-global Lasagna/Fiber model selector and the
 base-voxel extrapolation-distance control. Tag pills are edited directly from
 the same toolbar.
 
+Switching the fiber-global mode asks for confirmation before it re-optimizes,
+because the switch overwrites the current line: to Fiber model it re-traces
+every global-goal span with model predictions; back to Lasagna it re-fits them.
+Suppressed (agent-driven) sessions skip the prompt.
+
+Prediction-traced geometry carries a per-fiber review workflow on two mutually
+exclusive reserved tags (mirrored in `scripts/fiber_merge.py`):
+`interp_unreviewed` is applied automatically whenever a save contains
+freshly-optimized geometry with accepted trace spans, replacing any existing
+`trace_verified`; a human marks the whole fiber `trace_verified` from the
+fiber panel's context menu (Mark trace verified / Mark as needs review) after
+inspecting the line. Any later optimization that re-traces spans returns the
+fiber to `interp_unreviewed`; re-fitting the whole line without traces clears
+both tags. The fiber panel's `interp` column shows the interpolation
+provenance per fiber — `legacy` (no trace spans), `predictions` (trace
+spans, native mode), or `mixed` (trace spans under a lasagna-global fiber);
+the review state itself is visible as the ordinary tags. Span child rows
+show the stored producer marker `C`/`L`/`T`. Predictions provenance is the per-span
+`segment_to_next.fiber_manifest` written at trace acceptance (the selected
+fiber-inference manifest identity); the panel surfaces it as a tooltip on
+the `interp` cells, and `fiber.list` over the agent bridge exposes the same
+data as `traceState`, `traceNeedsReview`, `traceVerified`, and per-span
+`interpMode` plus `fiberManifest`.
+
+Legacy version-1 files can be upgraded in bulk with
+`scripts/fiber_migrate_v1_to_v3.py`, which applies exactly the metadata
+upgrade VC3D performs on save (mode `lasagna`, spans goal `global`, actual
+`lasagna`) without touching geometry, tags, or branches. Migrating a synced
+fiber directory in one coordinated step avoids the per-file version-mismatch
+conflicts the sync merge would otherwise raise.
+
 Each direction continues until it reaches all target-local planes within the
 20-base-voxel endpoint threshold or exhausts its step budget. VC3D then moves
 locally tangent planes along both complete traces and intersects the opposite

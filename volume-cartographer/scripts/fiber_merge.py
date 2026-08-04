@@ -69,6 +69,12 @@ REOPTIMIZE_TAG = 'needs_reoptimization'
 # ^ consumed by VC3D's load-time re-optimization prompt; keep the literal
 #   in sync with kNeedsReoptimizationTag in LineAnnotationController.cpp.
 
+TRACE_NEEDS_REVIEW_TAG = 'interp_unreviewed'
+TRACE_VERIFIED_TAG = 'trace_verified'
+# ^ VC3D's review workflow for prediction-traced geometry; keep the
+#   literals in sync with kTraceNeedsReviewTag / kTraceVerifiedTag in
+#   LineAnnotationFiberSegments.hpp. Mutually exclusive on any one fiber.
+
 
 def _cp_position(value):
     return value.get('position') if isinstance(value, dict) else value
