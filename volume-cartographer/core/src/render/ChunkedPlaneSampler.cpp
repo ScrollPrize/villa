@@ -3,24 +3,37 @@
 #include <utils/thread_pool.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <limits>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace vc::render {
+
 namespace {
 
 struct LocalChunkCache {
-    explicit LocalChunkCache(IChunkedArray& a, std::size_t expectedChunks = 0)
+    // ChunkResult owns a shared_ptr to decoded chunk bytes. Keeping every
+    // result touched by a frame pins the whole working set even after the
+    // shared ChunkCache evicts it. A small window preserves the hot consecutive
+    // lookup fast path without allowing each render worker to become another
+    // unbounded decoded-byte cache.
+    static constexpr std::size_t kMaxPinnedChunks = 8;
+
+    explicit LocalChunkCache(
+        IChunkedArray& a, std::size_t expectedChunks = 0, bool queueMisses_ = true)
         : array(a)
+        , queueMisses(queueMisses_)
     {
         if (expectedChunks > 0) {
-            chunks.reserve(expectedChunks);
+            chunks.reserve(std::min(expectedChunks, kMaxPinnedChunks));
             requestedKeys.reserve(expectedChunks);
             errorKeys.reserve(expectedChunks);
         }
@@ -36,8 +49,15 @@ struct LocalChunkCache {
 
         auto it = chunks.find(key);
         if (it == chunks.end()) {
-            ChunkResult result = array.tryGetChunk(key.level, key.iz, key.iy, key.ix);
-            if (result.status == ChunkStatus::MissQueued && requestedKeys.insert(key).second)
+            if (chunks.size() >= kMaxPinnedChunks) {
+                lastResult = nullptr;
+                chunks.clear();
+            }
+            ChunkResult result = queueMisses
+                ? array.tryGetChunk(key.level, key.iz, key.iy, key.ix)
+                : array.getChunkIfCached(key.level, key.iz, key.iy, key.ix);
+            if (queueMisses && result.status == ChunkStatus::MissQueued &&
+                requestedKeys.insert(key).second)
                 ++requested;
             if (result.status == ChunkStatus::Error && errorKeys.insert(key).second)
                 ++errors;
@@ -50,6 +70,7 @@ struct LocalChunkCache {
     }
 
     IChunkedArray& array;
+    bool queueMisses = true;
     std::unordered_map<ChunkKey, ChunkResult, ChunkKeyHash> chunks;
     std::unordered_set<ChunkKey, ChunkKeyHash> requestedKeys;
     std::unordered_set<ChunkKey, ChunkKeyHash> errorKeys;
@@ -57,8 +78,33 @@ struct LocalChunkCache {
     const ChunkResult* lastResult = nullptr;
 };
 
+struct PinnedChunkCache {
+    explicit PinnedChunkCache(std::size_t expectedChunks = 0)
+    {
+        if (expectedChunks > 0)
+            chunks.reserve(expectedChunks);
+    }
+
+    const ChunkResult* get(const ChunkKey& key) const
+    {
+        auto it = chunks.find(key);
+        if (it == chunks.end())
+            return nullptr;
+        return &it->second;
+    }
+
+    std::unordered_map<ChunkKey, ChunkResult, ChunkKeyHash> chunks;
+};
+
+enum class StrictSampleStatus {
+    Ready,
+    Missing,
+    Error
+};
+
 constexpr int kParallelMinPixels = 128 * 128;
 constexpr int kMaxRenderSamplerWorkers = 8;
+constexpr int kMaxCornerBatchWorkers = 64;
 
 int renderSamplerWorkerCount()
 {
@@ -78,6 +124,26 @@ utils::ThreadPool& renderSamplerPool()
     return *pool;
 #else
     static utils::ThreadPool pool(static_cast<std::size_t>(renderSamplerWorkerCount()));
+    return pool;
+#endif
+}
+
+int cornerBatchWorkerCount()
+{
+    const unsigned hc = std::thread::hardware_concurrency();
+    if (hc <= 2)
+        return 1;
+    return std::clamp(static_cast<int>(hc) - 2, 1, kMaxCornerBatchWorkers);
+}
+
+utils::ThreadPool& cornerBatchPool()
+{
+#if defined(_WIN32)
+    static auto* pool = new utils::ThreadPool(
+        static_cast<std::size_t>(cornerBatchWorkerCount()));
+    return *pool;
+#else
+    static utils::ThreadPool pool(static_cast<std::size_t>(cornerBatchWorkerCount()));
     return pool;
 #endif
 }
@@ -113,11 +179,12 @@ struct MissingLevelContext {
     MissingLevelContext(IChunkedArray& array_,
                         int level_,
                         LevelAccess access_,
+                        bool queueMisses_,
                         LevelPlane plane_ = {})
         : level(level_)
         , access(access_)
         , plane(plane_)
-        , cache(array_, 64)
+        , cache(array_, 64, queueMisses_)
     {
     }
 
@@ -248,6 +315,74 @@ bool readVoxel(IChunkedArray& array,
 
     out = std::to_integer<uint8_t>((*result.bytes)[offset]);
     return true;
+}
+
+StrictSampleStatus readPinnedVoxel(const PinnedChunkCache& cache,
+                                   const LevelAccess& access,
+                                   int level,
+                                   int iz,
+                                   int iy,
+                                   int ix,
+                                   uint8_t& out,
+                                   std::string& error)
+{
+    const auto& shape = access.shape;
+    if (unsigned(iz) >= unsigned(shape[0])
+        || unsigned(iy) >= unsigned(shape[1])
+        || unsigned(ix) >= unsigned(shape[2])) {
+        out = access.fill;
+        return StrictSampleStatus::Ready;
+    }
+
+    const auto& chunkShape = access.chunkShape;
+    if (chunkShape[0] <= 0 || chunkShape[1] <= 0 || chunkShape[2] <= 0) {
+        error = "invalid chunk shape while sampling pinned chunk";
+        return StrictSampleStatus::Error;
+    }
+
+    const int cz = iz / chunkShape[0];
+    const int cy = iy / chunkShape[1];
+    const int cx = ix / chunkShape[2];
+    const ChunkKey key{level, cz, cy, cx};
+    const ChunkResult* result = cache.get(key);
+    if (!result) {
+        error = "required chunk was not pinned before requested-level sampling";
+        return StrictSampleStatus::Error;
+    }
+    if (result->status == ChunkStatus::Missing)
+        return StrictSampleStatus::Missing;
+    if (result->status == ChunkStatus::MissQueued) {
+        error = "blocking requested-level sampling encountered an unresolved chunk";
+        return StrictSampleStatus::Error;
+    }
+    if (result->status == ChunkStatus::Error) {
+        error = result->error.empty() ? "chunk fetch failed" : result->error;
+        return StrictSampleStatus::Error;
+    }
+
+    if (result->status == ChunkStatus::AllFill) {
+        out = access.fill;
+        return StrictSampleStatus::Ready;
+    }
+
+    if (result->status != ChunkStatus::Data || !result->bytes) {
+        error = "chunk resolved without payload";
+        return StrictSampleStatus::Error;
+    }
+
+    const int lz = iz - cz * chunkShape[0];
+    const int ly = iy - cy * chunkShape[1];
+    const int lx = ix - cx * chunkShape[2];
+    const std::size_t offset = (std::size_t(lz) * std::size_t(chunkShape[1])
+                              + std::size_t(ly)) * std::size_t(chunkShape[2])
+                              + std::size_t(lx);
+    if (offset >= result->bytes->size()) {
+        error = "chunk payload is smaller than expected";
+        return StrictSampleStatus::Error;
+    }
+
+    out = std::to_integer<uint8_t>((*result->bytes)[offset]);
+    return StrictSampleStatus::Ready;
 }
 
 bool addVoxelDependency(IChunkedArray& array,
@@ -574,6 +709,102 @@ bool sampleTrilinear(IChunkedArray& array,
     return true;
 }
 
+StrictSampleStatus samplePinnedNearest(const PinnedChunkCache& cache,
+                                       const LevelAccess& access,
+                                       int level,
+                                       const cv::Vec3f& p,
+                                       uint8_t& out,
+                                       std::string& error)
+{
+    const auto& shape = access.shape;
+    const float x = p[0], y = p[1], z = p[2];
+    if (!inLevelBounds(shape, z, y, x)) {
+        out = access.fill;
+        return StrictSampleStatus::Ready;
+    }
+
+    int ix = int(x + 0.5f);
+    int iy = int(y + 0.5f);
+    int iz = int(z + 0.5f);
+    ix = std::clamp(ix, 0, shape[2] - 1);
+    iy = std::clamp(iy, 0, shape[1] - 1);
+    iz = std::clamp(iz, 0, shape[0] - 1);
+    return readPinnedVoxel(cache, access, level, iz, iy, ix, out, error);
+}
+
+StrictSampleStatus samplePinnedTrilinear(const PinnedChunkCache& cache,
+                                         const LevelAccess& access,
+                                         int level,
+                                         const cv::Vec3f& p,
+                                         uint8_t& out,
+                                         std::string& error)
+{
+    const auto& shape = access.shape;
+    const float x = p[0], y = p[1], z = p[2];
+    if (!inLevelBounds(shape, z, y, x)) {
+        out = access.fill;
+        return StrictSampleStatus::Ready;
+    }
+
+    const int ix = int(std::floor(x));
+    const int iy = int(std::floor(y));
+    const int iz = int(std::floor(z));
+    const float fx = x - float(ix);
+    const float fy = y - float(iy);
+    const float fz = z - float(iz);
+
+    uint8_t v000 = 0, v001 = 0, v010 = 0, v011 = 0;
+    uint8_t v100 = 0, v101 = 0, v110 = 0, v111 = 0;
+    std::array<StrictSampleStatus, 8> statuses{};
+    statuses[0] = readPinnedVoxel(cache, access, level, iz,     iy,     ix,     v000, error);
+    statuses[1] = readPinnedVoxel(cache, access, level, iz,     iy,     ix + 1, v001, error);
+    statuses[2] = readPinnedVoxel(cache, access, level, iz,     iy + 1, ix,     v010, error);
+    statuses[3] = readPinnedVoxel(cache, access, level, iz,     iy + 1, ix + 1, v011, error);
+    statuses[4] = readPinnedVoxel(cache, access, level, iz + 1, iy,     ix,     v100, error);
+    statuses[5] = readPinnedVoxel(cache, access, level, iz + 1, iy,     ix + 1, v101, error);
+    statuses[6] = readPinnedVoxel(cache, access, level, iz + 1, iy + 1, ix,     v110, error);
+    statuses[7] = readPinnedVoxel(cache, access, level, iz + 1, iy + 1, ix + 1, v111, error);
+    for (StrictSampleStatus status : statuses) {
+        if (status == StrictSampleStatus::Error)
+            return StrictSampleStatus::Error;
+        if (status == StrictSampleStatus::Missing)
+            return StrictSampleStatus::Missing;
+    }
+
+    const float c00 = std::fma(fx, float(v001) - float(v000), float(v000));
+    const float c01 = std::fma(fx, float(v011) - float(v010), float(v010));
+    const float c10 = std::fma(fx, float(v101) - float(v100), float(v100));
+    const float c11 = std::fma(fx, float(v111) - float(v110), float(v110));
+    const float c0 = std::fma(fy, c01 - c00, c00);
+    const float c1 = std::fma(fy, c11 - c10, c10);
+    const float value = std::clamp(std::fma(fz, c1 - c0, c0), 0.0f, 255.0f);
+    out = static_cast<uint8_t>(value);
+    return StrictSampleStatus::Ready;
+}
+
+StrictSampleStatus samplePinnedPoint(const PinnedChunkCache& cache,
+                                     const LevelAccess& access,
+                                     int level,
+                                     const cv::Vec3f& p0,
+                                     vc::Sampling sampling,
+                                     bool zeroIsSentinel,
+                                     uint8_t& out,
+                                     std::string& error)
+{
+    if (!finiteCoord(p0) || (zeroIsSentinel && surfaceSentinel(p0))) {
+        if (zeroIsSentinel)
+            return StrictSampleStatus::Error;
+        out = access.fill;
+        return StrictSampleStatus::Ready;
+    }
+
+    const cv::Vec3f p = toLevelCoord(access, p0);
+    if (sampling == vc::Sampling::Nearest)
+        return samplePinnedNearest(cache, access, level, p, out, error);
+
+    return samplePinnedTrilinear(cache, access, level, p, out, error);
+}
+
 bool samplePoint(IChunkedArray& array,
                  LocalChunkCache& cache,
                  const LevelAccess& access,
@@ -622,6 +853,16 @@ void addStats(ChunkedPlaneSampler::Stats& dst, const ChunkedPlaneSampler::Stats&
     dst.coveredPixels += src.coveredPixels;
     dst.requestedChunks += src.requestedChunks;
     dst.errorChunks += src.errorChunks;
+    dst.missingChunks += src.missingChunks;
+    dst.fallbackLevels += src.fallbackLevels;
+    dst.requestedLevelOnly = dst.requestedLevelOnly || src.requestedLevelOnly;
+    dst.cornerPrepareSeconds += src.cornerPrepareSeconds;
+    dst.cornerLayoutSeconds += src.cornerLayoutSeconds;
+    dst.cornerPinSeconds += src.cornerPinSeconds;
+    dst.cornerGatherSeconds += src.cornerGatherSeconds;
+    dst.cornerLayoutChunkRuns += src.cornerLayoutChunkRuns;
+    dst.cornerBoundaryPoints += src.cornerBoundaryPoints;
+    dst.cornerDependencies += src.cornerDependencies;
 }
 
 int countUncovered(const cv::Mat_<uint8_t>& coverage)
@@ -670,7 +911,11 @@ ChunkedPlaneSampler::Stats markKnownMissingPlanePixels(
         const LevelAccess access = makeLevelAccess(array, level);
         if (!hasSampleableLevel(access))
             continue;
-        levels.emplace_back(array, level, access,
+        const bool queueMisses =
+            options.queueMisses &&
+            (options.queuedFallbackLevels < 0 ||
+             level - firstLevel <= options.queuedFallbackLevels);
+        levels.emplace_back(array, level, access, queueMisses,
                             toLevelPlane(access, origin, vxStep, vyStep));
     }
     std::vector<ChunkKey> keys;
@@ -734,7 +979,11 @@ ChunkedPlaneSampler::Stats markKnownMissingCoordsPixels(
         const LevelAccess access = makeLevelAccess(array, level);
         if (!hasSampleableLevel(access))
             continue;
-        levels.emplace_back(array, level, access);
+        const bool queueMisses =
+            options.queueMisses &&
+            (options.queuedFallbackLevels < 0 ||
+             level - firstLevel <= options.queuedFallbackLevels);
+        levels.emplace_back(array, level, access, queueMisses);
     }
     std::vector<ChunkKey> keys;
     keys.reserve(8);
@@ -888,7 +1137,7 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestPlaneDependencies(
     if (!hasSampleableLevel(access))
         return stats;
     const LevelPlane levelPlane = toLevelPlane(access, origin, vxStep, vyStep);
-    LocalChunkCache chunkCache(array, 64);
+    LocalChunkCache chunkCache(array, 64, options.queueMisses);
     const int tile = std::max(1, options.tileSize);
     std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
     tileKeys.reserve(std::size_t(tile) * std::size_t(tile) * 2);
@@ -928,7 +1177,7 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestCoordsDependencies(
     const LevelAccess access = makeLevelAccess(array, level);
     if (!hasSampleableLevel(access))
         return stats;
-    LocalChunkCache chunkCache(array, 64);
+    LocalChunkCache chunkCache(array, 64, options.queueMisses);
     const int tile = std::max(1, options.tileSize);
     const int h = std::min(coords.rows, coverage.rows);
     const int w = std::min(coords.cols, coverage.cols);
@@ -988,7 +1237,8 @@ ChunkedPlaneSampler::Stats samplePlaneLevelImpl(
 
     auto processTileRange = [&](std::size_t begin, std::size_t end) {
         ChunkedPlaneSampler::Stats localStats;
-        LocalChunkCache chunkCache(array, std::max<std::size_t>(16, (end - begin) * 4));
+        LocalChunkCache chunkCache(
+            array, std::max<std::size_t>(16, (end - begin) * 4), options.queueMisses);
         for (std::size_t i = begin; i < end; ++i) {
             const SampleTile& sampleTile = tiles[i];
             for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
@@ -1071,7 +1321,8 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
 
     auto processTileRange = [&](std::size_t begin, std::size_t end) {
         ChunkedPlaneSampler::Stats localStats;
-        LocalChunkCache chunkCache(array, std::max<std::size_t>(16, (end - begin) * 4));
+        LocalChunkCache chunkCache(
+            array, std::max<std::size_t>(16, (end - begin) * 4), options.queueMisses);
         for (std::size_t i = begin; i < end; ++i) {
             const SampleTile& sampleTile = tiles[i];
             for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
@@ -1120,6 +1371,125 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelImpl(
     return stats;
 }
 
+ChunkedPlaneSampler::Stats sampleCoordsLevelBlockingRequestedLevelImpl(
+    IChunkedArray& array,
+    int level,
+    const cv::Mat_<cv::Vec3f>& coords,
+    cv::Mat_<uint8_t>& out,
+    cv::Mat_<uint8_t>& coverage,
+    const ChunkedPlaneSampler::Options& options)
+{
+    ChunkedPlaneSampler::Stats stats;
+    stats.requestedLevelOnly = true;
+    stats.fallbackLevels = 0;
+    if (level < 0 || level >= array.numLevels() || coords.empty() || out.empty() || coverage.empty())
+        return stats;
+
+    const LevelAccess access = makeLevelAccess(array, level);
+    if (!hasSampleableLevel(access))
+        return stats;
+
+    const std::vector<ChunkKey> keys = ChunkedPlaneSampler::collectCoordsDependencies(
+        array, level, coords, coverage, options);
+    stats.requestedChunks = static_cast<int>(keys.size());
+
+    if (!keys.empty())
+        array.prefetchChunks(keys, false);
+
+    PinnedChunkCache pinned(keys.size());
+    for (const ChunkKey& key : keys) {
+        ChunkResult result = array.getChunkBlocking(key.level, key.iz, key.iy, key.ix);
+        if (result.status == ChunkStatus::Error) {
+            ++stats.errorChunks;
+            const std::string message = result.error.empty()
+                ? "chunk fetch failed during blocking requested-level sampling"
+                : result.error;
+            throw std::runtime_error(message);
+        }
+        if (result.status == ChunkStatus::MissQueued) {
+            ++stats.errorChunks;
+            throw std::runtime_error(
+                "blocking requested-level sampling received unresolved chunk after getChunkBlocking");
+        }
+        if (result.status == ChunkStatus::Missing)
+            ++stats.missingChunks;
+        pinned.chunks.emplace(key, std::move(result));
+    }
+
+    const int tile = std::max(1, options.tileSize);
+    const int h = std::min({coords.rows, out.rows, coverage.rows});
+    const int w = std::min({coords.cols, out.cols, coverage.cols});
+    std::vector<SampleTile> tiles;
+    tiles.reserve(std::size_t((h + tile - 1) / tile) *
+                  std::size_t((w + tile - 1) / tile));
+    for (int ty = 0; ty < h; ty += tile) {
+        const int yEnd = std::min(ty + tile, h);
+        for (int tx = 0; tx < w; tx += tile) {
+            const int xEnd = std::min(tx + tile, w);
+            tiles.push_back({tx, ty, xEnd, yEnd});
+        }
+    }
+
+    auto processTileRange = [&](std::size_t begin, std::size_t end) {
+        ChunkedPlaneSampler::Stats localStats;
+        localStats.requestedLevelOnly = true;
+        for (std::size_t i = begin; i < end; ++i) {
+            const SampleTile& sampleTile = tiles[i];
+            for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
+                const cv::Vec3f* coordRow = coords.ptr<cv::Vec3f>(y);
+                uint8_t* outRow = out.ptr<uint8_t>(y);
+                uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
+                for (int x = sampleTile.tx; x < sampleTile.xEnd; ++x) {
+                    if (coverageRow[x] || surfaceSentinel(coordRow[x]))
+                        continue;
+
+                    uint8_t value = 0;
+                    std::string error;
+                    const StrictSampleStatus status = samplePinnedPoint(
+                        pinned, access, level, coordRow[x], options.sampling,
+                        false, value, error);
+                    if (status == StrictSampleStatus::Error) {
+                        throw std::runtime_error(
+                            error.empty()
+                                ? "blocking requested-level sampling failed"
+                                : error);
+                    }
+
+                    const bool wasCovered = coverageRow[x] != 0;
+                    outRow[x] = status == StrictSampleStatus::Missing ? uint8_t{0} : value;
+                    coverageRow[x] = 1;
+                    if (!wasCovered)
+                        ++localStats.coveredPixels;
+                }
+            }
+        }
+        return localStats;
+    };
+
+    if (!shouldParallelizeSamples(h, w) || tiles.size() <= 1) {
+        addStats(stats, processTileRange(0, tiles.size()));
+        return stats;
+    }
+
+    const std::size_t workerCount = std::min<std::size_t>(
+        renderSamplerPool().worker_count(), tiles.size());
+    const std::size_t tilesPerWorker = (tiles.size() + workerCount - 1) / workerCount;
+    std::vector<std::future<ChunkedPlaneSampler::Stats>> futures;
+    futures.reserve(workerCount);
+    for (std::size_t worker = 0; worker < workerCount; ++worker) {
+        const std::size_t begin = worker * tilesPerWorker;
+        const std::size_t end = std::min(begin + tilesPerWorker, tiles.size());
+        if (begin >= end)
+            break;
+        futures.push_back(renderSamplerPool().submit([&, begin, end] {
+            return processTileRange(begin, end);
+        }));
+    }
+    for (auto& future : futures)
+        addStats(stats, future.get());
+    return stats;
+}
+
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneLevel(
     IChunkedArray& array,
     int level,
@@ -1145,6 +1515,602 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsLevel(
     return sampleCoordsLevelImpl(array, level, coords, out, coverage, options, false);
 }
 
+ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+    IChunkedArray& array,
+    int level,
+    const cv::Mat_<cv::Vec3f>& coords,
+    cv::Mat_<uint8_t>& out,
+    cv::Mat_<uint8_t>& coverage,
+    const Options& options)
+{
+    return sampleCoordsLevelBlockingRequestedLevelImpl(
+        array, level, coords, out, coverage, options);
+}
+
+ChunkedPlaneSampler::Stats
+ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+    const std::vector<IChunkedArray*>& arrays,
+    int level,
+    const std::vector<cv::Vec3f>& levelCoords,
+    void* visitorContext,
+    TrilinearCornerPointVisitor visitor,
+    int parallelThreads,
+    bool collectLocalityStats)
+{
+    using Clock = std::chrono::steady_clock;
+    const auto prepareStart = Clock::now();
+    Stats stats;
+    stats.requestedLevelOnly = true;
+    if (arrays.empty() || levelCoords.empty())
+        return stats;
+    if (visitor == nullptr)
+        throw std::invalid_argument("corner batch visitor must not be null");
+    if (arrays.front() == nullptr || level < 0 || level >= arrays.front()->numLevels())
+        throw std::invalid_argument("invalid requested-level corner batch source");
+
+    std::vector<cv::Vec3f> fractionsXYZ(levelCoords.size());
+    std::vector<uint8_t> valid(levelCoords.size());
+
+    const LevelAccess firstAccess = makeLevelAccess(*arrays.front(), level);
+    if (!hasSampleableLevel(firstAccess))
+        throw std::invalid_argument("requested-level corner batch has an invalid grid");
+    std::vector<LevelAccess> accesses;
+    accesses.reserve(arrays.size());
+    for (IChunkedArray* array : arrays) {
+        if (array == nullptr || level >= array->numLevels() ||
+            array->shape(level) != firstAccess.shape ||
+            array->dtype() != ChunkDtype::UInt8) {
+            throw std::invalid_argument(
+                "requested-level corner batch arrays must share one uint8 shape");
+        }
+        LevelAccess access = makeLevelAccess(*array, level);
+        if (!hasSampleableLevel(access))
+            throw std::invalid_argument("requested-level corner batch has an invalid grid");
+        accesses.push_back(access);
+    }
+
+    struct VoxelCube {
+        int x0 = 0;
+        int y0 = 0;
+        int z0 = 0;
+        int x1 = 0;
+        int y1 = 0;
+        int z1 = 0;
+    };
+    struct VoxelCubeKey {
+        int x = 0;
+        int y = 0;
+        int z = 0;
+
+        [[nodiscard]] bool operator==(const VoxelCubeKey&) const = default;
+    };
+    struct VoxelCubeKeyHash {
+        [[nodiscard]] size_t operator()(const VoxelCubeKey& key) const noexcept
+        {
+            size_t hash = static_cast<size_t>(key.x);
+            hash ^= static_cast<size_t>(key.y) + 0x9e3779b97f4a7c15ULL +
+                (hash << 6U) + (hash >> 2U);
+            hash ^= static_cast<size_t>(key.z) + 0x9e3779b97f4a7c15ULL +
+                (hash << 6U) + (hash >> 2U);
+            return hash;
+        }
+    };
+    constexpr uint32_t kNoBoundary = std::numeric_limits<uint32_t>::max();
+    struct PointCorners {
+        uint32_t dependencyIndex = 0;
+        uint32_t baseByteOffset = 0;
+        uint32_t boundaryIndex = std::numeric_limits<uint32_t>::max();
+        uint8_t clampedAxes = 0;
+
+        [[nodiscard]] bool singleDependency() const noexcept
+        {
+            return boundaryIndex == std::numeric_limits<uint32_t>::max();
+        }
+    };
+    struct BoundaryCorners {
+        std::array<uint32_t, 8> dependencyIndex{};
+        std::array<uint32_t, 8> byteOffset{};
+    };
+    constexpr uint32_t kInvalidCube = std::numeric_limits<uint32_t>::max();
+    std::vector<uint32_t> pointCubeIndices(levelCoords.size(), kInvalidCube);
+    std::vector<VoxelCube> voxelCubes;
+    voxelCubes.reserve(levelCoords.size());
+    std::vector<uint32_t> cubeOccupancies;
+    cubeOccupancies.reserve(levelCoords.size());
+    std::unordered_map<VoxelCubeKey, uint32_t, VoxelCubeKeyHash> cubeIndices;
+    cubeIndices.reserve(levelCoords.size());
+    for (size_t pointIndex = 0; pointIndex < levelCoords.size(); ++pointIndex) {
+        const cv::Vec3f point = levelCoords[pointIndex];
+        if (!finiteCoord(point) ||
+            !inLevelBounds(firstAccess.shape, point[2], point[1], point[0])) {
+            fractionsXYZ[pointIndex] = {0.0f, 0.0f, 0.0f};
+            valid[pointIndex] = 0;
+            continue;
+        }
+        VoxelCube cube;
+        cube.x0 = static_cast<int>(std::floor(point[0]));
+        cube.y0 = static_cast<int>(std::floor(point[1]));
+        cube.z0 = static_cast<int>(std::floor(point[2]));
+        cube.x1 = std::min(cube.x0 + 1, firstAccess.shape[2] - 1);
+        cube.y1 = std::min(cube.y0 + 1, firstAccess.shape[1] - 1);
+        cube.z1 = std::min(cube.z0 + 1, firstAccess.shape[0] - 1);
+        fractionsXYZ[pointIndex] = {
+            point[0] - static_cast<float>(cube.x0),
+            point[1] - static_cast<float>(cube.y0),
+            point[2] - static_cast<float>(cube.z0)};
+        valid[pointIndex] = 1;
+        const VoxelCubeKey key{cube.x0, cube.y0, cube.z0};
+        const auto [it, inserted] = cubeIndices.try_emplace(
+            key, static_cast<uint32_t>(voxelCubes.size()));
+        if (inserted) {
+            if (voxelCubes.size() >= static_cast<size_t>(kInvalidCube)) {
+                throw std::overflow_error(
+                    "corner batch has too many unique voxel cubes");
+            }
+            voxelCubes.push_back(cube);
+            cubeOccupancies.push_back(0);
+        }
+        pointCubeIndices[pointIndex] = it->second;
+        ++cubeOccupancies[it->second];
+        ++stats.cornerPointCount;
+    }
+    stats.cornerUniqueVoxelCubes = voxelCubes.size();
+    if (collectLocalityStats) {
+        for (const uint32_t occupancy : cubeOccupancies) {
+            const size_t bin = std::min<size_t>(
+                occupancy, stats.cornerCubeOccupancyHistogram.size() - 1);
+            ++stats.cornerCubeOccupancyHistogram[bin];
+            stats.cornerMaxCandidatesPerCube = std::max<uint64_t>(
+                stats.cornerMaxCandidatesPerCube, occupancy);
+        }
+    }
+    const auto prepareEnd = Clock::now();
+    stats.cornerPrepareSeconds =
+        std::chrono::duration<double>(prepareEnd - prepareStart).count();
+
+    struct CornerLayout {
+        std::array<int, 3> chunkShape{};
+        std::vector<PointCorners> points;
+        std::vector<ChunkKey> dependencies;
+        std::vector<BoundaryCorners> boundaryCorners;
+        std::vector<size_t> volumes;
+    };
+    std::vector<CornerLayout> layouts;
+    std::vector<size_t> volumeLayout(arrays.size(), 0);
+    for (size_t volumeIndex = 0; volumeIndex < arrays.size(); ++volumeIndex) {
+        const auto chunkShape = accesses[volumeIndex].chunkShape;
+        auto it = std::find_if(
+            layouts.begin(), layouts.end(),
+            [&](const CornerLayout& layout) { return layout.chunkShape == chunkShape; });
+        if (it == layouts.end()) {
+            layouts.push_back({chunkShape, {}, {}, {}, {volumeIndex}});
+            volumeLayout[volumeIndex] = layouts.size() - 1;
+        } else {
+            volumeLayout[volumeIndex] =
+                static_cast<size_t>(std::distance(layouts.begin(), it));
+            it->volumes.push_back(volumeIndex);
+        }
+    }
+
+    for (auto& layout : layouts) {
+        layout.points.resize(voxelCubes.size());
+        layout.boundaryCorners.reserve(voxelCubes.size() / 8 + 8);
+        constexpr size_t kLinearDependencyLimit = 16;
+        layout.dependencies.reserve(kLinearDependencyLimit);
+        std::unordered_map<ChunkKey, size_t, ChunkKeyHash> dependencyIndices;
+        bool useDependencyMap = false;
+        ChunkKey currentKey{};
+        size_t currentDependencyIndex = 0;
+        std::array<int, 3> currentBegin{};
+        std::array<int, 3> currentEnd{};
+        bool haveCurrentChunk = false;
+        const auto resolveDependency = [&](const ChunkKey& key) {
+            if (!useDependencyMap) {
+                const auto it = std::find(
+                    layout.dependencies.begin(), layout.dependencies.end(), key);
+                if (it != layout.dependencies.end()) {
+                    return static_cast<size_t>(
+                        std::distance(layout.dependencies.begin(), it));
+                }
+                const size_t index = layout.dependencies.size();
+                layout.dependencies.push_back(key);
+                if (layout.dependencies.size() > kLinearDependencyLimit) {
+                    dependencyIndices.reserve(layout.dependencies.size() * 2);
+                    for (size_t dependencyIndex = 0;
+                         dependencyIndex < layout.dependencies.size();
+                         ++dependencyIndex) {
+                        dependencyIndices.emplace(
+                            layout.dependencies[dependencyIndex], dependencyIndex);
+                    }
+                    useDependencyMap = true;
+                }
+                return index;
+            }
+            const auto [it, inserted] = dependencyIndices.try_emplace(
+                key, layout.dependencies.size());
+            if (inserted)
+                layout.dependencies.push_back(key);
+            return it->second;
+        };
+        for (size_t cubeIndex = 0; cubeIndex < voxelCubes.size(); ++cubeIndex) {
+            const VoxelCube& cube = voxelCubes[cubeIndex];
+            const bool withinCurrentChunk =
+                haveCurrentChunk &&
+                cube.x0 >= currentBegin[2] && cube.x0 < currentEnd[2] &&
+                cube.y0 >= currentBegin[1] && cube.y0 < currentEnd[1] &&
+                cube.z0 >= currentBegin[0] && cube.z0 < currentEnd[0];
+            if (!withinCurrentChunk) {
+                ++stats.cornerLayoutChunkRuns;
+                currentKey = {
+                    level,
+                    cube.z0 / layout.chunkShape[0],
+                    cube.y0 / layout.chunkShape[1],
+                    cube.x0 / layout.chunkShape[2]};
+                currentDependencyIndex = resolveDependency(currentKey);
+                currentBegin = {
+                    currentKey.iz * layout.chunkShape[0],
+                    currentKey.iy * layout.chunkShape[1],
+                    currentKey.ix * layout.chunkShape[2]};
+                currentEnd = {
+                    currentBegin[0] + layout.chunkShape[0],
+                    currentBegin[1] + layout.chunkShape[1],
+                    currentBegin[2] + layout.chunkShape[2]};
+                haveCurrentChunk = true;
+            }
+            PointCorners& point = layout.points[cubeIndex];
+            const bool singleDependency =
+                cube.x1 < currentEnd[2] &&
+                cube.y1 < currentEnd[1] &&
+                cube.z1 < currentEnd[0];
+            if (currentDependencyIndex >
+                static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                throw std::overflow_error(
+                    "corner batch has too many chunk dependencies");
+            }
+            point.dependencyIndex = static_cast<uint32_t>(currentDependencyIndex);
+            if (!singleDependency) {
+                ++stats.cornerBoundaryPoints;
+                if (layout.boundaryCorners.size() >=
+                    static_cast<size_t>(kNoBoundary)) {
+                    throw std::overflow_error(
+                        "corner batch has too many boundary points");
+                }
+                point.boundaryIndex = static_cast<uint32_t>(
+                    layout.boundaryCorners.size());
+                layout.boundaryCorners.emplace_back();
+            } else {
+                const int lz = cube.z0 - currentBegin[0];
+                const int ly = cube.y0 - currentBegin[1];
+                const int lx = cube.x0 - currentBegin[2];
+                const size_t byteOffset =
+                    (static_cast<size_t>(lz) *
+                         static_cast<size_t>(layout.chunkShape[1]) +
+                     static_cast<size_t>(ly)) *
+                        static_cast<size_t>(layout.chunkShape[2]) +
+                    static_cast<size_t>(lx);
+                if (byteOffset >
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                    throw std::overflow_error(
+                        "corner batch chunk exceeds uint32 byte offsets");
+                }
+                point.baseByteOffset = static_cast<uint32_t>(byteOffset);
+                point.clampedAxes = static_cast<uint8_t>(
+                    (cube.x1 == cube.x0 ? 1 : 0) |
+                    (cube.y1 == cube.y0 ? 2 : 0) |
+                    (cube.z1 == cube.z0 ? 4 : 0));
+                continue;
+            }
+            BoundaryCorners& boundary =
+                layout.boundaryCorners[point.boundaryIndex];
+            std::array<uint32_t, 8> dependencyByChunkMask{};
+            dependencyByChunkMask[0] =
+                static_cast<uint32_t>(currentDependencyIndex);
+            uint8_t resolvedChunkMasks = 1;
+            const bool crossesX = cube.x1 >= currentEnd[2];
+            const bool crossesY = cube.y1 >= currentEnd[1];
+            const bool crossesZ = cube.z1 >= currentEnd[0];
+            const std::array<int, 2> localX{
+                cube.x0 - currentBegin[2],
+                cube.x1 - (crossesX ? currentEnd[2] : currentBegin[2])};
+            const std::array<int, 2> localY{
+                cube.y0 - currentBegin[1],
+                cube.y1 - (crossesY ? currentEnd[1] : currentBegin[1])};
+            const std::array<int, 2> localZ{
+                cube.z0 - currentBegin[0],
+                cube.z1 - (crossesZ ? currentEnd[0] : currentBegin[0])};
+            size_t corner = 0;
+            for (int dz = 0; dz <= 1; ++dz) {
+                for (int dy = 0; dy <= 1; ++dy) {
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const uint8_t chunkMask = static_cast<uint8_t>(
+                            (dx != 0 && crossesX ? 1 : 0) |
+                            (dy != 0 && crossesY ? 2 : 0) |
+                            (dz != 0 && crossesZ ? 4 : 0));
+                        if ((resolvedChunkMasks & (uint8_t{1} << chunkMask)) == 0) {
+                            const ChunkKey adjacentKey{
+                                level,
+                                currentKey.iz + ((chunkMask & 4) != 0 ? 1 : 0),
+                                currentKey.iy + ((chunkMask & 2) != 0 ? 1 : 0),
+                                currentKey.ix + ((chunkMask & 1) != 0 ? 1 : 0)};
+                            const size_t dependencyIndex =
+                                resolveDependency(adjacentKey);
+                            if (dependencyIndex > static_cast<size_t>(
+                                    std::numeric_limits<uint32_t>::max())) {
+                                throw std::overflow_error(
+                                    "corner batch has too many chunk dependencies");
+                            }
+                            dependencyByChunkMask[chunkMask] =
+                                static_cast<uint32_t>(dependencyIndex);
+                            resolvedChunkMasks |= uint8_t{1} << chunkMask;
+                        }
+                        const size_t dependencyIndex =
+                            dependencyByChunkMask[chunkMask];
+                        if (dependencyIndex >
+                            static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                            throw std::overflow_error(
+                                "corner batch has too many chunk dependencies");
+                        }
+                        boundary.dependencyIndex[corner] =
+                            static_cast<uint32_t>(dependencyIndex);
+                        const size_t byteOffset =
+                            (static_cast<size_t>(localZ[dz]) *
+                                 static_cast<size_t>(layout.chunkShape[1]) +
+                             static_cast<size_t>(localY[dy])) *
+                                static_cast<size_t>(layout.chunkShape[2]) +
+                            static_cast<size_t>(localX[dx]);
+                        if (byteOffset >
+                            static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+                            throw std::overflow_error(
+                                "corner batch chunk exceeds uint32 byte offsets");
+                        }
+                        boundary.byteOffset[corner] =
+                            static_cast<uint32_t>(byteOffset);
+                        ++corner;
+                    }
+                }
+            }
+        }
+        stats.cornerDependencies += layout.dependencies.size();
+        if (collectLocalityStats) {
+            for (const ChunkKey& key : layout.dependencies) {
+                size_t id = ChunkKeyHash{}(key);
+                for (const int extent : layout.chunkShape) {
+                    id ^= static_cast<size_t>(extent) + 0x9e3779b97f4a7c15ULL +
+                        (id << 6U) + (id >> 2U);
+                }
+                stats.cornerDependencyIds.push_back(static_cast<uint64_t>(id));
+            }
+        }
+    }
+    std::sort(
+        stats.cornerDependencyIds.begin(), stats.cornerDependencyIds.end());
+    stats.cornerDependencyIds.erase(
+        std::unique(
+            stats.cornerDependencyIds.begin(), stats.cornerDependencyIds.end()),
+        stats.cornerDependencyIds.end());
+    const auto layoutEnd = Clock::now();
+    stats.cornerLayoutSeconds =
+        std::chrono::duration<double>(layoutEnd - prepareEnd).count();
+
+    for (size_t volumeIndex = 0; volumeIndex < arrays.size(); ++volumeIndex) {
+        const auto& dependencies = layouts[volumeLayout[volumeIndex]].dependencies;
+        stats.requestedChunks += static_cast<int>(dependencies.size());
+        if (!dependencies.empty())
+            arrays[volumeIndex]->prefetchChunks(dependencies, false);
+    }
+
+    struct PinnedVolume {
+        std::vector<ChunkResult> chunks;
+        std::vector<const std::byte*> data;
+        std::vector<size_t> size;
+    };
+    std::vector<PinnedVolume> pinned(arrays.size());
+    for (size_t volumeIndex = 0; volumeIndex < pinned.size(); ++volumeIndex) {
+        auto& volume = pinned[volumeIndex];
+        const size_t dependencyCount =
+            layouts[volumeLayout[volumeIndex]].dependencies.size();
+        volume.chunks.resize(dependencyCount);
+        volume.data.resize(dependencyCount, nullptr);
+        volume.size.resize(dependencyCount, 0);
+    }
+    size_t volumeIndex = 0;
+    for (IChunkedArray* array : arrays) {
+        const auto& dependencies = layouts[volumeLayout[volumeIndex]].dependencies;
+        for (size_t dependencyIndex = 0;
+             dependencyIndex < dependencies.size();
+            ++dependencyIndex) {
+            const ChunkKey& key = dependencies[dependencyIndex];
+            ChunkResult result = array->getChunkBlocking(
+                key.level, key.iz, key.iy, key.ix);
+            if (result.status == ChunkStatus::Error) {
+                ++stats.errorChunks;
+                throw std::runtime_error(
+                    result.error.empty() ? "corner batch chunk fetch failed" : result.error);
+            }
+            if (result.status == ChunkStatus::MissQueued) {
+                ++stats.errorChunks;
+                throw std::runtime_error(
+                    "corner batch received unresolved chunk after blocking fetch");
+            }
+            if (result.status == ChunkStatus::Missing)
+                ++stats.missingChunks;
+            pinned[volumeIndex].chunks[dependencyIndex] = std::move(result);
+            const auto& stored = pinned[volumeIndex].chunks[dependencyIndex];
+            if (stored.status == ChunkStatus::Data && stored.bytes) {
+                pinned[volumeIndex].data[dependencyIndex] = stored.bytes->data();
+                pinned[volumeIndex].size[dependencyIndex] = stored.bytes->size();
+            }
+        }
+        ++volumeIndex;
+    }
+    const auto pinEnd = Clock::now();
+    stats.cornerPinSeconds =
+        std::chrono::duration<double>(pinEnd - layoutEnd).count();
+
+    const size_t volumeCount = arrays.size();
+    std::vector<std::array<uint8_t, 8>> cubeValues(
+        voxelCubes.size() * volumeCount);
+    for (size_t cubeIndex = 0; cubeIndex < voxelCubes.size(); ++cubeIndex) {
+        for (const CornerLayout& layout : layouts) {
+            const PointCorners& point = layout.points[cubeIndex];
+            std::array<uint32_t, 8> commonOffsets{};
+            uint32_t commonMaxOffset = 0;
+            const BoundaryCorners* boundary = nullptr;
+            if (point.singleDependency()) {
+                const uint32_t xStride =
+                    (point.clampedAxes & 1) != 0 ? 0U : 1U;
+                const uint32_t yStride = (point.clampedAxes & 2) != 0
+                    ? 0U
+                    : static_cast<uint32_t>(layout.chunkShape[2]);
+                const uint32_t zStride = (point.clampedAxes & 4) != 0
+                    ? 0U
+                    : static_cast<uint32_t>(layout.chunkShape[1]) *
+                          static_cast<uint32_t>(layout.chunkShape[2]);
+                const uint32_t base = point.baseByteOffset;
+                commonOffsets = {
+                    base,
+                    base + xStride,
+                    base + yStride,
+                    base + yStride + xStride,
+                    base + zStride,
+                    base + zStride + xStride,
+                    base + zStride + yStride,
+                    base + zStride + yStride + xStride};
+                commonMaxOffset = commonOffsets[7];
+            } else {
+                boundary = &layout.boundaryCorners[point.boundaryIndex];
+            }
+            for (const size_t currentVolumeIndex : layout.volumes) {
+                const PinnedVolume& volume = pinned[currentVolumeIndex];
+                const uint8_t fill = accesses[currentVolumeIndex].fill;
+                auto& currentValues =
+                    cubeValues[cubeIndex * volumeCount + currentVolumeIndex];
+                if (point.singleDependency()) {
+                    const size_t dependencyIndex = point.dependencyIndex;
+                    const std::byte* data = volume.data[dependencyIndex];
+                    if (data == nullptr) {
+                        currentValues.fill(fill);
+                        continue;
+                    }
+                    if (commonMaxOffset >= volume.size[dependencyIndex]) {
+                        throw std::runtime_error(
+                            "corner batch decoded chunk has invalid byte extent");
+                    }
+                    for (size_t corner = 0; corner < 8; ++corner) {
+                        currentValues[corner] = std::to_integer<uint8_t>(
+                            data[commonOffsets[corner]]);
+                    }
+                    continue;
+                }
+                for (size_t corner = 0; corner < 8; ++corner) {
+                    uint8_t value = fill;
+                    const size_t dependencyIndex =
+                        boundary->dependencyIndex[corner];
+                    const std::byte* data = volume.data[dependencyIndex];
+                    if (data != nullptr) {
+                        if (boundary->byteOffset[corner] >=
+                            volume.size[dependencyIndex]) {
+                            throw std::runtime_error(
+                                "corner batch decoded chunk has invalid byte extent");
+                        }
+                        value = std::to_integer<uint8_t>(
+                            data[boundary->byteOffset[corner]]);
+                    }
+                    currentValues[corner] = value;
+                }
+            }
+        }
+    }
+
+    const size_t requestedWorkers = parallelThreads > 0
+        ? static_cast<size_t>(parallelThreads)
+        : cornerBatchPool().worker_count();
+    const size_t workerCount = std::min({
+        cornerBatchPool().worker_count(), requestedWorkers, levelCoords.size()});
+    const size_t pointsPerWorker =
+        (levelCoords.size() + workerCount - 1) / workerCount;
+    const size_t taskCount =
+        (levelCoords.size() + pointsPerWorker - 1) / pointsPerWorker;
+    stats.cornerWorkerTasks = taskCount;
+    cornerBatchPool().run_indexed_batch(taskCount, [&](size_t worker) {
+        const size_t begin = worker * pointsPerWorker;
+        const size_t end = std::min(begin + pointsPerWorker, levelCoords.size());
+        for (size_t pointIndex = begin; pointIndex < end; ++pointIndex) {
+            if (valid[pointIndex] == 0) {
+                visitor(
+                    visitorContext,
+                    pointIndex,
+                    fractionsXYZ[pointIndex],
+                    false,
+                    {});
+                continue;
+            }
+            const size_t cubeIndex = pointCubeIndices[pointIndex];
+            visitor(
+                visitorContext,
+                pointIndex,
+                fractionsXYZ[pointIndex],
+                true,
+                std::span<const std::array<uint8_t, 8>>(
+                    cubeValues.data() + cubeIndex * volumeCount,
+                    volumeCount));
+        }
+    });
+    const auto gatherEnd = Clock::now();
+    stats.cornerGatherSeconds =
+        std::chrono::duration<double>(gatherEnd - pinEnd).count();
+    const size_t validPoints = static_cast<size_t>(
+        std::count(valid.begin(), valid.end(), uint8_t{1}));
+    const size_t covered = validPoints * arrays.size() * 8;
+    stats.coveredPixels = static_cast<int>(std::min<size_t>(
+        covered, static_cast<size_t>(std::numeric_limits<int>::max())));
+    return stats;
+}
+
+ChunkedPlaneSampler::Stats
+ChunkedPlaneSampler::sampleTrilinearCornersLevelBlockingRequestedLevel(
+    const std::vector<IChunkedArray*>& arrays,
+    int level,
+    const std::vector<cv::Vec3f>& levelCoords,
+    std::vector<std::vector<std::array<uint8_t, 8>>>& values,
+    std::vector<cv::Vec3f>& fractionsXYZ,
+    std::vector<uint8_t>& valid,
+    int parallelThreads)
+{
+    values.assign(
+        arrays.size(),
+        std::vector<std::array<uint8_t, 8>>(levelCoords.size()));
+    fractionsXYZ.resize(levelCoords.size());
+    valid.resize(levelCoords.size());
+    struct MaterializeContext {
+        std::vector<std::vector<std::array<uint8_t, 8>>>* values;
+        std::vector<cv::Vec3f>* fractionsXYZ;
+        std::vector<uint8_t>* valid;
+    } context{&values, &fractionsXYZ, &valid};
+    const auto materialize = +[](
+        void* rawContext,
+        size_t pointIndex,
+        const cv::Vec3f& fractionXYZ,
+        bool pointValid,
+        std::span<const std::array<uint8_t, 8>> volumeCorners) {
+        auto& out = *static_cast<MaterializeContext*>(rawContext);
+        (*out.fractionsXYZ)[pointIndex] = fractionXYZ;
+        (*out.valid)[pointIndex] = pointValid ? uint8_t{1} : uint8_t{0};
+        if (!pointValid)
+            return;
+        for (size_t volumeIndex = 0; volumeIndex < volumeCorners.size(); ++volumeIndex) {
+            (*out.values)[volumeIndex][pointIndex] = volumeCorners[volumeIndex];
+        }
+    };
+    return visitTrilinearCornersLevelBlockingRequestedLevel(
+        arrays,
+        level,
+        levelCoords,
+        &context,
+        materialize,
+        parallelThreads);
+}
+
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneFineToCoarse(
     IChunkedArray& array,
     int startLevel,
@@ -1157,9 +2123,15 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::samplePlaneFineToCoarse(
 {
     Stats total;
     int remaining = countUncovered(coverage);
-    for (int level = std::max(0, startLevel); level < array.numLevels(); ++level) {
+    const int firstLevel = std::max(0, startLevel);
+    for (int level = firstLevel; level < array.numLevels(); ++level) {
+        Options levelOptions = options;
+        levelOptions.queueMisses =
+            options.queueMisses &&
+            (options.queuedFallbackLevels < 0 ||
+             level - firstLevel <= options.queuedFallbackLevels);
         Stats stats = samplePlaneLevel(array, level, origin, vxStep, vyStep,
-                                       out, coverage, options);
+                                       out, coverage, levelOptions);
         addStats(total, stats);
         remaining -= stats.coveredPixels;
         if (remaining <= 0)
@@ -1183,8 +2155,15 @@ ChunkedPlaneSampler::Stats ChunkedPlaneSampler::sampleCoordsFineToCoarse(
 {
     Stats total;
     int remaining = countSampleableCoords(coverage, coords);
-    for (int level = std::max(0, startLevel); level < array.numLevels(); ++level) {
-        Stats stats = sampleCoordsLevel(array, level, coords, out, coverage, options);
+    const int firstLevel = std::max(0, startLevel);
+    for (int level = firstLevel; level < array.numLevels(); ++level) {
+        Options levelOptions = options;
+        levelOptions.queueMisses =
+            options.queueMisses &&
+            (options.queuedFallbackLevels < 0 ||
+             level - firstLevel <= options.queuedFallbackLevels);
+        Stats stats = sampleCoordsLevel(
+            array, level, coords, out, coverage, levelOptions);
         addStats(total, stats);
         remaining -= stats.coveredPixels;
         if (remaining <= 0)

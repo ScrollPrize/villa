@@ -46,11 +46,17 @@ struct GeneratedOverlay {
         struct BranchLink {
             uint64_t fiberId = 0;
             int controlPointIndex = -1;
+            bool pending = false;
         };
 
         size_t controlIndex = std::numeric_limits<size_t>::max();
         bool isSeed = false;
         bool hasBranches = false;
+        bool hasPendingLinks = false;
+        bool isLinkCandidate = false;
+        bool hasTracedSegmentToNext = false;
+        std::string interpolationGoal = "global";
+        char interpolationModeMarker = 'L';
         std::vector<uint64_t> branchIds;
         std::vector<BranchLink> branchLinks;
     };
@@ -67,6 +73,40 @@ struct GeneratedOverlay {
         bool manual = false;
     };
 
+    struct BranchLinkMarker {
+        uint64_t linkedFiberId = 0;
+        cv::Vec3f localControlPoint{std::numeric_limits<float>::quiet_NaN(),
+                                    std::numeric_limits<float>::quiet_NaN(),
+                                    std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f linkedControlPoint{std::numeric_limits<float>::quiet_NaN(),
+                                     std::numeric_limits<float>::quiet_NaN(),
+                                     std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f localDirection{std::numeric_limits<float>::quiet_NaN(),
+                                 std::numeric_limits<float>::quiet_NaN(),
+                                 std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f linkedDirection{std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN()};
+        cv::Vec3f planePoint{std::numeric_limits<float>::quiet_NaN(),
+                             std::numeric_limits<float>::quiet_NaN(),
+                             std::numeric_limits<float>::quiet_NaN()};
+        bool estimated = false;
+    };
+
+    struct FiberIntersectionMarker {
+        cv::Vec3f point{std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN()};
+        uint64_t fiberId = 0;
+        int segmentIndex = -1;
+        double arclength = std::numeric_limits<double>::quiet_NaN();
+        double distance = std::numeric_limits<double>::quiet_NaN();
+        bool projectedBranchLink = false;
+        bool pendingBranchLink = false;
+        bool isLinkCandidateFiber = false;
+        std::optional<cv::Vec3f> connectorStart;
+    };
+
     std::vector<cv::Vec3f> linePoints;
     std::vector<std::vector<cv::Vec3f>> branchLinePoints;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
@@ -79,6 +119,8 @@ struct GeneratedOverlay {
     std::vector<double> markerLinePositions;
     std::vector<ControlPointMarker> controlPoints;
     std::vector<PredSnapMarker> predSnapPoints;
+    std::vector<BranchLinkMarker> branchLinks;
+    std::vector<FiberIntersectionMarker> fiberIntersections;
     double currentLinePosition = std::numeric_limits<double>::quiet_NaN();
     GeneratedCurrentLineMarkerState currentLineMarkerState =
         GeneratedCurrentLineMarkerState::Neutral;
@@ -88,6 +130,13 @@ struct GeneratedOverlay {
 };
 
 struct GeneratedSpanAlignmentMetric {
+    enum class Kind {
+        LasagnaNormalAlignment,
+        NativeMeetingError,
+        NativeFailure,
+        Cspline,
+    };
+
     int spanIndex = 0;
     int firstControlIndex = 0;
     int secondControlIndex = 0;
@@ -97,13 +146,25 @@ struct GeneratedSpanAlignmentMetric {
     bool available = false;
     bool pending = false;
     std::string error;
+    Kind kind = Kind::LasagnaNormalAlignment;
+    double meetingErrorBaseVoxels =
+        std::numeric_limits<double>::quiet_NaN();
+    double meetingErrorRatio =
+        std::numeric_limits<double>::quiet_NaN();
+    std::string meetingSource;
+    std::string failureCode;
+    std::string failureDetail;
+    char modeMarker = 'L';
+    std::string message;
 };
 
 struct GeneratedViews {
     std::string lineSurfaceName;
     QString lineSurfaceTitle;
+    std::shared_ptr<QuadSurface> lineSurface;
     std::string lineSideSliceName;
     QString lineSideSliceTitle;
+    std::shared_ptr<QuadSurface> lineSideSlice;
     std::string currentCutName;
     std::shared_ptr<PlaneSurface> currentCutSurface;
     std::string sideCutName;
@@ -123,8 +184,24 @@ struct GeneratedViews {
     bool initialCurrentCutFollowsStripMouse = true;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
     std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints;
+    std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks;
+    std::vector<GeneratedOverlay::FiberIntersectionMarker> fiberIntersections;
     std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics;
 };
+
+inline void replaceGeneratedBranchOverlayData(
+    GeneratedViews& views,
+    std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
+    std::vector<std::vector<cv::Vec3f>> branchLinePoints,
+    std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
+    std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics)
+{
+    views.controlPoints = std::move(controlPoints);
+    views.branchLinePoints = std::move(branchLinePoints);
+    views.branchLinks = std::move(branchLinks);
+    views.fiberIntersections.clear();
+    views.spanAlignmentMetrics = std::move(spanAlignmentMetrics);
+}
 
 struct GeneratedControlPointLinePositionIndex {
     std::vector<size_t> sortedControlIndices;
@@ -158,6 +235,63 @@ struct GeneratedLineViewNavigationState {
 inline bool finiteGeneratedPoint(const cv::Vec3f& point)
 {
     return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+inline bool finiteStoredPoint(const cv::Vec3d& point)
+{
+    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+}
+
+inline bool storedPointsApproximatelyEqual(const cv::Vec3d& a,
+                                           const cv::Vec3d& b,
+                                           double tolerance = 1.0e-6)
+{
+    if (!finiteStoredPoint(a) || !finiteStoredPoint(b)) {
+        return false;
+    }
+    const cv::Vec3d delta = a - b;
+    return delta.dot(delta) <= tolerance * tolerance;
+}
+
+inline std::optional<cv::Vec3d> storedSinglePointFiberSeed(
+    const std::vector<cv::Vec3d>& controlPoints,
+    const std::vector<cv::Vec3d>& linePoints)
+{
+    std::optional<cv::Vec3d> controlSeed;
+    size_t finiteControlCount = 0;
+    for (const cv::Vec3d& point : controlPoints) {
+        if (!finiteStoredPoint(point)) {
+            continue;
+        }
+        ++finiteControlCount;
+        if (finiteControlCount == 1) {
+            controlSeed = point;
+        }
+    }
+
+    std::optional<cv::Vec3d> lineSeed;
+    size_t finiteLineCount = 0;
+    for (const cv::Vec3d& point : linePoints) {
+        if (!finiteStoredPoint(point)) {
+            continue;
+        }
+        ++finiteLineCount;
+        if (finiteLineCount == 1) {
+            lineSeed = point;
+        }
+    }
+
+    if (finiteControlCount > 1 || finiteLineCount > 1) {
+        return std::nullopt;
+    }
+    if (!controlSeed && !lineSeed) {
+        return std::nullopt;
+    }
+    if (controlSeed && lineSeed &&
+        !storedPointsApproximatelyEqual(*controlSeed, *lineSeed)) {
+        return std::nullopt;
+    }
+    return controlSeed ? controlSeed : lineSeed;
 }
 
 inline cv::Vec3f normalizedGeneratedVectorOrNan(const cv::Vec3f& vector)
@@ -803,8 +937,23 @@ inline GeneratedOverlay makeGeneratedCrossSliceOverlay(
             }
         }
     }
+
+    for (const auto& intersection : views.fiberIntersections) {
+        if (!finiteGeneratedPoint(intersection.point)) {
+            continue;
+        }
+        const float distance = pointDistance(intersection.point);
+        if (std::isfinite(distance) && std::abs(distance) <= *controlDistanceThreshold) {
+            overlay.fiberIntersections.push_back(intersection);
+        }
+    }
     return overlay;
 }
+
+struct GeneratedLinkCandidateMenuState {
+    bool enabled = false;
+    QString label;
+};
 
 struct GeneratedControlPointContextMenuOptions {
     QWidget* parent = nullptr;
@@ -813,12 +962,25 @@ struct GeneratedControlPointContextMenuOptions {
     QPointF scenePoint;
     QPoint globalPos;
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints;
+    std::vector<GeneratedOverlay::FiberIntersectionMarker> fiberIntersections;
     size_t linePointCount = 0;
     double linePosition = std::numeric_limits<double>::quiet_NaN();
     bool stripViewer = false;
+    bool linkWithCandidateEnabled = false;
+    QString linkWithCandidateLabel;
+    cv::Vec3f branchLinkDirection{std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN()};
     std::function<void(double, cv::Vec3f)> deleteControlPoint;
-    std::function<void(size_t)> addBranch;
+    std::function<void(size_t, cv::Vec3f, bool, cv::Vec3f)> addBranch;
     std::function<void(uint64_t, int)> openBranch;
+    std::function<void(size_t, uint64_t, int)> unlinkBranch;
+    // (controlIndex, linkedFiberId, linkedControlPointIndex, newPendingState)
+    std::function<void(size_t, uint64_t, int, bool)> setBranchLinkPending;
+    std::function<void(size_t, cv::Vec3f)> designateLinkCandidate;
+    std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
+    std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
+    std::function<void(size_t, size_t, std::string)> setSegmentInterpolationGoal;
 };
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,

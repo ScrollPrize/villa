@@ -54,6 +54,11 @@
 // Use libtiff for BigTIFF
 #include <tiffio.h>
 
+// GCC/Clang spell the restrict qualifier __restrict__; MSVC only has __restrict.
+#if defined(_MSC_VER)
+#define __restrict__ __restrict
+#endif
+
 namespace {
 
 void replaceFile(const std::filesystem::path& source,
@@ -290,6 +295,68 @@ cv::Vec3f surfaceCenterFor(const cv::Mat_<cv::Vec3f>& points, const cv::Vec2f& s
     };
 }
 
+struct LazySurfaceGeometry {
+    cv::Vec2f scale;
+    cv::Vec3f center;
+    cv::Rect bounds;
+};
+
+LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
+                                            const utils::Json& metadata)
+{
+    auto readScale = [](const utils::Json& json) -> std::optional<cv::Vec2f> {
+        if (!json.contains("scale") || !json["scale"].is_array() ||
+            json["scale"].size() < 2) {
+            return std::nullopt;
+        }
+        const cv::Vec2f scale{json["scale"][0].get_float(),
+                              json["scale"][1].get_float()};
+        if (!std::isfinite(scale[0]) || !std::isfinite(scale[1]) ||
+            scale[0] <= 0.0f || scale[1] <= 0.0f) {
+            return std::nullopt;
+        }
+        return scale;
+    };
+
+    std::optional<cv::Vec2f> scale = readScale(metadata);
+    if (!scale) {
+        const auto diskMetadata =
+            vc::json::load_json_file(path / "meta.json");
+        scale = readScale(diskMetadata);
+    }
+    if (!scale) {
+        throw std::runtime_error("Missing or invalid surface scale in: " +
+                                 (path / "meta.json").string());
+    }
+
+    const auto xPath = path / "x.tif";
+    TIFF* tif = TIFFOpen(xPath.string().c_str(), "r");
+    if (!tif) {
+        throw std::runtime_error("Failed to open TIFF: " + xPath.string());
+    }
+    uint32_t width = 0;
+    uint32_t height = 0;
+    const bool haveGeometry =
+        TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &width) &&
+        TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &height);
+    TIFFClose(tif);
+    if (!haveGeometry || width == 0 || height == 0) {
+        throw std::runtime_error("TIFF missing width/height: " + xPath.string());
+    }
+
+    LazySurfaceGeometry result;
+    result.scale = *scale;
+    result.center = {
+        scaledCenterComponent(static_cast<int>(width), result.scale[0]),
+        scaledCenterComponent(static_cast<int>(height), result.scale[1]),
+        0.0f,
+    };
+    result.bounds = {
+        0, 0, static_cast<int>(width) - 1, static_cast<int>(height) - 1,
+    };
+    return result;
+}
+
 cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
     const cv::Mat_<cv::Vec3f>& points,
     const cv::Size& newSize)
@@ -477,6 +544,49 @@ void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
     }
 }
 
+void warpQuadValidityConstU8(const cv::Mat_<uint8_t>& vertexValidity,
+                             cv::Mat_<uint8_t>& dst,
+                             double ox, double oy,
+                             double sx, double sy,
+                             uint8_t border)
+{
+    const int sc = vertexValidity.cols;
+    const int sr = vertexValidity.rows;
+    const int dw = dst.cols;
+    const int dh = dst.rows;
+    if (sc < 2 || sr < 2) {
+        dst.setTo(border);
+        return;
+    }
+
+    const double maxX = static_cast<double>(sc - 1);
+    const double maxY = static_cast<double>(sr - 1);
+#pragma omp parallel for schedule(dynamic, 8)
+    for (int dy = 0; dy < dh; ++dy) {
+        const double fy = oy + static_cast<double>(dy) * sy;
+        uint8_t* output = dst[dy];
+        if (fy < 0.0 || fy > maxY) {
+            std::memset(output, border, static_cast<std::size_t>(dw));
+            continue;
+        }
+        const int row = std::min(static_cast<int>(std::floor(fy)), sr - 2);
+        const uint8_t* top = vertexValidity[row];
+        const uint8_t* bottom = vertexValidity[row + 1];
+        for (int dx = 0; dx < dw; ++dx) {
+            const double fx = ox + static_cast<double>(dx) * sx;
+            if (fx < 0.0 || fx > maxX) {
+                output[dx] = border;
+                continue;
+            }
+            const int col = std::min(static_cast<int>(std::floor(fx)), sc - 2);
+            output[dx] = top[col] && top[col + 1]
+                              && bottom[col] && bottom[col + 1]
+                ? uint8_t{255}
+                : uint8_t{0};
+        }
+    }
+}
+
 void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
                            cv::Mat_<cv::Vec3f>& dst,
                            double ox, double oy,
@@ -609,6 +719,10 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
         }
     }
 
+    const LazySurfaceGeometry geometry = readLazySurfaceGeometry(path, meta);
+    _scale = geometry.scale;
+    _center = geometry.center;
+    _bounds = geometry.bounds;
     _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
 }
@@ -630,6 +744,10 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &
         }
     }
 
+    const LazySurfaceGeometry geometry = readLazySurfaceGeometry(path, meta);
+    _scale = geometry.scale;
+    _center = geometry.center;
+    _bounds = geometry.bounds;
     _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
 }
@@ -697,8 +815,7 @@ cv::Vec3f QuadSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset) cons
     const_cast<QuadSurface*>(this)->ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
 
-    cv::Rect bounds = {0,0,_points->cols-2,_points->rows-2};
-    if (!bounds.contains(cv::Point(p[0],p[1])))
+    if (!loc_valid_xy(*_points, {p[0], p[1]}))
         return {-1,-1,-1};
 
     return at_int((*_points), {p[0],p[1]});
@@ -720,6 +837,11 @@ cv::Size QuadSurface::size()
     return {static_cast<int>(_points->cols / _scale[0]), static_cast<int>(_points->rows / _scale[1])};
 }
 
+cv::Size QuadSurface::gridSize() const
+{
+    return {_bounds.width + 1, _bounds.height + 1};
+}
+
 cv::Vec2f QuadSurface::scale() const
 {
     return _scale;
@@ -728,6 +850,92 @@ cv::Vec2f QuadSurface::scale() const
 cv::Vec3f QuadSurface::center() const
 {
     return _center;
+}
+
+cv::Vec2d QuadSurface::surfaceToGrid(const cv::Vec2d& surface) const
+{
+    return {
+        (surface[0] + static_cast<double>(_center[0]))
+            * static_cast<double>(_scale[0]),
+        (surface[1] + static_cast<double>(_center[1]))
+            * static_cast<double>(_scale[1]),
+    };
+}
+
+cv::Vec2d QuadSurface::gridToSurface(const cv::Vec2d& grid) const
+{
+    if (!std::isfinite(_scale[0]) || !std::isfinite(_scale[1])
+        || _scale[0] <= 0.0f || _scale[1] <= 0.0f) {
+        return {NAN, NAN};
+    }
+    return {
+        grid[0] / static_cast<double>(_scale[0])
+            - static_cast<double>(_center[0]),
+        grid[1] / static_cast<double>(_scale[1])
+            - static_cast<double>(_center[1]),
+    };
+}
+
+QuadSurface::SurfaceSample QuadSurface::sampleAtSurface(
+    const cv::Vec2d& surface) const
+{
+    SurfaceSample result;
+    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1])) {
+        result.status = SurfaceSample::Status::NonFinite;
+        return result;
+    }
+    if (!std::isfinite(_scale[0]) || !std::isfinite(_scale[1])
+        || _scale[0] <= 0.0f || _scale[1] <= 0.0f) {
+        result.status = SurfaceSample::Status::InvalidScale;
+        return result;
+    }
+
+    const_cast<QuadSurface*>(this)->ensureLoaded();
+    if (!_points || _points->cols < 2 || _points->rows < 2) {
+        result.status = SurfaceSample::Status::MissingPoints;
+        return result;
+    }
+
+    result.grid = surfaceToGrid(surface);
+    const double maxCol = static_cast<double>(_points->cols - 1);
+    const double maxRow = static_cast<double>(_points->rows - 1);
+    constexpr double gridTolerance = 1e-6;
+    if (result.grid[0] < -gridTolerance || result.grid[1] < -gridTolerance
+        || result.grid[0] > maxCol + gridTolerance
+        || result.grid[1] > maxRow + gridTolerance) {
+        result.status = SurfaceSample::Status::OutsideGrid;
+        return result;
+    }
+    result.grid[0] = std::clamp(result.grid[0], 0.0, maxCol);
+    result.grid[1] = std::clamp(result.grid[1], 0.0, maxRow);
+
+    const int col = std::min(
+        static_cast<int>(std::floor(result.grid[0])), _points->cols - 2);
+    const int row = std::min(
+        static_cast<int>(std::floor(result.grid[1])), _points->rows - 2);
+    const cv::Vec3f& p00 = (*_points)(row, col);
+    const cv::Vec3f& p01 = (*_points)(row, col + 1);
+    const cv::Vec3f& p10 = (*_points)(row + 1, col);
+    const cv::Vec3f& p11 = (*_points)(row + 1, col + 1);
+    if (!isValidPointSample(p00) || !isValidPointSample(p01)
+        || !isValidPointSample(p10) || !isValidPointSample(p11)) {
+        result.status = SurfaceSample::Status::InvalidQuad;
+        return result;
+    }
+
+    const float colFraction =
+        static_cast<float>(result.grid[0] - static_cast<double>(col));
+    const float rowFraction =
+        static_cast<float>(result.grid[1] - static_cast<double>(row));
+    const cv::Vec3f top = p00 * (1.0f - colFraction) + p01 * colFraction;
+    const cv::Vec3f bottom = p10 * (1.0f - colFraction) + p11 * colFraction;
+    result.volume = top * (1.0f - rowFraction) + bottom * rowFraction;
+    if (!isValidPointSample(result.volume)) {
+        result.status = SurfaceSample::Status::NonFinite;
+        return result;
+    }
+    result.status = SurfaceSample::Status::Valid;
+    return result;
 }
 
 cv::Vec2f QuadSurface::ptrToGrid(const cv::Vec3f& ptr) const
@@ -975,7 +1183,9 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     // Trigger the cache build + set _validMaskAllValid before deciding
     // whether we need the validity warp below.
     cv::Mat_<uint8_t> valid_src = validMask();
-    bool skipValidity = _validMaskAllValid;
+    // Strict mode must still evaluate cell support on an all-valid vertex
+    // mask so degenerate one-row/one-column components cannot render.
+    bool skipValidity = _validMaskAllValid && !_strictQuadRenderValidity;
 
     // --- warp coords and validity ----------------------------------------
     // Per-call scratch is thread_local: gen() runs concurrently per-tile from
@@ -1012,7 +1222,13 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
             if (!skipValidity) {
                 cv::Mat_<uint8_t> compValid = valid_src(cv::Rect(c0, 0, cw, rows));
                 compValidBig.create(h + 8, w + 8);
-                warpNearestConstU8(compValid, compValidBig, ox - c0, oy, sx, sy, 0);
+                if (_strictQuadRenderValidity) {
+                    warpQuadValidityConstU8(
+                        compValid, compValidBig, ox - c0, oy, sx, sy, 0);
+                } else {
+                    warpNearestConstU8(
+                        compValid, compValidBig, ox - c0, oy, sx, sy, 0);
+                }
                 compCoords.copyTo(coords_big, compValidBig);
                 cv::bitwise_or(valid_big, compValidBig, valid_big);
             } else {
@@ -1034,7 +1250,11 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
         coords_big.create(h + 8, w + 8);
         warpBilinearReplicateVec3f(*_points, coords_big, ox, oy, sx, sy);
         valid_big.create(h + 8, w + 8);
-        warpNearestConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
+        if (_strictQuadRenderValidity) {
+            warpQuadValidityConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
+        } else {
+            warpNearestConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
+        }
         skipValidity = false;  // force invalidation pass below
     }
 
@@ -1757,6 +1977,12 @@ void QuadSurface::save(const std::filesystem::path &path_, const std::string &uu
 
     // Prepare and write metadata
     {
+        // The cached _bbox can be stale here: it is seeded from meta.json at
+        // load time, and the point grid can be mutated directly afterwards
+        // (rawPointsPtr(), validPoints(), ...) without any invalidation hook.
+        // Drop the cache so bbox() recomputes from the points actually being
+        // saved (#1272).
+        _bbox = {{-1, -1, -1}, {-1, -1, -1}};
         auto lo = utils::Json::array();
         lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
         auto hi = utils::Json::array();
@@ -1885,6 +2111,13 @@ void QuadSurface::save_meta()
     }
 
     {
+        // NB: deliberately no bbox recompute here, unlike save(). save_meta()
+        // rewrites meta.json only and leaves the x/y/z TIFFs untouched, so
+        // recomputing from the in-memory grid would describe geometry that
+        // was never persisted. For a surface with unsaved inward edits that
+        // would write an under-covering bbox, i.e. exactly the #1272 failure
+        // this change set exists to prevent. The bbox is refreshed where the
+        // geometry itself is written.
         auto lo = utils::Json::array();
         lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
         auto hi = utils::Json::array();
@@ -1935,11 +2168,18 @@ Rect3D QuadSurface::bbox()
     return _bbox;
 }
 
-std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &path, int flags)
+namespace {
+
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
+    const std::filesystem::path &path,
+    const std::optional<cv::Rect> &requestedRegion,
+    int flags)
 {
     recoverIncompleteSave(path);
 
-    auto read_band_into = [](const std::filesystem::path& fpath,
+    cv::Rect loadedRegion;
+    auto read_band_into = [&requestedRegion, &loadedRegion](
+                             const std::filesystem::path& fpath,
                              cv::Mat_<cv::Vec3f>& points,
                              int channel,
                              int& outW, int& outH) -> void
@@ -1970,17 +2210,28 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
             throw std::runtime_error("Unsupported BitsPerSample in " + fpath.string());
         }
 
-        // Allocate destination if first band
+        const cv::Rect fullRegion(0, 0, static_cast<int>(W), static_cast<int>(H));
+        const cv::Rect bandRegion = requestedRegion.value_or(fullRegion);
+        if (bandRegion.width <= 0 || bandRegion.height <= 0
+            || (bandRegion & fullRegion) != bandRegion) {
+            TIFFClose(tif);
+            throw std::runtime_error("Requested TIFF region is out of bounds in "
+                                     + fpath.string());
+        }
+
+        // Allocate destination if first band.
         if (points.empty()) {
-            points.create(static_cast<int>(H), static_cast<int>(W));
+            points.create(bandRegion.height, bandRegion.width);
             // Initialize as invalid
             for (int y=0;y<points.rows;++y)
                 for (int x=0;x<points.cols;++x)
                     points(y,x) = cv::Vec3f(-1.f,-1.f,-1.f);
             outW = static_cast<int>(W);
             outH = static_cast<int>(H);
+            loadedRegion = bandRegion;
         } else {
-            if (outW != static_cast<int>(W) || outH != static_cast<int>(H)) {
+            if (outW != static_cast<int>(W) || outH != static_cast<int>(H)
+                || loadedRegion != bandRegion) {
                 TIFFClose(tif);
                 throw std::runtime_error("Band size mismatch in " + fpath.string());
             }
@@ -2023,21 +2274,39 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
             const tmsize_t tileBytes = TIFFTileSize(tif);
             std::vector<uint8_t> tileBuf(static_cast<size_t>(tileBytes));
 
-            for (uint32_t y0=0; y0<H; y0+=tileH) {
-                const uint32_t dy = std::min(tileH, H - y0);
-                for (uint32_t x0=0; x0<W; x0+=tileW) {
-                    const uint32_t dx = std::min(tileW, W - x0);
+            const uint32_t firstTileY =
+                static_cast<uint32_t>(loadedRegion.y) / tileH * tileH;
+            const uint32_t firstTileX =
+                static_cast<uint32_t>(loadedRegion.x) / tileW * tileW;
+            const uint32_t regionEndY =
+                static_cast<uint32_t>(loadedRegion.y + loadedRegion.height);
+            const uint32_t regionEndX =
+                static_cast<uint32_t>(loadedRegion.x + loadedRegion.width);
+            for (uint32_t y0=firstTileY; y0<regionEndY; y0+=tileH) {
+                const uint32_t copyY0 =
+                    std::max(y0, static_cast<uint32_t>(loadedRegion.y));
+                const uint32_t copyY1 = std::min(
+                    std::min(y0 + tileH, H), regionEndY);
+                for (uint32_t x0=firstTileX; x0<regionEndX; x0+=tileW) {
+                    const uint32_t copyX0 =
+                        std::max(x0, static_cast<uint32_t>(loadedRegion.x));
+                    const uint32_t copyX1 = std::min(
+                        std::min(x0 + tileW, W), regionEndX);
                     const ttile_t tidx = TIFFComputeTile(tif, x0, y0, 0, 0);
                     tmsize_t n = TIFFReadEncodedTile(tif, tidx, tileBuf.data(), tileBytes);
                     if (n < 0) {
                         // fill with zeros on read error
                         std::fill(tileBuf.begin(), tileBuf.end(), 0);
                     }
-                    for (uint32_t ty=0; ty<dy; ++ty) {
+                    for (uint32_t sourceY=copyY0; sourceY<copyY1; ++sourceY) {
+                        const uint32_t ty = sourceY - y0;
                         const uint8_t* row = tileBuf.data() + (static_cast<size_t>(ty)*tileW*bytesPer);
-                        for (uint32_t tx=0; tx<dx; ++tx) {
+                        for (uint32_t sourceX=copyX0; sourceX<copyX1; ++sourceX) {
+                            const uint32_t tx = sourceX - x0;
                             float fv = to_float(row + static_cast<size_t>(tx)*bytesPer);
-                            cv::Vec3f& dst = points(static_cast<int>(y0+ty), static_cast<int>(x0+tx));
+                            cv::Vec3f& dst = points(
+                                static_cast<int>(sourceY) - loadedRegion.y,
+                                static_cast<int>(sourceX) - loadedRegion.x);
                             dst[channel] = fv;
                         }
                     }
@@ -2046,14 +2315,20 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
         } else {
             const tmsize_t scanBytes = TIFFScanlineSize(tif);
             std::vector<uint8_t> scanBuf(static_cast<size_t>(scanBytes));
-            for (uint32_t y=0; y<H; ++y) {
+            const uint32_t endY =
+                static_cast<uint32_t>(loadedRegion.y + loadedRegion.height);
+            const uint32_t endX =
+                static_cast<uint32_t>(loadedRegion.x + loadedRegion.width);
+            for (uint32_t y=static_cast<uint32_t>(loadedRegion.y); y<endY; ++y) {
                 if (TIFFReadScanline(tif, scanBuf.data(), y, 0) != 1) {
                     std::fill(scanBuf.begin(), scanBuf.end(), 0);
                 }
                 const uint8_t* row = scanBuf.data();
-                for (uint32_t x=0; x<W; ++x) {
+                for (uint32_t x=static_cast<uint32_t>(loadedRegion.x); x<endX; ++x) {
                     float fv = to_float(row + static_cast<size_t>(x)*bytesPer);
-                    cv::Vec3f& dst = points(static_cast<int>(y), static_cast<int>(x));
+                    cv::Vec3f& dst = points(
+                        static_cast<int>(y) - loadedRegion.y,
+                        static_cast<int>(x) - loadedRegion.x);
                     dst[channel] = fv;
                 }
             }
@@ -2144,8 +2419,14 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
                     auto invalidate = [&](uint32_t srcX, uint32_t srcY){
                         const uint32_t dstX = (scaleX == 1) ? srcX : (srcX / scaleX);
                         const uint32_t dstY = (scaleY == 1) ? srcY : (srcY / scaleY);
-                        if (dstX < static_cast<uint32_t>(W) && dstY < static_cast<uint32_t>(H)) {
-                            (*points)(static_cast<int>(dstY), static_cast<int>(dstX)) = invalidPoint;
+                        if (dstX >= static_cast<uint32_t>(loadedRegion.x)
+                            && dstX < static_cast<uint32_t>(
+                                loadedRegion.x + loadedRegion.width)
+                            && dstY >= static_cast<uint32_t>(loadedRegion.y)
+                            && dstY < static_cast<uint32_t>(
+                                loadedRegion.y + loadedRegion.height)) {
+                            (*points)(static_cast<int>(dstY) - loadedRegion.y,
+                                      static_cast<int>(dstX) - loadedRegion.x) = invalidPoint;
                         }
                     };
                     if (TIFFIsTiled(mtif)) {
@@ -2154,20 +2435,38 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
                         TIFFGetField(mtif, TIFFTAG_TILELENGTH, &tileH);
                         const tmsize_t tileBytes = TIFFTileSize(mtif);
                         std::vector<uint8_t> tileBuf(static_cast<size_t>(tileBytes));
-                        for (uint32_t y0=0; y0<mH; y0+=tileH) {
-                            const uint32_t dy = std::min(tileH, mH - y0);
-                            for (uint32_t x0=0; x0<mW; x0+=tileW) {
-                                const uint32_t dx = std::min(tileW, mW - x0);
+                        const uint32_t maskX0 =
+                            static_cast<uint32_t>(loadedRegion.x) * scaleX;
+                        const uint32_t maskY0 =
+                            static_cast<uint32_t>(loadedRegion.y) * scaleY;
+                        const uint32_t maskX1 = std::min(
+                            mW, static_cast<uint32_t>(
+                                loadedRegion.x + loadedRegion.width) * scaleX);
+                        const uint32_t maskY1 = std::min(
+                            mH, static_cast<uint32_t>(
+                                loadedRegion.y + loadedRegion.height) * scaleY);
+                        const uint32_t firstTileX = maskX0 / tileW * tileW;
+                        const uint32_t firstTileY = maskY0 / tileH * tileH;
+                        for (uint32_t y0=firstTileY; y0<maskY1; y0+=tileH) {
+                            const uint32_t copyY0 = std::max(y0, maskY0);
+                            const uint32_t copyY1 =
+                                std::min(std::min(y0 + tileH, mH), maskY1);
+                            for (uint32_t x0=firstTileX; x0<maskX1; x0+=tileW) {
+                                const uint32_t copyX0 = std::max(x0, maskX0);
+                                const uint32_t copyX1 =
+                                    std::min(std::min(x0 + tileW, mW), maskX1);
                                 const ttile_t tidx = TIFFComputeTile(mtif, x0, y0, 0, 0);
                                 tmsize_t n = TIFFReadEncodedTile(mtif, tidx, tileBuf.data(), tileBytes);
                                 if (n < 0) std::fill(tileBuf.begin(), tileBuf.end(), 0);
                                 const size_t tileRowStride = static_cast<size_t>(tileW) * pixelStride;
-                                for (uint32_t ty=0; ty<dy; ++ty) {
+                                for (uint32_t sourceY=copyY0; sourceY<copyY1; ++sourceY) {
+                                    const uint32_t ty = sourceY - y0;
                                     const uint8_t* row = tileBuf.data() + static_cast<size_t>(ty) * tileRowStride;
-                                    for (uint32_t tx=0; tx<dx; ++tx) {
+                                    for (uint32_t sourceX=copyX0; sourceX<copyX1; ++sourceX) {
+                                        const uint32_t tx = sourceX - x0;
                                         const uint8_t* px = row + static_cast<size_t>(tx) * pixelStride;
                                         if (!to_valid(px)) {
-                                            invalidate(x0 + tx, y0 + ty);
+                                            invalidate(sourceX, sourceY);
                                         }
                                     }
                                 }
@@ -2176,12 +2475,22 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
                     } else {
                         const tmsize_t scanBytes = TIFFScanlineSize(mtif);
                         std::vector<uint8_t> scanBuf(static_cast<size_t>(scanBytes));
-                        for (uint32_t y=0; y<mH; ++y) {
+                        const uint32_t maskX0 =
+                            static_cast<uint32_t>(loadedRegion.x) * scaleX;
+                        const uint32_t maskY0 =
+                            static_cast<uint32_t>(loadedRegion.y) * scaleY;
+                        const uint32_t maskX1 = std::min(
+                            mW, static_cast<uint32_t>(
+                                loadedRegion.x + loadedRegion.width) * scaleX);
+                        const uint32_t maskY1 = std::min(
+                            mH, static_cast<uint32_t>(
+                                loadedRegion.y + loadedRegion.height) * scaleY);
+                        for (uint32_t y=maskY0; y<maskY1; ++y) {
                             if (TIFFReadScanline(mtif, scanBuf.data(), y, 0) != 1) {
                                 std::fill(scanBuf.begin(), scanBuf.end(), 0);
                             }
                             const uint8_t* row = scanBuf.data();
-                            for (uint32_t x=0; x<mW; ++x) {
+                            for (uint32_t x=maskX0; x<maskX1; ++x) {
                                 const uint8_t* px = row + static_cast<size_t>(x) * pixelStride;
                                 if (!to_valid(px)) {
                                     invalidate(x, y);
@@ -2196,20 +2505,36 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::filesystem::path &
     }
 
     auto surf = std::make_unique<QuadSurface>(points.release(), scale);
-    surf->path = path;
+    if (!requestedRegion) surf->path = path;
     surf->id   = metadata["uuid"].get_string();
     surf->meta = metadata;
 
     // Register extra channels lazily (left as OpenCV-based on-demand load).
-    for (const auto& entry : std::filesystem::directory_iterator(path)) {
-        if (entry.path().extension() == ".tif") {
-            std::string filename = entry.path().stem().string();
-            if (filename != "x" && filename != "y" && filename != "z") {
-                surf->setChannel(filename, cv::Mat());
+    if (!requestedRegion) {
+        for (const auto& entry : std::filesystem::directory_iterator(path)) {
+            if (entry.path().extension() == ".tif") {
+                std::string filename = entry.path().stem().string();
+                if (filename != "x" && filename != "y" && filename != "z") {
+                    surf->setChannel(filename, cv::Mat());
+                }
             }
         }
     }
     return surf;
+}
+
+} // namespace
+
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz(
+    const std::filesystem::path &path, int flags)
+{
+    return load_quad_from_tifxyz_impl(path, std::nullopt, flags);
+}
+
+std::unique_ptr<QuadSurface> load_quad_from_tifxyz_region(
+    const std::filesystem::path &path, const cv::Rect &region, int flags)
+{
+    return load_quad_from_tifxyz_impl(path, region, flags);
 }
 
 Rect3D expand_rect(const Rect3D &a, const cv::Vec3f &p)

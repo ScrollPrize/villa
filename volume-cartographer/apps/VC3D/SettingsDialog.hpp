@@ -49,6 +49,7 @@ class SettingsDialog : public QDialog, private Ui_VCSettingsDlg
         std::shared_ptr<VolumePkg> _volumePackage;
         std::shared_ptr<Volume> _currentVolume;
         std::filesystem::path _currentVolumeCacheDir;
+        std::filesystem::path _activeRemoteCacheRoot;
         CacheChunkLayout _currentVolumeChunkLayout;
         QComboBox* _outputSegmentsCombo{nullptr};
         QPushButton* _redownloadCacheButton{nullptr};

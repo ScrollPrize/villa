@@ -1,7 +1,10 @@
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
+#include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/lasagna/NormalAlignment.hpp"
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -52,8 +55,8 @@ bool finiteDirection(const cv::Vec3d& v)
 
 void printUsage(const char* argv0)
 {
-    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--seed=x,y,z] [--verbose]\n"
-              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt|--reinit-reopt] [--output <fiber.json>] [--obj-output-dir <dir>] [--reinit-debug-obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--strip-render-scale N] [--constant-normal-jacobian] [--verbose]\n"
+    std::cerr << "Usage: " << argv0 << " <manifest.lasagna.json> [--working-to-base-scale N] [--constant-normal-jacobian] [--benchmark-solvers] [--benchmark-threads] [--trace-init] [--segments-per-side=N] [--segment-length=N] [--seed=x,y,z] [--verbose]\n"
+              << "       " << argv0 << " <manifest.lasagna.json> --fiber <fiber.json> [--reopt|--reinit-reopt|--benchmark-control-placement] [--output <fiber.json>] [--obj-output-dir <dir>] [--reinit-debug-obj-output-dir <dir>] [--strip-output-dir <dir>] [--texture-zarr <zarr>] [--texture-level N] [--strip-render-scale N] [--constant-normal-jacobian] [--verbose]\n"
               << "Runs line annotation optimization at seed "
               << "[17955,15141,37891] with initial z-axis mode, or loads/reoptimizes a saved VC3D fiber.\n";
 }
@@ -85,6 +88,20 @@ int parsePositiveInt(const std::string& value, const char* name)
     return parsed;
 }
 
+double parsePositiveDouble(const std::string& value, const char* name)
+{
+    size_t consumed = 0;
+    double parsed = 0.0;
+    try {
+        parsed = std::stod(value, &consumed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string(name) + " must be a positive number");
+    }
+    if (consumed != value.size() || !std::isfinite(parsed) || parsed <= 0.0)
+        throw std::invalid_argument(std::string(name) + " must be a positive number");
+    return parsed;
+}
+
 int parseNonNegativeInt(const std::string& value, const char* name)
 {
     size_t consumed = 0;
@@ -102,6 +119,7 @@ int parseNonNegativeInt(const std::string& value, const char* name)
 
 struct FiberInput {
     nlohmann::json root;
+    vc::fiber_tracer::Vc3dFiberJson parsed;
     std::vector<cv::Vec3d> controlPoints;
     std::vector<cv::Vec3d> linePoints;
 };
@@ -122,19 +140,6 @@ cv::Vec3d pointFromJson(const nlohmann::json& value)
     return point;
 }
 
-std::vector<cv::Vec3d> readPointArray(const nlohmann::json& root, const char* key)
-{
-    if (!root.contains(key) || !root.at(key).is_array()) {
-        throw std::runtime_error(std::string("fiber JSON is missing array ") + key);
-    }
-    std::vector<cv::Vec3d> points;
-    points.reserve(root.at(key).size());
-    for (const auto& value : root.at(key)) {
-        points.push_back(pointFromJson(value));
-    }
-    return points;
-}
-
 FiberInput loadFiberInput(const std::filesystem::path& fiberPath)
 {
     std::ifstream input(fiberPath);
@@ -143,15 +148,10 @@ FiberInput loadFiberInput(const std::filesystem::path& fiberPath)
     }
     FiberInput fiber;
     fiber.root = nlohmann::json::parse(input);
-    if (fiber.root.value("type", std::string{}) != "vc3d_fiber") {
-        throw std::runtime_error("fiber JSON type is not vc3d_fiber");
-    }
-    if (fiber.root.value("version", 0) != 1) {
-        throw std::runtime_error("unsupported vc3d_fiber version");
-    }
-
-    fiber.controlPoints = readPointArray(fiber.root, "control_points");
-    fiber.linePoints = readPointArray(fiber.root, "line_points");
+    fiber.parsed = vc::fiber_tracer::parseVc3dFiberJson(
+        fiber.root, fiberPath.string());
+    fiber.controlPoints = fiber.parsed.controlPoints;
+    fiber.linePoints = fiber.parsed.linePoints;
     if (fiber.controlPoints.empty()) {
         throw std::runtime_error("fiber JSON has no control_points");
     }
@@ -166,21 +166,112 @@ nlohmann::json pointToJson(const cv::Vec3d& point)
     return nlohmann::json::array({point[0], point[1], point[2]});
 }
 
-void saveReoptimizedFiber(const FiberInput& fiber,
-                          const std::vector<cv::Vec3d>& optimizedLinePoints,
-                          const std::filesystem::path& outputPath)
+nlohmann::json fiberTraceConfigJson(double traceToBaseScale)
+{
+    vc::fiber_tracer::FiberTraceConfig config;
+    config.traceToBaseScale = traceToBaseScale;
+    return {
+        {"step_voxels", config.stepVoxels},
+        {"cone_angle_degrees", config.coneAngleDegrees},
+        {"cone_angle_step_degrees", config.coneAngleStepDegrees},
+        {"cone_grid_size", config.coneGridSize},
+        {"beam_width", config.beamWidth},
+        {"beam_prune_distance_voxels", config.beamPruneDistanceVoxels},
+        {"beam_lookahead_steps", config.beamLookaheadSteps},
+        {"smoothness_weight", config.smoothnessWeight},
+        {"smoothness_normal_weight", config.smoothnessNormalWeight},
+        {"smoothness_tangent_weight", config.smoothnessTangentWeight},
+        {"smoothness_free_angle_degrees", config.smoothnessFreeAngleDegrees},
+        {"cumulative_smoothness_steps", config.cumulativeSmoothnessSteps},
+        {"cumulative_smoothness_tangent_weight", config.cumulativeSmoothnessTangentWeight},
+        {"initial_free_angle_degrees", config.initialFreeAngleDegrees},
+        {"max_step_factor", config.maxStepFactor},
+        {"meeting_accept_max_error_ratio", config.meetingAcceptMaxErrorRatio},
+        {"endpoint_accept_threshold_base_voxels", config.endpointAcceptThresholdBaseVoxels},
+    };
+}
+
+std::vector<nlohmann::json> lasagnaSpanMetrics(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<int>& fixedIndices,
+    const vc::lasagna::NormalSampler& sampler)
+{
+    if (fixedIndices.size() < 2)
+        return {};
+    std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
+    (void)sampler.sampleNormalBatch(linePoints, false, samples);
+    if (samples.size() != linePoints.size())
+        throw std::runtime_error("normal sampler returned the wrong number of samples");
+    std::vector<nlohmann::json> metrics(fixedIndices.size() - 1, nullptr);
+    for (size_t span = 0; span + 1 < fixedIndices.size(); ++span) {
+        const int first = fixedIndices[span];
+        const int last = fixedIndices[span + 1];
+        if (first < 0 || last <= first || static_cast<size_t>(last) >= linePoints.size())
+            throw std::runtime_error("invalid optimized control-point index map");
+        double maximum = -1.0;
+        for (int index = first; index < last; ++index) {
+            const cv::Vec3d tangent = linePoints[static_cast<size_t>(index + 1)] -
+                                      linePoints[static_cast<size_t>(index)];
+            for (int sampleIndex : {index, index + 1}) {
+                const auto& sample = samples[static_cast<size_t>(sampleIndex)].sample;
+                if (!sample.valid)
+                    continue;
+                const double error = vc::lasagna::normalAlignmentErrorDegrees(
+                    tangent, sample.normal);
+                if (std::isfinite(error))
+                    maximum = std::max(maximum, error);
+            }
+        }
+        if (maximum >= 0.0)
+            metrics[span] = maximum;
+    }
+    return metrics;
+}
+
+void saveFiberOutput(const FiberInput& fiber,
+                     const std::vector<cv::Vec3d>& outputLinePoints,
+                     const std::vector<int>& fixedIndices,
+                     const vc::lasagna::NormalSampler& sampler,
+                     const std::string& normalManifest,
+                     double workingToBaseScale,
+                     bool geometryChanged,
+                     const std::filesystem::path& outputPath)
 {
     if (outputPath.empty()) {
         throw std::runtime_error("output path is empty");
     }
     nlohmann::json root = fiber.root;
-    root["line_points"] = nlohmann::json::array();
-    for (const auto& point : optimizedLinePoints) {
-        root["line_points"].push_back(pointToJson(point));
+    if (geometryChanged) {
+        if (fixedIndices.size() != fiber.controlPoints.size())
+            throw std::runtime_error("optimized output is missing control-point indices");
+        const auto metrics = lasagnaSpanMetrics(outputLinePoints, fixedIndices, sampler);
+        root["type"] = "vc3d_fiber";
+        root["version"] = 3;
+        root["optimization_mode"] = fiber.parsed.optimizationMode;
+        root["control_points"] = nlohmann::json::array();
+        for (size_t index = 0; index < fiber.controlPoints.size(); ++index) {
+            nlohmann::json control{{"position", pointToJson(fiber.controlPoints[index])}};
+            if (index + 1 < fiber.controlPoints.size()) {
+                const std::string goal = fiber.parsed.version == 3
+                    ? fiber.parsed.segmentMetadata[index].at("interp_goal").get<std::string>()
+                    : std::string{"global"};
+                const nlohmann::json config = fiber.parsed.version == 3
+                    ? fiber.parsed.segmentMetadata[index].at("config")
+                    : fiberTraceConfigJson(workingToBaseScale);
+                control["segment_to_next"] =
+                    vc::fiber_tracer::makeLasagnaSegmentMetadataJson(
+                        goal, normalManifest, workingToBaseScale, config,
+                        metrics.at(index));
+            }
+            root["control_points"].push_back(std::move(control));
+        }
+        root["line_points"] = nlohmann::json::array();
+        for (const auto& point : outputLinePoints)
+            root["line_points"].push_back(pointToJson(point));
+        root["generation"] = std::max<uint64_t>(
+            uint64_t{1}, root.value("generation", uint64_t{1})) + uint64_t{1};
+        (void)vc::fiber_tracer::parseVc3dFiberJson(root, outputPath.string());
     }
-    root["generation"] = std::max<uint64_t>(uint64_t{1},
-                                            root.value("generation", uint64_t{1})) +
-                         uint64_t{1};
 
     const std::filesystem::path parent = outputPath.parent_path();
     std::error_code ec;
@@ -475,14 +566,10 @@ void printReinitSpanTable(const std::vector<vc::lasagna::LineReinitializationSpa
               << std::setw(8) << "lnear"
               << std::setw(5) << "rsgn"
               << std::setw(8) << "rnear"
-              << std::setw(8) << "clnear"
-              << std::setw(8) << "crnear"
               << std::setw(9) << "lirms"
               << std::setw(9) << "lfrms"
               << std::setw(9) << "rirms"
               << std::setw(9) << "rfrms"
-              << std::setw(9) << "clfrms"
-              << std::setw(9) << "crfrms"
               << std::setw(8) << "mxstep"
               << std::setw(8) << "mxtan"
               << std::setw(8) << "mxnorm"
@@ -497,14 +584,10 @@ void printReinitSpanTable(const std::vector<vc::lasagna::LineReinitializationSpa
                   << std::setw(8) << span.candLeftClosestTargetDistance
                   << std::setw(5) << span.candRightSelectedSign
                   << std::setw(8) << span.candRightClosestTargetDistance
-                  << std::setw(8) << span.candContinueLeftClosestTargetDistance
-                  << std::setw(8) << span.candContinueRightClosestTargetDistance
                   << std::setw(9) << initialRmsForCandidate(span, "left")
                   << std::setw(9) << finalRmsForCandidate(span, "left")
                   << std::setw(9) << initialRmsForCandidate(span, "right")
                   << std::setw(9) << finalRmsForCandidate(span, "right")
-                  << std::setw(9) << finalRmsForCandidate(span, "continue-left")
-                  << std::setw(9) << finalRmsForCandidate(span, "continue-right")
                   << std::setw(8) << span.chosenMaxEvenStepDeviation
                   << std::setw(8) << span.chosenMaxTangentSmoothDeviation
                   << std::setw(8) << span.chosenMaxNormalSmoothDeviation
@@ -1593,6 +1676,7 @@ int main(int argc, char** argv)
     bool differentiableNormalSampling = true;
     bool benchmarkSolvers = false;
     bool benchmarkThreads = false;
+    bool benchmarkControlPlacement = false;
     bool traceInit = false;
     bool reopt = false;
     bool reinitReopt = false;
@@ -1606,6 +1690,8 @@ int main(int argc, char** argv)
     int textureLevel = 0;
     int stripRenderScale = 4;
     int segmentsPerSide = 200;
+    double segmentLength = 32.0;
+    double workingToBaseScale = 1.0;
     cv::Vec3d seedPoint{17955.0, 15141.0, 37891.0};
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -1615,6 +1701,8 @@ int main(int argc, char** argv)
             benchmarkSolvers = true;
         } else if (arg == "--benchmark-threads") {
             benchmarkThreads = true;
+        } else if (arg == "--benchmark-control-placement") {
+            benchmarkControlPlacement = true;
         } else if (arg == "--trace-init") {
             traceInit = true;
         } else if (arg == "--reopt") {
@@ -1663,8 +1751,15 @@ int main(int argc, char** argv)
                 throw std::invalid_argument("--strip-render-scale requires a positive integer");
             }
             stripRenderScale = parsePositiveInt(argv[++i], "strip-render-scale");
+        } else if (arg == "--working-to-base-scale") {
+            if (i + 1 >= argc)
+                throw std::invalid_argument("--working-to-base-scale requires a number");
+            workingToBaseScale = parsePositiveDouble(
+                argv[++i], "working-to-base-scale");
         } else if (arg.rfind("--segments-per-side=", 0) == 0) {
             segmentsPerSide = parsePositiveInt(arg.substr(20), "segments-per-side");
+        } else if (arg.rfind("--segment-length=", 0) == 0) {
+            segmentLength = parsePositiveDouble(arg.substr(17), "segment-length");
         } else if (arg.rfind("--seed=", 0) == 0) {
             seedPoint = parseSeed(arg.substr(7));
         } else {
@@ -1701,6 +1796,13 @@ int main(int argc, char** argv)
         if (reopt && reinitReopt) {
             throw std::invalid_argument("--reopt and --reinit-reopt are mutually exclusive");
         }
+        if (benchmarkControlPlacement && fiberPath.empty()) {
+            throw std::invalid_argument("--benchmark-control-placement requires --fiber <fiber.json>");
+        }
+        if (benchmarkControlPlacement && (reopt || reinitReopt)) {
+            throw std::invalid_argument(
+                "--benchmark-control-placement cannot be combined with --reopt/--reinit-reopt");
+        }
         if (wantsTextureOutput && fiberPath.empty()) {
             throw std::invalid_argument("--obj-output-dir/--strip-output-dir require --fiber <fiber.json>");
         }
@@ -1724,7 +1826,8 @@ int main(int argc, char** argv)
         }
 
         const std::filesystem::path manifestPath = argv[1];
-        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(manifestPath);
+        vc::lasagna::LasagnaDataset dataset = vc::lasagna::LasagnaDataset::open(
+            manifestPath, {workingToBaseScale});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         vc::lasagna::LineOptimizer optimizer(sampler);
         std::shared_ptr<Volume> textureVolume;
@@ -1737,11 +1840,15 @@ int main(int argc, char** argv)
         }
 
         const cv::Vec3d sourceSliceNormal{0.0, 0.0, 1.0};
-        const auto seedNormal = sampler.sampleNormal(seedPoint);
+        vc::lasagna::NormalSample seedNormal;
+        if (fiberPath.empty()) {
+            (void)sampler.prefetchNormalSamples({seedPoint}, false);
+            seedNormal = sampler.sampleNormal(seedPoint);
+        }
 
         vc::lasagna::LineOptimizationConfig config;
         config.segmentsPerSide = segmentsPerSide;
-        config.segmentLength = 32.0;
+        config.segmentLength = segmentLength;
         config.straightnessWeight = 0.1;
         config.tangentStraightnessWeight = 5.0;
         config.samplesPerSegment = 1;
@@ -1760,12 +1867,100 @@ int main(int argc, char** argv)
             const int displayFrameAnchorIndex = nearestLinePointIndex(
                 fiber.linePoints,
                 fiber.controlPoints[static_cast<size_t>(seedControlIndex)]);
+            const auto fiberSeedFetchStart = std::chrono::steady_clock::now();
+            (void)sampler.prefetchNormalSamples(
+                {fiber.controlPoints[static_cast<size_t>(seedControlIndex)]}, false);
             const auto fiberSeedNormal =
                 sampler.sampleNormal(fiber.controlPoints[static_cast<size_t>(seedControlIndex)]);
             config.initialTangent = initialZInOutTangent(sourceSliceNormal, fiberSeedNormal);
             config.useInitialTangent = finiteDirection(config.initialTangent);
             config.initialLinePoints = fiber.linePoints;
             config.printSolverProgress = false;
+
+            if (benchmarkControlPlacement) {
+                const cv::Vec3d fiberSeed =
+                    fiber.controlPoints[static_cast<size_t>(seedControlIndex)];
+                config.initialLinePoints.clear();
+                const auto initializationStart = fiberSeedFetchStart;
+                const auto initialized = optimizer.optimizeFromSeed(fiberSeed, config);
+                const auto initializationEnd = std::chrono::steady_clock::now();
+                std::vector<cv::Vec3d> currentLine = linePointsFromModel(initialized.line);
+                std::vector<vc::lasagna::LineControlPoint> controls{{
+                    static_cast<double>(initialized.line.displayFrameAnchorIndex),
+                    fiberSeed,
+                    true,
+                    initialized.line.displayFrameAnchorIndex,
+                }};
+
+                std::vector<size_t> placementOrder;
+                placementOrder.reserve(fiber.controlPoints.size() - 1);
+                for (size_t index = 0; index < fiber.controlPoints.size(); ++index) {
+                    if (static_cast<int>(index) != seedControlIndex) {
+                        placementOrder.push_back(index);
+                    }
+                }
+                const int seedOriginalLineIndex = nearestLinePointIndex(fiber.linePoints, fiberSeed);
+                std::stable_sort(
+                    placementOrder.begin(),
+                    placementOrder.end(),
+                    [&](size_t a, size_t b) {
+                        const int ai = nearestLinePointIndex(fiber.linePoints, fiber.controlPoints[a]);
+                        const int bi = nearestLinePointIndex(fiber.linePoints, fiber.controlPoints[b]);
+                        return std::abs(ai - seedOriginalLineIndex) <
+                               std::abs(bi - seedOriginalLineIndex);
+                    });
+
+                std::cout.imbue(std::locale::classic());
+                std::cout << std::fixed << std::setprecision(3)
+                          << "control_placement_benchmark seed_control=" << seedControlIndex
+                          << " initial_points=" << currentLine.size()
+                          << " initial_ms="
+                          << std::chrono::duration<double, std::milli>(
+                                 initializationEnd - initializationStart).count()
+                          << '\n';
+                for (size_t placement = 0; placement < placementOrder.size(); ++placement) {
+                    const size_t sourceControlIndex = placementOrder[placement];
+                    const cv::Vec3d target = fiber.controlPoints[sourceControlIndex];
+                    const int nearestIndex = nearestLinePointIndex(currentLine, target);
+                    controls.push_back({static_cast<double>(nearestIndex), target, false, -1});
+                    const size_t changedControlIndex = controls.size() - 1;
+                    const auto start = std::chrono::steady_clock::now();
+                    auto update = vc::lasagna::updateExistingLineControlPoint(
+                        std::move(currentLine),
+                        std::move(controls),
+                        changedControlIndex,
+                        sampler,
+                        config);
+                    const auto end = std::chrono::steady_clock::now();
+                    currentLine = std::move(update.linePoints);
+                    controls = std::move(update.controlPoints);
+                    std::cout << "placement=" << (placement + 1)
+                              << " source_control=" << sourceControlIndex
+                              << " line_points=" << currentLine.size()
+                              << " ms="
+                              << std::chrono::duration<double, std::milli>(end - start).count()
+                              << '\n';
+                }
+                if (currentLine.size() == fiber.linePoints.size()) {
+                    double squaredDistanceSum = 0.0;
+                    double maxDistance = 0.0;
+                    for (size_t index = 0; index < currentLine.size(); ++index) {
+                        const double distance = cv::norm(
+                            currentLine[index] - fiber.linePoints[index]);
+                        squaredDistanceSum += distance * distance;
+                        maxDistance = std::max(maxDistance, distance);
+                    }
+                    std::cout << "fiber_pointwise_rms="
+                              << std::sqrt(squaredDistanceSum /
+                                           static_cast<double>(currentLine.size()))
+                              << " fiber_pointwise_max=" << maxDistance << '\n';
+                } else {
+                    std::cout << "fiber_pointwise_comparison=unavailable"
+                              << " reconstructed_points=" << currentLine.size()
+                              << " source_points=" << fiber.linePoints.size() << '\n';
+                }
+                return 0;
+            }
 
             const auto fixedIndices = fixedIndicesForControls(fiber);
             if (fixedIndices.empty()) {
@@ -1941,7 +2136,14 @@ int main(int argc, char** argv)
                 printLineViewDiagnostics(outputLine);
             }
             if (!effectiveOutputPath.empty() && !reinitFailedWithoutDebugOutput) {
-                saveReoptimizedFiber(fiber, outputLinePoints, effectiveOutputPath);
+                saveFiberOutput(fiber,
+                                outputLinePoints,
+                                outputFixedIndices,
+                                sampler,
+                                argv[1],
+                                workingToBaseScale,
+                                reopt || reinitReopt,
+                                effectiveOutputPath);
                 if (verbose) {
                     std::cout << "Saved " << (reinitReopt ? "reinitialized/reoptimized" :
                                               (reopt ? "reoptimized" : "original"))

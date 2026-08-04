@@ -1,0 +1,576 @@
+/* ==========================================================================
+   chat.css — "Ask the Scrolls" floating Q&A widget (trigger + panel)
+   Everything scoped under .vc-chat*. Tokens only — no raw color values.
+
+   SECTION MAP
+   §1 Trigger (the only thing on initial load)
+   §2 Panel frame (desktop card / mobile full-screen sheet)
+   §3 Header
+   §4 Message list (user bubbles, assistant text, markdown-lite bits)
+   §5 Empty state (example-question chips)
+   §6 Streaming dots + interrupted marker + error note
+   §7 Input row + disclaimer
+   §8 Visually-hidden live region
+   §9 Coexistence with the landing prize sticker (.vc-gp2027)
+   ========================================================================== */
+
+/* ==========================================================================
+   §1 Trigger
+   ========================================================================== */
+.vc-chat-trigger {
+  position: fixed;
+  z-index: 170; /* above content + the landing prize sticker (150), below the navbar (200) */
+  right: calc(20px + env(safe-area-inset-right));
+  bottom: calc(20px + env(safe-area-inset-bottom));
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 10px 16px;
+  background: var(--vc-surface);
+  background: color-mix(in srgb, var(--vc-surface) 92%, transparent);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--vc-line-strong);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text);
+  font-family: var(--vc-font);
+  font-size: 0.8125rem;
+  font-weight: 650;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s, bottom 0.3s ease;
+}
+/* Desktop: a much more prominent entry point (owner request). Mobile keeps
+   the compact pill so it stays clear of thumbs, sticker, and footer. */
+@media (min-width: 997px) {
+  .vc-chat-trigger {
+    gap: 10px;
+    min-height: 56px;
+    padding: 16px 24px;
+    font-size: 1rem;
+    right: calc(28px + env(safe-area-inset-right));
+    bottom: calc(28px + env(safe-area-inset-bottom));
+  }
+  .vc-chat-trigger svg {
+    width: 20px;
+    height: 20px;
+  }
+}
+.vc-chat-trigger:hover {
+  background: var(--vc-raised);
+}
+.vc-chat-trigger:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+.vc-chat-trigger svg {
+  display: block;
+  color: var(--vc-text-dim);
+}
+
+/* ==========================================================================
+   §2 Panel frame
+   ========================================================================== */
+.vc-chat-panel {
+  position: fixed;
+  z-index: 240; /* above the navbar's dropdowns and the prize sticker */
+  right: calc(20px + env(safe-area-inset-right));
+  bottom: calc(20px + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  width: 380px;
+  max-width: calc(100vw - 40px);
+  height: min(560px, 80vh);
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line-strong);
+  border-radius: var(--vc-r-card);
+  overflow: hidden;
+  /* Closed: invisible, inert, out of the tab order (visibility removes it
+     from the a11y tree) — but still mounted, so streaming state survives. */
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(8px);
+  pointer-events: none;
+  transition: opacity 0.16s ease, transform 0.16s ease, visibility 0.16s;
+}
+.vc-chat-panel[data-open="true"] {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+  pointer-events: auto;
+}
+
+/* Mobile <997px: full-screen sheet. dvh (not vh) so the URL bar never hides
+   the input row; safe-area padding lands on the disclaimer (§7). */
+@media (max-width: 996px) {
+  .vc-chat-panel {
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    max-width: none;
+    height: 100dvh;
+    border: 0;
+    border-radius: 0;
+    transform: translateY(16px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vc-chat-trigger,
+  .vc-chat-panel {
+    transition: none;
+  }
+}
+
+/* Notched phones: the sheet header clears the status bar / camera. */
+@media (max-width: 996px) {
+  .vc-chat-head {
+    padding-top: calc(8px + env(safe-area-inset-top));
+  }
+  .vc-chat-inputrow {
+    padding-left: max(12px, env(safe-area-inset-left));
+    padding-right: max(12px, env(safe-area-inset-right));
+  }
+}
+
+/* ==========================================================================
+   §3 Header
+   ========================================================================== */
+.vc-chat-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 8px 8px 16px;
+  border-bottom: 1px solid var(--vc-line);
+}
+.vc-chat-head__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.9375rem;
+  font-weight: 650;
+  color: var(--vc-text);
+}
+.vc-chat-head__clear {
+  flex: none;
+  min-height: 44px;
+  padding: 0 12px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text-faint);
+  font-family: var(--vc-font);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+.vc-chat-head__clear:hover {
+  color: var(--vc-text);
+  background: var(--vc-raised);
+}
+.vc-chat-head__close {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text-dim);
+  cursor: pointer;
+}
+.vc-chat-head__close:hover {
+  color: var(--vc-text);
+  background: var(--vc-raised);
+}
+.vc-chat-head__clear:focus-visible,
+.vc-chat-head__close:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: -2px;
+}
+
+/* ==========================================================================
+   §4 Message list
+   ========================================================================== */
+.vc-chat-list {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.vc-chat-msg {
+  min-width: 0;
+  font-size: 0.875rem;
+  line-height: 1.6;
+  color: var(--vc-text);
+  overflow-wrap: break-word;
+}
+.vc-chat-msg--user {
+  align-self: flex-end;
+  max-width: 88%;
+  padding: 8px 12px;
+  background: var(--vc-raised);
+  border-radius: var(--vc-r-card);
+  white-space: pre-wrap;
+}
+.vc-chat-msg--assistant {
+  align-self: stretch;
+}
+.vc-chat-msg--assistant p {
+  margin: 0 0 8px;
+}
+.vc-chat-msg--assistant p:last-child {
+  margin-bottom: 0;
+}
+.vc-chat-msg--assistant ul {
+  margin: 0 0 8px;
+  padding-left: 20px;
+}
+.vc-chat-msg--assistant ul:last-child {
+  margin-bottom: 0;
+}
+.vc-chat-msg--assistant li {
+  margin: 2px 0;
+}
+.vc-chat-msg--assistant code {
+  font-family: var(--vc-mono);
+  font-size: 0.8125em;
+  padding: 0.05em 0.3em;
+  background: var(--vc-code-bg);
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-btn);
+}
+/* Body-link grammar (spec §3): text color + soft ember underline. */
+.vc-chat-msg--assistant a,
+.vc-chat-empty__hint a,
+.vc-chat-error a {
+  color: var(--vc-text);
+  text-decoration: underline;
+  text-decoration-color: var(--vc-accent-underline);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+.vc-chat-msg--assistant a:hover,
+.vc-chat-empty__hint a:hover,
+.vc-chat-error a:hover {
+  color: var(--vc-accent);
+  text-decoration-color: var(--vc-accent);
+}
+.vc-chat-msg--assistant a:focus-visible,
+.vc-chat-empty__hint a:focus-visible,
+.vc-chat-error a:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+
+/* ==========================================================================
+   §5 Empty state
+   ========================================================================== */
+.vc-chat-empty {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  gap: 8px;
+}
+/* A quiet mark holds the empty space so it reads as designed, not unloaded.
+   margin-top:auto (not flex-grow) splits the leftover space with the hint
+   below, so on the tall mobile sheet the mark and the hint+chips read as one
+   grouped block instead of two fragments separated by a void. */
+.vc-chat-empty__mark {
+  flex: 0 0 auto;
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--vc-text-ghost);
+  min-height: 48px;
+  padding-bottom: 16px;
+}
+.vc-chat-empty__hint {
+  margin: 0 0 4px;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--vc-text-faint);
+}
+.vc-chat-chip {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 10px 12px;
+  background: transparent;
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text-dim);
+  font-family: var(--vc-font);
+  font-size: 0.875rem;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s, color 0.15s;
+}
+.vc-chat-chip:hover {
+  border-color: var(--vc-line-strong);
+  background: var(--vc-raised);
+  color: var(--vc-text);
+}
+.vc-chat-chip:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+
+/* ==========================================================================
+   §6 Streaming dots, interrupted marker, error note
+   ========================================================================== */
+.vc-chat-dots {
+  display: inline-flex;
+  gap: 4px;
+  padding: 6px 0;
+}
+.vc-chat-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--vc-r-full);
+  background: var(--vc-text-faint);
+  animation: vc-chat-pulse 1.2s ease-in-out infinite;
+}
+.vc-chat-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.vc-chat-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes vc-chat-pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vc-chat-dots i {
+    animation: none;
+    opacity: 0.6;
+  }
+}
+.vc-chat-interrupted {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 0.75rem;
+  font-style: italic;
+  color: var(--vc-text-ghost);
+}
+/* Error note: the ONE admonition recipe (surface + hairline + ember edge). */
+.vc-chat-error {
+  padding: 10px 12px;
+  background: var(--vc-surface);
+  border: 1px solid var(--vc-line);
+  border-left: 2px solid var(--vc-accent);
+  border-radius: var(--vc-r-card);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--vc-text-dim);
+}
+
+/* ==========================================================================
+   §7 Input row + disclaimer
+   ========================================================================== */
+.vc-chat-inputrow {
+  flex: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin: 0;
+  padding: 12px 12px 0;
+  border-top: 1px solid var(--vc-line);
+}
+.vc-chat-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 44px;
+  max-height: 104px; /* 4 lines */
+  padding: 12px;
+  resize: none;
+  background: var(--vc-bg);
+  border: 1px solid var(--vc-line);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text);
+  font-family: var(--vc-font);
+  font-size: 0.875rem;
+  line-height: 20px;
+}
+.vc-chat-input::placeholder {
+  color: var(--vc-text-ghost);
+}
+.vc-chat-input:focus {
+  outline: none;
+  border-color: var(--vc-accent); /* accent = focus state (allowed) */
+}
+/* Send: the widget's one filled element — the accent's sanctioned home. */
+.vc-chat-send {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--vc-accent);
+  border: 1px solid var(--vc-accent);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text);
+  cursor: pointer;
+}
+.vc-chat-send:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.vc-chat-send:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+.vc-chat-stop {
+  flex: none;
+  min-width: 44px;
+  height: 44px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--vc-line-strong);
+  border-radius: var(--vc-r-btn);
+  color: var(--vc-text-dim);
+  font-family: var(--vc-font);
+  font-size: 0.8125rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+.vc-chat-stop:hover {
+  background: var(--vc-raised);
+  color: var(--vc-text);
+}
+.vc-chat-stop:focus-visible {
+  outline: 2px solid var(--vc-accent);
+  outline-offset: 2px;
+}
+.vc-chat-foot {
+  flex: none;
+  margin: 0;
+  padding: 8px 16px calc(10px + env(safe-area-inset-bottom));
+  font-size: 0.6875rem;
+  line-height: 1.4;
+  color: var(--vc-text-ghost);
+  text-align: center;
+}
+
+/* ==========================================================================
+   §8 Visually-hidden live region (assistant answers, once per message)
+   ========================================================================== */
+.vc-chat-sr {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   §9 Coexistence with the landing prize sticker (.vc-gp2027)
+   Below 997px the sticker owns the same bottom edge (full-width bar <561px,
+   corner card 561–768px, centered pill 769–996px). While it is on screen the
+   trigger steps above it. Progressive: without :has() they overlap, which is
+   survivable — the trigger stays clickable at z 170.
+   ========================================================================== */
+@media (max-width: 768px) {
+  body:has(.vc-gp2027--in:not(.vc-gp2027--yield)) .vc-chat-trigger {
+    bottom: calc(148px + env(safe-area-inset-bottom));
+  }
+}
+@media (min-width: 769px) and (max-width: 996px) {
+  body:has(.vc-gp2027--in:not(.vc-gp2027--yield)) .vc-chat-trigger {
+    bottom: calc(84px + env(safe-area-inset-bottom));
+  }
+}
+
+/* ==========================================================================
+   §10 Footer clearance
+   The fixed trigger sits over the page bottom, and the footer's centered
+   copyright/license lines are the one thing it can permanently occlude at
+   narrow widths (nothing below them to scroll clear). Give the footer room.
+   ========================================================================== */
+@media (max-width: 996px) {
+  .footer {
+    padding-bottom: calc(88px + env(safe-area-inset-bottom));
+  }
+}
+
+/* ==========================================================================
+   §11 Virtual Philodemus identity (avatar chip, header subtitle, trigger label)
+   ========================================================================== */
+.vc-chat-avatar {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--vc-raised);
+  border: 1px solid var(--vc-line-strong);
+  border-radius: var(--vc-r-full);
+  color: var(--vc-accent);
+  margin-right: 4px;
+}
+.vc-chat-avatar--bare {
+  background: transparent;
+  border: 0;
+  margin-right: 0;
+}
+.vc-chat-avatar--empty {
+  color: var(--vc-text-faint);
+  margin-right: 0;
+}
+.vc-chat-head__subtitle {
+  display: block;
+  font-size: 0.6875rem;
+  font-weight: 400;
+  line-height: 1.3;
+  color: var(--vc-text-faint);
+}
+/* Trigger label: full name where the big desktop pill has room, "Ask" on the
+   compact mobile pill. */
+.vc-chat-trigger__long {
+  display: none;
+}
+@media (min-width: 997px) {
+  .vc-chat-trigger__long {
+    display: inline;
+  }
+  .vc-chat-trigger__short {
+    display: none;
+  }
+}
+/* The trigger's spiral is the assistant's mark — ember, overriding the generic
+   trigger-svg dim color. */
+.vc-chat-trigger .vc-chat-avatar svg {
+  color: var(--vc-accent);
+}
+/* Desktop TOC clearance: the sticky "On this page" card otherwise scrolls its
+   last entries underneath the fixed trigger on short viewports. */
+@media (min-width: 997px) {
+  .theme-doc-toc-desktop {
+    max-height: calc(100vh - var(--ifm-navbar-height) - 8.5rem);
+    overflow-y: auto;
+  }
+}

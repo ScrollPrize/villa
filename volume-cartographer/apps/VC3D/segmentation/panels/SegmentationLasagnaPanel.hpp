@@ -5,6 +5,10 @@
 #include <QStringList>
 #include <QWidget>
 
+#include <optional>
+
+#include <opencv2/core.hpp>
+
 #include "utils/Json.hpp"
 
 class CollapsibleSettingsGroup;
@@ -75,6 +79,19 @@ public:
                                  int seedX,
                                  int seedY,
                                  int seedZ);
+    /// Starts optimization without dialogs and reports failures through
+    /// errorMessage. Returns true when the optimization was submitted.
+    ///   configPath: empty => selectedLasagnaConfigPathForMode(mode)
+    ///   seed:       nullopt => panel seed / focus (no seed override)
+    ///   atlasPath:  empty => panel selection; applied via setSelectedAtlasPath
+    bool startOptimizationHeadless(CState* state,
+                                   LasagnaMode mode,
+                                   const QString& configPath,
+                                   std::optional<cv::Vec3i> seed,
+                                   const QString& atlasPath,
+                                   QString* errorMessage = nullptr);
+    /// Repeats the last action without entering the interactive signal chain.
+    bool repeatLastLasagnaActionHeadless(CState* state, QString* errorMessage = nullptr);
     [[nodiscard]] QString selectedLasagnaConfigPathForMode(LasagnaMode mode) const;
     [[nodiscard]] QStringList lasagnaConfigPathsForMode(LasagnaMode mode) const;
     [[nodiscard]] QString selectedAtlasPath() const { return _atlasDirPath; }
@@ -92,6 +109,26 @@ signals:
     void lasagnaOutputActivated(const QString& outputName);
 
 private:
+    enum class Presentation {
+        Interactive,
+        Silent
+    };
+
+    struct SubmissionResult {
+        bool submitted{false};
+        QString error;
+
+        static SubmissionResult success()
+        {
+            return {.submitted = true};
+        }
+
+        static SubmissionResult failure(const QString& error)
+        {
+            return {.submitted = false, .error = error};
+        }
+    };
+
     void writeSetting(const QString& key, const QVariant& value);
     void populateConfigCombo(QComboBox* combo, const QString& dir,
                              const QString& selectName, QString& outPath,
@@ -103,7 +140,10 @@ private:
     void triggerOptimization();
     void launchLasagnaMode(LasagnaMode mode);
     void launchAtlasOptimization();
-    void startAtlasOptimization(CState* state, QStatusBar* statusBar);
+    [[nodiscard]] SubmissionResult startAtlasOptimization(
+        CState* state,
+        QStatusBar* statusBar,
+        Presentation presentation = Presentation::Interactive);
     void syncCompactConfigCombos();
     void syncCompactStatusFromFull();
     void updateCompactLinkedSurfaceTable(const QStringList& names);
@@ -111,21 +151,28 @@ private:
     [[nodiscard]] QStringList currentLinkedSurfaceNames() const;
     void showLasagnaConfigError(const QString& message,
                                 QStatusBar* statusBar,
-                                int timeoutMs);
+                                int timeoutMs,
+                                Presentation presentation = Presentation::Interactive);
     [[nodiscard]] bool validateLasagnaConfigPath(const QString& configPath,
-                                                 QStatusBar* statusBar);
+                                                 QStatusBar* statusBar,
+                                                 Presentation presentation =
+                                                     Presentation::Interactive);
     [[nodiscard]] bool validateAtlasDirPath(const QString& atlasDir,
-                                            QStatusBar* statusBar);
+                                            QStatusBar* statusBar,
+                                            Presentation presentation =
+                                                Presentation::Interactive);
     void populateAtlasCombo(const QString& volpkgRoot, const QString& selectPath);
     void refreshAtlasComboFromState();
-    void startOptimizationWithOverrides(CState* state,
-                                        QStatusBar* statusBar,
-                                        int modeOverride,
-                                        const QString& configPathOverride,
-                                        bool hasSeedOverride,
-                                        int seedX,
-                                        int seedY,
-                                        int seedZ);
+    [[nodiscard]] SubmissionResult startOptimizationWithOverrides(
+        CState* state,
+        QStatusBar* statusBar,
+        int modeOverride,
+        const QString& configPathOverride,
+        bool hasSeedOverride,
+        int seedX,
+        int seedY,
+        int seedZ,
+        Presentation presentation = Presentation::Interactive);
 
     // -- Sections --
     CollapsibleSettingsGroup* _connectionGroup{nullptr};
@@ -208,6 +255,7 @@ private:
 
     int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand, 3=offset
     LasagnaMode _lastLasagnaMode{LasagnaMode::ReOptimize};
+
     int _connectionMode{0};  // 0=internal, 1=external
     QString _externalHost{"127.0.0.1"};
     int _externalPort{9999};

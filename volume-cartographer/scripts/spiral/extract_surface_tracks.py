@@ -15,6 +15,7 @@ from vesuvius.data.utils import open_zarr
 
 predictions_zarr_path = 's3://volpkgs/s1_ds2.volpkg/volumes/2um_ds2_ps256_surf.zarr/0'
 tracks_dbm_path = '/home/paul/projects/vesuvius-scrolls/spiral/tracks/2um_ds2_ps256_surf_v2.dbm'
+write_native_packed_store = True
 
 # All wrt the original (full-resolution) volume; downsampling is applied internally after CC extraction
 downsample_factor = 4
@@ -235,6 +236,14 @@ def main():
 
         print('extracting vertical zy-plane tracks')
         extract_vertical(predictions_zarr_array, tracks_db, axis='x', min_yx=min_yx, max_yx=max_yx)
+
+    if write_native_packed_store:
+        # The DBM remains the resumable extraction format and compatibility
+        # source. Fits and crossing builds consume this adjacent packed store.
+        from tracks import _packed_store_if_current, write_packed_track_store
+        if _packed_store_if_current(tracks_dbm_path) is None:
+            write_packed_track_store(
+                tracks_dbm_path, force=True, show_progress=True)
 
 
 if __name__ == '__main__':

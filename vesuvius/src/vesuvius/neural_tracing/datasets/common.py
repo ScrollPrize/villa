@@ -21,9 +21,63 @@ from vesuvius.image_proc.intensity.normalization import normalize_zscore
 from vesuvius.neural_tracing.s3_utils import s3_storage_options_for_path
 import tifffile
 import warnings
+from collections.abc import MutableMapping
 
 
 _HTTP_PREFIXES = ('http://', 'https://')
+_ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
+
+if _ZARR_V3:
+    from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
+else:
+    # These names are only used by the Zarr 3 store implementation below.
+    OffsetByteRequest = RangeByteRequest = SuffixByteRequest = ()
+
+
+@dataclass
+class ZarrCacheTraceStats:
+    cache_hits: int = 0
+    downloads: int = 0
+    negative_hits: int = 0
+    missing: int = 0
+    cache_hit_bytes: int = 0
+    download_bytes: int = 0
+    cache_hit_ms: float = 0.0
+    download_ms: float = 0.0
+    missing_ms: float = 0.0
+
+
+_CACHE_TRACE_LOCAL = threading.local()
+
+
+def begin_zarr_cache_trace() -> None:
+    _CACHE_TRACE_LOCAL.stats = ZarrCacheTraceStats()
+
+
+def end_zarr_cache_trace() -> ZarrCacheTraceStats:
+    stats = getattr(_CACHE_TRACE_LOCAL, "stats", None)
+    _CACHE_TRACE_LOCAL.stats = None
+    return stats if isinstance(stats, ZarrCacheTraceStats) else ZarrCacheTraceStats()
+
+
+def _record_zarr_cache_event(kind: str, *, byte_count: int = 0, elapsed_ms: float = 0.0) -> None:
+    stats = getattr(_CACHE_TRACE_LOCAL, "stats", None)
+    if not isinstance(stats, ZarrCacheTraceStats):
+        return
+    if kind == "cache_hit":
+        stats.cache_hits += 1
+        stats.cache_hit_bytes += int(byte_count)
+        stats.cache_hit_ms += float(elapsed_ms)
+    elif kind == "download":
+        stats.downloads += 1
+        stats.download_bytes += int(byte_count)
+        stats.download_ms += float(elapsed_ms)
+    elif kind == "negative_hit":
+        stats.negative_hits += 1
+        stats.missing_ms += float(elapsed_ms)
+    elif kind == "missing":
+        stats.missing += 1
+        stats.missing_ms += float(elapsed_ms)
 
 
 class OfflineCacheMiss(Exception):
@@ -71,26 +125,24 @@ except ImportError:
     pass
 
 
-class _DiskCacheStore(zarr.storage.Store):
+class _DiskCacheStoreV3(getattr(zarr.storage, 'WrapperStore', object)):
     """Read-only Zarr v2 store wrapper that lazily caches remote bytes to disk."""
-
-    _readable = True
-    _writeable = False
-    _erasable = False
-    _listable = True
 
     def __init__(
         self,
-        remote: zarr.storage.BaseStore,
+        remote: Any,
         cache_dir: str,
         url: str,
         offline: bool = False,
         retry_budget_seconds: float = 0.0,
     ) -> None:
-        super().__init__()
+        super().__init__(remote)
         self._remote = remote
+        self._cache_root = cache_dir
+        self._url = url
         self._offline = offline
         self._retry_budget_seconds = float(retry_budget_seconds)
+        self._url = str(url)
         # Namespace cache by the normalized remote URL to prevent cross-dataset
         # chunk-key collisions. Zarr chunk keys are relative paths inside one
         # store (e.g. "c/0/1/2"), so without a per-URL prefix every dataset
@@ -105,8 +157,238 @@ class _DiskCacheStore(zarr.storage.Store):
     # with a real cached chunk filename.
     _NEGATIVE_MARKER_SUFFIX = ".__notfound__"
 
-    def _remote_get_with_retry(self, key):
+    @property
+    def supports_writes(self) -> bool:
+        return False
+
+    @property
+    def supports_deletes(self) -> bool:
+        return False
+
+    def with_read_only(self, read_only: bool = False):
+        if not read_only:
+            raise NotImplementedError("_DiskCacheStore is always read-only")
+        return type(self)(
+            self._remote.with_read_only(True),
+            self._cache_root,
+            self._url,
+            offline=self._offline,
+            retry_budget_seconds=self._retry_budget_seconds,
+        )
+
+    async def _remote_get_with_retry(self, key, prototype, byte_range=None):
         """Read one key from the wrapped remote store with backoff retries."""
+        if self._retry_budget_seconds <= 0.0:
+            return await self._remote.get(key, prototype, byte_range)
+
+        deadline = time.monotonic() + self._retry_budget_seconds
+        delay = 1.0
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self._remote.get(key, prototype, byte_range)
+            except _NEVER_RETRY_EXCEPTIONS:
+                raise
+            except _RETRYABLE_EXCEPTIONS as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    print(
+                        f"[_DiskCacheStore] giving up on {key!r} after "
+                        f"{attempt} attempts, "
+                        f"{self._retry_budget_seconds:.0f}s budget exhausted: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    raise
+                wait = min(delay, remaining, 60.0)
+                print(
+                    f"[_DiskCacheStore] transient error fetching {key!r} "
+                    f"(attempt {attempt}): {type(exc).__name__}: {exc}; "
+                    f"retrying in {wait:.1f}s "
+                    f"(remaining budget {remaining:.0f}s)",
+                    flush=True,
+                )
+                await asyncio.sleep(wait)
+                delay = min(delay * 2.0, 60.0)
+
+    def _atomic_write_bytes(self, target: str, data: bytes) -> None:
+        """Write `data` to `target` atomically.
+
+        Uses a per-process/thread temp file in the same directory + os.replace,
+        which is atomic on POSIX. Concurrent readers always see either the
+        old content or the new — never a partially written file.
+        """
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = f"{target}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _buffer_from_cached_bytes(data, prototype, byte_range=None):
+        if isinstance(byte_range, RangeByteRequest):
+            data = data[byte_range.start:byte_range.end]
+        elif isinstance(byte_range, OffsetByteRequest):
+            data = data[byte_range.offset:]
+        elif isinstance(byte_range, SuffixByteRequest):
+            data = data[-byte_range.suffix:]
+        elif byte_range is not None:
+            raise ValueError(f"unexpected byte range request: {byte_range!r}")
+        return prototype.buffer.from_bytes(data)
+
+    async def get(self, key, prototype, byte_range=None):
+        start = time.perf_counter()
+        cached = os.path.join(self._cache_dir, key)
+        marker = cached + self._NEGATIVE_MARKER_SUFFIX
+
+        # Positive cache hit.
+        if os.path.isfile(cached):
+            try:
+                with open(cached, 'rb') as f:
+                    data = f.read()
+                _record_zarr_cache_event(
+                    "cache_hit",
+                    byte_count=len(data),
+                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
+                )
+                return self._buffer_from_cached_bytes(data, prototype, byte_range)
+            except FileNotFoundError:
+                # Raced with a concurrent replace; fall through to re-fetch.
+                pass
+        # Negative cache hit → known-missing, skip the remote round-trip.
+        if os.path.isfile(marker):
+            _record_zarr_cache_event(
+                "negative_hit",
+                elapsed_ms=(time.perf_counter() - start) * 1000.0,
+            )
+            return None
+
+        if self._offline:
+            raise OfflineCacheMiss(
+                f"offline mode: chunk {key!r} not in local cache "
+                f"({self._cache_dir})"
+            )
+
+        # A partial response cannot populate the full-object disk cache. Range
+        # reads are uncommon for Zarr chunks, so delegate cache misses to the
+        # remote store and preserve its exact ByteRequest semantics.
+        result = await self._remote_get_with_retry(key, prototype, byte_range)
+        if result is None:
+            try:
+                self._atomic_write_bytes(marker, b"")
+            except OSError:
+                pass
+            _record_zarr_cache_event(
+                "missing",
+                elapsed_ms=(time.perf_counter() - start) * 1000.0,
+            )
+            return None
+
+        if byte_range is None:
+            data = result.to_bytes()
+            self._atomic_write_bytes(cached, data)
+            byte_count = len(data)
+        else:
+            byte_count = len(result.to_bytes())
+        _record_zarr_cache_event(
+            "download",
+            byte_count=byte_count,
+            elapsed_ms=(time.perf_counter() - start) * 1000.0,
+        )
+        return result
+
+    async def exists(self, key):
+        cached = os.path.join(self._cache_dir, key)
+        if os.path.isfile(cached):
+            return True
+        if os.path.isfile(cached + self._NEGATIVE_MARKER_SUFFIX):
+            return False
+        if self._offline:
+            return False
+        return await self._remote.exists(key)
+
+    async def get_partial_values(self, prototype, key_ranges):
+        return await asyncio.gather(*(
+            self.get(key, prototype, byte_range)
+            for key, byte_range in key_ranges
+        ))
+
+    async def set(self, key, value):
+        raise PermissionError("read-only cache store")
+
+    async def delete(self, key):
+        raise PermissionError("read-only cache store")
+
+    def close(self) -> None:
+        close_fn = getattr(self._remote, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, _DiskCacheStoreV3)
+            and self._remote == other._remote
+            and self._cache_dir == other._cache_dir
+        )
+
+
+class _DiskCacheStoreV2(MutableMapping):
+    """Read-only Zarr v2 mapping that lazily caches remote bytes to disk."""
+
+    _NEGATIVE_MARKER_SUFFIX = ".__notfound__"
+
+    def __init__(
+        self,
+        remote: MutableMapping,
+        cache_dir: str,
+        url: str,
+        offline: bool = False,
+        retry_budget_seconds: float = 0.0,
+    ) -> None:
+        self._remote = remote
+        self._cache_root = cache_dir
+        self._url = url
+        self._offline = offline
+        self._retry_budget_seconds = float(retry_budget_seconds)
+        normalized = url.rstrip('/')
+        scheme, sep, rest = normalized.partition('://')
+        subdir = os.path.join(scheme, rest) if sep else normalized
+        self._cache_dir = os.path.join(cache_dir, subdir)
+
+    def with_read_only(self, read_only: bool = False):
+        if not read_only:
+            raise NotImplementedError("_DiskCacheStore is always read-only")
+        return type(self)(
+            self._remote,
+            self._cache_root,
+            self._url,
+            offline=self._offline,
+            retry_budget_seconds=self._retry_budget_seconds,
+        )
+
+    def _atomic_write_bytes(self, target: str, data: bytes) -> None:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = f"{target}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _remote_get_with_retry(self, key):
         if self._retry_budget_seconds <= 0.0:
             return self._remote[key]
 
@@ -117,8 +399,6 @@ class _DiskCacheStore(zarr.storage.Store):
             attempt += 1
             try:
                 return self._remote[key]
-            except KeyError:
-                raise
             except _NEVER_RETRY_EXCEPTIONS:
                 raise
             except _RETRYABLE_EXCEPTIONS as exc:
@@ -143,27 +423,8 @@ class _DiskCacheStore(zarr.storage.Store):
                 time.sleep(wait)
                 delay = min(delay * 2.0, 60.0)
 
-    def _atomic_write_bytes(self, target: str, data: bytes) -> None:
-        """Write `data` to `target` atomically.
-
-        Uses a per-process/thread temp file in the same directory + os.replace,
-        which is atomic on POSIX. Concurrent readers always see either the
-        old content or the new — never a partially written file.
-        """
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        tmp = f"{target}.tmp.{os.getpid()}.{threading.get_ident()}"
-        try:
-            with open(tmp, 'wb') as f:
-                f.write(data)
-            os.replace(tmp, target)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-
     def __getitem__(self, key):
+        start = time.perf_counter()
         cached = os.path.join(self._cache_dir, key)
         marker = cached + self._NEGATIVE_MARKER_SUFFIX
 
@@ -171,14 +432,23 @@ class _DiskCacheStore(zarr.storage.Store):
         if os.path.isfile(cached):
             try:
                 with open(cached, 'rb') as f:
-                    return f.read()
+                    data = f.read()
+                _record_zarr_cache_event(
+                    "cache_hit",
+                    byte_count=len(data),
+                    elapsed_ms=(time.perf_counter() - start) * 1000.0,
+                )
+                return data
             except FileNotFoundError:
                 # Raced with a concurrent replace; fall through to re-fetch.
                 pass
         # Negative cache hit → known-missing, skip the remote round-trip.
         if os.path.isfile(marker):
+            _record_zarr_cache_event(
+                "negative_hit",
+                elapsed_ms=(time.perf_counter() - start) * 1000.0,
+            )
             raise KeyError(key)
-
         if self._offline:
             raise OfflineCacheMiss(
                 f"offline mode: chunk {key!r} not in local cache "
@@ -192,13 +462,19 @@ class _DiskCacheStore(zarr.storage.Store):
                 self._atomic_write_bytes(marker, b"")
             except OSError:
                 pass
+            _record_zarr_cache_event(
+                "missing",
+                elapsed_ms=(time.perf_counter() - start) * 1000.0,
+            )
             raise
 
-        if not isinstance(result, (bytes, bytearray, memoryview)):
-            result = bytes(result)
-        else:
-            result = bytes(result)
+        result = bytes(result)
         self._atomic_write_bytes(cached, result)
+        _record_zarr_cache_event(
+            "download",
+            byte_count=len(result),
+            elapsed_ms=(time.perf_counter() - start) * 1000.0,
+        )
         return result
 
     def get(self, key, default=None):
@@ -220,17 +496,8 @@ class _DiskCacheStore(zarr.storage.Store):
     def __iter__(self):
         return iter(self._remote)
 
-    def keys(self):
-        return self.__iter__()
-
     def __len__(self):
         return len(self._remote)
-
-    def listdir(self, path=None):
-        return self._remote.listdir(path)
-
-    def getsize(self, path=None):
-        return self._remote.getsize(path)
 
     def __setitem__(self, key, value):
         raise PermissionError("read-only cache store")
@@ -245,20 +512,24 @@ class _DiskCacheStore(zarr.storage.Store):
 
     def __eq__(self, other):
         return (
-            isinstance(other, _DiskCacheStore)
+            isinstance(other, _DiskCacheStoreV2)
             and self._remote == other._remote
             and self._cache_dir == other._cache_dir
         )
 
 
+_DiskCacheStore = _DiskCacheStoreV3 if _ZARR_V3 else _DiskCacheStoreV2
+
+
 def _make_remote_store(path: str, storage_opts: dict, *, missing_exceptions: tuple[type[Exception], ...]):
-    return zarr.storage.FSStore(
-        path.rstrip('/'),
-        mode='r',
-        exceptions=missing_exceptions,
-        missing_exceptions=missing_exceptions,
-        **storage_opts,
-    )
+    if _ZARR_V3:
+        return zarr.storage.FsspecStore.from_url(
+            path.rstrip('/'),
+            storage_options=storage_opts,
+            read_only=True,
+            allowed_exceptions=missing_exceptions,
+        )
+    return zarr.storage.FSStore(path.rstrip('/'), mode='r', **storage_opts)
 
 
 def _resolve_config_relative_path(path_value, config):

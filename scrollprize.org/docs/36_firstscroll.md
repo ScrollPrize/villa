@@ -1,7 +1,6 @@
 ---
 title: "An entire Herculaneum scroll has been read for the first time"
-sidebar_label: "First scroll read (Jun 2026)"
-hide_table_of_contents: true
+sidebar_label: "First scroll read"
 hide_title: true
 ---
 
@@ -27,6 +26,12 @@ import JsonLd from '@site/src/components/JsonLd';
 
 <JsonLd data={{"@context":"https://schema.org","@type":"NewsArticle","headline":"An entire Herculaneum scroll has been read for the first time","datePublished":"2026-06-25","dateModified":"2026-06-25","author":{"@type":"Organization","name":"Vesuvius Challenge"},"publisher":{"@type":"Organization","name":"Vesuvius Challenge","logo":{"@type":"ImageObject","url":"https://scrollprize.org/img/social/opengraph.jpg"}},"image":"https://scrollprize.org/img/firstscroll/og.webp","mainEntityOfPage":"https://scrollprize.org/firstscroll"}} />
 
+:::info[HISTORICAL MILESTONE]
+
+This announcement is from June 25th, 2026. See [Prizes](prizes) for what is open today.
+
+:::
+
 <figure className="!mt-0 !mb-6">
   <video autoPlay playsInline loop muted className="w-[100%] rounded-lg" poster="/img/firstscroll/hero-poster.webp">
     <source src="/img/firstscroll/hero-reveal.webm" type="video/webm" />
@@ -34,16 +39,9 @@ import JsonLd from '@site/src/components/JsonLd';
   </video>
 </figure>
 
-<h1 className="color-white text-4xl md:text-7xl font-black !mb-2 leading-none tracking-tighter">We read an <span style={{
-  background:
-    "radial-gradient(53.44% 245.78% at 13.64% 46.56%, #F5653F 0%, #D53A17 100%)",
-  WebkitBackgroundClip: "text",
-  WebkitTextFillColor: "transparent",
-  backgroundClip: "text",
-  textFillColor: "transparent",
-}}>entire scroll</span> — without ever opening it</h1>
+<h1 className="color-white text-4xl md:text-7xl !mb-2 leading-none">We read an <span className="text-accent">entire scroll</span> — without ever opening it</h1>
 
-<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none tracking-tight">PHerc. 1667, sealed since the eruption of Vesuvius in 79 AD, has been virtually unwrapped and read from beginning to end.</div>
+<div className="md:text-3xl text-lg font-medium mt-6 mb-2 opacity-80 leading-none">PHerc. 1667, sealed since the eruption of Vesuvius in 79 AD, has been virtually unwrapped and read from beginning to end.</div>
 
 <div className="opacity-60 mb-8 italic">June 25th, 2026</div>
 
@@ -54,17 +52,17 @@ For almost 2,000 years, the carbonized library of Herculaneum has kept a cruel b
 Today that changes. We have **completely virtually unwrapped and read PHerc. 1667** — the scroll the Vesuvius Challenge community knows as Scroll 4 — without ever touching its pages. It is the first Herculaneum papyrus to be digitally unrolled and read in full, end to end, and made available for sustained scholarly study.
 
 <figure className="my-6">
-  <div className="relative rounded-lg overflow-hidden border border-solid border-[#FFFFFF20]">
+  <div className="relative rounded-lg overflow-hidden border border-solid border-line">
     <div className="overflow-x-auto">
       <img src="/img/firstscroll/banner-strip.webp" data-zoom-src="/img/firstscroll/banner-full.webp" className="block !h-[200px] md:!h-[300px] w-auto max-w-none" alt="The complete unwrapped writing surface of PHerc. 1667, showing columns of ancient Greek text." />
     </div>
     {/* Scalebar overlay — pinned, stays in view while panning. Bar width = 10 cm at the displayed scale (depends on the h-[200px]/h-[300px] image heights above). */}
     <div className="pointer-events-none absolute left-3 bottom-3 flex flex-col items-start gap-1">
-      <span className="text-white text-xs md:text-sm font-semibold leading-none px-1.5 py-1 rounded bg-[#000000a6]">10 cm</span>
-      <div className="h-[5px] md:h-[6px] w-[179px] md:w-[269px] bg-white rounded-[2px] ring-1 ring-[#00000066]"></div>
+      <span className="text-white text-xs md:text-sm font-semibold leading-none px-1.5 py-1 rounded bg-black/65">10 cm</span>
+      <div className="h-[5px] md:h-[6px] w-[179px] md:w-[269px] bg-white rounded-[2px] ring-1 ring-black/40"></div>
     </div>
     {/* Credit overlay — pinned bottom-right */}
-    <div className="pointer-events-none absolute right-3 bottom-3 text-[#ffffffe6] text-xs md:text-sm font-medium leading-none px-1.5 py-1 rounded bg-[#000000a6]">© Vesuvius Challenge 2026</div>
+    <div className="pointer-events-none absolute right-3 bottom-3 text-white/90 text-xs md:text-sm font-medium leading-none px-1.5 py-1 rounded bg-black/65">© Vesuvius Challenge 2026</div>
   </div>
   <figcaption className="mt-0">The complete writing surface of PHerc. 1667, virtually unwrapped — roughly 1.4 metres of papyrus and around twenty-two columns of Greek. Scroll sideways to pan; click to zoom. <a href="/img/firstscroll/banner-full.webp" target="_blank" rel="noopener">Download the high-resolution image.</a></figcaption>
 </figure>

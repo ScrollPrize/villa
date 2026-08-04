@@ -6,13 +6,19 @@
 #endif
 
 #include <qapplication.h>
+#include <QAbstractSpinBox>
 #include <QCommandLineParser>
+#include <QComboBox>
+#include <QEvent>
+#include <QImageReader>
 
 #include "CWindow.hpp"
+#include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/Version.hpp"
 #include <QSettings>
 #include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/CrashHandler.hpp"
@@ -88,7 +94,40 @@ static bool hasCliFlag(int argc, char* argv[], const char* flag)
     return false;
 }
 
+class WheelFocusFilter final : public QObject
+{
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() != QEvent::Wheel)
+            return QObject::eventFilter(watched, event);
+
+        auto* widget = qobject_cast<QWidget*>(watched);
+        while (widget) {
+            if (auto* spinBox = qobject_cast<QAbstractSpinBox*>(widget)) {
+                if (!spinBox->hasFocus()) {
+                    event->ignore();
+                    return true;
+                }
+                break;
+            }
+            if (auto* comboBox = qobject_cast<QComboBox*>(widget)) {
+                if (!comboBox->hasFocus()) {
+                    event->ignore();
+                    return true;
+                }
+                break;
+            }
+            widget = widget->parentWidget();
+        }
+
+        return QObject::eventFilter(watched, event);
+    }
+};
+
+#if defined(__GNUC__) || defined(__clang__)
 __attribute__((visibility("default")))
+#endif
 auto main(int argc, char* argv[]) -> int
 {
 #ifdef _WIN32
@@ -111,6 +150,12 @@ auto main(int argc, char* argv[]) -> int
 
 #if defined(__GLIBC__) && !defined(VC_HAVE_MIMALLOC)
     // Tune glibc's malloc to give freed pages back to the OS more aggressively.
+    // Bound per-thread arenas before VC3D creates its worker pools. Smaller
+    // volume chunks increasingly use arena allocations rather than independent
+    // mmaps; allowing glibc's default (up to 8 * CPU count) let OpenMP/thread
+    // pool multiplication retain tens of GiB in 128-MiB arena mappings even
+    // after the cache references were released.
+    ::mallopt(M_ARENA_MAX, 4);
     // Lower M_MMAP_THRESHOLD pushes bigger allocations through mmap (returned
     // independently on free), reducing main-heap fragmentation. Lower
     // M_TRIM_THRESHOLD runs sbrk-trim more often. Only takes effect when
@@ -190,6 +235,16 @@ auto main(int argc, char* argv[]) -> int
     }
 
     QApplication app(argc, argv);
+    // Wide surface-aligned Spiral overlays can legitimately exceed Qt's
+    // 128-MiB default image-I/O allocation limit. Set the Qt runtime value
+    // after QApplication construction because Qt may cache the environment
+    // setting before VC3D's pre-main hook runs. Preserve an explicit user
+    // override and retain a finite allocation guard.
+    if (qEnvironmentVariableIsEmpty("QT_IMAGEIO_MAXALLOC")) {
+        QImageReader::setAllocationLimit(512);
+    }
+    WheelFocusFilter wheelFocusFilter;
+    app.installEventFilter(&wheelFocusFilter);
     QApplication::setOrganizationName("Vesuvius Challenge");
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
@@ -234,6 +289,12 @@ auto main(int argc, char* argv[]) -> int
         "Load the named segmentation folder first instead of loading all segmentation folders.",
         "folder");
     parser.addOption(loadFirstOption);
+
+    QCommandLineOption volumePackageOption(
+        "volpkg",
+        "Open a volume package at startup.",
+        "path");
+    parser.addOption(volumePackageOption);
 
     QCommandLineOption debugOption(
         "debug",
@@ -296,6 +357,19 @@ auto main(int argc, char* argv[]) -> int
         "200");
     parser.addOption(replayTimedProfilePeriodOption);
 
+    QCommandLineOption agentBridgeOption(
+        "agent-bridge",
+        "Enable the agent bridge (JSON-RPC over a local socket) on the default "
+        "socket name vc3d-agent-<pid>.");
+    parser.addOption(agentBridgeOption);
+
+    QCommandLineOption agentBridgeNameOption(
+        "agent-bridge-name",
+        "Enable the agent bridge on an explicit QLocalServer name (implies "
+        "--agent-bridge).",
+        "name");
+    parser.addOption(agentBridgeNameOption);
+
     parser.process(app);
 
     if (parser.isSet(debugOption)) {
@@ -347,6 +421,18 @@ auto main(int argc, char* argv[]) -> int
         vc::render::ChunkCache::setPersistentQuantizationDefault(
             settings.value(perf::REMOTE_CACHE_QUANTIZATION,
                            perf::REMOTE_CACHE_QUANTIZATION_DEFAULT).toInt());
+        constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+        vc::render::PersistentZarrCacheBudget::Limits limits;
+        const auto maximumGiB = settings.value(
+            perf::REMOTE_CACHE_MAX_GIB, perf::REMOTE_CACHE_MAX_GIB_DEFAULT).toULongLong();
+        if (maximumGiB > 0)
+            limits.maximumBytes = maximumGiB * gib;
+        limits.minimumFreeBytes = settings.value(
+            perf::REMOTE_CACHE_MIN_FREE_GIB,
+            perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong() * gib;
+        const auto cacheRoot = vc3d::remoteCachePath(
+            settings.value(viewer::REMOTE_CACHE_DIR).toString()).toStdString();
+        vc::render::PersistentZarrCacheBudget::configure(cacheRoot, limits);
     }
     if (parser.isSet(cacheSizeOption)) {
         bool ok = false;
@@ -372,6 +458,48 @@ auto main(int argc, char* argv[]) -> int
     int rc = 0;
     {
         CWindow aWin(cacheSizeGB, benchOptions);
+
+        if (parser.isSet(volumePackageOption)) {
+            QString errorMessage;
+            if (!aWin.openVolumePackage(parser.value(volumePackageOption).trimmed(),
+                                        false,
+                                        &errorMessage)) {
+                std::cerr << "Error: " << errorMessage.toStdString() << std::endl;
+                std::cout.flush();
+                std::cerr.flush();
+                std::_Exit(2);
+            }
+        }
+
+        // Agent bridge (opt-in, off by default). Constructed only when a bridge
+        // flag is present, so normal runs pay zero cost and open no socket.
+        std::unique_ptr<AgentBridgeServer> agentBridge;
+        const bool bridgeRequested =
+            parser.isSet(agentBridgeOption) || parser.isSet(agentBridgeNameOption);
+        if (bridgeRequested) {
+            QString bridgeName = parser.value(agentBridgeNameOption).trimmed();
+            if (bridgeName.isEmpty()) {
+                bridgeName = QStringLiteral("vc3d-agent-%1")
+                                 .arg(QCoreApplication::applicationPid());
+            }
+            agentBridge = std::make_unique<AgentBridgeServer>(&aWin);
+            if (!agentBridge->listen(bridgeName)) {
+                std::cerr << "Error: agent bridge failed to listen on '"
+                          << bridgeName.toStdString() << "'." << std::endl;
+                std::cout.flush();
+                std::cerr.flush();
+                // Exit like the std::_Exit path below rather than returning: a plain
+                // return runs DSO finalizers (gnutls/libtasn1 free through mimalloc
+                // post-teardown) and segfaults in _dl_fini. Nothing has loaded yet.
+                std::_Exit(2);
+            }
+            std::cout << "VC3D-AGENT-BRIDGE: listening name="
+                      << agentBridge->serverName().toStdString()
+                      << " path=" << agentBridge->fullServerName().toStdString()
+                      << std::endl;
+            std::cout.flush();
+        }
+
         aWin.show();
         rc = QApplication::exec();
     }

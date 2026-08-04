@@ -25,6 +25,7 @@
 namespace fs = std::filesystem;
 using vc::render::ChunkCache;
 using vc::render::ChunkDtype;
+using vc::render::DecodedChunkCacheBudget;
 using vc::render::ChunkFetchResult;
 using vc::render::ChunkFetchStatus;
 using vc::render::ChunkKey;
@@ -146,6 +147,44 @@ TEST_CASE("ChunkCache: first tryGetChunk queues; second returns the data")
     auto cached = c->tryGetChunk(0, 0, 0, 0);
     CHECK(cached.status == ChunkStatus::Data);
     CHECK(f->fetchCalls.load() == callsAfter);
+}
+
+TEST_CASE("ChunkCache: cache-only reads neither queue nor promote decoded chunks")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    for (int ix = 0; ix < 3; ++ix) {
+        ChunkFetchResult result;
+        result.status = ChunkFetchStatus::Found;
+        result.bytes = makeBytes(64, std::byte{static_cast<unsigned char>(ix + 1)});
+        f->setCanned({0, 0, 0, ix}, std::move(result));
+    }
+
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 12}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options opts;
+    opts.decodedByteCapacity = 1024;
+    opts.decodedByteBudget = std::make_shared<DecodedChunkCacheBudget>(128);
+    opts.maxConcurrentReads = 1;
+    opts.detectAllFillChunks = false;
+    ChunkCache cache(
+        std::move(levels),
+        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
+        0.0, ChunkDtype::UInt8, opts);
+
+    CHECK(cache.getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(f->fetchCalls.load() == 0);
+    REQUIRE(waitForResolved(cache, 0, 0, 0, 0).status == ChunkStatus::Data);
+    REQUIRE(waitForResolved(cache, 0, 0, 0, 1).status == ChunkStatus::Data);
+
+    // Looking at the oldest chunk as a fallback must not make it newer than
+    // the target working set.
+    CHECK(cache.getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::Data);
+    REQUIRE(waitForResolved(cache, 0, 0, 0, 2).status == ChunkStatus::Data);
+
+    CHECK(cache.getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+    CHECK(cache.getChunkIfCached(0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(cache.getChunkIfCached(0, 0, 0, 2).status == ChunkStatus::Data);
 }
 
 TEST_CASE("ChunkCache: getChunkBlocking returns Data immediately for a found chunk")
@@ -323,18 +362,32 @@ TEST_CASE("ChunkCache: ctor without options uses defaults")
 
 namespace {
 
-std::shared_ptr<ChunkCache> makeTinyCapacityCache(std::shared_ptr<CountingFetcher> f,
-                                                  std::chrono::milliseconds protection)
+std::shared_ptr<ChunkCache> makeTinyCapacityCache(
+    std::shared_ptr<CountingFetcher> f)
 {
     // 8x8x8 volume of 4x4x4 chunks: 8 chunks of 64 decoded bytes each.
-    // Capacity of 128 bytes holds two chunks; the eviction hard ceiling
-    // (2x capacity) holds four.
+    // Capacity of 128 bytes holds exactly two chunks.
     std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
     ChunkCache::Options opts;
     opts.maxConcurrentReads = 1;
     opts.detectAllFillChunks = true;
     opts.decodedByteCapacity = 128;
-    opts.evictionProtectionWindow = protection;
+    return std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
+        0.0, ChunkDtype::UInt8, opts);
+}
+
+std::shared_ptr<ChunkCache> makeSharedBudgetCache(
+    std::shared_ptr<CountingFetcher> f,
+    const std::shared_ptr<DecodedChunkCacheBudget>& budget)
+{
+    std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
+    ChunkCache::Options opts;
+    opts.maxConcurrentReads = 1;
+    opts.detectAllFillChunks = true;
+    opts.decodedByteCapacity = 1024;
+    opts.decodedByteBudget = budget;
     return std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
@@ -358,11 +411,74 @@ void cannedDataChunks(CountingFetcher& f, int count)
 
 } // namespace
 
-TEST_CASE("ChunkCache: recently touched entries survive over-budget stores")
+TEST_CASE("ChunkCache: shared decoded budget is enforced across caches")
+{
+    auto budget = std::make_shared<DecodedChunkCacheBudget>(128);
+    auto f1 = std::make_shared<CountingFetcher>();
+    auto f2 = std::make_shared<CountingFetcher>();
+    cannedDataChunks(*f1, 2);
+    cannedDataChunks(*f2, 2);
+    auto c1 = makeSharedBudgetCache(f1, budget);
+    auto c2 = makeSharedBudgetCache(f2, budget);
+
+    CHECK(waitForResolved(*c1, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c2, 0, 0, 0, 0).status == ChunkStatus::Data);
+    // Make c1's first chunk newer than c2's before adding a third chunk.
+    CHECK(c1->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c2, 0, 0, 0, 1).status == ChunkStatus::Data);
+
+    const auto stats = budget->stats();
+    CHECK(stats.decodedBytes <= 128);
+    CHECK(stats.maximumBytes == 128);
+    CHECK(stats.cacheCount == 2);
+    CHECK(c1->stats().decodedBytes == stats.decodedBytes);
+    CHECK(c1->stats().decodedByteCapacity == 128);
+    CHECK(c1->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(c2->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+}
+
+TEST_CASE("ChunkCache: invalidation releases shared decoded budget bytes")
+{
+    auto budget = std::make_shared<DecodedChunkCacheBudget>(128);
+    auto f1 = std::make_shared<CountingFetcher>();
+    auto f2 = std::make_shared<CountingFetcher>();
+    cannedDataChunks(*f1, 1);
+    cannedDataChunks(*f2, 1);
+    auto c1 = makeSharedBudgetCache(f1, budget);
+    auto c2 = makeSharedBudgetCache(f2, budget);
+
+    CHECK(waitForResolved(*c1, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c2, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(budget->stats().decodedBytes == 128);
+
+    c1->invalidate();
+    CHECK(budget->stats().decodedBytes == 64);
+    c2->invalidate();
+    CHECK(budget->stats().decodedBytes == 0);
+}
+
+TEST_CASE("ChunkCache: separate decoded budgets do not evict each other")
+{
+    auto normalBudget = std::make_shared<DecodedChunkCacheBudget>(64);
+    auto overlayBudget = std::make_shared<DecodedChunkCacheBudget>(64);
+    auto normalFetcher = std::make_shared<CountingFetcher>();
+    auto overlayFetcher = std::make_shared<CountingFetcher>();
+    cannedDataChunks(*normalFetcher, 1);
+    cannedDataChunks(*overlayFetcher, 1);
+    auto normal = makeSharedBudgetCache(normalFetcher, normalBudget);
+    auto overlay = makeSharedBudgetCache(overlayFetcher, overlayBudget);
+
+    CHECK(waitForResolved(*normal, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*overlay, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(normalBudget->stats().decodedBytes == 64);
+    CHECK(overlayBudget->stats().decodedBytes == 64);
+}
+
+TEST_CASE("ChunkCache: recently touched entries never exceed capacity")
 {
     auto f = std::make_shared<CountingFetcher>();
     cannedDataChunks(*f, 4);
-    auto c = makeTinyCapacityCache(f, std::chrono::minutes{10});
+    auto c = makeTinyCapacityCache(f);
 
     // Chunk order: (0,0,0), (0,0,1), (0,1,0), (0,1,1).
     CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
@@ -370,48 +486,97 @@ TEST_CASE("ChunkCache: recently touched entries survive over-budget stores")
     CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
     CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
 
-    // 4 x 64 = 256 bytes cached against a 128-byte budget: all four are
-    // inside the protection window and under the hard ceiling, so none may
-    // be evicted even though the cache is over budget.
-    CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::Data);
-    CHECK(c->tryGetChunk(0, 0, 0, 1).status == ChunkStatus::Data);
+    // Strict LRU retains only the two most recent chunks.
+    CHECK(c->stats().decodedBytes <= 128);
+    CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
     CHECK(c->tryGetChunk(0, 0, 1, 0).status == ChunkStatus::Data);
     CHECK(c->tryGetChunk(0, 0, 1, 1).status == ChunkStatus::Data);
-    CHECK(f->fetchCalls.load() == 4);
-    CHECK(c->stats().decodedBytes == 256);
 }
 
-TEST_CASE("ChunkCache: hard ceiling still evicts protected entries")
+TEST_CASE("ChunkCache: every store enforces the configured byte capacity")
 {
     auto f = std::make_shared<CountingFetcher>();
     cannedDataChunks(*f, 5);
-    auto c = makeTinyCapacityCache(f, std::chrono::minutes{10});
+    auto c = makeTinyCapacityCache(f);
 
     CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
     CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
     CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
     CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
-    // Fifth store pushes decoded bytes past the 256-byte hard ceiling; the
-    // LRU tail is reclaimed despite protection, back down to the ceiling.
     CHECK(waitForResolved(*c, 0, 1, 0, 0).status == ChunkStatus::Data);
 
-    CHECK(c->stats().decodedBytes == 256);
+    CHECK(c->stats().decodedBytes <= 128);
     CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
     CHECK(c->tryGetChunk(0, 1, 0, 0).status == ChunkStatus::Data);
 }
 
-TEST_CASE("ChunkCache: zero protection window restores strict-capacity LRU")
+TEST_CASE("ChunkCache: a new view priority epoch does not relax capacity")
 {
     auto f = std::make_shared<CountingFetcher>();
-    cannedDataChunks(*f, 4);
-    auto c = makeTinyCapacityCache(f, std::chrono::milliseconds{0});
+    cannedDataChunks(*f, 5);
+    auto c = makeTinyCapacityCache(f);
 
+    c->beginViewRequest();
     CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
     CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
     CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
     CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 1, 0, 0).status == ChunkStatus::Data);
 
-    // Strict LRU: only the two most recent chunks fit the 128-byte budget.
+    // View epochs affect fetch priority only; decoded storage remains strict.
+    CHECK(c->stats().decodedBytes <= 128);
+    CHECK(c->tryGetChunk(0, 1, 0, 0).status == ChunkStatus::Data);
+}
+
+TEST_CASE("ChunkCache: entries from an earlier view epoch stay evictable")
+{
+    auto f = std::make_shared<CountingFetcher>();
+    cannedDataChunks(*f, 4);
+    auto c = makeTinyCapacityCache(f);
+
+    CHECK(waitForResolved(*c, 0, 0, 0, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 0, 1).status == ChunkStatus::Data);
+
+    // Advancing request priority does not change ordinary LRU eviction.
+    c->beginViewRequest();
+    CHECK(waitForResolved(*c, 0, 0, 1, 0).status == ChunkStatus::Data);
+    CHECK(waitForResolved(*c, 0, 0, 1, 1).status == ChunkStatus::Data);
+
+    CHECK(c->stats().decodedBytes <= 128);
+    CHECK(c->tryGetChunk(0, 0, 1, 0).status == ChunkStatus::Data);
+    CHECK(c->tryGetChunk(0, 0, 1, 1).status == ChunkStatus::Data);
+}
+
+TEST_CASE("ChunkCache: a large view working set never exceeds capacity")
+{
+    // 16x8x8 volume of 4x4x4 chunks: 16 chunks.
+    auto f = std::make_shared<CountingFetcher>();
+    for (int iz = 0; iz < 4; ++iz)
+        for (int iy : {0, 1})
+            for (int ix : {0, 1}) {
+                ChunkFetchResult fr;
+                fr.status = ChunkFetchStatus::Found;
+                fr.bytes = makeBytes(64, std::byte{99});
+                f->setCanned({0, iz, iy, ix}, fr);
+            }
+    std::vector<ChunkCache::LevelInfo> levels = {{{16, 8, 8}, {4, 4, 4}, {}}};
+    ChunkCache::Options opts;
+    opts.maxConcurrentReads = 1;
+    opts.detectAllFillChunks = true;
+    opts.decodedByteCapacity = 128;
+    auto c = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
+        0.0, ChunkDtype::UInt8, opts);
+
+    c->beginViewRequest();
+    for (int i = 0; i < 9; ++i) {
+        const int iz = i / 4;
+        const int iy = (i / 2) % 2;
+        const int ix = i % 2;
+        CHECK(waitForResolved(*c, 0, iz, iy, ix).status == ChunkStatus::Data);
+    }
+
     CHECK(c->stats().decodedBytes <= 128);
     CHECK(c->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
 }
@@ -497,6 +662,46 @@ TEST_CASE("ChunkCache: coarser levels are fetched before finer ones")
     REQUIRE(order.size() == 3);
     CHECK(order[1].level == 1); // coarse chunk jumped the fine one
     CHECK(order[2].level == 0);
+}
+
+TEST_CASE("ChunkCache: an exclusive new view discards unresolved old-view fetches")
+{
+    auto f = std::make_shared<BlockingOrderFetcher>();
+    std::vector<ChunkCache::LevelInfo> levels = {
+        {{4, 4, 4096}, {4, 4, 4}, {}},
+    };
+    ChunkCache::Options opts;
+    opts.maxConcurrentReads = 1;
+    opts.detectAllFillChunks = false;
+    auto c = std::make_shared<ChunkCache>(
+        std::move(levels),
+        std::vector<std::shared_ptr<vc::render::IChunkFetcher>>{f},
+        0.0, ChunkDtype::UInt8, opts);
+
+    // One old-view fetch is running and three more are queued.
+    (void)c->tryGetChunk(0, 0, 0, 0);
+    f->waitFirstStarted();
+    for (int ix = 1; ix < 4; ++ix)
+        (void)c->tryGetChunk(0, 0, 0, ix);
+    c->beginViewRequest(/*discardPending=*/true);
+
+    // Repeated pans while the old fetch is still running must not accumulate
+    // executor work outside the ChunkCache entry map.
+    for (int view = 0; view < 20; ++view) {
+        const int firstChunk = 5 + view * 32;
+        for (int ix = firstChunk; ix < firstChunk + 32; ++ix)
+            (void)c->tryGetChunk(0, 0, 0, ix);
+        c->beginViewRequest(/*discardPending=*/true);
+    }
+
+    f->release();
+    // The new view remains usable. Superseded queued jobs were removed before
+    // they could call the fetcher; the one already-running old job may finish.
+    CHECK(waitForResolved(*c, 0, 0, 0, 4).status == ChunkStatus::Data);
+    const auto order = f->order();
+    REQUIRE(order.size() == 2);
+    CHECK(order[0].ix == 0);
+    CHECK(order[1].ix == 4);
 }
 
 TEST_CASE("ChunkCache: disk-cached chunks resolve without touching the fetcher pool")

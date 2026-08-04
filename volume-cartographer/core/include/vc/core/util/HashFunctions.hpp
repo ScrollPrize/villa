@@ -29,7 +29,7 @@ namespace std {
 }
 
 struct vec3i_hash {
-    static inline size_t operator()(cv::Vec3i p)
+    size_t operator()(const cv::Vec3i& p) const
     {
         size_t hash1 = std::hash<int>{}(p[0]);
         size_t hash2 = std::hash<int>{}(p[1]);
@@ -42,7 +42,7 @@ struct vec3i_hash {
 };
 
 struct vec3f_hash {
-    static inline size_t operator()(cv::Vec3f p)
+    size_t operator()(const cv::Vec3f& p) const
     {
         size_t hash1 = std::hash<float>{}(p[0]);
         size_t hash2 = std::hash<float>{}(p[1]);
@@ -55,7 +55,7 @@ struct vec3f_hash {
 };
 
 struct vec4i_hash {
-    static inline size_t operator()(cv::Vec4i p)
+    size_t operator()(const cv::Vec4i& p) const
     {
         size_t hash1 = std::hash<int>{}(p[0]);
         size_t hash2 = std::hash<int>{}(p[1]);
@@ -72,7 +72,7 @@ struct vec4i_hash {
 };
 
 struct string_pair_hash {
-    static inline size_t operator()(const std::pair<std::string,std::string>& p)
+    size_t operator()(const std::pair<std::string,std::string>& p) const
     {
         size_t hash1 = std::hash<std::string>{}(p.first);
         size_t hash2 = std::hash<std::string>{}(p.second);

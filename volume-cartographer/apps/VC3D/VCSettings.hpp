@@ -64,7 +64,10 @@ inline QString remoteCachePath(const QString& suggestion = {})
 inline QString settingsFilePath()
 {
     // Settings must stay in the user's home — /ephemeral is lost on stop.
-    const QString configDir = QDir::homePath() + "/.VC3D";
+    // Tests may redirect the otherwise fixed per-user directory without
+    // changing production behavior.
+    QString configDir = qEnvironmentVariable("VC3D_CONFIG_DIR").trimmed();
+    if (configDir.isEmpty()) configDir = QDir::homePath() + "/.VC3D";
     QDir dir;
     if (!dir.exists(configDir)) {
         dir.mkpath(configDir);
@@ -248,6 +251,13 @@ namespace perf {
     constexpr auto REMOTE_CACHE_QUANTIZATION = "perf/remote_cache_quantization";
     constexpr int REMOTE_CACHE_QUANTIZATION_DEFAULT = 1;
 
+    // Shared budget for every managed remote Zarr chunk beneath the resolved
+    // vc3d cache root. Zero maximum means unlimited.
+    constexpr auto REMOTE_CACHE_MAX_GIB = "perf/remote_cache_max_gib";
+    constexpr qulonglong REMOTE_CACHE_MAX_GIB_DEFAULT = 0;
+    constexpr auto REMOTE_CACHE_MIN_FREE_GIB = "perf/remote_cache_min_free_gib";
+    constexpr qulonglong REMOTE_CACHE_MIN_FREE_GIB_DEFAULT = 20;
+
     // LOD synthesis method.  Selects how c3d chunks are decoded when a
     // downscaled view is requested.  Value is one of:
     //   "codec_synthesis"   — call c3d_chunk_decode_lod; codec-native filter.
@@ -265,6 +275,35 @@ namespace perf {
 }
 
 // -----------------------------------------------------------------------------
+// Spiral Workspace Settings
+//
+// Spiral-only and independent of perf::RAM_CACHE_SIZE_GB, which keeps governing
+// the main workspace's shared decoded-chunk budget. All three apply without a
+// restart.
+// -----------------------------------------------------------------------------
+namespace spiral {
+    // Budget for the flattened view's cache of resampled surface space, for the
+    // displayed (base) volume. 0 disables it, so the flattened view samples the
+    // volume every frame as it did before the cache existed.
+    constexpr auto SURFACE_CACHE_GB = "spiral/surface_cache_gb";
+    constexpr int SURFACE_CACHE_GB_DEFAULT = 4;
+
+    // Same, for the overlay volume. Its own budget because overlay and base
+    // compete for nothing else. 0 disables it and leaves the overlay channel on
+    // its existing resident-only sampling path.
+    constexpr auto OVERLAY_SURFACE_CACHE_GB = "spiral/overlay_surface_cache_gb";
+    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 0;
+
+    // LRU cap for the private decoded-chunk pool behind the spiral slice panes.
+    // A floor rather than a ceiling: it is raised automatically when it cannot
+    // hold one frame (otherwise a single render thrashes), and the status bar
+    // reports the effective value. The surface-tile filler gets a pool of the
+    // same size as an internal constant.
+    constexpr auto PLANE_CHUNK_CACHE_MB = "spiral/plane_chunk_cache_mb";
+    constexpr int PLANE_CHUNK_CACHE_MB_DEFAULT = 2048;
+}
+
+// -----------------------------------------------------------------------------
 // Main Window Settings
 // -----------------------------------------------------------------------------
 namespace window {
@@ -279,9 +318,15 @@ namespace window {
 
 namespace line_annotation {
     constexpr auto GEOMETRY = "lineAnnotation/geometry";
+    constexpr auto INITIAL_CENTERLINE_LENGTH_VX = "lineAnnotation/initial_centerline_length_vx";
+    constexpr int INITIAL_CENTERLINE_LENGTH_VX_DEFAULT = 2400;
+    constexpr auto EXTRAPOLATION_DISTANCE_VX = "lineAnnotation/extrapolation_distance_vx";
+    constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
-    constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes";
+    // "_v2" retires ratios saved before the fixed top strip / smaller bottom
+    // strip layout; old values would override the new default proportions.
+    constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";
     constexpr auto TOP_SPLITTER_SIZES = "lineAnnotation/top_splitter_sizes";
     constexpr auto STRIP_SPLITTER_SIZES = "lineAnnotation/strip_splitter_sizes";
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
@@ -449,6 +494,7 @@ namespace volume_overlay {
     constexpr auto WINDOW_HIGH = "window_high";
     constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
+    constexpr auto SAMPLING_METHOD = "sampling_method";
     constexpr auto MAX_DISPLAYED_RESOLUTION = "max_displayed_resolution";
     constexpr auto COMPOSITE_ENABLED = "composite_enabled";
     constexpr auto COMPOSITE_METHOD = "composite_method";
@@ -456,6 +502,7 @@ namespace volume_overlay {
     constexpr auto COMPOSITE_LAYERS_BEHIND = "composite_layers_behind";
 
     constexpr int MAX_DISPLAYED_RESOLUTION_DEFAULT = 0;
+    constexpr auto SAMPLING_METHOD_DEFAULT = "nearest";
     constexpr bool COMPOSITE_ENABLED_DEFAULT = false;
     constexpr auto COMPOSITE_METHOD_DEFAULT = "max";
     constexpr int COMPOSITE_LAYERS_FRONT_DEFAULT = 8;

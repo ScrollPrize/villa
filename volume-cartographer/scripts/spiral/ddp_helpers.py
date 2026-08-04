@@ -1,3 +1,4 @@
+import datetime
 import os
 
 import torch
@@ -41,7 +42,20 @@ def maybe_init_distributed():
     if not is_distributed():
         return
     torch.cuda.set_device(get_local_rank())
-    dist.init_process_group(backend='nccl')
+    # The default NCCL PG timeout is 10 min, and the ncclUniqueId is exchanged
+    # via the c10d store on the *first* collective. Since that first collective
+    # (broadcast_model_params) runs only after slow, per-rank startup work, any
+    # startup skew > timeout makes the fastest ranks bail in store->get with a
+    # 600000ms timeout. Give startup plenty of headroom.
+    timeout_min = int(os.environ.get('FIT_SPIRAL_DDP_TIMEOUT_MIN', '60'))
+    dist.init_process_group(
+        backend='nccl',
+        timeout=datetime.timedelta(minutes=timeout_min),
+    )
+    # Force the NCCL communicator to be built now, while all ranks are still in
+    # sync right after init, rather than lazily after divergent startup. This
+    # ensures a real HW/link fault is reported immediately.
+    dist.barrier(device_ids=[get_local_rank()])
 
 
 def maybe_destroy_distributed():
@@ -67,7 +81,7 @@ def allreduce_grads_(params):
         p.grad.div_(world_size)
 
 
-def split_counts_across_ranks(config, count_keys, split_key='distributed_split_batch'):
+def split_counts_across_ranks(config, count_keys, split_key='optimizer_distributed_split_batch'):
     world_size = get_world_size()
     if world_size == 1 or not config[split_key]:
         return 1
@@ -91,21 +105,22 @@ class StepTimer:
             return
         event = torch.cuda.Event(enable_timing=True)
         event.record()
-        self._events[name] = [event, None]
+        self._events.setdefault(name, []).append([event, None])
 
     def stop(self, name):
         if not self.enabled:
             return
         event = torch.cuda.Event(enable_timing=True)
         event.record()
-        self._events[name][1] = event
+        self._events[name][-1][1] = event
 
     def tick(self):
         if not self.enabled:
             return
         torch.cuda.synchronize()
-        for name, (start, stop) in self._events.items():
-            self.totals[name] = self.totals.get(name, 0.0) + start.elapsed_time(stop)
+        for name, intervals in self._events.items():
+            elapsed = sum(start.elapsed_time(stop) for start, stop in intervals)
+            self.totals[name] = self.totals.get(name, 0.0) + elapsed
         self._events.clear()
         self.count += 1
 

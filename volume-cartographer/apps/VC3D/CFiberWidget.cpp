@@ -8,6 +8,7 @@
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QColor>
+#include <QDoubleSpinBox>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
@@ -22,6 +23,7 @@
 #include <QStyledItemDelegate>
 #include <QStyleOptionViewItem>
 #include <QStringList>
+#include <QTimer>
 #include <QTreeView>
 #include <QVBoxLayout>
 
@@ -35,6 +37,8 @@ namespace {
 enum FiberColumn {
     kNameColumn = 0,
     kDirectionColumn,
+    kLinkColumn,
+    kPendingColumn,
     kLengthColumn,
     kControlPointsColumn,
     kLinePointsColumn,
@@ -290,11 +294,54 @@ void CFiberWidget::setupUi()
         }
     });
 
+    auto* fiberDisplayLayout = new QHBoxLayout();
+    _showFibersCheckBox = new QCheckBox(tr("Show fibers"), mainWidget);
+    _showFibersCheckBox->setObjectName(QStringLiteral("fiberShowFibersCheckBox"));
+    _showFibersCheckBox->setEnabled(false);
+    _showFibersCheckBox->setToolTip(
+        tr("Show all loaded fibers as control-point chains in the volume viewers."));
+    fiberDisplayLayout->addWidget(_showFibersCheckBox);
+    connect(_showFibersCheckBox, &QCheckBox::toggled,
+            this, &CFiberWidget::showFibersToggled);
+
+    _showLinkedCheckBox = new QCheckBox(tr("Show linked"), mainWidget);
+    _showLinkedCheckBox->setObjectName(QStringLiteral("fiberShowLinkedCheckBox"));
+    _showLinkedCheckBox->setEnabled(false);
+    _showLinkedCheckBox->setToolTip(
+        tr("Color linked fibers as one group and mark linked control points "
+           "(blue = pending, purple = approved)."));
+    fiberDisplayLayout->addWidget(_showLinkedCheckBox);
+    connect(_showLinkedCheckBox, &QCheckBox::toggled,
+            this, &CFiberWidget::showLinkedToggled);
+
+    auto* viewDistanceLabel = new QLabel(tr("View distance:"), mainWidget);
+    fiberDisplayLayout->addWidget(viewDistanceLabel);
+    _fiberViewDistanceSpinBox = new QDoubleSpinBox(mainWidget);
+    _fiberViewDistanceSpinBox->setObjectName(QStringLiteral("fiberViewDistanceSpinBox"));
+    _fiberViewDistanceSpinBox->setRange(0.0, 10000.0);
+    _fiberViewDistanceSpinBox->setDecimals(1);
+    _fiberViewDistanceSpinBox->setSingleStep(1.0);
+    _fiberViewDistanceSpinBox->setValue(10.0);
+    _fiberViewDistanceSpinBox->setSuffix(tr(" vx"));
+    _fiberViewDistanceSpinBox->setMaximumWidth(100);
+    _fiberViewDistanceSpinBox->setToolTip(
+        tr("Maximum distance from the current plane or surface at which fibers remain visible."));
+    viewDistanceLabel->setBuddy(_fiberViewDistanceSpinBox);
+    fiberDisplayLayout->addWidget(_fiberViewDistanceSpinBox);
+    fiberDisplayLayout->addStretch(1);
+    layout->addLayout(fiberDisplayLayout);
+    connect(_fiberViewDistanceSpinBox,
+            qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this,
+            &CFiberWidget::fiberViewDistanceChanged);
+
     _model = new QStandardItemModel(this);
     _model->setColumnCount(kColumnCount);
     _model->setHorizontalHeaderLabels({
         tr("name"),
         tr("dir"),
+        tr("link"),
+        tr("pending"),
         tr("len"),
         tr("cps"),
         tr("pts"),
@@ -320,6 +367,8 @@ void CFiberWidget::setupUi()
     _treeView->header()->setSortIndicator(_sortColumn, _sortOrder);
     _treeView->setColumnWidth(kNameColumn, 220);
     _treeView->setColumnWidth(kDirectionColumn, 42);
+    _treeView->setColumnWidth(kLinkColumn, 42);
+    _treeView->setColumnWidth(kPendingColumn, 56);
     _treeView->setColumnWidth(kLengthColumn, 72);
     _treeView->setColumnWidth(kControlPointsColumn, 48);
     _treeView->setColumnWidth(kLinePointsColumn, 48);
@@ -412,6 +461,48 @@ void CFiberWidget::setupUi()
 
     updateClassificationUi();
     setWidget(mainWidget);
+}
+
+void CFiberWidget::setShowFibersAvailable(bool available)
+{
+    _showFibersCheckBox->setEnabled(available);
+    _showLinkedCheckBox->setEnabled(available);
+    if (!available) {
+        setShowFibersChecked(false);
+    }
+}
+
+void CFiberWidget::setShowFibersChecked(bool checked)
+{
+    const QSignalBlocker blocker(_showFibersCheckBox);
+    _showFibersCheckBox->setChecked(checked);
+}
+
+bool CFiberWidget::showFibersChecked() const
+{
+    return _showFibersCheckBox->isChecked();
+}
+
+void CFiberWidget::setShowLinkedChecked(bool checked)
+{
+    const QSignalBlocker blocker(_showLinkedCheckBox);
+    _showLinkedCheckBox->setChecked(checked);
+}
+
+bool CFiberWidget::showLinkedChecked() const
+{
+    return _showLinkedCheckBox->isChecked();
+}
+
+void CFiberWidget::setFiberViewDistance(double distance)
+{
+    const QSignalBlocker blocker(_fiberViewDistanceSpinBox);
+    _fiberViewDistanceSpinBox->setValue(distance);
+}
+
+double CFiberWidget::fiberViewDistance() const
+{
+    return _fiberViewDistanceSpinBox->value();
 }
 
 QString CFiberWidget::displayNameForFiber(const FiberEntry& fiber)
@@ -591,6 +682,8 @@ void CFiberWidget::rebuildModel()
     _model->setHorizontalHeaderLabels({
         tr("name"),
         tr("dir"),
+        tr("link"),
+        tr("pending"),
         tr("len"),
         tr("cps"),
         tr("pts"),
@@ -606,6 +699,12 @@ void CFiberWidget::rebuildModel()
         QList<QStandardItem*> row{
             readOnlyItem(displayNameForFiber(fiber)),
             readOnlyItem(directionForFiber(fiber)),
+            readOnlyItem(fiber.linkedFiberCount > 0
+                             ? QString::number(fiber.linkedFiberCount)
+                             : QString()),
+            readOnlyItem(fiber.pendingLinkCount > 0
+                             ? QString::number(fiber.pendingLinkCount)
+                             : QString()),
             readOnlyItem(formatDouble(fiber.lengthVx, 1)),
             readOnlyItem(QString::number(fiber.controlPointCount)),
             readOnlyItem(QString::number(fiber.linePointCount)),
@@ -624,6 +723,8 @@ void CFiberWidget::rebuildModel()
             QList<QStandardItem*> childRow{
                 readOnlyItem(spanName),
                 readOnlyItem(directionForFiber(fiber)),
+                readOnlyItem(QString()),
+                readOnlyItem(QString()),
                 readOnlyItem(formatDouble(span.lengthVx, 1)),
                 readOnlyItem(QString::number(span.controlPointCount)),
                 readOnlyItem(QString::number(span.linePointCount)),
@@ -752,6 +853,14 @@ void CFiberWidget::sortFibers()
             less = compareText(a, b);
             break;
         }
+        case kLinkColumn:
+            different = lhs.linkedFiberCount != rhs.linkedFiberCount;
+            less = compareNumber(lhs.linkedFiberCount, rhs.linkedFiberCount);
+            break;
+        case kPendingColumn:
+            different = lhs.pendingLinkCount != rhs.pendingLinkCount;
+            less = compareNumber(lhs.pendingLinkCount, rhs.pendingLinkCount);
+            break;
         case kLengthColumn:
             different = lhs.lengthVx != rhs.lengthVx;
             less = compareNumber(lhs.lengthVx, rhs.lengthVx);
@@ -940,12 +1049,15 @@ void CFiberWidget::onAddTagClicked()
     const std::vector<uint64_t> previousSelection = selectedFiberIds();
     _newTagEdit->clear();
     addUniqueSorted(_knownTags, tag.toStdString());
+    const uint64_t fiberId = _selectedFiberId;
     applyTagLocally(_selectedFiberId, tag.toStdString(), true);
     sortFibers();
     rebuildModel();
     selectFibers(previousSelection);
-    emit fiberTagChanged(_selectedFiberId, tag, true);
     rebuildTagList();
+    QTimer::singleShot(0, this, [this, fiberId, tag]() {
+        emit fiberTagChanged(fiberId, tag, true);
+    });
 }
 
 void CFiberWidget::onHeaderSectionClicked(int section)
@@ -1038,11 +1150,14 @@ void CFiberWidget::requestFiberTagChange(const QString& tag, bool enabled)
         return;
     }
     const std::vector<uint64_t> previousSelection = selectedFiberIds();
+    const uint64_t fiberId = _selectedFiberId;
     applyTagLocally(_selectedFiberId, tag.toStdString(), enabled);
     sortFibers();
     rebuildModel();
     selectFibers(previousSelection);
-    emit fiberTagChanged(_selectedFiberId, tag, enabled);
+    QTimer::singleShot(0, this, [this, fiberId, tag, enabled]() {
+        emit fiberTagChanged(fiberId, tag, enabled);
+    });
 }
 
 void CFiberWidget::applyTagLocally(uint64_t fiberId, const std::string& tag, bool enabled)
@@ -1135,6 +1250,20 @@ void CFiberWidget::showContextMenu(const QPoint& pos)
         const auto ids = selectedFiberIds();
         if (!ids.empty()) {
             emit addFibersToPointCollectionsRequested(ids);
+        }
+    });
+    auto* addToSpiralAction = menu.addAction(
+        selectedForCollection.size() > 1
+            ? tr("Add %1 lines to current spiral fit").arg(selectedForCollection.size())
+            : tr("Add to current spiral fit"));
+    addToSpiralAction->setEnabled(_spiralFitAvailable && !selectedForCollection.empty());
+    addToSpiralAction->setToolTip(_spiralFitAvailable
+        ? tr("Upload the fiber(s) to the active Spiral session; they are used on the next run")
+        : tr("No Spiral session is active on the connected service"));
+    connect(addToSpiralAction, &QAction::triggered, this, [this]() {
+        const auto ids = selectedFiberIds();
+        if (!ids.empty()) {
+            emit addFibersToSpiralFitRequested(ids);
         }
     });
     auto* renameAction = createRenameFiberFileAction(&menu);

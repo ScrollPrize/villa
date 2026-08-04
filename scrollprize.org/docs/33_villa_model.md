@@ -47,7 +47,7 @@ Here are some bonuses:
 * [CAD file (.ldr)](https://drive.google.com/file/d/19mWyPmxUkGZDcNYq97MesiavrAZVZQA4/view?usp=drive_link)
 
 3D model viewer and some renders below:
-<div style={{ width: "90%", aspectRatio: 2/1 }}>
+<div style={{ width: "90%", aspectRatio: 2/1, minHeight: "340px" }}>
     <iframe
     title="New swiftXR Project"
     frameborder="0"

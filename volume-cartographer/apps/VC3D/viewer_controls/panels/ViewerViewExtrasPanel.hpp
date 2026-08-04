@@ -10,6 +10,7 @@ class ViewerViewExtrasPanel : public QWidget
 
 public:
     explicit ViewerViewExtrasPanel(ViewerManager* viewerManager, QWidget* parent = nullptr);
+    void setViewerManager(ViewerManager* viewerManager) { _viewerManager = viewerManager; }
 
 private:
     ViewerManager* _viewerManager{nullptr};
