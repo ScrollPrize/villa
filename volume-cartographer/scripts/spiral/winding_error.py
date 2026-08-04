@@ -11,6 +11,14 @@ candidate winding solution against a phantom's exact per-voxel winding field:
   per-winding     MAE binned by true winding index (where does it drift?)
   torn vs clean   breakdown over the phantom's signal-dropout tear regions
 
+Relation to spiralcheck (github.com/Nicodol/spiralcheck): complementary, not
+competing. spiralcheck scores REAL whole-scroll fits from their output meshes
+against held-out human-verified patches -- evaluation this tool cannot do,
+since real scrolls have no truth. This tool scores against EXACT synthetic
+truth at every voxel, including regions no human annotated -- evaluation
+held-out patches cannot do, since they inherit human labels' locations and
+noise. Use spiralcheck on real fits; use this on phantoms.
+
 Candidates:
   --candidate-checkpoint      a phantom checkpoint (self-tests, method dev) or
                               a real fit checkpoint (needs --umbilicus, loaded
@@ -19,11 +27,25 @@ Candidates:
                               phantom's voxel grid -- so ANY method that
                               produces a winding field (e.g. a lasagna winding
                               volume) can be scored, not just spiral fits
+  --candidate-tifxyz          a tifxyz surface directory (or a directory of
+                              them) -- the pipeline's lingua franca, and what
+                              spiralcheck consumes -- scored by where its
+                              vertices actually sit in phantom truth
 
 Gauge: a candidate fit of the same volume can differ from the phantom by a
 constant winding offset (theta-origin / winding-index choice), so residuals
 are aligned by their median before scoring; raw (unaligned) MAE is also
-reported. Opposite-sense (CW vs ACW) candidates are not auto-detected.
+reported. KNOWN CONSEQUENCE: a globally constant mis-count (every voxel
+off by exactly +1 winding) is absorbed as gauge and scores as zero error --
+inspect the reported gauge offset, which is where such errors surface.
+Opposite-sense (CW vs ACW) candidates are not auto-detected.
+
+Topology caveat: switch rate is a POINTWISE assignment metric, not a
+connectivity metric -- it does not detect all topological defects (the
+surface-detection Kaggle competition used deliberately topology-aware scoring
+for that reason, and spiralcheck's intrinsic winding-order checks cover
+related ground). The tifxyz mode's grid-discontinuity figure is a first
+topology-flavoured check, not a substitute.
 
 Branch cut: a winding field w = (r - theta*dr/2pi)/dr necessarily jumps by 1
 across its theta=0 ray. When truth and candidate place that ray differently, a
@@ -44,6 +66,7 @@ import torch
 from checkpoint_io import load_checkpoint_cpu
 from sample_spiral import get_theta_and_radii
 from synth_phantom import build_model_from_phantom_checkpoint, build_model
+from tifxyz import load_tifxyz
 
 
 def load_phantom(phantom_dir, device):
@@ -179,6 +202,96 @@ def evaluate(phantom_model, mask, candidate, num_points, cut_margin, seed, devic
     return score(w_true, w_cand, torn, cut_ok)
 
 
+def load_tifxyz_candidates(path):
+    """A single tifxyz directory (contains x.tif) or a directory of them."""
+    if os.path.exists(os.path.join(path, 'x.tif')):
+        entries = [path]
+    else:
+        entries = sorted(
+            os.path.join(path, e) for e in os.listdir(path)
+            if os.path.exists(os.path.join(path, e, 'x.tif')))
+    if not entries:
+        raise click.UsageError(f'{path} contains no tifxyz surfaces')
+    return [(os.path.basename(e), load_tifxyz(e)) for e in entries]
+
+
+@torch.no_grad()
+def evaluate_tifxyz(phantom_model, patches, cut_margin):
+    """Score tifxyz surfaces by where their vertices sit in phantom truth.
+
+    on_surface: |w_true - round(w_true)| per valid vertex -- distance from ANY
+      true sheet, in winding units. Zero for a perfect surface regardless of
+      which winding it traces, so it needs no gauge.
+    grid_discontinuity: fraction of grid-adjacent valid vertex pairs whose
+      TRUE windings differ by > 0.5 -- the mesh jumps sheets between
+      neighbouring grid cells. Pairs straddling the theta=0 cut are excluded
+      (w_true legitimately jumps by 1 there on a continuous spiral surface).
+    winding_agreement: only when the surface carries per-vertex winding.tif
+      annotations -- gauge-aligned agreement with truth, as for other modes.
+    """
+    per_patch = {}
+    for name, patch in patches:
+        zyxs = patch.zyxs.reshape(-1, 3)
+        valid = patch.valid_vertex_mask.reshape(-1).numpy()
+        w_true, theta = winding_and_theta(phantom_model, zyxs)
+        on_surface = np.abs(w_true - np.round(w_true))[valid]
+
+        h, w = patch.zyxs.shape[:2]
+        w_grid = w_true.reshape(h, w)
+        theta_grid = theta.reshape(h, w)
+        valid_grid = valid.reshape(h, w)
+        pair_jumps = []
+        for da, db in (((slice(None), slice(None, -1)), (slice(None), slice(1, None))),
+                       ((slice(None, -1), slice(None)), (slice(1, None), slice(None)))):
+            both = valid_grid[da] & valid_grid[db]
+            not_seam = np.abs(theta_grid[da] - theta_grid[db]) < np.pi
+            sel = both & not_seam
+            pair_jumps.append(np.abs(w_grid[da] - w_grid[db])[sel] > 0.5)
+        jumps = np.concatenate(pair_jumps)
+
+        agreement = None
+        if isinstance(patch.winding, torch.Tensor):
+            annotated = patch.winding.reshape(-1).numpy()[valid]
+            cut_ok = cut_distance(theta[valid]) > cut_margin
+            residual = (w_true[valid] - annotated)[cut_ok]
+            offset = float(np.median(residual))
+            aligned = residual - offset
+            agreement = {'gauge_offset': offset,
+                         'mae': float(np.abs(aligned).mean()),
+                         'switch_rate': float((np.abs(aligned) > 0.5).mean())}
+        per_patch[name] = {
+            'num_valid_vertices': int(valid.sum()),
+            'on_surface_mae': float(on_surface.mean()),
+            'on_surface_p95': float(np.percentile(on_surface, 95)),
+            'grid_discontinuity_frac': float(jumps.mean()) if len(jumps) else 0.,
+            'winding_agreement': agreement,
+        }
+    total = sum(p['num_valid_vertices'] for p in per_patch.values())
+    overall = {
+        'num_patches': len(per_patch),
+        'num_valid_vertices': total,
+        'on_surface_mae': float(sum(
+            p['on_surface_mae'] * p['num_valid_vertices'] for p in per_patch.values()) / total),
+        'grid_discontinuity_frac': float(np.mean(
+            [p['grid_discontinuity_frac'] for p in per_patch.values()])),
+    }
+    return {'overall': overall, 'per_patch': per_patch}
+
+
+def print_tifxyz_report(result):
+    o = result['overall']
+    click.echo(f"{o['num_patches']} surfaces, {o['num_valid_vertices']} valid vertices")
+    click.echo(f"on-surface MAE {o['on_surface_mae']:.4f} windings; "
+               f"grid discontinuity {o['grid_discontinuity_frac'] * 100:.2f}% of pairs")
+    for name, p in sorted(result['per_patch'].items()):
+        agreement = p['winding_agreement']
+        suffix = (f"  agreement MAE {agreement['mae']:.4f} "
+                  f"(gauge {agreement['gauge_offset']:+.3f})" if agreement else '')
+        click.echo(f"  {name}: on-surface {p['on_surface_mae']:.4f}, "
+                   f"p95 {p['on_surface_p95']:.4f}, "
+                   f"discont {p['grid_discontinuity_frac'] * 100:.2f}%{suffix}")
+
+
 @torch.no_grad()
 def run_self_test(phantom_dir, num_points, cut_margin, seed, device):
     """Sanity-check the harness itself: the phantom scored against itself must
@@ -216,6 +329,9 @@ def run_self_test(phantom_dir, num_points, cut_margin, seed, device):
 @click.option('--candidate-winding-volume', default=None,
               type=click.Path(exists=True, dir_okay=False),
               help='Candidate float32 winding TIFF on the phantom voxel grid.')
+@click.option('--candidate-tifxyz', default=None,
+              type=click.Path(exists=True, file_okay=False),
+              help='Candidate tifxyz surface directory (or directory of them).')
 @click.option('--umbilicus', default=None, type=click.Path(exists=True, dir_okay=False),
               help='umbilicus json for real fit checkpoints (phantom checkpoints '
                    'carry their own).')
@@ -229,19 +345,32 @@ def run_self_test(phantom_dir, num_points, cut_margin, seed, device):
 @click.option('--self-test', is_flag=True,
               help='Ignore candidates; verify the harness on the phantom itself.')
 @click.option('--device', default='cpu', help="torch device ('cpu', 'cuda', ...).")
-def main(phantom, candidate_checkpoint, candidate_winding_volume, umbilicus,
-         num_points, cut_margin, seed, output, self_test, device):
+def main(phantom, candidate_checkpoint, candidate_winding_volume,
+         candidate_tifxyz, umbilicus, num_points, cut_margin, seed, output,
+         self_test, device):
     device = torch.device(device)
 
     if self_test:
         raise SystemExit(0 if run_self_test(phantom, num_points, cut_margin,
                                             seed, device) else 1)
 
-    if (candidate_checkpoint is None) == (candidate_winding_volume is None):
+    given = [c for c in (candidate_checkpoint, candidate_winding_volume,
+                         candidate_tifxyz) if c is not None]
+    if len(given) != 1:
         raise click.UsageError(
-            'pass exactly one of --candidate-checkpoint / --candidate-winding-volume')
+            'pass exactly one of --candidate-checkpoint / '
+            '--candidate-winding-volume / --candidate-tifxyz')
 
     _, phantom_model, mask = load_phantom(phantom, device)
+    if candidate_tifxyz is not None:
+        result = evaluate_tifxyz(phantom_model,
+                                 load_tifxyz_candidates(candidate_tifxyz),
+                                 cut_margin)
+        print_tifxyz_report(result)
+        if output is not None:
+            with open(output, 'w') as f:
+                json.dump(result, f, indent=2)
+        return
     if candidate_checkpoint is not None:
         candidate = ('model', load_candidate_model(candidate_checkpoint, umbilicus, device))
     else:

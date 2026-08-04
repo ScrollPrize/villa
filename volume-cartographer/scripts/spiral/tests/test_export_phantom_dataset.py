@@ -74,6 +74,32 @@ def test_position_noise_corrupts_vertices(phantom_dir, dataset_dir, tmp_path):
     assert 1.0 < displacement.mean() < 6.0  # ~ chi(3) mean at sigma 2
 
 
+def test_tifxyz_candidate_mode(phantom_dir, dataset_dir, tmp_path):
+    # Exported patches ARE tifxyz surfaces on true windings, so scoring them
+    # through the mesh mode must report near-zero on-surface error, zero
+    # grid discontinuities, and near-zero annotation disagreement -- while a
+    # noisy export must score measurably off-surface.
+    from winding_error import evaluate_tifxyz, load_tifxyz_candidates
+    _, model, _ = load_phantom(phantom_dir, torch.device('cpu'))
+    clean = evaluate_tifxyz(
+        model, load_tifxyz_candidates(os.path.join(dataset_dir, 'verified_patches')),
+        cut_margin=0.1)
+    assert clean['overall']['on_surface_mae'] < 0.01
+    assert clean['overall']['grid_discontinuity_frac'] == 0.
+    for p in clean['per_patch'].values():
+        assert p['winding_agreement']['mae'] < 0.01
+
+    noisy_dir = str(tmp_path / 'noisy_for_mesh')
+    result = CliRunner().invoke(export_phantom_dataset.main, [
+        '--phantom', phantom_dir, '--out', noisy_dir, '--step', '2',
+        '--coverage', '0.7', '--position-noise', '3.0'])
+    assert result.exit_code == 0, result.output
+    noisy = evaluate_tifxyz(
+        model, load_tifxyz_candidates(os.path.join(noisy_dir, 'verified_patches')),
+        cut_margin=0.1)
+    assert noisy['overall']['on_surface_mae'] > clean['overall']['on_surface_mae'] * 5
+
+
 def test_reference_fit_improves_over_init(phantom_dir, dataset_dir, tmp_path):
     fitted_path = str(tmp_path / 'fitted.pt')
     result = CliRunner().invoke(fit_phantom_reference.main, [

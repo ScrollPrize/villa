@@ -24,7 +24,12 @@ measurable curve:
   --no-winding-annotations  drop winding.tif (geometry-only patches)
 
 Scoring a fit trained on each exported variant with winding_error.py measures
-exactly how much label quantity/quality the fit needs.
+how much label quantity/quality that fitter needs. Scope caveat: dial curves
+produced with fit_phantom_reference.py (a single-loss baseline) characterise
+the BASELINE's sensitivity, not the production fitter's -- fit_spiral carries
+DT/track/normal losses that may absorb label defects very differently. Treat
+reference-fitter curves as demonstrations of the dials until the production
+fitter is run on the same exported datasets (CUDA host required).
 
 The production fitter is CUDA-only (fit_spiral.py builds its patch atlas on
 'cuda'); this exporter is device-free, so datasets can be produced anywhere
