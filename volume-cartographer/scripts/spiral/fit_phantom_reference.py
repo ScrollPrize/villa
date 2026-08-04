@@ -93,10 +93,15 @@ def load_dataset(dataset_dir):
 @click.option('--reg-flow', default=0., type=float,
               help='L2 weight on the flow velocity field (prior toward the '
                    'identity deformation off the annotated surfaces).')
+@click.option('--reg-flow-smooth', default=0., type=float,
+              help='L2 weight on flow-lattice finite differences. Magnitude '
+                   'penalties bound how far the deformation strays; this '
+                   'bounds how fast it wiggles between constraints -- the '
+                   'jagged-surface failure mode on sparse real traces.')
 @click.option('--seed', default=0, type=int)
 @click.option('--device', default='cpu')
 def main(dataset, out, steps, batch, lr, huber_delta, seam_margin, reg_gap,
-         reg_flow, seed, device):
+         reg_flow, reg_flow_smooth, seed, device):
     torch.manual_seed(seed)
     device = torch.device(device)
     meta, umbilicus_zyx, zyxs, windings = load_dataset(dataset)
@@ -145,6 +150,13 @@ def main(dataset, out, steps, batch, lr, huber_delta, seam_margin, reg_gap,
             loss = loss + reg_flow * sum(
                 flow.pow(2).mean() for field in model.flow_fields
                 for flow in field.flows)
+        if reg_flow_smooth > 0:
+            # Skip singleton lattice dims: diff there is empty and its mean
+            # is NaN, which silently poisons the whole loss.
+            loss = loss + reg_flow_smooth * sum(
+                torch.diff(flow, dim=dim).pow(2).mean()
+                for field in model.flow_fields for flow in field.flows
+                for dim in (2, 3, 4) if flow.shape[dim] > 1)
         optimiser.zero_grad()
         loss.backward()
         # The flow field routes its gradients through a shared accumulator
@@ -171,6 +183,7 @@ def main(dataset, out, steps, batch, lr, huber_delta, seam_margin, reg_gap,
         'reference_fit': {'dataset': os.path.abspath(dataset), 'steps': steps,
                           'lr': lr, 'batch': batch, 'seed': seed,
                           'reg_gap': reg_gap, 'reg_flow': reg_flow,
+                          'reg_flow_smooth': reg_flow_smooth,
                           'final_loss': float(np.mean(losses[-50:])),
                           'gauge': float(gauge)},
     }, out)
