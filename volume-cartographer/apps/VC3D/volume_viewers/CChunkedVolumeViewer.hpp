@@ -318,6 +318,8 @@ private:
         const char* reason = "internal caller",
         std::source_location caller = std::source_location::current());
     void updateStatusLabel();
+    void notifyNormalOffsetChanged();
+    void setZOffset(float value);
     void rebuildChunkArray();
     void clearDisplayedFramebuffer();
     void syncCameraTransform();
@@ -599,6 +601,7 @@ private:
         size_t targetGenerationHash = 0;
         size_t activeSegHash = 0;
         size_t highlightedSurfaceHash = 0;
+        int segNormalOffsetQ = 0;
         size_t flattenedPlanesHash = 0;
         size_t cameraHash = 0;
         bool valid = false;

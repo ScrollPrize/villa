@@ -509,6 +509,7 @@ private:
     QShortcut* fZoomInShortcut;
     QShortcut* fZoomOutShortcut;
     QShortcut* fResetViewShortcut;
+    QShortcut* fZoomToFitShortcut;
     QShortcut* fOpenLasagnaWorkspaceShortcut{nullptr};
     QShortcut* fRepeatLasagnaActionShortcut{nullptr};
 
