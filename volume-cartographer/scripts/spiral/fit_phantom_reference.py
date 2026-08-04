@@ -62,8 +62,12 @@ def load_dataset(dataset_dir):
         patch = load_tifxyz(os.path.join(patches_dir, entry))
         if not isinstance(patch.winding, torch.Tensor):
             raise click.UsageError(f'{entry} has no per-vertex winding annotation')
-        zyxs.append(patch.zyxs.reshape(-1, 3))
-        windings.append(patch.winding.reshape(-1))
+        # Sparse grids mark missing cells with the -1 sentinel; training on
+        # those would anchor the fit to garbage coordinates (phantom exports
+        # are fully valid, so this only bites on real traced data).
+        valid = patch.valid_vertex_mask.reshape(-1)
+        zyxs.append(patch.zyxs.reshape(-1, 3)[valid])
+        windings.append(patch.winding.reshape(-1)[valid])
     return meta, umbilicus_zyx, torch.cat(zyxs), torch.cat(windings)
 
 
@@ -105,7 +109,19 @@ def main(dataset, out, steps, batch, lr, huber_delta, seam_margin, reg_gap,
                               z_margin=z_margin)
     model = build_model(cfg, 0, pm['z_size'], umbilicus_zyx, 'CW', device)
     model.train().requires_grad_(True)
-    gauge = torch.zeros([], device=device, requires_grad=True)
+    # Initialise the gauge at the median initial residual: annotations may
+    # carry a large constant winding offset (any theta-origin / numbering
+    # convention is valid), and at lr * steps the gauge scalar can only travel
+    # a fraction of a winding during the fit -- a mis-initialised gauge
+    # otherwise leaves the whole fit stuck at |offset| windings of loss.
+    with torch.no_grad():
+        transform0 = model.get_slice_to_spiral_transform()
+        dr0 = model.get_dr_per_winding()
+        _, _, shifted0 = get_theta_and_radii(
+            transform0(zyxs.to(device))[..., 1:], dr0)
+        gauge0 = (shifted0 / dr0 - windings.to(device)).median()
+    gauge = gauge0.clone().requires_grad_(True)
+    click.echo(f'gauge initialised to {float(gauge0):+.3f} windings')
     optimiser = torch.optim.Adam([*model.parameters(), gauge], lr=lr)
 
     zyxs = zyxs.to(device)
