@@ -7,12 +7,15 @@ faked; these tests exercise the service plumbing only.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import io
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -22,13 +25,25 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
+
+import numpy as np
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import spiral_service
-from spiral_service import (ApiError, ArtifactRegistry, ServiceLogBuffer, ServiceState,
-                            SpiralServer, load_or_create_api_key, parse_gpu_ids)
+from spiral_service import (ApiError, ArtifactRegistry, ExclusiveFileLock,
+                            FileLockUnavailable, ServiceLogBuffer, ServiceState,
+                            SpiralServer, _mapped_winding_ids,
+                            _load_flatten_correspondence,
+                            _prepare_cleaned_lasagna_surface,
+                            _raw_run_diff_rgba, _sample_rgba_through_map,
+                            _validate_tifxyz_output_step,
+                            load_or_create_api_key, parse_gpu_ids,
+                            parse_session_name)
 from fit_session import API_VERSION, SpiralInputPaths, resolve_dataset_root
+from config import Config
 
 
 class FakeSession:
@@ -36,41 +51,50 @@ class FakeSession:
         self.state = "Paused"
         self.run_calls = []
         self.run_config = {
-            "num_patches_per_step": 360,
+            "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "loss_start_patch_dt": 25_000,
             "loss_start_track_dt": 10_000,
-            "save_png_visualizations": False,
+            "output_save_png_visualizations": False,
             "track_length_bin_weights": None,
-            "max_track_crossing_per_step": 0,
+            "track_max_track_crossing_per_step": 0,
             "track_min_sample_spacing": 20.0,
             "track_max_sample_spacing": 60.0,
+            "track_min_walk_steps_per_track": 24,
+            "track_max_walk_steps_per_track": 256,
+            "track_min_walks_per_track": 2,
+            "track_max_walks_per_track": 4,
         }
         self.default_advanced_config = {
-            "learning_rate": 3e-5,
-            "num_patches_per_step": 360,
+            "optimizer_learning_rate": 3e-5,
+            "sample_count_patches_per_step": 360,
             "loss_weight_patch_radius": 8.0,
             "track_crossing_precompute_max": 8,
+            "track_crossing_mode": "track_walk",
+            "track_walk_minimum_cycle_travel": 20.0,
         }
         self.saved = []
         self.closed = False
+        self.path_change_calls = []
+        self.progress = None
 
     def status(self):
         return {
             "state": self.state, "phase": self.state, "current_iteration": 5,
             "target_iteration": 5, "latest_metrics": {}, "warnings": [],
             "error": None, "preview_manifest_path": None, "preview_generation": 0,
-            "geometry_snapshot_manifest_path": None,
             "supports_input_incorporation": True,
             "run_config": dict(self.run_config),
-            "run_config_limits": {"max_track_crossing_per_step": 8},
+            "run_config_limits": {"track_max_track_crossing_per_step": 8},
             "default_advanced_config": dict(self.default_advanced_config),
+            "progress": self.progress,
         }
 
     def run(self, count, pending_inputs=None, mark_incorporated=None,
-            influence_config=None, run_config=None):
+            influence_config=None, run_config=None, path_changes=None):
         self.run_calls.append((count, list(pending_inputs or []), mark_incorporated,
                                dict(influence_config or {}), dict(run_config or {})))
+        self.path_change_calls.append(dict(path_changes or {}))
         self.run_config.update(run_config or {})
         return 5 + count
 
@@ -94,7 +118,49 @@ def _attach_fake_session(state, output_directory, dataset_root=""):
         "verified_patches": str(Path(dataset_root) / "verified_patches") if dataset_root else "",
         "fibers": str(Path(dataset_root) / "fibers") if dataset_root else "",
     })
+    state.session_request = {
+        "paths": state.session_paths.manifest(),
+        "run": {"config": Config().as_dict()},
+    }
+    state.session_revision += 1
     return state.session
+
+
+class ProgressStatusTests(unittest.TestCase):
+    def test_status_propagates_structured_fit_progress(self):
+        state = spiral_service.ServiceState()
+        session = _attach_fake_session(state, "/tmp/spiral-progress-test")
+        session.state = "Loading"
+        session.progress = {
+            "operation": "loading",
+            "stage_name": "Loading tracks",
+            "detail": "12,000 tracks retained",
+            "step": 3,
+            "total_steps": 10,
+            "unit": "DB keys",
+            "elapsed_seconds": 4.5,
+            "eta_seconds": 10.5,
+        }
+
+        status = state.status()
+
+        self.assertEqual(status["progress"], session.progress)
+        self.assertEqual(status["progress"]["stage_name"], "Loading tracks")
+
+    def test_empty_status_has_explicit_null_progress(self):
+        self.assertIsNone(spiral_service.ServiceState().status()["progress"])
+
+
+def _planned_run(state, request):
+    request = dict(request)
+    configuration = Config(request.pop("run_config", {})).as_dict()
+    plan = state.plan_run({
+        "configuration": configuration,
+        "iterations": request.pop("iterations"),
+        "influence": request.pop("influence_config", {}),
+        "expected_session_revision": state.session_revision,
+    })
+    return state.run({"plan_token": plan["plan_token"]})
 
 
 def _digest(data):
@@ -113,6 +179,22 @@ def _upload_input(state, kind, input_id, files, role=None):
     for name, data in files.items():
         state.receive_upload_file(upload_id, name, io.BytesIO(data), len(data))
     return upload_id
+
+
+def _commit_pcl_process(dataset, output, input_id, ready, start, result):
+    try:
+        state = ServiceState()
+        _attach_fake_session(state, output, dataset)
+        upload_id = _upload_input(
+            state, "pcl", input_id, PCL_FILES, role="patch_overlap")
+        state.finalize_upload(upload_id)
+        ready.put(input_id)
+        if not start.wait(10):
+            raise RuntimeError("timed out waiting for concurrent commit start")
+        state.commit_inputs()
+        result.put((input_id, "ok"))
+    except BaseException as exc:
+        result.put((input_id, f"{type(exc).__name__}: {exc}"))
 
 
 PATCH_FILES = {
@@ -153,6 +235,47 @@ class GpuSelectionTests(unittest.TestCase):
         for value in ("", "0,", "-1", "gpu0", "1,1"):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 parse_gpu_ids(value)
+
+
+class NamedSessionTests(unittest.TestCase):
+    def test_safe_session_names_are_accepted(self):
+        for value in ("alice", "gpu-1", "team_one", "run.2026"):
+            with self.subTest(value=value):
+                self.assertEqual(parse_session_name(value), value)
+
+    def test_unsafe_session_names_are_rejected(self):
+        for value in ("", ".", "..", "../alice", "alice/bob", "a b", "_alice",
+                      "a" * 65):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                parse_session_name(value)
+
+    def test_named_resolution_isolates_output_but_shares_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "umbilicus.json").write_text("{}")
+            (root / "verified_patches").mkdir()
+            unnamed = resolve_dataset_root(root)
+            alice = resolve_dataset_root(root, session_name="alice")
+            bob = resolve_dataset_root(root, session_name="bob")
+            self.assertEqual(unnamed.resolved["output_directory"],
+                             str(root / "spiral_output"))
+            self.assertEqual(alice.resolved["output_directory"],
+                             str(root / "spiral_output" / "alice"))
+            self.assertEqual(bob.resolved["output_directory"],
+                             str(root / "spiral_output" / "bob"))
+            self.assertEqual(alice.resolved["cache_directory"],
+                             bob.resolved["cache_directory"])
+
+    def test_exclusive_lock_rejects_duplicate_live_owner_and_releases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session" / ".spiral-service.lock"
+            first = ExclusiveFileLock(path).acquire()
+            second = ExclusiveFileLock(path)
+            with self.assertRaises(FileLockUnavailable):
+                second.acquire()
+            first.release()
+            second.acquire()
+            second.release()
 
 
 class HttpServiceFixture(unittest.TestCase):
@@ -215,8 +338,36 @@ class AuthenticationTests(HttpServiceFixture):
         self.assertEqual(health["api_version"], API_VERSION)
         self.assertIn("service_version", health)
         self.assertIn("service_name", health)
+        self.assertIn("session_name", health)
         self.assertIn("session_generation", health)
         self.assertIn("service_generation", health)
+
+
+class RestartTests(HttpServiceFixture):
+    def test_restart_requires_authentication_and_command_id(self):
+        status, _, _ = self.request(
+            "POST", "/service/restart", token=None,
+            body={"command_id": "restart-1"})
+        self.assertEqual(status, 401)
+        self.assertFalse(self.server.restart_requested.is_set())
+
+        status, payload, _ = self.request("POST", "/service/restart", body={})
+        self.assertEqual(status, 400)
+        self.assertIn("command_id", json.loads(payload)["error"])
+        self.assertFalse(self.server.restart_requested.is_set())
+
+    def test_restart_is_acknowledged_and_duplicate_requests_are_idempotent(self):
+        body = {"command_id": "restart-1"}
+        status, payload, _ = self.request("POST", "/service/restart", body=body)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(payload)["restarting"])
+
+        status, duplicate, _ = self.request("POST", "/service/restart", body=body)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(duplicate), json.loads(payload))
+
+        self.assertTrue(self.server._restart_scheduled)
+        self.assertTrue(self.server.restart_requested.wait(2))
 
 
 class LogStreamingTests(HttpServiceFixture):
@@ -272,6 +423,22 @@ class LogStreamingTests(HttpServiceFixture):
         self.assertEqual([entry["text"] for entry in logs.read_after(0)["entries"]],
                          ["useful fitter warning"])
 
+    def test_carriage_return_progress_redraws_are_relayed_as_complete_lines(self):
+        logs = ServiceLogBuffer()
+        logs.write("stderr", "\rloading patches:  25%|██▌       | 1/4")
+        logs.write("stderr", "\rloading patches: 100%|██████████| 4/4\n")
+        logs.write("stderr", "\r 40%|████      | 400/1000")
+        logs.write("stderr", "\r100%|██████████| 1000/1000\n")
+
+        self.assertEqual(
+            [entry["text"] for entry in logs.read_after(0)["entries"]],
+            [
+                "loading patches:  25%|██▌       | 1/4",
+                "loading patches: 100%|██████████| 4/4",
+                " 40%|████      | 400/1000",
+                "100%|██████████| 1000/1000",
+            ])
+
 
 class ArtifactHttpTests(HttpServiceFixture):
     def _register_artifact(self, contents=b"0123456789abcdef"):
@@ -293,6 +460,28 @@ class ArtifactHttpTests(HttpServiceFixture):
         self.assertEqual(manifest["entry_point"], "manifest.json")
         for entry in manifest["files"]:
             self.assertRegex(entry["sha256"], r"^[0-9a-f]{64}$")
+
+    def test_registration_reports_each_hashed_file(self):
+        artifact_root = self.root / "artifact-progress"
+        artifact_root.mkdir()
+        (artifact_root / "manifest.json").write_text("{}")
+        (artifact_root / "first.bin").write_bytes(b"first")
+        (artifact_root / "second.bin").write_bytes(b"second")
+        progress = []
+
+        self.state.artifacts.register_directory(
+            "spiral-preview", "session-1", 2, artifact_root, "manifest.json",
+            progress=lambda current, total, relative: progress.append(
+                (current, total, relative)),
+            hash_workers=2)
+
+        self.assertEqual(
+            progress,
+            [
+                (1, 3, "first.bin"),
+                (2, 3, "manifest.json"),
+                (3, 3, "second.bin"),
+            ])
 
     def test_unknown_artifact_is_not_found_and_pruned_is_gone(self):
         ref, _ = self._register_artifact()
@@ -375,6 +564,43 @@ class DatasetOwnershipTests(unittest.TestCase):
         self.assertEqual(response["root"], str(self.root))
         self.assertIn("umbilicus", response["resolved"])
 
+    def test_dataset_endpoint_advertises_named_session(self):
+        resolution = resolve_dataset_root(self.root, session_name="alice")
+        state = ServiceState(
+            dataset_root=str(self.root), dataset_resolution=resolution,
+            session_name="alice")
+        response = state.dataset()
+        self.assertEqual(response["session_name"], "alice")
+        self.assertEqual(
+            response["resolved"]["output_directory"],
+            str(self.root / "spiral_output" / "alice"))
+
+    def test_dataset_resolution_discovers_drawn_control_points(self):
+        drawn = self.root / "drawn_control_points.json"
+        drawn.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "drawn", "points": {}}},
+        }))
+        resolution = resolve_dataset_root(self.root)
+        entries = [entry for entry in resolution.pcl_inputs
+                   if entry["role"] == "drawn_control_points"]
+        self.assertEqual(entries, [{
+            "path": str(drawn), "role": "drawn_control_points", "required": False,
+        }])
+
+    def test_dataset_resolution_discovers_same_winding_collections(self):
+        same_winding = self.root / "same_windings.json"
+        same_winding.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {"0": {"name": "same_winding_0001", "points": {}}},
+        }))
+        resolution = resolve_dataset_root(self.root)
+        entries = [entry for entry in resolution.pcl_inputs
+                   if entry["role"] == "same_winding"]
+        self.assertEqual(entries, [{
+            "path": str(same_winding), "role": "same_winding", "required": False,
+        }])
+
     def test_arbitrary_root_resolution_is_refused(self):
         with self.assertRaises(ApiError) as caught:
             self.state.resolve("/somewhere/else")
@@ -397,23 +623,74 @@ class DatasetOwnershipTests(unittest.TestCase):
                              "run": {"z_begin": 0, "z_end": 10}})
         self.assertEqual(caught.exception.status, 400)
 
-    def test_dataset_request_omits_disabled_optional_inputs(self):
-        config = {
-            "use_verified_patches": False,
-            "use_unverified_patches": False,
-            "use_normals": False,
-            "use_surf_sdt": False,
-            "use_tracks": False,
-            "use_gradient_magnitude": False,
-            "use_fibers": False,
-        }
+    def test_dataset_request_uses_resolved_paths_without_input_toggles(self):
         request = self.state._dataset_session_request({
-            "run": {"z_begin": 0, "z_end": 10, "config": config},
+            "run": {"z_begin": 0, "z_end": 10},
         })
-        for field in ("verified_patches", "unverified_patches", "normal_x",
-                      "normal_y", "surf_sdt", "tracks_dbm",
-                      "gradient_magnitude", "fibers"):
-            self.assertEqual(request["paths"][field], "")
+        self.assertEqual(
+            request["paths"]["verified_patches"],
+            str(self.root / "verified_patches"))
+        self.assertEqual(request["paths"]["unverified_patches"], "")
+
+    def test_status_advertises_canonical_active_session_request(self):
+        config = {
+            "dense_spacing_mode": "grad_mag",
+            "loss_weight_dense_spacing": 0,
+            "loss_weight_dense_normals": 0,
+            "loss_weight_shell_outer": 0,
+            "loss_weight_shell_patch_radius": 0,
+            "loss_weight_patch_radius": 7.5,
+        }
+        request = {
+            "run": {
+                "z_begin": 100,
+                "z_end": 900,
+                "scroll_name": "attached-scroll",
+                "config": config,
+            },
+            "preview": {"first_winding": 12, "variant": "raw"},
+        }
+        with mock.patch("spiral_runtime.create_session",
+                        return_value=FakeSession()):
+            response = self.state.load(request)
+
+        attached = response["session_request"]
+        self.assertEqual(attached, self.state.status()["session_request"])
+        self.assertEqual(attached["paths"]["dataset_root"], str(self.root))
+        self.assertEqual(attached["paths"]["verified_patches"],
+                         str(self.root / "verified_patches"))
+        self.assertEqual(attached["paths"]["fibers"], "")
+        self.assertEqual(attached["run"]["z_begin"], 100)
+        self.assertEqual(attached["run"]["z_end"], 900)
+        self.assertEqual(attached["run"]["scroll_name"], "attached-scroll")
+        self.assertEqual(attached["run"]["config"], config)
+        self.assertEqual(attached["preview"],
+                         {"first_winding": 12, "variant": "raw"})
+
+        self.state.delete()
+        self.assertIsNone(self.state.status()["session_request"])
+
+    def test_failed_load_does_not_advertise_a_session_request(self):
+        request = {
+            "run": {
+                "z_begin": 0,
+                "z_end": 10,
+                "config": {
+                    "dense_spacing_mode": "grad_mag",
+                    "loss_weight_dense_spacing": 0,
+                    "loss_weight_dense_normals": 0,
+                    "loss_weight_shell_outer": 0,
+                    "loss_weight_shell_patch_radius": 0,
+                },
+            },
+        }
+        with mock.patch("spiral_runtime.create_session",
+                        side_effect=RuntimeError("startup failed")):
+            with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                self.state.load(request)
+        status = self.state.status()
+        self.assertIsNone(status["session_id"])
+        self.assertIsNone(status["session_request"])
 
     def test_save_checkpoint_is_constrained_to_output_directory(self):
         _attach_fake_session(self.state, self.root / "spiral_output", self.root)
@@ -473,7 +750,7 @@ class UploadTests(unittest.TestCase):
         self.assertIn(".spiral-ephemeral", str(published))
         status = self.state.status()
         self.assertEqual(status["ephemeral_inputs"][0]["id"], "patch-1")
-        self.assertEqual(status["default_advanced_config"]["learning_rate"], 3e-5)
+        self.assertEqual(status["default_advanced_config"]["optimizer_learning_rate"], 3e-5)
         self.assertNotEqual(status["default_advanced_config"], status["run_config"])
         # Finalize is idempotent.
         self.assertEqual(self.state.finalize_upload(upload_id)["input"]["id"],
@@ -513,11 +790,43 @@ class UploadTests(unittest.TestCase):
         with self.assertRaisesRegex(ApiError, "vc_pointcollections"):
             self.state.finalize_upload(upload_id)
 
+    def test_finalize_rejects_incomplete_v3_fibers_without_repair(self):
+        self._session()
+        incomplete = {
+            "type": "vc3d_fiber",
+            "version": 3,
+            "line_points": [[0, 0, 0], [1, 0, 0]],
+            "control_points": [{"position": [0, 0, 0]}, {"position": [1, 0, 0]}],
+        }
+        for suffix, mutation, message in (
+            ("mode", {}, "missing optimization_mode"),
+            ("segment", {"optimization_mode": "lasagna"}, "missing segment_to_next"),
+        ):
+            payload = {**incomplete, **mutation}
+            upload_id = _upload_input(
+                self.state,
+                "fiber",
+                f"bad-v3-{suffix}",
+                {"fiber.json": json.dumps(payload).encode()},
+            )
+            with self.assertRaisesRegex(ApiError, message):
+                self.state.finalize_upload(upload_id)
+
     def test_pcl_uploads_require_a_role(self):
         self._session()
         with self.assertRaisesRegex(ApiError, "role"):
             self.state.begin_upload({"kind": "pcl", "id": "roleless", "files": [
                 {"name": "pcl.json", "size": 1, "sha256": "0" * 64}]})
+
+    def test_drawn_control_points_are_forwarded_to_the_next_run(self):
+        session = self._session()
+        upload_id = _upload_input(self.state, "pcl", "drawn-1", PCL_FILES,
+                                  role="drawn_control_points")
+        self.state.finalize_upload(upload_id)
+        _planned_run(self.state, {"iterations": 2})
+        _, pending, _, _, _ = session.run_calls[-1]
+        self.assertEqual([(record["id"], record["role"]) for record in pending],
+                         [("drawn-1", "drawn_control_points")])
 
     def test_quota_is_enforced(self):
         self._session()
@@ -549,7 +858,7 @@ class UploadTests(unittest.TestCase):
         session = self._session()
         upload_id = _upload_input(self.state, "fiber", "fiber-1", FIBER_FILES)
         self.state.finalize_upload(upload_id)
-        self.state.run({"iterations": 10})
+        _planned_run(self.state, {"iterations": 10})
         count, pending, mark, influence, _ = session.run_calls[-1]
         self.assertEqual(count, 10)
         self.assertEqual([record["id"] for record in pending], ["fiber-1"])
@@ -558,93 +867,121 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(self.state.status()["ephemeral_inputs"][0]["state"],
                          "incorporated")
         # A later run does not re-incorporate.
-        self.state.run({"iterations": 5})
+        _planned_run(self.state, {"iterations": 5})
         self.assertEqual(session.run_calls[-1][1], [])
 
     def test_run_passes_and_validates_transient_influence_config(self):
         session = self._session()
         influence = {
-            "interactive_influence_enabled": True,
-            "interactive_influence_z": 1200,
-            "interactive_influence_windings": 2.5,
-            "interactive_influence_theta_frac": 0.2,
-            "interactive_influence_disable_dt_frac": 0.4,
-            "interactive_influence_sigma": 0.25,
-            "interactive_influence_footprint_points": 512,
-            "interactive_influence_anchor_lattice_points": 2000,
-            "interactive_influence_anchor_geometry_points": 1000,
-            "interactive_influence_anchor_samples_per_step": 128,
-            "interactive_influence_anchor_ramp_power": 3.0,
+            "influence_enabled": True,
+            "influence_z": 1200,
+            "influence_windings": 2.5,
+            "influence_theta_frac": 0.2,
+            "influence_disable_dt_frac": 0.4,
+            "influence_sigma": 0.25,
+            "sample_count_influence_footprint_points": 512,
+            "sample_count_influence_anchor_lattice_points": 2000,
+            "sample_count_influence_anchor_geometry_points": 1000,
+            "sample_count_influence_anchor_samples_per_step": 128,
+            "influence_anchor_ramp_power": 3.0,
             "loss_weight_anchor": 15.0,
         }
-        self.state.run({"iterations": 10, "influence_config": influence})
+        _planned_run(self.state, {"iterations": 10, "influence_config": influence})
         self.assertEqual(session.run_calls[-1][3], influence)
 
         with self.assertRaises(ApiError) as caught:
-            self.state.run({"iterations": 10, "influence_config": {
-                "interactive_influence_theta_frac": 1.5,
+            _planned_run(self.state, {"iterations": 10, "influence_config": {
+                "influence_theta_frac": 1.5,
             }})
         self.assertEqual(caught.exception.status, 400)
 
     def test_run_passes_and_validates_mutable_training_config(self):
         session = self._session()
         config = {
-            "num_patches_per_step": 240,
+            "sample_count_patches_per_step": 240,
             "loss_weight_patch_radius": 3.5,
             "loss_start_track_dt": None,
-            "save_png_visualizations": True,
+            "output_save_png_visualizations": True,
             "track_length_bin_weights": [0.2, 0.3, 0.5],
-            "max_track_crossing_per_step": 3,
+            "track_max_track_crossing_per_step": 3,
             "track_min_sample_spacing": 12.0,
             "track_max_sample_spacing": 32.0,
+            "track_min_walk_steps_per_track": 18,
+            "track_max_walk_steps_per_track": 96,
+            "track_max_walks_per_track": 5,
         }
 
-        response = self.state.run({"iterations": 10, "run_config": config})
+        response = _planned_run(self.state, {"iterations": 10, "run_config": config})
 
         self.assertEqual(session.run_calls[-1][4], config)
-        self.assertEqual(response["run_config"]["num_patches_per_step"], 240)
+        self.assertEqual(response["run_config"]["sample_count_patches_per_step"], 240)
 
-        with self.assertRaisesRegex(ApiError, "non-mutable"):
-            self.state.run({"iterations": 10, "run_config": {
-                "learning_rate": 1e-4,
+        with self.assertRaisesRegex(ApiError, "Start New Fit"):
+            _planned_run(self.state, {"iterations": 10, "run_config": {
+                "model_num_flow_stages": 2,
             }})
-        with self.assertRaisesRegex(ApiError, "at least 1"):
-            self.state.run({"iterations": 10, "run_config": {
-                "num_patches_per_step": 0,
+        with self.assertRaisesRegex(ValueError, "Invalid value"):
+            _planned_run(self.state, {"iterations": 10, "run_config": {
+                "output_save_png_visualizations": 1,
             }})
-        with self.assertRaisesRegex(ApiError, "must be boolean"):
-            self.state.run({"iterations": 10, "run_config": {
-                "save_png_visualizations": 1,
-            }})
-        with self.assertRaisesRegex(ApiError, "three finite non-negative"):
-            self.state.run({"iterations": 10, "run_config": {
+        with self.assertRaisesRegex(ValueError, "vector length"):
+            _planned_run(self.state, {"iterations": 10, "run_config": {
                 "track_length_bin_weights": [1, 2],
-            }})
-        with self.assertRaisesRegex(ApiError, "prepared limit"):
-            self.state.run({"iterations": 10, "run_config": {
-                "max_track_crossing_per_step": 9,
-            }})
-        with self.assertRaisesRegex(ApiError, "finite positive"):
-            self.state.run({"iterations": 10, "run_config": {
-                "track_min_sample_spacing": 0,
-            }})
-        with self.assertRaisesRegex(ApiError, "must be <="):
-            self.state.run({"iterations": 10, "run_config": {
-                "track_min_sample_spacing": 33,
             }})
 
     def test_run_accepts_advertised_zero_count_for_disabled_input(self):
         session = self._session()
-        session.run_config["dense_attachment_num_points"] = 0
+        session.run_config["sample_count_dense_attachment_points"] = 0
 
-        response = self.state.run({"iterations": 10, "run_config": {
-            "dense_attachment_num_points": 0,
+        response = _planned_run(self.state, {"iterations": 10, "run_config": {
+            "sample_count_dense_attachment_points": 0,
         }})
 
         self.assertEqual(session.run_calls[-1][4], {
-            "dense_attachment_num_points": 0,
+            "sample_count_dense_attachment_points": 0,
         })
-        self.assertEqual(response["run_config"]["dense_attachment_num_points"], 0)
+        self.assertEqual(response["run_config"]["sample_count_dense_attachment_points"], 0)
+
+    def test_outer_shell_path_is_a_shell_only_run_change(self):
+        session = self._session()
+        shell = self.dataset / "outer_shell_v2"
+        shell.mkdir()
+        inputs = self.state.session_paths.manifest()
+        inputs["outer_shell"] = str(shell)
+        plan = self.state.plan_run({
+            "configuration": Config().as_dict(),
+            "iterations": 3,
+            "inputs": inputs,
+            "expected_session_revision": self.state.session_revision,
+        })
+
+        self.assertFalse(plan["session_reload_required"])
+        self.assertEqual(plan["affected_prepared_inputs"], ["shell"])
+        self.assertEqual(plan["input_changes"][0]["runtime_impact"],
+                         "shell_reload")
+        self.state.run({"plan_token": plan["plan_token"]})
+        self.assertEqual(session.path_change_calls[-1], {
+            "outer_shell": str(shell),
+        })
+
+    def test_non_shell_path_and_patch_erosion_still_require_reload(self):
+        self._session()
+        inputs = self.state.session_paths.manifest()
+        inputs["verified_patches"] = str(self.dataset / "other-patches")
+        configuration = Config({
+            "patch_erode_patches": (
+                Config().patch_erode_patches + 1),
+        }).as_dict()
+        plan = self.state.plan_run({
+            "configuration": configuration,
+            "iterations": 3,
+            "inputs": inputs,
+            "expected_session_revision": self.state.session_revision,
+        })
+
+        self.assertTrue(plan["session_reload_required"])
+        with self.assertRaisesRegex(ApiError, "reloading fit inputs"):
+            self.state.run({"plan_token": plan["plan_token"]})
 
     def test_new_session_does_not_see_previous_ephemeral_inputs(self):
         self._session()
@@ -657,12 +994,12 @@ class UploadTests(unittest.TestCase):
         self.assertFalse(ephemeral_dir.exists())
 
 
-def _zip_checkpoint_bytes():
+def _zip_checkpoint_bytes(payload=b"payload"):
     import io as _io
     import zipfile
     buffer = _io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("data.pkl", b"payload")
+        archive.writestr("data.pkl", payload)
     return buffer.getvalue()
 
 
@@ -683,7 +1020,21 @@ class CheckpointUploadTests(unittest.TestCase):
 
     def _upload_checkpoint(self, name, data=None):
         data = data if data is not None else _zip_checkpoint_bytes()
-        upload_id = _upload_input(self.state, "checkpoint", name, {name: data})
+        request = {
+            "kind": "checkpoint",
+            "id": name,
+            "files": [{
+                "name": name,
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        }
+        begin = self.state.begin_upload(request)
+        if begin.get("deduplicated"):
+            return begin["input"]
+        upload_id = begin["upload_id"]
+        self.state.receive_upload_file(
+            upload_id, name, io.BytesIO(data), len(data))
         return self.state.finalize_upload(upload_id)["input"]
 
     def test_checkpoint_upload_works_without_a_session_in_dataset_mode(self):
@@ -717,15 +1068,121 @@ class CheckpointUploadTests(unittest.TestCase):
                          if (self.root / "spiral_output" / "uploaded-checkpoints").exists()
                          else False)
 
-    def test_name_collision_is_uniquified_not_overwritten(self):
+    def test_identical_checkpoint_is_reused_without_an_upload(self):
         first = self._upload_checkpoint("resume.ckpt")
-        second = self._upload_checkpoint("resume.ckpt")
+        data = _zip_checkpoint_bytes()
+        begin = self.state.begin_upload({
+            "kind": "checkpoint",
+            "id": "renamed.ckpt",
+            "files": [{
+                "name": "renamed.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        self.assertNotIn("upload_id", begin)
+        second = begin["input"]
+        self.assertEqual(first["path"], second["path"])
+        self.assertEqual(second["id"], "renamed.ckpt")
+        self.assertTrue(Path(first["path"]).is_file())
+
+    def test_same_name_with_different_content_is_not_reused(self):
+        first = self._upload_checkpoint("resume.ckpt", _zip_checkpoint_bytes(b"first"))
+        second = self._upload_checkpoint("resume.ckpt", _zip_checkpoint_bytes(b"second"))
         self.assertNotEqual(first["path"], second["path"])
         self.assertTrue(Path(first["path"]).is_file())
         self.assertTrue(Path(second["path"]).is_file())
 
+    def test_checkpoint_deduplication_survives_service_restart(self):
+        first = self._upload_checkpoint("resume.ckpt")
+        restarted = ServiceState(dataset_root=str(self.root),
+                                 dataset_resolution=self.resolution)
+        data = _zip_checkpoint_bytes()
+        begin = restarted.begin_upload({
+            "kind": "checkpoint",
+            "id": "after-restart.ckpt",
+            "files": [{
+                "name": "after-restart.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        self.assertEqual(begin["input"]["path"], first["path"])
+
+    def test_legacy_named_checkpoint_is_found_by_digest(self):
+        root = self.root / "spiral_output" / "uploaded-checkpoints"
+        root.mkdir()
+        data = _zip_checkpoint_bytes()
+        legacy = root / "resume-before-v7.ckpt"
+        legacy.write_bytes(data)
+        begin = self.state.begin_upload({
+            "kind": "checkpoint",
+            "id": "resume.ckpt",
+            "files": [{
+                "name": "resume.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        self.assertEqual(Path(begin["input"]["path"]), legacy)
+
+    def test_concurrent_identical_uploads_converge_on_one_file(self):
+        data = _zip_checkpoint_bytes()
+        request = {
+            "kind": "checkpoint",
+            "id": "resume.ckpt",
+            "files": [{
+                "name": "resume.ckpt",
+                "size": len(data),
+                "sha256": _digest(data),
+            }],
+        }
+        first_id = self.state.begin_upload(request)["upload_id"]
+        second_id = self.state.begin_upload(request)["upload_id"]
+        for upload_id in (first_id, second_id):
+            self.state.receive_upload_file(
+                upload_id, "resume.ckpt", io.BytesIO(data), len(data))
+        first = self.state.finalize_upload(first_id)["input"]
+        second = self.state.finalize_upload(second_id)["input"]
+        self.assertEqual(first["path"], second["path"])
+        root = self.root / "spiral_output" / "uploaded-checkpoints"
+        self.assertEqual([Path(first["path"])], list(root.iterdir()))
+
+    def test_reusing_a_checkpoint_refreshes_retention_recency(self):
+        payloads = [str(i).encode() for i in range(
+            spiral_service.UPLOADED_CHECKPOINTS_KEPT)]
+        published = [
+            Path(self._upload_checkpoint(
+                f"resume-{i}.ckpt", _zip_checkpoint_bytes(payload))["path"])
+            for i, payload in enumerate(payloads)
+        ]
+        base_time = time.time() - 100
+        for age, path in enumerate(published):
+            os.utime(path, (base_time + age, base_time + age))
+
+        reused_data = _zip_checkpoint_bytes(payloads[0])
+        begin = self.state.begin_upload({
+            "kind": "checkpoint",
+            "id": "reuse.ckpt",
+            "files": [{
+                "name": "reuse.ckpt",
+                "size": len(reused_data),
+                "sha256": _digest(reused_data),
+            }],
+        })
+        self.assertTrue(begin["deduplicated"])
+        newest = Path(self._upload_checkpoint(
+            "new.ckpt", _zip_checkpoint_bytes(b"new"))["path"])
+        self.assertTrue(published[0].exists())
+        self.assertFalse(published[1].exists())
+        self.assertTrue(newest.exists())
+
     def test_retention_prunes_old_uploads(self):
-        published = [Path(self._upload_checkpoint(f"resume-{i}.ckpt")["path"])
+        published = [Path(self._upload_checkpoint(
+            f"resume-{i}.ckpt", _zip_checkpoint_bytes(str(i).encode()))["path"])
                      for i in range(spiral_service.UPLOADED_CHECKPOINTS_KEPT + 2)]
         for old_age, path in enumerate(published):
             if path.exists():
@@ -792,6 +1249,143 @@ class CommitTests(unittest.TestCase):
         self.assertTrue(all(record["committed"] and record["state"] == "pending"
                             for record in inputs))
 
+    def test_concurrent_service_commits_serialize_pcl_merges(self):
+        output_b = self.root / "output-b"
+        output_b.mkdir()
+        state_b = ServiceState()
+        _attach_fake_session(state_b, output_b, self.dataset)
+        upload_a = _upload_input(
+            self.state, "pcl", "pcl-a", PCL_FILES, role="patch_overlap")
+        upload_b = _upload_input(
+            state_b, "pcl", "pcl-b", PCL_FILES, role="patch_overlap")
+        self.state.finalize_upload(upload_a)
+        state_b.finalize_upload(upload_b)
+        target = self.dataset / "patch-overlap-pcls.json"
+        target.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1", "collections": {},
+        }))
+
+        active = 0
+        max_active = 0
+        activity_lock = threading.Lock()
+        original_merge = spiral_service._merge_pcl_documents
+
+        def slow_merge(existing, incoming):
+            nonlocal active, max_active
+            with activity_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.1)
+                return original_merge(existing, incoming)
+            finally:
+                with activity_lock:
+                    active -= 1
+
+        errors = []
+
+        def commit(state):
+            try:
+                state.commit_inputs()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+                spiral_service, "_merge_pcl_documents", side_effect=slow_merge):
+            threads = [
+                threading.Thread(target=commit, args=(self.state,)),
+                threading.Thread(target=commit, args=(state_b,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+        self.assertFalse(errors)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(max_active, 1)
+        merged = json.loads(target.read_text())
+        self.assertEqual(len(merged["collections"]), 2)
+
+    def test_independent_processes_preserve_both_pcl_commits(self):
+        target = self.dataset / "patch-overlap-pcls.json"
+        target.write_text(json.dumps({
+            "vc_pointcollections_json_version": "1", "collections": {},
+        }))
+        context = multiprocessing.get_context("spawn")
+        ready = context.Queue()
+        start = context.Event()
+        result = context.Queue()
+        processes = []
+        for name in ("process-a", "process-b"):
+            output = self.root / name
+            output.mkdir()
+            processes.append(context.Process(
+                target=_commit_pcl_process,
+                args=(str(self.dataset), str(output), name, ready, start, result)))
+        for process in processes:
+            process.start()
+        self.assertEqual({ready.get(timeout=20), ready.get(timeout=20)},
+                         {"process-a", "process-b"})
+        start.set()
+        outcomes = dict(result.get(timeout=30) for _ in processes)
+        for process in processes:
+            process.join(30)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+        self.assertEqual(outcomes, {"process-a": "ok", "process-b": "ok"})
+        merged = json.loads(target.read_text())
+        self.assertEqual(len(merged["collections"]), 2)
+
+    def test_drawn_control_points_commit_preserves_line_and_point_order(self):
+        existing = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"4": {"name": "existing", "points": {}}},
+        }
+        target = self.dataset / "drawn_control_points.json"
+        target.write_text(json.dumps(existing))
+        incoming = {"drawn.json": json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {"name": "first", "points": {
+                    "0": {"p": [0, 0, 0]}, "1": {"p": [30, 0, 0]}}},
+                "1": {"name": "second", "points": {
+                    "0": {"p": [0, 1, 0]}, "1": {"p": [30, 1, 0]}}},
+            },
+        }).encode()}
+        self._finalize("pcl", "drawn-1", incoming, role="drawn_control_points")
+        self.state.commit_inputs()
+        merged = json.loads(target.read_text())
+        self.assertEqual([collection["name"] for collection in merged["collections"].values()],
+                         ["existing", "first", "second"])
+        self.assertEqual(list(merged["collections"]["5"]["points"]), ["0", "1"])
+        self.assertEqual(len(list(self.dataset.glob(
+            "drawn_control_points.json.*.bak"))), 1)
+
+    def test_same_winding_commit_preserves_collection_and_point_order(self):
+        existing = {
+            "vc_pointcollections_json_version": "1",
+            "collections": {"2": {"name": "existing", "points": {}}},
+        }
+        target = self.dataset / "same_windings.json"
+        target.write_text(json.dumps(existing))
+        incoming = {"same.json": json.dumps({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {"name": "same_winding_0001", "points": {
+                    "0": {"p": [1, 2, 3]}, "1": {"p": [4, 5, 6]}}},
+                "1": {"name": "same_winding_0002", "points": {
+                    "0": {"p": [7, 8, 9]}, "1": {"p": [10, 11, 12]}}},
+            },
+        }).encode()}
+        self._finalize("pcl", "same-1", incoming, role="same_winding")
+        self.state.commit_inputs()
+        merged = json.loads(target.read_text())
+        self.assertEqual([collection["name"] for collection in merged["collections"].values()],
+                         ["existing", "same_winding_0001", "same_winding_0002"])
+        self.assertEqual(list(merged["collections"]["3"]["points"]), ["0", "1"])
+        self.assertEqual(len(list(self.dataset.glob(
+            "same_windings.json.*.bak"))), 1)
+
     def test_commit_keeps_pending_inputs_queued_and_incorporation_retires_them(self):
         record = self._finalize("patch", "patch-9", PATCH_FILES)
         staged = Path(record["path"])
@@ -800,7 +1394,7 @@ class CommitTests(unittest.TestCase):
         self.assertTrue(staged.exists())
         with self.assertRaisesRegex(ApiError, "already committed"):
             self.state.commit_inputs()
-        self.state.run({"iterations": 3})
+        _planned_run(self.state, {"iterations": 3})
         _, pending, mark, _, _ = self.session.run_calls[-1]
         self.assertEqual([entry["id"] for entry in pending], ["patch-9"])
         # Once incorporated, a committed record is done and leaves the list.
@@ -814,12 +1408,12 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(response["removed"], "fiber-9")
         self.assertEqual(self.state.status()["ephemeral_inputs"], [])
         self.assertFalse(staged.exists())
-        self.state.run({"iterations": 1})
+        _planned_run(self.state, {"iterations": 1})
         self.assertEqual(self.session.run_calls[-1][1], [])
 
     def test_remove_incorporated_input_is_rejected(self):
         self._finalize("patch", "patch-9", PATCH_FILES)
-        self.state.run({"iterations": 1})
+        _planned_run(self.state, {"iterations": 1})
         _, pending, mark, _, _ = self.session.run_calls[-1]
         mark(pending)
         with self.assertRaises(ApiError) as caught:
@@ -853,6 +1447,254 @@ class CommitTests(unittest.TestCase):
         self.assertIn("read-only", status["commit_unavailable_reason"])
         with self.assertRaisesRegex(ApiError, "read-only"):
             self.state.commit_inputs()
+
+
+class MappedPreviewArtifactTests(unittest.TestCase):
+    def test_lasagna_output_scale_must_match_requested_step(self):
+        self.assertEqual(
+            _validate_tifxyz_output_step(
+                {"scale": [0.05, 0.05]}, 20.0),
+            [0.05, 0.05])
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            _validate_tifxyz_output_step(
+                {"scale": [0.04, 0.04]}, 20.0)
+
+    def test_failed_flatten_keeps_previous_preview_and_discards_raw_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous = root / "previous"
+            current = root / "current"
+            previous.mkdir()
+            current.mkdir()
+            previous_manifest = previous / "manifest.json"
+            current_manifest = current / "manifest.json"
+            previous_manifest.write_text("{}")
+            current_manifest.write_text("{}")
+            state = ServiceState()
+            state.session_id = "session"
+            state._previous_raw_preview_manifest = str(previous_manifest)
+            state._preview_artifact = {"id": "previous-preview"}
+
+            with mock.patch.object(
+                    state, "_publish_flattened_preview",
+                    side_effect=RuntimeError("flatten failed")):
+                state._maybe_register_artifacts({
+                    "preview_generation": 1,
+                    "preview_manifest_path": str(current_manifest),
+                })
+
+            self.assertEqual(
+                state._preview_artifact, {"id": "previous-preview"})
+            self.assertTrue(previous.exists())
+            self.assertFalse(current.exists())
+            self.assertIn("flatten failed", state._preview_publish_error)
+
+    def test_winding_membership_uses_flatten_correspondence(self):
+        manifest = {
+            "winding_ids": [7, 9],
+            "winding_column_ranges": [[0, 2], [2, 4]],
+        }
+        source_yx = np.asarray([
+            [[0.0, 3.0], [1.0, 0.0], [1.0, 2.0]],
+            [[9.0, 9.0], [0.0, 1.0], [0.0, 2.0]],
+        ], dtype=np.float32)
+        output_valid = np.asarray([
+            [True, True, True],
+            [True, False, True],
+        ])
+
+        winding_ids, bounds = _mapped_winding_ids(
+            manifest, (2, 4), source_yx, output_valid)
+
+        np.testing.assert_array_equal(winding_ids, np.asarray([
+            [9, 7, 9],
+            [-1, -1, 9],
+        ], dtype=np.int32))
+        self.assertEqual(bounds, [
+            {
+                "winding": 7, "row_begin": 0, "row_end": 1,
+                "column_begin": 1, "column_end": 2,
+            },
+            {
+                "winding": 9, "row_begin": 0, "row_end": 2,
+                "column_begin": 0, "column_end": 3,
+            },
+        ])
+
+    def test_loss_overlay_is_bilinearly_warped_with_alpha(self):
+        source = np.zeros((2, 2, 4), dtype=np.uint8)
+        source[0, 0] = [200, 0, 0, 255]
+        source[0, 1] = [0, 0, 200, 255]
+        source_yx = np.asarray([[
+            [0.0, 0.0], [0.0, 0.5], [0.0, 1.0],
+        ]], dtype=np.float32)
+
+        mapped = _sample_rgba_through_map(
+            source, source_yx, np.asarray([[True, True, False]]))
+
+        np.testing.assert_array_equal(mapped[0, 0], [200, 0, 0, 255])
+        np.testing.assert_allclose(mapped[0, 1], [100, 0, 100, 255], atol=1)
+        np.testing.assert_array_equal(mapped[0, 2], [0, 0, 0, 0])
+
+    def test_threaded_loss_overlay_matches_sequential_bytes(self):
+        rng = np.random.default_rng(20260730)
+        source = rng.integers(0, 256, size=(17, 23, 4), dtype=np.uint8)
+        source_yx = np.stack([
+            rng.uniform(-1.0, 17.5, size=(13, 19)),
+            rng.uniform(-1.0, 23.5, size=(13, 19)),
+        ], axis=-1).astype(np.float32)
+        output_valid = rng.random((13, 19)) > 0.2
+
+        sequential = _sample_rgba_through_map(
+            source, source_yx, output_valid)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            threaded = _sample_rgba_through_map(
+                source, source_yx, output_valid, executor=executor)
+
+        np.testing.assert_array_equal(threaded, sequential)
+
+    def test_winding_bounds_union_duplicate_disjoint_ranges(self):
+        manifest = {
+            "winding_ids": [7, 9, 7],
+            "winding_column_ranges": [[0, 2], [2, 4], [4, 6]],
+        }
+        source_yx = np.asarray([[
+            [0, 0], [0, 2], [0, 5], [0, 3],
+        ]], dtype=np.float32)
+        result, bounds = _mapped_winding_ids(
+            manifest, (1, 6), source_yx, np.ones((1, 4), dtype=bool))
+
+        np.testing.assert_array_equal(result, [[7, 9, 7, 9]])
+        self.assertEqual(bounds, [
+            {
+                "winding": 7, "row_begin": 0, "row_end": 1,
+                "column_begin": 0, "column_end": 3,
+            },
+            {
+                "winding": 9, "row_begin": 0, "row_end": 1,
+                "column_begin": 1, "column_end": 4,
+            },
+        ])
+
+    def test_flatten_correspondence_prefers_npy_sidecar(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            map_path = Path(temporary) / "flatten-map.npy"
+            expected = np.arange(24, dtype=np.float32).reshape(3, 4, 2)
+            np.save(map_path, expected, allow_pickle=False)
+            actual = _load_flatten_correspondence(
+                Path(temporary) / "missing.pt", map_path)
+            np.testing.assert_array_equal(actual, expected)
+
+    @staticmethod
+    def _write_surface(path, xyz):
+        path.mkdir()
+        for axis, values in zip("xyz", np.moveaxis(xyz, -1, 0)):
+            Image.fromarray(values.astype(np.float32)).save(
+                path / f"{axis}.tif")
+
+    def test_run_diff_matches_windings_before_flatten_mapping(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous = np.zeros((2, 4, 3), dtype=np.float32)
+            current = previous.copy()
+            current[:, 2:, 2] = 3.0
+            self._write_surface(root / "previous", previous)
+            self._write_surface(root / "current", current)
+            common = {
+                "winding_ids": [1, 2],
+                "winding_column_ranges": [[0, 2], [2, 4]],
+            }
+
+            rgba, changed = _raw_run_diff_rgba(
+                {**common, "surface_path": str(root / "previous")},
+                {**common, "surface_path": str(root / "current")})
+
+            self.assertEqual(changed, 4)
+            self.assertTrue(np.all(rgba[:, :2, 3] == 0))
+            self.assertTrue(np.all(rgba[:, 2:, 3] > 0))
+
+
+class LasagnaSurfaceCleanupTests(unittest.TestCase):
+    @staticmethod
+    def _write_surface(path, valid):
+        path.mkdir()
+        rows, columns = np.indices(valid.shape)
+        xyz = [
+            columns.astype(np.float32),
+            rows.astype(np.float32),
+            np.full(valid.shape, 10.0, dtype=np.float32),
+        ]
+        for coordinate in xyz:
+            coordinate[~valid] = -1.0
+        for name, coordinate in zip(("x.tif", "y.tif", "z.tif"), xyz):
+            Image.fromarray(coordinate).save(path / name)
+        (path / "meta.json").write_text(json.dumps({
+            "format": "tifxyz",
+            "type": "seg",
+            "uuid": "preview",
+            "scale": [1.0, 1.0],
+            "bbox": [[0.0, 0.0, 0.0], [99.0, 99.0, 99.0]],
+            "area_vx2": 100.0,
+            "area_cm2": 2.0,
+            "winding_column_ranges": [[0, valid.shape[1]]],
+        }))
+
+    def test_erodes_and_keeps_only_largest_component_without_mutating_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "cleaned"
+            valid = np.zeros((16, 28), dtype=bool)
+            valid[1:12, 1:12] = True
+            valid[4:11, 18:25] = True
+            self._write_surface(source, valid)
+            original_files = {
+                name: (source / name).read_bytes()
+                for name in ("meta.json", "x.tif", "y.tif", "z.tif")
+            }
+
+            result = _prepare_cleaned_lasagna_surface(source, destination)
+
+            self.assertEqual(result, destination)
+            for name, contents in original_files.items():
+                self.assertEqual((source / name).read_bytes(), contents)
+            cleaned_coordinates = []
+            for axis in "xyz":
+                with Image.open(destination / f"{axis}.tif") as image:
+                    cleaned_coordinates.append(np.asarray(image).copy())
+            cleaned_xyz = np.stack(cleaned_coordinates, axis=-1)
+            cleaned_valid = np.any(cleaned_xyz != -1.0, axis=-1)
+            expected = np.zeros_like(valid)
+            expected[4:9, 4:9] = True
+            np.testing.assert_array_equal(cleaned_valid, expected)
+            self.assertTrue(np.all(cleaned_xyz[~expected] == -1.0))
+
+            metadata = json.loads(
+                (destination / "meta.json").read_text())
+            self.assertEqual(
+                metadata["bbox"],
+                [[4.0, 4.0, 10.0], [8.0, 8.0, 10.0]])
+            self.assertEqual(metadata["area_vx2"], 16.0)
+            self.assertAlmostEqual(metadata["area_cm2"], 0.32)
+            self.assertEqual(metadata["winding_column_ranges"], [[0, 28]])
+            self.assertEqual(metadata["lasagna_input_cleanup"], {
+                "erosion_cells": 3,
+                "component_connectivity": 4,
+                "components_after_erosion": 2,
+            })
+
+    def test_fails_if_erosion_removes_every_valid_vertex(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            valid = np.ones((6, 6), dtype=bool)
+            self._write_surface(source, valid)
+
+            with self.assertRaisesRegex(
+                    RuntimeError, "removed every valid TIFXYZ vertex"):
+                _prepare_cleaned_lasagna_surface(
+                    source, root / "cleaned")
+            self.assertFalse((root / "cleaned").exists())
 
 
 class ServiceProcessTests(unittest.TestCase):
@@ -906,6 +1748,44 @@ class ServiceProcessTests(unittest.TestCase):
             finally:
                 process.terminate()
                 process.wait(10)
+                process.stdout.close()
+
+    def test_restart_reexecs_in_place_and_reuses_the_fixed_port(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            key_file = Path(temporary) / "key"
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            process = self._launch(
+                ["--port", str(port), "--api-key-file", str(key_file)],
+                temporary)
+            try:
+                self._read_until_ready(process)
+                original_pid = process.pid
+                key = key_file.read_text().strip()
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/service/restart",
+                    method="POST",
+                    data=json.dumps({"command_id": "restart-integration"}).encode(),
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    })
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    acknowledgement = json.loads(response.read())
+                self.assertTrue(acknowledgement["restarting"])
+
+                self._read_until_ready(process)
+                self.assertEqual(process.pid, original_pid)
+                health_request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(health_request, timeout=10) as response:
+                    self.assertTrue(json.loads(response.read())["ready"])
+            finally:
+                process.terminate()
+                process.wait(10)
+                process.stdout.close()
 
     def test_selected_gpus_are_reported_by_health(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -962,6 +1842,50 @@ class ServiceProcessTests(unittest.TestCase):
             output, _ = process.communicate(timeout=30)
             self.assertEqual(process.returncode, 2)
             self.assertIn("missing required", output)
+
+    def test_named_dataset_service_has_exclusive_restartable_ownership(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset = root / "dataset"
+            dataset.mkdir()
+            (dataset / "umbilicus.json").write_text("{}")
+            (dataset / "verified_patches").mkdir()
+            key_file = root / "key"
+            arguments = [
+                "--port", "0", "--api-key-file", str(key_file),
+                "--dataset", str(dataset), "--session-name", "alice",
+            ]
+            first = self._launch(arguments, temporary)
+            try:
+                lines = self._read_until_ready(first)
+                self.assertIn("Spiral session name: alice", lines)
+                ready = next(line for line in lines
+                             if line.startswith("SPIRAL_SERVICE_READY"))
+                port = int(ready.split("port=")[1].split()[0])
+                key = key_file.read_text().strip()
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={"Authorization": f"Bearer {key}"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    health = json.loads(response.read())
+                self.assertEqual(health["session_name"], "alice")
+
+                duplicate = self._launch(arguments, temporary)
+                output, _ = duplicate.communicate(timeout=30)
+                self.assertEqual(duplicate.returncode, 2)
+                self.assertIn("already owned", output)
+            finally:
+                first.terminate()
+                first.wait(10)
+                first.stdout.close()
+
+            restarted = self._launch(arguments, temporary)
+            try:
+                self._read_until_ready(restarted)
+            finally:
+                restarted.terminate()
+                restarted.wait(10)
+                restarted.stdout.close()
 
     def test_non_loopback_bind_requires_dataset(self):
         with tempfile.TemporaryDirectory() as temporary:

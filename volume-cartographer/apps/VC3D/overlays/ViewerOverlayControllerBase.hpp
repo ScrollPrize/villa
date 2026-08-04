@@ -8,6 +8,7 @@
 #include <QColor>
 #include <QFont>
 #include <QImage>
+#include <QPainterPath>
 #include <QPointF>
 #include <QRectF>
 #include <QString>
@@ -30,7 +31,6 @@ class ViewerManager;
 class QGraphicsItem;
 class QGraphicsScene;
 class Surface;
-class QPainterPath;
 
 class ViewerOverlayControllerBase : public QObject
 {
@@ -100,6 +100,11 @@ public:
         OverlayStyle style{};
     };
 
+    struct PainterPathPrimitive {
+        QPainterPath path;
+        OverlayStyle style{};
+    };
+
     struct TextPrimitive {
         QPointF position;
         QString text;
@@ -161,6 +166,7 @@ public:
                                           LineStripPrimitive,
                                           SurfaceLineStripPrimitive,
                                           RectPrimitive,
+                                          PainterPathPrimitive,
                                           TextPrimitive,
                                           PathPrimitive,
                                           ArrowPrimitive,
@@ -273,6 +279,9 @@ protected:
                      bool filled,
                      OverlayStyle style);
 
+        void addPainterPath(const QPainterPath& path,
+                            OverlayStyle style);
+
         void addText(const QPointF& position,
                      const QString& text,
                      const QFont& font,
@@ -316,6 +325,10 @@ protected:
 
     virtual bool isOverlayEnabledFor(VolumeViewerBase* viewer) const;
     virtual void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) = 0;
+    FilteredPoints projectPointChainForHitTest(
+        VolumeViewerBase* viewer,
+        const std::vector<cv::Vec3f>& points,
+        float tolerance);
 
     QPointF volumeToScene(VolumeViewerBase* viewer, const cv::Vec3f& volumePoint) const;
     cv::Vec3f sceneToVolume(VolumeViewerBase* viewer, const QPointF& scenePoint) const;
@@ -369,6 +382,13 @@ protected:
     // chain storage is replaced or mutated.
     void clearPointChainProjectionCache();
 
+    // Projects a chain onto the viewer's surface with per-point opacity;
+    // cached — see clearPointChainProjectionCache().
+    FilteredPoints projectedPointChain(VolumeViewerBase* viewer,
+                                       const std::vector<cv::Vec3f>& points,
+                                       float tolerance,
+                                       std::vector<float>* opacities) const;
+
     // The default implementation materializes primitives as QGraphicsItems.
     // High-volume overlays may override this to retain their graphics items
     // across refreshes while continuing to use the common primitive builder.
@@ -410,10 +430,6 @@ private:
         std::vector<float> opacities;
     };
 
-    FilteredPoints projectedPointChain(VolumeViewerBase* viewer,
-                                       const std::vector<cv::Vec3f>& points,
-                                       float tolerance,
-                                       std::vector<float>* opacities) const;
     void clearPointChainProjectionCache(VolumeViewerBase* viewer);
 
     struct ViewerEntry {

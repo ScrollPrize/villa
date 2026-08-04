@@ -92,28 +92,22 @@ struct LineReinitializationSpanReport {
     int candLeftTruncatedPoints = 0;
     int candRightRolloutSteps = 0;
     int candRightTruncatedPoints = 0;
-    int candContinueLeftRolloutSteps = 0;
-    int candContinueLeftTruncatedPoints = 0;
-    int candContinueRightRolloutSteps = 0;
-    int candContinueRightTruncatedPoints = 0;
     int candLeftSelectedSign = 0;
     int candRightSelectedSign = 0;
     double candLeftClosestTargetDistance = 0.0;
     double candRightClosestTargetDistance = 0.0;
-    double candContinueLeftClosestTargetDistance = 0.0;
-    double candContinueRightClosestTargetDistance = 0.0;
     double candLeftInitialCost = 0.0;
     double candLeftFinalCost = 0.0;
     double candRightInitialCost = 0.0;
     double candRightFinalCost = 0.0;
-    double candContinueLeftInitialCost = 0.0;
-    double candContinueLeftFinalCost = 0.0;
-    double candContinueRightInitialCost = 0.0;
-    double candContinueRightFinalCost = 0.0;
     double chosenMaxEvenStepDeviation = 0.0;
     double chosenMaxTangentSmoothDeviation = 0.0;
     double chosenMaxNormalSmoothDeviation = 0.0;
     double chosenMaxNormalAlignmentAbs = 0.0;
+    bool hardLeftDirection = false;
+    bool hardRightDirection = false;
+    cv::Vec3d hardLeftDirectionVector{0.0, 0.0, 0.0};
+    cv::Vec3d hardRightDirectionVector{0.0, 0.0, 0.0};
     std::string chosen;
     std::vector<LineReinitializationCandidateReport> candidates;
 };
@@ -138,6 +132,17 @@ struct LineControlPoint {
     cv::Vec3d volumePoint{0.0, 0.0, 0.0};
     bool isSeed = false;
     int optimizedIndex = -1;
+};
+
+enum class LineControlPointSide {
+    Before,
+    After,
+};
+
+struct LineControlPointHardDirectionConstraint {
+    int controlPointIndex = -1;
+    LineControlPointSide side = LineControlPointSide::After;
+    cv::Vec3d direction{0.0, 0.0, 0.0};
 };
 
 struct LineControlPointUpdateResult {
@@ -185,14 +190,17 @@ public:
         const LineOptimizationConfig& config = {},
         int activeStart = -1,
         int activeEnd = -1,
-        std::string candidateName = "existing-line+global") const;
+        std::string candidateName = "existing-line+global",
+        std::vector<std::pair<int, int>> protectedPointRanges = {}) const;
 
     [[nodiscard]] LineReinitializationOptimizationResult reinitializeAndOptimizeExistingLine(
         std::vector<cv::Vec3d> linePoints,
         std::vector<LineControlPoint> controlPoints,
         std::vector<int> fixedControlAnchorIndices,
         int displayFrameAnchorIndex,
-        const LineOptimizationConfig& config = {}) const;
+        const LineOptimizationConfig& config = {},
+        std::vector<std::pair<int, int>> protectedControlSpans = {},
+        std::vector<LineControlPointHardDirectionConstraint> hardDirectionConstraints = {}) const;
 
 private:
     const NormalSampler& normalSampler_;

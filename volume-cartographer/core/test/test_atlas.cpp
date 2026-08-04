@@ -285,25 +285,23 @@ AtlasSnapPrepareFixture writeAtlasSnapPrepareFixture(const std::string& name)
         vc::atlas::atlasPredSnapAttachmentPath(fixture.atlasDir, set.fiberPath),
         set);
 
-    const fs::path zarrPath = fixture.root / "pred.zarr";
-    std::vector<uint8_t> payload(4 * 3 * 3 * 3, 0);
-    for (size_t i = 0; i < 3 * 3 * 3; ++i) {
-        payload[i] = 255;
-        payload[1 * 3 * 3 * 3 + i] = 255;
-        payload[2 * 3 * 3 * 3 + i] = 128;
-        payload[3 * 3 * 3 * 3 + i] = 170;
-    }
-    createU8Zarr(zarrPath, {4, 3, 3, 3}, {4, 3, 3, 3}, payload);
+    createU8Zarr(fixture.root / "grad_mag.zarr", {3, 3, 3}, {3, 3, 3},
+                 std::vector<uint8_t>(3 * 3 * 3, 255));
+    createU8Zarr(fixture.root / "nx.zarr", {3, 3, 3}, {3, 3, 3},
+                 std::vector<uint8_t>(3 * 3 * 3, 255));
+    createU8Zarr(fixture.root / "ny.zarr", {3, 3, 3}, {3, 3, 3},
+                 std::vector<uint8_t>(3 * 3 * 3, 128));
+    createU8Zarr(fixture.root / "pred_dt.zarr", {3, 3, 3}, {3, 3, 3},
+                 std::vector<uint8_t>(3 * 3 * 3, 170));
     writeText(fixture.manifestPath, R"({
         "version": 2,
         "grad_mag_encode_scale": 255.0,
         "grad_mag_factor": 1.0,
         "groups": {
-            "pred": {
-                "zarr": "pred.zarr",
-                "scaledown": 0,
-                "channels": ["grad_mag", "nx", "ny", "pred_dt"]
-            }
+            "grad_mag": {"zarr":"grad_mag.zarr","scaledown":0,"channels":["grad_mag"]},
+            "nx": {"zarr":"nx.zarr","scaledown":0,"channels":["nx"]},
+            "ny": {"zarr":"ny.zarr","scaledown":0,"channels":["ny"]},
+            "pred_dt": {"zarr":"pred_dt.zarr","scaledown":0,"channels":["pred_dt"]}
         }
     })");
     return fixture;
@@ -445,7 +443,12 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     const fs::path volpkgRoot = tempRoot("vc_atlas_roundtrip");
     const fs::path atlasDir = volpkgRoot / "atlases" / "fiber_1";
     writeText(volpkgRoot / "fibers" / "1.json",
-              R"({"type":"vc3d_fiber","version":1,"line_points":[[1,2,3]],"control_points":[[1,2,3]]})");
+              R"({
+  "type": "vc3d_fiber",
+  "version": 1,
+  "line_points": [[1, 2, 3], [2, 2, 3]],
+  "control_points": [[1, 2, 3], [2, 2, 3]]
+})");
 
     vc::atlas::Atlas atlas;
     atlas.metadata.name = "fiber_1";

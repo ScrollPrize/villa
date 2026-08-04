@@ -594,6 +594,11 @@ public:
     [[nodiscard]] std::string
     chunk_key(std::span<const std::size_t> chunk_indices) const;
 
+    [[nodiscard]] std::string
+    chunk_store_key(std::span<const std::size_t> chunk_indices) const;
+
+    [[nodiscard]] bool direct_chunk_payload_is_decoded_bytes() const noexcept;
+
     /// Backward-compatible chunk_path (filesystem only).
     [[nodiscard]] std::filesystem::path
     chunk_path(std::span<const std::size_t> chunk_indices) const {

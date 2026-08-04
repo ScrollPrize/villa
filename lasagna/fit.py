@@ -1108,18 +1108,18 @@ def _dummy_flatten_data() -> fit_data.FitData3D:
 	)
 
 
-def _mesh_step_from_tifxyz_meta(meta: dict, fallback: int) -> int:
+def _flatten_source_step_from_tifxyz_meta(meta: dict, fallback: int) -> float:
 	scale = meta.get("scale") if isinstance(meta, dict) else None
 	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
-		return max(1, int(round(1.0 / float(scale[0]))))
-	return max(1, int(fallback))
+		return 1.0 / float(scale[0])
+	return float(max(1, int(fallback)))
 
 
-def _scale_from_tifxyz_meta(meta: dict, mesh_step: int) -> float:
+def _scale_from_tifxyz_meta(meta: dict, source_step: float) -> float:
 	scale = meta.get("scale") if isinstance(meta, dict) else None
 	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
 		return float(scale[0])
-	return 1.0 / float(max(1, int(mesh_step)))
+	return 1.0 / float(source_step)
 
 
 def _shape_list(shape: tuple[int, int, int] | None) -> list[int] | None:
@@ -1247,14 +1247,19 @@ def _export_flatten_result(
 	x = np.where(mask_np, xyz_np[..., 0], -1.0).astype(np.float32, copy=False)
 	y = np.where(mask_np, xyz_np[..., 1], -1.0).astype(np.float32, copy=False)
 	z = np.where(mask_np, xyz_np[..., 2], -1.0).astype(np.float32, copy=False)
-	mesh_step = 1.0 / float(scale) if float(scale) > 0.0 else float(mdl.params.mesh_step)
-	area = fit2tifxyz._get_area(x, y, z, mesh_step, voxel_size_um)
+	output_step = (
+		float(mdl.params.flatten_output_step)
+		if mdl.params.flatten_output_step is not None
+		else (1.0 / float(scale) if float(scale) > 0.0 else float(mdl.params.mesh_step))
+	)
+	output_scale = 1.0 / output_step
+	area = fit2tifxyz._get_area(x, y, z, output_step, voxel_size_um)
 	fit2tifxyz._write_tifxyz(
 		out_dir=out_dir / "flatten.tifxyz",
 		x=x,
 		y=y,
 		z=z,
-		scale=scale,
+		scale=output_scale,
 		model_source=model_source,
 		fit_config=fit_config,
 		area=area,
@@ -1285,6 +1290,7 @@ def _run_flatten_mode(
 	opt_cfg: cli_opt.OptConfig,
 	progress_enabled: bool,
 	out_dir: str | None,
+	lifecycle_fn=None,
 ) -> int:
 	ext_surfaces_cfg = cfg.get("external_surfaces", None)
 	if not isinstance(ext_surfaces_cfg, list) or len(ext_surfaces_cfg) != 1:
@@ -1300,8 +1306,8 @@ def _run_flatten_mode(
 	device = torch.device(str(getattr(args, "device", "cuda")))
 	from tifxyz_io import load_tifxyz
 	xyz, valid, meta = load_tifxyz(str(ext0["path"]), device=device)
-	mesh_step = _mesh_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
-	scale = _scale_from_tifxyz_meta(meta, mesh_step)
+	source_step = _flatten_source_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
+	scale = _scale_from_tifxyz_meta(meta, source_step)
 
 	stage_cfg = copy.deepcopy(cfg)
 	for key in ("external_surfaces", "tifxyz", "voxel_size_um", "corr_points"):
@@ -1321,6 +1327,10 @@ def _run_flatten_mode(
 		"flatten_output_margin",
 		flatten_args.get("flatten_forward_output_margin", 0.10),
 	))
+	flatten_output_step = float(flatten_args.get(
+		"flatten_output_step",
+		source_step,
+	))
 	filter_source_angles = _truthy_config_bool(flatten_args.get("flatten_filter_source_angles", True))
 	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
 	filter_radius = int(flatten_args.get("flatten_filter_radius", 2))
@@ -1329,7 +1339,7 @@ def _run_flatten_mode(
 		xyz,
 		valid,
 		device=device,
-		mesh_step=mesh_step,
+		mesh_step=source_step,
 		winding_step=model_cfg.winding_step,
 		subsample_mesh=model_cfg.subsample_mesh,
 		subsample_winding=model_cfg.subsample_winding,
@@ -1338,6 +1348,7 @@ def _run_flatten_mode(
 		flatten_filter_radius=filter_radius,
 		flatten_direction=flatten_direction,
 		flatten_output_margin=flatten_output_margin,
+		flatten_output_step=flatten_output_step,
 	)
 	data = _dummy_flatten_data()
 
@@ -1348,7 +1359,8 @@ def _run_flatten_mode(
 		f"[fit] model-init=flatten solver={flatten_direction} source={ext0['path']} "
 		f"shape={tuple(xyz.shape)} valid={int(valid.sum())}/{valid.numel()} "
 		f"model_shape={mdl.mesh_h}x{mdl.mesh_w} "
-		f"mesh_step={mesh_step} target_step={float(mdl.flatten_target_step.detach().cpu()):.6g}",
+		f"source_step={source_step:.6g} output_step={flatten_output_step:.6g} "
+		f"measured_source_step={float(mdl.flatten_measured_source_step.detach().cpu()):.6g}",
 		flush=True,
 	)
 	filter_stats = getattr(mdl, "flatten_source_filter_stats", {})
@@ -1403,6 +1415,8 @@ def _run_flatten_mode(
 		seed_xyz=None,
 		out_dir=out_dir,
 	)
+	if lifecycle_fn is not None:
+		lifecycle_fn("saving", "Saving optimized flatten model")
 
 	if device.type == "cuda":
 		peak_gb = torch.cuda.max_memory_allocated(device) / 2**30
@@ -1430,7 +1444,7 @@ def _run_flatten_mode(
 	return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, lifecycle_fn=None) -> int:
 	if argv is None:
 		argv = sys.argv[1:]
 
@@ -1479,6 +1493,7 @@ def main(argv: list[str] | None = None) -> int:
 			opt_cfg=opt_cfg,
 			progress_enabled=progress_enabled,
 			out_dir=_out_dir,
+			lifecycle_fn=lifecycle_fn,
 		)
 
 	data_cfg = cli_data.from_args(args)
@@ -2039,6 +2054,10 @@ def main(argv: list[str] | None = None) -> int:
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
 		  f"cylinder_enabled={getattr(mdl, 'cylinder_enabled', False)}")
 	_stage_done("construct_model", _t)
+	require_umbilicus = bool(
+		getattr(mdl, "cylinder_enabled", False)
+		and hasattr(mdl, "prepare_umbilicus_tube_init")
+	)
 
 	# Load external reference surfaces
 	_t = _stage_start("load_external_surfaces")
@@ -2172,6 +2191,7 @@ def main(argv: list[str] | None = None) -> int:
 			device=device,
 			sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
 			skip_channels=_streaming_skip_channels(needed_channels),
+			require_umbilicus=require_umbilicus,
 		)
 		Z, Y, X = d.size
 		# Volume extent covers the full zarr volume
@@ -2404,6 +2424,8 @@ def main(argv: list[str] | None = None) -> int:
 		require_snap_surf_map_state=(model_init == "model" and self_map_init != "off"),
 	)
 	_stage_done("optimizer", _t)
+	if lifecycle_fn is not None:
+		lifecycle_fn("saving", "Saving optimized Lasagna model")
 
 	if device.type == "cuda":
 		peak_gb = torch.cuda.max_memory_allocated(device) / 2**30

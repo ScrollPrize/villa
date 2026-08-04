@@ -1,21 +1,33 @@
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
-#include <QFile>
+#include <QDoubleSpinBox>
 #include <QJsonArray>
 #include <QJsonDocument>
-#include <QPlainTextEdit>
-#include <QPushButton>
+#include <QJsonObject>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPalette>
+#include <QScrollArea>
+#include <QSignalSpy>
+#include <QSpinBox>
 #include <QTemporaryDir>
+#include <QTest>
+#include <QToolButton>
 
-#include "SpiralReloadComparison.hpp"
+#define private public
 #include "elements/SpiralConfigProfileEditor.hpp"
+#undef private
+
+#include "elements/CollapsibleSettingsGroup.hpp"
 
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 
 namespace {
+
 void require(bool condition, const char* message)
 {
     if (!condition) {
@@ -23,157 +35,257 @@ void require(bool condition, const char* message)
         std::exit(1);
     }
 }
+
+QJsonObject field(const QString& label,
+                  const QString& type,
+                  const QString& impact)
+{
+    return {
+        {QStringLiteral("label"), label},
+        {QStringLiteral("type"), type},
+        {QStringLiteral("runtime_impact"), impact},
+    };
 }
+
+QJsonObject syntheticCatalog()
+{
+    QJsonObject fields;
+    QJsonObject defaults;
+
+    QJsonObject optimizer = field(
+        QStringLiteral("Learning Rate"), QStringLiteral("number"),
+        QStringLiteral("run_boundary"));
+    optimizer[QStringLiteral("minimum")] = 0.0;
+    optimizer[QStringLiteral("maximum")] = 10.0;
+    optimizer[QStringLiteral("precision")] = 3;
+    optimizer[QStringLiteral("step")] = 0.1;
+    fields[QStringLiteral("optimizer_learning_rate")] = optimizer;
+    defaults[QStringLiteral("optimizer_learning_rate")] = 0.5;
+
+    QJsonObject momentum = field(
+        QStringLiteral("Momentum"), QStringLiteral("number"),
+        QStringLiteral("run_boundary"));
+    momentum[QStringLiteral("minimum")] = 0.0;
+    momentum[QStringLiteral("maximum")] = 1.0;
+    momentum[QStringLiteral("precision")] = 2;
+    momentum[QStringLiteral("step")] = 0.05;
+    fields[QStringLiteral("optimizer_momentum")] = momentum;
+    defaults[QStringLiteral("optimizer_momentum")] = 0.9;
+
+    QJsonObject model = field(
+        QStringLiteral("Iterations"), QStringLiteral("integer"),
+        QStringLiteral("new_fit"));
+    model[QStringLiteral("minimum")] = 1;
+    model[QStringLiteral("maximum")] = 1000;
+    fields[QStringLiteral("model_iterations")] = model;
+    defaults[QStringLiteral("model_iterations")] = 25;
+
+    fields[QStringLiteral("patch_enabled")] = field(
+        QStringLiteral("Use Patches"), QStringLiteral("boolean"),
+        QStringLiteral("run_boundary"));
+    defaults[QStringLiteral("patch_enabled")] = true;
+
+    QJsonObject sample = field(
+        QStringLiteral("Sampling Mode"), QStringLiteral("enum"),
+        QStringLiteral("prepared_input_rebuild"));
+    sample[QStringLiteral("values")] =
+        QJsonArray{QStringLiteral("fast"), QStringLiteral("accurate")};
+    fields[QStringLiteral("sample_count_mode")] = sample;
+    defaults[QStringLiteral("sample_count_mode")] = QStringLiteral("fast");
+
+    QJsonObject input = field(
+        QStringLiteral("Input Channels"), QStringLiteral("array"),
+        QStringLiteral("shell_reload"));
+    input[QStringLiteral("nullable")] = true;
+    fields[QStringLiteral("input_channels")] = input;
+    defaults[QStringLiteral("input_channels")] = QJsonValue::Null;
+
+    const QList<QPair<QString, QString>> remaining{
+        {QStringLiteral("pcl_radius"), QStringLiteral("PCL Radius")},
+        {QStringLiteral("tracks_count"), QStringLiteral("Track Count")},
+        {QStringLiteral("dense_weight"), QStringLiteral("Dense Weight")},
+        {QStringLiteral("loss_scale"), QStringLiteral("Loss Scale")},
+        {QStringLiteral("dt_limit"), QStringLiteral("DT Limit")},
+        {QStringLiteral("output_stride"), QStringLiteral("Output Stride")},
+        {QStringLiteral("shell_width"), QStringLiteral("Shell Width")},
+        {QStringLiteral("influence_radius"), QStringLiteral("Influence Radius")},
+    };
+    for (const auto& item : remaining) {
+        QJsonObject spec = field(
+            item.second, QStringLiteral("integer"),
+            QStringLiteral("run_boundary"));
+        spec[QStringLiteral("minimum")] = 0;
+        spec[QStringLiteral("maximum")] = 100;
+        fields[item.first] = spec;
+        defaults[item.first] = 1;
+    }
+
+    return {
+        {QStringLiteral("defaults"), defaults},
+        {QStringLiteral("schema"), QJsonObject{
+             {QStringLiteral("fields"), fields},
+         }},
+    };
+}
+
+void processLayout()
+{
+    QApplication::sendPostedEvents();
+    QApplication::processEvents();
+    QTest::qWait(20);
+}
+
+} // namespace
 
 int main(int argc, char** argv)
 {
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM"))
         qputenv("QT_QPA_PLATFORM", "offscreen");
 
-    QTemporaryDir home;
-    require(home.isValid(), "Temporary HOME is unavailable");
-    qputenv("VC3D_CONFIG_DIR", home.path().toUtf8());
-    std::unique_ptr<QApplication> app = std::make_unique<QApplication>(argc, argv);
+    QTemporaryDir configDir;
+    require(configDir.isValid(), "Failed to create temporary config directory");
+    qputenv("VC3D_CONFIG_DIR", configDir.path().toUtf8());
 
-    {
-        QFile profiles(home.filePath(QStringLiteral("spiral-advanced-profiles.json")));
-        require(profiles.open(QIODevice::WriteOnly), "Could not seed saved profiles");
-        profiles.write(R"({"version":1,"profiles":[{"id":"p1","name":"My profile","json":"{\n  \"saved\": 1\n}"}]})");
-    }
+    std::unique_ptr<QApplication> app;
+    if (!QApplication::instance())
+        app = std::make_unique<QApplication>(argc, argv);
 
     SpiralConfigProfileEditor editor;
-    auto* combo = editor.findChild<QComboBox*>(QStringLiteral("spiralAdvancedProfileCombo"));
-    auto* textEdit = editor.findChild<QPlainTextEdit*>(QStringLiteral("spiralAdvancedJsonEditor"));
-    require(combo && textEdit, "Advanced profile controls were not constructed");
-    if (combo->findData(QStringLiteral("default")) < 0
-        || combo->findData(QStringLiteral("custom")) < 0
-        || combo->findData(QStringLiteral("p1")) < 0) {
-        QStringList entries;
-        for (int index = 0; index < combo->count(); ++index)
-            entries << combo->itemText(index) + QStringLiteral("=")
-                + combo->itemData(index).toString();
-        std::cerr << "Profile entries: " << entries.join('|').toStdString() << std::endl;
-        require(false, "Default, Custom, and persisted profiles must share the dropdown");
-    }
-    require(editor.currentText() == QStringLiteral("{}"),
-            "Default must not restore legacy Advanced JSON");
+    editor.setCatalog(syntheticCatalog());
 
-    const QJsonObject defaults{
-        {QStringLiteral("session_value"), 7},
-        {QStringLiteral("run_value"), 11},
+    const QStringList expectedPrefixes{
+        QStringLiteral("sample"), QStringLiteral("loss"),
+        QStringLiteral("patch"), QStringLiteral("tracks"),
+        QStringLiteral("optimizer"), QStringLiteral("model"),
+        QStringLiteral("input"), QStringLiteral("pcl"),
+        QStringLiteral("dense"), QStringLiteral("dt"),
+        QStringLiteral("output"), QStringLiteral("shell"),
+        QStringLiteral("influence"),
     };
-    const QSet<QString> runKeys{QStringLiteral("run_value")};
-    const QJsonObject sparseDefaultRequest{
-        {QStringLiteral("run"), QJsonObject{
-            {QStringLiteral("config"), QJsonObject{}},
-            {QStringLiteral("z_begin"), 100},
-        }},
+    const QStringList expectedTitles{
+        QStringLiteral("Sample Count"), QStringLiteral("Loss"),
+        QStringLiteral("Patch"), QStringLiteral("Tracks"),
+        QStringLiteral("Optimizer"), QStringLiteral("Model"),
+        QStringLiteral("Input"), QStringLiteral("PCL"),
+        QStringLiteral("Dense"), QStringLiteral("DT"),
+        QStringLiteral("Output"), QStringLiteral("Shell"),
+        QStringLiteral("Influence"),
     };
-    const QJsonObject expandedCustomRequest{
-        {QStringLiteral("run"), QJsonObject{
-            {QStringLiteral("config"), defaults},
-            {QStringLiteral("z_begin"), 100},
-        }},
-    };
-    require(
-        vc3d::normalizedSpiralReloadRequest(
-            sparseDefaultRequest, defaults, runKeys)
-            == vc3d::normalizedSpiralReloadRequest(
-                expandedCustomRequest, defaults, runKeys),
-        "Sparse Default and equivalent expanded Custom must compare equally");
-
-    QJsonObject runOnlyChange = expandedCustomRequest;
-    QJsonObject runOnlyBody = runOnlyChange.value(QStringLiteral("run")).toObject();
-    QJsonObject runOnlyConfig = runOnlyBody.value(QStringLiteral("config")).toObject();
-    runOnlyConfig[QStringLiteral("run_value")] = 99;
-    runOnlyBody[QStringLiteral("config")] = runOnlyConfig;
-    runOnlyChange[QStringLiteral("run")] = runOnlyBody;
-    require(
-        vc3d::normalizedSpiralReloadRequest(
-            sparseDefaultRequest, defaults, runKeys)
-            == vc3d::normalizedSpiralReloadRequest(
-                runOnlyChange, defaults, runKeys),
-        "A run-mutable Advanced value must not require reload");
-
-    QJsonObject sessionChange = expandedCustomRequest;
-    QJsonObject sessionBody = sessionChange.value(QStringLiteral("run")).toObject();
-    QJsonObject sessionConfig = sessionBody.value(QStringLiteral("config")).toObject();
-    sessionConfig[QStringLiteral("session_value")] = 8;
-    sessionBody[QStringLiteral("config")] = sessionConfig;
-    sessionChange[QStringLiteral("run")] = sessionBody;
-    require(
-        vc3d::normalizedSpiralReloadRequest(
-            sparseDefaultRequest, defaults, runKeys)
-            != vc3d::normalizedSpiralReloadRequest(
-                sessionChange, defaults, runKeys),
-        "A changed session-scoped Advanced value must require reload");
-
-    editor.setSessionDefault(QJsonObject{{QStringLiteral("python_default"), 7}});
-    require(editor.currentText().contains(QStringLiteral("python_default")),
-            "Session Default did not update the editor");
-
-    auto* popOut = editor.findChild<QPushButton*>(QStringLiteral("spiralAdvancedPopOut"));
-    auto* dialog = editor.findChild<QDialog*>(QStringLiteral("spiralAdvancedConfigDialog"));
-    require(popOut && dialog && !dialog->isModal(),
-            "Advanced editor pop-out must be a modeless dialog");
-    int presentationTextChanges = 0;
-    QObject::connect(&editor, &SpiralConfigProfileEditor::textChanged,
-                     [&presentationTextChanges]() { ++presentationTextChanges; });
-    const QString textBeforePopOut = editor.currentText();
-    popOut->click();
-    QApplication::processEvents();
-    require(dialog->isVisible() && dialog->isAncestorOf(textEdit),
-            "Pop Out must move the authoritative editor into the dialog");
-    require(editor.currentProfileId() == QStringLiteral("default"),
-            "Pop Out must not convert Default into a Custom profile");
-    require(editor.currentText() == textBeforePopOut && presentationTextChanges == 0,
-            "Pop Out must not report an Advanced JSON edit");
-    dialog->close();
-    QApplication::processEvents();
-    require(!dialog->isVisible() && editor.isAncestorOf(textEdit),
-            "Closing the dialog must pop the same editor back inline");
-    require(editor.currentProfileId() == QStringLiteral("default")
-                && presentationTextChanges == 0,
-            "Pop In must not change the profile or report an edit");
-
-    combo->setCurrentIndex(combo->findData(QStringLiteral("p1")));
-    editor.setCurrentText(QStringLiteral("{\"saved\":3}"));
-    auto* save = editor.findChild<QPushButton*>(QStringLiteral("spiralAdvancedProfileSave"));
-    require(save && save->isEnabled(), "Dirty persisted profile must enable Save");
-    save->click();
-    {
-        QFile profiles(home.filePath(QStringLiteral("spiral-advanced-profiles.json")));
-        require(profiles.open(QIODevice::ReadOnly), "Could not read saved profiles");
-        const QJsonArray stored = QJsonDocument::fromJson(profiles.readAll())
-                                      .object().value(QStringLiteral("profiles")).toArray();
-        require(stored.size() == 1
-                    && stored[0].toObject().value(QStringLiteral("json")).toString()
-                        == QStringLiteral("{\"saved\":3}"),
-                "Save must explicitly overwrite the selected profile");
+    require(editor._controlGroups.size() == expectedPrefixes.size(),
+            "Catalog fields were not split into the expected groups");
+    for (int index = 0; index < expectedPrefixes.size(); ++index) {
+        const auto& group = editor._controlGroups[index];
+        require(group.prefix == expectedPrefixes[index],
+                "Groups are not in stable prefix order");
+        require(group.widget->isExpanded(),
+                "Configuration groups should initially be expanded");
+        auto* button = group.widget->findChild<QToolButton*>();
+        require(button && button->text() == expectedTitles[index],
+                "A configuration group has the wrong human-friendly title");
     }
 
-    combo->setCurrentIndex(combo->findData(QStringLiteral("default")));
-    editor.setCurrentText(QStringLiteral("{\"draft\":2}"));
-    require(editor.currentProfileId() == QStringLiteral("custom"),
-            "Editing Default must create a Custom draft");
+    require(qobject_cast<QDoubleSpinBox*>(
+                editor._fieldEditors.value(QStringLiteral("optimizer_learning_rate"))),
+            "Number fields should use QDoubleSpinBox");
+    require(qobject_cast<QSpinBox*>(
+                editor._fieldEditors.value(QStringLiteral("model_iterations"))),
+            "Integer fields should use QSpinBox");
+    require(qobject_cast<QCheckBox*>(
+                editor._fieldEditors.value(QStringLiteral("patch_enabled"))),
+            "Boolean fields should use QCheckBox");
+    require(qobject_cast<QComboBox*>(
+                editor._fieldEditors.value(QStringLiteral("sample_count_mode"))),
+            "Enum fields should use QComboBox");
+    require(qobject_cast<QLineEdit*>(
+                editor._fieldEditors.value(QStringLiteral("input_channels"))),
+            "Array fields should use QLineEdit");
+    auto* impact = editor.findChild<QLabel*>(
+        QStringLiteral("spiralConfigImpact_optimizer_learning_rate"));
+    require(impact && impact->text() == QStringLiteral("Next Run"),
+            "Runtime impact should use its compact display label");
+    require(impact->foregroundRole() == QPalette::WindowText
+                && impact->styleSheet().isEmpty(),
+            "Runtime impact should inherit theme-aware window text");
 
-    popOut->click();
-    QApplication::processEvents();
-    require(dialog->isVisible() && dialog->isAncestorOf(textEdit),
-            "Pop Out must move the authoritative editor into the dialog");
-    dialog->close();
-    QApplication::processEvents();
-    require(!dialog->isVisible() && editor.isAncestorOf(textEdit),
-            "Closing the dialog must pop the same editor back inline");
+    const QString beforeCollapse = editor.currentText();
+    auto* optimizerGroup = editor._controlGroups[4].widget;
+    optimizerGroup->setExpanded(false);
+    require(!optimizerGroup->isExpanded(),
+            "Configuration groups should be collapsible");
+    require(editor.currentText() == beforeCollapse,
+            "Collapsing a group must not change configuration values");
 
-    SpiralConfigProfileEditor restarted;
-    require(restarted.currentText() == QStringLiteral("{}"),
-            "Session Default and Custom draft must not persist across instances");
-    auto* restartedCombo = restarted.findChild<QComboBox*>(
-        QStringLiteral("spiralAdvancedProfileCombo"));
-    restartedCombo->setCurrentIndex(restartedCombo->findData(QStringLiteral("p1")));
-    require(restarted.currentText() == QStringLiteral("{\"saved\":3}"),
-            "Saved profiles must persist across editor instances");
+    editor._search->setText(QStringLiteral("Learning Rate"));
+    processLayout();
+    require(optimizerGroup->isExpanded(),
+            "Search should temporarily expand a matching group");
+    require(!optimizerGroup->isHidden(),
+            "Search should retain groups containing matching rows");
+    require(editor.findChild<QWidget*>(
+                QStringLiteral("spiralConfigRow_optimizer_momentum"))->isHidden(),
+            "Search should hide non-matching rows within a matching group");
+    require(editor._controlGroups[1].widget->isHidden(),
+            "Search should hide groups with no matching rows");
+    editor._search->clear();
+    processLayout();
+    require(!optimizerGroup->isExpanded(),
+            "Clearing search should restore the prior collapse state");
+    require(!editor._controlGroups[1].widget->isHidden(),
+            "Clearing search should restore hidden groups");
+
+    editor.showWindow();
+    QDialog* dialog = editor.findChild<QDialog*>(
+        QStringLiteral("spiralAdvancedConfigDialog"));
+    QWidget* grid = editor.findChild<QWidget*>(
+        QStringLiteral("spiralConfigGroupGrid"));
+    require(dialog && grid, "Configuration dialog grid was not created");
+    const QList<QPair<int, int>> widths{{520, 1}, {900, 2}, {1320, 3}};
+    for (const auto& width : widths) {
+        dialog->resize(width.first, 760);
+        processLayout();
+        require(grid->property("spiralColumnCount").toInt() == width.second,
+                "Responsive group grid selected the wrong column count");
+        require(editor._controlsScroll->horizontalScrollBarPolicy()
+                    == Qt::ScrollBarAlwaysOff,
+                "Controls area should never show a horizontal scrollbar");
+    }
+    require(editor._controlGroups[0].widget->y()
+                == editor._controlGroups[1].widget->y()
+            && editor._controlGroups[1].widget->y()
+                == editor._controlGroups[2].widget->y(),
+            "Groups in the same grid row should be top aligned");
+    const int sampleTop =
+        editor._controlGroups[3].widget->mapTo(grid, QPoint()).y();
+    bool packedBelowColumnHead = false;
+    for (int index = 0; index < 3; ++index) {
+        const int headBottom =
+            editor._controlGroups[index].widget->mapTo(grid, QPoint()).y()
+            + editor._controlGroups[index].widget->height();
+        packedBelowColumnHead |=
+            sampleTop >= headBottom && sampleTop - headBottom <= 16;
+    }
+    require(packedBelowColumnHead,
+            "Groups should pack into columns without fixed-row gaps");
+
+    auto* iterations = qobject_cast<QSpinBox*>(
+        editor._fieldEditors.value(QStringLiteral("model_iterations")));
+    QSignalSpy textChanged(&editor, &SpiralConfigProfileEditor::textChanged);
+    iterations->setValue(31);
+    processLayout();
+    const QJsonObject edited = QJsonDocument::fromJson(
+        editor.currentText().toUtf8()).object();
+    require(edited.value(QStringLiteral("model_iterations")).toInt() == 31,
+            "Editing a grouped control did not update Expert JSON");
+    require(editor._dirty && textChanged.count() > 0,
+            "Editing a grouped control did not update profile dirty state");
+
+    QJsonObject external = edited;
+    external[QStringLiteral("model_iterations")] = 47;
+    editor.setCurrentText(QString::fromUtf8(
+        QJsonDocument(external).toJson(QJsonDocument::Compact)));
+    processLayout();
+    require(iterations->value() == 47,
+            "Expert JSON changes did not update grouped controls");
 
     return 0;
 }

@@ -9,7 +9,6 @@ add_library(vc_core
         src/VolumePkg.cpp
         src/SurfacePatchIndex.cpp
         src/PointIndex.cpp
-        src/PolylineIndex.cpp
         src/Logging.cpp
         src/CrashHandler.cpp
         src/MemMap.cpp
@@ -29,6 +28,7 @@ add_library(vc_core
         src/CacheCompression.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
+        src/RemoteFileCache.cpp
         src/HttpFetch.cpp
         src/PostProcess.cpp
         src/Geometry.cpp
@@ -37,8 +37,10 @@ add_library(vc_core
         src/Thinning.cpp
         src/Umbilicus.cpp
         src/render/ChunkCache.cpp
+        src/render/DecodedChunkCacheBudget.cpp
         src/render/PersistentZarrCacheBudget.cpp
         src/render/ChunkedPlaneSampler.cpp
+        src/render/SurfaceCache.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
         src/render/ZarrChunkFetcher.cpp
@@ -147,6 +149,7 @@ add_library(vc_inpaint src/InpaintSurface.cpp)
 target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
 
 add_library(vc_lasagna
+    src/lasagna/ChannelSampler.cpp
     src/lasagna/Dataset.cpp
     src/lasagna/EclMaxflow.cpp
     src/lasagna/EclMaxflowCut.cpp
@@ -155,8 +158,10 @@ add_library(vc_lasagna
     src/lasagna/LasagnaNormalSampler.cpp
     src/lasagna/LineViewBuilder.cpp
     src/lasagna/LineOptimizer.cpp
+    src/lasagna/LineSpline.cpp
     src/lasagna/Manifest.cpp
     src/lasagna/MaxflowGraph.cpp
+    src/lasagna/ProjectVolumes.cpp
 )
 if(VC_ENABLE_ECL_MAXFLOW)
     target_sources(vc_lasagna PRIVATE src/lasagna/EclMaxflow.cu)
@@ -184,6 +189,14 @@ add_library(vc_atlas
 )
 target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
 
+add_library(vc_fiber_tracer
+    src/fiber_tracer/FiberTrace.cpp
+)
+target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna)
+if(VC_TESTING)
+    target_compile_definitions(vc_fiber_tracer PRIVATE VC_TESTING)
+endif()
+
 add_library(vc_tracer
     src/GrowPatch.cpp
     src/GrowSurface.cpp
@@ -198,7 +211,7 @@ target_link_libraries(vc_tracer PUBLIC vc_core vc_flattening Ceres::ceres)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 
 if(VC_USE_PCH)
-    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_atlas vc_tracer)
+    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_atlas vc_fiber_tracer vc_tracer)
         target_precompile_headers(${_lib} REUSE_FROM vc_common_pch)
     endforeach()
 endif()

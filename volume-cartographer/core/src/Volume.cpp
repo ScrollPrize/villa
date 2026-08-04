@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -72,8 +73,7 @@ std::string deriveRemoteVolumeName(const std::string& url)
 }
 
 std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl,
-                                                    const vc::HttpAuth& auth,
-                                                    bool discoverPublicSamplePixelSize)
+                                                    const vc::HttpAuth& auth)
 {
     const auto numberFromObject = [](const utils::Json& obj,
                                      std::initializer_list<const char*> keys) -> std::optional<double> {
@@ -141,7 +141,7 @@ std::optional<utils::Json> loadRemoteVolumeMetadata(const std::string& remoteUrl
                 hasVoxelSize = true;
             }
         }
-        if (!hasVoxelSize && discoverPublicSamplePixelSize) {
+        if (!hasVoxelSize) {
             const utils::Json* current = &json;
             for (const char* key : {"scan", "tomo", "acquisition", "detector"}) {
                 if (!current->is_object() || !current->contains(key)) {
@@ -181,6 +181,36 @@ std::string deriveRemoteVolumeId(const std::string& url)
     const auto name = deriveRemoteVolumeName(normalized);
     const auto hash = utils::fnv1a(std::string_view(normalized));
 
+    std::ostringstream out;
+    out << name << "-" << std::hex << std::nouppercase << std::setw(16)
+        << std::setfill('0') << hash;
+    return out.str();
+}
+
+std::string normalizeLocalVolumePathForId(const std::filesystem::path& path)
+{
+    return std::filesystem::absolute(path).lexically_normal().string();
+}
+
+std::string deriveLocalVolumeName(const std::filesystem::path& path)
+{
+    const auto filename = path.filename().string();
+    if (!filename.empty() &&
+        std::all_of(filename.begin(), filename.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        })) {
+        const auto parentName = path.parent_path().filename().string();
+        if (!parentName.empty())
+            return parentName;
+    }
+    return filename.empty() ? std::string("volume") : filename;
+}
+
+std::string deriveLocalVolumeId(const std::filesystem::path& path)
+{
+    const std::string name = deriveLocalVolumeName(path);
+    const std::string normalized = normalizeLocalVolumePathForId(path);
+    const auto hash = utils::fnv1a(std::string_view(normalized));
     std::ostringstream out;
     out << name << "-" << std::hex << std::nouppercase << std::setw(16)
         << std::setfill('0') << hash;
@@ -1075,9 +1105,8 @@ void Volume::loadMetadata()
         }
         metaPath = altPath;
     } else {
-        const auto baseName = path_.filename().string();
-        metadata_["uuid"] = baseName;
-        metadata_["name"] = baseName;
+        metadata_["uuid"] = deriveLocalVolumeId(path_);
+        metadata_["name"] = deriveLocalVolumeName(path_);
         metadata_["type"] = "vol";
         metadata_["format"] = "zarr";
         metadata_["width"] = 0;
@@ -1396,8 +1425,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
 
     std::optional<double> nativeRemoteVoxelSize;
     try {
-        if (auto remoteMeta = loadRemoteVolumeMetadata(
-                remoteUrl, auth, spec.baseScaleLevel > 0)) {
+        if (auto remoteMeta = loadRemoteVolumeMetadata(remoteUrl, auth)) {
             if (remoteMeta->contains("voxelsize") &&
                 (*remoteMeta)["voxelsize"].is_number()) {
                 const double value = (*remoteMeta)["voxelsize"].get_double();
@@ -1453,6 +1481,107 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     }
 
     return vol;
+}
+
+std::shared_ptr<Volume> Volume::NewFromPreparedChunkedSource(std::function<vc::render::OpenedChunkedZarr()> sourceFactory, const utils::Json& metadata)
+{
+    if (!sourceFactory)
+        throw std::invalid_argument("prepared 3D volume source factory is required");
+    auto opened = sourceFactory();
+    if (opened.fetchers.empty() || opened.shapes.empty() || opened.fetchers.size() != opened.shapes.size() ||
+        opened.chunkShapes.size() != opened.shapes.size() ||
+        opened.storageChunkShapes.size() != opened.shapes.size()) {
+        throw std::invalid_argument("prepared 3D volume source is incomplete");
+    }
+    if (opened.transforms.size() != opened.shapes.size()) {
+        opened.transforms.resize(opened.shapes.size());
+        for (std::size_t level = 0; level < opened.transforms.size(); ++level) {
+            const double invScale = 1.0 / static_cast<double>(std::uint64_t{1} << level);
+            opened.transforms[level].scaleFromLevel0 = {invScale, invScale, invScale};
+        }
+    }
+    int firstPresentLevel = -1;
+    for (std::size_t level = 0; level < opened.shapes.size(); ++level) {
+        const auto& shape = opened.shapes[level];
+        const auto& chunks = opened.chunkShapes[level];
+        const bool missingLevel = shape[0] == 0 && shape[1] == 0 && shape[2] == 0;
+        if (chunks[0] <= 0 || chunks[1] <= 0 || chunks[2] <= 0) {
+            throw std::invalid_argument("prepared 3D volume source has an invalid chunk shape");
+        }
+        if (missingLevel) {
+            if (opened.fetchers[level])
+                throw std::invalid_argument("prepared 3D volume source has a fetcher for a missing level");
+            continue;
+        }
+        if (!opened.fetchers[level] || shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0) {
+            throw std::invalid_argument("prepared 3D volume source has an invalid level");
+        }
+        if (firstPresentLevel < 0)
+            firstPresentLevel = static_cast<int>(level);
+    }
+    if (firstPresentLevel < 0)
+        throw std::invalid_argument("prepared 3D volume source has no present levels");
+    if (!metadata.is_object() || !metadata.contains("uuid") || !metadata["uuid"].is_string() || metadata["uuid"].get_string().empty()) {
+        throw std::invalid_argument("prepared 3D volume metadata requires a uuid");
+    }
+
+    auto volume = std::make_shared<Volume>(std::filesystem::path{}, RemoteConstructTag{});
+    volume->metadata_ = metadata;
+    volume->metadata_["type"] = "vol";
+    volume->metadata_["format"] = "zarr";
+    const auto& first = opened.shapes[static_cast<std::size_t>(firstPresentLevel)];
+    const auto metadataPositiveInt = [&](const char* key) -> std::optional<int> {
+        if (!volume->metadata_.contains(key) || !volume->metadata_[key].is_number())
+            return std::nullopt;
+        const int value = volume->metadata_[key].get_int();
+        if (value <= 0)
+            return std::nullopt;
+        return value;
+    };
+    const auto metadataSlices = metadataPositiveInt("slices");
+    const auto metadataHeight = metadataPositiveInt("height");
+    const auto metadataWidth = metadataPositiveInt("width");
+    if (metadataSlices && metadataHeight && metadataWidth) {
+        volume->_slices = *metadataSlices;
+        volume->_height = *metadataHeight;
+        volume->_width = *metadataWidth;
+    } else {
+        const size_t scale = size_t{1} << firstPresentLevel;
+        volume->_slices = static_cast<int>(static_cast<size_t>(first[0]) * scale);
+        volume->_height = static_cast<int>(static_cast<size_t>(first[1]) * scale);
+        volume->_width = static_cast<int>(static_cast<size_t>(first[2]) * scale);
+    }
+    for (std::size_t level = 0; level < opened.shapes.size(); ++level) {
+        const auto& shape = opened.shapes[level];
+        if (shape[0] == 0 && shape[1] == 0 && shape[2] == 0) {
+            continue;
+        }
+        const auto& storageChunkShape = opened.storageChunkShapes[level];
+        const int levelInt = static_cast<int>(level);
+        const int expectedSlices = ceilDivPow2(volume->_slices, levelInt);
+        const int expectedHeight = ceilDivPow2(volume->_height, levelInt);
+        const int expectedWidth = ceilDivPow2(volume->_width, levelInt);
+        if (!paddedShapeOK(shape[0], expectedSlices, storageChunkShape[0]) ||
+            !paddedShapeOK(shape[1], expectedHeight, storageChunkShape[1]) ||
+            !paddedShapeOK(shape[2], expectedWidth, storageChunkShape[2])) {
+            throw std::runtime_error(
+                "prepared zarr level " + std::to_string(levelInt) + " shape [z,y,x]=("
+                + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2])
+                + ") does not match expected downscaled metadata dimensions (slices=" + std::to_string(expectedSlices)
+                + ", height=" + std::to_string(expectedHeight) + ", width=" + std::to_string(expectedWidth) + ")");
+        }
+    }
+    volume->metadata_["slices"] = volume->_slices;
+    volume->metadata_["height"] = volume->_height;
+    volume->metadata_["width"] = volume->_width;
+    volume->zarrLevelShapes_ = opened.shapes;
+    volume->zarrLevelChunkShapes_ = opened.chunkShapes;
+    volume->zarrLevelStorageChunkShapes_ = opened.storageChunkShapes;
+    volume->zarrDtype_ = opened.dtype;
+    volume->zarrFillValue_ = opened.fillValue;
+    volume->remoteNumScales_ = opened.shapes.size();
+    volume->preparedSourceFactory_ = std::move(sourceFactory);
+    return volume;
 }
 
 std::filesystem::path Volume::remotePersistentCachePath() const
@@ -1595,20 +1724,37 @@ int Volume::finestPresentScaleLevelAtOrBelow(int level) const
 
 vc::render::IChunkedArray* Volume::chunkedCache()
 {
+    return sharedChunkCache().get();
+}
+
+std::shared_ptr<vc::render::ChunkCache> Volume::sharedChunkCache()
+{
     std::lock_guard<std::mutex> lock(cacheMutex_);
     if (!chunkedCache_) {
         vc::render::ChunkCache::Options options;
         options.decodedByteCapacity = cacheBudgetHot_;
+        options.decodedByteBudget = decodedCacheBudget_;
         options.maxConcurrentReads = ioThreads_ > 0 ? static_cast<std::size_t>(ioThreads_) : 16;
-        chunkedCache_ = createChunkCache(std::move(options));
+        chunkedCache_ = createChunkCacheConfigured(std::move(options));
         if (!chunkedCache_) {
             throw std::runtime_error("Volume::chunkedCache failed to create chunk cache");
         }
     }
-    return chunkedCache_.get();
+    return chunkedCache_;
 }
 
 std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
+    vc::render::ChunkCache::Options options) const
+{
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        if (!options.decodedByteBudget)
+            options.decodedByteBudget = decodedCacheBudget_;
+    }
+    return createChunkCacheConfigured(std::move(options));
+}
+
+std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCacheConfigured(
     vc::render::ChunkCache::Options options) const
 {
     if (isRemote_ && !remoteCacheRoot_.empty())
@@ -1618,11 +1764,17 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
         options.persistentCacheBudgetRoot = remoteCacheRoot_;
     }
 
-    vc::render::OpenedChunkedZarr opened = isRemote_
-        ? (baseScaleLevel_ > 0
-               ? vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_, baseScaleLevel_)
-               : vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_))
-        : vc::render::openLocalZarrPyramid(path_);
+    vc::render::OpenedChunkedZarr opened;
+    if (preparedSourceFactory_) {
+        opened = preparedSourceFactory_();
+    } else if (isRemote_) {
+        opened = baseScaleLevel_ > 0
+            ? vc::render::openHttpZarrPyramid(
+                  remoteUrl_, remoteAuth_, baseScaleLevel_)
+            : vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_);
+    } else {
+        opened = vc::render::openLocalZarrPyramid(path_);
+    }
 
     if (opened.fetchers.empty()) {
         return nullptr;
@@ -1636,29 +1788,56 @@ std::shared_ptr<vc::render::ChunkCache> Volume::createChunkCache(
         std::move(options));
 }
 
-void Volume::setCacheBudget(size_t hotBytes)
+void Volume::setCacheBudget(
+    size_t hotBytes,
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget)
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (cacheBudgetHot_ == hotBytes) {
+    if (cacheBudgetHot_ == hotBytes && decodedCacheBudget_ == decodedBudget) {
         // Re-applying the same budget must not drop the warm cache; multiple
         // workspaces share Volume instances and each applies its budget on
         // volume selection.
         return;
     }
     cacheBudgetHot_ = hotBytes;
+    decodedCacheBudget_ = std::move(decodedBudget);
+    if (chunkedCache_)
+        chunkedCache_->invalidate();
     chunkedCache_.reset();
+}
+
+void Volume::retainCacheClient()
+{
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    ++cacheClientCount_;
+}
+
+void Volume::releaseCacheClient()
+{
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    if (cacheClientCount_ == 0)
+        return;
+    --cacheClientCount_;
+    if (cacheClientCount_ == 0 && chunkedCache_) {
+        chunkedCache_->invalidate();
+        chunkedCache_.reset();
+    }
 }
 
 void Volume::setIOThreads(int count)
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
     ioThreads_ = count;
+    if (chunkedCache_)
+        chunkedCache_->invalidate();
     chunkedCache_.reset();
 }
 
 void Volume::invalidateCache()
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
+    if (chunkedCache_)
+        chunkedCache_->invalidate();
     chunkedCache_.reset();
 }
 

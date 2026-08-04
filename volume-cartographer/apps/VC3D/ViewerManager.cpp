@@ -21,6 +21,8 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/DecodedChunkCacheBudget.hpp"
 
 #include <QApplication>
 #include <QCursor>
@@ -225,6 +227,10 @@ ViewerManager::ViewerManager(CState* state,
 
     if (_state) {
         connect(_state,
+                &CState::volumeChanged,
+                this,
+                &ViewerManager::currentVolumeChanged);
+        connect(_state,
                 &CState::surfaceChanged,
                 this,
                 &ViewerManager::handleSurfaceChanged);
@@ -255,6 +261,171 @@ ViewerManager::~ViewerManager()
 const std::vector<ViewerManager*>& ViewerManager::allManagers()
 {
     return managerRegistry();
+}
+
+void ViewerManager::applySpiralCacheSettings()
+{
+    using namespace vc3d::settings;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    constexpr std::size_t mib = 1024ULL * 1024ULL;
+    constexpr std::size_t gib = 1024ULL * mib;
+    const auto planeMb = std::max<qlonglong>(
+        0, settings.value(spiral::PLANE_CHUNK_CACHE_MB,
+                          spiral::PLANE_CHUNK_CACHE_MB_DEFAULT).toLongLong());
+    const auto surfaceGb = std::max<qlonglong>(
+        0, settings.value(spiral::SURFACE_CACHE_GB,
+                          spiral::SURFACE_CACHE_GB_DEFAULT).toLongLong());
+    const auto overlayGb = std::max<qlonglong>(
+        0, settings.value(spiral::OVERLAY_SURFACE_CACHE_GB,
+                          spiral::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toLongLong());
+
+    if (_chunkCachePolicy == ChunkCachePolicy::PrivateBounded)
+        setChunkCacheFloorBytes(ChunkCachePool::PlaneViews, std::size_t(planeMb) * mib);
+    else
+        setChunkCachePolicy(ChunkCachePolicy::PrivateBounded, std::size_t(planeMb) * mib);
+    setSurfaceCacheBudgets(std::size_t(surfaceGb) * gib, std::size_t(overlayGb) * gib);
+}
+
+void ViewerManager::setChunkCachePolicy(ChunkCachePolicy policy, std::size_t capacityBytes)
+{
+    const bool policyChanged = _chunkCachePolicy != policy;
+    _chunkCachePolicy = policy;
+    privateChunkPool(ChunkCachePool::PlaneViews).floorBytes = capacityBytes;
+    // The tile filler's pool is not a user setting: it is sized like the plane
+    // pool by default and, like it, raised when one round of concurrent tile
+    // fills cannot fit. Exposing it later is a one-line change.
+    constexpr std::size_t kSurfaceTilePoolFloorBytes = 2ULL * 1024 * 1024 * 1024;
+    privateChunkPool(ChunkCachePool::SurfaceTiles).floorBytes = kSurfaceTilePoolFloorBytes;
+    privateChunkPool(ChunkCachePool::OverlaySurfaceTiles).floorBytes =
+        kSurfaceTilePoolFloorBytes;
+    if (policyChanged) {
+        for (auto& pool : _privateChunkPools) {
+            pool.cache.reset();
+            pool.budget.reset();
+            pool.volume.reset();
+            pool.builtCapacity = 0;
+        }
+    }
+    // Viewers created before the opt-in are already holding a cache from the
+    // previous policy, so make them re-acquire.
+    forEachBaseViewer([](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->refreshChunkSource();
+    });
+}
+
+std::size_t ViewerManager::chunkCacheFloorBytes(ChunkCachePool pool) const
+{
+    return privateChunkPool(pool).floorBytes;
+}
+
+void ViewerManager::setChunkCacheFloorBytes(ChunkCachePool pool, std::size_t bytes)
+{
+    auto& slot = privateChunkPool(pool);
+    if (slot.floorBytes == bytes)
+        return;
+    slot.floorBytes = bytes;
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded)
+        return;
+    forEachBaseViewer([](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->refreshChunkSource();
+    });
+}
+
+std::size_t ViewerManager::effectiveChunkCacheCapacity(ChunkCachePool pool) const
+{
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded)
+        return 0;
+    const auto& slot = privateChunkPool(pool);
+    return std::max(slot.floorBytes, slot.requiredBytes);
+}
+
+void ViewerManager::noteChunkFootprint(ChunkCachePool pool, std::size_t footprintBytes)
+{
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded || footprintBytes == 0)
+        return;
+    // The sampler pins only a small window of chunks at a time and re-reads the
+    // rest through the cache across tiles, so a cap that merely equals one
+    // frame's footprint still thrashes. Two frames' worth is the working
+    // minimum.
+    const std::size_t required = footprintBytes <= std::numeric_limits<std::size_t>::max() / 2
+                                     ? footprintBytes * 2
+                                     : std::numeric_limits<std::size_t>::max();
+    auto& slot = privateChunkPool(pool);
+    // Hard ceiling on how far a *derived* requirement may raise the configured
+    // floor. The point of this policy is a bounded pool; an estimate that comes
+    // back wrong must degrade into thrashing, never into unbounded retention.
+    // The status bar reports the effective capacity either way.
+    const std::size_t ceiling =
+        slot.floorBytes > 0 ? std::min(slot.floorBytes * kChunkCacheDerivedFloorMultiplier,
+                                       kChunkCacheAbsoluteCapBytes)
+                            : kChunkCacheAbsoluteCapBytes;
+    slot.requiredBytes = std::min(std::max(slot.requiredBytes, required), ceiling);
+}
+
+std::shared_ptr<vc::render::ChunkCache> ViewerManager::chunkCacheFor(
+    const std::shared_ptr<Volume>& volume, ChunkCachePool pool)
+{
+    if (!volume)
+        return nullptr;
+    if (_chunkCachePolicy != ChunkCachePolicy::PrivateBounded) {
+        // Byte-for-byte the pre-policy behaviour, including Volume's refusal to
+        // drop a warm cache when a second workspace re-applies its budget.
+        return volume->sharedChunkCache();
+    }
+
+    auto& slot = privateChunkPool(pool);
+    const std::size_t wanted = std::max(slot.floorBytes, slot.requiredBytes);
+    // Exact comparison, not >=, so lowering the setting shrinks the pool rather
+    // than silently keeping the larger one until something else rebuilds it.
+    if (slot.cache && slot.volume.lock() == volume && slot.builtCapacity == wanted)
+        return slot.cache;
+
+    // Releasing the previous pool here is what bounds retention: it is dropped
+    // on a volume switch or a capacity growth, and never accumulates with
+    // browsing history. An in-flight render holding the old cache keeps it
+    // alive until that frame finishes.
+    slot.cache.reset();
+    slot.budget.reset();
+    slot.builtCapacity = 0;
+    slot.volume = volume;
+
+    try {
+        vc::render::ChunkCache::Options options;
+        options.decodedByteCapacity = wanted;
+        // A private budget of the same size, rather than the process-wide one:
+        // Volume::createChunkCache substitutes its own budget for a null here,
+        // which would rejoin this pool to the shared ceiling.
+        slot.budget = std::make_shared<vc::render::DecodedChunkCacheBudget>(wanted);
+        options.decodedByteBudget = slot.budget;
+        // maxConcurrentReads is left at the default so this pool shares the
+        // process-wide chunk I/O workers instead of starting its own.
+        slot.cache = volume->createChunkCache(std::move(options));
+        slot.builtCapacity = wanted;
+    } catch (const std::exception& e) {
+        Logger()->warn("spiral private chunk cache unavailable: {}", e.what());
+        slot.cache.reset();
+        slot.budget.reset();
+        slot.volume.reset();
+        slot.builtCapacity = 0;
+    }
+    return slot.cache;
+}
+
+void ViewerManager::setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes)
+{
+    _surfaceCacheEnabled = true;
+    if (_surfaceCacheBudgetBytes == baseBytes &&
+        _overlaySurfaceCacheBudgetBytes == overlayBytes) {
+        return;
+    }
+    _surfaceCacheBudgetBytes = baseBytes;
+    _overlaySurfaceCacheBudgetBytes = overlayBytes;
+    forEachBaseViewer([baseBytes, overlayBytes](VolumeViewerBase* viewer) {
+        if (viewer)
+            viewer->setSurfaceCacheBudgets(baseBytes, overlayBytes);
+    });
 }
 
 void ViewerManager::onGlobalTick()
@@ -388,6 +559,10 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
     baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     baseViewer->setOverlayComposite(_overlayComposite);
+    if (_surfaceCacheEnabled) {
+        baseViewer->setSurfaceCacheBudgets(_surfaceCacheBudgetBytes,
+                                           _overlaySurfaceCacheBudgetBytes);
+    }
 
     if (_segmentationModule && role != ViewerRole::Annotation) {
         _segmentationModule->attachViewer(baseViewer);
@@ -401,7 +576,6 @@ void ViewerManager::unregisterViewer(VolumeViewerBase* viewer)
     if (!viewer) {
         return;
     }
-
     const auto viewerIt = std::find(_baseViewers.begin(), _baseViewers.end(), viewer);
     const bool knownViewer = viewerIt != _baseViewers.end() ||
                              _resetDefaults.find(viewer) != _resetDefaults.end();
@@ -913,6 +1087,30 @@ void ViewerManager::setSegmentationOverlay(SegmentationOverlayController* overla
     registerOverlay(overlay);
 }
 
+void ViewerManager::scheduleSurfacePatchIndexOverlayRefresh()
+{
+    if (!_segmentationOverlay || _surfacePatchIndexOverlayRefreshPending) {
+        return;
+    }
+
+    // Surface-overlap queries can legitimately run before an asynchronous
+    // index rebuild has installed their target surfaces. In that case the
+    // controller caches an empty result. Retry after every completed index
+    // mutation so that result does not remain empty indefinitely.
+    //
+    // Queue this instead of refreshing synchronously: an index swap can occur
+    // inside SegmentationOverlayController::endIndexRead(), while its previous
+    // overlap result is still being finalized. A direct callback there would
+    // re-enter and overwrite the controller's in-flight request state.
+    _surfacePatchIndexOverlayRefreshPending = true;
+    QTimer::singleShot(0, this, [this]() {
+        _surfacePatchIndexOverlayRefreshPending = false;
+        if (_segmentationOverlay) {
+            _segmentationOverlay->forceRefreshAllOverlays();
+        }
+    });
+}
+
 void ViewerManager::setSegmentationEditActive(bool active)
 {
     _segmentationEditActive = active;
@@ -1274,6 +1472,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     if (_surfacePatchIndex.updateSurface(surface)) {
         _indexedSurfaceIds.insert(surfId);
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Rebuilt SurfacePatchIndex entries for surface" << surfId.c_str();
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -1316,6 +1515,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Updated SurfacePatchIndex region for" << surfId.c_str()
                                 << "rows" << rowStart << "-" << rowEnd
                                 << "cols" << colStart << "-" << colEnd;
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -1367,6 +1567,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
+        scheduleSurfacePatchIndexOverlayRefresh();
         return;
     }
 
@@ -1418,6 +1619,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
                 v->invalidateIntersect();
                 v->renderIntersections("surface index cache hit");
             });
+            scheduleSurfacePatchIndexOverlayRefresh();
             return;
         }
         // Entry went stale (surfaces reloaded, deleted, or stride changed);
@@ -1475,6 +1677,7 @@ void ViewerManager::endIndexRead()
         _indexedSurfaceIds.insert(_deferredIndexSwapIds.begin(), _deferredIndexSwapIds.end());
         _deferredIndexSwapIds.clear();
         forEachBaseViewer([](VolumeViewerBase* v) { v->renderIntersections("deferred index swap"); });
+        scheduleSurfacePatchIndexOverlayRefresh();
     }
     // Run any single-surface mutation task that was held while reads were in flight.
     startNextSurfacePatchIndexTask();
@@ -1522,6 +1725,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     // require another full rebuild. Apply just those deltas on the worker.
     if (queuedDuringRebuild.empty()) {
         forEachBaseViewer([](VolumeViewerBase* v) { v->renderIntersections(); });
+        scheduleSurfacePatchIndexOverlayRefresh();
     } else {
         forEachBaseViewer([](VolumeViewerBase* v) { v->invalidateIntersect(); });
         for (auto& task : queuedDuringRebuild) {
@@ -1609,6 +1813,15 @@ void ViewerManager::handleSurfacePatchIndexTaskFinished()
     }
 
     const auto result = _surfacePatchIndexTaskWatcher->future().result();
+    if (_surfacePatchIndexNeedsRebuild) {
+        // A bulk surface replacement superseded this serialized delta while it
+        // was running. The task mutated only the outgoing live index; rebuild
+        // once from the final state and do not render the transient result.
+        _indexedSurfaceIds.clear();
+        primeSurfacePatchIndicesAsync();
+        return;
+    }
+
     if (result.success) {
         if (result.type == SurfacePatchIndexTaskType::Update) {
             _indexedSurfaceIds.insert(result.id);
@@ -1624,6 +1837,7 @@ void ViewerManager::handleSurfacePatchIndexTaskFinished()
                 v->renderIntersections();
             });
         }
+        scheduleSurfacePatchIndexOverlayRefresh();
     } else if (result.type == SurfacePatchIndexTaskType::Update) {
         _indexedSurfaceIds.erase(result.id);
         _surfacePatchIndexNeedsRebuild = true;
@@ -1666,6 +1880,7 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
         const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
         if (flushed) {
             _indexedSurfaceIds.insert(surfId);
+            scheduleSurfacePatchIndexOverlayRefresh();
         }
         _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !flushed;
         return flushed;
@@ -1700,6 +1915,31 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
 
 void ViewerManager::handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate)
 {
+    if (name.empty()) {
+        // Empty-name notifications represent a completed bulk mutation of the
+        // surface catalog. Drop serialized deltas and rebuild once from the
+        // final CState snapshot instead of replaying thousands of updates.
+        _pendingSurfacePatchIndexTasks.clear();
+        _surfacesQueuedDuringRebuild.clear();
+        _pendingSurfacePatchIndexSurfaceIds.clear();
+        _deferredIndexSwap.reset();
+        _deferredIndexSwapIds.clear();
+        _indexedSurfaceIds.clear();
+        _surfacePatchIndexNeedsRebuild = true;
+        forEachBaseViewer([](VolumeViewerBase* v) {
+            v->invalidateIntersect();
+        });
+
+        // A single-surface task mutates the live index. Let it drain before
+        // launching the replacement build; its completion handler will prime.
+        const bool taskRunning =
+            _surfacePatchIndexTaskWatcher && _surfacePatchIndexTaskWatcher->isRunning();
+        if (!taskRunning) {
+            primeSurfacePatchIndicesAsync();
+        }
+        return;
+    }
+
     bool affectsSurfaceIndex = false;
     bool regionUpdated = false;
 

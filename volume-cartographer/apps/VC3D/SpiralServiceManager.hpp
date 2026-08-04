@@ -3,9 +3,11 @@
 #include "SpiralServiceProfile.hpp"
 
 #include <QJsonObject>
+#include <QElapsedTimer>
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
+#include <QStringList>
 #include <QTimer>
 
 #include <functional>
@@ -28,6 +30,9 @@ class SpiralServiceManager : public QObject
 {
     Q_OBJECT
 public:
+    using FetchPreviewFileCallback =
+        std::function<void(const QString& localPath, const QString& error)>;
+
     enum class ConnectionState { Disconnected, Starting, Connecting, Ready,
                                  Reconnecting, Failed };
     Q_ENUM(ConnectionState)
@@ -38,6 +43,7 @@ public:
     void connectToService(const SpiralServiceProfile& profile);
     void disconnectFromService();
     void reconnect();
+    void restartRemoteService();
 
     // Convenience for the built-in local profile (compatibility with callers
     // that only ever used the auto-launched loopback service).
@@ -55,7 +61,8 @@ public:
     void resolveDataset(const QString& root);
     void loadSession(QJsonObject request);
     void runIterations(int iterations, const QJsonObject& influenceConfig,
-                       const QJsonObject& runConfig);
+                       const QJsonObject& runConfig,
+                       const QJsonObject& inputs = {});
     void stopAfterIteration();
     // Save on service: writes to a service-host path.
     void saveCheckpoint(const QString& path);
@@ -69,21 +76,36 @@ public:
                          const QString& inputId, const QString& role = {});
     // Remove an added input that has not joined the resident fit yet.
     void removeEphemeralInput(const QString& kind, const QString& inputId);
+    // Fetch a file intentionally omitted from the initial preview transfer.
+    // Only files declared by the currently installed preview artifact are
+    // accepted by the cache.
+    void fetchPreviewFile(const QString& relativeName,
+                          FetchPreviewFileCallback done);
 
 signals:
     void connectionStateChanged(SpiralServiceManager::ConnectionState state,
                                 const QString& message);
     void serviceStateChanged(const QString& state);
     void datasetResolved(const QJsonObject& resolution);
-    void sessionAccepted(const QJsonObject& inputPaths, qint64 sessionGeneration);
+    void configurationCatalogChanged(const QJsonObject& catalog);
+    void configurationReviewRequested();
+    // Emitted once when this connection first observes a resident session,
+    // whether VC3D loaded it or attached after another client did.
+    void sessionSynchronized(const QJsonObject& sessionRequest,
+                             const QJsonObject& status);
     void sessionStatusChanged(const QJsonObject& status);
     void sessionActiveChanged(bool active);
     // Local (cache) filesystem paths: artifact transfers already happened.
     void previewAvailable(const QString& manifestPath, qint64 generation);
-    void geometryAvailable(const QString& manifestPath, quint64 generation);
+    void previewTransferProgress(const QString& phase, const QString& fileName,
+                                 int filesComplete, int totalFiles,
+                                 qint64 bytesReceived, qint64 totalBytes);
+    void checkpointDownloadProgress(const QString& phase,
+                                    qint64 bytesReceived, qint64 totalBytes);
     void checkpointDownloadFinished(const QString& localPath, const QString& error);
     void checkpointUploadProgress(qint64 sentBytes, qint64 totalBytes);
     void inputUploadFinished(const QString& inputId, const QString& error);
+    void commitInputsFinished(const QStringList& committedIds, const QString& error);
     void logMessage(const QString& message);
     void errorOccurred(const QString& message);
 
@@ -102,6 +124,7 @@ private:
     void startLocalProcess();
     void startTunnel();
     void beginHandshake();
+    void probeRestartedService();
     void handleHealth(const QJsonObject& health);
     QNetworkRequest makeRequest(const QString& path, int timeoutMs) const;
     void post(const QString& path, QJsonObject body, Timeout timeout,
@@ -124,15 +147,15 @@ private:
     void fetchAdvertisedDataset();
     QString commandId();
     QString endpointFingerprint() const;
-    QJsonObject remoteInputPaths() const;
     void continueUpload(const QString& uploadId, const QString& inputId,
                         const QString& baseDir, QStringList pendingFiles);
-    void sendLoadRequest(QJsonObject request, const QJsonObject& inputPaths);
+    void sendLoadRequest(QJsonObject request);
     // Streams a client-local resume checkpoint into the service's
     // uploaded-checkpoints directory and reports the resulting host path.
     void uploadCheckpointForResume(const QString& localPath,
                                    std::function<void(const QString& hostPath,
-                                                      const QString& error)> done);
+                                                      const QString& error,
+                                                      bool reused)> done);
 
     SpiralServiceProfile _profile;
     QProcess* _process = nullptr;       // owned local service process, if any
@@ -151,16 +174,21 @@ private:
     bool _hasActiveSession = false;
     bool _serviceOwnsDataset = false;
     bool _remoteLogsInFlight = false;
+    bool _restartInProgress = false;
+    QElapsedTimer _restartElapsed;
     int _remoteLogFailures = 0;
     qint64 _lastRemoteLogSequence = 0;
     QJsonObject _advertisedDataset;
+    QJsonObject _configurationDefaults;
+    QJsonObject _appliedConfiguration;
+    qint64 _sessionRevision = 0;
     quint64 _commandCounter = 0;
     qint64 _lastStatusGeneration = -1;
     QString _installedPreviewArtifact;
+    QString _installedPreviewSession;
     QString _fetchingPreviewArtifact;
-    QString _installedGeometryArtifact;
-    QString _fetchingGeometryArtifact;
+    QString _fetchingCheckpointArtifact;
     qint64 _previewSequence = 0;
     QString _lastPreviewLocalPath;
-    QString _lastGeometryLocalPath;
+    QString _synchronizedSessionId;
 };

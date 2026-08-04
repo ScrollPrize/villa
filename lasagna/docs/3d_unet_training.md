@@ -645,10 +645,18 @@ replaces the 2D pipeline (3 per-axis runs + `integrate` fusion) with a single
 pass.
 
 The pipeline: tiled 3D inference with per-tile sigmoid and avg_pool3d
-downscaling on GPU, linear-blended into a disk-backed memmap accumulator
-→ chunked normal estimation from 3×2 direction channels → uint8 encoding
-→ zarr output. Input tiles are read lazily from zarr (no full-crop load).
-Uses CUDA by default when available.
+downscaling on GPU, linear-blended into rolling, disk-backed per-channel z-band
+accumulators → chunked normal estimation from 3×2 direction channels → uint8
+encoding → zarr output. Input tiles are read lazily from zarr (no full-crop
+load). Uses CUDA by default when available.
+
+The generic tiled mechanics live in `lasagna/tiled_predict3d.py`: canonical
+global tile positions, crop-independent output chunk selection, rolling
+z-band scratch, output-chunk resume, temp cleanup, progress, and atomic chunk
+writes. `preprocess_cos_omezarr.py predict3d` is the Lasagna adapter/wrapper
+for cos, `grad_mag/nx/ny`, optional `pred_dt`, `.lasagna.json` metadata, and
+Lasagna pyramid generation. The wrapper CLI and output semantics stay
+compatible with earlier `predict3d` runs.
 
 #### Basic usage
 
@@ -700,20 +708,43 @@ Metadata is stored in `preprocess_params` with keys: `scaledown` (OME-Zarr level
 
 #### Memory considerations
 
-The accumulator is a disk-backed numpy memmap at **downscaled** resolution
-(crop dims // scaledown). Input tiles are read lazily from the zarr — the
-full crop is never loaded into RAM.
+The active accumulator is a rolling z band backed by separate numpy memmap files
+per logical accumulator channel. Completed z bands are normalized, written as
+full OME-Zarr chunks, and discarded before the next bands are processed. Input
+tiles are read lazily from the zarr — the full crop is never loaded into RAM.
 
 | Component            | RAM usage (2000³ crop, sd=4) |
 |----------------------|-----------------------------|
 | Input                | ~0 (lazy zarr reads)         |
-| Memmap accumulator   | ~4.5 GiB (fits in page cache)|
+| Rolling accumulator  | active z-band only           |
 | Post-processing      | ~0.5 GiB (Z-chunked)         |
-| **Total**            | **~5 GiB**                   |
+| **Total**            | bounded by active band       |
 
-For very large volumes the memmap spills to disk (e.g. ~1.1 TiB temp for a
-full 2 TB volume at sd=1), but RSS stays at a few GiB. The process sets
-`oom_score_adj=1000` so the OOM killer targets it before the parent session.
+Resume is based on durable output chunks, not accumulator scratch. A fine
+output chunk is complete when the `cos` chunk exists. A coarse output chunk is
+complete only when all three `grad_mag`, `nx`, and `ny` chunks exist. If one
+coarse sibling is missing, the model chunk is recomputed and only the missing
+siblings are written. Optional `pred_dt` is a separate derived product: missing
+`pred_dt` chunks trigger only `pred_dt` generation and do not rerun neural
+inference when the model-derived chunks are already complete.
+
+Output chunks and model tiles use global lattices anchored at the full-volume
+origin. Crops only select which global chunks to produce; they do not shift the
+tile grid. If two separate crop runs touch the same output chunk, that chunk is
+computed from the same canonical tile support.
+
+All chunk writes go through unique temporary paths and are installed with
+atomic rename. On startup/resume and on normal finish, stale predict3d temp
+paths in the output directory are removed; pid-bearing temp paths owned by
+other live predict3d processes are left alone.
+
+The shared runner treats each logical product independently. For Lasagna,
+`cos` is a single-channel fine product, `grad_mag/nx/ny` is one coherent
+coarse model product, and `pred_dt` is a derived product. Fiber inference uses
+the same mechanics but different adapters and output semantics.
+
+The process sets `oom_score_adj=1000` so the OOM killer targets it before the
+parent session.
 
 
 ---

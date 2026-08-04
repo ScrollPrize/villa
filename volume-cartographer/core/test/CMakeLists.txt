@@ -60,7 +60,8 @@ function(vc_add_test)
         target_compile_definitions(${T_NAME} PRIVATE ${T_DEFS})
     endif()
     add_test(NAME ${T_NAME} COMMAND ${T_NAME})
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS ${T_NAME})
+    vc_register_test_target(${T_NAME})
+    vc_register_ctest(${T_NAME} ${T_NAME})
 endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
@@ -140,15 +141,6 @@ vc_add_test(NAME test_scale_bar_units
     LIBS doctest::doctest Qt6::Core Qt6::Gui Qt6::Widgets vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-qt6_wrap_cpp(spiral_config_profile_editor_moc
-    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.hpp)
-vc_add_test(NAME test_spiral_config_profile_editor
-    SOURCES test_spiral_config_profile_editor.cpp
-            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.cpp
-            ${spiral_config_profile_editor_moc}
-    LIBS Qt6::Core Qt6::Gui Qt6::Widgets
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
 qt6_wrap_cpp(cfiber_widget_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CFiberWidget.hpp)
 vc_add_test(NAME test_fiber_widget
     SOURCES test_fiber_widget.cpp
@@ -160,6 +152,13 @@ vc_add_test(NAME test_fiber_widget
 
 qt6_wrap_cpp(lasagna_service_manager_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaServiceManager.hpp)
 qt6_wrap_cpp(lasagna_batch_window_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.hpp)
+vc_add_test(NAME test_lasagna_service_manager_factory
+    SOURCES test_lasagna_service_manager_factory.cpp
+            test_lasagna_service_manager_stub.cpp
+            ${lasagna_service_manager_moc}
+    LIBS Qt6::Core vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 vc_add_test(NAME test_lasagna_batch_window
     SOURCES test_lasagna_batch_window.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.cpp
@@ -191,12 +190,24 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 
+qt6_wrap_cpp(spiral_config_profile_editor_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.hpp)
+vc_add_test(NAME test_spiral_config_profile_editor
+    SOURCES test_spiral_config_profile_editor.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
+            ${spiral_config_profile_editor_moc}
+            ${collapsible_settings_group_moc}
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
 vc_add_test(NAME test_line_annotation_generated_views
     SOURCES test_line_annotation_generated_views.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSaveJob.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberSliceGeometry.cpp
@@ -204,7 +215,7 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${line_annotation_vccollection_moc}
             ${line_annotation_cstate_moc}
-    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna
+    LIBS doctest::doctest Qt6::Core vc_core vc_lasagna vc_fiber_tracer
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_fiber_slice_geometry
@@ -215,6 +226,9 @@ vc_add_test(NAME test_fiber_slice_geometry
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_fiber_trace3d
+    LIBS doctest::doctest vc_fiber_tracer
+    DEFS VC_TESTING)
 
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
@@ -268,9 +282,10 @@ vc_add_test(NAME test_merge_grid_resolve)
 # itself if unset, so the default ctest run stays fast.
 add_executable(test_merge_e2e_small test_merge_e2e_small.cpp)
 target_link_libraries(test_merge_e2e_small PRIVATE doctest::doctest vc_core nlohmann_json::nlohmann_json)
+vc_register_test_target(test_merge_e2e_small)
 if(VC_RUN_E2E)
     add_test(NAME test_merge_e2e_small COMMAND test_merge_e2e_small)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_merge_e2e_small)
+    vc_register_ctest(test_merge_e2e_small test_merge_e2e_small)
     # The binary path probe in the test prefers VC_MERGE_TIFXYZ_BIN, so
     # CTest runs reliably regardless of the working directory.
     set_tests_properties(test_merge_e2e_small PROPERTIES
@@ -279,47 +294,52 @@ endif()
 
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
+vc_register_test_target(bench_volume_sample)
 # Bench has a generous wall-clock assertion; not part of default ctest
 # unless the user opts in via VC_RUN_BENCHES. Expose it as a target so
 # it's always built and runnable manually.
 if(VC_RUN_BENCHES)
     add_test(NAME bench_volume_sample COMMAND bench_volume_sample)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_volume_sample)
+    vc_register_ctest(bench_volume_sample bench_volume_sample)
 endif()
 
 add_executable(bench_quadsurface_gen bench_quadsurface_gen.cpp)
 target_link_libraries(bench_quadsurface_gen PRIVATE doctest::doctest vc_core)
+vc_register_test_target(bench_quadsurface_gen)
 # Perf-regression guard for QuadSurface::gen() (warp helpers + per-surface
 # cache reuse). Loose relative assertion; opt-in via VC_RUN_BENCHES, always
 # built as a target so it's runnable manually.
 if(VC_RUN_BENCHES)
     add_test(NAME bench_quadsurface_gen COMMAND bench_quadsurface_gen)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_quadsurface_gen)
+    vc_register_ctest(bench_quadsurface_gen bench_quadsurface_gen)
 endif()
 
 add_executable(bench_chunked_plane_sampler bench_chunked_plane_sampler.cpp)
 target_link_libraries(bench_chunked_plane_sampler PRIVATE doctest::doctest vc_core)
+vc_register_test_target(bench_chunked_plane_sampler)
 # Perf guard for the slice sampler hot path. Like bench_volume_sample it
 # carries only a loose wall-clock assertion, so it stays out of default
 # ctest unless the user opts in via VC_RUN_BENCHES; the target is always
 # built and runnable manually.
 if(VC_RUN_BENCHES)
     add_test(NAME bench_chunked_plane_sampler COMMAND bench_chunked_plane_sampler)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_chunked_plane_sampler)
+    vc_register_ctest(bench_chunked_plane_sampler bench_chunked_plane_sampler)
 endif()
 
 add_executable(bench_lasagna_line_edit bench_lasagna_line_edit.cpp)
 target_link_libraries(bench_lasagna_line_edit PRIVATE vc_lasagna)
+vc_register_test_target(bench_lasagna_line_edit)
 if(VC_RUN_BENCHES)
     add_test(NAME bench_lasagna_line_edit COMMAND bench_lasagna_line_edit --help)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_lasagna_line_edit)
+    vc_register_ctest(bench_lasagna_line_edit bench_lasagna_line_edit)
 endif()
 
 add_executable(bench_fiber_intersections bench_fiber_intersections.cpp)
 target_link_libraries(bench_fiber_intersections PRIVATE vc_atlas vc_lasagna nlohmann_json::nlohmann_json)
+vc_register_test_target(bench_fiber_intersections)
 if(VC_RUN_BENCHES)
     add_test(NAME bench_fiber_intersections COMMAND bench_fiber_intersections --help)
-    set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS bench_fiber_intersections)
+    vc_register_ctest(bench_fiber_intersections bench_fiber_intersections)
 endif()
 
 # Sanitizer canaries: one exe, one subcommand per sanitizer. Each canary
@@ -334,6 +354,7 @@ if(VC_ENABLE_ASAN OR VC_ENABLE_UBSAN OR VC_ENABLE_TSAN OR VC_ENABLE_LSAN
 endif()
 add_executable(sanitizer_canary ${_canary_srcs})
 set_target_properties(sanitizer_canary PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+vc_register_test_target(sanitizer_canary)
 
 # ctest: PASS_REGULAR_EXPRESSION must match in stdout/stderr for the test
 # to pass. The canary aborts via the sanitizer runtime on success, or
@@ -343,6 +364,7 @@ set_target_properties(sanitizer_canary PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORC
 # by unrelated failures and would mask a regression.
 function(_add_canary name arg regex)
     add_test(NAME ${name} COMMAND sanitizer_canary ${arg})
+    vc_register_ctest(${name} sanitizer_canary)
     set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${regex}")
 endfunction()
 
@@ -372,6 +394,7 @@ vc_add_test(NAME test_gridstore_malformed)
 # Soft-skips on network failure so offline runs still pass; set
 # VC_TEST_REQUIRE_NETWORK=1 to flip those skips into hard failures.
 vc_add_test(NAME test_pherc0172_live)
+set_property(TEST test_pherc0172_live APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_tiff)
 
@@ -379,6 +402,7 @@ vc_add_test(NAME test_normalgridtools)
 
 # Live S3: opens the PHerc 0172 volume and reads small chunks.
 vc_add_test(NAME test_volume_live_s3)
+set_property(TEST test_volume_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normal_grid_volume)
 
@@ -391,6 +415,7 @@ vc_add_test(NAME test_http_fetch_errors)
 # Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises
 # the NormalGridGenerate library API against it. Soft-skips on network.
 vc_add_test(NAME test_normal_grid_live)
+set_property(TEST test_normal_grid_live APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_normalgridtools_real)
 
@@ -411,6 +436,8 @@ vc_add_test(NAME test_quadsurface_basics)
 vc_add_test(NAME test_load_json)
 
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_lasagna_project_volumes LIBS doctest::doctest vc_lasagna)
+vc_add_test(NAME test_remote_file_cache)
 
 vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp
@@ -444,8 +471,6 @@ vc_add_test(NAME test_remote_url)
 vc_add_test(NAME test_logging)
 
 vc_add_test(NAME test_plane_surface_branches)
-
-vc_add_test(NAME test_polyline_index)
 
 vc_add_test(NAME test_affine_transform_surface)
 

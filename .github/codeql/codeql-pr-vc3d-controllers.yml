@@ -1,0 +1,15 @@
+name: VC CodeQL PR VC3D controllers shard
+
+# Analyze files directly in apps/VC3D. Component subdirectories are handled by
+# the companion VC3D shard.
+paths:
+  - 'volume-cartographer/apps/VC3D'
+
+paths-ignore:
+  - 'volume-cartographer/apps/VC3D/agent_bridge'
+  - 'volume-cartographer/apps/VC3D/elements'
+  - 'volume-cartographer/apps/VC3D/overlays'
+  - 'volume-cartographer/apps/VC3D/segmentation'
+  - 'volume-cartographer/apps/VC3D/test'
+  - 'volume-cartographer/apps/VC3D/viewer_controls'
+  - 'volume-cartographer/apps/VC3D/volume_viewers'

@@ -95,6 +95,11 @@ int LasagnaChannelGroup::scaleFactor() const noexcept
     return 1 << scaledown;
 }
 
+bool LasagnaChannelGroup::isRemote() const noexcept
+{
+    return !remoteZarrBaseUrl.empty();
+}
+
 bool LasagnaChannelGroup::hasChannel(std::string_view channel) const noexcept
 {
     return channelIndex(channel).has_value();
@@ -154,6 +159,8 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
         ? std::filesystem::path{}
         : std::filesystem::absolute(manifestPath).lexically_normal();
     manifest.baseDirectory = manifestBaseDir(manifestPath);
+    manifest.manifestLocation = manifest.manifestPath.string();
+    manifest.manifestIsRemote = false;
     manifest.raw = root;
     manifest.version = root.value("version", 0);
     manifest.sourceToBase = root.value("source_to_base", 1.0);

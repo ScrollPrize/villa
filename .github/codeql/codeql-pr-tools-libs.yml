@@ -1,0 +1,10 @@
+name: VC CodeQL PR tools and libraries shard
+
+# This is the catch-all shard: new source directories outside core and VC3D
+# are included automatically.
+paths:
+  - 'volume-cartographer'
+
+paths-ignore:
+  - 'volume-cartographer/apps/VC3D'
+  - 'volume-cartographer/core'

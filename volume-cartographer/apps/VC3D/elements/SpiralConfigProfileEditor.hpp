@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QHash>
 #include <QVector>
 #include <QWidget>
 
@@ -10,6 +11,8 @@ class QEvent;
 class QLabel;
 class QPlainTextEdit;
 class QPushButton;
+class QScrollArea;
+class CollapsibleSettingsGroup;
 
 class SpiralConfigProfileEditor final : public QWidget
 {
@@ -27,7 +30,10 @@ public:
 
     void setCurrentText(const QString& text);
     void setSessionDefault(const QJsonObject& config);
+    void showSessionDefault();
     void clearSessionDefault();
+    void setCatalog(const QJsonObject& catalog);
+    void showWindow();
 
 signals:
     void textChanged();
@@ -64,6 +70,21 @@ private:
 
     void popOut();
     void popIn();
+    void rebuildControls();
+    void controlsToJson();
+    void jsonToControls();
+    void filterControls(const QString& text);
+
+    struct ControlRow {
+        QString key;
+        QString searchableText;
+        QWidget* widget = nullptr;
+    };
+    struct ControlGroup {
+        QString prefix;
+        CollapsibleSettingsGroup* widget = nullptr;
+        QVector<ControlRow> rows;
+    };
 
     QWidget* _editorContents = nullptr;
     QComboBox* _profileCombo = nullptr;
@@ -76,6 +97,14 @@ private:
     QPlainTextEdit* _textEdit = nullptr;
     QLabel* _statusLabel = nullptr;
     QDialog* _dialog = nullptr;
+    QJsonObject _catalog;
+    QWidget* _controlsPage = nullptr;
+    QScrollArea* _controlsScroll = nullptr;
+    QWidget* _controlsGrid = nullptr;
+    class QLineEdit* _search = nullptr;
+    QHash<QString, QWidget*> _fieldEditors;
+    QVector<ControlGroup> _controlGroups;
+    QHash<CollapsibleSettingsGroup*, bool> _preSearchExpanded;
 
     QVector<StoredProfile> _profiles;
     QString _currentProfileId = QStringLiteral("default");

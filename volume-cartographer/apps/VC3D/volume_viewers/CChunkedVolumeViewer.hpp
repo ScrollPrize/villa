@@ -50,7 +50,11 @@ class ViewerStatsBar;
 class VCCollection;
 class Volume;
 
-namespace vc::render { class ChunkCache; }
+namespace vc::render {
+class ChunkCache;
+class SurfaceCache;
+class SurfaceGeometryTileCache;
+}
 
 class CChunkedVolumeViewer : public QWidget, public VolumeViewerBase
 {
@@ -123,6 +127,7 @@ public:
     void setStretchValues(bool) { if (_closing) return; submitRender("setStretchValues"); }
     void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
     void setPlaneIntersectionLinesVisible(bool visible) override;
+    bool isPlaneIntersectionLinesVisible() const { return _planeIntersectionLinesVisible; }
 
     void setShowDirectionHints(bool on) override { if (_closing) return; _showDirectionHints = on; emit overlaysUpdated(); }
     bool isShowDirectionHints() const override { return _showDirectionHints; }
@@ -179,14 +184,35 @@ public:
     void setIntersectionOpacity(float v) override;
     void setIntersectionThickness(float v) override;
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override;
+    std::vector<std::string> highlightedSurfaceIds() const {
+        return {_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end()};
+    }
     void setSurfacePatchSamplingStride(int s) override;
 
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override;
+    std::uint64_t surfaceOverlaysRevision() const override { return _surfaceOverlaysRevision; }
     float surfaceOverlapThreshold() const override { return _surfaceOverlapThreshold; }
-    void setSurfaceOverlayEnabled(bool enabled) override { if (_closing) return; _surfaceOverlayEnabled = enabled; emit overlaysUpdated(); }
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override { if (_closing) return; _surfaceOverlays = overlays; emit overlaysUpdated(); }
-    void setSurfaceOverlapThreshold(float threshold) override { if (_closing) return; _surfaceOverlapThreshold = std::max(0.0f, threshold); emit overlaysUpdated(); }
+    void setSurfaceOverlayEnabled(bool enabled) override
+    {
+        if (_closing || _surfaceOverlayEnabled == enabled) return;
+        _surfaceOverlayEnabled = enabled;
+        emit overlaysUpdated();
+    }
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override
+    {
+        if (_closing || _surfaceOverlays == overlays) return;
+        _surfaceOverlays = overlays;
+        ++_surfaceOverlaysRevision;
+        emit overlaysUpdated();
+    }
+    void setSurfaceOverlapThreshold(float threshold) override
+    {
+        const float clamped = std::max(0.0f, threshold);
+        if (_closing || _surfaceOverlapThreshold == clamped) return;
+        _surfaceOverlapThreshold = clamped;
+        emit overlaysUpdated();
+    }
 
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
@@ -203,6 +229,14 @@ public:
     bool isMeasurementActive() const;
     void clearMeasurement();
     void markSurfaceGeometryChanged();
+    // Geometry-epoch introspection: lets callers tell whether the currently
+    // DISPLAYED frame was rendered from the current surface geometry (stale
+    // in-flight frames adopt with an older epoch).
+    std::uint64_t surfaceGeometryEpoch() const { return _surfaceGeometryEpoch; }
+    std::uint64_t displayedSurfaceGeometryEpoch() const
+    {
+        return _displayedRenderJob ? _displayedRenderJob->surfaceGeometryEpoch : 0;
+    }
     void setShiftScrollOverride(ShiftScrollOverride override) { _shiftScrollOverride = std::move(override); }
 
     CVolumeViewerView* graphicsView() const override { return _view; }
@@ -213,6 +247,8 @@ public:
     }
 
     void reloadPerfSettings() override;
+    void refreshChunkSource() override;
+    void setSurfaceCacheBudgets(std::size_t baseBytes, std::size_t overlayBytes) override;
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -283,13 +319,30 @@ private:
         std::source_location caller = std::source_location::current());
     void updateStatusLabel();
     void rebuildChunkArray();
+    void clearDisplayedFramebuffer();
     void syncCameraTransform();
     void requestDirectPaint();
     void resizeFramebuffer();
     void recalcPyramidLevel();
     void updateScalebarScale();   // push µm/scene-px to the view's scalebar overlay
+    // Chunks one frame of this view touches, used to raise the private pool's
+    // floor so a single render cannot thrash its own cap.
+    std::size_t estimatedFrameChunkFootprintBytes() const;
+    // Chunks one round of concurrent surface-tile fills touches, for the
+    // filler's own pool.
+    std::size_t estimatedSurfaceTileChunkFootprintBytes() const;
+    void noteChunkCacheFootprint();
+    // Build/drop the base and overlay SurfaceCache to match the current
+    // (volume, surface, geometry epoch) identity and the configured budgets.
+    void ensureSurfaceCaches();
+    void dropSurfaceCaches();
+    void dropOverlaySurfaceCache();
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
+    // Multiply the current scale by `factor` (clamped to [kMinScale, kMaxScale]),
+    // keeping the scene point under `scenePos` fixed. The shared core of both the
+    // discrete wheel zoom (zoomStepsAt) and the continuous adjustZoomByFactor.
+    void zoomByFactorAt(float factor, const QPointF& scenePos);
     bool isAxisAlignedView() const;
     void ensureDefaultSurface();
     void updateContentBounds();
@@ -325,6 +378,12 @@ private:
         OverlayCompositeSettings overlayComposite;
         std::uint64_t chunkContentEpoch = 0;
         std::uint64_t surfaceGeometryEpoch = 0;
+        // Null unless this is a flattened view with a live SurfaceCache. The
+        // epoch changes whenever a cache is rebuilt, so a carried-forward
+        // previous frame is never mixed with a different cache's samples.
+        std::shared_ptr<vc::render::SurfaceCache> surfaceCache;
+        std::shared_ptr<vc::render::SurfaceCache> overlaySurfaceCache;
+        std::uint64_t surfaceCacheEpoch = 0;
         std::shared_ptr<GeneratedSurfaceCache> genCache;
         bool genCacheDirty = false;
         std::string profileReason;
@@ -338,6 +397,7 @@ private:
         int fbW,
         int fbH,
         std::chrono::steady_clock::time_point submittedAt);
+    void requestSurfaceViewForJob(const PendingRenderJob& job);
     void startRenderJob(PendingRenderJob job);
     void submitPendingRenderJobIfNeeded();
     void updateDisplayedFramebufferMapping();
@@ -353,7 +413,6 @@ private:
     struct RenderResult;
     static RenderResult renderFrame(RenderContext ctx);
     void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
-    void maybeDegradeForCachePressure(const RenderResult& result);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int overlayRenderStartLevel(bool preferSurfaceResolution = false) const;
@@ -425,15 +484,36 @@ private:
     std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
     bool _genCacheDirty = true;
 
+    // --- SurfaceCache (flattened view only) ---
+    // Tiles of resampled surface space. Present only when a workspace set a
+    // non-zero budget and this viewer shows a QuadSurface segmentation; a null
+    // cache means the frame takes the pre-cache render path verbatim.
+    std::shared_ptr<vc::render::SurfaceCache> _surfaceCache;
+    std::shared_ptr<vc::render::SurfaceCache> _overlaySurfaceCache;
+    std::shared_ptr<vc::render::SurfaceGeometryTileCache> _surfaceGeometryTiles;
+    std::size_t _surfaceCacheBudgetBytes = 0;
+    std::size_t _overlaySurfaceCacheBudgetBytes = 0;
+    // Identity the live caches were built for.
+    Volume* _surfaceCacheVolume = nullptr;
+    Surface* _surfaceCacheSurface = nullptr;
+    std::uint64_t _surfaceCacheGeometryEpoch = 0;
+    Volume* _overlaySurfaceCacheVolume = nullptr;
+    std::uint64_t _surfaceCacheEpoch = 0;
+    std::uint64_t _surfaceViewGeneration = 0;
+    std::uint64_t _surfaceTileCbId = 0;
+    std::uint64_t _overlaySurfaceTileCbId = 0;
+    // Tile fills finish in bursts. Only one UI callback/render needs to
+    // represent all tiles that became resident during a short debounce window.
+    std::atomic_bool _surfaceTileRenderQueued{false};
+    // Last frame fell outside the stored band and used the legacy path, so the
+    // status bar can make that performance cliff legible.
+    bool _surfaceCacheOutOfBand = false;
+
     float _surfacePtrX = 0.0f;
     float _surfacePtrY = 0.0f;
     float _scale = 1.0f;
     float _dsScale = 1.0f;
     int _dsScaleIdx = 0;
-    // Extra pyramid levels applied on top of _dsScaleIdx when the shared
-    // chunk cache reports view-protection stalls (live working set larger
-    // than capacity). Reset when the zoom crosses a level boundary.
-    int _cachePressureLevelBias = 0;
     float _zOff = 0.0f;
     float _camSurfX = 0.0f;
     float _camSurfY = 0.0f;
@@ -445,6 +525,9 @@ private:
     std::string _baseColormapId;
     std::shared_ptr<Volume> _overlayVolume;
     std::shared_ptr<vc::render::ChunkCache> _overlayChunkArray;
+    // The final viewer lease invalidates the overlay cache even if an
+    // obsolete render job still holds the cache object.
+    std::shared_ptr<void> _overlayChunkCacheOwner;
     vc::render::IChunkedArray::ChunkReadyCallbackId _overlayChunkCbId = 0;
     float _overlayOpacity = 0.5f;
     std::string _overlayColormapId;
@@ -470,6 +553,7 @@ private:
     bool _surfaceOverlayEnabled = false;
     bool _initializedFirstSegmentationSurface = false;
     std::map<std::string, cv::Vec3b> _surfaceOverlays;
+    std::uint64_t _surfaceOverlaysRevision = 0;
     float _surfaceOverlapThreshold = 5.0f;
     float _intersectionOpacity = 0.7f;
     float _intersectionThickness = 0.0f;

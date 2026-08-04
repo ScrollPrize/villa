@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -19,7 +20,10 @@
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/RemoteAuth.hpp"
 
-namespace vc::render { class IChunkedArray; }
+namespace vc::render {
+class IChunkedArray;
+struct OpenedChunkedZarr;
+}
 namespace utils { class ZarrArray; }
 
 struct CompositeParams;
@@ -87,6 +91,12 @@ public:
         const vc::HttpAuth& auth = {},
         const utils::Json& metadata = {});
 
+    // Construct a normal 3D Volume from a caller-prepared chunk source. The
+    // source factory is invoked again when a cache is recreated. It must return
+    // only 3D level descriptors; interpretation of higher-dimensional backing
+    // data belongs to the preparing module.
+    static std::shared_ptr<Volume> NewFromPreparedChunkedSource(std::function<vc::render::OpenedChunkedZarr()> sourceFactory, const utils::Json& metadata);
+
     [[nodiscard]] bool isRemote() const noexcept { return isRemote_; }
     [[nodiscard]] std::string id() const;
     [[nodiscard]] std::string name() const;
@@ -145,11 +155,21 @@ public:
     // --- Cache management ---
 
     [[nodiscard]] vc::render::IChunkedArray* chunkedCache();
+    [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> sharedChunkCache();
     [[nodiscard]] std::shared_ptr<vc::render::ChunkCache> createChunkCache(
         vc::render::ChunkCache::Options options) const;
 
-    // Set cache budget for the chunked sampling cache.
-    void setCacheBudget(size_t hotBytes);
+    // Set the local safety ceiling and optional process-wide decoded budget
+    // for the single cache shared by volume sampling and viewers.
+    void setCacheBudget(
+        size_t hotBytes,
+        std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedBudget = {});
+
+    // CState clients keep a shared Volume active across workspaces. The final
+    // release invalidates and drops its cache even if the Volume object itself
+    // remains retained by a VolumePkg.
+    void retainCacheClient();
+    void releaseCacheClient();
 
     // Set the number of background IO threads for chunk fetching.
     void setIOThreads(int count);
@@ -278,6 +298,8 @@ protected:
     mutable std::shared_ptr<vc::render::ChunkCache> chunkedCache_;
     mutable std::mutex cacheMutex_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
+    std::shared_ptr<vc::render::DecodedChunkCacheBudget> decodedCacheBudget_;
+    std::size_t cacheClientCount_ = 0;
     int ioThreads_ = 0;  // 0 = use default
 
     // Per-level read-side ZarrArray cache. Avoids reparsing .zarray/zarr.json
@@ -287,6 +309,8 @@ protected:
     mutable std::vector<std::shared_ptr<utils::ZarrArray>> readArrayCache_;
     mutable std::mutex readArrayCacheMutex_;
     std::shared_ptr<utils::ZarrArray> cachedZarrArrayForRead(int level) const;
+    std::shared_ptr<vc::render::ChunkCache> createChunkCacheConfigured(
+        vc::render::ChunkCache::Options options) const;
 
     void loadMetadata();
 
@@ -299,4 +323,5 @@ protected:
     vc::HttpAuth remoteAuth_;
     std::filesystem::path remoteCacheRoot_;
     size_t remoteNumScales_ = 0;
+    std::function<vc::render::OpenedChunkedZarr()> preparedSourceFactory_;
 };

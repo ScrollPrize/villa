@@ -7,8 +7,19 @@
 import time
 
 import numpy as np
+import scipy.ndimage
 import scipy.sparse
 from scipy.sparse.csgraph import dijkstra as _csgraph_dijkstra
+
+# Uniform-weight grid graphs have exponentially many exactly-tied shortest paths between a
+# given pair, and Dijkstra deterministically picks the same one each time (a characteristic
+# staircase), so successive pool refreshes trace near-identical routes. Multiplying each edge
+# weight by uniform(1, 1 + EDGE_WEIGHT_JITTER) randomises which tied path wins while keeping
+# every chosen path within (1 + EDGE_WEIGHT_JITTER) of true geodesic length.
+EDGE_WEIGHT_JITTER = 0.05
+
+# Matches the 8-connectivity of the quad graph built below.
+_EIGHT_CONNECTED = np.ones((3, 3), dtype=bool)
 
 
 def warmup():
@@ -26,10 +37,10 @@ def _unpack_mask(packed_mask, shape):
     return np.unpackbits(packed_mask, count=n).astype(bool).reshape(shape)
 
 
-def build_quad_graph(valid_quad_mask):
+def build_quad_graph(valid_quad_mask, rng=None):
     # 8-connected CSR adjacency over the (flattened) quad grid; edges join valid cells with
     # weight 1 (orthogonal) or sqrt(2) (diagonal), so Dijkstra distances are geometric path
-    # lengths in quad units.
+    # lengths in quad units (within 1 + EDGE_WEIGHT_JITTER when `rng` enables jitter).
     h, w = valid_quad_mask.shape
     n = h * w
     flat_idx = np.arange(n).reshape(h, w)
@@ -43,8 +54,11 @@ def build_quad_graph(valid_quad_mask):
         rows.append(flat_idx[src_i, src_j][edge_valid])
         cols.append(flat_idx[dst_i, dst_j][edge_valid])
         weights.append(np.full(int(edge_valid.sum()), weight, dtype=np.float32))
+    weights = np.concatenate(weights)
+    if rng is not None:
+        weights = weights * rng.uniform(1., 1. + EDGE_WEIGHT_JITTER, size=weights.size).astype(np.float32)
     return scipy.sparse.csr_matrix(
-        (np.concatenate(weights), (np.concatenate(rows), np.concatenate(cols))),
+        (weights, (np.concatenate(rows), np.concatenate(cols))),
         shape=(n, n),
     )
 
@@ -85,11 +99,18 @@ def backtrack_path_ij(predecessors, end_flat, width):
 def compute_patch_path_pool(valid_quad_mask, num_starts, endpoints_per_start, seed):
     # Path pool for the patch radius/DT losses: `num_starts` uniform-random start cells, one
     # Dijkstra each, `endpoints_per_start` distant endpoints per start. Returns a list of
-    # int32 ij path arrays.
+    # int32 ij path arrays. Starts are drawn from the largest connected component so they
+    # can't land on isolated slivers that yield degenerate near-single-cell paths.
     rng = np.random.default_rng(seed)
     width = valid_quad_mask.shape[1]
-    valid_ij = np.argwhere(valid_quad_mask)
-    graph = build_quad_graph(valid_quad_mask)
+    labels, num_components = scipy.ndimage.label(valid_quad_mask, structure=_EIGHT_CONNECTED)
+    if num_components > 1:
+        counts = np.bincount(labels.ravel())
+        counts[0] = 0
+        valid_ij = np.argwhere(labels == counts.argmax())
+    else:
+        valid_ij = np.argwhere(valid_quad_mask)
+    graph = build_quad_graph(valid_quad_mask, rng)
     pool = []
     for _ in range(num_starts):
         start_i, start_j = valid_ij[rng.integers(len(valid_ij))]
@@ -116,7 +137,7 @@ def compute_anchor_path_pools(valid_quad_mask, i_q, j_q, paths_per_cone, seed):
     # starting at the anchor). Caller guarantees valid_quad_mask[i_q, j_q].
     rng = np.random.default_rng(seed)
     height, width = valid_quad_mask.shape
-    graph = build_quad_graph(valid_quad_mask)
+    graph = build_quad_graph(valid_quad_mask, rng)
     dist, predecessors = _csgraph_dijkstra(
         graph, directed=False, indices=i_q * width + j_q, return_predecessors=True,
     )

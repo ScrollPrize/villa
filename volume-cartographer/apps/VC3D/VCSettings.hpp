@@ -275,6 +275,35 @@ namespace perf {
 }
 
 // -----------------------------------------------------------------------------
+// Spiral Workspace Settings
+//
+// Spiral-only and independent of perf::RAM_CACHE_SIZE_GB, which keeps governing
+// the main workspace's shared decoded-chunk budget. All three apply without a
+// restart.
+// -----------------------------------------------------------------------------
+namespace spiral {
+    // Budget for the flattened view's cache of resampled surface space, for the
+    // displayed (base) volume. 0 disables it, so the flattened view samples the
+    // volume every frame as it did before the cache existed.
+    constexpr auto SURFACE_CACHE_GB = "spiral/surface_cache_gb";
+    constexpr int SURFACE_CACHE_GB_DEFAULT = 4;
+
+    // Same, for the overlay volume. Its own budget because overlay and base
+    // compete for nothing else. 0 disables it and leaves the overlay channel on
+    // its existing resident-only sampling path.
+    constexpr auto OVERLAY_SURFACE_CACHE_GB = "spiral/overlay_surface_cache_gb";
+    constexpr int OVERLAY_SURFACE_CACHE_GB_DEFAULT = 0;
+
+    // LRU cap for the private decoded-chunk pool behind the spiral slice panes.
+    // A floor rather than a ceiling: it is raised automatically when it cannot
+    // hold one frame (otherwise a single render thrashes), and the status bar
+    // reports the effective value. The surface-tile filler gets a pool of the
+    // same size as an internal constant.
+    constexpr auto PLANE_CHUNK_CACHE_MB = "spiral/plane_chunk_cache_mb";
+    constexpr int PLANE_CHUNK_CACHE_MB_DEFAULT = 2048;
+}
+
+// -----------------------------------------------------------------------------
 // Main Window Settings
 // -----------------------------------------------------------------------------
 namespace window {
@@ -291,9 +320,13 @@ namespace line_annotation {
     constexpr auto GEOMETRY = "lineAnnotation/geometry";
     constexpr auto INITIAL_CENTERLINE_LENGTH_VX = "lineAnnotation/initial_centerline_length_vx";
     constexpr int INITIAL_CENTERLINE_LENGTH_VX_DEFAULT = 2400;
+    constexpr auto EXTRAPOLATION_DISTANCE_VX = "lineAnnotation/extrapolation_distance_vx";
+    constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
     constexpr int MAX_CONTROL_POINT_DISTANCE_VX_DEFAULT = 0;
-    constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes";
+    // "_v2" retires ratios saved before the fixed top strip / smaller bottom
+    // strip layout; old values would override the new default proportions.
+    constexpr auto OUTER_SPLITTER_SIZES = "lineAnnotation/outer_splitter_sizes_v2";
     constexpr auto TOP_SPLITTER_SIZES = "lineAnnotation/top_splitter_sizes";
     constexpr auto STRIP_SPLITTER_SIZES = "lineAnnotation/strip_splitter_sizes";
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";

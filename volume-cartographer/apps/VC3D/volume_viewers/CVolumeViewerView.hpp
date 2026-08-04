@@ -28,7 +28,15 @@ public:
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
-    void setVoxelSize(double sx, double sy) { m_vx = sx; m_vy = sy; update(); }
+    // physical=false: sx/sy are voxels (not µm) per scene px; the scalebar
+    // labels in "vx" instead of physical units.
+    void setVoxelSize(double sx, double sy, bool physical = true)
+    {
+        m_vx = sx;
+        m_vy = sy;
+        m_physicalUnits = physical;
+        update();
+    }
     static ScaleBarLabel formatScaleBarLength(double barUm);
     void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
     bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }
@@ -93,8 +101,9 @@ private:
     void drawTiltHandle(QPainter* painter) const;
     bool pointInSceneWidget(const QPointF& viewportPos) const;
 
-    // µm per scene-unit (pixel)
+    // µm (or voxels, when !m_physicalUnits) per scene-unit (pixel)
     double m_vx = 32.0, m_vy = 32.0;
+    bool m_physicalUnits = true;
     bool _middleButtonPanEnabled = true;
     bool _scrollPanDisabled = false;
     bool _sceneWidgetMouseCapture = false;
@@ -107,6 +116,7 @@ private:
     mutable double _cachedDpr = 0;
     mutable int _cachedVpW = 0;
     mutable int _cachedVpH = 0;
+    mutable bool _cachedPhysicalUnits = true;
     mutable double _cachedVx = 0;
 
     TiltHandleMode _tiltHandleMode = TiltHandleMode::Hidden;
