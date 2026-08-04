@@ -464,6 +464,10 @@ vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_atlas)
 
 vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
 
+# The vc_tifxyz_selfcross census kernel (header-only under apps/src, shared
+# with the command-line tool so the tested code is the shipped code).
+vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
+
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
 
 vc_add_test(NAME test_remote_url)
