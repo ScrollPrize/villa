@@ -75,6 +75,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Region-of-interest inference for `vesuvius.predict`](https://github.com/ScrollPrize/villa/pull/1241): `--bbox "z0:z1,y0:y1,x0:x1"` restricts inference to one region of a volume, in global voxel coordinates, so `blend_logits` and `finalize_outputs` stay aligned. Only the chunks intersecting the region are streamed — on PHerc. Paris 4 a 200³ region reads 27 chunks (56.6 MB) instead of 10,368 (21.7 GB). By TAUIL Abd Elillah
 
+- [vesuvius-io-audit](https://github.com/aistae/vesuvius-io-audit) by Alisher Kuanyshbay. Byte-level audit of the data read path. Found that `vesuvius.predict` has no chunk cache — re-reading the identical patch transfers the full amount again — giving ~17x more traffic than needed on default settings (12.2 GB where 0.72 GB suffices), traced to `LRUStoreCache` being removed in zarr 3 so `use_volume_store_cache` became a no-op ([#1325](https://github.com/ScrollPrize/villa/issues/1325)). Also quantifies unaligned access (a single 512x512 slice costs 128x its payload; a half-chunk-offset 256³ cube costs +238%) and shows Z-order patch traversal would cut a further 57% once a cache exists — simulator validated against measured transfers to within 3%.
+
 - [vesuvius-catalog](https://github.com/Schurkai/vesuvius-catalog): scriptable catalog CLI/library for the open-data bucket - answers which samples have segments, ink outputs or surface predictions at which resolutions, resolves S3/HTTPS data URLs (JSON/CSV output for scripting), and includes working openers for the bucket's OME-Zarr v2 stores under zarr-python 3.
 
 ## Segmentation
