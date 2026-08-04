@@ -31,6 +31,7 @@
 #include "vc/lasagna/NormalAlignment.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/lasagna/ProjectVolumes.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -7189,8 +7190,38 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         selectedIdentity = selected;
         if (!vc::project::isLocationRemote(selected))
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
-        vpkg->setSelectedFiberInferenceDataset(selected);
-        vpkg->addFiberInferenceDatasetEntry(selected);
+        try {
+            vc::lasagna::LasagnaDatasetOpenOptions options;
+            options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+            const std::string resolved = vc::project::isLocationRemote(selected)
+                ? selected
+                : vc::project::resolveLocalPath(
+                      selected, vpkg->path().parent_path()).string();
+            const auto openedDataset = vc::lasagna::LasagnaDataset::openLocation(
+                resolved, options);
+            (void)vc::fiber_tracer::resolveFiberPredictionTraceScales(
+                openedDataset.manifest());
+            std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
+            for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(
+                     openedDataset, selected)) {
+                volumes.push_back({
+                    std::move(prepared.location), std::move(prepared.tags),
+                    std::move(prepared.volume)});
+            }
+            const auto result = vpkg->attachPreparedLasagnaDataset(
+                selected, {}, true, volumes, options.remoteCacheRoot);
+            if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
+                showError(
+                    tr("A Lasagna volume conflicts with an existing volume id."),
+                    headless);
+                return false;
+            }
+            manifestPath = openedDataset.manifest().manifestPath;
+            refreshLineAnnotationDatasetMenus();
+        } catch (const std::exception& error) {
+            showError(QString::fromUtf8(error.what()), headless);
+            return false;
+        }
     }
 
     if (!session.fiberPredictionField ||

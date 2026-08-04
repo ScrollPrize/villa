@@ -571,7 +571,7 @@ int attachOpenDataLasagna(VolumePkg& pkg,
                      "vc-open-data-coordinate-space:"});
                 if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict)
                     throw std::runtime_error(
-                        "a derived Lasagna volume id conflicts with the project");
+                        "a Lasagna volume id conflicts with the project");
             } catch (const std::exception& error) {
                 if (messages) {
                     messages->push_back(
