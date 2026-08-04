@@ -75,6 +75,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Region-of-interest inference for `vesuvius.predict`](https://github.com/ScrollPrize/villa/pull/1241): `--bbox "z0:z1,y0:y1,x0:x1"` restricts inference to one region of a volume, in global voxel coordinates, so `blend_logits` and `finalize_outputs` stay aligned. Only the chunks intersecting the region are streamed — on PHerc. Paris 4 a 200³ region reads 27 chunks (56.6 MB) instead of 10,368 (21.7 GB). By TAUIL Abd Elillah
 
+- [vesuvius-catalog](https://github.com/Schurkai/vesuvius-catalog): scriptable catalog CLI/library for the open-data bucket - answers which samples have segments, ink outputs or surface predictions at which resolutions, resolves S3/HTTPS data URLs (JSON/CSV output for scripting), and includes working openers for the bucket's OME-Zarr v2 stores under zarr-python 3.
+
 ## Segmentation
 
 ### 🌟 Highlighted
@@ -231,6 +233,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Probabilistic view on the offset for surface volume creation](https://discord.com/channels/1079907749569237093/1177617480366170162) by Giorgio Angelotti
 
 - [Creating segments from intersecting horizontal and vertical fibers](https://gist.github.com/jrudolph/3e0ebbd6e731f794733c236a86ff39fb) by Johannes Rudolph
+
+- [Phantom contamination audit of the published surface predictions](https://github.com/Schurkai/vesuvius-phantom-audit): chunk-listing-based measurement across all 36 samples with published m7 surface predictions (villa#1114) - every sample is affected, 16.9% of stored prediction chunks are certain phantoms; includes a voxel-exact-verified cleanup tool.
 
 - [Surface geometry failure diagnostic](https://github.com/Jinhojeong/vesuvius-surface-geometry-diagnostic) by Jinho Jeong. Geometry-stratified analysis of where surface models fail in compressed regions (villa #191): compressed sheets are fused rather than missed across three architectures, the CT carries no intensity dip between contacting sheets, and neither the model's probability field nor local CT geometry supplies a boundary either. Includes oracle measurements showing the official topometrics blend does not respond to repairing these merges, a patch-mode eval entry point and a 200-patch ground-truth pool so any surface model or splitter can be scored the same way.
 
