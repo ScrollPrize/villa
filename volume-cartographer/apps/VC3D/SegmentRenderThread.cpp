@@ -2,6 +2,11 @@
 #include <QDir>
 #include <QFileInfo>
 
+namespace {
+// Grace period between terminate() and the kill() fallback.
+constexpr int kRenderStopGraceMs = 1000;
+}
+
 SegmentRenderThread::SegmentRenderThread(QObject *parent)
     : QThread(parent)
     , m_scale(1.0f)
@@ -15,8 +20,15 @@ SegmentRenderThread::~SegmentRenderThread()
 {
     if (m_process) {
         if (m_process->state() != QProcess::NotRunning) {
+            // vc_render_tifxyz is a console-mode tool: on Windows terminate()
+            // posts WM_CLOSE, which it has no message loop to receive, so this
+            // waits out its full timeout and then deletes a still-running
+            // QProcess. Fall back to kill(), the way the service managers do.
             m_process->terminate();
-            m_process->waitForFinished(3000);
+            if (!m_process->waitForFinished(kRenderStopGraceMs)) {
+                m_process->kill();
+                m_process->waitForFinished();
+            }
         }
         delete m_process;
     }
