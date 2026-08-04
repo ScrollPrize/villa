@@ -1,0 +1,346 @@
+# Fiber Trace MVP
+
+This package contains the first training path for tracing VC3D fiber JSON
+records with direction-conditioned 3D crops. It is intentionally separate from
+the row/column surface tracing and Lasagna sparse-solve samplers.
+
+See [SPEC.md](SPEC.md) for the original fiber tracing training spec, the
+Lasagna/Vesuvius convention decisions, and the current implementation status.
+
+## Data Schema
+
+Training records accept legacy `vc3d_fiber` version 1 and the current version 3
+CP-owned segment schema. The unpublished file version 2 is unsupported. Version
+3 is written by VC3D:
+
+```json
+{
+  "type": "vc3d_fiber",
+  "version": 3,
+  "line_points": [[x, y, z], "..."],
+  "control_points": [
+    {"position": [x, y, z], "segment_to_next": {
+      "optimizer": "native_fiber_trace3d",
+      "metadata_version": 3,
+      "tracer_version": 2,
+      "interp_goal": "global",
+      "interp_mode": "lasagna",
+      "metric": 3.2,
+      "msg": "lasagna"
+    }},
+    {"position": [x, y, z]}
+  ]
+}
+```
+
+The training loader exposes `control_points_xyz` as before and separately
+returns the strictly validated optional segment metadata. `interp_goal`
+records the requested `global`/`cspline`/`lasagna`/`trace` policy, while
+`interp_mode` records the actual `cspline`/`lasagna`/`trace` geometry producer.
+`metric` is mode-dependent and `msg` is persisted display/debug status.
+Version-1 numeric CP arrays load as global Lasagna spans. The current
+`tracer_version: 2` is part of the version-3 segment schema and is unrelated to
+the removed top-level file version.
+
+The JSON points are interpreted in VC3D `x, y, z` order and remain `xyz`
+through all geometry calculations. Volume crops, masks, zarr reads, and tensor
+spatial axes are `z, y, x`; the loader converts `xyz -> zyx` only when indexing
+dense arrays.
+
+The preferred dataset config entry provides:
+
+- `base_volume_path`: base image OME-Zarr store
+- `base_volume_scale`: base image OME-Zarr pyramid level used as the training
+  grid, default `0`; level `L` has voxel spacing `2**L` in base voxels
+- `lasagna_manifest_path`: `.lasagna.json` manifest with `base_shape_zyx` and
+  `grad_mag`, `nx`, and `ny` channel groups
+- `fiber_paths` or `fiber_glob`: one or more VC3D fiber JSON files
+- optional `test_fiber_paths` or `test_fiber_glob`: held-out VC3D fiber JSON
+  files for TensorBoard test-loss logging
+
+The loader validates that `base_volume_path` level 0 has shape equal to the
+manifest `base_shape_zyx`. Image crops are read at `base_volume_scale`.
+`grad_mag`, `nx`, and `ny` are opened through the manifest, using each group's
+`scaledown` and channel index. Shape validation follows Lasagna's convention:
+`base_shape_zyx` plus group `scaledown` determine the zarr shape, while
+`group.sd_fac * source_to_base` determines the channel spacing in base voxels.
+These Lasagna channels do not have to be the same shape as the selected base
+image level; they are sampled into the selected training grid according to the
+manifest scale convention. Mask/grad-mag validity is binary: voxels with value
+`> 0` are valid and value `0` is invalid. There is no configurable validity
+threshold.
+
+Remote zarr paths use the existing `vesuvius.neural_tracing.datasets.common`
+zarr/cache support. Missing mask or grad-mag data is an error, and mask shape
+must align with the selected image volume level through the manifest. Normal
+channel shapes must align the same way.
+
+Manifest-less derivative channel configuration is not supported. Dataset
+entries with legacy `volume_path` or raw `grad_mag_path`, `mask_path`,
+`nx_path`, or `ny_path` keys are rejected because they bypass Lasagna manifest
+scale, shape, channel, and coordinate metadata.
+
+## Batch Construction
+
+Batches are single-fiber batches. For batch size `N`, the builder samples one
+fiber record and emits:
+
+- `N - floor(N / 4)` GT control-point crops with mixed
+  positive/ignore/negative labels derived from the selected fiber line and
+  Lasagna normal geometry
+- `floor(N / 4)` random valid crops whose valid voxels are explicit negatives
+
+GT crops choose control points with deterministic per-iteration random streams;
+duplicates are allowed when the sampled slots collide. The crop is offset so the
+control point can land anywhere in the final crop interior while still retaining
+at least `control_point_margin_voxels` to every crop border. Random-negative
+centers are precomputed before batch sampling from valid `grad_mag > 0` voxels
+with valid Lasagna normal channels. `random_negative_pool_size` controls the pool
+size, defaulting to `1000`; batch sampling then selects from that pool by
+deterministic modulo. The batch stores crop kind and direction kind metadata so
+tests and trainers can verify the composition. Batch size must be even for this
+MVP.
+
+## Direction Conditioning
+
+Each crop receives one normalized `fw(3)` conditioning vector in `xyz`
+component order. GT control-point crops condition on the local fiber tangent at
+the sampled control point with up to `positive_direction_jitter_degrees` of
+forward-direction augmentation, normally 30 degrees. Random-negative crops use
+an independent random forward condition.
+
+Conditioning direction does not change voxel labels. It is only an input to the
+model head. The label masks come from fiber-line geometry, the Lasagna normal
+channels, and the random-negative crop kind.
+
+Lasagna normals are decoded from `nx`/`ny` channels through Lasagna's own normal
+decoder. For GT crops, the selected control-point normal is used for label
+geometry and slice visualization, not as model conditioning. Normal channels are
+required.
+
+## Voxel Classification
+
+For every output voxel:
+
+- invalid mask/grad-mag voxels are `ignore`
+- GT-control crop voxels in the normal-frame positive zone and within the
+  configured along-fiber CP window are `positive`
+- cone negatives come only from the normal-axis double cone above/below the
+  local sheet, starting at `negative_cone_distance_voxels`
+- random-negative crop valid voxels are explicit `negative`
+- all other valid voxels are `ignore`
+
+The classifier also emits target local `fw` vectors in `xyz` component order
+plus a dense `target_id` tensor. Positive voxels carry the selected fiber-line
+identity, explicit negatives carry `NEGATIVE_ONLY_ID`, and ignored voxels carry
+`IGNORE_ID`.
+
+`normal_plane_jitter_voxels` and `normal_perpendicular_jitter_voxels` are
+measured in the selected training grid, not always base-level voxels. If
+`base_volume_scale` is `2`, then one training voxel spans `4` base voxels. The
+fiber coordinates remain base `xyz`; the loader divides them by
+`2**base_volume_scale` only for voxel classification. The normal-frame geometry
+knobs are explicit; there are no legacy radius fallbacks.
+
+`crop_size` is the final model/input label crop size. `augmentation_crop_size`
+is the larger outer crop read before post-augmentation center trimming; it must
+be at least `crop_size` and differ by an even number on each axis. The starter
+configs trim 16 voxels per side (`64 -> 96`, `128 -> 160`), which removes
+modest padded or interpolated borders without the larger read cost of a
+32-voxel margin.
+
+## Model And Losses
+
+`DirectionConditionedFiberTraceModel` uses the existing
+`Vesuvius3dUnetModel` as a compact 3D U-Net feature backbone and adds a
+direction-conditioned head. During training, contrastive pair voxels are sampled
+from the dense labels first, then the head is applied only to the selected U-Net
+feature vectors with their normalized `fw` conditioning. The dense head path is
+kept for debug visualization. The head outputs:
+
+- L2-normalized embedding
+- normalized predicted `fw`
+
+Losses are:
+
+- pairwise embedding contrastive loss over classified positives and explicit
+  negatives
+
+The contrastive loss samples pseudo-random deterministic positive-positive
+pairs from matching fiber-line `target_id`s across the whole flattened batch and
+positive-negative pairs against explicit negatives across that same batch.
+Negative voxels are never paired with each other. Soft distance-weighted
+contrastive loss is intentionally deferred.
+
+`loss.max_contrastive_samples` caps the sampled pair budget per batch.
+
+Model sizing is controlled by:
+
+- `unet_base_channels`: first U-Net stage width.
+- `unet_depth`: number of U-Net stages. Without an explicit
+  `features_per_stage`, stage widths double from the base width.
+- `conditioned_feature_channels`: U-Net output width handed to the conditioned
+  head before appending the 3 direction channels.
+- `head_channels`: hidden width of the conditioned head.
+- `embedding_dim`: output embedding width per voxel.
+- `decoder_upsample_mode`: U-Net decoder upsampling, either `pixelshuffle` for
+  3D sub-pixel upsampling or `transpose` for transpose convolutions.
+
+The starter configs use base `16`, depth `7`, conditioned feature width `64`,
+head width `64`, embedding width `16`, and `pixelshuffle` upsampling.
+
+## Config Knobs
+
+Use the runnable smoke template for a one-step import/data-path check:
+
+```bash
+PYTHONPATH=vesuvius/src python -m vesuvius.neural_tracing.fiber_trace.train vesuvius/src/vesuvius/neural_tracing/configs/fiber_trace_lasagna_smoke.json
+```
+
+Use the starter training template for a longer run:
+
+```bash
+PYTHONPATH=vesuvius/src:. python -m vesuvius.neural_tracing.fiber_trace.train vesuvius/src/vesuvius/neural_tracing/configs/fiber_trace_lasagna_train.json
+```
+
+Replace only the dataset paths first:
+
+- `base_volume_path`: the scan OME-Zarr
+- `base_volume_scale`: which scan OME-Zarr level to train on
+- `lasagna_manifest_path`: the Lasagna `.lasagna.json`
+- `fiber_glob` or `fiber_paths`: VC3D fiber JSON files
+- `test_fiber_glob` or `test_fiber_paths`: optional held-out VC3D fiber JSON
+  files for test-loss logging; use top-level `test_datasets` for a separate
+  test volume/manifest
+- `test_every`: training-step interval for deterministic test evaluation and
+  snapshot writes
+- `test_sample_count`: number of fixed deterministic test batches averaged at
+  each test interval
+- `test_start_iteration`: first deterministic test sample ordinal; the evaluated
+  set is `test_start_iteration .. test_start_iteration + test_sample_count - 1`
+- `test_visualization_every`: interval for logging the first fixed test batch as
+  `test_sample/...` TensorBoard images
+
+`image_normalization: "zscore"` normalizes each CT crop with the same helper
+used by the Lasagna training zarr path. Use `"unit"` only for uint8 smoke tests
+where `value / 255` is intended.
+
+`positive_direction_jitter_degrees: 30.0` controls the GT control-point forward
+conditioning augmentation. Direction conditioning does not change labels.
+
+`control_point_margin_voxels` controls the deterministic GT crop offset. The
+selected control point is sampled uniformly from the integer local crop interval
+`[margin, crop_size - margin - 1]` on each axis. If omitted, the builder uses
+`min(10, floor((size - 1) / 2))` per the smallest crop axis; explicit values that
+cannot fit the crop are rejected.
+
+Legacy label-conditioning keys such as `positive_direction_probability`,
+`negative_direction_min_degrees`, `negative_direction_max_degrees`,
+`positive_cosine`, and `negative_cosine` are rejected.
+
+`normal_plane_jitter_voxels: 40.0`,
+`normal_perpendicular_jitter_voxels: 10.0`, and
+`positive_along_fiber_limit_voxels: 40.0` define the positive zone around the
+rounded CP. Voxels past the along-fiber limit default back to ignore unless they
+independently satisfy the cone-negative rule. `negative_cone_distance_voxels:
+30.0` defines the cone-negative minimum distance away from the Lasagna-normal
+plane, where the normal-axis double cone starts.
+
+`random_negative_pool_size: 1000` precomputes the deterministic random-negative
+center pool before training batches are sampled. Training batches select from
+that pool by modulo instead of probing random valid voxels during batch
+construction.
+
+Sampling streams are deterministic by purpose and keyed from `seed`, iteration,
+batch slot, record index, and control index where relevant. Re-running a given
+training iteration samples the same record, crop offsets, conditioning vectors,
+and random-negative pool entries independent of previous sampler calls.
+
+`sample_limit` optionally bounds the deterministic sample set used by training
+and prefetch. With `sample_limit: 10`, steps 1 through 10 use their normal
+samples, step 11 reuses step 1's sample, step 12 reuses step 2's sample, and so
+on. Optimizer step count, logging, and snapshot cadence are unchanged; only the
+data sample ordinal is folded.
+
+`sample_visualization_every: 10000` logs up to two GT/control-point training
+samples to TensorBoard on that interval. The trainer writes three oriented
+slices through each sampled point:
+
+- `side`: fiber direction by sampled up/normal direction
+- `top`: fiber direction by binormal
+- `cross`: binormal by sampled up/normal direction, perpendicular to the fiber
+
+Each view is logged under `train_sample/<view>/` with the selected GT samples
+stitched side by side. The logged images are one normalized `image` slice, one
+fused `labels` image using negative/undefined/positive values `0/127/255`, one
+fixed-scale `cos_emb_cp` image for predicted embedding cosine against that
+sample's rounded CP embedding, and `cos_emb_other_cp` against the other selected
+CP embedding when two GT samples are available. Slice samples outside the crop
+are black in `image` and shown as a coarse `63/191` checkerboard in label/cosine
+views.
+
+The same self-CP cosine is also logged as three axis-aligned principal slices
+through the rounded CP under `principal_yx`, `principal_zx`, and `principal_zy`.
+
+## Entrypoint
+
+Run a training smoke or short job with:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_trace.train /path/to/config.json
+```
+
+With `device: "cuda"`, training uses PyTorch single-node DDP and spawns one
+worker per visible GPU by default. Limit visibility with `CUDA_VISIBLE_DEVICES`,
+or set `multi_gpu: false`/`multi_gpu: 1` for a single process. Set
+`multi_gpu: N` to use the first `N` visible GPUs. Each GPU receives its own
+configured `batch_size`; deterministic sample ordinals are offset by rank so the
+workers do not train on duplicated crops.
+
+To prefetch the zarr chunks that the same training config will touch, run:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_trace.train --prefetch /path/to/config.json
+```
+
+`--prefetch` builds the deterministic train crop chunk list for `num_steps` and
+the fixed test crop chunk list for `test_sample_count`, deduplicates chunk keys,
+then downloads the chunks into `volume_cache_dir` with up to 16 parallel
+workers. Use `--prefetch-workers N` to lower the worker count.
+
+Each run creates `run_path/run_name_YYYYmmdd_HHMMSS/`. TensorBoard event files
+are written directly in that run directory, including scalar losses every
+`log_every` steps, deterministic test losses every `test_every` steps,
+train sample-slice images every `sample_visualization_every` steps, test
+sample-slice images every `test_visualization_every` steps, and a `config/json`
+text entry with the training config. Model snapshots are written on test
+intervals when a test split is configured, otherwise on log intervals:
+
+- `snapshots/current.pt`: most recent evaluated model
+- `snapshots/best.pt`: best evaluated model by `test/total` when a test split is
+  configured, otherwise by `train/total`
+
+## Current Status
+
+Implemented:
+
+- VC3D fiber JSON parser and validation
+- tangent, forward-conditioning direction, Lasagna-normal geometry, and voxel
+  classification helpers
+- fixed-size single-fiber batch builder using zarr image, mask/grad-mag, and
+  fixed sampled-point `nx`/`ny` normal data decoded through Lasagna
+- direction-conditioned U-Net model/head
+- pairwise embedding contrastive loss
+- JSON-config train entrypoint with TensorBoard scalar/config logging and
+  sample-slice visualization plus current/best snapshots
+- single-node PyTorch DDP training across all visible GPUs by default
+- one debug timing/cache row per training step when `debug_sampling` or
+  `debug_cache` is enabled
+- unit and smoke tests on synthetic volumes
+
+Out of scope for this MVP:
+
+- cross-fiber negatives
+- inference/trace integration
+- PyTorch DataLoader-based distributed loading
+- Lasagna sampler or sparse-solve sampler integration

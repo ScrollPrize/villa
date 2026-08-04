@@ -31,8 +31,8 @@
 		"flatten_sdir": 1.0,
 		"flatten_map_step": 0.1,
 		"flatten_avg_offset": 1.0,
-		"flatten_orient": 10.0,
+		"flatten_orient": 2.0,
 		"flatten_sdir_eps": 1e-8,
-		"flatten_orient_min_det": 0.0
+		"flatten_orient_min_det": 0.01
 	}
 }

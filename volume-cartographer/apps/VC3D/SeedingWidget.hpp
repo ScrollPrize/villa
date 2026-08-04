@@ -13,11 +13,17 @@
 #include <QPointer>
 #include <QToolButton>
 #include <QFutureWatcher>
+#include <QSet>
+#include <QHash>
+#include <QStringList>
 #include <opencv2/core/mat.hpp>
 #include <memory>
+#include <filesystem>
+#include <vector>
 
 #include "elements/ProgressUtil.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
+#include "SeedingBatchTracker.hpp"
 
 using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 #include "vc/core/types/VolumePkg.hpp"
@@ -43,11 +49,36 @@ public:
 
     void setState(CState* state);
     void setViewerManager(ViewerManager* viewerManager);
-    
+
+    // Dialog-free operation entry points.
+    bool previewRaysHeadless(QString* errorMessage = nullptr);
+    bool castRaysHeadless(QString* errorMessage = nullptr);
+    void runResetPoints() { onResetPointsClicked(); }
+
+    // Non-blocking batch entry points shared by the UI and automation. They
+    // report validation failures through errorMessage and lifecycle through the
+    // signals below. A true return means at least one child was launched.
+    bool runSegmentationHeadless(QString* errorMessage);
+    bool runExpandSeedsHeadless(QString* errorMessage);
+    // Synchronous path-intensity analysis in Draw mode.
+    bool runAnalyzePathsHeadless(QString* errorMessage, int* pathsAnalyzed = nullptr,
+                                 int* peaksFound = nullptr);
+    // Cancels the active run/expand or neural-trace batch. Each child is asked
+    // to terminate, then killed if it does not exit within one second.
+    void cancelSeedingBatchHeadless();
+    // A neural trace shares jobsRunning but is not a seeding batch.
+    [[nodiscard]] bool seedingBatchActive() const { return jobsRunning && !_batch.kind().isEmpty(); }
+    [[nodiscard]] int seedingBatchTotal() const { return _batch.total(); }
+
 signals:
     void sendPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void sendStatusMessageAvailable(QString text, int timeout);
     void relWindingAnnotationModeChanged(bool active);
+    // Batch lifecycle. kind is "run" or "expand"; success requires every child
+    // to finish cleanly, and canceled distinguishes cancellation from failure.
+    void seedingBatchProgressChanged(const QString& kind, int completed, int total);
+    void seedingBatchFinished(const QString& kind, bool success, bool canceled,
+                              int completed, int total, const QString& message);
     
 public slots:
     void onSurfacesLoaded();  // Called when surfaces have been loaded/reloaded
@@ -100,6 +131,23 @@ private:
     void startDrawing(cv::Vec3f startPoint);
     void addPointToPath(cv::Vec3f point);
     void finalizePath();
+    // Batch seeding internals; replace the former self-referencing local lambdas in
+    // onRun/onExpand, whose captured stack locals would dangle now that the launching
+    // call returns before the batch finishes. One batch (run OR expand) at a time.
+    void startSegmentationProcessForPoint(int pointIndex);
+    void startExpansionProcessForIteration(int iterationIndex);
+    // Shared child launch: drains merged output (bounded tail), wires finished +
+    // errorOccurred(FailedToStart), and falls back to vc_grow_seg_from_seed directly if
+    // the nice/ionice wrappers are absent. Appends to runningProcesses before start() so a
+    // synchronous FailedToStart is still tracked.
+    void launchBatchProcess(QProcess* process, int index, const QStringList& toolArgs);
+    // A single QProcess reaches its terminal state exactly once here (deduped by the
+    // tracker keyed on process identity) since finished() and errorOccurred() may both
+    // fire. failedToStart routes FailedToStart through the same path so a missing
+    // wrapper/tool fails the batch rather than stranding it.
+    void handleBatchProcessFinished(QProcess* process, int index, int exitCode,
+                                    QProcess::ExitStatus exitStatus, bool failedToStart);
+    void finalizeSeedingBatch();
     // Relative winding annotation helpers
     void finalizePathLabelWraps(bool shiftHeld);
     void findPeaksAlongPathToCollection(const ViewerOverlayControllerBase::PathPrimitive& path, const std::string& collectionName);
@@ -164,6 +212,23 @@ private:
     // Process management
     QList<QPointer<QProcess>> runningProcesses;
     bool jobsRunning;
+
+    // Async seeding batch state (run/expand), promoted from onRun/onExpand locals so the
+    // QProcess finished callbacks read stable members, not dangling captures. Only one
+    // batch is active at a time (gated by jobsRunning). Outcome aggregation lives in
+    // SeedingBatchTracker _batch; only process-lifecycle bookkeeping stays here.
+    int _batchNextIndex{0};
+    int _batchOmpThreads{0};
+    SeedingBatchTracker _batch;
+    QHash<QProcess*, QString> _batchProcessTail; // bounded per-child output tail for diagnostics
+    std::vector<ColPoint> _batchPoints;      // run: source points; empty for expand
+    // Resolved vc_grow_seg_from_seed volume argument: local zarr path for a mirrored
+    // volume, or the remote locator for a streaming-only volume (issue #1188). QString,
+    // not filesystem::path, since a remote locator is a URL.
+    QString _batchVolumePath;
+    std::filesystem::path _batchPathsDir;
+    std::filesystem::path _batchConfigJson;  // seed.json (run) or expand.json (expand)
+    QString _batchWorkingDir;
 
     // Async cast rays
     QFutureWatcher<void>* _castRaysWatcher{nullptr};

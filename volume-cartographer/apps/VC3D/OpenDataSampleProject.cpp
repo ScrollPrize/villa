@@ -354,7 +354,8 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
     const OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult* resultOut,
-    const OpenDataSampleProgressCallback& progressCallback)
+    const OpenDataSampleProgressCallback& progressCallback,
+    const OpenDataResourceSelection* selection)
 {
     auto result = OpenDataSampleProjectResult{};
     std::shared_ptr<VolumePkg> pkg;
@@ -392,7 +393,7 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
         pkg->setRemoteCacheRoot(remoteCacheRoot);
     }
 
-    auto attachResult = attachOpenDataSampleVolumes(*pkg, sample);
+    auto attachResult = attachOpenDataSampleVolumes(*pkg, sample, selection);
     result.supportedVolumes = attachResult.supportedVolumes;
     result.attachedVolumeEntries = attachResult.attachedVolumeEntries;
     result.skippedVolumes = attachResult.skippedVolumes;
@@ -402,14 +403,15 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
                            attachResult.messages.begin(),
                            attachResult.messages.end());
     if (!remoteCacheRoot.empty()) {
-        const int attachedNormalGrids =
-            attachOpenDataNormalGrids(*pkg, sample, remoteCacheRoot);
-        if (attachedNormalGrids > 0) {
-            result.messages.push_back("Attached " + std::to_string(attachedNormalGrids) +
+        result.attachedNormalGrids =
+            attachOpenDataNormalGrids(*pkg, sample, remoteCacheRoot, selection);
+        if (result.attachedNormalGrids > 0) {
+            result.messages.push_back("Attached " +
+                                      std::to_string(result.attachedNormalGrids) +
                                       " streaming normal grid store(s).");
         }
         result.attachedLasagnaDatasets = attachOpenDataLasagna(
-            *pkg, sample, remoteCacheRoot, &result.messages);
+            *pkg, sample, remoteCacheRoot, &result.messages, selection);
         if (result.attachedLasagnaDatasets > 0) {
             result.messages.push_back(
                 "Attached " + std::to_string(result.attachedLasagnaDatasets) +
@@ -473,7 +475,8 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 
 OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     VolumePkg& pkg,
-    const OpenDataSample& sample)
+    const OpenDataSample& sample,
+    const OpenDataResourceSelection* selection)
 {
     OpenDataSampleProjectResult result;
     std::vector<std::string> supportedVolumeIds;
@@ -487,9 +490,22 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         bool inferredSourceCoordinateLevel = false;
     };
     std::vector<PredictionCandidate> predictions;
+    struct VirtualSourceCandidate {
+        const OpenDataVolume* volume = nullptr;
+        std::string sourceUrl;
+        int sourceCoordinateLevel = 0;
+        std::string representationLabel;
+    };
+    std::vector<VirtualSourceCandidate> virtualSources;
     std::vector<std::string> attachedLocations;
 
-    for (const auto& volume : sample.volumes) {
+    for (std::size_t volumeIndex = 0; volumeIndex < sample.volumes.size();
+         ++volumeIndex) {
+        const auto& volume = sample.volumes[volumeIndex];
+        // Skip an excluded volume and all of its artifacts and counters.
+        if (selection && !selection->allowsVolume(volume.id)) {
+            continue;
+        }
         if (volume.artifacts.empty()) {
             ++result.skippedVolumes;
             result.messages.push_back("Skipped " + volumeLabel(volume) + ": no volume artifact.");
@@ -507,10 +523,48 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
                 preferredSourceUrl.clear();
             }
         }
-        for (const auto& artifact : volume.artifacts) {
+        for (std::size_t artifactIndex = 0;
+             artifactIndex < volume.artifacts.size(); ++artifactIndex) {
+            const auto& artifact = volume.artifacts[artifactIndex];
             const std::string url = artifactUrl(artifact);
+            if (lowerCopy(artifact.type) == kLasagnaArtifactType) {
+                if (selection &&
+                    !selection->allowsRepresentation(
+                        volumeIndex, artifactIndex,
+                        OpenDataRepresentationKind::Lasagna, volume.id)) {
+                    continue;
+                }
+                if (!artifact.levelParameterPresent ||
+                    !artifact.sourceCoordinateLevel) {
+                    result.messages.push_back(
+                        "Skipped coordinate view for " +
+                        volumeArtifactLabel(volume, artifact) +
+                        ": parameters.level is missing or invalid.");
+                    continue;
+                }
+                if (*artifact.sourceCoordinateLevel > 0) {
+                    virtualSources.push_back(VirtualSourceCandidate{
+                        &volume,
+                        preferredSourceUrl,
+                        *artifact.sourceCoordinateLevel,
+                        volumeArtifactLabel(volume, artifact)});
+                }
+                continue;
+            }
             if (!isSupportedRemoteZarr(volume, artifact, url)) {
                 continue;
+            }
+
+            // Source volumes use only the volume filter; predictions must also
+            // pass the representation and kind filters.
+            if (selection) {
+                if (const auto reprKind =
+                        classifyDerivedRepresentation(artifact)) {
+                    if (!selection->allowsRepresentation(
+                            volumeIndex, artifactIndex, *reprKind, volume.id)) {
+                        continue;
+                    }
+                }
             }
 
             if (!foundSupportedArtifact && !volume.id.empty()) {
@@ -595,7 +649,6 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         }
     }
 
-    std::vector<std::string> attachedVirtualLocators;
     for (const auto& candidate : predictions) {
         const auto& volume = *candidate.volume;
         const auto& prediction = *candidate.prediction;
@@ -648,8 +701,40 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         if (level == 0)
             continue;
 
+        virtualSources.push_back(VirtualSourceCandidate{
+            &volume, candidate.sourceUrl, level, predictionLabel});
+    }
+
+    std::vector<std::string> attachedVirtualLocators;
+    for (const auto& candidate : virtualSources) {
+        const auto& volume = *candidate.volume;
+        const int level = candidate.sourceCoordinateLevel;
+        if (candidate.sourceUrl.empty() ||
+            std::find(attachedLocations.begin(), attachedLocations.end(),
+                      candidate.sourceUrl) == attachedLocations.end()) {
+            ++result.failedVolumes;
+            result.messages.push_back(
+                "Skipped virtual source for " +
+                candidate.representationLabel +
+                ": preferred source Zarr is unavailable or was not attached.");
+            continue;
+        }
+        if (!volume.pixelSizeUm || !std::isfinite(*volume.pixelSizeUm) ||
+            *volume.pixelSizeUm <= 0.0) {
+            ++result.failedVolumes;
+            result.messages.push_back(
+                "Skipped coordinate pairing for " +
+                candidate.representationLabel +
+                ": source volume has no positive voxel size.");
+            continue;
+        }
+
+        const double effectiveVoxelSize =
+            *volume.pixelSizeUm *
+            static_cast<double>(std::uint64_t{1} << level);
         const auto virtualLocator = vc::parseRemoteVolumeSpec(
-            candidate.sourceUrl + "#vc-base-scale=" + std::to_string(level)).portableLocator;
+            candidate.sourceUrl + "#vc-base-scale=" +
+            std::to_string(level)).portableLocator;
         if (std::find(attachedVirtualLocators.begin(), attachedVirtualLocators.end(),
                       virtualLocator) != attachedVirtualLocators.end()) {
             continue;

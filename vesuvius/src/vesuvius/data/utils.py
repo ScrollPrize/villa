@@ -4,6 +4,8 @@ import zarr
 import os
 from typing import Union, Dict, Any, Optional, Tuple
 
+_ZARR_V3 = int(zarr.__version__.split('.', 1)[0]) >= 3
+
 # Function to get the maximum value of a dtype
 def get_max_value(dtype: np.dtype) -> Union[float, int]:
     """
@@ -43,6 +45,7 @@ def open_zarr(path: str, mode: str = 'r',
               compressor: Any = None,
               fill_value: Any = None,
               order: str = None,
+              zarr_format: Optional[int] = 2,
               **kwargs) -> zarr.Array:
     """
     Open a zarr array with consistent handling of local and remote URLs.
@@ -59,6 +62,12 @@ def open_zarr(path: str, mode: str = 'r',
         Whether to print verbose information about opening the zarr array.
     shape, chunks, dtype, compressor, fill_value, order : zarr creation parameters
         Only used when mode is 'w' to create a new zarr array.
+    zarr_format : Optional[int], default 2
+        Zarr format version for arrays created with mode 'w'. Defaults to 2 because
+        the numcodecs compressors used throughout this package (and the logits stores
+        blend_logits validates) are v2 constructs: zarr 3 raises for `compressor=` on
+        a v3 array. Pass None to accept zarr's own default. Ignored when the
+        installed zarr is 2.x, which only writes v2 and does not accept the argument.
     **kwargs : Additional parameters passed to zarr.open
         
     Returns:
@@ -66,8 +75,8 @@ def open_zarr(path: str, mode: str = 'r',
     zarr.Array
         The opened zarr array
     """
-    if storage_options is None:
-        storage_options = {}
+    storage_options = dict(storage_options or {})
+    is_remote = path.startswith(('http://', 'https://', 's3://'))
     
     # Ensure parent directory exists for write modes and local paths
     if mode in ('w', 'w-', 'a') and not path.startswith(('http://', 'https://', 's3://')):
@@ -113,7 +122,11 @@ def open_zarr(path: str, mode: str = 'r',
         if verbose:
             print(f"Opening HTTP zarr store at {path} with storage_options: {storage_options}")
     
-    # Open zarr store directly with storage_options
+    # Zarr 3.2 rejects storage_options for local filesystem stores, even when
+    # the mapping is empty. Only URI-backed fsspec stores consume this option.
+    store_kwargs = {'storage_options': storage_options} if is_remote else {}
+
+    # Open the Zarr store with the protocol-appropriate keyword arguments.
     if verbose:
         print(f"Opening zarr store at {path} with mode={mode}")
     
@@ -130,14 +143,28 @@ def open_zarr(path: str, mode: str = 'r',
             create_kwargs['fill_value'] = fill_value
         if order is not None:
             create_kwargs['order'] = order
-        
+        # zarr 2 has no zarr_format argument: it warns "ignoring keyword
+        # argument 'zarr_format'" for every array and writes v2 regardless,
+        # which is already what this default asks for. Only zarr 3 needs telling.
+        if zarr_format is not None and _ZARR_V3:
+            create_kwargs['zarr_format'] = zarr_format
+
         # Add any other kwargs
         create_kwargs.update(kwargs)
-        
+
+        # zarr 3 derives `overwrite` from the mode, so passing it alongside
+        # mode='w' raises "got multiple values for keyword argument 'overwrite'".
+        # mode='w' already means truncate, so an explicit overwrite=True is
+        # redundant; drop it rather than making every caller know this.
+        if create_kwargs.pop('overwrite', None) is False:
+            raise ValueError(
+                "open_zarr(mode='w') always truncates; overwrite=False is contradictory"
+            )
+
         if verbose:
             print(f"Creating new zarr array with shape={shape}, chunks={chunks}, dtype={dtype}")
         
-        return zarr.open(path, mode=mode, shape=shape, storage_options=storage_options, **create_kwargs)
+        return zarr.open(path, mode=mode, shape=shape, **store_kwargs, **create_kwargs)
     else:
         # Just open the existing array
-        return zarr.open(path, mode=mode, storage_options=storage_options, **kwargs)
+        return zarr.open(path, mode=mode, **store_kwargs, **kwargs)

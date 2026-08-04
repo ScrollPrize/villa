@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -94,6 +96,29 @@ bool isLasagnaData(const fs::path& path, const std::vector<fs::path>& artifacts)
         return true;
     }
     return false;
+}
+
+std::set<std::string> managedGenericPayloads(const std::vector<fs::path>& files)
+{
+    constexpr std::string_view suffix = ".vc-remote-file.json";
+    std::set<std::string> payloads;
+    for (const auto& sidecar : files) {
+        const auto text = sidecar.string();
+        if (!text.ends_with(suffix))
+            continue;
+        try {
+            std::ifstream input(sidecar);
+            const auto metadata = nlohmann::json::parse(input);
+            if (metadata.value("accounting", std::string{}) != "managed")
+                continue;
+            const auto payload = fs::path(text.substr(0, text.size() - suffix.size()));
+            std::error_code ec;
+            if (fs::is_regular_file(payload, ec) && !ec)
+                payloads.insert(normalizedPath(payload).string());
+        } catch (...) {
+        }
+    }
+    return payloads;
 }
 
 struct Registry {
@@ -243,9 +268,11 @@ void PersistentZarrCacheBudget::startScan()
 
         std::unordered_map<std::string, Impl::Entry> found;
         std::uint64_t total = 0;
+        const auto genericPayloads = managedGenericPayloads(files);
         for (const auto& path : files) {
             if (!isVolumeChunk(path, self->impl_->root) &&
-                !isLasagnaData(path, artifacts))
+                !isLasagnaData(path, artifacts) &&
+                !genericPayloads.contains(path.string()))
                 continue;
             std::error_code fileEc;
             const auto size = fs::file_size(path, fileEc);

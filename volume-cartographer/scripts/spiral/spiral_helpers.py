@@ -8,14 +8,17 @@ import torch
 from tqdm import tqdm
 
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
-from tifxyz import load_tifxyz, save_tifxyz
+from tifxyz import load_tifxyz, save_tifxyz, save_combined_tifxyz
+from vc3d_fiber_format_adapter import (
+    parse_vc3d_fiber_format,
+)
 
 
 def scale_patch(patch, downsample_factor):
     patch.scale *= downsample_factor
     patch.zyxs /= downsample_factor
-    patch.valid_zyxs /= downsample_factor
     patch.area /= downsample_factor ** 2
+    patch.release_derived_caches()
 
 
 def patch_intersects_z_roi(patch, z_begin, z_end):
@@ -31,12 +34,28 @@ def scale_counts_for_z_range(
     z_end,
     reference_z_range_num_slices,
     z_range_scaled_count_keys,
+    floors=None,
 ):
+    """Scale per-step sample counts with the z-range, respecting floors.
+
+    Floors exist for losses whose per-sample information is sparse: the
+    phase bundle sees ~6 winding gradient sites per pair, so
+    volume-proportional scaling starves it on narrow windows (a 300-slice
+    session got ~380 pairs from the 12k default and corrected at half
+    grad_mag's rate - 2026-07-17 sampling-scale probes).
+    """
     num_slices = z_end - z_begin
     scale = num_slices / reference_z_range_num_slices
     for key in z_range_scaled_count_keys:
-        config[key] = max(1, round(config[key] * scale))
+        floor = 1 if floors is None else int(floors.get(key, 1))
+        config[key] = max(floor, round(config[key] * scale))
     return scale, num_slices
+
+
+SAMPLING_COUNT_FLOORS = {
+    'sample_count_dense_spacing_pairs': 8_000,
+    'sample_count_dense_spacing_density_extra_pairs': 16_000,
+}
 
 
 def _decimate_ordered_points_min_spacing(points, min_spacing):
@@ -53,15 +72,17 @@ def _decimate_ordered_points_min_spacing(points, min_spacing):
 
 
 def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_point_spacing=20.0):
-    # Fiber JSONs are stored as one vc3d_fiber per file. Their line_points are
-    # x/y/z coordinates at 4x the scale used by the regular PCL JSONs.
+    # Fiber JSONs are stored as one vc3d_fiber per file. Their control_points are
+    # x/y/z coordinates at 4x the scale used by the regular PCL JSONs. line_points
+    # are derived rendering geometry and must not be used as fitting constraints.
     with open(path, 'r') as f:
         data = json.load(f)
 
-    points_xyz = data.get('control_points', [])
-    if not points_xyz:
+    if data.get('version', 1) == 1 and not data.get('control_points'):
         print(f'WARNING: fiber {path} has no control_points; skipping')
         return None
+    parsed = parse_vc3d_fiber_format(data, path=path)
+    points_xyz = parsed.control_points_xyz
 
     points_xyz = np.asarray(points_xyz, dtype=np.float32)
     if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
@@ -86,14 +107,14 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
         'points': {},
         'metadata': {
             'source_format': data.get('type', 'vc3d_fiber'),
-            'fiber_version': data.get('version'),
-            'fiber_generation': data.get('generation'),
+            'fiber_version': parsed.version,
+            'fiber_generation': parsed.generation,
             'fiber_sequence': data.get('sequence'),
             'fiber_started_at': data.get('started_at'),
             'fiber_tags': data.get('tags', []),
             'hv_classification': data.get('hv_classification', {}),
             'input_coordinate_scale': coordinate_scale,
-            'fiber_min_point_spacing': min_point_spacing,
+            'pcl_fiber_min_point_spacing': min_point_spacing,
             'fiber_original_num_points': original_num_points,
         },
         'color': color,
@@ -190,6 +211,7 @@ def compute_winding_range_and_input_extents(
     z_begin,
     z_end,
     get_or_build_unattached_pcl_flat,
+    authoritative_zyx_lines=(),
 ):
     """Compute output winding range plus max observed radius/winding per patch and PCL."""
     device = dr_per_winding.device
@@ -271,6 +293,60 @@ def compute_winding_range_and_input_extents(
                     if strip_has_roi_cpu[k]:
                         pcl_extents[k] = (per_strip_max_r_cpu[k], per_strip_max_w_cpu[k])
 
+    # Tracks are authoritative fit geometry too.  Including them makes
+    # tracks-only/disable-patches sessions derive the same output upper bound
+    # instead of silently producing no preview.  Track DBMs can contain millions
+    # of short lines, so batch their points before moving them to the GPU.  A
+    # transform call per line makes preview generation dominated by CUDA launch
+    # overhead (and took hours for multi-million-track datasets).
+    pending_track_points = []
+    pending_track_point_count = 0
+
+    def update_from_track_points(zyxs):
+        # Reduce each transformed chunk immediately.  In addition to bounding
+        # memory, this lets callers reuse an already-flat GPU track tensor
+        # without concatenating a second full-dataset transform result.
+        for start in range(0, zyxs.shape[0], chunk):
+            spiral_zyxs = slice_to_spiral_transform(zyxs[start:start + chunk])
+            _, _, shifted_radius = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
+            update_from_winding_indices(
+                (shifted_radius / dr).round().to(torch.int64).clamp_min(0)
+            )
+
+    def flush_pending_track_points():
+        nonlocal pending_track_point_count
+        if not pending_track_points:
+            return
+        points = (pending_track_points[0] if len(pending_track_points) == 1
+                  else np.concatenate(pending_track_points, axis=0))
+        update_from_track_points(torch.as_tensor(points, device=device, dtype=torch.float32))
+        pending_track_points.clear()
+        pending_track_point_count = 0
+
+    for line in authoritative_zyx_lines or ():
+        if torch.is_tensor(line):
+            # Keep tensor callers supported without trying to convert CUDA data
+            # through NumPy.  Flush host-side points first to preserve the bound.
+            flush_pending_track_points()
+            zyxs = line.to(device=device, dtype=torch.float32).reshape(-1, 3)
+            in_roi = (zyxs[:, 0] >= z_begin) & (zyxs[:, 0] < z_end)
+            if in_roi.any():
+                update_from_track_points(zyxs[in_roi])
+            continue
+
+        points = np.asarray(line, dtype=np.float32).reshape(-1, 3)
+        if points.shape[0] == 0:
+            continue
+        in_roi = (points[:, 0] >= z_begin) & (points[:, 0] < z_end)
+        if not in_roi.any():
+            continue
+        points = points[in_roi]
+        pending_track_points.append(points)
+        pending_track_point_count += points.shape[0]
+        if pending_track_point_count >= chunk:
+            flush_pending_track_points()
+    flush_pending_track_points()
+
     first_winding = cfg['output_first_winding']
     if min_w is None:
         output_winding_range = (first_winding, first_winding)
@@ -310,6 +386,89 @@ def _infer_shell_outer_winding_idx(
     return int(observed_max + cfg['shell_outer_winding_margin'])
 
 
+def _resolve_shell_outer_winding_idx(cfg):
+    # Winding bound shared by every sampler that integrates over the spiral
+    # cylinder: the dense lasagna losses, the symmetric Dirichlet
+    # regulariser and the phase bundle (incl. min_spacing). Resolved once per
+    # run from the config; the shell branch may still override it with the
+    # inferred value. None disables those samplers (they early-return zero),
+    # whatever their weights: _structurally_disabled_dense_weight_keys
+    # reports that combination so the run can warn instead of staying silent.
+    configured = cfg['shell_outer_winding_idx']
+    if configured is None:
+        return None
+    try:
+        resolved = int(configured)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f'shell_outer_winding_idx must be an integer >= 2 or None, '
+            f'got {configured!r}')
+    if resolved < 2:
+        # sample_spiral_surface_frame draws windings from [1, idx); 0 and 1
+        # crash multinomial/arange at the first step with an opaque error.
+        raise ValueError(
+            f'shell_outer_winding_idx must be an integer >= 2 or None, '
+            f'got {configured!r}')
+    return resolved
+
+
+def resolve_outer_winding_idx_and_notes(cfg, shell_active, infer_outer_winding_idx):
+    """Resolve the run's outer winding index and the lines to print for it.
+
+    ``infer_outer_winding_idx`` is a zero-argument callable, invoked only
+    when shell losses are active and the config key is None (the historical
+    inference path). Returns ``(index_or_none, notes)``.
+    """
+    idx = _resolve_shell_outer_winding_idx(cfg)
+    notes = []
+    if shell_active:
+        if idx is None:
+            idx = int(infer_outer_winding_idx())
+            notes.append(f'inferred shell_outer_winding_idx = {idx}')
+        else:
+            notes.append(f'using configured shell_outer_winding_idx = {idx}')
+    elif idx is not None:
+        notes.append(
+            'no outer-shell losses; using configured shell_outer_winding_idx '
+            f'= {idx} for the dense and regularisation losses')
+    if idx is not None:
+        min_gap = idx + 3
+        gap_windings = cfg['model_gap_expander_num_windings']
+        if gap_windings < min_gap:
+            notes.append(
+                f'WARNING: shell_outer_winding_idx {idx} requires '
+                f'model_gap_expander_num_windings >= {min_gap}, got '
+                f'model_gap_expander_num_windings {gap_windings}; '
+                'increase model_gap_expander_num_windings or lower '
+                'shell_outer_winding_idx')
+    return idx, notes
+
+
+# Every loss weight whose term samples out to shell_outer_winding_idx and is
+# therefore silently zero while that index is unresolved.
+_DENSE_WEIGHT_KEYS_NEEDING_OUTER_WINDING_IDX = (
+    'loss_weight_dense_normals',
+    'loss_weight_dense_spacing',
+    'loss_weight_dense_spacing_count',
+    'loss_weight_dense_spacing_density',
+    'loss_weight_dense_attachment',
+    'loss_weight_min_spacing',
+    'loss_weight_sym_dirichlet',
+)
+
+
+def _structurally_disabled_dense_weight_keys(cfg, shell_outer_winding_idx):
+    """Nonzero weights that cannot produce a loss because no outer winding
+    index could be resolved (config key is None and no outer shell inferred
+    one)."""
+    if shell_outer_winding_idx is not None:
+        return ()
+    return tuple(
+        key for key in _DENSE_WEIGHT_KEYS_NEEDING_OUTER_WINDING_IDX
+        if cfg.get(key, 0.0) > 0
+    )
+
+
 def _warn_if_inputs_exceed_flow_bounds(
     patch_ids,
     patch_extents,
@@ -318,7 +477,7 @@ def _warn_if_inputs_exceed_flow_bounds(
     flow_field_radius,
     cfg,
 ):
-    gap_expander_num_windings = cfg['gap_expander_num_windings']
+    gap_expander_num_windings = cfg['model_gap_expander_num_windings']
 
     over_radius_patches = []
     over_winding_patches = []
@@ -570,8 +729,10 @@ def save_mesh(
     voxel_size_um,
     get_or_build_unattached_pcl_flat,
     get_patch_satisfied_areas,
+    tracks=(),
     run_tag=None,
     name='mesh',
+    progress=None,
 ):
     (min_winding_idx, max_winding_idx), _, _ = compute_winding_range_and_input_extents(
         slice_to_spiral_transform,
@@ -582,12 +743,13 @@ def save_mesh(
         z_begin,
         z_end,
         get_or_build_unattached_pcl_flat,
+        authoritative_zyx_lines=tracks,
     )
     if cfg['shell_outer_winding_idx'] is not None:
         max_winding_idx = min(max_winding_idx, cfg['shell_outer_winding_idx'])
     print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
     grid_spacing = cfg['output_step_size']
-    z_margin = cfg['flow_bounds_z_margin']
+    z_margin = cfg['model_flow_bounds_z_margin']
     spiral_yxs_by_winding = get_spiral_yxs(max_winding_idx, dr_per_winding, grid_spacing, group_by_winding=True)
     num_thetas_by_winding = [len(yxs_for_winding) for yxs_for_winding in spiral_yxs_by_winding]
     spiral_yxs = torch.cat(spiral_yxs_by_winding, dim=0)
@@ -597,15 +759,26 @@ def save_mesh(
     chunk = 65536
     flat_spiral_zyxs = spiral_zyxs.reshape(-1, 3)
     scroll_pieces = []
-    for start in range(0, flat_spiral_zyxs.shape[0], chunk):
+    transform_chunk_total = (
+        flat_spiral_zyxs.shape[0] + chunk - 1) // chunk
+    if progress is not None:
+        progress.begin(
+            'finalizing', 'Transforming final mesh',
+            step=0, total_steps=transform_chunk_total, unit='chunks')
+    for chunk_number, start in enumerate(
+            range(0, flat_spiral_zyxs.shape[0], chunk), start=1):
         scroll_pieces.append(slice_to_spiral_transform.inv(flat_spiral_zyxs[start : start + chunk]))
+        if progress is not None:
+            progress.update(chunk_number)
     scroll_zyxs = torch.cat(scroll_pieces, dim=0).reshape(*spiral_zyxs.shape)
 
     out_of_roi = (scroll_zyxs[..., 0] < z_begin) | (scroll_zyxs[..., 0] >= z_end)
     scroll_zyxs[out_of_roi] = -1.0
 
     spliced_scroll_zyxs = scroll_zyxs.clone()
-    # The splicing decision uses looser criteria than the reported satisfaction metrics.
+    # Splicing is deliberately more permissive than the reported satisfaction
+    # metrics: it should accept a mostly aligned patch without relabelling that
+    # patch as fully satisfied in the user-facing metrics.
     splicing_metrics_overrides = {
         'satisfaction_radius_tolerance': 0.495,
         'satisfaction_distance_tolerance': 12.0,
@@ -626,9 +799,18 @@ def save_mesh(
     tag_suffix = f'_{run_tag}' if run_tag else ''
     out_dir = f'{out_path}/meshes/{name}{tag_suffix}'
     os.makedirs(out_dir, exist_ok=True)
+    output_total = 2 * len(num_thetas_by_winding)
+    output_done = 0
+    if progress is not None:
+        progress.begin(
+            'finalizing', 'Writing final mesh windings',
+            step=0, total_steps=output_total, unit='windings')
     for uuid_suffix, variant_zyxs in [('', scroll_zyxs), ('_spliced', spliced_scroll_zyxs)]:
         offset = 0
-        for winding_idx, num_thetas in enumerate(tqdm(num_thetas_by_winding, desc=f'saving winding patches ({name}{uuid_suffix})')):
+        for winding_idx, num_thetas in enumerate(tqdm(
+                num_thetas_by_winding,
+                desc=f'saving winding patches ({name}{uuid_suffix})',
+                disable=progress is not None)):
             if num_thetas >= 2 and winding_idx >= min_winding_idx:
                 winding_slice = variant_zyxs[:, offset:offset + num_thetas]
                 invalid_mask = (winding_slice == -1.0).all(dim=-1).cpu().numpy()
@@ -643,6 +825,111 @@ def save_mesh(
                     source=f'fit_spiral {name}{uuid_suffix}',
                 )
             offset += num_thetas
+            output_done += 1
+            if progress is not None:
+                progress.update(
+                    output_done, detail=f'winding {winding_idx}{uuid_suffix}')
+
+
+@torch.inference_mode()
+def save_combined_preview(
+    slice_to_spiral_transform,
+    dr_per_winding,
+    patches,
+    unattached_pcl_strips,
+    generation_path,
+    cfg,
+    z_begin,
+    z_end,
+    voxel_size_um,
+    get_or_build_unattached_pcl_flat,
+    tracks=(),
+    *,
+    surface_id,
+    progress=None,
+):
+    """Write the authoritative connected preview used by VC3D and Lasagna."""
+    (_, derived_upper), _, _ = compute_winding_range_and_input_extents(
+        slice_to_spiral_transform,
+        dr_per_winding,
+        patches,
+        unattached_pcl_strips,
+        cfg,
+        z_begin,
+        z_end,
+        get_or_build_unattached_pcl_flat,
+        authoritative_zyx_lines=tracks,
+    )
+    configured_outer = cfg.get('shell_outer_winding_idx')
+    exclusive_upper = derived_upper
+    if configured_outer is not None:
+        configured_upper = int(configured_outer) + 1
+        exclusive_upper = (configured_upper if derived_upper <= int(cfg['output_first_winding'])
+                           else min(exclusive_upper, configured_upper))
+    first_winding = 10
+    last_winding = int(exclusive_upper) - 1
+    if last_winding < first_winding:
+        raise RuntimeError(
+            f'No preview winding is at or above {first_winding}; derived last winding is {last_winding}'
+        )
+
+    grid_spacing = int(cfg['output_step_size'])
+    z_margin = int(cfg['model_flow_bounds_z_margin'])
+    spiral_yxs_by_winding = get_spiral_yxs(
+        last_winding + 1,
+        dr_per_winding,
+        grid_spacing,
+        group_by_winding=True,
+    )
+    z0 = z_begin - z_margin
+    spiral_zs = torch.arange(
+        z0,
+        z_end + z_margin,
+        grid_spacing,
+        dtype=torch.float32,
+        device=dr_per_winding.device,
+    )
+    winding_grids = {}
+    total_windings = last_winding - first_winding + 1
+    if progress is not None:
+        progress.begin(
+            'exporting_preview', 'Transforming preview windings',
+            step=0, total_steps=total_windings, unit='windings')
+    for winding_number, winding in enumerate(
+            range(first_winding, last_winding + 1), start=1):
+        yxs = spiral_yxs_by_winding[winding]
+        if yxs.shape[0] < 2:
+            raise RuntimeError(f'Preview winding {winding} has fewer than two theta samples')
+        spiral = torch.cat([
+            spiral_zs[:, None, None].expand(-1, yxs.shape[0], 1),
+            yxs[None, :, :].expand(spiral_zs.shape[0], -1, 2),
+        ], dim=-1)
+        flat = spiral.reshape(-1, 3)
+        pieces = []
+        for start in range(0, flat.shape[0], 65536):
+            pieces.append(slice_to_spiral_transform.inv(flat[start:start + 65536]))
+        scroll = torch.cat(pieces, dim=0).reshape_as(spiral)
+        outside = (scroll[..., 0] < z_begin) | (scroll[..., 0] >= z_end)
+        scroll[outside] = -1.0
+        winding_grids[winding] = scroll.cpu().numpy().astype(np.float32)
+        if progress is not None:
+            progress.update(winding_number, detail=f'winding {winding}')
+
+    if progress is not None:
+        progress.begin(
+            'exporting_preview', 'Writing preview surface',
+            detail=f'{total_windings} windings')
+    manifest = save_combined_tifxyz(
+        winding_grids,
+        generation_path,
+        surface_id,
+        grid_spacing,
+        voxel_size_um,
+        source='fit_spiral interactive preview',
+        first_winding=first_winding,
+        cleanup_erosion_cells=3,
+    )
+    return manifest
 
 
 def load_patches(patches_path, segment_id_filter=lambda s: True):

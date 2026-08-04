@@ -90,6 +90,13 @@ if(VC_ENABLE_ECL_MAXFLOW)
     endif()
 endif()
 
+set(VC_QUICKBUILD_OPT_LEVEL "1" CACHE STRING
+    "Optimization level used by QuickBuild (0, 1, 2, or 3)")
+set_property(CACHE VC_QUICKBUILD_OPT_LEVEL PROPERTY STRINGS 0 1 2 3)
+if(NOT VC_QUICKBUILD_OPT_LEVEL MATCHES "^[0123]$")
+    message(FATAL_ERROR "VC_QUICKBUILD_OPT_LEVEL must be 0, 1, 2, or 3")
+endif()
+
 set(_vc_build_types Debug Release RelWithDebInfo MinSizeRel QuickBuild)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the build type." FORCE)
@@ -102,7 +109,8 @@ endif()
 # compile, but skip LTO and force the shared vc_core PCH back on.
 if(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
     set(VC_USE_PCH ON CACHE BOOL "Precompile common headers into neutral carrier targets; downstream targets REUSE_FROM them" FORCE)
-    message(STATUS "QuickBuild: -O1, PCH enabled, LTO disabled")
+    message(STATUS
+        "QuickBuild: -O${VC_QUICKBUILD_OPT_LEVEL}, PCH enabled, LTO disabled")
 endif()
 
 if(VC_USE_CCACHE AND VC_USE_SCCACHE)
@@ -278,6 +286,19 @@ else()
     elseif(WIN32)
         # binutils PE linker: --gc-sections works, mold/lld are not options.
         set(_link -Wl,--gc-sections -Wl,--as-needed)
+        # MinGW links DWARF straight into the PE, and on Windows nothing reads
+        # it: vc::crash::install() is a no-op off Linux (core/src/CrashHandler.cpp)
+        # and Windows debuggers consume PDB, not DWARF. Emitting it added ~1.5GB
+        # across the 43 packaged binaries — enough to push the NSIS payload past
+        # its data limit and fail packaging outright. Keep the codegen flags and
+        # drop the debug-info ones (-fno-eliminate-unused-debug-types only
+        # amplifies -g, so it goes too); configure with -DVC_WINDOWS_DEBUG_INFO=ON
+        # for a local gdb/lldb session under MSYS2.
+        option(VC_WINDOWS_DEBUG_INFO "Emit DWARF in MinGW builds (gdb/lldb)" OFF)
+        set(_dbg -fno-omit-frame-pointer -fasynchronous-unwind-tables)
+        if(VC_WINDOWS_DEBUG_INFO)
+            list(APPEND _dbg -g3 -fno-eliminate-unused-debug-types)
+        endif()
     else()
         find_program(VC_MOLD_BINARY mold)
         if(VC_MOLD_BINARY)
@@ -286,6 +307,12 @@ else()
             set(_link -Wl,--gc-sections -Wl,--as-needed)
         endif()
     endif()
+endif()
+if(NOT MSVC AND CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
+    # QuickBuild is used for fast compile-and-test iteration. Line tables keep
+    # crash reports actionable without paying to emit unused types, locals,
+    # and macro definitions that no automated test job consumes.
+    set(_dbg -g1 -fno-omit-frame-pointer -fasynchronous-unwind-tables)
 endif()
 if(MSVC)
     add_compile_options(${_dbg})
@@ -367,7 +394,7 @@ if(NOT MSVC)
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         add_compile_options(-O0)
     elseif(CMAKE_BUILD_TYPE STREQUAL "QuickBuild")
-        add_compile_options(-O1)
+        add_compile_options(-O${VC_QUICKBUILD_OPT_LEVEL})
     elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
         add_compile_options(-O3)
     elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
@@ -784,17 +811,132 @@ include(${CMAKE_SOURCE_DIR}/cmake/WindowsPackaging.cmake)
 include(${CMAKE_SOURCE_DIR}/cmake/MacPackaging.cmake)
 
 if(VC_TESTING)
+    # Tests that require advanced tracing/Lasagna libraries. Tests that compile
+    # VC3D sources but use only Qt/vc_core remain in the base shard so the two
+    # clean dependency closures stay balanced. The validation below makes stale
+    # or unregistered entries fatal.
+    set(VC_SPECIALIZED_TEST_TARGETS
+        test_viewer_overlay_surface_primitives
+        test_segmentation_lasagna_panel_ui
+        test_line_annotation_generated_views
+        test_lasagna_maxflow_graph
+        test_lasagna_manifest
+        test_lasagna_project_volumes
+        test_fiber_trace3d
+        test_open_data_manifest
+        test_lasagna_line_optimizer
+        test_lasagna_line_view_surfaces
+        test_lasagna_normal_sampler
+        test_atlas
+        test_fiber_intersections
+        test_chunked_tensor_meta
+        test_growth_config
+        test_growth_helpers
+        test_surf_tracker_data
+        test_neural_tracer_connection
+        bench_lasagna_line_edit
+        bench_fiber_intersections)
+
+    function(vc_register_test_target target)
+        if(NOT TARGET ${target})
+            message(FATAL_ERROR "Cannot register missing test target '${target}'")
+        endif()
+        get_property(_registered GLOBAL PROPERTY VC_TEST_TARGETS)
+        if(target IN_LIST _registered)
+            message(FATAL_ERROR "Test target '${target}' was registered more than once")
+        endif()
+        if(target IN_LIST VC_SPECIALIZED_TEST_TARGETS)
+            set(_group specialized)
+        else()
+            set(_group core)
+        endif()
+        set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS ${target})
+        set_property(GLOBAL APPEND PROPERTY VC_TEST_${_group}_TARGETS ${target})
+    endfunction()
+
+    function(vc_register_ctest test_name target)
+        get_property(_registered_targets GLOBAL PROPERTY VC_TEST_TARGETS)
+        if(NOT target IN_LIST _registered_targets)
+            message(FATAL_ERROR
+                "CTest '${test_name}' refers to unregistered target '${target}'")
+        endif()
+        get_property(_registered_tests GLOBAL PROPERTY VC_CTEST_NAMES)
+        if(test_name IN_LIST _registered_tests)
+            message(FATAL_ERROR "CTest '${test_name}' was registered more than once")
+        endif()
+        if(target IN_LIST VC_SPECIALIZED_TEST_TARGETS)
+            set(_label vc-specialized)
+        else()
+            set(_label vc-core)
+        endif()
+        set_property(TEST ${test_name} APPEND PROPERTY LABELS ${_label})
+        set_property(GLOBAL APPEND PROPERTY VC_CTEST_NAMES ${test_name})
+        get_property(_ctest_targets GLOBAL PROPERTY VC_CTEST_TARGETS)
+        if(NOT target IN_LIST _ctest_targets)
+            set_property(GLOBAL APPEND PROPERTY VC_CTEST_TARGETS ${target})
+        endif()
+    endfunction()
+
     enable_testing()
     add_subdirectory(core/test)
+    add_subdirectory(apps/VC3D/agent_bridge/test)
+    add_subdirectory(apps/VC3D/test)
+
+    get_property(_vc_test_targets GLOBAL PROPERTY VC_TEST_TARGETS)
+    get_property(_vc_core_test_targets GLOBAL PROPERTY VC_TEST_core_TARGETS)
+    get_property(_vc_specialized_test_targets GLOBAL PROPERTY VC_TEST_specialized_TARGETS)
+    foreach(_expected IN LISTS VC_SPECIALIZED_TEST_TARGETS)
+        if(NOT _expected IN_LIST _vc_specialized_test_targets)
+            message(FATAL_ERROR
+                "Specialized test target '${_expected}' was not registered")
+        endif()
+    endforeach()
+
+    set(_vc_actual_ctests)
+    foreach(_test_dir
+            "${CMAKE_SOURCE_DIR}/core/test"
+            "${CMAKE_SOURCE_DIR}/apps/VC3D/agent_bridge/test"
+            "${CMAKE_SOURCE_DIR}/apps/VC3D/test")
+        get_property(_dir_tests DIRECTORY "${_test_dir}" PROPERTY TESTS)
+        list(APPEND _vc_actual_ctests ${_dir_tests})
+    endforeach()
+    get_property(_vc_registered_ctests GLOBAL PROPERTY VC_CTEST_NAMES)
+    list(SORT _vc_actual_ctests)
+    list(SORT _vc_registered_ctests)
+    if(NOT _vc_actual_ctests STREQUAL _vc_registered_ctests)
+        message(FATAL_ERROR
+            "Every CTest must be registered in a CI shard.\n"
+            "Actual: ${_vc_actual_ctests}\n"
+            "Registered: ${_vc_registered_ctests}")
+    endif()
+
+    add_custom_target(vc_test_core DEPENDS ${_vc_core_test_targets})
+    add_custom_target(vc_test_specialized DEPENDS ${_vc_specialized_test_targets})
+    add_custom_target(check-core
+        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+                --parallel 4 -L "^vc-core$"
+        DEPENDS vc_test_core
+        USES_TERMINAL)
+    add_custom_target(check-core-offline
+        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+                --parallel 4 -L "^vc-core$" -LE "^network$"
+        DEPENDS vc_test_core
+        USES_TERMINAL)
+    add_custom_target(check-specialized
+        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+                --parallel 4 -L "^vc-specialized$"
+        DEPENDS vc_test_specialized
+        USES_TERMINAL)
     add_custom_target(check
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+        DEPENDS ${_vc_test_targets}
         USES_TERMINAL)
 
     if(VC_ENABLE_COVERAGE)
         find_program(LLVM_PROFDATA NAMES llvm-profdata REQUIRED)
         find_program(LLVM_COV NAMES llvm-cov REQUIRED)
-        get_property(_vc_test_targets GLOBAL PROPERTY VC_TEST_TARGETS)
-        string(REPLACE ";" "," _vc_test_targets_csv "${_vc_test_targets}")
+        get_property(_vc_coverage_targets GLOBAL PROPERTY VC_CTEST_TARGETS)
+        string(REPLACE ";" "," _vc_test_targets_csv "${_vc_coverage_targets}")
         add_custom_target(coverage-report
             COMMAND ${CMAKE_COMMAND}
                     -D "BUILD_DIR=${CMAKE_BINARY_DIR}"
@@ -803,7 +945,7 @@ if(VC_TESTING)
                     -D "LLVM_COV=${LLVM_COV}"
                     -D "TEST_TARGETS=${_vc_test_targets_csv}"
                     -P "${CMAKE_SOURCE_DIR}/cmake/run_coverage_report.cmake"
-            DEPENDS ${_vc_test_targets}
+            DEPENDS ${_vc_coverage_targets}
             USES_TERMINAL
             COMMENT "Running clang source-based coverage")
     endif()
