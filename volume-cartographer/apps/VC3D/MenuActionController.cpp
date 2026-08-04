@@ -1899,7 +1899,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote)
             const auto result =
                 targetPackage->attachPreparedLasagnaDataset(persistedLocation, {}, fiberInference, task.volumes, cacheRoot.toStdString());
             if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
-                QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("A derived Lasagna volume conflicts with an existing volume id."));
+                QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("A Lasagna volume conflicts with an existing volume id."));
                 return;
             }
             _window->refreshCurrentVolumePackageUi(QString(), true);
