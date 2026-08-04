@@ -35,6 +35,8 @@ set(srcs
     FiberSliceGeometry.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
+    LineAnnotationFiberSegments.cpp
+    LineAnnotationFiberSegments.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp
@@ -334,6 +336,7 @@ target_link_libraries(VC3D
     vc_core
     vc_atlas
     vc_lasagna
+    vc_fiber_tracer
     vc_tracer
     vc_flattening
     Ceres::ceres
@@ -409,3 +412,13 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/spiral/
         PATTERN "*.json"
         PATTERN "tests" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
+
+set(_vc3d_fiber_format_src
+    "${CMAKE_SOURCE_DIR}/../vesuvius/src/vc3d_fiber_format")
+if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
+    install(DIRECTORY "${_vc3d_fiber_format_src}"
+        DESTINATION share/volume-cartographer/spiral
+        FILES_MATCHING
+            PATTERN "*.py"
+            PATTERN "__pycache__" EXCLUDE)
+endif()

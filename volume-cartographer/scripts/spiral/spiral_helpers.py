@@ -9,6 +9,9 @@ from tqdm import tqdm
 
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
 from tifxyz import load_tifxyz, save_tifxyz, save_combined_tifxyz
+from vc3d_fiber_format_adapter import (
+    parse_vc3d_fiber_format,
+)
 
 
 def scale_patch(patch, downsample_factor):
@@ -75,10 +78,11 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
     with open(path, 'r') as f:
         data = json.load(f)
 
-    points_xyz = data.get('control_points') or []
-    if not points_xyz:
+    if data.get('version', 1) == 1 and not data.get('control_points'):
         print(f'WARNING: fiber {path} has no control_points; skipping')
         return None
+    parsed = parse_vc3d_fiber_format(data, path=path)
+    points_xyz = parsed.control_points_xyz
 
     points_xyz = np.asarray(points_xyz, dtype=np.float32)
     if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
@@ -103,8 +107,8 @@ def load_fiber_point_collection(path, collection_id, coordinate_scale=0.25, min_
         'points': {},
         'metadata': {
             'source_format': data.get('type', 'vc3d_fiber'),
-            'fiber_version': data.get('version'),
-            'fiber_generation': data.get('generation'),
+            'fiber_version': parsed.version,
+            'fiber_generation': parsed.generation,
             'fiber_sequence': data.get('sequence'),
             'fiber_started_at': data.get('started_at'),
             'fiber_tags': data.get('tags', []),

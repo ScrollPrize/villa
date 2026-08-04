@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import multiprocessing
 import os
@@ -10,7 +11,48 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+from threadpoolctl import threadpool_limits
 import zarr
+
+
+_NATIVE_THREAD_ENV = (
+	"OPENBLAS_NUM_THREADS",
+	"OMP_NUM_THREADS",
+	"MKL_NUM_THREADS",
+	"BLIS_NUM_THREADS",
+	"VECLIB_MAXIMUM_THREADS",
+	"NUMEXPR_NUM_THREADS",
+)
+_PYRAMID_WORKER_THREAD_LIMIT = None
+
+
+def _set_native_thread_env_one() -> None:
+	for name in _NATIVE_THREAD_ENV:
+		os.environ[name] = "1"
+
+
+def _pyramid_worker_init() -> None:
+	"""Keep native numerical runtimes single-threaded for this worker's life."""
+	global _PYRAMID_WORKER_THREAD_LIMIT
+	_set_native_thread_env_one()
+	_PYRAMID_WORKER_THREAD_LIMIT = threadpool_limits(limits=1)
+
+
+@contextmanager
+def _single_threaded_native_runtime():
+	"""Temporarily constrain parent and newly spawned native runtimes."""
+	missing = object()
+	previous = {name: os.environ.get(name, missing) for name in _NATIVE_THREAD_ENV}
+	_set_native_thread_env_one()
+	try:
+		with threadpool_limits(limits=1):
+			yield
+	finally:
+		for name, value in previous.items():
+			if value is missing:
+				os.environ.pop(name, None)
+			else:
+				os.environ[name] = value
 
 
 def shape_div2(shape: tuple[int, int, int], n: int) -> tuple[int, int, int]:
@@ -646,25 +688,42 @@ def _run_pool(work, worker, *, workers: int, tag: str, total: int | None = None)
 			print_progress(prefix=tag, done=d, total=n_work, t0=t0, suffix=suffix)
 			stop.wait(0.5)
 
-	prog_thread = threading.Thread(target=_prog, daemon=True)
+	prog_thread = threading.Thread(
+		target=_prog, daemon=True, name=f"pyramid-progress:{tag}"
+	)
 	prog_thread.start()
-	if int(workers) <= 1:
-		for status in map(worker, work):
-			with lock:
-				done_count[0] += 1
-				if status:
-					status_counts[str(status)] = status_counts.get(str(status), 0) + 1
-	else:
-		with multiprocessing.Pool(processes=min(max(1, int(workers)), n_work)) as pool:
-			for status in pool.imap_unordered(worker, work):
-				with lock:
-					done_count[0] += 1
-					if status:
-						status_counts[str(status)] = status_counts.get(str(status), 0) + 1
-	stop.set()
-	prog_thread.join(timeout=2)
-	print_progress(prefix=tag, done=n_work, total=n_work, t0=t0, suffix=_pyramid_status_suffix(status_counts))
-	print("", flush=True)
+	complete = False
+	pool_size = min(max(1, int(workers)), n_work)
+	print(
+		f"\n{tag} workers={pool_size} native_threads_per_worker=1",
+		flush=True,
+	)
+	try:
+		with _single_threaded_native_runtime():
+			if pool_size <= 1:
+				results = map(worker, work)
+				for status in results:
+					with lock:
+						done_count[0] += 1
+						if status:
+							status_counts[str(status)] = status_counts.get(str(status), 0) + 1
+			else:
+				with multiprocessing.Pool(
+					processes=pool_size,
+					initializer=_pyramid_worker_init,
+				) as pool:
+					for status in pool.imap_unordered(worker, work):
+						with lock:
+							done_count[0] += 1
+							if status:
+								status_counts[str(status)] = status_counts.get(str(status), 0) + 1
+		complete = True
+	finally:
+		stop.set()
+		prog_thread.join(timeout=2)
+		if complete:
+			print_progress(prefix=tag, done=n_work, total=n_work, t0=t0, suffix=_pyramid_status_suffix(status_counts))
+		print("", flush=True)
 
 
 def build_scalar_omezarr_pyramid(

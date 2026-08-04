@@ -10,9 +10,11 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <QAbstractItemView>
 #include <QAction>
 #include <QBrush>
 #include <QCloseEvent>
+#include <QComboBox>
 #include <QCursor>
 #include <QEvent>
 #include <QFont>
@@ -35,6 +37,7 @@
 #include <QPushButton>
 #include <QRect>
 #include <QResizeEvent>
+#include <QSignalBlocker>
 #include <QSettings>
 #include <QShortcut>
 #include <QSizePolicy>
@@ -49,8 +52,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <optional>
+#include <type_traits>
 
 namespace {
 
@@ -166,6 +171,15 @@ bool finitePoint(const cv::Vec3f& point)
 bool shouldShowSpanAlignmentMetric(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
+    if (metric.modeMarker == 'C' || metric.modeMarker == 'L' || metric.modeMarker == 'T')
+        return true;
+    using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
+    if (metric.kind == Kind::NativeMeetingError) {
+        return std::isfinite(metric.meetingErrorBaseVoxels);
+    }
+    if (metric.kind == Kind::NativeFailure) {
+        return !metric.failureCode.empty();
+    }
     return metric.pending ||
            !metric.error.empty() ||
            (metric.available && std::isfinite(metric.maxErrorDegrees));
@@ -174,6 +188,11 @@ bool shouldShowSpanAlignmentMetric(
 bool shouldHighlightSpanAlignmentMetric(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
+    using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
+    if (metric.kind == Kind::NativeFailure)
+        return true;
+    if (metric.kind == Kind::NativeMeetingError)
+        return false;
     return metric.available &&
            std::isfinite(metric.maxErrorDegrees) &&
            metric.maxErrorDegrees > kSpanMetricHighlightThresholdDegrees;
@@ -182,34 +201,85 @@ bool shouldHighlightSpanAlignmentMetric(
 QString spanAlignmentMetricText(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
-    if (metric.pending) {
-        return QStringLiteral("...");
+    using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
+    QString value;
+    if (metric.kind == Kind::NativeMeetingError) {
+        if (std::isfinite(metric.meetingErrorBaseVoxels)) {
+            value = QObject::tr("%1 vx").arg(
+                QString::number(metric.meetingErrorBaseVoxels, 'f', 1));
+        }
+    } else if (metric.kind == Kind::Cspline) {
+        value.clear();
+    } else if (metric.available && std::isfinite(metric.maxErrorDegrees)) {
+        value = QStringLiteral("%1%2")
+            .arg(QString::number(std::llround(metric.maxErrorDegrees)))
+            .arg(QChar(0x00b0));
     }
-    if (!metric.error.empty()) {
-        return QStringLiteral("err");
-    }
-    if (!metric.available || !std::isfinite(metric.maxErrorDegrees)) {
-        return {};
-    }
-    return QStringLiteral("%1%2")
-        .arg(QString::number(std::llround(metric.maxErrorDegrees)))
-        .arg(QChar(0x00b0));
+    QString firstLine(QChar(metric.modeMarker));
+    if (!value.isEmpty())
+        firstLine += QStringLiteral(" ") + value;
+    if (!metric.message.empty())
+        return firstLine + QStringLiteral("\n") + QString::fromStdString(metric.message);
+    return firstLine;
 }
 
 QString spanAlignmentMetricToolTip(
     const vc3d::line_annotation::GeneratedSpanAlignmentMetric& metric)
 {
+    using Kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind;
+    const QString status = metric.message.empty()
+        ? QString{}
+        : QObject::tr("Status: %1. ").arg(QString::fromStdString(metric.message));
+    if (metric.kind == Kind::NativeMeetingError) {
+        if (!std::isfinite(metric.meetingErrorBaseVoxels))
+            return {};
+        QString tooltip = QObject::tr("Trace meeting error: %1 base voxels")
+            .arg(QString::number(metric.meetingErrorBaseVoxels, 'f', 2));
+        if (std::isfinite(metric.meetingErrorRatio)) {
+            tooltip += QObject::tr(" (%1% of selected trace length)")
+                .arg(QString::number(metric.meetingErrorRatio * 100.0, 'f', 1));
+        }
+        if (!metric.meetingSource.empty()) {
+            tooltip += QObject::tr(". Source: %1")
+                .arg(QString::fromStdString(metric.meetingSource));
+        }
+        return status + tooltip;
+    }
+    if (metric.kind == Kind::NativeFailure) {
+        QString tooltip = QObject::tr("Native fiber trace failed: %1")
+            .arg(QString::fromStdString(metric.failureCode));
+        if (!metric.failureDetail.empty()) {
+            tooltip += QStringLiteral(". ") +
+                QString::fromStdString(metric.failureDetail);
+        }
+        if (std::isfinite(metric.meetingErrorBaseVoxels)) {
+            tooltip += QObject::tr(". Closest meeting: %1 base voxels")
+                .arg(QString::number(metric.meetingErrorBaseVoxels, 'f', 2));
+        }
+        return status + tooltip;
+    }
     if (metric.pending) {
-        return QObject::tr("Sampling Lasagna normals.");
+        return status + QObject::tr("Sampling Lasagna normals.");
     }
     if (!metric.error.empty()) {
-        return QString::fromStdString(metric.error);
+        return status + QString::fromStdString(metric.error);
     }
     if (metric.available && std::isfinite(metric.maxErrorDegrees)) {
-        return QObject::tr("Max normal-alignment error: %1 degrees")
+        return status + QObject::tr("Max normal-alignment error: %1 degrees")
             .arg(QString::number(metric.maxErrorDegrees, 'f', 1));
     }
-    return {};
+    return status;
+}
+
+void installComboEventFilter(QComboBox* combo, QObject* filter)
+{
+    if (!combo || !filter) {
+        return;
+    }
+    combo->installEventFilter(filter);
+    if (auto* popupView = combo->view()) {
+        popupView->installEventFilter(filter);
+    }
 }
 
 QVariantList splitterSizesToVariantList(const QList<int>& sizes)
@@ -470,6 +540,38 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     annotationMenuButton->setMenu(annotationMenu);
     buttonLayout->addWidget(annotationMenuButton);
 
+    _fiberOptimizationCombo = new QComboBox(buttonRow);
+    _fiberOptimizationCombo->setObjectName(
+        QStringLiteral("lineAnnotationFiberOptimizationModeCombo"));
+    _fiberOptimizationCombo->addItem(
+        tr("Lasagna"),
+        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::Lasagna));
+    _fiberOptimizationCombo->addItem(
+        tr("Fiber model"),
+        static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d));
+    installComboEventFilter(_fiberOptimizationCombo, this);
+    buttonLayout->addWidget(_fiberOptimizationCombo);
+    connect(_fiberOptimizationCombo,
+            qOverload<int>(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) {
+                emit fiberOptimizationModeChanged(fiberOptimizationMode());
+            });
+
+    _datasetMenuButton = new QToolButton(buttonRow);
+    _datasetMenuButton->setObjectName(QStringLiteral("lineAnnotationDatasetMenuButton"));
+    _datasetMenuButton->setText(tr("Datasets"));
+    _datasetMenuButton->setPopupMode(QToolButton::InstantPopup);
+    _datasetMenuButton->setToolTip(tr("Select the Lasagna and fiber inference datasets used for line annotation."));
+    _datasetMenuButton->installEventFilter(this);
+    auto* datasetMenu = new QMenu(_datasetMenuButton);
+    datasetMenu->setToolTipsVisible(true);
+    _lasagnaDatasetMenu = datasetMenu->addMenu(tr("Lasagna dataset"));
+    _fiberInferenceDatasetMenu = datasetMenu->addMenu(tr("Fiber dataset"));
+    _datasetMenuButton->setMenu(datasetMenu);
+    buttonLayout->addWidget(_datasetMenuButton);
+    rebuildDatasetMenus();
+
     auto* centerlineLengthLabel = new QLabel(tr("Length"), buttonRow);
     centerlineLengthLabel->installEventFilter(this);
     buttonLayout->addWidget(centerlineLengthLabel);
@@ -497,6 +599,36 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                 QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
                 settings.setValue(
                     vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX, value);
+            });
+    _extrapolationDistanceSpin = new QSpinBox(buttonRow);
+    _extrapolationDistanceSpin->setObjectName(
+        QStringLiteral("lineAnnotationExtrapolationDistanceSpinBox"));
+    _extrapolationDistanceSpin->setRange(0, 1000000);
+    _extrapolationDistanceSpin->setSingleStep(100);
+    _extrapolationDistanceSpin->setKeyboardTracking(false);
+    _extrapolationDistanceSpin->setPrefix(tr("Extrapolation "));
+    _extrapolationDistanceSpin->setSuffix(tr(" vx"));
+    _extrapolationDistanceSpin->setToolTip(
+        tr("Distance generated beyond each outer control point."));
+    {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        _extrapolationDistanceSpin->setValue(
+            settings.value(
+                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
+                vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT)
+                .toInt());
+    }
+    _extrapolationDistanceSpin->installEventFilter(this);
+    buttonLayout->addWidget(_extrapolationDistanceSpin);
+    connect(_extrapolationDistanceSpin,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            [this](int value) {
+                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                settings.setValue(
+                    vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
+                    value);
+                emit extrapolationDistanceChanged(value);
             });
     auto* maxDistanceLabel = new QLabel(tr("Max CP dist"), buttonRow);
     maxDistanceLabel->installEventFilter(this);
@@ -607,6 +739,100 @@ int LineAnnotationDialog::initialCenterlineLengthVx() const
         : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
 }
 
+int LineAnnotationDialog::extrapolationDistanceVx() const
+{
+    return _extrapolationDistanceSpin
+        ? _extrapolationDistanceSpin->value()
+        : vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT;
+}
+
+vc3d::line_annotation::FiberOptimizationMode
+LineAnnotationDialog::fiberOptimizationMode() const
+{
+    if (!_fiberOptimizationCombo) {
+        return vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+    }
+    return static_cast<vc3d::line_annotation::FiberOptimizationMode>(
+        _fiberOptimizationCombo->currentData().toInt());
+}
+
+void LineAnnotationDialog::setFiberOptimizationMode(
+    vc3d::line_annotation::FiberOptimizationMode mode)
+{
+    if (!_fiberOptimizationCombo) {
+        return;
+    }
+    const QSignalBlocker blocker(_fiberOptimizationCombo);
+    const int index = _fiberOptimizationCombo->findData(static_cast<int>(mode));
+    if (index >= 0) {
+        _fiberOptimizationCombo->setCurrentIndex(index);
+    }
+}
+
+void LineAnnotationDialog::setLasagnaDatasetOptions(
+    std::vector<std::pair<std::string, std::string>> options,
+    const std::string& selectedLocation)
+{
+    _lasagnaDatasetOptions = std::move(options);
+    _selectedLasagnaDatasetLocation = selectedLocation;
+    rebuildDatasetMenus();
+}
+
+void LineAnnotationDialog::setFiberInferenceDatasetOptions(
+    std::vector<std::pair<std::string, std::string>> options,
+    const std::string& selectedLocation)
+{
+    _fiberInferenceDatasetOptions = std::move(options);
+    _selectedFiberInferenceDatasetLocation = selectedLocation;
+    rebuildDatasetMenus();
+}
+
+void LineAnnotationDialog::rebuildDatasetMenus()
+{
+    auto populateMenu =
+        [this](QMenu* menu,
+               const std::vector<std::pair<std::string, std::string>>& options,
+               const std::string& selected,
+               bool fiberMenu) {
+            if (!menu) {
+                return;
+            }
+            menu->clear();
+            if (options.empty()) {
+                auto* action = menu->addAction(fiberMenu
+                    ? tr("No fiber datasets attached")
+                    : tr("No Lasagna datasets attached"));
+                action->setEnabled(false);
+                return;
+            }
+            for (const auto& [location, label] : options) {
+                auto* action = menu->addAction(QString::fromStdString(label));
+                action->setCheckable(true);
+                action->setChecked(location == selected);
+                action->setToolTip(QString::fromStdString(location));
+                connect(action, &QAction::triggered, this, [this, location, fiberMenu]() {
+                    if (fiberMenu) {
+                        emit fiberInferenceDatasetSelectionChanged(location);
+                    } else {
+                        emit lasagnaDatasetSelectionChanged(location);
+                    }
+                });
+            }
+        };
+    populateMenu(_lasagnaDatasetMenu,
+                 _lasagnaDatasetOptions,
+                 _selectedLasagnaDatasetLocation,
+                 false);
+    populateMenu(_fiberInferenceDatasetMenu,
+                 _fiberInferenceDatasetOptions,
+                 _selectedFiberInferenceDatasetLocation,
+                 true);
+    if (_datasetMenuButton) {
+        _datasetMenuButton->setEnabled(
+            !_lasagnaDatasetOptions.empty() || !_fiberInferenceDatasetOptions.empty());
+    }
+}
+
 int LineAnnotationDialog::maxControlPointDistanceVx() const
 {
     return _maxControlPointDistanceSpin ? _maxControlPointDistanceSpin->value() : 0;
@@ -652,16 +878,18 @@ void LineAnnotationDialog::setGeneratedBranchOverlayData(
     std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
     std::vector<std::vector<cv::Vec3f>> branchLinePoints,
     std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
-    bool requestSideStripIntersections)
+    bool requestSideStripIntersections,
+    std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics)
 {
     if (_closing || !_hasGeneratedViews) {
         return;
     }
-    _generatedViews.controlPoints = std::move(controlPoints);
-    _generatedViews.branchLinePoints = std::move(branchLinePoints);
-    _generatedViews.branchLinks = std::move(branchLinks);
-    _generatedViews.fiberIntersections.clear();
-    _generatedViews.spanAlignmentMetrics.clear();
+    vc3d::line_annotation::replaceGeneratedBranchOverlayData(
+        _generatedViews,
+        std::move(controlPoints),
+        std::move(branchLinePoints),
+        std::move(branchLinks),
+        std::move(spanAlignmentMetrics));
     _generatedControlIndex =
         vc3d::line_annotation::buildGeneratedControlPointLinePositionIndex(
             _generatedViews.controlPoints);
@@ -759,6 +987,12 @@ void LineAnnotationDialog::setGeneratedSpanAlignmentMetrics(
 
 void LineAnnotationDialog::setOptimizationBusy(bool busy)
 {
+    if (_fiberOptimizationCombo) {
+        _fiberOptimizationCombo->setEnabled(!busy);
+    }
+    if (_extrapolationDistanceSpin) {
+        _extrapolationDistanceSpin->setEnabled(!busy);
+    }
     auto* content = centralWidget();
     if (!content) {
         return;
@@ -963,7 +1197,7 @@ bool LineAnnotationDialog::setGeneratedRows(
     _overviewBar = nullptr;
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
-    _stripOverlaySwapPending = false;
+    _stripOverlaySwapPending.clear();
     _pendingPlacementFocus.reset();
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
@@ -1118,7 +1352,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
 {
     if (!_viewerManager || !_layout || views.linePoints.empty() ||
         views.lineUpVectors.size() != views.linePoints.size() ||
-        !views.lineSideSlice || !views.currentCutSurface || !views.sideCutSurface) {
+        !views.lineSurface || !views.lineSideSlice ||
+        !views.currentCutSurface || !views.sideCutSurface) {
         return false;
     }
 
@@ -1126,10 +1361,11 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     // and the controller re-registers the new surfaces in CState under the SAME
     // names before calling us, so the live viewers have already adopted them via
     // surfaceChanged (view centers preserved). Rebuilding the panes -- the
-    // previous behavior -- destroyed and recreated all four viewers, producing a
+    // previous behavior -- destroyed and recreated all four rendered viewers,
+    // producing a
     // visible blank/jump on every placement.
     if (_hasGeneratedViews && _currentCutViewer && _sideCutViewer &&
-        _stripViewers.size() == 1 && _stripViewers[0] &&
+        _stripViewers.size() == 2 && _stripViewers[0] && _stripViewers[1] &&
         _generatedViews.currentCutName == views.currentCutName &&
         _generatedViews.sideCutName == views.sideCutName &&
         _generatedViews.lineSurfaceName == views.lineSurfaceName &&
@@ -1142,7 +1378,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _heldLinePosition = _currentLinePosition;
         _currentCutOverlaySwapPending = true;
         _sideCutOverlaySwapPending = true;
-        _stripOverlaySwapPending = true;
+        _stripOverlaySwapPending.assign(_stripViewers.size(), true);
 
         const double previousLinePosition = _currentLinePosition;
         _generatedViews = views;
@@ -1237,8 +1473,39 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                         &LineAnnotationDialog::_currentCutOverlaySwapPending);
         hookOverlaySwap(_sideCutViewer.data(),
                         &LineAnnotationDialog::_sideCutOverlaySwapPending);
-        hookOverlaySwap(_stripViewers.front().data(),
-                        &LineAnnotationDialog::_stripOverlaySwapPending);
+        const auto hookStripOverlaySwap = [this](CChunkedVolumeViewer* viewer,
+                                                 size_t stripIndex) {
+            if (!viewer) {
+                if (stripIndex < _stripOverlaySwapPending.size()) {
+                    _stripOverlaySwapPending[stripIndex] = false;
+                }
+                return;
+            }
+            auto connection = std::make_shared<QMetaObject::Connection>();
+            *connection = connect(
+                viewer,
+                &CChunkedVolumeViewer::renderFrameCompleted,
+                this,
+                [this, viewer, connection, stripIndex](std::uint64_t, double) {
+                    if (_closing) {
+                        QObject::disconnect(*connection);
+                        return;
+                    }
+                    if (viewer->displayedSurfaceGeometryEpoch() !=
+                        viewer->surfaceGeometryEpoch()) {
+                        return;
+                    }
+                    QObject::disconnect(*connection);
+                    if (stripIndex < _stripOverlaySwapPending.size()) {
+                        _stripOverlaySwapPending[stripIndex] = false;
+                    }
+                    rebuildGeneratedStaticStripOverlays();
+                    rebuildGeneratedDynamicOverlays();
+                });
+        };
+        for (size_t i = 0; i < _stripViewers.size(); ++i) {
+            hookStripOverlaySwap(_stripViewers[i].data(), i);
+        }
         updatePauseIndicator();
         updateOptimizationStatusIndicator();
         rebuildGeneratedOverlays();
@@ -1309,7 +1576,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _overviewBar = nullptr;
     _currentCutOverlaySwapPending = false;
     _sideCutOverlaySwapPending = false;
-    _stripOverlaySwapPending = false;
+    _stripOverlaySwapPending.clear();
     _pendingPlacementFocus.reset();
     clearFastGeneratedOverlayItemRefs();
     _currentCutViewer = nullptr;
@@ -1510,8 +1777,12 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedContainers.push_back(overviewBar);
     _overviewBar = overviewBar;
 
-    {
-        const std::string& surfaceName = views.lineSideSliceName;
+    const std::pair<std::string, QString> stripSpecs[] = {
+        {views.lineSurfaceName, views.lineSurfaceTitle},
+        {views.lineSideSliceName, views.lineSideSliceTitle},
+    };
+    for (size_t stripIndex = 0; stripIndex < std::size(stripSpecs); ++stripIndex) {
+        const auto& [surfaceName, title] = stripSpecs[stripIndex];
         auto* base = _viewerManager->createViewerInWidget(
             surfaceName,
             stripSplitter,
@@ -1520,10 +1791,10 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         if (!viewer) {
             return false;
         }
-        viewer->setObjectName(views.lineSideSliceTitle);
-        const bool haveStripCamera = !stripCameras.empty();
+        viewer->setObjectName(title);
+        const bool haveStripCamera = stripIndex < stripCameras.size();
         auto stripCamera = haveStripCamera
-            ? stripCameras.front()
+            ? stripCameras[stripIndex]
             : generatedPaneCamera(viewer, camera);
         if (!haveStripCamera) {
             if (const auto center =
@@ -1536,8 +1807,8 @@ bool LineAnnotationDialog::setGeneratedLineViews(
                     views.initialStripLinePositionRange)) {
                 stripCamera.scale = *focusedScale;
             }
-            if (!_savedStripZooms.empty()) {
-                stripCamera.scale = _savedStripZooms.front();
+            if (stripIndex < _savedStripZooms.size()) {
+                stripCamera.scale = _savedStripZooms[stripIndex];
             }
         }
         viewer->applyCameraState(stripCamera, false);
@@ -1588,6 +1859,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     }
 
     stripSplitter->setStretchFactor(0, 1);
+    stripSplitter->setStretchFactor(1, 1);
     outerSplitter->setStretchFactor(0, 2);
     outerSplitter->setStretchFactor(1, 1);
 
@@ -1602,9 +1874,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     if (_savedOuterSplitterSizes.size() == outerSplitter->count()) {
         outerSplitter->setSizes(_savedOuterSplitterSizes);
     } else {
-        // Bottom strip gets ~23% (the old 1/3 reduced by ~30%); the difference
-        // goes to the cut views.
-        outerSplitter->setSizes({23, 7});
+        outerSplitter->setSizes({2, 1});
     }
 
     updatePauseIndicator();
@@ -1748,6 +2018,15 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
                                                              branchFiberId,
                                                              branchControlPointIndex,
                                                              pending);
+    };
+    options.setSegmentInterpolationGoal =
+        [this, surfaceName](size_t firstControlPointIndex,
+                            size_t secondControlPointIndex,
+                            std::string goal) {
+        emit generatedSegmentInterpolationGoalRequested(surfaceName,
+                                                        firstControlPointIndex,
+                                                        secondControlPointIndex,
+                                                        goal);
     };
     return vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
 }
@@ -2104,13 +2383,8 @@ void LineAnnotationDialog::setCurrentCutFollowsStripMouse(bool follows)
 
 void LineAnnotationDialog::updatePauseIndicator()
 {
-    CChunkedVolumeViewer* bottomStrip = nullptr;
-    for (const auto& stripViewer : _stripViewers) {
-        if (stripViewer) {
-            bottomStrip = stripViewer;
-            break;
-        }
-    }
+    CChunkedVolumeViewer* bottomStrip =
+        _stripViewers.empty() ? nullptr : _stripViewers.back().data();
     if (!bottomStrip) {
         if (_pauseIndicator) {
             _pauseIndicator->hide();
@@ -2137,13 +2411,8 @@ void LineAnnotationDialog::updatePauseIndicator()
 
 void LineAnnotationDialog::updateOptimizationStatusIndicator()
 {
-    CChunkedVolumeViewer* bottomStrip = nullptr;
-    for (const auto& stripViewer : _stripViewers) {
-        if (stripViewer) {
-            bottomStrip = stripViewer;
-            break;
-        }
-    }
+    CChunkedVolumeViewer* bottomStrip =
+        _stripViewers.empty() ? nullptr : _stripViewers.back().data();
     if (!bottomStrip) {
         if (_optimizationStatusLabel) {
             _optimizationStatusLabel->hide();
@@ -2433,14 +2702,21 @@ void LineAnnotationDialog::rebuildGeneratedStaticStripOverlays()
         if (!viewer) {
             continue;
         }
-        const std::string key = _generatedViews.lineSideSliceName;
-        // While an in-place update waits for the strip's first re-optimized
-        // frame, keep drawing the pre-update overlay.
+        const bool sideStrip = i == 1;
+        const std::string& key = sideStrip
+            ? _generatedViews.lineSideSliceName
+            : _generatedViews.lineSurfaceName;
+        const bool swapPending = i < _stripOverlaySwapPending.size() &&
+                                 _stripOverlaySwapPending[i];
+        // Each rendered strip keeps its previous overlay until its own
+        // re-optimized frame is displayed.
         const GeneratedViews& stripViews =
-            _stripOverlaySwapPending ? _heldGeneratedViews : _generatedViews;
+            swapPending ? _heldGeneratedViews : _generatedViews;
         GeneratedOverlay strip =
             vc3d::line_annotation::makeGeneratedStaticStripOverlay(stripViews);
-        strip.fiberIntersections = stripViews.fiberIntersections;
+        if (sideStrip) {
+            strip.fiberIntersections = stripViews.fiberIntersections;
+        }
         applyOverlayForViewer(staticStripOverlayKey(key), viewer, strip);
     }
 
@@ -2482,7 +2758,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     const auto ensureStripItems =
         [this](size_t index,
                CChunkedVolumeViewer* viewer,
-               const std::string& surfaceName) -> FastStripOverlayItems* {
+               const std::string& surfaceName,
+               size_t spanLabelCount) -> FastStripOverlayItems* {
         if (!viewer) {
             return nullptr;
         }
@@ -2490,7 +2767,6 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             _fastStripOverlayItems.resize(index + 1);
         }
         auto& entry = _fastStripOverlayItems[index];
-        const size_t spanLabelCount = _generatedViews.spanAlignmentMetrics.size();
         const bool recreate = entry.viewer != viewer ||
                               entry.surfaceName != surfaceName ||
                               !entry.currentLine ||
@@ -2550,17 +2826,30 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         if (!viewer) {
             continue;
         }
-        const std::string key = _generatedViews.lineSideSliceName;
-        auto* entry = ensureStripItems(i, viewer, key);
+        const bool sideStrip = i == 1;
+        const std::string& key = sideStrip
+            ? _generatedViews.lineSideSliceName
+            : _generatedViews.lineSurfaceName;
+        const bool swapPending = i < _stripOverlaySwapPending.size() &&
+                                 _stripOverlaySwapPending[i];
+        const GeneratedViews& stripViews =
+            swapPending ? _heldGeneratedViews : _generatedViews;
+        auto* entry = ensureStripItems(
+            i, viewer, key, stripViews.spanAlignmentMetrics.size());
         // While this pane's overlay swap is pending, map the current-position
         // marker (and span labels) through the held pre-update strip surface so
         // they stay consistent with the stale image instead of jumping a beat
         // ahead of it.
-        QuadSurface* quad = _stripOverlaySwapPending
-            ? _heldGeneratedViews.lineSideSlice.get()
-            : dynamic_cast<QuadSurface*>(viewer->currentSurface());
-        const double stripPosition =
-            _stripOverlaySwapPending ? _heldLinePosition : _currentLinePosition;
+        QuadSurface* quad = nullptr;
+        if (swapPending) {
+            quad = sideStrip ? stripViews.lineSideSlice.get()
+                             : stripViews.lineSurface.get();
+        } else {
+            quad = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+        }
+        const double stripPosition = swapPending
+            ? _heldLinePosition
+            : _currentLinePosition;
         if (!entry || !quad) {
             continue;
         }
@@ -2601,6 +2890,17 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                       viewport &&
                                       viewport->width() > 0 &&
                                       viewport->height() > 0;
+            struct VisibleSpanLabel {
+                std::remove_reference_t<decltype(entry->spanLabels[0])>* items = nullptr;
+                const vc3d::line_annotation::GeneratedSpanAlignmentMetric* metric = nullptr;
+                double preferredLeft = 0.0;
+                double left = 0.0;
+                double width = 0.0;
+                double height = 0.0;
+                int row = 0;
+            };
+            std::vector<VisibleSpanLabel> visibleLabels;
+            const QRect viewportRect = haveViewport ? viewport->rect() : QRect{};
             for (size_t labelIndex = 0; labelIndex < entry->spanLabels.size(); ++labelIndex) {
                 auto& labelItems = entry->spanLabels[labelIndex];
                 auto* background = labelItems.background;
@@ -2610,34 +2910,40 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                 }
                 background->setVisible(false);
                 text->setVisible(false);
-                if (labelIndex >= _generatedViews.spanAlignmentMetrics.size() || !haveViewport) {
+                if (labelIndex >= stripViews.spanAlignmentMetrics.size() || !haveViewport) {
                     continue;
                 }
 
-                const auto& metric = _generatedViews.spanAlignmentMetrics[labelIndex];
+                const auto& metric = stripViews.spanAlignmentMetrics[labelIndex];
                 if (!shouldShowSpanAlignmentMetric(metric)) {
                     continue;
                 }
-                const auto centerLinePosition =
-                    vc3d::line_annotation::generatedSpanAlignmentMetricCenterLinePosition(metric);
-                if (!centerLinePosition) {
+                if (!std::isfinite(metric.firstControlLinePosition) ||
+                    !std::isfinite(metric.secondControlLinePosition)) {
                     continue;
                 }
-                const QPointF centerScenePoint =
+                const QPointF firstScenePoint =
                     vc3d::line_annotation::generatedStripLinePositionToScene(
                         viewer,
                         quad,
-                        *centerLinePosition);
-                if (!std::isfinite(centerScenePoint.x()) ||
-                    !std::isfinite(centerScenePoint.y())) {
+                        metric.firstControlLinePosition);
+                const QPointF secondScenePoint =
+                    vc3d::line_annotation::generatedStripLinePositionToScene(
+                        viewer,
+                        quad,
+                        metric.secondControlLinePosition);
+                if (!std::isfinite(firstScenePoint.x()) ||
+                    !std::isfinite(secondScenePoint.x())) {
                     continue;
                 }
-
-                const QRect viewportRect = viewport->rect();
-                const int labelViewportY =
-                    std::max(viewportRect.top(), viewportRect.bottom() - 18);
-                const QPointF labelYScene =
-                    view->mapToScene(QPoint(viewportRect.center().x(), labelViewportY));
+                const double firstX = view->mapFromScene(firstScenePoint).x();
+                const double secondX = view->mapFromScene(secondScenePoint).x();
+                const double visibleFirst = std::max<double>(
+                    viewportRect.left(), std::min(firstX, secondX));
+                const double visibleLast = std::min<double>(
+                    viewportRect.right(), std::max(firstX, secondX));
+                if (visibleLast < visibleFirst)
+                    continue;
                 const QString label = spanAlignmentMetricText(metric);
                 if (label.isEmpty()) {
                     continue;
@@ -2653,16 +2959,70 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                 text->setBrush(QBrush(textColor));
                 text->setToolTip(spanAlignmentMetricToolTip(metric));
                 const QRectF textRect = text->boundingRect();
-                const QPointF textPos(centerScenePoint.x() - textRect.width() * 0.5,
-                                      labelYScene.y() - textRect.height());
-                text->setPos(textPos);
-
                 background->setBrush(QBrush(backgroundColor));
                 background->setRect(textRect.adjusted(-4.0, -2.0, 4.0, 2.0));
-                background->setPos(textPos);
                 background->setToolTip(text->toolTip());
-                background->setVisible(true);
-                text->setVisible(true);
+                const double width = textRect.width() + 8.0;
+                const double preferredCenter = std::clamp(
+                    (firstX + secondX) * 0.5, visibleFirst, visibleLast);
+                visibleLabels.push_back({
+                    &labelItems,
+                    &metric,
+                    std::clamp(preferredCenter - width * 0.5,
+                               static_cast<double>(viewportRect.left()),
+                               std::max(static_cast<double>(viewportRect.left()),
+                                        static_cast<double>(viewportRect.right()) - width)),
+                    0.0,
+                    width,
+                    textRect.height() + 4.0,
+                    0});
+            }
+
+            constexpr double gap = 4.0;
+            double totalWidth = 0.0;
+            for (const auto& label : visibleLabels)
+                totalWidth += label.width;
+            if (!visibleLabels.empty())
+                totalWidth += gap * static_cast<double>(visibleLabels.size() - 1);
+            const bool twoRows = totalWidth > viewportRect.width();
+            if (twoRows) {
+                for (size_t i = 0; i < visibleLabels.size(); ++i)
+                    visibleLabels[i].row = static_cast<int>(i % 2);
+            }
+            for (int row = 0; row < (twoRows ? 2 : 1); ++row) {
+                std::vector<size_t> indices;
+                for (size_t i = 0; i < visibleLabels.size(); ++i) {
+                    if (visibleLabels[i].row == row)
+                        indices.push_back(i);
+                }
+                double next = viewportRect.left();
+                for (size_t index : indices) {
+                    auto& label = visibleLabels[index];
+                    label.left = std::max(label.preferredLeft, next);
+                    next = label.left + label.width + gap;
+                }
+                double right = viewportRect.right();
+                for (auto it = indices.rbegin(); it != indices.rend(); ++it) {
+                    auto& label = visibleLabels[*it];
+                    label.left = std::min(label.left, right - label.width);
+                    label.left = std::max(label.left,
+                                          static_cast<double>(viewportRect.left()));
+                    right = label.left - gap;
+                }
+            }
+            for (auto& label : visibleLabels) {
+                const double viewportY = viewportRect.bottom() - 3.0 -
+                    label.height - label.row * (label.height + gap);
+                const QPointF scenePosition = view->mapToScene(QPoint(
+                    static_cast<int>(std::llround(label.left + 4.0)),
+                    static_cast<int>(std::llround(viewportY + 2.0))));
+                label.items->text->setPos(scenePosition);
+                const QPointF backgroundPosition = view->mapToScene(QPoint(
+                    static_cast<int>(std::llround(label.left)),
+                    static_cast<int>(std::llround(viewportY))));
+                label.items->background->setPos(backgroundPosition);
+                label.items->background->setVisible(true);
+                label.items->text->setVisible(true);
             }
         }
     }
@@ -3368,7 +3728,7 @@ void LineAnnotationDialog::forwardOverviewControlContextMenu(double linePosition
     if (!_hasGeneratedViews || _stripViewers.empty()) {
         return;
     }
-    CChunkedVolumeViewer* strip = _stripViewers.front().data();
+    CChunkedVolumeViewer* strip = _stripViewers.back().data();
     auto* quad = strip ? dynamic_cast<QuadSurface*>(strip->currentSurface()) : nullptr;
     auto* view = strip ? strip->graphicsView() : nullptr;
     if (!quad || !view) {

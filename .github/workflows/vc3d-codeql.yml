@@ -8,6 +8,7 @@ on:
     branches: [ main ]  # scan after merge too
     paths:
       - 'volume-cartographer/**'
+      - '.github/codeql/**'
       - '.github/workflows/vc3d-codeql.yml'
 # Keep an on-demand lever now that schedule (which can't be path-filtered) is removed.
   workflow_dispatch:
@@ -43,39 +44,84 @@ jobs:
           filters: |
             vc:
               - 'volume-cartographer/**'
+              - '.github/codeql/**'
+              - '.github/workflows/vc3d-codeql.yml'
 
-  # ⚡ Fast PR scan: no compile, quick feedback
-  analyze_fast:
-    if: github.event_name == 'pull_request'
+  # Fast PR scans use independent source databases so extraction and queries
+  # run concurrently. The post-merge deep scan remains monolithic to retain
+  # cross-component data-flow analysis.
+  analyze_fast_shards:
+    name: PR scan (${{ matrix.name }})
+    if: github.event_name == 'pull_request' && needs.changes.outputs.vc == 'true'
     needs: [changes]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            id: core
+            config: .github/codeql/codeql-pr-core.yml
+          - name: VC3D controllers
+            id: vc3d-controllers
+            config: .github/codeql/codeql-pr-vc3d-controllers.yml
+          - name: VC3D components
+            id: vc3d-components
+            config: .github/codeql/codeql-pr-vc3d-components.yml
+          - name: tools and libraries
+            id: tools-libs
+            config: .github/codeql/codeql-pr-tools-libs.yml
     permissions:
       security-events: write
       contents: read
     steps:
-      - name: No-op (unrelated changes)
-        if: needs.changes.outputs.vc != 'true'
-        run: echo "✅ No volume-cartographer changes — skipping CodeQL (PR fast scan)."
-
       - name: Checkout
-        if: needs.changes.outputs.vc == 'true'
         uses: actions/checkout@v4
 
       - name: Initialize CodeQL (no build)
-        if: needs.changes.outputs.vc == 'true'
         uses: github/codeql-action/init@v3
         with:
           languages: c-cpp
           build-mode: none
           queries: security-extended
-          config-file: .github/codeql/codeql-config.yml
+          config-file: ${{ matrix.config }}
 
       - name: Analyze
-        if: needs.changes.outputs.vc == 'true'
         uses: github/codeql-action/analyze@v3
         with:
-          category: "/language:c-cpp"
+          category: "/language:c-cpp/shard:${{ matrix.id }}"
+
+  # Preserve the existing required-check name while making it reflect every
+  # parallel PR shard. Unrelated PRs still receive a successful no-op result.
+  analyze_fast:
+    if: always() && github.event_name == 'pull_request'
+    needs: [changes, analyze_fast_shards]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify change detection
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+        run: |
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Change detection failed: $CHANGES_RESULT" >&2
+            exit 1
+          fi
+
+      - name: No-op (unrelated changes)
+        if: needs.changes.outputs.vc != 'true'
+        run: echo "No volume-cartographer or CodeQL changes; PR scan skipped."
+
+      - name: Verify PR scan shards
+        if: needs.changes.outputs.vc == 'true'
+        env:
+          SHARDS_RESULT: ${{ needs.analyze_fast_shards.result }}
+        run: |
+          if [[ "$SHARDS_RESULT" != "success" ]]; then
+            echo "One or more CodeQL PR shards failed: $SHARDS_RESULT" >&2
+            exit 1
+          fi
 
   # 🧪 Deep scan for push/schedule: compiles with fast settings
   analyze_deep:

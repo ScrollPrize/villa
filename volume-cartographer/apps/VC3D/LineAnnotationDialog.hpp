@@ -16,6 +16,7 @@
 #include <utility>
 
 #include "LineAnnotationGeneratedViews.hpp"
+#include "LineAnnotationFiberSegments.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
 #include <opencv2/core/mat.hpp>
@@ -34,8 +35,10 @@ class QProgressBar;
 class QPushButton;
 class QCloseEvent;
 class QHBoxLayout;
+class QMenu;
 class QResizeEvent;
 class QTimer;
+class QToolButton;
 class QVariantAnimation;
 class QVBoxLayout;
 class QSplitter;
@@ -117,7 +120,16 @@ public:
     const std::vector<Pane>& panes() const { return _panes; }
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
+    int extrapolationDistanceVx() const;
     int maxControlPointDistanceVx() const;
+    vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
+    void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
+    void setLasagnaDatasetOptions(
+        std::vector<std::pair<std::string, std::string>> options,
+        const std::string& selectedLocation);
+    void setFiberInferenceDatasetOptions(
+        std::vector<std::pair<std::string, std::string>> options,
+        const std::string& selectedLocation);
     void setGeneratedControlPoints(std::vector<GeneratedOverlay::ControlPointMarker> controlPoints);
     void setGeneratedBranchLinePoints(std::vector<std::vector<cv::Vec3f>> branchLinePoints);
     void setGeneratedBranchLinks(std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks);
@@ -125,7 +137,8 @@ public:
         std::vector<GeneratedOverlay::ControlPointMarker> controlPoints,
         std::vector<std::vector<cv::Vec3f>> branchLinePoints,
         std::vector<GeneratedOverlay::BranchLinkMarker> branchLinks,
-        bool requestSideStripIntersections = true);
+        bool requestSideStripIntersections = true,
+        std::vector<GeneratedSpanAlignmentMetric> spanAlignmentMetrics = {});
     void setGeneratedFiberIntersectionMarkers(
         std::vector<GeneratedOverlay::FiberIntersectionMarker> markers);
     void setGeneratedSideStripIntersectionBusy(bool busy);
@@ -186,6 +199,10 @@ signals:
                                                          uint64_t branchFiberId,
                                                          int branchControlPointIndex,
                                                          bool pending);
+    void generatedSegmentInterpolationGoalRequested(const std::string& surfaceName,
+                                                    size_t firstControlPointIndex,
+                                                    size_t secondControlPointIndex,
+                                                    const std::string& goal);
     void generatedPredSnapPointRequested(const std::string& surfaceName,
                                          cv::Vec3f volumePoint);
     void generatedSideStripIntersectionQueryRequested(const std::string& surfaceName);
@@ -194,6 +211,11 @@ signals:
     void fiberTagChangeRequested(const QString& tag, bool enabled);
     void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
+    void fiberOptimizationModeChanged(
+        vc3d::line_annotation::FiberOptimizationMode mode);
+    void lasagnaDatasetSelectionChanged(const std::string& location);
+    void fiberInferenceDatasetSelectionChanged(const std::string& location);
+    void extrapolationDistanceChanged(int distanceVx);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -295,6 +317,7 @@ private:
     void updateOptimizationStatusIndicator();
     void updateOptimizationOverlayGeometry();
     void updateFiberNameLabel();
+    void rebuildDatasetMenus();
     void restoreWindowGeometry();
     void saveWindowGeometry() const;
     void restoreGeneratedViewStateSettings();
@@ -302,11 +325,20 @@ private:
 
     ViewerManager* _viewerManager = nullptr;
     QVBoxLayout* _layout = nullptr;
+    QComboBox* _fiberOptimizationCombo = nullptr;
+    QToolButton* _datasetMenuButton = nullptr;
+    QMenu* _lasagnaDatasetMenu = nullptr;
+    QMenu* _fiberInferenceDatasetMenu = nullptr;
+    std::vector<std::pair<std::string, std::string>> _lasagnaDatasetOptions;
+    std::vector<std::pair<std::string, std::string>> _fiberInferenceDatasetOptions;
+    std::string _selectedLasagnaDatasetLocation;
+    std::string _selectedFiberInferenceDatasetLocation;
     // Checked = auto-reoptimize after each edit; unchecked = no optimization.
     QAction* _autoReoptimizeAction = nullptr;
     QAction* _showAsMeshAction = nullptr;
     QAction* _fullOptimizationAction = nullptr;
     QSpinBox* _initialCenterlineLengthSpin = nullptr;
+    QSpinBox* _extrapolationDistanceSpin = nullptr;
     QSpinBox* _maxControlPointDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;
@@ -356,7 +388,7 @@ private:
     double _heldLinePosition = 0.0;
     bool _currentCutOverlaySwapPending = false;
     bool _sideCutOverlaySwapPending = false;
-    bool _stripOverlaySwapPending = false;
+    std::vector<bool> _stripOverlaySwapPending;
     // Volume point of the most recent control-point placement click; the next
     // in-place update moves the current line position onto the control point
     // nearest to it, so the marker lands on the new point with the new image.

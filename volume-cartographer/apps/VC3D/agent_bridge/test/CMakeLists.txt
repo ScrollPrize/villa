@@ -20,4 +20,5 @@ target_link_libraries(test_agent_bridge_contract PRIVATE
     vc_core)
 
 add_test(NAME agent_bridge_contract COMMAND test_agent_bridge_contract)
-set_property(GLOBAL APPEND PROPERTY VC_TEST_TARGETS test_agent_bridge_contract)
+vc_register_test_target(test_agent_bridge_contract)
+vc_register_ctest(agent_bridge_contract test_agent_bridge_contract)

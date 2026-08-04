@@ -1,8 +1,11 @@
 #pragma once
 
+#include "vc/core/util/RemoteFileCache.hpp"
 #include "vc/lasagna/Manifest.hpp"
 
 #include <filesystem>
+#include <string>
+#include <string_view>
 
 namespace utils { class ZarrArray; }
 
@@ -10,9 +13,25 @@ namespace vc::lasagna {
 
 inline constexpr const char* kLasagnaRemoteMarker = "lasagna-remote.json";
 
+[[nodiscard]] bool isRemoteLasagnaLocation(std::string_view location);
+
 struct LasagnaDatasetOpenOptions {
     double workingToBaseScale = 1.0;
+    std::filesystem::path remoteCacheRoot;
+    vc::HttpAuth remoteAuth;
+    vc::core::util::RemoteFileCachePolicy cachePolicy = vc::core::util::RemoteFileCachePolicy::CacheFirst;
+    vc::core::util::RemoteFileFetcher remoteFileFetcher;
 };
+
+struct MaterializedLasagnaManifest {
+    std::filesystem::path path;
+    std::string normalizedLocation;
+    bool cacheHit = false;
+};
+
+[[nodiscard]] MaterializedLasagnaManifest materializeLasagnaManifest(const std::string& manifestLocation, const LasagnaDatasetOpenOptions& options);
+[[nodiscard]] std::string lasagnaGroupSourceLocation(
+    const LasagnaChannelGroup& group);
 
 class LasagnaDataset {
 public:
@@ -20,6 +39,9 @@ public:
 
     static LasagnaDataset open(
         const std::filesystem::path& manifestPath,
+        LasagnaDatasetOpenOptions options = {});
+    static LasagnaDataset openLocation(
+        const std::string& manifestLocation,
         LasagnaDatasetOpenOptions options = {});
 
     [[nodiscard]] const LasagnaDatasetManifest& manifest() const noexcept;
