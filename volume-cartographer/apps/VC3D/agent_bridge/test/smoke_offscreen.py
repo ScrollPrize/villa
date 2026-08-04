@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import socket
+import struct
 import sys
 import tempfile
 import time
@@ -1460,6 +1462,279 @@ def check_c3_live_probe(binary: str, name: str, sock_path: str,
                        f"{type(e).__name__}: {e}")
 
 
+def check_center_on_point_focus(
+    client: BridgeClient,
+    results: Results,
+) -> None:
+    """Regression: viewer.center_on_point must reapply slice-plane orientation.
+
+    center_on_point routes through CWindow::centerFocusAt, which ends by calling
+    AxisAlignedSliceController::applyOrientation. When the shared "focus" POI
+    carries a normal (its default is (0,0,1), and a prior surface click leaves a
+    surface normal), CChunkedVolumeViewer::onPOIChanged collapses EVERY axis-
+    aligned slice plane onto that one normal -- it does plane->setNormal(poi->n)
+    whenever |poi->n| > 0.5. applyOrientation is what restores the xy/xz/yz
+    planes to their distinct axis-aligned normals afterwards. An earlier fix that
+    only poked focus->p skipped applyOrientation, so the planes stayed collapsed.
+
+    center_on_point also clears the focus orientation source (surfaceId + normal)
+    first: otherwise centerFocusAt preserves a stale surfaceId from a prior click
+    and, when the requested point projects outside that surface, applyOrientation
+    fails and leaves the already-existing seg planes collapsed on the stale
+    normal.
+
+    Asserts the resulting slice-plane orientations (viewers[].planeNormal in
+    state.get) stay distinct -- xy along Z, seg xz along Y, seg yz along X -- that
+    the focus POI moved to the point, and that its normal was cleared (so no stale
+    normal can collapse the planes). Fails if the planes collapse (all along Z)
+    or the orientation source is left uncleared.
+    """
+    point = {"x": 8.0, "y": 8.0, "z": 8.0}
+
+    def dominant_axis(n: dict) -> int:
+        comps = [abs(n.get("x", 0.0)), abs(n.get("y", 0.0)), abs(n.get("z", 0.0))]
+        return comps.index(max(comps))
+
+    try:
+        result, _ = client.call(
+            "viewer.center_on_point", {"point": point}, timeout=RPC_TIMEOUT)
+        after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+
+        planes = {
+            v["surfName"]: v["planeNormal"]
+            for v in after.get("viewers", [])
+            if "planeNormal" in v and "surfName" in v
+        }
+        # Expected dominant axis per plane: xy->Z(2), seg xz->Y(1), seg yz->X(0).
+        expected = {"xy plane": 2, "seg xz": 1, "seg yz": 0}
+        planes_present = all(name in planes for name in expected)
+        planes_distinct = planes_present and all(
+            dominant_axis(planes[name]) == axis for name, axis in expected.items()
+        )
+
+        poi = after.get("focusPoi") or {}
+        pos = poi.get("position") or {}
+        focus_moved = (
+            result.get("centered") is True
+            and result.get("focusMoved") is True
+            and abs(pos.get("x", -1.0) - 8.0) < 1e-3
+            and abs(pos.get("y", -1.0) - 8.0) < 1e-3
+            and abs(pos.get("z", -1.0) - 8.0) < 1e-3
+        )
+
+        # center_on_point clears the focus orientation source (surfaceId +
+        # normal) before recentering, so a stale surface normal from a prior
+        # click cannot collapse the planes and applyOrientation is free to
+        # restore the canonical axes.
+        normal = poi.get("normal") or {}
+        normal_cleared = (
+            abs(normal.get("x", 1.0)) < 0.5
+            and abs(normal.get("y", 1.0)) < 0.5
+            and abs(normal.get("z", 1.0)) < 0.5
+        )
+
+        results.record(
+            "center_on_point_reapplies_plane_orientation",
+            focus_moved and planes_distinct and normal_cleared,
+            f"focus_moved={focus_moved} planes_distinct={planes_distinct} "
+            f"normal_cleared={normal_cleared} planes={planes} "
+            f"focusNormal={normal}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "center_on_point_reapplies_plane_orientation",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+
+def _make_segment_project(root: Path) -> tuple[Path, Path]:
+    """A volpkg with a volume large enough to contain the checked-in test
+    segment (bbox up to ~8011,5023,5592) plus the segment copied into a source
+    dir. The zarr has no chunk data (fill_value 0) so the large shape is free."""
+    w, h, d = 8100, 5100, 5700
+    volume = root / "volumes" / "vol1"
+    level = volume / "0"
+    level.mkdir(parents=True)
+    (volume / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    (volume / ".zattrs").write_text(json.dumps({}))
+    (volume / "meta.json").write_text(json.dumps({
+        "type": "vol", "uuid": "vol1", "name": "vol1", "format": "zarr",
+        "width": w, "height": h, "slices": d,
+        "voxelsize": 1.0, "min": 0.0, "max": 255.0,
+    }))
+    (level / ".zarray").write_text(json.dumps({
+        "zarr_format": 2, "shape": [d, h, w], "chunks": [64, 64, 64],
+        "dtype": "|u1", "compressor": None, "fill_value": 0, "order": "C",
+        "filters": None, "dimension_separator": ".",
+    }))
+    volpkg = root / "smoke.volpkg.json"
+    volpkg.write_text(json.dumps({"name": "smoke", "version": 1, "volumes": ["volumes"]}))
+    segsrc = root / "segs"
+    segment_id = "20241113080880"
+    shutil.copytree(
+        REPO_ROOT / "core" / "test" / "data" / "segments" / segment_id,
+        segsrc / segment_id,
+    )
+    return volpkg, segsrc
+
+
+def _read_tiff_float32_grid(path: Path) -> tuple[int, int, list[float]]:
+    """Minimal pure-stdlib reader for an uncompressed, single-strip, 32-bit
+    IEEE float, 1-sample-per-pixel TIFF (the shape the segment fixture uses).
+
+    Returns (width, height, values) where values is a flat row-major list.
+    """
+    data = path.read_bytes()
+    order = data[0:2]
+    if order == b"II":
+        endian = "<"
+    elif order == b"MM":
+        endian = ">"
+    else:
+        raise ValueError(f"{path}: not a TIFF (bad byte-order marker)")
+
+    (ifd_offset,) = struct.unpack_from(endian + "I", data, 4)
+    (entry_count,) = struct.unpack_from(endian + "H", data, ifd_offset)
+
+    width = height = strip_offset = rows_per_strip = None
+    for i in range(entry_count):
+        entry_off = ifd_offset + 2 + i * 12
+        tag, _typ, _count, value = struct.unpack_from(endian + "HHII", data, entry_off)
+        if tag == 256:
+            width = value
+        elif tag == 257:
+            height = value
+        elif tag == 273:
+            strip_offset = value
+        elif tag == 278:
+            rows_per_strip = value
+
+    if width is None or height is None or strip_offset is None:
+        raise ValueError(f"{path}: missing required TIFF tags")
+    if rows_per_strip is not None and rows_per_strip != height:
+        raise ValueError(f"{path}: expected a single-strip image")
+
+    n = width * height
+    values = list(struct.unpack_from(endian + f"{n}f", data, strip_offset))
+    return width, height, values
+
+
+def _first_surface_point(seg_dir: Path) -> dict:
+    """Return an interior grid cell of the segment surface (x/y/z all finite and
+    > 0; the fixture uses -1.0 as an invalid/empty sentinel), computed at runtime
+    so this test does not depend on a hand-picked cell surviving fixture
+    regeneration.
+
+    Picks the median of the valid cells rather than the first one: cells on the
+    surface boundary can fall outside AxisAlignedSliceController's projection and
+    make it fall back to canonical planes, which would defeat the point of the
+    check. An interior cell reliably yields the segment tangent frame.
+    """
+    wx, hx, xs = _read_tiff_float32_grid(seg_dir / "x.tif")
+    wy, hy, ys = _read_tiff_float32_grid(seg_dir / "y.tif")
+    wz, hz, zs = _read_tiff_float32_grid(seg_dir / "z.tif")
+    if (wx, hx) != (wy, hy) or (wx, hx) != (wz, hz):
+        raise ValueError(f"{seg_dir}: x/y/z.tif dimensions do not match")
+
+    valid = [
+        (x, y, z)
+        for x, y, z in zip(xs, ys, zs)
+        if math.isfinite(x) and math.isfinite(y) and math.isfinite(z)
+        and x > 0 and y > 0 and z > 0
+    ]
+    if not valid:
+        raise ValueError(f"{seg_dir}: no valid (finite, positive) surface point found")
+
+    x, y, z = valid[len(valid) // 2]
+    return {"x": x, "y": y, "z": z}
+
+
+def check_center_on_point_segment(binary: str, results: Results) -> None:
+    """Regression for center_on_point with an ACTIVE segmentation surface and
+    axis-aligned slice mode OFF (its own VC3D instance + a real geometry-backed
+    fixture segment).
+
+    In this mode applyOrientation derives the seg xz/yz planes from the segment
+    tangent frame, matching VC3D's own coordinate navigation. Two things must
+    hold, and the plain location-box path (centerFocusAt with a (0,0,1) normal
+    and no source clear) gets the second one wrong:
+      1. on a surface point, the seg planes take the segment tangent (not
+         canonical) -- proves the segment path is actually exercised.
+      2. the seg xz/yz planes never collapse onto the same normal, for a point
+         ON the surface AND a point OFF it. The location-box path collapses both
+         seg planes onto (0,0,1) off-surface; center_on_point clears the stale
+         source and zeros the focus normal to prevent that.
+    """
+    # A finite grid cell of the fixture surface (on the surface), computed at
+    # runtime from the fixture's TIFFs, and a point far from it.
+    segment_id = "20241113080880"
+    on_pt = _first_surface_point(
+        REPO_ROOT / "core" / "test" / "data" / "segments" / segment_id
+    )
+    off_pt = {"x": 10.0, "y": 10.0, "z": 10.0}
+
+    def seg_normals(state: dict) -> dict:
+        return {
+            v["surfName"]: v["planeNormal"]
+            for v in state.get("viewers", [])
+            if v.get("surfName") in ("seg xz", "seg yz") and "planeNormal" in v
+        }
+
+    def dist(a: dict, b: dict) -> float:
+        return sum((a.get(k, 0.0) - b.get(k, 0.0)) ** 2 for k in ("x", "y", "z")) ** 0.5
+
+    proc = None
+    client = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="vc3d-smoke-seg-") as tmp_dir:
+            root = Path(tmp_dir)
+            volpkg, segsrc = _make_segment_project(root)
+            name = unique_name("seg")
+            proc = launch(binary, name, str(volpkg), str(root / "config-seg"))
+            sock_path = proc.wait_for_handshake(timeout=60.0)
+            client = BridgeClient(sock_path, connect_timeout=10.0)
+
+            client.call("segments.attach", {"location": str(segsrc)}, timeout=20.0)
+            client.call("segments.activate", {"segmentId": segment_id}, timeout=20.0)
+            client.call("viewer.set_axis_aligned_slices", {"enabled": False}, timeout=20.0)
+
+            client.call("viewer.center_on_point", {"point": on_pt}, timeout=20.0)
+            on_state, _ = client.call("state.get", {}, timeout=20.0)
+            client.call("viewer.center_on_point", {"point": off_pt}, timeout=20.0)
+            off_state, _ = client.call("state.get", {}, timeout=20.0)
+
+            on_n = seg_normals(on_state)
+            off_n = seg_normals(off_state)
+            xz_on, yz_on = on_n.get("seg xz", {}), on_n.get("seg yz", {})
+            xz_off, yz_off = off_n.get("seg xz", {}), off_n.get("seg yz", {})
+
+            # 1. segment path exercised: on-surface seg xz is not canonical (0,1,0)
+            tangent = bool(xz_on) and abs(xz_on.get("x", 0.0)) > 0.1
+            # 2. no collapse: seg xz and seg yz stay distinct, on AND off surface
+            no_collapse_on = dist(xz_on, yz_on) > 0.1
+            no_collapse_off = dist(xz_off, yz_off) > 0.1
+
+            results.record(
+                "center_on_point_segment_tangent_no_collapse",
+                tangent and no_collapse_on and no_collapse_off,
+                f"tangent={tangent} no_collapse_on={no_collapse_on} "
+                f"no_collapse_off={no_collapse_off} xz_on={xz_on} "
+                f"xz_off={xz_off} yz_off={yz_off}",
+            )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "center_on_point_segment_tangent_no_collapse",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+    finally:
+        if client is not None:
+            client.close()
+        if proc is not None:
+            proc.terminate()
+
+
 def main() -> int:
     global RPC_TIMEOUT
 
@@ -1526,6 +1801,8 @@ def main() -> int:
             check_canvas_normalization(client, results)
 
             check_volume_attach(client, results, tmp_path, volpkg)
+            check_center_on_point_focus(client, results)
+            check_center_on_point_segment(binary, results)
             check_segments_attach(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_project_create(client, results, tmp_path)
