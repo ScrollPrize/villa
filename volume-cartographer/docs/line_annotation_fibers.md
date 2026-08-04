@@ -78,12 +78,6 @@ the `interp` cells, and `fiber.list` over the agent bridge exposes the same
 data as `traceState`, `traceNeedsReview`, `traceVerified`, and per-span
 `interpMode` plus `fiberManifest`.
 
-Legacy version-1 files can be upgraded in bulk with
-`scripts/fiber_migrate_v1_to_v3.py`, which applies exactly the metadata
-upgrade VC3D performs on save (mode `lasagna`, spans goal `global`, actual
-`lasagna`) without touching geometry, tags, or branches. Migrating a synced
-fiber directory in one coordinated step avoids the per-file version-mismatch
-conflicts the sync merge would otherwise raise.
 
 Each direction continues until it reaches all target-local planes within the
 20-base-voxel endpoint threshold or exhausts its step budget. VC3D then moves

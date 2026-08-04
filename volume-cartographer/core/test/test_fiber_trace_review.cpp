@@ -129,10 +129,10 @@ TEST_CASE("applyTraceReviewTagExclusivity keeps the pair mutually exclusive")
     CHECK(tags == std::vector<std::string>{kTraceNeedsReviewTag, "other"});
 }
 
-// Golden fixture shared with scripts/fiber_migrate_v1_to_v3.py: the Python
-// LASAGNA_SEGMENT constant must serialize the exact document VC3D writes
-// for a v1-upgraded span. Keep this literal textually identical to the
-// Python constant (and to what fiberSaveSnapshotToJson emits).
+// Golden fixture pinning the default lasagna segment descriptor — the
+// exact document fiberSaveSnapshotToJson emits for a v1-upgraded span.
+// External tooling (fiber_merge validators, offline upgraders) relies on
+// these bytes staying stable.
 TEST_CASE("default lasagna segment metadata matches the migration fixture")
 {
     const auto expected = nlohmann::json::parse(R"({
