@@ -47,9 +47,14 @@ std::vector<uint8_t> makeValidFileBytes(const std::string& path)
         gs.add(diagonal(5, {50, 50}));
         gs.save(path);
     }
-    std::ifstream in(path, std::ios::binary);
-    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)),
-                               std::istreambuf_iterator<char>());
+    // Read in a nested scope: Windows refuses to delete a file that still has an
+    // open handle, so the stream has to be closed before the remove() below.
+    std::vector<uint8_t> bytes;
+    {
+        std::ifstream in(path, std::ios::binary);
+        bytes.assign((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    }
     std::filesystem::remove(path);
     return bytes;
 }
@@ -95,9 +100,13 @@ TEST_CASE("GridStore: a valid file still loads (hardening does not reject good f
     const auto path = tmpPath("valid.bin");
     writeBytes(path, bytes);
 
-    GridStore loaded(path);
-    CHECK(loaded.size() == cv::Size(100, 100));
-    CHECK(loaded.get_all().size() == 2);
+    // Nested scope: the mmap-backed GridStore must be destroyed before the file
+    // can be deleted. Windows refuses to remove a file that is still mapped.
+    {
+        GridStore loaded(path);
+        CHECK(loaded.size() == cv::Size(100, 100));
+        CHECK(loaded.get_all().size() == 2);
+    }
 
     std::filesystem::remove(path);
 }

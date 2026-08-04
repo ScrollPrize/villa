@@ -263,15 +263,21 @@ TEST_CASE("stats: startup scan ignores files newer than its cutoff")
     writeSizedFile(target / "0.bin", 31);
     writeSizedFile(target / "1.empty", 1);
 
-    auto f = std::make_shared<CountingFetcher>();
-    auto c = makeCache(f, persist);
-
+    // Stamp the "too new" file before the cache exists. The scan runs on a worker
+    // thread with a cutoff taken at construction, so writing this file afterwards
+    // races the scan: on a slower filesystem the scan can read post.bin before the
+    // future timestamp is applied and count it. Preparing it up front keeps the
+    // timestamp strictly greater than the cutoff without depending on timing.
     writeSizedFile(target / "post.bin", 17);
     std::error_code ec;
     fs::last_write_time(
         target / "post.bin",
         fs::file_time_type::clock::now() + std::chrono::seconds{10},
         ec);
+    REQUIRE_FALSE(ec);
+
+    auto f = std::make_shared<CountingFetcher>();
+    auto c = makeCache(f, persist);
 
     auto s = waitForStats(*c, [](const ChunkCache::Stats& s) {
         return !s.persistentCacheScanInFlight;
