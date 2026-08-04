@@ -35,6 +35,40 @@ def get_max_value(dtype: np.dtype) -> Union[float, int]:
         raise ValueError("Unsupported dtype")
     return max_value
 
+
+
+_CACHE_ENV = "VESUVIUS_CHUNK_CACHE_DIR"
+
+
+def _chunk_cache_url(path: str, storage_options: Dict[str, Any],
+                     cache_dir: Optional[str]) -> Tuple[str, Dict[str, Any]]:
+    """Route a remote store through an on-disk chunk cache.
+
+    Without this every read goes to the network, so overlapping patches
+    re-download the same chunks: re-reading an identical patch transfers the
+    full amount again. This replaces the caching that was lost when zarr 3
+    removed ``LRUStoreCache`` (see the ``use_volume_store_cache`` warning in
+    ``neural_tracing/heatmap_single_point/dataset.py``).
+
+    ``simplecache`` rather than ``filecache``: the open-data volumes are
+    immutable, so revalidating each chunk against S3 only costs a round trip.
+    Measured on PHercParis4 level 2, same patch read three times —
+    ``simplecache``: 8.39 MB then 0 MB, 0 requests; ``filecache``: 8.39 MB then
+    0 MB but 4 requests each time.
+
+    Returns the (possibly rewritten) path and storage options.
+    """
+    if not cache_dir:
+        return path, storage_options
+
+    protocol = path.split("://", 1)[0]
+    nested = dict(storage_options)
+    return (
+        f"simplecache::{path}",
+        {protocol: nested, "simplecache": {"cache_storage": cache_dir}},
+    )
+
+
 def open_zarr(path: str, mode: str = 'r', 
               storage_options: Optional[Dict[str, Any]] = None,
               verbose: bool = False,
@@ -46,6 +80,7 @@ def open_zarr(path: str, mode: str = 'r',
               fill_value: Any = None,
               order: str = None,
               zarr_format: Optional[int] = 2,
+              cache_dir: Optional[str] = None,
               **kwargs) -> zarr.Array:
     """
     Open a zarr array with consistent handling of local and remote URLs.
@@ -124,6 +159,16 @@ def open_zarr(path: str, mode: str = 'r',
     
     # Zarr 3.2 rejects storage_options for local filesystem stores, even when
     # the mapping is empty. Only URI-backed fsspec stores consume this option.
+    # Cache chunks on disk for remote reads. Opt-in: explicit cache_dir, or
+    # the VESUVIUS_CHUNK_CACHE_DIR environment variable.
+    if is_remote and mode == 'r':
+        resolved_cache = cache_dir or os.environ.get(_CACHE_ENV)
+        if resolved_cache:
+            path, storage_options = _chunk_cache_url(
+                path, storage_options, resolved_cache)
+            if verbose:
+                print(f"Caching chunks under {resolved_cache}")
+
     store_kwargs = {'storage_options': storage_options} if is_remote else {}
 
     # Open the Zarr store with the protocol-appropriate keyword arguments.
