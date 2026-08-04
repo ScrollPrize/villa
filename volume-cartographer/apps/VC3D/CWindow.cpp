@@ -18,7 +18,6 @@
 #include "vc/atlas/Atlas.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
-#include "vc/lasagna/ProjectVolumes.hpp"
 
 #include <iostream>
 
@@ -8580,10 +8579,6 @@ bool CWindow::OpenVolume(const QString& path,
             QMessageBox::warning(this, tr("Error"), message);
         }
         return false;
-    }
-
-    for (const auto& diagnostic : vc::lasagna::reconcileLasagnaProjectVolumes(*package)) {
-        Logger()->warn("Could not reconcile project Lasagna data: {}", diagnostic);
     }
 
     // Check version number
