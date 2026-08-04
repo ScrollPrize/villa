@@ -1,0 +1,7 @@
+name: VC CodeQL PR core shard
+
+paths:
+  - 'volume-cartographer/core'
+
+paths-ignore:
+  - 'volume-cartographer/core/test/sanitizer_canary.cpp'

@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
+#include <utility>
 
 namespace vc::lasagna
 {
