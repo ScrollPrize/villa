@@ -1128,7 +1128,10 @@ int main(int argc, char *argv[])
         ("resume", po::bool_switch()->default_value(false), "Skip chunks that already exist on disk")
         ("pre", po::bool_switch()->default_value(false), "Create zarr + all level datasets")
         ("voxel-size", po::value<double>(), "Physical voxel size for OME-Zarr scale metadata (reads from volume metadata if omitted)")
-        ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Physical unit for OME-Zarr axes (e.g. nanometer, micrometer)");
+        ("voxel-unit", po::value<std::string>()->default_value("micrometer"),
+            "Physical unit for OME-Zarr axes and TIFF resolution (e.g. micrometer, nanometer). "
+            "Defaults to micrometer: volpkg meta.json voxelsize, the docs and the volume "
+            "names (..._7.91um_...) are all in micrometers.");
     // clang-format on
 
     po::options_description all("Usage");
