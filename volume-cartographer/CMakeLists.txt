@@ -226,6 +226,23 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     add_compile_options(-pipe -march=armv8.2-a)
 else()
+    # Reaching here silently drops the architecture baseline the branches above
+    # set, so warn instead of shipping a quietly deoptimised build. An empty
+    # CMAKE_SYSTEM_PROCESSOR is the case seen in practice: CMake derives it from
+    # PROCESSOR_ARCHITECTURE on Windows, and a shell without that variable
+    # yields "", which matches none of the branches. On Linux that costs the
+    # documented -march=x86-64-v3 floor with no other symptom.
+    if(NOT CMAKE_SYSTEM_PROCESSOR)
+        message(WARNING
+            "CMAKE_SYSTEM_PROCESSOR is empty, so no -march baseline was applied. "
+            "The build falls back to the compiler default, losing the x86-64-v3 "
+            "floor on Linux. Check that PROCESSOR_ARCHITECTURE is set in the "
+            "environment (Windows) or pass -DCMAKE_SYSTEM_PROCESSOR explicitly.")
+    else()
+        message(WARNING
+            "Unrecognised CMAKE_SYSTEM_PROCESSOR '${CMAKE_SYSTEM_PROCESSOR}': no "
+            "-march baseline was applied and the build uses the compiler default.")
+    endif()
     add_compile_options(-pipe)
 endif()
 
