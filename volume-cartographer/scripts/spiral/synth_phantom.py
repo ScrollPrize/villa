@@ -30,6 +30,18 @@ Honest realism caveats, staged deliberately:
     model; compression-dependent haze is future work.
 A method that aces this phantom can still fail on real scrolls; the phantom
 bounds correctness from below, it does not certify it.
+
+Realism calibration: --preset pherc0009b sets the intensity/texture/deformation
+knobs to values measured from the real PHerc0009B 2.4 um masked open-data
+volume (see measure_real_scroll.py for the reproducible measurement): murky
+gaps at ~0.29 rather than clean background, sheets at ~0.65 with within-sheet
+fiber texture and sparse bright speckles, wilder gap variation, and stronger
+anisotropy. Fiber texture is generated in CANONICAL space, so it deforms with
+the papyrus, as real fibers do. Two knowing simplifications: the preset's
+dr-per-winding is compute-bounded, below the ~90-200 voxel spacing measured in
+the real volume, and the cosine-bank texture reads as smooth marbling where
+real sheets are granular fiber bundles -- state both when quoting preset
+results.
 """
 
 import json
@@ -49,6 +61,21 @@ from sample_spiral import get_theta_and_radii
 from transforms import SpiralAndTransform
 
 PHANTOM_SCHEMA_VERSION = 1
+
+# Knob values measured from real scans (see module docstring). A preset only
+# overrides knobs the user left at their defaults, so explicit flags win.
+PRESETS = {
+    # PHerc0009B 2.4um masked volume, measured by measure_real_scroll.py at
+    # the volume centre: gap ~p25 0.29, sheet ~p85 0.65, high-freq noise
+    # 0.034, strong pack-bunching and flattening. dr is compute-bounded below
+    # the real ~90-200 voxel spacing (see docstring).
+    'pherc0009b': {
+        'dr_per_winding': 32., 'sheet_sigma': 7., 'gap_level': 0.29,
+        'sheet_level': 0.65, 'fiber_amp': 0.35, 'speckle_amp': 0.25,
+        'noise_std': 0.034, 'gap_log_std': 0.5, 'linear_std': 0.3,
+        'flow_std': 0.015,
+    },
+}
 
 
 def make_phantom_config(z_size, yx_size, dr_per_winding, num_table_windings, z_margin):
@@ -175,39 +202,86 @@ def make_umbilicus(z_begin, z_end, z_margin, centre_yx, amplitude, rng):
     return torch.from_numpy(np.concatenate([zs[:, None], yx], axis=-1))
 
 
+def _cosine_bank(rng, num, k_winding, k_turn, k_z):
+    """A seeded bank of 3D cosines over canonical (winding, theta, z)
+    coordinates -- cheap procedural noise that needs no lattice storage and is
+    evaluated at arbitrary points. Frequency ranges are (lo, hi) tuples in
+    cycles per winding / per full turn / per z-voxel."""
+    bank = {
+        'k_w': torch.tensor(rng.uniform(*k_winding, num), dtype=torch.float32),
+        'k_t': torch.tensor(rng.uniform(*k_turn, num), dtype=torch.float32),
+        'k_z': torch.tensor(rng.uniform(*k_z, num), dtype=torch.float32),
+        'phase': torch.tensor(rng.uniform(0, 2 * np.pi, num), dtype=torch.float32),
+        'amp': torch.tensor(rng.dirichlet(np.ones(num)), dtype=torch.float32),
+    }
+    # Normalise so the summed field has approximately unit std.
+    bank['scale'] = float(1. / np.sqrt((bank['amp'].numpy() ** 2).sum() / 2))
+    return bank
+
+
+def _eval_bank(bank, w, theta, z, device):
+    args = (2 * torch.pi) * (
+        bank['k_w'].to(device) * w[..., None]
+        + bank['k_t'].to(device) * (theta[..., None] / (2 * torch.pi))
+        + bank['k_z'].to(device) * z[..., None]) + bank['phase'].to(device)
+    return (torch.cos(args) * bank['amp'].to(device)).sum(-1) * bank['scale']
+
+
 @torch.no_grad()
 def render(model, z_size, yx_size, first_winding, last_winding, sheet_sigma,
-           device, chunk_size=200_000):
+           gap_level, sheet_level, fiber_amp, speckle_amp, rng, device,
+           chunk_size=200_000):
     """Render the deformed spiral into slice space, with exact per-voxel truth.
 
     Returns (volume [0,1] float32, winding float32, valid mask bool), each
     shaped [Z, Y, X]. Winding truth is shifted_radius / dr -- the same readout
     find_inconsistent_windings calls "the model's raw winding number".
+
+    Intensity model: lerp(gap_level, textured sheet_level, sheet density).
+    With fiber_amp/speckle_amp zero this reduces to the original clean
+    two-level rendering. Fiber texture and speckles are evaluated on CANONICAL
+    (winding, theta, z) coordinates so they deform with the papyrus; fiber
+    frequencies are anisotropic (fast across the sheet thickness, slow along
+    it), giving the streaky along-sheet grain real scans show.
     """
     transform = model.get_slice_to_spiral_transform()
     dr = model.get_dr_per_winding()
+    fiber_bank = _cosine_bank(rng, 12, k_winding=(3., 9.), k_turn=(8., 60.),
+                              k_z=(0.02, 0.15))
+    speckle_bank = _cosine_bank(rng, 12, k_winding=(8., 20.), k_turn=(60., 200.),
+                                k_z=(0.1, 0.4))
 
     zs = torch.arange(z_size, dtype=torch.float32)
     ys = torch.arange(yx_size, dtype=torch.float32)
     grid = torch.cartesian_prod(zs, ys, ys)  # [N, 3] zyx, voxel centres
 
-    density = torch.empty(len(grid), dtype=torch.float32)
+    volume = torch.empty(len(grid), dtype=torch.float32)
     winding = torch.empty(len(grid), dtype=torch.float32)
     for start in tqdm(range(0, len(grid), chunk_size), desc='render'):
         chunk = grid[start : start + chunk_size].to(device)
         spiral = transform(chunk)
-        _, _, shifted = get_theta_and_radii(spiral[..., 1:], dr)
-        winding[start : start + chunk_size] = (shifted / dr).cpu()
-        density[start : start + chunk_size] = sample_spiral.get_spiral_density(
+        theta, _, shifted = get_theta_and_radii(spiral[..., 1:], dr)
+        w = shifted / dr
+        winding[start : start + chunk_size] = w.cpu()
+        density = sample_spiral.get_spiral_density(
             spiral[..., 1:], dr_per_winding=dr, sigma=sheet_sigma,
-            winding_range=(first_winding, last_winding + 1),
-        ).cpu()
+            winding_range=(first_winding, last_winding + 1))
+        sheet = sheet_level * torch.ones_like(density)
+        if fiber_amp > 0:
+            sheet = sheet * (1 + fiber_amp * _eval_bank(
+                fiber_bank, w, theta, chunk[..., 0], device))
+        if speckle_amp > 0:
+            # Sparse bright inclusions: the positive tail of a second field.
+            speck = _eval_bank(speckle_bank, w, theta, chunk[..., 0], device)
+            sheet = sheet + speckle_amp * torch.relu(speck - 2.)
+        volume[start : start + chunk_size] = (
+            gap_level + density * (sheet - gap_level)).cpu()
 
     shape = (z_size, yx_size, yx_size)
     winding = winding.view(shape).numpy()
-    density = density.view(shape).numpy()
+    volume = volume.view(shape).numpy()
     valid = (winding >= first_winding) & (winding <= last_winding)
-    return density, winding, valid
+    return volume, winding, valid
 
 
 def apply_tears(volume, valid, num_tears, rng, background):
@@ -269,6 +343,17 @@ def measure_roundtrip(model, valid, num_points, rng, device):
               help='Std of the umbilicus wander around the volume centre, in voxels.')
 @click.option('--sheet-sigma', default=1.5, type=float,
               help='Rendered sheet half-thickness (Gaussian sigma, voxels).')
+@click.option('--gap-level', default=0.15, type=float,
+              help='Intensity between sheets (real gaps are murky, ~0.29).')
+@click.option('--sheet-level', default=0.75, type=float,
+              help='Sheet intensity (real sheets measure ~0.65).')
+@click.option('--fiber-amp', default=0., type=float,
+              help='Within-sheet fiber texture amplitude (0 disables).')
+@click.option('--speckle-amp', default=0., type=float,
+              help='Bright-inclusion speckle amplitude (0 disables).')
+@click.option('--preset', default=None, type=click.Choice(sorted(PRESETS)),
+              help='Apply knob values calibrated against a real scan; '
+                   'explicitly passed flags still win.')
 @click.option('--noise-std', default=0.03, type=float, help='Additive Gaussian noise std.')
 @click.option('--haze-sigma', default=0., type=float,
               help='Uniform Gaussian blur sigma in voxels (0 disables).')
@@ -278,7 +363,20 @@ def measure_roundtrip(model, valid, num_points, rng, device):
 @click.option('--device', default='cpu', help="torch device ('cpu', 'cuda', ...).")
 def main(out, seed, z_size, yx_size, dr_per_winding, first_winding, flow_std,
          gap_log_std, linear_std, flow_smooth_sigma, umbilicus_amplitude,
-         sheet_sigma, noise_std, haze_sigma, num_tears, spiral_outward_sense, device):
+         sheet_sigma, gap_level, sheet_level, fiber_amp, speckle_amp, preset,
+         noise_std, haze_sigma, num_tears, spiral_outward_sense, device):
+    if preset is not None:
+        source = click.get_current_context().get_parameter_source
+        overrides = {name: value for name, value in PRESETS[preset].items()
+                     if source(name) == click.core.ParameterSource.DEFAULT}
+        (dr_per_winding, sheet_sigma, gap_level, sheet_level, fiber_amp,
+         speckle_amp, noise_std, gap_log_std, linear_std, flow_std) = [
+            overrides.get(name, value) for name, value in [
+                ('dr_per_winding', dr_per_winding), ('sheet_sigma', sheet_sigma),
+                ('gap_level', gap_level), ('sheet_level', sheet_level),
+                ('fiber_amp', fiber_amp), ('speckle_amp', speckle_amp),
+                ('noise_std', noise_std), ('gap_log_std', gap_log_std),
+                ('linear_std', linear_std), ('flow_std', flow_std)]]
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
     device = torch.device(device)
@@ -299,13 +397,12 @@ def main(out, seed, z_size, yx_size, dr_per_winding, first_winding, flow_std,
     randomise_model(model, rng, flow_std, gap_log_std, linear_std, flow_smooth_sigma)
 
     volume, winding, valid = render(
-        model, z_size, yx_size, first_winding, last_winding, sheet_sigma, device)
+        model, z_size, yx_size, first_winding, last_winding, sheet_sigma,
+        gap_level, sheet_level, fiber_amp, speckle_amp, rng, device)
 
-    background = 0.15
-    volume = background + volume * (0.75 - background)
     if haze_sigma > 0:
         volume = scipy.ndimage.gaussian_filter(volume, sigma=haze_sigma)
-    tear_mask = apply_tears(volume, valid, num_tears, rng, background) \
+    tear_mask = apply_tears(volume, valid, num_tears, rng, gap_level) \
         if num_tears > 0 else np.zeros_like(valid)
     if noise_std > 0:
         volume = volume + rng.standard_normal(volume.shape).astype(np.float32) * noise_std
@@ -327,6 +424,8 @@ def main(out, seed, z_size, yx_size, dr_per_winding, first_winding, flow_std,
         'gap_log_std': gap_log_std, 'linear_std': linear_std,
         'flow_smooth_sigma': flow_smooth_sigma,
         'umbilicus_amplitude': umbilicus_amplitude, 'sheet_sigma': sheet_sigma,
+        'gap_level': gap_level, 'sheet_level': sheet_level,
+        'fiber_amp': fiber_amp, 'speckle_amp': speckle_amp, 'preset': preset,
         'noise_std': noise_std, 'haze_sigma': haze_sigma, 'num_tears': num_tears,
     }
     torch.save({

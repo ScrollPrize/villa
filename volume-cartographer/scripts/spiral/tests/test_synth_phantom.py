@@ -138,6 +138,29 @@ def test_perturbed_deformation_scores_worse(phantom):
     assert worse['overall']['mae'] > max(identical['overall']['mae'] * 10, 1e-4)
 
 
+def test_preset_texture_preserves_truth(tmp_path):
+    # The pherc0009b preset changes RENDERING (fiber texture, speckles, murky
+    # gaps) and deformation magnitudes -- never the truth convention. The
+    # identical candidate must still score exactly zero, and the volume must
+    # actually carry the textured intensity statistics.
+    out = str(tmp_path / 'preset')
+    result = CliRunner().invoke(synth_phantom.main, [
+        '--out', out, '--preset', 'pherc0009b', '--seed', str(SEED),
+        '--z-size', '16', '--yx-size', '448', '--num-tears', '0'])
+    assert result.exit_code == 0, result.output
+    checkpoint, model, mask = load_phantom(out, torch.device('cpu'))
+    scored = evaluate(model, mask, ('model', model), num_points=10_000,
+                      cut_margin=0.1, seed=0, device=torch.device('cpu'))
+    assert scored['overall']['mae'] < 1e-6
+    meta = json.load(open(os.path.join(out, 'meta.json')))
+    assert meta['preset'] == 'pherc0009b'
+    assert meta['fiber_amp'] > 0 and meta['gap_level'] == pytest.approx(0.29)
+    volume = tifffile.imread(os.path.join(out, 'volume.tif'))
+    sheets = volume[mask > 0]
+    # Textured sheets must vary well beyond the additive noise floor.
+    assert sheets.std() > 20  # uint8 units; noise_std alone would be ~9
+
+
 def test_shape_mismatch_rejected(phantom):
     with pytest.raises(Exception):
         bad = np.zeros((4, 4, 4), dtype=np.float32)
