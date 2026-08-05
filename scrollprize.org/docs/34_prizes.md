@@ -316,17 +316,14 @@ If you are new to the project, this is a great place to start.
 
 **Best Submission of the Month: <span className="vc-money">\$20,000</span>, guaranteed every month, to the single best submission — selected by the Vesuvius Challenge team.**
 
-Beyond that, progress prizes will be awarded at a range of levels based on the contribution:
-
-* Gold Aureus: <span className="vc-money">\$20,000</span> (estimated 4-8 per year) – for major contributions
-* Denarius: <span className="vc-money">\$10,000</span> (estimated 10-15 per year)
-* Sestertius: <span className="vc-money">\$2,500</span> (estimated 25 per year)
-* Papyrus: <span className="vc-money">\$1,000</span> (estimated 50 per year)
+Beyond that, progress prizes will be awarded at a range of levels based on the significance of the contribution, typically <span className="vc-money">\$20,000</span>, <span className="vc-money">\$10,000</span>, <span className="vc-money">\$5,000</span>, <span className="vc-money">\$2,500</span>, <span className="vc-money">\$1,000</span> or <span className="vc-money">\$500</span>.
 
 We favor submissions that:
 * Are **released or open-sourced early**. Tools released earlier have a higher chance of being used for reading the scrolls than those released the last day of the month.
 * Actually **get used**. We’ll look for signals from the community: questions, comments, bug reports, feature requests. Our Annotation Team will publicly provide comments on tools they use.
-* Solve a **real problem**. For example, they improve metrics on real data (e.g. our [ink detection](/data_datasets#ink-labels-2026-07) or [surface prediction](/data_datasets#surface-labels-2026-07) datasets), or resolve a genuine outstanding bug in tools that people are using. 
+* Improve results quantitatively and/or qualitatively on **real data**. If you are working on [ink detection](/data_datasets#ink-labels-2026-07) or [surface prediction](/data_datasets#surface-labels-2026-07) your method should be evaluated on our public datasets. If you are working on virtual unwrapping, show visually that papyrus fibers are visible on your output surface, and it doesn't jump across sheets in cross-section.
+* Resolve outstanding **bugs in tools that people are using**, and that you are using yourself, evidenced by before/after screenshots, logs, etc.
+* Reveal **insightful, actionable** information. If you are building analytic tools, show how they facilitated improvements to unwrapping or ink detection, for example by detecting failure-cases of existing methods on real scroll data, or producing information that resulted in better model results for the relevant task (see above).
 * Are **well documented**. It helps a lot if relevant documentation, walkthroughs, images, tutorials or similar are included with the work so that others can use it!
 
 Any contribution that makes any of the [Open Problems](/2026_open_problems) easier to address will be eligible for a Progress Prize.
@@ -350,7 +347,7 @@ Submissions are evaluated monthly, and multiple submissions/awards per month are
    * Include comprehensive documentation
    * Provide usage examples
 3. Technical Integration
-   * Accept standard community formats (e.g. OME-Zarr or Zarr arrays, quadmeshes, triangular meshes)
+   * Accept standard community formats (e.g. OME-Zarr or Zarr arrays, tifxyz quadmeshes, triangular meshes)
    * Maintain consistent output formats
    * Designed for modular integration
 </details>
