@@ -272,6 +272,8 @@ class Inferer():
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
                  resume: bool = False,
+                 estimate: bool = False,
+                 estimate_bandwidth: float = 100.0,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -313,6 +315,8 @@ class Inferer():
         # Patch indices a previous run already wrote. Empty set == resume requested but
         # nothing recoverable found; None == not resuming, so the store is created fresh.
         self.resume_completed = None
+        self.estimate = estimate
+        self.estimate_bandwidth = estimate_bandwidth
         self.model_patch_size = None
         self.num_classes = None
 
@@ -869,6 +873,86 @@ class Inferer():
         else:
             return numcodecs.Blosc(cname='zstd', clevel=1, shuffle=shuffle)
 
+    # --- run cost estimation ----------------------------------------------------------
+    #
+    # The expensive part of a scroll-scale run is not the forward pass, it is fetching the
+    # same chunk repeatedly because the 192^3 patch grid does not align with the 128^3
+    # chunk grid. That count is exact and cheap, so it can be answered before committing.
+
+    def _input_array_geometry(self):
+        """(chunk_size_zyx, itemsize, shape, compressor, description) for the input array.
+
+        Returns None if the geometry cannot be read, in which case --estimate reports the
+        patch count and says why the byte figures are missing rather than inventing them.
+        """
+        try:
+            import zarr as _zarr
+        except ImportError:
+            return None
+
+        array_obj = getattr(getattr(self.dataset, 'volume', None), 'data', None)
+        if isinstance(array_obj, _zarr.Group):
+            if "0" not in array_obj:
+                return None
+            array_obj = array_obj["0"]
+        if not isinstance(array_obj, _zarr.Array):
+            return None
+
+        chunks = tuple(array_obj.chunks)
+        shape = tuple(array_obj.shape)
+        if len(chunks) == 4:            # C, Z, Y, X -> spatial only
+            chunks, shape = chunks[1:], shape[1:]
+        if len(chunks) != 3:
+            return None
+
+        # zarr 2 exposes .compressor, zarr 3 .compressors; absent or empty means raw.
+        compressor = getattr(array_obj, 'compressor', None)
+        if compressor is None:
+            seq = getattr(array_obj, 'compressors', None)
+            compressor = seq[0] if seq else None
+
+        return chunks, array_obj.dtype.itemsize, shape, compressor, str(self.input)
+
+    def _report_estimate(self):
+        from vesuvius.models.run import estimate as _estimate
+
+        positions = list(self.patch_start_coords_list)
+        geometry = self._input_array_geometry()
+        if geometry is None:
+            print(f"\n--estimate: {len(positions):,} patches for this run.")
+            print("  Could not read the input array's chunk geometry, so the transfer "
+                  "cost is not reported rather than guessed.\n")
+            return
+
+        chunk_size, itemsize, shape, compressor, path = geometry
+        plan = _estimate.build_plan(
+            positions,
+            tuple(self.patch_size),
+            chunk_size,
+            itemsize,
+            cache_sizes_gib=(0, 4, 16),
+        )
+        notes = []
+        if self.num_parts > 1:
+            notes.append(
+                f"NOTE: this is part {self.part_id} of {self.num_parts}; the whole volume "
+                f"costs more than the figures above."
+            )
+        if self.skip_empty_patches:
+            notes.append(
+                "NOTE: --skip_empty_patches is on, so patches that are entirely empty are "
+                "already excluded from the count above."
+            )
+        desc = f"{path}  {'x'.join(str(s) for s in shape)}"
+        for line in _estimate.format_plan(
+            plan,
+            self.estimate_bandwidth,
+            volume_desc=desc,
+            compressor=compressor,
+            extra_notes=notes,
+        ):
+            print(line)
+
     # --- resume support -------------------------------------------------------------
     #
     # A whole-scroll pass is hours to days of streaming, so an interrupted run is normal
@@ -1308,6 +1392,12 @@ class Inferer():
         if self.verbose: print("Creating dataset and dataloader...")
         self._create_dataset_and_loader()
 
+        if self.estimate:
+            # Deliberately before _create_output_stores: --estimate must not create,
+            # truncate or touch anything in output_dir. It is a question, not a run.
+            self._report_estimate()
+            return
+
         if self.verbose: print("Creating output stores...")
         self._create_output_stores()
 
@@ -1318,6 +1408,16 @@ class Inferer():
             print(f"Part {self.part_id} has no patches; wrote empty output stores and skipped inference.")
 
         if self.verbose: print("Inference complete.")
+
+    def infer_estimate(self):
+        """--estimate entry point: report the cost, write nothing, and let errors surface.
+
+        Deliberately not routed through infer(), whose broad `except` turns a hard failure
+        into a printed message and a zero exit status. A planner that silently reports
+        nothing and succeeds is worse than one that crashes.
+        """
+        self.estimate = True
+        self._run_inference()
 
     def infer(self):
         try:
@@ -1441,6 +1541,17 @@ def build_parser():
                            'existing logits store is appended to rather than recreated. '
                            'Refuses to resume if the volume, bbox, patch size, overlap, '
                            'model, TTA setting or part split differ from the previous run.')
+    parser.add_argument('--estimate', action='store_true',
+                      help='Report what this run will cost and exit without computing or '
+                           'writing anything. Prints the patch count, the number of distinct '
+                           'chunks it needs, and how many chunk fetches that becomes under '
+                           'the current traversal and under a cache, with the resulting '
+                           'transfer and wall-clock. Honours --bbox, --num_parts and '
+                           '--patch_size, so it costs the run you are actually about to start.')
+    parser.add_argument('--estimate_bandwidth', type=float, default=100.0,
+                      help='MB/s to convert --estimate transfer figures into wall-clock. '
+                           'Default 100. Set it to what your link actually sustains; the '
+                           'byte and fetch counts do not depend on it.')
     return parser
 
 
@@ -1515,7 +1626,15 @@ def main():
         max_patches=args.max_patches,
         bbox=bbox,
         resume=args.resume,
+        estimate=args.estimate,
+        estimate_bandwidth=args.estimate_bandwidth,
     )
+
+    if args.estimate:
+        # No output store is created and no postprocessing runs, so this path does not
+        # go through infer()'s "Starting Inference" banner or its return contract.
+        inferer.infer_estimate()
+        return
 
     try:
         print("\n--- Starting Inference ---")
