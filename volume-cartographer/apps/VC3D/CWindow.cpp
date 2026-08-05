@@ -7806,12 +7806,9 @@ void CWindow::CreateWidgets(void)
                     &CFiberWidget::fiberTraceReviewChanged,
                     _lineAnnotationController.get(),
                     [this](const std::vector<uint64_t>& fiberIds, bool verified) {
-                        if (!_lineAnnotationController) {
-                            return;
-                        }
-                        for (const uint64_t fiberId : fiberIds) {
-                            _lineAnnotationController->setFiberTraceReviewed(
-                                fiberId, verified);
+                        if (_lineAnnotationController) {
+                            _lineAnnotationController->setFibersTraceReviewed(
+                                fiberIds, verified);
                         }
                     });
             connect(widget,

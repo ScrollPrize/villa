@@ -197,8 +197,11 @@ public:
     void setFiberTag(uint64_t fiberId, const QString& tag, bool enabled);
     // Marks a traced fiber reviewed (removes interp_unreviewed) or flags
     // it for review (re-adds it) and saves. Rejects untraced fibers; the
-    // generic tag paths refuse to touch the reserved tag.
+    // generic tag paths refuse to touch the reserved tag. The batch form
+    // refreshes fiber summaries once instead of per fiber.
     void setFiberTraceReviewed(uint64_t fiberId, bool verified);
+    void setFibersTraceReviewed(const std::vector<uint64_t>& fiberIds,
+                                bool verified);
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
     void calculateFiberAlignmentMetrics();
@@ -527,6 +530,10 @@ private:
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
     // Pushes the H/V tag and the clickable tag buttons to the pane's dialog.
     void pushFiberUiState(const PaneRecord& pane) const;
+    // Shared body of setFiberTraceReviewed / setFibersTraceReviewed: tag
+    // change + save + pane sync WITHOUT the summary emission. Returns
+    // whether anything changed.
+    bool applyFiberTraceReview(uint64_t fiberId, bool verified);
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,

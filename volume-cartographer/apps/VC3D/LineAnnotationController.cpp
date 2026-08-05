@@ -3124,19 +3124,19 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
     emitFiberSummaries();
 }
 
-void LineAnnotationController::setFiberTraceReviewed(uint64_t fiberId, bool verified)
+bool LineAnnotationController::applyFiberTraceReview(uint64_t fiberId, bool verified)
 {
     auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
         return fiber.id == fiberId;
     });
     if (it == _fibers.end()) {
         showError(tr("Fiber %1 is not loaded.").arg(fiberId));
-        return;
+        return false;
     }
     if (!vc3d::line_annotation::hasAcceptedTraceSpan(it->controlPoints)) {
         showError(tr("Fiber %1 has no prediction-traced spans to review.")
                       .arg(fiberId));
-        return;
+        return false;
     }
 
     // Single-tag review model: a traced fiber WITHOUT interp_unreviewed
@@ -3151,8 +3151,7 @@ void LineAnnotationController::setFiberTraceReviewed(uint64_t fiberId, bool veri
         addUniqueSorted(it->tags, reviewTag);
     }
     if (it->tags == previousTags) {
-        emitFiberSummaries();
-        return;
+        return false;
     }
 
     it->needsSave = false;
@@ -3169,7 +3168,7 @@ void LineAnnotationController::setFiberTraceReviewed(uint64_t fiberId, bool veri
         showError(tr("Could not save fiber %1: %2")
                       .arg(fiberId)
                       .arg(QString::fromStdString(ex.what())));
-        return;
+        return false;
     }
 
     for (const auto& pane : _panes) {
@@ -3177,6 +3176,25 @@ void LineAnnotationController::setFiberTraceReviewed(uint64_t fiberId, bool veri
             pane.session->fiberTags = it->tags;
             pushFiberUiState(pane);
         }
+    }
+    return true;
+}
+
+void LineAnnotationController::setFiberTraceReviewed(uint64_t fiberId, bool verified)
+{
+    applyFiberTraceReview(fiberId, verified);
+    emitFiberSummaries();
+}
+
+void LineAnnotationController::setFibersTraceReviewed(
+    const std::vector<uint64_t>& fiberIds,
+    bool verified)
+{
+    // One summary emission for the whole batch: emitFiberSummaries
+    // rebuilds every fiber model and overlay chain, so per-fiber emission
+    // would make reviewing N fibers cost N full rebuilds.
+    for (const uint64_t fiberId : fiberIds) {
+        applyFiberTraceReview(fiberId, verified);
     }
     emitFiberSummaries();
 }
