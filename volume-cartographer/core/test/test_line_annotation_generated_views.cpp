@@ -161,6 +161,41 @@ std::vector<std::filesystem::path> recoveryFilesIn(const std::filesystem::path& 
 
 } // namespace
 
+TEST_CASE("fiber file name identity parsing round-trips canonical names")
+{
+    using vc3d::line_annotation::fiberFileName;
+    using vc3d::line_annotation::parsedFiberFileNameIdentity;
+
+    const auto simple = parsedFiberFileNameIdentity(
+        fiberFileName("kb", "20260719T194751553", 553));
+    REQUIRE(simple.has_value());
+    CHECK(simple->username == "kb");
+    CHECK(simple->startedAt == "20260719T194751553");
+    CHECK(simple->sequence == 553);
+
+    // Usernames may contain underscores; the stem parses from the right.
+    const auto underscored = parsedFiberFileNameIdentity(
+        fiberFileName("team_alpha", "20260101T000000000", 7));
+    REQUIRE(underscored.has_value());
+    CHECK(underscored->username == "team_alpha");
+    CHECK(underscored->sequence == 7);
+
+    // Sequences above the padded width still round-trip.
+    const auto wide = parsedFiberFileNameIdentity(
+        fiberFileName("dj", "20260101T000000000", 1234567));
+    REQUIRE(wide.has_value());
+    CHECK(wide->sequence == 1234567);
+
+    // Non-canonical names carry no identity.
+    CHECK_FALSE(parsedFiberFileNameIdentity("horizontal_bundle_03.json"));
+    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719T194751553_000553"));
+    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719_000553.json"));
+    CHECK_FALSE(parsedFiberFileNameIdentity("kb_2026071?T194751553_000553.json"));
+    CHECK_FALSE(parsedFiberFileNameIdentity("_20260719T194751553_000553.json"));
+    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719T194751553_.json"));
+    CHECK_FALSE(parsedFiberFileNameIdentity(".json"));
+}
+
 TEST_CASE("line annotation generated runtime surfaces register and clean up")
 {
     CState state(64 * 1024 * 1024);

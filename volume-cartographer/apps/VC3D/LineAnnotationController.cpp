@@ -31,6 +31,7 @@
 #include "vc/lasagna/NormalAlignment.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/lasagna/ProjectVolumes.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -49,6 +50,7 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QFileInfo>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -172,6 +174,11 @@ struct LineAnnotationController::LineAnnotationSession {
     // strip on save: a session whose line is still the loaded placeholder
     // must keep the tag.
     bool lineWasOptimized = false;
+    // True while an optimization result has not been saved yet; consumed
+    // by saveSessionAsFiber's trace-review tag transition. Unlike
+    // lineWasOptimized it resets on every save, so a verification granted
+    // between saves is not re-cleared by a later metadata-only save.
+    bool geometryChangedSinceReview = false;
     LineAnnotationController::SessionOptimizationState optimizationState =
         LineAnnotationController::SessionOptimizationState::Unoptimized;
     LineAnnotationController::SessionOptimizationState pendingOptimizationState =
@@ -307,6 +314,26 @@ QString fiberDisplayNameFromFileName(const std::string& fileName)
 {
     const QString stem = vc3d::displayStemForFiberFile(QString::fromStdString(fileName));
     return stem.isEmpty() ? QObject::tr("unsaved fiber") : stem;
+}
+
+std::string datasetEntryMenuLabel(const vc::project::Entry& entry)
+{
+    QString label;
+    if (!vc::project::isLocationRemote(entry.location)) {
+        label = QFileInfo(QString::fromStdString(entry.location)).fileName();
+    }
+    if (label.isEmpty()) {
+        label = QString::fromStdString(entry.location);
+    }
+    for (const auto& tag : entry.tags) {
+        if (tag.rfind("model:", 0) == 0 ||
+            tag.rfind("source:", 0) == 0 ||
+            tag.rfind("name:", 0) == 0) {
+            label += QStringLiteral(" (%1)").arg(QString::fromStdString(tag));
+            break;
+        }
+    }
+    return label.toStdString();
 }
 
 std::optional<FiberJsonPathOptions> showFiberJsonPathDialog(QWidget* parent,
@@ -1797,6 +1824,58 @@ void LineAnnotationController::setOptimizationTaskFactoryForTesting(Optimization
     _optimizationTaskFactory = std::move(factory);
 }
 
+void LineAnnotationController::setModeChangeConfirmationForTesting(
+    std::function<bool(vc3d::line_annotation::FiberOptimizationMode)> confirmer)
+{
+    _modeChangeConfirmation = std::move(confirmer);
+}
+
+bool LineAnnotationController::confirmFiberOptimizationModeChange(
+    const LineAnnotationSession& session,
+    vc3d::line_annotation::FiberOptimizationMode requestedMode)
+{
+    if (_modeChangeConfirmation) {
+        return _modeChangeConfirmation(requestedMode);
+    }
+    if (session.suppressErrorDialogs || _errorDialogsSuppressed) {
+        // Agent-driven flows are deliberate scripted actions; the review
+        // tags still flag the result for inspection.
+        return true;
+    }
+    const bool toNative = requestedMode ==
+        vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d;
+    QMessageBox prompt(_parentWidget.data());
+    prompt.setIcon(QMessageBox::Warning);
+    prompt.setWindowTitle(tr("Change interpolation mode"));
+    if (toNative) {
+        prompt.setText(
+            tr("Switching to the Fiber model re-traces every global-goal "
+               "span with model predictions and overwrites the current "
+               "line."));
+        prompt.setInformativeText(
+            tr("The fiber will be tagged '%1' until the whole line has "
+               "been reviewed and marked verified.")
+                .arg(QLatin1String(
+                    vc3d::line_annotation::kTraceNeedsReviewTag)));
+    } else {
+        prompt.setText(
+            tr("Switching to Lasagna re-fits every global-goal span and "
+               "overwrites the traced line."));
+        prompt.setInformativeText(
+            tr("Spans with an explicit trace goal keep their traced "
+               "geometry; the '%1' flag clears only if the resulting line "
+               "contains no traced spans.")
+                .arg(QLatin1String(
+                    vc3d::line_annotation::kTraceNeedsReviewTag)));
+    }
+    auto* proceedButton =
+        prompt.addButton(tr("Re-optimize"), QMessageBox::AcceptRole);
+    prompt.addButton(QMessageBox::Cancel);
+    prompt.setDefaultButton(QMessageBox::Cancel);
+    prompt.exec();
+    return prompt.clickedButton() == proceedButton;
+}
+
 void LineAnnotationController::setVolumeSelectorFactory(VolumeSelectorFactory factory)
 {
     _volumeSelectorFactory = std::move(factory);
@@ -1961,6 +2040,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     auto* dialog = new LineAnnotationDialog(_viewerManager, _volumeSelectorFactory, nullptr);
     dialog->setFiberDisplayName(fiberDisplayNameFromFileName(session->fiberFileName));
     dialog->setFiberOptimizationMode(session->fiberOptimizationMode);
+    refreshLineAnnotationDatasetMenu(dialog);
     if (!dialog->addPane(surfaceName, tr("Line Annotation Slice"), camera)) {
         dialog->deleteLater();
         _state->setSurface(surfaceName, nullptr);
@@ -1998,6 +2078,18 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                     return;
                 }
                 setFiberTag(pane->session->fiberId, tag, enabled);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::lasagnaDatasetSelectionChanged,
+            this,
+            [this](const std::string& location) {
+                handleLasagnaDatasetSelectionChanged(location);
+            });
+    connect(dialog,
+            &LineAnnotationDialog::fiberInferenceDatasetSelectionChanged,
+            this,
+            [this](const std::string& location) {
+                handleFiberInferenceDatasetSelectionChanged(location);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointRequested,
@@ -2143,6 +2235,13 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                 if (session.optimizedLine.points.size() < 2 ||
                     session.controlPoints.empty()) {
                     session.fiberOptimizationMode = mode;
+                    return;
+                }
+                if (!confirmFiberOptimizationModeChange(session, mode)) {
+                    if (pane->dialog) {
+                        pane->dialog->setFiberOptimizationMode(
+                            session.fiberOptimizationMode);
+                    }
                     return;
                 }
 
@@ -2614,6 +2713,17 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     const std::string oldFileName = it->fileName;
     StoredFiber renamed = *it;
     renamed.fileName = *newFileName;
+    // The canonical name encodes the fiber's identity; keep the stored
+    // username/started_at/sequence consistent with it so attribution and
+    // per-user sequence allocation follow the rename. Non-canonical names
+    // carry no identity, so the stored fields stay as they are.
+    const auto parsedIdentity =
+        vc3d::line_annotation::parsedFiberFileNameIdentity(*newFileName);
+    if (parsedIdentity) {
+        renamed.username = parsedIdentity->username;
+        renamed.startedAt = parsedIdentity->startedAt;
+        renamed.sequence = parsedIdentity->sequence;
+    }
     try {
         saveFiberNow(renamed);
         ec.clear();
@@ -2634,6 +2744,9 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     for (const auto& pane : _panes) {
         if (pane.session && pane.session->fiberId == fiberId) {
             pane.session->fiberFileName = it->fileName;
+            pane.session->fiberUsername = it->username;
+            pane.session->fiberStartedAt = it->startedAt;
+            pane.session->fiberSequence = it->sequence;
             if (pane.dialog) {
                 pane.dialog->setFiberDisplayName(
                     fiberDisplayNameFromFileName(pane.session->fiberFileName));
@@ -2957,6 +3070,17 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
         showError(validationError);
         return;
     }
+    if (*normalizedTag == vc3d::line_annotation::kTraceNeedsReviewTag) {
+        // Review state moves only through the dedicated review actions
+        // (setFiberTraceReviewed); the generic tag paths must not fabricate
+        // or clear it, since a traced fiber without the tag counts as
+        // reviewed.
+        showError(tr("'%1' is managed by the trace review workflow; use "
+                     "Mark trace verified / Mark as needs review instead.")
+                      .arg(QLatin1String(
+                          vc3d::line_annotation::kTraceNeedsReviewTag)));
+        return;
+    }
 
     auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
         return fiber.id == fiberId;
@@ -3001,6 +3125,81 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
             pane.session->fiberTags = it->tags;
             pushFiberUiState(pane);
         }
+    }
+    emitFiberSummaries();
+}
+
+bool LineAnnotationController::applyFiberTraceReview(uint64_t fiberId, bool verified)
+{
+    auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
+        return fiber.id == fiberId;
+    });
+    if (it == _fibers.end()) {
+        showError(tr("Fiber %1 is not loaded.").arg(fiberId));
+        return false;
+    }
+    if (!vc3d::line_annotation::hasAcceptedTraceSpan(it->controlPoints)) {
+        showError(tr("Fiber %1 has no prediction-traced spans to review.")
+                      .arg(fiberId));
+        return false;
+    }
+
+    // Single-tag review model: a traced fiber WITHOUT interp_unreviewed
+    // counts as reviewed, so verifying removes the tag and flagging for
+    // review re-adds it.
+    const std::vector<std::string> previousTags = it->tags;
+    const std::string reviewTag = vc3d::line_annotation::kTraceNeedsReviewTag;
+    if (verified) {
+        it->tags.erase(std::remove(it->tags.begin(), it->tags.end(), reviewTag),
+                       it->tags.end());
+    } else {
+        addUniqueSorted(it->tags, reviewTag);
+    }
+    if (it->tags == previousTags) {
+        return false;
+    }
+
+    it->needsSave = false;
+    try {
+        scheduleFiberSave(*it);
+    } catch (const std::exception& ex) {
+        it->tags = previousTags;
+        for (const auto& pane : _panes) {
+            if (pane.session && pane.session->fiberId == fiberId) {
+                pane.session->fiberTags = previousTags;
+                pushFiberUiState(pane);
+            }
+        }
+        showError(tr("Could not save fiber %1: %2")
+                      .arg(fiberId)
+                      .arg(QString::fromStdString(ex.what())));
+        return false;
+    }
+
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session->fiberId == fiberId) {
+            pane.session->fiberTags = it->tags;
+            pushFiberUiState(pane);
+        }
+    }
+    return true;
+}
+
+void LineAnnotationController::setFiberTraceReviewed(uint64_t fiberId, bool verified)
+{
+    applyFiberTraceReview(fiberId, verified);
+    emitFiberSummaries();
+}
+
+void LineAnnotationController::setFibersTraceReviewed(
+    const std::vector<uint64_t>& fiberIds,
+    bool verified)
+{
+    // One summary emission for the whole batch: emitFiberSummaries
+    // rebuilds every fiber model and overlay chain, so per-fiber emission
+    // would make reviewing N fibers cost N full rebuilds.
+    for (const uint64_t fiberId : fiberIds) {
+        applyFiberTraceReview(fiberId, verified);
     }
     emitFiberSummaries();
 }
@@ -5522,6 +5721,18 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             summary.linePointCount = span.linePointCount;
             summary.lengthVx = span.lengthVx;
             summary.alignment = cachedAlignmentForSpan(fiber.id, span.spanIndex);
+            if (span.firstControlIndex >= 0 &&
+                static_cast<size_t>(span.firstControlIndex) < fiber.controlPoints.size() &&
+                fiber.controlPoints[span.firstControlIndex].segmentToNext) {
+                const auto& segment =
+                    *fiber.controlPoints[span.firstControlIndex].segmentToNext;
+                summary.interpMarker =
+                    vc3d::line_annotation::segmentInterpolationModeMarker(
+                        segment.interpMode);
+                if (vc3d::line_annotation::isAcceptedNativeTrace(segment)) {
+                    summary.fiberManifest = segment.fiberManifestLocation;
+                }
+            }
             spanSummaries.push_back(std::move(summary));
         }
         const int componentSize = componentSizes[findRoot(indexById.at(fiber.id))];
@@ -5529,6 +5740,10 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             std::count_if(fiber.branches.begin(),
                           fiber.branches.end(),
                           [](const FiberBranchRef& branch) { return branch.pending; }));
+        const auto hasTag = [&fiber](const char* tag) {
+            return std::find(fiber.tags.begin(), fiber.tags.end(), tag) !=
+                fiber.tags.end();
+        };
         summaries.push_back(FiberSummary{
             fiber.id,
             fiber.fileName,
@@ -5547,7 +5762,16 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             fiber.tags,
             componentSize >= 2 ? componentSize : 0,
             pendingLinkCount,
+            vc3d::line_annotation::deriveTraceState(fiber.optimizationMode,
+                                                    fiber.controlPoints),
+            hasTag(vc3d::line_annotation::kTraceNeedsReviewTag),
         });
+        // Single-tag review model: traced geometry without the review tag
+        // has been reviewed.
+        summaries.back().traceVerified =
+            summaries.back().traceState !=
+                vc3d::line_annotation::FiberTraceState::Legacy &&
+            !summaries.back().traceNeedsReview;
     }
     std::sort(summaries.begin(), summaries.end(), [](const FiberSummary& a, const FiberSummary& b) {
         return a.id < b.id;
@@ -6901,28 +7125,37 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     std::string selectedIdentity;
     fs::path manifestPath;
     double workingToBaseScale = 1.0;
-    try {
-        if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
-                *vpkg, _state->currentVolumeId())) {
-            manifestPath = resolved->manifestPath;
-            selected = resolved->manifestBacked
-                ? manifestPath.string()
-                : vpkg->selectedLasagnaDataset();
-            selectedIdentity = resolved->sourceManifestLocation;
-            workingToBaseScale = resolved->workingToBaseScale;
-        }
-    } catch (const std::exception& ex) {
-        showError(tr("Cannot resolve Lasagna for the active volume: %1")
-                      .arg(QString::fromStdString(ex.what())),
-                  headless);
-        return false;
-    }
-
-    if (selected.empty() && !vpkg->selectedLasagnaDataset().empty()) {
+    if (!vpkg->selectedLasagnaDataset().empty()) {
         selected = vpkg->selectedLasagnaDataset();
         selectedIdentity = selected;
+        const auto entries = vpkg->lasagnaDatasetEntries();
+        const auto selectedEntry = std::find_if(
+            entries.begin(), entries.end(), [&](const auto& entry) {
+                return entry.location == selected;
+            });
+        if (selectedEntry != entries.end()) {
+            selectedIdentity =
+                vc3d::opendata::lasagnaSourceManifestLocation(*selectedEntry);
+        }
         if (!vc::project::isLocationRemote(selected)) {
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
+        }
+    } else {
+        try {
+            if (const auto resolved = vc3d::opendata::resolveLasagnaForVolume(
+                    *vpkg, _state->currentVolumeId())) {
+                manifestPath = resolved->manifestPath;
+                selected = resolved->manifestBacked
+                    ? manifestPath.string()
+                    : vpkg->selectedLasagnaDataset();
+                selectedIdentity = resolved->sourceManifestLocation;
+                workingToBaseScale = resolved->workingToBaseScale;
+            }
+        } catch (const std::exception& ex) {
+            showError(tr("Cannot resolve Lasagna for the active volume: %1")
+                          .arg(QString::fromStdString(ex.what())),
+                      headless);
+            return false;
         }
     }
     auto openSelectedDataset = [&](const std::string& location) {
@@ -6991,6 +7224,113 @@ bool LineAnnotationController::ensureDatasetForSession(LineAnnotationSession& se
     return true;
 }
 
+void LineAnnotationController::refreshLineAnnotationDatasetMenus() const
+{
+    for (const auto& pane : _panes) {
+        if (pane.dialog) {
+            refreshLineAnnotationDatasetMenu(pane.dialog);
+        }
+    }
+}
+
+void LineAnnotationController::refreshLineAnnotationDatasetMenu(
+    LineAnnotationDialog* dialog) const
+{
+    if (!dialog || !_state || !_state->vpkg()) {
+        return;
+    }
+    auto vpkg = _state->vpkg();
+    std::vector<std::pair<std::string, std::string>> lasagnaOptions;
+    for (const auto& entry : vpkg->lasagnaDatasetEntries()) {
+        lasagnaOptions.emplace_back(entry.location, datasetEntryMenuLabel(entry));
+    }
+    std::vector<std::pair<std::string, std::string>> fiberOptions;
+    for (const auto& entry : vpkg->fiberInferenceDatasetEntries()) {
+        fiberOptions.emplace_back(entry.location, datasetEntryMenuLabel(entry));
+    }
+    dialog->setLasagnaDatasetOptions(
+        std::move(lasagnaOptions),
+        vpkg->selectedLasagnaDataset());
+    dialog->setFiberInferenceDatasetOptions(
+        std::move(fiberOptions),
+        vpkg->selectedFiberInferenceDataset());
+}
+
+void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
+    const std::string& location)
+{
+    if (!_state || !_state->vpkg() || location.empty()) {
+        return;
+    }
+    for (const auto& pane : _panes) {
+        if (pane.session &&
+            pane.session->taskState == LineAnnotationSession::TaskState::Running) {
+            showError(tr("Line optimization is already running."),
+                      pane.session->suppressErrorDialogs);
+            refreshLineAnnotationDatasetMenus();
+            return;
+        }
+    }
+
+    auto vpkg = _state->vpkg();
+    if (vpkg->selectedLasagnaDataset() == location) {
+        return;
+    }
+    vpkg->setSelectedLasagnaDataset(location);
+    for (const auto& pane : _panes) {
+        if (!pane.session) {
+            continue;
+        }
+        auto& session = *pane.session;
+        session.dataset.reset();
+        session.normalSampler.reset();
+        session.traceNormalDataset.reset();
+        session.traceNormalSampler.reset();
+        session.selectedDatasetLocation.clear();
+        session.traceNormalDatasetLocation.clear();
+        if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
+            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        }
+    }
+    refreshLineAnnotationDatasetMenus();
+}
+
+void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
+    const std::string& location)
+{
+    if (!_state || !_state->vpkg() || location.empty()) {
+        return;
+    }
+    for (const auto& pane : _panes) {
+        if (pane.session &&
+            pane.session->taskState == LineAnnotationSession::TaskState::Running) {
+            showError(tr("Line optimization is already running."),
+                      pane.session->suppressErrorDialogs);
+            refreshLineAnnotationDatasetMenus();
+            return;
+        }
+    }
+
+    auto vpkg = _state->vpkg();
+    if (vpkg->selectedFiberInferenceDataset() == location) {
+        return;
+    }
+    vpkg->setSelectedFiberInferenceDataset(location);
+    for (const auto& pane : _panes) {
+        if (!pane.session) {
+            continue;
+        }
+        auto& session = *pane.session;
+        session.fiberInferenceDataset.reset();
+        session.fiberPredictionField.reset();
+        session.selectedFiberInferenceDatasetLocation.clear();
+        if (!session.optimizedLine.points.empty() && !session.controlPoints.empty()) {
+            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        }
+    }
+    refreshLineAnnotationDatasetMenus();
+}
+
 bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     LineAnnotationSession& session)
 {
@@ -7039,8 +7379,38 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
         selectedIdentity = selected;
         if (!vc::project::isLocationRemote(selected))
             manifestPath = vc::project::resolveLocalPath(selected, vpkg->path().parent_path());
-        vpkg->setSelectedFiberInferenceDataset(selected);
-        vpkg->addFiberInferenceDatasetEntry(selected);
+        try {
+            vc::lasagna::LasagnaDatasetOpenOptions options;
+            options.remoteCacheRoot = vpkg->remoteCacheRootOrEmpty();
+            const std::string resolved = vc::project::isLocationRemote(selected)
+                ? selected
+                : vc::project::resolveLocalPath(
+                      selected, vpkg->path().parent_path()).string();
+            const auto openedDataset = vc::lasagna::LasagnaDataset::openLocation(
+                resolved, options);
+            (void)vc::fiber_tracer::resolveFiberPredictionTraceScales(
+                openedDataset.manifest());
+            std::vector<VolumePkg::PreparedVolumeAttachment> volumes;
+            for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(
+                     openedDataset, selected)) {
+                volumes.push_back({
+                    std::move(prepared.location), std::move(prepared.tags),
+                    std::move(prepared.volume)});
+            }
+            const auto result = vpkg->attachPreparedLasagnaDataset(
+                selected, {}, true, volumes, options.remoteCacheRoot);
+            if (result == VolumePkg::AttachLasagnaResult::VolumeIdConflict) {
+                showError(
+                    tr("A Lasagna volume conflicts with an existing volume id."),
+                    headless);
+                return false;
+            }
+            manifestPath = openedDataset.manifest().manifestPath;
+            refreshLineAnnotationDatasetMenus();
+        } catch (const std::exception& error) {
+            showError(QString::fromUtf8(error.what()), headless);
+            return false;
+        }
     }
 
     if (!session.fiberPredictionField ||
@@ -7218,6 +7588,7 @@ bool LineAnnotationController::applyOptimizationTaskResult(LineAnnotationSession
     auto* pane = paneForSurface(session.surfaceName);
     session.taskState = LineAnnotationSession::TaskState::Succeeded;
     session.lineWasOptimized = true;
+    session.geometryChangedSinceReview = true;
     session.seedPoint = task.seedPoint;
     session.selectedManifestPath = task.manifestPath;
     session.optimizationReport = task.result.report;
@@ -10687,6 +11058,16 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                 std::remove(session.fiberTags.begin(), session.fiberTags.end(),
                             std::string{kNeedsReoptimizationTag}),
                 session.fiberTags.end());
+        }
+        if (session.geometryChangedSinceReview) {
+            // Freshly optimized geometry invalidates any prior human
+            // verification: traced spans re-enter review, a line re-fit
+            // without traces leaves the review workflow. Metadata-only
+            // saves (tags, links) skip this and keep the review state.
+            vc3d::line_annotation::applyTraceReviewTags(
+                session.fiberTags,
+                vc3d::line_annotation::hasAcceptedTraceSpan(session.controlPoints));
+            session.geometryChangedSinceReview = false;
         }
         ensureSessionFiberIdentity(session);
         const BranchMetadataSyncResult branchSync =

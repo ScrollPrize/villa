@@ -558,6 +558,20 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                 emit fiberOptimizationModeChanged(fiberOptimizationMode());
             });
 
+    _datasetMenuButton = new QToolButton(buttonRow);
+    _datasetMenuButton->setObjectName(QStringLiteral("lineAnnotationDatasetMenuButton"));
+    _datasetMenuButton->setText(tr("Datasets"));
+    _datasetMenuButton->setPopupMode(QToolButton::InstantPopup);
+    _datasetMenuButton->setToolTip(tr("Select the Lasagna and fiber inference datasets used for line annotation."));
+    _datasetMenuButton->installEventFilter(this);
+    auto* datasetMenu = new QMenu(_datasetMenuButton);
+    datasetMenu->setToolTipsVisible(true);
+    _lasagnaDatasetMenu = datasetMenu->addMenu(tr("Lasagna dataset"));
+    _fiberInferenceDatasetMenu = datasetMenu->addMenu(tr("Fiber dataset"));
+    _datasetMenuButton->setMenu(datasetMenu);
+    buttonLayout->addWidget(_datasetMenuButton);
+    rebuildDatasetMenus();
+
     auto* centerlineLengthLabel = new QLabel(tr("Length"), buttonRow);
     centerlineLengthLabel->installEventFilter(this);
     buttonLayout->addWidget(centerlineLengthLabel);
@@ -754,6 +768,71 @@ void LineAnnotationDialog::setFiberOptimizationMode(
         _fiberOptimizationCombo->setCurrentIndex(index);
     }
 }
+
+void LineAnnotationDialog::setLasagnaDatasetOptions(
+    std::vector<std::pair<std::string, std::string>> options,
+    const std::string& selectedLocation)
+{
+    _lasagnaDatasetOptions = std::move(options);
+    _selectedLasagnaDatasetLocation = selectedLocation;
+    rebuildDatasetMenus();
+}
+
+void LineAnnotationDialog::setFiberInferenceDatasetOptions(
+    std::vector<std::pair<std::string, std::string>> options,
+    const std::string& selectedLocation)
+{
+    _fiberInferenceDatasetOptions = std::move(options);
+    _selectedFiberInferenceDatasetLocation = selectedLocation;
+    rebuildDatasetMenus();
+}
+
+void LineAnnotationDialog::rebuildDatasetMenus()
+{
+    auto populateMenu =
+        [this](QMenu* menu,
+               const std::vector<std::pair<std::string, std::string>>& options,
+               const std::string& selected,
+               bool fiberMenu) {
+            if (!menu) {
+                return;
+            }
+            menu->clear();
+            if (options.empty()) {
+                auto* action = menu->addAction(fiberMenu
+                    ? tr("No fiber datasets attached")
+                    : tr("No Lasagna datasets attached"));
+                action->setEnabled(false);
+                return;
+            }
+            for (const auto& [location, label] : options) {
+                auto* action = menu->addAction(QString::fromStdString(label));
+                action->setCheckable(true);
+                action->setChecked(location == selected);
+                action->setToolTip(QString::fromStdString(location));
+                connect(action, &QAction::triggered, this, [this, location, fiberMenu]() {
+                    if (fiberMenu) {
+                        emit fiberInferenceDatasetSelectionChanged(location);
+                    } else {
+                        emit lasagnaDatasetSelectionChanged(location);
+                    }
+                });
+            }
+        };
+    populateMenu(_lasagnaDatasetMenu,
+                 _lasagnaDatasetOptions,
+                 _selectedLasagnaDatasetLocation,
+                 false);
+    populateMenu(_fiberInferenceDatasetMenu,
+                 _fiberInferenceDatasetOptions,
+                 _selectedFiberInferenceDatasetLocation,
+                 true);
+    if (_datasetMenuButton) {
+        _datasetMenuButton->setEnabled(
+            !_lasagnaDatasetOptions.empty() || !_fiberInferenceDatasetOptions.empty());
+    }
+}
+
 int LineAnnotationDialog::maxControlPointDistanceVx() const
 {
     return _maxControlPointDistanceSpin ? _maxControlPointDistanceSpin->value() : 0;
@@ -980,6 +1059,10 @@ void LineAnnotationDialog::setFiberTags(const std::vector<std::string>& knownTag
     const QString disabledToolTip =
         tr("Tags become editable once the fiber has been saved.");
     for (const auto& tag : knownTags) {
+        if (tag == vc3d::line_annotation::kTraceNeedsReviewTag) {
+            // Managed by the trace review workflow, not the generic pills.
+            continue;
+        }
         const QString tagText = QString::fromStdString(tag);
         const bool active = std::find(activeTags.begin(), activeTags.end(), tag) !=
                             activeTags.end();

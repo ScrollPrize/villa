@@ -152,6 +152,13 @@ vc_add_test(NAME test_fiber_widget
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_fiber_trace_review
+    SOURCES test_fiber_trace_review.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
+    LIBS doctest::doctest vc_core vc_lasagna vc_fiber_tracer
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 qt6_wrap_cpp(lasagna_service_manager_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaServiceManager.hpp)
 qt6_wrap_cpp(lasagna_batch_window_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.hpp)
 vc_add_test(NAME test_lasagna_service_manager_factory
@@ -465,6 +472,22 @@ vc_add_test(NAME test_lasagna_line_view_surfaces LIBS doctest::doctest vc_lasagn
 vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_atlas)
 
 vc_add_test(NAME test_atlas LIBS doctest::doctest vc_atlas)
+
+# The vc_tifxyz_selfcross census kernel (header-only under apps/src, shared
+# with the command-line tool so the tested code is the shipped code).
+vc_add_test(NAME test_tifxyz_selfcross LIBS doctest::doctest opencv_core)
+
+# End-to-end CLI contract for the same tool: exit codes, report
+# serialization, collection envelope. Needs the binary, so it only exists
+# in configurations that build the apps -- the test shards configure with
+# VC_BUILD_APPS=OFF and apps/ returns before the target is created, which
+# would make the TARGET_FILE expression a configure error.
+if(TARGET vc_tifxyz_selfcross)
+    vc_add_test(NAME test_tifxyz_selfcross_cli
+        LIBS doctest::doctest vc_core opencv_core opencv_imgcodecs
+        DEFS VC_SELFCROSS_BIN="$<TARGET_FILE:vc_tifxyz_selfcross>")
+    add_dependencies(test_tifxyz_selfcross_cli vc_tifxyz_selfcross)
+endif()
 
 vc_add_test(NAME test_fiber_intersections LIBS doctest::doctest vc_atlas)
 

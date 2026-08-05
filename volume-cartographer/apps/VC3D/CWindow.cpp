@@ -18,7 +18,6 @@
 #include "vc/atlas/Atlas.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
-#include "vc/lasagna/ProjectVolumes.hpp"
 
 #include <iostream>
 
@@ -2626,6 +2625,12 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             return _fiberController &&
                    _fiberController->handleVolumeClick(volLoc, normal, surf, button, modifiers);
         });
+    connect(_viewerManager.get(), &ViewerManager::surfaceActivationRequested,
+            this, [this](const std::string& surfaceId) {
+                if (_surfacePanel) {
+                    _surfacePanel->activateSurfaceById(surfaceId);
+                }
+            });
     connect(_viewerManager.get(), &ViewerManager::sharedCacheStatsChanged,
             this, &CWindow::onSharedCacheStatsChanged);
 
@@ -3155,6 +3160,17 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             viewer->resetSurfaceOffsets();
             viewer->fitSurfaceInView();
             viewer->renderVisible(true);
+        }
+    });
+
+    // Zoom-to-fit shortcut (Ctrl+0): fit the current segment in the flattened
+    // segmentation viewer, adjusting pan and zoom to its full extent.
+    fZoomToFitShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomToFit), this);
+    fZoomToFitShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fZoomToFitShortcut, &QShortcut::activated, [this]() {
+        VolumeViewerBase* viewer = _viewerManager ? _viewerManager->segmentationViewer() : nullptr;
+        if (viewer) {
+            viewer->resetViewForCurrentContent(true);
         }
     });
 
@@ -7632,9 +7648,23 @@ void CWindow::CreateWidgets(void)
                         span.linePointCount,
                         span.lengthVx,
                         spanAlignment,
+                        span.interpMarker,
+                        span.fiberManifest,
                     });
                 }
 
+                CFiberWidget::FiberEntry::TraceState traceState =
+                    CFiberWidget::FiberEntry::TraceState::Legacy;
+                switch (fiber.traceState) {
+                case vc3d::line_annotation::FiberTraceState::Predictions:
+                    traceState = CFiberWidget::FiberEntry::TraceState::Predictions;
+                    break;
+                case vc3d::line_annotation::FiberTraceState::Mixed:
+                    traceState = CFiberWidget::FiberEntry::TraceState::Mixed;
+                    break;
+                case vc3d::line_annotation::FiberTraceState::Legacy:
+                    break;
+                }
                 entries.push_back(CFiberWidget::FiberEntry{
                     fiber.id,
                     fiber.name,
@@ -7653,6 +7683,7 @@ void CWindow::CreateWidgets(void)
                     fiber.tags,
                     fiber.linkedFiberCount,
                     fiber.pendingLinkCount,
+                    traceState,
                 });
             }
             if (_fiberWidget) {
@@ -7788,6 +7819,15 @@ void CWindow::CreateWidgets(void)
                     &CFiberWidget::fiberTagChanged,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::setFiberTag);
+            connect(widget,
+                    &CFiberWidget::fiberTraceReviewChanged,
+                    _lineAnnotationController.get(),
+                    [this](const std::vector<uint64_t>& fiberIds, bool verified) {
+                        if (_lineAnnotationController) {
+                            _lineAnnotationController->setFibersTraceReviewed(
+                                fiberIds, verified);
+                        }
+                    });
             connect(widget,
                     &CFiberWidget::hvScoreRecalculationRequested,
                     _lineAnnotationController.get(),
@@ -8580,10 +8620,6 @@ bool CWindow::OpenVolume(const QString& path,
             QMessageBox::warning(this, tr("Error"), message);
         }
         return false;
-    }
-
-    for (const auto& diagnostic : vc::lasagna::reconcileLasagnaProjectVolumes(*package)) {
-        Logger()->warn("Could not reconcile project Lasagna data: {}", diagnostic);
     }
 
     // Check version number

@@ -75,6 +75,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Region-of-interest inference for `vesuvius.predict`](https://github.com/ScrollPrize/villa/pull/1241): `--bbox "z0:z1,y0:y1,x0:x1"` restricts inference to one region of a volume, in global voxel coordinates, so `blend_logits` and `finalize_outputs` stay aligned. Only the chunks intersecting the region are streamed — on PHerc. Paris 4 a 200³ region reads 27 chunks (56.6 MB) instead of 10,368 (21.7 GB). By TAUIL Abd Elillah
 
+- [vesuvius-catalog](https://github.com/Schurkai/vesuvius-catalog): scriptable catalog CLI/library for the open-data bucket - answers which samples have segments, ink outputs or surface predictions at which resolutions, resolves S3/HTTPS data URLs (JSON/CSV output for scripting), and includes working openers for the bucket's OME-Zarr v2 stores under zarr-python 3.
+
 ## Segmentation
 
 ### 🌟 Highlighted
@@ -182,10 +184,13 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Herculaneum Scroll Tools](https://github.com/axiosdevs/herculaneum-scroll-tools) by axiosdevs — CT-consistency QA for the published m7 surface predictions: voxel-exact phantom fractions measured for all 36 samples incl. all 13 grand-prize scrolls (43.3% of positives sit outside the masked CT), with a one-pass `clean` mode ([villa#1114](https://github.com/ScrollPrize/villa/issues/1114)); plus cross-scan registration (2023→2025 rescan, MAD 29 µm), a winding-constraint annotator/verifier in native spiral-input format, and dual-energy high-Z ink-candidate rendering.
 
+- [winding-sync](https://github.com/abundantjoe/winding-sync) by Joseph Balmaceda. Generates relative winding constraints directly from CT via structure-tensor lamina orientation, then reconciles contradictions globally as L1 integer synchronization (totally unimodular LP, exact integer solutions). Complements winding-number diffusion over existing surfaces by working from the raw volume before a surface exists. Tolerates 15% gross measurement error before dropping below 95% accuracy, versus 2% for spanning-tree propagation. Absolute winding counts are not yet calibrated; see README.
+
 - [spiral-fit-consumer-gpu](https://github.com/7jycwjmbfn-eng/spiral-fit-consumer-gpu) by Shuhan Yang runs the spiral fitter in this repo on a 12 GB consumer GPU without the native VC extension. Drop-in replacements for the sparse CUDA cache, which otherwise raises before the first step, and for point-to-patch linking, where a measured 41-hour ETA drops to minutes. Both are checked for bitwise-identical output against the originals. Includes a scaling ladder and pool-tuning measurements from one gaming laptop.
 
-
 - [TIFXYZ Doctor](https://github.com/aviad12g/tifxyz-doctor) by Aviad Cohen — deterministic QA and triage for TIFXYZ surface grids, with sparse overlays and reproducible corpus/reader checks. v0.2 adds an overlap-component-isolated benchmark on 709 official human-reviewed PHercParis4 `same_wrap` patches; its frozen cue localizes abrupt synthetic normal-offset steps while byte-identical null controls and the reported gradual-transition miss rate bound the claim.
+
+- [spiralcheck](https://github.com/Nicodol/spiralcheck) by Nicolas Dolegieviez. Held-out evaluation for whole-scroll spiral fits: scores a finished run from its output meshes alone (CPU-only, no checkpoint, producer-agnostic) against verified patches withheld from that fit, and measures geometrically how much of the withheld evidence actually sits within touching distance of the fit's real inputs — on PHerc. Paris 4, 54.8% of a naive name-level split leaked that way, which no hash-level check can see. Also ships ground-truth-free winding-order checks around the umbilicus, a planted-defect matrix with computed null-control bounds, and `spiralcheck demo`, which runs the whole pipeline on a synthetic scroll with planted defects and needs no data.
 
 ### 📦 Materials
 
@@ -229,6 +234,12 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 - [Probabilistic view on the offset for surface volume creation](https://discord.com/channels/1079907749569237093/1177617480366170162) by Giorgio Angelotti
 
 - [Creating segments from intersecting horizontal and vertical fibers](https://gist.github.com/jrudolph/3e0ebbd6e731f794733c236a86ff39fb) by Johannes Rudolph
+
+- [Phantom contamination audit of the published surface predictions](https://github.com/Schurkai/vesuvius-phantom-audit): chunk-listing-based measurement across all 36 samples with published m7 surface predictions (villa#1114) - every sample is affected, 16.9% of stored prediction chunks are certain phantoms; includes a voxel-exact-verified cleanup tool.
+
+- [Surface geometry failure diagnostic](https://github.com/Jinhojeong/vesuvius-surface-geometry-diagnostic) by Jinho Jeong. Geometry-stratified analysis of where surface models fail in compressed regions (villa #191): compressed sheets are fused rather than missed across three architectures, the CT carries no intensity dip between contacting sheets, and neither the model's probability field nor local CT geometry supplies a boundary either. Includes oracle measurements showing the official topometrics blend does not respond to repairing these merges, a patch-mode eval entry point and a 200-patch ground-truth pool so any surface model or splitter can be scored the same way.
+
+- [unmerge-cli](https://github.com/Jinhojeong/vesuvius-unmerge) by Jinho Jeong. Splits fused sheet instances by carrying identity through a contact from the resolved surroundings, using an anisotropic random-walk solve seeded from neighbouring instance labels. On raw predictions it refuses to split and flags the weld instead, since no boundary signal exists there. Applied to the published PHerc1218 instance labels it produced [pherc1218-topological-repair](https://www.kaggle.com/datasets/jhjeong0815/pherc1218-topological-repair), 54,377 repaired fusion sites in three tiers, listed as a companion dataset by [vesuvius-sheet-tools](https://github.com/IyanDopico/vesuvius-sheet-tools). That project independently cross-checked the flagged sites with its own intensity splitter and a matched spatial control, finding them 2.89x enriched for fused stacks over background.
 
 ### 📊 Visualization
 
