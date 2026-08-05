@@ -911,7 +911,8 @@ class Inferer():
         prediction reproducible only under a setting no artifact mentioned.
         """
         return self._json_scalar_dict({
-            'input': str(self.input_dir),
+            # the constructor takes input_dir= but stores it as self.input
+            'input': str(self.input),
             'bbox': None if self.bbox is None else list(self.bbox),
             'patch_size': list(self.patch_size) if self.patch_size is not None else None,
             'overlap': self.overlap,
@@ -919,7 +920,8 @@ class Inferer():
             'num_parts': self.num_parts,
             'part_id': self.part_id,
             'model_path': str(self.model_path),
-            'tta': None if self.disable_tta else self.tta_type,
+            # the CLI flag is --disable_tta; the instance stores the positive form
+            'tta': self.tta_type if self.do_tta else None,
             'normalization': self.normalization_scheme,
             'num_total_patches': self.num_total_patches,
         })

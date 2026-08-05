@@ -49,9 +49,9 @@ def _inferer(tmp_path, **overrides) -> Inferer:
     inf.compressor_name = "none"
     inf.compression_level = 1
     inf.bbox = None
-    inf.input_dir = "https://example.invalid/scroll.zarr/0"
+    # the constructor parameter is input_dir=, but it is stored as self.input
+    inf.input = "https://example.invalid/scroll.zarr/0"
     inf.model_path = "/models/m7"
-    inf.disable_tta = True
     inf.tta_type = "mirroring"
     inf.do_tta = False
     inf.normalization_scheme = "instance_zscore"
@@ -64,6 +64,26 @@ def _inferer(tmp_path, **overrides) -> Inferer:
     for k, v in overrides.items():
         setattr(inf, k, v)
     return inf
+
+
+def test_signature_only_reads_attributes_the_constructor_sets():
+    """Every self.X in _run_signature must actually exist on a real Inferer.
+
+    This exists because it did not. The signature read self.input_dir, which is the
+    constructor's parameter name; the value is stored as self.input. Nothing caught it --
+    the fixture above assigns attributes by hand, so it happily created the missing one,
+    and the failure only appeared in a live run, inside a writer thread, reported as
+    "Error writing patch 8". Fixtures test the fixture's shape, not production's.
+    """
+    import inspect
+    import re
+
+    sig_src = inspect.getsource(Inferer._run_signature)
+    init_src = inspect.getsource(Inferer.__init__)
+    assigned = set(re.findall(r"self\.(\w+)\s*=", init_src))
+    read = set(re.findall(r"self\.(\w+)", sig_src)) - {"_json_scalar_dict", "_json_scalar"}
+    missing = sorted(read - assigned)
+    assert not missing, f"_run_signature reads attributes __init__ never sets: {missing}"
 
 
 def test_manifest_round_trips(tmp_path):
@@ -119,10 +139,10 @@ def test_unreadable_manifest_does_not_raise(tmp_path):
         ("patch_size", (8, 8, 8)),
         ("overlap", 0.25),
         ("model_path", "/models/other"),
-        ("disable_tta", False),
+        ("do_tta", True),
         ("num_total_patches", 9),
         ("num_parts", 2),
-        ("input_dir", "https://example.invalid/other.zarr/0"),
+        ("input", "https://example.invalid/other.zarr/0"),
     ],
 )
 def test_resume_refuses_a_different_run(tmp_path, field, value):
