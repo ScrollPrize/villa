@@ -7174,14 +7174,24 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
         merged.branches.push_back(std::move(moved));
     }
 
-    // Persist the merged fiber before touching any in-memory state.
-    try {
-        saveFiberNow(merged);
-    } catch (const std::exception& ex) {
-        showError(tr("Could not save the merged fiber: %1")
-                      .arg(QString::fromStdString(ex.what())),
-                  suppressErrors);
+    // Persist the merged fiber (temp write + atomic rename) before touching
+    // any in-memory state.
+    std::error_code collisionError;
+    if (std::filesystem::exists(fiberPath(merged), collisionError)) {
+        showError(tr("A fiber file with the new name already exists."), suppressErrors);
         return;
+    }
+    {
+        const auto saveResult = vc3d::line_annotation::runFiberSaveJob(
+            ++_nextFiberSaveSequence,
+            {vc3d::line_annotation::FiberSavePayload{
+                merged.id, merged.generation, fiberPath(merged), fiberToJson(merged)}});
+        if (!saveResult.ok) {
+            showError(tr("Could not save the merged fiber: %1")
+                          .arg(QString::fromStdString(saveResult.error)),
+                      suppressErrors);
+            return;
+        }
     }
 
     const uint64_t mergedId = merged.id;
@@ -7263,18 +7273,14 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
                                  joinControlIndex, suppressErrors]() {
         closeFiberWindowForSurface(paneSurfaceName);
         // The close finalization may schedule an async save of an original;
-        // flush it before removing the files so they cannot be resurrected.
+        // flush it before retiring the files so they cannot be resurrected.
         waitForFiberSaves();
-        std::error_code removeError;
-        if (!std::filesystem::remove(clickedPath, removeError) || removeError) {
-            showError(tr("Could not delete the original fiber file %1.")
-                          .arg(QString::fromStdString(clickedPath.string())),
-                      suppressErrors);
-        }
-        removeError.clear();
-        if (!std::filesystem::remove(farPath, removeError) || removeError) {
-            showError(tr("Could not delete the original fiber file %1.")
-                          .arg(QString::fromStdString(farPath.string())),
+        // All-or-nothing: a failure restores both originals in place.
+        const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
+            ++_nextFiberSaveSequence, {}, {clickedPath, farPath});
+        if (!retireResult.ok) {
+            showError(tr("Could not retire the original fiber files: %1")
+                          .arg(QString::fromStdString(retireResult.error)),
                       suppressErrors);
         }
         _fibers.erase(std::remove_if(_fibers.begin(),
@@ -7524,22 +7530,28 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
         suffix.branches.push_back(std::move(suffixRef));
     }
 
-    // Persist both halves before touching any in-memory state; a failure
-    // here aborts the split with nothing to roll back.
-    try {
-        saveFiberNow(prefix);
-        try {
-            saveFiberNow(suffix);
-        } catch (...) {
-            std::error_code removeError;
-            std::filesystem::remove(fiberPath(prefix), removeError);
-            throw;
-        }
-    } catch (const std::exception& ex) {
-        showError(tr("Could not save the split fibers: %1")
-                      .arg(QString::fromStdString(ex.what())),
-                  suppressErrors);
+    // Persist both halves in one transaction (temp writes + atomic renames
+    // with rollback) before touching any in-memory state; a failure aborts
+    // the split with nothing to undo.
+    std::error_code collisionError;
+    if (std::filesystem::exists(fiberPath(prefix), collisionError) ||
+        std::filesystem::exists(fiberPath(suffix), collisionError)) {
+        showError(tr("A fiber file with the new name already exists."), suppressErrors);
         return;
+    }
+    {
+        const auto saveResult = vc3d::line_annotation::runFiberSaveJob(
+            ++_nextFiberSaveSequence,
+            {vc3d::line_annotation::FiberSavePayload{
+                 prefix.id, prefix.generation, fiberPath(prefix), fiberToJson(prefix)},
+             vc3d::line_annotation::FiberSavePayload{
+                 suffix.id, suffix.generation, fiberPath(suffix), fiberToJson(suffix)}});
+        if (!saveResult.ok) {
+            showError(tr("Could not save the split fibers: %1")
+                          .arg(QString::fromStdString(saveResult.error)),
+                      suppressErrors);
+            return;
+        }
     }
 
     const auto upsertFiber = [this](StoredFiber fiber) {
@@ -7637,12 +7649,14 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
                                  reopenControlIndex, suppressErrors]() {
         closeFiberWindowForSurface(paneSurfaceName);
         // The close finalization may schedule an async save of the original;
-        // flush it before removing the file so it cannot be resurrected.
+        // flush it before retiring the file so it cannot be resurrected.
         waitForFiberSaves();
-        std::error_code removeError;
-        if (!std::filesystem::remove(parentPath, removeError) || removeError) {
-            showError(tr("Could not delete the original fiber file %1.")
-                          .arg(QString::fromStdString(parentPath.string())),
+        const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
+            ++_nextFiberSaveSequence, {}, {parentPath});
+        if (!retireResult.ok) {
+            showError(tr("Could not retire the original fiber file %1: %2")
+                          .arg(QString::fromStdString(parentPath.string()))
+                          .arg(QString::fromStdString(retireResult.error)),
                       suppressErrors);
         }
         _fibers.erase(std::remove_if(_fibers.begin(),

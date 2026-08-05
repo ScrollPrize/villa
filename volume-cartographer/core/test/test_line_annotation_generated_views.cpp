@@ -702,6 +702,80 @@ TEST_CASE("line annotation failed multi fiber save keeps recovery backups")
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("line annotation save retires originals only after renames succeed")
+{
+    const auto dir = makeTempSaveDir("retire_success");
+    const auto original = dir / "fiber_old.json";
+    const auto target = dir / "fiber_new.json";
+    writeText(original, "{\"old\":true}\n");
+
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        13,
+        {{1, 1, target, nlohmann::json{{"new", true}}}},
+        {original});
+
+    CHECK(result.ok);
+    CHECK(readText(target).find("\"new\": true") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(original));
+    // The backup is removed after success; only the empty dot-directory
+    // may remain, which every fiber scanner ignores.
+    const auto retiredDir = dir / ".retired";
+    if (std::filesystem::exists(retiredDir)) {
+        CHECK(std::filesystem::is_empty(retiredDir));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation retire-only job is all-or-nothing")
+{
+    const auto dir = makeTempSaveDir("retire_only");
+    const auto first = dir / "fiber_a.json";
+    const auto second = dir / "fiber_b.json";
+    const auto missing = dir / "fiber_gone.json";
+    writeText(first, "{\"a\":true}\n");
+    writeText(second, "{\"b\":true}\n");
+
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        14, {}, {first, second, missing});
+
+    CHECK(result.ok);
+    CHECK_FALSE(std::filesystem::exists(first));
+    CHECK_FALSE(std::filesystem::exists(second));
+    const auto retiredDir = dir / ".retired";
+    if (std::filesystem::exists(retiredDir)) {
+        CHECK(std::filesystem::is_empty(retiredDir));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation failed save restores retired originals")
+{
+    const auto dir = makeTempSaveDir("retire_failure");
+    const auto original = dir / "fiber_old.json";
+    const auto firstTarget = dir / "fiber_a.json";
+    const auto secondTarget = dir / "fiber_b.json";
+    writeText(original, "{\"old\":true}\n");
+
+    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        15,
+        {{1, 1, firstTarget, nlohmann::json{{"new", "a"}}},
+         {2, 1, secondTarget, nlohmann::json{{"new", "b"}}}},
+        {original});
+    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
+
+    CHECK_FALSE(result.ok);
+    // The retired original is renamed straight back into place.
+    CHECK(std::filesystem::exists(original));
+    CHECK(readText(original).find("\"old\": true") != std::string::npos ||
+          readText(original).find("\"old\":true") != std::string::npos);
+    const auto retiredDir = dir / ".retired";
+    if (std::filesystem::exists(retiredDir)) {
+        CHECK(std::filesystem::is_empty(retiredDir));
+    }
+    std::filesystem::remove_all(dir);
+}
+
 TEST_CASE("line annotation intersection display h side uses manual tags before scores")
 {
     using vc3d::line_annotation::FiberHvClassification;
