@@ -754,6 +754,11 @@ private:
     // suppressed.
     void closeIntersectionInspectionForRetiredFibers(
         const std::vector<uint64_t>& fiberIds);
+    // Closes every dialog pane whose session holds one of the fibers. The
+    // single-dialog invariant means at most the invoking pane matches
+    // today; sweeping by fiber id keeps split/merge retirement correct by
+    // construction rather than by that invariant.
+    void closeDialogPanesForFibers(const std::vector<uint64_t>& fiberIds);
     // Returns false on failure; with a non-null `errorMessage` the failure is
     // reported there (dialog-free), otherwise via showError (interactive).
     bool rebuildIntersectionInspection(QString* errorMessage = nullptr);

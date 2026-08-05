@@ -4003,6 +4003,23 @@ void LineAnnotationController::closeIntersectionInspectionForRetiredFibers(
     _intersectionInspection.reset();
 }
 
+void LineAnnotationController::closeDialogPanesForFibers(
+    const std::vector<uint64_t>& fiberIds)
+{
+    // Collect first: closing mutates pane state through queued events.
+    std::vector<std::string> surfaceNames;
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.dialog &&
+            std::find(fiberIds.begin(), fiberIds.end(), pane.session->fiberId) !=
+                fiberIds.end()) {
+            surfaceNames.push_back(pane.surfaceName);
+        }
+    }
+    for (const auto& surfaceName : surfaceNames) {
+        closeFiberWindowForSurface(surfaceName);
+    }
+}
+
 bool LineAnnotationController::updateIntersectionFollowSlice(bool sourceSideFlag,
                                                              double linePosition,
                                                              const char* reason)
@@ -7001,7 +7018,6 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     const uint64_t clickedId = clicked.id;
     const std::string clickedFileName = clicked.fileName;
     const std::filesystem::path clickedPath = fiberPath(clicked);
-    const std::string paneSurfaceName = pane->surfaceName;
 
     const LinkCandidate candidate = *_linkCandidate;
     // The candidate fiber can be open in a dialog-less editing session with
@@ -7289,9 +7305,9 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     // its frames are still below us. Retire the originals and re-fit the
     // merged line on a clean stack.
     QTimer::singleShot(0, this, [this, clickedId, farId, clickedPath, farPath,
-                                 paneSurfaceName, mergedId, mergedFileName,
+                                 mergedId, mergedFileName,
                                  joinControlIndex, suppressErrors]() {
-        closeFiberWindowForSurface(paneSurfaceName);
+        closeDialogPanesForFibers({clickedId, farId});
         // The close finalization may schedule an async save of an original;
         // flush it before retiring the files so they cannot be resurrected.
         // A failure among the flushed saves (the redirected peer links ride
@@ -7328,6 +7344,15 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
             emit fibersDeleted(
                 {std::min(clickedId, farId), std::max(clickedId, farId)});
             closeIntersectionInspectionForRetiredFibers({clickedId, farId});
+        } else {
+            // The originals live on; surviving sessions must be saveable
+            // again or later edits would be silently dropped.
+            for (const auto& otherPane : _panes) {
+                if (otherPane.session && (otherPane.session->fiberId == clickedId ||
+                                          otherPane.session->fiberId == farId)) {
+                    otherPane.session->suppressFiberSave = false;
+                }
+            }
         }
 
         // Re-fit the merged line (join span + extrapolation tails); consumes
@@ -7428,7 +7453,6 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
     const uint64_t parentId = parent.id;
     const std::string parentFileName = parent.fileName;
     const std::filesystem::path parentPath = fiberPath(parent);
-    const std::string paneSurfaceName = pane->surfaceName;
 
     const LinkCandidate candidate = *_splitCandidate;
     const auto candidateIndex = matchingStoredControlPointIndex(
@@ -7678,11 +7702,11 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
     // loops that would process the closed dialog's deferred deletion while
     // its frames are still below us. Retire the original and re-fit the
     // halves on a clean stack.
-    QTimer::singleShot(0, this, [this, parentId, parentPath, paneSurfaceName,
+    QTimer::singleShot(0, this, [this, parentId, parentPath,
                                  prefixFiberId, suffixFiberId, prefixFileName,
                                  suffixFileName, reopenFiberId,
                                  reopenControlIndex, suppressErrors]() {
-        closeFiberWindowForSurface(paneSurfaceName);
+        closeDialogPanesForFibers({parentId});
         // The close finalization may schedule an async save of the original;
         // flush it before retiring the file so it cannot be resurrected. A
         // failure among the flushed saves (the redirected peer links ride
@@ -7716,6 +7740,14 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
             invalidateFiberAlignmentMetrics(parentId, false);
             emit fibersDeleted({parentId});
             closeIntersectionInspectionForRetiredFibers({parentId});
+        } else {
+            // The original lives on; surviving sessions must be saveable
+            // again or later edits would be silently dropped.
+            for (const auto& otherPane : _panes) {
+                if (otherPane.session && otherPane.session->fiberId == parentId) {
+                    otherPane.session->suppressFiberSave = false;
+                }
+            }
         }
 
         // Re-fit both halves so their lines regrow extrapolation tails past
