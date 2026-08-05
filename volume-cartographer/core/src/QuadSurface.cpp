@@ -815,8 +815,7 @@ cv::Vec3f QuadSurface::coord(const cv::Vec3f &ptr, const cv::Vec3f &offset) cons
     const_cast<QuadSurface*>(this)->ensureLoaded();
     cv::Vec3f p = internal_loc(offset+_center, ptr, _scale);
 
-    cv::Rect bounds = {0,0,_points->cols-2,_points->rows-2};
-    if (!bounds.contains(cv::Point(p[0],p[1])))
+    if (!loc_valid_xy(*_points, {p[0], p[1]}))
         return {-1,-1,-1};
 
     return at_int((*_points), {p[0],p[1]});
@@ -1978,6 +1977,12 @@ void QuadSurface::save(const std::filesystem::path &path_, const std::string &uu
 
     // Prepare and write metadata
     {
+        // The cached _bbox can be stale here: it is seeded from meta.json at
+        // load time, and the point grid can be mutated directly afterwards
+        // (rawPointsPtr(), validPoints(), ...) without any invalidation hook.
+        // Drop the cache so bbox() recomputes from the points actually being
+        // saved (#1272).
+        _bbox = {{-1, -1, -1}, {-1, -1, -1}};
         auto lo = utils::Json::array();
         lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
         auto hi = utils::Json::array();
@@ -2106,6 +2111,13 @@ void QuadSurface::save_meta()
     }
 
     {
+        // NB: deliberately no bbox recompute here, unlike save(). save_meta()
+        // rewrites meta.json only and leaves the x/y/z TIFFs untouched, so
+        // recomputing from the in-memory grid would describe geometry that
+        // was never persisted. For a surface with unsaved inward edits that
+        // would write an under-covering bbox, i.e. exactly the #1272 failure
+        // this change set exists to prevent. The bbox is refreshed where the
+        // geometry itself is written.
         auto lo = utils::Json::array();
         lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
         auto hi = utils::Json::array();

@@ -790,6 +790,28 @@ class UploadTests(unittest.TestCase):
         with self.assertRaisesRegex(ApiError, "vc_pointcollections"):
             self.state.finalize_upload(upload_id)
 
+    def test_finalize_rejects_incomplete_v3_fibers_without_repair(self):
+        self._session()
+        incomplete = {
+            "type": "vc3d_fiber",
+            "version": 3,
+            "line_points": [[0, 0, 0], [1, 0, 0]],
+            "control_points": [{"position": [0, 0, 0]}, {"position": [1, 0, 0]}],
+        }
+        for suffix, mutation, message in (
+            ("mode", {}, "missing optimization_mode"),
+            ("segment", {"optimization_mode": "lasagna"}, "missing segment_to_next"),
+        ):
+            payload = {**incomplete, **mutation}
+            upload_id = _upload_input(
+                self.state,
+                "fiber",
+                f"bad-v3-{suffix}",
+                {"fiber.json": json.dumps(payload).encode()},
+            )
+            with self.assertRaisesRegex(ApiError, message):
+                self.state.finalize_upload(upload_id)
+
     def test_pcl_uploads_require_a_role(self):
         self._session()
         with self.assertRaisesRegex(ApiError, "role"):

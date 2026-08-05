@@ -767,6 +767,36 @@ void ViewerManager::handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surf
         return;
     }
 
+    if ((modifiers & Qt::ControlModifier) && (modifiers & Qt::ShiftModifier) &&
+        button == Qt::LeftButton) {
+        // Ctrl+Shift+click: like Ctrl+click, but if a patch lies under the
+        // clicked point, activate it first so the flattened view navigates on
+        // the right segment. Slice views only — there `surf` is the plane; the
+        // flattened segmentation view reports the quad surface itself.
+        if (!dynamic_cast<PlaneSurface*>(surf)) {
+            return;
+        }
+        if (auto* patchIndex = surfacePatchIndexIfReady()) {
+            static constexpr float kPatchPickToleranceVoxels = 10.0f;
+            SurfacePatchIndex::PointQuery query;
+            query.worldPoint = volLoc;
+            query.tolerance = kPatchPickToleranceVoxels;
+            if (const auto hit = patchIndex->locate(query)) {
+                const auto current = std::dynamic_pointer_cast<QuadSurface>(
+                    _state ? _state->surface("segmentation") : nullptr);
+                if (hit->surface && hit->surface != current &&
+                    !hit->surface->id.empty()) {
+                    emit surfaceActivationRequested(hit->surface->id);
+                }
+            }
+        }
+        std::string surfId;
+        if (_state && surf) {
+            surfId = _state->findSurfaceId(surf);
+        }
+        centerFocusAt(volLoc, normal, surfId);
+        return;
+    }
     if (modifiers & Qt::ShiftModifier) {
         // Reserved for point tools.
         return;

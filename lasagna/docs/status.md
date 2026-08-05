@@ -11,7 +11,7 @@ produced by a 2D UNet run along each axis (z, y, x slices).
 preprocess_cos_omezarr.py  (preprocessing pipeline)
   ├─ infer mode    (2D UNet per-slice inference → per-axis zarr)
   ├─ integrate mode (3-axis fusion → single OME-Zarr)
-  └─ convert_fit_zarr_to_vc3d_omezarr.py  (flat zarr → per-channel OME-Zarr pyramid)
+  └─ convert_fit_zarr_to_vc3d_omezarr.py  (older preprocessing/fit CZYX intermediate → per-channel 3D OME-Zarr pyramid)
 
 fit.py  (fitting entrypoint)
   ├─ cli_data / cli_model / cli_opt / cli_json   (argument parsing + JSON config merge)
@@ -32,7 +32,7 @@ fit.py  (fitting entrypoint)
 |-----------|------|--------------|
 | UNet inference | `preprocess_cos_omezarr.py` (default mode) | Per-slice 2D UNet inference along a chosen axis (z/y/x); tiled with overlap; outputs 5-channel uint8 zarr (cos, grad_mag, dir0, dir1, valid) |
 | 3-axis fusion | `preprocess_cos_omezarr.py integrate` | Reads z/y/x per-axis volumes; normal-weighted fusion of cos + grad_mag; passes through per-axis dir0/dir1; optional distance transform from pred mask |
-| OME-Zarr conversion | `convert_fit_zarr_to_vc3d_omezarr.py` | Converts flat (C,Z,Y,X) zarr to per-channel OME-Zarr with multi-level pyramid |
+| OME-Zarr conversion | `convert_fit_zarr_to_vc3d_omezarr.py` | Converts the older preprocessing/fit flat (C,Z,Y,X) intermediate to separate per-channel 3D OME-Zarr volumes with multi-level pyramids. CZYX is not the VC3D project-volume format. |
 
 Integrated output channel layout (uint8):
 
@@ -87,9 +87,10 @@ Items described in the spec (`lasagna/lasagna_3d.md`) or the 2D model (`lasagna/
 - **Two execution paths**: tile-parallel (numba JIT, releases GIL for thread parallelism)
   and slab-based (pipelined read/compute/write). Both use chunk-aligned iteration to
   prevent concurrent write races on shared zarr chunks.
-- **OME-Zarr conversion**: `convert_fit_zarr_to_vc3d_omezarr.py` converts the flat
-  integrated zarr into per-channel OME-Zarr with multi-level pyramids for the fitting
-  pipeline.
+- **OME-Zarr conversion**: `convert_fit_zarr_to_vc3d_omezarr.py` converts the older
+  flat CZYX preprocessing/fit intermediate into separate per-channel 3D OME-Zarr volumes
+  with multi-level pyramids. Manifests attached to VC3D reference these 3D volumes,
+  not the CZYX intermediate.
 - **3D predict resume**: `predict3d` uses rolling per-channel z-band
   accumulators, atomic output chunk writes, output-directory temp cleanup, and
   channel-based completeness (`cos`; or `grad_mag`+`nx`+`ny`). Optional
@@ -116,7 +117,7 @@ self-contained mesh pyramid — no dangling arc parameters.
 |------|---------|
 | `lasagna/lasagna_3d.md` | Full 3D model specification |
 | `lasagna/preprocess_cos_omezarr.py` | UNet inference + 3-axis fusion preprocessing |
-| `lasagna/convert_fit_zarr_to_vc3d_omezarr.py` | Flat zarr → per-channel OME-Zarr pyramid |
+| `lasagna/convert_fit_zarr_to_vc3d_omezarr.py` | Older preprocessing/fit CZYX intermediate → per-channel 3D OME-Zarr pyramid |
 | `lasagna/model.py` | `Model3D`, pyramid ops, arc bake |
 | `lasagna/fit.py` | Main fitting entrypoint |
 | `lasagna/fit_data.py` | `FitData3D`, zarr loading, sampling |

@@ -1,7 +1,106 @@
 import queue
 import threading
+import json
+from pathlib import Path
+
+import pytest
 
 from lasagna.scripts import download_omezarr as dl
+
+
+@pytest.mark.parametrize("payload", ("", "{", "{}", "null", "[1]", '["ok", 2]'))
+def test_load_noremote_ignores_malformed_or_schema_invalid_cache(tmp_path, capsys, payload):
+    cache = tmp_path / ".dl_cache" / "2.noremote.json"
+    cache.parent.mkdir()
+    cache.write_text(payload, encoding="utf-8")
+
+    assert dl._load_noremote(str(tmp_path), [2]) == {2: set()}
+    warning = capsys.readouterr().err
+    assert "ignoring invalid noremote cache for level 2" in warning
+    assert str(cache) in warning
+
+
+def test_load_noremote_ignores_unreadable_cache(tmp_path, monkeypatch, capsys):
+    cache = tmp_path / ".dl_cache" / "1.noremote.json"
+    cache.parent.mkdir()
+    cache.write_text('[]\n', encoding="utf-8")
+    real_open = open
+
+    def fail_cache_open(path, *args, **kwargs):
+        if Path(path) == cache:
+            raise OSError("injected read failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fail_cache_open)
+    assert dl._load_noremote(str(tmp_path), [1]) == {1: set()}
+    assert "injected read failure" in capsys.readouterr().err
+
+
+def test_noremote_cache_valid_load_and_atomic_empty_save(tmp_path):
+    cache = tmp_path / ".dl_cache" / "0.noremote.json"
+    cache.parent.mkdir()
+    cache.write_text('["0.0.1", "0.0.2"]\n', encoding="utf-8")
+    assert dl._load_noremote(str(tmp_path), [0]) == {0: {"0.0.1", "0.0.2"}}
+
+    dl._save_noremote(str(tmp_path), {0: set()})
+    assert json.loads(cache.read_text(encoding="utf-8")) == []
+    assert list(cache.parent.glob("0.noremote.json.tmp.*")) == []
+
+
+def test_noremote_atomic_replace_failure_keeps_old_cache(tmp_path, monkeypatch, capsys):
+    cache = tmp_path / ".dl_cache" / "0.noremote.json"
+    cache.parent.mkdir()
+    cache.write_text('["old"]\n', encoding="utf-8")
+
+    def fail_replace(_source, _target):
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(dl.os, "replace", fail_replace)
+    dl._save_noremote(str(tmp_path), {0: {"new"}})
+    assert json.loads(cache.read_text(encoding="utf-8")) == ["old"]
+    assert list(cache.parent.glob("0.noremote.json.tmp.*")) == []
+    assert "could not save advisory noremote cache" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure_stage", ("open", "dump"))
+def test_noremote_atomic_write_failure_keeps_old_cache(
+    tmp_path, monkeypatch, capsys, failure_stage,
+):
+    cache = tmp_path / ".dl_cache" / "0.noremote.json"
+    cache.parent.mkdir()
+    cache.write_text('["old"]\n', encoding="utf-8")
+    if failure_stage == "open":
+        real_open = open
+
+        def fail_temp_open(path, *args, **kwargs):
+            if ".tmp." in str(path):
+                raise OSError("injected temp open failure")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fail_temp_open)
+    else:
+        monkeypatch.setattr(
+            dl.json, "dump",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("injected dump failure")),
+        )
+
+    dl._save_noremote(str(tmp_path), {0: {"new"}})
+    assert json.loads(cache.read_text(encoding="utf-8")) == ["old"]
+    assert list(cache.parent.glob("0.noremote.json.tmp.*")) == []
+    assert "could not save advisory noremote cache" in capsys.readouterr().err
+
+
+def test_download_rejects_non_positive_worker_count():
+    with pytest.raises(ValueError, match="workers must be a positive integer"):
+        dl.download("s3://bucket/volume.zarr", "volume.zarr", workers=0)
+
+
+def test_stats_snapshots_noremote_sets_by_value():
+    stats = dl.Stats()
+    stats.noremote_keys = {0: {"0.0.0"}}
+    snapshot = stats.snapshot_noremote()
+    stats.add_noremote(0, "0.0.1")
+    assert snapshot == {0: {"0.0.0"}}
 
 
 def _drain_chunk_keys(q: queue.Queue) -> list[str]:

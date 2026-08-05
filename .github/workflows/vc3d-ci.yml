@@ -27,6 +27,12 @@ jobs:
     timeout-minutes: 5
     outputs:
       vc: ${{ steps.filter.outputs.vc }}
+      test_core: ${{ steps.filter.outputs.test_core }}
+      test_specialized: ${{ steps.filter.outputs.test_specialized }}
+      vc3d: ${{ steps.filter.outputs.vc3d }}
+      cli: ${{ steps.filter.outputs.cli }}
+      flatboi: ${{ steps.filter.outputs.flatboi }}
+      mcp: ${{ steps.filter.outputs.mcp }}
     steps:
       - uses: actions/checkout@v4
       - id: filter
@@ -37,6 +43,69 @@ jobs:
               - 'volume-cartographer/**'
               - '.github/workflows/vc3d-ci.yml'
               - '.github/workflows/vc3d-macos.yml'
+            test_core:
+              - 'volume-cartographer/CMakeLists.txt'
+              - 'volume-cartographer/CMakePresets.json'
+              - 'volume-cartographer/scripts/**'
+              - 'volume-cartographer/Dockerfile*'
+              - 'volume-cartographer/cmake/**'
+              - 'volume-cartographer/core/**'
+              - 'volume-cartographer/apps/VC3D/**'
+              - 'volume-cartographer/utils/**'
+              - 'volume-cartographer/libs/c3d/**'
+              - 'volume-cartographer/libs/OpenABF/**'
+              - '.github/workflows/vc3d-ci.yml'
+            test_specialized:
+              - 'volume-cartographer/CMakeLists.txt'
+              - 'volume-cartographer/CMakePresets.json'
+              - 'volume-cartographer/scripts/**'
+              - 'volume-cartographer/Dockerfile*'
+              - 'volume-cartographer/cmake/**'
+              - 'volume-cartographer/core/**'
+              - 'volume-cartographer/apps/VC3D/**'
+              - 'volume-cartographer/utils/**'
+              - 'volume-cartographer/libs/c3d/**'
+              - 'volume-cartographer/libs/OpenABF/**'
+              - '.github/workflows/vc3d-ci.yml'
+            vc3d:
+              - 'volume-cartographer/CMakeLists.txt'
+              - 'volume-cartographer/CMakePresets.json'
+              - 'volume-cartographer/scripts/**'
+              - 'volume-cartographer/Dockerfile*'
+              - 'volume-cartographer/cmake/**'
+              - 'volume-cartographer/core/**'
+              - 'volume-cartographer/apps/VC3D/**'
+              - 'volume-cartographer/utils/**'
+              - 'volume-cartographer/libs/c3d/**'
+              - 'volume-cartographer/libs/OpenABF/**'
+              - '.github/workflows/vc3d-ci.yml'
+            cli:
+              - 'volume-cartographer/CMakeLists.txt'
+              - 'volume-cartographer/CMakePresets.json'
+              - 'volume-cartographer/scripts/**'
+              - 'volume-cartographer/Dockerfile*'
+              - 'volume-cartographer/cmake/**'
+              - 'volume-cartographer/core/**'
+              - 'volume-cartographer/apps/CMakeLists.txt'
+              - 'volume-cartographer/apps/src/**'
+              - 'volume-cartographer/apps/diffusion/**'
+              - 'volume-cartographer/apps/VC3D/FiberSliceGeometry.*'
+              - 'volume-cartographer/utils/**'
+              - 'volume-cartographer/libs/c3d/**'
+              - 'volume-cartographer/libs/OpenABF/**'
+              - '.github/workflows/vc3d-ci.yml'
+            flatboi:
+              - 'volume-cartographer/CMakeLists.txt'
+              - 'volume-cartographer/CMakePresets.json'
+              - 'volume-cartographer/scripts/**'
+              - 'volume-cartographer/Dockerfile*'
+              - 'volume-cartographer/cmake/FetchLibigl.cmake'
+              - 'volume-cartographer/libs/flatboi/**'
+              - 'volume-cartographer/libs/libigl_changes/**'
+              - '.github/workflows/vc3d-ci.yml'
+            mcp:
+              - 'volume-cartographer/tools/vc3d-mcp/**'
+              - '.github/workflows/vc3d-ci.yml'
 
   skip:
     name: Skip (no volume-cartographer changes)
@@ -47,52 +116,192 @@ jobs:
     steps:
       - run: echo "No volume-cartographer changes — skipping build."
 
-  build-test:
-    name: ${{ matrix.action }}-${{ matrix.preset }}-${{ matrix.compiler }} (${{ matrix.image }})
+  test-core:
+    name: Linux base tests (Clang QuickBuild)
     needs: changes
-    if: needs.changes.outputs.vc == 'true'
+    if: needs.changes.outputs.test_core == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     container:
       image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    continue-on-error: ${{ matrix.blocking != true }}
-    strategy:
-      fail-fast: false
-      # Each compiler builds the Release configuration and runs its tests in
-      # one blocking job, avoiding a second full Debug build.
-      matrix:
-        include:
-          - { image: "ubuntu-26.04", compiler: gcc,   preset: ci-release-tests, action: test, blocking: true }
-          - { image: "ubuntu-26.04", compiler: clang, preset: ci-release-tests, action: test, blocking: true }
     env:
       SCCACHE_GHA_ENABLED: 'true'
       SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
-      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-${{ matrix.compiler }}-${{ matrix.preset }}
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
     steps:
       - uses: actions/checkout@v4
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
-      - name: ${{ matrix.action }}
+      - name: Build and test base shard
         working-directory: volume-cartographer
         run: |
-          preset="${{ matrix.preset }}-${{ matrix.compiler }}"
           sccache --zero-stats
-          cmake --preset "$preset" -DVC_USE_SCCACHE=ON
-          ninja -C "build/$preset"
-          ctest --preset "$preset"
+          cmake -S . -B build/ci-fast-core -G Ninja \
+            -DCMAKE_BUILD_TYPE=QuickBuild \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DCMAKE_AUTOGEN_PARALLEL=4 \
+            -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
+            -DVC_TESTING=ON -DVC_BUILD_APPS=OFF \
+            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+          cmake --build build/ci-fast-core --target vc_test_core --parallel 4
+          ctest --test-dir build/ci-fast-core --output-on-failure \
+            --parallel 4 -L '^vc-core$'
+          sccache --show-stats
+
+  test-specialized:
+    name: Linux Lasagna/fiber/GUI tests (Clang QuickBuild)
+    needs: changes
+    if: needs.changes.outputs.test_specialized == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+      - name: Build and test specialized shard
+        working-directory: volume-cartographer
+        run: |
+          sccache --zero-stats
+          cmake -S . -B build/ci-fast-specialized -G Ninja \
+            -DCMAKE_BUILD_TYPE=QuickBuild \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DCMAKE_AUTOGEN_PARALLEL=4 \
+            -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
+            -DVC_TESTING=ON -DVC_BUILD_APPS=OFF \
+            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+          cmake --build build/ci-fast-specialized --target vc_test_specialized --parallel 4
+          ctest --test-dir build/ci-fast-specialized --output-on-failure \
+            --parallel 4 -L '^vc-specialized$'
+          sccache --show-stats
+
+  vc3d-compile-smoke:
+    name: Linux VC3D compile and smoke (Clang QuickBuild)
+    needs: changes
+    if: needs.changes.outputs.vc3d == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+      - name: Build and smoke VC3D
+        working-directory: volume-cartographer
+        run: |
+          sccache --zero-stats
+          cmake -S . -B build/ci-fast-vc3d -G Ninja \
+            -DCMAKE_BUILD_TYPE=QuickBuild \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DCMAKE_AUTOGEN_PARALLEL=4 \
+            -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
+            -DVC_TESTING=OFF -DVC_BUILD_APPS=ON \
+            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+          cmake --build build/ci-fast-vc3d --target VC3D --parallel 4
           QT_QPA_PLATFORM=offscreen python3 apps/VC3D/agent_bridge/test/smoke_offscreen.py \
-            --vc3d "build/$preset/bin/VC3D"
+            --vc3d build/ci-fast-vc3d/bin/VC3D
+          sccache --show-stats
+
+  cli-compile:
+    name: Linux CLI compile coverage (Clang QuickBuild)
+    needs: changes
+    if: needs.changes.outputs.cli == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+      - name: Compile every CLI target
+        working-directory: volume-cartographer
+        run: |
+          sccache --zero-stats
+          cmake -S . -B build/ci-fast-cli -G Ninja \
+            -DCMAKE_BUILD_TYPE=QuickBuild \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DCMAKE_AUTOGEN_PARALLEL=4 \
+            -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
+            -DVC_TESTING=OFF -DVC_BUILD_APPS=ON \
+            -DVC_BUILD_UI_TRACER=ON -DVC_BUILD_FLATBOI=OFF
+          cmake --build build/ci-fast-cli --target vc_cli_all --parallel 4
+          sccache --show-stats
+
+  flatboi-compile:
+    name: Linux Flatboi/PaStiX compile coverage (Clang QuickBuild)
+    needs: changes
+    if: needs.changes.outputs.flatboi == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/scrollprize/vc3d-deps/linux:sha-0c371b1d472c5281b703d65517e980d945da693f
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-linux-ubuntu-26.04-deps-0c371b1d-clang-quickbuild-o0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+      - name: Compile Flatboi and PaStiX
+        working-directory: volume-cartographer
+        run: |
+          sccache --zero-stats
+          cmake -S . -B build/ci-fast-flatboi -G Ninja \
+            -DCMAKE_BUILD_TYPE=QuickBuild \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_Fortran_COMPILER=flang \
+            -DCMAKE_AUTOGEN_PARALLEL=4 \
+            -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
+            -DVC_TESTING=OFF -DVC_BUILD_APPS=OFF \
+            -DVC_BUILD_UI_TRACER=OFF -DVC_BUILD_FLATBOI=ON
+          cmake --build build/ci-fast-flatboi --target flatboi --parallel 4
           sccache --show-stats
 
   mcp-test:
     name: MCP unit tests
     needs: changes
-    if: needs.changes.outputs.vc == 'true'
+    if: needs.changes.outputs.mcp == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -169,7 +378,7 @@ jobs:
 
   ci:
     name: CI
-    needs: [changes, skip, build-test, mcp-test, macos-build]
+    needs: [changes, skip, test-core, test-specialized, vc3d-compile-smoke, cli-compile, flatboi-compile, mcp-test, macos-build]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -178,15 +387,19 @@ jobs:
         env:
           R_CHANGES: ${{ needs.changes.result }}
           R_SKIP: ${{ needs.skip.result }}
-          R_BUILD_TEST: ${{ needs.build-test.result }}
+          R_TEST_CORE: ${{ needs.test-core.result }}
+          R_TEST_SPECIALIZED: ${{ needs.test-specialized.result }}
+          R_VC3D: ${{ needs.vc3d-compile-smoke.result }}
+          R_CLI: ${{ needs.cli-compile.result }}
+          R_FLATBOI: ${{ needs.flatboi-compile.result }}
           R_MCP_TEST: ${{ needs.mcp-test.result }}
           R_MACOS: ${{ needs.macos-build.result }}
         run: |
           set -e
-          echo "changes=$R_CHANGES skip=$R_SKIP build-test=$R_BUILD_TEST mcp-test=$R_MCP_TEST macos=$R_MACOS"
+          echo "changes=$R_CHANGES skip=$R_SKIP core=$R_TEST_CORE specialized=$R_TEST_SPECIALIZED vc3d=$R_VC3D cli=$R_CLI flatboi=$R_FLATBOI mcp=$R_MCP_TEST macos=$R_MACOS"
           # All non-skipped jobs must succeed (or be skipped legitimately).
           fail=0
-          for r in "$R_CHANGES" "$R_SKIP" "$R_BUILD_TEST" "$R_MCP_TEST" "$R_MACOS"; do
+          for r in "$R_CHANGES" "$R_SKIP" "$R_TEST_CORE" "$R_TEST_SPECIALIZED" "$R_VC3D" "$R_CLI" "$R_FLATBOI" "$R_MCP_TEST" "$R_MACOS"; do
             case "$r" in
               success|skipped) ;;
               *) fail=1 ;;
