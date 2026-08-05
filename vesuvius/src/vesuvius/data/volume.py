@@ -917,7 +917,11 @@ class Volume:
 
         # Zero-mask must be computed on the RAW data: normalization maps raw
         # zeros to a nonzero value (e.g. -mean/std under zscore schemes).
-        zero_mask = (data_slice == 0) if self.return_zero_mask else None
+        # getattr, not self.return_zero_mask: Volume is also built via
+        # __new__ without __init__ (see tests/data/test_volume_retry.py), and
+        # this path must keep working for instances that never set the flag.
+        want_zero_mask = getattr(self, "return_zero_mask", False)
+        zero_mask = (data_slice == 0) if want_zero_mask else None
 
         # --- Preprocessing Steps ---
 
@@ -1064,7 +1068,7 @@ class Volume:
                 print(f"  Error converting NumPy array to PyTorch Tensor: {e}")
                 raise
 
-        if self.return_zero_mask:
+        if want_zero_mask:
             if self.return_as_tensor:
                 zero_mask = torch.from_numpy(np.ascontiguousarray(zero_mask))
             return data_slice, zero_mask
