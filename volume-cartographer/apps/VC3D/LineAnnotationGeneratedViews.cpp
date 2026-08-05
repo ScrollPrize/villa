@@ -29,21 +29,34 @@ QPointF generatedStripControlPointToScene(
     const GeneratedOverlay::ControlPointMarker& control)
 {
     // The strip surface is parameterized by line position, so the O(1)
-    // mapping is exact whenever linePosition is known. volumeToScene runs
-    // QuadSurface::pointTo — an O(strip length) gradient descent from the
-    // strip center — which made every overlay rebuild cost
-    // O(controlPoints x lineLength) and dominated zoom/pan lag on
-    // many-control-point fibers; keep it only as the fallback. The
-    // preconditions are re-checked here because the helper reports failure
-    // as a default (finite) QPointF, which must not shadow the fallback.
+    // mapping is exact for control points ON the centerline — the common
+    // case. volumeToScene runs QuadSurface::pointTo — an O(strip length)
+    // gradient descent from the strip center — which made every overlay
+    // rebuild cost O(controlPoints x lineLength) and dominated zoom/pan
+    // lag on many-control-point fibers; keep it only for points that are
+    // genuinely off the centerline: manual/no-reoptimization edits retain
+    // the clicked off-line volume position until the next optimization,
+    // and their markers (and hit tests) must show the true position, not
+    // the centerline. Preconditions are re-checked here because the O(1)
+    // helper reports failure as a default (finite) QPointF, which must
+    // not shadow the fallback.
     if (viewer && surface && std::isfinite(control.linePosition)) {
         const auto* points = surface->rawPointsPtr();
         const cv::Vec2f scale = surface->scale();
-        if (points && !points->empty() && scale[0] != 0.0f && scale[1] != 0.0f) {
-            const QPointF positionScene = generatedStripLinePositionToScene(
-                viewer, surface, control.linePosition);
-            if (finiteScenePoint(positionScene)) {
-                return positionScene;
+        const int column = static_cast<int>(std::lround(control.linePosition));
+        if (points && !points->empty() && scale[0] != 0.0f && scale[1] != 0.0f &&
+            column >= 0 && column < points->cols) {
+            const cv::Vec3f centerlinePoint = (*points)(points->rows / 2, column);
+            constexpr float kOnCenterlineToleranceVx = 1.0e-3f;
+            const bool onCenterline = !finiteGeneratedPoint(control.point) ||
+                (finiteGeneratedPoint(centerlinePoint) &&
+                 cv::norm(control.point - centerlinePoint) <= kOnCenterlineToleranceVx);
+            if (onCenterline) {
+                const QPointF positionScene = generatedStripLinePositionToScene(
+                    viewer, surface, control.linePosition);
+                if (finiteScenePoint(positionScene)) {
+                    return positionScene;
+                }
             }
         }
     }

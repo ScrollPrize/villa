@@ -1861,7 +1861,12 @@ bool LineAnnotationController::confirmFiberOptimizationModeChange(
         prompt.setText(
             tr("Switching to Lasagna re-fits every global-goal span and "
                "overwrites the traced line."));
-        prompt.setInformativeText(tr("Trace review tags will be cleared."));
+        prompt.setInformativeText(
+            tr("Spans with an explicit trace goal keep their traced "
+               "geometry; the '%1' flag clears only if the resulting line "
+               "contains no traced spans.")
+                .arg(QLatin1String(
+                    vc3d::line_annotation::kTraceNeedsReviewTag)));
     }
     auto* proceedButton =
         prompt.addButton(tr("Re-optimize"), QMessageBox::AcceptRole);

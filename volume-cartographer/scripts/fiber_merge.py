@@ -1135,17 +1135,25 @@ def merge_fibers(base, local, remote):
     # contains prediction-traced spans but its geometry matches no side
     # that lacks the tag, the review is stale — re-add the tag (fail-safe:
     # unreviewed wins). Catches verify-vs-retrace races and span-mixing
-    # merges where neither reviewer saw the combined line.
-    if (TRACE_NEEDS_REVIEW_TAG not in merged['tags'] and
-            _has_trace_span(merged)):
-        reviewed_geometries = [
-            _geometry_pair(doc) for doc in (local, remote)
-            if TRACE_NEEDS_REVIEW_TAG not in (doc.get('tags') or [])
-        ]
-        if _geometry_pair(merged) not in reviewed_geometries:
-            merged['tags'].append(TRACE_NEEDS_REVIEW_TAG)
-            notes.append('merged geometry differs from every reviewed '
-                         'side; re-added ' + TRACE_NEEDS_REVIEW_TAG)
+    # merges where neither reviewer saw the combined line. Conversely, a
+    # merged line with NO trace spans has left the review workflow: the
+    # tag must go, because VC3D's generic tag controls reject it and its
+    # review actions reject untraced fibers, which would strand the tag
+    # (mirrors applyTraceReviewTags on save).
+    if _has_trace_span(merged):
+        if TRACE_NEEDS_REVIEW_TAG not in merged['tags']:
+            reviewed_geometries = [
+                _geometry_pair(doc) for doc in (local, remote)
+                if TRACE_NEEDS_REVIEW_TAG not in (doc.get('tags') or [])
+            ]
+            if _geometry_pair(merged) not in reviewed_geometries:
+                merged['tags'].append(TRACE_NEEDS_REVIEW_TAG)
+                notes.append('merged geometry differs from every reviewed '
+                             'side; re-added ' + TRACE_NEEDS_REVIEW_TAG)
+    elif TRACE_NEEDS_REVIEW_TAG in merged['tags']:
+        merged['tags'].remove(TRACE_NEEDS_REVIEW_TAG)
+        notes.append('merged geometry contains no trace spans; removed ' +
+                     TRACE_NEEDS_REVIEW_TAG)
     merged['generation'] = max(generation_local, generation_remote) + 1
     manual_tag_conflict = _merge_manual_hv_tag(base, local, remote, merged,
                                                notes)
