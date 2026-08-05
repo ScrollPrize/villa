@@ -1,5 +1,39 @@
+# 2026-08-03
+
+- Added experimental float16 shared raw-product accumulator rings while
+  retaining the measured-faster float32 default, float32 weights, and float32
+  flush arithmetic.
+- Moved shared inference integer-to-FP32 normalization onto CUDA after compact
+  H2D and made Fiber model autocast default to checkpoint training policy.
+- Added opt-in shared Fiber/Lasagna multi-device loader and worker stage
+  profiling with direct reader-concurrency diagnostics.
+- Overlapped shared Lasagna/Fiber output flushing with inference using one
+  enlarged bounded circular mmap and one runner-wide asynchronous flush,
+  without band-sized RAM snapshots or overlap copies.
+- Made downloader negative-remote caches tolerant and atomic, and exposed the
+  automatic S3 transfer worker count in Fiber and Lasagna inference CLIs.
+- Added shared bounded streaming multi-GPU whole-volume inference for Lasagna
+  and Fiber 3D, with separate CPU/Zarr prefetch, persistent per-device workers,
+  shared-memory input/results, and canonical single-writer accumulation.
+- Made Fiber 3D per-rank hang logs, manual dumps, test watchdog, resource
+  polling, and diagnostic CUDA synchronization explicitly opt-in through config
+  or CLI.
+
+# 2026-08-02
+
+- Fixed cropped shared 3D inference treating globally positioned output chunks
+  as unsupported when their origins exceeded the crop-local accumulator shape.
+- Fixed circular accumulator depth underplanning across initial chunk-aligned
+  no-op flushes in cropped, downscaled shared inference.
+- Distributed dense Fiber 3D tests deterministically across DDP ranks with
+  persistent process-worker prefetch, exact ordered metric reconstruction, and
+  stdout/TensorBoard total-test timing.
+
 # 2026-08-01
 
+- Added persistent per-rank Fiber 3D training diagnostics and an eight-minute
+  rank-0 test watchdog with per-batch phase/resource markers and manual
+  `SIGUSR2` stack dumps.
 - Fixed Vesuvius Python CI collection by exposing the monorepo's shared
   `lasagna` source namespace and triggering the workflow for Lasagna changes;
   repaired the Zarr 3.2.1 matrix with explicit cross-version v2 fixtures and
@@ -224,3 +258,33 @@
 - Replaced full-Z predict3d scratch mappings with fixed-depth circular mmap
   rings and consolidated Lasagna/Fiber neural inference onto one multi-scale,
   chunk-flushing runner.
+# 2026-08-03: process-parallel shared inference flush
+
+- Replaced the single Python flush thread with bounded persistent spawn workers
+  that read frozen rolling-accumulator mmaps by absolute path.
+- Added shared `flush_workers` control and `--flush-workers` to Fiber and
+  Lasagna inference (automatic CPU-count default capped at 64, synchronous
+  baseline 0).
+- Added process failure/hard-exit cleanup, overlap, multi-process execution,
+  and CLI forwarding coverage.
+- Motivation: the prior threaded implementation regressed the representative
+  eight-GPU inference phase from 178.8 s to 305.4 s.
+- Reused the pyramid pool's pre-spawn native-runtime guard so NumPy/OpenBLAS is
+  single-threaded during child module import, including for GPU workers.
+# 2026-08-03: TensorStore whole-volume inference prefetch
+
+- Shared Fiber/Lasagna inference now defaults to asynchronous TensorStore Zarr
+  bbox reads with read-ahead capacity independent of GPU/result slots.
+- Added bounded cache/I/O/copy and per-GPU prefetch controls, single-device
+  read-ahead, Python-Zarr fallback, exact reader-equivalence tests, and input
+  starvation/high-water diagnostics.
+
+# 2026-08-03: process-parallel native accumulation
+
+- Added deterministic process-owned chunk accumulation shared by Fiber and
+  Lasagna multi-device inference, with bounded queues and retained result-slot
+  lifetimes.
+- Added a portable native accumulator extension with runtime AVX-512F+F16C
+  dispatch and restored float16 product rings as the default.
+- Added `--accumulator-workers`, backend/throughput diagnostics, native
+  numerical coverage, and process-vs-synchronous output coverage.

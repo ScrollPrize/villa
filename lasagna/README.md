@@ -197,6 +197,68 @@ manifest, fixed-depth circular Z accumulation, chunk-resume, and OME-Zarr pyrami
 behavior; product-specific Lasagna logic remains in
 `preprocess_cos_omezarr.py`.
 
+Whole-volume predict3d can use every visible CUDA device through the shared
+runner:
+
+```bash
+lasagna-preprocess predict3d ... --devices all
+```
+
+Use a subset with `--devices cuda:0,cuda:2`. Input tiles default to asynchronous
+TensorStore bounding-box reads outside GPU workers. The tile Cartesian product
+is generated lazily and read-ahead is bounded independently from reusable GPU
+shared-memory slots. `--slots-per-gpu` (default 2) controls GPU input/result
+buffers; `--prefetch-tiles-per-gpu` (default 4) controls outstanding/ready input
+tiles. TensorStore defaults to a 4 GiB cache, 16 file-I/O threads, and 4
+decode/copy threads, configurable with `--input-cache-gib`,
+`--input-io-threads`, and `--input-copy-threads`. Use
+`--input-reader python-zarr` for the old backend; `--prefetch-workers` controls
+only its reader threads. Existing `--device` selects single-device inference,
+which also maintains bounded TensorStore read-ahead during GPU forwards.
+
+Add `--profile-pipeline` to a multi-device run for bounded loader/worker
+diagnostics. It reports backend read service, active wall span, throughput and
+effective outstanding-request concurrency, completion polling and ready-queue delay, shared-memory copy, CPU
+conversion, compact integer H2D, CUDA conversion, adapter preprocessing, model inference, output/D2H, result
+receipt, and commit time. Stage sums overlap across tiles/workers and are not
+elapsed wall time. CUDA events add diagnostic overhead, so disable the flag for
+final throughput measurements.
+
+CUDA inference transfers source `uint8`/`uint16` tiles without CPU float
+expansion and performs the historical normalization on-device in FP32. The CPU
+fallback retains the NumPy conversion path. Model-specific AMP remains owned by
+the model adapter; shared weighting, pyramid filtering, D2H results, and
+accumulation remain FP32.
+
+The same shared runner overlaps output flushing with subsequent inference using
+one enlarged circular mmap ring and persistent spawned writer processes. Each
+worker reopens the frozen mmap read-only and handles one output chunk, so no
+band-sized RAM snapshot crosses process boundaries and each worker has an
+independent Python GIL. `--flush-workers` defaults to the available CPU count
+capped at 64; use
+`--flush-workers 0` for the synchronous, immediate-release A/B baseline. Only
+one flush batch may be outstanding, so the next frontier waits if writers fall
+behind. The final `flush stats workers=... chunks=... work_sum=... wait=...`
+line reports that backpressure.
+
+Raw product rings default to float16, intentionally permitting small rounding
+differences while halving product-ring backing. The shared geometric weight
+ring and flush normalization remain float32; pass
+`--product-accumulator-dtype float32` when float32 accumulation is required.
+
+On multi-device runs, chunk accumulation is itself process-parallel. Persistent
+workers add directly from retained result shared-memory slots into the rolling
+mmap, with deterministic per-chunk ownership and FIFO update order.
+`--accumulator-workers` defaults to the CPU count capped at 32; zero restores
+the synchronous A/B baseline. The native `accumulator_add` module runtime-
+dispatches an AVX-512F+F16C row kernel where available and uses a portable
+fallback elsewhere; the package is never globally compiled for AVX-512.
+
+Automatic S3 chunk fetching defaults to 64 transfer threads. Set it separately
+from inference prefetch with, for example, `--download-workers 256`. Interrupted
+or malformed `.dl_cache/*.noremote.json` files are advisory: they are ignored
+with a warning and rewritten atomically rather than aborting inference.
+
 ### Multi-axis processing
 
 The `--axis` flag controls which dimension is sliced through:
