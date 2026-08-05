@@ -152,7 +152,7 @@ class InteractiveInfluenceState:
 
     def _generator(self, cfg):
         generator = torch.Generator()
-        generator.manual_seed(int(cfg['random_seed']) + self.num_incorporations)
+        generator.manual_seed(int(cfg['optimizer_random_seed']) + self.num_incorporations)
         return generator
 
     @torch.no_grad()
@@ -160,7 +160,7 @@ class InteractiveInfluenceState:
                          dr_per_winding, cfg, z_begin, z_end, generator):
         """Per-input scroll-space point sets -> pooled spiral (z, s, theta)."""
         per_input = []
-        max_points = int(cfg['interactive_influence_footprint_points'])
+        max_points = int(cfg['sample_count_influence_footprint_points'])
         for input_id, patch in new_patches.items():
             zyx = patch.zyxs[patch.valid_vertex_mask].reshape(-1, 3).to(torch.float32)
             per_input.append((input_id, 'patch', zyx))
@@ -245,8 +245,8 @@ class InteractiveInfluenceState:
         for flow_field in spiral_and_transform.flow_fields:
             lr_flow, hr_flow = flow_field.flows
             v_max = v_max + (
-                lr_flow[:, 0].abs().max() * float(flow_field.flow_scales[0])
-                + hr_flow[:, 0].abs().max() * float(flow_field.flow_scales[1])
+                lr_flow[:, 0].abs().max()
+                + hr_flow[:, 0].abs().max()
             )
         z_range = float(spiral_and_transform.flow_max_corner_zyx[0]
                         - spiral_and_transform.flow_min_corner_zyx[0])
@@ -299,9 +299,9 @@ class InteractiveInfluenceState:
         if anchor_geometry_zyx is not None and anchor_geometry_zyx.shape[0] > 0:
             geometry = subsample_rows(
                 anchor_geometry_zyx.to(torch.float32).cpu(),
-                int(cfg['interactive_influence_anchor_geometry_points']), generator)
+                int(cfg['sample_count_influence_anchor_geometry_points']), generator)
             parts.append(geometry.to(self.device))
-        num_lattice = int(cfg['interactive_influence_anchor_lattice_points'])
+        num_lattice = int(cfg['sample_count_influence_anchor_lattice_points'])
         outer_winding = int(cfg['shell_outer_winding_idx'])
         if num_lattice > 0 and outer_winding > 1:
             winding_indices = torch.arange(1, outer_winding, dtype=torch.float32)
@@ -452,13 +452,13 @@ class InteractiveInfluenceState:
 
 def make_influence_state(cfg, device):
     limits = (
-        float(cfg['interactive_influence_z']),
-        float(cfg['interactive_influence_windings']),
-        float(cfg['interactive_influence_theta_frac']) * 2. * math.pi,
+        float(cfg['influence_z']),
+        float(cfg['influence_windings']),
+        float(cfg['influence_theta_frac']) * 2. * math.pi,
     )
     return InteractiveInfluenceState(
         limits=limits,
-        sigma=float(cfg['interactive_influence_sigma']),
-        ramp_power=float(cfg['interactive_influence_anchor_ramp_power']),
+        sigma=float(cfg['influence_sigma']),
+        ramp_power=float(cfg['influence_anchor_ramp_power']),
         device=device,
     )

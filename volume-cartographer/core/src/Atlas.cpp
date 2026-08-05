@@ -3,6 +3,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/lasagna/Manifest.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
@@ -273,37 +274,16 @@ nlohmann::json readJsonFile(const fs::path& path)
     return nlohmann::json::parse(in);
 }
 
-std::vector<cv::Vec3d> pointArrayFromJson(const nlohmann::json& root,
-                                          const char* key,
-                                          const fs::path& path)
-{
-    const auto it = root.find(key);
-    if (it == root.end() || !it->is_array()) {
-        throw std::runtime_error("fiber JSON is missing array " + std::string(key) +
-                                 ": " + path.string());
-    }
-    std::vector<cv::Vec3d> points;
-    points.reserve(it->size());
-    for (const auto& point : *it) {
-        points.push_back(pointFromJson(point));
-    }
-    return points;
-}
-
 FiberInput loadSourceFiberInput(const fs::path& fiberPath,
                                 const fs::path& fiberRelativePath)
 {
     const auto root = readJsonFile(fiberPath);
-    if (root.value("type", std::string{}) != "vc3d_fiber") {
-        throw std::runtime_error("fiber JSON is not a vc3d_fiber: " + fiberPath.string());
-    }
-    if (root.value("version", 0) != 1) {
-        throw std::runtime_error("unsupported vc3d_fiber version in " + fiberPath.string());
-    }
+    const auto parsed = vc::fiber_tracer::parseVc3dFiberJson(
+        root, fiberPath.string());
     FiberInput input;
     input.fiberPath = fiberRelativePath;
-    input.controlPoints = pointArrayFromJson(root, "control_points", fiberPath);
-    input.linePoints = pointArrayFromJson(root, "line_points", fiberPath);
+    input.controlPoints = parsed.controlPoints;
+    input.linePoints = parsed.linePoints;
     validateFiberInputControlPoints(input);
     return input;
 }

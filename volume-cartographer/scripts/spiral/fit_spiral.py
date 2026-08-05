@@ -1,4 +1,13 @@
 import os
+import sys
+
+# Expandable segments stop the CUDA caching allocator from ratcheting its
+# reserved pool toward the VRAM ceiling under the variable-size per-step loss
+# graphs (measured ~12 GB lower steady-state envelope on the s1 fit). Must be
+# set before the allocator initialises; an explicit PYTORCH_CUDA_ALLOC_CONF in
+# the environment always wins.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import copy
 import itertools
 import json
@@ -27,6 +36,7 @@ from ddp_helpers import (
     maybe_init_distributed,
     split_counts_across_ranks,
 )
+from config import Config
 from lasagna_data import prepare_lasagna_volume, prepare_surf_sdt_volume
 from checkpoint_io import load_checkpoint_cpu
 from influence import make_influence_state, subsample_rows
@@ -55,6 +65,7 @@ from tracks import (
     prepare_main_phase_tracks,
     validate_track_sampling_config,
 )
+from track_graph import TrackGraph
 from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
 from sample_spiral import (
     get_spiral_points,
@@ -88,6 +99,8 @@ from spiral_helpers import (
     load_fiber_point_collections,
     scale_counts_for_z_range,
     _infer_shell_outer_winding_idx,
+    _structurally_disabled_dense_weight_keys,
+    resolve_outer_winding_idx_and_notes,
     patch_intersects_z_roi,
     save_combined_preview,
 )
@@ -100,6 +113,7 @@ from satisfaction_metrics import (
 )
 from visualization import overlay_patches_on_slices
 from transforms import SpiralAndTransform
+from spiral_progress import ProgressReporter, progress_or_null
 
 
 configure_torch_threads_from_env()
@@ -129,7 +143,7 @@ pcl_json_paths = [
 pcl_input_specs = None
 fibers_path = f'{dataset_path}/fibers'
 verified_patches_path = f'{dataset_path}/verified_patches'
-unverified_patches_path = f'{dataset_path}/unverified_patches'
+unverified_patches_path = None
 run_tag = os.environ.get('FIT_SPIRAL_RUN_TAG')
 shell_path = f'{dataset_path}/outer_shell'
 tracks_dbm_path = f'{dataset_path}/tracks/2um_ds2_ps256_surf_v2.dbm'  # or: m7_ds2_z3000_18000_surf.dbm
@@ -140,16 +154,16 @@ z_begin, z_end = 4000, 17000
 voxel_size_um = 9.6
 cache_path = os.environ.get('FIT_SPIRAL_CACHE_DIR', '../cache')
 lasagna_scale = 4
-# mmap is the default everywhere: the SDT store must be mmap-served, and the
-# session API already resolved 'auto' to mmap before this changed.
-lasagna_storage_backend = 'auto'
+# Normals, grad magnitude, and SDT are served by fully-resident sparse brick
+# pools loaded from pack_resident_pools.py sidecars next to the source zarrs.
+lasagna_storage_backend = 'sparse_cuda'
 render_volume_scale = int(os.environ.get('FIT_SPIRAL_RENDER_VOLUME_SCALE', '1' if scroll_zarr_path else '16'))
 _active_lasagna_store = None
 _active_scalar_stores = []
 
 
 def release_interactive_resources():
-    """Release worker pools and mmap handles owned by the resident session."""
+    """Release sparse volume stores owned by the resident session."""
     global _active_lasagna_store
     store, _active_lasagna_store = _active_lasagna_store, None
     if store is not None:
@@ -157,338 +171,6 @@ def release_interactive_resources():
     while _active_scalar_stores:
         _active_scalar_stores.pop().close()
 
-default_config = {
-    # Session-level dataset input switches. VC3D uses these in addition to
-    # clearing local paths because a dataset-owned remote service resolves
-    # its own paths. Disabled inputs must never be opened by the fitter.
-    'use_verified_patches': True,
-    'use_unverified_patches': True,
-    'use_normals': True,
-    'use_surf_sdt': True,
-    'use_tracks': True,
-    'use_gradient_magnitude': True,
-    'use_fibers': True,
-    'random_seed': 1,
-    # Multi-GPU batch policy (only relevant under torchrun, world size > 1):
-    #   True  -> split per-step object-sample counts by world_size so the effective
-    #            per-step batch matches single-GPU while each rank does less work.
-    #   False -> scale-up: every rank keeps full counts, giving an N x larger effective batch.
-    'distributed_split_batch': True,
-    'learning_rate': 3.e-5,
-    'exp_lr_schedule': True,
-    'lr_final_factor': 0.3,
-    'num_training_steps': 30_000,
-    'num_flow_integration_steps': 3,
-    'flow_integration_solver': 'rk4',
-    'num_flow_timesteps': 1,
-    # Number of independent stationary flow fields composed sequentially,
-    # phi = exp(v_N) o ... o exp(v_1) (each stage keeps the fast inline-rk4 + sparse-grad
-    # path when num_flow_timesteps == 1 and the solver is rk4). 1 == original behaviour.
-    'num_flow_stages': 1,
-    'flow_bounds_z_margin': 160,
-    'flow_bounds_radius': 3200,
-    'flow_voxel_resolution': 16,
-    'flow_field_type': 'cartesian',  # 'cartesian' or 'cylindrical'
-    'flow_field_high_res_lr_scale_initial': 2.0e-1,
-    'flow_field_high_res_lr_scale_final': 2.0e-1,
-    'flow_field_high_res_lr_ramp_start_step': 0,
-    'flow_field_high_res_lr_ramp_steps': 1,
-    'gap_expander_logit_resolution': 24,
-    'gap_expander_num_windings': 130,
-    'gap_expander_lr_scale': 0.3,
-    'linear_z_resolution': 48,
-    'initial_dr_per_winding': 16.,
-    'patch_radius_loss_margin': 0.025,
-    'patch_radius_loss_inv': False,
-    'patch_loss_z_margin': 0,
-    'patch_dt_norm_p': 0.5,
-    'patch_dt_within_patch_norm_p': 3.0,
-    'patch_dt_loss_margin': 0.025,
-    'patch_radius_within_norm_p': 3.0,  # >1 emphasises worst within-track points in the radius loss
-    'num_patches_per_step': 360,
-    'num_patches_per_step_for_dt': 240,
-    'num_points_per_patch': 800,
-    # How patch-loss strips are sampled in patch ij space (patch radius/DT losses and the
-    # rel/abs-winding L-shapes):
-    #   'straight' -> contiguous subranges of single rows/columns (+ 4 cardinal L-shapes for
-    #                 the winding losses).
-    #   'dijkstra' -> wiggly geodesic strips: from a start cell, walk the 8-connected valid-quad
-    #                 graph to a distant reachable endpoint via shortest path, skirting holes /
-    #                 ragged edges. Paths land in small per-patch (and per-anchor, for the
-    #                 winding losses) pools, built and continuously refreshed dataloader-style
-    #                 by FIT_SPIRAL_STRIP_PATH_WORKERS background processes (default 4; 0 =
-    #                 inline builds with fixed pools); per-step sampling just subsamples points
-    #                 along a pooled path, so steady-state cost matches 'straight'.
-    'patch_strip_sampling': 'straight',
-    'erode_patches': 1,  # if >0, erode every patch's valid region (verified + unverified) by this many grid cells
-    'disable_patches': False,  # fit on PCLs + tracks only; load no verified/unverified patches
-    'unverified_patch_radius_loss_margin': 0.025,
-    'unverified_patch_radius_loss_inv': False,
-    'unverified_patch_radius_within_norm_p': 3.0,
-    'unverified_patch_dt_norm_p': 0.5,
-    'unverified_patch_dt_within_patch_norm_p': 3.0,
-    'unverified_patch_dt_loss_margin': 0.025,
-    'unverified_num_patches_per_step': 120,
-    'unverified_num_patches_per_step_for_dt': 80,
-    'unverified_num_points_per_patch': 800,
-    'unverified_patch_exclusion_radius': 64.0,  # mask unverified-patch vertices within this of trusted geometry (full-res voxels)
-    'rel_winding_num_pcls': 48,
-    'rel_winding_num_patch_pairs_per_pcl': 4,
-    'rel_winding_adjacent_patches_only': True,
-    # Stratify the per-step pcl draws (rel-winding and unattached-strip losses) so each
-    # pcl source file, plus fibers split into horizontal/vertical, gets an equal share
-    # of the samples regardless of how many pcls it holds. This legacy switch remains
-    # for existing interactive configs; an explicit pcl_sampling_weights dict below
-    # takes precedence and enables weighted rather than equal stratification. False
-    # with pcl_sampling_weights=None restores uniform-over-pcls sampling.
-    'stratified_pcl_sampling': True,
-    # Per-group weighting of the per-step pcl draws (rel-winding and unattached-strip
-    # losses). None uses stratified_pcl_sampling above. A dict switches on weighted
-    # stratified sampling: each sampling group (pcl source json,
-    # keyed by basename with the .json suffix stripped e.g. 'relative_windings';
-    # fibers split into 'fibers:H' / 'fibers:V') gets a per-step share of the samples
-    # proportional to its weight, regardless of how many pcls it holds. When set, the
-    # dict must list every group explicitly (a missing group is an error); weight 0
-    # switches a group off entirely. Equal weights reproduce plain stratification; e.g.
-    # {'abs_winding': 1, 'patch-overlap-pcls': 1, 'relative_windings': 1,
-    #  'same_windings': 0, 'fibers:H': 2, 'fibers:V': 1} drops same-windings and
-    # doubles the horizontal-fiber share.
-    'pcl_sampling_weights': None,
-    'abs_winding_num_pcls': 48,
-    'abs_winding_num_points_per_pcl': 4,
-    'fiber_min_point_spacing': 40.,
-    'unattached_pcl_num_per_step': 84,
-    'unattached_pcl_num_points_per_step': 32,
-    'unattached_pcl_min_point_spacing': 16.,
-    'track_num_per_step': 48000,
-    'track_num_points_per_step': 24,
-    # Resample each complete track in full-resolution polyline arclength.
-    # track_num_points_per_step selects target-estimation points; the spacing
-    # bounds control how many points contribute to the complete-track loss.
-    'track_min_sample_spacing': 20.0,
-    'track_max_sample_spacing': 60.0,
-    # Optional track-pool policies. None preserves uniform sampling and keeps
-    # every track regardless of tortuosity; crossing supplements are opt-in.
-    'track_length_bin_weights': None,  # [short, medium, long], using eligible-track arclength tertiles
-    'track_max_tortuosity': None,  # whole-track arclength / endpoint chord; None disables filtering
-    # Crossing discovery is session-scoped; the active per-step count can then
-    # change freely up to this prepared ceiling at a Run boundary.
-    'track_crossing_precompute_max': 8,
-    # Opposite-family partners joined to each primary track's shared winding
-    # target. Zero disables crossing-connected sampling.
-    'max_track_crossing_per_step': 0,
-    'track_exclusion_radius': 16.0,
-    'track_radius_target': 'mean',
-    'track_radius_loss_margin': 0.025,
-    'track_radius_within_norm_p': 6.0,  # >1 emphasises worst within-track point in the radius loss (1.0 = mean)
-    'track_dt_within_track_norm_p': 3.0,  # within a track; -> inf strongly penalises isolated badly-aligned points
-    'track_dt_norm_p': 0.5,  # across tracks; -> 0 prefers many fully-satisfied tracks (winner-take-all snapping)
-    'track_dt_loss_margin': 0.025,
-    'dense_normals_num_points': 60_000,
-    # Interior paging of the dense volume stores (SDT + lasagna normals): chunk
-    # the store grid and keep only chunks inside the outer-shell envelope +
-    # margin when promoting to GPU residency. Nothing samples outside the
-    # shell (reads there return no-data = invalid, like past the canvas edge),
-    # and interior-only residency fits windows whose full plane cannot
-    # (z8500-16500 SDT: 66 GB plane -> ~15-20 GB interior). 0 disables (full
-    # plane / bbox behaviour). Margin is in working voxels and must cover ray
-    # extension past the shell + the chunk half-diagonal (~110 wv at 64x2).
-    'volume_paging_chunk': 64,
-    'volume_interior_margin': 300.0,
-    'regularisation_num_points': 4500,
-    'grad_mag_encode_scale': 1000.0,
-    'grad_mag_factor': 0.25,
-    'spacing_integration_steps': 8,
-    # Dense spacing has exactly two modes: 'phase' (the opt-in bundle -
-    # soft-sequence phase registration, crossing count, native minimum
-    # spacing, and SDT attachment, each with its own weight) and 'grad_mag'
-    # (the legacy density integral and default inherited from origin/main).
-    'dense_spacing_mode': 'grad_mag',
-    'dense_spacing_num_pairs': 12_000,
-    # m is a two-range mixture biased short: longer baselines average out
-    # per-gap counting noise (std ~ 0.5 * sqrt(m)) and let rays straddle wide
-    # unsupported regions, but the prediction's ~2-4% per-gap conservatism
-    # biases long counts low, so most pairs stay short; watch
-    # dense_spacing_count_mean before shifting the mixture longer.
-    'dense_spacing_pair_m_short': (3, 7),  # m uniform here for most pairs
-    'dense_spacing_pair_m_long': (5, 15),  # long-tail range for the rest
-    'dense_spacing_pair_long_fraction': 0.15,
-    'dense_spacing_count_temperature_wv': 0.5,  # GT-calibrated; 1.0 undercounts ~12%
-    'dense_spacing_target_step_wv': 1.0,  # polyline step target (sheets are 4-6 wv wide)
-    'dense_spacing_max_step_wv': 2.0,  # mapped adjacent samples above this invalidate the pair
-    'dense_spacing_max_steps': 1400,  # per-gap allocation; scaled from the measured m=7 budget (640) to cover m=15 rays
-    'dense_spacing_step_oversample': 1.25,  # each mapped gap chord can underestimate curvature
-    'dense_spacing_use_support_gate': True,
-    'dense_spacing_support_sigma': 4.0,  # working voxels; measured mean endpoint support 0.61
-    'dense_spacing_support_floor_alpha': 0.05,  # nominal-mass denominator floor
-    'dense_spacing_support_policy': 'product',  # or 'minimum'
-    # Optional count-only ray supplement on top of the shared phase/count
-    # batch, if the joint batch alone gives too little spatial coverage.
-    'dense_spacing_count_extra_pairs': 0,
-    'dense_spacing_phase_huber_delta': 0.5,
-    'dense_spacing_phase_extension_windings': 1.0,
-    'dense_spacing_phase_min_center_gap_wv': 4.0,
-    'dense_spacing_phase_graze_dot': 0.4,
-    'dense_spacing_phase_graze_depth_wv': 1.0,
-    # Soft sequence alignment (pair-HMM): matches are restricted to an
-    # absolute phase window so the aligner cannot explain a ray with a global
-    # integer shift; missing/extra skip costs are the effective
-    # outlier-truncation knobs; open == extend keeps each gap cost
-    # length-constant (2026-07-17 calibration: MAP missing/extra run lengths
-    # are geometric, so affine costs stay tied). Window/skip-cost/margin/
-    # temperature values are the 2026-07-17 GT-calibrated set: window 0.75
-    # cut wrong-registration matches (accepted |rho|>0.5) ~25% at equal
-    # coverage; missing 0.55/extra 0.7 prefer skipping over forced wrong
-    # matches; temperature 0.1 recovers ~half the suppressed mass and is the
-    # measured annealing floor (0.05 breaks half-winding ambiguity safety).
-    'dense_spacing_phase_window_windings': 0.75,
-    # Bands outside the central interval by more than this margin are free to
-    # skip (semi-global end gaps); the margin protects slightly displaced
-    # boundary bands from being dumped into the free gap.
-    'dense_spacing_phase_end_free_margin_windings': 0.5,
-    'dense_spacing_phase_missing_cost': 0.55,
-    'dense_spacing_phase_missing_extend_cost': 0.55,
-    'dense_spacing_phase_extra_cost': 0.7,
-    'dense_spacing_phase_extra_extend_cost': 0.7,
-    'dense_spacing_phase_temperature': 0.1,
-    'dense_spacing_phase_band_confidence_cost': 0.25,  # * (1 - |normal dot|), detached
-    # Confidence policy: suppress a winding's phase gradient when its match
-    # marginal is multimodal (low top-2 margin), and require a minimum number
-    # of useful matched windings plus matched mass before scoring a ray.
-    'dense_spacing_phase_top2_margin': 0.1,
-    'dense_spacing_phase_min_matched_windings': 2,
-    'dense_spacing_phase_min_matched_mass': 1.0,
-    # Native pre-expansion anti-collapse barrier. This is asset-independent
-    # and can run in either dense-spacing mode.
-    'loss_weight_min_spacing': 0.0,
-    # Crossing count: per-step it is gradient-starved on coarse fits and its
-    # support gate self-confirms, but its integer-topology pressure compounds
-    # - at 2000-step held-out probes (2026-07-17, wrap-aware scorer) count 8
-    # is the strongest single addition to the bundle (med_err 0.2179 vs
-    # 0.2346 without) even though 60/300-step probes read it as neutral.
-    # Note it over-contracts the already-correct bins slightly (its soft
-    # count is ~2-5% conservative); revisit the weight once fits converge.
-    # 2026-07-17 PM: 8 -> 2. On clean (GT-excluded-from-train) 1000z probes
-    # across top/mid/low bands, the count dose-response is monotone toward
-    # low weights near convergence (w8 over-contracts tight bins; w1-2 is
-    # the plateau). w2 keeps coarse-regime pull without the converged-fit
-    # harm. See docs/spiral_experiment_notebook.md 2026-07-17 wave C.
-    'loss_weight_dense_spacing_count': 0.0,
-    # Metric density term: |integral(lambda ds) - m| with a detached
-    # piecewise density (inverse detected-band gaps) integrated over the
-    # live central polyline; every step carries gradient (the principled
-    # replacement for the grad_mag integral). Band-GT calibration
-    # (wrap-aware, 2026-07-17): reads 0.94-1.06 for 12-45 wv spacings at
-    # r<1000, under-reads ~12% at r>1000 (detection recall - partial
-    # crossings), and is blind below ~12 wv detected spacing (SDT resolution
-    # floor) - hence the min-gap abstention below.
-    'loss_weight_dense_spacing_density': 0.0,
-    # Sub-resolution abstention: below ~12 wv detected spacing the store
-    # under-reads winding density ~30% (measured), so steps bracketed by a
-    # gap under min_gap_wv can abstain (contribute nothing, target-corrected
-    # by their detached model-phase span). DEFAULT OFF (0): 2000-step
-    # held-out probes show the biased contraction signal still helps
-    # far-from-converged fits at every gap bin (0.2203 vs 0.2346 med_err);
-    # set ~12 for late refinement of an already-registered fit, where
-    # optimising toward the biased reading would thin the tightest windings
-    # toward |dW| ~ 0.67 (dense_spacing_density_max_blind_fraction caps how
-    # blind a pair may be before it is dropped outright).
-    'dense_spacing_density_min_gap_wv': 0.0,
-    'dense_spacing_density_max_blind_fraction': 0.75,
-    # Density-only sampling supplement (fast path: polylines + band
-    # detection, no pair-HMM), chunked so one chunk's graph is resident per
-    # backward. Total density pairs = dense_spacing_num_pairs + this.
-    'dense_spacing_density_extra_pairs': 24_000,
-    # one 24k chunk instead of 3x8k: each chunk re-pays detection/pads/
-    # polyline launch (~22 ms/step on H100 at the shipped shape); the
-    # chunk graph peak is ~8.5 GB at 300z — fits H100/GB10 with room
-    'dense_spacing_density_chunk_pairs': 24_000,
-    'min_spacing_d_min_wv': 6.0,
-    'min_spacing_independent_samples': 2_000,
-    # SDT attachment: independent of the spacing loss (own weight/enable/counts).
-    # Late-fit snapping term: weight 10 actively fights coarse registration
-    # (pulls onto aliased sheets); 2-4 after warmup+ramp is the calibrated
-    # comparable-influence range (2026-07-17 gradient-norm probes).
-    'loss_weight_dense_attachment': 0.0,
-    'dense_attachment_scale': 8.0,  # working voxels; relu(sd) p50/p90 = 2/9 on the shipped store
-    'dense_attachment_num_points': 20_000,
-    'dense_attachment_warmup_steps': 3_000,  # measured against durable completed iterations
-    'dense_attachment_ramp_steps': 3_000,
-    'dense_normals_finite_difference_epsilon': 8.0,
-    'sym_dirichlet_finite_difference_epsilon': 4.0,
-    'loss_weight_patch_radius': 8.e0,
-    'loss_weight_patch_dt': 4.e0,
-    'loss_weight_unverified_patch_radius': 2.e0,
-    'loss_weight_unverified_patch_dt': 1.e0,
-    'loss_weight_rel_winding': 5.,
-    'loss_weight_abs_winding': 5.,
-    'loss_weight_unattached_pcl_radius': 2.e0,
-    'loss_weight_unattached_pcl_dt': 4.e0,
-    'loss_weight_track_radius': 50.,
-    'loss_weight_track_dt': 10.,
-    'loss_weight_sym_dirichlet': 10.0,
-    'loss_weight_dense_normals': 1.e2,
-    'loss_weight_dense_spacing': 12.,
-    'loss_weight_umbilicus': 1.25,
-    'loss_weight_shell_outer': 1.0,
-    'loss_weight_shell_patch_radius': 0.0,
-    'weight_decay_gap_expander': 1.e-2,
-    'weight_decay_flow_field': 0.0,
-    'loss_start_patch_dt': 25_000,
-    'loss_start_track_dt': 10_000,
-    'loss_start_unverified_patch_dt': None,  # None => fall back to loss_start_patch_dt
-    'dt_progressive_windings': False,  # gate the DT losses (patch, track, unattached-pcl) to grow outwards across windings
-    'dt_progressive_inner_winding': 20,   # outer-winding cutoff when each DT loss first turns on
-    'dt_progressive_steps': 50_000,  # steps to grow the cutoff from start_winding to shell_outer_winding_idx
-    'dt_progressive_exponent': 1.0,  # warp on the time fraction; 1.0 = linear in winding, <1 = slower later (~0.5 ≈ constant area rate)
-    # Whole-object DT targeting (see dt_targets.py, ported from
-    # origin/spiral-fibers-and-dt d60b739eb): determine each object's DT target from a
-    # sparse no-grad sample of the WHOLE patch/strip/track instead of each step's small
-    # sample median (which flip-flops across the rounding boundary for objects floating
-    # between windings). Objects attached to a winding use their median's nearest
-    # winding; objects whose majority is floating in a gap grab the outer one.
-    # 'strip_median' restores the legacy per-step sample target.
-    'dt_target_mode': 'strip_median',  # 'strip_median' | 'whole_object_quantile'
-    'dt_target_floating_threshold': 0.25,  # median point-to-nearest-sheet distance, in windings, required to grab the outer sheet
-    'dt_target_update_interval': 100,  # steps between whole-object target recomputations (1 = every step)
-    'patch_dt_target_num_points': 256,  # per-patch whole-grid samples for target determination
-    'dt_target_max_stride': 128,  # max gap between target-determination samples, in voxels (patches convert to grid cells via patch.scale; strip points are nominally at ~voxel spacing, so applied directly as an index stride)
-    'dt_target_num_points_per_strip': 512,  # target samples per track / pcl strip
-    'output_first_winding': 10,
-    'output_winding_margin': 4,
-    'output_step_size': 20,
-    'shell_outer_winding_idx': 130,
-    'shell_outer_winding_margin': 10,
-    'shell_num_samples': 24576,
-    'shell_num_theta_bins': 720,
-    'shell_huber_delta': 16.0,
-    'shell_table_smooth_sigma_z': 4.0,
-    'shell_table_smooth_sigma_theta': 1.0,
-    'shell_min_confidence': 0.25,
-    # Final diagnostic PNG overlays are expensive at scroll resolution and are
-    # not needed for mesh output or VC3D interactive previews.
-    'save_png_visualizations': False,
-    # Localized influence regions for interactive (ephemeral) inputs: when
-    # enabled, each input added to a resident session mid-run may only adjust
-    # the fit within its own footprint dilated by the extents below (gaussian
-    # decay towards the boundary), while everything outside is held in place
-    # by gradient masking plus an anchoring loss. See influence.py.
-    'interactive_influence_enabled': False,
-    'interactive_influence_z': 3000.0,        # hard half-extent along z, full-res voxels
-    'interactive_influence_windings': 5.0,    # hard half-extent across wraps, windings
-    'interactive_influence_theta_frac': 0.5,  # hard half-extent along the wrap, fraction of a full turn (circular; 0.5 = the whole circle is within reach of some point)
-    'interactive_influence_disable_dt_frac': 0.75,  # fraction of each requested run that suppresses DT losses after incorporating inputs
-    'interactive_influence_sigma': 0.3333,    # gaussian sigma as a fraction of the hard extent
-    'interactive_influence_footprint_points': 2048,  # subsampled per incorporated input
-    'loss_weight_anchor': 0.0,
-    # Anchor-bank sizes are absolute (not scaled with the z-range like the
-    # per-step object counts): the bank must cover the fitted volume densely
-    # enough regardless of how many objects each loss samples per step.
-    'interactive_influence_anchor_lattice_points': 100_000,
-    'interactive_influence_anchor_geometry_points': 100_000,
-    'interactive_influence_anchor_samples_per_step': 4096,
-    'interactive_influence_anchor_ramp_power': 2.0,
-}
 
 
 cfg = None
@@ -499,7 +181,7 @@ def get_env_config_overrides():
     if not overrides_json:
         return {}
     overrides = json.loads(overrides_json)
-    unknown_keys = sorted(set(overrides) - set(default_config))
+    unknown_keys = sorted(set(overrides) - set(Config().as_dict()))
     if unknown_keys:
         raise KeyError(f'unknown FIT_SPIRAL_CONFIG_OVERRIDES keys: {unknown_keys}')
     return overrides
@@ -615,11 +297,16 @@ class ShellPolarMap:
 
 
 class PatchGpuAtlas:
-    """All patches' (H, W, 3) zyxs grids packed into one flat GPU tensor, so
-    fractional-(i, j) bilinear lookups can run as a single batched gather instead
-    of per-patch CPU dispatch."""
+    """All patches' (H, W, 3) zyxs grids packed into one flat tensor, batched
+    per lookup instead of per-patch dispatch. The packed grids stay resident in
+    host memory: the (i, j) samples are drawn on the CPU anyway, so the
+    bilinear gather runs there (mostly-contiguous strip reads, a few MB per
+    step) and only the interpolated points are uploaded to `device`. This
+    keeps the atlas - which scales with the input patch count, not with any
+    per-step budget - out of VRAM entirely."""
 
     def __init__(self, patches_by_id, device='cuda'):
+        self.device = torch.device(device)
         flat_pieces = []
         offsets = [0]
         widths = []
@@ -632,16 +319,13 @@ class PatchGpuAtlas:
             offsets.append(offsets[-1] + H * W)
             widths.append(W)
             heights.append(H)
-        # Concatenate on CPU and perform one CUDA transfer. Concatenating pieces
-        # after individually uploading them temporarily requires roughly two
-        # complete atlases of VRAM during construction.
         self.zyxs_flat = (
-            torch.cat(flat_pieces, dim=0).to(device=device)
+            torch.cat(flat_pieces, dim=0)
             if flat_pieces
-            else torch.empty([0, 3], dtype=torch.float32, device=device))
-        self.offsets = torch.tensor(offsets, device=device, dtype=torch.int64)  # (N+1,)
-        self.widths = torch.tensor(widths, device=device, dtype=torch.int64)  # (N,)
-        self.heights = torch.tensor(heights, device=device, dtype=torch.int64)  # (N,)
+            else torch.empty([0, 3], dtype=torch.float32))
+        self.offsets = torch.tensor(offsets, dtype=torch.int64)  # (N+1,)
+        self.widths = torch.tensor(widths, dtype=torch.int64)  # (N,)
+        self.heights = torch.tensor(heights, dtype=torch.int64)  # (N,)
         self.id_to_idx = {pid: i for i, pid in enumerate(patches_by_id.keys())}
         native = load_native_spiral_sampling()
         self.sampling_atlas = (
@@ -656,10 +340,16 @@ class PatchGpuAtlas:
         return self.zyxs_flat.numel() * 4 / 1e6
 
     def lookup(self, patch_idx_per_sample, ijs):
-        # patch_idx_per_sample: (...,) int64 on GPU
-        # ijs: (..., 2) float on GPU
-        # returns (..., 3) on GPU. Caller must ensure floor(ij) lies on a valid quad.
-        return bilinear_atlas_lookup(
+        # patch_idx_per_sample: (...,) int64 on CPU
+        # ijs: (..., 2) float on CPU
+        # Gathers and interpolates on the host-resident atlas and returns
+        # (..., 3) on self.device. Caller must ensure floor(ij) lies on a
+        # valid quad. Runs inside the batch prefetcher when that is enabled,
+        # so both the gather and the upload happen a step ahead.
+        assert not patch_idx_per_sample.is_cuda and not ijs.is_cuda, (
+            'the atlas is host-resident: pass CPU indices/ijs; only the '
+            'interpolated points are uploaded')
+        zyxs = bilinear_atlas_lookup(
             self.zyxs_flat,
             self.offsets,
             self.widths,
@@ -667,17 +357,17 @@ class PatchGpuAtlas:
             ijs,
             heights=self.heights,
         )
+        return zyxs.to(device=self.device, non_blocking=True)
 
     def append_patches(self, patches_by_id):
         """Append new patches without rebuilding the resident atlas.
 
-        Only the new grids are uploaded; the existing flat tensor is
-        concatenated onto, so a resident interactive session can incorporate a
-        handful of added patches in seconds.
+        A host-side concatenation of just the new grids, so a resident
+        interactive session can incorporate a handful of added patches in
+        seconds.
         """
         if not patches_by_id:
             return
-        device = self.zyxs_flat.device
         flat_pieces = []
         offsets = [int(self.offsets[-1].item())]
         widths = []
@@ -691,16 +381,16 @@ class PatchGpuAtlas:
             offsets.append(offsets[-1] + H * W)
             widths.append(W)
             heights.append(H)
-        new_flat = torch.cat(flat_pieces, dim=0).to(device=device)
+        new_flat = torch.cat(flat_pieces, dim=0)
         self.zyxs_flat = torch.cat([self.zyxs_flat, new_flat], dim=0)
         self.offsets = torch.cat([
             self.offsets,
-            torch.tensor(offsets[1:], device=device, dtype=torch.int64),
+            torch.tensor(offsets[1:], dtype=torch.int64),
         ])
         self.widths = torch.cat([
-            self.widths, torch.tensor(widths, device=device, dtype=torch.int64)])
+            self.widths, torch.tensor(widths, dtype=torch.int64)])
         self.heights = torch.cat([
-            self.heights, torch.tensor(heights, device=device, dtype=torch.int64)])
+            self.heights, torch.tensor(heights, dtype=torch.int64)])
         next_idx = len(self.id_to_idx)
         for pid in patches_by_id:
             self.id_to_idx[pid] = next_idx
@@ -767,19 +457,6 @@ def get_or_build_unattached_pcl_flat(pcl_strips, device):
     return flat
 
 
-def get_flow_field_high_res_lr_scale(iteration):
-    # Factor multiplying the high-resolution flow logits, which scales down their effective
-    # learning rate relative to the main LR (kept <= 1 so the hi-res LR stays bounded by the
-    # main LR). Ramps linearly from _initial to _final over _ramp_steps steps, starting at
-    # _ramp_start_step; constant when _initial == _final.
-    initial = cfg['flow_field_high_res_lr_scale_initial']
-    final = cfg['flow_field_high_res_lr_scale_final']
-    start_step = cfg['flow_field_high_res_lr_ramp_start_step']
-    ramp_steps = max(1, int(cfg['flow_field_high_res_lr_ramp_steps']))
-    frac = min(1., max(0., (iteration - start_step) / ramp_steps))
-    return min(1., initial + frac * (final - initial))
-
-
 def get_progressive_dt_max_winding(iteration, dt_start_step, shell_outer_winding_idx):
     # When `dt_progressive_windings` is set, the DT losses (patch, track, unattached-pcl) only act
     # on tracks/patches whose snapped spiral-space winding is <= the returned cutoff. The cutoff
@@ -835,16 +512,99 @@ def get_dense_attachment_ramp(iteration):
     return min(1.0, (iteration - warmup + 1) / ramp)
 
 
-def main(load_only_patches_and_point_collections=False, interactive_driver=None):
-    global _active_lasagna_store
+def get_exponential_lr_at_step(
+        initial_lr, final_factor, completed_steps, training_horizon):
+    """LR on the absolute exponential curve for a completed-step count."""
+    horizon = max(1, int(training_horizon))
+    completed = max(0, int(completed_steps))
+    gamma = float(final_factor) ** (1.0 / horizon)
+    return float(initial_lr) * gamma ** completed
 
-    np.random.seed(cfg['random_seed'])
-    torch.random.manual_seed(cfg['random_seed'])
+
+def get_flow_field_high_res_lr_scale(iteration):
+    """Relative optimizer LR for the high-resolution flow lattices."""
+    initial = cfg['model_flow_field_high_res_lr_scale_initial']
+    final = cfg['model_flow_field_high_res_lr_scale_final']
+    start_step = cfg['model_flow_field_high_res_lr_ramp_start_step']
+    ramp_steps = max(
+        1, int(cfg['model_flow_field_high_res_lr_ramp_steps']))
+    fraction = min(
+        1., max(0., (int(iteration) - int(start_step)) / ramp_steps))
+    return min(1., float(initial) + fraction * (float(final) - float(initial)))
+
+
+def set_optimizer_group_lr_scale(
+        optimiser, lr_scheduler, *, group, reference_group, scale,
+        initial_lr):
+    """Set one parameter group's LR relative to another optimizer group."""
+    scale = float(scale)
+    group_index = next(
+        index for index, candidate in enumerate(optimiser.param_groups)
+        if candidate is group)
+    group['lr_scale'] = scale
+    group['initial_lr'] = float(initial_lr) * scale
+    group['lr'] = float(reference_group['lr']) * scale
+    lr_scheduler.base_lrs[group_index] = group['initial_lr']
+    if len(lr_scheduler._last_lr) == len(optimiser.param_groups):
+        lr_scheduler._last_lr[group_index] = group['lr']
+
+
+def realign_optimizer_lr_schedule(
+        optimiser, lr_scheduler, *, initial_lr, final_factor,
+        completed_steps, training_horizon, exponential):
+    """Realign an optimizer and scheduler to an absolute training step."""
+    horizon = max(1, int(training_horizon))
+    completed = max(0, int(completed_steps))
+    initial_lr = float(initial_lr)
+
+    if exponential:
+        gamma = float(final_factor) ** (1.0 / horizon)
+        if not isinstance(
+                lr_scheduler, torch.optim.lr_scheduler.ExponentialLR):
+            lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                optimiser, gamma=gamma)
+        lr_scheduler.gamma = gamma
+        aligned_lr = get_exponential_lr_at_step(
+            initial_lr, final_factor, completed, horizon)
+    else:
+        if not isinstance(lr_scheduler, torch.optim.lr_scheduler.LambdaLR):
+            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimiser, lambda step: 1.)
+        aligned_lr = initial_lr
+
+    lr_scales = [
+        float(group.get('lr_scale', 1.))
+        for group in optimiser.param_groups
+    ]
+    base_lrs = [initial_lr * scale for scale in lr_scales]
+    aligned_lrs = [aligned_lr * scale for scale in lr_scales]
+    for group, base_lr, current_lr in zip(
+            optimiser.param_groups, base_lrs, aligned_lrs):
+        group['initial_lr'] = base_lr
+        group['lr'] = current_lr
+    lr_scheduler.base_lrs = base_lrs
+    lr_scheduler.last_epoch = completed
+    lr_scheduler._last_lr = aligned_lrs
+    lr_scheduler._step_count = completed + 1
+    return lr_scheduler, horizon
+
+
+def main(
+        load_only_patches_and_point_collections=False, interactive_driver=None,
+        progress=None):
+    global _active_lasagna_store
+    has_progress = progress is not None
+    progress = progress_or_null(progress)
+
+    np.random.seed(cfg['optimizer_random_seed'])
+    torch.random.manual_seed(cfg['optimizer_random_seed'])
     if load_only_patches_and_point_collections:
         scroll_zarr = None
     else:
+        progress.begin('loading', 'Loading umbilicus')
         umbilicus = umbilicus_z_to_yx()
         if scroll_zarr_path:
+            progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
             scroll_zarr = zarr.open(scroll_zarr_path, mode='r')
         else:
@@ -854,20 +614,24 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # Patch loading and ROI filtering
     # ==========================================================================
 
-    def load_patches_from_dir(path):
+    def load_patches_from_dir(path, label='patches'):
         patches = {}
-        for entry in sorted(os.listdir(path)):
+        entries = sorted(os.listdir(path))
+        progress.begin(
+            'loading', f'Loading {label}',
+            step=0, total_steps=len(entries), unit='patches')
+        for entry_number, entry in enumerate(entries, start=1):
             segment_path = os.path.join(path, entry)
             try:
                 patches[entry] = load_tifxyz(segment_path)
             except Exception as e:
                 print(f'Failed to load segment {entry}: {e}')
-                continue
+            progress.update(
+                entry_number, detail=f'{len(patches):,} loaded')
         return patches
 
     filter_tracks_by_shell = (
         not load_only_patches_and_point_collections
-        and bool(cfg.get('use_tracks', True))
         and bool(tracks_dbm_path)
         and bool(shell_path)
     )
@@ -875,12 +639,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     if shell_losses_enabled() or filter_tracks_by_shell:
         if not shell_path:
             raise RuntimeError('shell losses are enabled, but FIT_SPIRAL_SHELL_PATH is not set')
+        progress.begin('loading', 'Loading outer shell')
         shell_patch = load_tifxyz(shell_path)
 
-    use_verified_patches = (
-        bool(cfg.get('use_verified_patches', True)) and not cfg['disable_patches'])
-    use_unverified_patches = (
-        bool(cfg.get('use_unverified_patches', True)) and not cfg['disable_patches'])
+    use_verified_patches = bool(verified_patches_path) and not cfg['input_disable_patches']
+    use_unverified_patches = bool(unverified_patches_path) and not cfg['input_disable_patches']
     if not use_verified_patches and not use_unverified_patches:
         verified_patches = {}
         unverified_patches = {}
@@ -889,12 +652,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         # An empty verified dir is allowed when unverified patches are supplied
         # (unverified-only ablations); both empty is a configuration error.
         verified_patches = (
-            load_patches_from_dir(verified_patches_path)
+            load_patches_from_dir(verified_patches_path, 'verified patches')
             if use_verified_patches and verified_patches_path else {}
         )
         unverified_patches = {}
         if use_unverified_patches and unverified_patches_path:
-            unverified_patches = load_patches_from_dir(unverified_patches_path)
+            unverified_patches = load_patches_from_dir(
+                unverified_patches_path, 'unverified patches')
 
     if (not verified_patches and not unverified_patches
             and (use_verified_patches or use_unverified_patches)):
@@ -903,24 +667,33 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     print(f" loaded {len(verified_patches)} patches")
     print(f" loaded {len(unverified_patches)} unverified patches")
 
+    patch_filter_total = len(verified_patches) + len(unverified_patches)
+    progress.begin(
+        'loading', 'Filtering patches to fit region',
+        step=0, total_steps=patch_filter_total, unit='patches')
+    filtered_count = 0
     for patches in (verified_patches, unverified_patches):
         for patch_id, patch in list(patches.items()):
-            # we erode cells this distance from any invalid cell to catch annotation errors
-            # which are hard to detect at the edges of patches
-            cells_to_erode = patch.erosion_cells(cfg['erode_patches'])
-            if cells_to_erode > 0:
-                if not erode_patch_valid_region(patch, cells_to_erode):
+            try:
+                # we erode cells this distance from any invalid cell to catch annotation errors
+                # which are hard to detect at the edges of patches
+                cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
+                if cells_to_erode > 0:
+                    if not erode_patch_valid_region(patch, cells_to_erode):
+                        del patches[patch_id]
+                        continue
+
+                # remove any patches which do not intersect with the roi we are fitting
+                if not patch_intersects_z_roi(patch, z_begin, z_end):
                     del patches[patch_id]
                     continue
-
-            # remove any patches which do not intersect with the roi we are fitting
-            if not patch_intersects_z_roi(patch, z_begin, z_end):
-                del patches[patch_id]
-                continue
-            # ROI testing may materialise the compact valid-coordinate view.
-            # Training retains the base grid and masks, so regenerate this view
-            # lazily only for a later exporter that actually requests it.
-            patch.release_derived_caches()
+                # ROI testing may materialise the compact valid-coordinate view.
+                # Training retains the base grid and masks, so regenerate this view
+                # lazily only for a later exporter that actually requests it.
+                patch.release_derived_caches()
+            finally:
+                filtered_count += 1
+                progress.update(filtered_count)
 
     # ==========================================================================
     # Point collection loading
@@ -934,7 +707,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     input_specs = pcl_input_specs
     if input_specs is None:
         input_specs = [(pattern, None) for pattern in pcl_json_paths]
-    for pattern, explicit_role in input_specs:
+    progress.begin(
+        'loading', 'Loading point collections',
+        step=0, total_steps=len(input_specs), unit='inputs')
+    for spec_number, (pattern, explicit_role) in enumerate(input_specs, start=1):
         expanded = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]
         for path in expanded:
             loaded = load_point_collection(path) or {}
@@ -954,11 +730,14 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 )
                 point_collections[next_id] = pcl
                 next_id += 1
+        progress.update(
+            spec_number, detail=f'{len(point_collections):,} collections loaded')
 
+    progress.begin('loading', 'Loading fiber point collections')
     fiber_point_collections, next_id = load_fiber_point_collections(
-        fibers_path if cfg.get('use_fibers', True) else None,
+        fibers_path,
         next_id,
-        min_point_spacing=cfg['fiber_min_point_spacing'],
+        min_point_spacing=cfg['pcl_fiber_min_point_spacing'],
     )
     # Fibers form two sampling groups, horizontal and vertical, rather than one
     # group per source file like the regular pcls.
@@ -997,6 +776,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # patch area and use distance only as a tie-break. Between-patches pcls connect
     # overlapping patches and attach only to their named patch pair, using nearest
     # distance within that pair.
+    progress.begin(
+        'loading', 'Linking points to patches',
+        detail=(
+            f'{len(point_collections):,} collections, '
+            f'{len(verified_patches):,} patches'))
     link_points_to_patches(
         verified_patches,
         point_collections,
@@ -1105,7 +889,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         pcl['points_by_patch'] = points_by_patch
     unattached_pcl_strips = _UnattachedPclStripList()
     unattached_strip_sampling_groups = []  # parallel to unattached_pcl_strips
-    min_point_spacing = cfg['unattached_pcl_min_point_spacing']
+    min_point_spacing = cfg['pcl_unattached_pcl_min_point_spacing']
     # For each unattached pcl, materialise an id-sorted strip of point zyxs and the
     # corresponding winding annotations. Strips with <2 points are dropped.
     # If min_point_spacing > 0, decimate each strip greedily along its id-sorted order
@@ -1144,7 +928,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         f'pcls: {len(cross_patch_pcls)} cross-patch, '
         f'{len(unattached_pcl_strips)} unattached'
     )
-    if cfg['stratified_pcl_sampling'] or cfg['pcl_sampling_weights'] is not None:
+    if cfg['pcl_stratified_pcl_sampling'] or cfg['pcl_sampling_weights'] is not None:
         def _group_counts(groups):
             counts = {}
             for group in groups:
@@ -1200,67 +984,26 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         raise ValueError(
             f'dense_spacing_mode={dense_spacing_mode!r} must be '
             "'phase' or 'grad_mag'")
-    phase_mode = (
-        dense_spacing_mode == 'phase'
-        and cfg.get('use_normals', True)
-        and cfg.get('use_surf_sdt', True)
-    )
+    phase_mode = dense_spacing_mode == 'phase'
     grad_mag_spacing_enabled = (
         dense_spacing_mode == 'grad_mag'
-        and cfg.get('use_gradient_magnitude', True)
         and cfg['loss_weight_dense_spacing'] > 0
     )
-    # Interior membership for dense-store GPU paging: inside the outer-shell
-    # polar envelope + margin (see volume_paging_chunk config comment). Built
-    # on CPU from the same shell/umbilicus inputs on every rank
-    # (deterministic), used only at store-promotion time.
-    volume_interior_fn = None
     shell_envelope = None
-    if (shell_patch is not None
-            and (int(cfg['volume_paging_chunk']) > 0 or filter_tracks_by_shell)):
+    if shell_patch is not None and filter_tracks_by_shell:
+        progress.begin('loading', 'Building outer-shell lookup')
         shell_envelope = ShellPolarMap(
             shell_patch,
             umbilicus,
-            z_min=z_begin - cfg['flow_bounds_z_margin'],
-            z_max=z_end + cfg['flow_bounds_z_margin'],
+            z_min=z_begin - cfg['model_flow_bounds_z_margin'],
+            z_max=z_end + cfg['model_flow_bounds_z_margin'],
             num_theta_bins=cfg['shell_num_theta_bins'],
             device='cpu',
         )
-        if int(cfg['volume_paging_chunk']) > 0:
-            interior_margin = float(cfg['volume_interior_margin'])
 
-            def volume_interior_fn(points_working_zyx):
-                points = torch.from_numpy(
-                    np.ascontiguousarray(points_working_zyx, dtype=np.float32))
-                target_radius, radius, _confidence, _valid = \
-                    shell_envelope.lookup(points)
-                # The radius table is distance-transform-filled and smoothed over
-                # the whole (z, theta) grid, so it is meaningful even in
-                # low-confidence bins — do NOT gate the mask on confidence (that
-                # kept ~87% of chunks). Stay conservative only outside the
-                # table's z coverage.
-                keep = radius <= target_radius + interior_margin
-                out_of_z = ((points[:, 0] < shell_envelope.z_min)
-                            | (points[:, 0] > shell_envelope.z_max))
-                return (keep | out_of_z).cpu().numpy()
-
-    # FIT_SPIRAL_PAGED_STORES: which stores may take GPU residency.
-    #   'all' (default) - both stores page/promote under the usual budget.
-    #   'sdt' - only the SDT pool is GPU-resident; the lasagna store is
-    #           FORCED to mmap. For big-window production runs where the
-    #           training state (full patch atlas + optimizer) already claims
-    #           ~38 GB/rank: SDT pool + both would OOM (observed 2026-07-19,
-    #           z8500-16500: 27.4 + 10.4 + ~38 > 79 GiB).
-    paged_stores = os.environ.get('FIT_SPIRAL_PAGED_STORES', 'all').strip().lower()
-    lasagna_backend_choice = lasagna_storage_backend
-    lasagna_interior_fn = volume_interior_fn
-    if paged_stores == 'sdt':
-        lasagna_backend_choice = 'mmap'
-        lasagna_interior_fn = None
     lasagna_volume = prepare_lasagna_volume(
         scroll_zarr,
-        use_normals=(cfg.get('use_normals', True)
-                     and (cfg['loss_weight_dense_normals'] > 0 or phase_mode)),
+        use_normals=(cfg['loss_weight_dense_normals'] > 0 or phase_mode),
         use_spacing=grad_mag_spacing_enabled,
         normal_nx_zarr_path=normal_nx_zarr_path,
         normal_ny_zarr_path=normal_ny_zarr_path,
@@ -1269,12 +1012,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         z_begin=z_begin,
         z_end=z_end,
         lasagna_scale=lasagna_scale,
-        storage_backend=lasagna_backend_choice,
+        storage_backend=lasagna_storage_backend,
         cache_directory=cache_path,
-        interior_fn=lasagna_interior_fn,
-        paged_chunk=int(cfg['volume_paging_chunk']) or 64,
+        progress=progress,
     )
-    if interactive_driver is not None and lasagna_volume and lasagna_volume.get('backend') == 'mmap':
+    if interactive_driver is not None and lasagna_volume:
         _active_lasagna_store = lasagna_volume['store']
 
     # Surf-SDT store: a core input of the whole phase bundle (registration,
@@ -1298,10 +1040,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             z_end=z_end,
             cache_directory=cache_path,
             storage_backend=lasagna_storage_backend,
-            interior_fn=volume_interior_fn,
-            paged_chunk=int(cfg['volume_paging_chunk']) or 64,
+            progress=progress,
         )
-        if interactive_driver is not None and sdt_volume.get('backend') == 'mmap':
+        if interactive_driver is not None:
             _active_scalar_stores.append(sdt_volume['store'])
 
     def phase_mode_active():
@@ -1332,16 +1073,38 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     track_families = None
     track_source_ids = None
     track_crossing_cache = None
-    if tracks_dbm_path is not None and cfg.get('use_tracks', True):
+    track_graph = None
+    track_reload_source = None
+    track_reload_families = None
+    track_reload_source_ids = None
+    if tracks_dbm_path is not None:
+        progress.begin(
+            'loading', 'Resolving track store',
+            detail=os.path.basename(tracks_dbm_path))
         print(f'loading tracks from {tracks_dbm_path}')
-        if track_sampling_config['crossing_precompute_max'] > 0:
+        if (track_sampling_config['crossing_precompute_max'] > 0
+                or track_sampling_config['crossing_mode'] == 'track_walk'):
             track_crossing_cache = load_track_crossing_cache(tracks_dbm_path)
+            if track_crossing_cache is not None:
+                track_graph = TrackGraph(track_crossing_cache)
+                print(
+                    f'built TrackGraph: {len(track_graph)} tracks, '
+                    f'{track_graph.edge_count} crossings in '
+                    f'{track_graph.build_seconds:.1f}s')
+                track_crossing_cache = None
             tracks, track_families, track_source_ids = load_tracks_from_dbm(
                 tracks_dbm_path, z_begin, z_end, return_families=True,
-                return_source_ids=True)
+                return_source_ids=True, progress=progress)
         else:
-            tracks = load_tracks_from_dbm(tracks_dbm_path, z_begin, z_end)
+            tracks = load_tracks_from_dbm(
+                tracks_dbm_path, z_begin, z_end, progress=progress)
+        track_reload_source = tracks
+        track_reload_families = track_families
+        track_reload_source_ids = track_source_ids
         if filter_tracks_by_shell:
+            progress.begin(
+                'loading', 'Filtering tracks to outer shell',
+                detail=f'{len(tracks):,} tracks')
             tracks, track_families, kept_track_indices = filter_tracks_to_outer_shell(
                 tracks, shell_envelope, track_families, return_indices=True)
             if track_source_ids is not None:
@@ -1355,6 +1118,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # ==========================================================================
 
     def prepare_patch_sampling_cache(patches):
+        progress.begin(
+            'loading', 'Preparing patch sampling',
+            step=0, total_steps=len(patches), unit='patches')
         native_sampling_available = load_native_spiral_sampling() is not None
         patch_areas = np.empty(len(patches), dtype=np.float32)
         for patch_idx, patch in enumerate(patches):
@@ -1409,6 +1175,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 )
 
             patch_areas[patch_idx] = float(patch.area)
+            progress.update(patch_idx + 1)
 
         inv_weights = patch_areas ** 0.5
         return inv_weights / inv_weights.sum()
@@ -1426,14 +1193,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         out_path += f'_{run_tag}'
     os.makedirs(out_path, exist_ok=True)
 
+    progress.begin(
+        'loading', 'Building verified-patch GPU atlas',
+        detail=f'{len(verified_patches):,} patches')
     patch_atlas = PatchGpuAtlas(verified_patches, device='cuda')
-    print(f'patch GPU atlas: {patch_atlas.memory_mb():.1f} MB')
+    print(f'patch atlas (host-resident): {patch_atlas.memory_mb():.1f} MB')
 
     # ==========================================================================================
     # trusted geometry (verified patches and pcls) kdtree / unverified patches + tracks masking
     # ==========================================================================================
 
-    num_slices_for_visualisation = cfg.get('num_slices_for_visualization', 20)
+    num_slices_for_visualisation = cfg.get('output_num_slices_for_visualization', 20)
     device = torch.device('cuda')
 
     # The trusted point cloud is consumed only by a CPU cKDTree. Build it directly
@@ -1475,6 +1245,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         verified_patches_and_pcls_np = verified_patches_and_pcls_cpu.numpy()
         verified_patches_and_pcls_np = np.ascontiguousarray(verified_patches_and_pcls_np, dtype=np.float32)
         if verified_patches_and_pcls_np.shape[0] > 0:
+            progress.begin(
+                'loading', 'Building trusted-geometry index',
+                detail=f'{len(verified_patches_and_pcls_np):,} points')
             trusted_geometry_tree = cKDTree(verified_patches_and_pcls_np)
 
     def _query_near_trusted_geometry(points_np, trusted_geometry_tree, threshold):
@@ -1602,7 +1375,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         # masks/area. Patches left with no valid quad are dropped. This is the patch analogue
         # of the DBM-track exclusion in tracks.py: untrusted patches only constrain regions
         # the trusted inputs don't already cover, so they can't fight verified geometry.
-        exclusion_radius = float(cfg['unverified_patch_exclusion_radius'])
+        exclusion_radius = float(cfg['patch_unverified_patch_exclusion_radius'])
+        progress.begin(
+            'loading', 'Masking unverified patches',
+            detail=f'{len(unverified_patches):,} patches')
         unverified_patches, n_masked_vertices, n_dropped_patches = (
             _mask_unverified_patches_near_trusted_geometry(
                 unverified_patches,
@@ -1620,6 +1396,37 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         unverified_patches_list = list(unverified_patches.values())
         unverified_patch_sampling_probabilities = prepare_patch_sampling_cache(unverified_patches_list)
         unverified_patch_atlas = PatchGpuAtlas(unverified_patches, device='cuda')
+
+    def rebuild_unverified_patch_inputs(exclusion_radius):
+        """Reload only the unverified-patch pool for a Run-boundary mask edit."""
+        if not unverified_patches_path:
+            return {}, [], None, None
+        candidates = load_patches_from_dir(unverified_patches_path)
+        for patch_id, patch in list(candidates.items()):
+            cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
+            if (cells_to_erode > 0
+                    and not erode_patch_valid_region(patch, cells_to_erode)):
+                del candidates[patch_id]
+                continue
+            if not patch_intersects_z_roi(patch, z_begin, z_end):
+                del candidates[patch_id]
+                continue
+            patch.release_derived_caches()
+        candidates, n_masked, n_dropped = \
+            _mask_unverified_patches_near_trusted_geometry(
+                candidates, trusted_geometry_tree, exclusion_radius)
+        print(
+            f'unverified patches: remasked {n_masked} vertices near trusted '
+            f'geometry (radius {exclusion_radius:.1f}), dropped {n_dropped}; '
+            f'{len(candidates)} remain')
+        candidate_list = list(candidates.values())
+        probabilities = (
+            prepare_patch_sampling_cache(candidate_list)
+            if candidate_list else None)
+        atlas = (
+            PatchGpuAtlas(candidates, device='cuda')
+            if candidate_list else None)
+        return candidates, candidate_list, probabilities, atlas
 
     # The full z series is a model input. PNG-only slice grids and raster inputs
     # are prepared lazily at final export, and never in a resident VC3D session.
@@ -1680,6 +1487,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     resume_checkpoint = None
     model_z_begin, model_z_end = z_begin, z_end
     if resume_path:
+        progress.begin(
+            'loading', 'Loading fit checkpoint',
+            detail=os.path.basename(resume_path))
         resume_checkpoint = load_checkpoint_cpu(resume_path)
         checkpoint_lasagna_scale = resume_checkpoint.get('lasagna_scale') if isinstance(resume_checkpoint, dict) else None
         if checkpoint_lasagna_scale != lasagna_scale:
@@ -1728,10 +1538,10 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                         f'{checkpoint_fingerprint}\n  current:    {current_fingerprint}')
             checkpoint_cfg = resume_checkpoint.get('cfg', {})
             shape_keys = (
-                'num_flow_integration_steps', 'flow_integration_solver', 'num_flow_timesteps',
-                'flow_bounds_z_margin', 'flow_bounds_radius', 'flow_voxel_resolution',
-                'flow_field_type', 'gap_expander_logit_resolution',
-                'gap_expander_num_windings', 'linear_z_resolution',
+                'model_num_flow_integration_steps', 'model_flow_integration_solver', 'model_num_flow_timesteps',
+                'model_flow_bounds_z_margin', 'model_flow_bounds_radius', 'model_flow_voxel_resolution',
+                'model_flow_field_type', 'model_gap_expander_logit_resolution',
+                'model_gap_expander_num_windings', 'model_linear_z_resolution',
             )
             incompatible = [
                 key for key in shape_keys
@@ -1751,19 +1561,20 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     'checkpoint range, or train from scratch with the wider range.'
                 )
 
-    flow_field_radius = cfg['flow_bounds_radius']
+    flow_field_radius = cfg['model_flow_bounds_radius']
     flow_min_corner_spiral_zyx = torch.tensor(
-        [model_z_begin - cfg['flow_bounds_z_margin'], -flow_field_radius, -flow_field_radius], dtype=torch.int64,
+        [model_z_begin - cfg['model_flow_bounds_z_margin'], -flow_field_radius, -flow_field_radius], dtype=torch.int64,
         device=device)
     flow_max_corner_spiral_zyx = torch.tensor(
-        [model_z_end + cfg['flow_bounds_z_margin'], flow_field_radius, flow_field_radius], dtype=torch.int64,
+        [model_z_end + cfg['model_flow_bounds_z_margin'], flow_field_radius, flow_field_radius], dtype=torch.int64,
         device=device)
 
-    num_training_steps = cfg['num_training_steps']
+    num_training_steps = cfg['optimizer_num_training_steps']
 
+    progress.begin('loading', 'Constructing spiral model')
     spiral_and_transform = SpiralAndTransform(
-        flow_integration_steps=cfg['num_flow_integration_steps'],
-        flow_integration_solver=cfg['flow_integration_solver'],
+        flow_integration_steps=cfg['model_num_flow_integration_steps'],
+        flow_integration_solver=cfg['model_flow_integration_solver'],
         umbilicus_zyx=umbilicus_zyx,
         flow_min_corner_zyx=flow_min_corner_spiral_zyx,
         flow_max_corner_zyx=flow_max_corner_spiral_zyx,
@@ -1777,74 +1588,147 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # ==========================================================================
 
     shell_map = None
-    shell_outer_winding_idx = None
     shell_valid_zyxs_gpu = None
-    if shell_patch is not None and shell_losses_enabled():
+
+    def subsample_shell_radius_pool(patch):
+        # The shell-patch radius loss draws sample_count_shell_samples random
+        # shell points per step; keep a pool of exactly that size resident on
+        # the GPU instead of the full shell cloud. A dedicated generator makes
+        # the pool deterministic (identical across DDP ranks) without
+        # perturbing the training RNG streams.
+        pool_generator = torch.Generator()
+        pool_generator.manual_seed(int(cfg['optimizer_random_seed']))
+        return subsample_rows(
+            patch.valid_zyxs, int(cfg['sample_count_shell_samples']), pool_generator,
+        ).to(device=device, dtype=torch.float32)
+
+    shell_active = shell_patch is not None and shell_losses_enabled()
+    if shell_active:
         if cfg['loss_weight_shell_outer'] > 0:
             shell_map = ShellPolarMap(
                 shell_patch,
                 umbilicus,
-                z_min=z_begin - cfg['flow_bounds_z_margin'],
-                z_max=z_end + cfg['flow_bounds_z_margin'],
+                z_min=z_begin - cfg['model_flow_bounds_z_margin'],
+                z_max=z_end + cfg['model_flow_bounds_z_margin'],
                 num_theta_bins=cfg['shell_num_theta_bins'],
                 device=device,
             )
         if cfg['loss_weight_shell_patch_radius'] > 0:
-            shell_valid_zyxs_gpu = shell_patch.valid_zyxs.to(device=device, dtype=torch.float32)
-        initial_transform = spiral_and_transform.get_slice_to_spiral_transform()
-        initial_dr = spiral_and_transform.get_dr_per_winding()
-        if cfg['shell_outer_winding_idx'] is None:
-            shell_outer_winding_idx = _infer_shell_outer_winding_idx(
-                initial_transform,
-                initial_dr,
-                verified_patches_list,
-                unattached_pcl_strips,
-                cfg,
-                z_begin,
-                z_end,
-                get_or_build_unattached_pcl_flat,
-            )
-            print(f'inferred shell_outer_winding_idx = {shell_outer_winding_idx}')
-        else:
-            shell_outer_winding_idx = int(cfg['shell_outer_winding_idx'])
-            print(f'using configured shell_outer_winding_idx = {shell_outer_winding_idx}')
-        min_gap_expander_num_windings = shell_outer_winding_idx + 3
-        if cfg['gap_expander_num_windings'] < min_gap_expander_num_windings:
-            print(
-                f'WARNING: shell_outer_winding_idx {shell_outer_winding_idx} requires '
-                f'gap_expander_num_windings >= {min_gap_expander_num_windings}, got '
-                f'gap_expander_num_windings {cfg["gap_expander_num_windings"]}; '
-                'increase gap_expander_num_windings or lower shell_outer_winding_idx'
-            )
+            shell_valid_zyxs_gpu = subsample_shell_radius_pool(shell_patch)
+
+    def infer_outer_winding_idx_for_this_run():
+        return _infer_shell_outer_winding_idx(
+            spiral_and_transform.get_slice_to_spiral_transform(),
+            spiral_and_transform.get_dr_per_winding(),
+            verified_patches_list,
+            unattached_pcl_strips,
+            cfg,
+            z_begin,
+            z_end,
+            get_or_build_unattached_pcl_flat,
+        )
+
+    # Dense losses sample out to this index even when shell losses are off.
+    shell_outer_winding_idx, outer_winding_notes = resolve_outer_winding_idx_and_notes(
+        cfg, shell_active, infer_outer_winding_idx_for_this_run)
+    for note in outer_winding_notes:
+        print(note)
+
+    dense_inactive_warned = set()
+
+    def warn_if_dense_losses_structurally_disabled():
+        # Loss weights are run-mutable, so re-check each step and warn once.
+        for weight_key in _structurally_disabled_dense_weight_keys(
+                cfg, shell_outer_winding_idx):
+            if weight_key not in dense_inactive_warned:
+                dense_inactive_warned.add(weight_key)
+                print(f'WARNING: {weight_key} > 0 but shell_outer_winding_idx '
+                      'is unresolved (config key is None and no outer shell '
+                      'inferred one); this loss samples the spiral out to that '
+                      'winding and stays INACTIVE. Set shell_outer_winding_idx '
+                      'to enable it (some of these losses also need the '
+                      'phase/SDT assets, see any warnings above).')
 
     # ==========================================================================
     # Optimizer and checkpoint helpers
     # ==========================================================================
 
-    # All flow stages' parameters go into the flow param group (stage 0 == .flow_field,
-    # plus any extra_flow_fields when num_flow_stages > 1).
-    flow_field_params = [p for flow_field in spiral_and_transform.flow_fields for p in flow_field.parameters()]
+    # Keep every stage's low- and high-resolution lattices in distinct groups
+    # so the HR learning-rate scale is an optimizer setting, not a multiplier
+    # in the model's forward path.
+    low_res_flow_params = [
+        flow_field.flows[0]
+        for flow_field in spiral_and_transform.flow_fields
+    ]
+    high_res_flow_params = [
+        flow_field.flows[1]
+        for flow_field in spiral_and_transform.flow_fields
+    ]
+    flow_field_params = low_res_flow_params + high_res_flow_params
     gap_expander_params = list(spiral_and_transform.gap_expander_params.parameters())
     linear_params = [spiral_and_transform.linear_logits]
     grouped_ids = {id(p) for p in flow_field_params + gap_expander_params + linear_params}
     other_params = [p for p in spiral_and_transform.parameters() if id(p) not in grouped_ids]
+    initial_high_res_lr_scale = get_flow_field_high_res_lr_scale(0)
     param_groups = [
         {'params': other_params, 'weight_decay': 0.0},
         {'params': linear_params, 'weight_decay': 0.0},
-        {'params': gap_expander_params, 'weight_decay': cfg['weight_decay_gap_expander']},
-        {'params': flow_field_params, 'weight_decay': cfg['weight_decay_flow_field']},
+        {'params': gap_expander_params, 'weight_decay': cfg['optimizer_weight_decay_gap_expander']},
+        {
+            'params': low_res_flow_params,
+            'weight_decay': cfg['optimizer_weight_decay_flow_field'],
+            'lr_scale': 1.,
+        },
+        {
+            'params': high_res_flow_params,
+            'weight_decay': cfg['optimizer_weight_decay_flow_field'],
+            'lr': cfg['optimizer_learning_rate'] * initial_high_res_lr_scale,
+            'lr_scale': initial_high_res_lr_scale,
+        },
     ]
-    optimiser = torch.optim.AdamW(param_groups, lr=cfg.learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
+    progress.begin('loading', 'Creating optimizer')
+    optimiser = torch.optim.AdamW(param_groups, lr=cfg.optimizer_learning_rate, betas=(0.9, 0.999), eps=1.e-8, fused=True)
     # Influence masks are scoped to one interactive Run request. They are
     # created from that run's pending inputs and discarded before its autosave.
     influence_state = None
     interactive_influence_loss_weight = 0.0
     interactive_influence_anchor_samples = 0
-    if cfg['exp_lr_schedule']:
-        gamma = cfg['lr_final_factor'] ** (1.0 / max(1, num_training_steps))
+    if cfg['optimizer_exp_lr_schedule']:
+        gamma = cfg['optimizer_lr_final_factor'] ** (1.0 / max(1, num_training_steps))
         lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimiser, gamma=gamma)
     else:
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimiser, lambda step: 1.)
+
+    def apply_high_res_lr_scale(iteration):
+        scale = get_flow_field_high_res_lr_scale(iteration)
+        low_res_group = next(
+            group for group in optimiser.param_groups
+            if any(param is low_res_flow_params[0] for param in group['params']))
+        high_res_group = next(
+            group for group in optimiser.param_groups
+            if any(param is high_res_flow_params[0] for param in group['params']))
+        set_optimizer_group_lr_scale(
+            optimiser,
+            lr_scheduler,
+            group=high_res_group,
+            reference_group=low_res_group,
+            scale=scale,
+            initial_lr=cfg['optimizer_learning_rate'],
+        )
+        return scale
+
+    def realign_lr_schedule(completed_steps):
+        """Align optimizer/scheduler state to the current absolute horizon."""
+        nonlocal lr_scheduler, num_training_steps
+        lr_scheduler, num_training_steps = realign_optimizer_lr_schedule(
+            optimiser,
+            lr_scheduler,
+            initial_lr=cfg['optimizer_learning_rate'],
+            final_factor=cfg['optimizer_lr_final_factor'],
+            completed_steps=completed_steps,
+            training_horizon=cfg['optimizer_num_training_steps'],
+            exponential=cfg['optimizer_exp_lr_schedule'],
+        )
 
     def checkpoint_payload(completed_iterations):
         def durable_config(value):
@@ -1887,7 +1771,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         temporary = f'{destination}.tmp-{os.getpid()}-{time.time_ns()}'
         try:
             torch.save(checkpoint_payload(completed_iterations), temporary)
-            with open(temporary, 'rb') as stream:
+            # 'rb+' not 'rb': fsync on Windows (_commit) requires a writable descriptor.
+            with open(temporary, 'rb+') as stream:
                 os.fsync(stream.fileno())
             os.replace(temporary, destination)
             try:
@@ -1916,7 +1801,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         gap_param = gap_expander_params[0]
         gap_group = next(group for group in optimiser.param_groups
                          if any(param is gap_param for param in group['params']))
-        gap_group['weight_decay'] = cfg['weight_decay_gap_expander']
+        gap_group['weight_decay'] = cfg['optimizer_weight_decay_gap_expander']
         if checkpoint.get('scheduler') is not None:
             lr_scheduler.load_state_dict(checkpoint['scheduler'])
 
@@ -1925,6 +1810,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         if embedded_iteration is not None:
             start_iteration = int(embedded_iteration)
         print(f'resuming from {resume_path} at iteration {start_iteration}')
+        progress.begin(
+            'loading', 'Restoring model and optimizer',
+            detail=os.path.basename(resume_path))
         load_model(resume_checkpoint)
         if not isinstance(resume_checkpoint, dict) or resume_checkpoint.get('scheduler') is None:
             for _ in range(start_iteration):
@@ -1951,6 +1839,12 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         del resume_checkpoint
         resume_checkpoint = None
 
+    if interactive_driver is not None:
+        # A checkpoint may carry the scheduler state from a shorter horizon.
+        # The active session configuration is authoritative.
+        realign_lr_schedule(start_iteration)
+
+    progress.begin('loading', 'Synchronizing model across GPU workers')
     broadcast_model_params(spiral_and_transform)
 
     if os.environ.get('FIT_SPIRAL_TORCH_PROFILE') == '1':
@@ -1972,6 +1866,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     prepared_main_tracks = None
     preview_extent_tracks = tracks
     if using_tracks:
+        progress.begin(
+            'loading', 'Preparing tracks for optimization',
+            detail=f'{len(tracks):,} tracks')
         prepared_main_tracks = prepare_main_phase_tracks(
             tracks,
             None,
@@ -1982,10 +1879,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             track_families=track_families,
             track_source_ids=track_source_ids,
             crossing_cache=track_crossing_cache,
+            track_graph=track_graph,
         )
         # The sidecar CSR is setup-only. The prepared bundle now owns only its
         # fixed-width training tables, so release the whole-DB graph promptly.
-        track_crossing_cache = None
+        if interactive_driver is None:
+            track_crossing_cache = None
+            track_graph = None
         # With the usual zero exclusion radius, the training bundle already
         # contains every authoritative track point as one flat CPU tensor.  Reuse it
         # for preview bounds instead of walking millions of short NumPy tracks.
@@ -2003,16 +1903,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     influence_anchor_geometry = None
     if interactive_driver is not None:
         stash_generator = torch.Generator()
-        stash_generator.manual_seed(int(cfg['random_seed']))
+        stash_generator.manual_seed(int(cfg['optimizer_random_seed']))
         influence_anchor_geometry = subsample_rows(
             verified_patches_and_pcls_cpu,
-            int(cfg['interactive_influence_anchor_geometry_points']),
+            int(cfg['sample_count_influence_anchor_geometry_points']),
             stash_generator,
         ).clone()
 
     # The trusted cloud and its double-precision cKDTree are setup-only data.
     # Track sampling retains its own compact offsets and coordinates.
-    trusted_geometry_tree = None
+    if interactive_driver is None:
+        trusted_geometry_tree = None
     verified_patches_and_pcls_cpu = None
     verified_patches_and_pcls_np = None
 
@@ -2027,12 +1928,17 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         raise ValueError(f"dt_target_mode must be 'strip_median' or 'whole_object_quantile', got {cfg['dt_target_mode']!r}")
     dt_target_whole_object = cfg['dt_target_mode'] == 'whole_object_quantile'
     if dt_target_whole_object:
+        progress.begin(
+            'loading', 'Preparing distance-target samples',
+            detail=(
+                f'{len(verified_patches_list) + len(unverified_patches_list):,} '
+                'patches'))
         prepare_patch_dt_target_samples(
-            verified_patches_list, cfg['patch_dt_target_num_points'], cfg['dt_target_max_stride'],
+            verified_patches_list, cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
         )
         if unverified_patches_list:
             prepare_patch_dt_target_samples(
-                unverified_patches_list, cfg['patch_dt_target_num_points'], cfg['dt_target_max_stride'],
+                unverified_patches_list, cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
             )
     # Caches are recomputed lazily once the corresponding DT loss is active.
     # Updates are deterministic given the transform, so DDP ranks stay consistent.
@@ -2055,8 +1961,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
     # ==========================================================================
 
     if is_distributed():
-        np.random.seed(cfg['random_seed'] + get_rank())
-        torch.manual_seed(cfg['random_seed'] + get_rank())
+        np.random.seed(cfg['optimizer_random_seed'] + get_rank())
+        torch.manual_seed(cfg['optimizer_random_seed'] + get_rank())
     dist_grad_params = list(spiral_and_transform.parameters())
     dist_grad_named = list(spiral_and_transform.named_parameters())
     if is_main_process():
@@ -2109,6 +2015,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 get_or_build_unattached_pcl_flat,
                 tracks=preview_extent_tracks,
                 surface_id=surface_id,
+                progress=progress,
             )
             diagnostic_weights = {
                 name: cfg.get(f'loss_weight_{name}', 0.0)
@@ -2128,10 +2035,12 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     float(cfg['loss_weight_dense_spacing_count']), 1.0)
             transform = spiral_and_transform.get_slice_to_spiral_transform()
             dr = spiral_and_transform.get_dr_per_winding()
+            progress.begin(
+                'exporting_preview', 'Computing preview diagnostics')
             recorder = LossMapRecorder(
                 manifest,
                 generation_path,
-                z0=z_begin - int(cfg['flow_bounds_z_margin']),
+                z0=z_begin - int(cfg['model_flow_bounds_z_margin']),
                 grid_spacing=int(cfg['output_step_size']),
                 dr_per_winding=dr,
                 weights=diagnostic_weights,
@@ -2139,8 +2048,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             with torch.no_grad(), capture_loss_maps(recorder, suppress_errors=True):
                 get_patch_and_umbilicus_losses(
                     transform, dr,
-                    cfg['num_patches_per_step'],
-                    cfg['num_patches_per_step_for_dt'],
+                    cfg['sample_count_patches_per_step'],
+                    cfg['sample_count_patches_per_step_for_dt'],
                     verified_patches_list, patch_atlas,
                     patch_sampling_probabilities, umbilicus_zyx,
                     compute_dt=cfg['loss_weight_patch_dt'] > 0,
@@ -2150,8 +2059,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 if unverified_patch_atlas is not None:
                     get_unverified_patch_losses(
                         transform, dr,
-                        cfg['unverified_num_patches_per_step'],
-                        cfg['unverified_num_patches_per_step_for_dt'],
+                        cfg['sample_count_unverified_patches_per_step'],
+                        cfg['sample_count_unverified_patches_per_step_for_dt'],
                         unverified_patches_list, unverified_patch_atlas,
                         unverified_patch_sampling_probabilities,
                         compute_dt=cfg['loss_weight_unverified_patch_dt'] > 0,
@@ -2159,7 +2068,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 if cfg['loss_weight_sym_dirichlet'] > 0:
                     get_symmetric_dirichlet_loss(
                         transform, dr, shell_outer_winding_idx,
-                        cfg['regularisation_num_points'])
+                        cfg['sample_count_regularisation_points'])
                 if cfg['loss_weight_rel_winding'] > 0 and cross_patch_pcls:
                     get_patch_rel_winding_loss(
                         transform, dr, verified_patches, patch_atlas,
@@ -2172,7 +2081,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     for _loss_name, _loss_value in iter_lasagna_losses(
                             transform, dr, lasagna_volume,
                             shell_outer_winding_idx,
-                            cfg['dense_normals_num_points'],
+                            cfg['sample_count_dense_normal_points'],
                             compute_spacing=grad_mag_spacing_enabled):
                         pass
                 if phase_mode_active():
@@ -2188,8 +2097,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                         transform, dr, unattached_pcl_strips,
                         pcl_sampling_strata['unattached'],
                         get_or_build_unattached_pcl_flat,
-                        cfg['unattached_pcl_num_per_step'],
-                        cfg['unattached_pcl_num_points_per_step'],
+                        cfg['sample_count_unattached_pcls_per_step'],
+                        cfg['sample_count_unattached_pcl_points_per_step'],
                         compute_dt=cfg['loss_weight_unattached_pcl_dt'] > 0,
                     )
                 if prepared_main_tracks is not None:
@@ -2265,12 +2174,12 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 path = record.get('path')
                 input_id = record.get('id')
                 if kind == 'patch':
-                    if cfg['disable_patches']:
+                    if cfg['input_disable_patches']:
                         raise RuntimeError('disable_patches=True: this session takes no patches')
                     if input_id in verified_patches or input_id in new_patches:
                         raise RuntimeError(f'Patch {input_id!r} is already part of this session')
                     patch = load_tifxyz(path)
-                    cells_to_erode = patch.erosion_cells(cfg['erode_patches'])
+                    cells_to_erode = patch.erosion_cells(cfg['patch_erode_patches'])
                     if cells_to_erode > 0 and not erode_patch_valid_region(patch, cells_to_erode):
                         raise RuntimeError(f'Patch {input_id!r} has no valid quads after erosion')
                     if not patch_intersects_z_roi(patch, z_begin, z_end):
@@ -2281,7 +2190,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     new_patches[input_id] = patch
                 elif kind == 'fiber':
                     pcl = load_fiber_point_collection(
-                        path, next_id, min_point_spacing=cfg['fiber_min_point_spacing'])
+                        path, next_id, min_point_spacing=cfg['pcl_fiber_min_point_spacing'])
                     if pcl is None:
                         raise RuntimeError(f'Fiber {input_id!r} has no usable control points')
                     pcl['source_file'] = path
@@ -2327,7 +2236,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 if cfg['dt_target_mode'] == 'whole_object_quantile':
                     prepare_patch_dt_target_samples(
                         list(new_patches.values()),
-                        cfg['patch_dt_target_num_points'], cfg['dt_target_max_stride'],
+                        cfg['sample_count_patch_dt_target_points'], cfg['dt_target_max_stride'],
                     )
 
             # ---- Point collections: link, classify, strip-materialise ----
@@ -2400,7 +2309,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     pcl['points_by_patch'] = points_by_patch
                     cross_patch_pcls.append(pcl)
 
-                min_point_spacing = cfg['unattached_pcl_min_point_spacing']
+                min_point_spacing = cfg['pcl_unattached_pcl_min_point_spacing']
                 for pcl_id, pcl in new_unattached.items():
                     sorted_items = sorted(pcl['points'].items(), key=lambda kv: int(kv[0]))
                     if len(sorted_items) < 2:
@@ -2439,7 +2348,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 # pools; force recomputation on next use.
                 dt_target_cache_manager.reset()
 
-            if run_cfg['interactive_influence_enabled'] and (new_patches or new_collections):
+            if run_cfg['influence_enabled'] and (new_patches or new_collections):
                 influence_state = make_influence_state(run_cfg, torch.device('cuda'))
                 influence_state.activate_or_extend_(
                     new_patches=new_patches,
@@ -2453,7 +2362,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 )
                 interactive_influence_loss_weight = float(run_cfg['loss_weight_anchor'])
                 interactive_influence_anchor_samples = int(
-                    run_cfg['interactive_influence_anchor_samples_per_step'])
+                    run_cfg['sample_count_influence_anchor_samples_per_step'])
 
             # run() sets the target before this callback is drained at the
             # pause boundary, so this is exactly the iteration window requested
@@ -2463,7 +2372,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             dt_resume_iteration = get_interactive_dt_resume_iteration(
                 interactive_status['current_iteration'],
                 interactive_status['target_iteration'],
-                run_cfg['interactive_influence_disable_dt_frac'],
+                run_cfg['influence_disable_dt_frac'],
             )
             interactive_dt_resume_iteration = dt_resume_iteration
 
@@ -2476,18 +2385,200 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             torch.cuda.set_rng_state_all(cuda_states)
 
     if interactive_driver is not None:
-        def configure_interactive_run(config):
-            # Only called by the resident driver on the fitter thread at a
-            # pause boundary. These settings are read afresh by every step.
-            if ({'track_length_bin_weights', 'max_track_crossing_per_step'}
-                    & set(config)):
-                configure_prepared_track_sampling(prepared_main_tracks, config)
+        def configure_interactive_run(config, path_changes=None):
+            """Apply Run-scoped settings without replacing the resident fit."""
+            global shell_path
+            nonlocal dt_target_whole_object, prepared_main_tracks
+            nonlocal lr_scheduler, num_training_steps
+            nonlocal patch_sampling_probabilities
+            nonlocal unverified_patch_sampling_probabilities
+            nonlocal unverified_patches, unverified_patches_list
+            nonlocal unverified_patch_atlas
+            nonlocal shell_patch, shell_map, shell_envelope
+            nonlocal shell_outer_winding_idx, shell_valid_zyxs_gpu
+            nonlocal tracks, track_families, track_source_ids
+            nonlocal preview_extent_tracks
+
+            path_changes = dict(path_changes or {})
+            changed = set(config)
+            old_values = {key: cfg[key] for key in config}
             cfg.update(config, allow_val_change=True)
+            try:
+                shell_changed = (
+                    bool(changed & {
+                        key for key in cfg.keys()
+                        if str(key).startswith('shell_')
+                    })
+                    or 'outer_shell' in path_changes
+                )
+                rebuilt_tracks = None
+                replace_prepared_tracks = False
+                rebuilt_track_rows = tracks
+                rebuilt_families = track_families
+                rebuilt_source_ids = track_source_ids
+                rebuilt_shell_patch = shell_patch
+                rebuilt_shell_map = shell_map
+                rebuilt_shell_envelope = shell_envelope
+                rebuilt_shell_outer = shell_outer_winding_idx
+                rebuilt_shell_valid = shell_valid_zyxs_gpu
+                requested_shell_path = str(
+                    path_changes.get('outer_shell', shell_path) or '')
+
+                if shell_changed:
+                    if not requested_shell_path:
+                        raise ValueError(
+                            'shell configuration requires an outer shell path')
+                    rebuilt_shell_patch = load_tifxyz(requested_shell_path)
+                    rebuilt_shell_envelope = (
+                        ShellPolarMap(
+                            rebuilt_shell_patch, umbilicus,
+                            z_min=z_begin - cfg['model_flow_bounds_z_margin'],
+                            z_max=z_end + cfg['model_flow_bounds_z_margin'],
+                            num_theta_bins=cfg['shell_num_theta_bins'],
+                            device='cpu')
+                        if filter_tracks_by_shell else None
+                    )
+                    if filter_tracks_by_shell and track_reload_source is not None:
+                        (rebuilt_track_rows, rebuilt_families,
+                         kept_track_indices) = filter_tracks_to_outer_shell(
+                            track_reload_source, rebuilt_shell_envelope,
+                            track_reload_families, return_indices=True)
+                        rebuilt_source_ids = (
+                            track_reload_source_ids[kept_track_indices]
+                            if track_reload_source_ids is not None else None)
+                        rebuilt_tracks = prepare_main_phase_tracks(
+                            rebuilt_track_rows, None,
+                            float(cfg['track_exclusion_radius']), device,
+                            anchor_tree=trusted_geometry_tree,
+                            sampling_config=validate_track_sampling_config(cfg),
+                            track_families=rebuilt_families,
+                            track_source_ids=rebuilt_source_ids,
+                            crossing_cache=track_crossing_cache,
+                            track_graph=track_graph)
+                        replace_prepared_tracks = True
+
+                    rebuilt_shell_map = (
+                        ShellPolarMap(
+                            rebuilt_shell_patch, umbilicus,
+                            z_min=z_begin - cfg['model_flow_bounds_z_margin'],
+                            z_max=z_end + cfg['model_flow_bounds_z_margin'],
+                            num_theta_bins=cfg['shell_num_theta_bins'],
+                            device=device)
+                        if cfg['loss_weight_shell_outer'] > 0 else None
+                    )
+                    rebuilt_shell_valid = (
+                        subsample_shell_radius_pool(rebuilt_shell_patch)
+                        if cfg['loss_weight_shell_patch_radius'] > 0 else None
+                    )
+                    rebuilt_shell_outer = int(cfg['shell_outer_winding_idx'])
+
+                reprepare_tracks = bool(changed & {
+                    'track_max_tortuosity',
+                    'track_exclusion_radius',
+                })
+                if reprepare_tracks and rebuilt_tracks is None and tracks:
+                    rebuilt_tracks = prepare_main_phase_tracks(
+                        tracks, None, float(cfg['track_exclusion_radius']),
+                        device, anchor_tree=trusted_geometry_tree,
+                        sampling_config=validate_track_sampling_config(cfg),
+                        track_families=track_families,
+                        track_source_ids=track_source_ids,
+                        crossing_cache=track_crossing_cache,
+                        track_graph=track_graph)
+                    replace_prepared_tracks = True
+
+                target_tracks = (
+                    rebuilt_tracks
+                    if replace_prepared_tracks else prepared_main_tracks)
+                if ({'track_length_bin_weights',
+                     'track_max_track_crossing_per_step',
+                     'track_min_walk_steps_per_track',
+                     'track_max_walk_steps_per_track',
+                     'track_min_walks_per_track',
+                     'track_max_walks_per_track',
+                     'track_walk_minimum_cycle_travel'}
+                        & changed):
+                    configure_prepared_track_sampling(target_tracks, config)
+
+                if 'patch_loss_z_margin' in changed:
+                    patch_sampling_probabilities = \
+                        prepare_patch_sampling_cache(verified_patches_list)
+                    if unverified_patches_list:
+                        unverified_patch_sampling_probabilities = \
+                            prepare_patch_sampling_cache(
+                                unverified_patches_list)
+                if 'patch_unverified_patch_exclusion_radius' in changed:
+                    (rebuilt_unverified, rebuilt_unverified_list,
+                     rebuilt_unverified_probabilities,
+                     rebuilt_unverified_atlas) = \
+                        rebuild_unverified_patch_inputs(float(
+                            cfg['patch_unverified_patch_exclusion_radius']))
+                else:
+                    rebuilt_unverified = unverified_patches
+                    rebuilt_unverified_list = unverified_patches_list
+                    rebuilt_unverified_probabilities = \
+                        unverified_patch_sampling_probabilities
+                    rebuilt_unverified_atlas = unverified_patch_atlas
+
+                dt_preparation_changed = bool(changed & {
+                    'dt_target_mode', 'dt_target_max_stride',
+                    'sample_count_patch_dt_target_points',
+                })
+                if dt_preparation_changed:
+                    dt_target_whole_object = (
+                        cfg['dt_target_mode'] == 'whole_object_quantile')
+                    if dt_target_whole_object:
+                        prepare_patch_dt_target_samples(
+                            verified_patches_list,
+                            cfg['sample_count_patch_dt_target_points'],
+                            cfg['dt_target_max_stride'])
+                        if unverified_patches_list:
+                            prepare_patch_dt_target_samples(
+                                unverified_patches_list,
+                                cfg['sample_count_patch_dt_target_points'],
+                                cfg['dt_target_max_stride'])
+                if any(key.startswith('dt_') for key in changed) \
+                        or dt_preparation_changed:
+                    dt_target_cache_manager.update_interval = max(
+                        1, int(cfg['dt_target_update_interval']))
+                    dt_target_cache_manager.reset()
+                if changed & {
+                        'optimizer_exp_lr_schedule',
+                        'optimizer_learning_rate',
+                        'optimizer_lr_final_factor',
+                        'optimizer_num_training_steps',
+                }:
+                    realign_lr_schedule(
+                        interactive_driver.status()['current_iteration'])
+            except Exception:
+                cfg.update(old_values, allow_val_change=True)
+                raise
+
+            if shell_changed:
+                shell_path = requested_shell_path
+                shell_patch = rebuilt_shell_patch
+                shell_map = rebuilt_shell_map
+                shell_envelope = rebuilt_shell_envelope
+                shell_outer_winding_idx = rebuilt_shell_outer
+                shell_valid_zyxs_gpu = rebuilt_shell_valid
+                tracks = rebuilt_track_rows
+                track_families = rebuilt_families
+                track_source_ids = rebuilt_source_ids
+            if replace_prepared_tracks:
+                prepared_main_tracks = rebuilt_tracks
+                preview_extent_tracks = (
+                    (prepared_main_tracks['flat_zyx_cpu'],)
+                    if prepared_main_tracks is not None else ())
+            unverified_patches = rebuilt_unverified
+            unverified_patches_list = rebuilt_unverified_list
+            unverified_patch_sampling_probabilities = \
+                rebuilt_unverified_probabilities
+            unverified_patch_atlas = rebuilt_unverified_atlas
 
         # In the usual zero-exclusion case preview bounds reuse the prepared
         # flat tensor, so the original list of per-track arrays is no longer
         # needed after setup.
-        if preview_extent_tracks is not tracks:
+        if preview_extent_tracks is not tracks and track_reload_source is None:
             tracks = None
         interactive_driver.on_ready(
             completed_iterations=start_iteration,
@@ -2507,20 +2598,37 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         if interactive_driver is not None
         else range(start_iteration, num_training_steps)
     )
-    for iteration in tqdm(iteration_sequence, disable=not is_main_process()):
+    if interactive_driver is None:
+        progress.begin(
+            'optimizing', 'Optimizing',
+            step=0, total_steps=max(0, num_training_steps - start_iteration),
+            unit='iterations')
+    for iteration in tqdm(
+            iteration_sequence,
+            disable=not is_main_process() or has_progress):
         if interactive_driver is not None and not interactive_driver.wait_for_iteration(iteration):
             break
         step_timer.start('fwd')
-        flow_field_high_res_lr_scale = get_flow_field_high_res_lr_scale(iteration)
-        for flow_field in spiral_and_transform.flow_fields:
-            flow_field.flow_scales[1] = flow_field_high_res_lr_scale
+        flow_field_high_res_lr_scale = apply_high_res_lr_scale(iteration)
 
-        slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform()
-        dr_per_winding = spiral_and_transform.get_dr_per_winding()
+        # The tiny graph paths shared by every transform evaluation this
+        # iteration (dr softplus, scaled linear logits, pinned gap logits) are
+        # cut at detached leaves. Each loss family's backward then owns its
+        # whole graph, so autograd can free the family's buffers as the
+        # backward pass consumes them instead of retaining the full graph
+        # (retain_graph) until the family is released. The leaf gradients
+        # accumulated across families flow through the real shared paths once,
+        # next to the flow-field gradient flush below.
+        shared_transform_outputs = spiral_and_transform.get_shared_transform_tensors()
+        shared_transform_leaves = tuple(
+            output.detach().requires_grad_(True) for output in shared_transform_outputs)
+        slice_to_spiral_transform = spiral_and_transform.get_slice_to_spiral_transform(
+            shared=shared_transform_leaves)
+        dr_per_winding = shared_transform_leaves[0]
 
         losses = {}
         log_metrics = {
-            'flow_field_high_res_lr_scale': spiral_and_transform.flow_field.flow_scales[1],
+            'flow_field_high_res_lr_scale': flow_field_high_res_lr_scale,
         }
 
         def backward_family(weighted_losses):
@@ -2529,10 +2637,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             if family_loss.requires_grad:
                 step_timer.stop('fwd')
                 step_timer.start('bwd')
-                # dr_per_winding and the transform's scaled linear logits are shared
-                # by later families. retain_graph keeps those tiny common paths valid;
-                # the family-specific graph is released when this function returns.
-                family_loss.backward(retain_graph=True)
+                # The paths shared with later families end at detached leaves
+                # (shared_transform_leaves and the flow fields' internal
+                # accumulators), so this family's graph is self-contained and
+                # its buffers are freed as the backward pass consumes them.
+                family_loss.backward()
                 step_timer.stop('bwd')
                 step_timer.start('fwd')
             for name, value in weighted_losses.items():
@@ -2550,10 +2659,9 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         unverified_patch_dt_start = cfg['loss_start_patch_dt'] if cfg['loss_start_unverified_patch_dt'] is None else cfg['loss_start_unverified_patch_dt']
         compute_unverified_patch_dt = not interactive_dt_suppressed and iteration > unverified_patch_dt_start
 
-        # Progressive-outward DT gating: winding cutoff that grows from the respective DT start
-        # step. Falls back to the configured shell_outer_winding_idx when shell losses are off so
-        # the feature still works; None => no gating.
-        dt_progressive_outer = shell_outer_winding_idx if shell_outer_winding_idx is not None else cfg['shell_outer_winding_idx']
+        # Progressive-outward DT gating: winding cutoff that grows from the
+        # respective DT start step. None means no gating.
+        dt_progressive_outer = shell_outer_winding_idx
         patch_dt_max_winding = get_progressive_dt_max_winding(iteration, cfg['loss_start_patch_dt'], dt_progressive_outer)
         track_dt_max_winding = get_progressive_dt_max_winding(iteration, track_dt_start, dt_progressive_outer)
         unverified_patch_dt_max_winding = get_progressive_dt_max_winding(iteration, unverified_patch_dt_start, dt_progressive_outer)
@@ -2585,7 +2693,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                         pcl_flat['zyxs'], pcl_flat['starts'],
                         windings=pcl_flat['windings'],
                         floating_threshold=cfg['dt_target_floating_threshold'],
-                        num_points_per_strip=cfg['dt_target_num_points_per_strip'],
+                        num_points_per_strip=cfg['sample_count_dt_target_points_per_strip'],
                         max_stride=cfg['dt_target_max_stride'],
                         max_total_points=20_000_000,
                     ))
@@ -2595,7 +2703,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     prepared_main_tracks['flat_zyx_cpu'], prepared_main_tracks['offsets'],
                     windings=None,
                     floating_threshold=cfg['dt_target_floating_threshold'],
-                    num_points_per_strip=cfg['dt_target_num_points_per_strip'],
+                    num_points_per_strip=cfg['sample_count_dt_target_points_per_strip'],
                     max_stride=cfg['dt_target_max_stride'],
                     max_total_points=20_000_000,
                 ))
@@ -2603,8 +2711,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         patch_loss_values = get_patch_and_umbilicus_losses(
             slice_to_spiral_transform,
             dr_per_winding,
-            cfg['num_patches_per_step'],
-            cfg['num_patches_per_step_for_dt'],
+            cfg['sample_count_patches_per_step'],
+            cfg['sample_count_patches_per_step_for_dt'],
             verified_patches_list,
             patch_atlas,
             patch_sampling_probabilities,
@@ -2632,8 +2740,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             unverified_loss_values = get_unverified_patch_losses(
                 slice_to_spiral_transform,
                 dr_per_winding,
-                cfg['unverified_num_patches_per_step'],
-                cfg['unverified_num_patches_per_step_for_dt'],
+                cfg['sample_count_unverified_patches_per_step'],
+                cfg['sample_count_unverified_patches_per_step_for_dt'],
                 unverified_patches_list,
                 unverified_patch_atlas,
                 unverified_patch_sampling_probabilities,
@@ -2653,7 +2761,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                     slice_to_spiral_transform,
                     dr_per_winding,
                     shell_outer_winding_idx,
-                    cfg['regularisation_num_points'],
+                    cfg['sample_count_regularisation_points'],
                 ) * cfg['loss_weight_sym_dirichlet'],
             })
 
@@ -2689,7 +2797,7 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 dr_per_winding,
                 lasagna_volume,
                 shell_outer_winding_idx,
-                cfg['dense_normals_num_points'],
+                cfg['sample_count_dense_normal_points'],
                 compute_spacing=grad_mag_spacing_enabled,
             ):
                 weight = (
@@ -2701,13 +2809,14 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 # Release before the generator builds the next loss's graph,
                 # or both large transform graphs are resident at peak.
                 del dense_loss_value
-            if lasagna_volume.get('backend') == 'mmap':
+            if lasagna_volume.get('backend') == 'sparse_cuda':
                 log_metrics.update({
                     f'lasagna_{name}': value
                     for name, value in lasagna_volume['store'].last_timings.items()
                 })
 
         warn_if_sdt_loss_inactive()
+        warn_if_dense_losses_structurally_disabled()
         phase_components_active = phase_mode_active()
         min_spacing_active = cfg['loss_weight_min_spacing'] > 0
         if phase_components_active or min_spacing_active:
@@ -2758,12 +2867,12 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 backward_family(pending_shared)
             del pending_shared
             if (phase_components_active
-                    and lasagna_volume['backend'] == 'mmap'):
+                    and lasagna_volume['backend'] == 'sparse_cuda'):
                 log_metrics.update({
                     f'dense_spacing_phase_normal_{name}': value
                     for name, value in lasagna_volume['store'].last_timings.items()
                 })
-            if phase_components_active and sdt_volume['backend'] == 'mmap':
+            if phase_components_active and sdt_volume['backend'] == 'sparse_cuda':
                 log_metrics.update({
                     f'dense_spacing_phase_sdt_store_{name}': value
                     for name, value in sdt_volume['store'].last_timings.items()
@@ -2779,8 +2888,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 unattached_pcl_strips,
                 pcl_sampling_strata['unattached'],
                 get_or_build_unattached_pcl_flat,
-                cfg['unattached_pcl_num_per_step'],
-                cfg['unattached_pcl_num_points_per_step'],
+                cfg['sample_count_unattached_pcls_per_step'],
+                cfg['sample_count_unattached_pcl_points_per_step'],
                 compute_dt=compute_patch_dt,
                 dt_max_winding=patch_dt_max_winding,
                 dt_target_cache=unattached_pcl_dt_target_cache,
@@ -2843,6 +2952,18 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             apply_accumulated_field_grad = getattr(flow_field, 'apply_accumulated_field_grad', None)
             if apply_accumulated_field_grad is not None:
                 apply_accumulated_field_grad()
+        # Propagate the leaf gradients the family backwards accumulated on the
+        # shared transform paths through the real parameters, exactly once.
+        shared_transform_pending = [
+            (output, leaf.grad)
+            for output, leaf in zip(shared_transform_outputs, shared_transform_leaves)
+            if output.requires_grad and leaf.grad is not None
+        ]
+        if shared_transform_pending:
+            torch.autograd.backward(
+                [output for output, _ in shared_transform_pending],
+                [grad for _, grad in shared_transform_pending],
+            )
         step_timer.stop('bwd')
         step_timer.start('comm')
         allreduce_grads_(dist_grad_params)
@@ -2851,7 +2972,11 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
         step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=nonfinite_grad_steps.device)
         for name, p in dist_grad_named:
             if p.grad is not None:
-                param_nonfinite = (~torch.isfinite(p.grad)).any()
+                # aminmax propagates NaN and surfaces +/-inf through two scalar
+                # reductions, avoiding the gradient-sized boolean temporaries
+                # that (~torch.isfinite(grad)).any() allocates per parameter.
+                grad_min, grad_max = torch.aminmax(p.grad)
+                param_nonfinite = ~(torch.isfinite(grad_min) & torch.isfinite(grad_max))
                 step_had_nonfinite |= param_nonfinite
                 nonfinite_grad_by_param[name] += param_nonfinite.to(nonfinite_grad_steps.dtype)
                 torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
@@ -2882,6 +3007,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
                 learning_rate=float(optimiser.param_groups[0]['lr']),
                 metrics={name: float(value) for name, value in log_metrics.items()},
             )
+        else:
+            progress.update(iteration - start_iteration + 1)
 
         if iteration % 200 == 0:
             # Only sync to CPU and log when we actually print, avoiding a per-iter
@@ -2915,8 +3042,13 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
 
     suffix = 'fitted'
     if is_main_process():
+        progress.begin(
+            'saving_checkpoint', 'Saving final checkpoint',
+            detail=f'checkpoint_{suffix}.ckpt')
         save_model(suffix, num_training_steps)
-        if cfg.get('save_png_visualizations', False):
+        if cfg.get('output_save_png_visualizations', False):
+            progress.begin(
+                'finalizing', 'Preparing final visualizations')
             (
                 zs_for_visualisation,
                 slice_yx,
@@ -2930,6 +3062,8 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             scroll_slices_for_visualisation = None
             prediction_slices_for_visualisation = None
             quad_label_map = None
+        progress.begin(
+            'finalizing', 'Computing satisfaction metrics and outputs')
         save_overlay_and_print_satisfaction(
             suffix,
             spiral_and_transform=spiral_and_transform,
@@ -2958,31 +3092,38 @@ def main(load_only_patches_and_point_collections=False, interactive_driver=None)
             voxel_size_um=voxel_size_um,
             get_or_build_unattached_pcl_flat=get_or_build_unattached_pcl_flat,
             run_tag=run_tag,
-            save_png_visualizations=cfg.get('save_png_visualizations', False),
+            save_png_visualizations=cfg.get('output_save_png_visualizations', False),
+            progress=progress,
         )
+        progress.finish()
+        progress.clear()
 
 
 if __name__ == '__main__':
+    cli_progress = (
+        ProgressReporter(stream=sys.stderr)
+        if int(os.environ.get('RANK', '0')) == 0 else None
+    )
     maybe_init_distributed()
     try:
-        config = dict(default_config)
+        config = Config().as_dict()
         config.update(get_env_config_overrides())
         reference_z_range_num_slices = 9500
         z_range_scaled_count_keys = (
-            'num_patches_per_step',
-            'num_patches_per_step_for_dt',
-            'unverified_num_patches_per_step',
-            'unverified_num_patches_per_step_for_dt',
-            'rel_winding_num_pcls',
-            'abs_winding_num_pcls',
-            'unattached_pcl_num_per_step',
-            'track_num_per_step',
-            'dense_normals_num_points',
-            'dense_spacing_num_pairs',
-            'dense_spacing_density_extra_pairs',
-            'dense_attachment_num_points',
-            'regularisation_num_points',
-            'shell_num_samples',
+            'sample_count_patches_per_step',
+            'sample_count_patches_per_step_for_dt',
+            'sample_count_unverified_patches_per_step',
+            'sample_count_unverified_patches_per_step_for_dt',
+            'sample_count_relative_winding_pcls',
+            'sample_count_absolute_winding_pcls',
+            'sample_count_unattached_pcls_per_step',
+            'sample_count_tracks_per_step',
+            'sample_count_dense_normal_points',
+            'sample_count_dense_spacing_pairs',
+            'sample_count_dense_spacing_density_extra_pairs',
+            'sample_count_dense_attachment_points',
+            'sample_count_regularisation_points',
+            'sample_count_shell_samples',
         )
         z_range_scale, z_range_num_slices = scale_counts_for_z_range(
             config, z_begin, z_end,
@@ -3007,6 +3148,8 @@ if __name__ == '__main__':
         wandb.init(project='scrolls', config=config, mode=wandb_mode)
         cfg = wandb.config
         configure_losses(cfg, z_begin, z_end)
-        main()
+        main(progress=cli_progress)
     finally:
+        if cli_progress is not None:
+            cli_progress.close()
         maybe_destroy_distributed()

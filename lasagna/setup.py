@@ -57,6 +57,7 @@ preprocess_requires = [
     "numpy>=1.24",
     "opencv-python-headless>=4.8",
     "torch>=2.1",
+    "threadpoolctl>=3.1",
     "zarr>=3.0,<4",
 ]
 preprocess_3d_requires = [
@@ -77,6 +78,11 @@ ext_modules = [
     Pybind11Extension(
         "monotone_norm",
         ["monotone_norm.cpp"],
+    ),
+    Pybind11Extension(
+        "accumulator_add",
+        ["accumulator_add.cpp"],
+        cxx_std=17,
     ),
 ]
 
@@ -103,6 +109,7 @@ setup(
             "lasagna-download-list=lasagna.scripts.download_volume_list:main",
             "lasagna-bootstrap=lasagna.scripts.bootstrap_venv:main",
             "lasagna-preprocess=preprocess_cos_omezarr:cli_main",
+            "lasagna-predict3d-holescan=predict3d_holescan:main",
         ],
     },
     zip_safe=False,

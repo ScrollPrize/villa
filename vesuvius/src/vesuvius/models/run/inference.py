@@ -28,6 +28,7 @@ from vesuvius.models.run.external_models.load_resnet import try_load_external_re
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
 from vesuvius.utils.k8s import get_tqdm_kwargs
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 def _tuple_if_sequence(value):
@@ -434,7 +435,7 @@ class Inferer():
                         raise
                     raise ValueError(
                         f"{e}. If this is an external ResNet checkpoint (ink_model.py + .pth), "
-                        "rerun with --model-type resnet."
+                        "rerun with --model_type resnet."
                     ) from e
             else:
                 # Auto mode: fallback to nnUNet loader
@@ -737,6 +738,14 @@ class Inferer():
             anon=self.input_anon,
             bbox=self.bbox,
             read_retries=self.read_retries,
+            # The float16 default suits the CUDA autocast path. CPU convolutions
+            # have no float16 kernels, so half patches meet float32 weights and
+            # raise "Input type (c10::Half) and bias type (float) should be the
+            # same". Ask for the dtype the CPU model can actually consume.
+            return_as_type=(
+                "np.float32" if self.device.type == "cpu"
+                else "np.float16"
+            ),
         )
 
         expected_attr_name = 'all_positions'
@@ -818,16 +827,20 @@ class Inferer():
         return concatenated
         
     def _get_zarr_compressor(self):
-        if self.compressor_name.lower() == 'zstd':
-            return zarr.Blosc(cname='zstd', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'lz4':
-            return zarr.Blosc(cname='lz4', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'zlib':
-            return zarr.Blosc(cname='zlib', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'none':
+        # numcodecs.Blosc, not zarr.Blosc: zarr 3 dropped that re-export, and the rest
+        # of the package (blending, finalize_outputs) already builds compressors here.
+        shuffle = numcodecs.blosc.SHUFFLE
+        name = self.compressor_name.lower()
+        if name == 'zstd':
+            return numcodecs.Blosc(cname='zstd', clevel=self.compression_level, shuffle=shuffle)
+        elif name == 'lz4':
+            return numcodecs.Blosc(cname='lz4', clevel=self.compression_level, shuffle=shuffle)
+        elif name == 'zlib':
+            return numcodecs.Blosc(cname='zlib', clevel=self.compression_level, shuffle=shuffle)
+        elif name == 'none':
             return None
         else:
-            return zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
+            return numcodecs.Blosc(cname='zstd', clevel=1, shuffle=shuffle)
 
     def _create_output_stores(self):
         if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
@@ -893,6 +906,13 @@ class Inferer():
             self.output_store.attrs['overlap'] = self.overlap
             self.output_store.attrs['part_id'] = self.part_id
             self.output_store.attrs['num_parts'] = self.num_parts
+            # Record whether test-time augmentation was used. Patch size and overlap are
+            # already here, but TTA is the setting that changes the output most and it
+            # leaves no trace otherwise, so a stored prediction cannot be reproduced from
+            # itself without guessing it.
+            self.output_store.attrs['tta'] = bool(self.do_tta)
+            if self.do_tta:
+                self.output_store.attrs['tta_type'] = self.tta_type
             if self.bbox is not None:
                 # Record the requested ROI (global voxel coords, half-open) so the
                 # output is self-describing about which region was processed.
@@ -1007,8 +1027,9 @@ class Inferer():
                     # Only perform inference if there are non-empty patches
                     if non_empty_indices:
                         non_empty_input = input_batch[non_empty_indices]
-                        
-                        with torch.inference_mode(), torch.amp.autocast('cuda'):
+
+                        with torch.inference_mode(), torch.amp.autocast(
+                                self.device.type, enabled=(self.device.type == 'cuda')):
                             if self.do_tta:
                                 non_empty_output = infer_with_tta(
                                     self.model,
@@ -1118,11 +1139,10 @@ def _parse_bbox_arg(value):
     return tuple(bounds)
 
 
-def main():
+def build_parser():
+    """Build the predict CLI parser (separate from main so it can be tested)."""
     import argparse
-    import sys
-    
-    parser = argparse.ArgumentParser(description='Run nnUNet inference on Zarr data')
+    parser = HyphenUnderscoreParser(description='Run nnUNet inference on Zarr data')
     parser.add_argument('--model_path', type=str, required=True,
                       help='Path to nnUNet model folder, train.py .pth, or external model path (when enabled)')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to the input Zarr volume')
@@ -1151,17 +1171,17 @@ def main():
                       help='Number of threads used to write patches to the output zarr. '
                            'Default: min(16, cpu_count). Increase for S3 outputs to push more parallelism.')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true',
+    parser.add_argument('--skip_empty_patches', action='store_true',
                       help='Skip patches that are empty (all values the same). Default: True')
-    parser.add_argument('--no-skip-empty-patches', dest='skip_empty_patches', action='store_false',
+    parser.add_argument('--no_skip_empty_patches', dest='skip_empty_patches', action='store_false',
                       help='Process all patches, even if they appear empty')
     parser.set_defaults(skip_empty_patches=True)
     
     # Add arguments for Zarr compression
-    parser.add_argument('--zarr-compressor', type=str, default='zstd',
+    parser.add_argument('--zarr_compressor', type=str, default='zstd',
                       choices=['zstd', 'lz4', 'zlib', 'none'],
                       help='Zarr compression algorithm')
-    parser.add_argument('--zarr-compression-level', type=int, default=3,
+    parser.add_argument('--zarr_compression_level', type=int, default=3,
                       help='Compression level (1-9, higher = better compression but slower)')
     
     # Add arguments for the updated Volume class
@@ -1172,14 +1192,14 @@ def main():
 
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
-    parser.add_argument('--model-type', type=str, default='auto',
+    parser.add_argument('--model_type', type=str, default='auto',
                       choices=['auto', 'nnunet', 'train_py', 'resnet'],
                       help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
     parser.add_argument('--model_cache_dir', type=str, default=DEFAULT_MODEL_CACHE_DIR,
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
-    parser.add_argument('--read-retries', dest='read_retries', type=int, default=4,
+    parser.add_argument('--read_retries', type=int, default=4,
                       help='Attempts per patch read (default 4). Transient remote failures '
                            '(dropped connections, truncated payloads, 429/5xx) are retried '
                            'with exponential backoff so one hiccup does not abort a long '
@@ -1194,8 +1214,13 @@ def main():
                            'Patch coordinates stay in the global frame, so blend_logits and '
                            'finalize_outputs need no extra flags. When streaming a remote '
                            'volume only the chunks intersecting the ROI are fetched.')
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+    import sys
+
+    args = build_parser().parse_args()
     
     # Parse optional patch size if provided
     patch_size = None

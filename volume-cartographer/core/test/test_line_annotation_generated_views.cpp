@@ -6,8 +6,11 @@
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationFiberSaveJob.hpp"
+#include "LineAnnotationFiberSegments.hpp"
+#include "vc/lasagna/LineSpline.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
@@ -25,6 +28,79 @@
 #include <vector>
 
 namespace {
+
+class FiberModeNormalSampler final : public vc::lasagna::NormalSampler {
+public:
+    explicit FiberModeNormalSampler(cv::Vec3d normal = {0.0, 0.0, 1.0})
+        : normal_(normal)
+    {
+    }
+
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d&) const override
+    {
+        return {normal_, true, {}};
+    }
+
+private:
+    cv::Vec3d normal_;
+};
+
+class FiberModePrediction final : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    explicit FiberModePrediction(double invalidX =
+                                     std::numeric_limits<double>::infinity())
+        : invalidX_(invalidX)
+    {
+    }
+
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d& point,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        vc::fiber_tracer::FiberPredictionSample sample;
+        if (std::abs(point[0] - invalidX_) < 1.0e-6) {
+            sample.options.push_back({});
+            return sample;
+        }
+        const float sign = referenceDirection[0] < 0.0 ? -1.0f : 1.0f;
+        sample.options.push_back({{sign, 0.0f, 0.0f}, 1.0f, true});
+        return sample;
+    }
+
+private:
+    double invalidX_;
+};
+
+class AlwaysInvalidFiberModePrediction final
+    : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d&,
+        const cv::Vec3d&) const override
+    {
+        vc::fiber_tracer::FiberPredictionSample sample;
+        sample.options.push_back({});
+        return sample;
+    }
+};
+
+class FirstStepInvalidFiberModePrediction final
+    : public vc::fiber_tracer::FiberPredictionSource {
+public:
+    vc::fiber_tracer::FiberPredictionSample sample(
+        const cv::Vec3d& point,
+        const cv::Vec3d& referenceDirection) const override
+    {
+        vc::fiber_tracer::FiberPredictionSample sample;
+        if (std::abs(point[0]) >= 4.0 - 1.0e-6) {
+            sample.options.push_back({});
+            return sample;
+        }
+        const float sign = referenceDirection[0] < 0.0 ? -1.0f : 1.0f;
+        sample.options.push_back({{sign, 0.0f, 0.0f}, 1.0f, true});
+        return sample;
+    }
+};
 
 vc::lasagna::NormalSample normal()
 {
@@ -84,6 +160,41 @@ std::vector<std::filesystem::path> recoveryFilesIn(const std::filesystem::path& 
 }
 
 } // namespace
+
+TEST_CASE("fiber file name identity parsing round-trips canonical names")
+{
+    using vc3d::line_annotation::fiberFileName;
+    using vc3d::line_annotation::parsedFiberFileNameIdentity;
+
+    const auto simple = parsedFiberFileNameIdentity(
+        fiberFileName("kb", "20260719T194751553", 553));
+    REQUIRE(simple.has_value());
+    CHECK(simple->username == "kb");
+    CHECK(simple->startedAt == "20260719T194751553");
+    CHECK(simple->sequence == 553);
+
+    // Usernames may contain underscores; the stem parses from the right.
+    const auto underscored = parsedFiberFileNameIdentity(
+        fiberFileName("team_alpha", "20260101T000000000", 7));
+    REQUIRE(underscored.has_value());
+    CHECK(underscored->username == "team_alpha");
+    CHECK(underscored->sequence == 7);
+
+    // Sequences above the padded width still round-trip.
+    const auto wide = parsedFiberFileNameIdentity(
+        fiberFileName("dj", "20260101T000000000", 1234567));
+    REQUIRE(wide.has_value());
+    CHECK(wide->sequence == 1234567);
+
+    // Non-canonical names carry no identity.
+    CHECK_FALSE(parsedFiberFileNameIdentity("horizontal_bundle_03.json"));
+    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719T194751553_000553"));
+    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719_000553.json"));
+    CHECK_FALSE(parsedFiberFileNameIdentity("kb_2026071?T194751553_000553.json"));
+    CHECK_FALSE(parsedFiberFileNameIdentity("_20260719T194751553_000553.json"));
+    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719T194751553_.json"));
+    CHECK_FALSE(parsedFiberFileNameIdentity(".json"));
+}
 
 TEST_CASE("line annotation generated runtime surfaces register and clean up")
 {
@@ -657,6 +768,32 @@ TEST_CASE("line annotation generated strip overlay includes controls and current
     CHECK(overlay.seedLineIndex == -1);
 }
 
+TEST_CASE("branch overlay replacement retains supplied native span diagnostics")
+{
+    vc3d::line_annotation::GeneratedViews views;
+    views.spanAlignmentMetrics.push_back({});
+    views.fiberIntersections.push_back({});
+    vc3d::line_annotation::GeneratedSpanAlignmentMetric metric;
+    metric.kind = vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind::NativeMeetingError;
+    metric.meetingErrorBaseVoxels = 2.5;
+
+    vc3d::line_annotation::replaceGeneratedBranchOverlayData(
+        views,
+        {{{1.0f, 2.0f, 3.0f}, 4.0, false}},
+        {{{1.0f, 0.0f, 0.0f}}},
+        {},
+        {metric});
+
+    REQUIRE(views.controlPoints.size() == 1);
+    CHECK(views.controlPoints.front().linePosition == doctest::Approx(4.0));
+    REQUIRE(views.spanAlignmentMetrics.size() == 1);
+    CHECK(views.spanAlignmentMetrics.front().kind ==
+          vc3d::line_annotation::GeneratedSpanAlignmentMetric::Kind::NativeMeetingError);
+    CHECK(views.spanAlignmentMetrics.front().meetingErrorBaseVoxels ==
+          doctest::Approx(2.5));
+    CHECK(views.fiberIntersections.empty());
+}
+
 TEST_CASE("line annotation generated overlays include pred-snap connector endpoints")
 {
     vc3d::line_annotation::GeneratedViews views;
@@ -1073,4 +1210,546 @@ TEST_CASE("fiber slice intersection opacity fades from 45 to 90 degrees")
     const auto flat = ellipseStyleForAngle(89.0, 3.0);
     CHECK(flat.majorRadius > round.majorRadius);
     CHECK(flat.minorRadius < round.minorRadius);
+}
+
+TEST_CASE("fiber segment metadata round trips with its owning control point")
+{
+    vc3d::line_annotation::StoredControlPoint control{{1.0, 2.0, 3.0}};
+    vc3d::line_annotation::FiberTraceSegmentMetadata metadata;
+    metadata.normalManifestLocation = "s3://bucket/normals.lasagna.json";
+    metadata.fiberManifestLocation = "s3://bucket/fibers.lasagna.json";
+    metadata.traceToBaseScale = 4.0;
+    metadata.config.traceToBaseScale = 4.0;
+    metadata.interpMode = vc3d::line_annotation::SegmentInterpolationMode::Trace;
+    metadata.meetingErrorBaseVoxels = 2.5;
+    metadata.meetingErrorRatio = 1.25;
+    metadata.meetingSource = "forward_moving_plane";
+    metadata.metric = 2.5;
+    metadata.message = "trace";
+    control.segmentToNext = metadata;
+
+    const auto json = vc3d::line_annotation::storedControlPointToJson(control);
+    const auto parsed = vc3d::line_annotation::storedControlPointFromJson(json, 3);
+    REQUIRE(parsed.segmentToNext.has_value());
+    CHECK(parsed[0] == doctest::Approx(1.0));
+    CHECK(parsed.segmentToNext->normalManifestLocation ==
+          "s3://bucket/normals.lasagna.json");
+    CHECK(parsed.segmentToNext->traceToBaseScale == doctest::Approx(4.0));
+    REQUIRE(parsed.segmentToNext->meetingErrorBaseVoxels.has_value());
+    REQUIRE(parsed.segmentToNext->meetingErrorRatio.has_value());
+    CHECK(*parsed.segmentToNext->meetingErrorBaseVoxels == doctest::Approx(2.5));
+    CHECK(*parsed.segmentToNext->meetingErrorRatio == doctest::Approx(1.25));
+    CHECK(parsed.segmentToNext->meetingSource == "forward_moving_plane");
+    CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
+        parsed.segmentToNext));
+
+    auto obsoleteMetadataJson = json;
+    obsoleteMetadataJson["segment_to_next"]["metadata_version"] = 2;
+    CHECK_THROWS_AS(
+        vc3d::line_annotation::storedControlPointFromJson(obsoleteMetadataJson, 3),
+        std::runtime_error);
+    CHECK_THROWS_AS(
+        vc3d::line_annotation::storedControlPointFromJson(json, 2),
+        std::runtime_error);
+
+    metadata.outcome = vc3d::line_annotation::FiberTraceSegmentMetadata::Outcome::LasagnaFallback;
+    metadata.interpMode = vc3d::line_annotation::SegmentInterpolationMode::Lasagna;
+    metadata.metric.reset();
+    metadata.failureCode = "no_trace_plane_intersection";
+    metadata.failureDetail = "forward=max_step_factor reverse=no_valid_candidates";
+    control.segmentToNext = metadata;
+    const auto fallbackJson = vc3d::line_annotation::storedControlPointToJson(control);
+    CHECK(fallbackJson["segment_to_next"]["meeting_error_base_voxels"].is_null());
+    CHECK(fallbackJson["segment_to_next"]["meeting_error_ratio"].is_null());
+    CHECK(fallbackJson["segment_to_next"]["meeting_source"] == "");
+
+    const nlohmann::json sharedReaderRoot = {
+        {"control_points",
+         nlohmann::json::array({
+             fallbackJson,
+             nlohmann::json{{"position", {4.0, 5.0, 6.0}}},
+         })}};
+    CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        sharedReaderRoot, "control_points", 3, "test fiber"));
+    CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
+        sharedReaderRoot, "control_points", 2, "test fiber"),
+        std::runtime_error);
+
+    nlohmann::json strictRoot = sharedReaderRoot;
+    strictRoot["type"] = "vc3d_fiber";
+    strictRoot["version"] = 3;
+    strictRoot["optimization_mode"] = "native_fiber_trace3d";
+    strictRoot["line_points"] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};
+    CHECK_NOTHROW(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber"));
+    auto missingMode = strictRoot;
+    missingMode.erase("optimization_mode");
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::parseVc3dFiberJson(missingMode, "test fiber"),
+        std::runtime_error);
+    auto missingDescriptor = strictRoot;
+    missingDescriptor["control_points"][0].erase("segment_to_next");
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::parseVc3dFiberJson(missingDescriptor, "test fiber"),
+        std::runtime_error);
+    const auto regeneratedLasagna =
+        vc::fiber_tracer::makeLasagnaSegmentMetadataJson(
+            "trace",
+            "s3://bucket/new-normals.lasagna.json",
+            4.0,
+            fallbackJson.at("segment_to_next").at("config"),
+            3.5);
+    CHECK(regeneratedLasagna.at("interp_goal") == "trace");
+    CHECK(regeneratedLasagna.at("interp_mode") == "lasagna");
+    CHECK(regeneratedLasagna.at("metric").get<double>() == doctest::Approx(3.5));
+    CHECK(regeneratedLasagna.at("fiber_manifest") == "");
+    CHECK(regeneratedLasagna.at("meeting_error_base_voxels").is_null());
+
+    vc::fiber_tracer::FiberTraceSegmentResult rejectedResult;
+    rejectedResult.meetingErrorBaseVoxels = 250.0;
+    rejectedResult.meetingErrorRatio = 2.5;
+    rejectedResult.meetingSource = "discarded_native_meeting";
+    rejectedResult.reason = "meeting_error_threshold";
+    const auto rejectedMetadata =
+        vc3d::line_annotation::fiberTraceSegmentMetadataForResult(
+            metadata.normalManifestLocation,
+            metadata.fiberManifestLocation,
+            metadata.traceToBaseScale,
+            metadata.config,
+            rejectedResult);
+    CHECK_FALSE(rejectedMetadata.meetingErrorBaseVoxels.has_value());
+    CHECK_FALSE(rejectedMetadata.meetingErrorRatio.has_value());
+    CHECK(rejectedMetadata.meetingSource.empty());
+    CHECK(rejectedMetadata.failureCode == "meeting_error_threshold");
+
+    std::vector<vc3d::line_annotation::StoredControlPoint> invalid{parsed};
+    CHECK_THROWS_AS(vc3d::line_annotation::validateStoredControlPoints(invalid),
+                    std::runtime_error);
+}
+
+TEST_CASE("fiber optimization mode has stable persisted values")
+{
+    using vc3d::line_annotation::FiberOptimizationMode;
+    CHECK(vc3d::line_annotation::kDefaultNewFiberOptimizationMode ==
+          FiberOptimizationMode::NativeFiberTrace3d);
+    CHECK(vc3d::line_annotation::fiberOptimizationModeToString(
+              FiberOptimizationMode::Lasagna) == "lasagna");
+    CHECK(vc3d::line_annotation::fiberOptimizationModeToString(
+              FiberOptimizationMode::NativeFiberTrace3d) ==
+          "native_fiber_trace3d");
+    CHECK(vc3d::line_annotation::fiberOptimizationModeFromString("lasagna") ==
+          FiberOptimizationMode::Lasagna);
+    CHECK(vc3d::line_annotation::fiberOptimizationModeFromString(
+              "native_fiber_trace3d") ==
+          FiberOptimizationMode::NativeFiberTrace3d);
+    CHECK_THROWS_AS(
+        vc3d::line_annotation::fiberOptimizationModeFromString("unknown"),
+        std::runtime_error);
+}
+
+TEST_CASE("native seed tracing requires native mode and configured inference")
+{
+    using vc3d::line_annotation::FiberOptimizationMode;
+    using vc3d::line_annotation::shouldRunNativeSeedTrace;
+
+    CHECK(shouldRunNativeSeedTrace(
+        FiberOptimizationMode::NativeFiberTrace3d, true, 0));
+    CHECK(shouldRunNativeSeedTrace(
+        FiberOptimizationMode::NativeFiberTrace3d, false, 1));
+    CHECK_FALSE(shouldRunNativeSeedTrace(
+        FiberOptimizationMode::NativeFiberTrace3d, false, 0));
+    CHECK_FALSE(shouldRunNativeSeedTrace(
+        FiberOptimizationMode::NativeFiberTrace3d, false, 2));
+    CHECK_FALSE(shouldRunNativeSeedTrace(FiberOptimizationMode::Lasagna, true, 1));
+}
+
+TEST_CASE("segment interpolation resolution applies short fallback only to global goals")
+{
+    using namespace vc3d::line_annotation;
+    CHECK(resolveSegmentInterpolationMode(
+              SegmentInterpolationGoal::Global,
+              FiberOptimizationMode::NativeFiberTrace3d,
+              99.999) == SegmentInterpolationMode::Cspline);
+    CHECK(resolveSegmentInterpolationMode(
+              SegmentInterpolationGoal::Global,
+              FiberOptimizationMode::NativeFiberTrace3d,
+              100.0) == SegmentInterpolationMode::Trace);
+    CHECK(resolveSegmentInterpolationMode(
+              SegmentInterpolationGoal::Trace,
+              FiberOptimizationMode::Lasagna,
+              1.0) == SegmentInterpolationMode::Trace);
+    CHECK(resolveSegmentInterpolationMode(
+              SegmentInterpolationGoal::Lasagna,
+              FiberOptimizationMode::NativeFiberTrace3d,
+              1.0) == SegmentInterpolationMode::Lasagna);
+}
+
+TEST_CASE("fiber mode falls back only the failed native span")
+{
+    FiberModeNormalSampler normals;
+    FiberModePrediction predictions(32.0);
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+        {6.0, {16.0, 0.0, 0.0}, false, 6},
+        {10.0, {32.0, 0.0, 0.0}, false, 10},
+    };
+    request.controlPoints[0].segmentToNext.emplace();
+    request.controlPoints[0].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Trace;
+    request.controlPoints[1].segmentToNext.emplace();
+    request.controlPoints[1].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Trace;
+    for (int x = -8; x <= 40; x += 4) {
+        request.linePointsBase.push_back(
+            {static_cast<double>(x), 0.0, 0.0});
+    }
+    request.predictions = &predictions;
+    request.baseNormalSampler = &normals;
+    request.traceNormalSampler = &normals;
+    request.normalManifestLocation = "normal.lasagna.json";
+    request.fiberManifestLocation = "fiber.lasagna.json";
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.retraceAll = true;
+    request.traceConfig.stepVoxels = 4.0;
+    request.traceConfig.coneAngleDegrees = 0.0;
+    request.traceConfig.beamWidth = 1;
+    request.traceConfig.maxStepFactor = 2.0;
+    request.traceConfig.smoothnessWeight = 0.0;
+    request.traceConfig.smoothnessNormalWeight = 0.0;
+    request.traceConfig.smoothnessTangentWeight = 0.0;
+    request.traceConfig.cumulativeSmoothnessTangentWeight = 0.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+
+    REQUIRE(result.controlPoints.size() == 3);
+    CHECK(result.nativeSegments == 1);
+    CHECK(result.lasagnaFallbackSegments == 1);
+    CHECK(result.controlPoints[0].segmentToNext.has_value());
+    CHECK(vc3d::line_annotation::isAcceptedNativeTrace(
+        result.controlPoints[0].segmentToNext));
+    CHECK(result.controlPoints[0].segmentToNext->normalManifestLocation ==
+          "normal.lasagna.json");
+    CHECK(result.controlPoints[0].segmentToNext->fiberManifestLocation ==
+          "fiber.lasagna.json");
+    REQUIRE(result.controlPoints[1].segmentToNext.has_value());
+    CHECK_FALSE(vc3d::line_annotation::isAcceptedNativeTrace(
+        result.controlPoints[1].segmentToNext));
+    CHECK(result.controlPoints[1].segmentToNext->failureCode ==
+          "trace_exception");
+    CHECK(result.controlPoints[1].segmentToNext->normalManifestLocation ==
+          "normal.lasagna.json");
+    CHECK(result.controlPoints[1].segmentToNext->fiberManifestLocation ==
+          "fiber.lasagna.json");
+    CHECK(result.nativeExtrapolations +
+              result.lasagnaFallbackExtrapolations == 2);
+    CHECK(result.lasagnaFallbackExtrapolations >= 1);
+    const auto& points = result.optimization.line.points;
+    REQUIRE(points.size() >= 3);
+    size_t sharedIndex = 0;
+    double sharedDistance = std::numeric_limits<double>::infinity();
+    for (size_t index = 0; index < points.size(); ++index) {
+        const double distance = cv::norm(
+            points[index].position - cv::Vec3d{16.0, 0.0, 0.0});
+        if (distance < sharedDistance) {
+            sharedDistance = distance;
+            sharedIndex = index;
+        }
+    }
+    REQUIRE(sharedDistance < 1.0e-9);
+    REQUIRE(sharedIndex + 1 < points.size());
+    const cv::Vec3d fallbackDirection = vc3d::fiber_slice::normalizedOrZero(
+        points[sharedIndex + 1].position - points[sharedIndex].position);
+    CHECK(fallbackDirection.dot(cv::Vec3d{1.0, 0.0, 0.0}) ==
+          doctest::Approx(1.0).epsilon(1.0e-10));
+}
+
+TEST_CASE("fiber mode records only manifest identities used by direct interpolation")
+{
+    FiberModeNormalSampler normals;
+    const auto optimize = [&](vc3d::line_annotation::SegmentInterpolationGoal goal) {
+        vc3d::line_annotation::FiberModeOptimizationRequest request;
+        request.controlPoints = {
+            {2.0, {0.0, 0.0, 0.0}, true, 2},
+            {6.0, {16.0, 0.0, 0.0}, false, 6},
+        };
+        request.controlPoints.front().segmentToNext.emplace();
+        request.controlPoints.front().segmentToNext->interpGoal = goal;
+        request.controlPoints.front().segmentToNext->normalManifestLocation = "stale-normal";
+        request.controlPoints.front().segmentToNext->fiberManifestLocation = "stale-fiber";
+        for (int x = -8; x <= 24; x += 4)
+            request.linePointsBase.push_back({static_cast<double>(x), 0.0, 0.0});
+        request.baseNormalSampler = &normals;
+        request.normalManifestLocation = "normal.lasagna.json";
+        request.fiberManifestLocation = "fiber.lasagna.json";
+        request.globalMode = vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+        request.lasagnaConfig.segmentsPerSide = 2;
+        request.lasagnaConfig.segmentLength = 4.0;
+        request.lasagnaConfig.maxIterations = 20;
+        request.lasagnaConfig.printSolverProgress = false;
+        return vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+    };
+
+    const auto lasagna = optimize(
+        vc3d::line_annotation::SegmentInterpolationGoal::Lasagna);
+    REQUIRE(lasagna.controlPoints.front().segmentToNext.has_value());
+    CHECK(lasagna.controlPoints.front().segmentToNext->normalManifestLocation ==
+          "normal.lasagna.json");
+    CHECK(lasagna.controlPoints.front().segmentToNext->fiberManifestLocation.empty());
+
+    const auto spline = optimize(
+        vc3d::line_annotation::SegmentInterpolationGoal::Cspline);
+    REQUIRE(spline.controlPoints.front().segmentToNext.has_value());
+    CHECK(spline.controlPoints.front().segmentToNext->normalManifestLocation.empty());
+    CHECK(spline.controlPoints.front().segmentToNext->fiberManifestLocation.empty());
+}
+
+TEST_CASE("fiber mode truncates extrapolation at an invalid prediction edge")
+{
+    FiberModeNormalSampler normals;
+    FiberModePrediction predictions(8.0);
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+    };
+    for (int x = -8; x <= 8; x += 4) {
+        request.linePointsBase.push_back(
+            {static_cast<double>(x), 0.0, 0.0});
+    }
+    request.predictions = &predictions;
+    request.baseNormalSampler = &normals;
+    request.traceNormalSampler = &normals;
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.traceConfig.stepVoxels = 4.0;
+    request.traceConfig.coneAngleDegrees = 0.0;
+    request.traceConfig.beamWidth = 1;
+    request.traceConfig.maxStepFactor = 2.0;
+    request.traceConfig.smoothnessWeight = 0.0;
+    request.traceConfig.smoothnessNormalWeight = 0.0;
+    request.traceConfig.smoothnessTangentWeight = 0.0;
+    request.traceConfig.cumulativeSmoothnessTangentWeight = 0.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+
+    REQUIRE(result.controlPoints.size() == 1);
+    CHECK(result.nativeSegments == 0);
+    CHECK(result.lasagnaFallbackSegments == 0);
+    CHECK(result.nativeExtrapolations == 2);
+    CHECK(result.lasagnaFallbackExtrapolations == 0);
+    REQUIRE(result.optimization.line.points.size() >= 3);
+    const auto& points = result.optimization.line.points;
+    CHECK(points.front().position[0] == doctest::Approx(-8.0));
+    CHECK(points.back().position[0] == doctest::Approx(4.0));
+}
+
+TEST_CASE("fiber mode reports no-progress extrapolation fallback reasons")
+{
+    FiberModeNormalSampler normals;
+    FirstStepInvalidFiberModePrediction predictions;
+    std::vector<vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic>
+        extrapolationFallbacks;
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+    };
+    for (int x = -8; x <= 8; x += 4) {
+        request.linePointsBase.push_back(
+            {static_cast<double>(x), 0.0, 0.0});
+    }
+    request.predictions = &predictions;
+    request.baseNormalSampler = &normals;
+    request.traceNormalSampler = &normals;
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.extrapolationFallbackCallback =
+        [&extrapolationFallbacks](const auto& diagnostic) {
+            extrapolationFallbacks.push_back(diagnostic);
+        };
+    request.traceConfig.stepVoxels = 4.0;
+    request.traceConfig.coneAngleDegrees = 0.0;
+    request.traceConfig.beamWidth = 1;
+    request.traceConfig.maxStepFactor = 100.0;
+    request.traceConfig.smoothnessNormalWeight = 0.0;
+    request.traceConfig.smoothnessTangentWeight = 0.0;
+    request.traceConfig.cumulativeSmoothnessTangentWeight = 0.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+
+    CHECK(result.nativeExtrapolations == 0);
+    CHECK(result.lasagnaFallbackExtrapolations == 2);
+    REQUIRE(extrapolationFallbacks.size() == 2);
+    CHECK(extrapolationFallbacks[0].side ==
+          vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic::Side::Left);
+    CHECK(extrapolationFallbacks[1].side ==
+          vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic::Side::Right);
+    for (const auto& diagnostic : extrapolationFallbacks) {
+        CHECK(diagnostic.reason == "no_valid_candidates");
+        CHECK(diagnostic.tracePointCount == 1);
+        CHECK_FALSE(diagnostic.fromException);
+    }
+}
+
+TEST_CASE("fiber mode retries stored trace results from their goal")
+{
+    FiberModeNormalSampler baseNormals({1.0, 0.0, 0.0});
+    FiberModeNormalSampler traceNormals;
+    AlwaysInvalidFiberModePrediction predictions;
+    std::vector<vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic>
+        extrapolationFallbacks;
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    request.controlPoints = {
+        {2.0, {0.0, 0.0, 0.0}, true, 2},
+        {6.0, {16.0, 0.0, 0.0}, false, 6},
+        {10.0, {32.0, 0.0, 0.0}, false, 10},
+    };
+    request.controlPoints[0].segmentToNext.emplace();
+    request.controlPoints[0].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Trace;
+    request.controlPoints[1].segmentToNext.emplace();
+    request.controlPoints[1].segmentToNext->interpGoal =
+        vc3d::line_annotation::SegmentInterpolationGoal::Trace;
+    request.controlPoints[1].segmentToNext->interpMode =
+        vc3d::line_annotation::SegmentInterpolationMode::Trace;
+    request.linePointsBase = {
+        {-8.0, 0.0, 0.0},
+        {-4.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0},
+        {4.0, 0.0, 0.0},
+        {8.0, 0.0, 0.0},
+        {12.0, 0.0, 0.0},
+        {16.0, 0.0, 0.0},
+        {20.0, 4.0, 0.0},
+        {24.0, 5.0, 0.0},
+        {28.0, 3.0, 0.0},
+        {32.0, 0.0, 0.0},
+        {36.0, 0.0, 0.0},
+    };
+    request.predictions = &predictions;
+    request.baseNormalSampler = &baseNormals;
+    request.traceNormalSampler = &traceNormals;
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.extrapolationFallbackCallback =
+        [&extrapolationFallbacks](const auto& diagnostic) {
+            extrapolationFallbacks.push_back(diagnostic);
+        };
+    request.traceConfig.stepVoxels = 4.0;
+    request.traceConfig.coneAngleDegrees = 0.0;
+    request.traceConfig.beamWidth = 1;
+    request.traceConfig.maxStepFactor = 2.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+
+    const auto result =
+        vc3d::line_annotation::optimizeFiberWithNativeFallback(
+            std::move(request));
+
+    REQUIRE(result.nativeSegments == 0);
+    REQUIRE(result.lasagnaFallbackSegments == 2);
+    REQUIRE(result.lasagnaFallbackExtrapolations == 2);
+    REQUIRE(extrapolationFallbacks.size() == 2);
+    for (size_t index = 0; index < 2; ++index) {
+        REQUIRE(result.controlPoints[index].segmentToNext.has_value());
+        CHECK(result.controlPoints[index].segmentToNext->interpGoal ==
+              vc3d::line_annotation::SegmentInterpolationGoal::Trace);
+        CHECK(result.controlPoints[index].segmentToNext->interpMode !=
+              vc3d::line_annotation::SegmentInterpolationMode::Trace);
+        CHECK_FALSE(result.controlPoints[index].segmentToNext->failureCode.empty());
+    }
+}
+
+TEST_CASE("fiber segment goals survive CP edits and copy on split")
+{
+    using vc3d::line_annotation::LineControlPoint;
+    vc3d::line_annotation::FiberTraceSegmentMetadata metadata;
+    metadata.normalManifestLocation = "normal";
+    metadata.fiberManifestLocation = "fiber";
+    std::vector<LineControlPoint> controls{
+        {0.0, {0.0, 0.0, 0.0}, false, 0},
+        {20.0, {20.0, 0.0, 0.0}, false, 20},
+        {10.0, {10.0, 0.0, 0.0}, false, 10},
+    };
+    controls[0].segmentToNext = metadata;
+    controls[2].segmentToNext = metadata;
+
+    vc3d::line_annotation::invalidateSegmentsAdjacentToControl(controls, 1);
+    CHECK(controls[0].segmentToNext.has_value());
+    CHECK(controls[2].segmentToNext.has_value());
+    CHECK_FALSE(controls[1].segmentToNext.has_value());
+
+    controls[0].segmentToNext = metadata;
+    controls.push_back({5.0, {5.0, 0.0, 0.0}, false, 5});
+    vc3d::line_annotation::invalidateSegmentSplitByInsertedControl(controls, 3);
+    CHECK(controls[0].segmentToNext.has_value());
+    REQUIRE(controls[3].segmentToNext.has_value());
+    CHECK(controls[3].segmentToNext->interpGoal ==
+          controls[0].segmentToNext->interpGoal);
+}
+
+TEST_CASE("line spline jointly interpolates ordered controls")
+{
+    vc::lasagna::LineSplineRequest request;
+    request.controlPoints = {
+        {0.0, 0.0, 0.0},
+        {10.0, 0.0, 0.0},
+        {25.0, 5.0, 0.0},
+    };
+    request.sampleSpacing = 2.0;
+    const auto result = vc::lasagna::interpolateLineControlPoints(request);
+    REQUIRE(result.controlPointIndices.size() == 3);
+    CHECK(result.points.front() == request.controlPoints.front());
+    CHECK(result.points[static_cast<size_t>(result.controlPointIndices[1])] ==
+          request.controlPoints[1]);
+    CHECK(result.points.back() == request.controlPoints.back());
+    for (const auto& point : result.points) {
+        CHECK(std::isfinite(point[0]));
+        CHECK(std::isfinite(point[1]));
+        CHECK(std::isfinite(point[2]));
+    }
+}
+
+TEST_CASE("two-point line spline is exactly straight and honors spacing")
+{
+    vc::lasagna::LineSplineRequest request;
+    request.controlPoints = {{1.0, 2.0, 3.0}, {11.0, 2.0, 3.0}};
+    request.sampleSpacing = 2.0;
+    const auto result = vc::lasagna::interpolateLineControlPoints(request);
+    REQUIRE(result.points.size() == 6);
+    for (const auto& point : result.points) {
+        CHECK(point[1] == doctest::Approx(2.0));
+        CHECK(point[2] == doctest::Approx(3.0));
+    }
+}
+
+TEST_CASE("line spline honors hard endpoint directions")
+{
+    vc::lasagna::LineSplineRequest request;
+    request.controlPoints = {{0.0, 0.0, 0.0}, {10.0, 10.0, 0.0}};
+    request.leftDirection = cv::Vec3d{1.0, 0.0, 0.0};
+    request.rightDirection = cv::Vec3d{0.0, 1.0, 0.0};
+    request.sampleSpacing = 0.25;
+    const auto result = vc::lasagna::interpolateLineControlPoints(request);
+    REQUIRE(result.points.size() > 3);
+    const cv::Vec3d first = result.points[1] - result.points[0];
+    const cv::Vec3d last = result.points.back() - result.points[result.points.size() - 2];
+    CHECK(first.dot(cv::Vec3d{1.0, 0.0, 0.0}) / cv::norm(first) > 0.99);
+    CHECK(last.dot(cv::Vec3d{0.0, 1.0, 0.0}) / cv::norm(last) > 0.99);
 }

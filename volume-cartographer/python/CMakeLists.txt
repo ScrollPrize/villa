@@ -92,6 +92,9 @@ set_target_properties(vc_track_crossings PROPERTIES
 )
 target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
 target_compile_features(vc_track_crossings PRIVATE cxx_std_23)
+target_compile_options(vc_track_crossings PRIVATE
+    $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-O3>
+)
 
 nanobind_add_module(vc_track_store
     NOMINSIZE

@@ -68,11 +68,11 @@ public:
         const QString& url,
         vc::HttpAuth* authOut,
         QString* errorMessage = nullptr) const;
+    QString remoteCacheDirectory(VolumeAttachmentPresentation presentation);
 
 private:
     struct TaskResult;
 
-    QString remoteCacheDirectory(VolumeAttachmentPresentation presentation);
     QString configuredRemoteCacheDirectory() const;
     QString suggestedRemoteCacheDirectory() const;
 

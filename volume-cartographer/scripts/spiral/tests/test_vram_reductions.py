@@ -1,3 +1,4 @@
+import types
 import unittest
 from pathlib import Path
 import tempfile
@@ -6,9 +7,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flow_fields import CartesianFlowField, sample_field
+from config import Config
+from flow_fields import CartesianFlowField, CylindricalFlowField, sample_field
 from checkpoint_io import load_checkpoint_cpu
 from tifxyz import Patch
+from transforms import SpiralAndTransform
 from tracks import (
     _grouped_same_radius_loss,
     _pack_track_points,
@@ -25,7 +28,7 @@ class CartesianFlowGradientTests(unittest.TestCase):
     def test_accumulator_reuse_matches_dense_autograd(self):
         torch.manual_seed(4)
         resolution = torch.tensor([12, 12, 12])
-        flow = CartesianFlowField(resolution, spatial_scale_factor=6, lr_scale_factor=0.2)
+        flow = CartesianFlowField(resolution, spatial_scale_factor=6)
         with torch.no_grad():
             flow.flows[0].normal_(std=0.1)
             flow.flows[1].normal_(std=0.1)
@@ -40,7 +43,7 @@ class CartesianFlowGradientTests(unittest.TestCase):
             size=tuple(reference_hr.shape[2:]),
             mode='trilinear',
         )[0]
-        reference_field = reference_lr_up + reference_hr[0] * 0.2
+        reference_field = reference_lr_up + reference_hr[0]
         reference_output = sample_field(reference_points, reference_field)
         reference_loss = reference_output.square().sum()
         reference_loss.backward()
@@ -62,8 +65,8 @@ class CartesianFlowGradientTests(unittest.TestCase):
     def test_multiple_streamed_backwards_accumulate_before_field_backward(self):
         torch.manual_seed(9)
         resolution = torch.tensor([12, 12, 12])
-        combined = CartesianFlowField(resolution, spatial_scale_factor=6, lr_scale_factor=0.2)
-        streamed = CartesianFlowField(resolution, spatial_scale_factor=6, lr_scale_factor=0.2)
+        combined = CartesianFlowField(resolution, spatial_scale_factor=6)
+        streamed = CartesianFlowField(resolution, spatial_scale_factor=6)
         with torch.no_grad():
             combined.flows[0].normal_(std=0.1)
             combined.flows[1].normal_(std=0.1)
@@ -85,6 +88,284 @@ class CartesianFlowGradientTests(unittest.TestCase):
 
         torch.testing.assert_close(streamed.flows[0].grad, combined.flows[0].grad)
         torch.testing.assert_close(streamed.flows[1].grad, combined.flows[1].grad)
+
+
+class CylindricalFlowGradientTests(unittest.TestCase):
+    def test_streamed_backwards_and_pending_field_grad_match_dense_autograd(self):
+        torch.manual_seed(11)
+        flow = CylindricalFlowField(torch.tensor([12, 12, 12]), spatial_scale_factor=6)
+        with torch.no_grad():
+            flow.flows[0].normal_(std=0.1)
+            flow.flows[1].normal_(std=0.1)
+
+        points_a = torch.rand(29, 3, requires_grad=True)
+        points_b = torch.rand(41, 3, requires_grad=True)
+        reference_a = points_a.detach().clone().requires_grad_(True)
+        reference_b = points_b.detach().clone().requires_grad_(True)
+        reference_lr = flow.flows[0].detach().clone().requires_grad_(True)
+        reference_hr = flow.flows[1].detach().clone().requires_grad_(True)
+
+        n0_lr = int(flow._lr_num_phi[0])
+        n0_hr = int(flow._hr_num_phi[0])
+        reference_lr_field = torch.cat(
+            [torch.zeros_like(reference_lr[0][:, :, :n0_lr]), reference_lr[0][:, :, n0_lr:]],
+            dim=2)
+        reference_hr_field = torch.cat(
+            [torch.zeros_like(reference_hr[0][:, :, :n0_hr]), reference_hr[0][:, :, n0_hr:]],
+            dim=2)
+
+        def reference_sample(pts):
+            return (
+                CylindricalFlowField._sample_lattice(reference_lr_field, flow._lr_num_phi, flow._lr_offsets, pts)
+                + CylindricalFlowField._sample_lattice(reference_hr_field, flow._hr_num_phi, flow._hr_offsets, pts)
+            )
+
+        reference_out_a = reference_sample(reference_a)
+        reference_out_b = reference_sample(reference_b)
+        (reference_out_a.square().mean() + reference_out_b.abs().mean()).backward()
+
+        sampler = flow.get_sampler(0.0)
+        out_a = sampler(points_a)
+        out_b = sampler(points_b)
+        # Two independent backwards through the one cached sampler, WITHOUT
+        # retain_graph: the shared pinned+scaled field graphs are cut at
+        # detached leaves, so neither backward touches the other's graph.
+        out_a.square().mean().backward()
+        out_b.abs().mean().backward()
+        flow.apply_accumulated_field_grad()
+
+        torch.testing.assert_close(out_a, reference_out_a)
+        torch.testing.assert_close(out_b, reference_out_b)
+        torch.testing.assert_close(points_a.grad, reference_a.grad)
+        torch.testing.assert_close(points_b.grad, reference_b.grad)
+        torch.testing.assert_close(flow.flows[0].grad, reference_lr.grad)
+        torch.testing.assert_close(flow.flows[1].grad, reference_hr.grad)
+        self.assertIsNone(flow._pending_field_graphs)
+
+
+def _make_small_spiral_model(seed, flow_field_type):
+    cfg = Config().as_dict()
+    cfg['model_flow_field_type'] = flow_field_type
+    cfg['model_gap_expander_num_windings'] = 10
+    z_span = 16 * 12  # 12 flow lattice voxels per axis at the default resolution
+    flow_min = torch.tensor([0, -96, -96], dtype=torch.int64)
+    flow_max = torch.tensor([z_span, 96, 96], dtype=torch.int64)
+    zs = torch.arange(0, z_span + 1, dtype=torch.float32)
+    umbilicus_zyx = torch.stack(
+        [zs, torch.full_like(zs, 3.), torch.full_like(zs, -2.)], dim=-1)
+    torch.manual_seed(seed)
+    model = SpiralAndTransform(
+        flow_integration_steps=3,
+        flow_integration_solver='rk4',
+        flow_min_corner_zyx=flow_min,
+        flow_max_corner_zyx=flow_max,
+        umbilicus_zyx=umbilicus_zyx,
+        config=cfg,
+        spiral_outward_sense='CW',
+    )
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.numel() > 1:
+                parameter.normal_(std=0.01)
+    return model
+
+
+def _sample_scroll_points(num_points, seed):
+    generator = torch.Generator().manual_seed(seed)
+    z = torch.rand(num_points, generator=generator) * 150 + 20
+    theta = torch.rand(num_points, generator=generator) * 2 * torch.pi
+    radius = torch.rand(num_points, generator=generator) * 60 + 20
+    y = 3. + torch.sin(theta) * radius
+    x = -2. + torch.cos(theta) * radius
+    return torch.stack([z, y, x], dim=-1)
+
+
+class SharedTransformLeafTests(unittest.TestCase):
+    def _loss_families(self, transform, dr_per_winding, points_a, points_b):
+        spiral_a = transform(points_a)
+        family_a = (spiral_a[..., 1:].norm(dim=-1) / dr_per_winding).mean()
+        spiral_b = transform(points_b)
+        family_b = spiral_b.square().mean() * 1.e-4 + dr_per_winding * 0.01
+        return family_a, family_b
+
+    def _check_streamed_leaf_backwards_match_combined(self, flow_field_type):
+        reference = _make_small_spiral_model(23, flow_field_type)
+        streamed = _make_small_spiral_model(23, flow_field_type)
+        streamed.load_state_dict(reference.state_dict())
+        points_a = _sample_scroll_points(31, 5)
+        points_b = _sample_scroll_points(17, 6)
+
+        transform = reference.get_slice_to_spiral_transform()
+        family_a, family_b = self._loss_families(
+            transform, reference.get_dr_per_winding(), points_a, points_b)
+        (family_a + family_b).backward()
+        for flow_field in reference.flow_fields:
+            flow_field.apply_accumulated_field_grad()
+
+        shared_outputs = streamed.get_shared_transform_tensors()
+        shared_leaves = tuple(
+            output.detach().requires_grad_(True) for output in shared_outputs)
+        leaf_transform = streamed.get_slice_to_spiral_transform(shared=shared_leaves)
+        leaf_a, leaf_b = self._loss_families(
+            leaf_transform, shared_leaves[0], points_a, points_b)
+        torch.testing.assert_close(leaf_a, family_a)
+        torch.testing.assert_close(leaf_b, family_b)
+        # One backward per family, WITHOUT retain_graph: every path shared
+        # between families ends at a detached leaf.
+        leaf_a.backward()
+        leaf_b.backward()
+        for flow_field in streamed.flow_fields:
+            flow_field.apply_accumulated_field_grad()
+        pending = [
+            (output, leaf.grad) for output, leaf in zip(shared_outputs, shared_leaves)
+            if output.requires_grad and leaf.grad is not None
+        ]
+        self.assertTrue(pending)
+        torch.autograd.backward(
+            [output for output, _ in pending], [grad for _, grad in pending])
+
+        reference_grads = {name: p.grad for name, p in reference.named_parameters()}
+        for name, parameter in streamed.named_parameters():
+            reference_grad = reference_grads[name]
+            if parameter.grad is None and reference_grad is None:
+                continue
+            torch.testing.assert_close(
+                parameter.grad, reference_grad, rtol=1e-4, atol=1e-6,
+                msg=lambda base, name=name: f'{name}: {base}')
+
+    def test_cartesian_streamed_leaf_backwards_match_combined(self):
+        self._check_streamed_leaf_backwards_match_combined('cartesian')
+
+    def test_cylindrical_streamed_leaf_backwards_match_combined(self):
+        self._check_streamed_leaf_backwards_match_combined('cylindrical')
+
+
+class HostResidentPatchAtlasTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # fit_spiral is import-heavy (wandb, zarr, ...); load it once for the
+        # class rather than at test-module import.
+        from fit_spiral import PatchGpuAtlas
+        cls.PatchGpuAtlas = PatchGpuAtlas
+
+    @staticmethod
+    def _fake_patch(height, width, seed):
+        generator = torch.Generator().manual_seed(seed)
+        return types.SimpleNamespace(
+            zyxs=torch.rand(height, width, 3, generator=generator) * 100.,
+            _sampling_valid_quad_mask_np=np.ones((height - 1, width - 1), dtype=bool),
+        )
+
+    @staticmethod
+    def _manual_bilinear(grid, i, j):
+        i0, j0 = int(np.floor(i)), int(np.floor(j))
+        di, dj = i - i0, j - j0
+        top = grid[i0, j0] * (1 - dj) + grid[i0, j0 + 1] * dj
+        bottom = grid[i0 + 1, j0] * (1 - dj) + grid[i0 + 1, j0 + 1] * dj
+        return top * (1 - di) + bottom * di
+
+    def test_atlas_stays_on_host_and_lookup_matches_manual_bilinear(self):
+        patches = {'a': self._fake_patch(5, 7, 0), 'b': self._fake_patch(9, 4, 1)}
+        atlas = self.PatchGpuAtlas(patches, device='cpu')
+        self.assertEqual(atlas.zyxs_flat.device.type, 'cpu')
+        self.assertEqual(atlas.offsets.device.type, 'cpu')
+
+        idx = torch.tensor([0, 1, 1, 0])
+        ijs = torch.tensor([[0.25, 0.75], [3.5, 1.25], [7.0, 2.0], [3.25, 5.5]])
+        out = atlas.lookup(idx, ijs)
+        expected = torch.stack([
+            self._manual_bilinear(patches[key].zyxs, float(ij[0]), float(ij[1]))
+            for key, ij in zip(['a', 'b', 'b', 'a'], ijs)
+        ])
+        torch.testing.assert_close(out, expected)
+
+    def test_append_patches_stays_on_host(self):
+        atlas = self.PatchGpuAtlas({'a': self._fake_patch(5, 5, 3)}, device='cpu')
+        extra = self._fake_patch(4, 8, 4)
+        atlas.append_patches({'b': extra})
+        self.assertEqual(atlas.zyxs_flat.device.type, 'cpu')
+        self.assertEqual(atlas.id_to_idx['b'], 1)
+        out = atlas.lookup(torch.tensor([1]), torch.tensor([[1.5, 2.5]]))
+        torch.testing.assert_close(out[0], self._manual_bilinear(extra.zyxs, 1.5, 2.5))
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
+    def test_lookup_uploads_only_interpolated_points(self):
+        atlas = self.PatchGpuAtlas({'a': self._fake_patch(6, 6, 2)}, device='cuda')
+        self.assertEqual(atlas.zyxs_flat.device.type, 'cpu')
+        idx = torch.zeros(3, dtype=torch.int64)
+        ijs = torch.tensor([[0.5, 0.5], [2.25, 3.75], [4.0, 4.0]])
+        out = atlas.lookup(idx, ijs)
+        self.assertTrue(out.is_cuda)
+        with self.assertRaises(AssertionError):
+            atlas.lookup(idx.cuda(), ijs.cuda())
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
+    def test_sample_patch_batch_carries_pregathered_points(self):
+        import losses as losses_module
+        patches = {f'p{n}': self._fake_patch(8, 8, 10 + n) for n in range(3)}
+        atlas = self.PatchGpuAtlas(patches, device='cuda')
+        if atlas.sampling_atlas is None:
+            self.skipTest('native spiral sampling module unavailable')
+        previous_cfg = losses_module.cfg
+        losses_module.cfg = {'patch_strip_sampling': 'straight'}
+        try:
+            np.random.seed(0)
+            probabilities = np.full(3, 1 / 3, dtype=np.float64)
+            ijs_gpu, idx_gpu, zyxs_gpu = losses_module._sample_patch_batch(
+                'test_patches', list(patches.values()), probabilities,
+                num_to_sample=4, num_points_per_direction=6, patch_atlas=atlas)
+        finally:
+            losses_module.cfg = previous_cfg
+        self.assertEqual(tuple(zyxs_gpu.shape), (2, 4, 6, 3))
+        self.assertTrue(zyxs_gpu.is_cuda)
+        idx_cpu = idx_gpu.cpu()
+        expected = atlas.lookup(
+            idx_cpu[None, :, None].expand(2, 4, 6), ijs_gpu.cpu())
+        torch.testing.assert_close(zyxs_gpu, expected)
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'needs CUDA')
+    def test_prefetched_batch_carries_pregathered_points(self):
+        import os
+        import losses as losses_module
+        import prefetch as prefetch_module
+        patches = {f'p{n}': self._fake_patch(8, 8, 20 + n) for n in range(3)}
+        atlas = self.PatchGpuAtlas(patches, device='cuda')
+        if atlas.sampling_atlas is None:
+            self.skipTest('native spiral sampling module unavailable')
+        previous_cfg = losses_module.cfg
+        losses_module.cfg = {'patch_strip_sampling': 'straight'}
+        os.environ['FIT_SPIRAL_PREFETCH'] = '1'
+        try:
+            probabilities = np.full(3, 1 / 3, dtype=np.float64)
+            # First call runs inline and schedules the next batch; the second
+            # pops the prefetched triple assembled on the worker thread.
+            for _ in range(2):
+                ijs_gpu, idx_gpu, zyxs_gpu = losses_module._sample_patch_batch(
+                    'test_prefetch_patches', list(patches.values()), probabilities,
+                    num_to_sample=4, num_points_per_direction=6, patch_atlas=atlas)
+                self.assertEqual(tuple(zyxs_gpu.shape), (2, 4, 6, 3))
+                expected = atlas.lookup(
+                    idx_gpu.cpu()[None, :, None].expand(2, 4, 6), ijs_gpu.cpu())
+                torch.testing.assert_close(zyxs_gpu, expected)
+        finally:
+            os.environ.pop('FIT_SPIRAL_PREFETCH', None)
+            losses_module.cfg = previous_cfg
+            prefetch_module.get_prefetcher().drop(
+                ('test_prefetch_patches', 4, 6))
+
+
+class NonFiniteGradCheckTests(unittest.TestCase):
+    def test_aminmax_detects_every_nonfinite_class(self):
+        # The training loop relies on aminmax propagating NaN and surfacing
+        # +/-inf so the non-finite-gradient telemetry needs no gradient-sized
+        # boolean temporaries.
+        for bad in (float('nan'), float('inf'), float('-inf')):
+            grad = torch.zeros(1024)
+            grad[381] = bad
+            grad_min, grad_max = torch.aminmax(grad)
+            self.assertFalse(bool(torch.isfinite(grad_min) & torch.isfinite(grad_max)))
+        grad_min, grad_max = torch.aminmax(torch.randn(1024))
+        self.assertTrue(bool(torch.isfinite(grad_min) & torch.isfinite(grad_max)))
 
 
 class CpuTrackStorageTests(unittest.TestCase):
@@ -169,7 +450,7 @@ class CpuTrackStorageTests(unittest.TestCase):
             sampling_config={
                 'track_length_bin_weights': None,
                 'track_max_tortuosity': None,
-                'max_track_crossing_per_step': 0,
+                'track_max_track_crossing_per_step': 0,
             },
         )
 
@@ -238,7 +519,7 @@ class CpuTrackStorageTests(unittest.TestCase):
             sampling_config={
                 'track_length_bin_weights': [0.15, 0.25, 0.60],
                 'track_max_tortuosity': None,
-                'max_track_crossing_per_step': 0,
+                'track_max_track_crossing_per_step': 0,
             },
         )
 
@@ -291,7 +572,7 @@ class CpuTrackStorageTests(unittest.TestCase):
         self.assertEqual(filtered['lengths'].numel(), 1)
         np.testing.assert_array_equal(filtered['flat_zyx_cpu'].numpy(), straight)
 
-    def test_crossing_partners_are_opposite_family_angled_and_spaced(self):
+    def test_crossing_partners_are_sampled_from_all_exact_partners(self):
         primary = self._line_track(20, z=10, y=10, axis=2)
 
         def vertical_at(x):
@@ -314,36 +595,41 @@ class CpuTrackStorageTests(unittest.TestCase):
                 'track_length_bin_weights': None,
                 'track_max_tortuosity': None,
                 'track_crossing_precompute_max': 2,
-                'max_track_crossing_per_step': 2,
+                'track_max_track_crossing_per_step': 2,
             },
             track_families=['horizontal', 'vertical', 'vertical', 'vertical', 'vertical'],
         )
 
-        np.testing.assert_array_equal(
-            prepared['crossing_partners'][0].numpy(), [1, 3])
-        np.testing.assert_array_equal(
-            prepared['crossing_self_local'][0].numpy(), [4, 16])
-        np.testing.assert_array_equal(
-            prepared['crossing_partner_local'][0].numpy(), [10, 10])
-        self.assertNotIn(4, prepared['crossing_partners'][0].tolist())
+        self.assertIn('crossing_index', prepared)
+        self.assertEqual(
+            int(prepared['crossing_index_stats']['directed_crossings']), 6)
 
         configure_prepared_track_sampling(prepared, {
-            'max_track_crossing_per_step': 1,
+            'track_max_track_crossing_per_step': 1,
         })
 
         # Force primary track zero so the first draw uses the Run-scoped limit.
         prepared['sampling_probabilities'] = torch.tensor([1., 0., 0., 0., 0.])
-        sample = _sample_prepared_track_points(prepared, 1, 4)
-        np.testing.assert_array_equal(sample['track_idx'].numpy(), [0, 1])
+        torch.manual_seed(123)
+        first = _sample_prepared_track_points(prepared, 1, 4)
+        torch.manual_seed(123)
+        repeated = _sample_prepared_track_points(prepared, 1, 4)
+        np.testing.assert_array_equal(
+            first['track_idx'].numpy(), repeated['track_idx'].numpy())
+        self.assertEqual(first['track_idx'][0], 0)
+        self.assertIn(int(first['track_idx'][1]), {1, 2, 3})
+        sample = first
         self.assertEqual(sample['row_lengths'].shape, (2,))
         self.assertEqual(sample['group_id'].tolist(), [0, 0])
         self.assertEqual(sample['group_width'], 2)
 
         configure_prepared_track_sampling(prepared, {
-            'max_track_crossing_per_step': 2,
+            'track_max_track_crossing_per_step': 2,
         })
         sample = _sample_prepared_track_points(prepared, 1, 4)
-        np.testing.assert_array_equal(sample['track_idx'].numpy(), [0, 1, 3])
+        self.assertEqual(sample['track_idx'][0], 0)
+        self.assertEqual(len(set(sample['track_idx'][1:].tolist())), 2)
+        self.assertTrue(set(sample['track_idx'][1:].tolist()) <= {1, 2, 3})
         self.assertEqual(sample['group_width'], 3)
         for primary_flat, partner_flat in zip(
                 sample['primary_cross_flat'], sample['partner_cross_flat']):
@@ -351,6 +637,16 @@ class CpuTrackStorageTests(unittest.TestCase):
                 sample['sampled_scroll'][primary_flat],
                 sample['sampled_scroll'][partner_flat],
             )
+
+        configure_prepared_track_sampling(prepared, {
+            'track_max_track_crossing_per_step': 1,
+        })
+        observed = set()
+        for seed in range(32):
+            torch.manual_seed(seed)
+            draw = _sample_prepared_track_points(prepared, 1, 4)
+            observed.add(int(draw['track_idx'][1]))
+        self.assertEqual(observed, {1, 2, 3})
 
     def test_crossing_index_uses_first_local_index_for_repeated_voxel(self):
         horizontal = np.array([
@@ -373,15 +669,21 @@ class CpuTrackStorageTests(unittest.TestCase):
             [horizontal, vertical, same_family], None, 0.0, 'cpu',
             sampling_config={
                 'track_crossing_precompute_max': 1,
-                'max_track_crossing_per_step': 1,
+                'track_max_track_crossing_per_step': 1,
             },
             track_families=['horizontal', 'vertical', 'vertical'],
         )
 
-        self.assertEqual(prepared['crossing_partners'][0, 0], 1)
-        self.assertEqual(prepared['crossing_self_local'][0, 0], 2)
-        self.assertEqual(prepared['crossing_partner_local'][0, 0], 2)
-        self.assertNotIn(2, prepared['crossing_partners'][1].tolist())
+        self.assertEqual(
+            int(prepared['crossing_index_stats']['directed_crossings']), 4)
+        prepared['sampling_probabilities'] = torch.tensor([1., 0., 0.])
+        sample = _sample_prepared_track_points(prepared, 1, 4)
+        self.assertEqual(sample['track_idx'][0], 0)
+        self.assertIn(int(sample['track_idx'][1]), {1, 2})
+        torch.testing.assert_close(
+            sample['sampled_scroll'][sample['primary_cross_flat'][0]],
+            sample['sampled_scroll'][sample['partner_cross_flat'][0]],
+        )
 
     def test_track_point_packing_is_chunk_independent(self):
         points = np.array([
@@ -429,7 +731,7 @@ class CpuTrackStorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '>= 1'):
             validate_track_sampling_config({'track_max_tortuosity': 0.9})
         with self.assertRaisesRegex(ValueError, 'non-negative integer'):
-            validate_track_sampling_config({'max_track_crossing_per_step': 1.5})
+            validate_track_sampling_config({'track_max_track_crossing_per_step': 1.5})
         with self.assertRaisesRegex(ValueError, 'non-negative integer'):
             validate_track_sampling_config({
                 'track_crossing_precompute_max': -1,
@@ -463,8 +765,8 @@ class CpuTrackStorageTests(unittest.TestCase):
         ]
         prepared = prepare_main_phase_tracks(tracks, None, 0.0, 'cpu')
         config = {
-            'track_num_per_step': 2,
-            'track_num_points_per_step': 4,
+            'sample_count_tracks_per_step': 2,
+            'sample_count_track_points_per_step': 4,
             'track_radius_loss_margin': 0.025,
             'track_radius_target': 'mean',
             'track_radius_within_norm_p': 3.0,
