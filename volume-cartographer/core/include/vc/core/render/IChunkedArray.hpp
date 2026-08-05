@@ -57,10 +57,33 @@ public:
     // a later repaint on the UI thread.
     virtual ChunkResult tryGetChunk(int level, int iz, int iy, int ix) = 0;
 
+    // Return a resolved chunk only when it is already in memory. This must not
+    // queue a miss or promote a resident entry in the decoded-cache eviction
+    // order. Implementations without a decoded cache may use the default.
+    virtual ChunkResult getChunkIfCached(int level, int iz, int iy, int ix)
+    {
+        (void)iz;
+        (void)iy;
+        (void)ix;
+        ChunkResult result;
+        result.status = ChunkStatus::MissQueued;
+        result.dtype = dtype();
+        if (level >= 0 && level < numLevels())
+            result.shape = chunkShape(level);
+        return result;
+    }
+
     // Blocking access is for CLI, batch, optimization, and prefetch callers.
     // Viewer rendering paths must not call this on the Qt/main thread.
     virtual ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) = 0;
     virtual void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) = 0;
+    // Starts a newer interactive request. An exclusively-owned backing array
+    // may discard unresolved work from the superseded view; resident chunks
+    // are preserved.
+    virtual void beginViewRequest(bool discardPending = false)
+    {
+        (void)discardPending;
+    }
 
     virtual ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) = 0;
     virtual void removeChunkReadyListener(ChunkReadyCallbackId id) = 0;

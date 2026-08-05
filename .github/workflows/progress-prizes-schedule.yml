@@ -1,0 +1,374 @@
+name: Progress Prize production schedule
+run-name: Progress Prize scheduler ${{ github.event_name }} run ${{ github.run_id }}
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
+      timezone: America/Los_Angeles
+    - cron: "40 23 28-31 * *"
+      timezone: America/Los_Angeles
+    - cron: "17 0 1 * *"
+      timezone: America/Los_Angeles
+    - cron: "47 6 1 * *"
+      timezone: America/Los_Angeles
+
+permissions: {}
+
+concurrency:
+  group: progress-prizes-schedule
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  preflight:
+    name: Validate the secret-free scheduler context
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Reject untrusted triggers and refs
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_EXPRESSION: ${{ github.event.schedule || '' }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+
+          const allowedSchedules = new Set([
+            '17 6 * * *',
+            '40 23 28-31 * *',
+            '17 0 1 * *',
+            '47 6 1 * *',
+          ]);
+          assert.equal(process.env.REPOSITORY, 'ScrollPrize/villa');
+          assert.equal(process.env.REPOSITORY_ID, '890972577');
+          assert.equal(process.env.REPOSITORY_OWNER_ID, '121906140');
+          assert.equal(process.env.REF, 'refs/heads/main');
+          assert.match(process.env.HEAD_SHA ?? '', /^[a-f0-9]{40}$/);
+          assert.equal(process.env.WORKFLOW_SHA, process.env.HEAD_SHA);
+          assert.equal(
+            process.env.WORKFLOW_REF,
+            'ScrollPrize/villa/.github/workflows/progress-prizes-schedule.yml@refs/heads/main',
+          );
+          assert.match(process.env.RUN_ID ?? '', /^[1-9]\d*$/);
+          if (process.env.EVENT_NAME === 'schedule') {
+            assert.equal(allowedSchedules.has(process.env.SCHEDULE_EXPRESSION ?? ''), true);
+          } else {
+            assert.equal(process.env.EVENT_NAME, 'workflow_dispatch');
+            assert.equal(process.env.SCHEDULE_EXPRESSION, '');
+          }
+          NODE
+
+  plan:
+    name: Plan from the real Pacific clock
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      operation: ${{ steps.plan.outputs.operation }}
+      source-cycle: ${{ steps.plan.outputs['source-cycle'] }}
+      target-cycle: ${{ steps.plan.outputs['target-cycle'] }}
+      reason: ${{ steps.plan.outputs.reason }}
+    steps:
+      - name: Check out the exact trusted scheduler commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Validate context and select one operation
+        id: plan
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_EXPRESSION: ${{ github.event.schedule || '' }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { appendFile } from 'node:fs/promises';
+          import {
+            PROGRESS_PRIZE_SCHEDULES,
+            SCHEDULE_OPERATIONS,
+            planScheduleDispatch,
+          } from './scrollprize.org/scripts/progress-prizes/schedule.mjs';
+
+          assert.equal(process.env.REPOSITORY, 'ScrollPrize/villa');
+          assert.equal(process.env.REPOSITORY_ID, '890972577');
+          assert.equal(process.env.REPOSITORY_OWNER_ID, '121906140');
+          assert.equal(process.env.REF, 'refs/heads/main');
+          assert.match(process.env.HEAD_SHA ?? '', /^[a-f0-9]{40}$/);
+          assert.equal(process.env.WORKFLOW_SHA, process.env.HEAD_SHA);
+          assert.equal(
+            process.env.WORKFLOW_REF,
+            'ScrollPrize/villa/.github/workflows/progress-prizes-schedule.yml@refs/heads/main',
+          );
+          assert.equal(
+            new Set(['schedule', 'workflow_dispatch']).has(process.env.EVENT_NAME ?? ''),
+            true,
+          );
+
+          const scheduledCron = process.env.SCHEDULE_EXPRESSION || undefined;
+          if (process.env.EVENT_NAME === 'schedule') {
+            assert.equal(new Set(Object.values(PROGRESS_PRIZE_SCHEDULES)).has(scheduledCron), true);
+          } else {
+            assert.equal(scheduledCron, undefined);
+          }
+
+          const plan = planScheduleDispatch({
+            now: new Date(),
+            eventName: process.env.EVENT_NAME,
+            scheduledCron,
+          });
+          assert.equal(new Set(Object.values(SCHEDULE_OPERATIONS)).has(plan.operation), true);
+          assert.match(plan.sourceCycle, /^\d{4}-(?:0[1-9]|1[0-2])$/);
+          assert.match(plan.targetCycle, /^\d{4}-(?:0[1-9]|1[0-2])$/);
+          assert.match(plan.reason, /^[a-z0-9-]+$/);
+
+          await appendFile(
+            process.env.GITHUB_OUTPUT,
+            [
+              `operation=${plan.operation}`,
+              `source-cycle=${plan.sourceCycle}`,
+              `target-cycle=${plan.targetCycle}`,
+              `reason=${plan.reason}`,
+              '',
+            ].join('\n'),
+          );
+          await appendFile(
+            process.env.GITHUB_STEP_SUMMARY,
+            [
+              '### Progress Prize schedule decision',
+              '',
+              `- Operation: \`${plan.operation}\``,
+              `- Source cycle: \`${plan.sourceCycle}\``,
+              `- Target cycle: \`${plan.targetCycle}\``,
+              `- Reason: \`${plan.reason}\``,
+              `- Observed at: \`${plan.observedAt.toISOString()}\``,
+              '- Clock: `real America/Los_Angeles time`',
+              '',
+            ].join('\n'),
+          );
+          NODE
+
+  dedupe:
+    name: Refuse stale or duplicate production work
+    if: needs.plan.outputs.operation != 'none'
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      should-dispatch: ${{ steps.dedupe.outputs.dispatch }}
+      reason: ${{ steps.dedupe.outputs['dedupe-reason'] }}
+    steps:
+      - name: Check out the exact trusted coordination code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Inspect only the exact production workflow and page PR
+        id: dedupe
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OPERATION: ${{ needs.plan.outputs.operation }}
+          TARGET_CYCLE: ${{ needs.plan.outputs['target-cycle'] }}
+        run: >-
+          node .github/progress-prizes-schedule.mjs dedupe
+          --operation "$OPERATION"
+          --target-cycle "$TARGET_CYCLE"
+      - name: Summarize the public deduplication decision
+        env:
+          DEDUPE_REASON: ${{ steps.dedupe.outputs['dedupe-reason'] }}
+          SHOULD_DISPATCH: ${{ steps.dedupe.outputs.dispatch }}
+        run: |
+          set -euo pipefail
+          [[ "$DEDUPE_REASON" =~ ^[a-z0-9-]+$ ]]
+          [[ "$SHOULD_DISPATCH" == true || "$SHOULD_DISPATCH" == false ]]
+          printf '%s\n' \
+            '### Production dispatch deduplication' \
+            '' \
+            "- Dispatch: \`$SHOULD_DISPATCH\`" \
+            "- Reason: \`$DEDUPE_REASON\`" \
+            '' >>"$GITHUB_STEP_SUMMARY"
+
+  dispatch:
+    name: Dispatch the guarded production workflow
+    if: needs.dedupe.outputs['should-dispatch'] == 'true'
+    needs:
+      - plan
+      - dedupe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check out the exact trusted dispatch code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Dispatch an exact real-clock operation
+        id: child
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OPERATION: ${{ needs.plan.outputs.operation }}
+          SOURCE_CYCLE: ${{ needs.plan.outputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ needs.plan.outputs['target-cycle'] }}
+          REQUEST_ID: ${{ github.run_id }}
+        run: >-
+          node .github/progress-prizes-schedule.mjs dispatch
+          --operation "$OPERATION"
+          --source-cycle "$SOURCE_CYCLE"
+          --target-cycle "$TARGET_CYCLE"
+          --request-id "$REQUEST_ID"
+      - name: Record the exact public child run
+        if: steps.child.outputs.dispatched == 'true'
+        env:
+          CHILD_RUN_ID: ${{ steps.child.outputs['child-run-id'] }}
+          CHILD_RUN_URL: ${{ steps.child.outputs['child-run-html-url'] }}
+        run: |
+          set -euo pipefail
+          [[ "$CHILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$CHILD_RUN_URL" = \
+            "https://github.com/ScrollPrize/villa/actions/runs/$CHILD_RUN_ID"
+          printf '%s\n' \
+            '### Guarded production dispatch' \
+            '' \
+            "- Child run: [$CHILD_RUN_ID]($CHILD_RUN_URL)" \
+            '' >>"$GITHUB_STEP_SUMMARY"
+      - name: Record a race-safe duplicate suppression
+        if: steps.child.outputs.dispatched == 'false'
+        env:
+          DISPATCH_REASON: ${{ steps.child.outputs['dispatch-reason'] }}
+          BLOCKING_STATUS: ${{ steps.child.outputs['blocking-status'] }}
+        run: |
+          set -euo pipefail
+          test "$DISPATCH_REASON" = production-run-nonterminal
+          [[ "$BLOCKING_STATUS" =~ ^(requested|queued|pending|waiting|in_progress)$ ]]
+          printf '%s\n' \
+            '### Guarded production dispatch' \
+            '' \
+            '- Child dispatch: `suppressed`' \
+            "- Reason: \`$DISPATCH_REASON\`" \
+            "- Blocking state: \`$BLOCKING_STATUS\`" \
+            '' >>"$GITHUB_STEP_SUMMARY"
+
+  report-failure:
+    name: Report a redacted scheduler failure
+    if: >-
+      always() &&
+      github.repository == 'ScrollPrize/villa' &&
+      github.repository_id == '890972577' &&
+      github.repository_owner_id == '121906140' &&
+      github.ref == 'refs/heads/main' &&
+      github.workflow_ref == 'ScrollPrize/villa/.github/workflows/progress-prizes-schedule.yml@refs/heads/main' &&
+      github.workflow_sha == github.sha &&
+      (needs.preflight.result == 'failure' ||
+       needs.plan.result == 'failure' ||
+       needs.dedupe.result == 'failure' ||
+       needs.dispatch.result == 'failure')
+    needs:
+      - preflight
+      - plan
+      - dedupe
+      - dispatch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Create or reuse the fixed automation issue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          const title = '[automation] Progress Prize rollover needs attention';
+          const notice = [
+            'The secret-free Progress Prize scheduler did not complete.',
+            '',
+            `Review the redacted [Actions run](${process.env.RUN_URL}).`,
+            '',
+            'Google identifiers, ACL identities, and operation output are intentionally omitted.',
+          ].join('\n');
+
+          async function github(path, method = 'GET', body) {
+            const response = await fetch(`https://api.github.com${path}`, {
+              method,
+              redirect: 'error',
+              headers: {
+                accept: 'application/vnd.github+json',
+                authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                'content-type': 'application/json',
+                'user-agent': 'progress-prize-schedule-reporter',
+                'x-github-api-version': '2022-11-28',
+              },
+              body: body === undefined ? undefined : JSON.stringify(body),
+            });
+            if (!response.ok) throw new Error('Redacted scheduler issue reporting failed.');
+            return response.status === 204 ? undefined : response.json();
+          }
+
+          const query = new URLSearchParams({
+            q: `repo:ScrollPrize/villa is:issue is:open in:title "${title}"`,
+            per_page: '100',
+          });
+          const search = await github(`/search/issues?${query}`);
+          if (!Number.isInteger(search?.total_count) || search.total_count > 100) {
+            throw new Error('Redacted scheduler issue search is ambiguous.');
+          }
+          const existing = search.items.filter(
+            (issue) => !issue.pull_request && issue.title === title,
+          );
+          if (existing.length > 1) throw new Error('Redacted scheduler issue search is ambiguous.');
+          if (existing.length === 1) {
+            await github(
+              `/repos/ScrollPrize/villa/issues/${existing[0].number}/comments`,
+              'POST',
+              { body: notice },
+            );
+          } else {
+            await github('/repos/ScrollPrize/villa/issues', 'POST', { title, body: notice });
+          }
+          NODE

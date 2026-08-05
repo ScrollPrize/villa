@@ -41,6 +41,27 @@ ViewerNavigationPanel::ViewerNavigationPanel(ViewerManager* viewerManager, QWidg
             _viewerManager->setZScrollSensitivity(value);
         }
     });
+    connectViewerManager();
+}
+
+void ViewerNavigationPanel::setViewerManager(ViewerManager* viewerManager)
+{
+    if (_viewerManager == viewerManager) {
+        return;
+    }
+    if (_viewerManager) {
+        disconnect(_viewerManager, nullptr, this, nullptr);
+    }
+    _viewerManager = viewerManager;
+    if (_zScrollSpin && _viewerManager) {
+        const QSignalBlocker blocker(_zScrollSpin);
+        _zScrollSpin->setValue(_viewerManager->zScrollSensitivity());
+    }
+    connectViewerManager();
+}
+
+void ViewerNavigationPanel::connectViewerManager()
+{
     if (_viewerManager) {
         connect(_viewerManager, &ViewerManager::zScrollSensitivityChanged, this, [this](double value) {
             if (!_zScrollSpin) {

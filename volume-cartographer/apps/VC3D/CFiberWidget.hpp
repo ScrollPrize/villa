@@ -14,6 +14,7 @@ class QLabel;
 class QButtonGroup;
 class QAction;
 class QCheckBox;
+class QDoubleSpinBox;
 class QLineEdit;
 class QTreeView;
 class QVBoxLayout;
@@ -33,6 +34,14 @@ public:
             std::string error;
         };
 
+        // Mirrors vc3d::line_annotation::FiberTraceState without pulling
+        // the annotation headers into this standalone widget.
+        enum class TraceState {
+            Legacy,       // no prediction-traced spans
+            Predictions,  // traced spans, fiber mode native_fiber_trace3d
+            Mixed,        // traced spans under a lasagna-global fiber
+        };
+
         struct SpanEntry {
             int spanIndex = 0;
             int firstControlIndex = 0;
@@ -41,6 +50,11 @@ public:
             int linePointCount = 0;
             double lengthVx = 0.0;
             AlignmentMetrics alignment;
+            // 'C' (cspline), 'L' (lasagna), or 'T' (prediction trace).
+            char interpMarker = 'L';
+            // Fiber-inference manifest the trace ran with; empty for
+            // non-trace spans.
+            std::string fiberManifest;
         };
 
         uint64_t id = 0;
@@ -58,6 +72,9 @@ public:
         std::string automaticHvTag;
         std::string manualHvTag;
         std::vector<std::string> tags;
+        int linkedFiberCount = 0;
+        int pendingLinkCount = 0;
+        TraceState traceState = TraceState::Legacy;
     };
 
     explicit CFiberWidget(QWidget* parent = nullptr);
@@ -81,21 +98,36 @@ public:
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
     void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
+    // Emits fiberTraceReviewChanged for the selected non-legacy fibers;
+    // also the programmatic entry the context-menu actions use.
+    void requestMarkTraceReviewed(bool verified);
+    void setShowFibersAvailable(bool available);
+    void setShowFibersChecked(bool checked);
+    [[nodiscard]] bool showFibersChecked() const;
+    void setShowLinkedChecked(bool checked);
+    [[nodiscard]] bool showLinkedChecked() const;
+    void setFiberViewDistance(double distance);
+    [[nodiscard]] double fiberViewDistance() const;
 
 signals:
     void fiberOpenRequested(uint64_t fiberId);
     void deleteFibersRequested(std::vector<uint64_t> fiberIds);
     void manualHvTagChanged(uint64_t fiberId, QString tag);
     void fiberTagChanged(uint64_t fiberId, QString tag, bool enabled);
+    void fiberTraceReviewChanged(std::vector<uint64_t> fiberIds, bool verified);
     void hvScoreRecalculationRequested(uint64_t fiberId);
     void fiberSpanOpenRequested(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void newAtlasFromFiberRequested(uint64_t fiberId);
     void addFibersToPointCollectionsRequested(std::vector<uint64_t> fiberIds);
+    void addFibersToSpiralFitRequested(std::vector<uint64_t> fiberIds);
     void fiberSliceRequested(uint64_t fiberId);
     void renameFiberFileRequested(uint64_t fiberId);
     void importFibersRequested();
     void exportFibersRequested();
     void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);
+    void showFibersToggled(bool checked);
+    void showLinkedToggled(bool checked);
+    void fiberViewDistanceChanged(double distance);
 
 private slots:
     void onSelectionChanged();
@@ -108,7 +140,13 @@ private slots:
     void onHeaderSectionClicked(int section);
     void showContextMenu(const QPoint& pos);
 
+public:
+    // Enables the "Add to current spiral fit" context action while a Spiral
+    // session is active on the connected service.
+    void setSpiralFitAvailable(bool available) { _spiralFitAvailable = available; }
+
 private:
+    bool _spiralFitAvailable = false;
     void setupUi();
     void rebuildModel();
     void sortFibers();
@@ -128,6 +166,7 @@ private:
     bool confirmDeleteFibers(const std::vector<uint64_t>& fiberIds);
     static QString displayNameForFiber(const FiberEntry& fiber);
     static QString directionForFiber(const FiberEntry& fiber);
+    static QString statusTextForFiber(const FiberEntry& fiber);
 
     uint64_t _selectedFiberId = 0;
     std::vector<FiberEntry> _fibers;
@@ -137,6 +176,9 @@ private:
     Qt::SortOrder _sortOrder = Qt::AscendingOrder;
 
     QCheckBox* _calcMetricsCheckBox;
+    QCheckBox* _showFibersCheckBox;
+    QCheckBox* _showLinkedCheckBox;
+    QDoubleSpinBox* _fiberViewDistanceSpinBox;
     QTreeView* _treeView;
     QStandardItemModel* _model;
     QLabel* _nameLabel;

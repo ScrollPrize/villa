@@ -29,6 +29,7 @@ import opt_loss_atlas_line
 from snap_surf import map_global as snap_surf_map_global
 from progress_table import format_progress_value, print_progress_legend
 import opt_loss_flatten
+from flatten_clamped_adam import FlattenClampedAdam
 
 
 def _debug_cuda_sync(label: str) -> None:
@@ -379,7 +380,7 @@ def _parse_opt_settings(
 			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
 	if "map_flatten_ms" in params and not any(
 		float(eff.get(name, 0.0)) != 0.0
-		for name in ("flatten_sdir", "flatten_map_step", "flatten_avg_offset", "flatten_orient")
+		for name in ("flatten_sdir", "flatten_map_step", "flatten_edge_step", "flatten_avg_offset", "flatten_orient")
 	):
 		raise ValueError(f"stages_json: stage '{stage_name}' with map_flatten_ms requires a nonzero flatten loss")
 	return OptSettings(
@@ -445,6 +446,7 @@ lambda_global: dict[str, float] = {
 	"cyl_outside": 0.0,
 	"flatten_sdir": 0.0,
 	"flatten_map_step": 0.0,
+	"flatten_edge_step": 0.0,
 	"flatten_avg_offset": 0.0,
 	"flatten_orient": 0.0,
 }
@@ -524,6 +526,7 @@ def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
 def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 	cfg = dict(cfg)
 	args_cfg = cfg.pop("args", None)
+	top_args = dict(args_cfg) if isinstance(args_cfg, dict) else {}
 	model_init = _model_init_from_args(args_cfg)
 	if init_mode is None:
 		init_mode = _init_mode_from_args(args_cfg)
@@ -586,6 +589,14 @@ def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
 			_require_consumed_dict(where=f"stage '{name}'", cfg=s)
 			if not isinstance(global_opt_cfg, dict):
 				raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
+			if "flatten_edge_step_global_scale" in top_args:
+				global_opt_cfg = dict(global_opt_cfg)
+				stage_args = dict(global_opt_cfg.get("args") or {})
+				stage_args.setdefault(
+					"flatten_edge_step_global_scale",
+					top_args["flatten_edge_step_global_scale"],
+				)
+				global_opt_cfg["args"] = stage_args
 			global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base)
 			out.append(Stage(name=name, global_opt=global_opt))
 		return out
@@ -847,6 +858,121 @@ def _clamp_flatten_map_ms_update(
 				p.copy_(prev + delta * scale)
 			else:
 				p.copy_(prev + delta.clamp(min=-float(max_step), max=float(max_step)))
+
+
+def _renorm_forward_flatten_map_step(model) -> dict[str, float]:
+	"""Rescale a forward flatten UV map so avg physical voxels per UV pixel hits target."""
+	if not bool(getattr(model, "flatten_enabled", False)):
+		return {}
+	if str(getattr(model, "flatten_direction", "inverse")).strip().lower() != "forward":
+		return {}
+	if not hasattr(model, "flatten_map") or not hasattr(model, "flatten_map_ms"):
+		return {}
+	with torch.no_grad():
+		uv = model.flatten_map()
+		xyz = getattr(model, "flatten_source_xyz", None)
+		valid = getattr(model, "flatten_source_valid", None)
+		cell_valid = getattr(model, "flatten_source_cell_valid", None)
+		target_t = getattr(model, "flatten_target_step", None)
+		if xyz is None or valid is None or cell_valid is None or target_t is None:
+			return {}
+		if uv.ndim != 3 or xyz.ndim != 3 or int(uv.shape[-1]) != 2 or int(xyz.shape[-1]) != 3:
+			return {}
+		if tuple(uv.shape[:2]) != tuple(xyz.shape[:2]) or tuple(valid.shape) != tuple(uv.shape[:2]):
+			return {}
+		if tuple(cell_valid.shape) != (max(0, int(uv.shape[0]) - 1), max(0, int(uv.shape[1]) - 1)):
+			return {}
+		target_step = float(target_t.detach().cpu())
+		if not math.isfinite(target_step) or target_step <= 0.0:
+			return {}
+		valid_t = (
+			valid.to(device=uv.device, dtype=torch.bool)
+			& torch.isfinite(uv).all(dim=-1)
+			& torch.isfinite(xyz).all(dim=-1)
+		)
+		row_edge_valid, col_edge_valid, diag00_valid, diag01_valid = opt_loss_flatten._retained_source_edge_masks(
+			valid_t,
+			cell_valid.to(device=uv.device, dtype=torch.bool),
+		)
+		sum_ratio = uv.new_zeros(())
+		sum_weight = uv.new_zeros(())
+
+		def _accumulate(delta_uv: torch.Tensor, delta_xyz: torch.Tensor, mask: torch.Tensor) -> None:
+			nonlocal sum_ratio, sum_weight
+			uv_len = torch.linalg.vector_norm(delta_uv, dim=-1)
+			phys_len = torch.linalg.vector_norm(delta_xyz, dim=-1)
+			ok = mask & torch.isfinite(uv_len) & torch.isfinite(phys_len) & (uv_len > 1.0e-8) & (phys_len > 0.0)
+			mask_f = ok.to(dtype=uv.dtype)
+			sum_ratio = sum_ratio + ((phys_len / uv_len) * mask_f).sum()
+			sum_weight = sum_weight + mask_f.sum()
+
+		if int(uv.shape[0]) > 1:
+			_accumulate(
+				uv[1:, :] - uv[:-1, :],
+				xyz[1:, :] - xyz[:-1, :],
+				row_edge_valid & valid_t[1:, :] & valid_t[:-1, :],
+			)
+		if int(uv.shape[1]) > 1:
+			_accumulate(
+				uv[:, 1:] - uv[:, :-1],
+				xyz[:, 1:] - xyz[:, :-1],
+				col_edge_valid & valid_t[:, 1:] & valid_t[:, :-1],
+			)
+		if int(uv.shape[0]) > 1 and int(uv.shape[1]) > 1:
+			_accumulate(
+				uv[1:, 1:] - uv[:-1, :-1],
+				xyz[1:, 1:] - xyz[:-1, :-1],
+				diag00_valid & valid_t[1:, 1:] & valid_t[:-1, :-1],
+			)
+			_accumulate(
+				uv[1:, :-1] - uv[:-1, 1:],
+				xyz[1:, :-1] - xyz[:-1, 1:],
+				diag01_valid & valid_t[1:, :-1] & valid_t[:-1, 1:],
+			)
+		if not bool((sum_weight > 0).detach().cpu()):
+			return {}
+		current_step = float((sum_ratio / sum_weight.clamp_min(1.0)).detach().cpu())
+		if not math.isfinite(current_step) or current_step <= 0.0:
+			return {}
+		scale = current_step / target_step
+		if not math.isfinite(scale) or scale <= 0.0:
+			return {}
+		if abs(scale - 1.0) <= 1.0e-6:
+			return {
+				"flatten_renorm_step_before": current_step,
+				"flatten_renorm_step_after": current_step,
+				"flatten_renorm_scale": 1.0,
+			}
+		center_mask = valid_t
+		center_weight = center_mask.to(dtype=uv.dtype).sum()
+		if not bool((center_weight > 0).detach().cpu()):
+			return {}
+		center = (uv * center_mask.unsqueeze(-1).to(dtype=uv.dtype)).sum(dim=(0, 1)) / center_weight.clamp_min(1.0)
+		renorm_uv = center + (uv - center) * float(scale)
+		flat = renorm_uv.permute(2, 0, 1).unsqueeze(1).contiguous()
+		new_pyr = fit_model.Model3D._construct_pyramid_from_flat_3d(
+			flat,
+			len(model.flatten_map_ms),
+			pyramid_d=False,
+		)
+		if len(new_pyr) != len(model.flatten_map_ms):
+			return {}
+		for dst, src in zip(model.flatten_map_ms, new_pyr, strict=True):
+			if tuple(dst.shape) != tuple(src.shape):
+				return {}
+		for dst, src in zip(model.flatten_map_ms, new_pyr, strict=True):
+			dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
+		return {
+			"flatten_renorm_step_before": current_step,
+			"flatten_renorm_step_after": target_step,
+			"flatten_renorm_scale": float(scale),
+			"flatten_grid_step_avg": target_step,
+		}
+
+
+def _clear_optimizer_state_for_params(opt: torch.optim.Optimizer, params: list[torch.nn.Parameter]) -> None:
+	for p in params:
+		opt.state.pop(p, None)
 
 
 def check_data_bounds(model, data: fit_data.FitData3D, margin: float = 100.0,
@@ -1881,6 +2007,10 @@ def optimize(
 			"loss": opt_loss_flatten.flatten_map_step_loss,
 			"needs": Needs(flatten=True),
 		},
+		"flatten_edge_step": {
+			"loss": opt_loss_flatten.flatten_edge_step_loss,
+			"needs": Needs(flatten=True),
+		},
 		"flatten_avg_offset": {
 			"loss": opt_loss_flatten.flatten_avg_offset_loss,
 			"needs": Needs(flatten=True),
@@ -2088,6 +2218,15 @@ def optimize(
 			if "map_flatten_ms" in opt_cfg.params and bool(getattr(model, "flatten_enabled", False))
 			else 0.0
 		)
+		flatten_renorm_interval = (
+			max(0, int(stage_args.get("flatten_renorm_interval", 0)))
+			if "map_flatten_ms" in opt_cfg.params and bool(getattr(model, "flatten_enabled", False))
+			else 0
+		)
+		fused_flatten_adam_clamp = _truthy(os.environ.get(
+			"LASAGNA_FUSED_FLATTEN_ADAM_CLAMP",
+			stage_args.get("fused_flatten_adam_clamp", False),
+		))
 		if opt_timing_enabled and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: opt timing enabled interval={opt_timing_interval} "
@@ -2252,10 +2391,118 @@ def optimize(
 			flush=True,
 		)
 
+		_flatten_diagnostics = _truthy(os.environ.get(
+			"LASAGNA_FLATTEN_DIAGNOSTICS",
+			stage_args.get("flatten_diagnostics", True),
+		))
 		opt_loss_flatten.configure(
 			sdir_eps=float(stage_args.get("flatten_sdir_eps", 1.0e-8)),
-			orient_min_det=float(stage_args.get("flatten_orient_min_det", 0.0)),
+			orient_min_det=float(stage_args.get("flatten_orient_min_det", 1.0e-2)),
+			order_margin=float(stage_args.get("flatten_order_margin", 0.05)),
+			edge_step_global_scale=float(stage_args.get("flatten_edge_step_global_scale", 1.0)),
+			diagnostics=_flatten_diagnostics,
 		)
+		if _need_term("flatten_edge_step", stage_eff) > 0 and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: flatten_edge_step_global_scale="
+				f"{float(stage_args.get('flatten_edge_step_global_scale', 1.0)):g}",
+				flush=True,
+			)
+		_compile_flatten = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN",
+			stage_args.get("compile_flatten", False),
+		))
+		_compile_flatten_backend = os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_BACKEND",
+			stage_args.get("compile_flatten_backend", None),
+		)
+		_compile_flatten_mode = os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_MODE",
+			stage_args.get("compile_flatten_mode", None),
+		)
+		_compile_flatten_dynamic = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_DYNAMIC",
+			stage_args.get("compile_flatten_dynamic", False),
+		))
+		_compile_flatten_fullgraph = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_FULLGRAPH",
+			stage_args.get("compile_flatten_fullgraph", False),
+		))
+		_compile_flatten_combined = _truthy(os.environ.get(
+			"LASAGNA_COMPILE_FLATTEN_COMBINED",
+			stage_args.get("compile_flatten_combined", True),
+		))
+		opt_loss_flatten.configure_compile(
+			enabled=_compile_flatten,
+			backend=_compile_flatten_backend,
+			mode=_compile_flatten_mode,
+			dynamic=_compile_flatten_dynamic,
+			fullgraph=_compile_flatten_fullgraph,
+		)
+		if not _flatten_diagnostics and "map_flatten_ms" in opt_cfg.params:
+			print(f"[optimizer] {label}: flatten_diagnostics=0", flush=True)
+		if _compile_flatten and "map_flatten_ms" in opt_cfg.params:
+			_details = []
+			if _compile_flatten_backend:
+				_details.append(f"backend={_compile_flatten_backend}")
+			if _compile_flatten_mode:
+				_details.append(f"mode={_compile_flatten_mode}")
+			if _compile_flatten_dynamic:
+				_details.append("dynamic=1")
+			if _compile_flatten_fullgraph:
+				_details.append("fullgraph=1")
+			if (
+				_compile_flatten_combined
+				and not _flatten_diagnostics
+				and str(getattr(model, "flatten_direction", "inverse")) == "forward"
+			):
+				_details.append("combined=1")
+			_detail_str = " " + " ".join(_details) if _details else ""
+			print(f"[optimizer] {label}: compile_flatten=1{_detail_str}", flush=True)
+		_flatten_combined_names = (
+			"flatten_sdir",
+			"flatten_map_step",
+			"flatten_avg_offset",
+			"flatten_orient",
+		)
+		_flatten_combined_weights = None
+		_flatten_combined_step_loss = "map"
+		if (
+			_compile_flatten
+			and _compile_flatten_combined
+			and not _flatten_diagnostics
+			and "map_flatten_ms" in opt_cfg.params
+			and str(getattr(model, "flatten_direction", "inverse")) == "forward"
+		):
+			_flatten_map_combined_names = (
+				"flatten_sdir",
+				"flatten_map_step",
+				"flatten_avg_offset",
+				"flatten_orient",
+			)
+			_flatten_edge_combined_names = (
+				"flatten_sdir",
+				"flatten_edge_step",
+				"flatten_avg_offset",
+				"flatten_orient",
+			)
+			_map_step_weight = _need_term("flatten_map_step", stage_eff)
+			_edge_step_weight = _need_term("flatten_edge_step", stage_eff)
+			if _edge_step_weight != 0.0 and _map_step_weight == 0.0:
+				_flatten_combined_names = _flatten_edge_combined_names
+				_flatten_combined_step_loss = "edge"
+			elif _map_step_weight != 0.0 and _edge_step_weight == 0.0:
+				_flatten_combined_names = _flatten_map_combined_names
+				_flatten_combined_step_loss = "map"
+			_flatten_weight_values = tuple(_need_term(name, stage_eff) for name in _flatten_combined_names)
+			if all(weight != 0.0 for weight in _flatten_weight_values) and not (
+				_map_step_weight != 0.0 and _edge_step_weight != 0.0
+			):
+				_flatten_combined_weights = torch.tensor(
+					_flatten_weight_values,
+					device=next(model.parameters()).device,
+					dtype=torch.float32,
+				)
 		_compile_cyl_normal_raw = os.environ.get(
 			"LASAGNA_COMPILE_CYL_NORMAL",
 			stage_args.get("compile_cyl_normal", False),
@@ -2341,7 +2588,10 @@ def optimize(
 					for pi, p in enumerate(group):
 						if pi < k0:
 							continue
-						param_groups_.append({"params": [p], "lr": _lr_scalespace(lr=settings.lr, scale_i=pi)})
+						param_group = {"params": [p], "lr": _lr_scalespace(lr=settings.lr, scale_i=pi)}
+						if name == "map_flatten_ms":
+							param_group["_flatten_scale_i"] = pi
+						param_groups_.append(param_group)
 				elif name == "cyl_params" and bool(getattr(model, "cyl_shell_mode", False)):
 					scale_count = 0
 					if hasattr(model, "cyl_param_scale_count"):
@@ -2360,16 +2610,40 @@ def optimize(
 						param_groups_.append({"params": [p], "lr": lr_last})
 			return all_params_, param_groups_
 
+		def _make_optimizer(
+			param_groups_: list[dict],
+			opt_settings: OptSettings | None = None,
+		) -> torch.optim.Optimizer:
+			settings = opt_settings if opt_settings is not None else opt_cfg
+			if (
+				fused_flatten_adam_clamp
+				and flatten_max_update > 0.0
+				and settings.params == ["map_flatten_ms"]
+			):
+				return FlattenClampedAdam(param_groups_, base_step=flatten_max_update)
+			return torch.optim.Adam(param_groups_)
+
 		_t = _stage_start(f"{label}.build_optimizer")
 		all_params, param_groups = _make_param_groups()
 		if not param_groups:
 			return data
-		opt = torch.optim.Adam(param_groups)
+		opt = _make_optimizer(param_groups)
 		_capture_optimizer_target_lrs(opt)
 		if flatten_max_update > 0.0 and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: flatten_max_update={flatten_max_update:g} "
 				f"(per-scale cap doubles at each coarser level)",
+				flush=True,
+			)
+		if isinstance(opt, FlattenClampedAdam) and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: fused_flatten_adam_clamp=1 "
+				f"(Triton CUDA with PyTorch fallback)",
+				flush=True,
+			)
+		if flatten_renorm_interval > 0 and not is_cyl_shelling_stage:
+			print(
+				f"[optimizer] {label}: flatten_renorm_interval={flatten_renorm_interval}",
 				flush=True,
 			)
 		_stage_done(f"{label}.build_optimizer", _t)
@@ -2394,7 +2668,7 @@ def optimize(
 				all_params, param_groups = _make_param_groups()
 				if not param_groups:
 					return data
-				opt = torch.optim.Adam(param_groups)
+				opt = _make_optimizer(param_groups)
 				_capture_optimizer_target_lrs(opt)
 		_stage_done(f"{label}.winding_offset_autocrop", _t)
 
@@ -2547,15 +2821,23 @@ def optimize(
 				"atlas_line_snap_valid": "a_sval",
 				"atlas_line_snap_rms": "a_srms",
 				"atlas_line_snap_active_vertices": "a_svtx",
+				"flatten_sdir": "f_sdir",
+				"flatten_sdir_contrib": "f_sdirW",
 				"flatten_point_valid": "f_pt",
 				"flatten_quad_valid": "f_quad",
 				"flatten_tgt_step": "f_tgt",
+				"flatten_grid_step_avg": "f_step",
 				"flatten_valid_to_invalid": "f_v2i",
 				"flatten_invalid_to_valid": "f_i2v",
 				"flatten_map_step": "f_mstep",
+				"flatten_map_step_contrib": "f_mstpW",
+				"flatten_edge_step": "f_estep",
+				"flatten_edge_step_contrib": "f_estpW",
 				"flatten_avg_offset": "f_avg",
+				"flatten_avg_offset_contrib": "f_avgW",
 				"flatten_avg_offset_norm": "f_avgn",
 				"flatten_orient": "f_orient",
+				"flatten_orient_contrib": "f_oriW",
 				"flatten_orient_fold_frac": "f_fold",
 				"flatten_orient_lowdet_frac": "f_lowdet",
 				"flatten_orient_min_det": "f_mindet",
@@ -2706,6 +2988,10 @@ def optimize(
 				"atlas_line_snap_valid": "atlas valid pred-snap samples",
 				"atlas_line_snap_rms": "atlas pred-snap RMS",
 				"atlas_line_snap_active_vertices": "atlas active pred-snap vertices",
+				"flatten_edge_step": "physical edge step loss",
+				"flatten_edge_step_contrib": "weighted physical edge step loss",
+				"flatten_map_step": "UV map step loss",
+				"flatten_map_step_contrib": "weighted UV map step loss",
 				"p:wcirc_avg_vx": "param circ avg",
 				"p:wcirc_tgt_vx": "param circ target",
 				"p:wstep_invalid_avg_vx": "param invalid avg",
@@ -2805,29 +3091,51 @@ def optimize(
 				"snaps_map_nsign": 179,
 				"snaps_map_scales": 180,
 				"snaps_map_repair": 181,
-				"smooth_step": 196,
-				"avg_step": 197,
-				"atlas_line": 182,
-				"atlas_line_control": 183,
-				"atlas_line_other": 184,
-				"atlas_line_snap": 185,
-				"atlas_line_samples": 186,
-				"atlas_line_valid": 187,
-				"atlas_line_rms": 188,
-				"atlas_line_active_vertices": 189,
-				"atlas_line_signed_delta_mean": 190,
-				"atlas_line_control_valid": 191,
-				"atlas_line_control_rms": 192,
-				"atlas_line_control_active_vertices": 193,
-				"atlas_line_other_valid": 194,
-				"atlas_line_other_rms": 195,
-				"atlas_line_other_active_vertices": 196,
-				"atlas_line_snap_valid": 197,
-				"atlas_line_snap_rms": 198,
-				"atlas_line_snap_active_vertices": 199,
-				"cyl_outside_pen_frac": 200,
-				"cyl_outside_depth_max": 201,
-				"cyl_outside_depth_avg": 202,
+				"flatten_sdir": 182,
+				"flatten_sdir_contrib": 183,
+				"flatten_map_step": 184,
+				"flatten_map_step_contrib": 185,
+				"flatten_edge_step": 186,
+				"flatten_edge_step_contrib": 187,
+				"flatten_avg_offset": 188,
+				"flatten_avg_offset_contrib": 189,
+				"flatten_orient": 190,
+				"flatten_orient_contrib": 191,
+				"flatten_tgt_step": 192,
+				"flatten_grid_step_avg": 193,
+				"flatten_point_valid": 194,
+				"flatten_quad_valid": 195,
+				"flatten_avg_offset_norm": 196,
+				"flatten_orient_fold_frac": 197,
+				"flatten_orient_lowdet_frac": 198,
+				"flatten_orient_min_det": 199,
+				"flatten_orient_mean_det": 200,
+				"flatten_sdir_no_new": 201,
+				"flatten_valid_to_invalid": 202,
+				"flatten_invalid_to_valid": 203,
+				"smooth_step": 204,
+				"avg_step": 205,
+				"cyl_outside_pen_frac": 206,
+				"cyl_outside_depth_max": 207,
+				"cyl_outside_depth_avg": 208,
+				"atlas_line": 220,
+				"atlas_line_control": 221,
+				"atlas_line_other": 222,
+				"atlas_line_snap": 223,
+				"atlas_line_samples": 224,
+				"atlas_line_valid": 225,
+				"atlas_line_rms": 226,
+				"atlas_line_active_vertices": 227,
+				"atlas_line_signed_delta_mean": 228,
+				"atlas_line_control_valid": 229,
+				"atlas_line_control_rms": 230,
+				"atlas_line_control_active_vertices": 231,
+				"atlas_line_other_valid": 232,
+				"atlas_line_other_rms": 233,
+				"atlas_line_other_active_vertices": 234,
+				"atlas_line_snap_valid": 235,
+				"atlas_line_snap_rms": 236,
+				"atlas_line_snap_active_vertices": 237,
 			}
 			def _sort_key(k: str) -> tuple[int, str]:
 				return (key_order.get(k, 0), k)
@@ -2836,6 +3144,10 @@ def optimize(
 			def _desc_key(k: str) -> str:
 				if k in desc_map:
 					return desc_map[k]
+				if k == "flatten_grid_step_avg":
+					return "flatten current avg grid step"
+				if k.endswith("_contrib") and k.startswith("flatten_"):
+					return f"weighted {k[:-8]}"
 				if k.startswith("p:"):
 					return f"param {k[2:]}"
 				return k
@@ -2904,8 +3216,13 @@ def optimize(
 			values = {k: _fmt_val(k, tv[k]) for k in tv_keys}
 			values.update({f"p:{k}": _fmt_val(f"p:{k}", pv[k]) for k in pv_keys})
 			widths = {k: max(len(_display_key(k)), len(values[k]), 5) for k in cols}
-			if force_header or (shell_no is not None and _status_rows == 0) or (shell_no is None and _status_rows % 20 == 0):
-				legend_cols = tuple(cols)
+			legend_cols = tuple(cols)
+			if (
+				force_header
+				or _status_legend_cols != legend_cols
+				or (shell_no is not None and _status_rows == 0)
+				or (shell_no is None and _status_rows % 20 == 0)
+			):
 				if _status_legend_cols != legend_cols:
 					_print_status_legend(cols)
 					_status_legend_cols = legend_cols
@@ -3158,7 +3475,44 @@ def optimize(
 			if stage_uses_cyl_loss:
 				opt_loss_cyl.reset_candidate_terms()
 			D = res_.xyz_lr.shape[0]
+			if _flatten_combined_weights is not None:
+				for name in _flatten_combined_names:
+					t = terms[name]
+					missing = _missing_loss_fields(
+						name=name,
+						required=t.get("needs", Needs()),
+						res_=res_,
+					)
+					if missing:
+						raise RuntimeError(
+							f"{profile_label or label}: active combined flatten loss missing "
+							f"artifact(s) for '{name}': {', '.join(missing)}"
+						)
+				loss_label = f"{profile_label or label}.flatten_combined"
+				_log_cuda_memory(f"{loss_label}.before")
+				_t_loss = _stage_start(loss_label) if profile_label is not None else None
+				_t_loss_wall = time.perf_counter() if timing is not None else None
+				combined_parts = opt_loss_flatten.flatten_combined_loss_parts(
+					res=res_,
+					weights=_flatten_combined_weights,
+					step_loss=_flatten_combined_step_loss,
+				)
+				combined_loss = combined_parts[0]
+				_debug_cuda_sync(loss_label)
+				_log_cuda_memory(f"{loss_label}.after_raw")
+				if timing is not None and _t_loss_wall is not None:
+					timing.sync()
+					timing.add("loss:flatten_combined", time.perf_counter() - _t_loss_wall)
+				if _t_loss is not None:
+					_stage_done(loss_label, _t_loss)
+				total = total + combined_loss
+				for i, name in enumerate(_flatten_combined_names):
+					lv = combined_parts[i + 1]
+					tv[name] = float(lv.detach().cpu())
+					tv[f"{name}_contrib"] = float((lv * _flatten_combined_weights[i]).detach().cpu())
 			for name, t in terms.items():
+				if _flatten_combined_weights is not None and name in _flatten_combined_names:
+					continue
 				min_d = t.get("min_depth", 1)
 				if D < min_d:
 					continue
@@ -3218,7 +3572,16 @@ def optimize(
 				else:
 					lv, lms, masks = result
 					w = _need_term(name, eff_)
+					is_flatten_term = name in (
+						"flatten_sdir",
+						"flatten_map_step",
+						"flatten_edge_step",
+						"flatten_avg_offset",
+						"flatten_orient",
+					)
 					tv[name] = float(lv.detach().cpu())
+					if is_flatten_term:
+						tv[f"{name}_contrib"] = float((lv * w).detach().cpu())
 					if name == "pred_dt":
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					if name == "cyl_outside":
@@ -3227,7 +3590,7 @@ def optimize(
 						tv.update(opt_loss_snap_surf.last_stats())
 					if name == "atlas_line":
 						tv.update(opt_loss_atlas_line.last_stats())
-					if name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
+					if _flatten_diagnostics and name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
 						tv.update(opt_loss_flatten.last_stats())
 					total = total + w * lv
 			display_loss: float | None = None
@@ -3412,7 +3775,7 @@ def optimize(
 				all_params, param_groups = _make_param_groups(pass_settings)
 				if not param_groups:
 					raise RuntimeError(f"{shell_label}: no cylinder parameters available to optimize")
-				opt = torch.optim.Adam(param_groups)
+				opt = _make_optimizer(param_groups, pass_settings)
 				_capture_optimizer_target_lrs(opt)
 				resample_count = 0
 				resampled_this_pass = False
@@ -3467,6 +3830,11 @@ def optimize(
 					_prefetch_loss_points_for_result(res0, pass_needs)
 					loss0, term_vals0, display_loss0 = _eval_terms(
 						res0, pass_eff, profile_label=f"{shell_label}.initial_eval.loss")
+				if bool(getattr(model, "flatten_enabled", False)):
+					term_vals0 = {
+						**term_vals0,
+						**opt_loss_flatten.current_grid_step_stats(res0),
+					}
 				term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 				if not suppress_initial_status:
 					_print_status(
@@ -3480,8 +3848,9 @@ def optimize(
 						force_header=True,
 						shell_no=shell_no,
 					)
-				snapshot_fn(stage=shell_label.replace(".", "_"), step=0,
-							loss=float(loss0.detach().cpu()), data=data, res=res0)
+				if snap_int > 0:
+					snapshot_fn(stage=shell_label.replace(".", "_"), step=0,
+								loss=float(loss0.detach().cpu()), data=data, res=res0)
 				_stage_done(f"{shell_label}.initial_eval", _t)
 
 				loss = loss0
@@ -3600,6 +3969,11 @@ def optimize(
 							(status_interval > 0 and (step1 % status_interval) == 0)
 						)
 					if _status_due:
+						if bool(getattr(model, "flatten_enabled", False)):
+							term_vals = {
+								**term_vals,
+								**opt_loss_flatten.current_grid_step_stats(res),
+							}
 						term_vals = {k: round(v, 4) for k, v in term_vals.items()}
 						_t_wall_now = time.perf_counter()
 						_t_wall_elapsed = _t_wall_now - _t_wall_start
@@ -3993,6 +4367,11 @@ def optimize(
 					param_vals0[k] = float(vs[0].detach().cpu())
 			_stage_done(f"{label}.initial_eval.param_values", _t_params)
 			_t_status = _stage_start(f"{label}.initial_eval.status_print")
+			if bool(getattr(model, "flatten_enabled", False)):
+				term_vals0 = {
+					**term_vals0,
+					**opt_loss_flatten.current_grid_step_stats(res0),
+				}
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			_print_status(
@@ -4008,9 +4387,10 @@ def optimize(
 				opt_loss_corr.print_detail("START")
 				_corr_start_printed[0] = True
 		_stage_done(f"{label}.initial_eval", _t)
-		_t = _stage_start(f"{label}.initial_snapshot")
-		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0)
-		_stage_done(f"{label}.initial_snapshot", _t)
+		if snap_int > 0:
+			_t = _stage_start(f"{label}.initial_snapshot")
+			snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0)
+			_stage_done(f"{label}.initial_snapshot", _t)
 
 		max_steps = opt_cfg.steps
 		final_step = 0
@@ -4116,7 +4496,11 @@ def optimize(
 			_t_part = time.perf_counter()
 			_flatten_update_before = None
 			_flatten_update_params = all_params.get("flatten_map_ms", [])
-			if flatten_max_update > 0.0 and _flatten_update_params:
+			if (
+				flatten_max_update > 0.0
+				and _flatten_update_params
+				and not isinstance(opt, FlattenClampedAdam)
+			):
 				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
 			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
 			_log_cuda_memory(f"{label}.{step + 1}.opt_step.before")
@@ -4129,6 +4513,20 @@ def optimize(
 					_flatten_update_before,
 					base_step=flatten_max_update,
 				)
+			step1 = step + 1
+			if flatten_renorm_interval > 0 and (step1 % flatten_renorm_interval) == 0:
+				_renorm_stats = _renorm_forward_flatten_map_step(model)
+				if _renorm_stats:
+					_clear_optimizer_state_for_params(opt, _flatten_update_params)
+					if "flatten_grid_step_avg" in _renorm_stats:
+						term_vals["flatten_grid_step_avg"] = _renorm_stats["flatten_grid_step_avg"]
+					print(
+						f"[optimizer] {label}: flatten renorm step={step1} "
+						f"avg_step={_renorm_stats['flatten_renorm_step_before']:.6g} "
+						f"target={_renorm_stats['flatten_renorm_step_after']:.6g} "
+						f"uv_scale={_renorm_stats['flatten_renorm_scale']:.6g}",
+						flush=True,
+					)
 			if _opt_timing is not None:
 				_opt_timing.sync()
 				_opt_timing.add("optimizer_step", time.perf_counter() - _t_part)
@@ -4180,7 +4578,6 @@ def optimize(
 
 			_t_steps_acc += 1
 			_done_steps[0] += 1
-			step1 = step + 1
 			final_step = step1
 			_stage_progress = step1 / max_steps if max_steps > 0 else 1.0
 			_overall_progress = (
@@ -4210,6 +4607,14 @@ def optimize(
 
 			_t_part = time.perf_counter()
 			if step == 0 or step1 == max_steps or auto_stop or (status_interval > 0 and (step1 % status_interval) == 0):
+				if bool(getattr(model, "flatten_enabled", False)):
+					_renorm_grid_step = term_vals.get("flatten_grid_step_avg")
+					term_vals = {
+						**term_vals,
+						**opt_loss_flatten.current_grid_step_stats(res),
+					}
+					if _renorm_grid_step is not None:
+						term_vals["flatten_grid_step_avg"] = _renorm_grid_step
 				param_vals: dict[str, float] = {}
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:

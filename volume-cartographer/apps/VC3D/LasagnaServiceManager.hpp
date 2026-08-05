@@ -32,13 +32,24 @@ class LasagnaServiceManager : public QObject
 
 public:
     static LasagnaServiceManager& instance();
+    /**
+     * Create an isolated manager for a short-lived, locally owned service.
+     *
+     * Unlike instance(), this manager is parent-owned and contains the local
+     * Python process tree so destroying or stopping it cannot leave workers
+     * behind. External services are still only disconnected, never killed.
+     */
+    static LasagnaServiceManager* createTransient(QObject* parent);
 
     /**
      * Ensure the service process is running (internal mode).
      * @param pythonPath  Path to python executable (empty = auto-detect).
+     * @param dataDirectory Directory containing one or more .lasagna.json
+     *        dataset descriptors. Required when starting an internal service.
      * @return true if service is running (or was successfully started).
      */
-    bool ensureServiceRunning(const QString& pythonPath = QString());
+    bool ensureServiceRunning(const QString& pythonPath = QString(),
+                              const QString& dataDirectory = QString());
 
     /**
      * Connect to an externally started service.
@@ -87,6 +98,12 @@ public:
      */
     static QJsonArray discoverServices();
 
+    /** Locate a config beside the Lasagna service checkout. */
+    static QString findConfigFile(const QString& fileName);
+
+    /** Describe a local tifxyz directory for the existing artifact-upload path. */
+    static QJsonObject makeTifxyzArtifactUpload(const QString& tifxyzDirectory);
+
     /** Fetch available datasets from the connected service (GET /datasets). */
     void fetchDatasets();
 
@@ -127,7 +144,8 @@ signals:
     void datasetsReceived(const QJsonArray& datasets);
 
 private:
-    explicit LasagnaServiceManager(QObject* parent = nullptr);
+    explicit LasagnaServiceManager(QObject* parent = nullptr,
+                                   bool containProcessTree = false);
     ~LasagnaServiceManager() override;
 
     LasagnaServiceManager(const LasagnaServiceManager&) = delete;
@@ -136,7 +154,7 @@ private:
     /** Construct base URL from current _host and _port. */
     QString baseUrl() const;
 
-    bool startService(const QString& pythonPath);
+    bool startService(const QString& pythonPath, const QString& dataDirectory);
     void handleProcessFinished(int exitCode, QProcess::ExitStatus exitStatus);
     void handleProcessError(QProcess::ProcessError error);
     void handleReadyReadStdout();
@@ -173,6 +191,10 @@ private:
     std::unique_ptr<QProcess> _process;
     QNetworkAccessManager* _nam{nullptr};
     QTimer* _pollTimer{nullptr};
+    bool _containProcessTree{false};
+#ifdef Q_OS_WIN
+    void* _processJob{nullptr};
+#endif
 
     struct ArtifactUploadJob
     {
@@ -187,6 +209,7 @@ private:
     int _port{0};
     bool _isExternal{false};
     QString _lastError;
+    QString _dataDirectory;
     bool _serviceReady{false};
     bool _optimizationRunning{false};
     QString _localOutputDir;  // where to unpack optimization results

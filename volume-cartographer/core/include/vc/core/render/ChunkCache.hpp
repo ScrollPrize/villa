@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vc/core/render/DecodedChunkCacheBudget.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
 
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -30,6 +32,10 @@ public:
 
     struct Options {
         std::size_t decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
+        // Optional aggregate byte budget shared with other ChunkCache
+        // instances. The local capacity above remains a per-cache safety
+        // ceiling; the shared budget additionally constrains their sum.
+        std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
         // Bound resolved non-data entries (all-fill/missing/error). These
         // entries are small individually, but sparse remote volumes can touch
         // unbounded empty chunk grids during exploration.
@@ -55,13 +61,6 @@ public:
         // CacheCompression.hpp). Combined (max) with the process-wide
         // default below at construction.
         int cacheQuantBinWidth = 1;
-        // Entries read within this window are skipped by capacity eviction
-        // (until the hard ceiling of twice the capacity): they belong to a
-        // view that is still being rendered, so dropping them frees little
-        // memory (render workers pin the bytes for the frame anyway) and
-        // guarantees a refetch plus a visible blank on the next re-render.
-        // Zero restores strict-capacity LRU.
-        std::chrono::milliseconds evictionProtectionWindow{3000};
     };
 
     struct Stats {
@@ -77,6 +76,17 @@ public:
         std::optional<std::size_t> persistentCacheMaximumBytes;
         std::size_t remoteFetchesInFlight = 0;
         double remoteDownloadBytesPerSecond = 0.0;
+
+    };
+
+    struct PersistentChunkDependency {
+        ChunkKey key;
+        bool valid = false;
+        std::optional<std::string> sourceChunkKey;
+        std::filesystem::path persistentPath;
+        std::filesystem::path persistentEmptyPath;
+        std::string persistentExtension;
+        bool sourcePayloadMatchesPersistentCache = false;
     };
 
     ChunkCache(std::vector<LevelInfo> levels,
@@ -98,15 +108,20 @@ public:
     LevelTransform levelTransform(int level) const override;
 
     ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override;
+    ChunkResult getChunkIfCached(int level, int iz, int iy, int ix) override;
     ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override;
     void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) override;
 
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) override;
     void removeChunkReadyListener(ChunkReadyCallbackId id) override;
 
+    PersistentChunkDependency persistentChunkDependency(int level, int iz, int iy, int ix) const;
+
     Stats stats() const;
     void invalidate();
-    void beginViewRequest();
+    // Advances fetch priority so newer view renders supersede stale requests.
+    // discardPending is only safe for an exclusively-owned interactive cache.
+    void beginViewRequest(bool discardPending = false) override;
     void waitForPersistentWrites() const;
 
     // Process-wide default for Options::compressPersistentCache, OR-ed into
@@ -119,6 +134,13 @@ public:
     // the compression default above; the larger of the two values wins).
     static void setPersistentQuantizationDefault(int binWidth);
     static int persistentQuantizationDefault();
+
+    // Optional process-wide default aggregate budget. Applications install
+    // this once; explicitly supplied budgets (for example the overlay pool)
+    // take precedence.
+    static void setDecodedByteBudgetDefault(
+        const std::shared_ptr<DecodedChunkCacheBudget>& budget);
+    static std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudgetDefault();
 
 private:
     enum class EntryStatus {
@@ -140,7 +162,7 @@ private:
         int basePriority = 0;
         std::int64_t priority = 0;
         std::uint64_t fetchSerial = 0;
-        std::chrono::steady_clock::time_point lastTouch{};
+        std::uint64_t budgetTouch = 0;
         std::list<ChunkKey>::iterator lruIt;
     };
 
@@ -155,6 +177,7 @@ private:
             , fillValue_(fillValue)
             , dtype_(dtype)
             , options_(std::move(options))
+            , schedulerGroup_(ChunkCache::nextSchedulerGroup())
         {}
 
         std::vector<LevelInfo> levels_;
@@ -168,8 +191,14 @@ private:
         std::unordered_map<ChunkKey, Entry, ChunkKeyHash> entries_;
         std::list<ChunkKey> lru_;
         std::size_t decodedBytes_ = 0;
+        std::uint64_t decodedBudgetRegistration_ = 0;
         std::uint64_t generation_ = 0;
         std::int64_t viewEpoch_ = 1;
+        // Shared executor tasks carry this cache-specific group/epoch. A new
+        // exclusive view can compact only its own stale tasks without
+        // disturbing other ChunkCache instances using the same pools.
+        const std::uint64_t schedulerGroup_;
+        std::uint64_t schedulerEpoch_ = 0;
         std::uint64_t nextFetchSerial_ = 1;
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;
@@ -179,9 +208,11 @@ private:
         std::atomic_bool persistentCacheScanInFlight_{false};
         std::atomic_size_t persistentWritesInFlight_{0};
         std::shared_ptr<PersistentZarrCacheBudget> persistentBudget_;
+
     };
 
-    static ChunkResult resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry);
+    static ChunkResult resultFromEntryLocked(
+        State& state, const ChunkKey& key, Entry& entry, bool promote = true);
     static int fetchBasePriority(const State& state, const ChunkKey& key, int priorityOffset);
     static void queueFetchLocked(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
@@ -195,7 +226,8 @@ private:
                                         ChunkKey key,
                                         std::uint64_t generation,
                                         std::uint64_t fetchSerial,
-                                        std::int64_t priority);
+                                        std::int64_t priority,
+                                        std::uint64_t schedulerEpoch);
     static void storeFetchResultLocked(const std::shared_ptr<State>& state,
                                        const ChunkKey& key,
                                        ChunkFetchResult fetch,
@@ -222,12 +254,20 @@ private:
     static void pruneDownloadHistoryLocked(State& state, std::chrono::steady_clock::time_point now);
     static void touchLocked(State& state, const ChunkKey& key, Entry& entry);
     static void enforceCapacityLocked(const std::shared_ptr<State>& state);
+    static std::optional<std::uint64_t> oldestDecodedTouch(
+        const std::shared_ptr<State>& state);
+    static std::size_t evictOldestDecoded(const std::shared_ptr<State>& state);
+    static std::size_t evictOldestDecodedLocked(const std::shared_ptr<State>& state);
+    static void addDecodedBytesLocked(State& state, std::size_t bytes);
+    static void removeDecodedBytesLocked(State& state, std::size_t bytes);
+    static void enforceSharedBudget(const std::shared_ptr<State>& state);
     static bool isValidKey(const State& state, const ChunkKey& key);
     static bool isAllFill(const State& state, const std::vector<std::byte>& bytes);
     static std::size_t dtypeSize(ChunkDtype dtype);
     static std::size_t expectedChunkBytes(const State& state, const ChunkKey& key);
     static void notifyListeners(const std::shared_ptr<State>& state);
     static void waitForResolvedLocked(State& state, std::unique_lock<std::mutex>& lock, const ChunkKey& key);
+    static std::uint64_t nextSchedulerGroup();
 
     std::shared_ptr<State> state_;
 };

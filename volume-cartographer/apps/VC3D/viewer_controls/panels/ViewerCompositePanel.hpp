@@ -50,6 +50,7 @@ public:
                                   ViewerManager* viewerManager,
                                   QWidget* parent = nullptr);
 
+    void setViewerManager(ViewerManager* viewerManager);
     void toggleSegmentationComposite();
     void setSegmentationCompositeChecked(bool checked);
 
@@ -58,6 +59,7 @@ private:
     void setupVolumetricControls(QVBoxLayout* layout);
     void initializeExistingViewers();
     void applyInitialSettingsToViewer(VolumeViewerBase* viewer);
+    void syncUiFromManager();
     void updateCompositeParamsVisibility();
     void syncVolumetricCameraFromViewer();
     void applyToSegmentationViewer(const std::function<void(VolumeViewerBase*)>& apply);

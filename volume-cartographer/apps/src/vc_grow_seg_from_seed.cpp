@@ -570,8 +570,22 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (thread_limit)
+    if (thread_limit) {
         omp_set_num_threads(thread_limit);
+    }
+    else if (omp_get_max_threads() > 8) {
+        // Tracing throughput peaks at a small thread count and degrades well
+        // past it: measured on an i7-10700F (8C/16T) and a Ryzen 9 8940HX
+        // (16C/32T), wall time per cm2 traced is lowest at 4 threads on both,
+        // and running unbounded costs 2.2x and 3.5x respectively. The penalty
+        // grows with core count, so the default is worst exactly on the large
+        // machines used for batch tracing. VC3D already passes thread_limit=1
+        // when it launches this tool (SegmentationCommandHandler.cpp).
+        std::cout << "NOTE: running with " << omp_get_max_threads()
+                  << " OpenMP threads; tracing does not scale past a few threads. "
+                  << "Set \"thread_limit\" in the params JSON (VC3D uses 1) or "
+                  << "OMP_NUM_THREADS to cap it." << std::endl;
+    }
 
     std::unique_ptr<QuadSurface> resume_surf;
     if (mode == "resume") {
@@ -1408,7 +1422,18 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
-    QuadSurface *surf = tracer(*volume, 1.0, 0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+    QuadSurface *surf = nullptr;
+    try {
+        surf = tracer(*volume, 1.0, 0, origin, params, cache_root.string(), voxelsize, direction_fields, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+    } catch (const std::exception& e) {
+        // A growth failure (e.g. a remote normal-grid store whose metadata
+        // could not be fetched) must exit as a normal tool failure, not crash
+        // the process with an uncaught exception (SIGABRT). The bridge and the
+        // GUI runner report a non-zero exit + this stderr line cleanly.
+        std::cerr << "ERROR: vc_grow_seg_from_seed: segment growth failed: "
+                  << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
 
     double area_cm2 = surf->meta["area_cm2"].get_double();
     if (area_cm2 < min_area_cm) {

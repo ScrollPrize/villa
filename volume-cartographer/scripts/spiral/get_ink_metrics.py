@@ -3,15 +3,21 @@
 and report how much inked surface area the ensemble finds and how well that ink is
 organised into the layout expected of a written scroll (text lines and columns).
 
-render_ink.py writes one 8-bit grayscale strip jpg per winding-range chunk into an `ink/`
-folder (e.g. `w010-027.jpg`). This script feeds those strips through the trained 2d nnU-Net
-ensemble (3 folds, Dataset001_Ink), whose job is to segment inked (foreground) pixels.
-More foreground => more legible ink, so the total foreground area is a scalar quality metric
-for a render_ink output: higher is better. Ink that additionally forms regularly spaced
-text lines and clean, correctly sized columns is more likely to be real writing than
-scattered false positives, so two layout scores complement the area.
+render_ink.py renders the whole scroll as one wide ink strip and chops it into fixed-width
+jpg tiles named `wLLL-HHH_flat.NNN.jpg` (a render narrow enough to fit stays a single
+`wLLL-HHH_flat.jpg`) in an `ink/` folder. This script concatenates those tiles back, in tile
+order, into that one very wide strip covering all windings and scores it as a whole -- so the
+metrics describe the whole scroll, not individual windings. (Any legacy per-winding strip
+images without `_flat` in the same folder are ignored.)
 
-For each strip it:
+That combined strip is fed through the trained 2d nnU-Net ensemble (3 folds, Dataset001_Ink),
+whose job is to segment inked (foreground) pixels. More foreground => more legible ink, so the
+total foreground area is a scalar quality metric for a render_ink output: higher is better. Ink
+that additionally forms regularly spaced text lines and clean, correctly sized columns is more
+likely to be real writing than scattered false positives, so two layout scores complement the
+area.
+
+For that strip it:
   1. converts the strip to the single-channel PNG nnU-Net expects (`<stem>_0000.png`),
   2. predicts each fold's softmax probabilities (the folds are run as separate processes,
      spread across the available GPUs so they run in parallel),
@@ -22,13 +28,14 @@ For each strip it:
      width, separated by ink-free gaps),
   5. saves the mask (png) and a red ink-on-strip overlay (jpg, detected column edges in
      cyan),
-  6. counts foreground pixels (the surface area of predicted ink).
+  6. counts foreground pixels (the surface area of predicted ink),
+  7. also scores the strip in fixed-width x-slices so the report can break the numbers
+     down along the scroll (a column crossing a slice boundary is split there).
 
-Finally it aggregates the per-strip areas and layout scores, writes
-metrics.json / metrics.csv (the json additionally carries the full per-strip column
-detection detail: run/gap positions and scores plus a downsampled density profile),
-and renders everything into a single self-contained report.html next to them
-(see make_ink_report.py, which can also rebuild the report on its own).
+Finally it writes metrics.json / metrics.csv (the json additionally carries the full column
+detection detail -- run/gap positions and scores plus a downsampled density profile -- and the
+per-slice breakdown) and renders everything into a single self-contained report.html next to
+them (see make_ink_report.py, which can also rebuild the report on its own).
 
 Usage:
     get_ink_metrics.py /path/to/<run>/meshes/<...>/ink
@@ -40,6 +47,7 @@ nnU-Net model folder instead.
 """
 
 import os
+import re
 import sys
 import csv
 import glob
@@ -57,6 +65,19 @@ from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
 
 from make_ink_report import build_report
+
+# The combined whole-scroll strip is legitimately enormous (hundreds of megapixels);
+# disable PIL's decompression-bomb guard so the tiles and combined strip open.
+Image.MAX_IMAGE_PIXELS = None
+
+# The combined whole-scroll mask/overlay are far wider than a single jpg can hold, so
+# (like render_ink's ink render) they are chopped along x into fixed-width tiles.
+OVERLAY_TILE_WIDTH = 16384
+
+# The combined strip is also scored in fixed-width x-slices (in addition to as a whole),
+# so the report can show a per-slice score table and align it with the display rows. A
+# column straddling a slice boundary is split there (its halves score as edge runs).
+SLICE_WIDTH_PX = 8192
 
 # ---------------------------------------------------------------------------
 # The model: a HuggingFace repo id (downloaded to the HF cache on first use) or a
@@ -300,6 +321,43 @@ def list_strips(ink_dir):
     return out
 
 
+def collect_tiles(ink_dir):
+    """The whole-scroll render's tiles, in tile order, as (name, [paths]).
+
+    render_ink writes the full-scroll ink render chopped into fixed-width jpg tiles
+    `wLLL-HHH_flat.NNN.jpg` (a render narrow enough to fit stays a single
+    `wLLL-HHH_flat.jpg`); these are concatenated into the single strip covering all
+    windings. Any legacy per-winding strip images (no `_flat`) sharing the folder are
+    ignored; if the folder has no `_flat` tiles at all, every image in it is treated as
+    the strip's tiles. `name` is their shared base (the stem minus any trailing `.NNN`)."""
+    imgs = list_strips(ink_dir)
+    if not imgs:
+        return None, []
+    tiles = [p for p in imgs if '_flat' in os.path.basename(p)] or imgs
+
+    def tile_idx(p):
+        m = re.match(r'^.*\.(\d+)$', os.path.splitext(os.path.basename(p))[0])
+        return int(m.group(1)) if m else -1
+
+    tiles = sorted(tiles, key=tile_idx)
+    name = re.sub(r'\.\d+$', '', os.path.splitext(os.path.basename(tiles[0]))[0])
+    return name, tiles
+
+
+def load_concat_strip(paths):
+    """Load each tile as 8-bit grayscale and concatenate horizontally (in tile
+    order) into one wide strip, padding shorter tiles down to the max height with
+    0 (black == no ink) so the widths line up."""
+    tiles = [np.asarray(Image.open(p).convert('L')) for p in paths]
+    if len(tiles) == 1:
+        return tiles[0]
+    max_h = max(t.shape[0] for t in tiles)
+    padded = [t if t.shape[0] == max_h
+              else np.pad(t, ((0, max_h - t.shape[0]), (0, 0)))
+              for t in tiles]
+    return np.concatenate(padded, axis=1)
+
+
 def detect_folds(model_dir):
     folds = []
     for name in sorted(os.listdir(model_dir)):
@@ -332,23 +390,63 @@ def load_fold_prob(npz_path):
     return p
 
 
-def save_predictions(out_dir, stem, gray, mask, col_runs=()):
-    """Write the binary mask (png) and a red-ink overlay (jpg) for one strip,
-    with the detected column edges drawn in cyan on the overlay."""
-    Image.fromarray((mask * 255).astype(np.uint8)).save(os.path.join(out_dir, f'{stem}_mask.png'))
+def slice_metrics(fg_prob, mask, col_width_px, col_width_tol, line_band, slice_px=SLICE_WIDTH_PX):
+    """Score the strip in independent fixed-width x-slices, so the report can show a
+    per-slice breakdown aligned to its display rows. Each slice is treated like its
+    own little strip (its own column/line detection and ink count); a column crossing
+    a slice boundary is therefore split into two edge runs that don't count toward
+    that slice's width conformity. Returns a list of per-slice dicts (x0/x1/width,
+    ink, and the same line_/col_ scores the whole strip reports, minus the detail)."""
+    w = fg_prob.shape[1]
+    slices = []
+    for x0 in range(0, w, slice_px):
+        x1 = min(w, x0 + slice_px)
+        sub = fg_prob[:, x0:x1]
+        sm = mask[:, x0:x1]
+        cm, _ = score_columns(sub, col_width_px, col_width_tol)
+        lm = score_lines(sub, line_band)
+        fg, n = int(sm.sum()), int(sm.size)
+        d = {'x0': int(x0), 'x1': int(x1), 'width': int(x1 - x0),
+             'fg_pixels': fg, 'fg_fraction': (fg / n) if n else 0.0}
+        d.update(lm)
+        d.update(cm)
+        slices.append(d)
+    return slices
 
-    rgb = np.stack([gray, gray, gray], axis=-1).astype(np.float32)
+
+def save_predictions(out_dir, stem, gray, mask, col_runs=(), tile_width=OVERLAY_TILE_WIDTH):
+    """Write the binary mask (png) and the red-ink overlay (jpg) for one strip,
+    with the detected column edges drawn in cyan on the overlay.
+
+    Full resolution is kept: a strip wider than tile_width is chopped along x into
+    fixed-width tiles named <stem>_mask.NNN.png / <stem>_overlay.NNN.jpg (mirroring
+    render_ink's chopped ink render), while a narrower strip stays a single
+    <stem>_mask.png / <stem>_overlay.jpg. Each tile is composed on its own so peak
+    memory stays bounded by one tile, not the whole (enormous) strip."""
+    h, w = mask.shape
+    single = w <= tile_width
+    n_tiles = 1 if single else (w + tile_width - 1) // tile_width
     color = np.array([255.0, 40.0, 40.0])
-    alpha = 0.45
-    m = mask.astype(bool)
-    rgb[m] = (1 - alpha) * rgb[m] + alpha * color
     cyan = np.array([40.0, 255.0, 255.0])
-    for s, e in col_runs:
-        for x in (s, e - 1):
-            x0, x1 = max(0, x - 1), min(rgb.shape[1], x + 2)
-            rgb[:, x0:x1] = 0.4 * rgb[:, x0:x1] + 0.6 * cyan
-    Image.fromarray(rgb.astype(np.uint8)).save(
-        os.path.join(out_dir, f'{stem}_overlay.jpg'), quality=95)
+    alpha = 0.45
+    for t in range(n_tiles):
+        x0 = t * tile_width
+        x1 = w if single else min(w, x0 + tile_width)
+        g = gray[:, x0:x1]
+        m = mask[:, x0:x1].astype(bool)
+        rgb = np.stack([g, g, g], axis=-1).astype(np.float32)
+        rgb[m] = (1 - alpha) * rgb[m] + alpha * color
+        for s, e in col_runs:
+            for x in (s, e - 1):  # column edges live in whole-strip px; offset into the tile
+                if x0 <= x < x1:
+                    xl = x - x0
+                    a, b = max(0, xl - 1), min(rgb.shape[1], xl + 2)
+                    rgb[:, a:b] = 0.4 * rgb[:, a:b] + 0.6 * cyan
+        suffix = '' if single else f'.{t:03d}'
+        Image.fromarray((m * np.uint8(255))).save(
+            os.path.join(out_dir, f'{stem}_mask{suffix}.png'))
+        Image.fromarray(rgb.astype(np.uint8)).save(
+            os.path.join(out_dir, f'{stem}_overlay{suffix}.jpg'), quality=95)
 
 
 def run_main(argv):
@@ -389,9 +487,10 @@ def run_main(argv):
     ink_dir = os.path.abspath(args.ink_dir)
     if not os.path.isdir(ink_dir):
         ap.error(f'ink_dir not found: {ink_dir}')
-    strips = list_strips(ink_dir)
-    if not strips:
-        ap.error(f'no image strips found in {ink_dir}')
+    # The whole-scroll render's tiles, concatenated into the single strip we score.
+    name, tiles = collect_tiles(ink_dir)
+    if not tiles:
+        ap.error(f'no ink strip images found in {ink_dir}')
 
     out_dir = os.path.abspath(args.output) if args.output else \
         os.path.join(os.path.dirname(ink_dir), 'ink_metric')
@@ -408,23 +507,18 @@ def run_main(argv):
     gpus = [g.strip() for g in args.gpus.split(',')] if args.gpus else detect_gpus()
 
     print(f'ink_dir : {ink_dir}')
-    print(f'strips  : {len(strips)}')
+    print(f'strip   : {name}  ({len(tiles)} tile(s) concatenated)')
     print(f'model   : {args.model}' + (f' ({model_dir})' if model_dir != args.model else ''))
     print(f'folds   : {folds}   gpus: {gpus}   checkpoint: {args.checkpoint}')
     print(f'output  : {out_dir}')
 
-    # 1. Stage strips as nnU-Net inputs: single-channel PNG named <stem>_0000.png.
-    #    Remember each strip's original grayscale for the overlays and its size.
-    stems = []          # nnU-Net case id per strip
-    gray_by_stem = {}   # stem -> original grayscale array
-    src_by_stem = {}    # stem -> original strip path
-    for p in strips:
-        stem = os.path.splitext(os.path.basename(p))[0]
-        gray = np.asarray(Image.open(p).convert('L'))
-        Image.fromarray(gray).save(os.path.join(in_dir, f'{stem}_0000.png'))
-        stems.append(stem)
-        gray_by_stem[stem] = gray
-        src_by_stem[stem] = p
+    # 1. Stage the strip as the nnU-Net input: concatenate its tiles into one wide
+    #    grayscale image and write it as the single-channel PNG <name>_0000.png.
+    gray = load_concat_strip(tiles)
+    Image.fromarray(gray).save(os.path.join(in_dir, f'{name}_0000.png'))
+    source = (os.path.basename(tiles[0]) if len(tiles) == 1
+              else f'{len(tiles)} tiles: {os.path.basename(tiles[0])} .. '
+                   f'{os.path.basename(tiles[-1])}')
 
     # 2. Predict every fold in parallel: one subprocess per fold, each pinned to a GPU.
     t0 = time.time()
@@ -477,56 +571,49 @@ def run_main(argv):
     if len(line_band) != 2 or line_band[0] >= line_band[1]:
         ap.error(f'--line-pitch-px must be "min,max", got {args.line_pitch_px!r}')
 
-    rows = []
-    total_fg = 0
-    total_px = 0
-    for stem in stems:
-        probs = [load_fold_prob(os.path.join(fold_out[f], f'{stem}.npz')) for f in folds]
-        avg = np.mean(probs, axis=0)          # (num_classes, H, W)
-        fg_prob = avg[1]                       # class 1 == ink
-        mask = fg_prob >= args.fg_threshold
-        col_metrics, col_detail = score_columns(fg_prob, args.col_width_px, args.col_width_tol)
-        line_metrics = score_lines(fg_prob, line_band)
-        gray = gray_by_stem[stem]
-        # Guard against any resampling size drift between prob map and source strip.
-        if mask.shape != gray.shape:
-            gray = np.asarray(Image.fromarray(gray).resize(
-                (mask.shape[1], mask.shape[0]), Image.NEAREST))
-        save_predictions(pred_dir, stem, gray, mask,
-                         [(r['start'], r['end']) for r in col_detail['runs']])
+    probs = [load_fold_prob(os.path.join(fold_out[f], f'{name}.npz')) for f in folds]
+    avg = np.mean(probs, axis=0)          # (num_classes, H, W)
+    fg_prob = avg[1]                       # class 1 == ink
+    mask = fg_prob >= args.fg_threshold
+    col_metrics, col_detail = score_columns(fg_prob, args.col_width_px, args.col_width_tol)
+    line_metrics = score_lines(fg_prob, line_band)
+    # Guard against any resampling size drift between prob map and source strip.
+    if mask.shape != gray.shape:
+        gray = np.asarray(Image.fromarray(gray).resize(
+            (mask.shape[1], mask.shape[0]), Image.NEAREST))
+    save_predictions(pred_dir, name, gray, mask,
+                     [(r['start'], r['end']) for r in col_detail['runs']])
 
-        fg = int(mask.sum())
-        n = int(mask.size)
-        total_fg += fg
-        total_px += n
-        row = {
-            'strip': stem,
-            'source': src_by_stem[stem],
-            'width': int(mask.shape[1]),
-            'height': int(mask.shape[0]),
-            'total_pixels': n,
-            'fg_pixels': fg,
-            'fg_fraction': (fg / n) if n else 0.0,
-        }
-        if px_area_cm2 is not None:
-            row['fg_area_cm2'] = fg * px_area_cm2
-        row.update(line_metrics)
-        row.update(col_metrics)
-        # Full per-run/per-gap detection detail: goes to metrics.json, but stays
-        # out of the flat metrics.csv.
-        row['columns'] = col_detail
-        rows.append(row)
-        print(f'  {stem:14s} {mask.shape[1]:5d}x{mask.shape[0]:<5d} '
-              f'ink={fg:>10,d}px  ({row["fg_fraction"]*100:5.2f}%)  '
-              f'lines={row["line_score"]:.2f}@{row["line_median_pitch_px"]}px  '
-              f'cols={row["col_score"]:.2f} '
-              f'({row["col_count"]} x ~{row["col_median_width_px"]}px)')
+    fg = int(mask.sum())
+    n = int(mask.size)
+    row = {
+        'strip': name,
+        'source': source,
+        'width': int(mask.shape[1]),
+        'height': int(mask.shape[0]),
+        'total_pixels': n,
+        'fg_pixels': fg,
+        'fg_fraction': (fg / n) if n else 0.0,
+    }
+    if px_area_cm2 is not None:
+        row['fg_area_cm2'] = fg * px_area_cm2
+    row.update(line_metrics)
+    row.update(col_metrics)
+    # Full per-run/per-gap detection detail: goes to metrics.json, but stays out of
+    # the flat metrics.csv.
+    row['columns'] = col_detail
+    # Per-slice breakdown (scored independently) for the report's granular table and
+    # its display rows; json-only, kept out of the flat metrics.csv.
+    row['slices'] = slice_metrics(fg_prob, mask, args.col_width_px,
+                                  args.col_width_tol, line_band)
+    print(f'  {name}  {mask.shape[1]:,}x{mask.shape[0]} '
+          f'ink={fg:,}px  ({row["fg_fraction"]*100:.2f}%)  '
+          f'lines={row["line_score"]:.2f}@{row["line_median_pitch_px"]}px  '
+          f'cols={row["col_score"]:.2f} '
+          f'({row["col_count"]} x ~{row["col_median_width_px"]}px)')
 
-    # 7. Aggregate + persist. Layout scores aggregate as strip-area-weighted
-    #    means, so a big structureless strip drags the overall score down.
-    def area_weighted(key):
-        return sum(r[key] * r['total_pixels'] for r in rows) / total_px if total_px else 0.0
-
+    # 7. Persist. The whole-scroll strip is the single scored unit, so the overall
+    #    numbers are just its own.
     summary = {
         'ink_dir': ink_dir,
         'model': args.model,
@@ -536,24 +623,23 @@ def run_main(argv):
         'col_width_px': args.col_width_px,
         'col_width_tol': args.col_width_tol,
         'line_pitch_px': list(line_band),
-        'num_strips': len(rows),
-        'total_fg_pixels': total_fg,
-        'total_pixels': total_px,
-        'overall_fg_fraction': (total_fg / total_px) if total_px else 0.0,
-        'overall_line_score': area_weighted('line_score'),
-        'overall_column_score': area_weighted('col_score'),
+        'total_fg_pixels': fg,
+        'total_pixels': n,
+        'overall_fg_fraction': row['fg_fraction'],
+        'overall_line_score': row['line_score'],
+        'overall_column_score': row['col_score'],
     }
     if px_area_cm2 is not None:
-        summary['total_fg_area_cm2'] = total_fg * px_area_cm2
+        summary['total_fg_area_cm2'] = fg * px_area_cm2
         summary['pixel_size_um'] = args.pixel_size_um
 
     with open(os.path.join(out_dir, 'metrics.json'), 'w') as f:
-        json.dump({'summary': summary, 'strips': rows}, f, indent=2)
+        json.dump({'summary': summary, 'strips': [row]}, f, indent=2)
     with open(os.path.join(out_dir, 'metrics.csv'), 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=[k for k in rows[0] if k != 'columns'],
+        w = csv.DictWriter(f, fieldnames=[k for k in row if k not in ('columns', 'slices')],
                            extrasaction='ignore')
         w.writeheader()
-        w.writerows(rows)
+        w.writerow(row)
 
     report_path = build_report(out_dir)
 
@@ -563,9 +649,9 @@ def run_main(argv):
     print('\n' + '=' * 64)
     print('INK METRICS')
     print('=' * 64)
-    print(f'strips scored          : {len(rows)}')
-    print(f'TOTAL ink foreground   : {total_fg:,} px   (metric; higher = more ink)')
-    print(f'total strip area       : {total_px:,} px')
+    print(f'strip                  : {name}')
+    print(f'TOTAL ink foreground   : {fg:,} px   (metric; higher = more ink)')
+    print(f'total strip area       : {n:,} px')
     print(f'overall ink fraction   : {summary["overall_fg_fraction"]*100:.3f} %')
     print(f'overall line-ness      : {summary["overall_line_score"]:.3f}   '
           f'(1 = all line pitches in {line_band[0]:g}-{line_band[1]:g} px band)')

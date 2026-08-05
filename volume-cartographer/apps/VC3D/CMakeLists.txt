@@ -35,6 +35,8 @@ set(srcs
     FiberSliceGeometry.hpp
     LineAnnotationController.cpp
     LineAnnotationController.hpp
+    LineAnnotationFiberSegments.cpp
+    LineAnnotationFiberSegments.hpp
     LineAnnotationDialog.cpp
     LineAnnotationDialog.hpp
     LineAnnotationGeneratedViews.cpp
@@ -62,6 +64,8 @@ set(srcs
     AtlasControlPointsDock.cpp
     AtlasControlPointsDock.hpp
     AtlasControlPointsTypes.hpp
+    CommandLaunchError.hpp
+    FiberSaveBatchTracker.hpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
     volume_viewers/annotation_tools/SameWrapAnnotationTool.cpp
@@ -79,6 +83,8 @@ set(srcs
     elements/DropdownChecklistButton.hpp
     elements/JsonProfileEditor.cpp
     elements/JsonProfileEditor.hpp
+    elements/SpiralConfigProfileEditor.cpp
+    elements/SpiralConfigProfileEditor.hpp
     elements/LabeledControlRow.cpp
     elements/LabeledControlRow.hpp
     elements/VolumeSelector.cpp
@@ -87,12 +93,16 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    elements/ViewerSplitGrid.cpp
+    elements/ViewerSplitGrid.hpp
     RemoteVolumeCachePaths.cpp
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
     SurfaceDisplayName.hpp
     SurfaceTimestamp.hpp
+    SeedingBatchTracker.cpp
+    SeedingBatchTracker.hpp
     SeedingWidget.cpp
     SeedingWidget.hpp
     segmentation/SegmentationCommon.hpp
@@ -161,16 +171,22 @@ set(srcs
     overlays/AtlasControlPointsOverlayController.hpp
     overlays/FiberSliceOverlayController.cpp
     overlays/FiberSliceOverlayController.hpp
+    overlays/FiberOverlayController.cpp
+    overlays/FiberOverlayController.hpp
     overlays/InkDetectionOverlayController.cpp
     overlays/InkDetectionOverlayController.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp
     overlays/ViewerOverlayControllerBase.hpp
+    overlays/SpiralOverlayController.cpp
+    overlays/SpiralOverlayController.hpp
     SurfacePanelController.cpp
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
+    VolumeAttachmentController.cpp
+    VolumeAttachmentController.hpp
     UnifiedBrowserDialog.cpp
     UnifiedBrowserDialog.hpp
     segmentation/SegmentationModule.cpp
@@ -182,6 +198,22 @@ set(srcs
     NeuralTraceServiceManager.hpp
     LasagnaServiceManager.cpp
     LasagnaServiceManager.hpp
+    SpiralArtifactCache.cpp
+    SpiralArtifactCache.hpp
+    SpiralBrushController.cpp
+    SpiralBrushController.hpp
+    SpiralPointChain.cpp
+    SpiralPointChain.hpp
+    SpiralServiceManager.cpp
+    SpiralServiceManager.hpp
+    SpiralServiceProfile.hpp
+    SpiralSessionSync.hpp
+    SpiralSshTunnel.cpp
+    SpiralSshTunnel.hpp
+    SpiralPanel.cpp
+    SpiralPanel.hpp
+    SpiralWorkspace.cpp
+    SpiralWorkspace.hpp
     LasagnaBatchWindow.cpp
     LasagnaBatchWindow.hpp
     segmentation/panels/SegmentationLasagnaPanel.cpp
@@ -225,6 +257,39 @@ set(srcs
     volume_viewers/CameraGizmoWidget.hpp
     volume_viewers/VolumetricCompositor.cpp
     volume_viewers/VolumetricCompositor.hpp
+    agent_bridge/AgentBridgeServer.cpp
+    agent_bridge/AgentBridgeServer.hpp
+    agent_bridge/AgentBridgeMethod.cpp
+    agent_bridge/AgentBridgeMethod.hpp
+    agent_bridge/AgentBridgeMethods_atlas.cpp
+    agent_bridge/AgentBridgeMethods_canvas.cpp
+    agent_bridge/AgentBridgeMethods_editing.cpp
+    agent_bridge/AgentBridgeMethods_fiber.cpp
+    agent_bridge/AgentBridgeMethods_flatten.cpp
+    agent_bridge/AgentBridgeMethods_jobs.cpp
+    agent_bridge/AgentBridgeMethods_lasagna.cpp
+    agent_bridge/AgentBridgeMethods_points.cpp
+    agent_bridge/AgentBridgeMethods_seeding.cpp
+    agent_bridge/AgentBridgeMethods_session.cpp
+    agent_bridge/AgentBridgeMethods_surfaceops.cpp
+    agent_bridge/AgentBridgeMethods_viewer.cpp
+    agent_bridge/AgentBridgeMethods_wrap.cpp
+    agent_bridge/AgentBridgeCommandError.hpp
+    agent_bridge/AgentBridgeInternal.hpp
+    agent_bridge/AgentBridgeJobs.cpp
+    agent_bridge/AgentBridgeHandlers_catalog.cpp
+    agent_bridge/AgentBridgeHandlers_session.cpp
+    agent_bridge/AgentBridgeHandlers_editing.cpp
+    agent_bridge/AgentBridgeHandlers_wrap.cpp
+    agent_bridge/AgentBridgeHandlers_atlas.cpp
+    agent_bridge/AgentBridgeHandlers_fiber.cpp
+    agent_bridge/AgentBridgeHandlers_seeding.cpp
+    agent_bridge/AgentBridgeHandlers_lasagna.cpp
+    agent_bridge/AgentBridgeHandlers_flatten.cpp
+    agent_bridge/AgentBridgeHandlers_points.cpp
+    agent_bridge/AgentBridgeHandlers_review.cpp
+    agent_bridge/AgentBridgeHandlers_viewer.cpp
+    agent_bridge/AgentBridgeHandlers_surfaceops.cpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
@@ -275,6 +340,7 @@ target_link_libraries(VC3D
     vc_core
     vc_atlas
     vc_lasagna
+    vc_fiber_tracer
     vc_tracer
     vc_flattening
     Ceres::ceres
@@ -338,4 +404,25 @@ if(VC_USE_PCH)
         "$<$<COMPILE_LANGUAGE:CXX>:<QtCore/QtCore>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<QtWidgets/QtWidgets>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<QtConcurrent/QtConcurrent>>")
+endif()
+
+# The manager checks this location after the development-tree and explicit
+# SPIRAL_SERVICE_PATH candidates.  Install the complete module set because the
+# service deliberately reuses the existing fitter rather than duplicating it.
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/spiral/
+    DESTINATION share/volume-cartographer/spiral
+    FILES_MATCHING
+        PATTERN "*.py"
+        PATTERN "*.json"
+        PATTERN "tests" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE)
+
+set(_vc3d_fiber_format_src
+    "${CMAKE_SOURCE_DIR}/../vesuvius/src/vc3d_fiber_format")
+if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
+    install(DIRECTORY "${_vc3d_fiber_format_src}"
+        DESTINATION share/volume-cartographer/spiral
+        FILES_MATCHING
+            PATTERN "*.py"
+            PATTERN "__pycache__" EXCLUDE)
 endif()

@@ -1,5 +1,83 @@
 # 2D TIFF layer UNet trainer
 
+## Installation
+
+Lasagna requires [`uv`](https://docs.astral.sh/uv/) and currently targets
+Python 3.14. The recommended installer creates an editable virtual environment,
+selects a driver-compatible official PyTorch build, and installs the fit
+service, downloader, and full 2D/3D preprocessing stack.
+
+```bash
+cd /path/to/villa/lasagna
+python3 scripts/bootstrap_venv.py --venv .venv
+source .venv/bin/activate
+```
+
+The bootstrap uses `nvidia-smi` to select a pinned official PyTorch build for
+CUDA 12.8, CUDA 13.0, or CPU, then installs Lasagna. Override detection with
+`--backend cpu`, `--backend cu128`, or `--backend cu130`, for example:
+
+```bash
+python3 scripts/bootstrap_venv.py --venv .venv --backend cu128
+```
+
+Verify the selected PyTorch build and GPU access:
+
+```bash
+python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+```
+
+The install exposes these commands:
+
+```bash
+lasagna-fit-service --help
+lasagna-download --help
+lasagna-download-list --help
+lasagna-preprocess --help
+lasagna-preprocess integrate --help
+lasagna-preprocess predict3d --help
+```
+
+The bootstrap installs Lasagna with `-e`, so changes in this checkout are
+immediately visible in the environment without reinstalling.
+
+This installation currently expects the `villa` monorepo layout: Lasagna uses
+the sibling `vesuvius/src` model implementation and installs its declared model
+dependencies. It deliberately does not build Volume Cartographer, which is not
+needed for preprocessing. Copying only the `lasagna/` directory is therefore
+not yet a supported standalone installation.
+
+### Batch-download the PHerc scale-0 volumes
+
+Pass a one-S3-URI-per-line list from the directory that should contain the
+scroll directories:
+
+```bash
+cd /path/to/scrolls
+lasagna-download-list /ephemeral/hendrik/las_volumes/pherc_volumes.txt
+```
+
+This processes one volume at a time and uses 512 parallel chunk-transfer
+workers inside each volume. The resulting layout is:
+
+```text
+scrolls/
+  PHerc0125/
+    info.json
+    volumes/
+      20250821151825-9.362um-1.2m-113keV-masked.zarr/
+```
+
+Use `--dry-run` to inspect a run without writing anything:
+
+```bash
+lasagna-download-list /path/to/other-volumes.txt
+lasagna-download-list /ephemeral/hendrik/las_volumes/pherc_volumes.txt --dry-run
+```
+
+CuPy remains an optional acceleration path and is not required for the
+preprocessing commands above.
+
 ## Design decisions
 
 - Minimal dependencies: PyTorch, tifffile, TensorBoard, single in-repo U-Net implementation.
@@ -112,6 +190,74 @@ Notes:
 
 Runs tiled UNet inference on an OME-Zarr volume and writes an 8-bit OME-Zarr with
 cos, gradient-magnitude, direction, and validity channels.
+
+The `predict3d` subcommand is the Lasagna cos/normal wrapper around the shared
+3D tiled inference code in `tiled_predict3d.py`. It keeps the existing CLI,
+manifest, fixed-depth circular Z accumulation, chunk-resume, and OME-Zarr pyramid
+behavior; product-specific Lasagna logic remains in
+`preprocess_cos_omezarr.py`.
+
+Whole-volume predict3d can use every visible CUDA device through the shared
+runner:
+
+```bash
+lasagna-preprocess predict3d ... --devices all
+```
+
+Use a subset with `--devices cuda:0,cuda:2`. Input tiles default to asynchronous
+TensorStore bounding-box reads outside GPU workers. The tile Cartesian product
+is generated lazily and read-ahead is bounded independently from reusable GPU
+shared-memory slots. `--slots-per-gpu` (default 2) controls GPU input/result
+buffers; `--prefetch-tiles-per-gpu` (default 4) controls outstanding/ready input
+tiles. TensorStore defaults to a 4 GiB cache, 16 file-I/O threads, and 4
+decode/copy threads, configurable with `--input-cache-gib`,
+`--input-io-threads`, and `--input-copy-threads`. Use
+`--input-reader python-zarr` for the old backend; `--prefetch-workers` controls
+only its reader threads. Existing `--device` selects single-device inference,
+which also maintains bounded TensorStore read-ahead during GPU forwards.
+
+Add `--profile-pipeline` to a multi-device run for bounded loader/worker
+diagnostics. It reports backend read service, active wall span, throughput and
+effective outstanding-request concurrency, completion polling and ready-queue delay, shared-memory copy, CPU
+conversion, compact integer H2D, CUDA conversion, adapter preprocessing, model inference, output/D2H, result
+receipt, and commit time. Stage sums overlap across tiles/workers and are not
+elapsed wall time. CUDA events add diagnostic overhead, so disable the flag for
+final throughput measurements.
+
+CUDA inference transfers source `uint8`/`uint16` tiles without CPU float
+expansion and performs the historical normalization on-device in FP32. The CPU
+fallback retains the NumPy conversion path. Model-specific AMP remains owned by
+the model adapter; shared weighting, pyramid filtering, D2H results, and
+accumulation remain FP32.
+
+The same shared runner overlaps output flushing with subsequent inference using
+one enlarged circular mmap ring and persistent spawned writer processes. Each
+worker reopens the frozen mmap read-only and handles one output chunk, so no
+band-sized RAM snapshot crosses process boundaries and each worker has an
+independent Python GIL. `--flush-workers` defaults to the available CPU count
+capped at 64; use
+`--flush-workers 0` for the synchronous, immediate-release A/B baseline. Only
+one flush batch may be outstanding, so the next frontier waits if writers fall
+behind. The final `flush stats workers=... chunks=... work_sum=... wait=...`
+line reports that backpressure.
+
+Raw product rings default to float16, intentionally permitting small rounding
+differences while halving product-ring backing. The shared geometric weight
+ring and flush normalization remain float32; pass
+`--product-accumulator-dtype float32` when float32 accumulation is required.
+
+On multi-device runs, chunk accumulation is itself process-parallel. Persistent
+workers add directly from retained result shared-memory slots into the rolling
+mmap, with deterministic per-chunk ownership and FIFO update order.
+`--accumulator-workers` defaults to the CPU count capped at 32; zero restores
+the synchronous A/B baseline. The native `accumulator_add` module runtime-
+dispatches an AVX-512F+F16C row kernel where available and uses a portable
+fallback elsewhere; the package is never globally compiled for AVX-512.
+
+Automatic S3 chunk fetching defaults to 64 transfer threads. Set it separately
+from inference prefetch with, for example, `--download-workers 256`. Interrupted
+or malformed `.dl_cache/*.noremote.json` files are advisory: they are ignored
+with a warning and rewritten atomically rather than aborting inference.
 
 ### Multi-axis processing
 

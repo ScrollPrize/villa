@@ -8,6 +8,7 @@
 #include <vector>
 
 class VolumePkg;
+namespace vc::project { struct Entry; }
 
 namespace vc3d::opendata {
 
@@ -21,8 +22,11 @@ inline constexpr std::string_view kOpenDataLasagnaModelTagPrefix =
 struct OpenDataLasagnaInfo {
     std::string sampleId;
     std::string volumeId;
+    std::size_t artifactIndex = 0;
     std::string artifactUrl;
     std::string modelId;
+    int sourceCoordinateLevel = 0;
+    bool levelWasExplicit = false;
     bool lasagnaVersionPresent = false;
     std::optional<int> lasagnaVersion;
     bool sourceToBasePresent = false;
@@ -32,11 +36,17 @@ struct OpenDataLasagnaInfo {
 
 struct ResolvedOpenDataLasagna {
     std::filesystem::path manifestPath;
+    std::string sourceManifestLocation;
     double workingToBaseScale = 1.0;
     std::string coordinateSpace;
     std::string artifactUrl;
     bool manifestBacked = false;
 };
+
+// Returns the public manifest URL for a catalogue-backed entry and the stored
+// project location for an ordinary entry.
+[[nodiscard]] std::string lasagnaSourceManifestLocation(
+    const vc::project::Entry& entry);
 
 [[nodiscard]] std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
     const std::string& sampleId,
@@ -53,10 +63,13 @@ struct ResolvedOpenDataLasagna {
     const std::filesystem::path& remoteCacheRoot,
     std::string* errorOut = nullptr);
 
+// selection optionally restricts attached volumes and representations;
+// nullptr attaches everything.
 int attachOpenDataLasagna(VolumePkg& pkg,
                           const OpenDataSample& sample,
                           const std::filesystem::path& remoteCacheRoot,
-                          std::vector<std::string>* messages = nullptr);
+                          std::vector<std::string>* messages = nullptr,
+                          const OpenDataResourceSelection* selection = nullptr);
 
 [[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaForVolume(
     const VolumePkg& pkg,
