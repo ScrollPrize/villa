@@ -72,6 +72,33 @@ def test_manifest_round_trips(tmp_path):
     assert inf._load_completed() == {1, 2, 3}
 
 
+def test_manifest_survives_numpy_typed_config(tmp_path):
+    """patch_size and num_classes arrive from the model config as numpy integers.
+
+    json.dump raises on those *after* opening the file, which left a zero-byte .tmp and no
+    manifest -- so the run looked fine and every later --resume silently found nothing to
+    resume. The first end-to-end run failed exactly this way; the unit tests above did not
+    catch it because they all use plain Python ints.
+    """
+    inf = _inferer(
+        tmp_path,
+        patch_size=np.array([4, 4, 4]),
+        num_classes=np.int64(2),
+        num_total_patches=np.int64(8),
+        overlap=np.float64(0.5),
+    )
+    inf._write_manifest({np.int64(1), 2})
+    assert inf._load_completed() == {1, 2}
+    assert not list(tmp_path.glob("*.tmp")), "a failed write must not leave a .tmp behind"
+
+
+def test_failed_manifest_write_leaves_no_tmp(tmp_path):
+    inf = _inferer(tmp_path, normalization_scheme=object())  # not JSON-serialisable
+    with pytest.raises(TypeError):
+        inf._write_manifest({0})
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 def test_no_manifest_reads_as_nothing_to_resume(tmp_path):
     # None rather than set(): the caller must be able to tell "no previous run" apart from
     # "a previous run that completed zero patches".

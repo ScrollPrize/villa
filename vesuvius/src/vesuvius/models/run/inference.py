@@ -790,6 +790,13 @@ class Inferer():
             self.resume_completed = self._load_completed()
             if self.resume_completed is None:
                 print("--resume: no previous run found in this output_dir; starting from scratch")
+            elif not hasattr(self.dataset, 'set_completed_indices'):
+                # Fail rather than quietly recompute everything: a resume that silently does
+                # nothing looks like a resume that worked until the bill arrives.
+                raise RuntimeError(
+                    f"--resume is not supported for {type(self.dataset).__name__}, which does "
+                    "not implement set_completed_indices()."
+                )
             else:
                 self.dataset.set_completed_indices(self.resume_completed)
                 print(f"--resume: {len(self.resume_completed)} of {self.num_total_patches} "
@@ -877,6 +884,23 @@ class Inferer():
     def _manifest_path(self):
         return os.path.join(self.output_dir, f"completed_part_{self.part_id}.json")
 
+    @staticmethod
+    def _json_scalar(value):
+        """Coerce numpy scalars to Python ones so the manifest is JSON-serialisable.
+
+        patch_size and num_classes arrive from the model config and are frequently numpy
+        integers. json.dump raises on those AFTER opening the output file, which leaves a
+        zero-byte .tmp behind and no manifest -- so the run appears to work and every
+        subsequent --resume silently finds nothing to resume. That is how this was found.
+        """
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return [Inferer._json_scalar(v) for v in value.tolist()]
+        if isinstance(value, (list, tuple)):
+            return [Inferer._json_scalar(v) for v in value]
+        return value
+
     def _run_signature(self):
         """What must match for a resume to be legitimate.
 
@@ -885,7 +909,7 @@ class Inferer():
         ways, with nothing recording the split -- the exact failure that made a published
         prediction reproducible only under a setting no artifact mentioned.
         """
-        return {
+        return self._json_scalar_dict({
             'input': str(self.input_dir),
             'bbox': None if self.bbox is None else list(self.bbox),
             'patch_size': list(self.patch_size) if self.patch_size is not None else None,
@@ -897,7 +921,11 @@ class Inferer():
             'tta': None if self.disable_tta else self.tta_type,
             'normalization': self.normalization_scheme,
             'num_total_patches': self.num_total_patches,
-        }
+        })
+
+    @staticmethod
+    def _json_scalar_dict(d):
+        return {k: Inferer._json_scalar(v) for k, v in d.items()}
 
     def _load_completed(self):
         """Completed patch indices from a previous run, or None if there is nothing to resume.
@@ -932,12 +960,22 @@ class Inferer():
         """Rewrite the manifest atomically. Small (ints), so simplicity beats appending."""
         path = self._manifest_path()
         tmp = path + '.tmp'
-        with open(tmp, 'w') as fh:
-            json.dump({'signature': self._run_signature(),
-                       'completed': sorted(int(i) for i in completed)}, fh)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        payload = {'signature': self._run_signature(),
+                   'completed': sorted(int(i) for i in completed)}
+        try:
+            with open(tmp, 'w') as fh:
+                json.dump(payload, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            # Leaving a zero-byte .tmp and no manifest is worse than failing loudly: the run
+            # looks fine and every later --resume silently finds nothing to resume.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _create_output_stores(self):
         if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
