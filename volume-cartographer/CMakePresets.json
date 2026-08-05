@@ -177,7 +177,7 @@
     {
       "name": "macos-homebrew-llvm",
       "displayName": "macOS Homebrew LLVM",
-      "description": "Native macOS build using Homebrew LLVM/Clang, lld, and Homebrew binutils. The only Apple-toolchain pieces in the loop are SDKROOT (system headers/frameworks) and libSystem, because there is no Homebrew alternative for those.",
+      "description": "Native macOS build using Homebrew LLVM/Clang, lld, and Homebrew binutils. The only Apple-toolchain pieces in the loop are SDKROOT (system headers/frameworks) and libSystem, because there is no Homebrew alternative for those. CMAKE_FIND_FRAMEWORK=LAST because CMake's macOS default searches /Library/Frameworks ahead of the Homebrew prefix: any third-party framework that vendors a common C library wins the header search while the library still resolves to Homebrew. Mono.framework vendors libtiff, which is enough to pair Mono's tiff.h with Homebrew's libtiff.dylib.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-macos",
       "cacheVariables": {
@@ -202,6 +202,7 @@
         "CMAKE_SHARED_LINKER_FLAGS_INIT": "-fuse-ld=lld",
         "CMAKE_MODULE_LINKER_FLAGS_INIT": "-fuse-ld=lld",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "13.3",
+        "CMAKE_FIND_FRAMEWORK": "LAST",
         "VC_TESTING": "OFF"
       }
     }
