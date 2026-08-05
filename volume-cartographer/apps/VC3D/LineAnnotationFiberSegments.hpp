@@ -122,10 +122,12 @@ struct StoredControlPoint : cv::Vec3d {
 
 // Review workflow for prediction-traced geometry: a fiber whose saved line
 // contains accepted native-trace spans must be inspected by a human before
-// it counts as trustworthy. Both tags live in the ordinary fiber tags
-// array (mirrored in scripts/fiber_merge.py) and are mutually exclusive.
+// it counts as trustworthy. The tag lives in the ordinary fiber tags array
+// (mirrored in scripts/fiber_merge.py) and is applied automatically
+// whenever freshly optimized geometry contains trace spans; a traced fiber
+// WITHOUT it counts as reviewed, so review state changes only through the
+// dedicated review actions, never the generic tag controls.
 inline constexpr const char* kTraceNeedsReviewTag = "interp_unreviewed";
-inline constexpr const char* kTraceVerifiedTag = "trace_verified";
 
 enum class FiberTraceState {
     Legacy,       // no prediction-traced spans in the stored geometry
@@ -146,11 +148,6 @@ enum class FiberTraceState {
 // geometry demands a (new) review, un-traced geometry leaves the review
 // workflow entirely. Keeps the tags vector sorted and unique.
 void applyTraceReviewTags(std::vector<std::string>& tags, bool hasTraceSpans);
-
-// Keeps the two review tags mutually exclusive when one of them is added
-// through a generic tag path (pills, dock checkboxes, agent bridge).
-void applyTraceReviewTagExclusivity(std::vector<std::string>& tags,
-                                    const std::string& addedTag);
 
 struct FiberExtrapolationFallbackDiagnostic {
     enum class Side {

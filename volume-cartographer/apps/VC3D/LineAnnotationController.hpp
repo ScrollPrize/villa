@@ -112,8 +112,8 @@ public:
         // Number of branch links on this fiber still awaiting review approval.
         int pendingLinkCount = 0;
         // Interpolation provenance of the stored geometry plus the human
-        // review state carried by the interp_unreviewed/trace_verified
-        // tags.
+        // review state carried by the interp_unreviewed tag; traceVerified
+        // is derived (traced geometry without the tag has been reviewed).
         vc3d::line_annotation::FiberTraceState traceState =
             vc3d::line_annotation::FiberTraceState::Legacy;
         bool traceNeedsReview = false;
@@ -195,8 +195,9 @@ public:
     void exportFibers();
     void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
     void setFiberTag(uint64_t fiberId, const QString& tag, bool enabled);
-    // Swaps the mutually-exclusive trace review tags (trace_verified /
-    // interp_unreviewed) and saves; verifying requires traced spans.
+    // Marks a traced fiber reviewed (removes interp_unreviewed) or flags
+    // it for review (re-adds it) and saves. Rejects untraced fibers; the
+    // generic tag paths refuse to touch the reserved tag.
     void setFiberTraceReviewed(uint64_t fiberId, bool verified);
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();

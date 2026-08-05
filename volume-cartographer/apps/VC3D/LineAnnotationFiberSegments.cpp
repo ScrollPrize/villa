@@ -289,20 +289,9 @@ FiberTraceState deriveTraceState(
 
 void applyTraceReviewTags(std::vector<std::string>& tags, bool hasTraceSpans)
 {
-    eraseTag(tags, kTraceVerifiedTag);
     if (hasTraceSpans) {
         addTagSorted(tags, kTraceNeedsReviewTag);
     } else {
-        eraseTag(tags, kTraceNeedsReviewTag);
-    }
-}
-
-void applyTraceReviewTagExclusivity(std::vector<std::string>& tags,
-                                    const std::string& addedTag)
-{
-    if (addedTag == kTraceNeedsReviewTag) {
-        eraseTag(tags, kTraceVerifiedTag);
-    } else if (addedTag == kTraceVerifiedTag) {
         eraseTag(tags, kTraceNeedsReviewTag);
     }
 }

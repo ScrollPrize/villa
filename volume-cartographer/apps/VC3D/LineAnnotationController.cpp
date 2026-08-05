@@ -3065,6 +3065,17 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
         showError(validationError);
         return;
     }
+    if (*normalizedTag == vc3d::line_annotation::kTraceNeedsReviewTag) {
+        // Review state moves only through the dedicated review actions
+        // (setFiberTraceReviewed); the generic tag paths must not fabricate
+        // or clear it, since a traced fiber without the tag counts as
+        // reviewed.
+        showError(tr("'%1' is managed by the trace review workflow; use "
+                     "Mark trace verified / Mark as needs review instead.")
+                      .arg(QLatin1String(
+                          vc3d::line_annotation::kTraceNeedsReviewTag)));
+        return;
+    }
 
     auto it = std::find_if(_fibers.begin(), _fibers.end(), [fiberId](const StoredFiber& fiber) {
         return fiber.id == fiberId;
@@ -3078,8 +3089,6 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
     const std::vector<std::string> previousTags = it->tags;
     if (enabled) {
         addUniqueSorted(it->tags, *normalizedTag);
-        vc3d::line_annotation::applyTraceReviewTagExclusivity(it->tags,
-                                                              *normalizedTag);
     } else {
         it->tags.erase(std::remove(it->tags.begin(), it->tags.end(), *normalizedTag),
                        it->tags.end());
@@ -3124,20 +3133,23 @@ void LineAnnotationController::setFiberTraceReviewed(uint64_t fiberId, bool veri
         showError(tr("Fiber %1 is not loaded.").arg(fiberId));
         return;
     }
-    if (verified &&
-        !vc3d::line_annotation::hasAcceptedTraceSpan(it->controlPoints)) {
-        showError(tr("Fiber %1 has no prediction-traced spans to verify.")
+    if (!vc3d::line_annotation::hasAcceptedTraceSpan(it->controlPoints)) {
+        showError(tr("Fiber %1 has no prediction-traced spans to review.")
                       .arg(fiberId));
         return;
     }
 
+    // Single-tag review model: a traced fiber WITHOUT interp_unreviewed
+    // counts as reviewed, so verifying removes the tag and flagging for
+    // review re-adds it.
     const std::vector<std::string> previousTags = it->tags;
-    const std::string addTag = verified
-        ? vc3d::line_annotation::kTraceVerifiedTag
-        : vc3d::line_annotation::kTraceNeedsReviewTag;
-    addKnownFiberTags({addTag});
-    addUniqueSorted(it->tags, addTag);
-    vc3d::line_annotation::applyTraceReviewTagExclusivity(it->tags, addTag);
+    const std::string reviewTag = vc3d::line_annotation::kTraceNeedsReviewTag;
+    if (verified) {
+        it->tags.erase(std::remove(it->tags.begin(), it->tags.end(), reviewTag),
+                       it->tags.end());
+    } else {
+        addUniqueSorted(it->tags, reviewTag);
+    }
     if (it->tags == previousTags) {
         emitFiberSummaries();
         return;
@@ -5730,8 +5742,13 @@ std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fi
             vc3d::line_annotation::deriveTraceState(fiber.optimizationMode,
                                                     fiber.controlPoints),
             hasTag(vc3d::line_annotation::kTraceNeedsReviewTag),
-            hasTag(vc3d::line_annotation::kTraceVerifiedTag),
         });
+        // Single-tag review model: traced geometry without the review tag
+        // has been reviewed.
+        summaries.back().traceVerified =
+            summaries.back().traceState !=
+                vc3d::line_annotation::FiberTraceState::Legacy &&
+            !summaries.back().traceNeedsReview;
     }
     std::sort(summaries.begin(), summaries.end(), [](const FiberSummary& a, const FiberSummary& b) {
         return a.id < b.id;

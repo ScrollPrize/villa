@@ -47,6 +47,11 @@ enum FiberColumn {
     kColumnCount,
 };
 
+// Managed by the trace review workflow (context menu / controller), never
+// by the generic tag checkboxes; keep the literal in sync with
+// kTraceNeedsReviewTag in LineAnnotationFiberSegments.hpp.
+constexpr const char* kReservedReviewTag = "interp_unreviewed";
+
 constexpr int kFiberIdRole = Qt::UserRole + 1;
 constexpr int kIsSpanRole = Qt::UserRole + 2;
 constexpr int kSpanFirstControlIndexRole = Qt::UserRole + 3;
@@ -191,7 +196,8 @@ void applyRowMetadata(const QList<QStandardItem*>& row,
     const bool highlight = shouldHighlight(metric, showMetrics);
     const QColor warningColor(255, 232, 232);
     const QString tooltip = metricTooltip(metric, showMetrics);
-    for (QStandardItem* item : row) {
+    for (int column = 0; column < row.size(); ++column) {
+        QStandardItem* item = row[column];
         if (!item) {
             continue;
         }
@@ -202,7 +208,11 @@ void applyRowMetadata(const QList<QStandardItem*>& row,
         } else {
             item->setData(QVariant(), Qt::BackgroundRole);
         }
-        item->setToolTip(tooltip);
+        if (column != kInterpStatusColumn) {
+            // The interp cell keeps its predictions-provenance tooltip;
+            // metric refreshes must not overwrite it.
+            item->setToolTip(tooltip);
+        }
     }
 }
 
@@ -486,7 +496,7 @@ QString CFiberWidget::directionForFiber(const FiberEntry& fiber)
 QString CFiberWidget::statusTextForFiber(const FiberEntry& fiber)
 {
     // Interpolation provenance only; the review state lives in the tags
-    // column (interp_unreviewed / trace_verified).
+    // column (interp_unreviewed present = needs review).
     switch (fiber.traceState) {
     case FiberEntry::TraceState::Predictions:
         return tr("predictions");
@@ -861,10 +871,16 @@ void CFiberWidget::setKnownTags(const std::vector<std::string>& tags)
 {
     _knownTags.clear();
     for (const auto& tag : tags) {
+        if (tag == kReservedReviewTag) {
+            continue;
+        }
         addUniqueSorted(_knownTags, tag);
     }
     for (const auto& fiber : _fibers) {
         for (const auto& tag : fiber.tags) {
+            if (tag == kReservedReviewTag) {
+                continue;
+            }
             addUniqueSorted(_knownTags, tag);
         }
     }

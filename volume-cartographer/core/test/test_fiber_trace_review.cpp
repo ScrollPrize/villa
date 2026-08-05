@@ -15,12 +15,10 @@ using vc3d::line_annotation::FiberTraceState;
 using vc3d::line_annotation::LineControlPoint;
 using vc3d::line_annotation::SegmentInterpolationMode;
 using vc3d::line_annotation::StoredControlPoint;
-using vc3d::line_annotation::applyTraceReviewTagExclusivity;
 using vc3d::line_annotation::applyTraceReviewTags;
 using vc3d::line_annotation::deriveTraceState;
 using vc3d::line_annotation::hasAcceptedTraceSpan;
 using vc3d::line_annotation::kTraceNeedsReviewTag;
-using vc3d::line_annotation::kTraceVerifiedTag;
 
 namespace {
 
@@ -83,17 +81,16 @@ TEST_CASE("deriveTraceState maps producer and mode to the panel state")
 
 TEST_CASE("applyTraceReviewTags transitions")
 {
-    SUBCASE("traced geometry demands review and clears verified")
+    SUBCASE("traced geometry demands review")
     {
-        std::vector<std::string> tags{"approved", kTraceVerifiedTag};
+        std::vector<std::string> tags{"approved"};
         applyTraceReviewTags(tags, true);
         CHECK(tags == std::vector<std::string>{"approved",
                                                kTraceNeedsReviewTag});
     }
     SUBCASE("un-traced geometry leaves the workflow")
     {
-        std::vector<std::string> tags{kTraceNeedsReviewTag,
-                                      kTraceVerifiedTag, "zebra"};
+        std::vector<std::string> tags{kTraceNeedsReviewTag, "zebra"};
         applyTraceReviewTags(tags, false);
         CHECK(tags == std::vector<std::string>{"zebra"});
     }
@@ -112,21 +109,6 @@ TEST_CASE("applyTraceReviewTags transitions")
         applyTraceReviewTags(tags, false);
         CHECK(tags == std::vector<std::string>{"alpha"});
     }
-}
-
-TEST_CASE("applyTraceReviewTagExclusivity keeps the pair mutually exclusive")
-{
-    std::vector<std::string> tags{kTraceNeedsReviewTag, kTraceVerifiedTag};
-    applyTraceReviewTagExclusivity(tags, kTraceVerifiedTag);
-    CHECK(tags == std::vector<std::string>{kTraceVerifiedTag});
-
-    tags = {kTraceNeedsReviewTag, kTraceVerifiedTag};
-    applyTraceReviewTagExclusivity(tags, kTraceNeedsReviewTag);
-    CHECK(tags == std::vector<std::string>{kTraceNeedsReviewTag});
-
-    tags = {kTraceNeedsReviewTag, "other"};
-    applyTraceReviewTagExclusivity(tags, "other");
-    CHECK(tags == std::vector<std::string>{kTraceNeedsReviewTag, "other"});
 }
 
 // Golden fixture pinning the default lasagna segment descriptor — the

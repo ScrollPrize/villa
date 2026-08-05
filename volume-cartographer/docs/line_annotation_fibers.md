@@ -59,24 +59,31 @@ because the switch overwrites the current line: to Fiber model it re-traces
 every global-goal span with model predictions; back to Lasagna it re-fits them.
 Suppressed (agent-driven) sessions skip the prompt.
 
-Prediction-traced geometry carries a per-fiber review workflow on two mutually
-exclusive reserved tags (mirrored in `scripts/fiber_merge.py`):
-`interp_unreviewed` is applied automatically whenever a save contains
-freshly-optimized geometry with accepted trace spans, replacing any existing
-`trace_verified`; a human marks the whole fiber `trace_verified` from the
-fiber panel's context menu (Mark trace verified / Mark as needs review) after
-inspecting the line. Any later optimization that re-traces spans returns the
-fiber to `interp_unreviewed`; re-fitting the whole line without traces clears
-both tags. The fiber panel's `interp` column shows the interpolation
-provenance per fiber — `legacy` (no trace spans), `predictions` (trace
-spans, native mode), or `mixed` (trace spans under a lasagna-global fiber);
-the review state itself is visible as the ordinary tags. Span child rows
-show the stored producer marker `C`/`L`/`T`. Predictions provenance is the per-span
-`segment_to_next.fiber_manifest` written at trace acceptance (the selected
-fiber-inference manifest identity); the panel surfaces it as a tooltip on
-the `interp` cells, and `fiber.list` over the agent bridge exposes the same
-data as `traceState`, `traceNeedsReview`, `traceVerified`, and per-span
-`interpMode` plus `fiberManifest`.
+Prediction-traced geometry carries a per-fiber review workflow on one
+reserved tag (mirrored in `scripts/fiber_merge.py`): `interp_unreviewed` is
+applied automatically whenever a save contains freshly-optimized geometry
+with accepted trace spans; a traced fiber WITHOUT the tag counts as
+reviewed. A human marks the whole fiber reviewed from the fiber panel's
+context menu (Mark trace verified removes the tag; Mark as needs review
+re-adds it) after inspecting the line. Any later optimization that
+re-traces spans re-applies the tag; re-fitting the whole line without
+traces clears it. Because absence of the tag IS the review verdict, the
+tag is managed only by the review actions: the generic tag pills and
+checkboxes never offer it, and `setFiberTag` rejects it. Sync preserves
+the semantics the same way — `merge_fibers` re-adds `interp_unreviewed`
+whenever the merged result still contains trace spans but its geometry
+matches no side that lacked the tag (a review verdict covers only the
+exact geometry the reviewer saw). The fiber panel's `interp` column shows
+the interpolation provenance per fiber — `legacy` (no trace spans),
+`predictions` (trace spans, native mode), or `mixed` (trace spans under a
+lasagna-global fiber); the review state itself is visible as the ordinary
+tags. Span child rows show the stored producer marker `C`/`L`/`T`.
+Predictions provenance is the per-span `segment_to_next.fiber_manifest`
+written at trace acceptance (the selected fiber-inference manifest
+identity); the panel surfaces it as a tooltip on the `interp` cells, and
+`fiber.list` over the agent bridge exposes the same data as `traceState`,
+`traceNeedsReview`, `traceVerified` (derived: traced and unflagged), and
+per-span `interpMode` plus `fiberManifest`.
 
 
 Each direction continues until it reaches all target-local planes within the
