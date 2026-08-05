@@ -6984,6 +6984,32 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
     const std::string paneSurfaceName = pane->surfaceName;
 
     const LinkCandidate candidate = *_linkCandidate;
+    // The candidate fiber can be open in a dialog-less editing session with
+    // unsaved changes; merging (and then deleting) the stale stored snapshot
+    // would discard them. Bake such a session into _fibers first — same
+    // eligibility guards as scheduleBranchMetadataSaves.
+    for (const auto& otherPane : _panes) {
+        if (!otherPane.session ||
+            otherPane.session->fiberId != candidate.fiberId ||
+            otherPane.session->suppressFiberSave ||
+            otherPane.session->taskState != LineAnnotationSession::TaskState::Succeeded ||
+            otherPane.session->optimizedLine.points.empty() ||
+            otherPane.session->controlPoints.empty()) {
+            continue;
+        }
+        StoredFiber liveFar = storedFiberFromSession(*otherPane.session);
+        auto liveIt = std::find_if(
+            _fibers.begin(), _fibers.end(), [&liveFar](const StoredFiber& fiber) {
+                return fiber.id == liveFar.id ||
+                    (!liveFar.fileName.empty() && fiber.fileName == liveFar.fileName);
+            });
+        if (liveIt == _fibers.end()) {
+            _fibers.push_back(std::move(liveFar));
+        } else {
+            *liveIt = std::move(liveFar);
+        }
+        break;
+    }
     const auto candidateIt = std::find_if(
         _fibers.begin(), _fibers.end(), [&candidate](const StoredFiber& fiber) {
             return fiber.id == candidate.fiberId;
