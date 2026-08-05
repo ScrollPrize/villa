@@ -150,6 +150,13 @@ vc_add_test(NAME test_fiber_widget
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
+vc_add_test(NAME test_fiber_trace_review
+    SOURCES test_fiber_trace_review.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/LineAnnotationFiberSegments.hpp
+    LIBS doctest::doctest vc_core vc_lasagna vc_fiber_tracer
+    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
 qt6_wrap_cpp(lasagna_service_manager_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaServiceManager.hpp)
 qt6_wrap_cpp(lasagna_batch_window_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.hpp)
 vc_add_test(NAME test_lasagna_service_manager_factory

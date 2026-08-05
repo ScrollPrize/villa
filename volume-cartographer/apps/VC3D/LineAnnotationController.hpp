@@ -82,6 +82,13 @@ public:
             int linePointCount = 0;
             double lengthVx = 0.0;
             AlignmentMetrics alignment;
+            // Actual producer of the stored span geometry: 'C' (cspline),
+            // 'L' (lasagna), or 'T' (prediction trace).
+            char interpMarker = 'L';
+            // Predictions provenance: the fiber-inference manifest the
+            // trace ran with (segment_to_next.fiber_manifest); empty for
+            // non-trace spans.
+            std::string fiberManifest;
         };
 
         uint64_t id = 0;
@@ -104,6 +111,13 @@ public:
         int linkedFiberCount = 0;
         // Number of branch links on this fiber still awaiting review approval.
         int pendingLinkCount = 0;
+        // Interpolation provenance of the stored geometry plus the human
+        // review state carried by the interp_unreviewed tag; traceVerified
+        // is derived (traced geometry without the tag has been reviewed).
+        vc3d::line_annotation::FiberTraceState traceState =
+            vc3d::line_annotation::FiberTraceState::Legacy;
+        bool traceNeedsReview = false;
+        bool traceVerified = false;
     };
 
     struct FiberSnapshotWithPath {
@@ -181,6 +195,13 @@ public:
     void exportFibers();
     void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
     void setFiberTag(uint64_t fiberId, const QString& tag, bool enabled);
+    // Marks a traced fiber reviewed (removes interp_unreviewed) or flags
+    // it for review (re-adds it) and saves. Rejects untraced fibers; the
+    // generic tag paths refuse to touch the reserved tag. The batch form
+    // refreshes fiber summaries once instead of per fiber.
+    void setFiberTraceReviewed(uint64_t fiberId, bool verified);
+    void setFibersTraceReviewed(const std::vector<uint64_t>& fiberIds,
+                                bool verified);
     void recalculateFiberHvClassification(uint64_t fiberId);
     void recalculateAllFiberHvClassifications();
     void calculateFiberAlignmentMetrics();
@@ -241,6 +262,11 @@ public:
 
     void setDatasetPickerForTesting(DatasetPicker picker);
     void setOptimizationTaskFactoryForTesting(OptimizationTaskFactory factory);
+    // Replaces the modal QMessageBox that guards fiber optimization-mode
+    // switches; the callback receives the requested mode and returns
+    // whether to proceed.
+    void setModeChangeConfirmationForTesting(
+        std::function<bool(vc3d::line_annotation::FiberOptimizationMode)> confirmer);
     void setVolumeSelectorFactory(VolumeSelectorFactory factory);
     void setSurfacePanel(SurfacePanelController* panel);
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
@@ -504,6 +530,10 @@ private:
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
     // Pushes the H/V tag and the clickable tag buttons to the pane's dialog.
     void pushFiberUiState(const PaneRecord& pane) const;
+    // Shared body of setFiberTraceReviewed / setFibersTraceReviewed: tag
+    // change + save + pane sync WITHOUT the summary emission. Returns
+    // whether anything changed.
+    bool applyFiberTraceReview(uint64_t fiberId, bool verified);
     [[nodiscard]] std::optional<std::string> pickDataset(QWidget* parent,
                                                           const std::filesystem::path& startDir) const;
     [[nodiscard]] OptimizationTaskResult runOptimizationTask(std::filesystem::path manifestPath,
@@ -522,6 +552,12 @@ private:
     // needs_reoptimization tag; on load VC3D offers to re-fit their lines.
     // Declining keeps the tag so the next load asks again.
     void promptReoptimizationForMergedFibers();
+    // Modal guard before a fiber optimization-mode switch re-optimizes the
+    // line; returns false when the user cancels. Suppressed (agent-driven)
+    // sessions proceed without prompting.
+    [[nodiscard]] bool confirmFiberOptimizationModeChange(
+        const LineAnnotationSession& session,
+        vc3d::line_annotation::FiberOptimizationMode requestedMode);
     // fileNames, not runtime ids: ids are densely reassigned on reloads,
     // which can happen while the prompt's modal spins.
     void reoptimizeMergedFibers(const std::vector<std::string>& fiberFileNames);
@@ -727,6 +763,8 @@ private:
     std::optional<std::filesystem::path> _currentAtlasDir;
     DatasetPicker _datasetPicker;
     OptimizationTaskFactory _optimizationTaskFactory;
+    std::function<bool(vc3d::line_annotation::FiberOptimizationMode)>
+        _modeChangeConfirmation;
     bool _errorDialogsSuppressed = false;
     // Deduplicates the deferred re-optimization prompt across reentrant
     // fiber (re)loads.

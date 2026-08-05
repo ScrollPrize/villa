@@ -1238,3 +1238,74 @@ def test_v3_fiber_requires_complete_non_repaired_schema(mutation):
     assert not result['ok']
     assert result['merged'] is None
     assert result['conflicts']
+
+
+def test_review_invalidated_when_merged_geometry_was_not_reviewed():
+    """hendrik P1: one machine retraces, the other verifies the OLD
+    geometry; the merged (new) geometry must come back needing review."""
+    base = make_v3_fiber(BASE_CPS)
+    base['tags'] = [fiber_merge.TRACE_NEEDS_REVIEW_TAG]
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    set_v3_span(local, 1, goal='global', bend=1.5)  # retrace, tag kept
+    remote['tags'] = []                             # reviewed old geometry
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert merged['line_points'][5:8] == local['line_points'][5:8]
+    assert fiber_merge.TRACE_NEEDS_REVIEW_TAG in merged['tags']
+    assert any('re-added' in note for note in result['notes'])
+
+
+def test_review_survives_when_merged_geometry_is_the_reviewed_geometry():
+    base = make_v3_fiber(BASE_CPS)
+    base['tags'] = [fiber_merge.TRACE_NEEDS_REVIEW_TAG]
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    local['tags'] = [fiber_merge.TRACE_NEEDS_REVIEW_TAG, 'zebra']
+    remote['tags'] = []  # reviewed; geometry unchanged everywhere
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert fiber_merge.TRACE_NEEDS_REVIEW_TAG not in merged['tags']
+    assert 'zebra' in merged['tags']
+
+
+def test_span_mix_of_two_reviewed_sides_needs_a_fresh_review():
+    """Both sides were reviewed, but the span-atomic merge combines
+    geometry no single reviewer ever saw."""
+    base = make_v3_fiber(BASE_CPS)
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    set_v3_span(local, 1, goal='cspline', bend=1.5)
+    set_v3_span(remote, 3, goal='lasagna', bend=-2.0)
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert fiber_merge.TRACE_NEEDS_REVIEW_TAG in merged['tags']
+
+
+def test_review_tag_removed_when_merged_geometry_has_no_traces():
+    """A merged line with no trace spans must not keep interp_unreviewed:
+    the GUI cannot clear it (generic tag controls reject the reserved tag
+    and review actions reject untraced fibers)."""
+    base = make_v3_fiber(BASE_CPS)  # reviewed trace geometry, no tag
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    for span in range(len(BASE_CPS) - 1):  # refit everything to Lasagna
+        set_v3_span(local, span, goal='lasagna', bend=0.5)
+    remote['tags'] = [fiber_merge.TRACE_NEEDS_REVIEW_TAG]
+
+    result = merge_fibers(base, local, remote)
+
+    assert result['ok'], result['conflicts']
+    merged = result['merged']
+    assert not fiber_merge._has_trace_span(merged)
+    assert fiber_merge.TRACE_NEEDS_REVIEW_TAG not in merged['tags']
+    assert any('removed' in note for note in result['notes'])
