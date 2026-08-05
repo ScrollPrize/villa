@@ -158,6 +158,31 @@ def test_the_uncached_row_is_the_worst_row():
     assert uncached == max(r["fetches"] for r in plan["rows"])
 
 
+def test_the_uncached_case_is_reported_once_and_not_per_order():
+    """Order cannot matter with no cache, so simulating it per order is wasted work.
+
+    On a whole scroll the uncached pass is tens of millions of touches; running it
+    three times to print the same number three times cost minutes and read as though
+    the orders had been compared and tied.
+    """
+    plan = _plan()
+    uncached = [r for r in plan["rows"] if r["cache_gib"] == 0]
+    assert len(uncached) == 1
+    assert uncached[0]["order"] is None
+
+
+def test_no_cache_fetch_count_really_is_order_independent():
+    """The justification for collapsing the row, asserted rather than assumed."""
+    positions = [(z, y, x) for z in (0, 96, 192) for y in (0, 96) for x in (0, 96)]
+    counts = {
+        order: estimate.simulate(
+            positions, (192,) * 3, (128,) * 3, cache_chunks=0, order=order
+        )[0]
+        for order in estimate.ORDERS
+    }
+    assert len(set(counts.values())) == 1, counts
+
+
 def test_report_names_the_compressor_only_when_there_is_one():
     plan = _plan()
     raw = "\n".join(estimate.format_plan(plan, 100.0, compressor=None))
@@ -192,6 +217,30 @@ def test_estimate_reads_only_attributes_the_class_actually_sets():
         read |= set(re.findall(r"self\.(\w+)", inspect.getsource(method)))
     missing = sorted(read - assigned - {"_report_estimate", "_input_array_geometry"})
     assert not missing, f"the estimate path reads attributes the class never sets: {missing}"
+
+
+def test_estimate_never_creates_an_output_store():
+    """--estimate is a question, not a run: it must not touch --output_dir at all.
+
+    _create_output_stores opens the logits array with mode='w', which recreates it. If
+    the estimate path ever fell through to it, asking "what would this cost" would
+    destroy the run you were asking about — the exact failure --resume exists to stop.
+    """
+    calls = []
+    inf = Inferer.__new__(Inferer)
+    inf.estimate = True
+    inf.verbose = False
+    inf._load_model = lambda: calls.append("load_model")
+    inf._create_dataset_and_loader = lambda: calls.append("dataset")
+    inf._create_output_stores = lambda: calls.append("output_stores")
+    inf._process_batches = lambda: calls.append("process")
+    inf._report_estimate = lambda: calls.append("report")
+
+    inf._run_inference()
+
+    assert "report" in calls
+    assert "output_stores" not in calls, "--estimate reached _create_output_stores"
+    assert "process" not in calls, "--estimate ran inference"
 
 
 def test_estimate_reports_patch_count_when_geometry_is_unreadable(capsys):

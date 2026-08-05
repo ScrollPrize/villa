@@ -118,11 +118,29 @@ def build_plan(positions, patch_size, chunk_size, itemsize, cache_sizes_gib=(0, 
         chunk_bytes *= c
 
     rows = []
-    distinct = 0
+
+    # With no cache every touch is a fetch, so the traversal order cannot change the
+    # count. Simulate it once rather than once per order: on a whole scroll that is
+    # tens of millions of touches, and running it three times to print the same number
+    # three times is both slow and misleading to read.
+    uncached_fetches, distinct = simulate(
+        positions, patch_size, chunk_size, cache_chunks=0, order="current"
+    )
+    rows.append({
+        "order": None,                       # None == applies to every order
+        "cache_gib": 0,
+        "cache_chunks": 0,
+        "fetches": uncached_fetches,
+        "bytes": uncached_fetches * chunk_bytes,
+        "amplification": uncached_fetches / distinct if distinct else 0.0,
+    })
+
     for order in ORDERS:
         for gib in cache_sizes_gib:
-            cache_chunks = int(gib * GIB // chunk_bytes) if gib else 0
-            fetches, distinct = simulate(
+            if not gib:
+                continue                     # the uncached row above covers this
+            cache_chunks = int(gib * GIB // chunk_bytes)
+            fetches, _ = simulate(
                 positions, patch_size, chunk_size, cache_chunks, order
             )
             rows.append({
@@ -167,18 +185,24 @@ def format_plan(plan, bandwidth_mbps, volume_desc="", compressor=None, extra_not
     out.append("")
     out.append(f"  {'traversal':<15} {'cache':>7} {'fetches':>13} {'transfer':>13} {'amplification':>14} {'at ' + format(bandwidth_mbps, '.0f') + ' MB/s':>12}")
     out.append(f"  {'-' * 78}")
+    labels = {
+        None: "any order",
+        "current": "current (villa)",
+        "chunk_blocked": "chunk-blocked",
+        "morton": "morton",
+    }
     for row in plan["rows"]:
         cache = "none" if not row["cache_gib"] else f"{row['cache_gib']} GiB"
-        label = {"current": "current (villa)", "chunk_blocked": "chunk-blocked", "morton": "morton"}[row["order"]]
         secs = row["bytes"] / (bandwidth_mbps * 1e6) if bandwidth_mbps > 0 else 0
         out.append(
-            f"  {label:<15} {cache:>7} {row['fetches']:>13,} {_fmt_bytes(row['bytes']):>13}"
+            f"  {labels[row['order']]:<15} {cache:>7} {row['fetches']:>13,} {_fmt_bytes(row['bytes']):>13}"
             f" {row['amplification']:>13.2f}x {_fmt_hours(secs):>12}"
         )
     out.append("")
-    out.append("  `current` is what this build does today: no chunk cache, so every touch is a fetch.")
-    out.append("  The other rows are what the same patch list would cost under a cache and a")
-    out.append("  different visit order — see villa #1177, #1327 and #1331.")
+    out.append("  The first row is what this build does today: no chunk cache, so every touch is")
+    out.append("  a fetch — and with nothing cached the visit order cannot change that count.")
+    out.append("  The rest are what the same patch list would cost under a cache and a different")
+    out.append("  visit order — see villa #1177, #1327 and #1331.")
 
     if compressor is not None:
         out.append("")
