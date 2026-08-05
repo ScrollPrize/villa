@@ -3983,6 +3983,26 @@ void LineAnnotationController::cleanupIntersectionInspectionSurfaces()
     _intersectionInspection->generatedSurfaceContexts.clear();
 }
 
+void LineAnnotationController::closeIntersectionInspectionForRetiredFibers(
+    const std::vector<uint64_t>& fiberIds)
+{
+    if (!_intersectionInspection) {
+        return;
+    }
+    const auto sessionHoldsRetiredFiber =
+        [&fiberIds](const std::shared_ptr<LineAnnotationSession>& session) {
+            return session &&
+                std::find(fiberIds.begin(), fiberIds.end(), session->fiberId) !=
+                fiberIds.end();
+        };
+    if (!sessionHoldsRetiredFiber(_intersectionInspection->sourceLineSession) &&
+        !sessionHoldsRetiredFiber(_intersectionInspection->targetLineSession)) {
+        return;
+    }
+    cleanupIntersectionInspectionSurfaces();
+    _intersectionInspection.reset();
+}
+
 bool LineAnnotationController::updateIntersectionFollowSlice(bool sourceSideFlag,
                                                              double linePosition,
                                                              const char* reason)
@@ -7274,26 +7294,41 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
         closeFiberWindowForSurface(paneSurfaceName);
         // The close finalization may schedule an async save of an original;
         // flush it before retiring the files so they cannot be resurrected.
+        // A failure among the flushed saves (the redirected peer links ride
+        // this queue) keeps the originals on disk AND in memory: disk and
+        // panel then agree, showing the originals beside the merged fiber.
+        const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
         waitForFiberSaves();
-        // All-or-nothing: a failure restores both originals in place.
-        const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
-            ++_nextFiberSaveSequence, {}, {clickedPath, farPath});
-        if (!retireResult.ok) {
-            showError(tr("Could not retire the original fiber files: %1")
-                          .arg(QString::fromStdString(retireResult.error)),
+        bool retired = _fiberSaveFailureCount == saveFailuresBefore;
+        if (!retired) {
+            showError(tr("A pending fiber save failed; the original fiber "
+                         "files were kept."),
                       suppressErrors);
+        } else {
+            // All-or-nothing: a failure restores both originals in place.
+            const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
+                ++_nextFiberSaveSequence, {}, {clickedPath, farPath});
+            retired = retireResult.ok;
+            if (!retired) {
+                showError(tr("Could not retire the original fiber files: %1")
+                              .arg(QString::fromStdString(retireResult.error)),
+                          suppressErrors);
+            }
         }
-        _fibers.erase(std::remove_if(_fibers.begin(),
-                                     _fibers.end(),
-                                     [clickedId, farId](const StoredFiber& fiber) {
-                                         return fiber.id == clickedId ||
-                                             fiber.id == farId;
-                                     }),
-                      _fibers.end());
-        invalidateFiberAlignmentMetrics(clickedId, false);
-        invalidateFiberAlignmentMetrics(farId, false);
-        emit fibersDeleted(
-            {std::min(clickedId, farId), std::max(clickedId, farId)});
+        if (retired) {
+            _fibers.erase(std::remove_if(_fibers.begin(),
+                                         _fibers.end(),
+                                         [clickedId, farId](const StoredFiber& fiber) {
+                                             return fiber.id == clickedId ||
+                                                 fiber.id == farId;
+                                         }),
+                          _fibers.end());
+            invalidateFiberAlignmentMetrics(clickedId, false);
+            invalidateFiberAlignmentMetrics(farId, false);
+            emit fibersDeleted(
+                {std::min(clickedId, farId), std::max(clickedId, farId)});
+            closeIntersectionInspectionForRetiredFibers({clickedId, farId});
+        }
 
         // Re-fit the merged line (join span + extrapolation tails); consumes
         // the needs_reoptimization tag, which otherwise re-prompts on load.
@@ -7649,24 +7684,39 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
                                  reopenControlIndex, suppressErrors]() {
         closeFiberWindowForSurface(paneSurfaceName);
         // The close finalization may schedule an async save of the original;
-        // flush it before retiring the file so it cannot be resurrected.
+        // flush it before retiring the file so it cannot be resurrected. A
+        // failure among the flushed saves (the redirected peer links ride
+        // this queue) keeps the original on disk AND in memory: disk and
+        // panel then agree, showing the original beside its halves.
+        const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
         waitForFiberSaves();
-        const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
-            ++_nextFiberSaveSequence, {}, {parentPath});
-        if (!retireResult.ok) {
-            showError(tr("Could not retire the original fiber file %1: %2")
-                          .arg(QString::fromStdString(parentPath.string()))
-                          .arg(QString::fromStdString(retireResult.error)),
+        bool retired = _fiberSaveFailureCount == saveFailuresBefore;
+        if (!retired) {
+            showError(tr("A pending fiber save failed; the original fiber "
+                         "file was kept."),
                       suppressErrors);
+        } else {
+            const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
+                ++_nextFiberSaveSequence, {}, {parentPath});
+            retired = retireResult.ok;
+            if (!retired) {
+                showError(tr("Could not retire the original fiber file %1: %2")
+                              .arg(QString::fromStdString(parentPath.string()))
+                              .arg(QString::fromStdString(retireResult.error)),
+                          suppressErrors);
+            }
         }
-        _fibers.erase(std::remove_if(_fibers.begin(),
-                                     _fibers.end(),
-                                     [parentId](const StoredFiber& fiber) {
-                                         return fiber.id == parentId;
-                                     }),
-                      _fibers.end());
-        invalidateFiberAlignmentMetrics(parentId, false);
-        emit fibersDeleted({parentId});
+        if (retired) {
+            _fibers.erase(std::remove_if(_fibers.begin(),
+                                         _fibers.end(),
+                                         [parentId](const StoredFiber& fiber) {
+                                             return fiber.id == parentId;
+                                         }),
+                          _fibers.end());
+            invalidateFiberAlignmentMetrics(parentId, false);
+            emit fibersDeleted({parentId});
+            closeIntersectionInspectionForRetiredFibers({parentId});
+        }
 
         // Re-fit both halves so their lines regrow extrapolation tails past
         // the split CPs. Consumes the needs_reoptimization tag set at
@@ -12632,6 +12682,7 @@ void LineAnnotationController::finishFiberSaveJob(
             emit fiberSaved(result.fiberIds[i], generation);
         }
     } else {
+        ++_fiberSaveFailureCount;
         errorMessage = tr("Could not save fiber data: %1")
                            .arg(QString::fromStdString(result.error));
         if (!result.recoveryFiles.empty()) {

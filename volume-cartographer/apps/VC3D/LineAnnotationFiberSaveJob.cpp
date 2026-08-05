@@ -51,6 +51,13 @@ FiberSaveJobResult runFiberSaveJob(uint64_t sequence,
     // failure can rename each backup straight back into place.
     std::vector<std::pair<fs::path, fs::path>> retiredMoves;
     retiredMoves.reserve(retirePaths.size());
+    // Whether each payload target existed before its rename, and how many
+    // renames landed: a failure removes renamed targets that had no
+    // previous content, so a partial batch cannot leave orphan new files
+    // (pre-existing targets keep the new content plus their recovery copy).
+    std::vector<bool> targetExisted;
+    targetExisted.reserve(payloads.size());
+    size_t renamedCount = 0;
     try {
         for (size_t i = 0; i < payloads.size(); ++i) {
             const auto& payload = payloads[i];
@@ -125,12 +132,14 @@ FiberSaveJobResult runFiberSaveJob(uint64_t sequence,
             std::getenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE") != nullptr;
         for (size_t i = 0; i < payloads.size(); ++i) {
             std::error_code ec;
+            targetExisted.push_back(fs::exists(payloads[i].path, ec));
             fs::rename(tempPaths[i], payloads[i].path, ec);
             if (ec) {
                 throw std::runtime_error("Failed to replace " +
                                          payloads[i].path.string() + ": " +
                                          ec.message());
             }
+            renamedCount = i + 1;
             if (failAfterFirst && multiFiberSave && i == 0) {
                 throw std::runtime_error("Injected failure after first fiber replacement");
             }
@@ -155,6 +164,14 @@ FiberSaveJobResult runFiberSaveJob(uint64_t sequence,
         for (const auto& tempPath : tempPaths) {
             std::error_code ec;
             fs::remove(tempPath, ec);
+        }
+        // Remove renamed targets that did not exist before the job so a
+        // partial batch leaves no orphan new files behind.
+        for (size_t i = 0; i < renamedCount && i < targetExisted.size(); ++i) {
+            if (!targetExisted[i]) {
+                std::error_code ec;
+                fs::remove(payloads[i].path, ec);
+            }
         }
         // Restore retirements; a backup that cannot be moved back is
         // surfaced like a kept recovery file.

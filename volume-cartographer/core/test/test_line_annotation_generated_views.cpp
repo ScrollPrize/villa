@@ -773,6 +773,32 @@ TEST_CASE("line annotation failed save restores retired originals")
     if (std::filesystem::exists(retiredDir)) {
         CHECK(std::filesystem::is_empty(retiredDir));
     }
+    // The renamed-in brand-new target is removed too: no orphan half of an
+    // aborted batch survives.
+    CHECK_FALSE(std::filesystem::exists(firstTarget));
+    CHECK_FALSE(std::filesystem::exists(secondTarget));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("line annotation failed multi fiber save removes orphan new targets")
+{
+    const auto dir = makeTempSaveDir("orphan_targets");
+    const auto first = dir / "fiber_new_a.json";
+    const auto second = dir / "fiber_new_b.json";
+
+    setenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE", "1", 1);
+    const auto result = vc3d::line_annotation::runFiberSaveJob(
+        16,
+        {{1, 1, first, nlohmann::json{{"new", "a"}}},
+         {2, 1, second, nlohmann::json{{"new", "b"}}}});
+    unsetenv("VC3D_FIBER_SAVE_FAIL_AFTER_FIRST_REPLACE");
+
+    CHECK_FALSE(result.ok);
+    // Neither brand-new target survives the aborted batch; a pre-existing
+    // target would instead keep the new content plus its recovery copy.
+    CHECK_FALSE(std::filesystem::exists(first));
+    CHECK_FALSE(std::filesystem::exists(second));
+    CHECK(recoveryFilesIn(dir).empty());
     std::filesystem::remove_all(dir);
 }
 

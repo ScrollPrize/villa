@@ -748,6 +748,12 @@ private:
     // saveOpenFibersHeadless (no waiting).
     void saveOpenFibersCore();
     void cleanupIntersectionInspectionSurfaces();
+    // Tears down the intersection-inspection workspace when one of its
+    // editing sessions holds a fiber that was just retired (split/merge);
+    // otherwise the pane would stay open and editable with all saves
+    // suppressed.
+    void closeIntersectionInspectionForRetiredFibers(
+        const std::vector<uint64_t>& fiberIds);
     // Returns false on failure; with a non-null `errorMessage` the failure is
     // reported there (dialog-free), otherwise via showError (interactive).
     bool rebuildIntersectionInspection(QString* errorMessage = nullptr);
@@ -789,6 +795,10 @@ private:
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
     bool _fiberSaveRunning = false;
+    // Total failed save jobs; callers compare before/after a
+    // waitForFiberSaves() flush to gate destructive follow-ups (fiber
+    // retirement) on the flushed saves having actually succeeded.
+    uint64_t _fiberSaveFailureCount = 0;
     mutable std::shared_ptr<FiberSaveBatchTracker> _activeFiberSaveBatch;
     uint64_t _nextSideStripIntersectionToken = 0;
     uint64_t _latestSideStripIntersectionToken = 0;
