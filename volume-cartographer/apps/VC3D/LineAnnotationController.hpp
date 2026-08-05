@@ -267,6 +267,13 @@ public:
     // whether to proceed.
     void setModeChangeConfirmationForTesting(
         std::function<bool(vc3d::line_annotation::FiberOptimizationMode)> confirmer);
+    // Replaces the modal QMessageBox shown when the two fibers of a merge
+    // carry different optimization modes; the callback receives (clicked,
+    // candidate) modes and returns the mode to keep, or nullopt to cancel.
+    void setMergeModePickerForTesting(
+        std::function<std::optional<vc3d::line_annotation::FiberOptimizationMode>(
+            vc3d::line_annotation::FiberOptimizationMode,
+            vc3d::line_annotation::FiberOptimizationMode)> picker);
     void setVolumeSelectorFactory(VolumeSelectorFactory factory);
     void setSurfacePanel(SurfacePanelController* panel);
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
@@ -463,6 +470,27 @@ private:
     void handleGeneratedControlPointLinkWithCandidate(const std::string& surfaceName,
                                                       size_t controlPointIndex,
                                                       cv::Vec3f volumePoint);
+    // Concatenates the link candidate's fiber onto the session's fiber
+    // end-to-end (both control points must be endpoints) into one brand-new
+    // fiber: tags unioned, third-party links remapped, the pair link between
+    // the merge endpoints consumed, both originals deleted, the merged line
+    // re-optimized and reopened at the join.
+    void handleGeneratedControlPointMergeWithCandidate(const std::string& surfaceName,
+                                                       size_t controlPointIndex,
+                                                       cv::Vec3f volumePoint);
+    void handleGeneratedControlPointSplitCandidate(const std::string& surfaceName,
+                                                   size_t controlPointIndex,
+                                                   cv::Vec3f volumePoint);
+    // Splits the session's fiber between the split candidate and the clicked
+    // adjacent control point into two brand-new fibers (fresh identities,
+    // tags/mode/span metadata inherited, branch links remapped onto the
+    // halves), deletes the original, and reopens the candidate's half.
+    // linkHalves additionally records a reciprocal branch link between the
+    // two boundary control points ("Split from candidate and link").
+    void handleGeneratedControlPointSplitFromCandidate(const std::string& surfaceName,
+                                                       size_t controlPointIndex,
+                                                       cv::Vec3f volumePoint,
+                                                       bool linkHalves);
     void handleGeneratedOpenNearbyAnnotation(uint64_t fiberId, cv::Vec3f volumePoint);
     void handleGeneratedControlPointUnlink(const std::string& surfaceName,
                                            size_t controlPointIndex,
@@ -477,6 +505,12 @@ private:
         controlMarkersForSession(const LineAnnotationSession& session) const;
     [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
         linkCandidateMenuState(const LineAnnotationSession& session) const;
+    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
+        splitCandidateMenuState(const LineAnnotationSession& session) const;
+    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
+        splitAndLinkCandidateMenuState(const LineAnnotationSession& session) const;
+    [[nodiscard]] vc3d::line_annotation::GeneratedLinkCandidateMenuState
+        mergeCandidateMenuState(const LineAnnotationSession& session) const;
     [[nodiscard]] std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker>
         markLinkCandidateFiberIntersections(
             std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers,
@@ -558,6 +592,14 @@ private:
     [[nodiscard]] bool confirmFiberOptimizationModeChange(
         const LineAnnotationSession& session,
         vc3d::line_annotation::FiberOptimizationMode requestedMode);
+    // Modal picker when the two fibers of a merge carry different
+    // optimization modes; nullopt cancels the merge. Suppressed
+    // (agent-driven) sessions take the clicked fiber's mode.
+    [[nodiscard]] std::optional<vc3d::line_annotation::FiberOptimizationMode>
+        pickMergeOptimizationMode(
+            const LineAnnotationSession& session,
+            vc3d::line_annotation::FiberOptimizationMode clickedMode,
+            vc3d::line_annotation::FiberOptimizationMode candidateMode);
     // fileNames, not runtime ids: ids are densely reassigned on reloads,
     // which can happen while the prompt's modal spins.
     void reoptimizeMergedFibers(const std::vector<std::string>& fiberFileNames);
@@ -765,15 +807,21 @@ private:
     OptimizationTaskFactory _optimizationTaskFactory;
     std::function<bool(vc3d::line_annotation::FiberOptimizationMode)>
         _modeChangeConfirmation;
+    std::function<std::optional<vc3d::line_annotation::FiberOptimizationMode>(
+        vc3d::line_annotation::FiberOptimizationMode,
+        vc3d::line_annotation::FiberOptimizationMode)>
+        _mergeModePicker;
     bool _errorDialogsSuppressed = false;
     // Deduplicates the deferred re-optimization prompt across reentrant
     // fiber (re)loads.
     bool _reoptimizationPromptPending = false;
     mutable QString _lastSuppressedError;
 
-    // Transient (in-memory only) staging state for linking two existing control
-    // points across fibers. Position is the primary key; the stored index is a
-    // hint re-resolved at link time because indices are remapped on save.
+    // Transient (in-memory only) staging state for a designated control
+    // point: linking two CPs across fibers (_linkCandidate) or splitting a
+    // fiber between adjacent CPs (_splitCandidate). Position is the primary
+    // key; the stored index is a hint re-resolved at use time because
+    // indices are remapped on save.
     struct LinkCandidate {
         uint64_t fiberId = 0;
         std::string fiberFileName;
@@ -781,4 +829,5 @@ private:
         int storedControlPointIndexHint = -1;
     };
     std::optional<LinkCandidate> _linkCandidate;
+    std::optional<LinkCandidate> _splitCandidate;
 };

@@ -1903,7 +1903,10 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     CChunkedVolumeViewer* viewer,
     const QPointF& scenePoint,
     const QPoint& globalPos,
-    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState)
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState,
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState,
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState,
+    const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState)
 {
     if (!viewer || !_hasGeneratedViews || _generatedViews.controlPoints.empty() ||
         _generatedViews.linePoints.empty()) {
@@ -1970,6 +1973,11 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.stripViewer = stripViewer;
     options.linkWithCandidateEnabled = linkCandidateState.enabled;
     options.linkWithCandidateLabel = linkCandidateState.label;
+    options.mergeWithCandidateEnabled = mergeCandidateState.enabled;
+    options.mergeWithCandidateLabel = mergeCandidateState.label;
+    options.splitFromCandidateEnabled = splitCandidateState.enabled;
+    options.splitFromCandidateLabel = splitCandidateState.label;
+    options.splitFromCandidateAndLinkLabel = splitAndLinkCandidateState.label;
     options.branchLinkDirection = branchLinkDirectionForViewer(viewer, linePosition);
     options.deleteControlPoint = [this, surfaceName](double selectedLinePosition,
                                                      cv::Vec3f selectedPoint) {
@@ -2001,6 +2009,30 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
         emit generatedControlPointLinkWithCandidateRequested(surfaceName,
                                                              controlPointIndex,
                                                              volumePoint);
+    };
+    options.mergeWithCandidate = [this, surfaceName](size_t controlPointIndex,
+                                                     cv::Vec3f volumePoint) {
+        emit generatedControlPointMergeWithCandidateRequested(surfaceName,
+                                                              controlPointIndex,
+                                                              volumePoint);
+    };
+    options.designateSplitCandidate = [this, surfaceName](size_t controlPointIndex,
+                                                          cv::Vec3f volumePoint) {
+        emit generatedControlPointSplitCandidateRequested(surfaceName,
+                                                          controlPointIndex,
+                                                          volumePoint);
+    };
+    options.splitFromCandidate = [this, surfaceName](size_t controlPointIndex,
+                                                     cv::Vec3f volumePoint) {
+        emit generatedControlPointSplitFromCandidateRequested(surfaceName,
+                                                              controlPointIndex,
+                                                              volumePoint);
+    };
+    options.splitFromCandidateAndLink = [this, surfaceName](size_t controlPointIndex,
+                                                            cv::Vec3f volumePoint) {
+        emit generatedControlPointSplitAndLinkFromCandidateRequested(surfaceName,
+                                                                     controlPointIndex,
+                                                                     volumePoint);
     };
     options.openNearbyAnnotation = [this](uint64_t fiberId, cv::Vec3f volumePoint) {
         emit generatedNearbyAnnotationOpenRequested(fiberId, volumePoint);
@@ -3074,8 +3106,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.controlPoints ||
         !_fastCurrentCutOverlayItems.seedPoints ||
         !_fastCurrentCutOverlayItems.linkCandidatePoints ||
+        !_fastCurrentCutOverlayItems.splitCandidatePoints ||
         !_fastCurrentCutOverlayItems.branchControlPoints ||
         !_fastCurrentCutOverlayItems.pendingBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.sameHvBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.fiberIntersections ||
         !_fastCurrentCutOverlayItems.linkCandidateFiberIntersections ||
         !_fastCurrentCutOverlayItems.branchLinkFiberIntersections ||
@@ -3115,6 +3150,14 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.linkCandidatePoints->setBrush(linkCandidateBrush);
         _fastCurrentCutOverlayItems.linkCandidatePoints->setZValue(163.0);
 
+        QPen splitCandidatePen(QColor(235, 60, 60, 245));
+        splitCandidatePen.setWidthF(2.0);
+        QBrush splitCandidateBrush(QColor(235, 60, 60, 175));
+        _fastCurrentCutOverlayItems.splitCandidatePoints = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.splitCandidatePoints->setPen(splitCandidatePen);
+        _fastCurrentCutOverlayItems.splitCandidatePoints->setBrush(splitCandidateBrush);
+        _fastCurrentCutOverlayItems.splitCandidatePoints->setZValue(163.5);
+
         QPen branchControlPen(QColor(210, 95, 255, 245));
         branchControlPen.setWidthF(2.0);
         QBrush branchControlBrush(QColor(210, 95, 255, 175));
@@ -3131,6 +3174,25 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.pendingBranchControlPoints->setBrush(
             pendingBranchControlBrush);
         _fastCurrentCutOverlayItems.pendingBranchControlPoints->setZValue(162.5);
+
+        QPen sameHvBranchControlPen(QColor(255, 140, 0, 245));
+        sameHvBranchControlPen.setWidthF(2.0);
+        QBrush sameHvBranchControlBrush(QColor(255, 140, 0, 175));
+        _fastCurrentCutOverlayItems.sameHvBranchControlPoints = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setPen(sameHvBranchControlPen);
+        _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setBrush(
+            sameHvBranchControlBrush);
+        _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setZValue(162.0);
+
+        QPen sameHvPendingBranchControlPen(QColor(255, 190, 120, 245));
+        sameHvPendingBranchControlPen.setWidthF(2.0);
+        QBrush sameHvPendingBranchControlBrush(QColor(255, 190, 120, 175));
+        _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints = new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setPen(
+            sameHvPendingBranchControlPen);
+        _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setBrush(
+            sameHvPendingBranchControlBrush);
+        _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setZValue(162.5);
 
         QPen fiberIntersectionPen(QColor(255, 245, 75, 245));
         fiberIntersectionPen.setWidthF(1.25);
@@ -3181,8 +3243,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
                                  _fastCurrentCutOverlayItems.controlPoints,
                                  _fastCurrentCutOverlayItems.seedPoints,
                                  _fastCurrentCutOverlayItems.linkCandidatePoints,
+                                 _fastCurrentCutOverlayItems.splitCandidatePoints,
                                  _fastCurrentCutOverlayItems.branchControlPoints,
                                  _fastCurrentCutOverlayItems.pendingBranchControlPoints,
+                                 _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
+                                 _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
                                  _fastCurrentCutOverlayItems.fiberIntersections,
                                  _fastCurrentCutOverlayItems.linkCandidateFiberIntersections,
                                  _fastCurrentCutOverlayItems.branchLinkFiberIntersections,
@@ -3216,8 +3281,11 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath controlPath;
     QPainterPath seedPath;
     QPainterPath linkCandidatePath;
+    QPainterPath splitCandidatePath;
     QPainterPath branchControlPath;
     QPainterPath pendingBranchControlPath;
+    QPainterPath sameHvBranchControlPath;
+    QPainterPath sameHvPendingBranchControlPath;
     const double lineRadius =
         std::max(0.5, (_viewerManager ? _viewerManager->zScrollSensitivity() : 1.0) * 0.5);
     const double lower = cutPosition - lineRadius;
@@ -3252,13 +3320,19 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         if (!std::isfinite(scenePoint.x()) || !std::isfinite(scenePoint.y())) {
             continue;
         }
-        if (control.isLinkCandidate) {
+        if (control.isSplitCandidate) {
+            splitCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
+                                          control.isSeed ? 11.0 : 10.0);
+        } else if (control.isLinkCandidate) {
             linkCandidatePath.addEllipse(scenePoint, control.isSeed ? 11.0 : 10.0,
                                          control.isSeed ? 11.0 : 10.0);
         } else if (control.hasPendingLinks) {
-            pendingBranchControlPath.addEllipse(scenePoint, 12.0, 12.0);
+            (control.hasSameHvPendingLinks ? sameHvPendingBranchControlPath
+                                           : pendingBranchControlPath)
+                .addEllipse(scenePoint, 12.0, 12.0);
         } else if (control.hasBranches) {
-            branchControlPath.addEllipse(scenePoint, 12.0, 12.0);
+            (control.hasSameHvBranches ? sameHvBranchControlPath : branchControlPath)
+                .addEllipse(scenePoint, 12.0, 12.0);
         } else if (control.isSeed) {
             seedPath.addEllipse(scenePoint, 11.0, 11.0);
         } else {
@@ -3268,8 +3342,12 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     _fastCurrentCutOverlayItems.controlPoints->setPath(controlPath);
     _fastCurrentCutOverlayItems.seedPoints->setPath(seedPath);
     _fastCurrentCutOverlayItems.linkCandidatePoints->setPath(linkCandidatePath);
+    _fastCurrentCutOverlayItems.splitCandidatePoints->setPath(splitCandidatePath);
     _fastCurrentCutOverlayItems.branchControlPoints->setPath(branchControlPath);
     _fastCurrentCutOverlayItems.pendingBranchControlPoints->setPath(pendingBranchControlPath);
+    _fastCurrentCutOverlayItems.sameHvBranchControlPoints->setPath(sameHvBranchControlPath);
+    _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setPath(
+        sameHvPendingBranchControlPath);
 
     QPainterPath fiberIntersectionPath;
     QPainterPath linkCandidateFiberIntersectionPath;
@@ -3698,12 +3776,16 @@ void LineAnnotationDialog::updateOverviewBar()
         LineAnnotationOverviewBar::ControlDot dot;
         dot.linePosition = control.linePosition;
         // Same state palette as the cut-view overlays.
-        if (control.isLinkCandidate) {
+        if (control.isSplitCandidate) {
+            dot.color = QColor(235, 60, 60);
+        } else if (control.isLinkCandidate) {
             dot.color = QColor(60, 235, 120);
         } else if (control.hasPendingLinks) {
-            dot.color = QColor(80, 150, 255);
+            dot.color = control.hasSameHvPendingLinks ? QColor(255, 190, 120)
+                                                      : QColor(80, 150, 255);
         } else if (control.hasBranches) {
-            dot.color = QColor(210, 95, 255);
+            dot.color = control.hasSameHvBranches ? QColor(255, 140, 0)
+                                                  : QColor(210, 95, 255);
         } else {
             dot.color = QColor(255, 230, 0);
         }
