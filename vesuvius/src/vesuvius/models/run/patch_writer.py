@@ -17,10 +17,14 @@ class BoundedPatchWriter:
     """
 
     def __init__(self, output_store, max_workers, *, pbar=None,
-                 on_progress=None, stall_report_interval=5.0):
+                 on_progress=None, on_written=None, stall_report_interval=5.0):
         self._store = output_store
         self._pbar = pbar
         self._on_progress = on_progress
+        # on_written(write_index) fires only after the patch is durably in the store, which
+        # is what --resume records. Kept separate from on_progress, which is a bare counter
+        # for the progress bar and has no index to give.
+        self._on_written = on_written
         self._max_workers = max_workers
         self._max_inflight = max_workers * 2
         self._inflight = threading.BoundedSemaphore(self._max_inflight)
@@ -77,6 +81,11 @@ class BoundedPatchWriter:
     def _write(self, write_index, patch_data):
         try:
             self._store[write_index] = patch_data
+            # Order matters: record completion only after the assignment returns, and never
+            # in the except branch. A resume that trusts a patch the store never accepted
+            # would leave a permanent hole that no later run goes back for.
+            if self._on_written is not None:
+                self._on_written(write_index)
             if self._on_progress is not None:
                 self._on_progress()
         except Exception as e:

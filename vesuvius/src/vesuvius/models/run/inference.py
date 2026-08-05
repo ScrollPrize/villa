@@ -3,6 +3,7 @@ import numpy as np
 import zarr
 import os
 import errno
+import json
 try:
     import fcntl  # POSIX-only; used to serialize model-cache downloads
 except ImportError:  # pragma: no cover - Windows has no fcntl
@@ -269,6 +270,7 @@ class Inferer():
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
                  bbox: [list, tuple] = None,
+                 resume: bool = False,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -306,6 +308,10 @@ class Inferer():
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
         self.bbox = tuple(bbox) if bbox is not None else None
+        self.resume = resume
+        # Patch indices a previous run already wrote. Empty set == resume requested but
+        # nothing recoverable found; None == not resuming, so the store is created fresh.
+        self.resume_completed = None
         self.model_patch_size = None
         self.num_classes = None
 
@@ -776,6 +782,19 @@ class Inferer():
         # over non-empty patches when the input zarr's chunk occupancy has been
         # pre-indexed). len(loader_dataset) drives tqdm and the written-count
         # assertion below, so progress/ETA reflect only patches the model actually sees.
+        # Resume is applied here rather than in _run_inference because the completed set has
+        # to be known before the DataLoader is built, and the manifest's signature check needs
+        # num_total_patches, which is only known once the dataset exists. This is the one
+        # point where both are true.
+        if getattr(self, "resume", False):
+            self.resume_completed = self._load_completed()
+            if self.resume_completed is None:
+                print("--resume: no previous run found in this output_dir; starting from scratch")
+            else:
+                self.dataset.set_completed_indices(self.resume_completed)
+                print(f"--resume: {len(self.resume_completed)} of {self.num_total_patches} "
+                      f"patches already written; skipping them")
+
         loader_dataset = self.dataset.active_view()
         self.num_active_patches = len(loader_dataset)
         if self.verbose:
@@ -842,6 +861,84 @@ class Inferer():
         else:
             return numcodecs.Blosc(cname='zstd', clevel=1, shuffle=shuffle)
 
+    # --- resume support -------------------------------------------------------------
+    #
+    # A whole-scroll pass is hours to days of streaming, so an interrupted run is normal
+    # rather than exceptional. Without resume the only options are to rerun everything or
+    # to hand-slice the volume with --num_parts, and a dead shard is still a dead shard.
+    #
+    # The logits store is already chunked one-chunk-per-patch, so a finished patch is
+    # individually addressable. It is NOT enough to list the chunks that exist, though:
+    # write_empty_chunks=False means a patch that legitimately produced all zeros writes no
+    # chunk at all, and on a masked scroll volume those are the majority. Listing chunks
+    # would therefore re-run every empty patch on every resume. So completion is recorded
+    # explicitly, in an append-only sidecar next to the store.
+
+    def _manifest_path(self):
+        return os.path.join(self.output_dir, f"completed_part_{self.part_id}.json")
+
+    def _run_signature(self):
+        """What must match for a resume to be legitimate.
+
+        Deliberately strict. Silently resuming a run whose patch grid, model or TTA setting
+        differs would produce one output store containing patches computed two different
+        ways, with nothing recording the split -- the exact failure that made a published
+        prediction reproducible only under a setting no artifact mentioned.
+        """
+        return {
+            'input': str(self.input_dir),
+            'bbox': None if self.bbox is None else list(self.bbox),
+            'patch_size': list(self.patch_size) if self.patch_size is not None else None,
+            'overlap': self.overlap,
+            'num_classes': self.num_classes,
+            'num_parts': self.num_parts,
+            'part_id': self.part_id,
+            'model_path': str(self.model_path),
+            'tta': None if self.disable_tta else self.tta_type,
+            'normalization': self.normalization_scheme,
+            'num_total_patches': self.num_total_patches,
+        }
+
+    def _load_completed(self):
+        """Completed patch indices from a previous run, or None if there is nothing to resume.
+
+        Returns None (rather than an empty set) when no usable manifest exists, so the caller
+        can tell "resume from nothing" apart from "resume from a run that finished 0 patches".
+        """
+        path = self._manifest_path()
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r') as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"--resume: ignoring unreadable manifest at {path} ({e}); starting over")
+            return None
+
+        want, got = self._run_signature(), data.get('signature')
+        if got != want:
+            differing = sorted(k for k in want if want.get(k) != (got or {}).get(k))
+            raise RuntimeError(
+                f"--resume refused: {path} was written by a different run.\n"
+                f"  differing: {', '.join(differing) or 'unknown'}\n"
+                f"  previous:  { {k: (got or {}).get(k) for k in differing} }\n"
+                f"  requested: { {k: want[k] for k in differing} }\n"
+                "Resuming would mix patches computed under different settings into one store. "
+                "Point --output_dir somewhere else, or drop --resume to start over."
+            )
+        return set(int(i) for i in data.get('completed', []))
+
+    def _write_manifest(self, completed):
+        """Rewrite the manifest atomically. Small (ints), so simplicity beats appending."""
+        path = self._manifest_path()
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as fh:
+            json.dump({'signature': self._run_signature(),
+                       'completed': sorted(int(i) for i in completed)}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+
     def _create_output_stores(self):
         if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
             raise RuntimeError("Cannot create output stores: model/patch info missing.")
@@ -852,24 +949,48 @@ class Inferer():
         output_shape = (self.num_total_patches, self.num_classes, *self.patch_size)
         output_chunks = (1, self.num_classes, *self.patch_size)  # we align chunks to patch size for better write performance
         main_store_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
-        
-        print(f"Creating output store at: {main_store_path}")
-        
-        self.output_store = open_zarr(
-            path=main_store_path, 
-            mode='w',  
-            storage_options={'anon': False} if main_store_path.startswith('s3://') else None,
-            verbose=self.verbose,
-            shape=output_shape,
-            chunks=output_chunks,
-            dtype=np.float16,  
-            compressor=compressor,
-            write_empty_chunks=False  # we skip empty chunks here so we don't write all zero patches to the array but keep
-                                      # the proper indices for later re-zarring 
-        )
-        
-        print(f"Created zarr array at {main_store_path} with shape {self.output_store.shape}")
-        
+
+        # mode='w' recreates the array and discards every chunk already written, so a resume
+        # must reopen in place instead. _load_completed() has already refused anything whose
+        # signature disagrees, so by here the existing store is known to be the same run.
+        # getattr, not attribute access: several tests build an Inferer via __new__ and set
+        # only the fields their behaviour needs, and a new attribute should not break them.
+        if getattr(self, 'resume_completed', None):
+            print(f"Reopening output store for resume at: {main_store_path}")
+            self.output_store = open_zarr(
+                path=main_store_path,
+                mode='r+',
+                storage_options={'anon': False} if main_store_path.startswith('s3://') else None,
+                verbose=self.verbose,
+            )
+            if tuple(self.output_store.shape) != tuple(output_shape):
+                raise RuntimeError(
+                    f"--resume refused: existing store at {main_store_path} has shape "
+                    f"{tuple(self.output_store.shape)}, expected {tuple(output_shape)}."
+                )
+            print(f"Reopened zarr array with shape {self.output_store.shape}")
+        else:
+            print(f"Creating output store at: {main_store_path}")
+
+            self.output_store = open_zarr(
+                path=main_store_path,
+                mode='w',
+                storage_options={'anon': False} if main_store_path.startswith('s3://') else None,
+                verbose=self.verbose,
+                shape=output_shape,
+                chunks=output_chunks,
+                dtype=np.float16,
+                compressor=compressor,
+                write_empty_chunks=False  # we skip empty chunks here so we don't write all zero patches to the array but keep
+                                          # the proper indices for later re-zarring
+            )
+
+            print(f"Created zarr array at {main_store_path} with shape {self.output_store.shape}")
+
+        # The coordinates store is rewritten either way: it is small, fully determined by the
+        # patch grid, and identical on a legitimate resume, so recreating it costs nothing and
+        # keeps the two stores from drifting apart.
+
         self.coords_store_path = os.path.join(self.output_dir, f"coordinates_part_{self.part_id}.zarr")
         coord_shape = (self.num_total_patches, len(self.patch_size))
         # zarr rejects chunks with a zero dimension even when shape[0] is 0, so floor at 1.
@@ -982,6 +1103,28 @@ class Inferer():
 
         progress_lock = threading.Lock()
 
+        # Completion bookkeeping for --resume. The manifest is flushed every
+        # RESUME_FLUSH_EVERY writes rather than on every write: rewriting it per patch would
+        # add an fsync to each one, and the cost of a stale manifest is only that a handful
+        # of patches get recomputed, which is exactly what a resume is for.
+        RESUME_FLUSH_EVERY = 64
+        resuming = getattr(self, 'resume', False)
+        completed = set(getattr(self, 'resume_completed', None) or ())
+        resume_state = {'since_flush': 0}
+
+        def on_written(write_index):
+            if not resuming:
+                return
+            with progress_lock:
+                completed.add(int(write_index))
+                resume_state['since_flush'] += 1
+                flush = resume_state['since_flush'] >= RESUME_FLUSH_EVERY
+                if flush:
+                    resume_state['since_flush'] = 0
+                    snapshot = set(completed)
+            if flush:
+                self._write_manifest(snapshot)
+
         def to_device(tensor):
             return tensor.to(self.device, non_blocking=(self.device.type == 'cuda'))
 
@@ -996,6 +1139,7 @@ class Inferer():
                 max_workers=max_workers,
                 pbar=pbar,
                 on_progress=on_progress,
+                on_written=on_written if resuming else None,
             ) as writer:
                 if self.verbose:
                     print(f"Writer pool: {writer.max_workers} workers, max in-flight: {writer.max_inflight}")
@@ -1064,6 +1208,17 @@ class Inferer():
 
             total_wait = writer.total_wait_seconds
             elapsed = writer.elapsed_seconds
+
+        # Final flush after the writer pool has drained, so the manifest reflects every patch
+        # the store actually accepted. Note this correctly records EMPTY patches as done:
+        # they are submitted like any other, write_empty_chunks=False simply means no chunk
+        # lands on disk. That is the whole reason completion is tracked here and not by
+        # listing the store -- on a masked scroll volume most patches are empty, and a
+        # listing-based resume would rerun all of them on every restart, forever.
+        if getattr(self, "resume", False):
+            self._write_manifest(completed)
+            print(f"--resume: manifest records {len(completed)} of "
+                  f"{self.num_total_patches} patches complete")
 
         if total_wait > 0:
             pct = (total_wait / elapsed * 100.0) if elapsed > 0 else 0.0
@@ -1214,6 +1369,12 @@ def build_parser():
                            'Patch coordinates stay in the global frame, so blend_logits and '
                            'finalize_outputs need no extra flags. When streaming a remote '
                            'volume only the chunks intersecting the ROI are fetched.')
+    parser.add_argument('--resume', action='store_true',
+                      help='Continue a previous run in the same --output_dir instead of '
+                           'starting over. Patches already written are skipped and the '
+                           'existing logits store is appended to rather than recreated. '
+                           'Refuses to resume if the volume, bbox, patch size, overlap, '
+                           'model, TTA setting or part split differ from the previous run.')
     return parser
 
 
@@ -1287,6 +1448,7 @@ def main():
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
         bbox=bbox,
+        resume=args.resume,
     )
 
     try:

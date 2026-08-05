@@ -498,10 +498,30 @@ class VCDataset(Dataset):
         is unchanged.
         """
         mask = getattr(self, 'non_empty_mask', None)
-        if mask is None or len(mask) != len(self.all_positions):
+        if mask is not None and len(mask) != len(self.all_positions):
+            mask = None
+        completed = getattr(self, 'completed_indices', None)
+
+        if mask is None and not completed:
             return self
-        indices = np.flatnonzero(mask).tolist()
+
+        if mask is None:
+            indices = list(range(len(self.all_positions)))
+        else:
+            indices = np.flatnonzero(mask).tolist()
+
+        if completed:
+            indices = [i for i in indices if i not in completed]
         return torch.utils.data.Subset(self, indices)
+
+    def set_completed_indices(self, completed):
+        """Exclude already-written patches from the view the DataLoader iterates.
+
+        Used by `--resume`. Kept separate from `non_empty_mask` because the two mean
+        different things: a patch can be skipped because it is empty, or because a previous
+        run already wrote it, and only the second is recoverable state.
+        """
+        self.completed_indices = set(int(i) for i in completed) if completed else set()
 
 
     def set_distributed(self, rank: int, world_size: int):
