@@ -78,21 +78,43 @@ def _volume_with(data):
     return vol
 
 
-def test_levels_found_when_listing_is_empty() -> None:
-    """The HTTP case: metadata names the levels, listing reports nothing."""
-    group = _FakeGroup(_multiscales(["0", "1", "2", "3"]), members={})
-    vol = _volume_with(group)
+def _real_group(level_names, with_metadata):
+    """A genuine in-memory zarr Group, optionally carrying multiscales."""
+    g = zarr.group()
+    for name in level_names:
+        g.create_array(name, shape=(2, 2, 2), dtype="u1")
+    if with_metadata:
+        g.attrs["multiscales"] = _multiscales(level_names)["multiscales"]
+    return g
+
+
+def test_levels_come_from_metadata_when_present() -> None:
+    """Metadata wins, and its declared order is kept."""
+    g = _real_group(["0", "1", "2", "3"], with_metadata=True)
+    vol = _volume_with(g)
 
     assert vol._level_keys() == ["0", "1", "2", "3"]
     assert vol._num_levels() == 4
 
 
 def test_listing_used_when_no_metadata() -> None:
-    group = _FakeGroup({}, members={"0": object(), "1": object()})
-    vol = _volume_with(group)
+    g = _real_group(["0", "1"], with_metadata=False)
+    vol = _volume_with(g)
 
     assert sorted(vol._level_keys()) == ["0", "1"]
     assert vol._num_levels() == 2
+
+
+def test_metadata_survives_an_unlistable_store() -> None:
+    """The HTTP case: keys() is empty, metadata still names the levels."""
+    g = _real_group(["0", "1", "2"], with_metadata=True)
+    vol = _volume_with(g)
+    object.__setattr__(vol, "_level_keys_cache", None)
+
+    # emulate a store that cannot enumerate itself
+    import unittest.mock as mock
+    with mock.patch.object(type(g), "keys", return_value=iter(())):
+        assert vol._level_keys() == ["0", "1", "2"]
 
 
 def test_plain_array_reports_a_single_level() -> None:
@@ -100,17 +122,17 @@ def test_plain_array_reports_a_single_level() -> None:
     assert vol._num_levels() == 1
 
 
+def test_legacy_list_of_levels_still_counted() -> None:
+    """The older form, where data is a plain list, must keep working."""
+    vol = _volume_with([zarr.zeros((4, 4, 4)), zarr.zeros((2, 2, 2))])
+    assert vol._num_levels() == 2
+
+
 def test_level_keys_are_computed_once() -> None:
-    """Each lookup would otherwise be a network round trip."""
-    calls = {"n": 0}
+    """Each lookup would otherwise be a round trip on a remote store."""
+    g = _real_group(["0", "1"], with_metadata=True)
+    vol = _volume_with(g)
 
-    class _Counting(_FakeGroup):
-        def keys(self):
-            calls["n"] += 1
-            return super().keys()
-
-    vol = _volume_with(_Counting({}, members={"0": object()}))
-    vol._level_keys()
-    vol._level_keys()
-    vol._level_keys()
-    assert calls["n"] == 1
+    first = vol._level_keys()
+    assert vol._level_keys() is first
+    assert vol._level_keys() is first

@@ -405,11 +405,13 @@ class Volume:
         cached = getattr(self, "_level_keys_cache", None)
         if cached is not None:
             return cached
-        if isinstance(self.data, zarr.Array):
-            keys: List[str] = []
-        else:
+        if isinstance(self.data, zarr.Group):
             keys = _multiscale_level_paths(self.data) or [
                 str(k) for k in self.data.keys()]
+        else:
+            # A plain array, or the legacy list-of-levels form: neither is
+            # addressed by key.
+            keys: List[str] = []
         self._level_keys_cache = keys
         return keys
 
@@ -417,7 +419,9 @@ class Volume:
         """Number of resolution levels, without relying on listing."""
         if isinstance(self.data, zarr.Array):
             return 1
-        return len(self._level_keys())
+        if isinstance(self.data, zarr.Group):
+            return len(self._level_keys())
+        return len(self.data)   # legacy list of levels
 
     def _s3_storage_options(self, path: str) -> Optional[dict]:
         """Return storage_options for S3 paths, None otherwise."""
@@ -1150,7 +1154,9 @@ class Volume:
             raise IndexError(
                 f"Invalid subvolume index: {subvolume_idx}. "
                 f"Available: 0 to {self._num_levels() - 1}")
-        return tuple(self.data[self._level_keys()[subvolume_idx]].shape)
+        keys = self._level_keys()
+        level = self.data[keys[subvolume_idx]] if keys else self.data[subvolume_idx]
+        return tuple(level.shape)
 
     @property
     def ndim(self, subvolume_idx: int = 0) -> int:
