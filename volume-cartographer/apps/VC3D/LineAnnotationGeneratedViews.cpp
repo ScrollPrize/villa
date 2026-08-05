@@ -28,6 +28,25 @@ QPointF generatedStripControlPointToScene(
     QuadSurface* surface,
     const GeneratedOverlay::ControlPointMarker& control)
 {
+    // The strip surface is parameterized by line position, so the O(1)
+    // mapping is exact whenever linePosition is known. volumeToScene runs
+    // QuadSurface::pointTo — an O(strip length) gradient descent from the
+    // strip center — which made every overlay rebuild cost
+    // O(controlPoints x lineLength) and dominated zoom/pan lag on
+    // many-control-point fibers; keep it only as the fallback. The
+    // preconditions are re-checked here because the helper reports failure
+    // as a default (finite) QPointF, which must not shadow the fallback.
+    if (viewer && surface && std::isfinite(control.linePosition)) {
+        const auto* points = surface->rawPointsPtr();
+        const cv::Vec2f scale = surface->scale();
+        if (points && !points->empty() && scale[0] != 0.0f && scale[1] != 0.0f) {
+            const QPointF positionScene = generatedStripLinePositionToScene(
+                viewer, surface, control.linePosition);
+            if (finiteScenePoint(positionScene)) {
+                return positionScene;
+            }
+        }
+    }
     if (viewer && finiteGeneratedPoint(control.point)) {
         const QPointF pointScene = viewer->volumeToScene(control.point);
         if (finiteScenePoint(pointScene)) {
@@ -578,17 +597,34 @@ void applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
 
     if (!overlay.useSurfaceCenterLine && sceneLine.size() >= 2) {
         const auto controlRange = generatedControlLinePositionRange(overlay.controlPoints);
+        // Consecutive non-tail segments accumulate into one polyline
+        // primitive per run (same pattern as the branch lines above): a
+        // primitive per segment meant one QGraphicsPathItem per segment,
+        // and rebuilding thousands of scene items per overlay refresh
+        // dominated zoom/pan lag on long fibers.
+        std::vector<QPointF> run;
+        const auto flushRun = [&]() {
+            if (run.size() >= 2) {
+                primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
+                    std::move(run),
+                    false,
+                    lineStyle});
+            }
+            run = {};
+        };
         for (size_t i = 1; i < sceneLine.size(); ++i) {
             const auto& previous = sceneLine[i - 1];
             const auto& current = sceneLine[i];
             if (generatedLineSegmentIsTail(previous.second, current.second, controlRange)) {
+                flushRun();
                 continue;
             }
-            primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
-                {previous.first, current.first},
-                false,
-                lineStyle});
+            if (run.empty()) {
+                run.push_back(previous.first);
+            }
+            run.push_back(current.first);
         }
+        flushRun();
     }
 
     if (finiteGeneratedPoint(overlay.pointMarker)) {
