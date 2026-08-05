@@ -13,6 +13,7 @@ import hashlib
 import multiprocessing
 import subprocess
 import threading
+import time
 import fsspec
 import numcodecs
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
@@ -1141,32 +1142,54 @@ class Inferer():
 
         progress_lock = threading.Lock()
 
-        # Completion bookkeeping for --resume. The manifest is flushed every
-        # RESUME_FLUSH_EVERY writes rather than on every write: rewriting it per patch would
-        # add an fsync to each one, and the cost of a stale manifest is only that a handful
-        # of patches get recomputed, which is exactly what a resume is for.
-        RESUME_FLUSH_EVERY = 64
+        # Completion bookkeeping for --resume. The manifest is not rewritten on every write,
+        # which would put an fsync in front of each patch; it is flushed periodically, and the
+        # interval is the worst-case amount of work a hard kill can cost.
+        #
+        # A count-only interval is not enough, and the first end-to-end test proved it: the
+        # run was interrupted after 63 writes with the interval at 64, so nothing was ever
+        # persisted and the resume had nothing to find. A checkpoint whose survival depends on
+        # reaching a counter is not a checkpoint. Whichever of the two limits comes first wins.
+        RESUME_FLUSH_EVERY = 16
+        RESUME_FLUSH_SECONDS = 30.0
         resuming = getattr(self, 'resume', False)
         completed = set(getattr(self, 'resume_completed', None) or ())
-        resume_state = {'since_flush': 0}
+        resume_state = {'since_flush': 0, 'last_flush': time.monotonic()}
 
         def on_written(write_index):
             if not resuming:
                 return
+            snapshot = None
             with progress_lock:
                 completed.add(int(write_index))
                 resume_state['since_flush'] += 1
-                flush = resume_state['since_flush'] >= RESUME_FLUSH_EVERY
-                if flush:
+                now = time.monotonic()
+                if (resume_state['since_flush'] >= RESUME_FLUSH_EVERY
+                        or now - resume_state['last_flush'] >= RESUME_FLUSH_SECONDS):
                     resume_state['since_flush'] = 0
+                    resume_state['last_flush'] = now
                     snapshot = set(completed)
-            if flush:
+            if snapshot is not None:
                 self._write_manifest(snapshot)
 
         def to_device(tensor):
             return tensor.to(self.device, non_blocking=(self.device.type == 'cuda'))
 
-        with tqdm(total=self.num_active_patches, desc=f"Inferring Part {self.part_id}", **get_tqdm_kwargs()) as pbar:
+        def flush_manifest():
+            """Persist whatever is complete. Safe to call more than once."""
+            if not resuming:
+                return
+            with progress_lock:
+                snapshot = set(completed)
+            self._write_manifest(snapshot)
+            return snapshot
+
+        # Ctrl-C and unhandled errors still checkpoint what finished, by wrapping the whole
+        # inference block rather than the loop body. A hard kill (TerminateProcess on Windows,
+        # SIGKILL, power loss) cannot run this, which is why the periodic flush above exists
+        # and is what actually bounds the loss.
+        try:
+          with tqdm(total=self.num_active_patches, desc=f"Inferring Part {self.part_id}", **get_tqdm_kwargs()) as pbar:
             def on_progress():
                 with progress_lock:
                     self.current_patch_write_index += 1
@@ -1246,6 +1269,9 @@ class Inferer():
 
             total_wait = writer.total_wait_seconds
             elapsed = writer.elapsed_seconds
+        except BaseException:
+            flush_manifest()
+            raise
 
         # Final flush after the writer pool has drained, so the manifest reflects every patch
         # the store actually accepted. Note this correctly records EMPTY patches as done:
@@ -1253,8 +1279,8 @@ class Inferer():
         # lands on disk. That is the whole reason completion is tracked here and not by
         # listing the store -- on a masked scroll volume most patches are empty, and a
         # listing-based resume would rerun all of them on every restart, forever.
-        if getattr(self, "resume", False):
-            self._write_manifest(completed)
+        if resuming:
+            flush_manifest()
             print(f"--resume: manifest records {len(completed)} of "
                   f"{self.num_total_patches} patches complete")
 
