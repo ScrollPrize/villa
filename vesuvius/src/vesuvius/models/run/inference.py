@@ -905,11 +905,13 @@ class Inferer():
         if len(chunks) != 3:
             return None
 
-        # zarr 2 exposes .compressor, zarr 3 .compressors; absent or empty means raw.
-        compressor = getattr(array_obj, 'compressor', None)
-        if compressor is None:
-            seq = getattr(array_obj, 'compressors', None)
-            compressor = seq[0] if seq else None
+        # zarr 3 exposes .compressors, zarr 2 .compressor; absent or empty means raw.
+        # Ask for the plural first: on zarr 3 the singular still exists but warns.
+        seq = getattr(array_obj, 'compressors', None)
+        if seq is not None:
+            compressor = seq[0] if len(seq) else None
+        else:
+            compressor = getattr(array_obj, 'compressor', None)
 
         return chunks, array_obj.dtype.itemsize, shape, compressor, str(self.input)
 
