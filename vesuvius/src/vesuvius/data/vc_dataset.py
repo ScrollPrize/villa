@@ -46,6 +46,7 @@ class VCDataset(Dataset):
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
             anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
             read_retries: int = 4,  # Attempts per read, forwarded to Volume
+            traversal_order: str = 'morton',  # 'morton' (chunk-local) or 'zyx' (row-major)
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -84,11 +85,16 @@ class VCDataset(Dataset):
                              (e.g., 'np.float16', 'np.float32'). Default is 'np.float32'.
             domain: Data source domain for Volume ('dl.ash2txt', 'local'). Auto-detected if None.
             anon: Use anonymous requests for input S3 reads.
+            traversal_order: Order in which patch positions are visited. 'morton' walks
+                a Z-order curve over chunk indices so overlapping patches reuse cached
+                chunks; 'zyx' keeps the previous row-major order. The set of patches is
+                identical either way — only the sequence differs.
             read_retries: Attempts per read, forwarded to Volume (default 4). Transient
                 remote failures are retried with exponential backoff so one dropped
                 connection does not abort a long streaming run. Pass 1 to disable.
         """
         self.input_path = input_path
+        self.traversal_order = traversal_order
         self.input_format = input_format # Keep for informational purposes
         self.targets = targets
         self.patch_size = patch_size
@@ -337,6 +343,12 @@ class VCDataset(Dataset):
                     for x in x_positions:
                         self.all_positions.append((z, y, x))
 
+            # Reorder for chunk locality. Row-major walks an entire row of x
+            # before moving on, so by the time it reaches the neighbouring row
+            # the chunks it needs have been evicted and get fetched again.
+            # This changes only the sequence, never the set of patches.
+            self._reorder_positions_for_locality()
+
             # Optional coverage diagnostics in verbose mode
             if self.verbose and self.all_positions:
                 # Coverage is judged against the tiled extent: the ROI when a bbox is
@@ -485,6 +497,51 @@ class VCDataset(Dataset):
 
         return mask
 
+
+    @staticmethod
+    def _morton(a: int, b: int, c: int, bits: int = 21) -> int:
+        """Interleave three chunk indices into a Z-order key."""
+        m = 0
+        for i in range(bits):
+            m |= ((a >> i) & 1) << (3 * i)
+            m |= ((b >> i) & 1) << (3 * i + 1)
+            m |= ((c >> i) & 1) << (3 * i + 2)
+        return m
+
+    def _input_chunk_shape(self):
+        """Spatial chunk shape of the input array, or None if unavailable."""
+        try:
+            import zarr as _zarr
+        except ImportError:
+            return None
+        array_obj = getattr(getattr(self, 'volume', None), 'data', None)
+        if isinstance(array_obj, _zarr.Group):
+            array_obj = array_obj["0"] if "0" in array_obj else None
+        if not isinstance(array_obj, _zarr.Array):
+            return None
+        chunks = tuple(array_obj.chunks)
+        return chunks[1:] if len(chunks) == 4 else chunks
+
+    def _reorder_positions_for_locality(self) -> None:
+        """Sort patch positions along a Z-order curve over chunk indices.
+
+        Sorting happens before the work is split across parts and ranks, so
+        each worker still receives a contiguous run of the curve and keeps
+        locality within its own share.
+        """
+        if self.traversal_order != 'morton' or not self.all_positions:
+            return
+        chunks = self._input_chunk_shape()
+        if chunks is None or len(chunks) != 3:
+            if self.verbose:
+                print("  Traversal: chunk shape unavailable, keeping row-major order")
+            return
+        cz, cy, cx = chunks
+        self.all_positions.sort(
+            key=lambda p: self._morton(p[0] // cz, p[1] // cy, p[2] // cx))
+        if self.verbose:
+            print(f"  Traversal: Z-order over {chunks} chunks "
+                  f"({len(self.all_positions)} positions)")
 
     def active_view(self):
         """Return the dataset view the DataLoader should iterate.
