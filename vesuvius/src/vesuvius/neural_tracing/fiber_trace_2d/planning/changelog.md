@@ -5,6 +5,8 @@
 - Added longest-prefix contextual help and shared argument-aware Bash/Zsh
   completion, including exact cache-local OME scale proposals.
 - Made manager catalog indexing tolerate volumes whose optional shape is null.
+- Replaced repeated `volume ls` labels with a grouped table and added exact
+  chunk-backed prefetched-scale reporting.
 
 # 2026-08-03
 

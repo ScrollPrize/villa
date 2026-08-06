@@ -2505,6 +2505,14 @@
   roots, selected public S3 origin, and catalog hash/fetch metadata. Stable
   selectors are `sample_id/long_id`, globally unique `long_id`, and globally
   unique volume ID.
+- Human `volume ls` renders a deterministic, aligned table with one header,
+  groups records by sample/scroll, prints the scroll once, and marks child
+  volumes with tree branches. Its `PREFETCHED` column contains numerically
+  sorted local OME groups only when `.zarray` and at least one non-metadata
+  chunk exist; advertised or metadata-only groups remain absent. UTF-capable
+  output uses `├─`/`└─`, otherwise `|-`/`\-`. Empty results are header-only.
+  `volume ls --json` retains the backend-neutral record schema for machines and
+  is unaffected by human rendering.
 - Snapshot roots may be a run collection, one run, or `snapshots/`. Listing
   deduplicates canonical paths, reads checkpoints with CPU mapping, mmap and
   `weights_only=True`, and caches metadata by path/size/mtime. The stable

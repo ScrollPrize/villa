@@ -38,6 +38,20 @@ las_manager volume ls
 las_manager volume ls --sample PHerc0332 --format uint8
 ```
 
+Human output is an aligned table grouped by scroll. The scroll is printed once
+and `├─`/`└─` branches identify its volumes. `PREFETCHED` lists numeric OME
+groups that already contain local chunk data in the manager cache:
+
+```text
+SCROLL     VOLUME                                             ID              SHAPE            VOXEL    FORMAT  PREFETCHED  ORIGINS
+---------  -------------------------------------------------  --------------  ---------------  -------  ------  ----------  -------
+PHerc0125  └─ 20250821151825-9.362um-1.2m-113keV-masked.zarr  20250821151825  20840x8387x8387  9.362um  uint8   1,2         s3
+```
+
+Metadata-only groups are not reported as prefetched. Use `volume ls --json`
+for scripts and other machine consumers; its schema is independent of the
+human table.
+
 The raw catalog and validation sidecar live under `<cache_dir>/catalog`.
 `fetch` always revalidates. Volume commands refresh a missing or hour-old cache
 using ETag/Last-Modified when available; a malformed refresh never replaces a

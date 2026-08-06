@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Sequence
 
 from .catalog import get_catalog, index_volumes, resolve_volume
@@ -232,11 +234,105 @@ def _print_run(path, record) -> None:
     )
 
 
-def _print_volume(record) -> None:
+def _volume_cells(record) -> tuple[str, str, str, str, str, str]:
     shape = "x".join(str(v) for v in record.shape) or "-"
     voxel = f"{record.pixel_size_um:g}um" if record.pixel_size_um is not None else "-"
     origins = sorted({root.get("type", "?") for origin in record.origins for root in origin.get("access_roots", ())})
-    print(f"{record.selector}\tid={record.volume_id}\tshape={shape}\tvoxel={voxel}\tformat={record.data_format or '-'}\torigins={','.join(origins) or '-'}")
+    return (
+        record.long_id or "-",
+        record.volume_id or "-",
+        shape,
+        voxel,
+        record.data_format or "-",
+        ",".join(origins) or "-",
+    )
+
+
+def _has_local_chunk(group: Path) -> bool:
+    pending = [group]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.name.startswith("."):
+                        continue
+                    if entry.is_file(follow_symlinks=False):
+                        return True
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+        except OSError:
+            continue
+    return False
+
+
+def _prefetched_scales(config, record) -> str:
+    from .prefetch import volume_cache_root
+
+    try:
+        root = volume_cache_root(config, record)
+        children = list(root.iterdir()) if root.is_dir() else []
+    except (OSError, ValueError):
+        return "-"
+    levels = sorted(
+        int(child.name)
+        for child in children
+        if child.name.isdigit() and child.is_dir() and (child / ".zarray").is_file()
+        and _has_local_chunk(child)
+    )
+    return ",".join(str(level) for level in levels) or "-"
+
+
+def _render_volume_table(records, config, *, unicode_tree: bool = True) -> str:
+    headers = ("SCROLL", "VOLUME", "ID", "SHAPE", "VOXEL", "FORMAT", "PREFETCHED", "ORIGINS")
+    ordered = sorted(records, key=lambda record: (record.sample_id, record.long_id))
+    rows: list[tuple[str, ...]] = []
+    offset = 0
+    while offset < len(ordered):
+        sample_id = ordered[offset].sample_id
+        end = offset + 1
+        while end < len(ordered) and ordered[end].sample_id == sample_id:
+            end += 1
+        group = ordered[offset:end]
+        for index, record in enumerate(group):
+            branch = ("└─" if index == len(group) - 1 else "├─") if unicode_tree else (
+                "\\-" if index == len(group) - 1 else "|-"
+            )
+            volume, volume_id, shape, voxel, data_format, origins = _volume_cells(record)
+            rows.append((
+                sample_id if index == 0 else "",
+                f"{branch} {volume}",
+                volume_id,
+                shape,
+                voxel,
+                data_format,
+                _prefetched_scales(config, record),
+                origins,
+            ))
+        offset = end
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows)) if rows else len(headers[index])
+        for index in range(len(headers))
+    ]
+
+    def line(values: tuple[str, ...]) -> str:
+        return "  ".join(
+            value.ljust(widths[index]) if index < len(values) - 1 else value
+            for index, value in enumerate(values)
+        )
+
+    separator = tuple("-" * width for width in widths)
+    return "\n".join([line(headers), line(separator), *(line(row) for row in rows)])
+
+
+def _print_volume_table(records, config) -> None:
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        "├─└─".encode(encoding)
+        unicode_tree = True
+    except (LookupError, UnicodeEncodeError):
+        unicode_tree = False
+    print(_render_volume_table(records, config, unicode_tree=unicode_tree))
 
 
 def _print_snapshot(index: int, record) -> None:
@@ -316,8 +412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.json:
                 print(json.dumps([asdict(record) for record in records], indent=2, sort_keys=True))
             else:
-                for record in records:
-                    _print_volume(record)
+                _print_volume_table(records, config)
         elif args.command == "snapshot":
             records = index_snapshots(config)
             if args.backend:
