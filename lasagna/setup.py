@@ -41,6 +41,7 @@ packages = find_packages(
 # Preserve the programmatic import already used by callers and tests while the
 # legacy internal imports continue to use the top-level ``scripts`` package.
 packages.append("lasagna.scripts")
+packages.append("lasagna.manager")
 
 fit_service_requires = [
     "numpy>=1.24",
@@ -95,7 +96,7 @@ setup(
     python_requires=">=3.14,<3.15",
     py_modules=py_modules,
     packages=packages,
-    package_dir={"lasagna.scripts": "scripts"},
+    package_dir={"lasagna.scripts": "scripts", "lasagna.manager": "manager"},
     install_requires=all_requires,
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
@@ -109,6 +110,7 @@ setup(
             "lasagna-download-list=lasagna.scripts.download_volume_list:main",
             "lasagna-bootstrap=lasagna.scripts.bootstrap_venv:main",
             "lasagna-preprocess=preprocess_cos_omezarr:cli_main",
+            "las_manager=lasagna.manager.cli:main",
             "lasagna-predict3d-holescan=predict3d_holescan:main",
         ],
     },

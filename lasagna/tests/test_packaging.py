@@ -15,6 +15,8 @@ def test_packaging_declares_requested_console_commands():
     assert "lasagna-download-list=lasagna.scripts.download_volume_list:main" in source
     assert "lasagna-bootstrap=lasagna.scripts.bootstrap_venv:main" in source
     assert "lasagna-preprocess=preprocess_cos_omezarr:cli_main" in source
+    assert "las_manager=lasagna.manager.cli:main" in source
+    assert '"lasagna.manager": "manager"' in source
 
 
 def test_pep517_build_dependencies_include_pybind11():
