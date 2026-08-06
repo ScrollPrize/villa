@@ -704,6 +704,164 @@ def _find_lasagna_service():
         "set LASAGNA_SERVICE_PATH")
 
 
+class PreviewSelfcrossRejected(RuntimeError):
+    """A flattened preview was withheld by the self-intersection policy."""
+
+
+# A hung census must not hang publication forever: past this the run is
+# state "error", which fails closed in reject mode.
+SELFCROSS_TIMEOUT_SECONDS = 3600
+
+
+def _find_selfcross_tool():
+    """Locate vc_tifxyz_selfcross, or None when it is not installed.
+
+    VC_SELFCROSS_PATH wins when set; a set-but-missing path is an error
+    rather than a silent fallback, so a typo cannot quietly disable the
+    check. Otherwise the tool is taken from PATH.
+    """
+    configured = str(os.environ.get("VC_SELFCROSS_PATH") or "").strip()
+    if configured:
+        candidate = Path(configured).expanduser()
+        if not candidate.is_file():
+            raise RuntimeError(
+                f"VC_SELFCROSS_PATH is set but not a file: {candidate}")
+        return candidate.resolve()
+    found = shutil.which("vc_tifxyz_selfcross")
+    return Path(found).resolve() if found else None
+
+
+def _census_flattened_preview(surface_dir, output_dir, tool=None):
+    """Census a flattened tifxyz for transverse self-intersection.
+
+    Runs vc_tifxyz_selfcross (both quad triangulations) on the surface,
+    writing its JSON report and point collection into ``output_dir``.
+    Returns a manifest-ready summary whose ``state`` is one of:
+
+    - ``clean``   -- census ran; zero transverse contacts either diagonal
+    - ``dirty``   -- census ran; transverse contacts exist
+    - ``not_run`` -- the tool is not installed
+    - ``error``   -- the tool failed or produced an unreadable report
+
+    Never raises; policy decisions belong to the caller.
+    """
+    summary = {"state": "not_run", "tool": None, "report": None,
+               "collection": None, "transverse": None, "detail": None}
+    try:
+        if tool is None:
+            tool = _find_selfcross_tool()
+    except RuntimeError as exc:
+        summary["state"] = "error"
+        summary["detail"] = str(exc)
+        return summary
+    if tool is None:
+        summary["detail"] = ("vc_tifxyz_selfcross not found; install it or "
+                             "set VC_SELFCROSS_PATH")
+        return summary
+    # Only the basename is published: the manifest travels with the
+    # preview, and an absolute executable path is host detail, not census
+    # provenance.
+    summary["tool"] = Path(tool).name
+    report_path = Path(output_dir) / "selfcross-report.json"
+    collection_path = Path(output_dir) / "selfcross-sites.json"
+
+    def failed(detail):
+        # Never leave partial diagnostics behind: a report the summary
+        # does not vouch for must not ship inside the generation.
+        report_path.unlink(missing_ok=True)
+        collection_path.unlink(missing_ok=True)
+        summary["state"] = "error"
+        summary["detail"] = detail
+        return summary
+
+    try:
+        proc = subprocess.run(
+            [str(tool), str(surface_dir), "-o", str(report_path),
+             "--collection", str(collection_path)],
+            capture_output=True, text=True,
+            timeout=SELFCROSS_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return failed(f"vc_tifxyz_selfcross failed to run: {exc}")
+    if proc.returncode != 0:
+        return failed(f"vc_tifxyz_selfcross exited "
+                      f"{proc.returncode}: {proc.stderr[-500:]}")
+    # The report is validated, not trusted: cleanliness is derived from
+    # the per-diagonal counts, and the tool's own clean flag must agree
+    # with them or the whole census is an error.
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        census = report["census"]
+        if not isinstance(census, list) or len(census) != 2:
+            raise ValueError("expected exactly 2 census entries")
+        transverse = {}
+        for entry in census:
+            diagonal = entry["diagonal"]
+            if diagonal not in (0, 1) or f"d{diagonal}" in transverse:
+                raise ValueError(f"unexpected diagonal record: {diagonal!r}")
+            count = entry["transverse"]
+            if isinstance(count, bool) or not isinstance(count, int) \
+                    or count < 0:
+                raise ValueError(
+                    f"bad transverse count for diagonal {diagonal}: "
+                    f"{count!r}")
+            transverse[f"d{diagonal}"] = count
+        clean = report["clean_of_transverse_self_intersection"]
+        if not isinstance(clean, bool):
+            raise ValueError(f"clean flag is not boolean: {clean!r}")
+        if clean != (transverse["d0"] == 0 and transverse["d1"] == 0):
+            raise ValueError(
+                f"clean flag {clean} contradicts counts {transverse}")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return failed(f"invalid selfcross report: {exc}")
+    summary["state"] = "clean" if clean else "dirty"
+    summary["report"] = report_path.name
+    if collection_path.is_file():
+        summary["collection"] = collection_path.name
+    summary["transverse"] = transverse
+    return summary
+
+
+def _apply_preview_selfcross_policy(policy, surface_dir, publish_root,
+                                    publish_parent, generation, published):
+    """Enforce the preview self-intersection policy at the commit boundary.
+
+    ``off`` returns immediately and touches nothing. Otherwise the census
+    summary is recorded in the ``published`` manifest dict, and in
+    ``reject`` mode any state other than ``clean`` raises
+    PreviewSelfcrossRejected -- after writing the rejection evidence to
+    ``publish_parent``, which survives the staging directory's cleanup.
+    """
+    if policy == "off":
+        return None
+    summary = _census_flattened_preview(surface_dir, publish_root)
+    summary["policy"] = policy
+    published["selfcross"] = summary
+    if policy == "reject" and summary["state"] != "clean":
+        evidence = dict(summary)
+        evidence["generation"] = int(generation)
+        report_name = summary.get("report")
+        if report_name:
+            try:
+                evidence["report_json"] = json.loads(
+                    (Path(publish_root) / report_name).read_text(
+                        encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        # Unique per attempt: a crash/restart retry of the same generation
+        # must add evidence, never overwrite it.
+        evidence_path = Path(publish_parent) / (
+            f"generation-{generation}.selfcross-rejection-"
+            f"{secrets.token_hex(4)}.json")
+        evidence_path.write_text(json.dumps(evidence, indent=2) + "\n",
+                                 encoding="utf-8")
+        raise PreviewSelfcrossRejected(
+            f"Refusing to publish preview generation {generation}: "
+            f"self-intersection census state is {summary['state']!r} "
+            f"({summary.get('detail') or summary.get('transverse')}); "
+            f"evidence at {evidence_path}")
+    return summary
+
+
 def _md5_file(path):
     digest = hashlib.md5(usedforsecurity=False)
     with Path(path).open("rb") as stream:
@@ -1102,7 +1260,8 @@ def _stop_process_group(process):
 
 class ServiceState:
     def __init__(self, dataset_root=None, dataset_resolution=None,
-                 service_name=None, session_name="", logs=None, gpu_ids=(0,)):
+                 service_name=None, session_name="", logs=None, gpu_ids=(0,),
+                 preview_selfcross="off"):
         self.lock = threading.RLock()
         self.session = None
         self.session_id = None
@@ -1123,6 +1282,7 @@ class ServiceState:
         self.session_name = str(session_name or "")
         self.logs = logs if logs is not None else ServiceLogBuffer()
         self.gpu_ids = tuple(gpu_ids)
+        self.preview_selfcross = str(preview_selfcross or "off")
         self.artifacts = ArtifactRegistry()
         self.uploads = {}
         self.ephemeral_records = []
@@ -2099,6 +2259,15 @@ class ServiceState:
                     published.pop("run_diff", None)
                 else:
                     published["run_diff"] = run_diff
+                selfcross_policy = getattr(self, "preview_selfcross", "off")
+                if selfcross_policy != "off":
+                    start_stage(
+                        "finalizing",
+                        "Censusing preview for self-intersection",
+                        step=0, total_steps=0, overall_progress=0.0)
+                    _apply_preview_selfcross_policy(
+                        selfcross_policy, flattened_surface, publish_root,
+                        publish_parent, generation, published)
                 (publish_root / "manifest.json").write_text(
                     json.dumps(published, indent=2) + "\n",
                     encoding="utf-8")
@@ -2950,6 +3119,14 @@ def main(argv=None):
     parser.add_argument(
         "--gpus", type=parse_gpu_ids, default=(0,), metavar="DEVICE[,DEVICE...]",
         help="Physical CUDA device indices to use (default: 0; example: 0,1,2,3)")
+    parser.add_argument(
+        "--preview-selfcross", choices=("off", "report", "reject"),
+        default="off",
+        help="Self-intersection census of the flattened preview at "
+             "publication (vc_tifxyz_selfcross, both triangulations). "
+             "'report' records the result in the preview manifest; "
+             "'reject' additionally withholds publication unless the "
+             "census is clean, keeping the previous preview. Default off.")
     args = parser.parse_args(argv)
 
     # fit_spiral and Torch are imported lazily when a session is loaded. Narrow
@@ -3025,7 +3202,8 @@ def main(argv=None):
                          service_name=args.service_name,
                          session_name=args.session_name or "",
                          logs=logs,
-                         gpu_ids=args.gpus)
+                         gpu_ids=args.gpus,
+                         preview_selfcross=args.preview_selfcross)
     # A stable, operator-chosen port must survive TIME_WAIT restarts; an
     # ephemeral port must not reuse an address it did not own.
     SpiralServer.allow_reuse_address = args.port != 0
