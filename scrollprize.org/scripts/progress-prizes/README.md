@@ -255,8 +255,12 @@ assertion.workflow_sha == assertion.sha
 The schedule milestone does not receive Google configuration or OIDC. It
 computes the Pacific window and dispatches this exact production workflow with
 `GITHUB_TOKEN`; GitHub documents `workflow_dispatch` as an event that is allowed
-to create a new run from `GITHUB_TOKEN`. The production WIF condition therefore
-does not need to permit the schedule workflow path or a `schedule` event.
+to create a new run from `GITHUB_TOKEN`. The rehearsal uses the same pattern for
+its read-only production preflight: it dispatches `validate`, binds the exact
+returned child run, and awaits its result. Production Google authentication
+therefore remains confined to the production workflow. The production WIF
+condition does not need to permit the schedule or rehearsal workflow paths, or
+a `schedule` event.
 
 Bind only that provider principal to its matching service account with
 `roles/iam.workloadIdentityUser`. Use the numeric Google project number when

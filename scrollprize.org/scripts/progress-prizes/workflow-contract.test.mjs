@@ -28,7 +28,6 @@ const workflowNames = [
   'progress-prizes-vercel-preview.yml',
 ];
 const googleJobNames = [
-  'validate-production',
   'bootstrap-staging',
   'inject-copy-fault',
   'recover-prepare',
@@ -177,16 +176,15 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
 
   for (const name of googleJobNames) {
     const protectedJob = jobBlock(rehearsal, name);
-    const environment = name === 'validate-production' ? 'production' : 'staging';
     assert.match(protectedJob, /runs-on: ubuntu-24\.04/);
     assert.match(protectedJob, /timeout-minutes: 20/);
-    assert.match(protectedJob, new RegExp(`environment: progress-prizes-${environment}`));
+    assert.match(protectedJob, /environment: progress-prizes-staging/);
     assert.match(protectedJob, /contents: read\n      id-token: write/);
     assert.match(protectedJob, /ref: \$\{\{ github\.sha \}\}/);
     assert.match(protectedJob, /persist-credentials: false/);
     assert.match(protectedJob, /id: google/);
     assert.match(protectedJob, /uses: \.\/\.github\/actions\/progress-prizes-google/);
-    assert.match(protectedJob, new RegExp(`^          environment: ${environment}$`, 'm'));
+    assert.match(protectedJob, /^          environment: staging$/m);
     assert.match(
       protectedJob,
       /responder-uri: \$\{\{ steps\.google\.outputs\['responder-uri'\] \}\}/,
@@ -209,24 +207,27 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   assert.doesNotMatch(rehearsal, /ref: refs\/heads\/main/);
   assert.equal(
     [...rehearsal.matchAll(/environment: progress-prizes-production/g)].length,
-    1,
+    0,
   );
   assert.equal(
     [...rehearsal.matchAll(/environment: progress-prizes-staging/g)].length,
-    googleJobNames.length - 1,
+    googleJobNames.length,
   );
   const productionValidationJob = jobBlock(rehearsal, 'validate-production');
-  assert.match(
-    productionValidationJob,
-    /^          staging-service-account-email: \$\{\{ secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL \}\}$/m,
-  );
+  assert.match(productionValidationJob, /actions: write\n      contents: read/);
+  assert.match(productionValidationJob, /progress-prizes-schedule\.mjs dispatch/);
+  assert.match(productionValidationJob, /--operation validate/);
+  assert.match(productionValidationJob, /REQUEST_ID: \$\{\{ github\.run_id \}\}/);
+  assert.match(productionValidationJob, /steps\.child\.outputs\['child-run-id'\]/);
+  assert.match(productionValidationJob, /gh run watch "\$CHILD_RUN_ID" --repo ScrollPrize\/villa --exit-status/);
+  assert.doesNotMatch(productionValidationJob, /id-token:|environment: progress-prizes-|secrets\./);
   assert.equal(
     [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL/g)].length,
     googleJobNames.length,
     'every Google job must receive an independently protected staging identity',
   );
   assert.doesNotMatch(productionValidationJob, /staging-folder-id|PROGRESS_PRIZE_STAGING_FOLDER_ID/);
-  for (const name of googleJobNames.filter((name) => name !== 'validate-production')) {
+  for (const name of googleJobNames) {
     const stagingJob = jobBlock(rehearsal, name);
     assert.match(
       stagingJob,
@@ -239,7 +240,7 @@ test('Google OIDC is confined to direct literal Environment jobs and one composi
   }
   assert.equal(
     [...rehearsal.matchAll(/secrets\.PROGRESS_PRIZE_STAGING_FOLDER_ID/g)].length,
-    googleJobNames.length - 1,
+    googleJobNames.length,
   );
 
   for (const name of jobNames(rehearsal).filter((name) => !googleJobNames.includes(name))) {
