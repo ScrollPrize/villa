@@ -5316,23 +5316,48 @@ LineAnnotationController::mergeCandidateMenuState(const LineAnnotationSession& s
         return state;
     }
     // Merging joins fiber endpoints; gate on the candidate side here, the
-    // clicked side is validated in the handler.
-    const auto fiberIt = std::find_if(
-        _fibers.begin(), _fibers.end(), [this](const StoredFiber& fiber) {
-            return fiber.id == _linkCandidate->fiberId;
-        });
-    if (fiberIt == _fibers.end()) {
-        return state;
+    // clicked side is validated in the handler. Prefer a live editing
+    // session's geometry so enablement agrees with the handler, which
+    // bakes such a session before merging.
+    std::optional<int> candidateIndex;
+    size_t controlCount = 0;
+    bool candidateResolved = false;
+    for (const auto& pane : _panes) {
+        if (!pane.session || pane.session->fiberId != _linkCandidate->fiberId) {
+            continue;
+        }
+        const auto sessionIndex = sessionControlPointIndexByPosition(
+            pane.session->controlPoints, _linkCandidate->position);
+        if (sessionIndex) {
+            const auto storedIndexMap =
+                storedIndexMapForSessionControls(pane.session->controlPoints);
+            if (static_cast<size_t>(*sessionIndex) < storedIndexMap.size()) {
+                candidateIndex = storedIndexMap[*sessionIndex];
+            }
+        }
+        controlCount = pane.session->controlPoints.size();
+        candidateResolved = true;
+        break;
     }
-    const auto candidateIndex = matchingStoredControlPointIndex(
-        fiberIt->controlPoints,
-        _linkCandidate->storedControlPointIndexHint,
-        _linkCandidate->position);
+    if (!candidateResolved) {
+        const auto fiberIt = std::find_if(
+            _fibers.begin(), _fibers.end(), [this](const StoredFiber& fiber) {
+                return fiber.id == _linkCandidate->fiberId;
+            });
+        if (fiberIt == _fibers.end()) {
+            return state;
+        }
+        candidateIndex = matchingStoredControlPointIndex(
+            fiberIt->controlPoints,
+            _linkCandidate->storedControlPointIndexHint,
+            _linkCandidate->position);
+        controlCount = fiberIt->controlPoints.size();
+    }
     if (!candidateIndex) {
         return state;
     }
     if (*candidateIndex != 0 &&
-        static_cast<size_t>(*candidateIndex) + 1 != fiberIt->controlPoints.size()) {
+        static_cast<size_t>(*candidateIndex) + 1 != controlCount) {
         state.enabled = false;
         state.label = tr("Merge with candidate (not an endpoint)");
         return state;
@@ -7308,52 +7333,62 @@ void LineAnnotationController::handleGeneratedControlPointMergeWithCandidate(
                                  mergedId, mergedFileName,
                                  joinControlIndex, suppressErrors]() {
         closeDialogPanesForFibers({clickedId, farId});
-        // The close finalization may schedule an async save of an original;
-        // flush it before retiring the files so they cannot be resurrected.
-        // A failure among the flushed saves (the redirected peer links ride
-        // this queue) keeps the originals on disk AND in memory: disk and
-        // panel then agree, showing the originals beside the merged fiber.
-        const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
-        waitForFiberSaves();
-        bool retired = _fiberSaveFailureCount == saveFailuresBefore;
-        if (!retired) {
-            showError(tr("A pending fiber save failed; the original fiber "
-                         "files were kept."),
-                      suppressErrors);
-        } else {
-            // All-or-nothing: a failure restores both originals in place.
-            const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
-                ++_nextFiberSaveSequence, {}, {clickedPath, farPath});
-            retired = retireResult.ok;
-            if (!retired) {
-                showError(tr("Could not retire the original fiber files: %1")
-                              .arg(QString::fromStdString(retireResult.error)),
-                          suppressErrors);
-            }
-        }
-        if (retired) {
-            _fibers.erase(std::remove_if(_fibers.begin(),
-                                         _fibers.end(),
-                                         [clickedId, farId](const StoredFiber& fiber) {
-                                             return fiber.id == clickedId ||
-                                                 fiber.id == farId;
-                                         }),
-                          _fibers.end());
-            invalidateFiberAlignmentMetrics(clickedId, false);
-            invalidateFiberAlignmentMetrics(farId, false);
-            emit fibersDeleted(
-                {std::min(clickedId, farId), std::max(clickedId, farId)});
-            closeIntersectionInspectionForRetiredFibers({clickedId, farId});
-        } else {
-            // The originals live on; surviving sessions must be saveable
-            // again or later edits would be silently dropped.
+        closeIntersectionInspectionForRetiredFibers({clickedId, farId});
+        // Fail loudly instead of reconciling: on any problem below, the
+        // originals are kept, their surviving sessions are made saveable
+        // again, and a full reload rebuilds memory from disk (branch refs
+        // re-derive from branch_file; the merged fiber's
+        // needs_reoptimization tag re-prompts the re-fit). The user
+        // resolves the duplicate old/new fibers.
+        const auto bailOut = [this, clickedId, farId,
+                              suppressErrors](const QString& reason) {
             for (const auto& otherPane : _panes) {
                 if (otherPane.session && (otherPane.session->fiberId == clickedId ||
                                           otherPane.session->fiberId == farId)) {
                     otherPane.session->suppressFiberSave = false;
                 }
             }
+            showError(tr("The merge could not be completed: %1\nThe original "
+                         "fibers were kept; reloading fibers from disk.")
+                          .arg(reason),
+                      suppressErrors);
+            loadFibersForCurrentPackage();
+        };
+        // Flush the queue (the redirected peer links ride it) and the close
+        // before retiring, so a failed save or a pane that refused to close
+        // (failed finalization) is caught while the originals still exist.
+        const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
+        waitForFiberSaves();
+        if (_fiberSaveFailureCount != saveFailuresBefore) {
+            bailOut(tr("a pending fiber save failed"));
+            return;
         }
+        for (const auto& otherPane : _panes) {
+            if (otherPane.session && otherPane.dialog &&
+                (otherPane.session->fiberId == clickedId ||
+                 otherPane.session->fiberId == farId)) {
+                bailOut(tr("the annotation workspace did not close"));
+                return;
+            }
+        }
+        // All-or-nothing: a failure restores both originals in place.
+        const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
+            ++_nextFiberSaveSequence, {}, {clickedPath, farPath});
+        if (!retireResult.ok) {
+            bailOut(QString::fromStdString(retireResult.error));
+            return;
+        }
+        _fibers.erase(std::remove_if(_fibers.begin(),
+                                     _fibers.end(),
+                                     [clickedId, farId](const StoredFiber& fiber) {
+                                         return fiber.id == clickedId ||
+                                             fiber.id == farId;
+                                     }),
+                      _fibers.end());
+        invalidateFiberAlignmentMetrics(clickedId, false);
+        invalidateFiberAlignmentMetrics(farId, false);
+        emit fibersDeleted(
+            {std::min(clickedId, farId), std::max(clickedId, farId)});
 
         // Re-fit the merged line (join span + extrapolation tails); consumes
         // the needs_reoptimization tag, which otherwise re-prompts on load.
@@ -7707,48 +7742,54 @@ void LineAnnotationController::handleGeneratedControlPointSplitFromCandidate(
                                  suffixFileName, reopenFiberId,
                                  reopenControlIndex, suppressErrors]() {
         closeDialogPanesForFibers({parentId});
-        // The close finalization may schedule an async save of the original;
-        // flush it before retiring the file so it cannot be resurrected. A
-        // failure among the flushed saves (the redirected peer links ride
-        // this queue) keeps the original on disk AND in memory: disk and
-        // panel then agree, showing the original beside its halves.
-        const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
-        waitForFiberSaves();
-        bool retired = _fiberSaveFailureCount == saveFailuresBefore;
-        if (!retired) {
-            showError(tr("A pending fiber save failed; the original fiber "
-                         "file was kept."),
-                      suppressErrors);
-        } else {
-            const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
-                ++_nextFiberSaveSequence, {}, {parentPath});
-            retired = retireResult.ok;
-            if (!retired) {
-                showError(tr("Could not retire the original fiber file %1: %2")
-                              .arg(QString::fromStdString(parentPath.string()))
-                              .arg(QString::fromStdString(retireResult.error)),
-                          suppressErrors);
-            }
-        }
-        if (retired) {
-            _fibers.erase(std::remove_if(_fibers.begin(),
-                                         _fibers.end(),
-                                         [parentId](const StoredFiber& fiber) {
-                                             return fiber.id == parentId;
-                                         }),
-                          _fibers.end());
-            invalidateFiberAlignmentMetrics(parentId, false);
-            emit fibersDeleted({parentId});
-            closeIntersectionInspectionForRetiredFibers({parentId});
-        } else {
-            // The original lives on; surviving sessions must be saveable
-            // again or later edits would be silently dropped.
+        closeIntersectionInspectionForRetiredFibers({parentId});
+        // Fail loudly instead of reconciling: on any problem below, the
+        // original is kept, its surviving sessions are made saveable again,
+        // and a full reload rebuilds memory from disk (branch refs re-derive
+        // from branch_file; the halves' needs_reoptimization tag re-prompts
+        // the re-fit). The user resolves the duplicate old/new fibers.
+        const auto bailOut = [this, parentId, suppressErrors](const QString& reason) {
             for (const auto& otherPane : _panes) {
                 if (otherPane.session && otherPane.session->fiberId == parentId) {
                     otherPane.session->suppressFiberSave = false;
                 }
             }
+            showError(tr("The split could not be completed: %1\nThe original "
+                         "fiber was kept; reloading fibers from disk.")
+                          .arg(reason),
+                      suppressErrors);
+            loadFibersForCurrentPackage();
+        };
+        // Flush the queue (the redirected peer links ride it) and the close
+        // before retiring, so a failed save or a pane that refused to close
+        // (failed finalization) is caught while the original still exists.
+        const uint64_t saveFailuresBefore = _fiberSaveFailureCount;
+        waitForFiberSaves();
+        if (_fiberSaveFailureCount != saveFailuresBefore) {
+            bailOut(tr("a pending fiber save failed"));
+            return;
         }
+        for (const auto& otherPane : _panes) {
+            if (otherPane.session && otherPane.dialog &&
+                otherPane.session->fiberId == parentId) {
+                bailOut(tr("the annotation workspace did not close"));
+                return;
+            }
+        }
+        const auto retireResult = vc3d::line_annotation::runFiberSaveJob(
+            ++_nextFiberSaveSequence, {}, {parentPath});
+        if (!retireResult.ok) {
+            bailOut(QString::fromStdString(retireResult.error));
+            return;
+        }
+        _fibers.erase(std::remove_if(_fibers.begin(),
+                                     _fibers.end(),
+                                     [parentId](const StoredFiber& fiber) {
+                                         return fiber.id == parentId;
+                                     }),
+                      _fibers.end());
+        invalidateFiberAlignmentMetrics(parentId, false);
+        emit fibersDeleted({parentId});
 
         // Re-fit both halves so their lines regrow extrapolation tails past
         // the split CPs. Consumes the needs_reoptimization tag set at
