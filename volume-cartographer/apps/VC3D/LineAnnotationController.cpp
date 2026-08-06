@@ -9361,6 +9361,88 @@ void LineAnnotationController::updateGeneratedViewMetricsForFiber(uint64_t fiber
     }
 }
 
+std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
+    const LineAnnotationSession& session)
+{
+    constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<cv::Vec3f> normals;
+    normals.reserve(session.optimizedLine.points.size());
+
+    std::shared_ptr<Volume> volume;
+    try {
+        volume = _state ? _state->currentVolume() : nullptr;
+    } catch (...) {
+        volume.reset();
+    }
+
+    fs::path volpkgRoot;
+    if (_state && _state->vpkg()) {
+        auto vpkg = _state->vpkg();
+        volpkgRoot = vpkg->path().empty()
+            ? fs::path(vpkg->getVolpkgDirectory())
+            : vpkg->path().parent_path();
+    }
+    if (!_scrollUmbilicusLoadAttempted || volpkgRoot != _scrollUmbilicusRoot) {
+        _scrollUmbilicusLoadAttempted = true;
+        _scrollUmbilicusRoot = volpkgRoot;
+        _scrollUmbilicus.reset();
+        try {
+            if (!volpkgRoot.empty() && volume) {
+                const cv::Vec3i volumeShape{volume->numSlices(),
+                                            volume->sliceHeight(),
+                                            volume->sliceWidth()};
+                for (const char* name : {"umbilicus.json", "estimated_umbilicus.json"}) {
+                    const fs::path candidate = volpkgRoot / name;
+                    if (fs::exists(candidate)) {
+                        _scrollUmbilicus =
+                            vc::core::util::Umbilicus::FromFile(candidate, volumeShape);
+                        break;
+                    }
+                }
+            }
+        } catch (...) {
+            _scrollUmbilicus.reset();
+        }
+    }
+
+    cv::Vec2f volumeCenterXY{kNan, kNan};
+    if (volume) {
+        volumeCenterXY = {static_cast<float>(volume->sliceWidth()) * 0.5f,
+                          static_cast<float>(volume->sliceHeight()) * 0.5f};
+    }
+
+    for (const auto& point : session.optimizedLine.points) {
+        const cv::Vec3d sampled = normalizedOrZero(point.sampledNormal.normal);
+        if (!point.sampledNormal.valid || !finiteDirection(sampled)) {
+            normals.push_back({kNan, kNan, kNan});
+            continue;
+        }
+        cv::Vec3f normal = toVec3f(sampled);
+        const cv::Vec3f position = toVec3f(point.position);
+        cv::Vec3f towardCenter{kNan, kNan, kNan};
+        if (_scrollUmbilicus) {
+            try {
+                towardCenter = _scrollUmbilicus->vector_to_umbilicus(position);
+            } catch (...) {
+            }
+        }
+        if (!std::isfinite(towardCenter[0]) && std::isfinite(volumeCenterXY[0])) {
+            towardCenter = {volumeCenterXY[0] - position[0],
+                            volumeCenterXY[1] - position[1],
+                            0.0f};
+        }
+        // Sign convention: normals point away from the scroll center. The
+        // dialog uses them directly as the cut view's up hint, and the
+        // viewer's scene y renders downward, so this puts the fiber's
+        // center-facing surface at the top of the view.
+        if (std::isfinite(towardCenter[0]) && normal.dot(towardCenter) > 0.0f) {
+            normal = -normal;
+        }
+        normals.push_back(normal);
+    }
+    return normals;
+}
+
 bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session)
 {
     if (!_state) {
@@ -9422,6 +9504,7 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
     generatedViews.lineSideSlice = views.lineSideSlice;
     generatedViews.linePoints = std::move(linePoints);
     generatedViews.lineUpVectors = views.lineUpVectors;
+    generatedViews.lineNormals = orientedLineNormalsForSession(session);
     generatedViews.branchLinePoints = generatedBranchLinePointsForSession(session);
     generatedViews.branchLinks = generatedBranchLinkMarkers(session.branches);
     generatedViews.seedPoint = seedPoint;

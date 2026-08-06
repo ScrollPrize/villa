@@ -26,6 +26,7 @@
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
+#include "vc/core/util/Umbilicus.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -549,6 +550,11 @@ private:
                                          std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                          bool globalGoalsOnly = false) const;
     void finishOptimization(const std::string& surfaceName);
+    // Per-line-point sampled sheet normals, sign-oriented away from the
+    // scroll center (umbilicus when available, volume XY center otherwise);
+    // NaN entries mark invalid samples.
+    [[nodiscard]] std::vector<cv::Vec3f> orientedLineNormalsForSession(
+        const LineAnnotationSession& session);
     bool materializeGeneratedViews(LineAnnotationSession& session);
     bool materializeGeneratedViews(LineAnnotationSession& session,
                                    const std::string& surfacePrefix);
@@ -796,6 +802,13 @@ private:
     bool _fiberMetricsPending = false;
     std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
+    // Scroll-center reference for orienting generated-view normals; loaded
+    // lazily from the volpkg's umbilicus file and re-attempted when the
+    // volpkg root changes. nullopt after a failed attempt (volume-center
+    // fallback is used instead).
+    std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
+    std::filesystem::path _scrollUmbilicusRoot;
+    bool _scrollUmbilicusLoadAttempted = false;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
