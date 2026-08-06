@@ -361,6 +361,9 @@ function assertAutomationOptions(command, options) {
   if (options.fault !== undefined && !['bootstrap', 'prepare', 'activate'].includes(command)) {
     throw new Error('--fault is accepted only by bootstrap, prepare, and activate');
   }
+  if (command === 'reconcile-active' && options['simulated-now'] !== undefined) {
+    throw new Error('reconcile-active rejects --simulated-now');
+  }
   if (command === 'bootstrap') {
     const sourceCycle = requireOption(options, 'source-cycle');
     parseCycle(sourceCycle);
@@ -410,7 +413,14 @@ function assertAutomationOptions(command, options) {
 }
 
 function collaboratorPermissions(command, env) {
-  if (!['validate', 'bootstrap', 'prepare', 'activate', 'verify'].includes(command)) return [];
+  if (![
+    'validate',
+    'bootstrap',
+    'prepare',
+    'activate',
+    'reconcile-active',
+    'verify',
+  ].includes(command)) return [];
   return [{
     type: 'group',
     role: 'writer',
@@ -475,6 +485,9 @@ export async function runAutomationCli(argv, {
   // This validation deliberately precedes token access, Google client creation,
   // responder URL resolution, and every filesystem/network call.
   const runtime = buildRuntime(options, env);
+  if (command === 'reconcile-active' && runtime.eventName !== 'workflow_dispatch') {
+    throw new Error('reconcile-active requires a manual workflow_dispatch event');
+  }
   assertRolloverRuntimeSafety(runtime, {
     faultInjection: options.fault,
     allowActivationRewind: options['allow-activation-rewind'] === true,
@@ -565,6 +578,12 @@ export async function runAutomationCli(argv, {
         preparationDays,
         faultInjection: options.fault,
         headSha: activation.headSha,
+      });
+    } else if (command === 'reconcile-active') {
+      result = await rollover.reconcileActive({
+        targetCycle,
+        sourceFormId: productionSourceFormId,
+        collaboratorPermissions: collaborators,
       });
     } else if (command === 'verify') {
       result = await rollover.verify({

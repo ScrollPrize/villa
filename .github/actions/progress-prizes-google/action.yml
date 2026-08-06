@@ -3,7 +3,7 @@ description: Run one guarded Progress Prize Google Forms operation from a truste
 
 inputs:
   operation:
-    description: validate, bootstrap, prepare, activate, verify, or cleanup
+    description: validate, bootstrap, prepare, activate, reconcile-active, verify, or cleanup
     required: true
   environment:
     description: staging or production
@@ -130,7 +130,7 @@ runs:
         test "$REF" = refs/heads/main
         test "$EVENT_NAME" = workflow_dispatch
         case "$OPERATION" in
-          validate|bootstrap|prepare|activate|verify|cleanup) ;;
+          validate|bootstrap|prepare|activate|reconcile-active|verify|cleanup) ;;
           *) exit 1 ;;
         esac
         case "$EXPECT_FAULT" in true|false) ;; *) exit 1 ;; esac
@@ -148,7 +148,7 @@ runs:
         fi
         case "$OPERATION" in
           validate|bootstrap) test -n "$SOURCE_CYCLE" ;;
-          prepare|activate|verify|cleanup) test -n "$TARGET_CYCLE" ;;
+          prepare|activate|reconcile-active|verify|cleanup) test -n "$TARGET_CYCLE" ;;
         esac
         if test "$OPERATION" = bootstrap; then test "$SOURCE_CYCLE" = 2026-07 || exit 1; fi
         if test "$OPERATION" = activate; then
@@ -165,6 +165,16 @@ runs:
           test "$OPERATION" = bootstrap
           test "$SOURCE_CYCLE" = 2026-07
           test "$TARGET_CYCLE" = 2026-08
+        fi
+        if test "$OPERATION" = reconcile-active; then
+          test "$EVENT_NAME" = workflow_dispatch
+          test -z "$SIMULATED_NOW"
+          test -z "$FAULT"
+          test "$EXPECT_FAULT" = false
+          test "$DRY_RUN" = false
+          test "$ALLOW_ACTIVATION_REWIND" = false
+          test -z "$HEAD_SHA"
+          test -z "$BASE_SHA"
         fi
         if test "$AUTOMATION_ENVIRONMENT" = production; then
           test "$OPERATION" != bootstrap

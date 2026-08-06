@@ -17,6 +17,7 @@ on:
           - dry-run
           - prepare
           - activate
+          - reconcile-active
           - verify
       source-cycle:
         description: Source cycle (YYYY-MM)
@@ -81,7 +82,7 @@ jobs:
           assert.match(process.env.HEAD_SHA ?? '', /^[a-f0-9]{40}$/);
           assert.equal(process.env.EVENT_NAME, 'workflow_dispatch');
           assert.equal(
-            new Set(['validate', 'dry-run', 'prepare', 'activate', 'verify'])
+            new Set(['validate', 'dry-run', 'prepare', 'activate', 'reconcile-active', 'verify'])
               .has(process.env.OPERATION ?? ''),
             true,
           );
@@ -95,6 +96,9 @@ jobs:
             : `${sourceYear}-${String(sourceMonth + 1).padStart(2, '0')}`;
           assert.equal(process.env.TARGET_CYCLE, target);
           if (process.env.REQUEST_ID !== '') assert.match(process.env.REQUEST_ID, /^[1-9]\d*$/);
+          if (process.env.OPERATION === 'reconcile-active') {
+            assert.equal(process.env.REQUEST_ID, '');
+          }
           NODE
 
   validate:
@@ -192,6 +196,69 @@ jobs:
             ].join('\n'),
           );
           NODE
+
+  reconcile-approval:
+    name: Approve marker-only active-state reconciliation
+    if: inputs.operation == 'reconcile-active'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: progress-prizes-production-activation
+    permissions: {}
+    steps:
+      - name: Bind approval to a manual exact-main reconciliation
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          TRIGGER_SHA: ${{ github.sha }}
+          REQUEST_ID: ${{ inputs['request-id'] }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+        run: |
+          set -euo pipefail
+          test "$EVENT_NAME" = workflow_dispatch
+          test "$REF" = refs/heads/main
+          [[ "$TRIGGER_SHA" =~ ^[a-f0-9]{40}$ ]]
+          test -z "$REQUEST_ID"
+          [[ "$SOURCE_CYCLE" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]
+          [[ "$TARGET_CYCLE" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]
+
+  reconcile-active:
+    name: Audit and reconcile only active Drive markers
+    if: inputs.operation == 'reconcile-active'
+    needs:
+      - preflight
+      - reconcile-approval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the exact trusted trigger commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Reconcile only the verified active Drive markers
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: reconcile-active
+          environment: production
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          branch: main
+          target-branch: main
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
 
   prepare-google:
     if: inputs.operation == 'prepare'
