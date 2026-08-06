@@ -83,8 +83,11 @@ public:
         QGraphicsPathItem* controlPoints = nullptr;
         QGraphicsPathItem* seedPoints = nullptr;
         QGraphicsPathItem* linkCandidatePoints = nullptr;
+        QGraphicsPathItem* splitCandidatePoints = nullptr;
         QGraphicsPathItem* branchControlPoints = nullptr;
         QGraphicsPathItem* pendingBranchControlPoints = nullptr;
+        QGraphicsPathItem* sameHvBranchControlPoints = nullptr;
+        QGraphicsPathItem* sameHvPendingBranchControlPoints = nullptr;
         QGraphicsPathItem* fiberIntersections = nullptr;
         QGraphicsPathItem* linkCandidateFiberIntersections = nullptr;
         QGraphicsPathItem* branchLinkFiberIntersections = nullptr;
@@ -116,7 +119,10 @@ public:
         CChunkedVolumeViewer* viewer,
         const QPointF& scenePoint,
         const QPoint& globalPos,
-        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {});
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {},
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitCandidateState = {},
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& splitAndLinkCandidateState = {},
+        const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {});
     const std::vector<Pane>& panes() const { return _panes; }
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
@@ -189,6 +195,18 @@ signals:
     void generatedControlPointLinkWithCandidateRequested(const std::string& surfaceName,
                                                          size_t controlPointIndex,
                                                          cv::Vec3f volumePoint);
+    void generatedControlPointMergeWithCandidateRequested(const std::string& surfaceName,
+                                                          size_t controlPointIndex,
+                                                          cv::Vec3f volumePoint);
+    void generatedControlPointSplitCandidateRequested(const std::string& surfaceName,
+                                                      size_t controlPointIndex,
+                                                      cv::Vec3f volumePoint);
+    void generatedControlPointSplitFromCandidateRequested(const std::string& surfaceName,
+                                                          size_t controlPointIndex,
+                                                          cv::Vec3f volumePoint);
+    void generatedControlPointSplitAndLinkFromCandidateRequested(const std::string& surfaceName,
+                                                                 size_t controlPointIndex,
+                                                                 cv::Vec3f volumePoint);
     void generatedNearbyAnnotationOpenRequested(uint64_t fiberId, cv::Vec3f volumePoint);
     void generatedControlPointUnlinkRequested(const std::string& surfaceName,
                                               size_t controlPointIndex,

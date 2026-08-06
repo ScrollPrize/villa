@@ -143,38 +143,55 @@ jobs:
     needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    environment: progress-prizes-production
     permissions:
+      actions: write
       contents: read
-      id-token: write
-    outputs:
-      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
     steps:
-      - name: Check out trusted Google operation
+      - name: Check out trusted production validation proxy
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
           clean: true
           fetch-depth: 1
-      - name: Validate production Google Form
-        id: google
-        uses: ./.github/actions/progress-prizes-google
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          operation: validate
-          environment: production
-          source-cycle: ${{ inputs['source-cycle'] }}
-          branch: main
-          target-branch: main
-          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
-          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
-          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
-          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
-          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
-          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
-          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
-          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+          node-version: 24
+      - name: Dispatch the exact production read-only validation
+        id: child
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_CYCLE: ${{ inputs['source-cycle'] }}
+          TARGET_CYCLE: ${{ inputs['target-cycle'] }}
+          REQUEST_ID: ${{ github.run_id }}
+        run: >-
+          node .github/progress-prizes-schedule.mjs dispatch
+          --operation validate
+          --source-cycle "$SOURCE_CYCLE"
+          --target-cycle "$TARGET_CYCLE"
+          --request-id "$REQUEST_ID"
+      - name: Bind the exact child validation run
+        env:
+          CHILD_RUN_ID: ${{ steps.child.outputs['child-run-id'] }}
+          CHILD_RUN_URL: ${{ steps.child.outputs['child-run-html-url'] }}
+          DISPATCHED: ${{ steps.child.outputs.dispatched }}
+        run: |
+          set -euo pipefail
+          test "$DISPATCHED" = true
+          [[ "$CHILD_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$CHILD_RUN_URL" = "https://github.com/ScrollPrize/villa/actions/runs/$CHILD_RUN_ID"
+          printf '%s\n' \
+            '### Read-only production validation proxy' \
+            '' \
+            "- Child run: $CHILD_RUN_URL" \
+            '- Google authentication is confined to the production workflow.' \
+            '' >>"$GITHUB_STEP_SUMMARY"
+      - name: Await the exact production validation result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHILD_RUN_ID: ${{ steps.child.outputs['child-run-id'] }}
+        run: gh run watch "$CHILD_RUN_ID" --repo ScrollPrize/villa --exit-status
 
   bootstrap-staging:
     if: >-
@@ -679,10 +696,146 @@ jobs:
           source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
           editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
 
+  reconcile-active-once:
+    if: inputs.operation == 'full-rehearsal'
+    needs:
+      - merge-smoke
+      - prove-activation-idempotency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Fetch exact merged smoke page as data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ needs.merge-smoke.outputs['merge-sha'] }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { writeFile } from 'node:fs/promises';
+
+          const sha = process.env.MERGE_SHA ?? '';
+          if (!/^[a-f0-9]{40}$/i.test(sha)) throw new Error('Missing exact smoke merge SHA.');
+          const url = new URL('https://api.github.com/repos/ScrollPrize/villa/contents/scrollprize.org/docs/34_prizes.md');
+          url.searchParams.set('ref', sha);
+          const response = await fetch(url, {
+            redirect: 'error',
+            headers: {
+              accept: 'application/vnd.github.raw+json',
+              authorization: `Bearer ${process.env.GH_TOKEN}`,
+              'user-agent': 'progress-prize-rollover',
+              'x-github-api-version': '2022-11-28',
+            },
+          });
+          if (response.status !== 200) throw new Error('Could not read the exact merged smoke page.');
+          const body = await response.text();
+          if (Buffer.byteLength(body, 'utf8') > 1024 * 1024) throw new Error('Managed page response is too large.');
+          await writeFile('scrollprize.org/docs/34_prizes.md', body, { mode: 0o600 });
+          NODE
+      - name: Reconcile active staging markers once
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: reconcile-active
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
+  reconcile-active-twice:
+    if: inputs.operation == 'full-rehearsal'
+    needs:
+      - merge-smoke
+      - reconcile-active-once
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: progress-prizes-staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      responder-uri: ${{ steps.google.outputs['responder-uri'] }}
+    steps:
+      - name: Check out trusted Google operation
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 1
+      - name: Fetch exact merged smoke page as data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ needs.merge-smoke.outputs['merge-sha'] }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { writeFile } from 'node:fs/promises';
+
+          const sha = process.env.MERGE_SHA ?? '';
+          if (!/^[a-f0-9]{40}$/i.test(sha)) throw new Error('Missing exact smoke merge SHA.');
+          const url = new URL('https://api.github.com/repos/ScrollPrize/villa/contents/scrollprize.org/docs/34_prizes.md');
+          url.searchParams.set('ref', sha);
+          const response = await fetch(url, {
+            redirect: 'error',
+            headers: {
+              accept: 'application/vnd.github.raw+json',
+              authorization: `Bearer ${process.env.GH_TOKEN}`,
+              'user-agent': 'progress-prize-rollover',
+              'x-github-api-version': '2022-11-28',
+            },
+          });
+          if (response.status !== 200) throw new Error('Could not read the exact merged smoke page.');
+          const body = await response.text();
+          if (Buffer.byteLength(body, 'utf8') > 1024 * 1024) throw new Error('Managed page response is too large.');
+          await writeFile('scrollprize.org/docs/34_prizes.md', body, { mode: 0o600 });
+          NODE
+      - name: Reconcile active staging markers twice
+        id: google
+        uses: ./.github/actions/progress-prizes-google
+        with:
+          operation: reconcile-active
+          environment: staging
+          source-cycle: ${{ inputs['source-cycle'] }}
+          target-cycle: ${{ inputs['target-cycle'] }}
+          branch: codex/progress-prize-smoke-20260720
+          target-branch: codex/progress-prize-smoke-base-20260720
+          workload-identity-provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service-account-email: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          staging-service-account-email: ${{ secrets.PROGRESS_PRIZE_STAGING_SERVICE_ACCOUNT_EMAIL }}
+          drive-admin-email: ${{ secrets.PROGRESS_PRIZE_DRIVE_ADMIN_EMAIL }}
+          drive-id: ${{ secrets.PROGRESS_PRIZE_DRIVE_ID }}
+          folder-id: ${{ secrets.PROGRESS_PRIZE_FOLDER_ID }}
+          staging-folder-id: ${{ secrets.PROGRESS_PRIZE_STAGING_FOLDER_ID }}
+          archive-folder-id: ${{ secrets.PROGRESS_PRIZE_ARCHIVE_FOLDER_ID }}
+          source-form-id: ${{ secrets.PROGRESS_PRIZE_SOURCE_FORM_ID }}
+          editor-group-email: ${{ secrets.PROGRESS_PRIZE_EDITOR_GROUP_EMAIL }}
+
   cleanup-full-rehearsal:
     if: inputs.operation == 'full-rehearsal'
     needs:
-      - prove-activation-idempotency
+      - reconcile-active-twice
       - verify-post-merge-preview
     runs-on: ubuntu-24.04
     timeout-minutes: 20
